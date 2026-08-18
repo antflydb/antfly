@@ -63,6 +63,10 @@ pub const RecordWrite = struct {
     artifact_writes: []const ArtifactWrite = &.{},
     artifact_deletes: []const []const u8 = &.{},
     target_hints: ?[]const change_journal_mod.TargetHint = null,
+    /// Publish completion metadata only after the writer finishes the primary,
+    /// split-delta, and HA handoff. The DB writer batches this metadata while
+    /// it still owns the HA mutation/fencing boundary.
+    publish_resolution_handoff: bool = false,
 };
 
 pub const DerivedRecordWriter = *const fn (ptr: *anyopaque, write: RecordWrite) anyerror!u64;
@@ -239,16 +243,11 @@ pub const ProcessOutcome = struct {
 
 const PersistenceMode = enum { immediate, deferred };
 const handoff_digest_len = std.crypto.hash.sha2.Sha256.digest_length;
-const HandoffValue = [1 + handoff_digest_len]u8;
+pub const HandoffValue = [handoff_digest_len]u8;
 
-fn resolutionHandoffValue(artifact_value: ?[]const u8) HandoffValue {
-    var value = [_]u8{0} ** (1 + handoff_digest_len);
-    if (artifact_value) |bytes| {
-        value[0] = 1;
-        var digest: [handoff_digest_len]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-        @memcpy(value[1..], &digest);
-    }
+pub fn resolutionHandoffValue(artifact_value: []const u8) HandoffValue {
+    var value: HandoffValue = undefined;
+    std.crypto.hash.sha2.Sha256.hash(artifact_value, &value, .{});
     return value;
 }
 
@@ -256,7 +255,7 @@ fn resolutionHandoffMatches(
     gpa: Allocator,
     store: resolver_lib.ArtifactStore,
     resolution_key: []const u8,
-    artifact_value: ?[]const u8,
+    artifact_value: []const u8,
 ) !bool {
     const marker_key = try internal_keys.resolutionHandoffKeyAlloc(gpa, resolution_key);
     defer gpa.free(marker_key);
@@ -266,16 +265,38 @@ fn resolutionHandoffMatches(
     return if (stored) |bytes| std.mem.eql(u8, bytes, &expected) else false;
 }
 
+fn resolutionHandoffExists(
+    gpa: Allocator,
+    store: resolver_lib.ArtifactStore,
+    resolution_key: []const u8,
+) !bool {
+    const marker_key = try internal_keys.resolutionHandoffKeyAlloc(gpa, resolution_key);
+    defer gpa.free(marker_key);
+    const stored = try store.get(gpa, marker_key);
+    defer if (stored) |bytes| gpa.free(bytes);
+    return stored != null;
+}
+
 fn saveResolutionHandoff(
     gpa: Allocator,
     store: resolver_lib.ArtifactStore,
     resolution_key: []const u8,
-    artifact_value: ?[]const u8,
+    artifact_value: []const u8,
 ) !void {
     const marker_key = try internal_keys.resolutionHandoffKeyAlloc(gpa, resolution_key);
     defer gpa.free(marker_key);
     const value = resolutionHandoffValue(artifact_value);
     try store.put(marker_key, &value);
+}
+
+fn deleteResolutionHandoff(
+    gpa: Allocator,
+    store: resolver_lib.ArtifactStore,
+    resolution_key: []const u8,
+) !void {
+    const marker_key = try internal_keys.resolutionHandoffKeyAlloc(gpa, resolution_key);
+    defer gpa.free(marker_key);
+    try store.delete(marker_key);
 }
 
 /// Process a changed extraction (asset) artifact key: look up the resolver that
@@ -403,12 +424,13 @@ fn processChangedExtractionWithConfig(
     defer if (existing) |bytes| gpa.free(bytes);
 
     if (computed == null) {
-        const handoff_complete = try resolutionHandoffMatches(gpa, store, resolution_key, null);
+        const stale_handoff = try resolutionHandoffExists(gpa, store, resolution_key);
         return .{
-            // A missing marker means a prior delete may have committed locally
-            // but failed its split/HA handoff. Re-emit the full clear until the
-            // post-handoff marker is durable.
-            .result = if (existing == null and handoff_complete) .source_missing else .cleared,
+            // A retained write marker means a prior delete may have committed
+            // locally but failed its split/HA handoff. Re-emit the full clear;
+            // a successful clear removes the marker instead of retaining a
+            // document-identifying tombstone indefinitely.
+            .result = if (existing == null and !stale_handoff) .source_missing else .cleared,
             .resolution_key = resolution_key,
         };
     }
@@ -1012,16 +1034,8 @@ pub fn processRecordKeys(
             .batch = .{ .changed_artifact_keys = pending.full_keys.items },
             .artifact_writes = pending.artifact_writes.items,
             .artifact_deletes = pending.artifact_deletes.items,
+            .publish_resolution_handoff = true,
         });
-        // Publish completion only after the writer has finished the primary,
-        // split-delta, and HA handoff. Missing/stale markers force a safe full
-        // retry instead of incorrectly downgrading to graph-only replay.
-        for (pending.artifact_writes.items) |artifact| {
-            try saveResolutionHandoff(gpa, store, artifact.key, artifact.value);
-        }
-        for (pending.artifact_deletes.items) |key| {
-            try saveResolutionHandoff(gpa, store, key, null);
-        }
     }
     if (pending.graph_only_keys.items.len > 0) {
         _ = try write_fn(write_ctx, .{
@@ -2458,6 +2472,7 @@ const CaptureWriter = struct {
     calls: u64 = 0,
     inferred_calls: u64 = 0,
     graph_only_calls: u64 = 0,
+    handoff_calls: u64 = 0,
 
     fn deinit(self: *CaptureWriter) void {
         for (self.keys.items) |k| self.alloc.free(k);
@@ -2477,6 +2492,16 @@ const CaptureWriter = struct {
             if (hints.len == 1 and hints[0] == .graph) self.graph_only_calls += 1;
         } else {
             self.inferred_calls += 1;
+        }
+        if (write.publish_resolution_handoff) {
+            self.handoff_calls += 1;
+            const store = self.store orelse return error.MissingTestArtifactStore;
+            for (write.artifact_writes) |artifact| {
+                try saveResolutionHandoff(self.alloc, store, artifact.key, artifact.value);
+            }
+            for (write.artifact_deletes) |key| {
+                try deleteResolutionHandoff(self.alloc, store, key);
+            }
         }
         self.calls += 1;
         return self.calls;
@@ -2722,6 +2747,9 @@ test "processRecordKeys fans one source artifact out to all consuming resolvers"
     try testing.expectEqual(@as(usize, 2), writer.keys.items.len);
     try testing.expectEqualSlices(u8, people_key, writer.keys.items[0]);
     try testing.expectEqualSlices(u8, org_key, writer.keys.items[1]);
+    // Both resolver outputs share one writer handoff; production publishes all
+    // completion markers in one follow-up metadata transaction.
+    try testing.expectEqual(@as(u64, 1), writer.handoff_calls);
 }
 
 /// Minimal replay Source for tests: replays a fixed list of encoded records.
