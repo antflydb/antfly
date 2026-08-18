@@ -10221,7 +10221,7 @@ test "metadata service batches store status reports" {
     try std.testing.expectEqual(@as(usize, 1), status.active_backfills);
 }
 
-test "metadata service persists coalesces and clears reallocation requests" {
+test "metadata service persists coalesces promotes and clears reallocation requests" {
     const Factory = struct {
         alloc: std.mem.Allocator,
         store: *raft_engine.core.MemoryStorage,
@@ -10300,9 +10300,6 @@ test "metadata service persists coalesces and clears reallocation requests" {
     try runServiceRoundsUntilMetadataReady(&svc);
 
     try svc.requestReallocation(77_000);
-    // Queue a competing generation before either command applies. Raft apply
-    // order must admit the first and coalesce the second in one transaction.
-    try svc.requestReallocation(88_000);
     try svc.runRound();
     const requested = try svc.getProjectedReallocationRequest();
     try std.testing.expect(requested != null);
@@ -10320,22 +10317,31 @@ test "metadata service persists coalesces and clears reallocation requests" {
     defer svc.freeAdminSnapshot(&requested_snapshot);
     try std.testing.expectEqual(requested, requested_snapshot.reallocation_request);
 
-    // Concurrent triggers coalesce around the active causal barrier instead
-    // of replacing its generation while stores may be acknowledging it.
+    // A reconcile plan may decide to clear this generation before a lifecycle
+    // mutation queues another reallocation. Apply two such triggers before the
+    // stale clear: they must coalesce into one private pending generation, and
+    // the clear must atomically promote the latest trigger instead of losing it.
+    try svc.requestReallocation(88_000);
     try svc.requestReallocation(99_000);
+    var clear_active_plan = metadata_reconciler.ReconciliationPlan.empty();
+    clear_active_plan.clear_reallocation_request = requested.?.request_id;
+    try svc.applyReconciliationPlan(&clear_active_plan);
     try svc.runRound();
-    const coalesced = try svc.getProjectedReallocationRequest();
-    try std.testing.expectEqual(requested, coalesced);
+    const promoted = try svc.getProjectedReallocationRequest();
+    try std.testing.expect(promoted != null);
+    try std.testing.expect(promoted.?.request_id != requested.?.request_id);
+    try std.testing.expectEqual(@as(u64, 99_000), promoted.?.requested_at_ms);
 
+    // A repeated clear from the old plan cannot consume its promoted successor.
     var stale_plan = metadata_reconciler.ReconciliationPlan.empty();
-    stale_plan.clear_reallocation_request = requested.?.request_id +% 1;
+    stale_plan.clear_reallocation_request = requested.?.request_id;
     try svc.applyReconciliationPlan(&stale_plan);
     try svc.runRound();
-    try std.testing.expectEqual(requested, try svc.getProjectedReallocationRequest());
+    try std.testing.expectEqual(promoted, try svc.getProjectedReallocationRequest());
 
-    var current_plan = metadata_reconciler.ReconciliationPlan.empty();
-    current_plan.clear_reallocation_request = requested.?.request_id;
-    try svc.applyReconciliationPlan(&current_plan);
+    var clear_promoted_plan = metadata_reconciler.ReconciliationPlan.empty();
+    clear_promoted_plan.clear_reallocation_request = promoted.?.request_id;
+    try svc.applyReconciliationPlan(&clear_promoted_plan);
     try svc.runRound();
     try std.testing.expect((try svc.getProjectedReallocationRequest()) == null);
 }

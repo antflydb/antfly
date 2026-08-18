@@ -690,6 +690,89 @@ test "metadata raft apply store initializes one durable snapshotted cluster inca
     try std.testing.expectEqual(first, (try target.getMetadataIncarnation(group_id)).?);
 }
 
+test "metadata raft apply store snapshots and promotes the latest pending reallocation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-reallocation-source", .{tmp.sub_path});
+    defer std.testing.allocator.free(source_root);
+    const target_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-reallocation-target", .{tmp.sub_path});
+    defer std.testing.allocator.free(target_root);
+    const group_id = group_ids.main_metadata_group_id;
+    const incarnation: metadata_incarnation.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
+    const fingerprint = metadata.reallocation_request.membershipFingerprint(&.{1});
+    const active: metadata.ReallocationRequestRecord = .{
+        .request_id = 17,
+        .requested_at_ms = 17_000,
+        .barrier_protocol_version = metadata.reallocation_request.barrier_protocol_version,
+        .metadata_incarnation = incarnation,
+        .protected_metadata_member_count = 1,
+        .protected_metadata_membership_fingerprint = fingerprint,
+    };
+    const superseded_pending: metadata.ReallocationRequestRecord = .{
+        .request_id = 18,
+        .requested_at_ms = 18_000,
+        .barrier_protocol_version = metadata.reallocation_request.barrier_protocol_version,
+        .metadata_incarnation = incarnation,
+        .protected_metadata_member_count = 1,
+        .protected_metadata_membership_fingerprint = fingerprint,
+    };
+    const latest_pending: metadata.ReallocationRequestRecord = .{
+        .request_id = 19,
+        .requested_at_ms = 19_000,
+        .barrier_protocol_version = metadata.reallocation_request.barrier_protocol_version,
+        .metadata_incarnation = incarnation,
+        .protected_metadata_member_count = 1,
+        .protected_metadata_membership_fingerprint = fingerprint,
+    };
+
+    const active_command = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_reallocation_request = active });
+    defer std.testing.allocator.free(active_command);
+    const superseded_pending_command = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_reallocation_request = superseded_pending });
+    defer std.testing.allocator.free(superseded_pending_command);
+    const latest_pending_command = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_reallocation_request = latest_pending });
+    defer std.testing.allocator.free(latest_pending_command);
+    const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = active_command },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = superseded_pending_command },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = latest_pending_command },
+    });
+    defer std.testing.allocator.free(entries);
+
+    var source = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = source_root });
+    defer source.deinit();
+    try source.snapshotBuilder().applyBatch(.{ .group_id = group_id, .commit_index = 3, .entries_bytes = entries });
+    try std.testing.expectEqual(active, (try source.getReallocationRequest(group_id)).?);
+    const snapshot = try source.snapshotBuilder().buildSnapshot(std.testing.allocator, group_id);
+    defer std.testing.allocator.free(snapshot);
+
+    var target = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = target_root });
+    defer target.deinit();
+    try std.testing.expect(try target.snapshotBuilder().installSnapshot(std.testing.allocator, group_id, 3, snapshot));
+    try std.testing.expectEqual(active, (try target.getReallocationRequest(group_id)).?);
+
+    const clear_active = try encodeTransitionCommand(std.testing.allocator, .{
+        .remove_reallocation_request = .{ .expected_request_id = active.request_id },
+    });
+    defer std.testing.allocator.free(clear_active);
+    const clear_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = clear_active },
+    });
+    defer std.testing.allocator.free(clear_entries);
+    try target.snapshotBuilder().applyBatch(.{ .group_id = group_id, .commit_index = 4, .entries_bytes = clear_entries });
+    try std.testing.expectEqual(latest_pending, (try target.getReallocationRequest(group_id)).?);
+
+    const clear_promoted = try encodeTransitionCommand(std.testing.allocator, .{
+        .remove_reallocation_request = .{ .expected_request_id = latest_pending.request_id },
+    });
+    defer std.testing.allocator.free(clear_promoted);
+    const final_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = clear_promoted },
+    });
+    defer std.testing.allocator.free(final_entries);
+    try target.snapshotBuilder().applyBatch(.{ .group_id = group_id, .commit_index = 5, .entries_bytes = final_entries });
+    try std.testing.expect((try target.getReallocationRequest(group_id)) == null);
+}
+
 test "metadata raft apply store snapshot replaces one complete projection and preserves other groups" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1860,6 +1943,7 @@ pub const RaftApplyStore = struct {
         range,
         reconcile_lease,
         reallocation_request,
+        reallocation_request_pending,
     };
     const MetadataSnapshotKey = union(enum) {
         prefix: MetadataSnapshotKeyFn,
@@ -1891,6 +1975,7 @@ pub const RaftApplyStore = struct {
         .{ .projection = .range, .key = .{ .prefix = rangePrefixForGroup } },
         .{ .projection = .reconcile_lease, .key = .{ .point = reconcileLeaseKeyForGroup } },
         .{ .projection = .reallocation_request, .key = .{ .point = reallocationRequestKeyForGroup } },
+        .{ .projection = .reallocation_request_pending, .key = .{ .point = pendingReallocationRequestKeyForGroup } },
     };
 
     fn metadataSnapshotProjectionBit(projection: MetadataSnapshotProjection) u32 {
@@ -1923,7 +2008,8 @@ pub const RaftApplyStore = struct {
             .upsert_reconcile_lease, .remove_reconcile_lease => metadataSnapshotProjectionBit(.reconcile_lease),
             .upsert_shuffle_join_lease, .remove_shuffle_join_lease => metadataSnapshotProjectionBit(.shuffle_join_lease),
             .upsert_restore_job, .remove_restore_job, .remove_restore_jobs => metadataSnapshotProjectionBit(.restore_job),
-            .upsert_reallocation_request, .remove_reallocation_request => metadataSnapshotProjectionBit(.reallocation_request),
+            .upsert_reallocation_request, .remove_reallocation_request => metadataSnapshotProjectionBit(.reallocation_request) |
+                metadataSnapshotProjectionBit(.reallocation_request_pending),
             .upsert_extension_package, .remove_extension_package => metadataSnapshotProjectionBit(.extension_package),
             .upsert_installed_extension, .remove_installed_extension => metadataSnapshotProjectionBit(.installed_extension),
             .upsert_extension_member, .remove_extension_member => metadataSnapshotProjectionBit(.extension_member),
@@ -2683,26 +2769,49 @@ pub const RaftApplyStore = struct {
                 });
             },
             .upsert_reallocation_request => |record| admit: {
-                var key_buf: [160]u8 = undefined;
-                const key = try reallocationRequestKeyForGroup(&key_buf, group_id);
-                const active: ?[]const u8 = txn.get(key) catch |err| switch (err) {
+                var active_key_buf: [160]u8 = undefined;
+                const active_key = try reallocationRequestKeyForGroup(&active_key_buf, group_id);
+                const active: ?[]const u8 = txn.get(active_key) catch |err| switch (err) {
                     error.NotFound => null,
                     else => return err,
                 };
-                // One active request is the causal acknowledgement barrier for
-                // every forced-placement pass. Concurrent triggers coalesce;
-                // replacing this record would invalidate in-flight store
-                // acknowledgements and can starve convergence indefinitely.
-                if (active != null) break :admit;
+                if (active) |encoded| {
+                    var pos: usize = 0;
+                    const current = try readReallocationRequestRecord(encoded, &pos);
+                    if (pos != encoded.len) return error.InvalidMetadataRecord;
+                    // Reapplying the active command is idempotent and must not
+                    // manufacture a successor generation.
+                    if (current.request_id == record.request_id) break :admit;
+
+                    // Keep the published generation stable while stores
+                    // acknowledge it, but retain one durable rerun latch. A
+                    // newer trigger may safely replace this private pending
+                    // value because no store can observe it until promotion.
+                    var pending_key_buf: [168]u8 = undefined;
+                    const pending_key = try pendingReallocationRequestKeyForGroup(&pending_key_buf, group_id);
+                    const value = try encodeReallocationRequestRecord(self.alloc, record);
+                    defer self.alloc.free(value);
+                    try txn.put(pending_key, value);
+                    break :admit;
+                }
+
                 const value = try encodeReallocationRequestRecord(self.alloc, record);
                 defer self.alloc.free(value);
-                try txn.put(key, value);
-                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+                try txn.put(active_key, value);
+                // This key should only coexist with an active request. Remove
+                // any orphan defensively when establishing a new generation.
+                var pending_key_buf: [168]u8 = undefined;
+                const pending_key = try pendingReallocationRequestKeyForGroup(&pending_key_buf, group_id);
+                txn.delete(pending_key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = active_key });
             },
             .remove_reallocation_request => |expected| remove: {
-                var key_buf: [160]u8 = undefined;
-                const key = try reallocationRequestKeyForGroup(&key_buf, group_id);
-                const encoded = txn.get(key) catch |err| switch (err) {
+                var active_key_buf: [160]u8 = undefined;
+                const active_key = try reallocationRequestKeyForGroup(&active_key_buf, group_id);
+                const encoded = txn.get(active_key) catch |err| switch (err) {
                     error.NotFound => break :remove,
                     else => return err,
                 };
@@ -2710,11 +2819,28 @@ pub const RaftApplyStore = struct {
                 const current = try readReallocationRequestRecord(encoded, &pos);
                 if (pos != encoded.len) return error.InvalidMetadataRecord;
                 if (current.request_id != expected.expected_request_id) break :remove;
-                txn.delete(key) catch |err| switch (err) {
-                    error.NotFound => {},
+
+                var pending_key_buf: [168]u8 = undefined;
+                const pending_key = try pendingReallocationRequestKeyForGroup(&pending_key_buf, group_id);
+                const pending_encoded: ?[]const u8 = txn.get(pending_key) catch |err| switch (err) {
+                    error.NotFound => null,
                     else => return err,
                 };
-                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+                if (pending_encoded) |pending_value| {
+                    var pending_pos: usize = 0;
+                    const pending = try readReallocationRequestRecord(pending_value, &pending_pos);
+                    if (pending_pos != pending_value.len) return error.InvalidMetadataRecord;
+                    const promoted_value = try encodeReallocationRequestRecord(self.alloc, pending);
+                    defer self.alloc.free(promoted_value);
+                    try txn.put(active_key, promoted_value);
+                    try txn.delete(pending_key);
+                } else {
+                    txn.delete(active_key) catch |err| switch (err) {
+                        error.NotFound => {},
+                        else => return err,
+                    };
+                }
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = active_key });
             },
             .upsert_extension_package => |record| {
                 var key_buf: [256]u8 = undefined;
@@ -7115,6 +7241,10 @@ pub fn metadataIncarnationKeyForGroup(buf: []u8, group_id: u64) ![]const u8 {
 
 pub fn reallocationRequestKeyForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_reallocation_request:{d}", .{group_id});
+}
+
+fn pendingReallocationRequestKeyForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_reallocation_request_pending:{d}", .{group_id});
 }
 
 pub fn shuffleJoinLeaseKeyForGroup(buf: []u8, group_id: u64, job_id: u64) ![]const u8 {
