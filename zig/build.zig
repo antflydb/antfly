@@ -7188,6 +7188,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.promotion_runtime.",
             "storage.db.query_metrics.",
             "storage.db.range_state.",
+            "storage.db.resolution_handoff.",
             "storage.db.resolution_runtime.",
             "storage.db.root_identity.",
             "storage.db.template_remote_stub.",
