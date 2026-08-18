@@ -3520,6 +3520,7 @@ pub fn build(b: *std.Build) void {
         "retrieval agent supports roots tree search",
         "retrieval agent isolates query predicates while applying accumulated filters",
         "retrieval agent installs canonical mandatory predicates once",
+        "query builder infers graph multi hop pattern from intent",
         "retrieval root scan pushes row inclusion and exclusion predicates into one filter",
         "retrieval contains filter treats wildcard operators as literals",
         "wildcard matching distinguishes operators from escaped literals",
@@ -3527,7 +3528,21 @@ pub fn build(b: *std.Build) void {
         "wildcard search plans preserve escaped exact literals and prefixes",
         "algebraic wildcard helpers preserve escaped literals",
         "algebraic traversal intersects query-scoped node admission",
+        "exact two-edge pattern uses typed batch probes without paths",
+        "exact two-edge probe plan is equivalent to generic expansion",
+        "exact two-edge probe honors incoming final direction",
+        "exact endpoint constrains the final pattern step before limiting",
+        "exact pattern targets preserve table identity",
+        "inapplicable exact plan does not consume generic fallback budget",
+        "graph exact edge probes stay aligned and preserve payloads",
+        "query merge allocation scales with the selected page",
+        "pattern response omits paths unless requested",
+        "parse supported graph queries accepts pattern requests",
+        "distributed graph edges request preserves typed graph edge access path",
+        "distributed graph edge reader carries identity generation",
+        "pattern hit shaping is lazy but preserves graph dependencies",
         "db unfiltered graph search retains algebraic execution",
+        "db preflightSearchRequest validates live lane bindings",
         "db graph search filters result nodes and hidden traversal intermediates",
         "db graph shortest path searches through admitted alternatives",
         "db graph artifact external node targets return ids without document hydration",
@@ -7640,6 +7655,42 @@ pub fn build(b: *std.Build) void {
     }
     const backend_bench_step = b.step("backend-bench", "Benchmark shared backend workloads across LMDB and LSM backends");
     backend_bench_step.dependOn(&run_backend_bench.step);
+
+    const graph_pattern_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/graph/pattern_query_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    graph_pattern_bench_mod.addImport("antfly_zig", lib_mod);
+    const graph_pattern_bench = b.addExecutable(.{
+        .name = "graph_pattern_query_bench",
+        .root_module = graph_pattern_bench_mod,
+    });
+    const graph_pattern_bench_build_step = b.step(
+        "graph-pattern-bench-build",
+        "Build the local graph-pattern latency and demand-working-set benchmark",
+    );
+    graph_pattern_bench_build_step.dependOn(&graph_pattern_bench.step);
+
+    const run_graph_pattern_bench = b.addRunArtifact(graph_pattern_bench);
+    if (b.args) |args| {
+        run_graph_pattern_bench.addArgs(args);
+    } else {
+        run_graph_pattern_bench.addArgs(&.{
+            "--mode",          "exact",
+            "--fanout",        "10000",
+            "--tags-per-post", "8",
+            "--target-degree", "100000",
+            "--match-every",   "10",
+            "--warmup",        "5",
+            "--samples",       "30",
+        });
+    }
+    const graph_pattern_bench_step = b.step(
+        "graph-pattern-bench",
+        "Benchmark exact or generic graph-pattern latency, allocations, and process peak RSS",
+    );
+    graph_pattern_bench_step.dependOn(&run_graph_pattern_bench.step);
 
     const lsm_backend_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/lsm_backend_bench.zig"),
