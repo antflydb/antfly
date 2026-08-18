@@ -3130,6 +3130,7 @@ fn attachSessionRunAdmission(
     resident: runtime.tier.memory.AdmissionAmounts,
     man: ?*const manifest_mod.ModelManifest,
 ) void {
+    session_factory.configureSharedCacheHardLimitsForSession(session.*, limits);
     const weight_bytes = std.math.add(
         usize,
         resident.host_weight_bytes,

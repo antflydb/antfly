@@ -176,6 +176,17 @@ the read-only mapping remains valid and a later access faults the file data back
 in. This bounds cold image/audio page-cache growth without serializing unrelated
 models or adding redundant copies.
 
+Lazy native weight caches also cannot size themselves independently from the
+serving owner. Session construction may derive an optimistic cache size from
+the visible node, but ModelManager installs the effective hard host/backend
+limits before publishing the session. Architecture-specific cache floors may
+improve throughput inside that envelope; they never widen past it. Each weight
+handle then reserves its physical representation in the request RunBudget for
+exactly the handle lifetime, while the shared cache evicts cold unpinned
+entries to stay under the installed ceiling. This keeps the Hypura-style
+mapped-artifact and bounded-hot-set behavior without allowing lazy promotion
+to bypass ResourceManager policy.
+
 The process envelope is not another inference slice. One resolved value is
 passed to storage and inference during standalone composition. ResourceManager
 derives an aggregate managed-host-memory budget from it; every storage slice

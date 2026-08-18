@@ -32,6 +32,10 @@ pub const Denial = struct {
 
 pub const SharedCache = struct {
     budget: Budget,
+    /// Serving policy installs non-zero ceilings before the session is
+    /// published. Architecture-specific floors may widen auto-derived cache
+    /// defaults, but must never widen past an explicit hard limit.
+    hard_budget: ?Budget = null,
     host_bytes: usize = 0,
     backend_bytes: usize = 0,
     host_loads: u64 = 0,
@@ -43,6 +47,18 @@ pub const SharedCache = struct {
 
     pub fn init(budget: Budget) SharedCache {
         return .{ .budget = budget };
+    }
+
+    /// Install process-owner limits before the cache becomes observable by a
+    /// request. Zero retains the auto-derived limit for that tier.
+    pub fn configureHardBudget(self: *SharedCache, hard_budget: Budget) void {
+        std.debug.assert(self.host_bytes == 0);
+        std.debug.assert(self.backend_bytes == 0);
+        self.hard_budget = hard_budget;
+        if (hard_budget.host_limit_bytes != 0)
+            self.budget.host_limit_bytes = hard_budget.host_limit_bytes;
+        if (hard_budget.backend_limit_bytes != 0)
+            self.budget.backend_limit_bytes = hard_budget.backend_limit_bytes;
     }
 
     pub fn noteResident(self: *SharedCache, tier: ResidencyTier, bytes: usize) void {
@@ -124,10 +140,23 @@ pub const SharedCache = struct {
     }
 
     pub fn widenToAtLeast(self: *SharedCache, floor: Budget) void {
-        self.budget.host_limit_bytes = @max(self.budget.host_limit_bytes, floor.host_limit_bytes);
-        self.budget.backend_limit_bytes = @max(self.budget.backend_limit_bytes, floor.backend_limit_bytes);
+        self.budget.host_limit_bytes = boundedFloor(
+            self.budget.host_limit_bytes,
+            floor.host_limit_bytes,
+            if (self.hard_budget) |hard| hard.host_limit_bytes else 0,
+        );
+        self.budget.backend_limit_bytes = boundedFloor(
+            self.budget.backend_limit_bytes,
+            floor.backend_limit_bytes,
+            if (self.hard_budget) |hard| hard.backend_limit_bytes else 0,
+        );
     }
 };
+
+fn boundedFloor(current: usize, floor: usize, hard_limit: usize) usize {
+    const widened = @max(current, floor);
+    return if (hard_limit == 0) widened else @min(widened, hard_limit);
+}
 
 pub fn defaultBudgetForBackend(backend: planner.BackendClass) Budget {
     const limits = memory.defaultLimitsForBackend(backend);
@@ -171,6 +200,23 @@ test "shared cache records denial details" {
     const msg = try cache.lastDenialString(&buf);
     try std.testing.expect(std.mem.indexOf(u8, msg, "tier=host") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg, "request=20") != null);
+}
+
+test "hard cache budget bounds architecture floors" {
+    var cache = SharedCache.init(.{
+        .host_limit_bytes = 1024,
+        .backend_limit_bytes = 2048,
+    });
+    cache.configureHardBudget(.{
+        .host_limit_bytes = 512,
+        .backend_limit_bytes = 768,
+    });
+    cache.widenToAtLeast(.{
+        .host_limit_bytes = 4096,
+        .backend_limit_bytes = 8192,
+    });
+    try std.testing.expectEqual(@as(usize, 512), cache.budget.host_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 768), cache.budget.backend_limit_bytes);
 }
 
 const std = @import("std");

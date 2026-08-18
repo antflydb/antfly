@@ -5720,6 +5720,34 @@ pub fn widenBudgetLimitsForSession(
     return widenLimits(limits, self.budget_floor);
 }
 
+/// Bind a session's lazy residency cache to the serving owner's hard limits
+/// before the session is published. Cache defaults are derived from host/node
+/// capacity during construction and can be much larger than a container or an
+/// explicit serving policy; leaving those defaults in place lets lazy weight
+/// promotion bypass the ModelManager/ResourceManager envelope.
+pub fn configureSharedCacheHardLimitsForSession(
+    session: Session,
+    limits: runtime.tier.memory.Limits,
+) void {
+    if (session.vtable != &arch_vtable) return;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    const hard_budget = runtime.tier.cache.Budget{
+        .host_limit_bytes = limits.host_limit_bytes,
+        .backend_limit_bytes = limits.backend_limit_bytes,
+    };
+    switch (self.backend_type) {
+        .native => if (self.backend_data.native.tier_cache) |*tier_cache|
+            tier_cache.configureHardBudget(hard_budget),
+        .metal => if (build_options.enable_metal) {
+            if (gpuBackendData(self).tier_cache) |*tier_cache|
+                tier_cache.configureHardBudget(hard_budget);
+        },
+        .pjrt => if (self.backend_data.pjrt.native.tier_cache) |*tier_cache|
+            tier_cache.configureHardBudget(hard_budget),
+        .cuda, .onnx, .wasm => {},
+    }
+}
+
 pub fn memoryBudgetExceededDetail(
     session: Session,
     run_budget: *const runtime.tier.memory.RunBudget,

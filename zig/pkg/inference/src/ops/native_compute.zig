@@ -4508,8 +4508,9 @@ fn freeTensor(ctx: *anyopaque, tensor: CT) void {
         } else if (entry.pin_count > 0) {
             entry.pin_count -= 1;
         }
-        if (b.name.len > 0) releaseWeightReservation(self, b.name);
     }
+    if (b.reservation != null and b.name.len > 0)
+        releaseWeightReservation(self, b.name);
     releaseOwnedDenseData(b);
     releaseLogicalShape(b);
     if (b.view_strides) |strides| b.allocator.free(strides);
@@ -4524,17 +4525,21 @@ fn freeTensor(ctx: *anyopaque, tensor: CT) void {
     b.allocator.destroy(b);
 }
 
-fn acquireWeightReservation(self: *NativeCompute, name: []const u8, bytes: usize) !void {
-    if (self.run_budget == null or name.len == 0) return;
+fn acquireWeightReservation(self: *NativeCompute, name: []const u8, bytes: usize) !?run_memory.Reservation {
+    if (self.run_budget == null or name.len == 0 or bytes == 0) return null;
     if (self.weight_reservations.getPtr(name)) |state| {
         state.count += 1;
-        return;
+        return state.reservation;
     }
     const reservation = try self.run_budget.?.tryReserveWeight(.host, bytes);
-    try self.weight_reservations.put(self.allocator, try self.allocator.dupe(u8, name), .{
+    errdefer self.run_budget.?.release(reservation);
+    const owned_name = try self.allocator.dupe(u8, name);
+    errdefer self.allocator.free(owned_name);
+    try self.weight_reservations.put(self.allocator, owned_name, .{
         .count = 1,
         .reservation = reservation,
     });
+    return reservation;
 }
 
 fn releaseWeightReservation(self: *NativeCompute, name: []const u8) void {
@@ -4556,6 +4561,98 @@ fn releaseWeightReservation(self: *NativeCompute, name: []const u8) void {
     }
 }
 
+fn finishWeight(
+    self: *NativeCompute,
+    tensor: CT,
+    name: []const u8,
+    bytes: usize,
+    shape: []const i64,
+) !CT {
+    errdefer freeTensor(self, tensor);
+    toBuf(tensor).reservation = try acquireWeightReservation(self, name, bytes);
+    return self.withLogicalShape(tensor, shape);
+}
+
+/// Finish a weight while the caller owns the lazy-weight guard. Error cleanup
+/// must not call freeTensor with the guarded entry attached, because freeTensor
+/// would attempt to reacquire that same non-reentrant guard.
+fn finishLazyWeightLocked(
+    self: *NativeCompute,
+    tensor: CT,
+    reservation: ?run_memory.Reservation,
+    shape: []const i64,
+) !CT {
+    errdefer {
+        const buf = toBuf(tensor);
+        buf.lazy_entry = null;
+        buf.reservation = null;
+        freeTensor(self, tensor);
+    }
+    toBuf(tensor).reservation = reservation;
+    return self.withLogicalShape(tensor, shape);
+}
+
+fn checkedF32Bytes(len: usize) usize {
+    return std.math.mul(usize, len, @sizeOf(f32)) catch
+        std.math.maxInt(usize);
+}
+
+fn loadedWeightHandleBytes(loaded: *const LoadedWeight, name: []const u8, cached_bytes: usize) usize {
+    if (loaded.quantized_storage != null or
+        loaded.tensor.dtype == .f32 or
+        shouldBorrowEmbeddingTensor(name))
+    {
+        return cached_bytes;
+    }
+    const element_bytes = loaded.tensor.dtype.byteSize();
+    if (element_bytes == 0 or loaded.tensor.data.len % element_bytes != 0)
+        return std.math.maxInt(usize);
+    return checkedF32Bytes(loaded.tensor.data.len / element_bytes);
+}
+
+fn makeBufFromWeightView(
+    self: *NativeCompute,
+    view: WeightF32View,
+    name: []const u8,
+    lazy_entry: ?*LazyWeightEntry,
+    quantized_storage: ?*const QuantizedStorage,
+) !CT {
+    return self.makeBufWithEntry(
+        @constCast(view.data),
+        view.owned != null,
+        name,
+        lazy_entry,
+        quantized_storage,
+        null,
+    ) catch |err| {
+        if (view.owned) |owned| self.allocator.free(owned);
+        return err;
+    };
+}
+
+test "native weight handles reserve and release run budget capacity" {
+    const allocator = std.testing.allocator;
+    var store = WeightStore{
+        .allocator = allocator,
+        .resident_weights = .{},
+        .lazy_weights = .{},
+    };
+    var budget = run_memory.RunBudget.init(.{ .host_limit_bytes = 96 });
+    var compute = NativeCompute.init(allocator, &store, &budget);
+    defer compute.weight_reservations.deinit(allocator);
+
+    try std.testing.expect((try acquireWeightReservation(&compute, "weight", 64)) != null);
+    try std.testing.expect((try acquireWeightReservation(&compute, "weight", 64)) != null);
+    try std.testing.expectEqual(@as(usize, 64), budget.host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 2), compute.weight_reservations.get("weight").?.count);
+
+    releaseWeightReservation(&compute, "weight");
+    try std.testing.expectEqual(@as(usize, 64), budget.host_weight_bytes);
+    releaseWeightReservation(&compute, "weight");
+    try std.testing.expectEqual(@as(usize, 0), budget.host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 0), compute.weight_reservations.count());
+}
+
 fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     if (self.data.resident_weights.getPtr(name)) |w| {
@@ -4565,23 +4662,24 @@ fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
                 try tensorF32View(self, &w.tensor)
             else
                 WeightF32View{ .data = empty_f32[0..] };
-            const tensor = try self.makeBufWithEntry(@constCast(view.data), view.owned != null, name, null, storage, null);
-            errdefer freeTensor(self, tensor);
-            return self.withLogicalShape(tensor, w.tensor.shape);
+            const tensor = try makeBufFromWeightView(self, view, name, null, storage);
+            return finishWeight(self, tensor, name, quantizedStorageBudgetBytes(storage), w.tensor.shape);
         }
         if (w.tensor.dtype == .f32) {
             const view = try tensorF32View(self, &w.tensor);
-            const tensor = try self.makeBufWithEntry(@constCast(view.data), view.owned != null, name, null, null, null);
-            errdefer freeTensor(self, tensor);
-            return self.withLogicalShape(tensor, w.tensor.shape);
+            const tensor = try makeBufFromWeightView(self, view, name, null, null);
+            return finishWeight(self, tensor, name, checkedF32Bytes(view.data.len), w.tensor.shape);
         }
         if (shouldBorrowEmbeddingTensor(name)) {
-            return self.makeBufWithEntry(empty_f32[0..], false, name, null, null, &w.tensor);
+            const tensor = try self.makeBufWithEntry(empty_f32[0..], false, name, null, null, &w.tensor);
+            return finishWeight(self, tensor, name, w.tensor.data.len, w.tensor.shape);
         }
         const converted = try convertTensorToOwnedF32(self.allocator, &w.tensor);
-        const tensor = try self.makeBufWithEntry(converted, true, name, null, null, null);
-        errdefer freeTensor(self, tensor);
-        return self.withLogicalShape(tensor, w.tensor.shape);
+        const tensor = self.makeBufWithEntry(converted, true, name, null, null, null) catch |err| {
+            self.allocator.free(converted);
+            return err;
+        };
+        return finishWeight(self, tensor, name, checkedF32Bytes(converted.len), w.tensor.shape);
     }
 
     self.data.prefetch.lock();
@@ -4602,31 +4700,39 @@ fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
             },
             else => return err,
         };
-        entry.pin_count += 1;
         const loaded = &(entry.loaded.?);
+        const reservation = try acquireWeightReservation(
+            self,
+            name,
+            loadedWeightHandleBytes(loaded, name, entry.loaded_bytes),
+        );
+        errdefer if (reservation != null) releaseWeightReservation(self, name);
+        entry.pin_count += 1;
+        errdefer entry.pin_count -= 1;
         if (loaded.quantized_storage) |*storage| {
             try ensurePreparedKBlock(self, storage);
             const view = if (loaded.tensor.data.len > 0)
                 try tensorF32View(self, &loaded.tensor)
             else
                 WeightF32View{ .data = empty_f32[0..] };
-            const tensor = try self.makeBufWithEntry(@constCast(view.data), view.owned != null, name, entry, storage, null);
-            errdefer freeTensor(self, tensor);
-            return self.withLogicalShape(tensor, loaded.tensor.shape);
+            const tensor = try makeBufFromWeightView(self, view, name, entry, storage);
+            return finishLazyWeightLocked(self, tensor, reservation, loaded.tensor.shape);
         }
         if (loaded.tensor.dtype == .f32) {
             const view = try tensorF32View(self, &loaded.tensor);
-            const tensor = try self.makeBufWithEntry(@constCast(view.data), view.owned != null, name, entry, null, null);
-            errdefer freeTensor(self, tensor);
-            return self.withLogicalShape(tensor, loaded.tensor.shape);
+            const tensor = try makeBufFromWeightView(self, view, name, entry, null);
+            return finishLazyWeightLocked(self, tensor, reservation, loaded.tensor.shape);
         }
         if (shouldBorrowEmbeddingTensor(name)) {
-            return self.makeBufWithEntry(empty_f32[0..], false, name, entry, null, &loaded.tensor);
+            const tensor = try self.makeBufWithEntry(empty_f32[0..], false, name, entry, null, &loaded.tensor);
+            return finishLazyWeightLocked(self, tensor, reservation, loaded.tensor.shape);
         }
         const converted = try convertTensorToOwnedF32(self.allocator, &loaded.tensor);
-        const tensor = try self.makeBufWithEntry(converted, true, name, entry, null, null);
-        errdefer freeTensor(self, tensor);
-        return self.withLogicalShape(tensor, loaded.tensor.shape);
+        const tensor = self.makeBufWithEntry(converted, true, name, entry, null, null) catch |err| {
+            self.allocator.free(converted);
+            return err;
+        };
+        return finishLazyWeightLocked(self, tensor, reservation, loaded.tensor.shape);
     }
 
     std.log.debug("MissingWeight: '{s}'", .{name});
@@ -45284,17 +45390,22 @@ test "getWeight preserves resident dense tensor shape metadata" {
         .resident_weights = resident_weights,
         .lazy_weights = .{},
     };
-    var compute = NativeCompute.init(allocator, &weight_store, null);
+    var run_budget = run_memory.RunBudget.init(.{ .host_limit_bytes = 1024 });
+    var compute = NativeCompute.init(allocator, &weight_store, &run_budget);
+    defer compute.weight_reservations.deinit(allocator);
     const cb = compute.computeBackend();
 
     const weight = try cb.getWeight(name);
-    defer cb.free(weight);
+    errdefer cb.free(weight);
+    try std.testing.expectEqual(elem_count * @sizeOf(f32), run_budget.host_weight_bytes);
 
     const got_shape = try cb.tensorShape(weight, allocator);
     defer allocator.free(got_shape);
 
     try std.testing.expectEqualDeep(&[_]i64{ 12, 4 }, got_shape);
     try std.testing.expectEqual(tensor_mod.DType.f32, try cb.tensorDType(weight));
+    cb.free(weight);
+    try std.testing.expectEqual(@as(usize, 0), run_budget.host_weight_bytes);
 }
 
 test "native quant budget pressure degrades only for non-expert weights" {
