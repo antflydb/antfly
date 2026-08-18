@@ -21,6 +21,10 @@ const platform_time = antfly.platform_time;
 
 const default_wait_timeout_ms: u64 = 10 * 60 * 1000;
 const default_wait_poll_ms: u64 = 1000;
+// Preserve the HTTP client's normal per-attempt ceiling even when the overall
+// wait budget is much larger, so stalled requests cannot suppress retries and
+// progress reporting for minutes.
+const max_wait_request_timeout_ms: u64 = 30_000;
 const max_wait_retry_delay_ms: u64 = 5000;
 const wait_progress_report_interval_ns: u64 = 10 * std.time.ns_per_s;
 
@@ -513,65 +517,114 @@ fn waitForIndex(
     }
 
     const name = index_name orelse cli.fatal("--index is required", .{});
-    return waitForIndexWithFetcher(allocator, io, .fromClient(client), table_name, name, timeout_ms, poll_ms);
+    const outcome = try waitForIndexWithFetcher(
+        allocator,
+        io,
+        .fromClient(client),
+        .system(),
+        table_name,
+        name,
+        timeout_ms,
+        poll_ms,
+    );
+    switch (outcome) {
+        .ready => {},
+        .timed_out => |last_state| fatalWaitTimeout(timeout_ms, name, last_state),
+    }
 }
 
 const IndexStatusResponse = antfly_client.openapi.ApiResponse(antfly_client.types.IndexStatus);
 
 const IndexStatusFetcher = struct {
     ptr: *anyopaque,
-    fetch_fn: *const fn (ptr: *anyopaque, table_name: []const u8, index_name: []const u8) anyerror!IndexStatusResponse,
+    fetch_fn: *const fn (ptr: *anyopaque, table_name: []const u8, index_name: []const u8, timeout_ms: u64) anyerror!IndexStatusResponse,
 
     fn fromClient(client: *antfly_client.AntflyClient) IndexStatusFetcher {
         return .{ .ptr = client, .fetch_fn = fetchFromClient };
     }
 
-    fn fetch(self: IndexStatusFetcher, table_name: []const u8, index_name: []const u8) !IndexStatusResponse {
-        return self.fetch_fn(self.ptr, table_name, index_name);
+    fn fetch(self: IndexStatusFetcher, table_name: []const u8, index_name: []const u8, timeout_ms: u64) !IndexStatusResponse {
+        return self.fetch_fn(self.ptr, table_name, index_name, timeout_ms);
     }
 
-    fn fetchFromClient(ptr: *anyopaque, table_name: []const u8, index_name: []const u8) anyerror!IndexStatusResponse {
+    fn fetchFromClient(ptr: *anyopaque, table_name: []const u8, index_name: []const u8, timeout_ms: u64) anyerror!IndexStatusResponse {
         const client: *antfly_client.AntflyClient = @ptrCast(@alignCast(ptr));
-        return client.getIndexResponse(table_name, index_name);
+        return client.getIndexResponseWithTimeout(table_name, index_name, timeout_ms);
     }
 };
+
+const WaitClock = struct {
+    ptr: ?*anyopaque = null,
+    now_fn: *const fn (ptr: ?*anyopaque) u64 = systemNow,
+
+    fn system() WaitClock {
+        return .{};
+    }
+
+    fn now(self: WaitClock) u64 {
+        return self.now_fn(self.ptr);
+    }
+
+    fn systemNow(_: ?*anyopaque) u64 {
+        return platform_time.monotonicNs();
+    }
+};
+
+const WaitOutcome = union(enum) {
+    ready: void,
+    timed_out: []const u8,
+};
+
+fn timedOut(last_state: ?[]const u8) WaitOutcome {
+    return .{ .timed_out = last_state orelse "unknown" };
+}
 
 fn waitForIndexWithFetcher(
     allocator: std.mem.Allocator,
     io: std.Io,
     fetcher: IndexStatusFetcher,
+    clock: WaitClock,
     table_name: []const u8,
     name: []const u8,
     timeout_ms: u64,
     poll_ms: u64,
-) !void {
-    const started_ns = platform_time.monotonicNs();
+) !WaitOutcome {
+    const started_ns = clock.now();
     const timeout_ns = std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
     var progress_reporter = WaitProgressReporter{};
     var consecutive_failures: u32 = 0;
     while (true) {
-        var resp = fetcher.fetch(table_name, name) catch |err| {
+        const request_timeout_ms = requestWaitTimeoutMs(started_ns, timeout_ns, clock.now()) orelse
+            return timedOut(progress_reporter.last_state);
+        var resp = fetcher.fetch(table_name, name, request_timeout_ms) catch |err| {
+            const now_ns = clock.now();
+            if (remainingWaitNs(started_ns, timeout_ns, now_ns) == null) {
+                return timedOut(progress_reporter.last_state);
+            }
             if (!retryableWaitTransportError(err)) return err;
             consecutive_failures +|= 1;
-            const now_ns = platform_time.monotonicNs();
             if (progress_reporter.shouldReport("unavailable", now_ns)) {
                 std.debug.print("Waiting for index {s}: unavailable ({s}); retrying\n", .{ name, @errorName(err) });
             }
-            sleepForNextWaitAttempt(io, started_ns, timeout_ns, timeout_ms, retryDelayMs(poll_ms, consecutive_failures, now_ns), name, progress_reporter.last_state);
+            sleepForNextWaitAttempt(io, clock, started_ns, timeout_ns, retryDelayMs(poll_ms, consecutive_failures, now_ns), name);
             continue;
         };
+        const response_ns = clock.now();
+        if (remainingWaitNs(started_ns, timeout_ns, response_ns) == null) {
+            resp.deinit();
+            return timedOut(progress_reporter.last_state);
+        }
         if (resp.status_code >= 300) {
             if (!retryableWaitHttpStatus(resp.status_code)) {
                 cli.expectHttpSuccess(resp);
                 cli.fatal("index {s} returned HTTP {d}", .{ name, resp.status_code });
             }
             consecutive_failures +|= 1;
-            const now_ns = platform_time.monotonicNs();
-            if (progress_reporter.shouldReport("unavailable", now_ns)) {
+            if (progress_reporter.shouldReport("unavailable", response_ns)) {
                 std.debug.print("Waiting for index {s}: unavailable (HTTP {d}); retrying\n", .{ name, resp.status_code });
             }
             resp.deinit();
-            sleepForNextWaitAttempt(io, started_ns, timeout_ns, timeout_ms, retryDelayMs(poll_ms, consecutive_failures, now_ns), name, progress_reporter.last_state);
+            sleepForNextWaitAttempt(io, clock, started_ns, timeout_ns, retryDelayMs(poll_ms, consecutive_failures, response_ns), name);
             continue;
         }
 
@@ -582,19 +635,19 @@ fn waitForIndexWithFetcher(
                 .ready => {
                     try writeIndexSummary(allocator, io, parsed.value);
                     resp.deinit();
-                    return;
+                    return .{ .ready = {} };
                 },
                 .failed => cli.fatal("index {s} entered terminal state {s}; run index list --output json for diagnostics", .{ name, summary.state }),
                 .waiting => {},
             }
-            if (progress_reporter.shouldReport(summary.state, platform_time.monotonicNs())) {
+            if (progress_reporter.shouldReport(summary.state, response_ns)) {
                 printWaitProgress(name, summary);
             }
         } else {
             cli.fatal("index {s} returned an unreadable HTTP {d} response", .{ name, resp.status_code });
         }
         resp.deinit();
-        sleepForNextWaitAttempt(io, started_ns, timeout_ns, timeout_ms, poll_ms, name, progress_reporter.last_state);
+        sleepForNextWaitAttempt(io, clock, started_ns, timeout_ns, poll_ms, name);
     }
 }
 
@@ -633,27 +686,38 @@ fn retryDelayMs(base_ms: u64, consecutive_failures: u32, entropy: u64) u64 {
     return bounded - jitter_span / 2 + entropy % (jitter_span + 1);
 }
 
+fn remainingWaitNs(started_ns: u64, timeout_ns: u64, now_ns: u64) ?u64 {
+    const elapsed_ns = now_ns -| started_ns;
+    if (elapsed_ns >= timeout_ns) return null;
+    return timeout_ns - elapsed_ns;
+}
+
+fn requestWaitTimeoutMs(started_ns: u64, timeout_ns: u64, now_ns: u64) ?u64 {
+    const remaining_ns = remainingWaitNs(started_ns, timeout_ns, now_ns) orelse return null;
+    return @min(@max(remaining_ns / std.time.ns_per_ms, 1), max_wait_request_timeout_ms);
+}
+
 fn sleepForNextWaitAttempt(
     io: std.Io,
+    clock: WaitClock,
     started_ns: u64,
     timeout_ns: u64,
-    timeout_ms: u64,
     requested_delay_ms: u64,
     index_name: []const u8,
-    last_state: ?[]const u8,
 ) void {
-    const elapsed_ns = platform_time.monotonicNs() -| started_ns;
-    if (elapsed_ns >= timeout_ns) {
-        cli.fatal("timed out after {d}ms waiting for index {s} (last state: {s}); run index list --output json for diagnostics", .{
-            timeout_ms,
-            index_name,
-            last_state orelse "unknown",
-        });
-    }
-    const delay_ns = @min(requested_delay_ms *| std.time.ns_per_ms, timeout_ns - elapsed_ns);
+    const remaining_ns = remainingWaitNs(started_ns, timeout_ns, clock.now()) orelse return;
+    const delay_ns = @min(requested_delay_ms *| std.time.ns_per_ms, remaining_ns);
     io.sleep(std.Io.Duration.fromNanoseconds(@intCast(delay_ns)), .awake) catch {
         cli.fatal("interrupted while waiting for index {s}", .{index_name});
     };
+}
+
+fn fatalWaitTimeout(timeout_ms: u64, index_name: []const u8, last_state: []const u8) noreturn {
+    cli.fatal("timed out after {d}ms waiting for index {s} (last state: {s}); run index list --output json for diagnostics", .{
+        timeout_ms,
+        index_name,
+        last_state,
+    });
 }
 
 fn canonicalWaitState(state: []const u8) []const u8 {
@@ -849,6 +913,20 @@ test "index wait disposition retries mismatch and fails only terminal states" {
     }));
 }
 
+fn fakeExternalIndexStatusResponse(
+    allocator: std.mem.Allocator,
+    status_code: u16,
+    state: []const u8,
+    rebuilding: bool,
+) !IndexStatusResponse {
+    const body = try std.fmt.allocPrint(allocator,
+        \\{{"shard_status":{{}},"config":{{"name":"external_idx","type":"embeddings","external":true,"dimension":3}},"status":{{"index_type":"embeddings","rebuilding":{s},"backfill_state":"{s}","total_indexed":1,"query_visible_doc_count":1,"coverage":{{"policy":"external","observation_complete":true,"observation_incomplete_reasons":[],"config_fingerprint":"0123456789abcdef","summary_ready":true,"config_mismatch_group_count":0,"source_total":10,"produced":1,"skipped":0,"terminal_failed":0,"covered":1,"settled":1,"uncovered":9,"pending":9,"complete":false,"healthy":false,"degraded":false}}}}}}
+    , .{ if (rebuilding) "true" else "false", state });
+    defer allocator.free(body);
+    const parsed = try std.json.parseFromSlice(antfly_client.types.IndexStatus, allocator, body, .{ .allocate = .alloc_always });
+    return .{ .status_code = status_code, .data = parsed, .allocator = allocator };
+}
+
 test "index wait retries bounded HTTP and transport failures" {
     try std.testing.expect(retryableWaitHttpStatus(404));
     try std.testing.expect(retryableWaitHttpStatus(429));
@@ -864,35 +942,123 @@ test "index wait retries bounded HTTP and transport failures" {
     const Fake = struct {
         allocator: std.mem.Allocator,
         calls: usize = 0,
+        smallest_timeout_ms: u64 = std.math.maxInt(u64),
 
-        fn fetch(ptr: *anyopaque, table_name: []const u8, index_name: []const u8) anyerror!IndexStatusResponse {
+        fn fetch(ptr: *anyopaque, table_name: []const u8, index_name: []const u8, timeout_ms: u64) anyerror!IndexStatusResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqualStrings("external_idx", index_name);
+            try std.testing.expect(timeout_ms > 0);
+            try std.testing.expect(timeout_ms <= 1000);
+            self.smallest_timeout_ms = @min(self.smallest_timeout_ms, timeout_ms);
             const call = self.calls;
             self.calls += 1;
             if (call == 0) return error.ConnectionResetByPeer;
             const state = if (call == 2) "running" else "ready";
-            const body = try std.fmt.allocPrint(self.allocator,
-                \\{{"shard_status":{{}},"config":{{"name":"external_idx","type":"embeddings","external":true,"dimension":3}},"status":{{"index_type":"embeddings","rebuilding":{s},"backfill_state":"{s}","total_indexed":1,"query_visible_doc_count":1,"coverage":{{"policy":"external","observation_complete":true,"observation_incomplete_reasons":[],"config_fingerprint":"0123456789abcdef","summary_ready":true,"config_mismatch_group_count":0,"source_total":10,"produced":1,"skipped":0,"terminal_failed":0,"covered":1,"settled":1,"uncovered":9,"pending":9,"complete":false,"healthy":false,"degraded":false}}}}}}
-            , .{ if (call == 2) "true" else "false", state });
-            defer self.allocator.free(body);
-            const parsed = try std.json.parseFromSlice(antfly_client.types.IndexStatus, self.allocator, body, .{ .allocate = .alloc_always });
             // A retryable HTTP status is authoritative even if an intermediary
             // supplies a stale but otherwise parseable success-shaped body.
-            return .{ .status_code = if (call == 1) 503 else 200, .data = parsed, .allocator = self.allocator };
+            return fakeExternalIndexStatusResponse(self.allocator, if (call == 1) 503 else 200, state, call == 2);
         }
     };
 
     var fake = Fake{ .allocator = std.testing.allocator };
-    try waitForIndexWithFetcher(
+    const outcome = try waitForIndexWithFetcher(
         std.testing.allocator,
         std.testing.io,
         .{ .ptr = &fake, .fetch_fn = Fake.fetch },
+        .system(),
         "docs",
         "external_idx",
         1000,
         1,
     );
+    try std.testing.expect(outcome == .ready);
     try std.testing.expectEqual(@as(usize, 4), fake.calls);
+    try std.testing.expect(fake.smallest_timeout_ms > 0);
+}
+
+test "index wait deadline rejects a response that arrives late" {
+    const Fake = struct {
+        allocator: std.mem.Allocator,
+        now_ns: u64 = 10 * std.time.ns_per_s,
+        calls: usize = 0,
+        request_timeout_ms: ?u64 = null,
+
+        fn now(ptr: ?*anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            return self.now_ns;
+        }
+
+        fn fetch(ptr: *anyopaque, table_name: []const u8, index_name: []const u8, timeout_ms: u64) anyerror!IndexStatusResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("external_idx", index_name);
+            self.calls += 1;
+            self.request_timeout_ms = timeout_ms;
+            self.now_ns += 2 * std.time.ns_per_ms;
+            return fakeExternalIndexStatusResponse(self.allocator, 200, "ready", false);
+        }
+    };
+
+    var fake = Fake{ .allocator = std.testing.allocator };
+    const outcome = try waitForIndexWithFetcher(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .ptr = &fake, .fetch_fn = Fake.fetch },
+        .{ .ptr = &fake, .now_fn = Fake.now },
+        "docs",
+        "external_idx",
+        1,
+        1,
+    );
+    try std.testing.expect(outcome == .timed_out);
+    try std.testing.expectEqualStrings("unknown", outcome.timed_out);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(?u64, 1), fake.request_timeout_ms);
+}
+
+test "index wait does not fetch after its deadline" {
+    try std.testing.expectEqual(@as(?u64, std.time.ns_per_ms), remainingWaitNs(100, std.time.ns_per_ms, 100));
+    try std.testing.expectEqual(@as(?u64, 1), requestWaitTimeoutMs(100, std.time.ns_per_ms, 100));
+    try std.testing.expectEqual(
+        @as(?u64, max_wait_request_timeout_ms),
+        requestWaitTimeoutMs(100, 20 * 60 * std.time.ns_per_s, 100),
+    );
+    try std.testing.expect(remainingWaitNs(100, std.time.ns_per_ms, 100 + std.time.ns_per_ms) == null);
+    try std.testing.expect(requestWaitTimeoutMs(100, std.time.ns_per_ms, 100 + std.time.ns_per_ms) == null);
+
+    const Fake = struct {
+        allocator: std.mem.Allocator,
+        base_ns: u64 = 20 * std.time.ns_per_s,
+        clock_calls: usize = 0,
+        fetch_calls: usize = 0,
+
+        fn now(ptr: ?*anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.clock_calls += 1;
+            return self.base_ns + if (self.clock_calls >= 4) @as(u64, std.time.ns_per_ms) else 0;
+        }
+
+        fn fetch(ptr: *anyopaque, _: []const u8, _: []const u8, timeout_ms: u64) anyerror!IndexStatusResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.fetch_calls += 1;
+            try std.testing.expectEqual(@as(u64, 1), timeout_ms);
+            return fakeExternalIndexStatusResponse(self.allocator, 200, "running", true);
+        }
+    };
+
+    var fake = Fake{ .allocator = std.testing.allocator };
+    const outcome = try waitForIndexWithFetcher(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .ptr = &fake, .fetch_fn = Fake.fetch },
+        .{ .ptr = &fake, .now_fn = Fake.now },
+        "docs",
+        "external_idx",
+        1,
+        1,
+    );
+    try std.testing.expect(outcome == .timed_out);
+    try std.testing.expectEqualStrings("running", outcome.timed_out);
+    try std.testing.expectEqual(@as(usize, 1), fake.fetch_calls);
 }

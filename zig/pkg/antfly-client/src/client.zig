@@ -151,6 +151,36 @@ pub const AntflyClient = struct {
         return self.inner.getIndex(table_name, index_name);
     }
 
+    /// Equivalent to `getIndexResponse`, but bounds the complete HTTP request.
+    /// Polling callers should pass their remaining operation budget so a
+    /// socket-level timeout cannot outlive the user-visible deadline.
+    pub fn getIndexResponseWithTimeout(
+        self: *AntflyClient,
+        table_name: []const u8,
+        index_name: []const u8,
+        timeout_ms: u64,
+    ) !openapi.ApiResponse(openapi.types.IndexStatus) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
+        defer self.allocator.free(encoded_index_name);
+        const url = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/db/v1/tables/{s}/indexes/{s}",
+            .{ self.inner.base_url, encoded_table_name, encoded_index_name },
+        );
+        defer self.allocator.free(url);
+        const headers: ?[]const [2][]const u8 = if (self.inner.auth_header) |*header|
+            @as(*const [1][2][]const u8, header)
+        else
+            null;
+        var resp = try self.inner.http.get(url, .{
+            .headers = headers,
+            .timeout_ms = @max(timeout_ms, 1),
+        });
+        return openapi.ApiResponse(openapi.types.IndexStatus).fromResponse(self.allocator, &resp);
+    }
+
     pub fn listIndexes(self: *AntflyClient, table_name: []const u8) !openapi.ApiResponse([]const openapi.types.IndexStatus) {
         var resp = try self.inner.listIndexes(table_name);
         if (resp.status_code >= 300) {

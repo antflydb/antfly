@@ -3294,7 +3294,7 @@ pub fn build(b: *std.Build) void {
 
     const antfly_client_pkg_tests = b.addTest(.{
         .root_module = antfly_client_pkg_mod,
-        .filters = &.{"antfly client pkg compiles"},
+        .filters = &.{ "antfly client pkg compiles", "get index response timeout bounds the complete HTTP request" },
     });
     const run_antfly_client_pkg_tests = addFilteredTestRunArtifact(b, antfly_client_pkg_tests);
     const antfly_client_pkg_test_step = b.step("antfly-client-test", "Run the standalone antfly-client package compile test");
