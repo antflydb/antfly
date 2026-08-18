@@ -142,6 +142,7 @@ pub const TransportResponse = struct {
     content_type: ?[]u8 = null,
     content_length: ?u64 = null,
     version_id: ?[]u8 = null,
+    checksum_sha256: ?[]u8 = null,
     last_modified: ?[]u8 = null,
 
     pub fn deinit(self: *TransportResponse, alloc: Allocator) void {
@@ -149,6 +150,7 @@ pub const TransportResponse = struct {
         if (self.etag) |value| alloc.free(value);
         if (self.content_type) |value| alloc.free(value);
         if (self.version_id) |value| alloc.free(value);
+        if (self.checksum_sha256) |value| alloc.free(value);
         if (self.last_modified) |value| alloc.free(value);
         self.* = undefined;
     }
@@ -324,6 +326,7 @@ fn httpxRequest(
     if (response.headers.get("Content-Type")) |value| result.content_type = try alloc.dupe(u8, value);
     result.content_length = if (response.headers.get("Content-Length")) |value| std.fmt.parseInt(u64, value, 10) catch null else null;
     if (response.headers.get("x-amz-version-id")) |value| result.version_id = try alloc.dupe(u8, value);
+    if (response.headers.get("x-amz-checksum-sha256")) |value| result.checksum_sha256 = try alloc.dupe(u8, value);
     if (response.headers.get("Last-Modified")) |value| result.last_modified = try alloc.dupe(u8, value);
     return result;
 }
@@ -714,6 +717,13 @@ pub const Client = struct {
             if (meta.version_id) |current| alloc.free(current);
             meta.version_id = next;
         }
+        if (response.checksum_sha256) |value| {
+            if (meta.checksum) |*current| current.deinit(alloc);
+            meta.checksum = .{
+                .algorithm = .sha256_base64,
+                .value = try alloc.dupe(u8, value),
+            };
+        }
 
         const out_body = response.body;
         response.body = &.{};
@@ -762,6 +772,10 @@ pub const Client = struct {
             .key = try alloc.dupe(u8, key),
             .etag = if (response.etag) |value| try alloc.dupe(u8, stripQuotes(value)) else null,
             .version_id = if (response.version_id) |value| try alloc.dupe(u8, value) else null,
+            .checksum = if (response.checksum_sha256) |value| .{
+                .algorithm = .sha256_base64,
+                .value = try alloc.dupe(u8, value),
+            } else null,
             .content_length = response.content_length orelse 0,
             .content_type = if (response.content_type) |value| try alloc.dupe(u8, value) else null,
             .last_modified_unix_ms = null,
@@ -2046,6 +2060,7 @@ test "s3 client signs and issues object operations through request fn" {
         content_type: ?[]const u8 = null,
         content_length: ?u64 = null,
         version_id: ?[]const u8 = null,
+        checksum_sha256: ?[]const u8 = null,
         expect_body: ?[]const u8 = null,
         expect_range: ?[]const u8 = null,
         expect_max_response_size: ?usize = null,
@@ -2087,6 +2102,7 @@ test "s3 client signs and issues object operations through request fn" {
                 .content_type = if (step.content_type) |value| try req_alloc.dupe(u8, value) else null,
                 .content_length = step.content_length,
                 .version_id = if (step.version_id) |value| try req_alloc.dupe(u8, value) else null,
+                .checksum_sha256 = if (step.checksum_sha256) |value| try req_alloc.dupe(u8, value) else null,
             };
         }
 
@@ -2113,9 +2129,9 @@ test "s3 client signs and issues object operations through request fn" {
         .{ .method = .PUT, .url_contains = "/bucket", .status = 200 },
         .{ .method = .PUT, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-put\"", .expect_body = "hello" },
         .{ .method = .HEAD, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5 },
-        .{ .method = .GET, .url_contains = "partNumber=7&versionId=v2", .status = 206, .body = "ell", .etag = "\"etag-get\"", .content_type = "text/plain", .content_length = 3, .version_id = "v2", .expect_range = "bytes=1-3" },
+        .{ .method = .GET, .url_contains = "partNumber=7&versionId=v2", .status = 206, .body = "ell", .etag = "\"etag-get\"", .content_type = "text/plain", .content_length = 3, .version_id = "v2", .checksum_sha256 = "sha256-get", .expect_range = "bytes=1-3" },
         .{ .method = .GET, .url_contains = "/bucket/docs/a.txt", .status = 206, .body = "hell", .etag = "\"etag-direct\"", .content_type = "text/plain", .content_length = 4, .expect_max_response_size = 4 },
-        .{ .method = .HEAD, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5 },
+        .{ .method = .HEAD, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5, .checksum_sha256 = "sha256-head" },
         .{ .method = .GET, .url_contains = "list-type=2", .status = 200, .body = "<ListBucketResult><Contents><Key>docs/a.txt</Key><ETag>\"etag-head\"</ETag><Size>5</Size></Contents></ListBucketResult>" },
         .{ .method = .DELETE, .url_contains = "/bucket/docs/a.txt", .status = 204 },
     };
@@ -2154,6 +2170,8 @@ test "s3 client signs and issues object operations through request fn" {
     try std.testing.expectEqualStrings("etag-get", get.metadata.etag.?);
     try std.testing.expectEqualStrings("v2", get.metadata.version_id.?);
     try std.testing.expectEqual(@as(u64, 3), get.metadata.content_length);
+    try std.testing.expectEqual(types.ObjectChecksumAlgorithm.sha256_base64, get.metadata.checksum.?.algorithm);
+    try std.testing.expectEqualStrings("sha256-get", get.metadata.checksum.?.value);
 
     var direct = try client.getObject("bucket", "docs/a.txt", .{
         .range = .{ .offset = 0, .length = 4 },
@@ -2167,6 +2185,8 @@ test "s3 client signs and issues object operations through request fn" {
     var meta = try client.statObject("bucket", "docs/a.txt");
     defer meta.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 5), meta.content_length);
+    try std.testing.expectEqual(types.ObjectChecksumAlgorithm.sha256_base64, meta.checksum.?.algorithm);
+    try std.testing.expectEqualStrings("sha256-head", meta.checksum.?.value);
 
     var listed = try client.listObjects("bucket", .{ .prefix = "docs/" });
     defer listed.deinit(alloc);

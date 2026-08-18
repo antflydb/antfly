@@ -15,11 +15,34 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+pub const ObjectChecksumAlgorithm = enum {
+    sha256_hex,
+    sha256_base64,
+    md5_base64,
+};
+
+pub const ObjectChecksum = struct {
+    algorithm: ObjectChecksumAlgorithm,
+    value: []u8,
+
+    pub fn deinit(self: *ObjectChecksum, alloc: Allocator) void {
+        alloc.free(self.value);
+        self.* = undefined;
+    }
+};
+
+pub const ObjectChecksumScope = enum {
+    object,
+    response_body,
+};
+
 pub const ObjectMetadata = struct {
     bucket: []u8,
     key: []u8,
     etag: ?[]u8 = null,
     version_id: ?[]u8 = null,
+    checksum: ?ObjectChecksum = null,
+    checksum_scope: ObjectChecksumScope = .object,
     content_length: u64,
     content_type: ?[]u8 = null,
     last_modified_unix_ms: ?i64 = null,
@@ -29,6 +52,7 @@ pub const ObjectMetadata = struct {
         alloc.free(self.key);
         if (self.etag) |value| alloc.free(value);
         if (self.version_id) |value| alloc.free(value);
+        if (self.checksum) |*value| value.deinit(alloc);
         if (self.content_type) |value| alloc.free(value);
         self.* = undefined;
     }
@@ -162,6 +186,10 @@ test "object metadata owns strings" {
         .bucket = try alloc.dupe(u8, "bucket"),
         .key = try alloc.dupe(u8, "key"),
         .etag = try alloc.dupe(u8, "etag"),
+        .checksum = .{
+            .algorithm = .sha256_hex,
+            .value = try alloc.dupe(u8, "abcd"),
+        },
         .content_length = 1,
     };
     meta.deinit(alloc);

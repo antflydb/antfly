@@ -2672,6 +2672,14 @@ pub fn build(b: *std.Build) void {
     const lib_httpx_test_step = b.step("lib-httpx-test", "Run standalone lib/httpx tests");
     lib_httpx_test_step.dependOn(&run_httpx_tests.step);
 
+    const objectstore_tests = b.addTest(.{
+        .root_module = objectstore_mod,
+        .filters = selectTestFilters(b, &.{}),
+    });
+    const run_objectstore_tests = b.addRunArtifact(objectstore_tests);
+    const lib_objectstore_test_step = b.step("lib-objectstore-test", "Run standalone lib/objectstore tests");
+    lib_objectstore_test_step.dependOn(&run_objectstore_tests.step);
+
     const common_http_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/common_http_test_root.zig"),
         .target = target,
