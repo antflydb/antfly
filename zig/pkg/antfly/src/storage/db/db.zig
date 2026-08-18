@@ -132,6 +132,7 @@ const traversal_mod = @import("../../graph/traversal.zig");
 const paths_mod = @import("../../graph/paths.zig");
 const graph_query_mod = @import("../../graph/query.zig");
 const graph_pattern_mod = @import("../../graph/pattern.zig");
+const graph_node_identity = @import("../../graph/node_identity.zig");
 const mapper = @import("document_mapper.zig");
 const planning_adapter_mod = @import("planning_adapter.zig");
 const planning_bindings_mod = @import("planning_bindings.zig");
@@ -15225,6 +15226,9 @@ pub const DB = struct {
             pattern,
             max_results,
             return_aliases,
+            &.{},
+            false,
+            true,
             null,
         );
     }
@@ -15237,6 +15241,9 @@ pub const DB = struct {
         pattern: []const graph_pattern_mod.PatternStep,
         max_results: u32,
         return_aliases: []const []const u8,
+        target_nodes: []const graph_node_identity.Ref,
+        target_required: bool,
+        include_paths: bool,
         node_admission: ?NodeAdmission,
     ) ![]graph_pattern_mod.PatternMatch {
         if (start_keys.len == 0) return try alloc.alloc(graph_pattern_mod.PatternMatch, 0);
@@ -15245,6 +15252,9 @@ pub const DB = struct {
         return try self.core.graphMatchPattern(alloc, index_name, start_keys, pattern, .{
             .max_results = max_results,
             .return_aliases = return_aliases,
+            .target_nodes = target_nodes,
+            .target_required = target_required,
+            .include_paths = include_paths,
             .evaluator = .{
                 .ctx = &filter_ctx,
                 .func = patternNodeFilterEvaluator,
@@ -24740,15 +24750,20 @@ pub const DB = struct {
         alloc: Allocator,
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
+        target_nodes: []const graph_node_identity.Ref,
     ) anyerror![]graph_pattern_mod.PatternMatch {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.matchPattern(
+        return try self.matchPatternWithNodeAdmission(
             alloc,
             named.query.index_name,
             start_key_refs,
             named.query.pattern,
             named.query.params.max_results,
             named.query.return_aliases,
+            target_nodes,
+            named.query.target_nodes != null,
+            named.query.params.include_paths,
+            null,
         );
     }
 
@@ -24757,6 +24772,7 @@ pub const DB = struct {
         alloc: Allocator,
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
+        target_nodes: []const graph_node_identity.Ref,
     ) anyerror![]graph_pattern_mod.PatternMatch {
         const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try execution.db.matchPatternWithNodeAdmission(
@@ -24766,6 +24782,9 @@ pub const DB = struct {
             named.query.pattern,
             named.query.params.max_results,
             named.query.return_aliases,
+            target_nodes,
+            named.query.target_nodes != null,
+            named.query.params.include_paths,
             execution.admission.iface(),
         );
     }
@@ -61105,30 +61124,12 @@ test "db preflightSearchRequest validates live lane bindings" {
     try std.testing.expectError(error.InvalidArgument, db.preflightSearchRequest(alloc, .{
         .graph_queries = &.{
             .{
-                .name = "pattern_with_target",
-                .query = .{
-                    .query_type = .pattern,
-                    .index_name = "graph_v1",
-                    .start_nodes = .{ .keys = &.{"doc:a"} },
-                    .target_nodes = .{ .keys = &.{"doc:b"} },
-                    .pattern = &.{
-                        .{
-                            .alias = "src",
-                            .edge = .{},
-                        },
-                    },
-                },
-            },
-        },
-    }, 0));
-    try std.testing.expectError(error.InvalidArgument, db.preflightSearchRequest(alloc, .{
-        .graph_queries = &.{
-            .{
                 .name = "pattern_missing_type",
                 .query = .{
                     .query_type = .pattern,
                     .index_name = "graph_v1",
                     .start_nodes = .{ .keys = &.{"doc:a"} },
+                    .target_nodes = .{ .keys = &.{"doc:b"} },
                     .pattern = &.{
                         .{
                             .alias = "src",
@@ -61160,6 +61161,7 @@ test "db preflightSearchRequest validates live lane bindings" {
                     .query_type = .pattern,
                     .index_name = "graph_v1",
                     .start_nodes = .{ .keys = &.{"doc:a"} },
+                    .target_nodes = .{ .keys = &.{"doc:b"} },
                     .pattern = &.{
                         .{
                             .alias = "src",
