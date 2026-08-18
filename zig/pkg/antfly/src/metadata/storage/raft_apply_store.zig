@@ -2682,9 +2682,18 @@ pub const RaftApplyStore = struct {
                     .metadata_group_id = group_id,
                 });
             },
-            .upsert_reallocation_request => |record| {
+            .upsert_reallocation_request => |record| admit: {
                 var key_buf: [160]u8 = undefined;
                 const key = try reallocationRequestKeyForGroup(&key_buf, group_id);
+                const active: ?[]const u8 = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                // One active request is the causal acknowledgement barrier for
+                // every forced-placement pass. Concurrent triggers coalesce;
+                // replacing this record would invalidate in-flight store
+                // acknowledgements and can starve convergence indefinitely.
+                if (active != null) break :admit;
                 const value = try encodeReallocationRequestRecord(self.alloc, record);
                 defer self.alloc.free(value);
                 try txn.put(key, value);

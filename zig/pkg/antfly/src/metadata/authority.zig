@@ -42,6 +42,18 @@ pub fn isMutationNotAdmittedError(err: anyerror) bool {
     };
 }
 
+/// Once an earlier step in a compound metadata operation may have been
+/// admitted, a later pre-admission rejection no longer proves that the whole
+/// HTTP mutation is safe to replay. Preserve that distinction explicitly so
+/// transport adapters cannot accidentally emit the strong non-admission
+/// contract for a partially completed operation.
+pub fn afterPossibleAdmission(err: anyerror) anyerror {
+    return if (isMutationNotAdmittedError(err))
+        error.MetadataMutationOutcomeUnknown
+    else
+        err;
+}
+
 test "metadata authority retry classification is fail closed" {
     try std.testing.expect(isRetryableError(error.NotLeader));
     try std.testing.expect(isRetryableError(error.ProposalDropped));
@@ -59,4 +71,6 @@ test "metadata mutation non-admission classification excludes ambiguous authorit
     try std.testing.expect(!isMutationNotAdmittedError(error.MetadataLinearizableReadTimeout));
     try std.testing.expect(!isMutationNotAdmittedError(error.ReconcileLeaseNotHeld));
     try std.testing.expect(!isMutationNotAdmittedError(error.OutOfMemory));
+    try std.testing.expectEqual(error.MetadataMutationOutcomeUnknown, afterPossibleAdmission(error.NotLeader));
+    try std.testing.expectEqual(error.OutOfMemory, afterPossibleAdmission(error.OutOfMemory));
 }

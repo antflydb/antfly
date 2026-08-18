@@ -119,11 +119,15 @@ def _retry_metadata_mutation_until_admitted(
 ) -> None:
     """Retry only requests that every contacted replica proved it did not admit."""
     deadline = time.monotonic() + timeout_s
+    last_not_admitted: MetadataMutationNotAdmitted | None = None
     while True:
+        if last_not_admitted is not None and time.monotonic() >= deadline:
+            raise last_not_admitted
         try:
             submit()
             return
-        except MetadataMutationNotAdmitted:
+        except MetadataMutationNotAdmitted as exc:
+            last_not_admitted = exc
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
                 raise
@@ -138,7 +142,14 @@ def _submit_metadata_mutation_if_unobserved(
     not_admitted_retry_interval_s: float = METADATA_MUTATION_NOT_ADMITTED_RETRY_INTERVAL_S,
 ) -> tuple[dict[str, Any] | None, str | None]:
     not_admitted_deadline: float | None = None
+    last_not_admitted: MetadataMutationNotAdmitted | None = None
     while True:
+        if (
+            last_not_admitted is not None
+            and not_admitted_deadline is not None
+            and time.monotonic() >= not_admitted_deadline
+        ):
+            raise last_not_admitted
         observed = observe()
         if observed is not None:
             return observed, None
@@ -153,13 +164,14 @@ def _submit_metadata_mutation_if_unobserved(
             if observed is not None:
                 return observed, None
             raise
-        except MetadataMutationNotAdmitted:
+        except MetadataMutationNotAdmitted as exc:
             # No replica admitted the request, so another observe/submit round
             # is safe. Bound the election wait so a broken cluster fails with
             # the precise non-admission error instead of polling phantom state.
             now = time.monotonic()
             if not_admitted_deadline is None:
                 not_admitted_deadline = now + not_admitted_retry_timeout_s
+            last_not_admitted = exc
             remaining = not_admitted_deadline - now
             if remaining <= 0.0:
                 raise
@@ -364,6 +376,44 @@ def test_direct_metadata_mutation_retries_only_definitive_non_admission():
             retry_interval_s=0.0,
         )
     assert attempts == 1
+
+
+def test_reallocation_wait_does_not_replace_an_observed_active_generation():
+    class FakeCluster:
+        def __init__(self) -> None:
+            self.active_reads_remaining = 1
+            self.submissions = 0
+
+        def metadata_snapshot(self) -> dict[str, Any]:
+            snapshot: dict[str, Any] = {
+                "tables": [{"name": "docs", "table_id": 1}],
+                "ranges": [{"table_id": 1, "group_id": 7}],
+                "placement_intents": [],
+            }
+            if self.active_reads_remaining > 0:
+                self.active_reads_remaining -= 1
+                snapshot["reallocation_request"] = {"request_id": 41}
+            elif self.submissions > 0:
+                snapshot["placement_intents"] = [
+                    {"record": {"group_id": 7, "local_node_id": 9}}
+                ]
+            return snapshot
+
+        def trigger_reallocate_once(self) -> None:
+            assert self.active_reads_remaining == 0
+            self.submissions += 1
+
+    cluster = FakeCluster()
+    assigned, error = _wait_node_owns_group(
+        cluster,  # type: ignore[arg-type]
+        "docs",
+        9,
+        timeout_s=1.0,
+        active_reallocation_poll_interval_s=0.0,
+    )
+    assert assigned is not None
+    assert error is None
+    assert cluster.submissions == 1
 
 
 class _ClusterStartupDeadline:
@@ -1921,28 +1971,87 @@ def _wait_node_owns_group(
     node_id: int,
     *,
     timeout_s: float = 90.0,
+    active_reallocation_poll_interval_s: float = 0.5,
 ) -> tuple[dict[str, Any] | None, str | None]:
+    deadline = time.monotonic() + timeout_s
+
+    def snapshot_owns_group(snapshot: dict[str, Any]) -> bool:
+        group_ids = _table_group_ids_from_snapshot(snapshot, table_name)
+        return bool(
+            group_ids
+            and node_id in _placed_nodes_for_groups_from_snapshot(snapshot, group_ids)
+        )
+
+    def active_reallocation_request_id(snapshot: dict[str, Any]) -> str | None:
+        request = snapshot.get("reallocation_request")
+        if not isinstance(request, dict):
+            return None
+        request_id = request.get("request_id")
+        if request_id in (None, 0, "", "0"):
+            return None
+        return str(request_id)
+
+    def placement_or_active_reallocation() -> dict[str, Any] | None:
+        try:
+            snapshot = cluster.metadata_snapshot()
+        except (AssertionError, requests.RequestException):
+            return None
+        if snapshot_owns_group(snapshot) or active_reallocation_request_id(snapshot) is not None:
+            return snapshot
+        return None
+
     def owns_group() -> dict[str, Any] | None:
         try:
             snapshot = cluster.metadata_snapshot()
         except (AssertionError, requests.RequestException):
             return None
-        group_ids = _table_group_ids_from_snapshot(snapshot, table_name)
-        if not group_ids:
-            return None
-        if node_id not in _placed_nodes_for_groups_from_snapshot(snapshot, group_ids):
-            return None
-        return snapshot
+        return snapshot if snapshot_owns_group(snapshot) else None
 
-    assigned, submission_error = _submit_metadata_mutation_if_unobserved(
-        observe=owns_group,
-        # A successful request replaces the active barrier generation. Admit
-        # at most one while placement is absent, then keep polling read-only.
-        submit=cluster.trigger_reallocate_once,
-    )
-    if assigned is not None:
-        return assigned, submission_error
-    return wait_until(owns_group, timeout_s=timeout_s, interval_s=0.5), submission_error
+    submission_error: str | None = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return None, submission_error
+
+        observed, error = _submit_metadata_mutation_if_unobserved(
+            observe=placement_or_active_reallocation,
+            # Active requests coalesce at Raft apply. Retry only proven
+            # non-admissions, and avoid even proposing while another actor's
+            # generation is visible.
+            submit=cluster.trigger_reallocate_once,
+            not_admitted_retry_timeout_s=min(
+                METADATA_MUTATION_NOT_ADMITTED_RETRY_TIMEOUT_S,
+                remaining,
+            ),
+        )
+        if error is not None:
+            submission_error = error
+        if observed is None:
+            # This call may have been admitted (including an ambiguous lost
+            # response), so all remaining work must be read-only convergence.
+            remaining = max(0.0, deadline - time.monotonic())
+            return wait_until(owns_group, timeout_s=remaining, interval_s=0.5), submission_error
+        if snapshot_owns_group(observed):
+            return observed, submission_error
+
+        # Another actor already owns the current reallocation generation. Do
+        # not replace it. Wait for that generation (and any successor) to
+        # finish; only an observed empty slot permits the outer loop to submit.
+        assert active_reallocation_request_id(observed) is not None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return None, submission_error
+            time.sleep(min(active_reallocation_poll_interval_s, remaining))
+            try:
+                observed = cluster.metadata_snapshot()
+            except (AssertionError, requests.RequestException):
+                continue
+            if snapshot_owns_group(observed):
+                return observed, submission_error
+            successor_request_id = active_reallocation_request_id(observed)
+            if successor_request_id is None:
+                break
 
 
 def _wait_node_drained_for_groups(

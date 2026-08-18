@@ -9,6 +9,7 @@ const std = @import("std");
 const operation = @import("../api/operation.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const metadata_api = @import("api.zig");
+const metadata_authority = @import("authority.zig");
 const table_manager = @import("table_manager.zig");
 
 pub const Source = struct {
@@ -102,7 +103,8 @@ pub const Operations = struct {
         if (self.source.supports_request_shutdown) {
             const callback = self.source.vtable.request_shutdown.?;
             if (callback(self.source.ptr, node_id)) |_| {
-                try self.triggerReallocateIfSupported();
+                self.triggerReallocateIfSupported() catch |err|
+                    return metadata_authority.afterPossibleAdmission(err);
                 return;
             } else |err| switch (err) {
                 error.UnsupportedOperation => {},
@@ -133,7 +135,8 @@ pub const Operations = struct {
             alloc.free(updated.lifecycle);
             updated.lifecycle = draining;
             updated_owned = false;
-            try upsert_node(self.source.ptr, alloc, updated);
+            upsert_node(self.source.ptr, alloc, updated) catch |err|
+                return if (changed) metadata_authority.afterPossibleAdmission(err) else err;
             changed = true;
             break;
         }
@@ -146,11 +149,11 @@ pub const Operations = struct {
             errdefer if (lifecycle_owned) alloc.free(lifecycle);
             role_owned = false;
             lifecycle_owned = false;
-            try upsert_node(self.source.ptr, alloc, .{
+            upsert_node(self.source.ptr, alloc, .{
                 .node_id = node_id,
                 .role = role,
                 .lifecycle = lifecycle,
-            });
+            }) catch |err| return if (changed) metadata_authority.afterPossibleAdmission(err) else err;
             changed = true;
         }
         for (snapshot.stores) |store| {
@@ -160,10 +163,12 @@ pub const Operations = struct {
             errdefer if (updated_owned) table_manager.freeStore(alloc, updated);
             updated.drain_requested = true;
             updated_owned = false;
-            try upsert_store(self.source.ptr, alloc, updated);
+            upsert_store(self.source.ptr, alloc, updated) catch |err|
+                return if (changed) metadata_authority.afterPossibleAdmission(err) else err;
             changed = true;
         }
-        if (changed) try self.triggerReallocateIfSupported();
+        if (changed) self.triggerReallocateIfSupported() catch |err|
+            return metadata_authority.afterPossibleAdmission(err);
     }
 
     pub fn cancelShutdown(self: Operations, alloc: std.mem.Allocator, ctx: operation.RequestContext, node_id: u64) !void {
@@ -172,7 +177,8 @@ pub const Operations = struct {
         if (self.source.supports_cancel_shutdown) {
             const callback = self.source.vtable.cancel_shutdown.?;
             if (callback(self.source.ptr, node_id)) |_| {
-                try self.triggerReallocateIfSupported();
+                self.triggerReallocateIfSupported() catch |err|
+                    return metadata_authority.afterPossibleAdmission(err);
                 return;
             } else |err| switch (err) {
                 error.UnsupportedOperation => {},
@@ -196,7 +202,8 @@ pub const Operations = struct {
             alloc.free(updated.lifecycle);
             updated.lifecycle = active;
             updated_owned = false;
-            try upsert_node(self.source.ptr, alloc, updated);
+            upsert_node(self.source.ptr, alloc, updated) catch |err|
+                return if (changed) metadata_authority.afterPossibleAdmission(err) else err;
             changed = true;
             break;
         }
@@ -207,10 +214,12 @@ pub const Operations = struct {
             errdefer if (updated_owned) table_manager.freeStore(alloc, updated);
             updated.drain_requested = false;
             updated_owned = false;
-            try upsert_store(self.source.ptr, alloc, updated);
+            upsert_store(self.source.ptr, alloc, updated) catch |err|
+                return if (changed) metadata_authority.afterPossibleAdmission(err) else err;
             changed = true;
         }
-        if (changed) try self.triggerReallocateIfSupported();
+        if (changed) self.triggerReallocateIfSupported() catch |err|
+            return metadata_authority.afterPossibleAdmission(err);
     }
 
     pub fn finalizeShutdown(self: Operations, ctx: operation.RequestContext, node_id: u64) !void {
@@ -222,7 +231,8 @@ pub const Operations = struct {
         defer self.source.vtable.free_snapshot(self.source.ptr, &snapshot);
         if (nodeFinalizeUnsafe(&snapshot, node_id)) return error.ActiveNodeFinalizeRejected;
         try callback(self.source.ptr, node_id);
-        try self.triggerReallocateIfSupported();
+        self.triggerReallocateIfSupported() catch |err|
+            return metadata_authority.afterPossibleAdmission(err);
     }
 
     fn triggerReallocateIfSupported(self: Operations) !void {
@@ -313,6 +323,59 @@ test "metadata node operations stop canceled shutdown before source mutation" {
         .cancellation = operation.CancellationToken.fromAtomic(&canceled),
     }, 9));
     try std.testing.expectEqual(@as(usize, 0), source.calls);
+}
+
+test "metadata node lifecycle preserves non-admission proof only before its first mutation" {
+    const FakeSource = struct {
+        reject_shutdown: bool = true,
+        shutdown_calls: usize = 0,
+        reallocate_calls: usize = 0,
+
+        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCall;
+        }
+
+        fn freeSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn requestShutdown(ptr: *anyopaque, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.shutdown_calls += 1;
+            if (self.reject_shutdown) return error.ProposalDropped;
+        }
+
+        fn triggerReallocate(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reallocate_calls += 1;
+            return error.ProposalDropped;
+        }
+    };
+
+    var source = FakeSource{};
+    const ops = Operations{ .source = .{
+        .ptr = &source,
+        .vtable = &.{
+            .snapshot = FakeSource.snapshot,
+            .free_snapshot = FakeSource.freeSnapshot,
+            .request_shutdown = FakeSource.requestShutdown,
+            .trigger_reallocate = FakeSource.triggerReallocate,
+        },
+        .supports_request_shutdown = true,
+    } };
+
+    try std.testing.expectError(
+        error.ProposalDropped,
+        ops.requestShutdown(std.testing.allocator, .{}, 9),
+    );
+    try std.testing.expectEqual(@as(usize, 1), source.shutdown_calls);
+    try std.testing.expectEqual(@as(usize, 0), source.reallocate_calls);
+
+    source.reject_shutdown = false;
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        ops.requestShutdown(std.testing.allocator, .{}, 9),
+    );
+    try std.testing.expectEqual(@as(usize, 2), source.shutdown_calls);
+    try std.testing.expectEqual(@as(usize, 1), source.reallocate_calls);
 }
 
 test "metadata node operations preserve pending finalization on shutdown retry" {

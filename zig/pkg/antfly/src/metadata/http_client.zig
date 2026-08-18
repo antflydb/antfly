@@ -27,6 +27,9 @@ const routes = @import("http_routes.zig");
 const max_transport_retries: usize = 1;
 const max_metadata_not_leader_retries: usize = 2;
 const default_request_timeout_ms: u32 = 5_000;
+const default_mutation_authority_retry_delay_ns: u64 = 100 * std.time.ns_per_ms;
+const max_mutation_authority_retry_delay_ns: u64 = std.time.ns_per_s;
+const mutation_authority_retry_cancellation_slice_ns: u64 = 10 * std.time.ns_per_ms;
 
 const RetryPolicy = enum {
     /// Preserve the metadata client's existing retry behavior.
@@ -683,9 +686,9 @@ pub const MetadataHttpClient = struct {
                 error.Timeout,
                 => {
                     // These failures can arrive after the server admitted the
-                    // POST. Replaying a reallocation would replace its active
-                    // causal-barrier generation, so make the ambiguity explicit
-                    // and let the caller observe state before submitting again.
+                    // POST. Although active requests coalesce, a replay can
+                    // arrive after the first generation clears and create a
+                    // second pass. Preserve ambiguity for observation instead.
                     if (retry_policy == .at_most_once) return error.ReallocationOutcomeUnknown;
                     if (transport_attempt >= max_transport_retries) return err;
                     transport_attempt += 1;
@@ -710,7 +713,16 @@ pub const MetadataHttpClient = struct {
                 return error.NotLeader;
             }
             not_leader_attempt += 1;
+            const retry_delay_ns = if (retry_policy == .at_most_once)
+                metadataAuthorityRetryDelayNs(resp)
+            else
+                0;
             resp.deinit(self.alloc);
+            if (retry_delay_ns != 0) try waitBeforeMetadataMutationRetry(
+                retry_delay_ns,
+                budget,
+                controlled_req.cancellation,
+            );
         }
     }
 
@@ -740,6 +752,45 @@ pub const MetadataHttpClient = struct {
             }
         }
         return false;
+    }
+
+    fn metadataAuthorityRetryDelayNs(resp: http_common.HttpResponse) u64 {
+        for (resp.headers) |header| {
+            if (!std.ascii.eqlIgnoreCase(header.name, "Retry-After")) continue;
+            const seconds = std.fmt.parseUnsigned(
+                u64,
+                std.mem.trim(u8, header.value, " \t\r\n"),
+                10,
+            ) catch break;
+            return @min(
+                seconds *| std.time.ns_per_s,
+                max_mutation_authority_retry_delay_ns,
+            );
+        }
+        return default_mutation_authority_retry_delay_ns;
+    }
+
+    fn waitBeforeMetadataMutationRetry(
+        requested_delay_ns: u64,
+        budget: ?RequestBudget,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !void {
+        const started_ns = platform_time.monotonicNs();
+        var delay_ns = requested_delay_ns;
+        if (budget) |value| {
+            if (started_ns >= value.deadline_ns) return error.Timeout;
+            delay_ns = @min(delay_ns, value.deadline_ns - started_ns);
+        }
+
+        var remaining_ns = delay_ns;
+        while (remaining_ns != 0) {
+            if (cancellation) |signal| {
+                if (signal.isCancelled()) return error.Cancelled;
+            }
+            const slice_ns = @min(remaining_ns, mutation_authority_retry_cancellation_slice_ns);
+            platform_time.sleepNs(slice_ns);
+            remaining_ns -= slice_ns;
+        }
     }
 
     fn mapStatus(status: u16, bad_request_err: ?anyerror, not_found_err: ?anyerror, conflict_err: ?anyerror) !void {
@@ -884,6 +935,35 @@ test "metadata http client retries reallocation only before connection admission
     var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
     try client.triggerReallocate("http://127.0.0.1:9000");
     try std.testing.expectEqual(@as(usize, 2), executor.attempts);
+}
+
+test "metadata http client bounds mutation authority retry-after delay" {
+    var one_second = [_]http_common.Header{.{
+        .name = @constCast("Retry-After"),
+        .value = @constCast(" 1 "),
+    }};
+    try std.testing.expectEqual(
+        @as(u64, std.time.ns_per_s),
+        MetadataHttpClient.metadataAuthorityRetryDelayNs(.{ .status = 503, .headers = one_second[0..] }),
+    );
+
+    var excessive = [_]http_common.Header{.{
+        .name = @constCast("retry-after"),
+        .value = @constCast("999999999999"),
+    }};
+    try std.testing.expectEqual(
+        max_mutation_authority_retry_delay_ns,
+        MetadataHttpClient.metadataAuthorityRetryDelayNs(.{ .status = 503, .headers = excessive[0..] }),
+    );
+
+    var invalid = [_]http_common.Header{.{
+        .name = @constCast("Retry-After"),
+        .value = @constCast("tomorrow"),
+    }};
+    try std.testing.expectEqual(
+        default_mutation_authority_retry_delay_ns,
+        MetadataHttpClient.metadataAuthorityRetryDelayNs(.{ .status = 503, .headers = invalid[0..] }),
+    );
 }
 
 test "metadata http client replays reallocation only with explicit mutation non-admission proof" {

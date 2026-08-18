@@ -1602,6 +1602,24 @@ pub const MetadataHttpServer = struct {
         };
     }
 
+    fn nodeLifecycleMutationError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        if (err == error.MetadataMutationOutcomeUnknown) {
+            // An earlier lifecycle command may already be durable even though
+            // a follow-up reallocation step lost authority. Expose only the
+            // broad observation hint; replay is not proven safe.
+            try ctx.setHeader("Retry-After", "1");
+            try ctx.setHeader(http_common.metadata_not_leader_header, http_common.metadata_not_leader_value);
+            return ctx.status(503).text("metadata mutation outcome unknown");
+        }
+        if (metadata_authority.isMutationNotAdmittedError(err)) {
+            try ctx.setHeader(
+                http_common.metadata_mutation_not_admitted_header,
+                http_common.metadata_mutation_not_admitted_value,
+            );
+        }
+        return nodeMutationError(ctx, err);
+    }
+
     fn metadataRegisterNode(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const body = (try ctx.body()) orelse "";
         const node = parseNodeRecord(ctx.allocator, body) catch return ctx.status(400).text("invalid node registration request");
@@ -1631,19 +1649,19 @@ pub const MetadataHttpServer = struct {
         const node_id = numericParam(ctx, "node_id", false) catch return ctx.status(404).text("not found");
         parseNodeShutdownRequest(ctx.allocator, (try ctx.body()) orelse "") catch
             return ctx.status(400).text("invalid node shutdown request");
-        self.nodeOperations().requestShutdown(ctx.allocator, requestContext(ctx), node_id) catch |err| return nodeMutationError(ctx, err);
+        self.nodeOperations().requestShutdown(ctx.allocator, requestContext(ctx), node_id) catch |err| return nodeLifecycleMutationError(ctx, err);
         return ctx.status(202).text("accepted");
     }
 
     fn metadataCancelNodeShutdown(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const node_id = numericParam(ctx, "node_id", false) catch return ctx.status(404).text("not found");
-        self.nodeOperations().cancelShutdown(ctx.allocator, requestContext(ctx), node_id) catch |err| return nodeMutationError(ctx, err);
+        self.nodeOperations().cancelShutdown(ctx.allocator, requestContext(ctx), node_id) catch |err| return nodeLifecycleMutationError(ctx, err);
         return ctx.status(202).text("accepted");
     }
 
     fn metadataFinalizeNodeShutdown(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const node_id = numericParam(ctx, "node_id", false) catch return ctx.status(404).text("not found");
-        self.nodeOperations().finalizeShutdown(requestContext(ctx), node_id) catch |err| return nodeMutationError(ctx, err);
+        self.nodeOperations().finalizeShutdown(requestContext(ctx), node_id) catch |err| return nodeLifecycleMutationError(ctx, err);
         return ctx.status(202).text("accepted");
     }
 
@@ -4810,4 +4828,33 @@ test "metadata mutation pre-admission responses prove proposal was not admitted"
             resp.headers.get(http_common.metadata_mutation_not_admitted_header).?,
         );
     }
+}
+
+test "metadata node lifecycle distinguishes pre-admission rejection from partial outcome" {
+    var rejected_request = try httpx.Request.init(std.testing.allocator, .PUT, "/internal/v1/nodes/9/shutdown");
+    defer rejected_request.deinit();
+    var rejected_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &rejected_request);
+    defer rejected_ctx.deinit();
+
+    var rejected = try MetadataHttpServer.nodeLifecycleMutationError(&rejected_ctx, error.ProposalDropped);
+    defer rejected.deinit();
+    try std.testing.expectEqual(@as(u16, 503), rejected.status.code);
+    try std.testing.expectEqualStrings(
+        http_common.metadata_mutation_not_admitted_value,
+        rejected.headers.get(http_common.metadata_mutation_not_admitted_header).?,
+    );
+
+    var partial_request = try httpx.Request.init(std.testing.allocator, .PUT, "/internal/v1/nodes/9/shutdown");
+    defer partial_request.deinit();
+    var partial_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &partial_request);
+    defer partial_ctx.deinit();
+
+    var partial = try MetadataHttpServer.nodeLifecycleMutationError(&partial_ctx, error.MetadataMutationOutcomeUnknown);
+    defer partial.deinit();
+    try std.testing.expectEqual(@as(u16, 503), partial.status.code);
+    try std.testing.expect(partial.headers.get(http_common.metadata_mutation_not_admitted_header) == null);
+    try std.testing.expectEqualStrings(
+        http_common.metadata_not_leader_value,
+        partial.headers.get(http_common.metadata_not_leader_header).?,
+    );
 }

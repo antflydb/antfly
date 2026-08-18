@@ -10221,7 +10221,7 @@ test "metadata service batches store status reports" {
     try std.testing.expectEqual(@as(usize, 1), status.active_backfills);
 }
 
-test "metadata service persists and clears reallocation requests" {
+test "metadata service persists coalesces and clears reallocation requests" {
     const Factory = struct {
         alloc: std.mem.Allocator,
         store: *raft_engine.core.MemoryStorage,
@@ -10300,6 +10300,9 @@ test "metadata service persists and clears reallocation requests" {
     try runServiceRoundsUntilMetadataReady(&svc);
 
     try svc.requestReallocation(77_000);
+    // Queue a competing generation before either command applies. Raft apply
+    // order must admit the first and coalesce the second in one transaction.
+    try svc.requestReallocation(88_000);
     try svc.runRound();
     const requested = try svc.getProjectedReallocationRequest();
     try std.testing.expect(requested != null);
@@ -10317,19 +10320,21 @@ test "metadata service persists and clears reallocation requests" {
     defer svc.freeAdminSnapshot(&requested_snapshot);
     try std.testing.expectEqual(requested, requested_snapshot.reallocation_request);
 
-    var stale_plan = metadata_reconciler.ReconciliationPlan.empty();
-    stale_plan.clear_reallocation_request = requested.?.request_id;
-    try svc.requestReallocation(88_000);
+    // Concurrent triggers coalesce around the active causal barrier instead
+    // of replacing its generation while stores may be acknowledging it.
+    try svc.requestReallocation(99_000);
     try svc.runRound();
+    const coalesced = try svc.getProjectedReallocationRequest();
+    try std.testing.expectEqual(requested, coalesced);
+
+    var stale_plan = metadata_reconciler.ReconciliationPlan.empty();
+    stale_plan.clear_reallocation_request = requested.?.request_id +% 1;
     try svc.applyReconciliationPlan(&stale_plan);
     try svc.runRound();
-    const replacement = try svc.getProjectedReallocationRequest();
-    try std.testing.expect(replacement != null);
-    try std.testing.expect(replacement.?.request_id != requested.?.request_id);
-    try std.testing.expectEqual(@as(u64, 88_000), replacement.?.requested_at_ms);
+    try std.testing.expectEqual(requested, try svc.getProjectedReallocationRequest());
 
     var current_plan = metadata_reconciler.ReconciliationPlan.empty();
-    current_plan.clear_reallocation_request = replacement.?.request_id;
+    current_plan.clear_reallocation_request = requested.?.request_id;
     try svc.applyReconciliationPlan(&current_plan);
     try svc.runRound();
     try std.testing.expect((try svc.getProjectedReallocationRequest()) == null);
