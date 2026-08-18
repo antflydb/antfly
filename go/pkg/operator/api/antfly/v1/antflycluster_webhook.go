@@ -826,7 +826,7 @@ Attempted change: "%s"`,
 
 Problem: Metadata nodes are quorum-bearing. The operator does not yet have a quorum-aware metadata membership-change workflow. Changing the StatefulSet topology with retained PVCs can start divergent Raft incarnations.
 
-Solution: Keep the existing metadata replica count, or recreate the cluster with the target topology.`,
+Solution: Keep the existing metadata replica count. To change topology, back up the cluster, create a differently named AntflyCluster at the target replica count so it receives fresh metadata PVCs, restore the backup, and cut over. Do not reuse retained metadata PVCs across replica-count changes.`,
 				oldMetadataReplicas, newMetadataReplicas))
 		}
 

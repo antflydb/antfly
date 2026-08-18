@@ -3508,11 +3508,6 @@ spec:
                 - metadataRaft
                 - resources
                 type: object
-                x-kubernetes-validations:
-                - message: metadata replica count is immutable after cluster creation;
-                    recreate the cluster with the target topology
-                  rule: '(has(self.replicas) ? self.replicas : 3) == (has(oldSelf.replicas)
-                    ? oldSelf.replicas : 3)'
               mode:
                 default: Distributed
                 enum:
@@ -4911,6 +4906,14 @@ spec:
             - image
             - storage
             type: object
+            x-kubernetes-validations:
+            - message: metadata replica count is immutable; create a differently named
+                cluster with fresh metadata PVCs at the target topology and restore
+                from backup
+              rule: '(has(self.metadataNodes) ? (has(self.metadataNodes.replicas)
+                ? self.metadataNodes.replicas : 3) : 3) == (has(oldSelf.metadataNodes)
+                ? (has(oldSelf.metadataNodes.replicas) ? oldSelf.metadataNodes.replicas
+                : 3) : 3)'
           status:
             properties:
               autoScalingStatus:

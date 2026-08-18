@@ -1518,7 +1518,7 @@ func TestValidateUpdate_MetadataReplicaChangesRejected(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected error when changing metadata replicas from %d to %d", tt.current, tt.attempted)
 			}
-			for _, want := range []string{"metadataNodes.replicas", "immutable", "divergent Raft incarnations", "recreate the cluster"} {
+			for _, want := range []string{"metadataNodes.replicas", "immutable", "divergent Raft incarnations", "differently named AntflyCluster", "fresh metadata PVCs", "Do not reuse retained metadata PVCs"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Fatalf("expected metadata replica error to contain %q, got: %v", want, err)
 				}

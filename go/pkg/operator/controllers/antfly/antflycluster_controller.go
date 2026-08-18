@@ -1470,9 +1470,53 @@ func (r *AntflyClusterReconciler) applyDefaults(cluster *antflyv1.AntflyCluster)
 
 // validateClusterConfiguration validates the cluster configuration (T025)
 // This is a fallback validation for cases where webhook validation is disabled
-func (r *AntflyClusterReconciler) validateClusterConfiguration(cluster *antflyv1.AntflyCluster) error {
+func (r *AntflyClusterReconciler) validateClusterConfiguration(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
 	// Call the webhook validation methods as fallback
-	return cluster.ValidateCreate()
+	if err := cluster.ValidateCreate(); err != nil {
+		return err
+	}
+
+	return r.validateMetadataReplicaCountAgainstStatefulSet(ctx, cluster)
+}
+
+// validateMetadataReplicaCountAgainstStatefulSet closes the update-validation
+// gap on clusters where admission webhooks or CRD CEL transition rules are not
+// available. The existing StatefulSet is the last applied topology and must not
+// be resized without a quorum-aware membership-change workflow.
+func (r *AntflyClusterReconciler) validateMetadataReplicaCountAgainstStatefulSet(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	if cluster.Spec.Mode != antflyv1.ClusterModeDistributed {
+		return nil
+	}
+
+	metadataStatefulSet := &appsv1.StatefulSet{}
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      cluster.Name + "-metadata",
+		Namespace: cluster.Namespace,
+	}, metadataStatefulSet)
+	if errors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read existing metadata StatefulSet: %w", err)
+	}
+
+	currentReplicas := int32(1)
+	if metadataStatefulSet.Spec.Replicas != nil {
+		currentReplicas = *metadataStatefulSet.Spec.Replicas
+	}
+	desiredReplicas := cluster.Spec.MetadataNodes.Replicas
+	if desiredReplicas == 0 {
+		desiredReplicas = 3
+	}
+	if desiredReplicas == currentReplicas {
+		return nil
+	}
+
+	return fmt.Errorf(`field 'spec.metadataNodes.replicas' is immutable after cluster creation (current: %d, attempted: %d)
+
+Problem: Metadata nodes are quorum-bearing. The operator does not yet have a quorum-aware metadata membership-change workflow. Changing the StatefulSet topology with retained PVCs can start divergent Raft incarnations.
+
+Solution: Keep the existing metadata replica count. To change topology, back up the cluster, create a differently named AntflyCluster at the target replica count so it receives fresh metadata PVCs, restore the backup, and cut over. Do not reuse retained metadata PVCs across replica-count changes.`, currentReplicas, desiredReplicas)
 }
 
 // calculateBackoff calculates exponential backoff duration for validation failures (T027)
@@ -1844,7 +1888,7 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	clusterKey := req.String()
 
 	if needsValidation {
-		if err := r.validateClusterConfiguration(workingCluster); err != nil {
+		if err := r.validateClusterConfiguration(ctx, workingCluster); err != nil {
 			log.Error(err, "Cluster configuration validation failed")
 			if statusErr := r.updateStatusWithValidationError(ctx, &antflyCluster, err); statusErr != nil {
 				log.Error(statusErr, "Failed to update status with validation error")

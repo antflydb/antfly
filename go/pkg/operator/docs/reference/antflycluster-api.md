@@ -83,6 +83,7 @@ Configuration for metadata nodes (Raft consensus, API coordination).
 
 **Notes**:
 - `replicas` should be an odd number (3 or 5) for Raft quorum
+- To change `replicas`, back up and restore into a differently named cluster with fresh metadata PVCs; do not reuse retained metadata PVCs
 - `useSpotPods` must be false when `spec.gke.autopilot=true`
 - `nodeSelector` must not be set when `spec.gke.autopilot=true` (Autopilot uses compute classes)
 - Scheduling fields (`tolerations`, `nodeSelector`, `affinity`, `topologySpreadConstraints`) are merged with cloud-provider-specific values (e.g., EKS Spot tolerations)

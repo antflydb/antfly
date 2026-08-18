@@ -356,9 +356,16 @@ kubectl patch antflycluster my-database --type='merge' -p='{"spec":{"dataNodes":
 Use `spec.dataNodes.suspend=true` for scale-to-zero pause/resume. Do not use `dataNodes.replicas: 0` for suspension; `0` or omitted uses the controller default. Suspension requires retained PVCs and cannot be combined with data-node autoscaling.
 
 Metadata replica counts are immutable after cluster creation. Choose the target
-odd replica count when creating the cluster; to change it, recreate the cluster
-at the target topology. The operator does not yet perform quorum-aware metadata
-membership transitions.
+odd replica count when creating the cluster. To change it, back up the cluster,
+create a differently named `AntflyCluster` at the target topology so it receives
+fresh metadata PVCs, restore the backup, and cut over. Do not recreate the same
+cluster name or reuse retained metadata PVCs across replica-count changes. The
+operator does not yet perform quorum-aware metadata membership transitions.
+
+The validating webhook and reconciler fallback enforce this rule on all
+supported Kubernetes versions. Kubernetes 1.25+ additionally enforces the
+generated CRD's CEL transition rule at API admission. CEL validation rules were
+alpha in Kubernetes 1.23 and are not relied on for Kubernetes 1.20-1.24.
 
 ## 📚 Examples
 

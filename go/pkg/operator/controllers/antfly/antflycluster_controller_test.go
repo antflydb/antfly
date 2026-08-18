@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/types"
@@ -59,6 +60,53 @@ func TestGeneratedConfigHashAnnotationChangesWithRemoteContentConfig(t *testing.
 	second := reconciler.buildPodAnnotations(context.Background(), newEnvFromCache(nil), cluster, nil)
 	if second[generatedConfigHashAnnotation] == firstHash {
 		t.Fatal("expected remote-content config change to alter pod-template hash")
+	}
+}
+
+func TestValidateMetadataReplicaCountAgainstStatefulSet(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	currentReplicas := int32(1)
+	metadataStatefulSet := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "example-metadata", Namespace: "default"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: &currentReplicas},
+	}
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(metadataStatefulSet).Build(),
+	}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
+		Spec: antflyv1.AntflyClusterSpec{
+			Mode: antflyv1.ClusterModeDistributed,
+			MetadataNodes: antflyv1.MetadataNodesSpec{
+				Replicas: 3,
+			},
+		},
+	}
+
+	err := reconciler.validateMetadataReplicaCountAgainstStatefulSet(context.Background(), cluster)
+	if err == nil {
+		t.Fatal("expected existing one-replica metadata topology to reject desired three replicas")
+	}
+	for _, want := range []string{"current: 1", "attempted: 3", "fresh metadata PVCs", "Do not reuse retained metadata PVCs"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected metadata topology validation error to contain %q, got: %v", want, err)
+		}
+	}
+
+	cluster.Spec.MetadataNodes.Replicas = currentReplicas
+	if err := reconciler.validateMetadataReplicaCountAgainstStatefulSet(context.Background(), cluster); err != nil {
+		t.Fatalf("expected unchanged metadata topology to pass, got: %v", err)
+	}
+
+	newCluster := cluster.DeepCopy()
+	newCluster.Name = "new"
+	newCluster.Spec.MetadataNodes.Replicas = 3
+	if err := reconciler.validateMetadataReplicaCountAgainstStatefulSet(context.Background(), newCluster); err != nil {
+		t.Fatalf("expected a cluster without an existing metadata StatefulSet to pass, got: %v", err)
 	}
 }
 
@@ -12046,6 +12094,57 @@ var _ = Describe("AntflyCluster Controller", func() {
 
 			// Cleanup
 			Expect(k8sClient.Delete(ctx, cluster)).To(Succeed())
+		})
+	})
+
+	Context("When metadataNodes is removed during an update", func() {
+		It("Should reject the optional-object CEL bypass", func() {
+			cluster := &antflyv1.AntflyCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "cel-metadata-bypass", Namespace: "default"},
+				Spec: antflyv1.AntflyClusterSpec{
+					Mode:  antflyv1.ClusterModeDistributed,
+					Image: "antfly:latest",
+					MetadataNodes: antflyv1.MetadataNodesSpec{
+						Replicas:     1,
+						Resources:    antflyv1.ResourceSpec{CPU: "500m", Memory: "512Mi"},
+						MetadataAPI:  antflyv1.APISpec{Port: 12377},
+						MetadataRaft: antflyv1.APISpec{Port: 9017},
+					},
+					DataNodes: antflyv1.DataNodesSpec{
+						Replicas:  3,
+						Resources: antflyv1.ResourceSpec{CPU: "1000m", Memory: "2Gi"},
+						API:       antflyv1.APISpec{Port: 12380},
+						Raft:      antflyv1.APISpec{Port: 9021},
+					},
+					Config: "{}",
+					Storage: antflyv1.StorageSpec{
+						StorageClass:    "standard",
+						MetadataStorage: "1Gi",
+						DataStorage:     "10Gi",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+			DeferCleanup(func() {
+				current := &antflyv1.AntflyCluster{}
+				if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), current); err == nil {
+					Expect(k8sClient.Delete(ctx, current)).To(Succeed())
+				}
+			})
+
+			Eventually(func() string {
+				raw := &unstructured.Unstructured{}
+				raw.SetAPIVersion(antflyv1.GroupVersion.String())
+				raw.SetKind("AntflyCluster")
+				if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), raw); err != nil {
+					return ""
+				}
+				unstructured.RemoveNestedField(raw.Object, "spec", "metadataNodes")
+				if err := k8sClient.Update(ctx, raw); err != nil {
+					return err.Error()
+				}
+				return ""
+			}, timeout, interval).Should(ContainSubstring("metadata replica count is immutable"))
 		})
 	})
 })

@@ -322,6 +322,7 @@ const (
 )
 
 // AntflyClusterSpec defines the desired state of AntflyCluster
+// +kubebuilder:validation:XValidation:rule="(has(self.metadataNodes) ? (has(self.metadataNodes.replicas) ? self.metadataNodes.replicas : 3) : 3) == (has(oldSelf.metadataNodes) ? (has(oldSelf.metadataNodes.replicas) ? oldSelf.metadataNodes.replicas : 3) : 3)",message="metadata replica count is immutable; create a differently named cluster with fresh metadata PVCs at the target topology and restore from backup"
 type AntflyClusterSpec struct {
 	// Mode selects the runtime topology managed by the operator.
 	// +optional
@@ -1152,7 +1153,6 @@ type HAAutomaticFailoverPolicy struct {
 }
 
 // MetadataNodesSpec defines the configuration for metadata nodes
-// +kubebuilder:validation:XValidation:rule="(has(self.replicas) ? self.replicas : 3) == (has(oldSelf.replicas) ? oldSelf.replicas : 3)",message="metadata replica count is immutable after cluster creation; recreate the cluster with the target topology"
 type MetadataNodesSpec struct {
 	// Replicas is the number of metadata nodes (default: 3). It is immutable
 	// after cluster creation until the operator supports quorum-aware metadata

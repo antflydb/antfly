@@ -180,12 +180,21 @@ The operator enforces:
 
 - odd metadata replica counts
 - immutable metadata replica counts after cluster creation; both scale-up and
-  scale-down require recreating the cluster at the target topology
+  scale-down require a backup/restore into a differently named cluster with
+  fresh metadata PVCs at the target topology
 - production configurations with enough replicas for quorum, typically at least
   three metadata nodes
 
 Validation errors are returned by the webhook when enabled. The reconciler still
-defends the same safety invariants when webhooks are unavailable.
+defends the same safety invariants when webhooks are unavailable. Kubernetes
+1.25+ also enforces the CRD CEL transition rule at API admission; the webhook
+and reconciler remain authoritative on Kubernetes 1.20-1.24.
+
+Do not delete and recreate the same `AntflyCluster` name or reuse retained
+metadata PVCs to change the replica count. StatefulSet and PVC names are
+deterministic, so doing so can remount the old one-voter state into the new
+topology and recreate the divergent-Raft failure. Back up, restore into fresh
+storage under a different cluster name, and cut over instead.
 
 ## Autoscaling
 
