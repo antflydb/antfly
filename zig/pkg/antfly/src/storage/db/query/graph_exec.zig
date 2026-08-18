@@ -4555,7 +4555,7 @@ test "buildPatternDocumentHits preserves resolved binding ordinals" {
             _: Allocator,
             _: *const types.NamedGraphQuery,
             _: []const []const u8,
-            _: []const []const u8,
+            _: []const graph_node_identity.Ref,
         ) anyerror![]graph_pattern_mod.PatternMatch {
             return error.TestUnexpectedResult;
         }
