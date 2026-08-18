@@ -618,6 +618,10 @@ fn matchExactTwoEdgePattern(
         if (probed_edges.len != probes.len) return error.InvalidGraphEdgeProbeResult;
 
         for (batch_candidates, probed_edges) |candidate, maybe_backward_edge| {
+            // Generic expansion never traverses a self-loop. Keep the
+            // candidate in the deterministic first-hop window, but do not
+            // admit an exact second edge back to the same middle node.
+            if (std.mem.eql(u8, candidate.middle_key, target_key)) continue;
             const backward_edge = maybe_backward_edge orelse continue;
             // A physical edge whose metadata changes node-table identity cannot
             // use this table-local plan. Release already-built results before
@@ -1436,6 +1440,63 @@ test "exact two-edge probe honors incoming final direction" {
     defer freeMatches(std.testing.allocator, matches);
     try std.testing.expectEqual(@as(usize, 1), matches.len);
     try std.testing.expectEqualStrings("target", matches[0].bindings[2].key);
+}
+
+test "exact two-edge probe excludes final self loops like generic expansion" {
+    const Reader = struct {
+        const first = [_]graph_mod.Edge{.{
+            .source = "start",
+            .target = "middle",
+            .edge_type = "FIRST",
+            .weight = 1,
+            .created_at = 0,
+            .updated_at = 0,
+            .metadata = "",
+        }};
+        const self_loop = graph_mod.Edge{
+            .source = "middle",
+            .target = "middle",
+            .edge_type = "SECOND",
+            .weight = 1,
+            .created_at = 0,
+            .updated_at = 0,
+            .metadata = "",
+        };
+
+        pub fn getEdges(_: @This(), _: Allocator, _: ?[]const u8, key: []const u8, _: []const []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            try std.testing.expectEqualStrings("start", key);
+            return @constCast(first[0..]);
+        }
+
+        pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
+
+        pub fn probeEdges(_: @This(), alloc: Allocator, _: ?[]const u8, probes: []const graph_mod.EdgeProbe) ![]?graph_mod.Edge {
+            try std.testing.expectEqual(@as(usize, 1), probes.len);
+            const result = try alloc.alloc(?graph_mod.Edge, 1);
+            result[0] = self_loop;
+            return result;
+        }
+
+        pub fn freeProbedEdges(_: @This(), alloc: Allocator, edges: []?graph_mod.Edge) void {
+            alloc.free(edges);
+        }
+    };
+
+    var stats = MatchStats{};
+    const matches = try matchPatternWithEdgeReader(std.testing.allocator, Reader{}, &.{"start"}, &.{
+        .{ .alias = "start" },
+        .{ .alias = "middle", .edge = .{ .types = &.{"FIRST"} } },
+        .{ .alias = "target", .edge = .{ .types = &.{"SECOND"} } },
+    }, .{
+        .target_nodes = &.{.{ .table = null, .key = "middle" }},
+        .target_required = true,
+        .include_paths = false,
+        .stats = &stats,
+    });
+    defer freeMatches(std.testing.allocator, matches);
+
+    try std.testing.expectEqual(MatchPlan.exact_two_edge_probe, stats.plan);
+    try std.testing.expectEqual(@as(usize, 0), matches.len);
 }
 
 test "exact endpoint constrains the final pattern step before limiting" {
