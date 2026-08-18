@@ -20,8 +20,17 @@ const internal_keys = @import("../internal_keys.zig");
 
 const Allocator = std.mem.Allocator;
 const digest_len = std.crypto.hash.sha2.Sha256.digest_length;
+const key_kind: u8 = 0x2f;
 
 pub const Value = [digest_len]u8;
+
+pub fn keyAlloc(alloc: Allocator, resolution_key: []const u8) ![]u8 {
+    var key = std.ArrayListUnmanaged(u8).empty;
+    defer key.deinit(alloc);
+    try key.appendSlice(alloc, &.{ internal_keys.replay_namespace, 0xff, key_kind });
+    try internal_keys.appendEncodedComponent(&key, alloc, resolution_key);
+    return try key.toOwnedSlice(alloc);
+}
 
 pub fn value(artifact_value: []const u8) Value {
     var digest: Value = undefined;
@@ -35,7 +44,7 @@ pub fn matches(
     resolution_key: []const u8,
     artifact_value: []const u8,
 ) !bool {
-    const marker_key = try internal_keys.resolutionHandoffKeyAlloc(alloc, resolution_key);
+    const marker_key = try keyAlloc(alloc, resolution_key);
     defer alloc.free(marker_key);
     const stored = try store.get(alloc, marker_key);
     defer if (stored) |bytes| alloc.free(bytes);
@@ -48,7 +57,7 @@ pub fn exists(
     store: resolver_lib.ArtifactStore,
     resolution_key: []const u8,
 ) !bool {
-    const marker_key = try internal_keys.resolutionHandoffKeyAlloc(alloc, resolution_key);
+    const marker_key = try keyAlloc(alloc, resolution_key);
     defer alloc.free(marker_key);
     const stored = try store.get(alloc, marker_key);
     defer if (stored) |bytes| alloc.free(bytes);
@@ -61,7 +70,7 @@ pub fn save(
     resolution_key: []const u8,
     artifact_value: []const u8,
 ) !void {
-    const marker_key = try internal_keys.resolutionHandoffKeyAlloc(alloc, resolution_key);
+    const marker_key = try keyAlloc(alloc, resolution_key);
     defer alloc.free(marker_key);
     const marker_value = value(artifact_value);
     try store.put(marker_key, &marker_value);
@@ -72,7 +81,23 @@ pub fn delete(
     store: resolver_lib.ArtifactStore,
     resolution_key: []const u8,
 ) !void {
-    const marker_key = try internal_keys.resolutionHandoffKeyAlloc(alloc, resolution_key);
+    const marker_key = try keyAlloc(alloc, resolution_key);
     defer alloc.free(marker_key);
     try store.delete(marker_key);
+}
+
+test "resolution handoff keys are private and encode arbitrary artifact keys" {
+    const alloc = std.testing.allocator;
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:\x00article", "resolution\x00v1");
+    defer alloc.free(resolution_key);
+
+    const handoff_key = try keyAlloc(alloc, resolution_key);
+    defer alloc.free(handoff_key);
+    const other_handoff_key = try keyAlloc(alloc, "different\x00artifact");
+    defer alloc.free(other_handoff_key);
+
+    try std.testing.expect(internal_keys.isInternalMetadataKey(handoff_key));
+    try std.testing.expect(!internal_keys.isInternalUserKey(handoff_key));
+    try std.testing.expect(!internal_keys.isResolutionArtifactKey(handoff_key));
+    try std.testing.expect(!std.mem.eql(u8, handoff_key, other_handoff_key));
 }

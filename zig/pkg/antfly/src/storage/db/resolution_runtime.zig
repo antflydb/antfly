@@ -363,7 +363,7 @@ fn processChangedExtractionWithConfig(
         return .{ .result = result, .resolution_key = resolution_key };
     }
 
-    var computed = try stage.compute(gpa, store, effective_provider, changed_key);
+    var computed = try stage.computeAlloc(gpa, store, effective_provider, changed_key);
     defer if (computed) |bytes| gpa.free(bytes);
     const existing = try store.get(gpa, resolution_key);
     defer if (existing) |bytes| gpa.free(bytes);
@@ -1444,9 +1444,9 @@ pub const default_max_records_per_window: usize = 1024;
 
 /// Iterate replay records matching the resolution hint from `from_sequence`,
 /// resolve each record's changed extraction artifacts, and journal the
-/// resolution writes via `write_fn`. Returns the highest sequence processed (or
-/// `from_sequence -| 1` if none), which the caller persists as applied. Pure of
-/// the runtime's threading/state so it is unit-testable.
+/// resolution writes via `write_fn`. Returns the highest sequence processed, or
+/// `from_sequence` when none match, which the caller persists as applied. Pure
+/// of the runtime's threading/state so it is unit-testable.
 pub fn catchUpWindow(
     gpa: Allocator,
     replay_source: replay_source_mod.Source,
@@ -2805,7 +2805,7 @@ test "catchUpWindow resolves matching records and journals resolution writes" {
     try testing.expectEqualSlices(u8, resolution_key, writer.keys.items[0]);
 }
 
-test "catchUpWindow with no matching records returns from-1" {
+test "catchUpWindow with no matching records returns from_sequence" {
     const alloc = testing.allocator;
     const resolvers = [_]ResolverConfig{};
     var fake = FakeStore{ .alloc = alloc };

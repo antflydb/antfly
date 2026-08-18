@@ -26003,7 +26003,7 @@ fn appendResolutionHandoffDeleteKey(
     deletes: *std.ArrayListUnmanaged([]const u8),
     resolution_key: []const u8,
 ) !void {
-    const handoff_key = try internal_keys.resolutionHandoffKeyAlloc(alloc, resolution_key);
+    const handoff_key = try resolution_handoff.keyAlloc(alloc, resolution_key);
     errdefer alloc.free(handoff_key);
     if (containsDeleteKey(deletes.items, handoff_key)) {
         alloc.free(handoff_key);
@@ -34684,14 +34684,14 @@ fn publishResolutionHandoffContextWithSink(
     defer ctx.alloc.free(marker_deletes);
 
     for (write.artifact_writes, 0..) |artifact, i| {
-        marker_keys[i] = try internal_keys.resolutionHandoffKeyAlloc(ctx.alloc, artifact.key);
+        marker_keys[i] = try resolution_handoff.keyAlloc(ctx.alloc, artifact.key);
         marker_keys_initialized += 1;
         marker_values[i] = resolution_handoff.value(artifact.value);
         marker_writes[i] = .{ .key = marker_keys[i], .value = &marker_values[i] };
     }
     for (write.artifact_deletes, 0..) |artifact_key, i| {
         const marker_index = write.artifact_writes.len + i;
-        marker_keys[marker_index] = try internal_keys.resolutionHandoffKeyAlloc(ctx.alloc, artifact_key);
+        marker_keys[marker_index] = try resolution_handoff.keyAlloc(ctx.alloc, artifact_key);
         marker_keys_initialized += 1;
         marker_deletes[i] = marker_keys[marker_index];
     }
@@ -34754,9 +34754,9 @@ test "db resolution handoff completion publishes fanout in one metadata batch" {
     try std.testing.expectEqual(@as(usize, 2), counting_sink.writes);
     try std.testing.expectEqual(@as(usize, 0), counting_sink.deletes);
 
-    const first_marker_key = try internal_keys.resolutionHandoffKeyAlloc(alloc, first_resolution_key);
+    const first_marker_key = try resolution_handoff.keyAlloc(alloc, first_resolution_key);
     defer alloc.free(first_marker_key);
-    const second_marker_key = try internal_keys.resolutionHandoffKeyAlloc(alloc, second_resolution_key);
+    const second_marker_key = try resolution_handoff.keyAlloc(alloc, second_resolution_key);
     defer alloc.free(second_marker_key);
     for (writes, [_][]const u8{ first_marker_key, second_marker_key }) |artifact, marker_key| {
         const raw = try db.core.store.get(alloc, marker_key);
@@ -34807,11 +34807,13 @@ test "storage.ha resolution handoff fence rejects completion after durable HA re
 
     const PauseBeforePublish = struct {
         io: std.Io,
+        entered: std.atomic.Value(bool) = .init(false),
         reached: std.Io.Event = .unset,
         release: std.Io.Event = .unset,
 
         fn run(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered.store(true, .release);
             self.reached.set(self.io);
             self.release.waitUncancelable(self.io);
         }
@@ -34823,6 +34825,9 @@ test "storage.ha resolution handoff fence rejects completion after durable HA re
         result: std.atomic.Value(u8) = .init(0),
 
         fn run(self: *@This()) void {
+            // Also wake the test if the writer fails before entering the hook,
+            // so a real regression reports its assertion instead of hanging.
+            defer self.pause.reached.set(self.pause.io);
             const writes = [_]resolution_runtime_mod.ArtifactWrite{.{
                 .key = self.resolution_key,
                 .value = "{\"entities\":[\"durable\"]}",
@@ -34844,7 +34849,7 @@ test "storage.ha resolution handoff fence rejects completion after durable HA re
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:fenced", "resolution_v1");
     defer alloc.free(resolution_key);
-    const marker_key = try internal_keys.resolutionHandoffKeyAlloc(alloc, resolution_key);
+    const marker_key = try resolution_handoff.keyAlloc(alloc, resolution_key);
     defer alloc.free(marker_key);
     var pause = PauseBeforePublish{ .io = std.testing.io };
     var probe = WriteProbe{
@@ -34860,6 +34865,7 @@ test "storage.ha resolution handoff fence rejects completion after durable HA re
     }
 
     pause.reached.waitUncancelable(pause.io);
+    try std.testing.expect(pause.entered.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
     try std.testing.expectEqual(@as(u64, 1), db.core.nextDerivedSequence());
     const artifact = try db.core.store.get(alloc, resolution_key);
@@ -50122,7 +50128,7 @@ test "db materializes doc->entity mention edges as provenance and clears them on
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
     defer alloc.free(resolution_key);
-    const resolution_handoff_key = try internal_keys.resolutionHandoffKeyAlloc(alloc, resolution_key);
+    const resolution_handoff_key = try resolution_handoff.keyAlloc(alloc, resolution_key);
     defer alloc.free(resolution_handoff_key);
     {
         const raw = try db.core.store.get(alloc, resolution_key);
@@ -50253,7 +50259,7 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
     defer alloc.free(resolution_key);
-    const resolution_handoff_key = try internal_keys.resolutionHandoffKeyAlloc(alloc, resolution_key);
+    const resolution_handoff_key = try resolution_handoff.keyAlloc(alloc, resolution_key);
     defer alloc.free(resolution_handoff_key);
     {
         const raw = try db.core.store.get(alloc, resolution_key);

@@ -809,11 +809,12 @@ pub const ResolutionStage = struct {
     /// a curated link survives re-resolution (replay-stable curation).
     overrides: ?OverrideProvider = null,
 
-    /// Compute the canonical resolution bytes for `extraction_key` without
-    /// mutating the store. Null means the source extraction no longer exists.
-    /// Keeping computation separate lets the DB commit the artifact mutation
-    /// and its downstream replay record in one atomic storage transaction.
-    pub fn compute(
+    /// Allocate the canonical resolution bytes for `extraction_key` without
+    /// mutating the store. The caller owns a non-null result and must free it
+    /// with `gpa`; null means the source extraction no longer exists. Keeping
+    /// computation separate lets the DB commit the artifact mutation and its
+    /// downstream replay record in one atomic storage transaction.
+    pub fn computeAlloc(
         self: ResolutionStage,
         gpa: std.mem.Allocator,
         store: ArtifactStore,
@@ -885,7 +886,7 @@ pub const ResolutionStage = struct {
         extraction_key: []const u8,
         resolution_key: []const u8,
     ) !RunResult {
-        const computed = try self.compute(gpa, store, provider, extraction_key);
+        const computed = try self.computeAlloc(gpa, store, provider, extraction_key);
         defer if (computed) |bytes| gpa.free(bytes);
 
         if (computed == null) {
