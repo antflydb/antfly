@@ -249,7 +249,7 @@ test "semantic readiness requires ready state and complete coverage" {
         .coverage = .{
             .policy = .strict,
             .observation_complete = true,
-            .observation_incomplete_reasons = &.{"config_mismatch"},
+            .observation_incomplete_reasons = &.{.config_mismatch},
             .config_fingerprint = "0123456789abcdef",
             .summary_ready = true,
             .config_mismatch_group_count = 1,
