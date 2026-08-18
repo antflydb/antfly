@@ -194,7 +194,13 @@ aggregate managed-host-memory budget from it; every storage slice reservation
 charges that aggregate as well as its local policy slice. Stable model and
 request limits use the same envelope, and immediately before an inference
 allocation the controller checks the requested increment against the leaf
-cgroup working set plus safety headroom. The working set is
+cgroup working set plus safety headroom. On Linux, when the remaining explicit
+envelope after charging that working set is the tighter live constraint,
+admission keeps a fixed 512 MiB emergency reserve inside that bounded view
+instead of reserving half of the remaining capacity a second time. Automatic
+host/cgroup sizing retains the dynamic pressure reserve. Current node or finite
+cgroup pressure also remains authoritative when it is tighter, so an explicit
+value cannot weaken a physical pressure signal. The working set is
 `memory.current - inactive_file`: it includes anonymous memory, the test
 harness, sibling processes, and active mapped pages while excluding only file
 pages that both the kernel and kubelet treat as reclaimable. This avoids making

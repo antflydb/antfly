@@ -1002,12 +1002,12 @@ jobs:
           ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT: "1800"
           ANTFLY_INFERENCE_MAX_LOADED_MODELS: "1"
           # This Burstable pod has a 15000Mi request but no finite memory.max.
-          # Declare a smaller process envelope so admission leaves kubelet and
-          # test-harness headroom instead of sizing itself from the host.
-          ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB: "13000"
+          # Bound the complete leaf working set at 14000Mi so admission retains
+          # its emergency reserve and leaves another 1000Mi of pod headroom.
+          ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB: "14000"
           # Bound the native hot set while allowing the measured 11173MiB 2B
           # decoder working set plus its scoped projector to complete. Keep
-          # 1000MiB outside this managed budget for whole-process overhead.
+          # 2000MiB inside the process envelope for harness and process overhead.
           ANTFLY_INFERENCE_HOST_BUDGET_MB: "12000"
           # This is a release contract, not an optional capability probe. Keep
           # it targeted so unrelated large-model suites do not inflate this job.

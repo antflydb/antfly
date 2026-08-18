@@ -259,12 +259,22 @@ pub const SystemMemoryInfo = struct {
     /// large portion of RAM and can reject every positive admission while
     /// macOS still reports normal memory pressure.
     availability_basis: AvailabilityBasis = .mem_available,
+    /// When an operator-owned Linux process envelope is the tighter live
+    /// constraint, it already bounds the complete leaf-cgroup working set.
+    /// Preserve only the emergency reserve inside that bounded view instead
+    /// of applying dynamic host headroom a second time.
+    live_admission_policy: LiveAdmissionPolicy = .dynamic_pressure,
 };
 
 pub const AvailabilityBasis = enum {
     mem_available,
     macos_memory_pressure,
     macos_reclaimable_pages,
+};
+
+pub const LiveAdmissionPolicy = enum {
+    dynamic_pressure,
+    explicit_process_envelope,
 };
 
 pub const ReservationKind = enum {
@@ -1171,7 +1181,7 @@ pub const AdmissionController = struct {
                     const available = memory_info.available_bytes orelse 0;
                     const reserve = liveHostAdmissionReserve(memory_info);
                     std.log.warn(
-                        "inference live-memory admission denied requested_bytes={d} pending_bytes={d} available_bytes={d} reserve_bytes={d} capacity_bytes={d} basis={s}",
+                        "inference live-memory admission denied requested_bytes={d} pending_bytes={d} available_bytes={d} reserve_bytes={d} capacity_bytes={d} basis={s} policy={s}",
                         .{
                             incremental_bytes,
                             self.live_pending_bytes,
@@ -1179,6 +1189,7 @@ pub const AdmissionController = struct {
                             reserve,
                             available -| reserve,
                             @tagName(memory_info.availability_basis),
+                            @tagName(memory_info.live_admission_policy),
                         },
                     );
                 } else {
@@ -1391,23 +1402,27 @@ fn macosLiveAdmissionGrace(total_bytes: usize) usize {
 
 /// Determine how much of the current availability sample must remain unused.
 ///
-/// Linux MemAvailable is an allocation-availability estimate. The stable shared
-/// admission limit already retains full node headroom against Antfly residency,
-/// so this second, live-pressure gate preserves half of current availability,
-/// with a 512 MiB emergency floor and the stable node headroom as a ceiling.
-/// This keeps a shared runner usable without reducing request capacity to zero
-/// merely because an already-admitted model lowered MemAvailable below half of
-/// the stable headroom. macOS supplies a system pressure percentage, with raw
-/// Mach page queues as a conservative fallback, and uses a smaller bounded
-/// grace window because its availability sample omits some reclaimable memory.
+/// Linux MemAvailable is an allocation-availability estimate. With automatic
+/// host/cgroup sizing, preserve half of current availability, with a 512 MiB
+/// emergency floor and the stable node headroom as a ceiling. An explicit
+/// process envelope already charges the complete leaf-cgroup working set and
+/// expresses the operator's process headroom; inside that envelope preserve a
+/// fixed 512 MiB emergency reserve rather than dynamically reserving the
+/// bounded remainder a second time. macOS supplies a system pressure
+/// percentage, with raw Mach page queues as a conservative fallback, and uses
+/// a smaller bounded grace window because its availability sample omits some
+/// reclaimable memory.
 fn liveHostAdmissionReserve(info: SystemMemoryInfo) usize {
     const available = info.available_bytes orelse return 0;
     const node_headroom = liveHostMemoryHeadroom(info.total_bytes);
     return switch (info.availability_basis) {
-        .mem_available => @min(
-            node_headroom,
-            @min(available, @max(mib(512), available / 2)),
-        ),
+        .mem_available => switch (info.live_admission_policy) {
+            .explicit_process_envelope => @min(available, mib(512)),
+            .dynamic_pressure => @min(
+                node_headroom,
+                @min(available, @max(mib(512), available / 2)),
+            ),
+        },
         .macos_memory_pressure, .macos_reclaimable_pages => blk: {
             const normal_capacity = available -| node_headroom;
             const emergency_reserve = @min(
@@ -1572,14 +1587,27 @@ fn applyProcessMemoryLimit(
     leaf_working_set_bytes: ?usize,
 ) SystemMemoryInfo {
     const effective_limit = @min(detected.total_bytes, limit_bytes);
-    var available = @min(detected.available_bytes orelse effective_limit, effective_limit);
+    const explicit_envelope_applies =
+        detected.live_admission_policy == .explicit_process_envelope or
+        limit_bytes <= detected.total_bytes;
+    const detected_available = detected.available_bytes orelse detected.total_bytes;
+    var available = @min(detected_available, effective_limit);
+    var live_admission_policy = LiveAdmissionPolicy.dynamic_pressure;
     if (leaf_working_set_bytes) |current| {
-        available = @min(available, effective_limit -| @min(current, effective_limit));
+        const envelope_available = effective_limit -| @min(current, effective_limit);
+        available = @min(available, envelope_available);
+        // An explicit envelope changes only the reserve applied to capacity it
+        // actually constrains. If node or finite-cgroup availability is lower,
+        // retain dynamic pressure protection rather than letting operator
+        // configuration weaken a tighter physical signal.
+        if (explicit_envelope_applies and envelope_available <= detected_available)
+            live_admission_policy = .explicit_process_envelope;
     }
     return .{
         .total_bytes = effective_limit,
         .available_bytes = available,
         .availability_basis = detected.availability_basis,
+        .live_admission_policy = live_admission_policy,
     };
 }
 
@@ -1599,6 +1627,11 @@ fn stableMemoryInfoForLimit(detected: ?SystemMemoryInfo, limit_bytes: usize) ?Sy
         .total_bytes = effective_limit,
         .available_bytes = effective_limit,
         .availability_basis = baseline.availability_basis,
+        .live_admission_policy = if (baseline.live_admission_policy == .explicit_process_envelope or
+            limit_bytes <= baseline.total_bytes)
+            .explicit_process_envelope
+        else
+            baseline.live_admission_policy,
     };
 }
 
@@ -2344,6 +2377,8 @@ fn applyCgroupMemoryInfo(
     return .{
         .total_bytes = limit,
         .available_bytes = if (available) |value| @min(value, limit) else null,
+        .availability_basis = host.availability_basis,
+        .live_admission_policy = host.live_admission_policy,
     };
 }
 
@@ -2899,6 +2934,10 @@ test "explicit process envelope charges leaf cgroup working set" {
     );
     try std.testing.expectEqual(gib(14), info.total_bytes);
     try std.testing.expectEqual(@as(?usize, gib(11)), info.available_bytes);
+    try std.testing.expectEqual(
+        LiveAdmissionPolicy.explicit_process_envelope,
+        info.live_admission_policy,
+    );
 
     const saturated = applyProcessMemoryLimit(info, gib(14), gib(20));
     try std.testing.expectEqual(@as(?usize, 0), saturated.available_bytes);
@@ -2910,6 +2949,74 @@ test "explicit process envelope charges leaf cgroup working set" {
     );
     try std.testing.expectEqual(gib(8), clamped.total_bytes);
     try std.testing.expectEqual(@as(?usize, gib(6)), clamped.available_bytes);
+    try std.testing.expectEqual(
+        LiveAdmissionPolicy.dynamic_pressure,
+        clamped.live_admission_policy,
+    );
+
+    const host_pressure = applyProcessMemoryLimit(
+        .{
+            .total_bytes = gib(64),
+            .available_bytes = gib(2),
+            .availability_basis = .mem_available,
+        },
+        gib(14),
+        gib(3),
+    );
+    try std.testing.expectEqual(@as(?usize, gib(2)), host_pressure.available_bytes);
+    try std.testing.expectEqual(
+        LiveAdmissionPolicy.dynamic_pressure,
+        host_pressure.live_admission_policy,
+    );
+    try std.testing.expectEqual(gib(1), liveHostAdmissionReserve(host_pressure));
+}
+
+test "explicit Linux envelope does not double reserve bounded availability" {
+    // Reproduce the full-E2E runner after earlier models were evicted. The
+    // 13,000 MiB process envelope has 4,253 MiB left after charging the raw
+    // leaf working set. Gemma's measured 3,387 MiB construction peak fits
+    // while retaining the 512 MiB emergency reserve; reserving half of the
+    // already-bounded availability incorrectly rejected it.
+    const info = applyProcessMemoryLimit(
+        .{
+            .total_bytes = 67_428_634_624,
+            .available_bytes = 17_917_997_056,
+            .availability_basis = .mem_available,
+        },
+        mib(13_000),
+        9_171_787_776,
+    );
+    try std.testing.expectEqual(@as(?usize, 4_459_700_224), info.available_bytes);
+    try std.testing.expectEqual(mib(512), liveHostAdmissionReserve(info));
+    try checkLiveHostMemoryWithInfo(info, 3_551_851_480);
+    var controller = AdmissionController{};
+    const load_reservation = try controller.tryReserveLiveCapacityWithInfo(3_551_851_480, info);
+    try std.testing.expectEqual(@as(usize, 4_459_700_224 - mib(512)), controller.live_capacity_bytes);
+    controller.releaseLiveReservation(load_reservation);
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        checkLiveHostMemoryWithInfo(info, 4_459_700_224 - mib(512) + 1),
+    );
+
+    // The same run later observed 399 MiB free inside its old 13,000 MiB
+    // envelope after Gemma became resident, causing a 9 MiB run allocation to
+    // fail closed. The calibrated 14,000 MiB process envelope leaves 1,399 MiB
+    // at that exact working set, so request-local scratch fits without
+    // weakening the emergency reserve.
+    const post_load = applyProcessMemoryLimit(
+        .{
+            .total_bytes = 67_428_634_624,
+            .available_bytes = 17_917_997_056,
+            .availability_basis = .mem_available,
+        },
+        mib(14_000),
+        13_212_901_376,
+    );
+    try std.testing.expectEqual(@as(?usize, 1_467_162_624), post_load.available_bytes);
+    try std.testing.expectEqual(mib(512), liveHostAdmissionReserve(post_load));
+    try checkLiveHostMemoryWithInfo(post_load, 9_699_328);
+    const run_reservation = try controller.tryReserveLiveCapacityWithInfo(9_699_328, post_load);
+    controller.releaseLiveReservation(run_reservation);
 }
 
 test "cgroup working set excludes only bounded inactive file pages" {
@@ -2932,6 +3039,16 @@ test "explicit process envelope remains authoritative without a host probe" {
     const live = applyOptionalProcessMemoryLimit(null, gib(14), gib(3)).?;
     try std.testing.expectEqual(gib(14), live.total_bytes);
     try std.testing.expectEqual(@as(?usize, gib(11)), live.available_bytes);
+    try std.testing.expectEqual(
+        LiveAdmissionPolicy.explicit_process_envelope,
+        live.live_admission_policy,
+    );
+
+    const unmeasured = applyOptionalProcessMemoryLimit(null, gib(14), null).?;
+    try std.testing.expectEqual(
+        LiveAdmissionPolicy.dynamic_pressure,
+        unmeasured.live_admission_policy,
+    );
 
     const stable = stableMemoryInfoForLimit(null, gib(14)).?;
     try std.testing.expectEqual(gib(14), stable.total_bytes);
