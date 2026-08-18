@@ -3379,10 +3379,16 @@ pub const Node = struct {
             admitted_prefill_chunk,
             kv_capacity_policy,
         );
-        var admission_lease = try self.model_manager.acquireRunResources(
+        var admission_amounts = runtime.tier.memory.AdmissionAmounts.fromEstimate(resource_estimate);
+        if (generation.messagesHaveImages(messages) or generation.messagesHaveAudio(messages)) {
+            admission_amounts = try admission_amounts.merge(
+                try model_manager_mod.projectorRunAdmissionAmounts(model.manifest),
+            );
+        }
+        var admission_lease = try self.model_manager.acquireRunResourceAmounts(
             budget_backend_class,
             budget_limits,
-            resource_estimate,
+            admission_amounts,
         );
         defer admission_lease.release();
 
@@ -6314,6 +6320,11 @@ pub const Node = struct {
             .limits = target_admission_limits,
             .amounts = .fromEstimate(resource_estimate),
         };
+        if (generation.messagesHaveImages(messages.items) or generation.messagesHaveAudio(messages.items)) {
+            admission_requests[0].amounts = try admission_requests[0].amounts.merge(
+                try model_manager_mod.projectorRunAdmissionAmounts(model.manifest),
+            );
+        }
         const admission_request_count: usize = if (draft_resource_estimate) |estimate| blk: {
             const draft_backend_class: runtime.tier.memory.BackendClass =
                 if (draft_backend_kind.? == .native) .cpu else .gpu;

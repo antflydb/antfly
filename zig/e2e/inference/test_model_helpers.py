@@ -19,6 +19,7 @@ from . import models
 from .conftest import (
     InferenceServer,
     _positive_timeout,
+    _server_budget_args,
     capacity_retry_delay,
     retry_transient_capacity,
 )
@@ -34,6 +35,25 @@ from .models import (
     bootstrap_models_for_listing,
     find_local_model_path,
 )
+
+
+def test_server_budget_args_validate_and_preserve_values(monkeypatch):
+    monkeypatch.setenv("ANTFLY_INFERENCE_HOST_BUDGET_MB", "7000")
+    monkeypatch.setenv("ANTFLY_INFERENCE_SCRATCH_BUDGET_MB", "0")
+
+    assert _server_budget_args() == [
+        "--host-budget-mb",
+        "7000",
+        "--scratch-budget-mb",
+        "0",
+    ]
+
+
+@pytest.mark.parametrize("value", ["-1", "invalid", "1.5"])
+def test_server_budget_args_reject_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("ANTFLY_INFERENCE_HOST_BUDGET_MB", value)
+    with pytest.raises(pytest.UsageError, match="non-negative integer"):
+        _server_budget_args()
 
 
 def test_partial_model_directory_is_not_available(tmp_path):

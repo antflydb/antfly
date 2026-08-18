@@ -136,6 +136,12 @@ the executor owner and “inference backend runtime descriptor” for the value.
     lease, observer record, and physical allocation are gone. Configuration
     fails closed if an external owner cannot provide this lifetime contract.
     Public policy values such as `NodeConfig` never expose an unowned callback.
+12. Artifact accounting follows physical lifetime. Decoder weights retained by
+    a model session belong to the model lease. A multimodal projector opened by
+    one generation belongs to that request lease, and its clean mmap pages are
+    discarded tensor-by-tensor after the compute backend has copied or consumed
+    them. Standalone and distributed serving use this same lifecycle; deployment
+    mode cannot turn request-scoped page cache into untracked model residency.
 
 ## Budget derivation
 
@@ -158,6 +164,17 @@ automatic detection—and malformed or overflowing selected values fail startup
 instead of silently reverting to host detection.
 Set the envelope below the orchestrator allocation so the kubelet, runtime, and
 test harness retain headroom.
+
+Mapped files are not free memory. Their resident clean pages contribute to raw
+cgroup and kubelet usage even though the allocator does not own them. ModelManager
+therefore separates stable decoder artifacts from request-scoped projector
+artifacts. A multimodal admission holds the projector's encoded bytes as host
+weight capacity for the whole request, while the projector reader uses random
+access and releases each consumed tensor range with `MADV_DONTNEED` and
+`POSIX_FADV_DONTNEED`. The hints are opportunistic and never affect correctness:
+the read-only mapping remains valid and a later access faults the file data back
+in. This bounds cold image/audio page-cache growth without serializing unrelated
+models or adding redundant copies.
 
 The process envelope is not another inference slice. One resolved value is
 passed to storage and inference during standalone composition. ResourceManager

@@ -999,12 +999,15 @@ jobs:
           # Cold native model and projector initialization can exceed the
           # steady request deadline on CPU-only release runners. Only tests
           # explicitly covering first-use paths opt into this hard bound.
-          ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT: "900"
+          ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT: "1800"
           ANTFLY_INFERENCE_MAX_LOADED_MODELS: "1"
           # This Burstable pod has a 15000Mi request but no finite memory.max.
           # Declare a smaller process envelope so admission leaves kubelet and
           # test-harness headroom instead of sizing itself from the host.
-          ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB: "14000"
+          ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB: "13000"
+          # Widen the CPU workload domain for the retained decoder plus scoped
+          # projector; the smaller process envelope remains the physical cap.
+          ANTFLY_INFERENCE_HOST_BUDGET_MB: "7000"
           # This is a release contract, not an optional capability probe. Keep
           # it targeted so unrelated large-model suites do not inflate this job.
           RUN_MULTIMODAL_GENERATOR_TESTS: "1"

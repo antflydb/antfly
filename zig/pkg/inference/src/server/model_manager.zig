@@ -3918,11 +3918,22 @@ pub const ModelManager = struct {
         limits: runtime.tier.memory.Limits,
         estimate: runtime.tier.memory.Estimate,
     ) !runtime.tier.memory.AdmissionLease {
-        return self.acquireAmountsWithEviction(
+        return self.acquireRunResourceAmounts(
             backend_class,
             limits,
             .fromEstimate(estimate),
         );
+    }
+
+    /// Admit already-classified transient amounts. Callers use this when an
+    /// execution owns request-scoped artifacts in addition to KV and scratch.
+    pub fn acquireRunResourceAmounts(
+        self: *ModelManager,
+        backend_class: runtime.tier.memory.BackendClass,
+        limits: runtime.tier.memory.Limits,
+        amounts: runtime.tier.memory.AdmissionAmounts,
+    ) !runtime.tier.memory.AdmissionLease {
+        return self.acquireAmountsWithEviction(backend_class, limits, amounts);
     }
 
     /// Atomically admits all transient resources for one execution. Speculative
@@ -6705,13 +6716,26 @@ fn estimateModelArtifactBytes(
         ) orelse return error.ResourceLimitExceeded;
         total = std.math.add(usize, total, native_weight_bytes) catch
             return error.ResourceLimitExceeded;
-        try addArtifactBytes(&total, man.allocator, man.gguf_projector_path);
     } else {
         try addArtifactBytes(&total, man.allocator, man.onnx_path);
     }
 
     if (total == 0) return error.NoModelFileFound;
     return total;
+}
+
+/// A multimodal projector is opened, mapped, and consumed by an individual
+/// generation request; it is not part of the decoder session's retained
+/// residency. Charge its mapped artifact to the request that owns that mapping.
+pub fn projectorRunAdmissionAmounts(
+    man: manifest_mod.ModelManifest,
+) !runtime.tier.memory.AdmissionAmounts {
+    const path = man.gguf_projector_path orelse return .{};
+    const bytes = std.math.cast(
+        usize,
+        try c_file.fileSize(man.allocator, path),
+    ) orelse return error.ResourceLimitExceeded;
+    return .{ .host_weight_bytes = bytes };
 }
 
 fn estimateModelLoadAdmission(
@@ -8512,6 +8536,42 @@ test "gpu model admission classifies weights and persistent scratch" {
     try std.testing.expectEqual(@as(usize, 0), metal.resident.host_weight_bytes);
     try std.testing.expectEqual(weights + extra_backend_resident.backend_weight_bytes, metal.resident.backend_weight_bytes);
     try std.testing.expectEqual(extra_backend_resident.backend_scratch_bytes, metal.resident.backend_scratch_bytes);
+}
+
+test "projector residency follows its request-scoped lifecycle" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const decoder_bytes: usize = 8192;
+    const projector_bytes: usize = 4096;
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "model.gguf",
+        .data = &([_]u8{0x31} ** decoder_bytes),
+    });
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "mmproj.gguf",
+        .data = &([_]u8{0x32} ** projector_bytes),
+    });
+    const root = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", dir.sub_path[0..] },
+    );
+    defer allocator.free(root);
+
+    var man = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .gguf_path = try std.fs.path.join(allocator, &.{ root, "model.gguf" }),
+        .gguf_projector_path = try std.fs.path.join(allocator, &.{ root, "mmproj.gguf" }),
+    };
+    defer man.deinit();
+
+    try std.testing.expectEqual(
+        decoder_bytes,
+        try estimateModelArtifactBytes(man, .native),
+    );
+    const request = try projectorRunAdmissionAmounts(man);
+    try std.testing.expectEqual(projector_bytes, request.host_weight_bytes);
+    try std.testing.expectEqual(projector_bytes, request.hostTotalBytes());
 }
 
 test "onnx admission separates encoded staging from completed residency" {

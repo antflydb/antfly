@@ -428,19 +428,18 @@ def test_multimodal_audio_generation(api):
         ],
     }]
 
-    response = api.post("/generate", json={
-        "model": model,
-        "messages": messages,
-        "max_tokens": 8,
-        "chat_template_kwargs": {"enable_thinking": False},
-    })
-    assert response.status_code == 200, (
-        "shipped Gemma decoder/projector failed audio inference: "
-        f"{response.status_code} {response.text[:2000]}"
+    response = api.generate(
+        messages,
+        model=model,
+        max_tokens=8,
+        chat_template_kwargs={"enable_thinking": False},
+        # Audio initializes a distinct projector path after vision. Keep the
+        # single request bounded without timing out and overlapping its work.
+        request_timeout=FIRST_USE_REQUEST_TIMEOUT,
     )
-    resp = response.json()
-    content = _message_content(resp)
-    assert content, f"No audio-conditioned generated content in response: {resp}"
+    assert _message_content(response), (
+        f"No multimodal audio content in response: {response}"
+    )
 
 
 def test_generate_rejects_tool_choice_without_tools(api):

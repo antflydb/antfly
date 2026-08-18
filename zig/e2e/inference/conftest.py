@@ -29,7 +29,7 @@ Usage:
     ANTFLY_INFERENCE_MAX_LOADED_MODELS=1 uv run --project e2e/inference pytest e2e/inference
 
     # Separate deadline for explicitly marked first-use model/backend initialization:
-    ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT=900 uv run --project e2e/inference pytest e2e/inference
+    ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT=1800 uv run --project e2e/inference pytest e2e/inference
 
     # Lazily pull missing models with a local antfly binary (opt-in):
     ANTFLY_INFERENCE_DOWNLOAD=1 uv run --project e2e/inference pytest e2e/inference
@@ -105,6 +105,35 @@ def env_first(*names: str) -> str | None:
         if value:
             return value
     return None
+
+
+_SERVER_BUDGET_FLAGS = (
+    ("ANTFLY_INFERENCE_HOST_BUDGET_MB", "--host-budget-mb"),
+    ("ANTFLY_INFERENCE_BACKEND_BUDGET_MB", "--backend-budget-mb"),
+    ("ANTFLY_INFERENCE_COMBINED_BUDGET_MB", "--combined-budget-mb"),
+    ("ANTFLY_INFERENCE_KV_BUDGET_MB", "--kv-budget-mb"),
+    ("ANTFLY_INFERENCE_SCRATCH_BUDGET_MB", "--scratch-budget-mb"),
+)
+
+
+def _server_budget_args() -> list[str]:
+    """Translate explicit E2E budget policy into injection-safe CLI args."""
+
+    args: list[str] = []
+    for env_name, flag in _SERVER_BUDGET_FLAGS:
+        raw = env_first(env_name)
+        if raw is None:
+            continue
+        try:
+            value = int(raw, 10)
+        except ValueError as exc:
+            raise pytest.UsageError(
+                f"{env_name} must be a non-negative integer"
+            ) from exc
+        if value < 0:
+            raise pytest.UsageError(f"{env_name} must be a non-negative integer")
+        args.extend((flag, str(value)))
+    return args
 
 
 def api_path(path: str) -> str:
@@ -211,6 +240,7 @@ class InferenceServer:
         port: int,
         max_loaded_models: str | None = None,
         extra_env: dict[str, str] | None = None,
+        extra_args: list[str] | None = None,
     ):
         self.url = f"http://{host}:{port}"
         self.failure_reported = False
@@ -234,6 +264,7 @@ class InferenceServer:
                     if max_loaded_models is not None
                     else []
                 ),
+                *(extra_args or []),
             ],
             stdout=self.output,
             stderr=subprocess.STDOUT,
@@ -339,6 +370,7 @@ def base_url():
         "127.0.0.1",
         port,
         max_loaded_models=env_first("ANTFLY_INFERENCE_MAX_LOADED_MODELS"),
+        extra_args=_server_budget_args(),
     )
     _LOCAL_SERVERS_BY_URL[server.url] = server
     yield server.url

@@ -36,6 +36,8 @@ const c_file = if (builtin.os.tag == .freestanding) struct {
         pub fn deinit(_: *MmapRegion) void {}
 
         pub fn adviseSequentialPrefix(_: *MmapRegion, _: usize) void {}
+
+        pub fn discardFileRange(_: *MmapRegion, _: usize, _: usize) void {}
     };
 
     pub fn readRegion(_: std.mem.Allocator, _: []const u8, _: u64, _: usize) ![]u8 {
@@ -382,6 +384,22 @@ pub const GgufStore = struct {
 
     pub fn tensorStore(self: *GgufStore) TensorStore {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// Drop clean file-cache pages after a request-scoped consumer has copied
+    /// a tensor into its compute representation. Persistent model stores do not
+    /// call this because another concurrent execution may still be borrowing
+    /// their mapped weights.
+    pub fn discardTensorFileCache(self: *GgufStore, name: []const u8) void {
+        const region = if (self.mmap_region) |*mapped| mapped else return;
+        const tensor = gguf_mod.tensor_catalog.Catalog.init(&self.parsed).find(name) orelse return;
+        const byte_len_u64 = gguf_mod.tensor_types.byteLen(
+            tensor.tensor_type,
+            tensor.dimensions,
+        ) orelse return;
+        const offset = std.math.cast(usize, tensor.data_offset) orelse return;
+        const byte_len = std.math.cast(usize, byte_len_u64) orelse return;
+        region.discardFileRange(offset, byte_len);
     }
 
     fn rawData(self: *const GgufStore) []const u8 {
