@@ -3972,7 +3972,7 @@ pub const DB = struct {
             self.core.replaySource(),
             self.core.batchExecutionResources().index_manager,
             append_ctx,
-            appendDerivedBatchFromEnrichment,
+            appendResolutionRecord,
             self.backend_runtime,
             // Cross-shard blocking source when the serving layer injected one
             // (via OpenOptions); null means local-only blocking against this
@@ -33378,7 +33378,19 @@ fn appendReplicatedHADerivedEffectContext(ctx: *const BatchExecutionContext, rec
 }
 
 fn encodeChangeRecordPayload(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch, sequence: u64) ![]u8 {
-    var record = try change_journal_mod.recordFromDerivedBatch(ctx.alloc, batch, sequence);
+    return try encodeChangeRecordPayloadWithTargetHints(ctx, batch, sequence, null);
+}
+
+fn encodeChangeRecordPayloadWithTargetHints(
+    ctx: *const BatchExecutionContext,
+    batch: derived_types.DerivedBatch,
+    sequence: u64,
+    target_hints: ?[]const change_journal_mod.TargetHint,
+) ![]u8 {
+    var record = if (target_hints) |hints|
+        try change_journal_mod.recordFromDerivedBatchWithTargetHints(ctx.alloc, batch, sequence, hints)
+    else
+        try change_journal_mod.recordFromDerivedBatch(ctx.alloc, batch, sequence);
     defer change_journal_mod.deinitRecord(ctx.alloc, &record);
     return try change_journal_mod.encodeRecord(ctx.alloc, record);
 }
@@ -34590,6 +34602,58 @@ fn appendDerivedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.De
     }
 
     var applied_batch = batch;
+    applied_batch.sequence = sequence;
+    try applyDerivedBatchContext(&batch_ctx, applied_batch);
+    return sequence;
+}
+
+fn appendResolutionRecord(ctx_ptr: *anyopaque, write: resolution_runtime_mod.RecordWrite) !u64 {
+    const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
+    if (write.artifact_writes.len == 0 and write.artifact_deletes.len == 0 and write.target_hints == null) {
+        return appendDerivedBatchFromEnrichment(ctx_ptr, write.batch);
+    }
+
+    var batch_ctx = ctx.batchContext();
+    var ha_mutation = acquireHAMutationSharedContext(&batch_ctx);
+    defer if (ha_mutation) |*lease| lease.release();
+    try enforceHAWriteGateOptional(batch_ctx.ha_write_gate);
+
+    const store_writes = try batch_ctx.alloc.alloc(docstore_mod.KVPair, write.artifact_writes.len);
+    defer batch_ctx.alloc.free(store_writes);
+    for (write.artifact_writes, 0..) |artifact, i| {
+        store_writes[i] = .{ .key = artifact.key, .value = artifact.value };
+    }
+
+    batch_ctx.apply_mutex.lockExclusive();
+    var apply_mutex_held = true;
+    errdefer if (apply_mutex_held) batch_ctx.apply_mutex.unlockExclusive();
+    const sequence = batch_ctx.store.reserveNextReplaySequence(1);
+    const payload = try encodeChangeRecordPayloadWithTargetHints(
+        &batch_ctx,
+        write.batch,
+        sequence,
+        write.target_hints,
+    );
+    defer batch_ctx.alloc.free(payload);
+    try batch_ctx.store.putBatchWithReplay(batch_ctx.io, store_writes, write.artifact_deletes, .{
+        .sequence = sequence,
+        .payload = payload,
+    });
+    if (shouldAppendSplitDeltaForContext(&batch_ctx)) {
+        try batch_ctx.shard_manager.appendSplitDelta(currentTimeNs(), store_writes, write.artifact_deletes);
+    }
+    batch_ctx.apply_mutex.unlockExclusive();
+    apply_mutex_held = false;
+
+    try mirrorHAReplayPayloadCommitContext(&batch_ctx, payload);
+    batch_ctx.executor.trackBacklogBytes(sequence, @intCast(payload.len)) catch {};
+    notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
+    if (ctx.executor.hasWorkers()) {
+        ctx.executor.forceSequence(sequence);
+        return sequence;
+    }
+
+    var applied_batch = write.batch;
     applied_batch.sequence = sequence;
     try applyDerivedBatchContext(&batch_ctx, applied_batch);
     return sequence;
@@ -49403,6 +49467,12 @@ const FakePromotionSink = struct {
         }
         return null;
     }
+
+    fn count(self: *FakePromotionSink) usize {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        return self.upserts.items.len;
+    }
 };
 
 test "db promotes resolved entities into entity-document upserts end-to-end" {
@@ -49958,12 +50028,9 @@ test "db does not materialize review-band resolution as canonical mention edges"
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    // Keep the lifecycle deterministic: every transition below must be
-    // completed by runUntilIdle rather than an opportunistic worker wake-up.
-    var db = try DB.open(alloc, std.mem.span(path), .{
-        .start_index_workers = false,
-        .start_optional_runtime_workers = false,
-    });
+    // Keep production workers enabled: this is the regression for the original
+    // race between background resolver catch-up and the runUntilIdle fence.
+    var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
     try db.addIndex(.{
@@ -50059,6 +50126,9 @@ test "db mention edge weight is fused from extractor trust and mention confidenc
         .start_optional_runtime_workers = false,
     });
     defer db.close();
+    var promotion_sink = FakePromotionSink{ .alloc = alloc };
+    defer promotion_sink.deinit();
+    db.setEntitySink(promotion_sink.sink());
 
     try db.addIndex(.{
         .name = "prov_graph",
@@ -50107,6 +50177,7 @@ test "db mention edge weight is fused from extractor trust and mention confidenc
     try std.testing.expectEqualStrings("person/ada_lovelace", out[0].target);
     // Calibrated weight, not the legacy 1.0.
     try std.testing.expectApproxEqAbs(@as(f64, 0.72), out[0].weight, 1e-9);
+    try std.testing.expectEqual(@as(usize, 1), promotion_sink.count());
 
     // Mention confidence belongs to the source extraction, not the resolution
     // decision. The resolution bytes therefore stay unchanged, but replay must
@@ -50130,6 +50201,8 @@ test "db mention edge weight is fused from extractor trust and mention confidenc
     defer graph_mod.GraphIndex.freeEdges(alloc, updated);
     try std.testing.expectEqual(@as(usize, 1), updated.len);
     try std.testing.expectApproxEqAbs(@as(f64, 0.36), updated[0].weight, 1e-9);
+    try std.testing.expectEqual(@as(usize, 1), promotion_sink.count());
+    try std.testing.expect(!db.pendingWorkStats().promotion.blocked);
 }
 
 test "db rewriteEntityEdges repoints provenance edges to a merge survivor" {

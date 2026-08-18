@@ -809,28 +809,20 @@ pub const ResolutionStage = struct {
     /// a curated link survives re-resolution (replay-stable curation).
     overrides: ?OverrideProvider = null,
 
-    /// `extraction_key` / `resolution_key` are the primary-store artifact keys
-    /// (encoded by the DB adapter). Returns what happened, for status/metrics.
-    pub fn run(
+    /// Compute the canonical resolution bytes for `extraction_key` without
+    /// mutating the store. Null means the source extraction no longer exists.
+    /// Keeping computation separate lets the DB commit the artifact mutation
+    /// and its downstream replay record in one atomic storage transaction.
+    pub fn compute(
         self: ResolutionStage,
         gpa: std.mem.Allocator,
         store: ArtifactStore,
         provider: ?CandidateProvider,
         extraction_key: []const u8,
-        resolution_key: []const u8,
-    ) !RunResult {
+    ) !?[]u8 {
         const extraction = try store.get(gpa, extraction_key);
         defer if (extraction) |e| gpa.free(e);
-
-        if (extraction == null) {
-            const existing = try store.get(gpa, resolution_key);
-            defer if (existing) |e| gpa.free(e);
-            if (existing != null) {
-                try store.delete(resolution_key);
-                return .cleared;
-            }
-            return .source_missing;
-        }
+        if (extraction == null) return null;
 
         var parsed = try parseExtractionEntities(gpa, extraction.?);
         defer parsed.deinit();
@@ -880,15 +872,38 @@ pub const ResolutionStage = struct {
             }
         }
 
-        const bytes = try resolution.toJson(gpa);
-        defer gpa.free(bytes);
+        return try resolution.toJson(gpa);
+    }
+
+    /// `extraction_key` / `resolution_key` are the primary-store artifact keys
+    /// (encoded by the DB adapter). Returns what happened, for status/metrics.
+    pub fn run(
+        self: ResolutionStage,
+        gpa: std.mem.Allocator,
+        store: ArtifactStore,
+        provider: ?CandidateProvider,
+        extraction_key: []const u8,
+        resolution_key: []const u8,
+    ) !RunResult {
+        const computed = try self.compute(gpa, store, provider, extraction_key);
+        defer if (computed) |bytes| gpa.free(bytes);
+
+        if (computed == null) {
+            const existing = try store.get(gpa, resolution_key);
+            defer if (existing) |e| gpa.free(e);
+            if (existing != null) {
+                try store.delete(resolution_key);
+                return .cleared;
+            }
+            return .source_missing;
+        }
 
         const existing = try store.get(gpa, resolution_key);
         defer if (existing) |e| gpa.free(e);
         if (existing) |e| {
-            if (std.mem.eql(u8, e, bytes)) return .unchanged;
+            if (std.mem.eql(u8, e, computed.?)) return .unchanged;
         }
-        try store.put(resolution_key, bytes);
+        try store.put(resolution_key, computed.?);
         return .written;
     }
 };

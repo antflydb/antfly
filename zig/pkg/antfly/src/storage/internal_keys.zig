@@ -56,6 +56,7 @@ pub const managed_index_admission_kind: u8 = 0x2b;
 pub const index_artifact_cleanup_kind: u8 = 0x2c;
 pub const range_document_count_key = [_]u8{ replay_namespace, 0xff, 0x2d };
 pub const artifact_repair_completion_kind: u8 = 0x2e;
+pub const resolution_handoff_kind: u8 = 0x2f;
 pub const embedding_artifact_repair_issue_kind: u8 = artifact_repair_issue_kind;
 pub const identity_doc_to_ordinal_kind: u8 = 0x01;
 pub const identity_ordinal_to_doc_kind: u8 = 0x02;
@@ -75,6 +76,17 @@ pub fn isInternalMetadataKey(key: []const u8) bool {
 
 pub fn isInternalUserKey(key: []const u8) bool {
     return key.len > 0 and key[0] == user_namespace;
+}
+
+/// Private completion marker for the last resolution artifact version whose
+/// full graph+promotion replay handoff completed. The artifact key is encoded
+/// as one component so arbitrary document and artifact-name bytes remain safe.
+pub fn resolutionHandoffKeyAlloc(alloc: Allocator, resolution_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, resolution_handoff_kind });
+    try appendEncodedComponent(&list, alloc, resolution_key);
+    return try list.toOwnedSlice(alloc);
 }
 
 pub fn identityVisibilityChunkKey(chunk_id: u32) [6]u8 {
@@ -1804,6 +1816,22 @@ test "resolution artifact key round-trips and is distinct from asset" {
     defer alloc.free(parsed.artifact_name);
     try std.testing.expectEqualStrings("doc:article-123", parsed.doc_key);
     try std.testing.expectEqualStrings("resolution_v1", parsed.artifact_name);
+}
+
+test "resolution handoff keys are private and encode arbitrary artifact keys" {
+    const alloc = std.testing.allocator;
+    const resolution_key = try resolutionArtifactKeyAlloc(alloc, "doc:\x00article", "resolution\x00v1");
+    defer alloc.free(resolution_key);
+
+    const handoff_key = try resolutionHandoffKeyAlloc(alloc, resolution_key);
+    defer alloc.free(handoff_key);
+    const other_handoff_key = try resolutionHandoffKeyAlloc(alloc, "different\x00artifact");
+    defer alloc.free(other_handoff_key);
+
+    try std.testing.expect(isInternalMetadataKey(handoff_key));
+    try std.testing.expect(!isInternalUserKey(handoff_key));
+    try std.testing.expect(!isResolutionArtifactKey(handoff_key));
+    try std.testing.expect(!std.mem.eql(u8, handoff_key, other_handoff_key));
 }
 
 test "parseAssetArtifactKeyAlloc returns doc key and artifact name" {
