@@ -179,7 +179,8 @@ validation than data-node scaling.
 The operator enforces:
 
 - odd metadata replica counts
-- no unsafe metadata scale-down
+- immutable metadata replica counts after cluster creation; both scale-up and
+  scale-down require recreating the cluster at the target topology
 - production configurations with enough replicas for quorum, typically at least
   three metadata nodes
 

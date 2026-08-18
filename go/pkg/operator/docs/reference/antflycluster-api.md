@@ -69,7 +69,7 @@ Configuration for metadata nodes (Raft consensus, API coordination).
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `replicas` | int32 | No | 3 | Number of metadata nodes |
+| `replicas` | int32 | No | 3 | Number of metadata nodes; immutable after cluster creation |
 | `resources` | [ResourceSpec](#resourcespec) | Yes | - | Resource requirements |
 | `metadataAPI` | [APISpec](#apispec) | Yes | - | Metadata API configuration |
 | `metadataRaft` | [APISpec](#apispec) | Yes | - | Metadata Raft configuration |

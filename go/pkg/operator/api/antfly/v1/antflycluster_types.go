@@ -1152,8 +1152,11 @@ type HAAutomaticFailoverPolicy struct {
 }
 
 // MetadataNodesSpec defines the configuration for metadata nodes
+// +kubebuilder:validation:XValidation:rule="(has(self.replicas) ? self.replicas : 3) == (has(oldSelf.replicas) ? oldSelf.replicas : 3)",message="metadata replica count is immutable after cluster creation; recreate the cluster with the target topology"
 type MetadataNodesSpec struct {
-	// Replicas is the number of metadata nodes (default: 3)
+	// Replicas is the number of metadata nodes (default: 3). It is immutable
+	// after cluster creation until the operator supports quorum-aware metadata
+	// membership changes.
 	Replicas int32 `json:"replicas,omitempty"`
 
 	// Resources defines the resource requirements
