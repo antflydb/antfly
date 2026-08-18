@@ -4813,10 +4813,11 @@ test "metadata.schema update refreshes algebraic dynamic templates without recre
     );
     defer metadata_table_manager.freeTable(std.testing.allocator, updated);
 
-    // Version is preserved (no document_schemas change) ...
-    try std.testing.expect(std.mem.indexOf(u8, updated.schema_json, "\"version\":2") != null);
-    // ... but the durable algebraic config now carries the numeric rule, proving
-    // the dynamic template propagated without a recreate or version bump.
+    // Current schema semantics treat an ordered dynamic-template change as a
+    // behavior change, so the schema generation advances without recreating the
+    // table.
+    try std.testing.expect(std.mem.indexOf(u8, updated.schema_json, "\"version\":3") != null);
+    // The durable algebraic config carries the numeric rule from that generation.
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"match\":\"ext_*\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"type\":\"number\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"capability_fingerprint\"") != null);
@@ -4825,8 +4826,10 @@ test "metadata.schema update refreshes algebraic dynamic templates without recre
     // durable config records that existing docs need re-projection; query-time
     // resolution of dynamic fields is withheld until rebuild.
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"dynamic_rules_backfill_pending\":true") != null);
-    // The full-text index entry is left untouched.
+    // The previous full-text index remains available while the new schema
+    // generation gets its own index.
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v3\"") != null);
 }
 
 test "metadata.schema update regenerates algebraic config and preserves user knobs" {
@@ -4845,9 +4848,7 @@ test "metadata.schema update regenerates algebraic config and preserves user kno
     defer canon_parsed.deinit();
     const fp = canon_parsed.value.object.get("capability_fingerprint").?.string;
 
-    const stored = try std.fmt.allocPrint(std.testing.allocator,
-        "{{\"alg\":{{\"type\":\"algebraic\",\"capability_fingerprint\":\"{s}\",\"adaptive\":{{\"observe\":false,\"min_observations\":9}},\"dynamic_field_rules\":[{{\"name\":\"ext\",\"match\":\"ext_*\",\"type\":\"string\"}}]}}}}",
-        .{fp});
+    const stored = try std.fmt.allocPrint(std.testing.allocator, "{{\"alg\":{{\"type\":\"algebraic\",\"capability_fingerprint\":\"{s}\",\"adaptive\":{{\"observe\":false,\"min_observations\":9}},\"dynamic_field_rules\":[{{\"name\":\"ext\",\"match\":\"ext_*\",\"type\":\"string\"}}]}}}}", .{fp});
     defer std.testing.allocator.free(stored);
 
     const refreshed = try regenerateAlgebraicIndexesFromSchemaAlloc(std.testing.allocator, "docs", stored, schema);
