@@ -43,6 +43,7 @@ const shard_mod = @import("../shard.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const resolver_catalog_mod = @import("catalog/resolver_catalog.zig");
 const resolution_runtime_mod = @import("resolution_runtime.zig");
+const resolution_handoff = @import("resolution_handoff.zig");
 const promotion_runtime_mod = @import("promotion_runtime.zig");
 const resolver_lib = @import("antfly_resolver");
 const backfill_state_mod = @import("backfill_state.zig");
@@ -34644,9 +34645,26 @@ fn appendDerivedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.De
     return sequence;
 }
 
+const ResolutionHandoffDocStoreSink = struct {
+    store: *docstore_mod.DocStore,
+
+    fn write(self: *@This(), writes: []const docstore_mod.KVPair, deletes: []const []const u8) !void {
+        try self.store.putBatch(writes, deletes);
+    }
+};
+
 fn publishResolutionHandoffContext(
     ctx: *const BatchExecutionContext,
     write: resolution_runtime_mod.RecordWrite,
+) !void {
+    var sink = ResolutionHandoffDocStoreSink{ .store = ctx.store };
+    try publishResolutionHandoffContextWithSink(ctx, write, &sink);
+}
+
+fn publishResolutionHandoffContextWithSink(
+    ctx: *const BatchExecutionContext,
+    write: resolution_runtime_mod.RecordWrite,
+    sink: anytype,
 ) !void {
     if (!write.publish_resolution_handoff) return;
     const marker_count = write.artifact_writes.len + write.artifact_deletes.len;
@@ -34658,7 +34676,7 @@ fn publishResolutionHandoffContext(
         for (marker_keys[0..marker_keys_initialized]) |key| ctx.alloc.free(key);
         ctx.alloc.free(marker_keys);
     }
-    const marker_values = try ctx.alloc.alloc(resolution_runtime_mod.HandoffValue, write.artifact_writes.len);
+    const marker_values = try ctx.alloc.alloc(resolution_handoff.Value, write.artifact_writes.len);
     defer ctx.alloc.free(marker_values);
     const marker_writes = try ctx.alloc.alloc(docstore_mod.KVPair, write.artifact_writes.len);
     defer ctx.alloc.free(marker_writes);
@@ -34668,7 +34686,7 @@ fn publishResolutionHandoffContext(
     for (write.artifact_writes, 0..) |artifact, i| {
         marker_keys[i] = try internal_keys.resolutionHandoffKeyAlloc(ctx.alloc, artifact.key);
         marker_keys_initialized += 1;
-        marker_values[i] = resolution_runtime_mod.resolutionHandoffValue(artifact.value);
+        marker_values[i] = resolution_handoff.value(artifact.value);
         marker_writes[i] = .{ .key = marker_keys[i], .value = &marker_values[i] };
     }
     for (write.artifact_deletes, 0..) |artifact_key, i| {
@@ -34688,23 +34706,36 @@ fn publishResolutionHandoffContext(
     if (transition_mutex) |mutex| lockAtomic(mutex);
     defer if (transition_mutex) |mutex| mutex.unlock();
     try enforceHAWriteGateOptional(ctx.ha_write_gate);
-    try ctx.store.putBatch(marker_writes, marker_deletes);
+    try sink.write(marker_writes, marker_deletes);
 }
 
-test "db resolution handoff completion obeys the final HA fence" {
+test "db resolution handoff completion publishes fanout in one metadata batch" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var public_gate = ha_public_gate_state_mod.State{};
     var db = try DB.open(alloc, std.mem.span(path), .{
-        .ha_write_gate = .{ .shared = .{ .state = &public_gate } },
         .start_index_workers = false,
     });
     defer db.close();
     var batch_ctx = db.batchContext();
+
+    const CountingSink = struct {
+        store: *docstore_mod.DocStore,
+        calls: usize = 0,
+        writes: usize = 0,
+        deletes: usize = 0,
+
+        fn write(self: *@This(), writes: []const docstore_mod.KVPair, deletes: []const []const u8) !void {
+            self.calls += 1;
+            self.writes += writes.len;
+            self.deletes += deletes.len;
+            try self.store.putBatch(writes, deletes);
+        }
+    };
+    var counting_sink = CountingSink{ .store = batch_ctx.store };
 
     const first_resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
     defer alloc.free(first_resolution_key);
@@ -34714,11 +34745,14 @@ test "db resolution handoff completion obeys the final HA fence" {
         .{ .key = first_resolution_key, .value = "{\"entities\":[\"a\"]}" },
         .{ .key = second_resolution_key, .value = "{\"entities\":[\"b\"]}" },
     };
-    try publishResolutionHandoffContext(&batch_ctx, .{
+    try publishResolutionHandoffContextWithSink(&batch_ctx, .{
         .batch = .{},
         .artifact_writes = &writes,
         .publish_resolution_handoff = true,
-    });
+    }, &counting_sink);
+    try std.testing.expectEqual(@as(usize, 1), counting_sink.calls);
+    try std.testing.expectEqual(@as(usize, 2), counting_sink.writes);
+    try std.testing.expectEqual(@as(usize, 0), counting_sink.deletes);
 
     const first_marker_key = try internal_keys.resolutionHandoffKeyAlloc(alloc, first_resolution_key);
     defer alloc.free(first_marker_key);
@@ -34727,30 +34761,149 @@ test "db resolution handoff completion obeys the final HA fence" {
     for (writes, [_][]const u8{ first_marker_key, second_marker_key }) |artifact, marker_key| {
         const raw = try db.core.store.get(alloc, marker_key);
         defer alloc.free(raw);
-        const expected = resolution_runtime_mod.resolutionHandoffValue(artifact.value);
+        const expected = resolution_handoff.value(artifact.value);
         try std.testing.expectEqualSlices(u8, &expected, raw);
     }
-
-    // A fence that arrives after the resolution artifact/replay commit must
-    // prevent the completion marker from claiming the handoff succeeded.
-    public_gate.publishPrimaryFence(true);
-    const fenced_resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:fenced", "resolution_v1");
-    defer alloc.free(fenced_resolution_key);
-    const fenced_marker_key = try internal_keys.resolutionHandoffKeyAlloc(alloc, fenced_resolution_key);
-    defer alloc.free(fenced_marker_key);
-    const fenced_write = [_]resolution_runtime_mod.ArtifactWrite{.{
-        .key = fenced_resolution_key,
-        .value = "{\"entities\":[\"fenced\"]}",
-    }};
-    try std.testing.expectError(error.HAFencedPrimary, publishResolutionHandoffContext(&batch_ctx, .{
-        .batch = .{},
-        .artifact_writes = &fenced_write,
-        .publish_resolution_handoff = true,
-    }));
-    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, fenced_marker_key));
 }
 
+test "storage.ha resolution handoff fence rejects completion after durable HA replay" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.heap.c_allocator;
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 271,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+
+    var public_gate = ha_public_gate_state_mod.State{};
+    public_gate.configurePrimary(&primary, false);
+    var transition_mutex: std.atomic.Mutex = .unlocked;
+    var barrier: HAMutationBarrier = .{};
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
+        .ha_async_effect_mirror = .{
+            .primary = &primary,
+            .mutation_barrier = &barrier,
+            .transition_mutex = &transition_mutex,
+        },
+        .ha_write_gate = .{ .shared = .{ .state = &public_gate } },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    const PauseBeforePublish = struct {
+        io: std.Io,
+        reached: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reached.set(self.io);
+            self.release.waitUncancelable(self.io);
+        }
+    };
+    const WriteProbe = struct {
+        ctx: *EnrichmentAppendContext,
+        resolution_key: []const u8,
+        pause: *PauseBeforePublish,
+        result: std.atomic.Value(u8) = .init(0),
+
+        fn run(self: *@This()) void {
+            const writes = [_]resolution_runtime_mod.ArtifactWrite{.{
+                .key = self.resolution_key,
+                .value = "{\"entities\":[\"durable\"]}",
+            }};
+            _ = appendResolutionRecordWithHook(self.ctx, .{
+                .batch = .{ .changed_artifact_keys = &.{self.resolution_key} },
+                .artifact_writes = &writes,
+                .publish_resolution_handoff = true,
+            }, ResolutionHandoffPublishHook{
+                .ptr = self.pause,
+                .run_fn = PauseBeforePublish.run,
+            }) catch |err| {
+                self.result.store(if (err == error.HAFencedPrimary) 1 else 2, .release);
+                return;
+            };
+            self.result.store(3, .release);
+        }
+    };
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:fenced", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const marker_key = try internal_keys.resolutionHandoffKeyAlloc(alloc, resolution_key);
+    defer alloc.free(marker_key);
+    var pause = PauseBeforePublish{ .io = std.testing.io };
+    var probe = WriteProbe{
+        .ctx = db.resolution_append_context.?,
+        .resolution_key = resolution_key,
+        .pause = &pause,
+    };
+    const thread = try std.Thread.spawn(.{}, WriteProbe.run, .{&probe});
+    var thread_joined = false;
+    errdefer {
+        pause.release.set(pause.io);
+        if (!thread_joined) thread.join();
+    }
+
+    pause.reached.waitUncancelable(pause.io);
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+    try std.testing.expectEqual(@as(u64, 1), db.core.nextDerivedSequence());
+    const artifact = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(artifact);
+    try std.testing.expectEqualStrings("{\"entities\":[\"durable\"]}", artifact);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, marker_key));
+    // The hook runs inside appendResolutionRecord's shared mutation lease.
+    try std.testing.expect(barrier.tryAcquireExclusive() == null);
+
+    lockAtomic(&transition_mutex);
+    public_gate.publishPrimaryFence(true);
+    pause.release.set(pause.io);
+    transition_mutex.unlock();
+    thread.join();
+    thread_joined = true;
+
+    try std.testing.expectEqual(@as(u8, 1), probe.result.load(.acquire));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, marker_key));
+    var capture = barrier.tryAcquireExclusive() orelse return error.TestExpectedEqual;
+    capture.release();
+}
+
+const ResolutionHandoffPublishHook = struct {
+    ptr: *anyopaque,
+    run_fn: *const fn (ptr: *anyopaque) void,
+
+    fn run(self: @This()) void {
+        self.run_fn(self.ptr);
+    }
+};
+
+const NoopResolutionHandoffPublishHook = struct {
+    fn run(_: @This()) void {}
+};
+
 fn appendResolutionRecord(ctx_ptr: *anyopaque, write: resolution_runtime_mod.RecordWrite) !u64 {
+    return try appendResolutionRecordWithHook(ctx_ptr, write, NoopResolutionHandoffPublishHook{});
+}
+
+fn appendResolutionRecordWithHook(
+    ctx_ptr: *anyopaque,
+    write: resolution_runtime_mod.RecordWrite,
+    before_handoff_publish: anytype,
+) !u64 {
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
     if (write.artifact_writes.len == 0 and write.artifact_deletes.len == 0 and write.target_hints == null) {
         return appendDerivedBatchFromEnrichment(ctx_ptr, write.batch);
@@ -34789,6 +34942,7 @@ fn appendResolutionRecord(ctx_ptr: *anyopaque, write: resolution_runtime_mod.Rec
     apply_mutex_held = false;
 
     try mirrorHAReplayPayloadCommitContext(&batch_ctx, payload);
+    before_handoff_publish.run();
     try publishResolutionHandoffContext(&batch_ctx, write);
     batch_ctx.executor.trackBacklogBytes(sequence, @intCast(payload.len)) catch {};
     notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
@@ -49980,7 +50134,7 @@ test "db materializes doc->entity mention edges as provenance and clears them on
     {
         const raw = try db.core.store.get(alloc, resolution_handoff_key);
         defer alloc.free(raw);
-        try std.testing.expectEqual(@sizeOf(resolution_runtime_mod.HandoffValue), raw.len);
+        try std.testing.expectEqual(@sizeOf(resolution_handoff.Value), raw.len);
     }
 
     const ada_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "prov_graph", "mentions", "person/ada_lovelace");
@@ -50109,7 +50263,7 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
     {
         const raw = try db.core.store.get(alloc, resolution_handoff_key);
         defer alloc.free(raw);
-        try std.testing.expectEqual(@sizeOf(resolution_runtime_mod.HandoffValue), raw.len);
+        try std.testing.expectEqual(@sizeOf(resolution_handoff.Value), raw.len);
     }
 
     const graph_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "prov_graph", "mentions", "person/ada_lovelace");

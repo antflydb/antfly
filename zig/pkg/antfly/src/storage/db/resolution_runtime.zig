@@ -28,6 +28,7 @@ const builtin = @import("builtin");
 const resolver_lib = @import("antfly_resolver");
 const matcher = @import("antfly_matcher");
 const resolver_catalog = @import("catalog/resolver_catalog.zig");
+const resolution_handoff = @import("resolution_handoff.zig");
 const internal_keys = @import("../internal_keys.zig");
 const artifact_ids = @import("artifact_ids.zig");
 const derived_types = @import("derived/derived_types.zig");
@@ -242,62 +243,6 @@ pub const ProcessOutcome = struct {
 };
 
 const PersistenceMode = enum { immediate, deferred };
-const handoff_digest_len = std.crypto.hash.sha2.Sha256.digest_length;
-pub const HandoffValue = [handoff_digest_len]u8;
-
-pub fn resolutionHandoffValue(artifact_value: []const u8) HandoffValue {
-    var value: HandoffValue = undefined;
-    std.crypto.hash.sha2.Sha256.hash(artifact_value, &value, .{});
-    return value;
-}
-
-fn resolutionHandoffMatches(
-    gpa: Allocator,
-    store: resolver_lib.ArtifactStore,
-    resolution_key: []const u8,
-    artifact_value: []const u8,
-) !bool {
-    const marker_key = try internal_keys.resolutionHandoffKeyAlloc(gpa, resolution_key);
-    defer gpa.free(marker_key);
-    const stored = try store.get(gpa, marker_key);
-    defer if (stored) |bytes| gpa.free(bytes);
-    const expected = resolutionHandoffValue(artifact_value);
-    return if (stored) |bytes| std.mem.eql(u8, bytes, &expected) else false;
-}
-
-fn resolutionHandoffExists(
-    gpa: Allocator,
-    store: resolver_lib.ArtifactStore,
-    resolution_key: []const u8,
-) !bool {
-    const marker_key = try internal_keys.resolutionHandoffKeyAlloc(gpa, resolution_key);
-    defer gpa.free(marker_key);
-    const stored = try store.get(gpa, marker_key);
-    defer if (stored) |bytes| gpa.free(bytes);
-    return stored != null;
-}
-
-fn saveResolutionHandoff(
-    gpa: Allocator,
-    store: resolver_lib.ArtifactStore,
-    resolution_key: []const u8,
-    artifact_value: []const u8,
-) !void {
-    const marker_key = try internal_keys.resolutionHandoffKeyAlloc(gpa, resolution_key);
-    defer gpa.free(marker_key);
-    const value = resolutionHandoffValue(artifact_value);
-    try store.put(marker_key, &value);
-}
-
-fn deleteResolutionHandoff(
-    gpa: Allocator,
-    store: resolver_lib.ArtifactStore,
-    resolution_key: []const u8,
-) !void {
-    const marker_key = try internal_keys.resolutionHandoffKeyAlloc(gpa, resolution_key);
-    defer gpa.free(marker_key);
-    try store.delete(marker_key);
-}
 
 /// Process a changed extraction (asset) artifact key: look up the resolver that
 /// consumes it and run the resolution stage to idempotently (re)persist the
@@ -424,7 +369,7 @@ fn processChangedExtractionWithConfig(
     defer if (existing) |bytes| gpa.free(bytes);
 
     if (computed == null) {
-        const stale_handoff = try resolutionHandoffExists(gpa, store, resolution_key);
+        const stale_handoff = try resolution_handoff.exists(gpa, store, resolution_key);
         return .{
             // A retained write marker means a prior delete may have committed
             // locally but failed its split/HA handoff. Re-emit the full clear;
@@ -436,7 +381,7 @@ fn processChangedExtractionWithConfig(
     }
     if (existing) |bytes| {
         if (std.mem.eql(u8, bytes, computed.?)) {
-            if (try resolutionHandoffMatches(gpa, store, resolution_key, computed.?)) {
+            if (try resolution_handoff.matches(gpa, store, resolution_key, computed.?)) {
                 return .{ .result = .unchanged, .resolution_key = resolution_key };
             }
             // The bytes exist without proof that their full downstream
@@ -2497,10 +2442,10 @@ const CaptureWriter = struct {
             self.handoff_calls += 1;
             const store = self.store orelse return error.MissingTestArtifactStore;
             for (write.artifact_writes) |artifact| {
-                try saveResolutionHandoff(self.alloc, store, artifact.key, artifact.value);
+                try resolution_handoff.save(self.alloc, store, artifact.key, artifact.value);
             }
             for (write.artifact_deletes) |key| {
-                try deleteResolutionHandoff(self.alloc, store, key);
+                try resolution_handoff.delete(self.alloc, store, key);
             }
         }
         self.calls += 1;
