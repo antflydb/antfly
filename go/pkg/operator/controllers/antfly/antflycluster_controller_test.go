@@ -78,11 +78,42 @@ func TestValidateMetadataReplicaTopology(t *testing.T) {
 		return &antflyv1.AntflyCluster{
 			ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
 			Spec: antflyv1.AntflyClusterSpec{
-				Mode:          antflyv1.ClusterModeDistributed,
-				MetadataNodes: antflyv1.MetadataNodesSpec{Replicas: replicas},
+				Mode: antflyv1.ClusterModeDistributed,
+				MetadataNodes: antflyv1.MetadataNodesSpec{
+					Replicas:    replicas,
+					MetadataAPI: antflyv1.APISpec{Port: 12377},
+				},
 			},
 			Status: antflyv1.AntflyClusterStatus{MetadataTopologyReplicas: recorded},
 		}
+	}
+	statusClient := func(statuses map[string]string) *http.Client {
+		return &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			body, ok := statuses[req.URL.Hostname()]
+			if !ok {
+				return nil, fmt.Errorf("unexpected metadata status host %s", req.URL.Hostname())
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     make(http.Header),
+			}, nil
+		})}
+	}
+	statusJSON := func(nodeID uint64, role string, leaderID uint64, incarnation string, voterCount int32) string {
+		return fmt.Sprintf(`{"metadata_group_id":1,"metadata_incarnation":%q,"metadata_raft_local_node_id":%d,"metadata_raft_role":%q,"metadata_raft_leader_id":%d,"metadata_raft_local_voter":true,"metadata_raft_voter_count":%d}`,
+			incarnation, nodeID, role, leaderID, voterCount)
+	}
+	pvc := func(ordinal int, annotation string) *corev1.PersistentVolumeClaim {
+		annotations := map[string]string(nil)
+		if annotation != "" {
+			annotations = map[string]string{metadataTopologyReplicasAnnotation: annotation}
+		}
+		return &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+			Name:        fmt.Sprintf("metadata-storage-example-metadata-%d", ordinal),
+			Namespace:   "default",
+			Annotations: annotations,
+		}}
 	}
 
 	driftedReplicas := int32(3)
@@ -108,7 +139,11 @@ func TestValidateMetadataReplicaTopology(t *testing.T) {
 		Spec:       appsv1.StatefulSetSpec{Replicas: &legacyReplicas},
 	}
 	cluster = newCluster(1, 0)
-	if err := newReconciler(legacyStatefulSet).validateMetadataReplicaTopology(context.Background(), cluster); err != nil {
+	legacyReconciler := newReconciler(legacyStatefulSet, pvc(0, ""))
+	legacyReconciler.HTTPClient = statusClient(map[string]string{
+		"example-metadata-0.example-metadata.default.svc.cluster.local": statusJSON(1, "leader", 1, "0123456789abcdef0123456789abcdef", 1),
+	})
+	if err := legacyReconciler.validateMetadataReplicaTopology(context.Background(), cluster); err != nil {
 		t.Fatalf("expected matching legacy StatefulSet topology to migrate, got: %v", err)
 	}
 	cluster.Spec.MetadataNodes.Replicas = 3
@@ -130,6 +165,19 @@ func TestValidateMetadataReplicaTopology(t *testing.T) {
 		t.Fatalf("expected retained PVC topology to reject same-name recreation at a new count, got: %v", err)
 	}
 
+	incompletePVC := pvc(0, "3")
+	cluster = newCluster(3, 0)
+	err = newReconciler(incompletePVC).validateMetadataReplicaTopology(context.Background(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "missing ordinal 1") {
+		t.Fatalf("expected incomplete retained PVC set to fail closed, got: %v", err)
+	}
+
+	extraPVCs := []client.Object{pvc(0, "3"), pvc(1, "3"), pvc(2, "3"), pvc(3, "3")}
+	err = newReconciler(extraPVCs...).validateMetadataReplicaTopology(context.Background(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "unexpected ordinal 3") {
+		t.Fatalf("expected out-of-range retained PVC to fail closed, got: %v", err)
+	}
+
 	unrecordedPVC := annotatedPVC.DeepCopy()
 	unrecordedPVC.Annotations = nil
 	cluster = newCluster(1, 0)
@@ -141,6 +189,54 @@ func TestValidateMetadataReplicaTopology(t *testing.T) {
 	cluster = newCluster(3, 0)
 	if err := newReconciler().validateMetadataReplicaTopology(context.Background(), cluster); err != nil {
 		t.Fatalf("expected a cluster without StatefulSets or retained PVCs to pass, got: %v", err)
+	}
+
+	legacyThree := int32(3)
+	legacyThreeStatefulSet := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "example-metadata", Namespace: "default"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: &legacyThree},
+	}
+	legacyObjects := []client.Object{legacyThreeStatefulSet, pvc(0, ""), pvc(1, ""), pvc(2, "")}
+	cluster = newCluster(3, 0)
+	splitReconciler := newReconciler(legacyObjects...)
+	splitReconciler.HTTPClient = statusClient(map[string]string{
+		"example-metadata-0.example-metadata.default.svc.cluster.local": statusJSON(1, "leader", 1, "11111111111111111111111111111111", 1),
+		"example-metadata-1.example-metadata.default.svc.cluster.local": statusJSON(2, "follower", 3, "22222222222222222222222222222222", 3),
+		"example-metadata-2.example-metadata.default.svc.cluster.local": statusJSON(3, "leader", 3, "22222222222222222222222222222222", 3),
+	})
+	err = splitReconciler.validateMetadataReplicaTopology(context.Background(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "voter_count=1") {
+		t.Fatalf("expected split legacy runtime topology to fail closed, got: %v", err)
+	}
+
+	disagreeingReconciler := newReconciler(legacyObjects...)
+	disagreeingReconciler.HTTPClient = statusClient(map[string]string{
+		"example-metadata-0.example-metadata.default.svc.cluster.local": statusJSON(1, "follower", 3, "33333333333333333333333333333333", 3),
+		"example-metadata-1.example-metadata.default.svc.cluster.local": statusJSON(2, "follower", 3, "44444444444444444444444444444444", 3),
+		"example-metadata-2.example-metadata.default.svc.cluster.local": statusJSON(3, "leader", 3, "33333333333333333333333333333333", 3),
+	})
+	err = disagreeingReconciler.validateMetadataReplicaTopology(context.Background(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "disagrees on metadata group, incarnation, or leader") {
+		t.Fatalf("expected disagreeing legacy incarnations to fail closed, got: %v", err)
+	}
+
+	malformedReconciler := newReconciler(legacyObjects...)
+	malformedReconciler.HTTPClient = statusClient(map[string]string{
+		"example-metadata-0.example-metadata.default.svc.cluster.local": `{`,
+	})
+	err = malformedReconciler.validateMetadataReplicaTopology(context.Background(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "decode metadata status") {
+		t.Fatalf("expected malformed legacy member status to fail closed, got: %v", err)
+	}
+
+	healthyReconciler := newReconciler(legacyObjects...)
+	healthyReconciler.HTTPClient = statusClient(map[string]string{
+		"example-metadata-0.example-metadata.default.svc.cluster.local": statusJSON(1, "follower", 3, "33333333333333333333333333333333", 3),
+		"example-metadata-1.example-metadata.default.svc.cluster.local": statusJSON(2, "follower", 3, "33333333333333333333333333333333", 3),
+		"example-metadata-2.example-metadata.default.svc.cluster.local": statusJSON(3, "leader", 3, "33333333333333333333333333333333", 3),
+	})
+	if err := healthyReconciler.validateMetadataReplicaTopology(context.Background(), cluster); err != nil {
+		t.Fatalf("expected an agreeing legacy runtime topology to migrate, got: %v", err)
 	}
 }
 

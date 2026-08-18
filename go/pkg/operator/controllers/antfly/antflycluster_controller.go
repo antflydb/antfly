@@ -1526,12 +1526,19 @@ func (r *AntflyClusterReconciler) validateMetadataReplicaTopology(ctx context.Co
 		return fmt.Errorf("list metadata PVCs for topology validation: %w", err)
 	}
 	metadataPVCsExist := false
+	pvcOrdinals := make(map[int32]string)
 	for i := range pvcList.Items {
 		pvc := &pvcList.Items[i]
 		if !strings.HasPrefix(pvc.Name, pvcPrefix) {
 			continue
 		}
 		metadataPVCsExist = true
+		ordinalText := strings.TrimPrefix(pvc.Name, pvcPrefix)
+		ordinal, err := strconv.ParseInt(ordinalText, 10, 32)
+		if err != nil || ordinal < 0 || strconv.FormatInt(ordinal, 10) != ordinalText {
+			return fmt.Errorf("metadata PVC %s has an invalid StatefulSet ordinal", pvc.Name)
+		}
+		pvcOrdinals[int32(ordinal)] = pvc.Name
 		if raw, ok := pvc.Annotations[metadataTopologyReplicasAnnotation]; ok {
 			replicas, err := parseMetadataTopologyReplicas(raw, fmt.Sprintf("metadata PVC %s annotation", pvc.Name))
 			if err != nil {
@@ -1541,16 +1548,43 @@ func (r *AntflyClusterReconciler) validateMetadataReplicaTopology(ctx context.Co
 		}
 	}
 
+	// Compare durable records before checking retained claim completeness so a
+	// replica-count change receives the direct immutability diagnostic.
+	for _, record := range records {
+		if record.replicas == desiredReplicas {
+			continue
+		}
+		return metadataTopologyChangeError(record.source, record.replicas, desiredReplicas)
+	}
+
+	// Any retained set must contain exactly the ordinals belonging to the
+	// recorded topology. In particular, do not let a same-name recreation fill
+	// missing ordinals with fresh claims and combine different Raft histories.
+	if metadataPVCsExist {
+		if err := validateMetadataPVCOrdinals(pvcOrdinals, desiredReplicas); err != nil {
+			return err
+		}
+	}
+
 	// Bootstrap pre-record clusters from their existing controller-owned
-	// StatefulSet only when no durable status/PVC record exists. Once recorded,
-	// StatefulSet replica drift is deliberately ignored and reconciled back to
-	// the accepted topology.
+	// StatefulSet only when no durable status/PVC record exists. The mutable
+	// replica field is not enough by itself: every retained claim and every
+	// running member must prove one stable Raft incarnation before migration.
 	if len(records) == 0 && statefulSetExists {
 		legacyReplicas := int32(1)
 		if metadataStatefulSet.Spec.Replicas != nil {
 			legacyReplicas = *metadataStatefulSet.Spec.Replicas
 		}
-		records = append(records, topologyRecord{source: "legacy metadata StatefulSet", replicas: legacyReplicas})
+		if legacyReplicas != desiredReplicas {
+			return metadataTopologyChangeError("legacy metadata StatefulSet", legacyReplicas, desiredReplicas)
+		}
+		if err := validateMetadataPVCOrdinals(pvcOrdinals, legacyReplicas); err != nil {
+			return fmt.Errorf("cannot safely migrate the legacy metadata topology: %w", err)
+		}
+		if err := r.validateLegacyMetadataRuntimeTopology(ctx, cluster, legacyReplicas); err != nil {
+			return err
+		}
+		return nil
 	}
 	if len(records) == 0 {
 		if metadataPVCsExist {
@@ -1563,18 +1597,137 @@ Solution: Keep the existing cluster topology if it can be recovered, or back up 
 		return nil
 	}
 
-	for _, record := range records {
-		if record.replicas == desiredReplicas {
-			continue
-		}
-		return fmt.Errorf(`field 'spec.metadataNodes.replicas' is immutable after cluster creation (recorded by %s: %d, attempted: %d)
+	return nil
+}
+
+func metadataTopologyChangeError(source string, recordedReplicas, desiredReplicas int32) error {
+	return fmt.Errorf(`field 'spec.metadataNodes.replicas' is immutable after cluster creation (recorded by %s: %d, attempted: %d)
 
 Problem: Metadata nodes are quorum-bearing. The operator does not yet have a quorum-aware metadata membership-change workflow. Changing the StatefulSet topology with retained PVCs can start divergent Raft incarnations.
 
-Solution: Keep the existing metadata replica count. To change topology, back up the cluster, create a differently named AntflyCluster at the target replica count so it receives fresh metadata PVCs, restore the backup, and cut over. Do not reuse retained metadata PVCs across replica-count changes`, record.source, record.replicas, desiredReplicas)
-	}
+Solution: Keep the existing metadata replica count. To change topology, back up the cluster, create a differently named AntflyCluster at the target replica count so it receives fresh metadata PVCs, restore the backup, and cut over. Do not reuse retained metadata PVCs across replica-count changes`, source, recordedReplicas, desiredReplicas)
+}
 
+func validateMetadataPVCOrdinals(pvcOrdinals map[int32]string, replicas int32) error {
+	for ordinal := int32(0); ordinal < replicas; ordinal++ {
+		if _, ok := pvcOrdinals[ordinal]; !ok {
+			return fmt.Errorf("retained metadata PVC set is incomplete: missing ordinal %d of expected ordinals 0 through %d", ordinal, replicas-1)
+		}
+	}
+	for ordinal, name := range pvcOrdinals {
+		if ordinal >= replicas {
+			return fmt.Errorf("retained metadata PVC %s has unexpected ordinal %d outside expected ordinals 0 through %d", name, ordinal, replicas-1)
+		}
+	}
 	return nil
+}
+
+type metadataRuntimeTopologyStatus struct {
+	MetadataGroupID         uint64  `json:"metadata_group_id"`
+	MetadataIncarnation     string  `json:"metadata_incarnation"`
+	MetadataRaftLocalNodeID uint64  `json:"metadata_raft_local_node_id"`
+	MetadataRaftRole        string  `json:"metadata_raft_role"`
+	MetadataRaftLeaderID    *uint64 `json:"metadata_raft_leader_id"`
+	MetadataRaftLocalVoter  bool    `json:"metadata_raft_local_voter"`
+	MetadataRaftVoterCount  int32   `json:"metadata_raft_voter_count"`
+}
+
+const maxMetadataRuntimeStatusBytes = 64 * 1024
+
+func (r *AntflyClusterReconciler) validateLegacyMetadataRuntimeTopology(ctx context.Context, cluster *antflyv1.AntflyCluster, replicas int32) error {
+	if replicas < 1 {
+		return fmt.Errorf("cannot safely migrate legacy metadata topology: invalid replica count %d", replicas)
+	}
+	maxNodeID := uint64(replicas) // #nosec G115 -- replicas is explicitly checked positive above.
+	var baseline *metadataRuntimeTopologyStatus
+	leaderReports := 0
+	for ordinal := int32(0); ordinal < replicas; ordinal++ {
+		status, err := r.fetchMetadataRuntimeTopology(ctx, cluster, ordinal)
+		if err != nil {
+			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d status is unavailable: %w", ordinal, err)
+		}
+		expectedNodeID := uint64(ordinal + 1)
+		if status.MetadataGroupID == 0 || !validMetadataIncarnation(status.MetadataIncarnation) {
+			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d returned an invalid group or incarnation", ordinal)
+		}
+		if status.MetadataRaftLocalNodeID != expectedNodeID {
+			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d reports local node %d, expected %d", ordinal, status.MetadataRaftLocalNodeID, expectedNodeID)
+		}
+		// The status API reports voter configuration as the local-voter bit and
+		// voter count. Require every deterministic member ID to report itself as
+		// a voter in a configuration with the expected cardinality.
+		if !status.MetadataRaftLocalVoter || status.MetadataRaftVoterCount != replicas {
+			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d reports local_voter=%t and voter_count=%d, expected local_voter=true and voter_count=%d", ordinal, status.MetadataRaftLocalVoter, status.MetadataRaftVoterCount, replicas)
+		}
+		if status.MetadataRaftLeaderID == nil || *status.MetadataRaftLeaderID < 1 || *status.MetadataRaftLeaderID > maxNodeID {
+			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d does not report a valid leader", ordinal)
+		}
+		switch status.MetadataRaftRole {
+		case "leader":
+			if *status.MetadataRaftLeaderID != status.MetadataRaftLocalNodeID {
+				return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d reports leader role for node %d but leader %d", ordinal, status.MetadataRaftLocalNodeID, *status.MetadataRaftLeaderID)
+			}
+			leaderReports++
+		case "follower":
+			if *status.MetadataRaftLeaderID == status.MetadataRaftLocalNodeID {
+				return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d reports follower role but identifies itself as leader", ordinal)
+			}
+		default:
+			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d is not in a stable Raft role: %q", ordinal, status.MetadataRaftRole)
+		}
+
+		if baseline == nil {
+			baseline = status
+			continue
+		}
+		if status.MetadataGroupID != baseline.MetadataGroupID ||
+			status.MetadataIncarnation != baseline.MetadataIncarnation ||
+			*status.MetadataRaftLeaderID != *baseline.MetadataRaftLeaderID {
+			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d disagrees on metadata group, incarnation, or leader", ordinal)
+		}
+	}
+	if leaderReports != 1 {
+		return fmt.Errorf("cannot safely migrate legacy metadata topology: expected exactly one member to report leader role, got %d", leaderReports)
+	}
+	return nil
+}
+
+func (r *AntflyClusterReconciler) fetchMetadataRuntimeTopology(ctx context.Context, cluster *antflyv1.AntflyCluster, ordinal int32) (*metadataRuntimeTopologyStatus, error) {
+	url := fmt.Sprintf("http://%s-metadata-%d.%s-metadata.%s.svc.cluster.local:%d/metadata/v1/status",
+		cluster.Name, ordinal, cluster.Name, cluster.Namespace, cluster.Spec.MetadataNodes.MetadataAPI.Port)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create metadata status request: %w", err)
+	}
+	resp, err := r.httpClient().Do(req) //nolint:gosec // URL is a deterministic cluster-internal pod address.
+	if err != nil {
+		return nil, fmt.Errorf("request metadata status: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil, fmt.Errorf("metadata status returned HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxMetadataRuntimeStatusBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read metadata status: %w", err)
+	}
+	if len(body) > maxMetadataRuntimeStatusBytes {
+		return nil, fmt.Errorf("metadata status exceeds %d bytes", maxMetadataRuntimeStatusBytes)
+	}
+	var status metadataRuntimeTopologyStatus
+	if err := json.Unmarshal(body, &status); err != nil {
+		return nil, fmt.Errorf("decode metadata status: %w", err)
+	}
+	return &status, nil
+}
+
+func validMetadataIncarnation(value string) bool {
+	if len(value) != 32 || value != strings.ToLower(value) || strings.Trim(value, "0") == "" {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 func parseMetadataTopologyReplicas(raw, source string) (int32, error) {
