@@ -14553,6 +14553,10 @@ pub const DB = struct {
             std.log.info("restore runtime repair phase=drain_async", .{});
             if (self.core.hasGeneratedEnrichmentTargets()) {
                 try self.runRestoreRepairDrainAsync();
+                // This is the only asynchronous restore phase that can apply
+                // newly generated dense vectors. Retire caches at that exact
+                // mutation boundary instead of after every restore quantum.
+                self.clearDenseHbcCaches();
             } else {
                 std.log.info("restore runtime repair phase=skip_async_drain", .{});
             }
@@ -17732,6 +17736,10 @@ pub const DB = struct {
     const DenseArtifactRebuildTarget = struct {
         dense_index_idx: usize,
         resume_from: ?[]u8 = null,
+        /// True only when resume_from came from a cursor owned by the current
+        /// catalog generation. Fresh and stale-generation targets must publish
+        /// a generation-owned restart cursor during execution, never probing.
+        resume_state_current: bool = false,
         artifact_target_count: u64 = 0,
 
         fn deinit(self: *@This(), alloc: Allocator) void {
@@ -18388,6 +18396,7 @@ pub const DB = struct {
         const Candidate = struct {
             dense_index_idx: usize,
             persisted_resume: ?[]u8 = null,
+            resume_state_current: bool = false,
             applied_sequence: u64,
             target_sequence: u64,
             artifact_counter_required: bool,
@@ -18443,7 +18452,17 @@ pub const DB = struct {
             const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
             defer alloc.free(rebuild_root_path);
             const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path, entry.config);
-            const persisted_resume = try rebuild_state.checkWithIo(alloc, self.core.index_manager.checkpointIo());
+            var loaded_rebuild_state = try rebuild_state.loadWithIo(alloc, self.core.index_manager.checkpointIo());
+            defer loaded_rebuild_state.deinit(alloc);
+            const persisted_resume: ?[]u8 = switch (loaded_rebuild_state) {
+                .absent => null,
+                // A cursor without the current catalog-generation identity is
+                // proof of interrupted work, but never a safe position. Carry
+                // an empty restart through the plan; execution owns the write.
+                .legacy => try alloc.dupe(u8, ""),
+                .corrupt => return error.InvalidRebuildState,
+                .valid => |key| try alloc.dupe(u8, key),
+            };
             errdefer if (persisted_resume) |buf| alloc.free(buf);
             const projection_checkpoint = try self.core.loadProjectionCheckpoint(alloc, entry.config.name);
             const config_hash = types.indexConfigHash(entry.config);
@@ -18481,6 +18500,7 @@ pub const DB = struct {
             try candidates.append(alloc, .{
                 .dense_index_idx = dense_index_idx,
                 .persisted_resume = persisted_resume,
+                .resume_state_current = loaded_rebuild_state == .valid,
                 .applied_sequence = applied_sequence,
                 .target_sequence = target_sequence,
                 .artifact_counter_required = artifact_counter_required,
@@ -18558,6 +18578,7 @@ pub const DB = struct {
                 try targets.append(alloc, .{
                     .dense_index_idx = dense_index_idx,
                     .resume_from = try alloc.dupe(u8, buf),
+                    .resume_state_current = candidate.resume_state_current,
                     .artifact_target_count = artifact_target_count,
                 });
                 continue;
@@ -18595,7 +18616,7 @@ pub const DB = struct {
             const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(self.alloc, entry.config.name);
             defer self.alloc.free(rebuild_root_path);
             const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path, entry.config);
-            try rebuild_state.clearWithIo(self.core.index_manager.checkpointIo());
+            try rebuild_state.clearAllWithIo(self.core.index_manager.checkpointIo());
             outcome.made_progress = true;
         }
         for (plan.generation_repairs) |repair| {
@@ -18645,13 +18666,14 @@ pub const DB = struct {
                 });
                 outcome.made_progress = true;
             }
-            // A non-null resume key was loaded from this exact rebuild-state
-            // checkpoint. Rewriting it adds I/O but no progress.
-            if (target.resume_from == null) {
+            // Only a cursor owned by this catalog generation is reusable.
+            // Fresh targets and stale-generation restart markers are persisted
+            // here so read-only readiness probes never perform migration I/O.
+            if (!target.resume_state_current) {
                 const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(self.alloc, entry.config.name);
                 defer self.alloc.free(rebuild_root_path);
                 const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path, entry.config);
-                try rebuild_state.updateWithIo(self.core.index_manager.checkpointIo(), "");
+                try rebuild_state.restartWithIo(self.core.index_manager.checkpointIo());
                 outcome.made_progress = true;
             }
         }
@@ -18678,7 +18700,7 @@ pub const DB = struct {
             const repaired = denseCoverageMatchesTarget(entry.index.stats().active_count, target.artifact_target_count) and
                 applied_sequence >= target_sequence;
             if (repaired) {
-                try rebuild_state.clearWithIo(self.core.index_manager.checkpointIo());
+                try rebuild_state.clearAllWithIo(self.core.index_manager.checkpointIo());
                 const checkpoint = try self.core.loadProjectionCheckpoint(alloc, entry.config.name);
                 try self.core.saveProjectionCheckpoint(entry.config.name, .{
                     .applied_sequence = applied_sequence,
@@ -18892,7 +18914,7 @@ pub const DB = struct {
                 const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
                 defer alloc.free(rebuild_root_path);
                 const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path, entry.config);
-                try rebuild_state.clearWithIo(self.core.index_manager.checkpointIo());
+                try rebuild_state.clearAllWithIo(self.core.index_manager.checkpointIo());
                 try self.core.saveProjectionCheckpoint(entry.config.name, .{
                     .applied_sequence = target_sequence,
                     .status = .clean,
@@ -19165,6 +19187,47 @@ pub const DB = struct {
         // the execution helper clears it, but readiness must not surface it as
         // rebuild debt (and this probe must remain mutation-free).
         return plan.targets.len > 0 or plan.generation_repairs.len > 0;
+    }
+
+    /// Internal scheduler predicate. Unlike logical readiness, maintenance
+    /// includes stale cursor cleanup, but excludes generation debt already
+    /// delegated to an equivalent durable repair intent. The probe is
+    /// read-only: cursor migration and query-gate changes happen in execution.
+    pub fn denseArtifactRebuildMaintenanceNeeded(self: *DB, alloc: Allocator) !bool {
+        var plan = try self.collectDenseArtifactRebuildPlan(alloc);
+        defer plan.deinit(alloc);
+        if (plan.targets.len > 0 or plan.rebuild_state_cleanups.len > 0) return true;
+        for (plan.generation_repairs) |repair| {
+            const entry = &self.core.index_manager.dense_indexes.items[repair.dense_index_idx];
+            if (!self.core.index_manager.repairUnavailable(entry.config.name)) return true;
+            const repair_id = (try self.indexRepairIdForIndex(alloc, entry.config.name)) orelse return true;
+            var existing = self.loadIndexRepairEntryById(alloc, repair_id) catch |err| switch (err) {
+                error.FileNotFound, error.IndexRepairIntentNotFound => return true,
+                else => return err,
+            };
+            defer existing.deinit(alloc);
+            if (automaticDenseGenerationRepairTriggerPriority(repair.trigger) >
+                automaticDenseGenerationRepairTriggerPriority(existing.intent.trigger)) return true;
+        }
+        return false;
+    }
+
+    /// Executes one internal maintenance pass and reports only state mutation,
+    /// not the legacy public work count. Cache retirement is owned here so
+    /// managed callers cannot mistake rediscovered repair debt for visibility.
+    pub fn runDenseArtifactRebuildMaintenanceWithProgress(
+        self: *DB,
+        alloc: Allocator,
+        progress_ctx: ?*anyopaque,
+        progress_hook: ?ReplayProgressHook,
+    ) !bool {
+        const outcome = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsOutcomeWithProgress(
+            alloc,
+            progress_ctx,
+            progress_hook,
+        );
+        if (outcome.dense_visibility_changed) self.clearDenseHbcCaches();
+        return outcome.made_progress;
     }
 
     pub fn rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeededWithProgress(
@@ -73209,13 +73272,26 @@ test "db dense artifact rebuild clears stale persisted state when no valid artif
         });
         defer reopened.close();
 
-        try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
-        try std.testing.expectEqual(@as(usize, 0), try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc));
-
         const rebuild_root_path = try reopened.denseIndexRebuildStatePathAlloc(alloc, "dense_idx");
         defer alloc.free(rebuild_root_path);
-        const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
-        try std.testing.expect((try rebuild_state.check(alloc)) == null);
+        const legacy_rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
+        var before_probe = try legacy_rebuild_state.loadWithIo(alloc, std.testing.io);
+        defer before_probe.deinit(alloc);
+        try std.testing.expectEqualStrings("doc:z", before_probe.valid);
+
+        try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
+        // Logical readiness is read-only and does not surface internal cursor
+        // cleanup as user-visible rebuild debt.
+        var after_probe = try legacy_rebuild_state.loadWithIo(alloc, std.testing.io);
+        defer after_probe.deinit(alloc);
+        try std.testing.expectEqualStrings("doc:z", after_probe.valid);
+
+        try std.testing.expect(try reopened.denseArtifactRebuildMaintenanceNeeded(alloc));
+        try std.testing.expect(try reopened.runDenseArtifactRebuildMaintenanceWithProgress(alloc, null, null));
+        try std.testing.expect(!(try reopened.denseArtifactRebuildMaintenanceNeeded(alloc)));
+        var cleared = try legacy_rebuild_state.loadWithIo(alloc, std.testing.io);
+        defer cleared.deinit(alloc);
+        try std.testing.expect(cleared == .absent);
     }
 }
 

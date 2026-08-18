@@ -16222,8 +16222,8 @@ pub const HostedProvisionedTableWriteSource = struct {
                 _ = try seedManagedIndexReplayFromStoredDocsIfNeeded(alloc, cached.db, index_name);
             }
 
-            if (try cached.db.hasPendingDenseArtifactRebuild(alloc)) {
-                _ = try cached.db.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+            if (try cached.db.denseArtifactRebuildMaintenanceNeeded(alloc)) {
+                _ = try cached.db.runDenseArtifactRebuildMaintenanceWithProgress(alloc, null, null);
             }
             try drainManagedDbBeforeClose(cached.db);
             try publishRuntimeStatusSnapshotToCacheConsistent(
@@ -18644,8 +18644,8 @@ fn replayManagedIndexForTableIfNeeded(
 
         _ = try seedManagedIndexReplayFromStoredDocsIfNeeded(alloc, &db, index_name);
 
-        if (try db.hasPendingDenseArtifactRebuild(alloc)) {
-            _ = try db.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+        if (try db.denseArtifactRebuildMaintenanceNeeded(alloc)) {
+            _ = try db.runDenseArtifactRebuildMaintenanceWithProgress(alloc, null, null);
             try db.runUntilIdle();
         }
     }
@@ -18699,8 +18699,8 @@ fn catchUpManagedIndexCreate(
 
     try db.runUntilIdle();
 
-    if (try db.hasPendingDenseArtifactRebuild(alloc)) {
-        _ = try db.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+    if (try db.denseArtifactRebuildMaintenanceNeeded(alloc)) {
+        _ = try db.runDenseArtifactRebuildMaintenanceWithProgress(alloc, null, null);
         try db.runUntilIdle();
     }
     if (requires_enrichment_replay) {
@@ -21310,7 +21310,7 @@ fn managedDbHasBroadCatchUpDebt(alloc: std.mem.Allocator, db: *db_mod.DB) !bool 
     const enrichment = db.pendingWorkStats().enrichment;
     if (enrichment.enabled and enrichment.applied_sequence < enrichment.target_sequence) return true;
     if (try db.restoreRuntimeRepairNeeded()) return true;
-    return try db.hasPendingDenseArtifactRebuild(alloc);
+    return try db.denseArtifactRebuildMaintenanceNeeded(alloc);
 }
 
 fn catchUpManagedDb(
@@ -21374,7 +21374,7 @@ fn catchUpManagedDb(
         std.log.warn("managed startup restore repair failed phase=probe class={s}", .{@errorName(err)});
         return err;
     };
-    const needs_dense_artifact_rebuild = db.hasPendingDenseArtifactRebuild(alloc) catch |err| {
+    const needs_dense_artifact_maintenance = db.denseArtifactRebuildMaintenanceNeeded(alloc) catch |err| {
         std.log.warn("managed startup catch-up dense rebuild probe failed table={s} err={}", .{ table_name, err });
         return err;
     };
@@ -21384,11 +21384,11 @@ fn catchUpManagedDb(
         else => return err,
     };
     const initial_index_repair_debt = initial_index_load_failure or initial_index_repair_intents;
-    const initial_repair_debt = had_debt or restore_repair_needed or needs_dense_artifact_rebuild or initial_index_load_failure or initial_index_repair_intents;
+    const initial_repair_debt = had_debt or restore_repair_needed or needs_dense_artifact_maintenance or initial_index_load_failure or initial_index_repair_intents;
 
     if (mode == .index_repair_only) {
         if (!initial_index_repair_debt) return .{};
-        if (had_debt or restore_repair_needed or needs_dense_artifact_rebuild) {
+        if (had_debt or restore_repair_needed or needs_dense_artifact_maintenance) {
             // Full startup/restore catch-up owns these mutations under its
             // exclusive lifecycle fence. Retain the exact index-repair queue
             // entry, but do not let a live, cooperatively admitted repair pass
@@ -21416,7 +21416,7 @@ fn catchUpManagedDb(
     }
 
     var repaired_restore_runtime = false;
-    var repaired_dense_artifacts: usize = 0;
+    var repaired_dense_artifacts = false;
     var repaired_indexes: usize = 0;
     var degraded_indexes: usize = 0;
     var made_progress = false;
@@ -21460,11 +21460,9 @@ fn catchUpManagedDb(
             return err;
         };
         made_progress = repaired_restore_runtime;
-        // Every restore phase may replace dense graph or artifact state. The
-        // live-writer path deliberately retains this DB between bounded
-        // quanta, so invalidate its HBC namespace at the mutation boundary
-        // rather than relying on the all-debt completion path below.
-        if (repaired_restore_runtime) db.clearDenseHbcCaches();
+        // Dense mutation phases retire their own HBC state inside DB repair.
+        // Keep the resident writer's warm cache across watermark, graph, and
+        // phase-marker-only quanta.
         try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
         std.log.info("managed restore repair step complete group_id={d} repaired={}", .{ group_id, repaired_restore_runtime });
     } else if (runs_broad_debt and had_debt) {
@@ -21514,15 +21512,15 @@ fn catchUpManagedDb(
         return .{};
     }
 
-    if (runs_broad_debt and !restore_repair_needed and needs_dense_artifact_rebuild) {
+    if (runs_broad_debt and !restore_repair_needed and needs_dense_artifact_maintenance) {
         progress_ctx.phase = .artifact_rebuild;
         try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
-        repaired_dense_artifacts = db.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeededWithProgress(alloc, &progress_ctx, ProgressCtx.run) catch |err| {
+        repaired_dense_artifacts = db.runDenseArtifactRebuildMaintenanceWithProgress(alloc, &progress_ctx, ProgressCtx.run) catch |err| {
             std.log.warn("managed startup catch-up dense rebuild failed table={s} err={}", .{ table_name, err });
             return err;
         };
-        made_progress = made_progress or repaired_dense_artifacts > 0;
-        if (repaired_dense_artifacts > 0) {
+        made_progress = made_progress or repaired_dense_artifacts;
+        if (repaired_dense_artifacts) {
             db.runUntilIdle() catch |err| {
                 std.log.warn("managed startup catch-up dense rebuild idle drain failed table={s} err={}", .{ table_name, err });
                 return err;
@@ -21532,12 +21530,12 @@ fn catchUpManagedDb(
         try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
     }
 
-    if (mode == .all_debt and !initial_repair_debt and !repaired_restore_runtime and repaired_dense_artifacts == 0) {
+    if (mode == .all_debt and !initial_repair_debt and !repaired_restore_runtime and !repaired_dense_artifacts) {
         return .{};
     }
 
     if (mode == .broad_debt_only) {
-        const initial_broad_debt = had_debt or restore_repair_needed or needs_dense_artifact_rebuild;
+        const initial_broad_debt = had_debt or restore_repair_needed or needs_dense_artifact_maintenance;
         return .{
             .had_debt = initial_repair_debt,
             // The caller rechecks broad debt under the same exclusive guard
@@ -21615,7 +21613,7 @@ fn catchUpManagedDb(
                 .made_progress = made_progress,
             };
         }
-        if (db.hasPendingDenseArtifactRebuild(alloc) catch |err| {
+        if (db.denseArtifactRebuildMaintenanceNeeded(alloc) catch |err| {
             std.log.warn("managed startup catch-up post-check dense rebuild probe failed table={s} err={}", .{ table_name, err });
             return err;
         }) {
@@ -21669,8 +21667,8 @@ fn catchUpManagedDb(
         .cleared_debt = if (index_only_result)
             repaired_indexes > 0
         else
-            had_debt or repaired_restore_runtime or repaired_dense_artifacts > 0 or repaired_indexes > 0,
-        .made_progress = made_progress or result_had_debt,
+            had_debt or repaired_restore_runtime or repaired_dense_artifacts or repaired_indexes > 0,
+        .made_progress = made_progress,
         .index_repair_attempted = advance_index_repairs and repaired_indexes != 0,
         .index_repair_repaired = repaired_indexes != 0,
         .index_repair_degraded = degraded_indexes != 0,
@@ -37844,9 +37842,9 @@ test "live managed repair upgrades broad recovery alongside status before bounde
     search.deinit();
 
     // Exercise the live-restore variant independently after replay/index
-    // coexistence has proven its contents. Restore must clear resident HBC
-    // state after every bounded mutation and keep its durable route while
-    // enabled workers converge asynchronous coverage.
+    // coexistence has proven its contents. Non-dense phase transitions retain
+    // the warm resident cache; the first dense mutation retires it while the
+    // durable route remains pinned across bounded quanta.
     _ = try repaired_dense.index.cacheMetadata(9999, "stale-before-restore");
     try std.testing.expect(repaired_dense.index.hbcCacheStats().metadata.used_bytes > 0);
     queued = try cached.db.repairArtifactIssuesWithRequestOptions(alloc, .{
@@ -37878,7 +37876,7 @@ test "live managed repair upgrades broad recovery alongside status before bounde
 
     cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .writer_no_replay, null, null);
     const recovering_dense = cached.db.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(u64, 0), recovering_dense.index.hbcCacheStats().total_bytes);
+    try std.testing.expect(recovering_dense.index.hbcCacheStats().metadata.used_bytes > 0);
     cached.deinit(alloc);
 
     for (0..16) |_| {
@@ -37915,6 +37913,95 @@ test "live managed repair upgrades broad recovery alongside status before bounde
     defer search.deinit();
     try std.testing.expectEqual(@as(u32, 3), search.total_hits);
     try std.testing.expectEqualStrings("doc:a", search.hits[0].id);
+}
+
+test "managed dense maintenance does not report delegated repair rediscovery as progress" {
+    const alloc = std.testing.allocator;
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/managed-dense-delegated-progress",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"_embeddings\":{\"dense_idx\":[1,0]}}",
+        }},
+        .sync_level = .full_index,
+    });
+    try markManagedIndexRepairRequired(alloc, &db, "dense_idx");
+
+    try std.testing.expect(try db.denseArtifactRebuildMaintenanceNeeded(alloc));
+    try std.testing.expect(try db.runDenseArtifactRebuildMaintenanceWithProgress(alloc, null, null));
+    try std.testing.expect(try db.hasPendingDenseArtifactRebuild(alloc));
+    try std.testing.expect(!(try db.denseArtifactRebuildMaintenanceNeeded(alloc)));
+    try std.testing.expect(!(try db.runDenseArtifactRebuildMaintenanceWithProgress(alloc, null, null)));
+
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, NoCatalog.iface());
+    defer source.deinit();
+    const result = try catchUpManagedDb(
+        &source,
+        alloc,
+        7001,
+        "docs",
+        &db,
+        false,
+        .isolated,
+        .broad_debt_only,
+        .{},
+    );
+    try std.testing.expect(result.had_debt);
+    try std.testing.expect(!result.cleared_debt);
+    try std.testing.expect(!result.made_progress);
+
+    const delegated = try catchUpManagedDb(
+        &source,
+        alloc,
+        7001,
+        "docs",
+        &db,
+        false,
+        .isolated,
+        .all_debt,
+        .{},
+    );
+    try std.testing.expect(delegated.had_debt);
+    try std.testing.expect(delegated.index_repair_pending);
+    try std.testing.expect(!delegated.made_progress);
 }
 
 test "managed startup catch-up defers while shared writer cache owns the table" {
