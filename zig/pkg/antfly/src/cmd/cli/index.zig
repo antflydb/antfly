@@ -16,10 +16,12 @@ const std = @import("std");
 const antfly = @import("../../cli_root.zig");
 const antfly_client = @import("antfly-client");
 const cli = @import("mod.zig");
+const index_readiness = @import("index_readiness.zig");
 const platform_time = antfly.platform_time;
 
 const default_wait_timeout_ms: u64 = 10 * 60 * 1000;
 const default_wait_poll_ms: u64 = 1000;
+const max_wait_retry_delay_ms: u64 = 5000;
 const wait_progress_report_interval_ns: u64 = 10 * std.time.ns_per_s;
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
@@ -261,9 +263,7 @@ fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient
     };
     defer parsed.deinit();
 
-    var resp = try client.createIndex(table_name, name, parsed.value);
-    defer resp.deinit();
-    cli.expectHttpSuccess(resp);
+    try client.createIndex(table_name, name, parsed.value);
     std.debug.print("Create index command successful.\n", .{});
 }
 
@@ -282,9 +282,7 @@ fn dropIndex(client: *antfly_client.AntflyClient, table_name: []const u8, pre_in
         }
     }
     const name = idx_name orelse cli.fatal("--index is required", .{});
-    var resp = try client.dropIndex(table_name, name);
-    defer resp.deinit();
-    cli.expectHttpSuccess(resp);
+    try client.dropIndex(table_name, name);
     std.debug.print("Drop index command successful.\n", .{});
 }
 
@@ -385,7 +383,7 @@ fn summarizeStats(stats: anytype) IndexSummary {
     const coverage_missing = if (@hasField(Stats, "coverage")) stats.coverage == null else false;
     const coverage_incomplete = if (@hasField(Stats, "coverage")) blk: {
         const coverage = stats.coverage orelse break :blk true;
-        break :blk !coverage.observation_complete or !coverage.complete;
+        break :blk !index_readiness.coverageReady(coverage);
     } else false;
     const state = if (error_text != null)
         "failed"
@@ -515,11 +513,69 @@ fn waitForIndex(
     }
 
     const name = index_name orelse cli.fatal("--index is required", .{});
+    return waitForIndexWithFetcher(allocator, io, .fromClient(client), table_name, name, timeout_ms, poll_ms);
+}
+
+const IndexStatusResponse = antfly_client.openapi.ApiResponse(antfly_client.types.IndexStatus);
+
+const IndexStatusFetcher = struct {
+    ptr: *anyopaque,
+    fetch_fn: *const fn (ptr: *anyopaque, table_name: []const u8, index_name: []const u8) anyerror!IndexStatusResponse,
+
+    fn fromClient(client: *antfly_client.AntflyClient) IndexStatusFetcher {
+        return .{ .ptr = client, .fetch_fn = fetchFromClient };
+    }
+
+    fn fetch(self: IndexStatusFetcher, table_name: []const u8, index_name: []const u8) !IndexStatusResponse {
+        return self.fetch_fn(self.ptr, table_name, index_name);
+    }
+
+    fn fetchFromClient(ptr: *anyopaque, table_name: []const u8, index_name: []const u8) anyerror!IndexStatusResponse {
+        const client: *antfly_client.AntflyClient = @ptrCast(@alignCast(ptr));
+        return client.getIndexResponse(table_name, index_name);
+    }
+};
+
+fn waitForIndexWithFetcher(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    fetcher: IndexStatusFetcher,
+    table_name: []const u8,
+    name: []const u8,
+    timeout_ms: u64,
+    poll_ms: u64,
+) !void {
     const started_ns = platform_time.monotonicNs();
     const timeout_ns = std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
     var progress_reporter = WaitProgressReporter{};
+    var consecutive_failures: u32 = 0;
     while (true) {
-        var resp = try client.getIndex(table_name, name);
+        var resp = fetcher.fetch(table_name, name) catch |err| {
+            if (!retryableWaitTransportError(err)) return err;
+            consecutive_failures +|= 1;
+            const now_ns = platform_time.monotonicNs();
+            if (progress_reporter.shouldReport("unavailable", now_ns)) {
+                std.debug.print("Waiting for index {s}: unavailable ({s}); retrying\n", .{ name, @errorName(err) });
+            }
+            sleepForNextWaitAttempt(io, started_ns, timeout_ns, timeout_ms, retryDelayMs(poll_ms, consecutive_failures, now_ns), name, progress_reporter.last_state);
+            continue;
+        };
+        if (resp.status_code >= 300) {
+            if (!retryableWaitHttpStatus(resp.status_code)) {
+                cli.expectHttpSuccess(resp);
+                cli.fatal("index {s} returned HTTP {d}", .{ name, resp.status_code });
+            }
+            consecutive_failures +|= 1;
+            const now_ns = platform_time.monotonicNs();
+            if (progress_reporter.shouldReport("unavailable", now_ns)) {
+                std.debug.print("Waiting for index {s}: unavailable (HTTP {d}); retrying\n", .{ name, resp.status_code });
+            }
+            resp.deinit();
+            sleepForNextWaitAttempt(io, started_ns, timeout_ns, timeout_ms, retryDelayMs(poll_ms, consecutive_failures, now_ns), name, progress_reporter.last_state);
+            continue;
+        }
+
+        consecutive_failures = 0;
         if (resp.data) |parsed| {
             const summary = summarizeIndex(parsed.value);
             switch (waitDisposition(summary)) {
@@ -534,27 +590,70 @@ fn waitForIndex(
             if (progress_reporter.shouldReport(summary.state, platform_time.monotonicNs())) {
                 printWaitProgress(name, summary);
             }
-        } else if (resp.status_code != 404 and resp.status_code != 503) {
-            cli.expectHttpSuccess(resp);
+        } else {
             cli.fatal("index {s} returned an unreadable HTTP {d} response", .{ name, resp.status_code });
-        } else if (progress_reporter.shouldReport("unavailable", platform_time.monotonicNs())) {
-            std.debug.print("Waiting for index {s}: unavailable (HTTP {d})\n", .{ name, resp.status_code });
         }
         resp.deinit();
-
-        const elapsed_ns = platform_time.monotonicNs() -| started_ns;
-        if (elapsed_ns >= timeout_ns) {
-            cli.fatal("timed out after {d}ms waiting for index {s} (last state: {s}); run index list --output json for diagnostics", .{
-                timeout_ms,
-                name,
-                progress_reporter.last_state orelse "unknown",
-            });
-        }
-        const delay_ns = @min(poll_ms *| std.time.ns_per_ms, timeout_ns - elapsed_ns);
-        io.sleep(std.Io.Duration.fromNanoseconds(@intCast(delay_ns)), .awake) catch {
-            cli.fatal("interrupted while waiting for index {s}", .{name});
-        };
+        sleepForNextWaitAttempt(io, started_ns, timeout_ns, timeout_ms, poll_ms, name, progress_reporter.last_state);
     }
+}
+
+fn retryableWaitHttpStatus(status: u16) bool {
+    return status == 404 or status == 408 or status == 425 or status == 429 or
+        status == 500 or status == 502 or status == 503 or status == 504;
+}
+
+fn retryableWaitTransportError(err: anyerror) bool {
+    const name = @errorName(err);
+    const permanent = [_][]const u8{
+        "OutOfMemory",
+        "InvalidUri",
+        "InvalidHostName",
+        "TooManyRedirects",
+        "UnsafeRedirect",
+        "ResponseTooLarge",
+        "InvalidResponse",
+        "ProtocolError",
+        "DecompressionFailed",
+        "Cancelled",
+        "Canceled",
+        "AccessDenied",
+    };
+    for (permanent) |value| if (std.mem.eql(u8, name, value)) return false;
+    if (std.mem.indexOf(u8, name, "Certificate") != null) return false;
+    return true;
+}
+
+fn retryDelayMs(base_ms: u64, consecutive_failures: u32, entropy: u64) u64 {
+    const exponent: u6 = @intCast(@min(consecutive_failures -| 1, 3));
+    const scaled = base_ms *| (@as(u64, 1) << exponent);
+    const bounded = @min(scaled, @max(base_ms, max_wait_retry_delay_ms));
+    const jitter_span = bounded / 5;
+    if (jitter_span == 0) return bounded;
+    return bounded - jitter_span / 2 + entropy % (jitter_span + 1);
+}
+
+fn sleepForNextWaitAttempt(
+    io: std.Io,
+    started_ns: u64,
+    timeout_ns: u64,
+    timeout_ms: u64,
+    requested_delay_ms: u64,
+    index_name: []const u8,
+    last_state: ?[]const u8,
+) void {
+    const elapsed_ns = platform_time.monotonicNs() -| started_ns;
+    if (elapsed_ns >= timeout_ns) {
+        cli.fatal("timed out after {d}ms waiting for index {s} (last state: {s}); run index list --output json for diagnostics", .{
+            timeout_ms,
+            index_name,
+            last_state orelse "unknown",
+        });
+    }
+    const delay_ns = @min(requested_delay_ms *| std.time.ns_per_ms, timeout_ns - elapsed_ns);
+    io.sleep(std.Io.Duration.fromNanoseconds(@intCast(delay_ns)), .awake) catch {
+        cli.fatal("interrupted while waiting for index {s}", .{index_name});
+    };
 }
 
 fn canonicalWaitState(state: []const u8) []const u8 {
@@ -698,6 +797,20 @@ test "index wait requires complete compatible coverage" {
     });
     try std.testing.expectEqualStrings("config_mismatch", summary.state);
     try std.testing.expect(!summary.failed);
+
+    coverage.policy = .external;
+    coverage.observation_complete = true;
+    coverage.config_mismatch_group_count = 0;
+    coverage.complete = false;
+    coverage.healthy = false;
+    summary = summarizeStats(antfly_client.types.EmbeddingsIndexStats{
+        .index_type = .embeddings,
+        .rebuilding = false,
+        .backfill_state = "ready",
+        .coverage = coverage,
+    });
+    try std.testing.expectEqualStrings("ready", summary.state);
+    try std.testing.expect(summary.ready);
 }
 
 test "index wait progress reporting is immediate periodic and state sensitive" {
@@ -734,4 +847,52 @@ test "index wait disposition retries mismatch and fails only terminal states" {
         .ready = true,
         .failed = false,
     }));
+}
+
+test "index wait retries bounded HTTP and transport failures" {
+    try std.testing.expect(retryableWaitHttpStatus(404));
+    try std.testing.expect(retryableWaitHttpStatus(429));
+    try std.testing.expect(retryableWaitHttpStatus(502));
+    try std.testing.expect(!retryableWaitHttpStatus(400));
+    try std.testing.expect(!retryableWaitHttpStatus(401));
+    try std.testing.expect(retryableWaitTransportError(error.ConnectionResetByPeer));
+    try std.testing.expect(retryableWaitTransportError(error.Timeout));
+    try std.testing.expect(!retryableWaitTransportError(error.InvalidUri));
+    try std.testing.expect(!retryableWaitTransportError(error.CertificateVerificationFailed));
+    try std.testing.expect(retryDelayMs(1000, 4, 0) <= max_wait_retry_delay_ms);
+
+    const Fake = struct {
+        allocator: std.mem.Allocator,
+        calls: usize = 0,
+
+        fn fetch(ptr: *anyopaque, table_name: []const u8, index_name: []const u8) anyerror!IndexStatusResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("external_idx", index_name);
+            const call = self.calls;
+            self.calls += 1;
+            if (call == 0) return error.ConnectionResetByPeer;
+            const state = if (call == 2) "running" else "ready";
+            const body = try std.fmt.allocPrint(self.allocator,
+                \\{{"shard_status":{{}},"config":{{"name":"external_idx","type":"embeddings","external":true,"dimension":3}},"status":{{"index_type":"embeddings","rebuilding":{s},"backfill_state":"{s}","total_indexed":1,"query_visible_doc_count":1,"coverage":{{"policy":"external","observation_complete":true,"observation_incomplete_reasons":[],"config_fingerprint":"0123456789abcdef","summary_ready":true,"config_mismatch_group_count":0,"source_total":10,"produced":1,"skipped":0,"terminal_failed":0,"covered":1,"settled":1,"uncovered":9,"pending":9,"complete":false,"healthy":false,"degraded":false}}}}}}
+            , .{ if (call == 2) "true" else "false", state });
+            defer self.allocator.free(body);
+            const parsed = try std.json.parseFromSlice(antfly_client.types.IndexStatus, self.allocator, body, .{ .allocate = .alloc_always });
+            // A retryable HTTP status is authoritative even if an intermediary
+            // supplies a stale but otherwise parseable success-shaped body.
+            return .{ .status_code = if (call == 1) 503 else 200, .data = parsed, .allocator = self.allocator };
+        }
+    };
+
+    var fake = Fake{ .allocator = std.testing.allocator };
+    try waitForIndexWithFetcher(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .ptr = &fake, .fetch_fn = Fake.fetch },
+        "docs",
+        "external_idx",
+        1000,
+        1,
+    );
+    try std.testing.expectEqual(@as(usize, 4), fake.calls);
 }

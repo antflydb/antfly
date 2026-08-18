@@ -136,12 +136,19 @@ pub const AntflyClient = struct {
     }
 
     pub fn getIndex(self: *AntflyClient, table_name: []const u8, index_name: []const u8) !openapi.ApiResponse(openapi.types.IndexStatus) {
-        var resp = try self.inner.getIndex(table_name, index_name);
+        var resp = try self.getIndexResponse(table_name, index_name);
         if (resp.status_code >= 300) {
             defer resp.deinit();
             return self.apiErrorFromResponse(&resp);
         }
         return resp;
+    }
+
+    /// Returns the typed HTTP response without converting non-2xx statuses to
+    /// `error.ApiError`. Long-running readiness commands use this to classify
+    /// retryable status codes without weakening normal one-shot API behavior.
+    pub fn getIndexResponse(self: *AntflyClient, table_name: []const u8, index_name: []const u8) !openapi.ApiResponse(openapi.types.IndexStatus) {
+        return self.inner.getIndex(table_name, index_name);
     }
 
     pub fn listIndexes(self: *AntflyClient, table_name: []const u8) !openapi.ApiResponse([]const openapi.types.IndexStatus) {

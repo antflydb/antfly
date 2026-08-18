@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const antfly_client = @import("antfly-client");
+const httpx = antfly_client.httpx;
 const cli = @import("mod.zig");
 
 const TableCreateOption = enum { table, shards, file, index, schema };
@@ -158,9 +159,7 @@ fn createTable(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.
         if (shards != null) {
             cli.fatal("--shards with --file is not supported; put num_shards in {s}", .{path});
         }
-        var resp = try client.createTable(name, parsed.value);
-        defer resp.deinit();
-        cli.expectHttpSuccess(resp);
+        try client.createTable(name, parsed.value);
         std.debug.print("Create table command successful.\n", .{});
         return;
     }
@@ -184,9 +183,7 @@ fn createTable(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.
         body.indexes = indexes;
     }
 
-    var resp = try client.createTable(name, body);
-    defer resp.deinit();
-    cli.expectHttpSuccess(resp);
+    try client.createTable(name, body);
     std.debug.print("Create table command successful.\n", .{});
 }
 
@@ -201,9 +198,7 @@ fn dropTable(client: *antfly_client.AntflyClient, args: *std.process.Args.Iterat
         }
     }
     const name = table_name orelse cli.fatal("--table is required", .{});
-    var resp = try client.dropTable(name);
-    defer resp.deinit();
-    cli.expectHttpSuccess(resp);
+    try client.dropTable(name);
     std.debug.print("Drop table command successful.\n", .{});
 }
 
@@ -343,4 +338,57 @@ test "table create inline configs reject malformed unknown and duplicate definit
     try std.testing.expectError(error.UnknownField, parseInlineSchemaConfig(alloc,
         \\{"unknown_schema_field":true}
     ));
+}
+
+test "table create sends the exact quickstart inline index through the HTTP client" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    const Assert = struct {
+        fn request(info: httpx.testing_mod.RequestInfo) !void {
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, info.body, .{});
+            defer parsed.deinit();
+            const root = parsed.value.object;
+            const indexes = root.get("indexes") orelse return error.MissingIndexes;
+            const title_body = indexes.object.get("title_body") orelse return error.MissingTitleBody;
+            try std.testing.expectEqualStrings("title_body", title_body.object.get("name").?.string);
+            try std.testing.expectEqualStrings("embeddings", title_body.object.get("type").?.string);
+            try std.testing.expectEqualStrings("{{title}} {{body}}", title_body.object.get("template").?.string);
+            try std.testing.expectEqualStrings("antflydb/clipclap", title_body.object.get("embedder").?.object.get("model").?.string);
+            try std.testing.expectEqual(@as(i64, 200), title_body.object.get("chunker").?.object.get("text").?.object.get("target_tokens").?.integer);
+        }
+    };
+
+    var server = try httpx.TestServer.start(alloc, io, &.{.{
+        .method = .POST,
+        .path = "/db/v1/tables/wikipedia",
+        .respond = .{ .body = "{}" },
+        .assert_request = Assert.request,
+    }});
+    defer server.deinit();
+
+    var http = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer http.deinit();
+    var client = try antfly_client.AntflyClient.init(alloc, &http, server.baseUrl());
+    defer client.deinit();
+    var succeeded = std.atomic.Value(bool).init(false);
+    var group = std.Io.Group.init;
+    const ClientTask = struct {
+        fn run(test_io: std.Io, c: *antfly_client.AntflyClient, success: *std.atomic.Value(bool)) std.Io.Cancelable!void {
+            var argv = [_][*:0]const u8{
+                "--table",
+                "wikipedia",
+                "--index",
+                \\{"name":"title_body","type":"embeddings","template":"{{title}} {{body}}","embedder":{"provider":"antfly","model":"antflydb/clipclap"},"chunker":{"provider":"antfly","text":{"target_tokens":200,"overlap_tokens":25}}}
+                ,
+            };
+            var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+            createTable(std.testing.allocator, test_io, c, &args) catch return;
+            success.store(true, .release);
+        }
+    };
+    try group.concurrent(io, ClientTask.run, .{ io, &client, &succeeded });
+    try server.handleOne();
+    try group.await(io);
+    try std.testing.expect(succeeded.load(.acquire));
 }

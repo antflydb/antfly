@@ -15,57 +15,134 @@
 const std = @import("std");
 const antfly_client = @import("antfly-client");
 const cli = @import("mod.zig");
+const index_readiness = @import("index_readiness.zig");
 
-pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
-    var table_name: ?[]const u8 = null;
-    var full_text_search: ?[]const u8 = null;
-    var full_text_search_json: ?[]const u8 = null;
-    var semantic_search: ?[]const u8 = null;
-    var fields_str: ?[]const u8 = null;
-    var limit: ?i64 = null;
-    var offset: ?i64 = null;
-    var indexes_str: ?[]const u8 = null;
-    var filter_query: ?[]const u8 = null;
-    var exclusion_query: ?[]const u8 = null;
-    var aggregations_json: ?[]const u8 = null;
-    var reranker_json: ?[]const u8 = null;
-    var pruner_json: ?[]const u8 = null;
+const QueryOptions = struct {
+    table_name: ?[]const u8 = null,
+    full_text_search: ?[]const u8 = null,
+    full_text_search_json: ?[]const u8 = null,
+    semantic_search: ?[]const u8 = null,
+    fields_str: ?[]const u8 = null,
+    limit: ?i64 = null,
+    offset: ?i64 = null,
+    indexes_str: ?[]const u8 = null,
+    filter_query: ?[]const u8 = null,
+    exclusion_query: ?[]const u8 = null,
+    aggregations_json: ?[]const u8 = null,
+    reranker_json: ?[]const u8 = null,
+    pruner_json: ?[]const u8 = null,
+};
 
+const QueryParseIssue = union(enum) {
+    missing_value: []const u8,
+    duplicate: []const u8,
+    unknown: []const u8,
+    invalid_integer: struct { flag: []const u8, value: []const u8 },
+    non_positive: struct { flag: []const u8, value: []const u8 },
+    negative: struct { flag: []const u8, value: []const u8 },
+    too_large: struct { flag: []const u8, value: []const u8 },
+    conflicting_search: void,
+    semantic_offset: void,
+};
+
+const QueryParseResult = union(enum) { value: QueryOptions, issue: QueryParseIssue };
+
+fn parseQueryOptions(iterator: std.process.Args.Iterator) QueryParseResult {
+    var args = iterator;
+    var options: QueryOptions = .{};
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
-            table_name = args.next();
+            if (options.table_name != null) return .{ .issue = .{ .duplicate = arg } };
+            options.table_name = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
         } else if (std.mem.eql(u8, arg, "--full-text-search")) {
-            full_text_search = args.next();
+            if (options.full_text_search != null) return .{ .issue = .{ .duplicate = arg } };
+            options.full_text_search = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
         } else if (std.mem.eql(u8, arg, "--full-text-search-json")) {
-            full_text_search_json = args.next();
+            if (options.full_text_search_json != null) return .{ .issue = .{ .duplicate = arg } };
+            options.full_text_search_json = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
         } else if (std.mem.eql(u8, arg, "--semantic-search")) {
-            semantic_search = args.next();
+            if (options.semantic_search != null) return .{ .issue = .{ .duplicate = arg } };
+            options.semantic_search = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
         } else if (std.mem.eql(u8, arg, "--fields")) {
-            fields_str = args.next();
+            if (options.fields_str != null) return .{ .issue = .{ .duplicate = arg } };
+            options.fields_str = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
         } else if (std.mem.eql(u8, arg, "--limit")) {
-            if (args.next()) |s| limit = std.fmt.parseInt(i64, s, 10) catch null;
+            if (options.limit != null) return .{ .issue = .{ .duplicate = arg } };
+            const raw = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
+            const value = std.fmt.parseInt(i64, raw, 10) catch return .{ .issue = .{ .invalid_integer = .{ .flag = arg, .value = raw } } };
+            if (value <= 0) return .{ .issue = .{ .non_positive = .{ .flag = arg, .value = raw } } };
+            if (value > std.math.maxInt(u32)) return .{ .issue = .{ .too_large = .{ .flag = arg, .value = raw } } };
+            options.limit = value;
         } else if (std.mem.eql(u8, arg, "--offset")) {
-            if (args.next()) |s| offset = std.fmt.parseInt(i64, s, 10) catch null;
+            if (options.offset != null) return .{ .issue = .{ .duplicate = arg } };
+            const raw = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
+            const value = std.fmt.parseInt(i64, raw, 10) catch return .{ .issue = .{ .invalid_integer = .{ .flag = arg, .value = raw } } };
+            if (value < 0) return .{ .issue = .{ .negative = .{ .flag = arg, .value = raw } } };
+            if (value > std.math.maxInt(u32)) return .{ .issue = .{ .too_large = .{ .flag = arg, .value = raw } } };
+            options.offset = value;
         } else if (std.mem.eql(u8, arg, "--indexes") or std.mem.eql(u8, arg, "-i")) {
-            indexes_str = args.next();
+            if (options.indexes_str != null) return .{ .issue = .{ .duplicate = arg } };
+            options.indexes_str = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
         } else if (std.mem.eql(u8, arg, "--filter-query")) {
-            filter_query = args.next();
+            if (options.filter_query != null) return .{ .issue = .{ .duplicate = arg } };
+            options.filter_query = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
         } else if (std.mem.eql(u8, arg, "--exclusion-query")) {
-            exclusion_query = args.next();
+            if (options.exclusion_query != null) return .{ .issue = .{ .duplicate = arg } };
+            options.exclusion_query = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
         } else if (std.mem.eql(u8, arg, "--aggregations")) {
-            aggregations_json = args.next();
+            if (options.aggregations_json != null) return .{ .issue = .{ .duplicate = arg } };
+            options.aggregations_json = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
         } else if (std.mem.eql(u8, arg, "--reranker")) {
-            reranker_json = args.next();
+            if (options.reranker_json != null) return .{ .issue = .{ .duplicate = arg } };
+            options.reranker_json = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
         } else if (std.mem.eql(u8, arg, "--pruner")) {
-            pruner_json = args.next();
+            if (options.pruner_json != null) return .{ .issue = .{ .duplicate = arg } };
+            options.pruner_json = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
         } else {
-            cli.fatal("unknown query flag: {s}", .{arg});
+            return .{ .issue = .{ .unknown = arg } };
         }
     }
-
-    if (full_text_search != null and full_text_search_json != null) {
-        cli.fatal("only one of --full-text-search or --full-text-search-json may be provided", .{});
+    if (options.full_text_search != null and options.full_text_search_json != null) {
+        return .{ .issue = .{ .conflicting_search = {} } };
     }
+    if (options.semantic_search != null and (options.offset orelse 0) != 0) {
+        return .{ .issue = .{ .semantic_offset = {} } };
+    }
+    return .{ .value = options };
+}
+
+fn fatalQueryParseIssue(issue: QueryParseIssue) noreturn {
+    switch (issue) {
+        .missing_value => |flag| cli.fatal("{s} requires a value", .{flag}),
+        .duplicate => |flag| cli.fatal("{s} may only be provided once", .{flag}),
+        .unknown => |flag| cli.fatal("unknown query flag: {s}", .{flag}),
+        .invalid_integer => |value| cli.fatal("invalid integer for {s}: {s}", .{ value.flag, value.value }),
+        .non_positive => |value| cli.fatal("{s} must be greater than zero: {s}", .{ value.flag, value.value }),
+        .negative => |value| cli.fatal("{s} must not be negative: {s}", .{ value.flag, value.value }),
+        .too_large => |value| cli.fatal("{s} exceeds the supported maximum: {s}", .{ value.flag, value.value }),
+        .conflicting_search => cli.fatal("only one of --full-text-search or --full-text-search-json may be provided", .{}),
+        .semantic_offset => cli.fatal("--offset is not supported with --semantic-search", .{}),
+    }
+}
+
+pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+    const options = switch (parseQueryOptions(args.*)) {
+        .value => |value| value,
+        .issue => |issue| fatalQueryParseIssue(issue),
+    };
+    const table_name = options.table_name;
+    const full_text_search = options.full_text_search;
+    const full_text_search_json = options.full_text_search_json;
+    const semantic_search = options.semantic_search;
+    const fields_str = options.fields_str;
+    const limit = options.limit;
+    const offset = options.offset;
+    const indexes_str = options.indexes_str;
+    const filter_query = options.filter_query;
+    const exclusion_query = options.exclusion_query;
+    const aggregations_json = options.aggregations_json;
+    const reranker_json = options.reranker_json;
+    const pruner_json = options.pruner_json;
 
     var full_text_value: ?std.json.Parsed(std.json.Value) = null;
     defer if (full_text_value) |*parsed| parsed.deinit();
@@ -165,7 +242,7 @@ fn warnIfSemanticIndexesAreNotReady(
             .embeddings_index_stats => |value| value,
             else => continue,
         };
-        if (embeddingIndexReady(stats)) continue;
+        if (index_readiness.embeddingIndexReady(stats)) continue;
 
         const state = if (stats.coverage) |coverage|
             if (coverage.config_mismatch_group_count > 0) "config_mismatch" else stats.backfill_state orelse "not_ready"
@@ -192,32 +269,46 @@ fn warnIfSemanticIndexesAreNotReady(
     }
 }
 
-fn embeddingIndexReady(stats: antfly_client.types.EmbeddingsIndexStats) bool {
-    if (stats.@"error" != null) return false;
-    if (stats.backfill_state) |state| {
-        if (!std.mem.eql(u8, state, "ready")) return false;
-    } else if (stats.rebuilding orelse true) {
-        return false;
-    }
-    const coverage = stats.coverage orelse return false;
-    return coverage.complete and
-        coverage.observation_complete and
-        coverage.config_mismatch_group_count == 0;
+test "query parser fails closed for missing malformed duplicate and incompatible options" {
+    var valid_argv = [_][*:0]const u8{ "--table", "docs", "--semantic-search", "alpha", "--limit", "5", "--indexes", "dense" };
+    const valid = parseQueryOptions(std.process.Args.Iterator.init(.{ .vector = valid_argv[0..] }));
+    try std.testing.expectEqualStrings("alpha", valid.value.semantic_search.?);
+    try std.testing.expectEqual(@as(?i64, 5), valid.value.limit);
+
+    var missing_argv = [_][*:0]const u8{"--semantic-search"};
+    const missing = parseQueryOptions(std.process.Args.Iterator.init(.{ .vector = missing_argv[0..] }));
+    try std.testing.expectEqualStrings("--semantic-search", missing.issue.missing_value);
+
+    var malformed_argv = [_][*:0]const u8{ "--limit", "many" };
+    const malformed = parseQueryOptions(std.process.Args.Iterator.init(.{ .vector = malformed_argv[0..] }));
+    try std.testing.expectEqualStrings("many", malformed.issue.invalid_integer.value);
+
+    var duplicate_argv = [_][*:0]const u8{ "--table", "docs", "-t", "other" };
+    const duplicate = parseQueryOptions(std.process.Args.Iterator.init(.{ .vector = duplicate_argv[0..] }));
+    try std.testing.expectEqualStrings("-t", duplicate.issue.duplicate);
+
+    var offset_argv = [_][*:0]const u8{ "--semantic-search", "alpha", "--offset", "1" };
+    const offset = parseQueryOptions(std.process.Args.Iterator.init(.{ .vector = offset_argv[0..] }));
+    try std.testing.expect(offset.issue == .semantic_offset);
+
+    var typo_argv = [_][*:0]const u8{ "--semantic-serach", "alpha" };
+    const typo = parseQueryOptions(std.process.Args.Iterator.init(.{ .vector = typo_argv[0..] }));
+    try std.testing.expectEqualStrings("--semantic-serach", typo.issue.unknown);
 }
 
-test "semantic readiness requires ready state and complete coverage" {
-    try std.testing.expect(!embeddingIndexReady(.{
+test "semantic readiness requires compatible policy-aware coverage" {
+    try std.testing.expect(!index_readiness.embeddingIndexReady(.{
         .index_type = .embeddings,
         .backfill_state = "ready",
         .rebuilding = false,
     }));
-    try std.testing.expect(!embeddingIndexReady(.{
+    try std.testing.expect(!index_readiness.embeddingIndexReady(.{
         .index_type = .embeddings,
         .backfill_state = "running",
         .rebuilding = true,
     }));
 
-    try std.testing.expect(embeddingIndexReady(.{
+    try std.testing.expect(index_readiness.embeddingIndexReady(.{
         .index_type = .embeddings,
         .backfill_state = "ready",
         .rebuilding = false,
@@ -242,7 +333,7 @@ test "semantic readiness requires ready state and complete coverage" {
         },
     }));
 
-    try std.testing.expect(!embeddingIndexReady(.{
+    try std.testing.expect(!index_readiness.embeddingIndexReady(.{
         .index_type = .embeddings,
         .backfill_state = "ready",
         .rebuilding = false,
@@ -307,7 +398,7 @@ fn buildFullTextSearchValue(allocator: std.mem.Allocator, query: []const u8) std
 fn parseJsonArg(comptime T: type, allocator: std.mem.Allocator, flag: []const u8, raw: []const u8) std.json.Parsed(T) {
     return std.json.parseFromSlice(T, allocator, raw, .{
         .allocate = .alloc_always,
-        .ignore_unknown_fields = true,
+        .ignore_unknown_fields = false,
     }) catch |err| {
         cli.fatal("invalid JSON for {s}: {}", .{ flag, err });
     };
