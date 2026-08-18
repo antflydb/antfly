@@ -752,6 +752,7 @@ const LocalProjectionInputs = struct {
 const ProjectedCoreSnapshot = struct {
     stores: []metadata_table_manager.StoreRecord = &.{},
     placement_intents: []raft_reconciler.PlacementIntent = &.{},
+    placement_version_fences: []metadata_reconciler.PlacementVersionFence = &.{},
     shuffle_join_leases: []metadata_table_manager.ShuffleJoinLeaseRecord = &.{},
     schema_progresses: []metadata_table_manager.SchemaProgressRecord = &.{},
     restore_progresses: []metadata_table_manager.RestoreProgressRecord = &.{},
@@ -764,6 +765,7 @@ const ProjectedCoreSnapshot = struct {
         if (self.stores.len > 0) alloc.free(self.stores);
         for (self.placement_intents) |intent| alloc.free(intent.peer_node_ids);
         if (self.placement_intents.len > 0) alloc.free(self.placement_intents);
+        if (self.placement_version_fences.len > 0) alloc.free(self.placement_version_fences);
         if (self.shuffle_join_leases.len > 0) alloc.free(self.shuffle_join_leases);
         if (self.schema_progresses.len > 0) alloc.free(self.schema_progresses);
         for (self.restore_progresses) |record| metadata_table_manager.freeRestoreProgress(alloc, record);
@@ -792,6 +794,7 @@ const ProjectedCoreSnapshot = struct {
             .merge_transitions = self.merge_transitions.len,
             .estimated_bytes = @sizeOf(metadata_table_manager.StoreRecord) * self.stores.len +
                 @sizeOf(raft_reconciler.PlacementIntent) * self.placement_intents.len +
+                @sizeOf(metadata_reconciler.PlacementVersionFence) * self.placement_version_fences.len +
                 @sizeOf(metadata_table_manager.ShuffleJoinLeaseRecord) * self.shuffle_join_leases.len +
                 @sizeOf(metadata_table_manager.SchemaProgressRecord) * self.schema_progresses.len +
                 @sizeOf(metadata_table_manager.RestoreProgressRecord) * self.restore_progresses.len +
@@ -1152,6 +1155,13 @@ fn cloneProjectedPlacementIntentsOwned(
         cloned = i + 1;
     }
     return out;
+}
+
+fn cloneProjectedPlacementVersionFencesOwned(
+    alloc: std.mem.Allocator,
+    fences: []const metadata_reconciler.PlacementVersionFence,
+) ![]metadata_reconciler.PlacementVersionFence {
+    return try alloc.dupe(metadata_reconciler.PlacementVersionFence, fences);
 }
 
 fn cloneProjectedSplitTransitionsOwned(
@@ -1889,14 +1899,26 @@ pub const MetadataService = struct {
         } });
     }
 
-    pub fn upsertReplicaIntent(self: *MetadataService, intent: raft_reconciler.PlacementIntent) !void {
-        try self.proposeTransitionCommand(.{ .upsert_replica_intent = intent });
+    pub fn upsertReplicaIntent(
+        self: *MetadataService,
+        intent: raft_reconciler.PlacementIntent,
+        expected_metadata_version: ?u64,
+        expected_version_fence: u64,
+        expected_target_drain_requested: bool,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .upsert_replica_intent = .{
+            .expected_metadata_version = expected_metadata_version,
+            .expected_version_fence = expected_version_fence,
+            .expected_target_drain_requested = expected_target_drain_requested,
+            .replacement = intent,
+        } });
     }
 
-    pub fn removeReplicaIntent(self: *MetadataService, group_id: u64, local_node_id: u64) !void {
+    pub fn removeReplicaIntent(self: *MetadataService, group_id: u64, local_node_id: u64, expected_metadata_version: u64) !void {
         try self.proposeTransitionCommand(.{ .remove_replica_intent = .{
             .group_id = group_id,
             .local_node_id = local_node_id,
+            .expected_metadata_version = expected_metadata_version,
         } });
     }
 
@@ -2373,13 +2395,21 @@ pub const MetadataService = struct {
     }
 
     pub fn applyReconciliationPlan(self: *MetadataService, plan: *const metadata_reconciler.ReconciliationPlan) !void {
-        for (plan.placement_upserts) |intent| try self.upsertReplicaIntent(intent);
+        std.debug.assert(plan.placement_upserts.len == plan.placement_upsert_preconditions.len);
+        for (plan.placement_upserts, plan.placement_upsert_preconditions) |intent, precondition| {
+            try self.upsertReplicaIntent(
+                intent,
+                precondition.expected_metadata_version,
+                precondition.expected_version_fence,
+                precondition.expected_target_drain_requested,
+            );
+        }
         for (plan.table_upserts) |record| try self.upsertTable(record);
         for (plan.split_admissions) |admission| try self.admitSplitTransition(admission);
         for (plan.range_upserts) |record| try self.upsertRange(record);
         for (plan.split_upserts) |record| try self.upsertSplitTransition(record);
         for (plan.merge_upserts) |record| try self.upsertMergeTransition(record);
-        for (plan.placement_removals) |record| try self.removeReplicaIntent(record.group_id, record.local_node_id);
+        for (plan.placement_removals) |record| try self.removeReplicaIntent(record.group_id, record.local_node_id, record.expected_metadata_version);
         for (plan.table_removals) |table_id| try self.removeTable(table_id);
         for (plan.range_removals) |group_id| try self.removeRange(group_id);
         for (plan.split_removals) |transition_id| try self.removeSplitTransition(transition_id);
@@ -2687,6 +2717,14 @@ pub const MetadataService = struct {
     pub fn listProjectedPlacementIntents(self: *MetadataService, alloc: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         return try store.listPlacementIntents(alloc, self.metadata_group_id);
+    }
+
+    pub fn listProjectedPlacementVersionFences(
+        self: *MetadataService,
+        alloc: std.mem.Allocator,
+    ) ![]metadata_reconciler.PlacementVersionFence {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listPlacementVersionFences(alloc, self.metadata_group_id);
     }
 
     pub fn listProjectedNodes(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_table_manager.NodeRecord {
@@ -3604,14 +3642,26 @@ pub const MetadataHttpService = struct {
         } });
     }
 
-    pub fn upsertReplicaIntent(self: *MetadataHttpService, intent: raft_reconciler.PlacementIntent) !void {
-        try self.proposeTransitionCommand(.{ .upsert_replica_intent = intent });
+    pub fn upsertReplicaIntent(
+        self: *MetadataHttpService,
+        intent: raft_reconciler.PlacementIntent,
+        expected_metadata_version: ?u64,
+        expected_version_fence: u64,
+        expected_target_drain_requested: bool,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .upsert_replica_intent = .{
+            .expected_metadata_version = expected_metadata_version,
+            .expected_version_fence = expected_version_fence,
+            .expected_target_drain_requested = expected_target_drain_requested,
+            .replacement = intent,
+        } });
     }
 
-    pub fn removeReplicaIntent(self: *MetadataHttpService, group_id: u64, local_node_id: u64) !void {
+    pub fn removeReplicaIntent(self: *MetadataHttpService, group_id: u64, local_node_id: u64, expected_metadata_version: u64) !void {
         try self.proposeTransitionCommand(.{ .remove_replica_intent = .{
             .group_id = group_id,
             .local_node_id = local_node_id,
+            .expected_metadata_version = expected_metadata_version,
         } });
     }
 
@@ -4294,13 +4344,21 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn applyReconciliationPlan(self: *MetadataHttpService, plan: *const metadata_reconciler.ReconciliationPlan) !void {
-        for (plan.placement_upserts) |intent| try self.upsertReplicaIntent(intent);
+        std.debug.assert(plan.placement_upserts.len == plan.placement_upsert_preconditions.len);
+        for (plan.placement_upserts, plan.placement_upsert_preconditions) |intent, precondition| {
+            try self.upsertReplicaIntent(
+                intent,
+                precondition.expected_metadata_version,
+                precondition.expected_version_fence,
+                precondition.expected_target_drain_requested,
+            );
+        }
         for (plan.table_upserts) |record| try self.upsertTable(record);
         for (plan.split_admissions) |admission| try self.admitSplitTransition(admission);
         for (plan.range_upserts) |record| try self.upsertRange(record);
         for (plan.split_upserts) |record| try self.upsertSplitTransition(record);
         for (plan.merge_upserts) |record| try self.upsertMergeTransition(record);
-        for (plan.placement_removals) |record| try self.removeReplicaIntent(record.group_id, record.local_node_id);
+        for (plan.placement_removals) |record| try self.removeReplicaIntent(record.group_id, record.local_node_id, record.expected_metadata_version);
         for (plan.table_removals) |table_id| try self.removeTable(table_id);
         for (plan.range_removals) |group_id| try self.removeRange(group_id);
         for (plan.split_removals) |transition_id| try self.removeSplitTransition(transition_id);
@@ -4886,6 +4944,7 @@ pub const MetadataHttpService = struct {
         errdefer snapshot.deinit(self.alloc);
         snapshot.stores = try store.listStores(self.alloc, self.metadata_group_id);
         snapshot.placement_intents = try store.listPlacementIntents(self.alloc, self.metadata_group_id);
+        snapshot.placement_version_fences = try store.listPlacementVersionFences(self.alloc, self.metadata_group_id);
         snapshot.shuffle_join_leases = try store.listShuffleJoinLeases(self.alloc, self.metadata_group_id);
         snapshot.schema_progresses = try store.listSchemaProgress(self.alloc, self.metadata_group_id);
         snapshot.restore_progresses = try store.listRestoreProgress(self.alloc, self.metadata_group_id);
@@ -5082,6 +5141,16 @@ pub const MetadataHttpService = struct {
         defer self.unlockRuntime();
         const snapshot = try self.projectedCoreSnapshotLocked();
         return try cloneProjectedPlacementIntentsOwned(alloc, snapshot.placement_intents);
+    }
+
+    pub fn listProjectedPlacementVersionFences(
+        self: *MetadataHttpService,
+        alloc: std.mem.Allocator,
+    ) ![]metadata_reconciler.PlacementVersionFence {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const snapshot = try self.projectedCoreSnapshotLocked();
+        return try cloneProjectedPlacementVersionFencesOwned(alloc, snapshot.placement_version_fences);
     }
 
     pub fn listProjectedNodes(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.NodeRecord {
@@ -9745,6 +9814,8 @@ test "metadata service projects committed placement intents into local hosted re
     try svc.campaignMetadataGroup();
     try svc.runRound();
 
+    try svc.upsertNode(.{ .node_id = 1 });
+    try svc.runRound();
     try svc.upsertReplicaIntent(.{
         .record = .{
             .group_id = 1951,
@@ -9753,7 +9824,7 @@ test "metadata service projects committed placement intents into local hosted re
             .bootstrap_mode = .empty,
         },
         .peer_node_ids = &.{ 1, 2, 3 },
-    });
+    }, null, 0, false);
 
     try runServiceRoundsUntilHostedStatus(&svc, 1951, .active, 8, "placement-intent activation");
 
@@ -9762,7 +9833,7 @@ test "metadata service projects committed placement intents into local hosted re
     try std.testing.expectEqual(@as(usize, 1), projected.len);
     try std.testing.expectEqual(@as(u64, 1951), projected[0].record.group_id);
 
-    try svc.removeReplicaIntent(1951, 1);
+    try svc.removeReplicaIntent(1951, 1, projected[0].record.metadata_version);
     try runServiceRoundsUntilHostedStatus(&svc, 1951, .absent, 8, "placement-intent removal");
 }
 
@@ -9844,6 +9915,10 @@ test "table workflow can drive placement intents through the real metadata contr
     try svc.campaignMetadataGroup();
     try svc.runRound();
 
+    try svc.upsertNode(.{ .node_id = 1 });
+    try svc.upsertNode(.{ .node_id = 2 });
+    try svc.upsertNode(.{ .node_id = 3 });
+    try svc.runRound();
     var workflow = metadata_table_workflow.TableWorkflow.init(std.testing.allocator);
     defer workflow.deinit();
     try workflow.setPlacementCandidates(&.{ 1, 2, 3 });
@@ -10146,7 +10221,7 @@ test "metadata service batches store status reports" {
     try std.testing.expectEqual(@as(usize, 1), status.active_backfills);
 }
 
-test "metadata service persists and clears reallocation requests" {
+test "metadata service persists coalesces promotes and clears reallocation requests" {
     const Factory = struct {
         alloc: std.mem.Allocator,
         store: *raft_engine.core.MemoryStorage,
@@ -10242,20 +10317,31 @@ test "metadata service persists and clears reallocation requests" {
     defer svc.freeAdminSnapshot(&requested_snapshot);
     try std.testing.expectEqual(requested, requested_snapshot.reallocation_request);
 
+    // A reconcile plan may decide to clear this generation before a lifecycle
+    // mutation queues another reallocation. Apply two such triggers before the
+    // stale clear: they must coalesce into one private pending generation, and
+    // the clear must atomically promote the latest trigger instead of losing it.
+    try svc.requestReallocation(88_000);
+    try svc.requestReallocation(99_000);
+    var clear_active_plan = metadata_reconciler.ReconciliationPlan.empty();
+    clear_active_plan.clear_reallocation_request = requested.?.request_id;
+    try svc.applyReconciliationPlan(&clear_active_plan);
+    try svc.runRound();
+    const promoted = try svc.getProjectedReallocationRequest();
+    try std.testing.expect(promoted != null);
+    try std.testing.expect(promoted.?.request_id != requested.?.request_id);
+    try std.testing.expectEqual(@as(u64, 99_000), promoted.?.requested_at_ms);
+
+    // A repeated clear from the old plan cannot consume its promoted successor.
     var stale_plan = metadata_reconciler.ReconciliationPlan.empty();
     stale_plan.clear_reallocation_request = requested.?.request_id;
-    try svc.requestReallocation(88_000);
-    try svc.runRound();
     try svc.applyReconciliationPlan(&stale_plan);
     try svc.runRound();
-    const replacement = try svc.getProjectedReallocationRequest();
-    try std.testing.expect(replacement != null);
-    try std.testing.expect(replacement.?.request_id != requested.?.request_id);
-    try std.testing.expectEqual(@as(u64, 88_000), replacement.?.requested_at_ms);
+    try std.testing.expectEqual(promoted, try svc.getProjectedReallocationRequest());
 
-    var current_plan = metadata_reconciler.ReconciliationPlan.empty();
-    current_plan.clear_reallocation_request = replacement.?.request_id;
-    try svc.applyReconciliationPlan(&current_plan);
+    var clear_promoted_plan = metadata_reconciler.ReconciliationPlan.empty();
+    clear_promoted_plan.clear_reallocation_request = promoted.?.request_id;
+    try svc.applyReconciliationPlan(&clear_promoted_plan);
     try svc.runRound();
     try std.testing.expect((try svc.getProjectedReallocationRequest()) == null);
 }
@@ -11581,6 +11667,8 @@ test "metadata service status reports repair and rebalance counts" {
     try svc.campaignMetadataGroup();
     try svc.runRound();
 
+    try svc.upsertNode(.{ .node_id = 1 });
+    try svc.upsertNode(.{ .node_id = 2 });
     try svc.upsertStore(.{ .store_id = 31, .node_id = 1, .role = "data", .live = true, .capacity_bytes = 1024, .available_bytes = 900 });
     try svc.upsertStore(.{ .store_id = 32, .node_id = 2, .role = "data", .live = true, .capacity_bytes = 1024, .available_bytes = 850 });
     try svc.runRound();
@@ -11665,7 +11753,7 @@ test "metadata service status reports repair and rebalance counts" {
             },
         },
         .peer_node_ids = &.{2},
-    });
+    }, null, 0, false);
     try svc.upsertReplicaIntent(.{
         .record = .{
             .group_id = 8801,
@@ -11683,7 +11771,7 @@ test "metadata service status reports repair and rebalance counts" {
             },
         },
         .peer_node_ids = &.{1},
-    });
+    }, null, 0, false);
     try svc.runRound();
 
     try svc.reportStoreStatus(.{
@@ -11984,6 +12072,7 @@ test "metadata service committed metadata changes request lifecycle reconcile ho
     try std.testing.expect(capture.calls >= 1);
 
     capture.calls = 0;
+    try svc.upsertNode(.{ .node_id = 1 });
     try svc.upsertReplicaIntent(.{
         .record = .{
             .group_id = 9901,
@@ -11992,7 +12081,7 @@ test "metadata service committed metadata changes request lifecycle reconcile ho
         },
         .store_id = 0,
         .peer_node_ids = &.{},
-    });
+    }, null, 0, false);
     try svc.requestReallocation(1);
     try runServiceRounds(&svc, 8);
     try std.testing.expect(capture.calls >= 1);
@@ -12661,6 +12750,7 @@ test "metadata service local replica root reconcile permit hook defers reconcile
 
     try svc.upsertTable(.{ .table_id = 99, .name = "docs" });
     try svc.upsertRange(.{ .group_id = 9901, .table_id = 99, .start_key = "", .end_key = null });
+    try svc.upsertNode(.{ .node_id = 1 });
     try svc.upsertReplicaIntent(.{
         .record = .{
             .group_id = 9901,
@@ -12669,7 +12759,7 @@ test "metadata service local replica root reconcile permit hook defers reconcile
         },
         .store_id = 0,
         .peer_node_ids = &.{},
-    });
+    }, null, 0, false);
 
     var capture = HookCapture{};
     var permit = PermitCapture{ .allow = false };

@@ -7,7 +7,9 @@
 
 const std = @import("std");
 const operation = @import("../api/operation.zig");
+const raft_reconciler = @import("../raft/reconciler.zig");
 const metadata_api = @import("api.zig");
+const metadata_authority = @import("authority.zig");
 const table_manager = @import("table_manager.zig");
 
 pub const Source = struct {
@@ -101,7 +103,8 @@ pub const Operations = struct {
         if (self.source.supports_request_shutdown) {
             const callback = self.source.vtable.request_shutdown.?;
             if (callback(self.source.ptr, node_id)) |_| {
-                try self.triggerReallocateIfSupported();
+                self.triggerReallocateIfSupported() catch |err|
+                    return metadata_authority.afterPossibleAdmission(err);
                 return;
             } else |err| switch (err) {
                 error.UnsupportedOperation => {},
@@ -120,7 +123,11 @@ pub const Operations = struct {
         for (snapshot.nodes) |node| {
             if (node.node_id != node_id) continue;
             node_found = true;
-            if (std.mem.eql(u8, node.lifecycle, table_manager.node_lifecycle_draining)) break;
+            // Shutdown is monotonic unless the operator explicitly cancels it.
+            // In particular, an idempotent request retry must not demote a
+            // pending finalization back to draining and lose its completion
+            // intent.
+            if (!table_manager.nodeLifecycleActive(node.lifecycle)) break;
             var updated = try table_manager.cloneNode(alloc, node);
             var updated_owned = true;
             errdefer if (updated_owned) table_manager.freeNode(alloc, updated);
@@ -128,7 +135,8 @@ pub const Operations = struct {
             alloc.free(updated.lifecycle);
             updated.lifecycle = draining;
             updated_owned = false;
-            try upsert_node(self.source.ptr, alloc, updated);
+            upsert_node(self.source.ptr, alloc, updated) catch |err|
+                return if (changed) metadata_authority.afterPossibleAdmission(err) else err;
             changed = true;
             break;
         }
@@ -141,11 +149,11 @@ pub const Operations = struct {
             errdefer if (lifecycle_owned) alloc.free(lifecycle);
             role_owned = false;
             lifecycle_owned = false;
-            try upsert_node(self.source.ptr, alloc, .{
+            upsert_node(self.source.ptr, alloc, .{
                 .node_id = node_id,
                 .role = role,
                 .lifecycle = lifecycle,
-            });
+            }) catch |err| return if (changed) metadata_authority.afterPossibleAdmission(err) else err;
             changed = true;
         }
         for (snapshot.stores) |store| {
@@ -155,10 +163,12 @@ pub const Operations = struct {
             errdefer if (updated_owned) table_manager.freeStore(alloc, updated);
             updated.drain_requested = true;
             updated_owned = false;
-            try upsert_store(self.source.ptr, alloc, updated);
+            upsert_store(self.source.ptr, alloc, updated) catch |err|
+                return if (changed) metadata_authority.afterPossibleAdmission(err) else err;
             changed = true;
         }
-        if (changed) try self.triggerReallocateIfSupported();
+        if (changed) self.triggerReallocateIfSupported() catch |err|
+            return metadata_authority.afterPossibleAdmission(err);
     }
 
     pub fn cancelShutdown(self: Operations, alloc: std.mem.Allocator, ctx: operation.RequestContext, node_id: u64) !void {
@@ -167,7 +177,8 @@ pub const Operations = struct {
         if (self.source.supports_cancel_shutdown) {
             const callback = self.source.vtable.cancel_shutdown.?;
             if (callback(self.source.ptr, node_id)) |_| {
-                try self.triggerReallocateIfSupported();
+                self.triggerReallocateIfSupported() catch |err|
+                    return metadata_authority.afterPossibleAdmission(err);
                 return;
             } else |err| switch (err) {
                 error.UnsupportedOperation => {},
@@ -191,7 +202,8 @@ pub const Operations = struct {
             alloc.free(updated.lifecycle);
             updated.lifecycle = active;
             updated_owned = false;
-            try upsert_node(self.source.ptr, alloc, updated);
+            upsert_node(self.source.ptr, alloc, updated) catch |err|
+                return if (changed) metadata_authority.afterPossibleAdmission(err) else err;
             changed = true;
             break;
         }
@@ -202,10 +214,12 @@ pub const Operations = struct {
             errdefer if (updated_owned) table_manager.freeStore(alloc, updated);
             updated.drain_requested = false;
             updated_owned = false;
-            try upsert_store(self.source.ptr, alloc, updated);
+            upsert_store(self.source.ptr, alloc, updated) catch |err|
+                return if (changed) metadata_authority.afterPossibleAdmission(err) else err;
             changed = true;
         }
-        if (changed) try self.triggerReallocateIfSupported();
+        if (changed) self.triggerReallocateIfSupported() catch |err|
+            return metadata_authority.afterPossibleAdmission(err);
     }
 
     pub fn finalizeShutdown(self: Operations, ctx: operation.RequestContext, node_id: u64) !void {
@@ -215,9 +229,10 @@ pub const Operations = struct {
         const callback = self.source.vtable.finalize_shutdown.?;
         var snapshot = try self.source.vtable.snapshot(self.source.ptr);
         defer self.source.vtable.free_snapshot(self.source.ptr, &snapshot);
-        if (wouldDeleteActiveNodeOrStore(&snapshot, node_id)) return error.ActiveNodeFinalizeRejected;
+        if (nodeFinalizeUnsafe(&snapshot, node_id)) return error.ActiveNodeFinalizeRejected;
         try callback(self.source.ptr, node_id);
-        try self.triggerReallocateIfSupported();
+        self.triggerReallocateIfSupported() catch |err|
+            return metadata_authority.afterPossibleAdmission(err);
     }
 
     fn triggerReallocateIfSupported(self: Operations) !void {
@@ -260,7 +275,7 @@ fn preserveLifecycleAndDrainIntent(alloc: std.mem.Allocator, snapshot: *const me
     }
 }
 
-fn wouldDeleteActiveNodeOrStore(snapshot: *const metadata_api.AdminSnapshot, node_id: u64) bool {
+fn nodeFinalizeUnsafe(snapshot: *const metadata_api.AdminSnapshot, node_id: u64) bool {
     var draining_node = false;
     for (snapshot.nodes) |node| {
         if (node.node_id != node_id) continue;
@@ -268,9 +283,13 @@ fn wouldDeleteActiveNodeOrStore(snapshot: *const metadata_api.AdminSnapshot, nod
         draining_node = true;
         break;
     }
-    if (draining_node) return false;
+    for (snapshot.placement_intents) |intent| {
+        if (intent.record.local_node_id == node_id) return true;
+    }
     for (snapshot.stores) |store| {
-        if (store.node_id == node_id and !store.drain_requested) return true;
+        if (store.node_id != node_id) continue;
+        if (!draining_node and !store.drain_requested) return true;
+        if (table_manager.storeHasTerminationDebt(store)) return true;
     }
     return false;
 }
@@ -304,4 +323,163 @@ test "metadata node operations stop canceled shutdown before source mutation" {
         .cancellation = operation.CancellationToken.fromAtomic(&canceled),
     }, 9));
     try std.testing.expectEqual(@as(usize, 0), source.calls);
+}
+
+test "metadata node lifecycle preserves non-admission proof only before its first mutation" {
+    const FakeSource = struct {
+        reject_shutdown: bool = true,
+        shutdown_calls: usize = 0,
+        reallocate_calls: usize = 0,
+
+        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCall;
+        }
+
+        fn freeSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn requestShutdown(ptr: *anyopaque, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.shutdown_calls += 1;
+            if (self.reject_shutdown) return error.ProposalDropped;
+        }
+
+        fn triggerReallocate(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reallocate_calls += 1;
+            return error.ProposalDropped;
+        }
+    };
+
+    var source = FakeSource{};
+    const ops = Operations{ .source = .{
+        .ptr = &source,
+        .vtable = &.{
+            .snapshot = FakeSource.snapshot,
+            .free_snapshot = FakeSource.freeSnapshot,
+            .request_shutdown = FakeSource.requestShutdown,
+            .trigger_reallocate = FakeSource.triggerReallocate,
+        },
+        .supports_request_shutdown = true,
+    } };
+
+    try std.testing.expectError(
+        error.ProposalDropped,
+        ops.requestShutdown(std.testing.allocator, .{}, 9),
+    );
+    try std.testing.expectEqual(@as(usize, 1), source.shutdown_calls);
+    try std.testing.expectEqual(@as(usize, 0), source.reallocate_calls);
+
+    source.reject_shutdown = false;
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        ops.requestShutdown(std.testing.allocator, .{}, 9),
+    );
+    try std.testing.expectEqual(@as(usize, 2), source.shutdown_calls);
+    try std.testing.expectEqual(@as(usize, 1), source.reallocate_calls);
+}
+
+test "metadata node operations preserve pending finalization on shutdown retry" {
+    const FakeSource = struct {
+        nodes: [1]table_manager.NodeRecord = .{.{
+            .node_id = 9,
+            .lifecycle = table_manager.node_lifecycle_finalizing,
+        }},
+        stores: [1]table_manager.StoreRecord = .{.{
+            .store_id = 9,
+            .node_id = 9,
+            .drain_requested = false,
+        }},
+        node_upserts: usize = 0,
+        store_upserts: usize = 0,
+
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .nodes = self.nodes[0..],
+                .stores = self.stores[0..],
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn upsertNode(ptr: *anyopaque, alloc: std.mem.Allocator, record: table_manager.NodeRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.node_upserts += 1;
+            table_manager.freeNode(alloc, record);
+        }
+
+        fn upsertStore(ptr: *anyopaque, alloc: std.mem.Allocator, record: table_manager.StoreRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.store_upserts += 1;
+            try std.testing.expect(record.drain_requested);
+            table_manager.freeStore(alloc, record);
+        }
+    };
+
+    var source = FakeSource{};
+    const ops = Operations{ .source = .{
+        .ptr = &source,
+        .vtable = &.{
+            .snapshot = FakeSource.snapshot,
+            .free_snapshot = FakeSource.freeSnapshot,
+            .upsert_node = FakeSource.upsertNode,
+            .upsert_store = FakeSource.upsertStore,
+        },
+        .supports_upsert_node = true,
+        .supports_upsert_store = true,
+    } };
+
+    try ops.requestShutdown(std.testing.allocator, .{}, 9);
+    try std.testing.expectEqual(@as(usize, 0), source.node_upserts);
+    try std.testing.expectEqual(@as(usize, 1), source.store_upserts);
+}
+
+test "metadata node operations reject finalization while termination debt remains" {
+    var placements = [_]raft_reconciler.PlacementIntent{.{
+        .record = .{ .group_id = 101, .replica_id = 1, .local_node_id = 9 },
+        .store_id = 9,
+    }};
+    var group_statuses = [_]table_manager.GroupStatusReport{.{ .group_id = 101 }};
+    var runtime_statuses = [_]table_manager.RuntimeGroupStatusReport{.{ .group_id = 101, .node_id = 9, .store_id = 9 }};
+    var stores = [_]table_manager.StoreRecord{.{
+        .store_id = 9,
+        .node_id = 9,
+        .drain_requested = true,
+        .group_statuses = group_statuses[0..],
+        .runtime_statuses = runtime_statuses[0..],
+    }};
+    var nodes = [_]table_manager.NodeRecord{.{
+        .node_id = 9,
+        .lifecycle = table_manager.node_lifecycle_draining,
+    }};
+    var snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = &.{},
+        .ranges = &.{},
+        .nodes = nodes[0..],
+        .stores = stores[0..],
+        .placement_intents = placements[0..],
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+
+    try std.testing.expect(nodeFinalizeUnsafe(&snapshot, 9));
+    snapshot.placement_intents = &.{};
+    try std.testing.expect(nodeFinalizeUnsafe(&snapshot, 9));
+    stores[0].group_statuses = &.{};
+    try std.testing.expect(nodeFinalizeUnsafe(&snapshot, 9));
+    stores[0].runtime_statuses = &.{};
+    try std.testing.expect(!nodeFinalizeUnsafe(&snapshot, 9));
+
+    // A retained observation explicitly owned by another store is not debt
+    // for this store in either shutdown status or mutation admission.
+    runtime_statuses[0] = .{ .group_id = 102, .node_id = 9, .store_id = 10 };
+    stores[0].runtime_statuses = runtime_statuses[0..];
+    try std.testing.expect(!nodeFinalizeUnsafe(&snapshot, 9));
 }

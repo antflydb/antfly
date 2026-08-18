@@ -3026,7 +3026,21 @@ pub const ApiHttpServer = struct {
         snapshot: ?*const metadata_api.AdminSnapshot,
         snapshot_index: ?*const RuntimeStatusSnapshotIndex,
     ) !?runtime_status.LocalTableRuntimeStatuses {
-        return try self.localTableRuntimeStatusesWithSnapshotIndexOptions(table_name, snapshot, snapshot_index, false);
+        return try self.localTableRuntimeStatusesWithSnapshotIndexOptions(table_name, snapshot, snapshot_index, null, false);
+    }
+
+    const IndexRuntimeTarget = struct {
+        name: []const u8,
+        identity: ?indexes_api.IndexRuntimeIdentity,
+    };
+
+    fn indexTableRuntimeStatusesWithSnapshot(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        target: IndexRuntimeTarget,
+        snapshot: *const metadata_api.AdminSnapshot,
+    ) !?runtime_status.LocalTableRuntimeStatuses {
+        return try self.localTableRuntimeStatusesWithSnapshotIndexOptions(table_name, snapshot, null, target, false);
     }
 
     fn lifecycleTableRuntimeStatusesWithSnapshot(
@@ -3034,7 +3048,7 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         snapshot: *const metadata_api.AdminSnapshot,
     ) !?runtime_status.LocalTableRuntimeStatuses {
-        return try self.localTableRuntimeStatusesWithSnapshotIndexOptions(table_name, snapshot, null, true);
+        return try self.localTableRuntimeStatusesWithSnapshotIndexOptions(table_name, snapshot, null, null, true);
     }
 
     fn localTableRuntimeStatusesWithSnapshotIndexOptions(
@@ -3042,6 +3056,7 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         snapshot: ?*const metadata_api.AdminSnapshot,
         snapshot_index: ?*const RuntimeStatusSnapshotIndex,
+        target_index: ?IndexRuntimeTarget,
         force_write_refresh: bool,
     ) !?runtime_status.LocalTableRuntimeStatuses {
         var items = std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus).empty;
@@ -3062,16 +3077,19 @@ pub const ApiHttpServer = struct {
                 } else {
                     read_statuses_present = true;
                     errdefer owned.deinit(self.alloc);
-                    read_needs_refresh = runtimeStatusesNeedWriterRefresh(owned.items);
-                    try self.appendLocalRuntimeStatuses(table_name, snapshot, snapshot_index, &items, &item_indexes, &owned);
+                    read_needs_refresh = if (target_index) |target|
+                        runtimeStatusesNeedWriterRefreshForIndex(owned.items, target)
+                    else
+                        runtimeStatusesNeedWriterRefresh(owned.items);
+                    try self.appendLocalRuntimeStatuses(table_name, snapshot, snapshot_index, target_index, &items, &item_indexes, &owned);
                 }
             }
         }
         if (snapshot) |admin_snapshot| {
             if (snapshot_index) |index| {
-                try self.appendRemoteRuntimeStatusesFromIndex(&items, &item_indexes, table_name, index);
+                try self.appendRemoteRuntimeStatusesFromIndex(&items, &item_indexes, table_name, index, target_index);
             } else {
-                try self.appendRemoteRuntimeStatusesFromSnapshot(&items, &item_indexes, table_name, admin_snapshot);
+                try self.appendRemoteRuntimeStatusesFromSnapshot(&items, &item_indexes, table_name, admin_snapshot, target_index);
             }
         }
         const should_query_writes = force_write_refresh or if (snapshot == null)
@@ -3097,7 +3115,7 @@ pub const ApiHttpServer = struct {
                     // that IndexNotFound is a retryable publication window.
                     try self.appendLocalRuntimeStatusCandidates(table_name, snapshot, snapshot_index, &items, &owned);
                 } else {
-                    try self.appendLocalRuntimeStatuses(table_name, snapshot, snapshot_index, &items, &item_indexes, &owned);
+                    try self.appendLocalRuntimeStatuses(table_name, snapshot, snapshot_index, target_index, &items, &item_indexes, &owned);
                 }
             }
         }
@@ -3139,11 +3157,71 @@ pub const ApiHttpServer = struct {
         return false;
     }
 
+    fn runtimeStatusesNeedWriterRefreshForIndex(
+        statuses: []const runtime_status.LocalTableRuntimeStatus,
+        target: IndexRuntimeTarget,
+    ) bool {
+        for (statuses) |status| {
+            if (runtimeStatusTargetNeedsWriterRefresh(status, target)) return true;
+        }
+        return false;
+    }
+
+    fn runtimeStatusTargetNeedsWriterRefresh(
+        status: runtime_status.LocalTableRuntimeStatus,
+        target: IndexRuntimeTarget,
+    ) bool {
+        if (runtimeStatusNeedsWriterRefresh(status)) return true;
+        // A read snapshot can be fresh for its retained index generation
+        // while the live writer is admitting or advancing a newer index.
+        if (runtimeStatusTargetRank(status, target) < 2) return true;
+        // The read cache's freshness describes the observation it retained;
+        // it does not make an incomplete lifecycle observation terminal. Only
+        // the requested index detail path pays for this writer refresh, and it
+        // stops doing so as soon as the cached proof is complete.
+        for (status.stats.indexes) |index| {
+            if (!std.mem.eql(u8, index.name, target.name)) continue;
+            // `repair_degraded` is also the derived representation of an
+            // incomplete repair or coverage summary, so it cannot distinguish
+            // terminal damage from a retained observation that the writer may
+            // already have advanced. Explicit issues and load failures are the
+            // durable cases; keep reporting those without polling the writer.
+            if (index.load_error != null or
+                index.repair_issue_count != 0 or
+                std.mem.eql(u8, index.index_repair_phase, "terminal"))
+            {
+                return false;
+            }
+            // Refresh only for an incomplete proof attached to the requested
+            // index. Table-level degradation may belong to another index, and
+            // ordinary backfill/replay debt is already authoritative status;
+            // refreshing those on every detail read would bypass the cached
+            // status fast path without improving correctness.
+            return !index.repair_summary_ready or !index.coverage_summary_ready;
+        }
+        return true;
+    }
+
+    fn runtimeStatusTargetRank(status: runtime_status.LocalTableRuntimeStatus, target: IndexRuntimeTarget) u8 {
+        for (status.stats.indexes) |index| {
+            if (!std.mem.eql(u8, index.name, target.name)) continue;
+            const identity = target.identity orelse return 2;
+            return if (index.coverage_identity_ready and
+                index.coverage_generation == identity.coverage_generation and
+                index.coverage_config_hash == identity.coverage_config_hash)
+                2
+            else
+                1;
+        }
+        return 0;
+    }
+
     fn appendLocalRuntimeStatuses(
         self: *ApiHttpServer,
         table_name: []const u8,
         snapshot: ?*const metadata_api.AdminSnapshot,
         snapshot_index: ?*const RuntimeStatusSnapshotIndex,
+        target_index: ?IndexRuntimeTarget,
         items: *std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus),
         item_indexes: *std.AutoHashMapUnmanaged(u64, usize),
         owned: *runtime_status.LocalTableRuntimeStatuses,
@@ -3166,7 +3244,7 @@ pub const ApiHttpServer = struct {
                 continue;
             }
             var candidate = item;
-            try upsertRuntimeStatus(self.alloc, items, item_indexes, &candidate);
+            try upsertRuntimeStatusForTarget(self.alloc, items, item_indexes, &candidate, target_index);
         }
         if (owned.items.len > 0) self.alloc.free(owned.items);
         owned.items = &.{};
@@ -3211,6 +3289,7 @@ pub const ApiHttpServer = struct {
         item_indexes: *std.AutoHashMapUnmanaged(u64, usize),
         table_name: []const u8,
         snapshot: *const metadata_api.AdminSnapshot,
+        target_index: ?IndexRuntimeTarget,
     ) !void {
         const table = tables_api.findTableByName(snapshot, table_name) orelse return;
         for (snapshot.stores) |store| {
@@ -3223,7 +3302,7 @@ pub const ApiHttpServer = struct {
                 var status = try localRuntimeStatusFromRemoteReport(self.alloc, remote);
                 var consumed = false;
                 errdefer if (!consumed) status.deinit(self.alloc);
-                try upsertRuntimeStatus(self.alloc, items, item_indexes, &status);
+                try upsertRuntimeStatusForTarget(self.alloc, items, item_indexes, &status, target_index);
                 consumed = true;
             }
         }
@@ -3235,13 +3314,14 @@ pub const ApiHttpServer = struct {
         item_indexes: *std.AutoHashMapUnmanaged(u64, usize),
         table_name: []const u8,
         snapshot_index: *const RuntimeStatusSnapshotIndex,
+        target_index: ?IndexRuntimeTarget,
     ) !void {
         const table_id = snapshot_index.tableId(table_name) orelse return;
         for (snapshot_index.reportsForTable(table_id)) |report| {
             var status = try localRuntimeStatusFromRemoteReport(self.alloc, report.*);
             var consumed = false;
             errdefer if (!consumed) status.deinit(self.alloc);
-            try upsertRuntimeStatus(self.alloc, items, item_indexes, &status);
+            try upsertRuntimeStatusForTarget(self.alloc, items, item_indexes, &status, target_index);
             consumed = true;
         }
     }
@@ -3255,6 +3335,57 @@ pub const ApiHttpServer = struct {
         if (item_indexes.get(status.group_id)) |existing_index| {
             const existing = &items.items[existing_index];
             if (!runtimeStatusPreferred(status.*, existing.*)) {
+                status.deinit(alloc);
+                return;
+            }
+            existing.deinit(alloc);
+            existing.* = status.*;
+            status.* = undefined;
+            return;
+        }
+        try items.ensureUnusedCapacity(alloc, 1);
+        try item_indexes.ensureUnusedCapacity(alloc, 1);
+        const index = items.items.len;
+        items.appendAssumeCapacity(status.*);
+        item_indexes.putAssumeCapacity(status.group_id, index);
+        status.* = undefined;
+    }
+
+    fn upsertRuntimeStatusForTarget(
+        alloc: std.mem.Allocator,
+        items: *std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus),
+        item_indexes: *std.AutoHashMapUnmanaged(u64, usize),
+        status: *runtime_status.LocalTableRuntimeStatus,
+        target: ?IndexRuntimeTarget,
+    ) !void {
+        const index_target = target orelse return try upsertRuntimeStatus(alloc, items, item_indexes, status);
+        if (item_indexes.get(status.group_id)) |existing_index| {
+            const existing = &items.items[existing_index];
+            // Quarantine is a group-level integrity fact and must retain its
+            // precedence even when another observation matches the requested
+            // index incarnation.
+            const candidate_quarantined = status.metadata.source == .rebuild_state_quarantine;
+            const existing_quarantined = existing.metadata.source == .rebuild_state_quarantine;
+            const preferred = if (candidate_quarantined != existing_quarantined)
+                runtimeStatusPreferred(status.*, existing.*)
+            else blk: {
+                const candidate_rank = runtimeStatusTargetRank(status.*, index_target);
+                const existing_rank = runtimeStatusTargetRank(existing.*, index_target);
+                if (candidate_rank != existing_rank) break :blk candidate_rank > existing_rank;
+                // Once an incomplete cached observation caused a targeted
+                // writer refresh, the live writer is the authoritative view
+                // for that same incarnation even if its freshness is still
+                // catching_up. Otherwise the cached value can win forever.
+                const candidate_is_writer = status.metadata.source == .live_writer_publish;
+                const existing_is_writer = existing.metadata.source == .live_writer_publish;
+                if (candidate_is_writer != existing_is_writer and
+                    runtimeStatusTargetNeedsWriterRefresh(existing.*, index_target))
+                {
+                    break :blk candidate_is_writer;
+                }
+                break :blk runtimeStatusPreferred(status.*, existing.*);
+            };
+            if (!preferred) {
                 status.deinit(alloc);
                 return;
             }
@@ -8569,14 +8700,22 @@ pub const ApiHttpServer = struct {
         var snapshot = (self.statusAdminSnapshot() catch return error.InternalFailure) orelse return error.NotFound;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.NotFound;
-        var lookup = (indexes_api.lookupSingleIndexConfig(alloc, table.indexes_json, index_name) catch return error.InternalFailure) orelse return error.NotFound;
+        var lookup = (indexes_api.lookupSingleIndexConfig(alloc, table.indexes_json, index_name) catch return error.InternalFailure) orelse
+            return error.NotFound;
         defer lookup.deinit();
-        var local_statuses = self.localTableRuntimeStatusesWithSnapshot(table_name, &snapshot) catch return error.InternalFailure;
+        const target = IndexRuntimeTarget{
+            .name = index_name,
+            .identity = indexes_api.indexRuntimeIdentity(alloc, index_name, lookup.config) catch return error.InternalFailure,
+        };
+        var local_statuses = self.indexTableRuntimeStatusesWithSnapshot(table_name, target, &snapshot) catch return error.InternalFailure;
         defer if (local_statuses) |*status| status.deinit(self.alloc);
-        return indexes_api.encodeSingleIndexLookup(
+        return indexes_api.encodeSingleIndexLookupForTable(
             alloc,
+            &snapshot,
+            table,
             index_name,
             lookup.config,
+            target.identity,
             if (local_statuses) |*status| status else null,
         ) catch return error.InternalFailure;
     }
@@ -28562,20 +28701,22 @@ test "api http server serves provisioned index runtime backfill status across sh
     });
     defer parsed_detail.deinit();
     try std.testing.expectEqualStrings("search_idx", parsed_detail.value.config.object.get("name").?.string);
-    // Provisioned runtime status reopens shard DBs, so pending backfill is resumed before stats are read.
+    // A status-only provisioned open reports persisted lifecycle state without
+    // running writer-owned backfill work. The synthetic rebuild cursors above
+    // therefore have no physical indexed documents yet.
     if (parsed_detail.value.status.backfill_active) |active| try std.testing.expect(active);
     if (parsed_detail.value.status.rebuilding) |rebuilding| try std.testing.expect(rebuilding);
-    if (parsed_detail.value.status.doc_count) |doc_count| try std.testing.expect(doc_count >= 1);
-    if (parsed_detail.value.status.total_indexed) |total_indexed| try std.testing.expect(total_indexed >= 1);
+    try std.testing.expectEqual(@as(?u64, 0), parsed_detail.value.status.doc_count);
+    try std.testing.expectEqual(@as(?u64, 0), parsed_detail.value.status.total_indexed);
     if (parsed_detail.value.shard_status.@"7001" orelse parsed_detail.value.shard_status.local) |provisioned_left_shard| {
         try std.testing.expectEqual(@as(?bool, true), provisioned_left_shard.backfill_active);
-        try std.testing.expectEqual(@as(?u64, 1), provisioned_left_shard.doc_count);
+        try std.testing.expectEqual(@as(?u64, 0), provisioned_left_shard.doc_count);
     }
     if (parsed_detail.value.shard_status.@"7002") |right_shard| {
         try std.testing.expectEqual(@as(?bool, true), right_shard.backfill_active);
     }
     if (parsed_detail.value.shard_status.@"7002") |right_shard| {
-        try std.testing.expectEqual(@as(?u64, 1), right_shard.doc_count);
+        try std.testing.expectEqual(@as(?u64, 0), right_shard.doc_count);
     }
 }
 
@@ -29709,8 +29850,167 @@ test "api index status refreshes synthetic configured index status from write so
     try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefresh(live_statuses[0..]));
 }
 
-test "api index status asks write source when read runtime status is absent" {
+test "api index status refreshes writer when read snapshot omits requested index" {
+    const indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "older_idx",
+        .kind = .dense_vector,
+        .doc_count = 1,
+    }};
+    const statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+        .stats = .{
+            .doc_count = 1,
+            .index_count = indexes.len,
+            .indexes = @constCast(indexes[0..]),
+        },
+    }};
+
+    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(statuses[0..], .{
+        .name = "older_idx",
+        .identity = null,
+    }));
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(statuses[0..], .{
+        .name = "newer_idx",
+        .identity = null,
+    }));
+
+    var current = indexes[0];
+    current.coverage_generation = 41;
+    current.coverage_config_hash = 99;
+    current.coverage_identity_ready = true;
+    const current_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+        .stats = .{
+            .doc_count = 1,
+            .index_count = 1,
+            .indexes = @constCast((&[_]db_mod.types.DBIndexStats{current})[0..]),
+        },
+    }};
+    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(current_statuses[0..], .{
+        .name = "older_idx",
+        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+    }));
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(current_statuses[0..], .{
+        .name = "older_idx",
+        .identity = .{ .coverage_generation = 42, .coverage_config_hash = 99 },
+    }));
+
+    const unrelated_incomplete_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+        .stats = .{
+            .doc_count = 1,
+            .index_count = 1,
+            .indexes = @constCast((&[_]db_mod.types.DBIndexStats{current})[0..]),
+            .repair_summary_ready = false,
+            .repair_degraded = true,
+        },
+    }};
+    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(unrelated_incomplete_statuses[0..], .{
+        .name = "older_idx",
+        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+    }));
+
+    var incomplete_index = current;
+    incomplete_index.repair_summary_ready = false;
+    incomplete_index.repair_degraded = true;
+    incomplete_index.backfill_active = true;
+    const incomplete_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+        .stats = .{
+            .doc_count = 1,
+            .index_count = 1,
+            .indexes = @constCast((&[_]db_mod.types.DBIndexStats{incomplete_index})[0..]),
+            // DB stats derive table degradation from the incomplete index.
+            .repair_degraded = true,
+        },
+    }};
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(incomplete_statuses[0..], .{
+        .name = "older_idx",
+        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+    }));
+
+    var retained_live_incomplete = incomplete_statuses[0];
+    retained_live_incomplete.metadata.source = .live_writer_publish;
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(&.{retained_live_incomplete}, .{
+        .name = "older_idx",
+        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+    }));
+
+    var terminal_index = incomplete_index;
+    terminal_index.repair_issue_count = 1;
+    const terminal_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+        .stats = .{
+            .doc_count = 1,
+            .index_count = 1,
+            .indexes = @constCast((&[_]db_mod.types.DBIndexStats{terminal_index})[0..]),
+            .repair_degraded = true,
+            .repair_issue_count = 1,
+        },
+    }};
+    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(terminal_statuses[0..], .{
+        .name = "older_idx",
+        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+    }));
+
+    var terminal_phase_index = incomplete_index;
+    terminal_phase_index.index_repair_phase = "terminal";
+    const terminal_phase_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+        .stats = .{
+            .doc_count = 1,
+            .index_count = 1,
+            .indexes = @constCast((&[_]db_mod.types.DBIndexStats{terminal_phase_index})[0..]),
+            .repair_degraded = true,
+        },
+    }};
+    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(terminal_phase_statuses[0..], .{
+        .name = "older_idx",
+        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+    }));
+}
+
+test "api index status prefers current same-name incarnation from write source" {
     const alloc = std.testing.allocator;
+
+    const StatusFactory = struct {
+        fn make(
+            inner_alloc: std.mem.Allocator,
+            coverage_generation: u64,
+            coverage_config_hash: u64,
+            source: runtime_status.RuntimeStatusSource,
+            freshness: runtime_status.RuntimeStatusFreshness,
+            doc_count: u64,
+        ) !runtime_status.LocalTableRuntimeStatuses {
+            const indexes = try inner_alloc.alloc(db_mod.types.DBIndexStats, 1);
+            errdefer inner_alloc.free(indexes);
+            indexes[0] = .{
+                .name = try inner_alloc.dupe(u8, "vec"),
+                .kind = .dense_vector,
+                .doc_count = doc_count,
+                .coverage_generation = coverage_generation,
+                .coverage_config_hash = coverage_config_hash,
+                .coverage_identity_ready = true,
+            };
+            const items = try inner_alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+            errdefer {
+                db_mod.types.freeDBStats(inner_alloc, .{ .doc_count = doc_count, .index_count = 1, .indexes = indexes });
+                inner_alloc.free(items);
+            }
+            items[0] = .{
+                .group_id = 10,
+                .metadata = .{ .source = source, .freshness = freshness },
+                .stats = .{ .doc_count = doc_count, .index_count = 1, .indexes = indexes },
+            };
+            return .{ .items = items };
+        }
+    };
 
     const FakeSource = struct {
         fn iface(self: *@This()) StatusSource {
@@ -29735,10 +30035,15 @@ test "api index status asks write source when read runtime status is absent" {
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
                     .table_id = 1,
                     .name = "docs",
-                    .indexes_json = "{\"vec\":{\"type\":\"embeddings\",\"dimension\":3}}",
+                    .indexes_json = "{\"vec\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}}",
                     .placement_role = "data",
                 }})[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 10,
+                    .table_id = 1,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
@@ -29755,6 +30060,7 @@ test "api index status asks write source when read runtime status is absent" {
 
     const FakeReads = struct {
         status_calls: std.atomic.Value(u32) = .init(0),
+        current_incomplete: bool = false,
 
         fn source(self: *@This()) table_reads.TableReadSource {
             return .{
@@ -29780,10 +30086,26 @@ test "api index status asks write source when read runtime status is absent" {
             return error.TestUnexpectedResult;
         }
 
-        fn localRuntimeStatuses(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8) !?runtime_status.LocalTableRuntimeStatuses {
+        fn localRuntimeStatuses(ptr: *anyopaque, inner_alloc: std.mem.Allocator, _: []const u8) !?runtime_status.LocalTableRuntimeStatuses {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             _ = self.status_calls.fetchAdd(1, .monotonic);
-            return null;
+            if (!self.current_incomplete) return try StatusFactory.make(inner_alloc, 41, 1, .cached_snapshot, .fresh, 7);
+            var parsed = try std.json.parseFromSlice(
+                std.json.Value,
+                inner_alloc,
+                "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}",
+                .{},
+            );
+            defer parsed.deinit();
+            const identity = (try indexes_api.indexRuntimeIdentity(inner_alloc, "vec", parsed.value)) orelse
+                return error.TestUnexpectedResult;
+            var statuses = try StatusFactory.make(inner_alloc, identity.coverage_generation, identity.coverage_config_hash, .cached_snapshot, .fresh, 7);
+            statuses.items[0].stats.repair_summary_ready = false;
+            statuses.items[0].stats.repair_degraded = true;
+            statuses.items[0].stats.indexes[0].repair_summary_ready = false;
+            statuses.items[0].stats.indexes[0].repair_degraded = true;
+            statuses.items[0].stats.indexes[0].backfill_active = true;
+            return statuses;
         }
     };
 
@@ -29804,10 +30126,21 @@ test "api index status asks write source when read runtime status is absent" {
             return;
         }
 
-        fn localRuntimeStatuses(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8) !?runtime_status.LocalTableRuntimeStatuses {
+        fn localRuntimeStatuses(ptr: *anyopaque, inner_alloc: std.mem.Allocator, _: []const u8) !?runtime_status.LocalTableRuntimeStatuses {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             _ = self.status_calls.fetchAdd(1, .monotonic);
-            return null;
+            var parsed = try std.json.parseFromSlice(
+                std.json.Value,
+                inner_alloc,
+                "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}",
+                .{},
+            );
+            defer parsed.deinit();
+            const identity = (try indexes_api.indexRuntimeIdentity(inner_alloc, "vec", parsed.value)) orelse
+                return error.TestUnexpectedResult;
+            // The current writer may legitimately be catching up. Its matching
+            // incarnation must still beat a fresh retained read snapshot.
+            return try StatusFactory.make(inner_alloc, identity.coverage_generation, identity.coverage_config_hash, .live_writer_publish, .catching_up, 11);
         }
     };
 
@@ -29824,6 +30157,35 @@ test "api index status asks write source when read runtime status is absent" {
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqual(@as(u32, 1), reads.status_calls.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 1), writes.status_calls.load(.monotonic));
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"config\":{\"name\":\"vec\",\"type\":\"embeddings\"},\"shard_status\":{\"10\":{\"runtime_source\":\"live_writer_publish\",\"runtime_freshness\":\"catching_up\"}}}",
+        resp.body,
+    );
+    var parsed_response = try ant_json.parseFromSlice(ant_json.Value, alloc, resp.body, .{});
+    defer parsed_response.deinit();
+    const config = parsed_response.value.object.get("config") orelse return error.TestUnexpectedResult;
+    if (config != .object) return error.TestUnexpectedResult;
+    try std.testing.expect(config.object.get("_coverage_incarnation") == null);
+
+    // A same-incarnation cache entry is not authoritative while it still
+    // advertises lifecycle debt. The targeted detail request must refresh it
+    // and prefer the writer's completed view even when the writer is marked
+    // catching_up at the group level.
+    reads.current_incomplete = true;
+    var refreshed_resp = try executeHttpxTestRequest(&server, .{
+        .method = .GET,
+        .uri = "/tables/docs/indexes/vec",
+    });
+    defer refreshed_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), refreshed_resp.status);
+    try std.testing.expectEqual(@as(u32, 2), reads.status_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 2), writes.status_calls.load(.monotonic));
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"shard_status\":{\"10\":{\"runtime_source\":\"live_writer_publish\"}}}",
+        refreshed_resp.body,
+    );
 }
 
 test "api index status uses propagated remote store runtime status" {
@@ -30422,11 +30784,11 @@ test "api index status ignores propagated runtime status from removed owner" {
     try std.testing.expectEqual(@as(u32, 1), writes.status_calls.load(.monotonic));
     var parsed = try std.json.parseFromSlice(Response, alloc, resp.body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(?u64, null), parsed.value.status.doc_count);
-    try std.testing.expectEqual(@as(?u64, null), parsed.value.status.expected_groups);
-    try std.testing.expectEqual(@as(?u64, null), parsed.value.status.reported_groups);
-    try std.testing.expectEqual(@as(?u64, null), parsed.value.status.missing_groups);
-    try std.testing.expectEqual(@as(?bool, null), parsed.value.status.replay_catch_up_required);
+    try std.testing.expectEqual(@as(?u64, 0), parsed.value.status.doc_count);
+    try std.testing.expectEqual(@as(?u64, 1), parsed.value.status.expected_groups);
+    try std.testing.expectEqual(@as(?u64, 0), parsed.value.status.reported_groups);
+    try std.testing.expectEqual(@as(?u64, 1), parsed.value.status.missing_groups);
+    try std.testing.expectEqual(@as(?bool, true), parsed.value.status.replay_catch_up_required);
 }
 
 test "api index status reports missing remote shard as not ready" {
@@ -30562,18 +30924,15 @@ test "api index status reports missing remote shard as not ready" {
     try std.testing.expectEqual(@as(u32, 1), writes.status_calls.load(.monotonic));
     var parsed = try std.json.parseFromSlice(Response, alloc, resp.body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    if (parsed.value.status.rebuilding) |rebuilding| try std.testing.expect(rebuilding);
-    if (parsed.value.status.backfill_active) |active| try std.testing.expect(active);
-    if (parsed.value.status.expected_groups) |expected_groups| try std.testing.expect(expected_groups >= 1);
-    if (parsed.value.status.reported_groups) |reported_groups| try std.testing.expectEqual(@as(u64, 0), reported_groups);
-    if (parsed.value.status.missing_groups) |missing_groups| try std.testing.expect(missing_groups >= 1);
-    if (parsed.value.status.replay_catch_up_required) |required| try std.testing.expect(required);
-    if (parsed.value.shard_status) |shards| {
-        if (shards.@"10") |shard| {
-            try std.testing.expectEqual(@as(?bool, true), shard.backfill_active);
-            try std.testing.expectEqual(@as(?bool, true), shard.replay_catch_up_required);
-        }
-    }
+    try std.testing.expectEqual(@as(?bool, true), parsed.value.status.backfill_active);
+    try std.testing.expectEqual(@as(?u64, 1), parsed.value.status.expected_groups);
+    try std.testing.expectEqual(@as(?u64, 0), parsed.value.status.reported_groups);
+    try std.testing.expectEqual(@as(?u64, 1), parsed.value.status.missing_groups);
+    try std.testing.expectEqual(@as(?bool, true), parsed.value.status.replay_catch_up_required);
+    const shards = parsed.value.shard_status orelse return error.TestExpectedEqual;
+    const shard = shards.@"10" orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(?bool, true), shard.backfill_active);
+    try std.testing.expectEqual(@as(?bool, true), shard.replay_catch_up_required);
 }
 
 test "api http server drop table waits for metadata lifecycle absence" {

@@ -266,9 +266,14 @@ pub fn restoreIntentTopologyCompatible(
 
 pub const node_lifecycle_active = "active";
 pub const node_lifecycle_draining = "draining";
+pub const node_lifecycle_finalizing = "finalizing";
 
 pub fn nodeLifecycleActive(lifecycle: []const u8) bool {
     return std.mem.eql(u8, lifecycle, node_lifecycle_active);
+}
+
+pub fn nodeLifecycleFinalizing(lifecycle: []const u8) bool {
+    return std.mem.eql(u8, lifecycle, node_lifecycle_finalizing);
 }
 
 pub const NodeRecord = struct {
@@ -714,6 +719,31 @@ pub const RuntimeGroupStatusReport = struct {
     doc_set_planning: RuntimeDocSetPlanningStatusReport = .{},
     indexes: []RuntimeIndexStatusReport = &.{},
 };
+
+/// Runtime observations can be retained or overlaid across store refreshes.
+/// Only an observation whose explicit identity belongs to the containing
+/// store is termination debt; zero is the unknown wildcard used by reports
+/// that inherit their identity from the StoreRecord envelope.
+pub fn runtimeStatusBelongsToStore(
+    status: RuntimeGroupStatusReport,
+    node_id: u64,
+    store_id: u64,
+) bool {
+    if (status.node_id != 0 and status.node_id != node_id) return false;
+    if (status.store_id != 0 and status.store_id != store_id) return false;
+    return true;
+}
+
+/// Shared by shutdown status, mutation preflight, and Raft apply so the
+/// operator-visible `safe_to_terminate` contract is exactly the deletion
+/// fence enforced by the state machine.
+pub fn storeHasTerminationDebt(store: StoreRecord) bool {
+    if (store.group_statuses.len != 0) return true;
+    for (store.runtime_statuses) |status| {
+        if (runtimeStatusBelongsToStore(status, store.node_id, store.store_id)) return true;
+    }
+    return false;
+}
 
 pub const RuntimeDocIdentityStatusReport = struct {
     namespace_table_id: u64 = 0,

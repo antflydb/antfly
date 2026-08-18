@@ -51,6 +51,10 @@ pub const MedianKeyLookup = struct {
 
 pub const CurrentMetadataState = struct {
     placement_intents: []const raft_reconciler.PlacementIntent = &.{},
+    /// Durable per-placement generations, including keys whose current intent
+    /// is absent. This is control-loop-only CAS state and is never serialized
+    /// in the public admin snapshot.
+    placement_version_fences: []const PlacementVersionFence = &.{},
     tables: []const table_manager.TableRecord = &.{},
     ranges: []const table_manager.RangeRecord = &.{},
     stores: []const table_manager.StoreRecord = &.{},
@@ -112,7 +116,67 @@ pub const PlannedMergeStep = struct {
 pub const PlacementRemoval = struct {
     group_id: u64,
     local_node_id: u64,
+    expected_metadata_version: u64,
 };
+
+pub const PlacementUpsertPrecondition = struct {
+    expected_metadata_version: ?u64,
+    expected_version_fence: u64,
+    expected_target_drain_requested: bool,
+};
+
+pub const PlacementVersionFence = struct {
+    group_id: u64,
+    local_node_id: u64,
+    version: u64,
+};
+
+const PlacementVersionFenceKey = struct {
+    group_id: u64,
+    local_node_id: u64,
+};
+
+const PlacementVersionFenceIndex = struct {
+    by_placement: std.AutoHashMapUnmanaged(PlacementVersionFenceKey, u64) = .empty,
+
+    fn init(alloc: std.mem.Allocator, fences: []const PlacementVersionFence) !@This() {
+        var index: @This() = .{};
+        errdefer index.deinit(alloc);
+        try index.by_placement.ensureTotalCapacity(alloc, @intCast(fences.len));
+        for (fences) |fence| {
+            index.by_placement.putAssumeCapacity(.{
+                .group_id = fence.group_id,
+                .local_node_id = fence.local_node_id,
+            }, fence.version);
+        }
+        return index;
+    }
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.by_placement.deinit(alloc);
+    }
+
+    fn version(
+        self: *const @This(),
+        group_id: u64,
+        local_node_id: u64,
+        existing: ?raft_reconciler.PlacementIntent,
+    ) u64 {
+        return self.by_placement.get(.{
+            .group_id = group_id,
+            .local_node_id = local_node_id,
+        }) orelse if (existing) |intent| intent.record.metadata_version else 0;
+    }
+};
+
+fn placementVersionFence(
+    index: *const PlacementVersionFenceIndex,
+    group_id: u64,
+    local_node_id: u64,
+    existing: ?raft_reconciler.PlacementIntent,
+) u64 {
+    return index.version(group_id, local_node_id, existing);
+}
 
 pub const SplitAdmission = struct {
     expected_source_epoch: u64,
@@ -127,6 +191,7 @@ pub const PlacementChangeKind = enum {
 
 pub const ReconciliationPlan = struct {
     placement_upserts: []raft_reconciler.PlacementIntent,
+    placement_upsert_preconditions: []PlacementUpsertPrecondition,
     table_upserts: []table_manager.TableRecord,
     range_upserts: []table_manager.RangeRecord,
     split_admissions: []SplitAdmission,
@@ -147,6 +212,7 @@ pub const ReconciliationPlan = struct {
     pub fn empty() ReconciliationPlan {
         return .{
             .placement_upserts = &.{},
+            .placement_upsert_preconditions = &.{},
             .table_upserts = &.{},
             .range_upserts = &.{},
             .split_admissions = &.{},
@@ -169,6 +235,7 @@ pub const ReconciliationPlan = struct {
     pub fn deinit(self: *ReconciliationPlan, alloc: std.mem.Allocator) void {
         for (self.placement_upserts) |intent| raft_reconciler.freeIntentOwned(alloc, intent);
         alloc.free(self.placement_upserts);
+        alloc.free(self.placement_upsert_preconditions);
         for (self.table_upserts) |record| table_manager.freeTable(alloc, record);
         alloc.free(self.table_upserts);
         for (self.range_upserts) |record| table_manager.freeRange(alloc, record);
@@ -249,6 +316,11 @@ pub const Reconciler = struct {
         defer manager.freeTables(self.alloc, desired_tables);
         var evidence = try StoreEvidenceIndex.init(self.alloc, current);
         defer evidence.deinit();
+        var placement_version_fences = try PlacementVersionFenceIndex.init(
+            self.alloc,
+            current.placement_version_fences,
+        );
+        defer placement_version_fences.deinit(self.alloc);
         const automatic_shard_planning_conclusive = try self.syncAutomaticShardIntents(
             manager,
             current,
@@ -329,10 +401,12 @@ pub const Reconciler = struct {
         );
         var table_upserts = std.ArrayListUnmanaged(table_manager.TableRecord).empty;
         var placement_upserts = std.ArrayListUnmanaged(raft_reconciler.PlacementIntent).empty;
+        var placement_upsert_preconditions = std.ArrayListUnmanaged(PlacementUpsertPrecondition).empty;
         errdefer {
             for (placement_upserts.items) |intent| raft_reconciler.freeIntentOwned(self.alloc, intent);
             placement_upserts.deinit(self.alloc);
         }
+        errdefer placement_upsert_preconditions.deinit(self.alloc);
         errdefer {
             for (table_upserts.items) |record| table_manager.freeTable(self.alloc, record);
             table_upserts.deinit(self.alloc);
@@ -397,9 +471,20 @@ pub const Reconciler = struct {
                 const existing = membership_index.currentIntent(effective.record.group_id, effective.record.local_node_id);
                 if (existing == null or !placementIntentsEqual(existing.?, effective)) {
                     try placement_upserts.ensureUnusedCapacity(self.alloc, 1);
+                    try placement_upsert_preconditions.ensureUnusedCapacity(self.alloc, 1);
                     placement_upserts.appendAssumeCapacity(
                         try clonePlacementIntent(self.alloc, effective),
                     );
+                    placement_upsert_preconditions.appendAssumeCapacity(.{
+                        .expected_metadata_version = if (existing) |intent| intent.record.metadata_version else null,
+                        .expected_version_fence = placementVersionFence(
+                            &placement_version_fences,
+                            effective.record.group_id,
+                            effective.record.local_node_id,
+                            existing,
+                        ),
+                        .expected_target_drain_requested = placementTargetDrainRequested(current.stores, effective),
+                    });
                 }
             }
         }
@@ -594,6 +679,7 @@ pub const Reconciler = struct {
                     try placement_removals.append(self.alloc, .{
                         .group_id = intent.record.group_id,
                         .local_node_id = intent.record.local_node_id,
+                        .expected_metadata_version = intent.record.metadata_version,
                     });
                 } else {
                     var draining = intent;
@@ -619,9 +705,20 @@ pub const Reconciler = struct {
                     applyRelocationWatermark(&draining, watermark);
                     if (!placementIntentsEqual(intent, draining)) {
                         try placement_upserts.ensureUnusedCapacity(self.alloc, 1);
+                        try placement_upsert_preconditions.ensureUnusedCapacity(self.alloc, 1);
                         placement_upserts.appendAssumeCapacity(
                             try clonePlacementIntent(self.alloc, draining),
                         );
+                        placement_upsert_preconditions.appendAssumeCapacity(.{
+                            .expected_metadata_version = intent.record.metadata_version,
+                            .expected_version_fence = placementVersionFence(
+                                &placement_version_fences,
+                                intent.record.group_id,
+                                intent.record.local_node_id,
+                                intent,
+                            ),
+                            .expected_target_drain_requested = placementTargetDrainRequested(current.stores, intent),
+                        });
                     }
                 }
             }
@@ -700,6 +797,7 @@ pub const Reconciler = struct {
         var plan = ReconciliationPlan.empty();
         errdefer plan.deinit(self.alloc);
         plan.placement_upserts = try placement_upserts.toOwnedSlice(self.alloc);
+        plan.placement_upsert_preconditions = try placement_upsert_preconditions.toOwnedSlice(self.alloc);
         plan.table_upserts = try table_upserts.toOwnedSlice(self.alloc);
         plan.range_upserts = try range_upserts.toOwnedSlice(self.alloc);
         plan.split_admissions = try split_admissions.toOwnedSlice(self.alloc);
@@ -1200,6 +1298,21 @@ fn findPlacementIntent(intents: []const raft_reconciler.PlacementIntent, group_i
     return null;
 }
 
+fn placementTargetDrainRequested(
+    stores: []const table_manager.StoreRecord,
+    intent: raft_reconciler.PlacementIntent,
+) bool {
+    for (stores) |store| {
+        if (intent.store_id != 0) {
+            if (store.store_id != intent.store_id) continue;
+        } else if (store.node_id != intent.record.local_node_id) {
+            continue;
+        }
+        return store.drain_requested;
+    }
+    return false;
+}
+
 fn normalizeRestoreBootstrapIntent(
     current: CurrentMetadataState,
     tables: []const table_manager.TableRecord,
@@ -1259,6 +1372,7 @@ fn effectivePlacementIntent(
     applyRelocationWatermark(&effective, watermark);
 
     if (existing) |current_intent| {
+        effective.record.metadata_version = current_intent.record.metadata_version;
         effective.relocation_generation = current_intent.relocation_generation;
         if (effective.relocation_generation == 0 and current_intent.serving_state != .serving) {
             effective.relocation_generation = current_intent.record.metadata_version + 1;
@@ -4896,14 +5010,22 @@ test "metadata reconciler keeps in-flight group placement sticky across repeated
         .{ .node_id = 102, .store_id = 102, .role = "data", .failure_domain = "rack-b", .retain_current = true },
         .{ .node_id = 103, .store_id = 103, .role = "data", .failure_domain = "rack-c", .retain_current = true },
     };
+    const placement_version_fences = [_]PlacementVersionFence{
+        .{ .group_id = 2111, .local_node_id = 101, .version = 7 },
+        .{ .group_id = 2111, .local_node_id = 102, .version = 7 },
+        .{ .group_id = 2111, .local_node_id = 103, .version = 7 },
+    };
 
     var reconciler = Reconciler.init(std.testing.allocator);
     var initial_plan = try reconciler.computePlan(&manager, &.{ 101, 102, 103 }, &candidates, .{
+        .placement_version_fences = &placement_version_fences,
         .reallocation_request = .{ .request_id = 1, .requested_at_ms = 1 },
     });
     defer initial_plan.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), initial_plan.placement_upserts.len);
+    try std.testing.expectEqual(@as(usize, 1), initial_plan.placement_upsert_preconditions.len);
+    try std.testing.expectEqual(@as(u64, 7), initial_plan.placement_upsert_preconditions[0].expected_version_fence);
     const initial = initial_plan.placement_upserts[0];
     try std.testing.expectEqual(raft_reconciler.PlacementServingState.serving, initial.serving_state);
 
