@@ -255,6 +255,7 @@ The status section is read-only and managed by the operator.
 |-------|------|-------------|
 | `phase` | string | Cluster phase (`Pending`, `Running`, `Degraded`, `Failed`) |
 | `conditions` | []Condition | Current conditions |
+| `metadataTopologyReplicas` | int32 | Immutable metadata replica count recorded by the controller |
 | `metadataNodesReady` | int32 | Ready metadata node count |
 | `dataNodesReady` | int32 | Ready data node count |
 | `autoScalingStatus` | [AutoScalingStatus](#autoscalingstatus) | Autoscaling state |

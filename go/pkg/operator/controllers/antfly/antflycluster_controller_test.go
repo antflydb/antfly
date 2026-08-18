@@ -63,50 +63,113 @@ func TestGeneratedConfigHashAnnotationChangesWithRemoteContentConfig(t *testing.
 	}
 }
 
-func TestValidateMetadataReplicaCountAgainstStatefulSet(t *testing.T) {
+func TestValidateMetadataReplicaTopology(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := appsv1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-
-	currentReplicas := int32(1)
-	metadataStatefulSet := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{Name: "example-metadata", Namespace: "default"},
-		Spec:       appsv1.StatefulSetSpec{Replicas: &currentReplicas},
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
 	}
-	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(metadataStatefulSet).Build(),
+	newReconciler := func(objects ...client.Object) *AntflyClusterReconciler {
+		return &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()}
 	}
-	cluster := &antflyv1.AntflyCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
-		Spec: antflyv1.AntflyClusterSpec{
-			Mode: antflyv1.ClusterModeDistributed,
-			MetadataNodes: antflyv1.MetadataNodesSpec{
-				Replicas: 3,
+	newCluster := func(replicas, recorded int32) *antflyv1.AntflyCluster {
+		return &antflyv1.AntflyCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
+			Spec: antflyv1.AntflyClusterSpec{
+				Mode:          antflyv1.ClusterModeDistributed,
+				MetadataNodes: antflyv1.MetadataNodesSpec{Replicas: replicas},
 			},
-		},
-	}
-
-	err := reconciler.validateMetadataReplicaCountAgainstStatefulSet(context.Background(), cluster)
-	if err == nil {
-		t.Fatal("expected existing one-replica metadata topology to reject desired three replicas")
-	}
-	for _, want := range []string{"current: 1", "attempted: 3", "fresh metadata PVCs", "Do not reuse retained metadata PVCs"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("expected metadata topology validation error to contain %q, got: %v", want, err)
+			Status: antflyv1.AntflyClusterStatus{MetadataTopologyReplicas: recorded},
 		}
 	}
 
-	cluster.Spec.MetadataNodes.Replicas = currentReplicas
-	if err := reconciler.validateMetadataReplicaCountAgainstStatefulSet(context.Background(), cluster); err != nil {
-		t.Fatalf("expected unchanged metadata topology to pass, got: %v", err)
+	driftedReplicas := int32(3)
+	metadataStatefulSet := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "example-metadata", Namespace: "default"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: &driftedReplicas},
+	}
+	reconciler := newReconciler(metadataStatefulSet)
+	cluster := newCluster(1, 1)
+	if err := reconciler.validateMetadataReplicaTopology(context.Background(), cluster); err != nil {
+		t.Fatalf("expected durable status topology to ignore StatefulSet drift, got: %v", err)
 	}
 
-	newCluster := cluster.DeepCopy()
-	newCluster.Name = "new"
-	newCluster.Spec.MetadataNodes.Replicas = 3
-	if err := reconciler.validateMetadataReplicaCountAgainstStatefulSet(context.Background(), newCluster); err != nil {
-		t.Fatalf("expected a cluster without an existing metadata StatefulSet to pass, got: %v", err)
+	cluster.Spec.MetadataNodes.Replicas = 3
+	err := reconciler.validateMetadataReplicaTopology(context.Background(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "AntflyCluster status: 1, attempted: 3") {
+		t.Fatalf("expected durable status to reject changed topology, got: %v", err)
+	}
+
+	legacyReplicas := int32(1)
+	legacyStatefulSet := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "example-metadata", Namespace: "default"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: &legacyReplicas},
+	}
+	cluster = newCluster(1, 0)
+	if err := newReconciler(legacyStatefulSet).validateMetadataReplicaTopology(context.Background(), cluster); err != nil {
+		t.Fatalf("expected matching legacy StatefulSet topology to migrate, got: %v", err)
+	}
+	cluster.Spec.MetadataNodes.Replicas = 3
+	err = newReconciler(legacyStatefulSet).validateMetadataReplicaTopology(context.Background(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "legacy metadata StatefulSet: 1, attempted: 3") {
+		t.Fatalf("expected legacy StatefulSet topology to reject a changed count during migration, got: %v", err)
+	}
+
+	annotatedPVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name:      "metadata-storage-example-metadata-0",
+		Namespace: "default",
+		Annotations: map[string]string{
+			metadataTopologyReplicasAnnotation: "1",
+		},
+	}}
+	cluster = newCluster(3, 0)
+	err = newReconciler(annotatedPVC).validateMetadataReplicaTopology(context.Background(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "metadata PVC metadata-storage-example-metadata-0: 1, attempted: 3") {
+		t.Fatalf("expected retained PVC topology to reject same-name recreation at a new count, got: %v", err)
+	}
+
+	unrecordedPVC := annotatedPVC.DeepCopy()
+	unrecordedPVC.Annotations = nil
+	cluster = newCluster(1, 0)
+	err = newReconciler(unrecordedPVC).validateMetadataReplicaTopology(context.Background(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "retained PVCs predate topology recording") {
+		t.Fatalf("expected unrecorded retained PVC topology to fail closed, got: %v", err)
+	}
+
+	cluster = newCluster(3, 0)
+	if err := newReconciler().validateMetadataReplicaTopology(context.Background(), cluster); err != nil {
+		t.Fatalf("expected a cluster without StatefulSets or retained PVCs to pass, got: %v", err)
+	}
+}
+
+func TestRecordMetadataTopologyOnPVCs(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name:      "metadata-storage-example-metadata-0",
+		Namespace: "default",
+	}}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pvc).Build()
+	reconciler := &AntflyClusterReconciler{Client: k8sClient}
+	cluster := &antflyv1.AntflyCluster{ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"}}
+
+	if err := reconciler.recordMetadataTopologyOnPVCs(context.Background(), cluster, 1); err != nil {
+		t.Fatal(err)
+	}
+	updated := &corev1.PersistentVolumeClaim{}
+	if err := k8sClient.Get(context.Background(), client.ObjectKeyFromObject(pvc), updated); err != nil {
+		t.Fatal(err)
+	}
+	if got := updated.Annotations[metadataTopologyReplicasAnnotation]; got != "1" {
+		t.Fatalf("metadata topology annotation = %q, want 1", got)
+	}
+
+	if err := reconciler.recordMetadataTopologyOnPVCs(context.Background(), cluster, 3); err == nil {
+		t.Fatal("expected an existing PVC topology record to be immutable")
 	}
 }
 
@@ -11959,6 +12022,16 @@ var _ = Describe("AntflyCluster Controller", func() {
 				}, metadataSts)
 			}, timeout, interval).Should(Succeed())
 			Expect(*metadataSts.Spec.Replicas).To(Equal(int32(3)))
+			Expect(metadataSts.Annotations).To(HaveKeyWithValue(metadataTopologyReplicasAnnotation, "3"))
+			Expect(metadataSts.Spec.VolumeClaimTemplates).To(HaveLen(1))
+			Expect(metadataSts.Spec.VolumeClaimTemplates[0].Annotations).To(HaveKeyWithValue(metadataTopologyReplicasAnnotation, "3"))
+			Eventually(func() int32 {
+				observed := &antflyv1.AntflyCluster{}
+				if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), observed); err != nil {
+					return 0
+				}
+				return observed.Status.MetadataTopologyReplicas
+			}, timeout, interval).Should(Equal(int32(3)))
 
 			// Verify data StatefulSet is created
 			dataSts := &appsv1.StatefulSet{}

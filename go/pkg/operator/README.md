@@ -366,6 +366,8 @@ The validating webhook and reconciler fallback enforce this rule on all
 supported Kubernetes versions. Kubernetes 1.25+ additionally enforces the
 generated CRD's CEL transition rule at API admission. CEL validation rules were
 alpha in Kubernetes 1.23 and are not relied on for Kubernetes 1.20-1.24.
+The reconciler records the accepted topology in status and on metadata PVCs so
+StatefulSet drift, deletion, or same-name recreation cannot erase the invariant.
 
 ## 📚 Examples
 

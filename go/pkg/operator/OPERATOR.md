@@ -194,7 +194,9 @@ Do not delete and recreate the same `AntflyCluster` name or reuse retained
 metadata PVCs to change the replica count. StatefulSet and PVC names are
 deterministic, so doing so can remount the old one-voter state into the new
 topology and recreate the divergent-Raft failure. Back up, restore into fresh
-storage under a different cluster name, and cut over instead.
+storage under a different cluster name, and cut over instead. The controller
+persists the accepted count in `status.metadataTopologyReplicas` and the
+`antfly.io/metadata-topology-replicas` annotation on each metadata PVC.
 
 ## Autoscaling
 
