@@ -200,7 +200,13 @@ pub const MetadataHttpClient = struct {
             .timeout_ms = default_request_timeout_ms,
         }, null, .at_most_once);
         defer resp.deinit(self.alloc);
-        if (resp.status == 503) return error.ReallocationProtocolUpgradeRequired;
+        if (resp.status == 503) {
+            // A broad authority hint without the stronger non-admission proof
+            // is not safe to replay and is not an upgrade verdict. Preserve
+            // the ambiguity so callers converge through observation.
+            if (isMetadataNotLeaderResponse(resp)) return error.ReallocationOutcomeUnknown;
+            return error.ReallocationProtocolUpgradeRequired;
+        }
         try mapStatus(resp.status, null, null, null);
     }
 
@@ -694,7 +700,11 @@ pub const MetadataHttpClient = struct {
                     return err,
                 else => return err,
             };
-            if (!isMetadataNotLeaderResponse(resp)) return resp;
+            const retryable_authority_response = switch (retry_policy) {
+                .replay_safe => isMetadataNotLeaderResponse(resp),
+                .at_most_once => isMetadataMutationNotAdmittedResponse(resp),
+            };
+            if (!retryable_authority_response) return resp;
             if (not_leader_attempt >= max_metadata_not_leader_retries) {
                 resp.deinit(self.alloc);
                 return error.NotLeader;
@@ -705,10 +715,26 @@ pub const MetadataHttpClient = struct {
     }
 
     fn isMetadataNotLeaderResponse(resp: http_common.HttpResponse) bool {
+        return responseHasHeaderValue(
+            resp,
+            http_common.metadata_not_leader_header,
+            http_common.metadata_not_leader_value,
+        );
+    }
+
+    fn isMetadataMutationNotAdmittedResponse(resp: http_common.HttpResponse) bool {
+        return responseHasHeaderValue(
+            resp,
+            http_common.metadata_mutation_not_admitted_header,
+            http_common.metadata_mutation_not_admitted_value,
+        );
+    }
+
+    fn responseHasHeaderValue(resp: http_common.HttpResponse, name: []const u8, value: []const u8) bool {
         if (resp.status != 503) return false;
         for (resp.headers) |header| {
-            if (std.ascii.eqlIgnoreCase(header.name, http_common.metadata_not_leader_header) and
-                std.ascii.eqlIgnoreCase(std.mem.trim(u8, header.value, " \t\r\n"), http_common.metadata_not_leader_value))
+            if (std.ascii.eqlIgnoreCase(header.name, name) and
+                std.ascii.eqlIgnoreCase(std.mem.trim(u8, header.value, " \t\r\n"), value))
             {
                 return true;
             }
@@ -858,6 +884,71 @@ test "metadata http client retries reallocation only before connection admission
     var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
     try client.triggerReallocate("http://127.0.0.1:9000");
     try std.testing.expectEqual(@as(usize, 2), executor.attempts);
+}
+
+test "metadata http client replays reallocation only with explicit mutation non-admission proof" {
+    const ProofKind = enum { mutation_not_admitted, broad_authority_hint };
+    const ProofExecutor = struct {
+        proof: ProofKind,
+        attempts: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn rejectionResponse(
+            alloc: std.mem.Allocator,
+            header_name: []const u8,
+            header_value: []const u8,
+        ) !http_common.HttpResponse {
+            const headers = try alloc.alloc(http_common.Header, 1);
+            errdefer alloc.free(headers);
+            headers[0] = .{
+                .name = try alloc.dupe(u8, header_name),
+                .value = &.{},
+            };
+            errdefer headers[0].deinit(alloc);
+            headers[0].value = try alloc.dupe(u8, header_value);
+            const body = try alloc.dupe(u8, "metadata authority unavailable");
+            errdefer alloc.free(body);
+            return .{ .status = 503, .headers = headers, .body = body };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            self.attempts += 1;
+            if (self.attempts > 1) return .{ .status = 202 };
+            return switch (self.proof) {
+                .mutation_not_admitted => try rejectionResponse(
+                    alloc,
+                    http_common.metadata_mutation_not_admitted_header,
+                    http_common.metadata_mutation_not_admitted_value,
+                ),
+                .broad_authority_hint => try rejectionResponse(
+                    alloc,
+                    http_common.metadata_not_leader_header,
+                    http_common.metadata_not_leader_value,
+                ),
+            };
+        }
+    };
+
+    var proved = ProofExecutor{ .proof = .mutation_not_admitted };
+    var proved_client = MetadataHttpClient.init(std.testing.allocator, proved.executor());
+    try proved_client.triggerReallocate("http://127.0.0.1:9000");
+    try std.testing.expectEqual(@as(usize, 2), proved.attempts);
+
+    var ambiguous = ProofExecutor{ .proof = .broad_authority_hint };
+    var ambiguous_client = MetadataHttpClient.init(std.testing.allocator, ambiguous.executor());
+    try std.testing.expectError(
+        error.ReallocationOutcomeUnknown,
+        ambiguous_client.triggerReallocate("http://127.0.0.1:9000"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), ambiguous.attempts);
 }
 
 test "metadata http client retries transient connection close on fetch status" {

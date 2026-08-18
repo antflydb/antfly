@@ -5928,7 +5928,7 @@ pub fn build(b: *std.Build) void {
         "metadata reconciler",
         "transition state",
         "metadata server ",
-        "metadata admin mux ",
+        "metadata admin maps retryable authority loss to service unavailable",
         "metadata merge request validation rejects incompatible doc identity namespaces",
         "metadata split request validation rejects stale doc identity namespace",
         "transition actions",

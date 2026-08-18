@@ -28,6 +28,20 @@ pub fn isRetryableError(err: anyerror) bool {
     };
 }
 
+/// Side-effecting clients may replay a mutation only when Raft rejected it
+/// before assigning a log index. Keep this deliberately narrower than the
+/// general authority retry set: read timeouts and reconcile-lease failures do
+/// not prove that a preceding mutation was never admitted.
+pub fn isMutationNotAdmittedError(err: anyerror) bool {
+    return switch (err) {
+        error.NotLeader,
+        error.ProposalDropped,
+        error.LeaderTransferInProgress,
+        => true,
+        else => false,
+    };
+}
+
 test "metadata authority retry classification is fail closed" {
     try std.testing.expect(isRetryableError(error.NotLeader));
     try std.testing.expect(isRetryableError(error.ProposalDropped));
@@ -36,4 +50,13 @@ test "metadata authority retry classification is fail closed" {
     try std.testing.expect(isRetryableError(error.ReconcileLeaseNotHeld));
     try std.testing.expect(!isRetryableError(error.InvalidArguments));
     try std.testing.expect(!isRetryableError(error.OutOfMemory));
+}
+
+test "metadata mutation non-admission classification excludes ambiguous authority failures" {
+    try std.testing.expect(isMutationNotAdmittedError(error.NotLeader));
+    try std.testing.expect(isMutationNotAdmittedError(error.ProposalDropped));
+    try std.testing.expect(isMutationNotAdmittedError(error.LeaderTransferInProgress));
+    try std.testing.expect(!isMutationNotAdmittedError(error.MetadataLinearizableReadTimeout));
+    try std.testing.expect(!isMutationNotAdmittedError(error.ReconcileLeaseNotHeld));
+    try std.testing.expect(!isMutationNotAdmittedError(error.OutOfMemory));
 }

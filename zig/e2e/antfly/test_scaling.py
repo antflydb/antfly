@@ -50,13 +50,15 @@ ADDRESS_IN_USE_LOG_MARKER = "listen address is already in use"
 AMBIGUOUS_METADATA_CLIENT_STATUSES = frozenset({408})
 METADATA_MUTATION_NOT_ADMITTED_HEADER = "X-Antfly-Metadata-Mutation-Not-Admitted"
 METADATA_MUTATION_NOT_ADMITTED_VALUE = "true"
+METADATA_MUTATION_NOT_ADMITTED_RETRY_TIMEOUT_S = 10.0
+METADATA_MUTATION_NOT_ADMITTED_RETRY_INTERVAL_S = 0.1
 
 
 class MetadataMutationRejected(AssertionError):
     """The metadata service definitively rejected a side-effecting request."""
 
 
-class MetadataMutationNotLeader(requests.HTTPError):
+class MetadataMutationNotAdmitted(requests.HTTPError):
     """The contacted replica explicitly rejected a mutation before admission."""
 
 
@@ -67,8 +69,8 @@ def _raise_for_metadata_mutation(response: requests.Response, *, operation: str)
         and response.headers.get(METADATA_MUTATION_NOT_ADMITTED_HEADER, "").strip().lower()
         == METADATA_MUTATION_NOT_ADMITTED_VALUE
     ):
-        raise MetadataMutationNotLeader(
-            f"{operation} reached a metadata follower",
+        raise MetadataMutationNotAdmitted(
+            f"{operation} was rejected before admission",
             response=response,
         )
     if 400 <= status < 500 and status not in AMBIGUOUS_METADATA_CLIENT_STATUSES:
@@ -89,7 +91,7 @@ def _metadata_mutation_once(
     """Submit at most once, routing only across explicit pre-admission rejections."""
     if not metadata_urls:
         raise AssertionError("cluster has no metadata URLs")
-    last_not_leader: MetadataMutationNotLeader | None = None
+    last_not_admitted: MetadataMutationNotAdmitted | None = None
     for url in metadata_urls:
         response = requests.request(
             method,
@@ -99,40 +101,75 @@ def _metadata_mutation_once(
         )
         try:
             _raise_for_metadata_mutation(response, operation=operation)
-        except MetadataMutationNotLeader as exc:
+        except MetadataMutationNotAdmitted as exc:
             # The header is emitted only when this replica rejected before
             # proposing. No transport error or generic 5xx is safe to reroute.
-            last_not_leader = exc
+            last_not_admitted = exc
             continue
         return
-    assert last_not_leader is not None
-    raise last_not_leader
+    assert last_not_admitted is not None
+    raise last_not_admitted
+
+
+def _retry_metadata_mutation_until_admitted(
+    submit: Callable[[], None],
+    *,
+    timeout_s: float = METADATA_MUTATION_NOT_ADMITTED_RETRY_TIMEOUT_S,
+    retry_interval_s: float = METADATA_MUTATION_NOT_ADMITTED_RETRY_INTERVAL_S,
+) -> None:
+    """Retry only requests that every contacted replica proved it did not admit."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            submit()
+            return
+        except MetadataMutationNotAdmitted:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise
+            time.sleep(min(retry_interval_s, remaining))
 
 
 def _submit_metadata_mutation_if_unobserved(
     *,
     observe: Callable[[], dict[str, Any] | None],
     submit: Callable[[], None],
+    not_admitted_retry_timeout_s: float = METADATA_MUTATION_NOT_ADMITTED_RETRY_TIMEOUT_S,
+    not_admitted_retry_interval_s: float = METADATA_MUTATION_NOT_ADMITTED_RETRY_INTERVAL_S,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    observed = observe()
-    if observed is not None:
-        return observed, None
-
-    try:
-        submit()
-    except MetadataMutationRejected:
-        # A different actor may have established the desired state between our
-        # preflight read and this definitive rejection. Re-read once, but never
-        # retry the mutation or hide a rejection while the state is absent.
+    not_admitted_deadline: float | None = None
+    while True:
         observed = observe()
         if observed is not None:
             return observed, None
-        raise
-    except requests.RequestException as exc:
-        # The request may have committed before its response was lost. Preserve
-        # the transport error while read-only convergence determines its outcome.
-        return None, repr(exc)
-    return None, None
+
+        try:
+            submit()
+        except MetadataMutationRejected:
+            # A different actor may have established the desired state between
+            # our preflight read and this definitive rejection. Re-read once,
+            # but never hide a rejection while the state is absent.
+            observed = observe()
+            if observed is not None:
+                return observed, None
+            raise
+        except MetadataMutationNotAdmitted:
+            # No replica admitted the request, so another observe/submit round
+            # is safe. Bound the election wait so a broken cluster fails with
+            # the precise non-admission error instead of polling phantom state.
+            now = time.monotonic()
+            if not_admitted_deadline is None:
+                not_admitted_deadline = now + not_admitted_retry_timeout_s
+            remaining = not_admitted_deadline - now
+            if remaining <= 0.0:
+                raise
+            time.sleep(min(not_admitted_retry_interval_s, remaining))
+            continue
+        except requests.RequestException as exc:
+            # The request may have committed before its response was lost.
+            # Preserve the transport error and switch to read-only convergence.
+            return None, repr(exc)
+        return None, None
 
 
 def test_metadata_mutation_response_distinguishes_rejection_from_ambiguity():
@@ -152,14 +189,14 @@ def test_metadata_mutation_response_distinguishes_rejection_from_ambiguity():
     follower = requests.Response()
     follower.status_code = 503
     follower.headers[METADATA_MUTATION_NOT_ADMITTED_HEADER] = METADATA_MUTATION_NOT_ADMITTED_VALUE
-    with pytest.raises(MetadataMutationNotLeader, match="metadata follower"):
+    with pytest.raises(MetadataMutationNotAdmitted, match="before admission"):
         _raise_for_metadata_mutation(follower, operation="trigger reallocation")
 
 
-def test_metadata_mutation_routes_only_explicit_follower_rejection(monkeypatch: pytest.MonkeyPatch):
+def test_metadata_mutation_routes_only_explicit_non_admission_proof(monkeypatch: pytest.MonkeyPatch):
     attempted: list[str] = []
 
-    def explicit_follower_then_leader(method: str, url: str, **kwargs: Any) -> requests.Response:
+    def explicit_rejection_then_admission(method: str, url: str, **kwargs: Any) -> requests.Response:
         del method, kwargs
         attempted.append(url)
         response = requests.Response()
@@ -170,7 +207,7 @@ def test_metadata_mutation_routes_only_explicit_follower_rejection(monkeypatch: 
             response.status_code = 202
         return response
 
-    monkeypatch.setattr(requests, "request", explicit_follower_then_leader)
+    monkeypatch.setattr(requests, "request", explicit_rejection_then_admission)
     _metadata_mutation_once(
         ["http://follower", "http://leader"],
         "POST",
@@ -255,6 +292,37 @@ def test_metadata_mutation_submission_is_state_driven_and_at_most_once():
         )
     assert submissions == 3
 
+    non_admission_attempts = 0
+
+    def election_then_admit() -> None:
+        nonlocal non_admission_attempts, submissions
+        non_admission_attempts += 1
+        submissions += 1
+        if non_admission_attempts == 1:
+            raise MetadataMutationNotAdmitted("election in progress")
+
+    observed, error = _submit_metadata_mutation_if_unobserved(
+        observe=observe,
+        submit=election_then_admit,
+        not_admitted_retry_timeout_s=1.0,
+        not_admitted_retry_interval_s=0.0,
+    )
+    assert observed is None
+    assert error is None
+    assert non_admission_attempts == 2
+    assert submissions == 5
+
+    def still_electing() -> None:
+        raise MetadataMutationNotAdmitted("still electing")
+
+    with pytest.raises(MetadataMutationNotAdmitted, match="still electing"):
+        _submit_metadata_mutation_if_unobserved(
+            observe=observe,
+            submit=still_electing,
+            not_admitted_retry_timeout_s=0.0,
+            not_admitted_retry_interval_s=0.0,
+        )
+
     def lose_response() -> None:
         nonlocal submissions
         submissions += 1
@@ -263,7 +331,39 @@ def test_metadata_mutation_submission_is_state_driven_and_at_most_once():
     observed, error = _submit_metadata_mutation_if_unobserved(observe=observe, submit=lose_response)
     assert observed is None
     assert error is not None and "response lost after submission" in error
-    assert submissions == 4
+    assert submissions == 6
+
+
+def test_direct_metadata_mutation_retries_only_definitive_non_admission():
+    attempts = 0
+
+    def election_then_admit() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise MetadataMutationNotAdmitted("election in progress")
+
+    _retry_metadata_mutation_until_admitted(
+        election_then_admit,
+        timeout_s=1.0,
+        retry_interval_s=0.0,
+    )
+    assert attempts == 2
+
+    attempts = 0
+
+    def ambiguous_failure() -> None:
+        nonlocal attempts
+        attempts += 1
+        raise requests.Timeout("outcome unknown")
+
+    with pytest.raises(requests.Timeout, match="outcome unknown"):
+        _retry_metadata_mutation_until_admitted(
+            ambiguous_failure,
+            timeout_s=1.0,
+            retry_interval_s=0.0,
+        )
+    assert attempts == 1
 
 
 class _ClusterStartupDeadline:
@@ -1206,12 +1306,17 @@ class MultiNodeScalingCluster:
             f"{self.debug_logs()}"
         )
 
-    def trigger_reallocate(self) -> None:
+    def trigger_reallocate_once(self) -> None:
         self.metadata_mutation_once(
             "POST",
             "/internal/v1/reallocate",
             operation="trigger reallocation",
         )
+
+    def trigger_reallocate(self) -> None:
+        # This direct form has no desired-state observer. It may retry only
+        # complete sweeps that proved no replica admitted the generation.
+        _retry_metadata_mutation_until_admitted(self.trigger_reallocate_once)
 
     def request_split(self, table_name: str, split_key: str) -> None:
         response = self.post_metadata(f"/internal/v1/tables/{table_name}/split", json_body={"split_key": split_key})
@@ -1831,9 +1936,9 @@ def _wait_node_owns_group(
 
     assigned, submission_error = _submit_metadata_mutation_if_unobserved(
         observe=owns_group,
-        # A successful request replaces the active barrier generation. Submit
-        # once only when placement is absent, then keep polling read-only.
-        submit=cluster.trigger_reallocate,
+        # A successful request replaces the active barrier generation. Admit
+        # at most one while placement is absent, then keep polling read-only.
+        submit=cluster.trigger_reallocate_once,
     )
     if assigned is not None:
         return assigned, submission_error
