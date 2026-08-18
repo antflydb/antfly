@@ -1490,9 +1490,11 @@ pub fn currentSystemMemoryInfo() ?SystemMemoryInfo {
 }
 
 /// Apply an operator-owned process/container envelope to the live memory view.
-/// On Linux the explicit limit is charged against raw leaf cgroup usage, so
-/// page cache, a test harness, and sibling processes remain visible even when
-/// memory.max itself is unlimited.
+/// On Linux the explicit limit is charged against the leaf cgroup working set,
+/// so the test harness, sibling processes, active file pages, and anonymous
+/// memory remain visible even when memory.max itself is unlimited. Only
+/// inactive file pages are excluded because the kernel and kubelet treat them
+/// as reclaimable under pressure.
 pub fn currentSystemMemoryInfoForLimit(limit_bytes: usize) ?SystemMemoryInfo {
     return switch (builtin.os.tag) {
         .linux => blk: {
@@ -1500,7 +1502,7 @@ pub fn currentSystemMemoryInfoForLimit(limit_bytes: usize) ?SystemMemoryInfo {
             break :blk applyOptionalProcessMemoryLimit(
                 sample.info,
                 limit_bytes,
-                sample.cgroup.leaf_current_bytes,
+                sample.cgroup.leaf_working_set_bytes,
             );
         },
         .macos => applyOptionalProcessMemoryLimit(
@@ -1515,24 +1517,24 @@ pub fn currentSystemMemoryInfoForLimit(limit_bytes: usize) ?SystemMemoryInfo {
 fn applyOptionalProcessMemoryLimit(
     detected: ?SystemMemoryInfo,
     limit_bytes: usize,
-    leaf_current_bytes: ?usize,
+    leaf_working_set_bytes: ?usize,
 ) ?SystemMemoryInfo {
     if (limit_bytes == 0) return detected;
     return applyProcessMemoryLimit(detected orelse .{
         .total_bytes = limit_bytes,
         .available_bytes = limit_bytes,
         .availability_basis = .mem_available,
-    }, limit_bytes, leaf_current_bytes);
+    }, limit_bytes, leaf_working_set_bytes);
 }
 
 fn applyProcessMemoryLimit(
     detected: SystemMemoryInfo,
     limit_bytes: usize,
-    leaf_current_bytes: ?usize,
+    leaf_working_set_bytes: ?usize,
 ) SystemMemoryInfo {
     const effective_limit = @min(detected.total_bytes, limit_bytes);
     var available = @min(detected.available_bytes orelse effective_limit, effective_limit);
-    if (leaf_current_bytes) |current| {
+    if (leaf_working_set_bytes) |current| {
         available = @min(available, effective_limit -| @min(current, effective_limit));
     }
     return .{
@@ -1698,9 +1700,13 @@ const CgroupMemoryInfo = struct {
     limit_bytes: ?usize = null,
     current_bytes: ?usize = null,
     available_bytes: ?usize = null,
-    /// Current usage at the process leaf, retained even when memory.max is
-    /// unlimited so an explicit process envelope can still be enforced.
+    /// Raw current usage at the process leaf, retained for diagnostics and
+    /// hierarchy tests even when memory.max is unlimited.
     leaf_current_bytes: ?usize = null,
+    /// Leaf working set (`current - inactive_file`), retained even when
+    /// memory.max is unlimited so an explicit process envelope can be enforced
+    /// without treating reclaimable build/download cache as resident memory.
+    leaf_working_set_bytes: ?usize = null,
 };
 
 const LinuxSystemMemorySample = struct {
@@ -1904,6 +1910,10 @@ fn readCgroupInactiveFileBytes(
     return parseCgroupInactiveFileBytes(bytes, version);
 }
 
+fn cgroupWorkingSetBytes(current_bytes: usize, inactive_file_bytes: ?usize) usize {
+    return current_bytes - @min(inactive_file_bytes orelse 0, current_bytes);
+}
+
 fn decodeMountInfoPath(destination: []u8, encoded: []const u8) ?usize {
     if (encoded.len == 0 or encoded[0] != '/') return null;
     var source_index: usize = 0;
@@ -1973,8 +1983,13 @@ fn mergeCgroupMemoryInfo(
     result: *CgroupMemoryInfo,
     candidate: CgroupMemoryInfo,
 ) void {
-    if (candidate.leaf_current_bytes) |current|
+    if (candidate.leaf_current_bytes) |current| {
         result.leaf_current_bytes = current;
+        // Keep the raw and reclaimability-adjusted views from the same
+        // authoritative mount candidate. A candidate with an unreadable stat
+        // file must not inherit a stale working set from a different mount.
+        result.leaf_working_set_bytes = candidate.leaf_working_set_bytes;
+    }
     if (candidate.limit_bytes) |limit| {
         if (result.limit_bytes == null or limit < result.limit_bytes.?) {
             result.limit_bytes = limit;
@@ -2204,6 +2219,11 @@ fn readCgroupHierarchy(
         if (directory.len == leaf_directory_len) {
             result.leaf_present = limit != null or current != null;
             result.info.leaf_current_bytes = current;
+            if (current) |usage|
+                result.info.leaf_working_set_bytes = cgroupWorkingSetBytes(
+                    usage,
+                    inactive_file_bytes,
+                );
         }
         accumulateCgroupLevel(
             &result.info,
@@ -2828,7 +2848,7 @@ test "live memory headroom scales down for constrained containers" {
     );
 }
 
-test "explicit process envelope charges raw leaf cgroup usage" {
+test "explicit process envelope charges leaf cgroup working set" {
     const info = applyProcessMemoryLimit(
         .{
             .total_bytes = gib(64),
@@ -2851,6 +2871,22 @@ test "explicit process envelope charges raw leaf cgroup usage" {
     );
     try std.testing.expectEqual(gib(8), clamped.total_bytes);
     try std.testing.expectEqual(@as(?usize, gib(6)), clamped.available_bytes);
+}
+
+test "cgroup working set excludes only bounded inactive file pages" {
+    try std.testing.expectEqual(gib(7), cgroupWorkingSetBytes(gib(12), gib(5)));
+    try std.testing.expectEqual(@as(usize, 0), cgroupWorkingSetBytes(gib(2), gib(3)));
+    try std.testing.expectEqual(gib(2), cgroupWorkingSetBytes(gib(2), null));
+}
+
+test "cgroup probe merge keeps raw and working-set samples coherent" {
+    var merged = CgroupMemoryInfo{
+        .leaf_current_bytes = gib(12),
+        .leaf_working_set_bytes = gib(7),
+    };
+    mergeCgroupMemoryInfo(&merged, .{ .leaf_current_bytes = gib(9) });
+    try std.testing.expectEqual(@as(?usize, gib(9)), merged.leaf_current_bytes);
+    try std.testing.expectEqual(@as(?usize, null), merged.leaf_working_set_bytes);
 }
 
 test "explicit process envelope remains authoritative without a host probe" {

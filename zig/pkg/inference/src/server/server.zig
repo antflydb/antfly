@@ -3449,6 +3449,8 @@ pub const Node = struct {
                 null;
         var result = pipeline.generate(messages, generation_config) catch |err| {
             if (comptime build_options.enable_cuda) session_factory.drainCudaProfile(model.session);
+            if (err == error.MemoryBudgetExceeded)
+                logMemoryBudgetExceeded(model.session, &run_budget);
             std.log.err("direct generator generation failed model={s} backend={s}: {s}", .{
                 model_name,
                 @tagName(model.session.backend()),
@@ -4797,18 +4799,6 @@ pub const Node = struct {
         var count: usize = 0;
         while (count < encoded.attention_mask.len and encoded.attention_mask[count] != 0) : (count += 1) {}
         return std.math.add(usize, count, media_allowance) catch error.PromptTooLong;
-    }
-
-    fn memoryBudgetExceededMessage(
-        allocator: std.mem.Allocator,
-        session: backends_mod.Session,
-        run_budget: *const runtime.tier.memory.RunBudget,
-    ) []const u8 {
-        var buf: [512]u8 = undefined;
-        const msg = session_factory.memoryBudgetExceededDetail(session, run_budget, &buf) catch {
-            return "request exceeds native generation memory budget";
-        };
-        return allocator.dupe(u8, msg) catch "request exceeds native generation memory budget";
     }
 
     pub fn generateEmbeddings(self: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -6241,10 +6231,7 @@ pub const Node = struct {
             admission_prefill_ceiling,
         ) catch |err| {
             if (err == error.MemoryBudgetExceeded) {
-                return ctx.status(507).json(.{
-                    .@"error" = "MEMORY_BUDGET_EXCEEDED",
-                    .message = memoryBudgetExceededMessage(ctx.allocator, model.session, &run_budget),
-                });
+                return generationMemoryBudgetResponse(ctx, model.session, &run_budget);
             }
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
         };
@@ -6381,10 +6368,7 @@ pub const Node = struct {
         if (draft_model_for_generation) |draft_model| {
             draft_cb = session_factory.getComputeBackendWithBudget(draft_model.session, ctx.allocator, &run_budget) catch |err| {
                 if (err == error.MemoryBudgetExceeded) {
-                    return ctx.status(400).json(.{
-                        .@"error" = "MODEL_RESOURCE_LIMIT",
-                        .message = memoryBudgetExceededMessage(ctx.allocator, draft_model.session, &run_budget),
-                    });
+                    return generationMemoryBudgetResponse(ctx, draft_model.session, &run_budget);
                 }
                 return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
             };
@@ -6397,10 +6381,7 @@ pub const Node = struct {
 
         var cb = session_factory.getComputeBackendWithBudget(model.session, ctx.allocator, &run_budget) catch |err| {
             if (err == error.MemoryBudgetExceeded) {
-                return ctx.status(400).json(.{
-                    .@"error" = "MODEL_RESOURCE_LIMIT",
-                    .message = memoryBudgetExceededMessage(ctx.allocator, model.session, &run_budget),
-                });
+                return generationMemoryBudgetResponse(ctx, model.session, &run_budget);
             }
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         };
@@ -6569,8 +6550,11 @@ pub const Node = struct {
             );
         }
 
-        var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
+        var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err| {
+            if (err == error.MemoryBudgetExceeded)
+                return generationMemoryBudgetResponse(ctx, model.session, &run_budget);
             return generationErrorResponse(ctx, err);
+        };
         defer result.deinit();
         if (debug_metal_timing) {
             if (model.native_generation_graph_cache.getSessionCompiledModelRuntime(.metal, .whole_model)) |runtime_model| {
@@ -14093,6 +14077,26 @@ test "post-preprocessing prompt overflow remains a client generation error" {
     try std.testing.expect(!batch_error.retryable);
 }
 
+test "generation memory exhaustion is an actionable non-retryable capacity error" {
+    const allocator = std.testing.allocator;
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/generate");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try generationErrorResponse(&ctx, error.MemoryBudgetExceeded);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 507), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"error\":\"MEMORY_BUDGET_EXCEEDED\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "--host-budget-mb") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"retryable\":false") != null);
+
+    const batch_error = batchGenerationError(error.MemoryBudgetExceeded);
+    try std.testing.expectEqualStrings("MEMORY_BUDGET_EXCEEDED", batch_error.code);
+    try std.testing.expect(!batch_error.retryable);
+}
+
 test "registerRoutesOn supports alternate prefixes through the shared router" {
     var node = try Node.init(std.testing.allocator, .{});
     defer node.deinit();
@@ -17408,12 +17412,45 @@ const GenerationRequestFailure = struct {
     retryable: bool,
 };
 
+const memory_budget_exceeded_message =
+    "model execution exceeds the configured inference memory budget; increase the relevant budget (for CPU models, --host-budget-mb) or choose a smaller/quantized model";
+
+fn logMemoryBudgetExceeded(
+    session: backends_mod.Session,
+    run_budget: *const runtime.tier.memory.RunBudget,
+) void {
+    if (builtin.is_test) return;
+    var buf: [512]u8 = undefined;
+    const detail = session_factory.memoryBudgetExceededDetail(session, run_budget, &buf) catch
+        "request exceeds native generation memory budget";
+    std.log.warn("generation memory admission denied: {s}", .{detail});
+}
+
+fn generationMemoryBudgetResponse(
+    ctx: *httpx.Context,
+    session: backends_mod.Session,
+    run_budget: *const runtime.tier.memory.RunBudget,
+) !httpx.Response {
+    logMemoryBudgetExceeded(session, run_budget);
+    return ctx.status(507).json(.{
+        .@"error" = "MEMORY_BUDGET_EXCEEDED",
+        .message = memory_budget_exceeded_message,
+        .retryable = false,
+    });
+}
+
 fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
     return switch (err) {
         error.PromptTooLong => .{
             .status = 400,
             .code = "INVALID_REQUEST",
             .message = "prompt exceeds the model context window after reserving output tokens",
+            .retryable = false,
+        },
+        error.MemoryBudgetExceeded => .{
+            .status = 507,
+            .code = "MEMORY_BUDGET_EXCEEDED",
+            .message = memory_budget_exceeded_message,
             .retryable = false,
         },
         else => null,
@@ -17475,6 +17512,8 @@ fn writeInternalStreamError(
 
 fn writeGenerationStreamError(writer: *httpx.Context.StreamWriter, err: anyerror) void {
     if (generationRequestFailure(err)) |failure| {
+        if (err == error.MemoryBudgetExceeded and !builtin.is_test)
+            std.log.warn("generation memory admission denied during streaming", .{});
         writer.writeEvent("error", failure.message) catch {};
         return;
     }

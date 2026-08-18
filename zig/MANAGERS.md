@@ -188,14 +188,18 @@ mapped-artifact and bounded-hot-set behavior without allowing lazy promotion
 to bypass ResourceManager policy.
 
 The process envelope is not another inference slice. One resolved value is
-passed to storage and inference during standalone composition. ResourceManager
-derives an aggregate managed-host-memory budget from it; every storage slice
-reservation charges that aggregate as well as its local policy slice. Stable
-model and request limits use the same envelope, and immediately before an
-inference allocation the controller checks the requested increment against the
-envelope minus raw leaf-cgroup usage and safety headroom. This live check covers
-unmanaged allocations and page cache that cannot appear in the reservation
-ledger.
+passed to storage and inference during standalone composition and by the
+dedicated `antfly inference run` entry point. ResourceManager derives an
+aggregate managed-host-memory budget from it; every storage slice reservation
+charges that aggregate as well as its local policy slice. Stable model and
+request limits use the same envelope, and immediately before an inference
+allocation the controller checks the requested increment against the leaf
+cgroup working set plus safety headroom. The working set is
+`memory.current - inactive_file`: it includes anonymous memory, the test
+harness, sibling processes, and active mapped pages while excluding only file
+pages that both the kernel and kubelet treat as reclaimable. This avoids making
+build/download cache a permanent admission charge without hiding mapped pages
+that are actually under pressure.
 
 Linux automatic resolution reads the process's actual cgroup path, walks every
 ancestor to the visible controller mount, and falls back to streamed mountinfo
