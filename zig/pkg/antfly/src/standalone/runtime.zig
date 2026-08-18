@@ -1807,6 +1807,9 @@ pub fn runFromIterator(
         .kv_limit_bytes = try mibToBytes(cli.inference_kv_budget_mb),
         .scratch_limit_bytes = try mibToBytes(cli.inference_scratch_budget_mb),
         .process_memory_limit_bytes = process_memory_limit_bytes,
+        .process_memory_limit_provenance = inferenceMemoryLimitProvenance(
+            process_memory_resolution.effective_source,
+        ),
         .preload_ptr = if (active_preload.len == 0) null else active_preload.ptr,
         .preload_len = active_preload.len,
         .keep_alive = inference_bridge.OptionalString.init(if (loaded_cfg) |cfg| cfg.inference.keep_alive else null),
@@ -5170,6 +5173,18 @@ fn storageMemoryLimitSource(
     };
 }
 
+fn inferenceMemoryLimitProvenance(
+    source: process_memory_budget.EffectiveSource,
+) inference_bridge.ProcessMemoryLimitProvenance {
+    return switch (source) {
+        .explicit => .explicit,
+        .cgroup_v2 => .cgroup_v2,
+        .cgroup_v1 => .cgroup_v1,
+        .host => .host,
+        .unavailable => .unavailable,
+    };
+}
+
 fn printUsage() void {
     std.debug.print(
         \\Usage: antfly standalone [options]
@@ -7002,6 +7017,25 @@ test "parse cli accepts inference budget overrides" {
     try std.testing.expectEqual(@as(usize, 1024), cfg.inference_scratch_budget_mb);
     try std.testing.expectEqual(@as(?usize, 14000), cfg.inference_process_memory_budget_mb);
     try std.testing.expectEqual(antfly.common.config.Config.InferenceConfig.KernelJitConfig.Mode.required, cfg.inference_kernel_jit_mode.?);
+}
+
+test "standalone preserves effective process envelope provenance for inference" {
+    const Case = struct {
+        source: process_memory_budget.EffectiveSource,
+        expected: inference_bridge.ProcessMemoryLimitProvenance,
+    };
+    inline for ([_]Case{
+        .{ .source = .explicit, .expected = .explicit },
+        .{ .source = .cgroup_v2, .expected = .cgroup_v2 },
+        .{ .source = .cgroup_v1, .expected = .cgroup_v1 },
+        .{ .source = .host, .expected = .host },
+        .{ .source = .unavailable, .expected = .unavailable },
+    }) |case| {
+        try std.testing.expectEqual(
+            case.expected,
+            inferenceMemoryLimitProvenance(case.source),
+        );
+    }
 }
 
 test "standalone kernel JIT mode precedence is CLI then environment then config" {

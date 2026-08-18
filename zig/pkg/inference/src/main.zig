@@ -515,6 +515,10 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         },
         .preload = preload_models.items,
         .process_memory_limit_bytes = process_memory_limit_bytes,
+        .process_memory_limit_provenance = if (process_memory_resolution.value_mib != null)
+            .explicit
+        else
+            .automatic,
         .allow_insecure_public_bind = allow_insecure_public_bind,
         .allow_unknown_models = allow_unknown_models,
     };

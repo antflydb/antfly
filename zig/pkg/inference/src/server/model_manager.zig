@@ -3469,6 +3469,7 @@ pub const ModelManager = struct {
     admission_enabled: bool = false,
     admission_limit_overrides: runtime.tier.memory.Limits = .{},
     process_memory_limit_bytes: usize = 0,
+    process_memory_limit_provenance: runtime.tier.memory.ProcessMemoryLimitProvenance = .automatic,
     forced_run_admission_denials_for_testing: usize = 0,
     resource_ownership: ResourceOwnership = .local,
     tokenizer_cache_budget_source: TokenizerCacheBudgetSource = .none,
@@ -3529,10 +3530,15 @@ pub const ModelManager = struct {
         self.resource_ownership = ownership;
     }
 
-    pub fn configureProcessMemoryLimit(self: *ModelManager, limit_bytes: usize) void {
+    pub fn configureProcessMemoryLimit(
+        self: *ModelManager,
+        limit_bytes: usize,
+        provenance: runtime.tier.memory.ProcessMemoryLimitProvenance,
+    ) void {
         std.debug.assert(self.loaded.count() == 0);
         std.debug.assert(self.whisper_assets.count() == 0);
         self.process_memory_limit_bytes = limit_bytes;
+        self.process_memory_limit_provenance = provenance;
         if (self.resource_domain) |domain|
             self.configureAdmissionController(domain);
     }
@@ -3583,7 +3589,10 @@ pub const ModelManager = struct {
                 self.process_memory_limit_bytes,
             ),
         );
-        domain.admission.configureProcessMemoryLimit(self.process_memory_limit_bytes);
+        domain.admission.configureProcessMemoryLimit(
+            self.process_memory_limit_bytes,
+            self.process_memory_limit_provenance,
+        );
         domain.admission.configureForcedRunDenialsForTesting(
             self.forced_run_admission_denials_for_testing,
         );

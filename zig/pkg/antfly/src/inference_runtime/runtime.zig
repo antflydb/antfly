@@ -98,9 +98,22 @@ const EmbeddedServerConfig = struct {
     s3_credentials: ?common_config.Config.S3CredentialsConfig = null,
     generation_budget_overrides: ServerBudgetOverrides = .{},
     process_memory_limit_bytes: usize = 0,
+    process_memory_limit_provenance: inference.runtime.tier.memory.ProcessMemoryLimitProvenance = .automatic,
     preload: []const inference.server.WarmModel = &.{},
     allow_insecure_public_bind: bool = false,
 };
+
+fn inferenceProcessMemoryLimitProvenance(
+    source: process_memory_budget.EffectiveSource,
+) inference.runtime.tier.memory.ProcessMemoryLimitProvenance {
+    return switch (source) {
+        .explicit => .explicit,
+        .cgroup_v2 => .cgroup_v2,
+        .cgroup_v1 => .cgroup_v1,
+        .host => .host,
+        .unavailable => .unavailable,
+    };
+}
 
 const BudgetOverridesMb = struct {
     host_budget_mb: usize = 0,
@@ -423,6 +436,9 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         .max_concurrent_requests = max_concurrent_requests,
         .generation_budget_overrides = budgetOverridesFromMb(budget_overrides_mb),
         .process_memory_limit_bytes = process_memory_resolution.limit_bytes,
+        .process_memory_limit_provenance = inferenceProcessMemoryLimitProvenance(
+            process_memory_resolution.effective_source,
+        ),
         .preload = preload_models.items,
         .kernel_jit = kernel_jit,
         .allow_insecure_public_bind = allow_insecure_public_bind,
@@ -489,6 +505,7 @@ pub fn spawnServerProcess(
         .ml_dir = config.ml_dir orelse defaultMlDir(alloc),
         .generation_budget_overrides = config.generation_budget_overrides,
         .process_memory_limit_bytes = config.process_memory_limit_bytes,
+        .process_memory_limit_provenance = config.process_memory_limit_provenance,
         .preload = config.preload,
         .allow_insecure_public_bind = config.allow_insecure_public_bind,
         .allow_unknown_models = config.allow_unknown_models,
@@ -857,6 +874,25 @@ test "inference runtime module compiles" {
     _ = run;
     _ = runFromIterator;
     _ = spawnServerProcess;
+}
+
+test "inference runtime preserves effective process envelope provenance" {
+    const Case = struct {
+        source: process_memory_budget.EffectiveSource,
+        expected: inference.runtime.tier.memory.ProcessMemoryLimitProvenance,
+    };
+    inline for ([_]Case{
+        .{ .source = .explicit, .expected = .explicit },
+        .{ .source = .cgroup_v2, .expected = .cgroup_v2 },
+        .{ .source = .cgroup_v1, .expected = .cgroup_v1 },
+        .{ .source = .host, .expected = .host },
+        .{ .source = .unavailable, .expected = .unavailable },
+    }) |case| {
+        try std.testing.expectEqual(
+            case.expected,
+            inferenceProcessMemoryLimitProvenance(case.source),
+        );
+    }
 }
 
 test "inference run detects trailing help without consuming arguments" {

@@ -47,6 +47,7 @@ DEFAULT_INFERENCE_STANDALONE_BACKEND_BUDGET_MB = 12288
 DEFAULT_INFERENCE_STANDALONE_COMBINED_BUDGET_MB = 16384
 DEFAULT_INFERENCE_STANDALONE_KV_BUDGET_MB = 0
 DEFAULT_INFERENCE_STANDALONE_SCRATCH_BUDGET_MB = 0
+DEFAULT_INFERENCE_STANDALONE_PROCESS_MEMORY_BUDGET_MB = 0
 
 
 def _integration_enabled(env_name: str) -> bool:
@@ -144,6 +145,7 @@ class EmbeddedInferenceStandaloneServer:
         model_name: str,
         *,
         inference_budget_mb: dict[str, int] | None = None,
+        process_memory_budget_mb: int = 0,
         host: str = "127.0.0.1",
     ):
         self.binary = binary
@@ -151,6 +153,10 @@ class EmbeddedInferenceStandaloneServer:
         self.model_name = model_name
         self.host = host
         self.inference_budget_mb = inference_budget_mb or {}
+        self.process_memory_budget_mb = process_memory_budget_mb
+        self.forced_kill = False
+        self.returncode: int | None = None
+        self.final_logs = ""
         with ExitStack() as setup:
             self.port_reservations = LoopbackPortReservations(host)
             setup.callback(self.port_reservations.close)
@@ -205,6 +211,8 @@ class EmbeddedInferenceStandaloneServer:
         ):
             if value > 0:
                 command.extend([flag_name, str(value)])
+        if self.process_memory_budget_mb > 0:
+            command.extend(["--process-memory-budget-mb", str(self.process_memory_budget_mb)])
         self.proc = self.port_reservations.handoff_to(
             (self.public_port, self.health_port),
             lambda: subprocess.Popen(
@@ -232,11 +240,15 @@ class EmbeddedInferenceStandaloneServer:
         if self.proc is not None and self.proc.poll() is None:
             self.proc.send_signal(signal.SIGTERM)
             try:
-                self.proc.wait(timeout=10)
+                self.proc.wait(timeout=45)
             except subprocess.TimeoutExpired:
+                self.forced_kill = True
                 self.proc.kill()
                 self.proc.wait()
+        if self.proc is not None:
+            self.returncode = self.proc.returncode
         self.proc = None
+        self.final_logs = self.debug_logs()
         self.log_file.close()
         self.tempdir.cleanup()
 
@@ -290,16 +302,23 @@ def embedded_standalone_runtime():
             "ANTFLY_INFERENCE_STANDALONE_SCRATCH_BUDGET_MB", DEFAULT_INFERENCE_STANDALONE_SCRATCH_BUDGET_MB
         ),
     }
+    process_memory_budget_mb = _env_int(
+        "ANTFLY_INFERENCE_STANDALONE_PROCESS_MEMORY_BUDGET_MB",
+        DEFAULT_INFERENCE_STANDALONE_PROCESS_MEMORY_BUDGET_MB,
+    )
 
     server = EmbeddedInferenceStandaloneServer(
         binary,
         models_dir,
         model_name,
         inference_budget_mb=inference_budget_mb,
+        process_memory_budget_mb=process_memory_budget_mb,
     )
+    warmup_performed = False
     try:
         if not _integration_enabled("ANTFLY_INFERENCE_STANDALONE_SKIP_GENERATOR_WARMUP"):
             _warm_inference_generator(server.inference_api_url, model_name)
+            warmup_performed = True
         yield {
             "base_url": server.url,
             "public_url": server.public_url,
@@ -308,10 +327,18 @@ def embedded_standalone_runtime():
             "model": model_name,
             "models_dir": str(models_dir),
             "inference_budget_mb": inference_budget_mb,
+            "process_memory_budget_mb": process_memory_budget_mb,
+            "warmup_performed": warmup_performed,
             "logs": server.debug_logs,
         }
     finally:
         server.stop()
+        if server.forced_kill or server.returncode != 0:
+            pytest.fail(
+                "standalone inference did not shut down cleanly "
+                f"(forced_kill={server.forced_kill}, returncode={server.returncode})\n"
+                f"last logs:\n{server.final_logs[-8000:]}"
+            )
 
 
 @pytest.fixture(scope="function")
@@ -463,6 +490,21 @@ def _parse_cli_json(stdout: str) -> dict | None:
     except json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def test_standalone_inference_process_envelope_composition(embedded_standalone_runtime):
+    budget_mb = embedded_standalone_runtime["process_memory_budget_mb"]
+    if budget_mb <= 0:
+        pytest.skip("Set ANTFLY_INFERENCE_STANDALONE_PROCESS_MEMORY_BUDGET_MB to validate composition")
+
+    assert embedded_standalone_runtime["warmup_performed"], "real generator warmup must complete"
+    expected_bytes = budget_mb * 1024 * 1024
+    logs = embedded_standalone_runtime["logs"]()
+    assert "effective_source=explicit" in logs
+    assert f"configured_limit_bytes={expected_bytes}" in logs
+    assert f"effective_limit_bytes={expected_bytes}" in logs
+    assert "inference resource policy ownership=external_required" in logs
+    assert "process_memory_limit_provenance=explicit" in logs
 
 
 def test_standalone_health_endpoints(embedded_standalone_runtime):

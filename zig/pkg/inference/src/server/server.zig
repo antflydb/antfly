@@ -656,6 +656,10 @@ pub const NodeConfig = struct {
     /// This is required when the runtime has no finite cgroup memory.max and
     /// should normally match the orchestrator's process memory allocation.
     process_memory_limit_bytes: usize = 0,
+    /// Where the finite byte value came from. Automatic is the fail-safe
+    /// default: callers must opt into the less conservative explicit-envelope
+    /// live reserve, while composing runtimes preserve their exact probe source.
+    process_memory_limit_provenance: runtime.tier.memory.ProcessMemoryLimitProvenance = .automatic,
     resource_ownership: model_manager_mod.ResourceOwnership = .local,
     generation_budget_overrides: BudgetOverrides = .{},
     generation_batching: GenerationBatchingConfig = .{},
@@ -2700,7 +2704,10 @@ pub const Node = struct {
             .compatibility_cache = .empty,
         };
         try node.model_manager.configureResourceOwnership(config.resource_ownership);
-        node.model_manager.configureProcessMemoryLimit(config.process_memory_limit_bytes);
+        node.model_manager.configureProcessMemoryLimit(
+            config.process_memory_limit_bytes,
+            config.process_memory_limit_provenance,
+        );
         node.model_manager.configureServingPolicy(.{
             .allow_unknown = config.allow_unknown_models,
         });
@@ -2717,8 +2724,12 @@ pub const Node = struct {
         });
         if (!builtin.is_test) {
             std.log.info(
-                "inference resource policy ownership={s} process_memory_limit_bytes={d}",
-                .{ @tagName(config.resource_ownership), config.process_memory_limit_bytes },
+                "inference resource policy ownership={s} process_memory_limit_bytes={d} process_memory_limit_provenance={s}",
+                .{
+                    @tagName(config.resource_ownership),
+                    config.process_memory_limit_bytes,
+                    @tagName(config.process_memory_limit_provenance),
+                },
             );
         }
         try node.model_manager.configureTokenizerCaches(config.tokenizer_cache);

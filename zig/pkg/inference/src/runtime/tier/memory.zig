@@ -277,6 +277,20 @@ pub const LiveAdmissionPolicy = enum {
     explicit_process_envelope,
 };
 
+/// Provenance is policy, not telemetry: only an operator-owned envelope may
+/// replace the dynamic pressure reserve with the fixed emergency reserve.
+/// Automatically detected host/cgroup limits remain dynamic even when their
+/// resolved byte value is forwarded by a composing runtime. Preserve their
+/// exact source for diagnostics and future source-specific policy.
+pub const ProcessMemoryLimitProvenance = enum {
+    automatic,
+    explicit,
+    cgroup_v2,
+    cgroup_v1,
+    host,
+    unavailable,
+};
+
 pub const ReservationKind = enum {
     weight,
     kv,
@@ -769,6 +783,7 @@ pub const AdmissionController = struct {
     /// inference-owned ledgers, the live check charges current container usage,
     /// including sibling processes and allocations outside inference.
     process_memory_limit_bytes: usize = 0,
+    process_memory_limit_provenance: ProcessMemoryLimitProvenance = .automatic,
     resource_budget: ?AdmissionResourceBudget = null,
     /// Opt-in fault injection for live server regression tests. Production
     /// callers leave this at zero, so normal admission behavior is unchanged.
@@ -814,11 +829,13 @@ pub const AdmissionController = struct {
     pub fn configureProcessMemoryLimit(
         self: *AdmissionController,
         limit_bytes: usize,
+        provenance: ProcessMemoryLimitProvenance,
     ) void {
         spinLockAdmission(&self.mutex);
         defer self.mutex.unlock();
         std.debug.assert(std.meta.eql(self.admitted, AdmissionAmounts{}));
         self.process_memory_limit_bytes = limit_bytes;
+        self.process_memory_limit_provenance = provenance;
     }
 
     pub fn configureResourceBudget(
@@ -1171,7 +1188,10 @@ pub const AdmissionController = struct {
         defer self.live_mutex.unlock();
 
         const info = if (self.live_pending_bytes == 0)
-            currentSystemMemoryInfoForLimit(self.process_memory_limit_bytes)
+            currentSystemMemoryInfoForLimit(
+                self.process_memory_limit_bytes,
+                self.process_memory_limit_provenance,
+            )
         else
             null;
         const starts_new_epoch = self.live_pending_bytes == 0;
@@ -1549,7 +1569,10 @@ pub fn currentSystemMemoryInfo() ?SystemMemoryInfo {
 /// memory remain visible even when memory.max itself is unlimited. Only
 /// inactive file pages are excluded because the kernel and kubelet treat them
 /// as reclaimable under pressure.
-pub fn currentSystemMemoryInfoForLimit(limit_bytes: usize) ?SystemMemoryInfo {
+pub fn currentSystemMemoryInfoForLimit(
+    limit_bytes: usize,
+    provenance: ProcessMemoryLimitProvenance,
+) ?SystemMemoryInfo {
     return switch (builtin.os.tag) {
         .linux => blk: {
             const sample = probeSystemMemoryInfoLinuxSample();
@@ -1557,14 +1580,16 @@ pub fn currentSystemMemoryInfoForLimit(limit_bytes: usize) ?SystemMemoryInfo {
                 sample.info,
                 limit_bytes,
                 sample.cgroup.leaf_working_set_bytes,
+                provenance,
             );
         },
         .macos => applyOptionalProcessMemoryLimit(
             probeSystemMemoryInfoMacos(),
             limit_bytes,
             null,
+            provenance,
         ),
-        else => applyOptionalProcessMemoryLimit(null, limit_bytes, null),
+        else => applyOptionalProcessMemoryLimit(null, limit_bytes, null, provenance),
     };
 }
 
@@ -1572,23 +1597,25 @@ fn applyOptionalProcessMemoryLimit(
     detected: ?SystemMemoryInfo,
     limit_bytes: usize,
     leaf_working_set_bytes: ?usize,
+    provenance: ProcessMemoryLimitProvenance,
 ) ?SystemMemoryInfo {
     if (limit_bytes == 0) return detected;
     return applyProcessMemoryLimit(detected orelse .{
         .total_bytes = limit_bytes,
         .available_bytes = limit_bytes,
         .availability_basis = .mem_available,
-    }, limit_bytes, leaf_working_set_bytes);
+    }, limit_bytes, leaf_working_set_bytes, provenance);
 }
 
 fn applyProcessMemoryLimit(
     detected: SystemMemoryInfo,
     limit_bytes: usize,
     leaf_working_set_bytes: ?usize,
+    provenance: ProcessMemoryLimitProvenance,
 ) SystemMemoryInfo {
     const effective_limit = @min(detected.total_bytes, limit_bytes);
     const explicit_envelope_applies =
-        detected.live_admission_policy == .explicit_process_envelope or
+        provenance == .explicit and
         limit_bytes <= detected.total_bytes;
     const detected_available = detected.available_bytes orelse detected.total_bytes;
     var available = @min(detected_available, effective_limit);
@@ -1627,11 +1654,10 @@ fn stableMemoryInfoForLimit(detected: ?SystemMemoryInfo, limit_bytes: usize) ?Sy
         .total_bytes = effective_limit,
         .available_bytes = effective_limit,
         .availability_basis = baseline.availability_basis,
-        .live_admission_policy = if (baseline.live_admission_policy == .explicit_process_envelope or
-            limit_bytes <= baseline.total_bytes)
-            .explicit_process_envelope
-        else
-            baseline.live_admission_policy,
+        // Stable limits describe sizing capacity, not the source of a live
+        // process envelope. Live admission receives provenance explicitly and
+        // must never reconstruct operator intent from numeric equality.
+        .live_admission_policy = .dynamic_pressure,
     };
 }
 
@@ -2931,6 +2957,7 @@ test "explicit process envelope charges leaf cgroup working set" {
         },
         gib(14),
         gib(3),
+        .explicit,
     );
     try std.testing.expectEqual(gib(14), info.total_bytes);
     try std.testing.expectEqual(@as(?usize, gib(11)), info.available_bytes);
@@ -2939,13 +2966,14 @@ test "explicit process envelope charges leaf cgroup working set" {
         info.live_admission_policy,
     );
 
-    const saturated = applyProcessMemoryLimit(info, gib(14), gib(20));
+    const saturated = applyProcessMemoryLimit(info, gib(14), gib(20), .explicit);
     try std.testing.expectEqual(@as(?usize, 0), saturated.available_bytes);
 
     const clamped = applyProcessMemoryLimit(
         .{ .total_bytes = gib(8), .available_bytes = gib(6) },
         gib(14),
         gib(2),
+        .explicit,
     );
     try std.testing.expectEqual(gib(8), clamped.total_bytes);
     try std.testing.expectEqual(@as(?usize, gib(6)), clamped.available_bytes);
@@ -2962,6 +2990,7 @@ test "explicit process envelope charges leaf cgroup working set" {
         },
         gib(14),
         gib(3),
+        .explicit,
     );
     try std.testing.expectEqual(@as(?usize, gib(2)), host_pressure.available_bytes);
     try std.testing.expectEqual(
@@ -2969,6 +2998,39 @@ test "explicit process envelope charges leaf cgroup working set" {
         host_pressure.live_admission_policy,
     );
     try std.testing.expectEqual(gib(1), liveHostAdmissionReserve(host_pressure));
+}
+
+test "process envelope provenance preserves automatic cgroup pressure policy" {
+    const detected = SystemMemoryInfo{
+        .total_bytes = gib(8),
+        .available_bytes = gib(4),
+        .availability_basis = .mem_available,
+    };
+
+    const automatic_cgroup = applyProcessMemoryLimit(detected, gib(8), gib(4), .cgroup_v2);
+    try std.testing.expectEqual(gib(4), automatic_cgroup.available_bytes.?);
+    try std.testing.expectEqual(
+        LiveAdmissionPolicy.dynamic_pressure,
+        automatic_cgroup.live_admission_policy,
+    );
+    try std.testing.expectEqual(gib(2), liveHostAdmissionReserve(automatic_cgroup));
+
+    const explicit = applyProcessMemoryLimit(detected, gib(8), gib(4), .explicit);
+    try std.testing.expectEqual(
+        LiveAdmissionPolicy.explicit_process_envelope,
+        explicit.live_admission_policy,
+    );
+    try std.testing.expectEqual(mib(512), liveHostAdmissionReserve(explicit));
+
+    // The outer resolver carries the cgroup source and its concrete effective
+    // limit when a larger explicit value was clamped by memory.max.
+    const clamped = applyProcessMemoryLimit(detected, gib(8), gib(4), .cgroup_v2);
+    try std.testing.expectEqual(gib(8), clamped.total_bytes);
+    try std.testing.expectEqual(
+        LiveAdmissionPolicy.dynamic_pressure,
+        clamped.live_admission_policy,
+    );
+    try std.testing.expectEqual(gib(2), liveHostAdmissionReserve(clamped));
 }
 
 test "explicit Linux envelope does not double reserve bounded availability" {
@@ -2985,6 +3047,7 @@ test "explicit Linux envelope does not double reserve bounded availability" {
         },
         mib(13_000),
         9_171_787_776,
+        .explicit,
     );
     try std.testing.expectEqual(@as(?usize, 4_459_700_224), info.available_bytes);
     try std.testing.expectEqual(mib(512), liveHostAdmissionReserve(info));
@@ -3011,6 +3074,7 @@ test "explicit Linux envelope does not double reserve bounded availability" {
         },
         mib(14_000),
         13_212_901_376,
+        .explicit,
     );
     try std.testing.expectEqual(@as(?usize, 1_467_162_624), post_load.available_bytes);
     try std.testing.expectEqual(mib(512), liveHostAdmissionReserve(post_load));
@@ -3036,7 +3100,7 @@ test "cgroup probe merge keeps raw and working-set samples coherent" {
 }
 
 test "explicit process envelope remains authoritative without a host probe" {
-    const live = applyOptionalProcessMemoryLimit(null, gib(14), gib(3)).?;
+    const live = applyOptionalProcessMemoryLimit(null, gib(14), gib(3), .explicit).?;
     try std.testing.expectEqual(gib(14), live.total_bytes);
     try std.testing.expectEqual(@as(?usize, gib(11)), live.available_bytes);
     try std.testing.expectEqual(
@@ -3044,7 +3108,7 @@ test "explicit process envelope remains authoritative without a host probe" {
         live.live_admission_policy,
     );
 
-    const unmeasured = applyOptionalProcessMemoryLimit(null, gib(14), null).?;
+    const unmeasured = applyOptionalProcessMemoryLimit(null, gib(14), null, .explicit).?;
     try std.testing.expectEqual(
         LiveAdmissionPolicy.dynamic_pressure,
         unmeasured.live_admission_policy,

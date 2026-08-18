@@ -207,6 +207,14 @@ pages that both the kernel and kubelet treat as reclaimable. This avoids making
 build/download cache a permanent admission charge without hiding mapped pages
 that are actually under pressure.
 
+Resolved bytes and provenance travel together through direct `NodeConfig` and
+the standalone inference ABI. Only an effective `explicit` source selects the
+fixed-reserve policy; cgroup, host, unavailable, and explicit-input-clamped-by-
+cgroup sources retain their exact automatic provenance and the dynamic-pressure
+policy. Inference never reconstructs operator intent from numeric equality with
+a detected limit, because an automatically resolved leaf-cgroup limit normally
+equals that same detected total.
+
 Budget overrides are normalized once in the inference memory tier and then
 used by direct CLI runs, server request budgets, and ModelManager load/run
 admission. Host and backend are the physical components of `combined`; when an
@@ -314,10 +322,11 @@ the final capability reference. The last reference asserts empty ledgers,
 detaches the upstream admission bridge, releases both external capability
 contexts, and destroys the controller.
 
-The standalone boundary mirrors the same rule. ABI `ResourceBudget` version 15
-adds retain/release callbacks for its host context. The inference archive copies
-that table into an independently ref-counted context, and its local admission
-and tokenizer capabilities retain that context. The host
+The standalone boundary mirrors the same rule. ABI version 15 added
+`ResourceBudget` retain/release callbacks for its host context; version 16 adds
+effective process-envelope provenance to `CreateContext`. The inference archive
+copies the resource table into an independently ref-counted context, and its
+local admission and tokenizer capabilities retain that context. The host
 `InferenceResourceBudgetOwner` in turn retains the node `ResourceManager` bridge
 until inference Node destruction has released every lease and observer. This
 keeps the Apache inference package decoupled from storage internals without

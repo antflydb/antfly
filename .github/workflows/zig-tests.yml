@@ -1017,6 +1017,21 @@ jobs:
           chmod +x ./zig-out/bin/antfly
           taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/inference pytest -q --continue-on-collection-errors e2e/inference
 
+      - name: Validate standalone inference resource composition
+        if: matrix.suite == 'inference'
+        working-directory: zig
+        env:
+          ANTFLY_BIN: ./zig-out/bin/antfly
+          ANTFLY_INFERENCE_STANDALONE_TESTS: "1"
+          ANTFLY_INFERENCE_STANDALONE_MODELS_DIR: ~/.antfly/inference/models
+          ANTFLY_INFERENCE_STANDALONE_MODEL_NAME: ggml-org/gemma-4-e2b-it-gguf
+          ANTFLY_INFERENCE_STANDALONE_PROCESS_MEMORY_BUDGET_MB: "14000"
+          ANTFLY_INFERENCE_STANDALONE_HOST_BUDGET_MB: "12000"
+          ANTFLY_INFERENCE_STANDALONE_COMBINED_BUDGET_MB: "12000"
+        run: |
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/antfly pytest -q \
+            e2e/antfly/test_standalone.py::test_standalone_inference_process_envelope_composition
+
       - name: Run Antfly full E2E
         if: matrix.suite == 'antfly'
         working-directory: zig

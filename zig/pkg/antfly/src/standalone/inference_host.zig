@@ -316,6 +316,14 @@ pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*a
         },
         .preload = warm_models.items,
         .process_memory_limit_bytes = context.process_memory_limit_bytes,
+        .process_memory_limit_provenance = switch (context.process_memory_limit_provenance) {
+            .automatic => .automatic,
+            .explicit => .explicit,
+            .cgroup_v2 => .cgroup_v2,
+            .cgroup_v1 => .cgroup_v1,
+            .host => .host,
+            .unavailable => .unavailable,
+        },
         .resource_ownership = .external_required,
         .tokenizer_cache = .{
             .bulk_slots_per_shard = 16 * 1024,
