@@ -418,11 +418,20 @@ client
 The CLI `load` command reads a JSON file and batches documents automatically. For SDK usage with large files, see the [Batch Operations](/docs/api/data-operations) documentation.
 </Callout>
 
-Embedding generation runs in the background. Monitor progress:
+Embedding generation runs in the background. Wait for the semantic index to be
+fully queryable before running semantic, hybrid, or RAG examples:
 
 ```bash
-antfly index list --table wikipedia
+antfly index wait --table wikipedia \
+  --index title_body \
+  --timeout 20m
 ```
+
+Use `antfly index list --table wikipedia` for a compact progress summary, or
+add `--output json` for the complete diagnostic payload.
+On a laptop, the initial local-model download and 10,000-document backfill can
+take several minutes; the wait command reports bounded periodic progress and
+enforces the timeout.
 
 ## Search
 

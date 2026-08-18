@@ -12887,6 +12887,28 @@ pub const ProvisionedTableWriteSource = struct {
                     target_generations[group_index] = entry.lsm_root_generation;
                     try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, cached.db);
                     try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
+                    // Catalog admission and local create can race an earlier
+                    // startup/status open of this generation. In that case the
+                    // resident writer may still own the old (often empty)
+                    // producer set even though the create request already
+                    // carries the authoritative managed-index definition.
+                    // Reconfigure before catalog reconciliation, then publish
+                    // the matching fingerprint only after every group commits.
+                    // Otherwise the new index is durable but its enrichment
+                    // worker remains permanently absent and status reports a
+                    // configuration mismatch at zero coverage.
+                    if (!ProvisionedTableWriteCache.entryManagedConfigMatches(entry, indexes_json)) {
+                        try reconfigureManagedDbEnrichmentRuntime(
+                            alloc,
+                            cached.db,
+                            indexes_json,
+                            self.backend_runtime,
+                            self.antfly_provider,
+                            self.inference_api_url,
+                            self.secret_store,
+                            self.remote_content,
+                        );
+                    }
                     _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
                         .drain_resolver_backfill = false,
                     });
@@ -39473,6 +39495,166 @@ test "provisioned create reuses a generation opened by startup reconciliation" {
     var admitted = (try serving_owner.db.lookup(alloc, "doc:admitted", .{})) orelse return error.TestUnexpectedResult;
     defer admitted.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, admitted.json, "already provisioned") != null);
+}
+
+test "provisioned create reconfigures managed enrichment on a stale cached writer" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const FakeEmbeddingProvider = struct {
+        var request_count: std.atomic.Value(u32) = .init(0);
+
+        fn executor() http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, arena: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/v1/embeddings"));
+            _ = request_count.fetchAdd(1, .monotonic);
+
+            var parsed_req = try parseJsonBodyIgnoreUnknown(TestEmbeddingRequest, arena, req.body);
+            defer parsed_req.deinit();
+            try std.testing.expect(jsonValueContainsText(parsed_req.value.input, "alpha body"));
+
+            return .{
+                .status = 200,
+                .content_type = try arena.dupe(u8, "application/json"),
+                .body = try arena.dupe(u8,
+                    \\{"object":"list","data":[{"object":"embedding","index":0,"embedding":[1,0,0]}],"model":"test-embed","usage":{"prompt_tokens":1,"total_tokens":1}}
+                ),
+            };
+        }
+    };
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/create-managed-runtime-race", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(path);
+
+    // Model the create-table race: startup observed the catalog before the
+    // managed index was published and opened the generation with only the
+    // default index. The create request below is the newer authority.
+    const Catalog = struct {
+        var indexes_json_buf: []const u8 = tables_api.default_indexes_json;
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            const tables = try std.testing.allocator.alloc(metadata_table_manager.TableRecord, 1);
+            errdefer std.testing.allocator.free(tables);
+            tables[0] = .{
+                .table_id = 7,
+                .name = "docs",
+                .schema_json = tables_api.default_schema_json,
+                .indexes_json = indexes_json_buf,
+                .placement_role = "data",
+            };
+            const ranges = try std.testing.allocator.alloc(metadata_table_manager.RangeRecord, 1);
+            errdefer std.testing.allocator.free(ranges);
+            ranges[0] = .{
+                .group_id = 7001,
+                .range_id = 7101,
+                .table_id = 7,
+                .start_key = "",
+                .end_key = null,
+            };
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = tables,
+                .ranges = ranges,
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            std.testing.allocator.free(snapshot.tables);
+            std.testing.allocator.free(snapshot.ranges);
+        }
+    };
+
+    var listener = std_http_listener.StdHttpListener.init(alloc, .{}, FakeEmbeddingProvider.executor());
+    defer listener.deinit();
+    try listener.start();
+    const base_uri = try listener.baseUri(alloc);
+    defer alloc.free(base_uri);
+
+    const managed_indexes_json = try std.fmt.allocPrint(alloc,
+        \\{{"full_text_index_v0":{{"name":"full_text_index_v0","type":"full_text"}},"title_body":{{"name":"title_body","type":"embeddings","field":"body","dimension":3,"embedder":{{"provider":"openai","model":"test-embed","url":"{s}"}}}}}}
+    , .{base_uri});
+    defer alloc.free(managed_indexes_json);
+    Catalog.indexes_json_buf = tables_api.default_indexes_json;
+    FakeEmbeddingProvider.request_count.store(0, .monotonic);
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var startup_write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer startup_write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
+    source.bindWriteCaches(&write_cache, &startup_write_cache);
+
+    {
+        var startup_owner = try startup_write_cache.getOrOpenLockedMode(
+            path,
+            Catalog.iface(),
+            7001,
+            source.visibleRootGeneration(7001),
+            "docs",
+            .startup_catch_up,
+        );
+        defer startup_owner.deinit(alloc);
+        try std.testing.expect(startup_owner.db.enrichment_runtime == null);
+    }
+
+    // Admission has committed the new catalog value, but the startup cache
+    // still owns a writer constructed from the earlier snapshot.
+    Catalog.indexes_json_buf = managed_indexes_json;
+    var req = tables_api.CreateTableRequest{
+        .indexes_json = try alloc.dupe(u8, managed_indexes_json),
+    };
+    defer req.deinit(alloc);
+    _ = try source.source().createTable(alloc, "docs", req);
+
+    try std.testing.expectEqual(@as(usize, 0), startup_write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    const entry = write_cache.entries.items[0];
+    try std.testing.expect(ProvisionedTableWriteCache.entryManagedConfigMatches(entry, managed_indexes_json));
+    try std.testing.expect(entry.db.core.index_manager.denseIndex("title_body") != null);
+    const runtime = entry.db.enrichment_runtime orelse return error.MissingDbEnrichmentRuntime;
+    try std.testing.expect(runtime.stats().worker_started);
+
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha body\"}" }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expect(FakeEmbeddingProvider.request_count.load(.monotonic) > 0);
+    try std.testing.expect(entry.db.core.index_manager.denseIndex("title_body").?.index.metadata.active_count > 0);
+
+    const query_vec = [_]f32{ 1, 0, 0 };
+    var result = try entry.db.search(alloc, .{
+        .index_name = "title_body",
+        .dense = .{ .vector = query_vec[0..], .k = 1 },
+        .limit = 1,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
 }
 
 test "provisioned table write source restore table does not hold local db mutex during restore work" {

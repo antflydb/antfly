@@ -74,8 +74,20 @@ pub fn commandUsage(command: []const u8) ?[]const u8 {
     \\  --strict                   Fail on the first rejected record
     \\
     ;
-    if (std.mem.eql(u8, command, "table")) return "usage: antfly table <create|drop|list|get> [options]\n";
-    if (std.mem.eql(u8, command, "index")) return "usage: antfly index <create|drop|list|get> --table <table> [options]\n";
+    if (std.mem.eql(u8, command, "table")) return
+    \\usage: antfly table <create|drop|list|get> [options]
+    \\
+    \\  table create --table <table> [--shards <n>] [--schema <json>] [--index <json> ...]
+    \\  table create --table <table> --file <config.json>
+    \\
+    ;
+    if (std.mem.eql(u8, command, "index")) return
+    \\usage: antfly index <create|drop|list|get|wait> --table <table> [options]
+    \\
+    \\  index list --table <table> [--output json|--verbose]
+    \\  index wait --table <table> --index <index> [--timeout 10m]
+    \\
+    ;
     if (std.mem.eql(u8, command, "artifact")) return "usage: antfly artifact <list|get|put|delete|reprocess|job> [options]\n";
     if (std.mem.eql(u8, command, "lookup")) return "usage: antfly lookup --table <table> --key <key> [options]\n";
     if (std.mem.eql(u8, command, "insert")) return "usage: antfly insert --table <table> --key <key> --document <json> [options]\n";

@@ -120,6 +120,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
     };
 
     if (table_name) |tbl| {
+        if (semantic_search != null) warnIfSemanticIndexesAreNotReady(client, tbl, indexes);
         var resp = try client.queryTable(tbl, body);
         defer resp.deinit();
         if (resp.data) |data| {
@@ -132,6 +133,139 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
             try cli.writeJson(allocator, io, data.value);
         }
     }
+}
+
+fn warnIfSemanticIndexesAreNotReady(
+    client: *antfly_client.AntflyClient,
+    table_name: []const u8,
+    selected_indexes: ?[]const []const u8,
+) void {
+    var resp = client.listIndexes(table_name) catch |err| {
+        std.debug.print("warning: unable to verify semantic index readiness: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer resp.deinit();
+    const parsed = resp.data orelse {
+        std.debug.print("warning: unable to verify semantic index readiness (HTTP {d})\n", .{resp.status_code});
+        return;
+    };
+    for (parsed.value) |index| {
+        if (index.config.type != .embeddings) continue;
+        if (selected_indexes) |selected| {
+            var matched = false;
+            for (selected) |name| {
+                if (std.mem.eql(u8, name, index.config.name)) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) continue;
+        }
+        const stats = switch (index.status) {
+            .embeddings_index_stats => |value| value,
+            else => continue,
+        };
+        if (embeddingIndexReady(stats)) continue;
+
+        const state = if (stats.coverage) |coverage|
+            if (coverage.config_mismatch_group_count > 0) "config_mismatch" else stats.backfill_state orelse "not_ready"
+        else if (stats.backfill_state != null and std.mem.eql(u8, stats.backfill_state.?, "ready"))
+            "coverage_unavailable"
+        else
+            stats.backfill_state orelse if (stats.rebuilding orelse true) "running" else "not_ready";
+        if (stats.coverage) |coverage| {
+            std.debug.print(
+                "warning: semantic index {s} is {s} (coverage {d}/{d}, complete={any}); results may be incomplete. Run `antfly index wait --table {s} --index {s}`.\n",
+                .{ index.config.name, state, coverage.produced, coverage.source_total, coverage.complete, table_name, index.config.name },
+            );
+        } else if (stats.backfill_progress) |progress| {
+            std.debug.print(
+                "warning: semantic index {s} is {s} ({d:.1}%); results may be incomplete. Run `antfly index wait --table {s} --index {s}`.\n",
+                .{ index.config.name, state, @max(0.0, @min(1.0, progress)) * 100.0, table_name, index.config.name },
+            );
+        } else {
+            std.debug.print(
+                "warning: semantic index {s} is {s}; results may be incomplete. Run `antfly index wait --table {s} --index {s}`.\n",
+                .{ index.config.name, state, table_name, index.config.name },
+            );
+        }
+    }
+}
+
+fn embeddingIndexReady(stats: antfly_client.types.EmbeddingsIndexStats) bool {
+    if (stats.@"error" != null) return false;
+    if (stats.backfill_state) |state| {
+        if (!std.mem.eql(u8, state, "ready")) return false;
+    } else if (stats.rebuilding orelse true) {
+        return false;
+    }
+    const coverage = stats.coverage orelse return false;
+    return coverage.complete and
+        coverage.observation_complete and
+        coverage.config_mismatch_group_count == 0;
+}
+
+test "semantic readiness requires ready state and complete coverage" {
+    try std.testing.expect(!embeddingIndexReady(.{
+        .index_type = .embeddings,
+        .backfill_state = "ready",
+        .rebuilding = false,
+    }));
+    try std.testing.expect(!embeddingIndexReady(.{
+        .index_type = .embeddings,
+        .backfill_state = "running",
+        .rebuilding = true,
+    }));
+
+    try std.testing.expect(embeddingIndexReady(.{
+        .index_type = .embeddings,
+        .backfill_state = "ready",
+        .rebuilding = false,
+        .coverage = .{
+            .policy = .strict,
+            .observation_complete = true,
+            .observation_incomplete_reasons = &.{},
+            .config_fingerprint = "0123456789abcdef",
+            .summary_ready = true,
+            .config_mismatch_group_count = 0,
+            .source_total = 1,
+            .produced = 1,
+            .skipped = 0,
+            .terminal_failed = 0,
+            .covered = 1,
+            .settled = 1,
+            .uncovered = 0,
+            .pending = 0,
+            .complete = true,
+            .healthy = true,
+            .degraded = false,
+        },
+    }));
+
+    try std.testing.expect(!embeddingIndexReady(.{
+        .index_type = .embeddings,
+        .backfill_state = "ready",
+        .rebuilding = false,
+        .coverage = .{
+            .policy = .strict,
+            .observation_complete = true,
+            .observation_incomplete_reasons = &.{"config_mismatch"},
+            .config_fingerprint = "0123456789abcdef",
+            .summary_ready = true,
+            .config_mismatch_group_count = 1,
+            .source_total = 1,
+            .produced = 1,
+            .skipped = 0,
+            .terminal_failed = 0,
+            .covered = 1,
+            .settled = 1,
+            .uncovered = 0,
+            .pending = 0,
+            .complete = true,
+            .healthy = false,
+            .degraded = true,
+        },
+    }));
 }
 
 pub fn lookup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
