@@ -17418,19 +17418,27 @@ pub const DB = struct {
             const drain_resolver_replay = self.resolverReplayNeedsDrain();
             if (drain_resolver_replay) {
                 if (self.resolution_runtime) |runtime| {
-                    if (drained_sequence > 0) runtime.notifySequence(drained_sequence - 1);
+                    // nextDerivedSequence() is the highest committed sequence,
+                    // not the next append sequence. Include that record when
+                    // recovering a missed runtime notification.
+                    if (drained_sequence > 0) runtime.notifySequence(drained_sequence);
                     try runtime.catchUp();
                 }
 
                 if (self.promotion_runtime) |runtime| {
                     const latest = self.core.nextDerivedSequence();
-                    if (latest > 0) runtime.notifySequence(latest - 1);
+                    if (latest > 0) runtime.notifySequence(latest);
                     try runtime.catchUp();
                 }
 
-                if (self.resolverReplayBlockedAfterRunnableDrain()) return;
-
-                try self.runMaintenanceUntilWithOptions(self.currentMaintenanceTargetSequence(), .{}, options);
+                // Resolution can append graph/promotion replay before
+                // promotion discovers that its external sink is unavailable.
+                // Drain those independent derived consumers before reporting
+                // the blocked stage; otherwise runUntilIdle can return with a
+                // durable resolution artifact that is absent from the graph.
+                if (self.core.nextDerivedSequence() > drained_sequence) {
+                    try self.runMaintenanceUntilWithOptions(self.currentMaintenanceTargetSequence(), .{}, options);
+                }
                 if (self.resolverReplayBlockedAfterRunnableDrain()) return;
             }
 
@@ -49039,14 +49047,17 @@ test "db backfills a mention name embedding so ann/cosine resolution links end-t
     try std.testing.expectEqualStrings("person/ada_lovelace", edges[0].target);
 }
 
-test "db resolves extracted entities into a resolution artifact end-to-end" {
+test "db runUntilIdle catches resolution up to the committed tail after a missed notification" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+    });
     defer db.close();
 
     // A graph index drives production of the relations_v1 asset (extraction)
@@ -49081,6 +49092,15 @@ test "db resolves extracted entities into a resolution artifact end-to-end" {
         },
         .sync_level = .enrichments,
     });
+
+    // Runtime notifications are wake-up optimizations, not correctness
+    // state. Simulate losing the notification after the source artifact was
+    // committed; runUntilIdle must recover from the durable replay tail.
+    const resolution_runtime = db.resolution_runtime.?;
+    resolution_runtime.target_sequence.store(
+        resolution_runtime.applied_sequence.load(.acquire),
+        .release,
+    );
     try db.runUntilIdle();
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
@@ -49938,7 +49958,12 @@ test "db does not materialize review-band resolution as canonical mention edges"
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    // Keep the lifecycle deterministic: every transition below must be
+    // completed by runUntilIdle rather than an opportunistic worker wake-up.
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+    });
     defer db.close();
 
     try db.addIndex(.{
@@ -50014,7 +50039,9 @@ test "db does not materialize review-band resolution as canonical mention edges"
     try std.testing.expectEqualStrings("match", curated_ent.get("decision").?.string);
     try std.testing.expectEqualStrings("person/ada_lovelace", curated_ent.get("doc_ref").?.object.get("key").?.string);
 
-    const curated_edges = try waitForGraphEdges(alloc, &db, "prov_graph", "doc:a", "mentions", .out, 1);
+    // runUntilIdle is the lifecycle fence: a blocked promotion sink must not
+    // prevent the independent graph consumer from publishing this edge.
+    const curated_edges = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
     defer graph_mod.GraphIndex.freeEdges(alloc, curated_edges);
     try std.testing.expectEqual(@as(usize, 1), curated_edges.len);
     try std.testing.expectEqualStrings("person/ada_lovelace", curated_edges[0].target);
@@ -50027,7 +50054,10 @@ test "db mention edge weight is fused from extractor trust and mention confidenc
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+    });
     defer db.close();
 
     try db.addIndex(.{
@@ -50066,12 +50096,40 @@ test "db mention edge weight is fused from extractor trust and mention confidenc
     });
     try db.runUntilIdle();
 
-    const out = try waitForGraphEdges(alloc, &db, "prov_graph", "doc:a", "mentions", .out, 1);
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const initial_resolution = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(initial_resolution);
+
+    const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
     defer graph_mod.GraphIndex.freeEdges(alloc, out);
     try std.testing.expectEqual(@as(usize, 1), out.len);
     try std.testing.expectEqualStrings("person/ada_lovelace", out[0].target);
     // Calibrated weight, not the legacy 1.0.
     try std.testing.expectApproxEqAbs(@as(f64, 0.72), out[0].weight, 1e-9);
+
+    // Mention confidence belongs to the source extraction, not the resolution
+    // decision. The resolution bytes therefore stay unchanged, but replay must
+    // still reconcile the source-dependent graph weight.
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace","confidence":0.4}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const updated_resolution = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(updated_resolution);
+    try std.testing.expectEqualStrings(initial_resolution, updated_resolution);
+
+    const updated = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, updated);
+    try std.testing.expectEqual(@as(usize, 1), updated.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.36), updated[0].weight, 1e-9);
 }
 
 test "db rewriteEntityEdges repoints provenance edges to a merge survivor" {

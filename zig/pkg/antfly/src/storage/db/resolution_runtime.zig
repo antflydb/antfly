@@ -227,8 +227,9 @@ pub const ProcessOutcome = struct {
 /// resolution artifact through `store`. Returns null when `changed_key` is not
 /// an asset artifact or no configured resolver consumes it. `provider` supplies
 /// blocking candidates (null = deterministic minting only). The returned
-/// `resolution_key` is owned by the caller, which journals it (on written /
-/// cleared) via a `DerivedBatch` so downstream stages (graph materializer) wake.
+/// `resolution_key` is owned by the caller, which journals it for every
+/// non-source-missing outcome via a `DerivedBatch` so downstream stages (graph
+/// materializer and promotion) reconcile at least once.
 pub fn processChangedExtraction(
     gpa: std.mem.Allocator,
     resolvers: []const ResolverConfig,
@@ -357,8 +358,15 @@ fn processChangedExtractionForAllResolvers(
         const outcome = (try processChangedExtractionWithConfig(gpa, cfg, store, provider, changed_key, candidate_source, embedder)) orelse continue;
         processed += 1;
         switch (outcome.result) {
-            .written, .cleared => try journal_keys.append(gpa, outcome.resolution_key),
-            else => gpa.free(outcome.resolution_key),
+            // Downstream graph output also depends on the source extraction
+            // (for example mention confidence), so an unchanged resolution is
+            // not proof that downstream state is current. Re-emitting its key
+            // also closes the crash window where the artifact commit survived
+            // but its prior downstream replay did not. Graph materialization
+            // and promotion are idempotent, giving this boundary at-least-once
+            // delivery without an unbounded retry loop.
+            .written, .unchanged, .cleared => try journal_keys.append(gpa, outcome.resolution_key),
+            .source_missing => gpa.free(outcome.resolution_key),
         }
     }
     return processed;
@@ -2341,11 +2349,14 @@ test "processRecordKeys resolves changed asset keys and journals resolution keys
     try testing.expectEqualSlices(u8, resolution_key, writer.keys.items[0]);
     try testing.expectEqual(@as(u64, 1), writer.calls);
 
-    // Idempotent replay: recomputed bytes match, so nothing is journaled.
+    // Idempotent resolution still re-emits the durable key: downstream graph
+    // state may depend on changed extraction metadata, and a retry must repair
+    // an interrupted artifact -> downstream replay handoff.
     writer.calls = 0;
     try processRecordKeys(alloc, &resolvers, store, null, &changed, &writer, CaptureWriter.writeFn, null, null);
-    try testing.expectEqual(@as(usize, 1), writer.keys.items.len);
-    try testing.expectEqual(@as(u64, 0), writer.calls);
+    try testing.expectEqual(@as(usize, 2), writer.keys.items.len);
+    try testing.expectEqualSlices(u8, resolution_key, writer.keys.items[1]);
+    try testing.expectEqual(@as(u64, 1), writer.calls);
 }
 
 test "processRecordKeys fans one source artifact out to all consuming resolvers" {
