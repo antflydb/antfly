@@ -1005,10 +1005,10 @@ jobs:
           # Declare a smaller process envelope so admission leaves kubelet and
           # test-harness headroom instead of sizing itself from the host.
           ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB: "13000"
-          # Bound the native hot set while allowing the 2B decoder's transient
-          # f32 weight views plus scoped projector to complete. The smaller
-          # process envelope remains the whole-process physical cap.
-          ANTFLY_INFERENCE_HOST_BUDGET_MB: "10000"
+          # Bound the native hot set while allowing the measured 11173MiB 2B
+          # decoder working set plus its scoped projector to complete. Keep
+          # 1000MiB outside this managed budget for whole-process overhead.
+          ANTFLY_INFERENCE_HOST_BUDGET_MB: "12000"
           # This is a release contract, not an optional capability probe. Keep
           # it targeted so unrelated large-model suites do not inflate this job.
           RUN_MULTIMODAL_GENERATOR_TESTS: "1"
