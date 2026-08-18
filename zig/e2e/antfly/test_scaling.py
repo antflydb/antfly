@@ -48,19 +48,65 @@ DATA_NODE_REGISTRATION_TIMEOUT_S = 180.0
 DATA_NODE_BIND_ATTEMPTS = 3
 ADDRESS_IN_USE_LOG_MARKER = "listen address is already in use"
 AMBIGUOUS_METADATA_CLIENT_STATUSES = frozenset({408})
+METADATA_MUTATION_NOT_ADMITTED_HEADER = "X-Antfly-Metadata-Mutation-Not-Admitted"
+METADATA_MUTATION_NOT_ADMITTED_VALUE = "true"
 
 
 class MetadataMutationRejected(AssertionError):
     """The metadata service definitively rejected a side-effecting request."""
 
 
+class MetadataMutationNotLeader(requests.HTTPError):
+    """The contacted replica explicitly rejected a mutation before admission."""
+
+
 def _raise_for_metadata_mutation(response: requests.Response, *, operation: str) -> None:
     status = response.status_code
+    if (
+        status == 503
+        and response.headers.get(METADATA_MUTATION_NOT_ADMITTED_HEADER, "").strip().lower()
+        == METADATA_MUTATION_NOT_ADMITTED_VALUE
+    ):
+        raise MetadataMutationNotLeader(
+            f"{operation} reached a metadata follower",
+            response=response,
+        )
     if 400 <= status < 500 and status not in AMBIGUOUS_METADATA_CLIENT_STATUSES:
         detail = response.text.strip()[:512]
         suffix = f": {detail}" if detail else ""
         raise MetadataMutationRejected(f"{operation} rejected with HTTP {status}{suffix}")
     response.raise_for_status()
+
+
+def _metadata_mutation_once(
+    metadata_urls: list[str],
+    method: str,
+    path: str,
+    *,
+    operation: str,
+    json_body: dict[str, Any] | None = None,
+) -> None:
+    """Submit at most once, routing only across explicit pre-admission rejections."""
+    if not metadata_urls:
+        raise AssertionError("cluster has no metadata URLs")
+    last_not_leader: MetadataMutationNotLeader | None = None
+    for url in metadata_urls:
+        response = requests.request(
+            method,
+            f"{url}{path}",
+            json=json_body,
+            timeout=5,
+        )
+        try:
+            _raise_for_metadata_mutation(response, operation=operation)
+        except MetadataMutationNotLeader as exc:
+            # The header is emitted only when this replica rejected before
+            # proposing. No transport error or generic 5xx is safe to reroute.
+            last_not_leader = exc
+            continue
+        return
+    assert last_not_leader is not None
+    raise last_not_leader
 
 
 def _submit_metadata_mutation_if_unobserved(
@@ -102,6 +148,61 @@ def test_metadata_mutation_response_distinguishes_rejection_from_ambiguity():
         ambiguous.status_code = status
         with pytest.raises(requests.HTTPError):
             _raise_for_metadata_mutation(ambiguous, operation="trigger reallocation")
+
+    follower = requests.Response()
+    follower.status_code = 503
+    follower.headers[METADATA_MUTATION_NOT_ADMITTED_HEADER] = METADATA_MUTATION_NOT_ADMITTED_VALUE
+    with pytest.raises(MetadataMutationNotLeader, match="metadata follower"):
+        _raise_for_metadata_mutation(follower, operation="trigger reallocation")
+
+
+def test_metadata_mutation_routes_only_explicit_follower_rejection(monkeypatch: pytest.MonkeyPatch):
+    attempted: list[str] = []
+
+    def explicit_follower_then_leader(method: str, url: str, **kwargs: Any) -> requests.Response:
+        del method, kwargs
+        attempted.append(url)
+        response = requests.Response()
+        if len(attempted) == 1:
+            response.status_code = 503
+            response.headers[METADATA_MUTATION_NOT_ADMITTED_HEADER] = METADATA_MUTATION_NOT_ADMITTED_VALUE
+        else:
+            response.status_code = 202
+        return response
+
+    monkeypatch.setattr(requests, "request", explicit_follower_then_leader)
+    _metadata_mutation_once(
+        ["http://follower", "http://leader"],
+        "POST",
+        "/internal/v1/reallocate",
+        operation="trigger reallocation",
+    )
+    assert attempted == [
+        "http://follower/internal/v1/reallocate",
+        "http://leader/internal/v1/reallocate",
+    ]
+
+    attempted.clear()
+
+    def ambiguous_failure(method: str, url: str, **kwargs: Any) -> requests.Response:
+        del method, kwargs
+        attempted.append(url)
+        response = requests.Response()
+        response.status_code = 503
+        # This is only an authority-routing hint; several ambiguous failures
+        # carry it, so it must not authorize a second mutation attempt.
+        response.headers["X-Antfly-Metadata-Not-Leader"] = "true"
+        return response
+
+    monkeypatch.setattr(requests, "request", ambiguous_failure)
+    with pytest.raises(requests.HTTPError):
+        _metadata_mutation_once(
+            ["http://unknown", "http://must-not-be-contacted"],
+            "POST",
+            "/internal/v1/reallocate",
+            operation="trigger reallocation",
+        )
+    assert attempted == ["http://unknown/internal/v1/reallocate"]
 
 
 def test_metadata_mutation_submission_is_state_driven_and_at_most_once():
@@ -941,15 +1042,13 @@ class MultiNodeScalingCluster:
         json_body: dict[str, Any] | None = None,
     ) -> None:
         """Issue one side-effecting request; callers resolve ambiguity by observing state."""
-        if not self.metadata_urls:
-            raise AssertionError("cluster has no metadata URLs")
-        response = requests.request(
+        _metadata_mutation_once(
+            self.metadata_urls,
             method,
-            f"{self.metadata_urls[0]}{path}",
-            json=json_body,
-            timeout=5,
+            path,
+            operation=operation,
+            json_body=json_body,
         )
-        _raise_for_metadata_mutation(response, operation=operation)
 
     def metadata_snapshot_from(self, index: int) -> dict[str, Any]:
         response = requests.get(f"{self.metadata_urls[index]}/metadata/v1/admin/snapshot", timeout=10)

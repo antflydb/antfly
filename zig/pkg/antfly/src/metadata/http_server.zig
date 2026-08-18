@@ -1319,6 +1319,15 @@ pub const MetadataHttpServer = struct {
         if (err == error.UnsupportedOperation) return ctx.status(405).text("unsupported operation");
         if (err == error.ReallocationProtocolUpgradeRequired)
             return ctx.status(503).text("metadata voter upgrade required");
+        if (err == error.NotLeader) {
+            // The local Raft host rejected this command before proposal. This
+            // is the only mutation failure that authorizes an at-most-once
+            // client to route the same request to another metadata replica.
+            try ctx.setHeader(
+                http_common.metadata_mutation_not_admitted_header,
+                http_common.metadata_mutation_not_admitted_value,
+            );
+        }
         return metadataReadError(ctx, err);
     }
 
@@ -4778,4 +4787,20 @@ test "metadata http server returns retryable authority response when reconcile l
     try std.testing.expectEqual(@as(u16, 503), resp.status.code);
     try std.testing.expectEqual(@as(usize, 1), source.create_calls);
     try std.testing.expectEqualStrings(http_common.metadata_not_leader_value, resp.headers.get(http_common.metadata_not_leader_header).?);
+    try std.testing.expect(resp.headers.get(http_common.metadata_mutation_not_admitted_header) == null);
+}
+
+test "metadata mutation not-leader response proves proposal was not admitted" {
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/internal/v1/reallocate");
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var resp = try MetadataHttpServer.metadataMutationError(&ctx, error.NotLeader);
+    defer resp.deinit();
+    try std.testing.expectEqual(@as(u16, 503), resp.status.code);
+    try std.testing.expectEqualStrings(
+        http_common.metadata_mutation_not_admitted_value,
+        resp.headers.get(http_common.metadata_mutation_not_admitted_header).?,
+    );
 }

@@ -752,6 +752,7 @@ const LocalProjectionInputs = struct {
 const ProjectedCoreSnapshot = struct {
     stores: []metadata_table_manager.StoreRecord = &.{},
     placement_intents: []raft_reconciler.PlacementIntent = &.{},
+    placement_version_fences: []metadata_reconciler.PlacementVersionFence = &.{},
     shuffle_join_leases: []metadata_table_manager.ShuffleJoinLeaseRecord = &.{},
     schema_progresses: []metadata_table_manager.SchemaProgressRecord = &.{},
     restore_progresses: []metadata_table_manager.RestoreProgressRecord = &.{},
@@ -764,6 +765,7 @@ const ProjectedCoreSnapshot = struct {
         if (self.stores.len > 0) alloc.free(self.stores);
         for (self.placement_intents) |intent| alloc.free(intent.peer_node_ids);
         if (self.placement_intents.len > 0) alloc.free(self.placement_intents);
+        if (self.placement_version_fences.len > 0) alloc.free(self.placement_version_fences);
         if (self.shuffle_join_leases.len > 0) alloc.free(self.shuffle_join_leases);
         if (self.schema_progresses.len > 0) alloc.free(self.schema_progresses);
         for (self.restore_progresses) |record| metadata_table_manager.freeRestoreProgress(alloc, record);
@@ -792,6 +794,7 @@ const ProjectedCoreSnapshot = struct {
             .merge_transitions = self.merge_transitions.len,
             .estimated_bytes = @sizeOf(metadata_table_manager.StoreRecord) * self.stores.len +
                 @sizeOf(raft_reconciler.PlacementIntent) * self.placement_intents.len +
+                @sizeOf(metadata_reconciler.PlacementVersionFence) * self.placement_version_fences.len +
                 @sizeOf(metadata_table_manager.ShuffleJoinLeaseRecord) * self.shuffle_join_leases.len +
                 @sizeOf(metadata_table_manager.SchemaProgressRecord) * self.schema_progresses.len +
                 @sizeOf(metadata_table_manager.RestoreProgressRecord) * self.restore_progresses.len +
@@ -1152,6 +1155,13 @@ fn cloneProjectedPlacementIntentsOwned(
         cloned = i + 1;
     }
     return out;
+}
+
+fn cloneProjectedPlacementVersionFencesOwned(
+    alloc: std.mem.Allocator,
+    fences: []const metadata_reconciler.PlacementVersionFence,
+) ![]metadata_reconciler.PlacementVersionFence {
+    return try alloc.dupe(metadata_reconciler.PlacementVersionFence, fences);
 }
 
 fn cloneProjectedSplitTransitionsOwned(
@@ -1893,10 +1903,12 @@ pub const MetadataService = struct {
         self: *MetadataService,
         intent: raft_reconciler.PlacementIntent,
         expected_metadata_version: ?u64,
+        expected_version_fence: u64,
         expected_target_drain_requested: bool,
     ) !void {
         try self.proposeTransitionCommand(.{ .upsert_replica_intent = .{
             .expected_metadata_version = expected_metadata_version,
+            .expected_version_fence = expected_version_fence,
             .expected_target_drain_requested = expected_target_drain_requested,
             .replacement = intent,
         } });
@@ -2388,6 +2400,7 @@ pub const MetadataService = struct {
             try self.upsertReplicaIntent(
                 intent,
                 precondition.expected_metadata_version,
+                precondition.expected_version_fence,
                 precondition.expected_target_drain_requested,
             );
         }
@@ -2704,6 +2717,14 @@ pub const MetadataService = struct {
     pub fn listProjectedPlacementIntents(self: *MetadataService, alloc: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         return try store.listPlacementIntents(alloc, self.metadata_group_id);
+    }
+
+    pub fn listProjectedPlacementVersionFences(
+        self: *MetadataService,
+        alloc: std.mem.Allocator,
+    ) ![]metadata_reconciler.PlacementVersionFence {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listPlacementVersionFences(alloc, self.metadata_group_id);
     }
 
     pub fn listProjectedNodes(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_table_manager.NodeRecord {
@@ -3625,10 +3646,12 @@ pub const MetadataHttpService = struct {
         self: *MetadataHttpService,
         intent: raft_reconciler.PlacementIntent,
         expected_metadata_version: ?u64,
+        expected_version_fence: u64,
         expected_target_drain_requested: bool,
     ) !void {
         try self.proposeTransitionCommand(.{ .upsert_replica_intent = .{
             .expected_metadata_version = expected_metadata_version,
+            .expected_version_fence = expected_version_fence,
             .expected_target_drain_requested = expected_target_drain_requested,
             .replacement = intent,
         } });
@@ -4326,6 +4349,7 @@ pub const MetadataHttpService = struct {
             try self.upsertReplicaIntent(
                 intent,
                 precondition.expected_metadata_version,
+                precondition.expected_version_fence,
                 precondition.expected_target_drain_requested,
             );
         }
@@ -4920,6 +4944,7 @@ pub const MetadataHttpService = struct {
         errdefer snapshot.deinit(self.alloc);
         snapshot.stores = try store.listStores(self.alloc, self.metadata_group_id);
         snapshot.placement_intents = try store.listPlacementIntents(self.alloc, self.metadata_group_id);
+        snapshot.placement_version_fences = try store.listPlacementVersionFences(self.alloc, self.metadata_group_id);
         snapshot.shuffle_join_leases = try store.listShuffleJoinLeases(self.alloc, self.metadata_group_id);
         snapshot.schema_progresses = try store.listSchemaProgress(self.alloc, self.metadata_group_id);
         snapshot.restore_progresses = try store.listRestoreProgress(self.alloc, self.metadata_group_id);
@@ -5116,6 +5141,16 @@ pub const MetadataHttpService = struct {
         defer self.unlockRuntime();
         const snapshot = try self.projectedCoreSnapshotLocked();
         return try cloneProjectedPlacementIntentsOwned(alloc, snapshot.placement_intents);
+    }
+
+    pub fn listProjectedPlacementVersionFences(
+        self: *MetadataHttpService,
+        alloc: std.mem.Allocator,
+    ) ![]metadata_reconciler.PlacementVersionFence {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const snapshot = try self.projectedCoreSnapshotLocked();
+        return try cloneProjectedPlacementVersionFencesOwned(alloc, snapshot.placement_version_fences);
     }
 
     pub fn listProjectedNodes(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.NodeRecord {
@@ -9789,7 +9824,7 @@ test "metadata service projects committed placement intents into local hosted re
             .bootstrap_mode = .empty,
         },
         .peer_node_ids = &.{ 1, 2, 3 },
-    }, null, false);
+    }, null, 0, false);
 
     try runServiceRoundsUntilHostedStatus(&svc, 1951, .active, 8, "placement-intent activation");
 
@@ -11707,7 +11742,7 @@ test "metadata service status reports repair and rebalance counts" {
             },
         },
         .peer_node_ids = &.{2},
-    }, null, false);
+    }, null, 0, false);
     try svc.upsertReplicaIntent(.{
         .record = .{
             .group_id = 8801,
@@ -11725,7 +11760,7 @@ test "metadata service status reports repair and rebalance counts" {
             },
         },
         .peer_node_ids = &.{1},
-    }, null, false);
+    }, null, 0, false);
     try svc.runRound();
 
     try svc.reportStoreStatus(.{
@@ -12035,7 +12070,7 @@ test "metadata service committed metadata changes request lifecycle reconcile ho
         },
         .store_id = 0,
         .peer_node_ids = &.{},
-    }, null, false);
+    }, null, 0, false);
     try svc.requestReallocation(1);
     try runServiceRounds(&svc, 8);
     try std.testing.expect(capture.calls >= 1);
@@ -12713,7 +12748,7 @@ test "metadata service local replica root reconcile permit hook defers reconcile
         },
         .store_id = 0,
         .peer_node_ids = &.{},
-    }, null, false);
+    }, null, 0, false);
 
     var capture = HookCapture{};
     var permit = PermitCapture{ .allow = false };

@@ -2633,6 +2633,14 @@ pub const MetadataHttpNodeSimulation = struct {
         return try store.listPlacementIntents(alloc, self.cluster.metadata_group_id);
     }
 
+    pub fn listProjectedPlacementVersionFences(
+        self: MetadataHttpNodeSimulation,
+        alloc: std.mem.Allocator,
+    ) ![]metadata_reconciler.PlacementVersionFence {
+        const store = self.sim().runtime.svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
+        return try store.listPlacementVersionFences(alloc, self.cluster.metadata_group_id);
+    }
+
     pub fn listProjectedNodes(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator) ![]metadata_table_manager.NodeRecord {
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
         return try store.listNodes(alloc, self.cluster.metadata_group_id);
@@ -2716,10 +2724,12 @@ pub const MetadataHttpNodeSimulation = struct {
         self: MetadataHttpNodeSimulation,
         intent: raft_reconciler.PlacementIntent,
         expected_metadata_version: ?u64,
+        expected_version_fence: u64,
         expected_target_drain_requested: bool,
     ) !void {
         try self.proposeTransitionCommand(.{ .upsert_replica_intent = .{
             .expected_metadata_version = expected_metadata_version,
+            .expected_version_fence = expected_version_fence,
             .expected_target_drain_requested = expected_target_drain_requested,
             .replacement = intent,
         } });
@@ -2867,6 +2877,7 @@ pub const MetadataHttpNodeSimulation = struct {
             if (containsProjectedPlacementIntent(projected_intents, intent)) continue;
             try commands.append(self.cluster.alloc, .{ .upsert_replica_intent = .{
                 .expected_metadata_version = precondition.expected_metadata_version,
+                .expected_version_fence = precondition.expected_version_fence,
                 .expected_target_drain_requested = precondition.expected_target_drain_requested,
                 .replacement = intent,
             } });

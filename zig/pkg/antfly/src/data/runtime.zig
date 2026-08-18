@@ -4230,6 +4230,10 @@ fn captureRaftBatchLeaderTimeoutDiagnostics(context: RaftBatchLeaderTimeoutCaptu
     };
 }
 
+fn structuralRaftAppliedIndex(durable: ?u64, process_local: ?u64) ?u64 {
+    return durable orelse process_local;
+}
+
 pub const DataServer = struct {
     const SplitProjectionReconcileResult = union(enum) {
         advanced,
@@ -9371,6 +9375,20 @@ pub const DataServer = struct {
         return raft.host.owned_data_store;
     }
 
+    /// Structural recovery needs the durable Raft watermark, including after
+    /// a process restart that has not applied a new entry locally. The apply
+    /// state machine's process-local watermark remains intentionally separate:
+    /// it orders request-scoped typed outcomes and cannot prove recovered
+    /// state by itself.
+    fn localDataRaftAppliedIndex(self: *DataServer, group_id: u64) ?u64 {
+        const durable = if (self.data_raft) |raft|
+            if (raft.host.http_host.host.raftStatus(group_id)) |status| status.applied_index else null
+        else
+            null;
+        const process_local = if (self.data_raft_apply) |apply_sm| apply_sm.appliedIndex(group_id) else null;
+        return structuralRaftAppliedIndex(durable, process_local);
+    }
+
     fn ensureSplitSourceApplyStoreSeededInto(
         self: *DataServer,
         source_store: *antfly.data.RaftApplyStore,
@@ -9404,8 +9422,8 @@ pub const DataServer = struct {
         for (0..max_reconcile_attempts) |_| {
             const watermark = try source_store.latestBatchForTransition(source_group_id);
             if (watermark) |batch| {
-                if (self.data_raft_apply) |apply_sm| {
-                    if (apply_sm.appliedIndex(source_group_id) < batch.last_entry_index)
+                if (self.localDataRaftAppliedIndex(source_group_id)) |applied_index| {
+                    if (applied_index < batch.last_entry_index)
                         return error.SplitSourceProjectionNotReady;
                 }
             }
@@ -9436,8 +9454,8 @@ pub const DataServer = struct {
         for (0..max_reconcile_attempts) |_| {
             const watermark = (try source_store.latestBatchForTransition(source_group_id)) orelse
                 return error.SplitSourceProjectionNotReady;
-            if (self.data_raft_apply) |apply_sm| {
-                if (apply_sm.appliedIndex(source_group_id) < watermark.last_entry_index)
+            if (self.localDataRaftAppliedIndex(source_group_id)) |applied_index| {
+                if (applied_index < watermark.last_entry_index)
                     return error.SplitSourceProjectionNotReady;
             }
             switch (try self.reconcileSplitSourceApplyStoreFromAuthoritativeDb(
@@ -10716,10 +10734,7 @@ pub const DataServer = struct {
                 status.relocation_generation = intent.relocation_generation;
                 break;
             }
-            status.raft_applied_index = if (self.data_raft_apply) |apply_sm|
-                apply_sm.appliedIndex(status.group_id)
-            else
-                0;
+            status.raft_applied_index = self.localDataRaftAppliedIndex(status.group_id) orelse 0;
         }
     }
 
@@ -17565,6 +17580,15 @@ test "data raft apply records transaction conflicts without stopping replica pro
     try std.testing.expectEqual(@as(u64, 9), apply_sm.appliedIndex(group_id));
     const replacement_outcome = apply_sm.takeApplyOutcome(group_id, 9) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(.unknown, replacement_outcome);
+}
+
+test "data runtime structural raft progress prefers durable restart state over process-local outcomes" {
+    // A restarted process has no request-scoped apply publication yet, while
+    // the Raft hard state still proves the state machine applied through 81.
+    try std.testing.expectEqual(@as(?u64, 81), structuralRaftAppliedIndex(81, 0));
+    // Tests and explicitly non-Raft hosts retain the local fallback.
+    try std.testing.expectEqual(@as(?u64, 13), structuralRaftAppliedIndex(null, 13));
+    try std.testing.expectEqual(@as(?u64, null), structuralRaftAppliedIndex(null, null));
 }
 
 test "data server can register a store without enabling data raft" {

@@ -18609,7 +18609,11 @@ pub const DB = struct {
         };
     }
 
-    fn prepareDenseArtifactRebuildPlan(self: *DB, plan: DenseArtifactRebuildPlan) !DenseArtifactRebuildPreparation {
+    fn prepareDenseArtifactRebuildPlan(
+        self: *DB,
+        plan: DenseArtifactRebuildPlan,
+        dense_visibility_attempted: *bool,
+    ) !DenseArtifactRebuildPreparation {
         var outcome: DenseArtifactRebuildPreparation = .{};
         for (plan.rebuild_state_cleanups) |dense_index_idx| {
             const entry = &self.core.index_manager.dense_indexes.items[dense_index_idx];
@@ -18643,6 +18647,10 @@ pub const DB = struct {
                             null,
                         );
                     }
+                    // Shadow publication can complete before a later durable
+                    // bookkeeping failure escapes. Arm cache retirement before
+                    // entering the mutation boundary.
+                    dense_visibility_attempted.* = true;
                     const rebuilt = try self.rebuildIndexWithShadowReplacement(self.alloc, cfg, .{}, null);
                     if (rebuilt.yielded) return error.ShadowIndexCatchUpIncomplete;
                     outcome.made_progress = true;
@@ -18940,9 +18948,16 @@ pub const DB = struct {
         progress_hook: ?ReplayProgressHook,
         resume_ctx: ?*anyopaque,
         resume_hook: ?DenseArtifactRebuildResumeHook,
+        dense_visibility_attempted: *bool,
         rebuild_chunk_size: usize,
         rebuild_progress_interval: usize,
     ) !usize {
+        errdefer if (dense_visibility_attempted.*) {
+            self.clearDenseHbcCaches();
+            // The nested mutation boundary has already retired every cache;
+            // keep the outer error guard from repeating the O(indexes) walk.
+            dense_visibility_attempted.* = false;
+        };
         const lower = try self.core.documentRangeLowerAlloc("");
         defer self.core.alloc.free(lower);
 
@@ -18972,6 +18987,7 @@ pub const DB = struct {
             progress_hook: ?ReplayProgressHook,
             resume_ctx: ?*anyopaque,
             resume_hook: ?DenseArtifactRebuildResumeHook,
+            dense_visibility_attempted: *bool,
             rebuild_chunk_size: usize,
             rebuild_progress_interval: usize,
             rebuild_targets: ?[]const DenseArtifactRebuildTarget = null,
@@ -19022,6 +19038,10 @@ pub const DB = struct {
             }
 
             fn flushChunk(state: *@This(), key: []const u8) !void {
+                // Dense apply may publish its HBC generation before returning
+                // a later cache/bookkeeping error. Mark the attempt first so
+                // every subsequent failure retires potentially stale readers.
+                state.dense_visibility_attempted.* = true;
                 try state.db.flushDenseArtifactRebuildChunk(state.alloc, &state.writes);
                 try state.updateOwnedKey(&state.last_flushed_key, key);
                 if (state.resume_hook) |hook| try hook(state.resume_ctx.?, key);
@@ -19117,6 +19137,7 @@ pub const DB = struct {
             .progress_hook = progress_hook,
             .resume_ctx = resume_ctx,
             .resume_hook = resume_hook,
+            .dense_visibility_attempted = dense_visibility_attempted,
             .rebuild_chunk_size = rebuild_chunk_size,
             .rebuild_progress_interval = rebuild_progress_interval,
             .rebuild_targets = rebuild_targets,
@@ -19133,6 +19154,7 @@ pub const DB = struct {
         try self.core.store.scanWithContext(lower, "", .{}, &state, ScanState.scanEntry);
 
         if (state.writes.items.len > 0) {
+            dense_visibility_attempted.* = true;
             try self.flushDenseArtifactRebuildChunk(alloc, &state.writes);
         }
         if (state.last_flushed_key == null and state.last_matching_key != null) {
@@ -19162,7 +19184,9 @@ pub const DB = struct {
         progress_ctx: ?*anyopaque,
         progress_hook: ?ReplayProgressHook,
     ) !usize {
-        return try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
+        var dense_visibility_attempted = false;
+        errdefer if (dense_visibility_attempted) self.clearDenseHbcCaches();
+        const rebuilt = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
             alloc,
             null,
             null,
@@ -19171,9 +19195,12 @@ pub const DB = struct {
             progress_hook,
             null,
             null,
+            &dense_visibility_attempted,
             2048,
             128,
         );
+        if (dense_visibility_attempted) self.clearDenseHbcCaches();
+        return rebuilt;
     }
 
     pub fn rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(self: *DB, alloc: Allocator) !usize {
@@ -19249,6 +19276,8 @@ pub const DB = struct {
         progress_ctx: ?*anyopaque,
         progress_hook: ?ReplayProgressHook,
     ) !DenseArtifactRebuildOutcome {
+        var dense_visibility_attempted = false;
+        errdefer if (dense_visibility_attempted) self.clearDenseHbcCaches();
         var plan = try self.collectDenseArtifactRebuildPlan(alloc);
         defer plan.deinit(alloc);
         if (plan.targets.len == 0 and
@@ -19262,7 +19291,7 @@ pub const DB = struct {
             };
         }
 
-        const prepared = try self.prepareDenseArtifactRebuildPlan(plan);
+        const prepared = try self.prepareDenseArtifactRebuildPlan(plan, &dense_visibility_attempted);
         if (plan.targets.len == 0) {
             // Collection used to clear stale resume metadata before reaching
             // the no-plan watermark path. Preserve that behavior now that
@@ -19320,6 +19349,7 @@ pub const DB = struct {
             progress_hook,
             &persist_ctx,
             ResumePersistCtx.run,
+            &dense_visibility_attempted,
             2048,
             128,
         );
@@ -72550,19 +72580,30 @@ test "db dense artifact rebuild resumes from persisted state" {
         const dense_entry = interrupted.core.index_manager.denseIndex("dense_idx") orelse return error.IndexNotFound;
         const rebuild_state = interrupted.core.index_manager.rebuildState(.dense_vector, dense_index_path, dense_entry.config);
         const ResumeFailureCtx = struct {
+            db: *DB,
             rebuild_state: backfill_state_mod.RebuildState,
             persisted_calls: usize = 0,
+            cache_bytes_before_failure: usize = 0,
 
             fn persistAndFail(ctx: *anyopaque, last_key: []const u8) !void {
                 const failure: *@This() = @ptrCast(@alignCast(ctx));
                 try failure.rebuild_state.update(last_key);
                 failure.persisted_calls += 1;
+                const index = failure.db.core.index_manager.denseIndex("dense_idx") orelse return error.IndexNotFound;
+                var search = try index.index.searchProfiledRequest(.{
+                    .query = &.{ 1, 0, 0 },
+                    .k = 1,
+                });
+                defer search.results.deinit();
+                failure.cache_bytes_before_failure = index.index.hbcCacheStats().total_bytes;
                 return error.TestInjectedFailure;
             }
         };
         var failure_ctx = ResumeFailureCtx{
+            .db = &interrupted,
             .rebuild_state = rebuild_state,
         };
+        var dense_visibility_attempted = false;
 
         try std.testing.expectError(
             error.TestInjectedFailure,
@@ -72575,11 +72616,14 @@ test "db dense artifact rebuild resumes from persisted state" {
                 null,
                 &failure_ctx,
                 ResumeFailureCtx.persistAndFail,
+                &dense_visibility_attempted,
                 4,
                 1,
             ),
         );
         try std.testing.expectEqual(@as(usize, 1), failure_ctx.persisted_calls);
+        try std.testing.expect(failure_ctx.cache_bytes_before_failure > 0);
+        try std.testing.expectEqual(@as(usize, 0), dense_entry.index.hbcCacheStats().total_bytes);
 
         const partial_stats = try interrupted.stats(alloc);
         defer types.freeDBStats(alloc, partial_stats);
@@ -72979,6 +73023,7 @@ test "db chunk-backed dense artifact rebuild stays pending until all chunk artif
         var failure_ctx = ResumeFailureCtx{
             .rebuild_state = rebuild_state,
         };
+        var dense_visibility_attempted = false;
 
         try std.testing.expectError(
             error.TestInjectedFailure,
@@ -72991,6 +73036,7 @@ test "db chunk-backed dense artifact rebuild stays pending until all chunk artif
                 null,
                 &failure_ctx,
                 ResumeFailureCtx.persistAndFail,
+                &dense_visibility_attempted,
                 1,
                 1,
             ),
@@ -73116,6 +73162,7 @@ test "db dense artifact rebuild does not let resumed targets skip fresh targets"
         var failure_ctx = ResumeFailureCtx{
             .rebuild_state = rebuild_state,
         };
+        var dense_visibility_attempted = false;
 
         const targets = [_]DB.DenseArtifactRebuildTarget{
             .{ .dense_index_idx = 0 },
@@ -73132,6 +73179,7 @@ test "db dense artifact rebuild does not let resumed targets skip fresh targets"
                 null,
                 &failure_ctx,
                 ResumeFailureCtx.persistAndFail,
+                &dense_visibility_attempted,
                 2,
                 1,
             ),

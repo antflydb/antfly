@@ -20,6 +20,7 @@ const group_ids = @import("../../common/group_ids.zig");
 const docstore = @import("../../storage/docstore.zig");
 const lsm_backend = @import("../../storage/lsm_backend.zig");
 const metadata = @import("../domain.zig");
+const metadata_reconciler = @import("../reconciler.zig");
 const metadata_incarnation = @import("../incarnation.zig");
 const transition_state = @import("../transition_state.zig");
 const extension_domain = @import("../../extensions/mod.zig");
@@ -89,6 +90,7 @@ pub const TransitionCommand = union(enum) {
     },
     upsert_replica_intent: struct {
         expected_metadata_version: ?u64,
+        expected_version_fence: u64,
         expected_target_drain_requested: bool,
         replacement: raft_reconciler.PlacementIntent,
     },
@@ -494,6 +496,7 @@ test "transition command validation rejects metadata group ids in data group fie
     const commands = [_]TransitionCommand{
         .{ .upsert_replica_intent = .{
             .expected_metadata_version = null,
+            .expected_version_fence = 0,
             .expected_target_drain_requested = false,
             .replacement = .{ .record = .{ .group_id = metadata_group_id, .replica_id = 1, .local_node_id = 1 } },
         } },
@@ -1199,6 +1202,48 @@ pub const RaftApplyStore = struct {
         return out;
     }
 
+    pub fn listPlacementVersionFences(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+    ) ![]metadata_reconciler.PlacementVersionFence {
+        var prefix_buf: [160]u8 = undefined;
+        const prefix = try placementVersionPrefixForGroup(&prefix_buf, group_id);
+        const kvs = try self.store.scanPrefix(alloc, prefix);
+        defer {
+            for (kvs) |kv| {
+                alloc.free(kv.key);
+                alloc.free(kv.value);
+            }
+            alloc.free(kvs);
+        }
+
+        const out = try alloc.alloc(metadata_reconciler.PlacementVersionFence, kvs.len);
+        errdefer alloc.free(out);
+        for (kvs, 0..) |kv, i| {
+            if (kv.key.len <= prefix.len or kv.value.len != @sizeOf(u64))
+                return error.InvalidPlacementVersionFence;
+            var parts = std.mem.splitScalar(u8, kv.key[prefix.len..], ':');
+            const range_group_id = try std.fmt.parseInt(
+                u64,
+                parts.next() orelse return error.InvalidPlacementVersionFence,
+                10,
+            );
+            const local_node_id = try std.fmt.parseInt(
+                u64,
+                parts.next() orelse return error.InvalidPlacementVersionFence,
+                10,
+            );
+            if (parts.next() != null) return error.InvalidPlacementVersionFence;
+            out[i] = .{
+                .group_id = range_group_id,
+                .local_node_id = local_node_id,
+                .version = std.mem.readInt(u64, kv.value[0..@sizeOf(u64)], .little),
+            };
+        }
+        return out;
+    }
+
     pub fn listLocalPlacementIntents(self: *RaftApplyStore, alloc: std.mem.Allocator, metadata_group_id: u64, local_node_id: u64) ![]raft_reconciler.PlacementIntent {
         const io = self.io_impl.io();
         self.apply_mutex.lockUncancelable(io);
@@ -1798,6 +1843,7 @@ pub const RaftApplyStore = struct {
         split_transition,
         merge_transition,
         placement,
+        placement_version,
         node,
         store,
         table,
@@ -1828,6 +1874,7 @@ pub const RaftApplyStore = struct {
         .{ .projection = .split_transition, .key = .{ .prefix = splitTransitionPrefixForGroup } },
         .{ .projection = .merge_transition, .key = .{ .prefix = mergeTransitionPrefixForGroup } },
         .{ .projection = .placement, .key = .{ .prefix = placementPrefixForGroup } },
+        .{ .projection = .placement_version, .key = .{ .prefix = placementVersionPrefixForGroup } },
         .{ .projection = .node, .key = .{ .prefix = nodePrefixForGroup } },
         .{ .projection = .store, .key = .{ .prefix = storePrefixForGroup } },
         .{ .projection = .table, .key = .{ .prefix = tablePrefixForGroup } },
@@ -1859,7 +1906,8 @@ pub const RaftApplyStore = struct {
             .upsert_node, .register_node, .remove_node => metadataSnapshotProjectionBit(.node),
             .request_node_shutdown, .cancel_node_shutdown, .finalize_node_shutdown => metadataSnapshotProjectionBit(.node) | metadataSnapshotProjectionBit(.store),
             .upsert_store, .register_store, .remove_store => metadataSnapshotProjectionBit(.store),
-            .upsert_replica_intent, .remove_replica_intent => metadataSnapshotProjectionBit(.placement),
+            .upsert_replica_intent, .remove_replica_intent => metadataSnapshotProjectionBit(.placement) |
+                metadataSnapshotProjectionBit(.placement_version),
             .upsert_table, .compare_and_replace_table, .remove_table => metadataSnapshotProjectionBit(.table),
             .upsert_schema_progress, .remove_schema_progress => metadataSnapshotProjectionBit(.schema_progress),
             .upsert_restore_progress, .remove_restore_progress => metadataSnapshotProjectionBit(.restore_progress),
@@ -2313,6 +2361,7 @@ pub const RaftApplyStore = struct {
                     txn,
                     group_id,
                     replacement.expected_metadata_version,
+                    replacement.expected_version_fence,
                     replacement.expected_target_drain_requested,
                     replacement.replacement,
                 );
@@ -3795,6 +3844,7 @@ pub const RaftApplyStore = struct {
         txn: *docstore.DocStore.Txn,
         metadata_group_id: u64,
         expected_metadata_version: ?u64,
+        expected_version_fence: u64,
         expected_target_drain_requested: bool,
         replacement: raft_reconciler.PlacementIntent,
     ) !void {
@@ -3820,10 +3870,18 @@ pub const RaftApplyStore = struct {
         );
         const existing = try self.loadPlacementIntentTxn(txn, key);
         defer if (existing) |intent| raft_reconciler.freeIntentOwned(self.alloc, intent);
+        const current_version_fence = try self.loadPlacementVersionFenceTxn(
+            txn,
+            metadata_group_id,
+            replacement.record.group_id,
+            replacement.record.local_node_id,
+        );
+        if (current_version_fence != expected_version_fence) return;
         if (expected_metadata_version) |expected| {
             if (existing == null or
                 existing.?.record.metadata_version != expected or
-                replacement.record.metadata_version != expected)
+                replacement.record.metadata_version != expected or
+                expected != expected_version_fence)
             {
                 return;
             }
@@ -4108,6 +4166,7 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             try out.append(alloc, @intFromEnum(TransitionTag.upsert_replica_intent));
             try out.append(alloc, @intFromBool(replacement.expected_metadata_version != null));
             if (replacement.expected_metadata_version) |version| try appendInt(alloc, &out, u64, version);
+            try appendInt(alloc, &out, u64, replacement.expected_version_fence);
             try out.append(alloc, @intFromBool(replacement.expected_target_drain_requested));
             try appendPlacementIntent(alloc, &out, replacement.replacement);
         },
@@ -4341,10 +4400,12 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
                 try readInt(encoded, &pos, u64)
             else
                 null;
+            const expected_version_fence = try readInt(encoded, &pos, u64);
             const expected_target_drain_requested = try readInt(encoded, &pos, u8);
             if (expected_target_drain_requested > 1) return error.InvalidMetadataTransitionEncoding;
             break :blk .{ .upsert_replica_intent = .{
                 .expected_metadata_version = expected_metadata_version,
+                .expected_version_fence = expected_version_fence,
                 .expected_target_drain_requested = expected_target_drain_requested == 1,
                 .replacement = try readPlacementIntent(alloc, encoded, &pos),
             } };
@@ -6963,6 +7024,10 @@ pub fn placementPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_placement:{d}:", .{group_id});
 }
 
+pub fn placementVersionPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_placement_version:{d}:", .{group_id});
+}
+
 pub fn nodePrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_node:{d}:", .{group_id});
 }
@@ -8297,8 +8362,10 @@ test "metadata raft apply store fences stale placement plans across drain cancel
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-draining-placement-fence", .{tmp.sub_path});
-    defer std.testing.allocator.free(root);
+    const source_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-draining-placement-fence-source", .{tmp.sub_path});
+    defer std.testing.allocator.free(source_root);
+    const restored_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-draining-placement-fence-restored", .{tmp.sub_path});
+    defer std.testing.allocator.free(restored_root);
 
     const register_node = try encodeTransitionCommand(std.testing.allocator, .{ .register_node = .{
         .node_id = 12,
@@ -8316,6 +8383,7 @@ test "metadata raft apply store fences stale placement plans across drain cancel
     defer std.testing.allocator.free(register_store);
     const create_serving = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_replica_intent = .{
         .expected_metadata_version = null,
+        .expected_version_fence = 0,
         .expected_target_drain_requested = false,
         .replacement = .{
             .record = .{ .group_id = 1201, .replica_id = 1, .local_node_id = 12 },
@@ -8324,6 +8392,17 @@ test "metadata raft apply store fences stale placement plans across drain cancel
         },
     } });
     defer std.testing.allocator.free(create_serving);
+    const recreate_serving_v3 = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_replica_intent = .{
+        .expected_metadata_version = null,
+        .expected_version_fence = 3,
+        .expected_target_drain_requested = false,
+        .replacement = .{
+            .record = .{ .group_id = 1201, .replica_id = 1, .local_node_id = 12 },
+            .store_id = 12,
+            .peer_node_ids = &.{12},
+        },
+    } });
+    defer std.testing.allocator.free(recreate_serving_v3);
     const request_shutdown = try encodeTransitionCommand(std.testing.allocator, .{ .request_node_shutdown = .{ .node_id = 12 } });
     defer std.testing.allocator.free(request_shutdown);
     const cancel_shutdown = try encodeTransitionCommand(std.testing.allocator, .{ .cancel_node_shutdown = .{ .node_id = 12 } });
@@ -8332,6 +8411,7 @@ test "metadata raft apply store fences stale placement plans across drain cancel
     defer std.testing.allocator.free(finalize_shutdown);
     const stale_serving_v1 = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_replica_intent = .{
         .expected_metadata_version = 1,
+        .expected_version_fence = 1,
         .expected_target_drain_requested = false,
         .replacement = .{
             .record = .{ .group_id = 1201, .replica_id = 1, .local_node_id = 12, .metadata_version = 1 },
@@ -8342,6 +8422,7 @@ test "metadata raft apply store fences stale placement plans across drain cancel
     defer std.testing.allocator.free(stale_serving_v1);
     const draining_v1 = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_replica_intent = .{
         .expected_metadata_version = 1,
+        .expected_version_fence = 1,
         .expected_target_drain_requested = true,
         .replacement = .{
             .record = .{ .group_id = 1201, .replica_id = 1, .local_node_id = 12, .metadata_version = 1 },
@@ -8359,6 +8440,7 @@ test "metadata raft apply store fences stale placement plans across drain cancel
     defer std.testing.allocator.free(remove_v2);
     const draining_v4 = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_replica_intent = .{
         .expected_metadata_version = 4,
+        .expected_version_fence = 4,
         .expected_target_drain_requested = true,
         .replacement = .{
             .record = .{ .group_id = 1201, .replica_id = 1, .local_node_id = 12, .metadata_version = 4 },
@@ -8388,7 +8470,7 @@ test "metadata raft apply store fences stale placement plans across drain cancel
     });
     defer std.testing.allocator.free(drain_entries);
 
-    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = source_root });
     defer store.deinit();
     try store.snapshotBuilder().applyBatch(.{
         .group_id = 21,
@@ -8404,46 +8486,68 @@ test "metadata raft apply store fences stale placement plans across drain cancel
         try std.testing.expectEqualSlices(u64, &.{ 12, 13 }, intents[0].peer_node_ids);
     }
 
-    const cancel_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+    const pre_snapshot_cancel_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
         .{ .term = 2, .index = 8, .entry_type = .normal, .data = remove_v2 },
         .{ .term = 2, .index = 9, .entry_type = .normal, .data = cancel_shutdown },
         // The cancelled drain rejects its old expected drain state.
         .{ .term = 2, .index = 10, .entry_type = .normal, .data = draining_v1 },
-        // A fresh active-node placement skips the retained tombstone version.
-        .{ .term = 2, .index = 11, .entry_type = .normal, .data = create_serving },
-        // An old removal cannot delete the new placement incarnation.
-        .{ .term = 2, .index = 12, .entry_type = .normal, .data = remove_v2 },
     });
-    defer std.testing.allocator.free(cancel_entries);
+    defer std.testing.allocator.free(pre_snapshot_cancel_entries);
     try store.snapshotBuilder().applyBatch(.{
         .group_id = 21,
-        .commit_index = 12,
-        .entries_bytes = cancel_entries,
+        .commit_index = 10,
+        .entries_bytes = pre_snapshot_cancel_entries,
+    });
+    const snapshot = try store.snapshotBuilder().buildSnapshot(std.testing.allocator, 21);
+    defer std.testing.allocator.free(snapshot);
+
+    var restored = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = restored_root });
+    defer restored.deinit();
+    try std.testing.expect(try restored.snapshotBuilder().installSnapshot(std.testing.allocator, 21, 10, snapshot));
+    const post_snapshot_cancel_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        // A stale absence plan is fenced after the intervening create/remove.
+        .{ .term = 2, .index = 11, .entry_type = .normal, .data = create_serving },
+        // A freshly observed absence can create the next incarnation.
+        .{ .term = 2, .index = 12, .entry_type = .normal, .data = recreate_serving_v3 },
+        // An old removal cannot delete the new placement incarnation.
+        .{ .term = 2, .index = 13, .entry_type = .normal, .data = remove_v2 },
+    });
+    defer std.testing.allocator.free(post_snapshot_cancel_entries);
+    try restored.snapshotBuilder().applyBatch(.{
+        .group_id = 21,
+        .commit_index = 13,
+        .entries_bytes = post_snapshot_cancel_entries,
     });
     {
-        const intents = try store.listPlacementIntents(std.testing.allocator, 21);
-        defer store.freePlacementIntents(std.testing.allocator, intents);
+        const intents = try restored.listPlacementIntents(std.testing.allocator, 21);
+        defer restored.freePlacementIntents(std.testing.allocator, intents);
         try std.testing.expectEqual(@as(usize, 1), intents.len);
         try std.testing.expectEqual(@as(u64, 4), intents[0].record.metadata_version);
         try std.testing.expectEqual(raft_reconciler.PlacementServingState.serving, intents[0].serving_state);
+        const fences = try restored.listPlacementVersionFences(std.testing.allocator, 21);
+        defer std.testing.allocator.free(fences);
+        try std.testing.expectEqual(@as(usize, 1), fences.len);
+        try std.testing.expectEqual(@as(u64, 1201), fences[0].group_id);
+        try std.testing.expectEqual(@as(u64, 12), fences[0].local_node_id);
+        try std.testing.expectEqual(@as(u64, 4), fences[0].version);
     }
 
     const finalize_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 3, .index = 13, .entry_type = .normal, .data = request_shutdown },
-        .{ .term = 3, .index = 14, .entry_type = .normal, .data = draining_v4 },
-        .{ .term = 3, .index = 15, .entry_type = .normal, .data = remove_v5 },
-        .{ .term = 3, .index = 16, .entry_type = .normal, .data = finalize_shutdown },
+        .{ .term = 3, .index = 14, .entry_type = .normal, .data = request_shutdown },
+        .{ .term = 3, .index = 15, .entry_type = .normal, .data = draining_v4 },
+        .{ .term = 3, .index = 16, .entry_type = .normal, .data = remove_v5 },
+        .{ .term = 3, .index = 17, .entry_type = .normal, .data = finalize_shutdown },
         // Missing finalized ownership rejects even an absence-matching create.
-        .{ .term = 3, .index = 17, .entry_type = .normal, .data = create_serving },
+        .{ .term = 3, .index = 18, .entry_type = .normal, .data = create_serving },
     });
     defer std.testing.allocator.free(finalize_entries);
-    try store.snapshotBuilder().applyBatch(.{
+    try restored.snapshotBuilder().applyBatch(.{
         .group_id = 21,
-        .commit_index = 17,
+        .commit_index = 18,
         .entries_bytes = finalize_entries,
     });
-    const final_intents = try store.listPlacementIntents(std.testing.allocator, 21);
-    defer store.freePlacementIntents(std.testing.allocator, final_intents);
+    const final_intents = try restored.listPlacementIntents(std.testing.allocator, 21);
+    defer restored.freePlacementIntents(std.testing.allocator, final_intents);
     try std.testing.expectEqual(@as(usize, 0), final_intents.len);
 }
 
@@ -8529,6 +8633,7 @@ test "metadata raft apply store waits for termination debt before finalizing nod
     defer std.testing.allocator.free(other_store_cmd);
     const placement_cmd = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_replica_intent = .{
         .expected_metadata_version = null,
+        .expected_version_fence = 0,
         .expected_target_drain_requested = true,
         .replacement = .{
             .record = .{ .group_id = 41, .replica_id = 1, .local_node_id = 12 },
@@ -10323,6 +10428,7 @@ test "metadata raft apply store projects placement intents from committed entrie
     const intent_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_replica_intent = .{
             .expected_metadata_version = null,
+            .expected_version_fence = 0,
             .expected_target_drain_requested = false,
             .replacement = .{
                 .record = .{
@@ -10405,6 +10511,7 @@ test "metadata raft apply store projects backup restore bootstrap source in plac
     const intent_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_replica_intent = .{
             .expected_metadata_version = null,
+            .expected_version_fence = 0,
             .expected_target_drain_requested = false,
             .replacement = .{
                 .record = .{

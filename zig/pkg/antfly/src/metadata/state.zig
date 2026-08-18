@@ -38,6 +38,7 @@ pub const CandidatePlacementInfo = struct {
 pub const CapturedCurrentState = struct {
     current: metadata_reconciler.CurrentMetadataState,
     placement_intents: []raft_reconciler.PlacementIntent,
+    placement_version_fences: []metadata_reconciler.PlacementVersionFence,
     tables: []metadata_table_manager.TableRecord,
     ranges: []metadata_table_manager.RangeRecord,
     restore_progresses: []metadata_table_manager.RestoreProgressRecord,
@@ -53,6 +54,7 @@ pub const CapturedCurrentState = struct {
             if (intent.peer_node_ids.len > 0) alloc.free(intent.peer_node_ids);
         }
         alloc.free(self.placement_intents);
+        alloc.free(self.placement_version_fences);
         for (self.tables) |record| metadata_table_manager.freeTable(alloc, record);
         alloc.free(self.tables);
         for (self.ranges) |record| metadata_table_manager.freeRange(alloc, record);
@@ -226,6 +228,8 @@ pub const MetadataState = struct {
     pub fn captureCurrent(self: *MetadataState, service: anytype) !CapturedCurrentState {
         const placement_intents = try service.listProjectedPlacementIntents(self.alloc);
         errdefer service.freeProjectedPlacementIntents(self.alloc, placement_intents);
+        const placement_version_fences = try listProjectedPlacementVersionFences(self, service);
+        errdefer self.alloc.free(placement_version_fences);
         const tables = try self.projected.listTables(self.alloc);
         errdefer self.projected.freeTables(self.alloc, tables);
         const ranges = try self.projected.listRanges(self.alloc);
@@ -275,6 +279,7 @@ pub const MetadataState = struct {
         return .{
             .current = .{
                 .placement_intents = placement_intents,
+                .placement_version_fences = placement_version_fences,
                 .tables = tables,
                 .ranges = ranges,
                 .stores = self.committed_stores.items,
@@ -288,6 +293,7 @@ pub const MetadataState = struct {
                 .merge_observations = merge_observations,
             },
             .placement_intents = placement_intents,
+            .placement_version_fences = placement_version_fences,
             .tables = tables,
             .ranges = ranges,
             .restore_progresses = restore_progresses,
@@ -315,6 +321,21 @@ pub const MetadataState = struct {
         self.committed_stores.clearRetainingCapacity();
     }
 };
+
+fn listProjectedPlacementVersionFences(
+    state: *MetadataState,
+    service: anytype,
+) ![]metadata_reconciler.PlacementVersionFence {
+    const ServiceType = @TypeOf(service);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (@hasDecl(ServiceDeclType, "listProjectedPlacementVersionFences")) {
+        return try service.listProjectedPlacementVersionFences(state.alloc);
+    }
+    return try state.alloc.alloc(metadata_reconciler.PlacementVersionFence, 0);
+}
 
 fn getProjectedReallocationRequest(service: anytype) !?reallocation_request.ReallocationRequestRecord {
     const ServiceType = @TypeOf(service);

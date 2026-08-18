@@ -636,7 +636,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
         },
         .store_id = 1,
         .peer_node_ids = &.{1},
-    }, null, false);
+    }, null, 0, false);
     rounds = 0;
     while (rounds < 8) : (rounds += 1) try svc.runRound();
 
@@ -1452,7 +1452,7 @@ test "public api e2e rebuilds schema-migration full-text index on exact backfill
         },
         .store_id = 1,
         .peer_node_ids = &.{1},
-    }, null, false);
+    }, null, 0, false);
     rounds = 0;
     while (rounds < 8) : (rounds += 1) try svc.runRound();
 
