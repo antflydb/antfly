@@ -373,13 +373,13 @@ pub const BudgetOverrides = struct {
     scratch_limit_bytes: usize = 0,
 
     pub fn apply(self: @This(), defaults: runtime.tier.memory.Limits) runtime.tier.memory.Limits {
-        var limits = defaults;
-        if (self.host_limit_bytes > 0) limits.host_limit_bytes = self.host_limit_bytes;
-        if (self.backend_limit_bytes > 0) limits.backend_limit_bytes = self.backend_limit_bytes;
-        if (self.combined_limit_bytes > 0) limits.combined_limit_bytes = self.combined_limit_bytes;
-        if (self.kv_limit_bytes > 0) limits.kv_limit_bytes = self.kv_limit_bytes;
-        if (self.scratch_limit_bytes > 0) limits.scratch_limit_bytes = self.scratch_limit_bytes;
-        return limits;
+        return runtime.tier.memory.applyLimitOverrides(defaults, .{
+            .host_limit_bytes = self.host_limit_bytes,
+            .backend_limit_bytes = self.backend_limit_bytes,
+            .combined_limit_bytes = self.combined_limit_bytes,
+            .kv_limit_bytes = self.kv_limit_bytes,
+            .scratch_limit_bytes = self.scratch_limit_bytes,
+        });
     }
 };
 

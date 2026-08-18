@@ -100,6 +100,29 @@ pub const Limits = struct {
     scratch_limit_bytes: usize = 0,
 };
 
+/// Apply selective operator overrides while preserving a coherent physical
+/// memory envelope. Host and backend limits are the two components of the
+/// combined limit, so changing either component without also changing the
+/// aggregate must derive a new aggregate from the effective component limits.
+/// An explicit combined override remains authoritative and may intentionally
+/// impose a tighter shared cap.
+pub fn applyLimitOverrides(defaults: Limits, overrides: Limits) Limits {
+    var limits = defaults;
+    const physical_component_overridden =
+        overrides.host_limit_bytes != 0 or overrides.backend_limit_bytes != 0;
+
+    if (overrides.host_limit_bytes != 0) limits.host_limit_bytes = overrides.host_limit_bytes;
+    if (overrides.backend_limit_bytes != 0) limits.backend_limit_bytes = overrides.backend_limit_bytes;
+    if (overrides.combined_limit_bytes != 0) {
+        limits.combined_limit_bytes = overrides.combined_limit_bytes;
+    } else if (physical_component_overridden) {
+        limits.combined_limit_bytes = limits.host_limit_bytes +| limits.backend_limit_bytes;
+    }
+    if (overrides.kv_limit_bytes != 0) limits.kv_limit_bytes = overrides.kv_limit_bytes;
+    if (overrides.scratch_limit_bytes != 0) limits.scratch_limit_bytes = overrides.scratch_limit_bytes;
+    return limits;
+}
+
 pub const bytes_per_mib: usize = 1024 * 1024;
 
 /// CLI-facing memory limit overrides expressed in whole mebibytes. Zero means
@@ -128,14 +151,7 @@ pub const BudgetOverridesMib = struct {
     /// Apply explicit overrides after backend defaults and model-specific
     /// widening have been resolved.
     pub fn apply(self: @This(), defaults: Limits) !Limits {
-        const overrides = try self.toByteLimits();
-        var limits = defaults;
-        if (overrides.host_limit_bytes != 0) limits.host_limit_bytes = overrides.host_limit_bytes;
-        if (overrides.backend_limit_bytes != 0) limits.backend_limit_bytes = overrides.backend_limit_bytes;
-        if (overrides.combined_limit_bytes != 0) limits.combined_limit_bytes = overrides.combined_limit_bytes;
-        if (overrides.kv_limit_bytes != 0) limits.kv_limit_bytes = overrides.kv_limit_bytes;
-        if (overrides.scratch_limit_bytes != 0) limits.scratch_limit_bytes = overrides.scratch_limit_bytes;
-        return limits;
+        return applyLimitOverrides(defaults, try self.toByteLimits());
     }
 };
 
@@ -158,7 +174,7 @@ test "budget MiB overrides convert every memory domain exactly" {
     try std.testing.expectEqual(@as(usize, 6 * bytes_per_mib), overrides.scratch_limit_bytes);
 }
 
-test "budget MiB overrides apply selectively and zero remains omitted" {
+test "budget MiB overrides apply selectively and keep physical limits coherent" {
     const defaults = Limits{
         .host_limit_bytes = 10,
         .backend_limit_bytes = 20,
@@ -172,10 +188,33 @@ test "budget MiB overrides apply selectively and zero remains omitted" {
     }).apply(defaults);
     try std.testing.expectEqual(@as(usize, 2 * bytes_per_mib), applied.host_limit_bytes);
     try std.testing.expectEqual(@as(usize, 20), applied.backend_limit_bytes);
-    try std.testing.expectEqual(@as(usize, 30), applied.combined_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 2 * bytes_per_mib + 20), applied.combined_limit_bytes);
     try std.testing.expectEqual(@as(usize, 3 * bytes_per_mib), applied.kv_limit_bytes);
     try std.testing.expectEqual(@as(usize, 50), applied.scratch_limit_bytes);
     try std.testing.expectEqual(defaults, try (BudgetOverridesMib{}).apply(defaults));
+}
+
+test "explicit combined budget remains authoritative over component overrides" {
+    const applied = applyLimitOverrides(.{
+        .host_limit_bytes = 100,
+        .backend_limit_bytes = 200,
+        .combined_limit_bytes = 300,
+    }, .{
+        .host_limit_bytes = 400,
+        .combined_limit_bytes = 250,
+    });
+    try std.testing.expectEqual(@as(usize, 400), applied.host_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 200), applied.backend_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 250), applied.combined_limit_bytes);
+}
+
+test "derived combined budget saturates instead of wrapping" {
+    const applied = applyLimitOverrides(.{
+        .host_limit_bytes = 1,
+        .backend_limit_bytes = std.math.maxInt(usize),
+        .combined_limit_bytes = 1,
+    }, .{ .host_limit_bytes = 2 });
+    try std.testing.expectEqual(std.math.maxInt(usize), applied.combined_limit_bytes);
 }
 
 test "budget MiB overrides accept the representable boundary and reject overflow" {

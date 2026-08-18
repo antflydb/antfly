@@ -201,6 +201,15 @@ pages that both the kernel and kubelet treat as reclaimable. This avoids making
 build/download cache a permanent admission charge without hiding mapped pages
 that are actually under pressure.
 
+Budget overrides are normalized once in the inference memory tier and then
+used by direct CLI runs, server request budgets, and ModelManager load/run
+admission. Host and backend are the physical components of `combined`; when an
+operator overrides either component without specifying `combined`, the
+aggregate is recomputed from the effective component limits. This makes a lone
+`--host-budget-mb` authoritative for CPU inference instead of leaving a smaller
+auto-derived combined limit in its path. An explicit combined override still
+wins, allowing an operator to impose a deliberately tighter cross-domain cap.
+
 Linux automatic resolution reads the process's actual cgroup path, walks every
 ancestor to the visible controller mount, and falls back to streamed mountinfo
 discovery for namespace and subtree mounts. Storage does not perform a second,

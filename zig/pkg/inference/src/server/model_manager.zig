@@ -4745,12 +4745,7 @@ pub const ModelManager = struct {
             admissionBackendClassForRuntime(backend_runtime),
             self.process_memory_limit_bytes,
         );
-        const overrides = self.admission_limit_overrides;
-        if (overrides.host_limit_bytes > 0) limits.host_limit_bytes = overrides.host_limit_bytes;
-        if (overrides.backend_limit_bytes > 0) limits.backend_limit_bytes = overrides.backend_limit_bytes;
-        if (overrides.combined_limit_bytes > 0) limits.combined_limit_bytes = overrides.combined_limit_bytes;
-        if (overrides.kv_limit_bytes > 0) limits.kv_limit_bytes = overrides.kv_limit_bytes;
-        if (overrides.scratch_limit_bytes > 0) limits.scratch_limit_bytes = overrides.scratch_limit_bytes;
+        limits = runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides);
         return limits;
     }
 
@@ -7397,6 +7392,14 @@ test "serving admission applies the node-wide host-memory override" {
     try std.testing.expectEqual(
         @as(usize, 100),
         manager.admissionController().shared_limits.host_limit_bytes,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 100),
+        manager.resource_domain.?.admission_limits.host_limit_bytes,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 100),
+        manager.resource_domain.?.admission_limits.combined_limit_bytes,
     );
 }
 
