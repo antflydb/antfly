@@ -153,25 +153,63 @@ pub const TableWorkflow = struct {
 
         const current = try service.listProjectedPlacementIntents(alloc);
         defer service.freeProjectedPlacementIntents(alloc, current);
+        const version_fences = try listProjectedPlacementVersionFences(alloc, service);
+        defer alloc.free(version_fences);
+        var version_fence_index = std.AutoHashMapUnmanaged(PlacementVersionFenceKey, u64).empty;
+        defer version_fence_index.deinit(alloc);
+        try version_fence_index.ensureTotalCapacity(alloc, @intCast(version_fences.len));
+        for (version_fences) |fence| {
+            version_fence_index.putAssumeCapacity(.{
+                .group_id = fence.group_id,
+                .local_node_id = fence.local_node_id,
+            }, fence.version);
+        }
 
         var summary: PlacementReconcileSummary = .{};
         for (desired) |intent| {
             const existing = findPlacementIntent(current, intent.record.group_id, intent.record.local_node_id);
-            if (existing == null or !placementIntentsEqual(existing.?, intent)) {
-                try service.upsertReplicaIntent(intent);
+            var replacement = intent;
+            if (existing) |current_intent| replacement.record.metadata_version = current_intent.record.metadata_version;
+            if (existing == null or !placementIntentsEqual(existing.?, replacement)) {
+                try service.upsertReplicaIntent(
+                    replacement,
+                    if (existing) |current_intent| current_intent.record.metadata_version else null,
+                    version_fence_index.get(.{
+                        .group_id = intent.record.group_id,
+                        .local_node_id = intent.record.local_node_id,
+                    }) orelse if (existing) |current_intent| current_intent.record.metadata_version else 0,
+                    false,
+                );
                 summary.upserts += 1;
             }
         }
         for (current) |intent| {
             if (intent.record.local_node_id != local_node_id) continue;
             if (findPlacementIntent(desired, intent.record.group_id, local_node_id) == null) {
-                try service.removeReplicaIntent(intent.record.group_id, local_node_id);
+                try service.removeReplicaIntent(intent.record.group_id, local_node_id, intent.record.metadata_version);
                 summary.removals += 1;
             }
         }
         return summary;
     }
 };
+
+fn listProjectedPlacementVersionFences(
+    alloc: std.mem.Allocator,
+    service: anytype,
+) ![]metadata_reconciler.PlacementVersionFence {
+    const ServiceType = @TypeOf(service);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (@hasDecl(ServiceDeclType, "listProjectedPlacementVersionFences")) {
+        return try service.listProjectedPlacementVersionFences(alloc);
+    }
+    return try alloc.alloc(metadata_reconciler.PlacementVersionFence, 0);
+}
+
+const PlacementVersionFenceKey = struct { group_id: u64, local_node_id: u64 };
 
 fn reconcileForService(loop: *control_loop.MetadataControlLoop, service: anytype) !control_loop.ReconcileSummary {
     const ServiceType = @TypeOf(service);
@@ -768,6 +806,7 @@ test "table workflow can reconcile projected local placement intents" {
     const FakeService = struct {
         alloc: std.mem.Allocator,
         intents: std.ArrayListUnmanaged(raft_reconciler.PlacementIntent) = .empty,
+        last_expected_version_fence: ?u64 = null,
 
         fn deinit(self: *@This()) void {
             for (self.intents.items) |intent| if (intent.peer_node_ids.len > 0) self.alloc.free(intent.peer_node_ids);
@@ -791,7 +830,23 @@ test "table workflow can reconcile projected local placement intents" {
             alloc.free(intents);
         }
 
-        fn upsertReplicaIntent(self: *@This(), intent: raft_reconciler.PlacementIntent) !void {
+        pub fn listProjectedPlacementVersionFences(
+            _: *@This(),
+            alloc: std.mem.Allocator,
+        ) ![]metadata_reconciler.PlacementVersionFence {
+            const fences = try alloc.alloc(metadata_reconciler.PlacementVersionFence, 1);
+            fences[0] = .{ .group_id = 1201, .local_node_id = 2, .version = 7 };
+            return fences;
+        }
+
+        fn upsertReplicaIntent(
+            self: *@This(),
+            intent: raft_reconciler.PlacementIntent,
+            _: ?u64,
+            expected_version_fence: u64,
+            _: bool,
+        ) !void {
+            self.last_expected_version_fence = expected_version_fence;
             for (self.intents.items) |*existing| {
                 if (existing.record.group_id != intent.record.group_id or existing.record.local_node_id != intent.record.local_node_id) continue;
                 if (existing.peer_node_ids.len > 0) self.alloc.free(existing.peer_node_ids);
@@ -807,7 +862,7 @@ test "table workflow can reconcile projected local placement intents" {
             });
         }
 
-        fn removeReplicaIntent(self: *@This(), group_id: u64, local_node_id: u64) !void {
+        fn removeReplicaIntent(self: *@This(), group_id: u64, local_node_id: u64, _: u64) !void {
             var i: usize = 0;
             while (i < self.intents.items.len) : (i += 1) {
                 const intent = self.intents.items[i];
@@ -840,6 +895,7 @@ test "table workflow can reconcile projected local placement intents" {
     try std.testing.expectEqual(@as(usize, 1), first.upserts);
     try std.testing.expectEqual(@as(usize, 0), first.removals);
     try std.testing.expectEqual(@as(usize, 1), fake.intents.items.len);
+    try std.testing.expectEqual(@as(?u64, 7), fake.last_expected_version_fence);
 
     const second = try workflow.reconcileLocalPlacementIntents(&fake, std.testing.allocator, 2, &.{ 1, 3 });
     try std.testing.expectEqual(@as(usize, 0), second.upserts);

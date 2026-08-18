@@ -28,6 +28,32 @@ pub fn isRetryableError(err: anyerror) bool {
     };
 }
 
+/// Side-effecting clients may replay a mutation only when Raft rejected it
+/// before assigning a log index. Keep this deliberately narrower than the
+/// general authority retry set: read timeouts and reconcile-lease failures do
+/// not prove that a preceding mutation was never admitted.
+pub fn isMutationNotAdmittedError(err: anyerror) bool {
+    return switch (err) {
+        error.NotLeader,
+        error.ProposalDropped,
+        error.LeaderTransferInProgress,
+        => true,
+        else => false,
+    };
+}
+
+/// Once an earlier step in a compound metadata operation may have been
+/// admitted, a later pre-admission rejection no longer proves that the whole
+/// HTTP mutation is safe to replay. Preserve that distinction explicitly so
+/// transport adapters cannot accidentally emit the strong non-admission
+/// contract for a partially completed operation.
+pub fn afterPossibleAdmission(err: anyerror) anyerror {
+    return if (isMutationNotAdmittedError(err))
+        error.MetadataMutationOutcomeUnknown
+    else
+        err;
+}
+
 test "metadata authority retry classification is fail closed" {
     try std.testing.expect(isRetryableError(error.NotLeader));
     try std.testing.expect(isRetryableError(error.ProposalDropped));
@@ -36,4 +62,15 @@ test "metadata authority retry classification is fail closed" {
     try std.testing.expect(isRetryableError(error.ReconcileLeaseNotHeld));
     try std.testing.expect(!isRetryableError(error.InvalidArguments));
     try std.testing.expect(!isRetryableError(error.OutOfMemory));
+}
+
+test "metadata mutation non-admission classification excludes ambiguous authority failures" {
+    try std.testing.expect(isMutationNotAdmittedError(error.NotLeader));
+    try std.testing.expect(isMutationNotAdmittedError(error.ProposalDropped));
+    try std.testing.expect(isMutationNotAdmittedError(error.LeaderTransferInProgress));
+    try std.testing.expect(!isMutationNotAdmittedError(error.MetadataLinearizableReadTimeout));
+    try std.testing.expect(!isMutationNotAdmittedError(error.ReconcileLeaseNotHeld));
+    try std.testing.expect(!isMutationNotAdmittedError(error.OutOfMemory));
+    try std.testing.expectEqual(error.MetadataMutationOutcomeUnknown, afterPossibleAdmission(error.NotLeader));
+    try std.testing.expectEqual(error.OutOfMemory, afterPossibleAdmission(error.OutOfMemory));
 }

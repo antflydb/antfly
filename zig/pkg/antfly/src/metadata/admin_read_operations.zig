@@ -183,10 +183,12 @@ fn buildNodeShutdownStatus(
 
     var node_known = false;
     var node_draining = false;
+    var node_finalizing = false;
     for (snapshot.nodes) |node| {
         if (node.node_id != node_id) continue;
         node_known = true;
         node_draining = !metadata_table_manager.nodeLifecycleActive(node.lifecycle);
+        node_finalizing = metadata_table_manager.nodeLifecycleFinalizing(node.lifecycle);
         break;
     }
 
@@ -229,8 +231,7 @@ fn buildNodeShutdownStatus(
             }
         }
         for (store.runtime_statuses) |runtime_status| {
-            if (runtime_status.node_id != 0 and runtime_status.node_id != node_id) continue;
-            if (runtime_status.store_id != 0 and runtime_status.store_id != store.store_id) continue;
+            if (!metadata_table_manager.runtimeStatusBelongsToStore(runtime_status, node_id, store.store_id)) continue;
             store_status.runtime_group_count += 1;
             runtime_group_total += 1;
             try appendUniqueU64(alloc, &pending_groups, runtime_status.group_id);
@@ -261,6 +262,8 @@ fn buildNodeShutdownStatus(
             "blocked"
         else if (safe_to_terminate)
             "complete"
+        else if (node_finalizing)
+            "finalizing"
         else
             "draining",
         .safe_to_terminate = safe_to_terminate,
@@ -340,4 +343,47 @@ test "metadata admin read operations enforce cancellation and own aggregate resu
     try std.testing.expect(shutdown.safe_to_terminate);
     try std.testing.expectEqual(@as(usize, 1), source.snapshot_calls);
     try std.testing.expectEqual(@as(usize, 1), source.free_calls);
+}
+
+test "metadata shutdown status exposes pending finalization with shared store debt semantics" {
+    var runtimes = [_]metadata_table_manager.RuntimeGroupStatusReport{.{
+        .group_id = 101,
+        .node_id = 9,
+        .store_id = 9,
+    }};
+    var stores = [_]metadata_table_manager.StoreRecord{.{
+        .store_id = 9,
+        .node_id = 9,
+        .drain_requested = true,
+        .runtime_statuses = runtimes[0..],
+    }};
+    var nodes = [_]metadata_table_manager.NodeRecord{.{
+        .node_id = 9,
+        .lifecycle = metadata_table_manager.node_lifecycle_finalizing,
+    }};
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = &.{},
+        .ranges = &.{},
+        .nodes = nodes[0..],
+        .stores = stores[0..],
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+
+    var pending = try buildNodeShutdownStatus(std.testing.allocator, &snapshot, 9);
+    defer pending.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("finalizing", pending.phase);
+    try std.testing.expect(!pending.safe_to_terminate);
+    try std.testing.expectEqual(@as(usize, 1), pending.stores[0].runtime_group_count);
+
+    // Explicitly foreign retained observations are ignored by this same
+    // predicate in status, preflight, and Raft apply.
+    runtimes[0].store_id = 10;
+    var complete = try buildNodeShutdownStatus(std.testing.allocator, &snapshot, 9);
+    defer complete.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("complete", complete.phase);
+    try std.testing.expect(complete.safe_to_terminate);
+    try std.testing.expectEqual(@as(usize, 0), complete.stores[0].runtime_group_count);
 }

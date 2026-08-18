@@ -529,6 +529,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     });
     try svc.campaignMetadataGroup();
     try svc.runRound();
+    try svc.upsertNode(.{ .node_id = 1 });
     try svc.upsertStore(.{
         .store_id = 1,
         .node_id = 1,
@@ -635,7 +636,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
         },
         .store_id = 1,
         .peer_node_ids = &.{1},
-    });
+    }, null, 0, false);
     rounds = 0;
     while (rounds < 8) : (rounds += 1) try svc.runRound();
 
@@ -1372,6 +1373,15 @@ test "public api e2e rebuilds schema-migration full-text index on exact backfill
     });
     try svc.campaignMetadataGroup();
     try svc.runRound();
+    try svc.upsertNode(.{ .node_id = 1 });
+    try svc.upsertStore(.{
+        .store_id = 1,
+        .node_id = 1,
+        .role = "data",
+        .health_class = "healthy",
+        .live = true,
+    });
+    try svc.runRound();
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
@@ -1442,7 +1452,7 @@ test "public api e2e rebuilds schema-migration full-text index on exact backfill
         },
         .store_id = 1,
         .peer_node_ids = &.{1},
-    });
+    }, null, 0, false);
     rounds = 0;
     while (rounds < 8) : (rounds += 1) try svc.runRound();
 

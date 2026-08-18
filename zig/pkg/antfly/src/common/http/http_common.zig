@@ -18,6 +18,10 @@ const CancellationToken = @import("../cancellation.zig").CancellationToken;
 
 pub const metadata_not_leader_header = "X-Antfly-Metadata-Not-Leader";
 pub const metadata_not_leader_value = "true";
+/// Stronger than the authority-routing hint above: mutation clients may move
+/// to another replica only when this response proves no proposal was admitted.
+pub const metadata_mutation_not_admitted_header = "X-Antfly-Metadata-Mutation-Not-Admitted";
+pub const metadata_mutation_not_admitted_value = "true";
 
 pub const Method = enum {
     GET,

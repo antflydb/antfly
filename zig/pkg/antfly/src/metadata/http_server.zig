@@ -1101,7 +1101,6 @@ pub const MetadataHttpServer = struct {
         try server.post(routes.Routes.internal_catalog_publication_check, httpx.Handler.bind(self, metadataCatalogPublicationCheck));
         try server.post(routes.Routes.internal_catalog_table_publication_check, httpx.Handler.bind(self, metadataCatalogTablePublicationCheck));
         try server.post(routes.Routes.internal_reallocate, httpx.Handler.bind(self, metadataTriggerReallocate));
-        try server.post(routes.Routes.internal_reallocate_v2, httpx.Handler.bind(self, metadataTriggerReallocate));
         try server.post(routes.Routes.internal_schema_progress, httpx.Handler.bind(self, metadataUpsertSchemaProgress));
         try server.post(routes.Routes.internal_extension_restore, httpx.Handler.bind(self, metadataRestoreExtensions));
         const extension_path = routes.Routes.internal_extensions_prefix ++ ":extension_name";
@@ -1320,6 +1319,15 @@ pub const MetadataHttpServer = struct {
         if (err == error.UnsupportedOperation) return ctx.status(405).text("unsupported operation");
         if (err == error.ReallocationProtocolUpgradeRequired)
             return ctx.status(503).text("metadata voter upgrade required");
+        if (metadata_authority.isMutationNotAdmittedError(err)) {
+            // Raft rejected this command before assigning a log index. Only
+            // this narrower proof authorizes an at-most-once client to route
+            // the same mutation to another metadata replica.
+            try ctx.setHeader(
+                http_common.metadata_mutation_not_admitted_header,
+                http_common.metadata_mutation_not_admitted_value,
+            );
+        }
         return metadataReadError(ctx, err);
     }
 
@@ -1588,10 +1596,28 @@ pub const MetadataHttpServer = struct {
         return switch (err) {
             error.InvalidArgument, error.StoreIdentityMismatch => ctx.status(400).text("invalid node request"),
             error.NodeNotFound, error.UnknownStore => ctx.status(404).text("node not found"),
-            error.ActiveNodeFinalizeRejected => ctx.status(409).text("active node cannot be finalized"),
+            error.ActiveNodeFinalizeRejected => ctx.status(409).text("node is not ready to finalize"),
             error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
             else => metadataReadError(ctx, err),
         };
+    }
+
+    fn nodeLifecycleMutationError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        if (err == error.MetadataMutationOutcomeUnknown) {
+            // An earlier lifecycle command may already be durable even though
+            // a follow-up reallocation step lost authority. Expose only the
+            // broad observation hint; replay is not proven safe.
+            try ctx.setHeader("Retry-After", "1");
+            try ctx.setHeader(http_common.metadata_not_leader_header, http_common.metadata_not_leader_value);
+            return ctx.status(503).text("metadata mutation outcome unknown");
+        }
+        if (metadata_authority.isMutationNotAdmittedError(err)) {
+            try ctx.setHeader(
+                http_common.metadata_mutation_not_admitted_header,
+                http_common.metadata_mutation_not_admitted_value,
+            );
+        }
+        return nodeMutationError(ctx, err);
     }
 
     fn metadataRegisterNode(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
@@ -1623,19 +1649,19 @@ pub const MetadataHttpServer = struct {
         const node_id = numericParam(ctx, "node_id", false) catch return ctx.status(404).text("not found");
         parseNodeShutdownRequest(ctx.allocator, (try ctx.body()) orelse "") catch
             return ctx.status(400).text("invalid node shutdown request");
-        self.nodeOperations().requestShutdown(ctx.allocator, requestContext(ctx), node_id) catch |err| return nodeMutationError(ctx, err);
+        self.nodeOperations().requestShutdown(ctx.allocator, requestContext(ctx), node_id) catch |err| return nodeLifecycleMutationError(ctx, err);
         return ctx.status(202).text("accepted");
     }
 
     fn metadataCancelNodeShutdown(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const node_id = numericParam(ctx, "node_id", false) catch return ctx.status(404).text("not found");
-        self.nodeOperations().cancelShutdown(ctx.allocator, requestContext(ctx), node_id) catch |err| return nodeMutationError(ctx, err);
+        self.nodeOperations().cancelShutdown(ctx.allocator, requestContext(ctx), node_id) catch |err| return nodeLifecycleMutationError(ctx, err);
         return ctx.status(202).text("accepted");
     }
 
     fn metadataFinalizeNodeShutdown(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const node_id = numericParam(ctx, "node_id", false) catch return ctx.status(404).text("not found");
-        self.nodeOperations().finalizeShutdown(requestContext(ctx), node_id) catch |err| return nodeMutationError(ctx, err);
+        self.nodeOperations().finalizeShutdown(requestContext(ctx), node_id) catch |err| return nodeLifecycleMutationError(ctx, err);
         return ctx.status(202).text("accepted");
     }
 
@@ -2946,7 +2972,7 @@ test "metadata http server reports reallocation protocol upgrade gating" {
 
     var source = UpgradeGatedSource{};
     var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
-    var response = try server.executeTypedHandlerForTest(.POST, routes.Routes.internal_reallocate_v2, &.{}, MetadataHttpServer.metadataTriggerReallocate);
+    var response = try server.executeTypedHandlerForTest(.POST, routes.Routes.internal_reallocate, &.{}, MetadataHttpServer.metadataTriggerReallocate);
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 503), response.status.code);
     try std.testing.expectEqualStrings("metadata voter upgrade required", response.body.?);
@@ -4779,4 +4805,56 @@ test "metadata http server returns retryable authority response when reconcile l
     try std.testing.expectEqual(@as(u16, 503), resp.status.code);
     try std.testing.expectEqual(@as(usize, 1), source.create_calls);
     try std.testing.expectEqualStrings(http_common.metadata_not_leader_value, resp.headers.get(http_common.metadata_not_leader_header).?);
+    try std.testing.expect(resp.headers.get(http_common.metadata_mutation_not_admitted_header) == null);
+}
+
+test "metadata mutation pre-admission responses prove proposal was not admitted" {
+    const errors = [_]anyerror{
+        error.NotLeader,
+        error.ProposalDropped,
+        error.LeaderTransferInProgress,
+    };
+    for (errors) |err| {
+        var request = try httpx.Request.init(std.testing.allocator, .POST, "/internal/v1/reallocate");
+        defer request.deinit();
+        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        defer ctx.deinit();
+
+        var resp = try MetadataHttpServer.metadataMutationError(&ctx, err);
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 503), resp.status.code);
+        try std.testing.expectEqualStrings(
+            http_common.metadata_mutation_not_admitted_value,
+            resp.headers.get(http_common.metadata_mutation_not_admitted_header).?,
+        );
+    }
+}
+
+test "metadata node lifecycle distinguishes pre-admission rejection from partial outcome" {
+    var rejected_request = try httpx.Request.init(std.testing.allocator, .PUT, "/internal/v1/nodes/9/shutdown");
+    defer rejected_request.deinit();
+    var rejected_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &rejected_request);
+    defer rejected_ctx.deinit();
+
+    var rejected = try MetadataHttpServer.nodeLifecycleMutationError(&rejected_ctx, error.ProposalDropped);
+    defer rejected.deinit();
+    try std.testing.expectEqual(@as(u16, 503), rejected.status.code);
+    try std.testing.expectEqualStrings(
+        http_common.metadata_mutation_not_admitted_value,
+        rejected.headers.get(http_common.metadata_mutation_not_admitted_header).?,
+    );
+
+    var partial_request = try httpx.Request.init(std.testing.allocator, .PUT, "/internal/v1/nodes/9/shutdown");
+    defer partial_request.deinit();
+    var partial_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &partial_request);
+    defer partial_ctx.deinit();
+
+    var partial = try MetadataHttpServer.nodeLifecycleMutationError(&partial_ctx, error.MetadataMutationOutcomeUnknown);
+    defer partial.deinit();
+    try std.testing.expectEqual(@as(u16, 503), partial.status.code);
+    try std.testing.expect(partial.headers.get(http_common.metadata_mutation_not_admitted_header) == null);
+    try std.testing.expectEqualStrings(
+        http_common.metadata_not_leader_value,
+        partial.headers.get(http_common.metadata_not_leader_header).?,
+    );
 }
