@@ -931,14 +931,43 @@ fn isSensitivePublicConfigField(field: []const u8) bool {
         std.ascii.eqlIgnoreCase(field, "credentials_path") or
         std.ascii.eqlIgnoreCase(field, "private_key") or
         std.ascii.eqlIgnoreCase(field, "secret")) return true;
-    const secret_suffixes = [_][]const u8{
-        "api_key",    "api-key",     "apikey",
-        "access_key", "accesskeyid", "password",
-        "credential", "signature",   "secret",
-        "token",
+    return normalizedCredentialNameIsSensitive(field);
+}
+
+fn normalizedCredentialNameIsSensitive(name: []const u8) bool {
+    var normalized_buffer: [128]u8 = undefined;
+    if (name.len > normalized_buffer.len) return true;
+    var normalized_len: usize = 0;
+    for (name) |byte| {
+        if (!std.ascii.isAlphanumeric(byte)) continue;
+        normalized_buffer[normalized_len] = std.ascii.toLower(byte);
+        normalized_len += 1;
+    }
+    const normalized = normalized_buffer[0..normalized_len];
+    if (normalized.len == 0) return true;
+    const exact_sensitive = [_][]const u8{
+        "auth", "code", "cookie", "credentials", "key", "password", "secret", "sig", "token", "xauth",
     };
-    for (secret_suffixes) |suffix| {
-        if (std.ascii.endsWithIgnoreCase(field, suffix)) return true;
+    for (exact_sensitive) |candidate| {
+        if (std.mem.eql(u8, normalized, candidate)) return true;
+    }
+    const sensitive_components = [_][]const u8{
+        "apikey",
+        "accesskey",
+        "secretkey",
+        "privatekey",
+        "subscriptionkey",
+        "authtoken",
+        "authkey",
+    };
+    for (sensitive_components) |component| {
+        if (std.mem.indexOf(u8, normalized, component) != null) return true;
+    }
+    const sensitive_suffixes = [_][]const u8{
+        "password", "passwd", "secret", "token", "credential", "signature", "authorization",
+    };
+    for (sensitive_suffixes) |suffix| {
+        if (std.mem.endsWith(u8, normalized, suffix)) return true;
     }
     return false;
 }
@@ -948,10 +977,16 @@ fn isSensitivePublicConfigValue(field: []const u8, value: std.json.Value) bool {
     // Secret-store references are implementation details and can disclose
     // credential inventory even when they do not contain the secret value.
     if (std.mem.indexOf(u8, value.string, "${secret:") != null) return true;
-    if (!std.ascii.eqlIgnoreCase(field, "url") and
-        !std.ascii.eqlIgnoreCase(field, "api_url") and
-        !std.ascii.eqlIgnoreCase(field, "base_url")) return false;
+    if (!isPublicProviderUrlField(field)) return false;
     return urlContainsCredentials(value.string);
+}
+
+fn isPublicProviderUrlField(field: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(field, "url") or
+        std.ascii.eqlIgnoreCase(field, "api_url") or
+        std.ascii.eqlIgnoreCase(field, "base_url") or
+        std.ascii.eqlIgnoreCase(field, "endpoint") or
+        std.ascii.eqlIgnoreCase(field, "endpoint_url");
 }
 
 fn urlContainsCredentials(url: []const u8) bool {
@@ -1002,11 +1037,7 @@ fn urlQueryKeyIsSensitive(encoded: []const u8) bool {
         index += 1;
     }
     const key = std.mem.trim(u8, decoded_buffer[0..decoded_len], &std.ascii.whitespace);
-    return isSensitivePublicConfigField(key) or
-        std.ascii.eqlIgnoreCase(key, "key") or
-        std.ascii.eqlIgnoreCase(key, "sig") or
-        std.ascii.endsWithIgnoreCase(key, "signature") or
-        std.ascii.endsWithIgnoreCase(key, "credential");
+    return isSensitivePublicConfigField(key);
 }
 
 fn appendPublicConfigValue(
@@ -3751,61 +3782,52 @@ test "public index config encoders redact coverage incarnation" {
     ;
     const encoded_map = try encodeIndexConfigMap(std.testing.allocator, indexes_json);
     defer std.testing.allocator.free(encoded_map);
-    try std.testing.expect(std.mem.indexOf(u8, encoded_map, coverage_policy_mod.incarnation_field) == null);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"embed_idx\":{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":384}}",
+        encoded_map,
+    );
 
     const encoded_single = (try encodeSingleIndexConfig(std.testing.allocator, indexes_json, "embed_idx")).?;
     defer std.testing.allocator.free(encoded_single);
-    try ant_json.testing.expectSubsetJsonText(
+    try ant_json.testing.expectEqualJsonText(
         std.testing.allocator,
-        "{\"type\":\"embeddings\",\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\"}}",
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":384}",
         encoded_single,
     );
-    try std.testing.expect(std.mem.indexOf(u8, encoded_single, coverage_policy_mod.incarnation_field) == null);
 }
 
 test "public index config encoders redact nested credentials" {
     const indexes_json =
-        \\{"embed_idx":{"type":"embeddings","dimension":384,"embedder":{"provider":"openai","model":"text-embedding-3-small","api_key":"sk-private","url":"https://alice:private-password@example.com/v1"},"summarizer":{"provider":"gemini","model":"gemini-2.5-flash","api_key":"${secret:gemini_key}","api_url":"https://example.com/v1?api%5Fkey=private-url-key"},"enrichments":[{"name":"asset_v1","kind":"asset","producer_json":"{\"provider\":\"s3\",\"secret_access_key\":\"unknown-provider-secret\",\"access_token\":\"private-token\",\"headers\":{\"Authorization\":\"Bearer private-auth\",\"X-Auth\":\"future-private-header\",\"Accept\":\"text/html\"},\"format\":\"html\"}"}]}}
+        \\{"embed_idx":{"type":"embeddings","dimension":384,"embedder":{"provider":"openai","model":"text-embedding-3-small","api_key":"sk-private","secret_key":"private-secret-key","url":"https://alice:private-password@example.com/v1","endpoint":"https://example.com/v1?auth=private-endpoint-auth"},"summarizer":{"provider":"gemini","model":"gemini-2.5-flash","api_key":"${secret:gemini_key}","api_url":"https://example.com/v1?access%5Fkey%5Fid=private-url-key"},"enrichments":[{"name":"asset_v1","kind":"asset","producer_json":"{\"provider\":\"s3\",\"secret_access_key\":\"unknown-provider-secret\",\"access_token\":\"private-token\",\"headers\":{\"Authorization\":\"Bearer private-auth\",\"X-Auth\":\"future-private-header\",\"Accept\":\"text/html\"},\"format\":\"html\"}"}]}}
     ;
 
     const encoded_single = (try encodeSingleIndexConfig(std.testing.allocator, indexes_json, "embed_idx")).?;
     defer std.testing.allocator.free(encoded_single);
-    try std.testing.expect(std.mem.indexOf(u8, encoded_single, "sk-private") == null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded_single, "private-token") == null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded_single, "${secret:gemini_key}") == null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded_single, "private-password") == null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded_single, "private-url-key") == null);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":384,\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\"},\"summarizer\":{\"provider\":\"gemini\",\"model\":\"gemini-2.5-flash\"},\"enrichments\":[\"asset_v1\"]}",
+        encoded_single,
+    );
 
     const created = try encodeCreatedIndexConfig(std.testing.allocator, "embed_idx", indexes_json[13 .. indexes_json.len - 1]);
     defer std.testing.allocator.free(created);
-    try std.testing.expect(std.mem.indexOf(u8, created, "sk-private") == null);
-    try std.testing.expect(std.mem.indexOf(u8, created, "private-token") == null);
-    try std.testing.expect(std.mem.indexOf(u8, created, "private-auth") == null);
-    try std.testing.expect(std.mem.indexOf(u8, created, "unknown-provider-secret") == null);
-    try std.testing.expect(std.mem.indexOf(u8, created, "future-private-header") == null);
-    try std.testing.expect(std.mem.indexOf(u8, created, "${secret:gemini_key}") == null);
-    try std.testing.expect(std.mem.indexOf(u8, created, "private-password") == null);
-    try std.testing.expect(std.mem.indexOf(u8, created, "private-url-key") == null);
-    var parsed_created = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, created, .{});
-    defer parsed_created.deinit();
-    const created_enrichments = parsed_created.value.object.get("enrichments") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(created_enrichments.array.items[0].object.get("producer_json") == null);
-    try ant_json.testing.expectSubsetJsonText(
+    try ant_json.testing.expectEqualJsonText(
         std.testing.allocator,
-        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"enrichments\":[{\"name\":\"asset_v1\",\"kind\":\"asset\"}]}",
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":384,\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\"},\"summarizer\":{\"provider\":\"gemini\",\"model\":\"gemini-2.5-flash\"},\"enrichments\":[{\"name\":\"asset_v1\",\"kind\":\"asset\"}]}",
         created,
     );
 }
 
 test "public index config encoders retain credential-free provider urls" {
     const config =
-        \\{"type":"embeddings","dimension":384,"embedder":{"provider":"openai","model":"text-embedding-3-small","url":"https://api.example.com/v1?api-version=2026-08-01"}}
+        \\{"type":"embeddings","dimension":384,"embedder":{"provider":"openai","model":"text-embedding-3-small","url":"https://api.example.com/v1?api-version=2026-08-01","endpoint":"https://gateway.example.com/v1?region=us-west-2"}}
     ;
     const created = try encodeCreatedIndexConfig(std.testing.allocator, "embed_idx", config);
     defer std.testing.allocator.free(created);
-    try ant_json.testing.expectSubsetJsonText(
+    try ant_json.testing.expectEqualJsonText(
         std.testing.allocator,
-        "{\"embedder\":{\"provider\":\"openai\",\"url\":\"https://api.example.com/v1?api-version=2026-08-01\"}}",
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":384,\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\",\"url\":\"https://api.example.com/v1?api-version=2026-08-01\",\"endpoint\":\"https://gateway.example.com/v1?region=us-west-2\"}}",
         created,
     );
 }
@@ -3816,17 +3838,11 @@ test "public index config encoders omit root write-only producer documents" {
     ;
     const created = try encodeCreatedIndexConfig(std.testing.allocator, "embed_idx", config);
     defer std.testing.allocator.free(created);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, created, .{});
-    defer parsed.deinit();
-    try ant_json.testing.expectSubsetJsonText(
+    try ant_json.testing.expectEqualJsonText(
         std.testing.allocator,
         "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"external\":true,\"dimension\":384}",
         created,
     );
-    try std.testing.expect(parsed.value.object.get("producer_json") == null);
-    try std.testing.expect(parsed.value.object.get("future_provider_secret") == null);
-    try std.testing.expect(std.mem.indexOf(u8, created, "private") == null);
 }
 
 test "identical index mutation retries preserve coverage incarnation" {

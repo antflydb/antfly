@@ -1840,6 +1840,7 @@ pub const ApiHttpServer = struct {
     index_installation_mutex: std.atomic.Mutex = .unlocked,
     index_installation_apply_mutex: std.atomic.Mutex = .unlocked,
     index_installation_queue: std.ArrayListUnmanaged(PendingIndexInstallation) = .empty,
+    index_installation_reserved_slots: usize = 0,
     index_installation_next_generation: u64 = 1,
     index_installation_cursor: usize = 0,
     backup_maintenance_closing: std.atomic.Value(bool) = .init(false),
@@ -8784,6 +8785,30 @@ pub const ApiHttpServer = struct {
         }
     };
 
+    const PreparedIndexInstallation = struct {
+        table_name: []u8,
+        index_name: []u8,
+        index_json: ?[]u8,
+        reservation_active: bool = true,
+        owns_payload: bool = true,
+
+        fn deinit(self: *PreparedIndexInstallation, server: *ApiHttpServer) void {
+            const alloc = std.heap.page_allocator;
+            if (self.reservation_active) {
+                platform_sync.lockYielding(&server.index_installation_mutex);
+                std.debug.assert(server.index_installation_reserved_slots > 0);
+                server.index_installation_reserved_slots -= 1;
+                server.index_installation_mutex.unlock();
+            }
+            if (self.owns_payload) {
+                alloc.free(self.table_name);
+                alloc.free(self.index_name);
+                if (self.index_json) |value| alloc.free(value);
+            }
+            self.* = undefined;
+        }
+    };
+
     const IndexInstallationReconcileResult = enum {
         complete,
         retry,
@@ -8803,24 +8828,62 @@ pub const ApiHttpServer = struct {
         }
     };
 
-    fn scheduleIndexInstallationReconcile(
+    fn prepareIndexInstallationReconcile(
         self: *ApiHttpServer,
         table_name: []const u8,
         index_name: []const u8,
         index_json: ?[]const u8,
+    ) !?PreparedIndexInstallation {
+        const runtime = self.cfg.backend_runtime orelse return null;
+        if (runtime.threaded_jobs == null or self.index_installation_owner_id == 0) return null;
+        if (self.index_installation_closing.load(.acquire)) return null;
+
+        const alloc = std.heap.page_allocator;
+        const owned_table_name = try alloc.dupe(u8, table_name);
+        var payload_transferred = false;
+        defer if (!payload_transferred) alloc.free(owned_table_name);
+        const owned_index_name = try alloc.dupe(u8, index_name);
+        defer if (!payload_transferred) alloc.free(owned_index_name);
+        const owned_index_json = if (index_json) |value| try alloc.dupe(u8, value) else null;
+        defer if (!payload_transferred) {
+            if (owned_index_json) |value| alloc.free(value);
+        };
+
+        platform_sync.lockYielding(&self.index_installation_mutex);
+        defer self.index_installation_mutex.unlock();
+        if (self.index_installation_closing.load(.acquire)) return null;
+        // Keep capacity for every pre-commit reservation even while unrelated
+        // requests append their own entries. Activation can therefore append
+        // after consensus without allocating or stealing another request's
+        // reserved slot.
+        try self.index_installation_queue.ensureUnusedCapacity(
+            alloc,
+            self.index_installation_reserved_slots + 1,
+        );
+        self.index_installation_reserved_slots += 1;
+        payload_transferred = true;
+        return .{
+            .table_name = owned_table_name,
+            .index_name = owned_index_name,
+            .index_json = owned_index_json,
+        };
+    }
+
+    fn activatePreparedIndexInstallation(
+        self: *ApiHttpServer,
+        prepared: *PreparedIndexInstallation,
         enqueue_if_absent: bool,
-    ) !bool {
+    ) bool {
         const runtime = self.cfg.backend_runtime orelse return false;
-        if (runtime.threaded_jobs == null or self.index_installation_owner_id == 0) return false;
-        if (self.index_installation_closing.load(.acquire)) return false;
+        if (!prepared.reservation_active or !prepared.owns_payload) return false;
 
         platform_sync.lockYielding(&self.index_installation_mutex);
         defer self.index_installation_mutex.unlock();
         if (self.index_installation_closing.load(.acquire)) return false;
         var existing: ?*PendingIndexInstallation = null;
         for (self.index_installation_queue.items) |*pending| {
-            if (std.mem.eql(u8, pending.table_name, table_name) and
-                std.mem.eql(u8, pending.index_name, index_name))
+            if (std.mem.eql(u8, pending.table_name, prepared.table_name) and
+                std.mem.eql(u8, pending.index_name, prepared.index_name))
             {
                 existing = pending;
                 break;
@@ -8828,56 +8891,39 @@ pub const ApiHttpServer = struct {
         }
         if (existing == null and !enqueue_if_absent) return false;
 
-        const alloc = std.heap.page_allocator;
         const generation = self.index_installation_next_generation;
         self.index_installation_next_generation +%= 1;
         if (self.index_installation_next_generation == 0) self.index_installation_next_generation = 1;
-        if (existing) |pending| {
-            if (index_json == null) {
-                // The post-commit delete fence must not allocate: retain the
-                // key storage already owned by the queue and replace only the
-                // operation payload/generation. This guarantees an older
-                // snapshotted create is superseded even under memory pressure.
-                if (pending.index_json) |value| alloc.free(value);
-                pending.index_json = null;
-                pending.generation = generation;
-                pending.failures = 0;
-                pending.retry_after_ns = 0;
-                try self.ensureIndexInstallationWorkerLocked(runtime);
-                return true;
-            }
-        }
-
-        const owned_table_name = try alloc.dupe(u8, table_name);
-        var ownership_transferred = false;
-        defer if (!ownership_transferred) alloc.free(owned_table_name);
-        const owned_index_name = try alloc.dupe(u8, index_name);
-        defer if (!ownership_transferred) alloc.free(owned_index_name);
-        const owned_index_json = if (index_json) |value| try alloc.dupe(u8, value) else null;
-        defer if (!ownership_transferred) {
-            if (owned_index_json) |value| alloc.free(value);
-        };
-
+        std.debug.assert(self.index_installation_reserved_slots > 0);
+        self.index_installation_reserved_slots -= 1;
         if (existing) |pending| {
             pending.deinit();
             pending.* = .{
-                .table_name = owned_table_name,
-                .index_name = owned_index_name,
-                .index_json = owned_index_json,
+                .table_name = prepared.table_name,
+                .index_name = prepared.index_name,
+                .index_json = prepared.index_json,
                 .generation = generation,
             };
-            ownership_transferred = true;
-            try self.ensureIndexInstallationWorkerLocked(runtime);
-            return true;
+        } else {
+            // prepareIndexInstallationReconcile reserved this exact slot.
+            self.index_installation_queue.appendAssumeCapacity(.{
+                .table_name = prepared.table_name,
+                .index_name = prepared.index_name,
+                .index_json = prepared.index_json,
+                .generation = generation,
+            });
         }
-        try self.index_installation_queue.append(alloc, .{
-            .table_name = owned_table_name,
-            .index_name = owned_index_name,
-            .index_json = owned_index_json,
-            .generation = generation,
-        });
-        ownership_transferred = true;
-        try self.ensureIndexInstallationWorkerLocked(runtime);
+        prepared.reservation_active = false;
+        prepared.owns_payload = false;
+        self.ensureIndexInstallationWorkerLocked(runtime) catch |err| {
+            // The keyed obligation is already installed. The independent
+            // maintenance supervisor will retry worker admission.
+            std.log.warn("index installation reconciliation worker admission deferred table={s} index={s} err={s}", .{
+                prepared.table_name,
+                prepared.index_name,
+                @errorName(err),
+            });
+        };
         return true;
     }
 
@@ -8987,14 +9033,34 @@ pub const ApiHttpServer = struct {
         defer if (current) |value| alloc.free(value);
 
         if (pending.index_json) |expected| {
-            const visible = current orelse return if (authoritative) .complete else .retry;
+            const visible = current orelse {
+                if (!authoritative) return .retry;
+                _ = writes.dropIndex(alloc, pending.table_name, pending.index_name) catch |err| switch (err) {
+                    error.IndexNotFound, error.TableNotFound => return .complete,
+                    else => return .retry,
+                };
+                return .complete;
+            };
             const equivalent = indexes_api.equivalentIndexConfigJson(alloc, visible, expected) catch return .retry;
-            if (!equivalent) return if (authoritative) .complete else .retry;
-            _ = writes.createIndex(alloc, pending.table_name, pending.index_name, expected) catch return .retry;
+            if (!equivalent and !authoritative) return .retry;
+            // Once the read is authoritative, the queue entry is a keyed
+            // reconciliation trigger rather than an instruction to replay
+            // stale state. Applying the visible config also repairs any
+            // foreground operation whose post-commit handler ran out of order.
+            _ = writes.createIndex(
+                alloc,
+                pending.table_name,
+                pending.index_name,
+                if (equivalent) expected else visible,
+            ) catch return .retry;
             return .complete;
         }
 
-        if (current != null) return if (authoritative) .complete else .retry;
+        if (current) |visible| {
+            if (!authoritative) return .retry;
+            _ = writes.createIndex(alloc, pending.table_name, pending.index_name, visible) catch return .retry;
+            return .complete;
+        }
         _ = writes.dropIndex(alloc, pending.table_name, pending.index_name) catch |err| switch (err) {
             error.IndexNotFound, error.TableNotFound => return .complete,
             else => return .retry,
@@ -9106,6 +9172,16 @@ pub const ApiHttpServer = struct {
         const stored_index_json = (indexes_api.storedIndexConfigJsonAlloc(alloc, expected_indexes_json, index_name) catch return error.InternalFailure) orelse return error.InternalFailure;
         defer alloc.free(stored_index_json);
 
+        // Reserve the keyed fallback payload and queue capacity before the
+        // catalog commit. It remains inactive until consensus succeeds, so a
+        // failed proposal cannot mutate local state, while post-commit
+        // supersession and fallback enqueue are allocation-free.
+        var prepared_installation = if (self.table_writes != null)
+            self.prepareIndexInstallationReconcile(table_name, index_name, stored_index_json) catch return error.InternalFailure
+        else
+            null;
+        defer if (prepared_installation) |*prepared| prepared.deinit(self);
+
         // Catalog mutation is the irreversible boundary. Observe cancellation
         // after all potentially expensive validation, but never claim a
         // canceled result once consensus may have committed the mutation.
@@ -9127,15 +9203,10 @@ pub const ApiHttpServer = struct {
             // A prior operation for this key may still be retrying even when
             // this operation needs no new fallback job. Supersede that stale
             // generation before applying the new local state.
-            const superseded_existing_installation = self.scheduleIndexInstallationReconcile(
-                table_name,
-                index_name,
-                stored_index_json,
-                false,
-            ) catch |err| superseded: {
-                std.log.warn("public create index could not supersede prior fallback generation table={s} index={s} err={}", .{ table_name, index_name, err });
-                break :superseded false;
-            };
+            const superseded_existing_installation = if (prepared_installation) |*prepared|
+                self.activatePreparedIndexInstallation(prepared, false)
+            else
+                false;
             // Never poll after the consensus commit boundary: a slow
             // projection must not hold an HTTP worker for up to the client's
             // own timeout and invite an ambiguous retry. One read preserves
@@ -9175,15 +9246,13 @@ pub const ApiHttpServer = struct {
                 break :requested null;
             };
             if (!local_installation_complete and reconcile_requested == null) {
-                const scheduled = self.scheduleIndexInstallationReconcile(
-                    table_name,
-                    index_name,
-                    stored_index_json,
-                    true,
-                ) catch |err| scheduled: {
-                    std.log.warn("public create index background installation enqueue deferred table={s} index={s} err={}", .{ table_name, index_name, err });
-                    break :scheduled false;
-                };
+                const scheduled = if (prepared_installation) |*prepared|
+                    if (!prepared.owns_payload)
+                        true
+                    else
+                        self.activatePreparedIndexInstallation(prepared, true)
+                else
+                    false;
                 if (!scheduled) {
                     // Manual and embedded runtimes have no background executor.
                     // Preserve their synchronous convergence contract without
@@ -9209,16 +9278,15 @@ pub const ApiHttpServer = struct {
     ) public_table_http.TableApi.ExecuteDeleteIndexError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         try ensureTableOperationActive(request);
-        const table_before = (self.loadOwnedTableRecord(alloc, table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
-        defer metadata_table_manager.freeTable(alloc, table_before);
-        // Validate existence and reserve the exact post-delete projection
-        // before the irreversible consensus boundary. No response after a
-        // committed delete may depend on a fresh allocation or a projection
-        // wait that can manufacture an ambiguous failure.
-        const expected_indexes_json = (indexes_api.removeIndexFromTableIndexesJson(alloc, table_before.indexes_json, index_name) catch return error.InternalFailure) orelse {
-            return error.NotFound;
-        };
-        defer alloc.free(expected_indexes_json);
+        // The admin snapshot is an asynchronous projection and must not decide
+        // whether the table or index exists: their create routes intentionally
+        // return before that projection catches up. Reserve recovery capacity
+        // now, then let the authoritative mutation below decide NotFound.
+        var prepared_installation = if (self.table_writes != null)
+            self.prepareIndexInstallationReconcile(table_name, index_name, null) catch return error.InternalFailure
+        else
+            null;
+        defer if (prepared_installation) |*prepared| prepared.deinit(self);
         try ensureTableOperationActive(request);
         self.source.dropIndex(alloc, table_name, index_name) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
@@ -9236,21 +9304,22 @@ pub const ApiHttpServer = struct {
             // Fence an older create immediately after the catalog commit. A
             // lagging projection is reconciler input, never an HTTP response
             // dependency after the commit boundary.
-            const superseded_existing_installation = self.scheduleIndexInstallationReconcile(table_name, index_name, null, false) catch |err| superseded: {
-                std.log.warn("public delete index could not supersede prior fallback generation table={s} index={s} err={}", .{ table_name, index_name, err });
-                break :superseded false;
-            };
+            var reconcile_activated = if (prepared_installation) |*prepared|
+                self.activatePreparedIndexInstallation(prepared, false)
+            else
+                false;
             const reconcile_requested = table_writes_source.requestTableIndexStructuralReconcile(alloc, table_name, index_name) catch |err| requested: {
                 std.log.warn("public delete index structural reconcile enqueue failed table={s} index={s} err={}", .{ table_name, index_name, err });
                 break :requested null;
             };
-            if (reconcile_requested == null) {
-                _ = self.scheduleIndexInstallationReconcile(table_name, index_name, null, true) catch |err| {
-                    std.log.warn("public delete index fallback reconcile enqueue failed table={s} index={s} err={}", .{ table_name, index_name, err });
-                };
+            if (reconcile_requested == null and !reconcile_activated) {
+                reconcile_activated = if (prepared_installation) |*prepared|
+                    self.activatePreparedIndexInstallation(prepared, true)
+                else
+                    false;
             }
-            if (superseded_existing_installation) platform_sync.lockYielding(&self.index_installation_apply_mutex);
-            defer if (superseded_existing_installation) self.index_installation_apply_mutex.unlock();
+            if (reconcile_activated) platform_sync.lockYielding(&self.index_installation_apply_mutex);
+            defer if (reconcile_activated) self.index_installation_apply_mutex.unlock();
             _ = table_writes_source.dropIndex(alloc, table_name, index_name) catch |err| switch (err) {
                 error.IndexNotFound => {},
                 else => std.log.warn("public delete index local apply deferred table={s} index={s} err={}", .{ table_name, index_name, err }),
@@ -28594,8 +28663,16 @@ test "api http server create index installs exact visible config and defers lagg
             platform_sync.lockYielding(&self.mutex);
             defer self.mutex.unlock();
             try std.testing.expectEqualStrings("docs", table_name);
-            const next = (try indexes_api.removeIndexFromTableIndexesJson(allocator, self.indexes_json, index_name)) orelse return error.IndexNotFound;
-            self.replaceIndexesJson(allocator, next, true);
+            // pending_indexes_json models the authoritative catalog state that
+            // has committed but is not yet present in adminSnapshot.
+            const authoritative = self.pending_indexes_json orelse self.indexes_json;
+            const next = (try indexes_api.removeIndexFromTableIndexesJson(allocator, authoritative, index_name)) orelse return error.IndexNotFound;
+            if (self.pending_indexes_json) |pending| {
+                allocator.free(pending);
+                self.pending_indexes_json = next;
+            } else {
+                self.replaceIndexesJson(allocator, next, true);
+            }
         }
 
         fn ensureLinearizableRead(ptr: *anyopaque) !void {
@@ -28857,6 +28934,41 @@ test "api http server create index installs exact visible config and defers lagg
     try std.testing.expectEqual(@as(usize, 13), no_reconcile_writes.create_calls.load(.acquire));
     try std.testing.expect(no_reconcile_writes.installed.load(.acquire));
 
+    // A successful create is immediately deletable from the authoritative
+    // catalog even while adminSnapshot still omits it. Reject the first worker
+    // admission so no background linearizable read can accidentally make the
+    // projection current before DELETE performs its lookup.
+    {
+        const real_durable_lane = runtime.durable_jobs;
+        var rejected_lane = FlakyDurableLane{
+            .delegate = real_durable_lane,
+            .fail_owner_id = fallback_server.index_installation_owner_id,
+        };
+        runtime.durable_jobs = rejected_lane.iface();
+        defer runtime.durable_jobs = real_durable_lane;
+        const immediate_body = try test_contract_helpers.encodeCreateIndexRequest(alloc, "immediate_delete_idx");
+        defer alloc.free(immediate_body);
+        var immediate_create_resp = try executeHttpxTestRequest(&fallback_server, .{
+            .method = .POST,
+            .uri = "/tables/docs/indexes/immediate_delete_idx",
+            .content_type = "application/json",
+            .body = immediate_body,
+        });
+        defer immediate_create_resp.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 201), immediate_create_resp.status);
+        try std.testing.expect(!fallback_server.index_installation_worker_in_flight.load(.acquire));
+
+        var immediate_delete_resp = try executeHttpxTestRequest(&fallback_server, .{
+            .method = .DELETE,
+            .uri = "/tables/docs/indexes/immediate_delete_idx",
+        });
+        defer immediate_delete_resp.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 201), immediate_delete_resp.status);
+        runtime.durable_jobs = real_durable_lane;
+        real_durable_lane.drainOwner(fallback_server.index_installation_owner_id);
+        try std.testing.expectEqual(@as(usize, 0), unprojected_source.projection_wait_calls.load(.acquire));
+    }
+
     // A delete that commits while an older create installation is retrying
     // supersedes that generation. Even if the stale attempt was already
     // snapshotted, foreground application and the worker share an apply fence,
@@ -28969,6 +29081,37 @@ test "api http server create index installs exact visible config and defers lagg
     const queued_after_supervisor = fallback_server.index_installation_queue.items.len;
     fallback_server.index_installation_mutex.unlock();
     try std.testing.expectEqual(@as(usize, 0), queued_after_supervisor);
+
+    var flaky_delete_lane = FlakyDurableLane{
+        .delegate = real_durable_lane,
+        .fail_owner_id = fallback_server.index_installation_owner_id,
+    };
+    runtime.durable_jobs = flaky_delete_lane.iface();
+    no_reconcile_writes.block_drops.store(true, .release);
+    const drops_before_submission_failure = no_reconcile_writes.drop_calls.load(.acquire);
+    var delete_submission_retry_resp = try executeHttpxTestRequest(&fallback_server, .{
+        .method = .DELETE,
+        .uri = "/tables/docs/indexes/submission_retry_idx",
+    });
+    defer delete_submission_retry_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), delete_submission_retry_resp.status);
+    try std.testing.expect(!fallback_server.index_installation_worker_in_flight.load(.acquire));
+    platform_sync.lockYielding(&fallback_server.index_installation_mutex);
+    const delete_queued_after_submission_failure = fallback_server.index_installation_queue.items.len;
+    fallback_server.index_installation_mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 1), delete_queued_after_submission_failure);
+
+    runtime.durable_jobs = real_durable_lane;
+    no_reconcile_writes.block_drops.store(false, .release);
+    try fallback_server.runSessionMaintenanceOnce();
+    runtime.durable_jobs.drainOwner(fallback_server.index_installation_owner_id);
+    try std.testing.expect(no_reconcile_writes.drop_calls.load(.acquire) > drops_before_submission_failure);
+    platform_sync.lockYielding(&fallback_server.index_installation_mutex);
+    const delete_queued_after_supervisor = fallback_server.index_installation_queue.items.len;
+    const reserved_after_supervisor = fallback_server.index_installation_reserved_slots;
+    fallback_server.index_installation_mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), delete_queued_after_supervisor);
+    try std.testing.expectEqual(@as(usize, 0), reserved_after_supervisor);
 }
 
 test "api http server create index expands schema-derived algebraic config" {
