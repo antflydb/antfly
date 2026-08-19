@@ -1652,8 +1652,19 @@ func (e *metadataTopologyValidationError) Unwrap() error {
 }
 
 func (r *AntflyClusterReconciler) validateLegacyMetadataRuntimeTopology(ctx context.Context, cluster *antflyv1.AntflyCluster, replicas int32) error {
+	if err := r.validateMetadataRuntimeTopology(ctx, cluster, replicas); err != nil {
+		return fmt.Errorf("cannot safely migrate legacy metadata topology: %w", err)
+	}
+	return nil
+}
+
+// validateMetadataRuntimeTopology proves that every expected member belongs to
+// one stable metadata Raft incarnation and the exact configured voter set. It
+// is used both while migrating pre-record clusters and when publishing
+// steady-state health.
+func (r *AntflyClusterReconciler) validateMetadataRuntimeTopology(ctx context.Context, cluster *antflyv1.AntflyCluster, replicas int32) error {
 	if replicas < 1 {
-		return fmt.Errorf("cannot safely migrate legacy metadata topology: invalid replica count %d", replicas)
+		return fmt.Errorf("invalid replica count %d", replicas)
 	}
 	maxNodeID := uint64(replicas) // #nosec G115 -- replicas is explicitly checked positive above.
 	expectedVoterSetFingerprint := metadataRaftVoterSetFingerprint(replicas)
@@ -1663,41 +1674,41 @@ func (r *AntflyClusterReconciler) validateLegacyMetadataRuntimeTopology(ctx cont
 	for ordinal := int32(0); ordinal < replicas; ordinal++ {
 		status, err := r.fetchMetadataRuntimeTopology(ctx, cluster, ordinal)
 		if err != nil {
-			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d status is unavailable: %w", ordinal, err)
+			return fmt.Errorf("member ordinal %d status is unavailable: %w", ordinal, err)
 		}
 		expectedNodeID := uint64(ordinal + 1)
 		if status.MetadataGroupID == 0 || !validMetadataIncarnation(status.MetadataIncarnation) {
-			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d returned an invalid group or incarnation", ordinal)
+			return fmt.Errorf("member ordinal %d returned an invalid group or incarnation", ordinal)
 		}
 		if status.MetadataRaftLocalNodeID != expectedNodeID {
-			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d reports local node %d, expected %d", ordinal, status.MetadataRaftLocalNodeID, expectedNodeID)
+			return fmt.Errorf("member ordinal %d reports local node %d, expected %d", ordinal, status.MetadataRaftLocalNodeID, expectedNodeID)
 		}
 		if !status.MetadataRaftLocalVoter || status.MetadataRaftVoterCount != replicas {
-			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d reports local_voter=%t and voter_count=%d, expected local_voter=true and voter_count=%d", ordinal, status.MetadataRaftLocalVoter, status.MetadataRaftVoterCount, replicas)
+			return fmt.Errorf("member ordinal %d reports local_voter=%t and voter_count=%d, expected local_voter=true and voter_count=%d", ordinal, status.MetadataRaftLocalVoter, status.MetadataRaftVoterCount, replicas)
 		}
 		if status.MetadataRaftJointConsensus != nil && *status.MetadataRaftJointConsensus {
-			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d reports an active joint-consensus membership transition", ordinal)
+			return fmt.Errorf("member ordinal %d reports an active joint-consensus membership transition", ordinal)
 		}
 		if status.MetadataRaftVoterSetFingerprint == nil || status.MetadataRaftJointConsensus == nil {
 			membershipStatusUnavailable = true
 		} else if *status.MetadataRaftVoterSetFingerprint != expectedVoterSetFingerprint {
-			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d reports voter set fingerprint %q, expected %q", ordinal, *status.MetadataRaftVoterSetFingerprint, expectedVoterSetFingerprint)
+			return fmt.Errorf("member ordinal %d reports voter set fingerprint %q, expected %q", ordinal, *status.MetadataRaftVoterSetFingerprint, expectedVoterSetFingerprint)
 		}
 		if status.MetadataRaftLeaderID == nil || *status.MetadataRaftLeaderID < 1 || *status.MetadataRaftLeaderID > maxNodeID {
-			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d does not report a valid leader", ordinal)
+			return fmt.Errorf("member ordinal %d does not report a valid leader", ordinal)
 		}
 		switch status.MetadataRaftRole {
 		case "leader":
 			if *status.MetadataRaftLeaderID != status.MetadataRaftLocalNodeID {
-				return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d reports leader role for node %d but leader %d", ordinal, status.MetadataRaftLocalNodeID, *status.MetadataRaftLeaderID)
+				return fmt.Errorf("member ordinal %d reports leader role for node %d but leader %d", ordinal, status.MetadataRaftLocalNodeID, *status.MetadataRaftLeaderID)
 			}
 			leaderReports++
 		case "follower":
 			if *status.MetadataRaftLeaderID == status.MetadataRaftLocalNodeID {
-				return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d reports follower role but identifies itself as leader", ordinal)
+				return fmt.Errorf("member ordinal %d reports follower role but identifies itself as leader", ordinal)
 			}
 		default:
-			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d is not in a stable Raft role: %q", ordinal, status.MetadataRaftRole)
+			return fmt.Errorf("member ordinal %d is not in a stable Raft role: %q", ordinal, status.MetadataRaftRole)
 		}
 
 		if baseline == nil {
@@ -1707,14 +1718,14 @@ func (r *AntflyClusterReconciler) validateLegacyMetadataRuntimeTopology(ctx cont
 		if status.MetadataGroupID != baseline.MetadataGroupID ||
 			status.MetadataIncarnation != baseline.MetadataIncarnation ||
 			*status.MetadataRaftLeaderID != *baseline.MetadataRaftLeaderID {
-			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d disagrees on metadata group, incarnation, or leader", ordinal)
+			return fmt.Errorf("member ordinal %d disagrees on metadata group, incarnation, or leader", ordinal)
 		}
 	}
 	if leaderReports != 1 {
-		return fmt.Errorf("cannot safely migrate legacy metadata topology: expected exactly one member to report leader role, got %d", leaderReports)
+		return fmt.Errorf("expected exactly one member to report leader role, got %d", leaderReports)
 	}
 	if membershipStatusUnavailable {
-		return fmt.Errorf("cannot safely migrate legacy metadata topology: %w; update spec.image to a runtime that reports metadata_raft_voter_set_fingerprint and metadata_raft_joint_consensus", errMetadataRuntimeMembershipStatusUnavailable)
+		return fmt.Errorf("%w; update spec.image to a runtime that reports metadata_raft_voter_set_fingerprint and metadata_raft_joint_consensus", errMetadataRuntimeMembershipStatusUnavailable)
 	}
 	return nil
 }
@@ -2613,6 +2624,13 @@ func periodicRequeueAfter(cluster *antflyv1.AntflyCluster) time.Duration {
 
 func periodicRequeueAfterAt(cluster *antflyv1.AntflyCluster, now time.Time) time.Duration {
 	var requeueAfter time.Duration
+	// Metadata agreement is runtime health, not just configuration validation.
+	// Re-observe it even when the AntflyCluster generation has not changed so a
+	// split incarnation cannot remain green indefinitely without another watch
+	// event.
+	if effectiveTopologyMode(cluster) == topologyModeDistributed && cluster.Status.MetadataTopologyReplicas > 0 {
+		requeueAfter = minPositiveDuration(requeueAfter, 30*time.Second)
+	}
 	if haKubernetesLeaseRenewalEnabled(cluster) {
 		requeueAfter = minPositiveDuration(requeueAfter, haFencingLeaseRenewalRequeueAfter(cluster))
 	}
@@ -4755,11 +4773,26 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	}
 	metadataFindings := poddiagnostics.DiagnosePods(metadataPods)
 	dataFindings := poddiagnostics.DiagnosePods(dataPods)
+	var metadataTopologyHealthErr error
+	if cluster.Status.MetadataNodesReady >= metadataReplicas && metadataReplicas > 0 && len(metadataFindings) == 0 {
+		if err := r.validateMetadataRuntimeTopology(ctx, cluster, metadataReplicas); err != nil {
+			metadataTopologyHealthErr = fmt.Errorf("metadata runtime topology validation failed: %w", err)
+		}
+	}
 	r.setComponentCondition(cluster, antflyv1.TypeMetadataReady, cluster.Status.MetadataNodesReady, metadataReplicas, metadataFindings, "metadata")
+	if metadataTopologyHealthErr != nil {
+		meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+			Type:               antflyv1.TypeMetadataReady,
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: cluster.Generation,
+			Reason:             antflyv1.ReasonValidationFailed,
+			Message:            metadataTopologyHealthErr.Error(),
+		})
+	}
 	r.setComponentCondition(cluster, antflyv1.TypeDataReady, cluster.Status.DataNodesReady, dataReplicas, dataFindings, "data")
 	allRuntimeFindings := append(append([]poddiagnostics.Finding{}, metadataFindings...), dataFindings...)
 
-	if len(allRuntimeFindings) > 0 {
+	if len(allRuntimeFindings) > 0 || metadataTopologyHealthErr != nil {
 		cluster.Status.Phase = "Degraded"
 	} else if cluster.Status.MetadataNodesReady >= metadataReplicas && cluster.Status.DataNodesReady >= dataReplicas {
 		cluster.Status.Phase = "Running"
@@ -4769,6 +4802,15 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 
 	r.updateRolloutCondition(cluster, metadataSts, dataSts)
 	r.setAvailableCondition(cluster, allRuntimeFindings, cluster.Status.Phase == "Running")
+	if metadataTopologyHealthErr != nil {
+		meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+			Type:               antflyv1.TypeAvailable,
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: cluster.Generation,
+			Reason:             antflyv1.ReasonValidationFailed,
+			Message:            metadataTopologyHealthErr.Error(),
+		})
+	}
 	r.recordClusterRuntimeFailureEvents(cluster, originalConditions)
 	r.updateProductTierStatus(cluster)
 	if err := r.observeHAPrimaryRouteStatus(ctx, cluster); err != nil {

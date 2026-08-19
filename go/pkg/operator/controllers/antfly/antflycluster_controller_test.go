@@ -425,6 +425,18 @@ func TestMetadataRaftVoterSetFingerprint(t *testing.T) {
 	}
 }
 
+func TestPeriodicRequeueIncludesRecordedMetadataTopologyHealth(t *testing.T) {
+	cluster := &antflyv1.AntflyCluster{
+		Spec: antflyv1.AntflyClusterSpec{Mode: antflyv1.ClusterModeDistributed},
+		Status: antflyv1.AntflyClusterStatus{
+			MetadataTopologyReplicas: 3,
+		},
+	}
+	if got := periodicRequeueAfterAt(cluster, time.Unix(0, 0)); got != 30*time.Second {
+		t.Fatalf("periodic metadata topology health requeue = %s, want 30s", got)
+	}
+}
+
 func TestMetadataTopologyValidationErrorFailsClusterHealth(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := antflyv1.AddToScheme(scheme); err != nil {
@@ -473,6 +485,135 @@ func TestMetadataTopologyValidationErrorFailsClusterHealth(t *testing.T) {
 		}
 		if condition.ObservedGeneration != cluster.Generation {
 			t.Fatalf("condition %s observed generation = %d, want %d", conditionType, condition.ObservedGeneration, cluster.Generation)
+		}
+	}
+}
+
+func TestUpdateStatusRejectsSteadyStateMetadataSplit(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := antflyv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default", Generation: 7},
+		Spec: antflyv1.AntflyClusterSpec{
+			Mode: antflyv1.ClusterModeDistributed,
+			MetadataNodes: antflyv1.MetadataNodesSpec{
+				Replicas:    3,
+				MetadataAPI: antflyv1.APISpec{Port: 12377},
+			},
+			DataNodes: antflyv1.DataNodesSpec{Replicas: 1},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			ObservedGeneration:       7,
+			MetadataTopologyReplicas: 3,
+			Conditions: []metav1.Condition{{
+				Type:               antflyv1.TypeConfigurationValid,
+				Status:             metav1.ConditionTrue,
+				ObservedGeneration: 7,
+				Reason:             antflyv1.ReasonValidationPassed,
+				Message:            "All validation rules passed",
+			}},
+		},
+	}
+	metadataReplicas := int32(3)
+	dataReplicas := int32(1)
+	metadataStatefulSet := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "example-metadata", Namespace: "default"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: &metadataReplicas},
+		Status:     appsv1.StatefulSetStatus{ReadyReplicas: metadataReplicas},
+	}
+	dataStatefulSet := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "example-data", Namespace: "default"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: &dataReplicas},
+		Status:     appsv1.StatefulSetStatus{ReadyReplicas: dataReplicas},
+	}
+
+	incarnations := map[string]string{
+		"example-metadata-0.example-metadata.default.svc.cluster.local": "11111111111111111111111111111111",
+		"example-metadata-1.example-metadata.default.svc.cluster.local": "22222222222222222222222222222222",
+		"example-metadata-2.example-metadata.default.svc.cluster.local": "22222222222222222222222222222222",
+	}
+	httpClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		incarnation, ok := incarnations[req.URL.Hostname()]
+		if !ok {
+			return nil, fmt.Errorf("unexpected metadata status host %s", req.URL.Hostname())
+		}
+		nodeID := uint64(1)
+		role := "follower"
+		if strings.Contains(req.URL.Hostname(), "-1.") {
+			nodeID = 2
+		} else if strings.Contains(req.URL.Hostname(), "-2.") {
+			nodeID = 3
+			role = "leader"
+		}
+		body := fmt.Sprintf(`{"metadata_group_id":1,"metadata_incarnation":%q,"metadata_raft_local_node_id":%d,"metadata_raft_role":%q,"metadata_raft_leader_id":3,"metadata_raft_local_voter":true,"metadata_raft_voter_count":3,"metadata_raft_voter_set_fingerprint":%q,"metadata_raft_joint_consensus":false}`,
+			incarnation, nodeID, role, metadataRaftVoterSetFingerprint(3))
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&antflyv1.AntflyCluster{}).
+		WithObjects(cluster, metadataStatefulSet, dataStatefulSet).
+		Build()
+	reconciler := &AntflyClusterReconciler{Client: k8sClient, HTTPClient: httpClient}
+	current := &antflyv1.AntflyCluster{}
+	if err := k8sClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), current); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.updateStatus(context.Background(), current); err != nil {
+		t.Fatal(err)
+	}
+
+	updated := &antflyv1.AntflyCluster{}
+	if err := k8sClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != "Degraded" {
+		t.Fatalf("cluster phase = %q, want Degraded", updated.Status.Phase)
+	}
+	for _, conditionType := range []string{antflyv1.TypeMetadataReady, antflyv1.TypeAvailable} {
+		condition := meta.FindStatusCondition(updated.Status.Conditions, conditionType)
+		if condition == nil {
+			t.Fatalf("missing %s condition", conditionType)
+		}
+		if condition.Status != metav1.ConditionFalse || condition.Reason != antflyv1.ReasonValidationFailed {
+			t.Fatalf("%s condition = %#v, want false topology validation failure", conditionType, condition)
+		}
+		if !strings.Contains(condition.Message, "disagrees on metadata group, incarnation, or leader") {
+			t.Fatalf("%s condition message = %q, want split-incarnation diagnostic", conditionType, condition.Message)
+		}
+	}
+	configurationValid := meta.FindStatusCondition(updated.Status.Conditions, antflyv1.TypeConfigurationValid)
+	if configurationValid == nil || configurationValid.Status != metav1.ConditionTrue {
+		t.Fatalf("configuration condition = %#v, want unchanged valid configuration", configurationValid)
+	}
+
+	for host := range incarnations {
+		incarnations[host] = "22222222222222222222222222222222"
+	}
+	if err := reconciler.updateStatus(context.Background(), updated); err != nil {
+		t.Fatal(err)
+	}
+	recovered := &antflyv1.AntflyCluster{}
+	if err := k8sClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), recovered); err != nil {
+		t.Fatal(err)
+	}
+	if recovered.Status.Phase != "Running" {
+		t.Fatalf("recovered cluster phase = %q, want Running", recovered.Status.Phase)
+	}
+	for _, conditionType := range []string{antflyv1.TypeMetadataReady, antflyv1.TypeAvailable} {
+		condition := meta.FindStatusCondition(recovered.Status.Conditions, conditionType)
+		if condition == nil || condition.Status != metav1.ConditionTrue {
+			t.Fatalf("recovered %s condition = %#v, want true", conditionType, condition)
 		}
 	}
 }
