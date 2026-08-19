@@ -370,18 +370,71 @@ const SourceIndexSink = union(enum) {
     }
 };
 
+/// Carries statement-shape facts and delimiter state through token mapping.
+/// Contextual keyword classification runs on every token, so facts that need a
+/// statement scan are computed once and nesting state advances monotonically.
+const TokenMappingContext = struct {
+    paren_depth: usize = 0,
+    balanced_prefix: bool = true,
+    segment_start: ?usize = null,
+    create_table: bool,
+    prepare: bool,
+    alter_table_tail_start: ?usize,
+    alter_table_saw_top_level_comma: bool = false,
+    create_routine_close: ?usize,
+    create_index_elements: ?TokenRange,
+
+    fn init(tokens: []const token_mod.Token) @This() {
+        return .{
+            .create_table = tokens.len >= 2 and tokens[0].matchesKeywordTag(.create) and tokens[1].matchesKeywordTag(.table),
+            .prepare = tokens.len > 0 and tokens[0].matchesKeywordTag(.prepare),
+            .alter_table_tail_start = alterTableTailStart(tokens),
+            .create_routine_close = createRoutineArgumentClose(tokens),
+            .create_index_elements = createIndexElementRange(tokens),
+        };
+    }
+
+    fn advance(self: *@This(), token: token_mod.Token, index: usize) void {
+        if (self.alter_table_tail_start) |tail_start| {
+            if (index >= tail_start and self.paren_depth == 0 and token.kind == .comma) {
+                self.alter_table_saw_top_level_comma = true;
+            }
+        }
+        switch (token.kind) {
+            .lparen => {
+                self.paren_depth += 1;
+                if (self.paren_depth == 1) self.segment_start = index + 1;
+            },
+            .rparen => {
+                if (self.paren_depth == 0) {
+                    self.balanced_prefix = false;
+                    self.segment_start = null;
+                    return;
+                }
+                self.paren_depth -= 1;
+                if (self.paren_depth == 0) self.segment_start = null;
+            },
+            .comma => if (self.paren_depth == 1) {
+                self.segment_start = index + 1;
+            },
+            else => {},
+        }
+    }
+};
+
 fn appendAllTokenIds(
     ids: *TokenIdSink,
     fallback_ids: ?*TokenIdSink,
     tokens: []const token_mod.Token,
     source_indexes: ?*SourceIndexSink,
 ) !void {
+    var mapping_context = TokenMappingContext.init(tokens);
     for (tokens, 0..) |token, index| {
         if (token.kind == .semicolon and trailingSemicolonOnly(tokens, index)) break;
         const previous = if (index > 0) tokens[index - 1] else null;
         const next = if (index + 1 < tokens.len) tokens[index + 1] else null;
         const before = ids.len();
-        try appendTokenIds(ids, tokens, index, token, previous, next);
+        try appendTokenIds(ids, tokens, index, token, previous, next, &mapping_context);
         const added = ids.len() - before;
         if (fallback_ids) |fallback_sink| {
             const fallback_id = fallbackTokenId(token);
@@ -390,6 +443,7 @@ fn appendAllTokenIds(
         if (source_indexes) |source_sink| {
             for (0..added) |_| try source_sink.append(index);
         }
+        mapping_context.advance(token, index);
     }
 }
 
@@ -436,14 +490,15 @@ fn appendTokenIds(
     token: token_mod.Token,
     previous: ?token_mod.Token,
     next: ?token_mod.Token,
+    mapping_context: *const TokenMappingContext,
 ) !void {
     switch (token.kind) {
         .identifier => {
-            if (contextualKeywordSymbolId(tokens, index, token, previous, next)) |id| {
+            if (contextualKeywordSymbolId(tokens, index, token, previous, next, mapping_context)) |id| {
                 try ids.append(id);
                 return;
             }
-            if (generatedParserTreatsKeywordAsIdentifier(tokens, index, token, previous, next)) {
+            if (generatedParserTreatsKeywordAsIdentifier(tokens, index, token, previous, next, mapping_context)) {
                 try appendIdentifierIds(ids, token.text, false);
                 return;
             }
@@ -499,13 +554,14 @@ fn contextualKeywordSymbolId(
     token: token_mod.Token,
     previous: ?token_mod.Token,
     next: ?token_mod.Token,
+    mapping_context: *const TokenMappingContext,
 ) ?u16 {
     if (sessionAuthorizationKeywordContext(tokens, index)) {
         if (token.matchesKeywordTag(.authorization)) return generated.tokenId(.AUTHORIZATION);
         if (token.matchesKeywordTag(.session)) return generated.tokenId(.SESSION);
     }
     if (indexConcurrentlyKeywordContext(tokens, index) and token.matchesKeywordTag(.concurrently)) return generated.tokenId(.CONCURRENTLY);
-    if (indexElementCollateKeywordContext(tokens, index, token, previous, next)) return generated.tokenId(.COLLATE);
+    if (indexElementCollateKeywordContext(index, token, previous, next, mapping_context)) return generated.tokenId(.COLLATE);
     if (routineKeywordContext(tokens, index) and token.matchesKeywordTag(.routine)) return generated.tokenId(.ROUTINE);
     if (sessionKeywordContext(tokens, index)) {
         if (token.matchesKeywordTag(.local)) return generated.tokenId(.LOCAL);
@@ -522,14 +578,14 @@ fn contextualKeywordSymbolId(
     {
         return generated.tokenId(.IDENT);
     }
-    if (alterTableDiagnosticIdentifierContext(tokens, index) and
-        token.matchesKeywordTag(.match) and
+    if (token.matchesKeywordTag(.match) and
+        alterTableDiagnosticIdentifierContext(index, mapping_context) and
         !alterTableForeignKeyMatchClauseContext(tokens, index))
     {
         return generated.tokenId(.IDENT);
     }
-    if (createRoutineDiagnosticIdentifierContext(tokens, index) and
-        (token.matchesKeywordTag(.current) or token.matchesKeywordTag(.from) or token.matchesKeywordTag(.rows) or token.matchesKeywordTag(.window)))
+    if ((token.matchesKeywordTag(.current) or token.matchesKeywordTag(.from) or token.matchesKeywordTag(.rows) or token.matchesKeywordTag(.window)) and
+        createRoutineDiagnosticIdentifierContext(index, mapping_context))
     {
         return generated.tokenId(.IDENT);
     }
@@ -664,15 +720,9 @@ fn copyDiagnosticIdentifierContext(tokens: []const token_mod.Token, index: usize
     return index > 0 and tokens.len > 0 and tokens[0].matchesKeywordTag(.copy);
 }
 
-fn alterTableDiagnosticIdentifierContext(tokens: []const token_mod.Token, index: usize) bool {
-    if (index < 4 or tokens.len < 4) return false;
-    if (!tokens[0].matchesKeywordTag(.alter) or !tokens[1].matchesKeywordTag(.table)) return false;
-    var cursor: usize = 2;
-    _ = consumeIfExists(tokens, &cursor, tokens.len);
-    if (cursor < tokens.len and tokens[cursor].matchesKeywordTag(.only)) cursor += 1;
-    const table = qualifiedNameRange(tokens, cursor, tokens.len) orelse return false;
-    if (index < table.end) return false;
-    return alterTableTailHasCommaBefore(tokens, table.end, index);
+fn alterTableDiagnosticIdentifierContext(index: usize, mapping_context: *const TokenMappingContext) bool {
+    const tail_start = mapping_context.alter_table_tail_start orelse return false;
+    return index >= tail_start and mapping_context.alter_table_saw_top_level_comma;
 }
 
 fn alterTableForeignKeyMatchClauseContext(tokens: []const token_mod.Token, index: usize) bool {
@@ -680,31 +730,8 @@ fn alterTableForeignKeyMatchClauseContext(tokens: []const token_mod.Token, index
         (tokens[index + 1].matchesKeywordTag(.full) or tokens[index + 1].kind == .identifier);
 }
 
-fn alterTableTailHasCommaBefore(tokens: []const token_mod.Token, start: usize, end: usize) bool {
-    var depth: usize = 0;
-    var index = start;
-    while (index < end and index < tokens.len) : (index += 1) switch (tokens[index].kind) {
-        .lparen, .lbracket => depth += 1,
-        .rparen, .rbracket => if (depth > 0) {
-            depth -= 1;
-        },
-        .comma => if (depth == 0) return true,
-        else => {},
-    };
-    return false;
-}
-
-fn createRoutineDiagnosticIdentifierContext(tokens: []const token_mod.Token, index: usize) bool {
-    if (index < 5 or tokens.len < 5 or !tokens[0].matchesKeywordTag(.create)) return false;
-    var cursor: usize = 1;
-    if (cursor + 1 < tokens.len and tokens[cursor].matchesKeywordTag(.@"or") and tokens[cursor + 1].matchesKeywordTag(.replace)) cursor += 2;
-    if (cursor >= tokens.len or
-        !(tokens[cursor].matchesKeywordTag(.function) or tokens[cursor].matchesKeywordTag(.procedure))) return false;
-    cursor += 1;
-    const routine_name = qualifiedNameRange(tokens, cursor, tokens.len) orelse return false;
-    cursor = routine_name.end;
-    if (cursor >= tokens.len or tokens[cursor].kind != .lparen) return false;
-    const close = findMatchingParen(tokens, cursor, tokens.len) orelse return false;
+fn createRoutineDiagnosticIdentifierContext(index: usize, mapping_context: *const TokenMappingContext) bool {
+    const close = mapping_context.create_routine_close orelse return false;
     return index > close;
 }
 
@@ -761,46 +788,19 @@ fn indexConcurrentlyKeywordContext(tokens: []const token_mod.Token, index: usize
 }
 
 fn indexElementCollateKeywordContext(
-    tokens: []const token_mod.Token,
     index: usize,
     token: token_mod.Token,
     previous: ?token_mod.Token,
     next: ?token_mod.Token,
+    mapping_context: *const TokenMappingContext,
 ) bool {
     if (!token.matchesKeywordTag(.collate) or previous == null or next == null or next.?.kind != .identifier) return false;
     switch (previous.?.kind) {
         .lparen, .comma, .semicolon => return false,
         else => {},
     }
-    if (tokens.len < 6 or !tokens[0].matchesKeywordTag(.create)) return false;
-    var open_index: ?usize = null;
-    var close_index: ?usize = null;
-    var depth: usize = 0;
-    for (tokens, 0..) |candidate, candidate_index| switch (candidate.kind) {
-        .lparen => {
-            if (depth == 0 and open_index == null and candidate_index > 0) open_index = candidate_index;
-            depth += 1;
-        },
-        .rparen => {
-            if (depth == 0) return false;
-            depth -= 1;
-            if (depth == 0 and open_index != null and close_index == null) {
-                close_index = candidate_index;
-                break;
-            }
-        },
-        else => {},
-    };
-    const open = open_index orelse return false;
-    const close = close_index orelse return false;
-    if (index <= open or index >= close) return false;
-    var saw_index = false;
-    var saw_on = false;
-    for (tokens[0..open]) |candidate| {
-        if (candidate.matchesKeywordTag(.index)) saw_index = true;
-        if (candidate.matchesKeywordTag(.on)) saw_on = true;
-    }
-    return saw_index and saw_on;
+    const elements = mapping_context.create_index_elements orelse return false;
+    return index > elements.start and index < elements.end;
 }
 
 fn transactionControlContext(tokens: []const token_mod.Token, index: usize) bool {
@@ -825,6 +825,7 @@ fn generatedParserTreatsKeywordAsIdentifier(
     token: token_mod.Token,
     previous: ?token_mod.Token,
     next: ?token_mod.Token,
+    mapping_context: *const TokenMappingContext,
 ) bool {
     // PostgreSQL permits every keyword as an attribute name after DOT. A
     // qualified name's first component follows ColId rules: IDENT,
@@ -833,7 +834,7 @@ fn generatedParserTreatsKeywordAsIdentifier(
     // revision rather than an ad hoc runtime exception list.
     const keyword = token.keyword orelse return false;
     const class = token_mod.keywordClass(keyword);
-    if (class == .type_function_name and typeFunctionNameContext(tokens, index, previous, next)) return true;
+    if (class == .type_function_name and typeFunctionNameContext(tokens, index, previous, next, mapping_context)) return true;
     if (previous != null and previous.?.kind == .dot) return true;
     if (next != null and next.?.kind == .dot) {
         return class == .unreserved or class == .column_name;
@@ -855,6 +856,7 @@ fn typeFunctionNameContext(
     index: usize,
     previous: ?token_mod.Token,
     next: ?token_mod.Token,
+    mapping_context: *const TokenMappingContext,
 ) bool {
     // PostgreSQL's type/function-name category is accepted as the unqualified
     // head of a function name and anywhere a type name is syntactically
@@ -862,7 +864,7 @@ fn typeFunctionNameContext(
     // would incorrectly accept constructs such as `FROM join`.
     if (next != null and next.?.kind == .lparen) return true;
     if (previous != null and previous.?.kind == .colon_colon) return true;
-    if (ddlTypeFunctionNameContext(tokens, index)) return true;
+    if (ddlTypeFunctionNameContext(tokens, index, mapping_context)) return true;
     if (previous == null or !previous.?.matchesKeywordTag(.as)) return false;
 
     var depth: usize = 0;
@@ -884,7 +886,11 @@ fn typeFunctionNameContext(
     return false;
 }
 
-fn ddlTypeFunctionNameContext(tokens: []const token_mod.Token, index: usize) bool {
+fn ddlTypeFunctionNameContext(
+    tokens: []const token_mod.Token,
+    index: usize,
+    mapping_context: *const TokenMappingContext,
+) bool {
     if (index == 0) return false;
     if (tokens.len >= 4 and tokens[0].matchesKeywordTag(.create) and tokens[1].matchesKeywordTag(.domain)) {
         return tokens[index - 1].matchesKeywordTag(.as);
@@ -895,31 +901,10 @@ fn ddlTypeFunctionNameContext(tokens: []const token_mod.Token, index: usize) boo
             (index >= 5 and tokens[index - 2].matchesKeywordTag(.column) and tokens[index - 3].matchesKeywordTag(.add));
     }
 
-    if (tokens.len < 4) return false;
-    const create_table = tokens[0].matchesKeywordTag(.create) and tokens[1].matchesKeywordTag(.table);
-    const prepare = tokens[0].matchesKeywordTag(.prepare);
-    if (!create_table and !prepare) return false;
-
-    var depth: usize = 0;
-    var segment_start: ?usize = null;
-    for (tokens[0..index], 0..) |candidate, candidate_index| switch (candidate.kind) {
-        .lparen => {
-            depth += 1;
-            if (depth == 1) segment_start = candidate_index + 1;
-        },
-        .rparen => {
-            if (depth == 0) return false;
-            depth -= 1;
-            if (depth == 0) segment_start = null;
-        },
-        .comma => if (depth == 1) {
-            segment_start = candidate_index + 1;
-        },
-        else => {},
-    };
-    if (depth != 1) return false;
-    const start = segment_start orelse return false;
-    return if (create_table)
+    if (tokens.len < 4 or (!mapping_context.create_table and !mapping_context.prepare)) return false;
+    if (!mapping_context.balanced_prefix or mapping_context.paren_depth != 1) return false;
+    const start = mapping_context.segment_start orelse return false;
+    return if (mapping_context.create_table)
         index == start + 1 and start < tokens.len and tokens[start].kind == .identifier
     else
         index == start;
@@ -982,6 +967,55 @@ fn consumeIfNotExists(tokens: []const token_mod.Token, index: *usize, end: usize
         !tokens[index.* + 1].matchesKeywordTag(.not) or !tokens[index.* + 2].matchesKeywordTag(.exists)) return false;
     index.* += 3;
     return true;
+}
+
+fn alterTableTailStart(tokens: []const token_mod.Token) ?usize {
+    if (tokens.len < 4 or !tokens[0].matchesKeywordTag(.alter) or !tokens[1].matchesKeywordTag(.table)) return null;
+    var cursor: usize = 2;
+    _ = consumeIfExists(tokens, &cursor, tokens.len);
+    if (cursor < tokens.len and tokens[cursor].matchesKeywordTag(.only)) cursor += 1;
+    const table = qualifiedNameRange(tokens, cursor, tokens.len) orelse return null;
+    return table.end;
+}
+
+fn createRoutineArgumentClose(tokens: []const token_mod.Token) ?usize {
+    if (tokens.len < 5 or !tokens[0].matchesKeywordTag(.create)) return null;
+    var cursor: usize = 1;
+    if (cursor + 1 < tokens.len and tokens[cursor].matchesKeywordTag(.@"or") and tokens[cursor + 1].matchesKeywordTag(.replace)) cursor += 2;
+    if (cursor >= tokens.len or
+        !(tokens[cursor].matchesKeywordTag(.function) or tokens[cursor].matchesKeywordTag(.procedure))) return null;
+    cursor += 1;
+    const routine_name = qualifiedNameRange(tokens, cursor, tokens.len) orelse return null;
+    cursor = routine_name.end;
+    return findMatchingParen(tokens, cursor, tokens.len);
+}
+
+fn createIndexElementRange(tokens: []const token_mod.Token) ?TokenRange {
+    if (tokens.len < 6 or !tokens[0].matchesKeywordTag(.create)) return null;
+    var open_index: ?usize = null;
+    var depth: usize = 0;
+    for (tokens, 0..) |candidate, candidate_index| switch (candidate.kind) {
+        .lparen => {
+            if (depth == 0 and open_index == null and candidate_index > 0) open_index = candidate_index;
+            depth += 1;
+        },
+        .rparen => {
+            if (depth == 0) return null;
+            depth -= 1;
+            if (depth == 0) {
+                const open = open_index orelse continue;
+                var saw_index = false;
+                var saw_on = false;
+                for (tokens[0..open]) |prefix| {
+                    if (prefix.matchesKeywordTag(.index)) saw_index = true;
+                    if (prefix.matchesKeywordTag(.on)) saw_on = true;
+                }
+                return if (saw_index and saw_on) .{ .start = open, .end = candidate_index } else null;
+            }
+        },
+        else => {},
+    };
+    return null;
 }
 
 fn qualifiedNameRange(tokens: []const token_mod.Token, start: usize, end: usize) ?TokenRange {
@@ -1104,6 +1138,7 @@ test "generated parser bridge honors PostgreSQL type function keyword contexts" 
         "SELECT CAST(payload AS binary) FROM docs",
         "SELECT public.join(id) FROM docs",
         "CREATE TABLE typed_docs (payload binary)",
+        "CREATE TABLE typed_docs (payload binary, checksum binary, label text)",
         "CREATE DOMAIN binary_payload AS binary",
         "PREPARE typed_lookup (binary) AS SELECT 1",
     };
@@ -1111,6 +1146,36 @@ test "generated parser bridge honors PostgreSQL type function keyword contexts" 
 
     // Type/function keywords are not general column identifiers (ColId).
     try std.testing.expectError(error.UnexpectedToken, parseSqlAlloc(std.testing.allocator, "SELECT * FROM join"));
+}
+
+test "generated parser bridge carries contextual DDL state in one pass" {
+    var alter_tokens = try lexer.tokenizeAlloc(
+        std.testing.allocator,
+        "ALTER TABLE docs ADD COLUMN value text, MATCH unsupported tail",
+    );
+    defer lexer.freeTokens(std.testing.allocator, &alter_tokens);
+    const alter_ids = try tokenIdsAlloc(std.testing.allocator, alter_tokens.items);
+    defer std.testing.allocator.free(alter_ids);
+    var match_index: ?usize = null;
+    for (alter_tokens.items, 0..) |token, index| {
+        if (token.matchesKeywordTag(.match)) match_index = index;
+    }
+    try std.testing.expectEqual(generated.tokenId(.IDENT), alter_ids[match_index.?]);
+
+    var routine_tokens = try lexer.tokenizeAlloc(
+        std.testing.allocator,
+        "CREATE FUNCTION f() CURRENT FROM ROWS WINDOW",
+    );
+    defer lexer.freeTokens(std.testing.allocator, &routine_tokens);
+    const routine_ids = try tokenIdsAlloc(std.testing.allocator, routine_tokens.items);
+    defer std.testing.allocator.free(routine_ids);
+    for (routine_tokens.items, routine_ids) |token, id| {
+        if (token.matchesKeywordTag(.current) or token.matchesKeywordTag(.from) or
+            token.matchesKeywordTag(.rows) or token.matchesKeywordTag(.window))
+        {
+            try std.testing.expectEqual(generated.tokenId(.IDENT), id);
+        }
+    }
 }
 
 test "generated parser bridge exposes a single pass parse result" {

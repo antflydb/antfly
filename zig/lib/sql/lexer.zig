@@ -16,6 +16,12 @@ const std = @import("std");
 
 const token_mod = @import("token.zig");
 
+// Reserve enough slots to keep ordinary statements allocation-efficient, but
+// never size a Token array directly from untrusted SQL byte length. Large
+// comments, literals, and identifiers may contain many bytes while producing
+// zero or one token.
+const eager_token_capacity_limit = 256;
+
 pub const Token = token_mod.Token;
 pub const TokenKind = token_mod.TokenKind;
 
@@ -89,7 +95,7 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
     var tokens = std.ArrayListUnmanaged(Token).empty;
     errdefer freeTokens(alloc, &tokens);
     const estimated_capacity = estimateTokenCapacity(sql);
-    if (estimated_capacity > 0) try tokens.ensureTotalCapacity(alloc, estimated_capacity);
+    if (estimated_capacity > 0) try tokens.ensureTotalCapacityPrecise(alloc, estimated_capacity);
 
     var i: usize = 0;
     while (i < sql.len) {
@@ -100,7 +106,9 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
         }
         if (ch == '-' and i + 1 < sql.len and sql[i + 1] == '-') {
             i += 2;
-            while (i < sql.len and sql[i] != '\n' and sql[i] != '\r') i += 1;
+            while (i < sql.len and sql[i] != '\n' and sql[i] != '\r') {
+                i += if (sql[i] >= 0x80) try utf8SequenceWidthAt(sql, i, diagnostic) else 1;
+            }
             continue;
         }
         if (ch == '/' and i + 1 < sql.len and sql[i + 1] == '*') {
@@ -108,6 +116,11 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
             i += 2;
             var depth: usize = 1;
             while (depth != 0) {
+                if (i >= sql.len) return lexError(diagnostic, .unterminated_block_comment, comment_start, sql.len);
+                if (sql[i] >= 0x80) {
+                    i += try utf8SequenceWidthAt(sql, i, diagnostic);
+                    continue;
+                }
                 if (i + 1 >= sql.len) return lexError(diagnostic, .unterminated_block_comment, comment_start, sql.len);
                 if (sql[i] == '/' and sql[i + 1] == '*') {
                     depth += 1;
@@ -115,9 +128,7 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
                 } else if (sql[i] == '*' and sql[i + 1] == '/') {
                     depth -= 1;
                     i += 2;
-                } else {
-                    i += 1;
-                }
+                } else i += 1;
             }
             continue;
         }
@@ -155,8 +166,14 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
                     }
                     break;
                 }
-                try out.append(alloc, sql[i]);
-                i += 1;
+                if (sql[i] >= 0x80) {
+                    const width = try utf8SequenceWidthAt(sql, i, diagnostic);
+                    try out.appendSlice(alloc, sql[i .. i + width]);
+                    i += width;
+                } else {
+                    try out.append(alloc, sql[i]);
+                    i += 1;
+                }
             }
             if (i >= sql.len) return lexError(diagnostic, .unterminated_quoted_identifier, source_start, sql.len);
             if (out.items.len == 0) return lexError(diagnostic, .empty_quoted_identifier, source_start, i + 1);
@@ -189,8 +206,14 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
                     }
                     break;
                 }
-                try out.append(alloc, sql[i]);
-                i += 1;
+                if (sql[i] >= 0x80) {
+                    const width = try utf8SequenceWidthAt(sql, i, diagnostic);
+                    try out.appendSlice(alloc, sql[i .. i + width]);
+                    i += width;
+                } else {
+                    try out.append(alloc, sql[i]);
+                    i += 1;
+                }
             }
             if (i >= sql.len) return lexError(diagnostic, .unterminated_string_literal, source_start, sql.len);
             const owned = try out.toOwnedSlice(alloc);
@@ -209,7 +232,8 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
             continue;
         }
         if (ch == '$') {
-            if (sqlDollarQuoteAt(sql, i)) |quote| {
+            if (try sqlDollarQuoteAt(sql, i, diagnostic)) |quote| {
+                try validateUtf8Range(sql, quote.body_start, quote.body_end, diagnostic);
                 if (!quote.closed) return lexError(diagnostic, .unterminated_dollar_quote, i, sql.len);
                 try tokens.append(alloc, .{
                     .kind = .string,
@@ -224,8 +248,9 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
             i += 1;
             while (i < sql.len and std.ascii.isDigit(sql[i])) i += 1;
             if (i == start + 1) return lexError(diagnostic, .invalid_placeholder, start, @min(start + 1, sql.len));
-            if (i < sql.len and (std.ascii.isAlphanumeric(sql[i]) or sql[i] == '_')) {
-                return lexError(diagnostic, .invalid_placeholder, start, i + 1);
+            if (i < sql.len and (std.ascii.isAlphanumeric(sql[i]) or sql[i] == '_' or sql[i] >= 0x80)) {
+                const end = if (sql[i] >= 0x80) i + try utf8SequenceWidthAt(sql, i, diagnostic) else i + 1;
+                return lexError(diagnostic, .invalid_placeholder, start, end);
             }
             try tokens.append(alloc, .{ .kind = .placeholder, .text = sql[start..i] });
             continue;
@@ -391,7 +416,7 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
 
 fn estimateTokenCapacity(sql: []const u8) usize {
     if (sql.len == 0) return 0;
-    return @min(sql.len, sql.len / 4 + 8);
+    return @min(eager_token_capacity_limit, @min(sql.len, sql.len / 4 + 8));
 }
 
 fn scanNumberEnd(sql: []const u8, start: usize, diagnostic: *LexDiagnostic) !usize {
@@ -429,7 +454,8 @@ fn scanNumberEnd(sql: []const u8, start: usize, diagnostic: *LexDiagnostic) !usi
         return lexError(diagnostic, .malformed_numeric_literal, start, i + 2);
     }
     if (i < sql.len and (std.ascii.isAlphabetic(sql[i]) or sql[i] == '_' or sql[i] == '$' or sql[i] >= 0x80)) {
-        return lexError(diagnostic, .malformed_numeric_literal, start, i + 1);
+        const end = if (sql[i] >= 0x80) i + try utf8SequenceWidthAt(sql, i, diagnostic) else i + 1;
+        return lexError(diagnostic, .malformed_numeric_literal, start, end);
     }
     return i;
 }
@@ -442,6 +468,13 @@ fn utf8SequenceWidthAt(sql: []const u8, index: usize, diagnostic: *LexDiagnostic
     _ = std.unicode.utf8Decode(sql[index..end]) catch
         return lexError(diagnostic, .invalid_utf8, index, end);
     return width;
+}
+
+fn validateUtf8Range(sql: []const u8, start: usize, end: usize, diagnostic: *LexDiagnostic) !void {
+    var index = start;
+    while (index < end) {
+        index += if (sql[index] >= 0x80) try utf8SequenceWidthAt(sql, index, diagnostic) else 1;
+    }
 }
 
 fn lexError(
@@ -484,7 +517,7 @@ const SqlDollarQuote = struct {
     closed: bool,
 };
 
-fn sqlDollarQuoteAt(sql: []const u8, dollar: usize) ?SqlDollarQuote {
+fn sqlDollarQuoteAt(sql: []const u8, dollar: usize, diagnostic: *LexDiagnostic) !?SqlDollarQuote {
     if (dollar + 1 >= sql.len or sql[dollar] != '$') return null;
     if (std.ascii.isDigit(sql[dollar + 1])) return null;
 
@@ -493,8 +526,16 @@ fn sqlDollarQuoteAt(sql: []const u8, dollar: usize) ?SqlDollarQuote {
         delimiter_end += 1;
     } else {
         if (!sqlDollarQuoteTagStart(sql[delimiter_end])) return null;
-        delimiter_end += 1;
-        while (delimiter_end < sql.len and sqlDollarQuoteTagContinue(sql[delimiter_end])) : (delimiter_end += 1) {}
+        delimiter_end += if (sql[delimiter_end] >= 0x80)
+            try utf8SequenceWidthAt(sql, delimiter_end, diagnostic)
+        else
+            1;
+        while (delimiter_end < sql.len and sqlDollarQuoteTagContinue(sql[delimiter_end])) {
+            delimiter_end += if (sql[delimiter_end] >= 0x80)
+                try utf8SequenceWidthAt(sql, delimiter_end, diagnostic)
+            else
+                1;
+        }
         if (delimiter_end >= sql.len or sql[delimiter_end] != '$') return null;
         delimiter_end += 1;
     }
@@ -516,11 +557,11 @@ fn sqlDollarQuoteAt(sql: []const u8, dollar: usize) ?SqlDollarQuote {
 }
 
 fn sqlDollarQuoteTagStart(ch: u8) bool {
-    return std.ascii.isAlphabetic(ch) or ch == '_';
+    return std.ascii.isAlphabetic(ch) or ch == '_' or ch >= 0x80;
 }
 
 fn sqlDollarQuoteTagContinue(ch: u8) bool {
-    return std.ascii.isAlphanumeric(ch) or ch == '_';
+    return std.ascii.isAlphanumeric(ch) or ch == '_' or ch >= 0x80;
 }
 
 fn expectLexDiagnostic(
@@ -709,17 +750,45 @@ test "sql adapter lexer accepts dollar signs inside unquoted identifiers" {
 }
 
 test "sql adapter lexer accepts validated Unicode unquoted identifiers" {
-    var tokens = try tokenizeAlloc(std.testing.allocator, "SELECT café, 日本語 FROM données");
+    var tokens = try tokenizeAlloc(std.testing.allocator, "SELECT café, \"日本語\", 'données', $étiquette$naïve$étiquette$ FROM données");
     defer freeTokens(std.testing.allocator, &tokens);
     try std.testing.expectEqualStrings("café", tokens.items[1].text);
     try std.testing.expectEqualStrings("日本語", tokens.items[3].text);
     try std.testing.expectEqualStrings("données", tokens.items[5].text);
+    try std.testing.expectEqualStrings("naïve", tokens.items[7].text);
+    try std.testing.expectEqualStrings("données", tokens.items[9].text);
     try std.testing.expectEqual(@as(?token_mod.TokenKeyword, null), tokens.items[1].keyword);
 }
 
 test "sql adapter lexer diagnoses invalid UTF-8 precisely" {
     try expectLexDiagnostic(std.testing.allocator, "SELECT \xff", .invalid_utf8, 7, 8);
     try expectLexDiagnostic(std.testing.allocator, "SELECT \xe2\x82", .invalid_utf8, 7, 9);
+    try expectLexDiagnostic(std.testing.allocator, "SELECT \"\xff\"", .invalid_utf8, 8, 9);
+    try expectLexDiagnostic(std.testing.allocator, "SELECT '\xff'", .invalid_utf8, 8, 9);
+    try expectLexDiagnostic(std.testing.allocator, "SELECT -- \xff", .invalid_utf8, 10, 11);
+    try expectLexDiagnostic(std.testing.allocator, "SELECT /* \xff */ 1", .invalid_utf8, 10, 11);
+    try expectLexDiagnostic(std.testing.allocator, "SELECT /*\xff", .invalid_utf8, 9, 10);
+    try expectLexDiagnostic(std.testing.allocator, "SELECT $$\xff$$", .invalid_utf8, 9, 10);
+    try expectLexDiagnostic(std.testing.allocator, "SELECT $$\xff", .invalid_utf8, 9, 10);
+    try expectLexDiagnostic(std.testing.allocator, "SELECT $é\xff$body$é\xff$", .invalid_utf8, 10, 11);
+}
+
+test "sql adapter lexer reports Unicode token continuations as one lexical failure" {
+    try expectLexDiagnostic(std.testing.allocator, "SELECT $1é", .invalid_placeholder, 7, 11);
+    try expectLexDiagnostic(std.testing.allocator, "SELECT 1é", .malformed_numeric_literal, 7, 10);
+}
+
+test "sql adapter lexer bounds speculative token capacity for large single-token input" {
+    const alloc = std.testing.allocator;
+    const sql = try alloc.alloc(u8, 64 * 1024);
+    defer alloc.free(sql);
+    @memset(sql, 'x');
+
+    var tokens = try tokenizeAlloc(alloc, sql);
+    defer freeTokens(alloc, &tokens);
+
+    try std.testing.expectEqual(@as(usize, 1), tokens.items.len);
+    try std.testing.expect(tokens.capacity <= eager_token_capacity_limit);
 }
 
 test "sql adapter lexer accepts nested block comments" {
