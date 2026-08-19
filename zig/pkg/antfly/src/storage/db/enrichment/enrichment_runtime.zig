@@ -3847,11 +3847,18 @@ test "isolated enrichment request error does not mark worker failed" {
 }
 
 test "chunked dense terminal failure is recorded once per parent request" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
     var failure_capture = TestFailureCapture{};
     var runtime = EnrichmentRuntime{
-        .alloc = std.testing.allocator,
+        .alloc = alloc,
         .io_impl = null,
-        .store = undefined,
+        .store = erased_store,
         .owns_store = false,
         .change_journal = undefined,
         .replay_source = undefined,
@@ -3922,11 +3929,17 @@ test "malformed chunked dense batch is isolated without failing the worker" {
     };
 
     const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
     var failure_capture = TestFailureCapture{};
     var runtime = EnrichmentRuntime{
         .alloc = alloc,
         .io_impl = null,
-        .store = undefined,
+        .store = erased_store,
         .owns_store = false,
         .change_journal = undefined,
         .replay_source = undefined,
