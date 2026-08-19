@@ -1730,11 +1730,11 @@ func (r *AntflyClusterReconciler) validateLegacyMetadataRuntimeTopology(ctx cont
 // is used both while migrating pre-record clusters and when publishing
 // steady-state health.
 func (r *AntflyClusterReconciler) validateMetadataRuntimeTopology(ctx context.Context, cluster *antflyv1.AntflyCluster, replicas int32) error {
-	return r.validateMetadataRuntimeTopologyAt(
+	return r.validateMetadataRuntimeTopologyWithClock(
 		ctx,
 		cluster,
 		replicas,
-		time.Now(),
+		time.Now,
 		metadataLeadershipObservationRetryInterval,
 		metadataLeadershipObservationGracePeriod,
 	)
@@ -1748,7 +1748,27 @@ func (r *AntflyClusterReconciler) validateMetadataRuntimeTopologyAt(
 	retryInterval time.Duration,
 	gracePeriod time.Duration,
 ) error {
+	return r.validateMetadataRuntimeTopologyWithClock(
+		ctx,
+		cluster,
+		replicas,
+		func() time.Time { return now },
+		retryInterval,
+		gracePeriod,
+	)
+}
+
+func (r *AntflyClusterReconciler) validateMetadataRuntimeTopologyWithClock(
+	ctx context.Context,
+	cluster *antflyv1.AntflyCluster,
+	replicas int32,
+	now func() time.Time,
+	retryInterval time.Duration,
+	gracePeriod time.Duration,
+) error {
+	startedAt := now()
 	err := r.validateMetadataRuntimeTopologyOnce(ctx, cluster, replicas)
+	observedAt := now()
 	key := metadataTopologyObservationKey(cluster)
 	var leadershipErr *metadataLeadershipObservationError
 	var probeErr *metadataRuntimeTopologyProbeError
@@ -1772,7 +1792,7 @@ func (r *AntflyClusterReconciler) validateMetadataRuntimeTopologyAt(
 	// Durable identity, membership, and payload failures still return immediately.
 	state := metadataTopologyObservationState{
 		uid:           cluster.UID,
-		deadline:      now.Add(grace),
+		deadline:      startedAt.Add(grace),
 		retryInterval: retry,
 	}
 	if observed, ok := r.metadataTopologyObservations.Load(key); ok {
@@ -1781,14 +1801,14 @@ func (r *AntflyClusterReconciler) validateMetadataRuntimeTopologyAt(
 			state = candidate
 			// Alternating leadership and probe failures must not restart or extend
 			// an observation window. Use the earliest applicable deadline.
-			if deadline := now.Add(grace); deadline.Before(state.deadline) {
+			if deadline := startedAt.Add(grace); deadline.Before(state.deadline) {
 				state.deadline = deadline
 			}
 			state.retryInterval = min(state.retryInterval, retry)
 		}
 	}
 	r.metadataTopologyObservations.Store(key, state)
-	remaining := state.deadline.Sub(now)
+	remaining := state.deadline.Sub(observedAt)
 	if remaining <= 0 {
 		state.expired = true
 		r.metadataTopologyObservations.Store(key, state)

@@ -544,6 +544,47 @@ func TestValidateMetadataRuntimeTopologyExpiresTransientProbeGrace(t *testing.T)
 	}
 }
 
+func TestValidateMetadataRuntimeTopologyCountsProbeDurationAgainstGrace(t *testing.T) {
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default", UID: "example-uid"},
+		Spec: antflyv1.AntflyClusterSpec{MetadataNodes: antflyv1.MetadataNodesSpec{
+			Replicas:    3,
+			MetadataAPI: antflyv1.APISpec{Port: 12377},
+		}},
+	}
+	reconciler := &AntflyClusterReconciler{HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("probe timed out")
+	})}}
+	startedAt := time.Unix(1_700_000_000, 0)
+	clockCalls := 0
+	clock := func() time.Time {
+		clockCalls++
+		if clockCalls == 1 {
+			return startedAt
+		}
+		return startedAt.Add(metadataRuntimeTopologyProbeGracePeriod)
+	}
+
+	err := reconciler.validateMetadataRuntimeTopologyWithClock(
+		context.Background(), cluster, 3, clock,
+		metadataLeadershipObservationRetryInterval, metadataLeadershipObservationGracePeriod,
+	)
+	if clockCalls != 2 {
+		t.Fatalf("topology observation clock calls = %d, want start and completion readings", clockCalls)
+	}
+	var pending *metadataTopologyObservationPendingError
+	if stderrors.As(err, &pending) {
+		t.Fatalf("probe consuming the full grace remained pending: %v", err)
+	}
+	var probeErr *metadataRuntimeTopologyProbeError
+	if !stderrors.As(err, &probeErr) {
+		t.Fatalf("error after probe consumed grace = %v, want runtime topology probe failure", err)
+	}
+	if retryAfter := reconciler.metadataTopologyObservationRequeueAfter(cluster); retryAfter != 0 {
+		t.Fatalf("expired delayed probe observation retry = %v, want none", retryAfter)
+	}
+}
+
 func TestRecordMetadataTopologyOnPVCs(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
