@@ -18,6 +18,7 @@ package sdk
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"math"
 	"slices"
@@ -38,11 +39,14 @@ type (
 	CreateEmbeddingsIndexRequest = oapi.CreateEmbeddingsIndexRequest
 	CreateGraphIndexRequest      = oapi.CreateGraphIndexRequest
 	CreateAlgebraicIndexRequest  = oapi.CreateAlgebraicIndexRequest
-	CreatedIndex                 = oapi.CreatedIndex
 	CreatedFullTextIndex         = oapi.CreatedFullTextIndex
 	CreatedEmbeddingsIndex       = oapi.CreatedEmbeddingsIndex
 	CreatedGraphIndex            = oapi.CreatedGraphIndex
 	CreatedAlgebraicIndex        = oapi.CreatedAlgebraicIndex
+	CreatedFullTextIndexType     = oapi.CreatedFullTextIndexType
+	CreatedEmbeddingsIndexType   = oapi.CreatedEmbeddingsIndexType
+	CreatedGraphIndexType        = oapi.CreatedGraphIndexType
+	CreatedAlgebraicIndexType    = oapi.CreatedAlgebraicIndexType
 	IndexStatus                  = oapi.IndexStatus
 	IndexType                    = oapi.IndexType
 
@@ -290,6 +294,127 @@ type (
 	PathWeightMode     = oapi.PathWeightMode
 )
 
+// CreatedIndex is a validated discriminated create-index response.
+// Accessors reject the wrong variant instead of decoding the same payload into
+// an unrelated generated struct.
+type CreatedIndex struct {
+	generated oapi.CreatedIndex
+}
+
+func (c *CreatedIndex) UnmarshalJSON(data []byte) error {
+	var generated oapi.CreatedIndex
+	if err := json.Unmarshal(data, &generated); err != nil {
+		return err
+	}
+	c.generated = generated
+	_, err := c.Value()
+	return err
+}
+
+func (c CreatedIndex) MarshalJSON() ([]byte, error) {
+	return json.Marshal(c.generated)
+}
+
+// Kind returns the validated response discriminator.
+func (c CreatedIndex) Kind() (IndexType, error) {
+	discriminator, err := c.generated.Discriminator()
+	if err != nil {
+		return "", fmt.Errorf("decode created index discriminator: %w", err)
+	}
+	kind := IndexType(discriminator)
+	if !kind.Valid() {
+		return "", fmt.Errorf("unknown created index discriminator %q", discriminator)
+	}
+	return kind, nil
+}
+
+// Value returns the concrete response selected by the discriminator.
+func (c CreatedIndex) Value() (any, error) {
+	kind, err := c.Kind()
+	if err != nil {
+		return nil, err
+	}
+	switch kind {
+	case IndexTypeFullText:
+		return c.AsCreatedFullTextIndex()
+	case IndexTypeEmbeddings:
+		return c.AsCreatedEmbeddingsIndex()
+	case IndexTypeGraph:
+		return c.AsCreatedGraphIndex()
+	case IndexTypeAlgebraic:
+		return c.AsCreatedAlgebraicIndex()
+	default:
+		return nil, fmt.Errorf("unknown created index discriminator %q", kind)
+	}
+}
+
+func (c CreatedIndex) AsCreatedFullTextIndex() (CreatedFullTextIndex, error) {
+	if err := c.requireKind(IndexTypeFullText); err != nil {
+		return CreatedFullTextIndex{}, err
+	}
+	value, err := c.generated.AsCreatedFullTextIndex()
+	if err != nil {
+		return CreatedFullTextIndex{}, err
+	}
+	if value.Name == "" || value.Type != CreatedFullTextIndexTypeFullText {
+		return CreatedFullTextIndex{}, fmt.Errorf("invalid full-text create-index response")
+	}
+	return value, nil
+}
+
+func (c CreatedIndex) AsCreatedEmbeddingsIndex() (CreatedEmbeddingsIndex, error) {
+	if err := c.requireKind(IndexTypeEmbeddings); err != nil {
+		return CreatedEmbeddingsIndex{}, err
+	}
+	value, err := c.generated.AsCreatedEmbeddingsIndex()
+	if err != nil {
+		return CreatedEmbeddingsIndex{}, err
+	}
+	if value.Name == "" || value.Type != CreatedEmbeddingsIndexTypeEmbeddings {
+		return CreatedEmbeddingsIndex{}, fmt.Errorf("invalid embeddings create-index response")
+	}
+	return value, nil
+}
+
+func (c CreatedIndex) AsCreatedGraphIndex() (CreatedGraphIndex, error) {
+	if err := c.requireKind(IndexTypeGraph); err != nil {
+		return CreatedGraphIndex{}, err
+	}
+	value, err := c.generated.AsCreatedGraphIndex()
+	if err != nil {
+		return CreatedGraphIndex{}, err
+	}
+	if value.Name == "" || value.Type != CreatedGraphIndexTypeGraph {
+		return CreatedGraphIndex{}, fmt.Errorf("invalid graph create-index response")
+	}
+	return value, nil
+}
+
+func (c CreatedIndex) AsCreatedAlgebraicIndex() (CreatedAlgebraicIndex, error) {
+	if err := c.requireKind(IndexTypeAlgebraic); err != nil {
+		return CreatedAlgebraicIndex{}, err
+	}
+	value, err := c.generated.AsCreatedAlgebraicIndex()
+	if err != nil {
+		return CreatedAlgebraicIndex{}, err
+	}
+	if value.Name == "" || value.Type != CreatedAlgebraicIndexTypeAlgebraic {
+		return CreatedAlgebraicIndex{}, fmt.Errorf("invalid algebraic create-index response")
+	}
+	return value, nil
+}
+
+func (c CreatedIndex) requireKind(expected IndexType) error {
+	actual, err := c.Kind()
+	if err != nil {
+		return err
+	}
+	if actual != expected {
+		return fmt.Errorf("created index is %q, not %q", actual, expected)
+	}
+	return nil
+}
+
 const (
 	QueryHitsTotalRelationExact = oapi.QueryHitsTotalRelationExact
 	QueryHitsTotalRelationGte   = oapi.QueryHitsTotalRelationGte
@@ -379,6 +504,9 @@ const (
 	IndexTypeFullText                          = oapi.IndexTypeFullText
 	IndexTypeGraph                             = oapi.IndexTypeGraph
 	IndexTypeAlgebraic                         = oapi.IndexTypeAlgebraic
+	CreatedFullTextIndexTypeFullText           = oapi.CreatedFullTextIndexTypeFullText
+	CreatedGraphIndexTypeGraph                 = oapi.CreatedGraphIndexTypeGraph
+	CreatedAlgebraicIndexTypeAlgebraic         = oapi.CreatedAlgebraicIndexTypeAlgebraic
 	CreateFullTextIndexRequestTypeFullText     = oapi.CreateFullTextIndexRequestTypeFullText
 	CreateEmbeddingsIndexRequestTypeEmbeddings = oapi.CreateEmbeddingsIndexRequestTypeEmbeddings
 	CreateGraphIndexRequestTypeGraph           = oapi.CreateGraphIndexRequestTypeGraph

@@ -11552,6 +11552,22 @@ export interface components {
         };
         /** @description Type-safe configuration for a new index. The index name is owned by the request path. */
         CreateIndexRequest: components["schemas"]["CreateFullTextIndexRequest"] | components["schemas"]["CreateEmbeddingsIndexRequest"] | components["schemas"]["CreateGraphIndexRequest"] | components["schemas"]["CreateAlgebraicIndexRequest"];
+        /** @description Credential-free normalized enrichment configuration returned after index creation. */
+        CreatedEnrichmentConfig: {
+            name: string;
+            kind: components["schemas"]["EnrichmentKind"];
+            field?: string;
+            template?: string;
+            source_artifact_name?: string;
+            expected_dims?: number;
+            chunk_size?: number;
+            chunk_overlap?: number;
+            chunker_json?: string;
+            /** @default false */
+            full_text_index?: boolean;
+            content_type?: string;
+            execution?: components["schemas"]["ExecutionPolicy"];
+        };
         /** @description Fields returned for every newly created index. Provider credentials are write-only and are never returned. */
         CreatedIndexCommon: {
             /** @description Name of the created index */
@@ -11564,7 +11580,7 @@ export interface components {
              */
             version?: number;
             /** @description Normalized inline managed enrichment definitions required by this index. */
-            enrichments?: components["schemas"]["EnrichmentConfig"][];
+            enrichments?: components["schemas"]["CreatedEnrichmentConfig"][];
         };
         /** @description Normalized effective full-text index configuration returned after creation. */
         CreatedFullTextIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["FullTextIndexConfig"] & {
@@ -11577,8 +11593,68 @@ export interface components {
              */
             type: "full_text";
         };
+        /** @description Credential-free provider configuration returned after index creation. Only non-secret provider settings are represented. */
+        CreatedProviderConfig: {
+            /** @description Configured provider discriminator. */
+            provider: string;
+            /** @description Configured provider model when applicable. */
+            model?: string;
+            models?: string[];
+            project_id?: string;
+            location?: string;
+            region?: string;
+            /** Format: uri */
+            url?: string;
+            /** Format: uri */
+            api_url?: string;
+            dimension?: number;
+            dimensions?: number;
+            input_type?: string;
+            truncate?: string;
+            strip_new_lines?: boolean;
+            batch_size?: number;
+            /** Format: float */
+            temperature?: number;
+            max_tokens?: number;
+            /** Format: float */
+            top_p?: number;
+            top_k?: number;
+            /** Format: float */
+            frequency_penalty?: number;
+            /** Format: float */
+            presence_penalty?: number;
+            timeout?: number;
+        };
+        /** @description Credential-free normalized embeddings configuration returned after creation. */
+        CreatedEmbeddingsIndexConfig: {
+            coverage_policy?: components["schemas"]["DerivedCoveragePolicy"];
+            /** @default false */
+            external?: boolean;
+            /** @default false */
+            sparse?: boolean;
+            dimension?: number;
+            field?: string;
+            embedding_name?: string;
+            source_artifact_name?: string;
+            template?: string;
+            distance_metric?: components["schemas"]["DistanceMetric"];
+            mem_only?: boolean;
+            embedder?: components["schemas"]["CreatedProviderConfig"];
+            summarizer?: components["schemas"]["CreatedProviderConfig"];
+            chunker?: components["schemas"]["ChunkerConfig"];
+            /** @default 10 */
+            top_k?: number;
+            /**
+             * Format: float
+             * @default 0
+             */
+            min_weight?: number;
+            /** @default 1024 */
+            chunk_size?: number;
+            execution?: components["schemas"]["IndexExecutionConfig"];
+        };
         /** @description Normalized effective dense or sparse embeddings index configuration returned after creation. */
-        CreatedEmbeddingsIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["EmbeddingsIndexConfig"] & {
+        CreatedEmbeddingsIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["CreatedEmbeddingsIndexConfig"] & {
             /** @enum {string} */
             type: "embeddings";
         } & {
@@ -11588,8 +11664,15 @@ export interface components {
              */
             type: "embeddings";
         };
+        /** @description Credential-free normalized graph configuration returned after creation. */
+        CreatedGraphIndexConfig: {
+            summarizer?: components["schemas"]["CreatedProviderConfig"];
+            template?: string;
+            edge_types?: components["schemas"]["EdgeTypeConfig"][];
+            max_edges_per_document?: number;
+        };
         /** @description Normalized effective graph index configuration returned after creation. */
-        CreatedGraphIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["GraphIndexConfig"] & {
+        CreatedGraphIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["CreatedGraphIndexConfig"] & {
             /** @enum {string} */
             type: "graph";
         } & {

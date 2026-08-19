@@ -129,12 +129,16 @@ from .create_user_request_metadata_type_0 import CreateUserRequestMetadataType0
 from .created_algebraic_index import CreatedAlgebraicIndex
 from .created_algebraic_index_type import CreatedAlgebraicIndexType
 from .created_embeddings_index import CreatedEmbeddingsIndex
+from .created_embeddings_index_config import CreatedEmbeddingsIndexConfig
 from .created_embeddings_index_type import CreatedEmbeddingsIndexType
+from .created_enrichment_config import CreatedEnrichmentConfig
 from .created_full_text_index import CreatedFullTextIndex
 from .created_full_text_index_type import CreatedFullTextIndexType
 from .created_graph_index import CreatedGraphIndex
+from .created_graph_index_config import CreatedGraphIndexConfig
 from .created_graph_index_type import CreatedGraphIndexType
 from .created_index_common import CreatedIndexCommon
+from .created_provider_config import CreatedProviderConfig
 from .credentials import Credentials
 from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
@@ -897,12 +901,16 @@ __all__ = (
     "CreatedAlgebraicIndex",
     "CreatedAlgebraicIndexType",
     "CreatedEmbeddingsIndex",
+    "CreatedEmbeddingsIndexConfig",
     "CreatedEmbeddingsIndexType",
+    "CreatedEnrichmentConfig",
     "CreatedFullTextIndex",
     "CreatedFullTextIndexType",
     "CreatedGraphIndex",
+    "CreatedGraphIndexConfig",
     "CreatedGraphIndexType",
     "CreatedIndexCommon",
+    "CreatedProviderConfig",
     "CreateEmbeddingsIndexRequest",
     "CreateEmbeddingsIndexRequestType",
     "CreateFullTextIndexRequest",

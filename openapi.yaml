@@ -21647,6 +21647,42 @@ components:
           embeddings: '#/components/schemas/CreateEmbeddingsIndexRequest'
           graph: '#/components/schemas/CreateGraphIndexRequest'
           algebraic: '#/components/schemas/CreateAlgebraicIndexRequest'
+    CreatedEnrichmentConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - kind
+      description: Credential-free normalized enrichment configuration returned after index creation.
+      properties:
+        name:
+          type: string
+        kind:
+          $ref: '#/components/schemas/EnrichmentKind'
+        field:
+          type: string
+        template:
+          type: string
+        source_artifact_name:
+          type: string
+        expected_dims:
+          type: integer
+          minimum: 0
+        chunk_size:
+          type: integer
+          minimum: 0
+        chunk_overlap:
+          type: integer
+          minimum: 0
+        chunker_json:
+          type: string
+        full_text_index:
+          type: boolean
+          default: false
+        content_type:
+          type: string
+        execution:
+          $ref: '#/components/schemas/ExecutionPolicy'
     CreatedIndexCommon:
       type: object
       description: Fields returned for every newly created index. Provider credentials are write-only
@@ -21668,7 +21704,7 @@ components:
         enrichments:
           type: array
           items:
-            $ref: '#/components/schemas/EnrichmentConfig'
+            $ref: '#/components/schemas/CreatedEnrichmentConfig'
           x-go-type-skip-optional-pointer: true
           description: Normalized inline managed enrichment definitions required by this index.
     CreatedFullTextIndex:
@@ -21684,12 +21720,124 @@ components:
               type: string
               enum:
                 - full_text
+    CreatedProviderConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - provider
+      description: Credential-free provider configuration returned after index creation. Only non-secret
+        provider settings are represented.
+      properties:
+        provider:
+          type: string
+          description: Configured provider discriminator.
+        model:
+          type: string
+          description: Configured provider model when applicable.
+        models:
+          type: array
+          items:
+            type: string
+        project_id:
+          type: string
+        location:
+          type: string
+        region:
+          type: string
+        url:
+          type: string
+          format: uri
+        api_url:
+          type: string
+          format: uri
+        dimension:
+          type: integer
+          minimum: 1
+        dimensions:
+          type: integer
+          minimum: 1
+        input_type:
+          type: string
+        truncate:
+          type: string
+        strip_new_lines:
+          type: boolean
+        batch_size:
+          type: integer
+          minimum: 1
+        temperature:
+          type: number
+          format: float
+        max_tokens:
+          type: integer
+          minimum: 1
+        top_p:
+          type: number
+          format: float
+        top_k:
+          type: integer
+        frequency_penalty:
+          type: number
+          format: float
+        presence_penalty:
+          type: number
+          format: float
+        timeout:
+          type: integer
+          minimum: 1
+    CreatedEmbeddingsIndexConfig:
+      type: object
+      description: Credential-free normalized embeddings configuration returned after creation.
+      properties:
+        coverage_policy:
+          $ref: '#/components/schemas/DerivedCoveragePolicy'
+        external:
+          type: boolean
+          default: false
+        sparse:
+          type: boolean
+          default: false
+        dimension:
+          type: integer
+          minimum: 1
+        field:
+          type: string
+        embedding_name:
+          type: string
+        source_artifact_name:
+          type: string
+        template:
+          type: string
+        distance_metric:
+          $ref: '#/components/schemas/DistanceMetric'
+        mem_only:
+          type: boolean
+        embedder:
+          $ref: '#/components/schemas/CreatedProviderConfig'
+        summarizer:
+          $ref: '#/components/schemas/CreatedProviderConfig'
+        chunker:
+          $ref: '#/components/schemas/ChunkerConfig'
+        top_k:
+          type: integer
+          minimum: 1
+          default: 10
+        min_weight:
+          type: number
+          format: float
+          default: 0.0
+        chunk_size:
+          type: integer
+          minimum: 64
+          default: 1024
+        execution:
+          $ref: '#/components/schemas/IndexExecutionConfig'
     CreatedEmbeddingsIndex:
       description: Normalized effective dense or sparse embeddings index configuration returned after
         creation.
       allOf:
         - $ref: '#/components/schemas/CreatedIndexCommon'
-        - $ref: '#/components/schemas/EmbeddingsIndexConfig'
+        - $ref: '#/components/schemas/CreatedEmbeddingsIndexConfig'
         - type: object
           required:
             - type
@@ -21698,11 +21846,25 @@ components:
               type: string
               enum:
                 - embeddings
+    CreatedGraphIndexConfig:
+      type: object
+      description: Credential-free normalized graph configuration returned after creation.
+      properties:
+        summarizer:
+          $ref: '#/components/schemas/CreatedProviderConfig'
+        template:
+          type: string
+        edge_types:
+          type: array
+          items:
+            $ref: '#/components/schemas/EdgeTypeConfig'
+        max_edges_per_document:
+          type: integer
     CreatedGraphIndex:
       description: Normalized effective graph index configuration returned after creation.
       allOf:
         - $ref: '#/components/schemas/CreatedIndexCommon'
-        - $ref: '#/components/schemas/GraphIndexConfig'
+        - $ref: '#/components/schemas/CreatedGraphIndexConfig'
         - type: object
           required:
             - type

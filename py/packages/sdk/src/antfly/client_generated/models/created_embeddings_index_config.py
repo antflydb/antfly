@@ -6,32 +6,24 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.created_embeddings_index_type import CreatedEmbeddingsIndexType
 from ..models.derived_coverage_policy import DerivedCoveragePolicy
 from ..models.distance_metric import DistanceMetric
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.chunker_config import ChunkerConfig
-    from ..models.created_enrichment_config import CreatedEnrichmentConfig
     from ..models.created_provider_config import CreatedProviderConfig
     from ..models.index_execution_config import IndexExecutionConfig
 
 
-T = TypeVar("T", bound="CreatedEmbeddingsIndex")
+T = TypeVar("T", bound="CreatedEmbeddingsIndexConfig")
 
 
 @_attrs_define
-class CreatedEmbeddingsIndex:
-    """Normalized effective dense or sparse embeddings index configuration returned after creation.
+class CreatedEmbeddingsIndexConfig:
+    """Credential-free normalized embeddings configuration returned after creation.
 
     Attributes:
-        name (str): Name of the created index
-        type_ (CreatedEmbeddingsIndexType):
-        description (str | Unset): Optional description of the index and its purpose
-        version (int | Unset): Version of the index implementation. Defaults to 0. Default: 0.
-        enrichments (list[CreatedEnrichmentConfig] | Unset): Normalized inline managed enrichment definitions required
-            by this index.
         coverage_policy (DerivedCoveragePolicy | Unset): How generation-scoped source outcomes determine derived-index
             completeness.
         external (bool | Unset):  Default: False.
@@ -58,11 +50,6 @@ class CreatedEmbeddingsIndex:
             namespaces with runtime effects are accepted.
     """
 
-    name: str
-    type_: CreatedEmbeddingsIndexType
-    description: str | Unset = UNSET
-    version: int | Unset = 0
-    enrichments: list[CreatedEnrichmentConfig] | Unset = UNSET
     coverage_policy: DerivedCoveragePolicy | Unset = UNSET
     external: bool | Unset = False
     sparse: bool | Unset = False
@@ -83,21 +70,6 @@ class CreatedEmbeddingsIndex:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        name = self.name
-
-        type_ = self.type_.value
-
-        description = self.description
-
-        version = self.version
-
-        enrichments: list[dict[str, Any]] | Unset = UNSET
-        if not isinstance(self.enrichments, Unset):
-            enrichments = []
-            for enrichments_item_data in self.enrichments:
-                enrichments_item = enrichments_item_data.to_dict()
-                enrichments.append(enrichments_item)
-
         coverage_policy: str | Unset = UNSET
         if not isinstance(self.coverage_policy, Unset):
             coverage_policy = self.coverage_policy.value
@@ -146,18 +118,7 @@ class CreatedEmbeddingsIndex:
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update(
-            {
-                "name": name,
-                "type": type_,
-            }
-        )
-        if description is not UNSET:
-            field_dict["description"] = description
-        if version is not UNSET:
-            field_dict["version"] = version
-        if enrichments is not UNSET:
-            field_dict["enrichments"] = enrichments
+        field_dict.update({})
         if coverage_policy is not UNSET:
             field_dict["coverage_policy"] = coverage_policy
         if external is not UNSET:
@@ -198,28 +159,10 @@ class CreatedEmbeddingsIndex:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.chunker_config import ChunkerConfig
-        from ..models.created_enrichment_config import CreatedEnrichmentConfig
         from ..models.created_provider_config import CreatedProviderConfig
         from ..models.index_execution_config import IndexExecutionConfig
 
         d = dict(src_dict)
-        name = d.pop("name")
-
-        type_ = CreatedEmbeddingsIndexType(d.pop("type"))
-
-        description = d.pop("description", UNSET)
-
-        version = d.pop("version", UNSET)
-
-        _enrichments = d.pop("enrichments", UNSET)
-        enrichments: list[CreatedEnrichmentConfig] | Unset = UNSET
-        if _enrichments is not UNSET:
-            enrichments = []
-            for enrichments_item_data in _enrichments:
-                enrichments_item = CreatedEnrichmentConfig.from_dict(enrichments_item_data)
-
-                enrichments.append(enrichments_item)
-
         _coverage_policy = d.pop("coverage_policy", UNSET)
         coverage_policy: DerivedCoveragePolicy | Unset
         if isinstance(_coverage_policy, Unset):
@@ -284,12 +227,7 @@ class CreatedEmbeddingsIndex:
         else:
             execution = IndexExecutionConfig.from_dict(_execution)
 
-        created_embeddings_index = cls(
-            name=name,
-            type_=type_,
-            description=description,
-            version=version,
-            enrichments=enrichments,
+        created_embeddings_index_config = cls(
             coverage_policy=coverage_policy,
             external=external,
             sparse=sparse,
@@ -309,8 +247,8 @@ class CreatedEmbeddingsIndex:
             execution=execution,
         )
 
-        created_embeddings_index.additional_properties = d
-        return created_embeddings_index
+        created_embeddings_index_config.additional_properties = d
+        return created_embeddings_index_config
 
     @property
     def additional_keys(self) -> list[str]:

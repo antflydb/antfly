@@ -909,7 +909,7 @@ fn appendPublicIndexConfig(
             std.mem.eql(u8, entry.key_ptr.*, coverage_policy_mod.incarnation_field)) continue;
         if (!public_index_contract.isAllowedConfigField(index_type, entry.key_ptr.*)) continue;
         if (public_index_contract.isWriteOnlyConfigField(entry.key_ptr.*)) continue;
-        if (isSensitivePublicConfigField(entry.key_ptr.*) and !isSecretReference(entry.value_ptr.*)) continue;
+        if (isSensitivePublicConfigField(entry.key_ptr.*)) continue;
         try out.append(alloc, ',');
         try appendJsonString(alloc, out, entry.key_ptr.*);
         try out.append(alloc, ':');
@@ -920,11 +920,6 @@ fn appendPublicIndexConfig(
         }
     }
     try out.append(alloc, '}');
-}
-
-fn isSecretReference(value: std.json.Value) bool {
-    if (value != .string) return false;
-    return std.mem.startsWith(u8, value.string, "${secret:") and std.mem.endsWith(u8, value.string, "}");
 }
 
 fn isSensitivePublicConfigField(field: []const u8) bool {
@@ -979,7 +974,7 @@ fn appendPublicConfigValue(
                 // so preserve the table-status invariant and omit the entire
                 // write-only document.
                 if (public_index_contract.isWriteOnlyConfigField(entry.key_ptr.*)) continue;
-                if (isSensitivePublicConfigField(entry.key_ptr.*) and !isSecretReference(entry.value_ptr.*)) continue;
+                if (isSensitivePublicConfigField(entry.key_ptr.*)) continue;
                 if (!first) try out.append(alloc, ',');
                 first = false;
                 try appendJsonString(alloc, out, entry.key_ptr.*);
@@ -3702,7 +3697,7 @@ test "public index config encoders redact nested credentials" {
     defer std.testing.allocator.free(encoded_single);
     try std.testing.expect(std.mem.indexOf(u8, encoded_single, "sk-private") == null);
     try std.testing.expect(std.mem.indexOf(u8, encoded_single, "private-token") == null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded_single, "${secret:gemini_key}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_single, "${secret:gemini_key}") == null);
 
     const created = try encodeCreatedIndexConfig(std.testing.allocator, "embed_idx", indexes_json[13 .. indexes_json.len - 1]);
     defer std.testing.allocator.free(created);
@@ -3712,7 +3707,7 @@ test "public index config encoders redact nested credentials" {
     try std.testing.expect(std.mem.indexOf(u8, created, "private-auth") == null);
     try std.testing.expect(std.mem.indexOf(u8, created, "unknown-provider-secret") == null);
     try std.testing.expect(std.mem.indexOf(u8, created, "future-private-header") == null);
-    try std.testing.expect(std.mem.indexOf(u8, created, "${secret:gemini_key}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, created, "${secret:gemini_key}") == null);
     var parsed_created = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, created, .{});
     defer parsed_created.deinit();
     const created_enrichments = parsed_created.value.object.get("enrichments") orelse return error.TestUnexpectedResult;

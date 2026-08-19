@@ -10,7 +10,7 @@ from ..models.created_full_text_index_type import CreatedFullTextIndexType
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.enrichment_config import EnrichmentConfig
+    from ..models.created_enrichment_config import CreatedEnrichmentConfig
 
 
 T = TypeVar("T", bound="CreatedFullTextIndex")
@@ -25,8 +25,8 @@ class CreatedFullTextIndex:
         type_ (CreatedFullTextIndexType):
         description (str | Unset): Optional description of the index and its purpose
         version (int | Unset): Version of the index implementation. Defaults to 0. Default: 0.
-        enrichments (list[EnrichmentConfig] | Unset): Normalized inline managed enrichment definitions required by this
-            index.
+        enrichments (list[CreatedEnrichmentConfig] | Unset): Normalized inline managed enrichment definitions required
+            by this index.
         mem_only (bool | Unset): Whether to use memory-only storage
         field (str | Unset): Document field indexed as text. Omit for the table's default full-document text index.
         artifact_name (str | Unset): Generated artifact stream indexed as text. Use with matching inline enrichments.
@@ -36,7 +36,7 @@ class CreatedFullTextIndex:
     type_: CreatedFullTextIndexType
     description: str | Unset = UNSET
     version: int | Unset = 0
-    enrichments: list[EnrichmentConfig] | Unset = UNSET
+    enrichments: list[CreatedEnrichmentConfig] | Unset = UNSET
     mem_only: bool | Unset = UNSET
     field: str | Unset = UNSET
     artifact_name: str | Unset = UNSET
@@ -89,7 +89,7 @@ class CreatedFullTextIndex:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.enrichment_config import EnrichmentConfig
+        from ..models.created_enrichment_config import CreatedEnrichmentConfig
 
         d = dict(src_dict)
         name = d.pop("name")
@@ -101,11 +101,11 @@ class CreatedFullTextIndex:
         version = d.pop("version", UNSET)
 
         _enrichments = d.pop("enrichments", UNSET)
-        enrichments: list[EnrichmentConfig] | Unset = UNSET
+        enrichments: list[CreatedEnrichmentConfig] | Unset = UNSET
         if _enrichments is not UNSET:
             enrichments = []
             for enrichments_item_data in _enrichments:
-                enrichments_item = EnrichmentConfig.from_dict(enrichments_item_data)
+                enrichments_item = CreatedEnrichmentConfig.from_dict(enrichments_item_data)
 
                 enrichments.append(enrichments_item)
 

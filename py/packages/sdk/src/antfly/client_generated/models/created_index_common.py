@@ -9,7 +9,7 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.enrichment_config import EnrichmentConfig
+    from ..models.created_enrichment_config import CreatedEnrichmentConfig
 
 
 T = TypeVar("T", bound="CreatedIndexCommon")
@@ -23,14 +23,14 @@ class CreatedIndexCommon:
         name (str): Name of the created index
         description (str | Unset): Optional description of the index and its purpose
         version (int | Unset): Version of the index implementation. Defaults to 0. Default: 0.
-        enrichments (list[EnrichmentConfig] | Unset): Normalized inline managed enrichment definitions required by this
-            index.
+        enrichments (list[CreatedEnrichmentConfig] | Unset): Normalized inline managed enrichment definitions required
+            by this index.
     """
 
     name: str
     description: str | Unset = UNSET
     version: int | Unset = 0
-    enrichments: list[EnrichmentConfig] | Unset = UNSET
+    enrichments: list[CreatedEnrichmentConfig] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -65,7 +65,7 @@ class CreatedIndexCommon:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.enrichment_config import EnrichmentConfig
+        from ..models.created_enrichment_config import CreatedEnrichmentConfig
 
         d = dict(src_dict)
         name = d.pop("name")
@@ -75,11 +75,11 @@ class CreatedIndexCommon:
         version = d.pop("version", UNSET)
 
         _enrichments = d.pop("enrichments", UNSET)
-        enrichments: list[EnrichmentConfig] | Unset = UNSET
+        enrichments: list[CreatedEnrichmentConfig] | Unset = UNSET
         if _enrichments is not UNSET:
             enrichments = []
             for enrichments_item_data in _enrichments:
-                enrichments_item = EnrichmentConfig.from_dict(enrichments_item_data)
+                enrichments_item = CreatedEnrichmentConfig.from_dict(enrichments_item_data)
 
                 enrichments.append(enrichments_item)
 

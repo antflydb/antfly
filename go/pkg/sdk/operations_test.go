@@ -205,11 +205,46 @@ func TestCreateIndexReturnsNormalizedConfigAndUsesPathIdentity(t *testing.T) {
 	if createdEmbedding.Name != "thumbnail image" || createdEmbedding.Type != CreatedEmbeddingsIndexTypeEmbeddings {
 		t.Fatalf("created = %#v", createdEmbedding)
 	}
+	if kind, err := created.Kind(); err != nil || kind != IndexTypeEmbeddings {
+		t.Fatalf("created.Kind() = %q, %v", kind, err)
+	}
+	if _, err := created.AsCreatedGraphIndex(); err == nil {
+		t.Fatal("created.AsCreatedGraphIndex unexpectedly accepted embeddings response")
+	}
 	if gotPath != "/db/v1/tables/wiki%2Fmedia/indexes/thumbnail%20image" {
 		t.Fatalf("path = %q", gotPath)
 	}
 	if strings.Contains(gotBody, `"name"`) {
 		t.Fatalf("request duplicated path identity: %s", gotBody)
+	}
+}
+
+func TestCreateIndexRejectsInvalidDiscriminatedResponse(t *testing.T) {
+	for _, body := range []string{
+		`{"name":"vectors","type":"future_index"}`,
+		`{"name":"vectors"}`,
+		`{"type":"embeddings","dimension":512}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusCreated)
+				_, _ = w.Write([]byte(body))
+			}))
+			defer server.Close()
+
+			client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+			if err != nil {
+				t.Fatalf("NewAntflyClientWithOptions: %v", err)
+			}
+			request, err := NewCreateIndexRequest(EmbeddingsIndexConfig{Dimension: 512})
+			if err != nil {
+				t.Fatalf("NewCreateIndexRequest: %v", err)
+			}
+			if _, err := client.CreateIndex(context.Background(), "docs", "vectors", *request); err == nil {
+				t.Fatalf("CreateIndex accepted invalid response %s", body)
+			}
+		})
 	}
 }
 

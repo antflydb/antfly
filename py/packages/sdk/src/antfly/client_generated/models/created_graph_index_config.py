@@ -6,29 +6,21 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.created_graph_index_type import CreatedGraphIndexType
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.created_enrichment_config import CreatedEnrichmentConfig
     from ..models.created_provider_config import CreatedProviderConfig
     from ..models.edge_type_config import EdgeTypeConfig
 
 
-T = TypeVar("T", bound="CreatedGraphIndex")
+T = TypeVar("T", bound="CreatedGraphIndexConfig")
 
 
 @_attrs_define
-class CreatedGraphIndex:
-    """Normalized effective graph index configuration returned after creation.
+class CreatedGraphIndexConfig:
+    """Credential-free normalized graph configuration returned after creation.
 
     Attributes:
-        name (str): Name of the created index
-        type_ (CreatedGraphIndexType):
-        description (str | Unset): Optional description of the index and its purpose
-        version (int | Unset): Version of the index implementation. Defaults to 0. Default: 0.
-        enrichments (list[CreatedEnrichmentConfig] | Unset): Normalized inline managed enrichment definitions required
-            by this index.
         summarizer (CreatedProviderConfig | Unset): Credential-free provider configuration returned after index
             creation. Only non-secret provider settings are represented.
         template (str | Unset):
@@ -36,11 +28,6 @@ class CreatedGraphIndex:
         max_edges_per_document (int | Unset):
     """
 
-    name: str
-    type_: CreatedGraphIndexType
-    description: str | Unset = UNSET
-    version: int | Unset = 0
-    enrichments: list[CreatedEnrichmentConfig] | Unset = UNSET
     summarizer: CreatedProviderConfig | Unset = UNSET
     template: str | Unset = UNSET
     edge_types: list[EdgeTypeConfig] | Unset = UNSET
@@ -48,21 +35,6 @@ class CreatedGraphIndex:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        name = self.name
-
-        type_ = self.type_.value
-
-        description = self.description
-
-        version = self.version
-
-        enrichments: list[dict[str, Any]] | Unset = UNSET
-        if not isinstance(self.enrichments, Unset):
-            enrichments = []
-            for enrichments_item_data in self.enrichments:
-                enrichments_item = enrichments_item_data.to_dict()
-                enrichments.append(enrichments_item)
-
         summarizer: dict[str, Any] | Unset = UNSET
         if not isinstance(self.summarizer, Unset):
             summarizer = self.summarizer.to_dict()
@@ -80,18 +52,7 @@ class CreatedGraphIndex:
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update(
-            {
-                "name": name,
-                "type": type_,
-            }
-        )
-        if description is not UNSET:
-            field_dict["description"] = description
-        if version is not UNSET:
-            field_dict["version"] = version
-        if enrichments is not UNSET:
-            field_dict["enrichments"] = enrichments
+        field_dict.update({})
         if summarizer is not UNSET:
             field_dict["summarizer"] = summarizer
         if template is not UNSET:
@@ -105,28 +66,10 @@ class CreatedGraphIndex:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.created_enrichment_config import CreatedEnrichmentConfig
         from ..models.created_provider_config import CreatedProviderConfig
         from ..models.edge_type_config import EdgeTypeConfig
 
         d = dict(src_dict)
-        name = d.pop("name")
-
-        type_ = CreatedGraphIndexType(d.pop("type"))
-
-        description = d.pop("description", UNSET)
-
-        version = d.pop("version", UNSET)
-
-        _enrichments = d.pop("enrichments", UNSET)
-        enrichments: list[CreatedEnrichmentConfig] | Unset = UNSET
-        if _enrichments is not UNSET:
-            enrichments = []
-            for enrichments_item_data in _enrichments:
-                enrichments_item = CreatedEnrichmentConfig.from_dict(enrichments_item_data)
-
-                enrichments.append(enrichments_item)
-
         _summarizer = d.pop("summarizer", UNSET)
         summarizer: CreatedProviderConfig | Unset
         if isinstance(_summarizer, Unset):
@@ -147,20 +90,15 @@ class CreatedGraphIndex:
 
         max_edges_per_document = d.pop("max_edges_per_document", UNSET)
 
-        created_graph_index = cls(
-            name=name,
-            type_=type_,
-            description=description,
-            version=version,
-            enrichments=enrichments,
+        created_graph_index_config = cls(
             summarizer=summarizer,
             template=template,
             edge_types=edge_types,
             max_edges_per_document=max_edges_per_document,
         )
 
-        created_graph_index.additional_properties = d
-        return created_graph_index
+        created_graph_index_config.additional_properties = d
+        return created_graph_index_config
 
     @property
     def additional_keys(self) -> list[str]:

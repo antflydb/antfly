@@ -343,7 +343,7 @@ pub const CreatedAlgebraicIndex = struct {
     /// Version of the index implementation. Defaults to 0.
     version: ?i64 = null,
     /// Normalized inline managed enrichment definitions required by this index.
-    enrichments: ?[]const EnrichmentConfig = null,
+    enrichments: ?[]const CreatedEnrichmentConfig = null,
     /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
     derive_from_schema: ?bool = null,
     type: []const u8,
@@ -358,41 +358,62 @@ pub const CreatedEmbeddingsIndex = struct {
     /// Version of the index implementation. Defaults to 0.
     version: ?i64 = null,
     /// Normalized inline managed enrichment definitions required by this index.
-    enrichments: ?[]const EnrichmentConfig = null,
-    /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
+    enrichments: ?[]const CreatedEnrichmentConfig = null,
     coverage_policy: ?DerivedCoveragePolicy = null,
-    /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
-    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
     sparse: ?bool = null,
-    /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
-    /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
     field: ?[]const u8 = null,
-    /// Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings.
     embedding_name: ?[]const u8 = null,
-    /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
     source_artifact_name: ?[]const u8 = null,
-    /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
-    /// Whether to use in-memory only storage (dense only)
     mem_only: ?bool = null,
-    /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
-    embedder: ?antfly_embeddings_openapi.EmbedderConfig = null,
-    /// Configuration for the summarizer plugin (dense managed indexes only)
-    summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
-    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
+    embedder: ?CreatedProviderConfig = null,
+    summarizer: ?CreatedProviderConfig = null,
     chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
-    /// Default number of results to return from search (sparse only)
     top_k: ?i64 = null,
-    /// Minimum weight threshold for sparse vector entries (sparse only)
     min_weight: ?f32 = null,
-    /// Number of documents per posting list chunk (sparse only)
     chunk_size: ?i64 = null,
-    /// Non-semantic execution policy for shorthand-created chunking or embedding producers.
     execution: ?IndexExecutionConfig = null,
     type: []const u8,
+};
+
+/// Credential-free normalized embeddings configuration returned after creation.
+pub const CreatedEmbeddingsIndexConfig = struct {
+    coverage_policy: ?DerivedCoveragePolicy = null,
+    external: ?bool = null,
+    sparse: ?bool = null,
+    dimension: ?i64 = null,
+    field: ?[]const u8 = null,
+    embedding_name: ?[]const u8 = null,
+    source_artifact_name: ?[]const u8 = null,
+    template: ?[]const u8 = null,
+    distance_metric: ?DistanceMetric = null,
+    mem_only: ?bool = null,
+    embedder: ?CreatedProviderConfig = null,
+    summarizer: ?CreatedProviderConfig = null,
+    chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
+    top_k: ?i64 = null,
+    min_weight: ?f32 = null,
+    chunk_size: ?i64 = null,
+    execution: ?IndexExecutionConfig = null,
+};
+
+/// Credential-free normalized enrichment configuration returned after index creation.
+pub const CreatedEnrichmentConfig = struct {
+    name: []const u8,
+    kind: EnrichmentKind,
+    field: ?[]const u8 = null,
+    template: ?[]const u8 = null,
+    source_artifact_name: ?[]const u8 = null,
+    expected_dims: ?i64 = null,
+    chunk_size: ?i64 = null,
+    chunk_overlap: ?i64 = null,
+    chunker_json: ?[]const u8 = null,
+    full_text_index: ?bool = null,
+    content_type: ?[]const u8 = null,
+    execution: ?ExecutionPolicy = null,
 };
 
 /// Normalized effective full-text index configuration returned after creation.
@@ -404,7 +425,7 @@ pub const CreatedFullTextIndex = struct {
     /// Version of the index implementation. Defaults to 0.
     version: ?i64 = null,
     /// Normalized inline managed enrichment definitions required by this index.
-    enrichments: ?[]const EnrichmentConfig = null,
+    enrichments: ?[]const CreatedEnrichmentConfig = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
     /// Document field indexed as text. Omit for the table's default full-document text index.
@@ -423,16 +444,20 @@ pub const CreatedGraphIndex = struct {
     /// Version of the index implementation. Defaults to 0.
     version: ?i64 = null,
     /// Normalized inline managed enrichment definitions required by this index.
-    enrichments: ?[]const EnrichmentConfig = null,
-    /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
-    summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
-    /// Handlebars template for generating summarizer input text. Uses document fields as template variables. Same pattern as EmbeddingsConfig template.
+    enrichments: ?[]const CreatedEnrichmentConfig = null,
+    summarizer: ?CreatedProviderConfig = null,
     template: ?[]const u8 = null,
-    /// List of edge types with their configurations
     edge_types: ?[]const EdgeTypeConfig = null,
-    /// Maximum number of edges per document (0 = unlimited)
     max_edges_per_document: ?i64 = null,
     type: []const u8,
+};
+
+/// Credential-free normalized graph configuration returned after creation.
+pub const CreatedGraphIndexConfig = struct {
+    summarizer: ?CreatedProviderConfig = null,
+    template: ?[]const u8 = null,
+    edge_types: ?[]const EdgeTypeConfig = null,
+    max_edges_per_document: ?i64 = null,
 };
 
 /// Discriminated normalized configuration returned after an index is created.
@@ -488,7 +513,34 @@ pub const CreatedIndexCommon = struct {
     /// Version of the index implementation. Defaults to 0.
     version: ?i64 = null,
     /// Normalized inline managed enrichment definitions required by this index.
-    enrichments: ?[]const EnrichmentConfig = null,
+    enrichments: ?[]const CreatedEnrichmentConfig = null,
+};
+
+/// Credential-free provider configuration returned after index creation. Only non-secret provider settings are represented.
+pub const CreatedProviderConfig = struct {
+    /// Configured provider discriminator.
+    provider: []const u8,
+    /// Configured provider model when applicable.
+    model: ?[]const u8 = null,
+    models: ?[]const []const u8 = null,
+    project_id: ?[]const u8 = null,
+    location: ?[]const u8 = null,
+    region: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    api_url: ?[]const u8 = null,
+    dimension: ?i64 = null,
+    dimensions: ?i64 = null,
+    input_type: ?[]const u8 = null,
+    truncate: ?[]const u8 = null,
+    strip_new_lines: ?bool = null,
+    batch_size: ?i64 = null,
+    temperature: ?f32 = null,
+    max_tokens: ?i64 = null,
+    top_p: ?f32 = null,
+    top_k: ?i64 = null,
+    frequency_penalty: ?f32 = null,
+    presence_penalty: ?f32 = null,
+    timeout: ?i64 = null,
 };
 
 /// A structured reason why the coverage projection cannot be treated as globally complete.
