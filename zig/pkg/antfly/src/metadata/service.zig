@@ -2472,6 +2472,14 @@ pub const MetadataService = struct {
         };
     }
 
+    pub fn runtimeTopology(self: *MetadataService) !metadata_api.MetadataRuntimeTopology {
+        return metadataRuntimeTopology(
+            self.metadata_group_id,
+            try self.metadataIncarnation(),
+            serviceGroupRaftTopologyObservation(self, self.metadata_group_id),
+        );
+    }
+
     pub fn status(self: *MetadataService) !MetadataStatus {
         var current_status = try snapshotStatus(self.alloc, self.metadata_group_id, self, self.metrics());
         current_status.metadata_epoch = self.lifecycle_signal.currentEpoch();
@@ -4416,6 +4424,14 @@ pub const MetadataHttpService = struct {
             .metadata_incarnation = self.metadataIncarnation() catch null,
             .metadata_epoch = projectedProvisioningFingerprint(self.alloc, self) catch self.lifecycle_signal.currentEpoch(),
         };
+    }
+
+    pub fn runtimeTopology(self: *MetadataHttpService) !metadata_api.MetadataRuntimeTopology {
+        return metadataRuntimeTopology(
+            self.metadata_group_id,
+            try self.metadataIncarnation(),
+            serviceGroupRaftTopologyObservation(self, self.metadata_group_id),
+        );
     }
 
     fn fallbackStatus(self: *MetadataHttpService) MetadataStatus {
@@ -6989,6 +7005,25 @@ fn applyMetadataRaftTopology(status: *MetadataStatus, observation: ServiceGroupR
     status.metadata_raft_votes_granted = observation.votes_granted;
     status.metadata_raft_votes_rejected = observation.votes_rejected;
     status.metadata_raft_votes_unknown = observation.votes_unknown;
+}
+
+fn metadataRuntimeTopology(
+    metadata_group_id: u64,
+    metadata_incarnation: ?metadata_api.MetadataClusterIncarnation,
+    observation: ServiceGroupRaftObservation,
+) metadata_api.MetadataRuntimeTopology {
+    return .{
+        .metadata_group_id = metadata_group_id,
+        .metadata_incarnation = metadata_incarnation,
+        .metadata_raft_local_node_id = observation.local_node_id,
+        .metadata_raft_role = observation.role,
+        .metadata_raft_leader_id = observation.leader_id,
+        .metadata_raft_term = observation.term,
+        .metadata_raft_local_voter = observation.local_voter,
+        .metadata_raft_voter_count = observation.voter_count,
+        .metadata_raft_voter_set_fingerprint = observation.voter_set_fingerprint,
+        .metadata_raft_joint_consensus = observation.joint_consensus,
+    };
 }
 
 fn raftObservationFromStatus(

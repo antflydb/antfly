@@ -137,6 +137,22 @@ pub const MetadataHead = struct {
     metadata_epoch: u64 = 0,
 };
 
+/// Compact, constant-size runtime topology consumed by safety monitors.
+/// Keep this separate from MetadataStatus so frequent topology probes never
+/// walk or clone the projected catalog.
+pub const MetadataRuntimeTopology = struct {
+    metadata_group_id: u64,
+    metadata_incarnation: ?MetadataClusterIncarnation = null,
+    metadata_raft_local_node_id: u64 = 0,
+    metadata_raft_role: []const u8 = "absent",
+    metadata_raft_leader_id: ?u64 = null,
+    metadata_raft_term: u64 = 0,
+    metadata_raft_local_voter: bool = false,
+    metadata_raft_voter_count: usize = 0,
+    metadata_raft_voter_set_fingerprint: ?MetadataRaftVoterSetFingerprint = null,
+    metadata_raft_joint_consensus: bool = false,
+};
+
 pub const ReplicationSourceActionHint = struct {
     table_id: u64,
     table_name: []u8,

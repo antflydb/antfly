@@ -169,6 +169,12 @@ func TestValidateMetadataReplicaTopology(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "metadata PVC metadata-storage-example-metadata-0: 1, attempted: 3") {
 		t.Fatalf("expected retained PVC topology to reject same-name recreation at a new count, got: %v", err)
 	}
+	staleCacheReconciler := newReconciler()
+	staleCacheReconciler.BoundaryReader = fake.NewClientBuilder().WithScheme(scheme).WithObjects(annotatedPVC).Build()
+	err = staleCacheReconciler.validateMetadataReplicaTopology(context.Background(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "metadata PVC metadata-storage-example-metadata-0: 1, attempted: 3") {
+		t.Fatalf("expected uncached topology boundary to reject a retained PVC hidden from the controller cache, got: %v", err)
+	}
 
 	incompletePVC := pvc(0, "3")
 	cluster = newCluster(3, 0)
@@ -286,7 +292,7 @@ func TestValidateMetadataReplicaTopology(t *testing.T) {
 		"example-metadata-0.example-metadata.default.svc.cluster.local": `{`,
 	})
 	err = malformedReconciler.validateMetadataReplicaTopology(context.Background(), cluster)
-	if err == nil || !strings.Contains(err.Error(), "decode metadata status") {
+	if err == nil || !strings.Contains(err.Error(), "decode metadata topology") {
 		t.Fatalf("expected malformed legacy member status to fail closed, got: %v", err)
 	}
 
@@ -374,6 +380,47 @@ func TestValidateMetadataRuntimeTopologyCarriesElectionObservationAcrossReconcil
 		if count != 4 {
 			t.Fatalf("metadata member %s request count = %d, want 4 observations", host, count)
 		}
+	}
+}
+
+func TestFetchMetadataRuntimeTopologyUsesCompactEndpointWithLegacyFallback(t *testing.T) {
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
+		Spec: antflyv1.AntflyClusterSpec{MetadataNodes: antflyv1.MetadataNodesSpec{
+			MetadataAPI: antflyv1.APISpec{Port: 12377},
+		}},
+	}
+	body := `{"metadata_group_id":1,"metadata_incarnation":"33333333333333333333333333333333","metadata_raft_local_node_id":1}`
+
+	var compactPaths []string
+	compact := &AntflyClusterReconciler{HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		compactPaths = append(compactPaths, req.URL.Path)
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}}
+	status, err := compact.fetchMetadataRuntimeTopology(context.Background(), cluster, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.MetadataGroupID != 1 {
+		t.Fatalf("metadata group = %d, want 1", status.MetadataGroupID)
+	}
+	if len(compactPaths) != 1 || compactPaths[0] != metadataRuntimeTopologyPath {
+		t.Fatalf("steady-state topology request paths = %v, want only compact endpoint", compactPaths)
+	}
+
+	var legacyPaths []string
+	legacy := &AntflyClusterReconciler{HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		legacyPaths = append(legacyPaths, req.URL.Path)
+		if req.URL.Path == metadataRuntimeTopologyPath {
+			return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader("not found")), Header: make(http.Header)}, nil
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}}
+	if _, err := legacy.fetchMetadataRuntimeTopology(context.Background(), cluster, 0); err != nil {
+		t.Fatal(err)
+	}
+	if len(legacyPaths) != 2 || legacyPaths[0] != metadataRuntimeTopologyPath || legacyPaths[1] != metadataRuntimeStatusPath {
+		t.Fatalf("legacy topology request paths = %v, want compact endpoint followed by status", legacyPaths)
 	}
 }
 

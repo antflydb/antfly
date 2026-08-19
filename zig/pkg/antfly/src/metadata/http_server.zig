@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const httpx = @import("httpx");
 const group_ids = @import("../common/group_ids.zig");
 const metadata_api = @import("api.zig");
@@ -73,6 +74,7 @@ pub const AdminSource = struct {
 
     pub const VTable = struct {
         head: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataHead = null,
+        runtime_topology: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataRuntimeTopology = null,
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
         validate_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) anyerror!bool = null,
@@ -128,6 +130,11 @@ pub const AdminSource = struct {
 
     pub fn status(self: AdminSource) !metadata_api.MetadataStatus {
         return try self.vtable.status(self.ptr);
+    }
+
+    pub fn runtimeTopology(self: AdminSource) !metadata_api.MetadataRuntimeTopology {
+        const topology_fn = self.vtable.runtime_topology orelse return error.UnsupportedOperation;
+        return try topology_fn(self.ptr);
     }
 
     pub fn adminSnapshot(self: AdminSource) !metadata_api.AdminSnapshot {
@@ -307,6 +314,7 @@ pub const AdminSource = struct {
             .ptr = svc,
             .vtable = &.{
                 .head = metadataServiceHead,
+                .runtime_topology = metadataServiceRuntimeTopology,
                 .status = metadataServiceStatus,
                 .admin_snapshot = metadataServiceAdminSnapshot,
                 .validate_publication = metadataServiceValidatePublication,
@@ -349,6 +357,7 @@ pub const AdminSource = struct {
             .ptr = svc,
             .vtable = &.{
                 .head = metadataHttpServiceHead,
+                .runtime_topology = metadataHttpServiceRuntimeTopology,
                 .status = metadataHttpServiceStatus,
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
                 .validate_publication = metadataHttpServiceValidatePublication,
@@ -394,6 +403,11 @@ pub const AdminSource = struct {
     fn metadataServiceStatus(ptr: *anyopaque) !metadata_api.MetadataStatus {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         return try svc.status();
+    }
+
+    fn metadataServiceRuntimeTopology(ptr: *anyopaque) !metadata_api.MetadataRuntimeTopology {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        return try svc.runtimeTopology();
     }
 
     fn metadataServiceAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
@@ -741,6 +755,11 @@ pub const AdminSource = struct {
         return svc.head();
     }
 
+    fn metadataHttpServiceRuntimeTopology(ptr: *anyopaque) !metadata_api.MetadataRuntimeTopology {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return try svc.runtimeTopology();
+    }
+
     fn metadataHttpServiceAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         return try svc.adminSnapshot();
@@ -1079,6 +1098,7 @@ pub const MetadataHttpServer = struct {
     pub fn registerRoutes(self: *MetadataHttpServer, server: *httpx.Server) !void {
         try server.get(routes.Routes.health, httpx.Handler.bind(self, metadataHealth));
         try server.get(routes.Routes.head, httpx.Handler.bind(self, metadataHead));
+        try server.get(routes.Routes.runtime_topology, httpx.Handler.bind(self, metadataRuntimeTopology));
         try server.get(routes.Routes.status, httpx.Handler.bind(self, metadataStatus));
         try server.get(routes.Routes.admin_snapshot, httpx.Handler.bind(self, metadataSnapshot));
         try server.get(routes.Routes.active_transitions, httpx.Handler.bind(self, metadataActiveTransitions));
@@ -1234,6 +1254,11 @@ pub const MetadataHttpServer = struct {
 
     fn metadataHead(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const result = self.readOperations().head(requestContext(ctx)) catch |err| return metadataReadError(ctx, err);
+        return self.trackedJson(ctx, result);
+    }
+
+    fn metadataRuntimeTopology(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const result = self.source.runtimeTopology() catch |err| return metadataReadError(ctx, err);
         return self.trackedJson(ctx, result);
     }
 
@@ -2988,6 +3013,7 @@ test "metadata http server serves status and filtered admin routes" {
                 .ptr = undefined,
                 .vtable = &.{
                     .head = head,
+                    .runtime_topology = runtimeTopology,
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .validate_publication = validatePublication,
@@ -2999,6 +3025,20 @@ test "metadata http server serves status and filtered admin routes" {
 
         fn head(_: *anyopaque) !metadata_api.MetadataHead {
             return .{ .metadata_group_id = 77, .metadata_incarnation = incarnation, .metadata_epoch = 5 };
+        }
+
+        fn runtimeTopology(_: *anyopaque) !metadata_api.MetadataRuntimeTopology {
+            return .{
+                .metadata_group_id = 77,
+                .metadata_incarnation = incarnation,
+                .metadata_raft_local_node_id = 2,
+                .metadata_raft_role = "follower",
+                .metadata_raft_leader_id = 1,
+                .metadata_raft_term = 9,
+                .metadata_raft_local_voter = true,
+                .metadata_raft_voter_count = 3,
+                .metadata_raft_voter_set_fingerprint = voter_set_fingerprint,
+            };
         }
 
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
@@ -3111,6 +3151,16 @@ test "metadata http server serves status and filtered admin routes" {
 
     var source = FakeSource{};
     var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+
+    var topology_resp = try server.executeTypedHandlerForTest(.GET, routes.Routes.runtime_topology, &.{}, MetadataHttpServer.metadataRuntimeTopology);
+    defer topology_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 200), topology_resp.status.code);
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"metadata_group_id\":77,\"metadata_raft_local_node_id\":2,\"metadata_raft_role\":\"follower\",\"metadata_raft_leader_id\":1,\"metadata_raft_term\":9,\"metadata_raft_local_voter\":true,\"metadata_raft_voter_count\":3}",
+        topology_resp.body.?,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, topology_resp.body.?, "\"projected_tables\"") == null);
 
     var status_resp = try server.executeTypedHandlerForTest(.GET, routes.Routes.status, &.{}, MetadataHttpServer.metadataStatus);
     defer status_resp.deinit();

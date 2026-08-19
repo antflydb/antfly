@@ -1499,6 +1499,10 @@ func (r *AntflyClusterReconciler) validateMetadataReplicaTopology(ctx context.Co
 	}
 
 	desiredReplicas := effectiveMetadataNodeReplicas(cluster)
+	// Retained storage is a safety boundary: a stale cache miss could otherwise
+	// approve and create a new StatefulSet before an incompatible retained claim
+	// becomes visible. Production wires BoundaryReader to the uncached API reader.
+	topologyReader := r.haBoundaryReader()
 	type topologyRecord struct {
 		source   string
 		replicas int32
@@ -1512,7 +1516,7 @@ func (r *AntflyClusterReconciler) validateMetadataReplicaTopology(ctx context.Co
 	}
 
 	metadataStatefulSet := &appsv1.StatefulSet{}
-	err := r.Get(ctx, types.NamespacedName{
+	err := topologyReader.Get(ctx, types.NamespacedName{
 		Name:      cluster.Name + "-metadata",
 		Namespace: cluster.Namespace,
 	}, metadataStatefulSet)
@@ -1532,7 +1536,7 @@ func (r *AntflyClusterReconciler) validateMetadataReplicaTopology(ctx context.Co
 
 	pvcPrefix := metadataPVCPrefix(cluster)
 	var pvcList corev1.PersistentVolumeClaimList
-	if err := r.List(ctx, &pvcList, client.InNamespace(cluster.Namespace)); err != nil {
+	if err := topologyReader.List(ctx, &pvcList, client.InNamespace(cluster.Namespace)); err != nil {
 		return fmt.Errorf("list metadata PVCs for topology validation: %w", err)
 	}
 	metadataPVCsExist := false
@@ -1641,7 +1645,11 @@ type metadataRuntimeTopologyStatus struct {
 	MetadataRaftJointConsensus      *bool   `json:"metadata_raft_joint_consensus"`
 }
 
-const maxMetadataRuntimeStatusBytes = 64 * 1024
+const (
+	maxMetadataRuntimeStatusBytes = 64 * 1024
+	metadataRuntimeTopologyPath   = "/metadata/v1/runtime-topology"
+	metadataRuntimeStatusPath     = "/metadata/v1/status"
+)
 
 var errMetadataRuntimeMembershipStatusUnavailable = stderrors.New("metadata runtime does not expose exact Raft membership status")
 
@@ -1933,45 +1941,59 @@ func (r *AntflyClusterReconciler) validateMetadataRuntimeTopologyOnce(ctx contex
 }
 
 func (r *AntflyClusterReconciler) fetchMetadataRuntimeTopology(ctx context.Context, cluster *antflyv1.AntflyCluster, ordinal int32) (*metadataRuntimeTopologyStatus, error) {
-	url := fmt.Sprintf("http://%s-metadata-%d.%s-metadata.%s.svc.cluster.local:%d/metadata/v1/status",
-		cluster.Name, ordinal, cluster.Name, cluster.Namespace, cluster.Spec.MetadataNodes.MetadataAPI.Port)
 	probeCtx, cancel := context.WithTimeout(ctx, metadataRuntimeTopologyProbeTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create metadata status request: %w", err)
-	}
-	resp, err := r.httpClient().Do(req) //nolint:gosec // URL is a deterministic cluster-internal pod address.
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, fmt.Errorf("request metadata status: %w", err)
+
+	// New runtimes expose an O(1) topology payload. Fall back once to the
+	// historical aggregate status route only while rolling an older runtime;
+	// steady-state monitoring must not clone the projected catalog.
+	paths := [...]string{metadataRuntimeTopologyPath, metadataRuntimeStatusPath}
+	for pathIndex, requestPath := range paths {
+		url := fmt.Sprintf("http://%s-metadata-%d.%s-metadata.%s.svc.cluster.local:%d%s",
+			cluster.Name, ordinal, cluster.Name, cluster.Namespace, cluster.Spec.MetadataNodes.MetadataAPI.Port, requestPath)
+		req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("create metadata topology request: %w", err)
 		}
-		return nil, &metadataRuntimeTopologyProbeError{cause: fmt.Errorf("request metadata status: %w", err)}
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		err := fmt.Errorf("metadata status returned HTTP %d", resp.StatusCode)
-		if resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= http.StatusInternalServerError {
-			return nil, &metadataRuntimeTopologyProbeError{cause: err}
+		resp, err := r.httpClient().Do(req) //nolint:gosec // URL is a deterministic cluster-internal pod address.
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("request metadata topology: %w", err)
+			}
+			return nil, &metadataRuntimeTopologyProbeError{cause: fmt.Errorf("request metadata topology: %w", err)}
 		}
-		return nil, err
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxMetadataRuntimeStatusBytes+1))
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, fmt.Errorf("read metadata status: %w", err)
+		if pathIndex == 0 && resp.StatusCode == http.StatusNotFound {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			continue
 		}
-		return nil, &metadataRuntimeTopologyProbeError{cause: fmt.Errorf("read metadata status: %w", err)}
+		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			err := fmt.Errorf("metadata topology returned HTTP %d", resp.StatusCode)
+			if resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= http.StatusInternalServerError {
+				return nil, &metadataRuntimeTopologyProbeError{cause: err}
+			}
+			return nil, err
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxMetadataRuntimeStatusBytes+1))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("read metadata topology: %w", readErr)
+			}
+			return nil, &metadataRuntimeTopologyProbeError{cause: fmt.Errorf("read metadata topology: %w", readErr)}
+		}
+		if len(body) > maxMetadataRuntimeStatusBytes {
+			return nil, fmt.Errorf("metadata topology exceeds %d bytes", maxMetadataRuntimeStatusBytes)
+		}
+		var status metadataRuntimeTopologyStatus
+		if err := json.Unmarshal(body, &status); err != nil {
+			return nil, fmt.Errorf("decode metadata topology: %w", err)
+		}
+		return &status, nil
 	}
-	if len(body) > maxMetadataRuntimeStatusBytes {
-		return nil, fmt.Errorf("metadata status exceeds %d bytes", maxMetadataRuntimeStatusBytes)
-	}
-	var status metadataRuntimeTopologyStatus
-	if err := json.Unmarshal(body, &status); err != nil {
-		return nil, fmt.Errorf("decode metadata status: %w", err)
-	}
-	return &status, nil
+	return nil, fmt.Errorf("metadata runtime topology route is unavailable")
 }
 
 func validMetadataIncarnation(value string) bool {
@@ -4266,7 +4288,7 @@ exec /antfly metadata --id $ID --config /config/config.json \
 
 func (r *AntflyClusterReconciler) recordMetadataTopologyOnPVCs(ctx context.Context, cluster *antflyv1.AntflyCluster, replicas int32) error {
 	var pvcList corev1.PersistentVolumeClaimList
-	if err := r.List(ctx, &pvcList, client.InNamespace(cluster.Namespace)); err != nil {
+	if err := r.haBoundaryReader().List(ctx, &pvcList, client.InNamespace(cluster.Namespace)); err != nil {
 		return fmt.Errorf("list metadata PVCs for topology recording: %w", err)
 	}
 
