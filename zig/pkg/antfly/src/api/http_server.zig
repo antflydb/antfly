@@ -2652,6 +2652,14 @@ pub const ApiHttpServer = struct {
         // primary-local. Their mutating routes are rejected in continuous HA,
         // and their cleanup/resume loop must remain frozen for the same reason.
         if (!self.mutationBackgroundExecutionPermitted()) return;
+        // Queue insertion is durable in server memory even when the bounded
+        // executor temporarily rejects the worker submission. The periodic
+        // supervisor is the independent wake source that makes such an
+        // obligation self-healing without retaining a sleeping worker solely
+        // to retry admission.
+        self.ensurePendingIndexInstallationWorker() catch |err| {
+            std.log.warn("failed to resume pending index installation reconciliation err={s}", .{@errorName(err)});
+        };
         self.retryPendingTransactionRecovery(32) catch |err| {
             std.log.warn("failed to advance stable transaction recovery err={s}", .{@errorName(err)});
         };
@@ -8821,6 +8829,25 @@ pub const ApiHttpServer = struct {
         if (existing == null and !enqueue_if_absent) return false;
 
         const alloc = std.heap.page_allocator;
+        const generation = self.index_installation_next_generation;
+        self.index_installation_next_generation +%= 1;
+        if (self.index_installation_next_generation == 0) self.index_installation_next_generation = 1;
+        if (existing) |pending| {
+            if (index_json == null) {
+                // The post-commit delete fence must not allocate: retain the
+                // key storage already owned by the queue and replace only the
+                // operation payload/generation. This guarantees an older
+                // snapshotted create is superseded even under memory pressure.
+                if (pending.index_json) |value| alloc.free(value);
+                pending.index_json = null;
+                pending.generation = generation;
+                pending.failures = 0;
+                pending.retry_after_ns = 0;
+                try self.ensureIndexInstallationWorkerLocked(runtime);
+                return true;
+            }
+        }
+
         const owned_table_name = try alloc.dupe(u8, table_name);
         var ownership_transferred = false;
         defer if (!ownership_transferred) alloc.free(owned_table_name);
@@ -8831,9 +8858,6 @@ pub const ApiHttpServer = struct {
             if (owned_index_json) |value| alloc.free(value);
         };
 
-        const generation = self.index_installation_next_generation;
-        self.index_installation_next_generation +%= 1;
-        if (self.index_installation_next_generation == 0) self.index_installation_next_generation = 1;
         if (existing) |pending| {
             pending.deinit();
             pending.* = .{
@@ -8873,6 +8897,17 @@ pub const ApiHttpServer = struct {
             .run = IndexInstallationWorker.run,
             .deinit = IndexInstallationWorker.deinit,
         }) catch |err| return err;
+    }
+
+    fn ensurePendingIndexInstallationWorker(self: *ApiHttpServer) !void {
+        const runtime = self.cfg.backend_runtime orelse return;
+        if (runtime.threaded_jobs == null or self.index_installation_owner_id == 0) return;
+        if (self.index_installation_closing.load(.acquire)) return;
+        platform_sync.lockYielding(&self.index_installation_mutex);
+        defer self.index_installation_mutex.unlock();
+        if (self.index_installation_queue.items.len == 0 or
+            self.index_installation_closing.load(.acquire)) return;
+        try self.ensureIndexInstallationWorkerLocked(runtime);
     }
 
     fn runIndexInstallationReconciler(self: *ApiHttpServer) void {
@@ -9176,6 +9211,14 @@ pub const ApiHttpServer = struct {
         try ensureTableOperationActive(request);
         const table_before = (self.loadOwnedTableRecord(alloc, table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
         defer metadata_table_manager.freeTable(alloc, table_before);
+        // Validate existence and reserve the exact post-delete projection
+        // before the irreversible consensus boundary. No response after a
+        // committed delete may depend on a fresh allocation or a projection
+        // wait that can manufacture an ambiguous failure.
+        const expected_indexes_json = (indexes_api.removeIndexFromTableIndexesJson(alloc, table_before.indexes_json, index_name) catch return error.InternalFailure) orelse {
+            return error.NotFound;
+        };
+        defer alloc.free(expected_indexes_json);
         try ensureTableOperationActive(request);
         self.source.dropIndex(alloc, table_name, index_name) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
@@ -9189,16 +9232,10 @@ pub const ApiHttpServer = struct {
                 return error.InternalFailure;
             },
         };
-        const expected_indexes_json = (indexes_api.removeIndexFromTableIndexesJson(alloc, table_before.indexes_json, index_name) catch return error.InternalFailure) orelse {
-            return error.NotFound;
-        };
-        defer alloc.free(expected_indexes_json);
-        self.waitForMetadataProjection(table_name, null, expected_indexes_json) catch |err| {
-            if (metadata_authority.isRetryableError(err)) return error.NotLeader;
-            std.log.err("public delete index metadata projection wait failed table={s} index={s} err={}", .{ table_name, index_name, err });
-            return error.InternalFailure;
-        };
         if (self.table_writes) |table_writes_source| {
+            // Fence an older create immediately after the catalog commit. A
+            // lagging projection is reconciler input, never an HTTP response
+            // dependency after the commit boundary.
             const superseded_existing_installation = self.scheduleIndexInstallationReconcile(table_name, index_name, null, false) catch |err| superseded: {
                 std.log.warn("public delete index could not supersede prior fallback generation table={s} index={s} err={}", .{ table_name, index_name, err });
                 break :superseded false;
@@ -28466,6 +28503,7 @@ test "api http server create index installs exact visible config and defers lagg
         pending_indexes_json: ?[]u8 = null,
         project_create: bool = true,
         mutex: std.atomic.Mutex = .unlocked,
+        projection_wait_calls: std.atomic.Value(usize) = .init(0),
 
         fn iface(self: *@This()) StatusSource {
             return .{
@@ -28477,6 +28515,7 @@ test "api http server create index installs exact visible config and defers lagg
                     .free_admin_snapshot = freeAdminSnapshot,
                     .create_index = createIndex,
                     .drop_index = dropIndex,
+                    .wait_table_projection = waitTableProjection,
                 },
             };
         }
@@ -28566,6 +28605,12 @@ test "api http server create index installs exact visible config and defers lagg
             const pending = self.pending_indexes_json orelse return;
             self.pending_indexes_json = null;
             self.replaceIndexesJson(std.testing.allocator, pending, true);
+        }
+
+        fn waitTableProjection(ptr: *anyopaque, _: []const u8, _: ?[]const u8, _: ?[]const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.projection_wait_calls.fetchAdd(1, .monotonic);
+            return error.TestProjectionUnavailable;
         }
     };
 
@@ -28702,6 +28747,7 @@ test "api http server create index installs exact visible config and defers lagg
         drop_calls: std.atomic.Value(usize) = .init(0),
         transient_failures: std.atomic.Value(usize) = .init(12),
         block_creates: std.atomic.Value(bool) = .init(false),
+        block_drops: std.atomic.Value(bool) = .init(false),
         installed: std.atomic.Value(bool) = .init(false),
 
         fn iface(self: *@This()) table_writes.TableWriteSource {
@@ -28734,8 +28780,50 @@ test "api http server create index installs exact visible config and defers lagg
         fn dropIndex(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!?void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             _ = self.drop_calls.fetchAdd(1, .monotonic);
+            if (self.block_drops.load(.acquire)) return error.ResourceBudgetExceeded;
             self.installed.store(false, .release);
             return {};
+        }
+    };
+
+    const FlakyDurableLane = struct {
+        delegate: db_mod.background_runtime.DurableJobLane,
+        fail_owner_id: u64,
+        failures_remaining: std.atomic.Value(usize) = .init(1),
+
+        fn iface(self: *@This()) db_mod.background_runtime.DurableJobLane {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .submit = submit,
+                    .drain_owner = drainOwner,
+                    .close_owner = closeOwner,
+                    .poll = poll,
+                },
+            };
+        }
+
+        fn submit(ptr: *anyopaque, job: db_mod.background_runtime.Job) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (job.owner_id == self.fail_owner_id and self.failures_remaining.swap(0, .acq_rel) != 0) {
+                return error.ResourceBudgetExceeded;
+            }
+            try self.delegate.submit(job);
+        }
+
+        fn drainOwner(ptr: *anyopaque, owner_id: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.delegate.drainOwner(owner_id);
+        }
+
+        fn closeOwner(ptr: *anyopaque, owner_id: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.delegate.closeOwner(owner_id);
+        }
+
+        fn poll(ptr: *anyopaque, max_jobs: usize) anyerror!usize {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.delegate.poll(max_jobs);
         }
     };
 
@@ -28797,10 +28885,90 @@ test "api http server create index installs exact visible config and defers lagg
     });
     defer delete_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), delete_resp.status);
+    try std.testing.expectEqual(@as(usize, 0), unprojected_source.projection_wait_calls.load(.acquire));
     no_reconcile_writes.block_creates.store(false, .release);
     runtime.durable_jobs.drainOwner(fallback_server.index_installation_owner_id);
     try std.testing.expect(no_reconcile_writes.drop_calls.load(.acquire) >= 1);
     try std.testing.expect(!no_reconcile_writes.installed.load(.acquire));
+
+    // The opposite race is equally important: a queued delete must not drop a
+    // later incarnation recreated under the same path-owned name.
+    const recreated_body = try test_contract_helpers.encodeCreateIndexRequest(alloc, "recreated_embed_idx");
+    defer alloc.free(recreated_body);
+    var initial_recreate_resp = try executeHttpxTestRequest(&fallback_server, .{
+        .method = .POST,
+        .uri = "/tables/docs/indexes/recreated_embed_idx",
+        .content_type = "application/json",
+        .body = recreated_body,
+    });
+    defer initial_recreate_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), initial_recreate_resp.status);
+    runtime.durable_jobs.drainOwner(fallback_server.index_installation_owner_id);
+    try std.testing.expect(no_reconcile_writes.installed.load(.acquire));
+
+    no_reconcile_writes.block_drops.store(true, .release);
+    const drops_before_retry = no_reconcile_writes.drop_calls.load(.acquire);
+    var queued_delete_resp = try executeHttpxTestRequest(&fallback_server, .{
+        .method = .DELETE,
+        .uri = "/tables/docs/indexes/recreated_embed_idx",
+    });
+    defer queued_delete_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), queued_delete_resp.status);
+    wait_attempts = 0;
+    while (no_reconcile_writes.drop_calls.load(.acquire) == drops_before_retry and wait_attempts < 1_000) : (wait_attempts += 1) {
+        sleepNs(std.time.ns_per_ms);
+    }
+    try std.testing.expect(no_reconcile_writes.drop_calls.load(.acquire) > drops_before_retry);
+
+    var final_recreate_resp = try executeHttpxTestRequest(&fallback_server, .{
+        .method = .POST,
+        .uri = "/tables/docs/indexes/recreated_embed_idx",
+        .content_type = "application/json",
+        .body = recreated_body,
+    });
+    defer final_recreate_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), final_recreate_resp.status);
+    runtime.durable_jobs.drainOwner(fallback_server.index_installation_owner_id);
+    try std.testing.expect(no_reconcile_writes.installed.load(.acquire));
+    no_reconcile_writes.block_drops.store(false, .release);
+
+    // Executor admission failure leaves the keyed obligation queued. The
+    // independent supervisor tick must restart it without another client
+    // mutation or a permanently sleeping retry job.
+    const real_durable_lane = runtime.durable_jobs;
+    var flaky_lane = FlakyDurableLane{
+        .delegate = real_durable_lane,
+        .fail_owner_id = fallback_server.index_installation_owner_id,
+    };
+    runtime.durable_jobs = flaky_lane.iface();
+    no_reconcile_writes.block_creates.store(true, .release);
+    const submission_retry_body = try test_contract_helpers.encodeCreateIndexRequest(alloc, "submission_retry_idx");
+    defer alloc.free(submission_retry_body);
+    var submission_retry_resp = try executeHttpxTestRequest(&fallback_server, .{
+        .method = .POST,
+        .uri = "/tables/docs/indexes/submission_retry_idx",
+        .content_type = "application/json",
+        .body = submission_retry_body,
+    });
+    defer submission_retry_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), submission_retry_resp.status);
+    try std.testing.expect(!fallback_server.index_installation_worker_in_flight.load(.acquire));
+    platform_sync.lockYielding(&fallback_server.index_installation_mutex);
+    const queued_after_submission_failure = fallback_server.index_installation_queue.items.len;
+    fallback_server.index_installation_mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 1), queued_after_submission_failure);
+    const create_calls_after_submission_failure = no_reconcile_writes.create_calls.load(.acquire);
+
+    runtime.durable_jobs = real_durable_lane;
+    no_reconcile_writes.block_creates.store(false, .release);
+    try fallback_server.runSessionMaintenanceOnce();
+    runtime.durable_jobs.drainOwner(fallback_server.index_installation_owner_id);
+    try std.testing.expect(no_reconcile_writes.create_calls.load(.acquire) > create_calls_after_submission_failure);
+    try std.testing.expect(no_reconcile_writes.installed.load(.acquire));
+    platform_sync.lockYielding(&fallback_server.index_installation_mutex);
+    const queued_after_supervisor = fallback_server.index_installation_queue.items.len;
+    fallback_server.index_installation_mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), queued_after_supervisor);
 }
 
 test "api http server create index expands schema-derived algebraic config" {
@@ -28938,11 +29106,14 @@ test "api http server create index expands schema-derived algebraic config" {
     defer parsed_created.deinit();
     try std.testing.expect(parsed_created.value.object.get("group_fields") == null);
     try std.testing.expect(parsed_created.value.object.get("materializations") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"derive_from_schema\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"group_fields\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"measure_fields\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"materializations\":[]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"sum_by_customer\"") == null);
+    var parsed_stored = try std.json.parseFromSlice(std.json.Value, alloc, source.indexes_json, .{});
+    defer parsed_stored.deinit();
+    const stored = parsed_stored.value.object.get("sales_rollup").?.object;
+    try std.testing.expect(stored.get("derive_from_schema") == null);
+    try std.testing.expect(stored.get("group_fields") != null);
+    try std.testing.expect(stored.get("measure_fields") != null);
+    try std.testing.expectEqual(@as(usize, 0), stored.get("materializations").?.array.items.len);
+    try std.testing.expect(stored.get("sum_by_customer") == null);
 }
 
 test "api http server rejects public algebraic materialization config" {
