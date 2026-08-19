@@ -87,6 +87,8 @@ fn publishRuntimeStatusRefreshForTest(
     try std.testing.expect(!result.hasRejectedTables());
 }
 const http_client = @import("http_client.zig");
+const algebraic_partials_wire = @import("algebraic_partials_wire.zig");
+const http_routes = @import("http_routes.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const platform_time = @import("antfly_platform").time;
 const distributed_stats_mod = @import("../search/distributed_stats.zig");
@@ -22195,6 +22197,7 @@ test "remote shard query phases propagate deadline and request cancellation" {
     const ExecutorState = struct {
         signal: *std.atomic.Value(bool),
         calls: usize = 0,
+        algebraic_base64_header_seen: bool = false,
 
         fn iface(self: *@This()) http_common.RequestExecutor {
             return .{
@@ -22209,6 +22212,13 @@ test "remote shard query phases propagate deadline and request cancellation" {
             try std.testing.expect(req.timeout_ms != null);
             try std.testing.expect(req.timeout_ms.? > 0);
             try std.testing.expect(req.timeout_ms.? <= 60_000);
+            if (std.mem.endsWith(u8, req.uri, http_routes.Routes.algebraic_partials_suffix)) {
+                try std.testing.expectEqualStrings(
+                    algebraic_partials_wire.base64_v1,
+                    req.header(algebraic_partials_wire.response_encoding_header) orelse return error.TestExpectedAlgebraicPartialsEncoding,
+                );
+                self.algebraic_base64_header_seen = true;
+            }
             const cancellation = req.cancellation orelse return error.TestExpectedCancellation;
             try std.testing.expect(!cancellation.isCancelled());
             self.signal.store(true, .release);
@@ -22272,6 +22282,7 @@ test "remote shard query phases propagate deadline and request cancellation" {
         controlled_request,
     ));
     try std.testing.expectEqual(@as(usize, 5), state.calls);
+    try std.testing.expect(state.algebraic_base64_header_seen);
 }
 
 test "remote query returns the shard-selected identity generation" {

@@ -21,6 +21,7 @@ const db_mod = @import("../storage/db/mod.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
+const algebraic_partials_wire = @import("algebraic_partials_wire.zig");
 const distributed_stats_mod = @import("../search/distributed_stats.zig");
 const routes = @import("http_routes.zig");
 const raft_routes = @import("../raft/transport/routes.zig");
@@ -1074,9 +1075,14 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
+        const response_headers = [_]http_common.RequestHeader{.{
+            .name = algebraic_partials_wire.response_encoding_header,
+            .value = algebraic_partials_wire.base64_v1,
+        }};
         var resp = try self.executor.execute(self.alloc, .{
             .method = .POST,
             .uri = uri,
+            .headers = &response_headers,
             .content_type = "application/json",
             .body = body,
             .timeout_ms = timeout_ms,

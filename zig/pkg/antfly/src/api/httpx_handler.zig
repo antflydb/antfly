@@ -36,6 +36,7 @@ const mcp = @import("antfly_mcp");
 const internal_join_operations = @import("internal_join_operations.zig");
 const internal_repair_operations = @import("internal_repair_operations.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
+const algebraic_partials_wire = @import("algebraic_partials_wire.zig");
 const http_client = @import("http_client.zig");
 const repair_jobs = @import("repair_jobs.zig");
 const ApiHttpServer = http_server_mod.ApiHttpServer;
@@ -1870,7 +1871,13 @@ pub const AntflyApiHandler = struct {
         var result = self.internalGroupOperations().algebraicPartials(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, body) catch |err|
             return if (err == error.InvalidArgument) textResponse(ctx, 400, "invalid algebraic partials request") else internalGroupErrorResponse(ctx, err);
         defer result.deinit(ctx.allocator);
-        return jsonResponse(ctx, 200, result.json);
+        if (algebraic_partials_wire.acceptsBase64V1(ctx.header(algebraic_partials_wire.response_encoding_header))) {
+            return jsonResponse(ctx, 200, result.json);
+        }
+        const legacy = algebraic_partials_wire.base64V1ToLegacyAlloc(ctx.allocator, result.json) catch
+            return textResponse(ctx, 500, "internal server error");
+        defer ctx.allocator.free(legacy);
+        return jsonResponse(ctx, 200, legacy);
     }
 
     fn internalGroupRoutedBatch(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
