@@ -610,6 +610,19 @@ fn addYaccSteps(
     const parser_test_step = b.step("sql-parser-test", "Run the storage-independent SQL lexer and parser tests");
     parser_test_step.dependOn(&run_parser_tests.step);
 
+    const parser_bench = b.addExecutable(.{
+        .name = "sql-parser-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/sql/parser_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    const run_parser_bench = b.addRunArtifact(parser_bench);
+    if (b.args) |args| run_parser_bench.addArgs(args);
+    const parser_bench_step = b.step("sql-parser-bench", "Benchmark generated SQL parser latency, throughput, and allocations");
+    parser_bench_step.dependOn(&run_parser_bench.step);
+
     return .{
         .run_yacc_tests = run_yacc_tests,
         .run_parser_tests = run_parser_tests,

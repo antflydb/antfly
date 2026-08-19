@@ -146,42 +146,62 @@ const PendingPrecedenceDeclaration = struct {
     level: u16,
 };
 
+/// Generates Zig source. The caller owns the returned slice and must free it
+/// with `allocator`; all parser-generator working memory is released before
+/// this function returns.
 pub fn generateZigMetadata(
     allocator: std.mem.Allocator,
     input_path: []const u8,
     source: []const u8,
 ) ![]u8 {
-    const grammar = try parseGrammar(allocator, source);
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const grammar = try parseGrammar(arena, source);
     try validateGrammar(grammar);
-    const tables = try buildSlrTables(allocator, grammar);
+    const tables = try buildSlrTables(arena, grammar);
     if (grammar.expected_conflicts) |expected_conflicts| {
         if (tables.conflicts.len != expected_conflicts) return error.ConflictCountMismatch;
     }
-    return try emitZigMetadata(allocator, input_path, source, grammar, tables);
+    const generated = try emitZigMetadata(arena, input_path, source, grammar, tables);
+    return allocator.dupe(u8, generated);
 }
 
+/// Computes the conflict count without transferring any allocated state to the
+/// caller.
 pub fn conflictExpectation(allocator: std.mem.Allocator, source: []const u8) !ConflictExpectation {
-    const grammar = try parseGrammar(allocator, source);
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const grammar = try parseGrammar(arena, source);
     try validateGrammar(grammar);
-    const tables = try buildSlrTables(allocator, grammar);
+    const tables = try buildSlrTables(arena, grammar);
     return .{
         .expected = grammar.expected_conflicts,
         .actual = tables.conflicts.len,
     };
 }
 
+/// Formats a conflict report. The caller owns the returned slice and must free
+/// it with `allocator`.
 pub fn conflictReportAlloc(
     allocator: std.mem.Allocator,
     input_path: []const u8,
     source: []const u8,
     max_conflicts: usize,
 ) ![]u8 {
-    const grammar = try parseGrammar(allocator, source);
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const grammar = try parseGrammar(arena, source);
     try validateGrammar(grammar);
-    const tables = try buildSlrTables(allocator, grammar);
+    const tables = try buildSlrTables(arena, grammar);
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
-    try appendFmt(allocator, &out,
+    try appendFmt(arena, &out,
         \\grammar conflict report: {s}
         \\expected: {s}
         \\actual: {d}
@@ -189,18 +209,18 @@ pub fn conflictReportAlloc(
     , .{
         input_path,
         if (grammar.expected_conflicts) |expected|
-            try std.fmt.allocPrint(allocator, "{d}", .{expected})
+            try std.fmt.allocPrint(arena, "{d}", .{expected})
         else
             "unset",
         tables.conflicts.len,
     });
-    if (tables.conflicts.len == 0) return try out.toOwnedSlice(allocator);
+    if (tables.conflicts.len == 0) return allocator.dupe(u8, out.items);
 
     const limit = @min(max_conflicts, tables.conflicts.len);
-    try appendFmt(allocator, &out, "first {d} conflicts:\n", .{limit});
+    try appendFmt(arena, &out, "first {d} conflicts:\n", .{limit});
     for (tables.conflicts[0..limit]) |conflict| {
         try appendFmt(
-            allocator,
+            arena,
             &out,
             "  state={d} terminal={s} existing={s} candidate={s}\n",
             .{
@@ -212,12 +232,12 @@ pub fn conflictReportAlloc(
         );
     }
     if (limit < tables.conflicts.len) {
-        try appendFmt(allocator, &out, "  ... {d} more conflicts\n", .{tables.conflicts.len - limit});
+        try appendFmt(arena, &out, "  ... {d} more conflicts\n", .{tables.conflicts.len - limit});
     }
-    return try out.toOwnedSlice(allocator);
+    return allocator.dupe(u8, out.items);
 }
 
-pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
+fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
     var grammar: Grammar = .{};
     var active_rule: ?usize = null;
     var skip_percent_prologue = false;
@@ -791,7 +811,7 @@ pub fn validateGrammar(grammar: Grammar) !void {
     }
 }
 
-pub fn buildSlrTables(allocator: std.mem.Allocator, grammar: Grammar) !Tables {
+fn buildSlrTables(allocator: std.mem.Allocator, grammar: Grammar) !Tables {
     try validateGrammar(grammar);
 
     const terminal_count = grammar.tokens.items.len + 1;
@@ -2547,6 +2567,28 @@ test "generateZigMetadata emits deterministic parser table metadata" {
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn expectedTerminalNameForState") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn actionsForState") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn symbolName") == null);
+}
+
+test "public generator APIs release working memory and return owned output" {
+    const source =
+        \\%expect 0
+        \\%start stmt
+        \\%token SELECT IDENT
+        \\stmt:
+        \\    SELECT IDENT
+        \\  ;
+    ;
+
+    const generated = try generateZigMetadata(std.testing.allocator, "owned.y", source);
+    defer std.testing.allocator.free(generated);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "pub fn parse(") != null);
+
+    const expectation = try conflictExpectation(std.testing.allocator, source);
+    try std.testing.expect(expectation.matches());
+
+    const report = try conflictReportAlloc(std.testing.allocator, "owned.y", source, 1);
+    defer std.testing.allocator.free(report);
+    try std.testing.expect(std.mem.indexOf(u8, report, "actual: 0") != null);
 }
 
 test "table indices reject grammars larger than u16 with an explicit error" {

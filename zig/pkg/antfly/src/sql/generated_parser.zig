@@ -21,6 +21,34 @@ const token_mod = @import("token.zig");
 const generated_token_id_stack_capacity = 1024;
 const generated_parse_stack_capacity = 512;
 
+const keyword_terminal_ids = blk: {
+    @setEvalBranchQuota(250_000);
+    const keyword_fields = std.meta.fields(token_mod.TokenKeyword);
+    const generated_fields = std.meta.fields(generated.Token);
+    var result: [keyword_fields.len]?u16 = @splat(null);
+    for (keyword_fields, 0..) |keyword_field, keyword_index| {
+        for (generated_fields) |generated_field| {
+            if (std.ascii.eqlIgnoreCase(keyword_field.name, generated_field.name)) {
+                result[keyword_index] = @intCast(generated_field.value + 1);
+                break;
+            }
+        }
+    }
+    break :blk result;
+};
+
+const identifier_name_terminals = blk: {
+    @setEvalBranchQuota(500_000);
+    var result: [generated.token_count + 1]bool = @splat(false);
+    for (1..generated.production_count) |production_index| {
+        const production = generated.productionInfo(@intCast(production_index)) orelse continue;
+        if (production.rule != .identifier_name or production.rhs_len != 1) continue;
+        const rhs = generated.productionRhs(@intCast(production_index)) orelse continue;
+        if (rhs[0] < result.len) result[rhs[0]] = true;
+    }
+    break :blk result;
+};
+
 pub const Diagnostic = struct {
     token_index: usize,
     source_start: usize,
@@ -236,7 +264,7 @@ fn appendTokenIds(
 ) !void {
     switch (token.kind) {
         .identifier => {
-            if (try contextualKeywordSymbolId(tokens, index, token, previous, next)) |id| {
+            if (contextualKeywordSymbolId(tokens, index, token, previous, next)) |id| {
                 try ids.append(id);
                 return;
             }
@@ -244,7 +272,7 @@ fn appendTokenIds(
                 try appendIdentifierIds(ids, token.text, false);
                 return;
             }
-            if (try keywordSymbolId(token)) |id| {
+            if (keywordSymbolId(token)) |id| {
                 try ids.append(id);
                 return;
             }
@@ -296,7 +324,7 @@ fn contextualKeywordSymbolId(
     token: token_mod.Token,
     previous: ?token_mod.Token,
     next: ?token_mod.Token,
-) !?u16 {
+) ?u16 {
     if (sessionAuthorizationKeywordContext(tokens, index)) {
         if (token.matchesKeywordTag(.authorization)) return generated.tokenId(.AUTHORIZATION);
         if (token.matchesKeywordTag(.session)) return generated.tokenId(.SESSION);
@@ -623,10 +651,20 @@ fn generatedParserTreatsKeywordAsIdentifier(
     previous: ?token_mod.Token,
     next: ?token_mod.Token,
 ) bool {
-    // PostgreSQL permits non-reserved keywords in qualified names. The lexer
-    // emits DOT as its own token, so preserve the identifier role on either
-    // side rather than promoting components such as `public` to terminals.
-    if ((previous != null and previous.?.kind == .dot) or (next != null and next.?.kind == .dot)) return true;
+    // PostgreSQL permits every keyword as an attribute name after DOT, but a
+    // qualified name's first component must still be an identifier-class
+    // keyword. Use the generated identifier_name productions as the source of
+    // truth so reserved forms such as `select.foo` remain syntax errors.
+    if (previous != null and previous.?.kind == .dot) return true;
+    if (next != null and next.?.kind == .dot) {
+        // PUBLIC is a PostgreSQL unreserved keyword, but adding its terminal to
+        // this conflict-heavy grammar currently creates new conflicts. Treat
+        // it as IDENT only in the qualified-name head position until the
+        // grammar's keyword categories are modeled directly.
+        if (token.matchesKeywordTag(.public)) return true;
+        const terminal = keywordSymbolId(token) orelse return false;
+        return terminal < identifier_name_terminals.len and identifier_name_terminals[terminal];
+    }
     if (token.matchesKeywordTag(.conflict)) return previous != null and previous.?.matchesKeywordTag(.as);
     if (token.matchesKeywordTag(.offset)) return next != null and next.?.matchesKeywordTag(.limit);
     if (token.matchesKeywordTag(.fetch)) return previous != null and previous.?.matchesKeywordTag(.as);
@@ -675,13 +713,9 @@ fn appendIdentifierIds(ids: *TokenIdSink, text: []const u8, allow_trailing_dot: 
     if (has_trailing_dot) try ids.appendToken(.DOT);
 }
 
-fn keywordSymbolId(token: token_mod.Token) !?u16 {
+fn keywordSymbolId(token: token_mod.Token) ?u16 {
     const keyword = token.keyword orelse return null;
-    const text = @tagName(keyword);
-    if (text.len > 64) return error.UnsupportedSqlShape;
-    var buffer: [64]u8 = undefined;
-    for (text, 0..) |character, index| buffer[index] = std.ascii.toUpper(character);
-    return generated.terminalIdByName(buffer[0..text.len]);
+    return keyword_terminal_ids[@intFromEnum(keyword)];
 }
 
 fn trailingSemicolonOnly(tokens: []const token_mod.Token, index: usize) bool {
@@ -776,6 +810,23 @@ test "generated parser bridge maps contextual synthetic terminals" {
     const history_ids = try tokenIdsAlloc(std.testing.allocator, history_tokens.items);
     defer std.testing.allocator.free(history_ids);
     try std.testing.expect(std.mem.indexOfScalar(u16, history_ids, generated.tokenId(.SYSTEM_TIME_FOR)) != null);
+}
+
+test "generated parser bridge preserves qualified keyword categories" {
+    try parseSqlAlloc(std.testing.allocator, "SELECT public.select FROM public.docs");
+
+    var reserved_head_tokens = try lexer.tokenizeAlloc(std.testing.allocator, "SELECT select.foo FROM docs");
+    defer lexer.freeTokens(std.testing.allocator, &reserved_head_tokens);
+    const reserved_head_ids = try tokenIdsAlloc(std.testing.allocator, reserved_head_tokens.items);
+    defer std.testing.allocator.free(reserved_head_ids);
+    try std.testing.expectEqual(generated.tokenId(.SELECT), reserved_head_ids[1]);
+    try std.testing.expectError(error.UnexpectedToken, parseTokensAlloc(std.testing.allocator, reserved_head_tokens.items));
+
+    var unreserved_head_tokens = try lexer.tokenizeAlloc(std.testing.allocator, "SELECT public.docs.id FROM public.docs");
+    defer lexer.freeTokens(std.testing.allocator, &unreserved_head_tokens);
+    const unreserved_head_ids = try tokenIdsAlloc(std.testing.allocator, unreserved_head_tokens.items);
+    defer std.testing.allocator.free(unreserved_head_ids);
+    try std.testing.expectEqual(generated.tokenId(.IDENT), unreserved_head_ids[1]);
 }
 
 test "generated parser bridge reports owned source-aware diagnostics" {

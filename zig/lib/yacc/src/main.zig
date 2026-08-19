@@ -38,14 +38,18 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const source = try std.Io.Dir.cwd().readFileAlloc(io, input_path, arena, .limited(4 * 1024 * 1024));
-    const generated = yacc.generateZigMetadata(arena, source_label, source) catch |err| {
+    const generated = yacc.generateZigMetadata(init.gpa, source_label, source) catch |err| {
         if (err == error.ConflictCountMismatch) {
-            const report = yacc.conflictReportAlloc(arena, source_label, source, 20) catch null;
-            if (report) |text| std.debug.print("{s}", .{text});
+            const report = yacc.conflictReportAlloc(init.gpa, source_label, source, 20) catch null;
+            if (report) |text| {
+                std.debug.print("{s}", .{text});
+                init.gpa.free(text);
+            }
         }
         std.debug.print("yacc-zig: invalid grammar {s}: {}\n", .{ input_path, err });
         std.process.exit(1);
     };
+    defer init.gpa.free(generated);
 
     if (std.mem.lastIndexOfScalar(u8, output_path, '/')) |slash| {
         try std.Io.Dir.cwd().createDirPath(io, output_path[0..slash]);

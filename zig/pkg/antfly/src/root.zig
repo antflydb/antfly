@@ -73,10 +73,6 @@ pub const paths = @import("graph/paths.zig");
 pub const graph_query = @import("graph/query.zig");
 pub const graph_pattern = @import("graph/pattern.zig");
 
-// SQL lexical and generated grammar foundation. Runtime lowering remains in a
-// later stack so this package boundary stays storage-independent.
-pub const sql_parser = @import("sql/parser_root.zig");
-
 // Sparse embeddings
 pub const sparse = @import("sparse/sparse.zig");
 

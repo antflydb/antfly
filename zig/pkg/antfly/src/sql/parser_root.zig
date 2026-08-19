@@ -17,8 +17,12 @@ const std = @import("std");
 pub const token = @import("token.zig");
 pub const lexer = @import("lexer.zig");
 pub const parser = @import("parser.zig");
-pub const generated_parser = @import("generated_parser.zig");
-pub const generated = @import("grammar/generated/root.zig");
+
+// The generated parser is intentionally test-only while the imported grammar
+// still has unresolved conflicts. Keeping it private prevents an experimental
+// conflict-resolution policy from becoming a production API by accident.
+const generated_parser = @import("generated_parser.zig");
+const generated = @import("grammar/generated/root.zig");
 
 test {
     _ = token;
