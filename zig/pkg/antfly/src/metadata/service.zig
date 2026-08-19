@@ -4479,7 +4479,16 @@ pub const MetadataHttpService = struct {
         const now_ms = nowMs();
         var current_status = snapshotStatus(self.alloc, self.metadata_group_id, self, self.metrics()) catch |err| blk: {
             std.log.warn("metadata status refresh failed err={s}", .{@errorName(err)});
-            break :blk self.loadMetadataStatusCache() orelse self.fallbackStatus();
+            var fallback = self.loadMetadataStatusCache() orelse self.fallbackStatus();
+            // Projection/catalog status is intentionally cacheable, but Raft
+            // leadership and membership are live safety signals consumed by the
+            // operator. Refresh only those cheap in-memory fields so a snapshot
+            // failure can never present stale topology as current.
+            applyMetadataRaftTopology(
+                &fallback,
+                serviceGroupRaftTopologyObservation(self, self.metadata_group_id),
+            );
+            break :blk fallback;
         };
         current_status.metadata_epoch = self.lifecycle_signal.currentEpoch();
         current_status.metrics = self.metrics();
@@ -6922,11 +6931,23 @@ const ServiceGroupRaftObservation = struct {
     transport_pending_retries: usize = 0,
 };
 
-fn serviceGroupRaftObservation(service: anytype, group_id: u64) ServiceGroupRaftObservation {
+fn serviceGroupRaftTopologyObservation(service: anytype, group_id: u64) ServiceGroupRaftObservation {
     const Service = @TypeOf(service);
     if (Service == *MetadataService) {
         const raft_status = service.raft.host.host.raftStatus(group_id) orelse return .{};
-        var observation = raftObservationFromStatus(raft_status, service.raft.host.host.cfg.local_node_id);
+        return raftObservationFromStatus(raft_status, service.raft.host.host.cfg.local_node_id);
+    }
+    if (Service == *MetadataHttpService) {
+        const raft_status = service.raft.host.http_host.host.raftStatus(group_id) orelse return .{};
+        return raftObservationFromStatus(raft_status, service.raft.host.http_host.host.cfg.local_node_id);
+    }
+    return .{};
+}
+
+fn serviceGroupRaftObservation(service: anytype, group_id: u64) ServiceGroupRaftObservation {
+    const Service = @TypeOf(service);
+    var observation = serviceGroupRaftTopologyObservation(service, group_id);
+    if (Service == *MetadataService) {
         const host_metrics = service.raft.host.host.metricsSnapshot();
         observation.inbound_message_enqueues = host_metrics.inbound_message_enqueues;
         observation.inbound_message_drains = host_metrics.inbound_message_drains;
@@ -6934,8 +6955,6 @@ fn serviceGroupRaftObservation(service: anytype, group_id: u64) ServiceGroupRaft
         return observation;
     }
     if (Service == *MetadataHttpService) {
-        const raft_status = service.raft.host.http_host.host.raftStatus(group_id) orelse return .{};
-        var observation = raftObservationFromStatus(raft_status, service.raft.host.http_host.host.cfg.local_node_id);
         const host_metrics = service.raft.host.http_host.host.metricsSnapshot();
         observation.inbound_message_enqueues = host_metrics.inbound_message_enqueues;
         observation.inbound_message_drains = host_metrics.inbound_message_drains;
@@ -6953,6 +6972,23 @@ fn serviceGroupRaftObservation(service: anytype, group_id: u64) ServiceGroupRaft
         return observation;
     }
     return .{};
+}
+
+fn applyMetadataRaftTopology(status: *MetadataStatus, observation: ServiceGroupRaftObservation) void {
+    status.metadata_raft_local_node_id = observation.local_node_id;
+    status.metadata_raft_role = observation.role;
+    status.metadata_raft_leader_id = observation.leader_id;
+    status.metadata_raft_term = observation.term;
+    status.metadata_raft_commit_index = observation.commit_index;
+    status.metadata_raft_local_voter = observation.local_voter;
+    status.metadata_raft_voter_count = observation.voter_count;
+    status.metadata_raft_voter_set_fingerprint = observation.voter_set_fingerprint;
+    status.metadata_raft_joint_consensus = observation.joint_consensus;
+    status.metadata_raft_election_elapsed = observation.election_elapsed;
+    status.metadata_raft_randomized_election_timeout = observation.randomized_election_timeout;
+    status.metadata_raft_votes_granted = observation.votes_granted;
+    status.metadata_raft_votes_rejected = observation.votes_rejected;
+    status.metadata_raft_votes_unknown = observation.votes_unknown;
 }
 
 fn raftObservationFromStatus(
@@ -12464,6 +12500,49 @@ test "metadata http service catalog cache is independent from volatile projectio
         admin_snapshot.reallocation_request.?.barrier_protocol_version,
     );
     try std.testing.expectEqual(try svc.metadataIncarnation(), admin_snapshot.reallocation_request.?.metadata_incarnation);
+
+    // A full status refresh may fail while cached projection data is still
+    // useful. Poison the cached Raft fields, force the projected store lookup
+    // to fail, and prove the fallback overlays the current in-memory topology.
+    const live_raft = serviceGroupRaftTopologyObservation(&svc, 2900);
+    try std.testing.expect(live_raft.voter_set_fingerprint != null);
+    var stale_status = try svc.status();
+    stale_status.metadata_raft_local_node_id = 99;
+    stale_status.metadata_raft_role = "leader";
+    stale_status.metadata_raft_leader_id = 99;
+    stale_status.metadata_raft_term += 100;
+    stale_status.metadata_raft_commit_index += 100;
+    stale_status.metadata_raft_local_voter = false;
+    stale_status.metadata_raft_voter_count = 99;
+    stale_status.metadata_raft_voter_set_fingerprint = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".*;
+    stale_status.metadata_raft_joint_consensus = true;
+    stale_status.metadata_raft_election_elapsed += 100;
+    stale_status.metadata_raft_randomized_election_timeout += 100;
+    stale_status.metadata_raft_votes_granted += 100;
+    stale_status.metadata_raft_votes_rejected += 100;
+    stale_status.metadata_raft_votes_unknown += 100;
+    svc.storeMetadataStatusCache(stale_status, nowMs() + metadata_status_cache_refresh_interval_ms);
+
+    const fallback_status = blk: {
+        const projected_store = svc.raft.host.owned_metadata_store orelse return error.MissingMetadataStore;
+        svc.raft.host.owned_metadata_store = null;
+        defer svc.raft.host.owned_metadata_store = projected_store;
+        break :blk try svc.status();
+    };
+    try std.testing.expectEqual(live_raft.local_node_id, fallback_status.metadata_raft_local_node_id);
+    try std.testing.expectEqualStrings(live_raft.role, fallback_status.metadata_raft_role);
+    try std.testing.expectEqual(live_raft.leader_id, fallback_status.metadata_raft_leader_id);
+    try std.testing.expectEqual(live_raft.term, fallback_status.metadata_raft_term);
+    try std.testing.expectEqual(live_raft.commit_index, fallback_status.metadata_raft_commit_index);
+    try std.testing.expectEqual(live_raft.local_voter, fallback_status.metadata_raft_local_voter);
+    try std.testing.expectEqual(live_raft.voter_count, fallback_status.metadata_raft_voter_count);
+    try std.testing.expectEqual(live_raft.voter_set_fingerprint, fallback_status.metadata_raft_voter_set_fingerprint);
+    try std.testing.expectEqual(live_raft.joint_consensus, fallback_status.metadata_raft_joint_consensus);
+    try std.testing.expectEqual(live_raft.election_elapsed, fallback_status.metadata_raft_election_elapsed);
+    try std.testing.expectEqual(live_raft.randomized_election_timeout, fallback_status.metadata_raft_randomized_election_timeout);
+    try std.testing.expectEqual(live_raft.votes_granted, fallback_status.metadata_raft_votes_granted);
+    try std.testing.expectEqual(live_raft.votes_rejected, fallback_status.metadata_raft_votes_rejected);
+    try std.testing.expectEqual(live_raft.votes_unknown, fallback_status.metadata_raft_votes_unknown);
 }
 
 test "metadata http service linearizable read waits for leader discovery" {
