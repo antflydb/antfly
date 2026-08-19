@@ -464,6 +464,7 @@ pub const GraphHydrateResponse = struct {
 pub const GraphEdgesRequest = struct {
     index_name: []u8,
     key: []u8,
+    edge_types: [][]const u8 = &.{},
     direction: graph_mod.EdgeDirection,
     tensor_access_path: ?OwnedGraphTensorAccessPath = null,
     tensor_program: ?query_contract.OwnedAlgebraicTensorProgramEnvelope = null,
@@ -475,6 +476,7 @@ pub const GraphEdgesRequest = struct {
     pub fn deinit(self: *GraphEdgesRequest, alloc: std.mem.Allocator) void {
         alloc.free(self.index_name);
         alloc.free(self.key);
+        freeConstStrings(alloc, self.edge_types);
         if (self.tensor_access_path) |*path| path.deinit(alloc);
         if (self.tensor_program) |*program| program.deinit(alloc);
         self.* = undefined;
@@ -663,6 +665,7 @@ const GraphHydrateResponseJson = struct {
 const GraphEdgesRequestJson = struct {
     index_name: []const u8,
     key: []const u8,
+    edge_types: []const []const u8 = &.{},
     direction: []const u8 = "out",
     topology_epoch: u64 = 0,
     identity_read_generation: ?u64 = null,
@@ -1385,6 +1388,7 @@ const DistributedEdgeReader = struct {
         a: std.mem.Allocator,
         table: ?[]const u8,
         key: []const u8,
+        edge_types: []const []const u8,
         direction: graph_mod.EdgeDirection,
     ) ![]graph_mod.Edge {
         const table_name = table orelse self.source_table;
@@ -1413,6 +1417,7 @@ const DistributedEdgeReader = struct {
         var req = GraphEdgesRequest{
             .index_name = index_name,
             .key = owned_key,
+            .edge_types = try dupConstStrings(a, edge_types),
             .direction = direction,
             .tensor_access_path = tensor_access_path,
             .tensor_program = tensor_program,
@@ -1459,6 +1464,17 @@ fn executeDistributedPattern(
         start_nodes[i] = .{ .table = item.table, .key = item.key };
     }
 
+    const target_frontier = if (graph_query.query.target_nodes) |selector|
+        try resolveStartFrontier(alloc, &state, req, base_result, prior_results, selector, false)
+    else
+        try alloc.alloc(FrontierState, 0);
+    defer freeFrontier(alloc, target_frontier);
+    const target_nodes = try alloc.alloc(graph_node_identity.Ref, target_frontier.len);
+    defer alloc.free(target_nodes);
+    for (target_frontier, 0..) |item, i| {
+        target_nodes[i] = .{ .table = item.table, .key = item.key };
+    }
+
     // Build distributed edge reader.
     const edge_reader = DistributedEdgeReader{
         .catalog = catalog,
@@ -1478,6 +1494,9 @@ fn executeDistributedPattern(
         .{
             .max_results = graph_query.query.params.max_results,
             .return_aliases = graph_query.query.return_aliases,
+            .target_nodes = target_nodes,
+            .target_required = graph_query.query.target_nodes != null,
+            .include_paths = graph_query.query.params.include_paths,
             .node_admission = admission.iface(),
         },
     );
@@ -3326,6 +3345,7 @@ pub fn encodeGraphEdgesRequest(alloc: std.mem.Allocator, req: GraphEdgesRequest)
     return try jsonStringifyAlloc(alloc, GraphEdgesRequestJson{
         .index_name = req.index_name,
         .key = req.key,
+        .edge_types = req.edge_types,
         .direction = switch (req.direction) {
             .out => "out",
             .in => "in",
@@ -3354,6 +3374,7 @@ pub fn parseGraphEdgesRequest(alloc: std.mem.Allocator, body: []const u8) !Graph
     return .{
         .index_name = try alloc.dupe(u8, parsed.value.index_name),
         .key = try alloc.dupe(u8, parsed.value.key),
+        .edge_types = try dupConstStrings(alloc, parsed.value.edge_types),
         .direction = if (std.mem.eql(u8, parsed.value.direction, "in"))
             .in
         else if (std.mem.eql(u8, parsed.value.direction, "both"))
@@ -6801,6 +6822,7 @@ test "distributed graph edges request preserves typed graph edge access path" {
     var req = GraphEdgesRequest{
         .index_name = try alloc.dupe(u8, "graph_idx"),
         .key = try alloc.dupe(u8, "doc:a"),
+        .edge_types = try dupConstStrings(alloc, &.{ "links", "mentions" }),
         .direction = .both,
         .topology_epoch = 42,
         .identity_read_generation = 12345,
@@ -6823,6 +6845,9 @@ test "distributed graph edges request preserves typed graph edge access path" {
     var parsed = try parseGraphEdgesRequest(alloc, encoded);
     defer parsed.deinit(alloc);
     try std.testing.expectEqual(graph_mod.EdgeDirection.both, parsed.direction);
+    try std.testing.expectEqual(@as(usize, 2), parsed.edge_types.len);
+    try std.testing.expectEqualStrings("links", parsed.edge_types[0]);
+    try std.testing.expectEqualStrings("mentions", parsed.edge_types[1]);
     try std.testing.expectEqual(@as(u64, 42), parsed.topology_epoch);
     try std.testing.expectEqual(@as(?u64, 12345), parsed.identity_read_generation);
     try std.testing.expect(parsed.tensor_access_path != null);
@@ -6946,6 +6971,8 @@ test "distributed graph edge reader carries identity generation" {
             try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
             try std.testing.expectEqualStrings("graph_idx", req.index_name);
             try std.testing.expectEqualStrings("doc:a", req.key);
+            try std.testing.expectEqual(@as(usize, 1), req.edge_types.len);
+            try std.testing.expectEqualStrings("links", req.edge_types[0]);
             try std.testing.expectEqual(graph_mod.EdgeDirection.out, req.direction);
             try std.testing.expectEqual(@as(u64, 0), req.topology_epoch);
             try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
@@ -6977,7 +7004,7 @@ test "distributed graph edge reader carries identity generation" {
         .admission = &admission,
     };
 
-    const edges = try reader.getEdges(alloc, null, "doc:a", .out);
+    const edges = try reader.getEdges(alloc, null, "doc:a", &.{"links"}, .out);
     defer reader.freeEdges(alloc, edges);
     try std.testing.expectEqual(@as(usize, 0), edges.len);
     try std.testing.expectEqual(@as(u32, 1), state.calls);
