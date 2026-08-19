@@ -260,7 +260,7 @@ pub const SystemMemoryInfo = struct {
     /// macOS still reports normal memory pressure.
     availability_basis: AvailabilityBasis = .mem_available,
     /// When an operator-owned Linux process envelope is the tighter live
-    /// constraint, it already bounds the complete leaf-cgroup working set.
+    /// constraint, it already bounds the complete leaf-cgroup charge.
     /// Preserve only the emergency reserve inside that bounded view instead
     /// of applying dynamic host headroom a second time.
     live_admission_policy: LiveAdmissionPolicy = .dynamic_pressure,
@@ -1425,7 +1425,7 @@ fn macosLiveAdmissionGrace(total_bytes: usize) usize {
 /// Linux MemAvailable is an allocation-availability estimate. With automatic
 /// host/cgroup sizing, preserve half of current availability, with a 512 MiB
 /// emergency floor and the stable node headroom as a ceiling. An explicit
-/// process envelope already charges the complete leaf-cgroup working set and
+/// process envelope already charges the complete leaf-cgroup usage and
 /// expresses the operator's process headroom; inside that envelope preserve a
 /// fixed 512 MiB emergency reserve rather than dynamically reserving the
 /// bounded remainder a second time. macOS supplies a system pressure
@@ -1563,12 +1563,11 @@ pub fn currentSystemMemoryInfo() ?SystemMemoryInfo {
     };
 }
 
-/// Apply an operator-owned process/container envelope to the live memory view.
-/// On Linux the explicit limit is charged against the leaf cgroup working set,
-/// so the test harness, sibling processes, active file pages, and anonymous
-/// memory remain visible even when memory.max itself is unlimited. Only
-/// inactive file pages are excluded because the kernel and kubelet treat them
-/// as reclaimable under pressure.
+/// Apply a resolved process/container envelope to the live memory view. On
+/// Linux an explicit operator limit is charged against raw leaf-cgroup usage,
+/// matching the usage that can evict a Burstable pod under node pressure.
+/// Automatically detected host/cgroup limits retain working-set semantics so
+/// reclaimable inactive file pages do not permanently reduce stable capacity.
 pub fn currentSystemMemoryInfoForLimit(
     limit_bytes: usize,
     provenance: ProcessMemoryLimitProvenance,
@@ -1579,7 +1578,7 @@ pub fn currentSystemMemoryInfoForLimit(
             break :blk applyOptionalProcessMemoryLimit(
                 sample.info,
                 limit_bytes,
-                sample.cgroup.leaf_working_set_bytes,
+                processEnvelopeUsageBytes(sample.cgroup, provenance),
                 provenance,
             );
         },
@@ -1593,10 +1592,23 @@ pub fn currentSystemMemoryInfoForLimit(
     };
 }
 
+fn processEnvelopeUsageBytes(
+    cgroup: CgroupMemoryInfo,
+    provenance: ProcessMemoryLimitProvenance,
+) ?usize {
+    // A configured process envelope is an operational ceiling, not a sizing
+    // hint. Charge it the same way the container runtime does so inactive file
+    // cache cannot consume the pod-request margin invisibly. Automatic limits
+    // continue to model reclaimable capacity and therefore use working set.
+    if (provenance == .explicit)
+        return cgroup.leaf_current_bytes orelse cgroup.leaf_working_set_bytes;
+    return cgroup.leaf_working_set_bytes;
+}
+
 fn applyOptionalProcessMemoryLimit(
     detected: ?SystemMemoryInfo,
     limit_bytes: usize,
-    leaf_working_set_bytes: ?usize,
+    leaf_usage_bytes: ?usize,
     provenance: ProcessMemoryLimitProvenance,
 ) ?SystemMemoryInfo {
     if (limit_bytes == 0) return detected;
@@ -1604,13 +1616,13 @@ fn applyOptionalProcessMemoryLimit(
         .total_bytes = limit_bytes,
         .available_bytes = limit_bytes,
         .availability_basis = .mem_available,
-    }, limit_bytes, leaf_working_set_bytes, provenance);
+    }, limit_bytes, leaf_usage_bytes, provenance);
 }
 
 fn applyProcessMemoryLimit(
     detected: SystemMemoryInfo,
     limit_bytes: usize,
-    leaf_working_set_bytes: ?usize,
+    leaf_usage_bytes: ?usize,
     provenance: ProcessMemoryLimitProvenance,
 ) SystemMemoryInfo {
     const effective_limit = @min(detected.total_bytes, limit_bytes);
@@ -1620,7 +1632,7 @@ fn applyProcessMemoryLimit(
     const detected_available = detected.available_bytes orelse detected.total_bytes;
     var available = @min(detected_available, effective_limit);
     var live_admission_policy = LiveAdmissionPolicy.dynamic_pressure;
-    if (leaf_working_set_bytes) |current| {
+    if (leaf_usage_bytes) |current| {
         const envelope_available = effective_limit -| @min(current, effective_limit);
         available = @min(available, envelope_available);
         // An explicit envelope changes only the reserve applied to capacity it
@@ -1802,8 +1814,7 @@ const CgroupMemoryInfo = struct {
     /// hierarchy tests even when memory.max is unlimited.
     leaf_current_bytes: ?usize = null,
     /// Leaf working set (`current - inactive_file`), retained even when
-    /// memory.max is unlimited so an explicit process envelope can be enforced
-    /// without treating reclaimable build/download cache as resident memory.
+    /// memory.max is unlimited for automatic cgroup/host pressure policy.
     leaf_working_set_bytes: ?usize = null,
 };
 
@@ -2948,7 +2959,7 @@ test "live memory headroom scales down for constrained containers" {
     );
 }
 
-test "explicit process envelope charges leaf cgroup working set" {
+test "explicit process envelope charges selected leaf cgroup usage" {
     const info = applyProcessMemoryLimit(
         .{
             .total_bytes = gib(64),
@@ -3000,6 +3011,31 @@ test "explicit process envelope charges leaf cgroup working set" {
     try std.testing.expectEqual(gib(1), liveHostAdmissionReserve(host_pressure));
 }
 
+test "process envelope usage matches provenance semantics" {
+    const sample = CgroupMemoryInfo{
+        .leaf_current_bytes = gib(15),
+        .leaf_working_set_bytes = gib(12),
+    };
+    try std.testing.expectEqual(
+        @as(?usize, gib(15)),
+        processEnvelopeUsageBytes(sample, .explicit),
+    );
+    try std.testing.expectEqual(
+        @as(?usize, gib(12)),
+        processEnvelopeUsageBytes(sample, .cgroup_v2),
+    );
+    try std.testing.expectEqual(
+        @as(?usize, gib(12)),
+        processEnvelopeUsageBytes(sample, .automatic),
+    );
+
+    const legacy = CgroupMemoryInfo{ .leaf_working_set_bytes = gib(11) };
+    try std.testing.expectEqual(
+        @as(?usize, gib(11)),
+        processEnvelopeUsageBytes(legacy, .explicit),
+    );
+}
+
 test "process envelope provenance preserves automatic cgroup pressure policy" {
     const detected = SystemMemoryInfo{
         .total_bytes = gib(8),
@@ -3035,8 +3071,8 @@ test "process envelope provenance preserves automatic cgroup pressure policy" {
 
 test "explicit Linux envelope does not double reserve bounded availability" {
     // Reproduce the full-E2E runner after earlier models were evicted. The
-    // 13,000 MiB process envelope has 4,253 MiB left after charging the raw
-    // leaf working set. Gemma's measured 3,387 MiB construction peak fits
+    // 13,000 MiB process envelope has 4,253 MiB left after charging the
+    // selected leaf usage. Gemma's measured 3,387 MiB construction peak fits
     // while retaining the 512 MiB emergency reserve; reserving half of the
     // already-bounded availability incorrectly rejected it.
     const info = applyProcessMemoryLimit(

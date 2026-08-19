@@ -763,6 +763,11 @@ pub const WeightStore = struct {
     residency: ?moe_residency.SharedResidency = null,
     tier_cache: ?tier_cache_mod.SharedCache = null,
     shared_prefetch: ?*tier_shared_mod.SharedPrefetchState = null,
+    /// Once authoritative live admission reports host pressure, keep clean
+    /// GGUF source pages request-scoped for this session. A loaded entry may
+    /// retain a prepared representation while its mmap source would otherwise
+    /// accumulate outside cache-residency accounting as tensors are touched.
+    discard_file_cache_under_pressure: std.atomic.Value(bool) = .init(false),
     allow_direct_quant: bool = true,
     gliner_head_dense_cache: std.StringHashMapUnmanaged(DenseDequantCacheEntry) = .{},
     gliner_head_dense_cache_bytes: usize = 0,
@@ -4504,9 +4509,9 @@ fn freeTensor(ctx: *anyopaque, tensor: CT) void {
                 platform.time.yieldBriefly();
             }
             defer guard.unlock();
-            if (entry.pin_count > 0) entry.pin_count -= 1;
-        } else if (entry.pin_count > 0) {
-            entry.pin_count -= 1;
+            releaseLazyEntryPinLocked(self.data, entry);
+        } else {
+            releaseLazyEntryPinLocked(self.data, entry);
         }
     }
     if (b.reservation != null and b.name.len > 0)
@@ -4523,6 +4528,19 @@ fn freeTensor(ctx: *anyopaque, tensor: CT) void {
         self.allocator.destroy(source);
     }
     b.allocator.destroy(b);
+}
+
+/// Release a borrower while holding the entry's residency guard (when one is
+/// configured). Clean mapped pages are discarded only after the last borrower
+/// leaves, so pressure reclamation cannot invalidate an active computation.
+fn releaseLazyEntryPinLocked(data: *WeightStore, entry: *LazyWeightEntry) void {
+    if (entry.pin_count == 0) return;
+    entry.pin_count -= 1;
+    if (entry.pin_count == 0 and
+        data.discard_file_cache_under_pressure.load(.acquire))
+    {
+        discardLazyEntryFileCache(data, entry);
+    }
 }
 
 fn acquireWeightReservation(self: *NativeCompute, name: []const u8, bytes: usize) !?run_memory.Reservation {
@@ -5016,6 +5034,13 @@ fn reserveHostCacheWithReclaimLocked(
     }
     while (true) {
         tier_cache.reserve(.host, bytes) catch |err| {
+            if (err == error.ResourceTemporarilyUnavailable) {
+                // The controller observes total process/cgroup pressure that
+                // cache geometry cannot see. Retain pressure mode even if no
+                // cold cache entry exists: active mmap pages become safely
+                // reclaimable as their last tensor handle is released.
+                data.discard_file_cache_under_pressure.store(true, .release);
+            }
             if (reclaimOneHostCacheEntryLocked(data, protected) == 0) return err;
             continue;
         };
@@ -5027,6 +5052,10 @@ fn reserveHostCacheWithReclaimLocked(
 /// This is intentionally bounded to one victim so ModelManager can re-probe
 /// the authoritative controller after every physical release.
 pub fn reclaimOneHostCacheEntry(data: *WeightStore) usize {
+    // This capability is invoked only after authoritative host admission has
+    // denied a request. Mark the session before inspecting victims so pinned
+    // entries shed clean source pages as soon as their borrowers depart.
+    data.discard_file_cache_under_pressure.store(true, .release);
     if (!data.prefetch_initialized) return 0;
     data.prefetch.lock();
     defer data.prefetch.unlock();
@@ -5095,11 +5124,48 @@ test "live host cache reservation reclaims only unpinned lazy weights" {
     try std.testing.expectEqual(@as(usize, 10), store.tier_cache.?.host_bytes);
 
     store.tier_cache.?.noteRelease(.host, 6);
+    try std.testing.expectEqual(@as(usize, 0), reclaimOneHostCacheEntry(&store));
+    try std.testing.expect(store.discard_file_cache_under_pressure.load(.acquire));
     store.prefetch.lock();
     const pinned = store.lazy_weights.getPtr("pinned.weight").?;
-    pinned.pin_count = 0;
+    releaseLazyEntryPinLocked(&store, pinned);
+    try std.testing.expectEqual(@as(usize, 0), pinned.pin_count);
     unloadLazyEntryTierLocked(&store, pinned, .host);
     store.prefetch.unlock();
+}
+
+test "live host cache denial enables mapped-page pressure mode" {
+    var controller = run_memory.AdmissionController{};
+    controller.configureSharedLimits(.{ .host_limit_bytes = 1024 });
+    controller.configureProcessMemoryLimit(2, .explicit);
+    defer controller.deinit();
+
+    const limits = run_memory.Limits{
+        .host_limit_bytes = 1024,
+        .combined_limit_bytes = 1024,
+    };
+    var store = WeightStore{
+        .allocator = std.testing.allocator,
+        .resident_weights = .{},
+        .lazy_weights = .{},
+        .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 1024 }),
+    };
+    defer store.lazy_weights.deinit(std.testing.allocator);
+    try store.tier_cache.?.configureAdmission(
+        std.testing.allocator,
+        &controller,
+        .cpu,
+        limits,
+        .{},
+    );
+    defer store.tier_cache.?.deinitAdmission();
+
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        reserveHostCacheWithReclaimLocked(&store, 2, null),
+    );
+    try std.testing.expect(store.discard_file_cache_under_pressure.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.host_bytes);
 }
 
 fn shouldEvictTierLocked(data: *const WeightStore, layer_index: usize, tier: ResidencyTier) bool {

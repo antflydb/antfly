@@ -1002,8 +1002,8 @@ jobs:
           ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT: "1800"
           ANTFLY_INFERENCE_MAX_LOADED_MODELS: "1"
           # This Burstable pod has a 15000Mi request but no finite memory.max.
-          # Bound the complete leaf working set at 14000Mi so admission retains
-          # its emergency reserve and leaves another 1000Mi of pod headroom.
+          # Bound raw leaf-cgroup charge at 14000Mi so admission retains its
+          # emergency reserve and leaves another 1000Mi of pod-request margin.
           ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB: "14000"
           # Bound the native hot set while allowing the measured 11173MiB 2B
           # decoder working set plus its scoped projector to complete. Keep
