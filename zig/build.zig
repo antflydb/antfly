@@ -7246,6 +7246,7 @@ pub fn build(b: *std.Build) void {
             "storage.lmdb_backend.",
             "storage.maintenance.",
             "storage.mem_backend.",
+            "storage.mem_ordered.",
             "storage.object_storage.",
             "storage.persistent.",
             "storage.portable_backup.",
