@@ -6968,18 +6968,35 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
         "Content-Type: application/json\r\n" ++
         "Content-Length: 11\r\n\r\n" ++
         "{\"limit\":1}";
-    for (&clients) |*slot| {
-        var client = try httpx.Socket.connect(address, client_io);
-        errdefer client.close();
-        try client.sendAll(request);
-        slot.* = client;
-    }
+    const clients_per_wave = 32;
+    const wave_count = clients.len / clients_per_wave;
+    const wave_convergence_poll_attempts = @max(convergence_poll_attempts / wave_count, 1);
+    try std.testing.expectEqual(@as(usize, 0), clients.len % clients_per_wave);
+    for (0..wave_count) |wave| {
+        const wave_start = wave * clients_per_wave;
+        for (clients[wave_start .. wave_start + clients_per_wave]) |*slot| {
+            var client = try httpx.Socket.connect(address, client_io);
+            errdefer client.close();
+            try client.sendAll(request);
+            slot.* = client;
+        }
 
-    for (0..convergence_poll_attempts) |_| {
-        const admission = api_server.queryAdmissionStats();
-        if (admission.in_flight == 8 and admission.rejected_total == 120) break;
-        var delay = std.posix.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
-        _ = std.posix.system.nanosleep(&delay, &delay);
+        const expected_rejected: u64 = @intCast((wave + 1) * clients_per_wave - 8);
+        for (0..wave_convergence_poll_attempts) |_| {
+            const admission = api_server.queryAdmissionStats();
+            if (admission.in_flight == 8 and
+                admission.rejected_total == expected_rejected and
+                e2e_server.server.runtimeStats().active_connections <= 8)
+            {
+                break;
+            }
+            var delay = std.posix.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+            _ = std.posix.system.nanosleep(&delay, &delay);
+        }
+        const wave_stats = api_server.queryAdmissionStats();
+        try std.testing.expectEqual(@as(usize, 8), wave_stats.in_flight);
+        try std.testing.expectEqual(expected_rejected, wave_stats.rejected_total);
+        try std.testing.expect(e2e_server.server.runtimeStats().active_connections <= 8);
     }
     const saturated = api_server.queryAdmissionStats();
     try std.testing.expectEqual(@as(usize, 8), saturated.in_flight);

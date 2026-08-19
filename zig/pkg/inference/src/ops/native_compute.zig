@@ -9015,6 +9015,17 @@ fn preparedKQKVPanel16ByteSize(out_dim: usize, row_blocks: usize) usize {
     return (out_dim / prepared_k_panel16_nr) * row_blocks * prepared_k_qkv_panel16_block_bytes;
 }
 
+fn preparedKQKVPanel16OwnedByteSize(
+    out_dim: usize,
+    row_blocks: usize,
+    key_b: []const u8,
+    key_c: []const u8,
+) ?usize {
+    const packed_bytes = preparedKQKVPanel16ByteSize(out_dim, row_blocks);
+    const with_key_b = std.math.add(usize, packed_bytes, key_b.len) catch return null;
+    return std.math.add(usize, with_key_b, key_c.len) catch null;
+}
+
 fn prepareQ8_0PanelPackedStorage(storage: *QuantizedStorage) !void {
     if (storage.preparedBytes(.panel4) != null) return;
     if (storage.packed_expert != null) return;
@@ -9641,6 +9652,12 @@ fn ensureQ4Q5QKVPanel16Cache(
     const row_blocks = in_dim / 256;
     const expected_bytes = preparedKQKVPanel16ByteSize(out_dim, row_blocks);
     if (expected_bytes == 0) return;
+    const expected_owned_bytes = preparedKQKVPanel16OwnedByteSize(
+        out_dim,
+        row_blocks,
+        weight_buf_b.name,
+        weight_buf_c.name,
+    ) orelse return;
     if (preparedQKVPanel16GroupCacheMatches(storage_a_const, weight_buf_b.name, weight_buf_c.name, expected_bytes, row_blocks)) return;
 
     while (!self.data.quantized_prepare_lock.tryLock()) {
@@ -9660,14 +9677,14 @@ fn ensureQ4Q5QKVPanel16Cache(
 
     var cache_reserved_bytes: usize = 0;
     if (self.data.tier_cache) |*tier_cache| {
-        evictColdNonExpertWeightsToFitLocked(self.data, .host, expected_bytes, weight_buf_a.lazy_entry);
-        tier_cache.reserve(.host, expected_bytes) catch {
-            tier_cache.noteDenied(.host, expected_bytes);
-            noteSharedCacheDenial(self.run_budget, tier_cache, .host, expected_bytes);
+        evictColdNonExpertWeightsToFitLocked(self.data, .host, expected_owned_bytes, weight_buf_a.lazy_entry);
+        tier_cache.reserve(.host, expected_owned_bytes) catch {
+            tier_cache.noteDenied(.host, expected_owned_bytes);
+            noteSharedCacheDenial(self.run_budget, tier_cache, .host, expected_owned_bytes);
             logSharedCacheDenial("q4q5_qkv_panel16_cache", tier_cache, weight_buf_a.name);
             return;
         };
-        cache_reserved_bytes = expected_bytes;
+        cache_reserved_bytes = expected_owned_bytes;
     }
     errdefer if (cache_reserved_bytes != 0) {
         self.data.tier_cache.?.noteRelease(.host, cache_reserved_bytes);
@@ -9684,9 +9701,11 @@ fn ensureQ4Q5QKVPanel16Cache(
         row_blocks,
     );
     if (inserted_bytes != 0) {
-        if (inserted_bytes < cache_reserved_bytes) {
-            self.data.tier_cache.?.noteRelease(.host, cache_reserved_bytes - inserted_bytes);
-        } else std.debug.assert(inserted_bytes == cache_reserved_bytes);
+        if (self.data.tier_cache) |*tier_cache| {
+            if (inserted_bytes < cache_reserved_bytes) {
+                tier_cache.noteRelease(.host, cache_reserved_bytes - inserted_bytes);
+            } else std.debug.assert(inserted_bytes == cache_reserved_bytes);
+        }
         cache_reserved_bytes = 0;
         if (weight_buf_a.lazy_entry) |entry| entry.loaded_bytes = quantizedStorageBudgetBytes(storage_a);
     } else if (cache_reserved_bytes != 0) {
@@ -42939,6 +42958,10 @@ test "prepared q5_k packed qkv panel16 mr2 uses packed cache" {
 
     try prepareQ4Q5QKVPanel16PackedStorageForBench(&storage_a, &storage_b, &storage_c, "k.weight", "v.weight");
     try std.testing.expectEqual(preparedKQKVPanel16ByteSize(out_dim, row_blocks), preparedQKVPanel16GroupPackedBytes(&storage_a, out_dim, row_blocks).?.len);
+    try std.testing.expectEqual(
+        preparedKQKVPanel16OwnedByteSize(out_dim, row_blocks, "k.weight", "v.weight").?,
+        storage_a.prepared_group_cache.?.ownedBytes(),
+    );
     @memset(storage_a.preparedBytes(.panel16).?, 0xA5);
     @memset(storage_b.preparedBytes(.panel16).?, 0xA5);
     @memset(storage_c.preparedBytes(.panel16).?, 0xA5);
