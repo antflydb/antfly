@@ -188,8 +188,10 @@ The operator enforces:
 Validation errors are returned by the webhook when enabled. The reconciler still
 defends the same safety invariants when webhooks are unavailable. Kubernetes
 1.25+ can additionally enforce the CRD CEL transition rule at API admission by
-installing `manifests/overlays/kubernetes-1.25`; the webhook and reconciler
-remain authoritative on Kubernetes 1.23-1.24.
+installing `kustomize/overlays/kubernetes-1.25`; the webhook and reconciler
+remain authoritative on Kubernetes 1.23-1.24. Automatic CRD bootstrap and the
+embedded `manifests.AllCRDsYAML()` bundle intentionally install the compatible
+baseline rather than selecting an overlay from the cluster version.
 
 Do not delete and recreate the same `AntflyCluster` name or reuse retained
 metadata PVCs to change the replica count. StatefulSet and PVC names are

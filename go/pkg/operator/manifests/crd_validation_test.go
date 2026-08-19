@@ -1,18 +1,50 @@
 package manifests
 
 import (
-	_ "embed"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	extensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	sigyaml "sigs.k8s.io/yaml"
 )
 
 const metadataReplicaTransitionRule = "(has(self.metadataNodes) ? (has(self.metadataNodes.replicas) ? self.metadataNodes.replicas : 3) : 3) == (has(oldSelf.metadataNodes) ? (has(oldSelf.metadataNodes.replicas) ? oldSelf.metadataNodes.replicas : 3) : 3)"
 
-//go:embed overlays/kubernetes-1.25/antflycluster-metadata-replicas-cel.json
-var metadataReplicaCELPatch []byte
+func TestCRDDirectoryContainsOnlyCRDs(t *testing.T) {
+	entries, err := os.ReadDir("crd")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	crdCount := 0
+	for _, entry := range entries {
+		if entry.IsDir() || (filepath.Ext(entry.Name()) != ".yaml" && filepath.Ext(entry.Name()) != ".yml") {
+			continue
+		}
+		crdCount++
+
+		data, err := os.ReadFile(filepath.Join("crd", entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var typeMeta struct {
+			APIVersion string `json:"apiVersion"`
+			Kind       string `json:"kind"`
+		}
+		if err := sigyaml.Unmarshal(data, &typeMeta); err != nil {
+			t.Fatalf("parse %s: %v", entry.Name(), err)
+		}
+		if typeMeta.APIVersion != "apiextensions.k8s.io/v1" || typeMeta.Kind != "CustomResourceDefinition" {
+			t.Fatalf("%s is not a v1 CustomResourceDefinition: apiVersion=%q kind=%q", entry.Name(), typeMeta.APIVersion, typeMeta.Kind)
+		}
+	}
+	if crdCount != len(AllCRDYAMLBytes()) {
+		t.Fatalf("crd directory contains %d YAML resources, embedded bundle contains %d", crdCount, len(AllCRDYAMLBytes()))
+	}
+}
 
 func TestBaseCRDOmitsMetadataReplicaTransitionRule(t *testing.T) {
 	crd, err := AntflyClusterCRD()
@@ -47,6 +79,10 @@ func TestBaseCRDOmitsMetadataReplicaTransitionRule(t *testing.T) {
 }
 
 func TestKubernetes125OverlayAddsMetadataReplicaTransitionRule(t *testing.T) {
+	metadataReplicaCELPatch, err := os.ReadFile(filepath.Join("..", "kustomize", "overlays", "kubernetes-1.25", "antflycluster-metadata-replicas-cel.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	var patch []struct {
 		Op    string                        `json:"op"`
 		Path  string                        `json:"path"`

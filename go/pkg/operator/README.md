@@ -369,11 +369,14 @@ Kubernetes 1.23 and are not relied on for Kubernetes 1.23-1.24.
 The reconciler records the accepted topology in status and on metadata PVCs so
 StatefulSet drift, deletion, or same-name recreation cannot erase the invariant.
 
-The generated CRD is the Kubernetes 1.23-compatible baseline. On Kubernetes
-1.25+, install the optional CEL validation overlay from a source checkout:
+The generated CRDs are the Kubernetes 1.23-compatible baseline. Automatic
+operator bootstrap and programmatic consumers of `manifests.AllCRDsYAML()` use
+this baseline; they do not select an overlay based on the cluster version. On
+Kubernetes 1.25+, install the optional CEL validation overlay from a source
+checkout:
 
 ```bash
-kubectl apply -k ./manifests/overlays/kubernetes-1.25
+kubectl apply -k ./kustomize/overlays/kubernetes-1.25
 ```
 
 ## 📚 Examples
