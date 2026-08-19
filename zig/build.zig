@@ -3294,7 +3294,11 @@ pub fn build(b: *std.Build) void {
 
     const antfly_client_pkg_tests = b.addTest(.{
         .root_module = antfly_client_pkg_mod,
-        .filters = &.{ "antfly client pkg compiles", "get index response timeout bounds the complete HTTP request" },
+        .filters = &.{
+            "antfly client pkg compiles",
+            "get index response timeout bounds the complete HTTP request",
+            "list indexes response timeout bounds readiness preflight",
+        },
     });
     const run_antfly_client_pkg_tests = addFilteredTestRunArtifact(b, antfly_client_pkg_tests);
     const antfly_client_pkg_test_step = b.step("antfly-client-test", "Run the standalone antfly-client package compile test");
@@ -3656,7 +3660,16 @@ pub fn build(b: *std.Build) void {
     cmd_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
     const cmd_tests = b.addTest(.{
         .root_module = cmd_test_mod,
-        .filters = &.{ "cmd.lite", "cmd.serverless", "cmd.cli.backup", "cmd.cli.index", "cmd.cli.query", "cmd.cli.table", "cmd.cli.mod" },
+        .filters = &.{
+            "cmd.lite",
+            "cmd.serverless",
+            "cmd.cli.backup",
+            "cmd.cli.index",
+            "cmd.cli.query",
+            "cmd.cli.table",
+            "cmd.cli.mod",
+            "cmd.cli.data.test.mutation parser",
+        },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4776,6 +4789,7 @@ pub fn build(b: *std.Build) void {
         "api http server join planner uses complete fresh local stats before metadata publication",
         "api http server serves provisioned index runtime backfill status across shards",
         "table contract rejects unsupported index kinds before catalog admission",
+        "table contract ignores create-table full text entries and preserves non-full-text indexes",
         "table contract keeps operational create request failures on the internal error path",
         "api http server rejects unsupported table index before metadata publication",
         "api http server serves table create and drop",
@@ -5740,7 +5754,8 @@ pub fn build(b: *std.Build) void {
             "provisioned native backup restore repeats through shared read and write owners",
             "provisioned create succeeds when post-commit runtime status is fenced",
             "provisioned create reuses a generation opened by startup reconciliation",
-            "provisioned create reconfigures managed enrichment on a stale cached writer",
+            "provisioned create installs managed enrichment despite a matching stale fingerprint",
+            "runtime status refreshes aged live writer publications",
             "hosted backup forwarding preserves external io authority",
             "provisioned table restore retry repairs exact incomplete restore state through active writer",
             "provisioned table restore preparation blocks writes and competing structural mutation",

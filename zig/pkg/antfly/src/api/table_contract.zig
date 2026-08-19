@@ -16,6 +16,7 @@ const std = @import("std");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const tables_api = @import("tables.zig");
 const indexes_api = @import("indexes.zig");
+const coverage_policy = @import("coverage_policy.zig");
 
 fn stringifyJsonAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
@@ -611,7 +612,14 @@ fn normalizeCreateTableIndexesFromValue(alloc: std.mem.Allocator, value: std.jso
         try out.appendSlice(alloc, normalized);
     }
     try out.append(alloc, '}');
-    return try out.toOwnedSlice(alloc);
+    const normalized = try out.toOwnedSlice(alloc);
+    defer alloc.free(normalized);
+    // The typed OpenAPI path must establish the same durable incarnation
+    // contract as the compatibility parser in tables.zig. Without it, inline
+    // embedding indexes are provisioned with a derived runtime identity while
+    // the catalog retains an identity-less config; readiness then correctly
+    // rejects every otherwise healthy shard as a config mismatch.
+    return try coverage_policy.withMissingIncarnationsAlloc(alloc, normalized);
 }
 
 fn appendDefaultFullTextIndexEntry(
@@ -893,6 +901,7 @@ test "table contract ignores create-table full text entries and preserves non-fu
     try std.testing.expect(embedding.get("name") == null);
     try std.testing.expectEqualStrings("embeddings", embedding.get("type").?.string);
     try std.testing.expectEqual(@as(i64, 384), embedding.get("dimension").?.integer);
+    try std.testing.expect(coverage_policy.incarnation(.{ .object = embedding }) != null);
 }
 
 test "table contract accepts public full text create index" {

@@ -105,6 +105,19 @@ pub fn printCommandUsage(command: []const u8) void {
     std.debug.print("{s}", .{usage});
 }
 
+pub fn takeUniqueValue(
+    args: *std.process.Args.Iterator,
+    slot: *?[]const u8,
+    flag: []const u8,
+) void {
+    if (slot.* != null) fatal("{s} may only be provided once", .{flag});
+    slot.* = args.next() orelse fatal("{s} requires a value", .{flag});
+}
+
+pub fn rejectRemainingArgs(args: *std.process.Args.Iterator, context: []const u8) void {
+    if (args.next()) |arg| fatal("unexpected argument for {s}: {s}", .{ context, arg });
+}
+
 test "client commands expose help without a server" {
     try std.testing.expect(isHelpArg("--help"));
     try std.testing.expect(isHelpArg("-h"));

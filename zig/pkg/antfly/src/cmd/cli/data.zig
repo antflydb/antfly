@@ -25,25 +25,59 @@ const default_batch_bytes: usize = 8 * 1024 * 1024;
 const checkpoint_version: u32 = 1;
 const checkpoint_max_bytes: usize = 1024 * 1024;
 
-pub fn insert(allocator: std.mem.Allocator, _: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
-    var table_name: ?[]const u8 = null;
-    var key: ?[]const u8 = null;
-    var value_json: ?[]const u8 = null;
+const MutationOptions = struct {
+    table_name: ?[]const u8 = null,
+    key: ?[]const u8 = null,
+    value_json: ?[]const u8 = null,
+};
 
+const MutationParseIssue = union(enum) {
+    missing_value: []const u8,
+    duplicate: []const u8,
+    unknown: []const u8,
+};
+
+const MutationParseResult = union(enum) {
+    value: MutationOptions,
+    issue: MutationParseIssue,
+};
+
+fn parseMutationOptions(iterator: std.process.Args.Iterator, allow_document: bool) MutationParseResult {
+    var args = iterator;
+    var options: MutationOptions = .{};
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
-            table_name = args.next();
+            if (options.table_name != null) return .{ .issue = .{ .duplicate = arg } };
+            options.table_name = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
         } else if (std.mem.eql(u8, arg, "--key")) {
-            key = args.next();
-        } else if (std.mem.eql(u8, arg, "--document") or std.mem.eql(u8, arg, "--value")) {
-            if (value_json != null) cli.fatal("use only one of --document or --value", .{});
-            value_json = args.next();
+            if (options.key != null) return .{ .issue = .{ .duplicate = arg } };
+            options.key = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
+        } else if (allow_document and (std.mem.eql(u8, arg, "--document") or std.mem.eql(u8, arg, "--value"))) {
+            if (options.value_json != null) return .{ .issue = .{ .duplicate = arg } };
+            options.value_json = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
+        } else {
+            return .{ .issue = .{ .unknown = arg } };
         }
     }
+    return .{ .value = options };
+}
 
-    const tbl = table_name orelse cli.fatal("--table is required", .{});
-    const k = key orelse cli.fatal("--key is required", .{});
-    const v = value_json orelse cli.fatal("--document is required", .{});
+fn fatalMutationParseIssue(issue: MutationParseIssue) noreturn {
+    switch (issue) {
+        .missing_value => |flag| cli.fatal("{s} requires a value", .{flag}),
+        .duplicate => |flag| cli.fatal("{s} may only be provided once", .{flag}),
+        .unknown => |flag| cli.fatal("unknown mutation option: {s}", .{flag}),
+    }
+}
+
+pub fn insert(allocator: std.mem.Allocator, _: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+    const options = switch (parseMutationOptions(args.*, true)) {
+        .value => |value| value,
+        .issue => |issue| fatalMutationParseIssue(issue),
+    };
+    const tbl = options.table_name orelse cli.fatal("--table is required", .{});
+    const k = options.key orelse cli.fatal("--key is required", .{});
+    const v = options.value_json orelse cli.fatal("--document is required", .{});
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, v, .{});
     defer parsed.deinit();
@@ -61,19 +95,12 @@ pub fn insert(allocator: std.mem.Allocator, _: std.Io, client: *antfly_client.An
 }
 
 pub fn delete(_: std.mem.Allocator, _: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
-    var table_name: ?[]const u8 = null;
-    var key: ?[]const u8 = null;
-
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
-            table_name = args.next();
-        } else if (std.mem.eql(u8, arg, "--key")) {
-            key = args.next();
-        }
-    }
-
-    const tbl = table_name orelse cli.fatal("--table is required", .{});
-    const k = key orelse cli.fatal("--key is required", .{});
+    const options = switch (parseMutationOptions(args.*, false)) {
+        .value => |value| value,
+        .issue => |issue| fatalMutationParseIssue(issue),
+    };
+    const tbl = options.table_name orelse cli.fatal("--table is required", .{});
+    const k = options.key orelse cli.fatal("--key is required", .{});
 
     const deletes = [_][]const u8{k};
     var resp = try client.batch(tbl, .{
@@ -878,6 +905,29 @@ fn writeCheckpointAtomically(alloc: std.mem.Allocator, io: std.Io, path: []const
         std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
         return err;
     };
+}
+
+test "mutation parser rejects unknown duplicate and missing options" {
+    var valid_argv = [_][*:0]const u8{ "--table", "docs", "--key", "doc:a", "--document", "{}" };
+    const valid = parseMutationOptions(std.process.Args.Iterator.init(.{ .vector = valid_argv[0..] }), true);
+    try std.testing.expectEqualStrings("docs", valid.value.table_name.?);
+    try std.testing.expectEqualStrings("{}", valid.value.value_json.?);
+
+    var unknown_argv = [_][*:0]const u8{ "--table", "docs", "--key", "doc:a", "--typo", "value" };
+    const unknown = parseMutationOptions(std.process.Args.Iterator.init(.{ .vector = unknown_argv[0..] }), false);
+    try std.testing.expectEqualStrings("--typo", unknown.issue.unknown);
+
+    var duplicate_argv = [_][*:0]const u8{ "--table", "docs", "-t", "other" };
+    const duplicate = parseMutationOptions(std.process.Args.Iterator.init(.{ .vector = duplicate_argv[0..] }), false);
+    try std.testing.expectEqualStrings("-t", duplicate.issue.duplicate);
+
+    var missing_argv = [_][*:0]const u8{"--document"};
+    const missing = parseMutationOptions(std.process.Args.Iterator.init(.{ .vector = missing_argv[0..] }), true);
+    try std.testing.expectEqualStrings("--document", missing.issue.missing_value);
+
+    var delete_document_argv = [_][*:0]const u8{ "--document", "{}" };
+    const delete_document = parseMutationOptions(std.process.Args.Iterator.init(.{ .vector = delete_document_argv[0..] }), false);
+    try std.testing.expectEqualStrings("--document", delete_document.issue.unknown);
 }
 
 test "line scanner handles split lines crlf final line and long lines" {

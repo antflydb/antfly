@@ -177,6 +177,37 @@ def test_insert_lookup_delete(cli):
     cli("table", "drop", "--table", table)
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("insert", "--table", "docs", "--key", "doc:a", "--document", "{}", "--typo", "value"),
+        ("delete", "--table", "docs", "--key", "doc:a", "--typo", "value"),
+        ("lookup", "--table", "docs", "--key", "doc:a", "--typo", "value"),
+        ("artifact", "list", "--table", "docs", "--typo", "value"),
+        (
+            "agents",
+            "query-builder",
+            "--intent",
+            "find documents",
+            "--generator",
+            '{"provider":"openai","model":"test"}',
+            "--typo",
+            "value",
+        ),
+    ],
+)
+def test_client_commands_reject_unknown_options_before_network_work(cli, args):
+    result = cli(*args, check=False)
+    assert result.returncode != 0
+    assert "unknown" in result.stderr.lower()
+
+
+def test_semantic_query_requires_table_before_network_work(cli):
+    result = cli("query", "--semantic-search", "alpha", check=False)
+    assert result.returncode != 0
+    assert "--table is required" in result.stderr
+
+
 # ---------------------------------------------------------------------------
 # Query (full-text search via CLI)
 # ---------------------------------------------------------------------------

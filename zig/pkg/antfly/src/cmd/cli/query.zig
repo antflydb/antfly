@@ -17,6 +17,10 @@ const antfly_client = @import("antfly-client");
 const cli = @import("mod.zig");
 const index_readiness = @import("index_readiness.zig");
 
+// Readiness is advisory for a query: keep its control-plane lookup bounded so
+// an unhealthy status endpoint cannot hold the data-plane request hostage.
+const semantic_readiness_timeout_ms: u64 = 1_500;
+
 const QueryOptions = struct {
     table_name: ?[]const u8 = null,
     full_text_search: ?[]const u8 = null,
@@ -43,6 +47,7 @@ const QueryParseIssue = union(enum) {
     too_large: struct { flag: []const u8, value: []const u8 },
     conflicting_search: void,
     semantic_offset: void,
+    missing_table: void,
 };
 
 const QueryParseResult = union(enum) { value: QueryOptions, issue: QueryParseIssue };
@@ -108,6 +113,9 @@ fn parseQueryOptions(iterator: std.process.Args.Iterator) QueryParseResult {
     if (options.semantic_search != null and (options.offset orelse 0) != 0) {
         return .{ .issue = .{ .semantic_offset = {} } };
     }
+    if (options.semantic_search != null and options.table_name == null) {
+        return .{ .issue = .{ .missing_table = {} } };
+    }
     return .{ .value = options };
 }
 
@@ -122,6 +130,7 @@ fn fatalQueryParseIssue(issue: QueryParseIssue) noreturn {
         .too_large => |value| cli.fatal("{s} exceeds the supported maximum: {s}", .{ value.flag, value.value }),
         .conflicting_search => cli.fatal("only one of --full-text-search or --full-text-search-json may be provided", .{}),
         .semantic_offset => cli.fatal("--offset is not supported with --semantic-search", .{}),
+        .missing_table => cli.fatal("--table is required", .{}),
     }
 }
 
@@ -217,7 +226,7 @@ fn warnIfSemanticIndexesAreNotReady(
     table_name: []const u8,
     selected_indexes: ?[]const []const u8,
 ) void {
-    var resp = client.listIndexes(table_name) catch |err| {
+    var resp = client.listIndexesResponseWithTimeout(table_name, semantic_readiness_timeout_ms) catch |err| {
         std.debug.print("warning: unable to verify semantic index readiness: {s}\n", .{@errorName(err)});
         return;
     };
@@ -294,6 +303,15 @@ test "query parser fails closed for missing malformed duplicate and incompatible
     var typo_argv = [_][*:0]const u8{ "--semantic-serach", "alpha" };
     const typo = parseQueryOptions(std.process.Args.Iterator.init(.{ .vector = typo_argv[0..] }));
     try std.testing.expectEqualStrings("--semantic-serach", typo.issue.unknown);
+
+    var tableless_argv = [_][*:0]const u8{ "--semantic-search", "alpha" };
+    const tableless = parseQueryOptions(std.process.Args.Iterator.init(.{ .vector = tableless_argv[0..] }));
+    try std.testing.expect(tableless.issue == .missing_table);
+
+    var global_full_text_argv = [_][*:0]const u8{ "--full-text-search", "alpha" };
+    const global_full_text = parseQueryOptions(std.process.Args.Iterator.init(.{ .vector = global_full_text_argv[0..] }));
+    try std.testing.expect(global_full_text == .value);
+    try std.testing.expect(global_full_text.value.table_name == null);
 }
 
 test "semantic readiness requires compatible policy-aware coverage" {
@@ -359,26 +377,76 @@ test "semantic readiness requires compatible policy-aware coverage" {
     }));
 }
 
-pub fn lookup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
-    var table_name: ?[]const u8 = null;
-    var key: ?[]const u8 = null;
+const LookupOptions = struct {
+    table_name: ?[]const u8 = null,
+    key: ?[]const u8 = null,
+};
 
+const LookupParseIssue = union(enum) {
+    missing_value: []const u8,
+    duplicate: []const u8,
+    unknown: []const u8,
+};
+
+const LookupParseResult = union(enum) { value: LookupOptions, issue: LookupParseIssue };
+
+fn parseLookupOptions(iterator: std.process.Args.Iterator) LookupParseResult {
+    var args = iterator;
+    var options: LookupOptions = .{};
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
-            table_name = args.next();
+            if (options.table_name != null) return .{ .issue = .{ .duplicate = arg } };
+            options.table_name = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
         } else if (std.mem.eql(u8, arg, "--key") or std.mem.eql(u8, arg, "-k")) {
-            key = args.next();
+            if (options.key != null) return .{ .issue = .{ .duplicate = arg } };
+            options.key = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
+        } else {
+            return .{ .issue = .{ .unknown = arg } };
         }
     }
+    return .{ .value = options };
+}
 
-    const tbl = table_name orelse cli.fatal("--table is required", .{});
-    const k = key orelse cli.fatal("--key is required", .{});
+fn fatalLookupParseIssue(issue: LookupParseIssue) noreturn {
+    switch (issue) {
+        .missing_value => |flag| cli.fatal("{s} requires a value", .{flag}),
+        .duplicate => |flag| cli.fatal("{s} may only be provided once", .{flag}),
+        .unknown => |flag| cli.fatal("unknown lookup option: {s}", .{flag}),
+    }
+}
+
+pub fn lookup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+    const options = switch (parseLookupOptions(args.*)) {
+        .value => |value| value,
+        .issue => |issue| fatalLookupParseIssue(issue),
+    };
+
+    const tbl = options.table_name orelse cli.fatal("--table is required", .{});
+    const k = options.key orelse cli.fatal("--key is required", .{});
 
     var resp = try client.lookupKey(tbl, k, .{});
     defer resp.deinit();
     if (resp.data) |data| {
         try cli.writeJson(allocator, io, data.value);
     }
+}
+
+test "lookup parser rejects unknown duplicate and missing options" {
+    var valid_argv = [_][*:0]const u8{ "--table", "docs", "--key", "doc:a" };
+    const valid = parseLookupOptions(std.process.Args.Iterator.init(.{ .vector = valid_argv[0..] }));
+    try std.testing.expectEqualStrings("doc:a", valid.value.key.?);
+
+    var unknown_argv = [_][*:0]const u8{ "--table", "docs", "--key", "doc:a", "--typo" };
+    const unknown = parseLookupOptions(std.process.Args.Iterator.init(.{ .vector = unknown_argv[0..] }));
+    try std.testing.expectEqualStrings("--typo", unknown.issue.unknown);
+
+    var duplicate_argv = [_][*:0]const u8{ "--key", "a", "-k", "b" };
+    const duplicate = parseLookupOptions(std.process.Args.Iterator.init(.{ .vector = duplicate_argv[0..] }));
+    try std.testing.expectEqualStrings("-k", duplicate.issue.duplicate);
+
+    var missing_argv = [_][*:0]const u8{"--key"};
+    const missing = parseLookupOptions(std.process.Args.Iterator.init(.{ .vector = missing_argv[0..] }));
+    try std.testing.expectEqualStrings("--key", missing.issue.missing_value);
 }
 
 fn buildFullTextSearchValue(allocator: std.mem.Allocator, query: []const u8) std.json.Parsed(std.json.Value) {

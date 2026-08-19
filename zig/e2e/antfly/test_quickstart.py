@@ -674,15 +674,16 @@ def test_public_managed_semantic_hybrid_quickstart_pipeline(backup_api, openai_e
 
 def test_public_managed_semantic_full_index_pipeline(backup_api, openai_embedder):
     table_name = f"quickstart_semantic_{__import__('time').time_ns()}"
+    index_name = "semantic_idx"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
     assert (
         backup_api.create_index(
             table_name,
-            "semantic_idx",
+            index_name,
             {
-                "name": "semantic_idx",
+                "name": index_name,
                 "type": "embeddings",
                 "field": "body",
                 "dimension": 3,
@@ -696,7 +697,7 @@ def test_public_managed_semantic_full_index_pipeline(backup_api, openai_embedder
         == {}
     )
 
-    backup_api.wait_index_ready(table_name, "semantic_idx", timeout_s=30.0, interval_s=0.5)
+    backup_api.wait_index_ready(table_name, index_name, timeout_s=30.0, interval_s=0.5)
 
     batch = backup_api.batch_write(
         table_name,
@@ -714,16 +715,83 @@ def test_public_managed_semantic_full_index_pipeline(backup_api, openai_embedder
     )
     assert batch["inserted"] == 2
 
+    backup_api.wait_index_ready(table_name, index_name, timeout_s=30.0, interval_s=0.25)
+    index = backup_api.get_index(table_name, index_name)
+    assert index["config"]["name"] == index_name
+    status = index["status"]
+    assert status["backfill_state"] == "ready"
+    assert status["rebuilding"] is False
+    assert status["coverage"]["observation_complete"] is True
+    assert status["coverage"]["config_mismatch_group_count"] == 0
+    assert status["enrichment_runtime"]["enabled"] is True
+    assert status["enrichment_runtime"]["worker_started"] is True
+
     result = backup_api.query_table(
         table_name,
         {
             "semantic_search": "alpha concept",
-            "indexes": ["semantic_idx"],
+            "indexes": [index_name],
             "limit": 5,
         },
     )
     responses = result["responses"]
     hits = responses[0]["hits"]["hits"]
+    assert hits[0]["_id"] == "doc:a"
+
+
+def test_inline_managed_index_create_load_ready_query_pipeline(backup_api, openai_embedder):
+    """Cover the published create-table path through query-visible readiness."""
+    table_name = f"quickstart_inline_semantic_{__import__('time').time_ns()}"
+    index_name = "title_body"
+    created = backup_api.create_table(
+        table_name,
+        num_shards=1,
+        indexes={
+            index_name: {
+                "name": index_name,
+                "type": "embeddings",
+                "template": "{{title}} {{body}}",
+                "dimension": 3,
+                "embedder": {
+                    "provider": "openai",
+                    "model": "text-embedding-3-small",
+                    "url": openai_embedder,
+                },
+            }
+        },
+    )
+    assert created["name"] == table_name
+    batch = backup_api.batch_write(
+        table_name,
+        inserts={
+            "doc:a": {"title": "Alpha", "body": "alpha concept overview"},
+            "doc:b": {"title": "Beta", "body": "beta unrelated notes"},
+        },
+        sync_level="full_index",
+    )
+    assert batch["inserted"] == 2
+
+    backup_api.wait_index_ready(table_name, index_name, timeout_s=30.0, interval_s=0.25)
+    index = backup_api.get_index(table_name, index_name)
+    assert index["config"]["name"] == index_name
+    status = index["status"]
+    assert status["backfill_state"] == "ready"
+    assert status["rebuilding"] is False
+    assert status["coverage"]["observation_complete"] is True
+    assert status["coverage"]["config_mismatch_group_count"] == 0
+    assert status["enrichment_runtime"]["enabled"] is True
+    assert status["enrichment_runtime"]["worker_started"] is True
+
+    result = backup_api.query_table(
+        table_name,
+        {
+            "semantic_search": "alpha concept",
+            "indexes": [index_name],
+            "limit": 2,
+        },
+    )
+    hits = result["responses"][0]["hits"]["hits"]
+    assert hits
     assert hits[0]["_id"] == "doc:a"
 
 

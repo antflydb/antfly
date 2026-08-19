@@ -190,6 +190,33 @@ pub const AntflyClient = struct {
         return resp;
     }
 
+    /// Returns index statuses without converting non-2xx responses while
+    /// bounding the complete request. This is intended for best-effort CLI
+    /// diagnostics that must never dominate the latency of the real action.
+    pub fn listIndexesResponseWithTimeout(
+        self: *AntflyClient,
+        table_name: []const u8,
+        timeout_ms: u64,
+    ) !openapi.ApiResponse([]const openapi.types.IndexStatus) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/db/v1/tables/{s}/indexes",
+            .{ self.inner.base_url, encoded_table_name },
+        );
+        defer self.allocator.free(url);
+        const headers: ?[]const [2][]const u8 = if (self.inner.auth_header) |*header|
+            @as(*const [1][2][]const u8, header)
+        else
+            null;
+        var resp = try self.inner.http.get(url, .{
+            .headers = headers,
+            .timeout_ms = @max(timeout_ms, 1),
+        });
+        return openapi.ApiResponse([]const openapi.types.IndexStatus).fromResponse(self.allocator, &resp);
+    }
+
     // --- Query operations ---
 
     pub fn query(self: *AntflyClient, body: openapi.types.QueryRequest) !openapi.ApiResponse(openapi.types.QueryResponses) {

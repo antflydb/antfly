@@ -658,23 +658,42 @@ fn retryableWaitHttpStatus(status: u16) bool {
 
 fn retryableWaitTransportError(err: anyerror) bool {
     const name = @errorName(err);
-    const permanent = [_][]const u8{
-        "OutOfMemory",
-        "InvalidUri",
-        "InvalidHostName",
-        "TooManyRedirects",
-        "UnsafeRedirect",
-        "ResponseTooLarge",
-        "InvalidResponse",
-        "ProtocolError",
-        "DecompressionFailed",
-        "Cancelled",
-        "Canceled",
-        "AccessDenied",
+    // Fail closed: only errors known to represent transient transport or pool
+    // availability are retried. New parser, TLS, configuration, and resource
+    // errors must surface immediately instead of silently consuming the full
+    // user-visible wait budget.
+    const transient = [_][]const u8{
+        "Timeout",
+        "ConnectionFailed",
+        "ConnectionReset",
+        "ConnectionResetByPeer",
+        "ConnectionTimeout",
+        "ConnectionTimedOut",
+        "ConnectionRefused",
+        "ConnectionAborted",
+        "ConnectionClosed",
+        "BrokenPipe",
+        "HostUnreachable",
+        "NetworkUnreachable",
+        "NetworkDown",
+        "NetworkSubsystemFailed",
+        "DnsResolutionFailed",
+        "TemporaryNameServerFailure",
+        "PoolExhausted",
+        "PoolExhaustedForHost",
+        "EndOfStream",
+        "UnexpectedEndOfStream",
+        "ReadFailed",
+        "WriteFailed",
+        "StreamError",
+        "FlowControlError",
+        "FrameError",
+        "Http2Error",
+        "Http3Error",
+        "QuicError",
     };
-    for (permanent) |value| if (std.mem.eql(u8, name, value)) return false;
-    if (std.mem.indexOf(u8, name, "Certificate") != null) return false;
-    return true;
+    for (transient) |value| if (std.mem.eql(u8, name, value)) return true;
+    return false;
 }
 
 fn retryDelayMs(base_ms: u64, consecutive_failures: u32, entropy: u64) u64 {
@@ -937,6 +956,10 @@ test "index wait retries bounded HTTP and transport failures" {
     try std.testing.expect(retryableWaitTransportError(error.Timeout));
     try std.testing.expect(!retryableWaitTransportError(error.InvalidUri));
     try std.testing.expect(!retryableWaitTransportError(error.CertificateVerificationFailed));
+    try std.testing.expect(!retryableWaitTransportError(error.InvalidHeader));
+    try std.testing.expect(!retryableWaitTransportError(error.InvalidChunkSize));
+    try std.testing.expect(!retryableWaitTransportError(error.CompressionError));
+    try std.testing.expect(!retryableWaitTransportError(error.TlsHandshakeFailed));
     try std.testing.expect(retryDelayMs(1000, 4, 0) <= max_wait_retry_delay_ms);
 
     const Fake = struct {

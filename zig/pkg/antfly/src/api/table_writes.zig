@@ -10593,7 +10593,16 @@ pub const ProvisionedTableWriteSource = struct {
         const min_refresh_interval_ns = std.time.ns_per_s;
         if (statuses.items.len == 0) return true;
         for (statuses.items) |status| {
-            if (status.metadata.source != .cached_snapshot) continue;
+            // A live-writer publication is still a point-in-time cache entry.
+            // Enrichment and derived-index workers can advance immediately
+            // after it is published (notably after inline table creation), so
+            // treating it as permanently current strands readiness at the
+            // pre-replay snapshot. Refresh both recovered and writer-published
+            // observations from the already-open writer at the bounded cadence.
+            switch (status.metadata.source) {
+                .cached_snapshot, .live_writer_publish => {},
+                else => continue,
+            }
             if (!runtime_status.statusRuntimeFresh(status)) return true;
             if (status.metadata.updated_at_ns == 0) return true;
             if (now_ns -| status.metadata.updated_at_ns >= min_refresh_interval_ns) return true;
@@ -12888,27 +12897,25 @@ pub const ProvisionedTableWriteSource = struct {
                     try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, cached.db);
                     try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
                     // Catalog admission and local create can race an earlier
-                    // startup/status open of this generation. In that case the
-                    // resident writer may still own the old (often empty)
-                    // producer set even though the create request already
-                    // carries the authoritative managed-index definition.
-                    // Reconfigure before catalog reconciliation, then publish
-                    // the matching fingerprint only after every group commits.
-                    // Otherwise the new index is durable but its enrichment
-                    // worker remains permanently absent and status reports a
-                    // configuration mismatch at zero coverage.
-                    if (!ProvisionedTableWriteCache.entryManagedConfigMatches(entry, indexes_json)) {
-                        try reconfigureManagedDbEnrichmentRuntime(
-                            alloc,
-                            cached.db,
-                            indexes_json,
-                            self.backend_runtime,
-                            self.antfly_provider,
-                            self.inference_api_url,
-                            self.secret_store,
-                            self.remote_content,
-                        );
-                    }
+                    // startup/status open of this generation. The entry
+                    // fingerprint is publication metadata, not proof that the
+                    // resident DB successfully installed the same producer
+                    // set: an adopted/opened writer can carry the new catalog
+                    // fingerprint while still owning the old (often empty)
+                    // runtime. Create is the authoritative, one-shot commit
+                    // boundary, so always install its requested runtime before
+                    // reconciling durable indexes. Publish the matching
+                    // fingerprint only after every group commits.
+                    try reconfigureManagedDbEnrichmentRuntime(
+                        alloc,
+                        cached.db,
+                        indexes_json,
+                        self.backend_runtime,
+                        self.antfly_provider,
+                        self.inference_api_url,
+                        self.secret_store,
+                        self.remote_content,
+                    );
                     _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
                         .drain_resolver_backfill = false,
                     });
@@ -39497,7 +39504,7 @@ test "provisioned create reuses a generation opened by startup reconciliation" {
     try std.testing.expect(std.mem.indexOf(u8, admitted.json, "already provisioned") != null);
 }
 
-test "provisioned create reconfigures managed enrichment on a stale cached writer" {
+test "provisioned create installs managed enrichment despite a matching stale fingerprint" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -39595,7 +39602,7 @@ test "provisioned create reconfigures managed enrichment on a stale cached write
     defer alloc.free(base_uri);
 
     const managed_indexes_json = try std.fmt.allocPrint(alloc,
-        \\{{"full_text_index_v0":{{"name":"full_text_index_v0","type":"full_text"}},"title_body":{{"name":"title_body","type":"embeddings","field":"body","dimension":3,"embedder":{{"provider":"openai","model":"test-embed","url":"{s}"}}}}}}
+        \\{{"full_text_index_v0":{{"name":"full_text_index_v0","type":"full_text"}},"title_body":{{"name":"title_body","type":"embeddings","template":"{{{{title}}}} {{{{body}}}}","dimension":3,"embedder":{{"provider":"openai","model":"test-embed","url":"{s}"}}}}}}
     , .{base_uri});
     defer alloc.free(managed_indexes_json);
     Catalog.indexes_json_buf = tables_api.default_indexes_json;
@@ -39603,14 +39610,12 @@ test "provisioned create reconfigures managed enrichment on a stale cached write
 
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
-    var startup_write_cache = ProvisionedTableWriteCache.init(alloc);
-    defer startup_write_cache.deinit();
     var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
     defer source.deinit();
-    source.bindWriteCaches(&write_cache, &startup_write_cache);
+    source.write_cache = &write_cache;
 
     {
-        var startup_owner = try startup_write_cache.getOrOpenLockedMode(
+        var stale_owner = try write_cache.getOrOpenLockedMode(
             path,
             Catalog.iface(),
             7001,
@@ -39618,8 +39623,16 @@ test "provisioned create reconfigures managed enrichment on a stale cached write
             "docs",
             .startup_catch_up,
         );
-        defer startup_owner.deinit(alloc);
-        try std.testing.expect(startup_owner.db.enrichment_runtime == null);
+        defer stale_owner.deinit(alloc);
+        try std.testing.expect(stale_owner.db.enrichment_runtime == null);
+        // Reproduce the production failure precisely: metadata publication
+        // advanced independently while the resident runtime stayed stale.
+        // A fingerprint match alone must never let create skip installation.
+        ProvisionedTableWriteCache.publishEntryManagedConfig(stale_owner.entry.?, managed_indexes_json);
+        try std.testing.expect(ProvisionedTableWriteCache.entryManagedConfigMatches(
+            stale_owner.entry.?,
+            managed_indexes_json,
+        ));
     }
 
     // Admission has committed the new catalog value, but the startup cache
@@ -39631,7 +39644,6 @@ test "provisioned create reconfigures managed enrichment on a stale cached write
     defer req.deinit(alloc);
     _ = try source.source().createTable(alloc, "docs", req);
 
-    try std.testing.expectEqual(@as(usize, 0), startup_write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     const entry = write_cache.entries.items[0];
     try std.testing.expect(ProvisionedTableWriteCache.entryManagedConfigMatches(entry, managed_indexes_json));
@@ -39655,6 +39667,31 @@ test "provisioned create reconfigures managed enrichment on a stale cached write
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "runtime status refreshes aged live writer publications" {
+    const now_ns = 2 * std.time.ns_per_s;
+    var item = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7001,
+        .metadata = .{
+            .source = .live_writer_publish,
+            .freshness = .fresh,
+            .updated_at_ns = 1,
+        },
+        .stats = .{},
+    };
+    var items = [_]runtime_status.LocalTableRuntimeStatus{item};
+    var statuses = runtime_status.LocalTableRuntimeStatuses{ .items = items[0..] };
+    try std.testing.expect(ProvisionedTableWriteSource.runtimeStatusesNeedWriterRefresh(&statuses, now_ns));
+
+    item.metadata.updated_at_ns = now_ns;
+    statuses.items[0] = item;
+    try std.testing.expect(!ProvisionedTableWriteSource.runtimeStatusesNeedWriterRefresh(&statuses, now_ns));
+
+    item.metadata.source = .synthetic_config;
+    item.metadata.updated_at_ns = 1;
+    statuses.items[0] = item;
+    try std.testing.expect(!ProvisionedTableWriteSource.runtimeStatusesNeedWriterRefresh(&statuses, now_ns));
 }
 
 test "provisioned table write source restore table does not hold local db mutex during restore work" {

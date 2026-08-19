@@ -2191,10 +2191,19 @@ def stateful_api(request: pytest.FixtureRequest):
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
-        def create_table(self, table_name: str, *, num_shards: int = 1, description: str | None = None) -> dict:
+        def create_table(
+            self,
+            table_name: str,
+            *,
+            num_shards: int = 1,
+            description: str | None = None,
+            indexes: dict[str, dict] | None = None,
+        ) -> dict:
             payload: dict[str, object] = {"num_shards": num_shards}
             if description is not None:
                 payload["description"] = description
+            if indexes is not None:
+                payload["indexes"] = indexes
             deadline = time.monotonic() + 5.0
             while True:
                 try:
@@ -2651,10 +2660,19 @@ def backup_api():
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
-        def create_table(self, table_name: str, *, num_shards: int = 1, description: str | None = None) -> dict:
+        def create_table(
+            self,
+            table_name: str,
+            *,
+            num_shards: int = 1,
+            description: str | None = None,
+            indexes: dict[str, dict] | None = None,
+        ) -> dict:
             payload: dict[str, object] = {"num_shards": num_shards}
             if description is not None:
                 payload["description"] = description
+            if indexes is not None:
+                payload["indexes"] = indexes
             deadline = time.monotonic() + 5.0
             while True:
                 try:
