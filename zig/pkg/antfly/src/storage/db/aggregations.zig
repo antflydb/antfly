@@ -2595,28 +2595,35 @@ fn computeAlgebraicTermsCardinalityChildrenAggregation(
         for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
-    // For each cardinality child, prefer a matching per-group HLL materialization
-    // (group_key -> estimate, read once) over a per-bucket exact rescan. A null
-    // slot means no materialization matched and the child uses the exact scan.
-    const HllEstimateMap = std.StringHashMapUnmanaged(u64);
-    const child_hll_maps = try alloc.alloc(?HllEstimateMap, child_requests.len);
+    // Build only the canonical group keys that can appear in the response. HLL
+    // reads below point-read this bounded set rather than cursor-scanning every
+    // materialized group before `terms.size` is applied.
+    const selected_group_keys = try index.alloc.alloc([]const u8, limit);
+    var selected_group_keys_initialized: usize = 0;
     defer {
-        for (child_hll_maps) |*maybe_map| {
-            if (maybe_map.*) |*map| {
-                var it = map.keyIterator();
-                while (it.next()) |key| alloc.free(key.*);
-                map.deinit(alloc);
-            }
-        }
-        alloc.free(child_hll_maps);
+        for (selected_group_keys[0..selected_group_keys_initialized]) |key| index.alloc.free(key);
+        index.alloc.free(selected_group_keys);
     }
-    // Parallel to child_hll_maps: the HLL standard error for each child served
+    for (candidates[0..limit], 0..) |candidate, i| {
+        selected_group_keys[i] = try index.approxCardinalityGroupKeyForScalarAlloc(candidate.key);
+        selected_group_keys_initialized += 1;
+    }
+    // Per child, estimates are aligned with selected_group_keys/candidates. A
+    // null slice means no matching HLL exists and auto mode uses the exact path;
+    // a null element means that selected group has no contributed values.
+    const child_hll_estimates = try alloc.alloc(?[]?u64, child_requests.len);
+    @memset(child_hll_estimates, null);
+    defer {
+        for (child_hll_estimates) |maybe_estimates| if (maybe_estimates) |estimates| index.alloc.free(estimates);
+        alloc.free(child_hll_estimates);
+    }
+    // Parallel to child_hll_estimates: the HLL standard error for each child served
     // from a sketch, so the emitted result can carry its error budget.
     const child_rel_errors = try alloc.alloc(?f64, child_requests.len);
     defer alloc.free(child_rel_errors);
     for (child_rel_errors) |*e| e.* = null;
     for (child_requests, 0..) |child_request, ci| {
-        child_hll_maps[ci] = null;
+        child_hll_estimates[ci] = null;
         if (child_request.cardinality_mode == .exact) continue;
         // Record the grouped cardinality shape so it can adaptively promote a
         // per-group sketch (no-op unless adaptive.lazy_materialization is on, and
@@ -2624,10 +2631,11 @@ fn computeAlgebraicTermsCardinalityChildrenAggregation(
         if (constraints.len == 0 and generation == null) {
             index.observeCardinalityForAdaptive(store, bucket_field, child_request.field);
         }
-        const maybe_group_entries = index.approxCardinalityEntriesForGroupAlloc(
+        const maybe_estimates = index.approxCardinalityEstimatesForGroupKeysAlloc(
             store,
             &.{bucket_field},
             child_request.field,
+            selected_group_keys,
             constraints,
             generation,
         ) catch |err| switch (err) {
@@ -2638,26 +2646,11 @@ fn computeAlgebraicTermsCardinalityChildrenAggregation(
             },
             else => return err,
         };
-        const group_entries = maybe_group_entries orelse {
+        const estimates = maybe_estimates orelse {
             if (child_request.cardinality_mode == .approximate) return error.UnsupportedAggregation;
             continue;
         };
-        defer {
-            for (group_entries) |*entry| entry.deinit(index.alloc);
-            index.alloc.free(group_entries);
-        }
-        var map: HllEstimateMap = .empty;
-        errdefer {
-            var it = map.keyIterator();
-            while (it.next()) |key| alloc.free(key.*);
-            map.deinit(alloc);
-        }
-        for (group_entries) |group_entry| {
-            const gop = try map.getOrPut(alloc, group_entry.group_key);
-            if (!gop.found_existing) gop.key_ptr.* = try alloc.dupe(u8, group_entry.group_key);
-            gop.value_ptr.* = group_entry.estimate;
-        }
-        child_hll_maps[ci] = map;
+        child_hll_estimates[ci] = estimates;
         child_rel_errors[ci] = try index.hllRelativeErrorForField(store, &.{bucket_field}, child_request.field, constraints, generation);
         // Record that this nested cardinality child is served from a
         // materialized HLL sketch, mirroring the root cardinality path, so
@@ -2680,11 +2673,10 @@ fn computeAlgebraicTermsCardinalityChildrenAggregation(
             alloc.free(child_results);
         }
         for (child_requests, 0..) |child_request, child_idx| {
-            const value: u64 = if (child_hll_maps[child_idx]) |map| blk: {
-                const group_key = try index.approxCardinalityGroupKeyForScalarAlloc(candidate.key);
-                defer index.alloc.free(group_key);
-                break :blk map.get(group_key) orelse 0;
-            } else (try index.exactCardinalityForFieldAtGenerationAlloc(store, child_request.field, child_constraints, generation)) orelse return null;
+            const value: u64 = if (child_hll_estimates[child_idx]) |estimates|
+                estimates[idx] orelse 0
+            else
+                (try index.exactCardinalityForFieldAtGenerationAlloc(store, child_request.field, child_constraints, generation)) orelse return null;
             child_results[child_idx] = .{
                 .name = child_request.name,
                 .field = child_request.field,
@@ -15005,6 +14997,7 @@ test "algebraic aggregation planner answers cardinality from HLL materialization
         \\    {"name":"customer","path":"customer","type":"string"}
         \\  ],
         \\  "hll_cardinalities": [
+        \\    {"name":"all_customers","group_by":[],"value_field":"customer","precision":14},
         \\    {"name":"customers_by_region","group_by":["region"],"value_field":"customer","precision":14}
         \\  ]
         \\}
@@ -15037,7 +15030,8 @@ test "algebraic aggregation planner answers cardinality from HLL materialization
         .algebraic_available = true,
     };
 
-    // Root cardinality is served by the merged HLL union: distinct {a,b,c} == 3.
+    // Root cardinality is served by its dedicated ungrouped HLL: distinct
+    // {a,b,c} == 3. Grouped sketches are never union-scanned at query time.
     const root_requests = [_]SearchAggregationRequest{.{ .name = "unique_customers", .type = "cardinality", .field = "customer" }};
     const root_aggs = try computeSearchAggregations(alloc, &root_requests, result, ctx);
     defer deinitResults(alloc, root_aggs);

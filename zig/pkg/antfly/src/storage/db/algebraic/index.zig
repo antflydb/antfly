@@ -19072,7 +19072,7 @@ pub const Index = struct {
 
     /// Reads one materialized HLL sketch per group and returns its estimated
     /// distinct count. O(groups) cursor reads with no per-document rescan.
-    pub fn approxCardinalityEntriesAlloc(self: *Index, store: *docstore_mod.DocStore, name: []const u8) ![]ApproxCardinalityEntry {
+    fn approxCardinalityEntriesAlloc(self: *Index, store: *docstore_mod.DocStore, name: []const u8) ![]ApproxCardinalityEntry {
         var txn = try store.beginReadTxn();
         defer txn.abort();
         return try self.approxCardinalityEntriesTxnAlloc(&txn, name);
@@ -19120,58 +19120,29 @@ pub const Index = struct {
         return null;
     }
 
-    /// Total distinct count across all groups of a materialized HLL cardinality,
-    /// computed by merging the per-group sketches (an exact union, not a sum of
-    /// per-group estimates).
-    fn mergedHllCardinalityEncodedTxnAlloc(self: *Index, txn: anytype, spec: HllCardinalityReadSpec) ![]u8 {
-        const prefix = try self.hllCardinalityPrefixAlloc(spec.name);
-        defer self.alloc.free(prefix);
-        var cursor = try txn.openCursor();
-        defer cursor.close();
-        var merged: ?[]u8 = null;
-        defer if (merged) |bytes| self.alloc.free(bytes);
-        var entry_opt = try cursor.seekAtOrAfter(prefix);
-        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
-            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
-            const group_component = token.componentAt(entry.key, prefix.len) catch return error.CorruptHllMaterialization;
-            if (group_component.next != entry.key.len) return error.CorruptHllMaterialization;
-            const next = (law_mod.combineAlloc(self.alloc, .hll, merged, entry.value) catch |err| switch (err) {
-                error.InvalidHllPrecision, error.InvalidHllSketch, error.IncompatibleHllSketch => return error.CorruptHllMaterialization,
-                else => return err,
-            }) orelse continue;
-            if (merged) |bytes| self.alloc.free(bytes);
-            merged = next;
-        }
-        if (merged) |bytes| {
-            merged = null;
-            return bytes;
+    /// Reads the single sketch of an ungrouped HLL materialization. Root
+    /// cardinality deliberately does not union a grouped materialization at
+    /// query time: doing so makes one request proportional to every group and
+    /// every dense sketch in the index. Root observations provision a dedicated
+    /// `group_by: []` sketch, whose canonical empty tuple is point-readable.
+    fn rootHllCardinalityEncodedTxnAlloc(self: *Index, txn: anytype, spec: HllCardinalityReadSpec) ![]u8 {
+        const empty_group = try token.canonicalTupleAlloc(self.alloc, &.{});
+        defer self.alloc.free(empty_group);
+        const key = try self.hllCardinalityKeyAlloc(spec.name, empty_group);
+        defer self.alloc.free(key);
+        const encoded = txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (encoded) |bytes| {
+            _ = hll.estimateEncoded(bytes) catch return error.CorruptHllMaterialization;
+            return try self.alloc.dupe(u8, bytes);
         }
         // A valid empty materialization still needs a mergeable HLL identity so
         // every shard contributes the same law and precision.
         var empty = try hll.Sketch.init(self.alloc, spec.precision);
         defer empty.deinit(self.alloc);
         return try hll.encodeAlloc(self.alloc, empty);
-    }
-
-    pub fn approxCardinalityTotalAlloc(self: *Index, store: *docstore_mod.DocStore, name: []const u8) !u64 {
-        var precision = hll.default_precision;
-        {
-            var registry = self.lockHllRegistry();
-            defer registry.deinit();
-            for (registry.items) |hcfg| {
-                if (!std.mem.eql(u8, hcfg.name, name)) continue;
-                precision = hllCardinalityPrecision(hcfg);
-                break;
-            }
-        }
-        var txn = try store.beginReadTxn();
-        defer txn.abort();
-        const encoded = try self.mergedHllCardinalityEncodedTxnAlloc(&txn, .{
-            .name = @constCast(name),
-            .precision = precision,
-        });
-        defer self.alloc.free(encoded);
-        return try hll.estimateEncoded(encoded);
     }
 
     fn hllGroupByMatches(self: *const Index, mat_group: []const []const u8, query_group: []const []const u8) bool {
@@ -19212,6 +19183,10 @@ pub const Index = struct {
             if (!std.mem.eql(u8, hcfg.value_field, resolved.name)) continue;
             if (group_fields) |fields| {
                 if (!self.hllGroupByMatches(hcfg.group_by, fields)) continue;
+            } else if (hcfg.group_by.len != 0) {
+                // Root cardinality must use its own ungrouped sketch. Merging
+                // every grouped sketch here would make request cost unbounded.
+                continue;
             }
             return .{
                 .name = try self.alloc.dupe(u8, hcfg.name),
@@ -19316,7 +19291,7 @@ pub const Index = struct {
         var txn = try store.beginReadTxn();
         defer txn.abort();
         if (!try self.hllCardinalityAvailableTxn(&txn, spec, generation)) return null;
-        const encoded = try self.mergedHllCardinalityEncodedTxnAlloc(&txn, spec);
+        const encoded = try self.rootHllCardinalityEncodedTxnAlloc(&txn, spec);
         defer self.alloc.free(encoded);
         return try hll.estimateEncoded(encoded);
     }
@@ -19336,7 +19311,7 @@ pub const Index = struct {
         var txn = try store.beginReadTxn();
         defer txn.abort();
         if (!try self.hllCardinalityAvailableTxn(&txn, spec, generation)) return null;
-        const encoded = try self.mergedHllCardinalityEncodedTxnAlloc(&txn, spec);
+        const encoded = try self.rootHllCardinalityEncodedTxnAlloc(&txn, spec);
         errdefer self.alloc.free(encoded);
         if (encoded.len > self.config().max_distributed_hll_partial_bytes)
             return error.HllCardinalityUnavailable;
@@ -19344,22 +19319,36 @@ pub const Index = struct {
     }
 
     /// Per-group distinct-count estimates for a `terms(group_fields) ->
-    /// cardinality(field)` query, keyed by the materialized group key, or null
-    /// when no HLL materialization matches the group layout and value field.
-    pub fn approxCardinalityEntriesForGroupAlloc(
+    /// cardinality(field)` query, aligned with the requested canonical group
+    /// keys, or null when no HLL materialization matches the group layout and
+    /// value field. Only requested output groups are point-read.
+    pub fn approxCardinalityEstimatesForGroupKeysAlloc(
         self: *Index,
         store: *docstore_mod.DocStore,
         group_fields: []const []const u8,
         field_or_path: []const u8,
+        group_keys: []const []const u8,
         constraints: []const ir.Constraint,
         generation: ?u64,
-    ) !?[]ApproxCardinalityEntry {
+    ) !?[]?u64 {
         var spec = (try self.hllCardinalitySpecForFieldAlloc(group_fields, field_or_path, constraints)) orelse return null;
         defer spec.deinit(self.alloc);
         var txn = try store.beginReadTxn();
         defer txn.abort();
         if (!try self.hllCardinalityAvailableTxn(&txn, spec, generation)) return null;
-        return try self.approxCardinalityEntriesTxnAlloc(&txn, spec.name);
+        const estimates = try self.alloc.alloc(?u64, group_keys.len);
+        errdefer self.alloc.free(estimates);
+        @memset(estimates, null);
+        for (group_keys, 0..) |group_key, i| {
+            const key = try self.hllCardinalityKeyAlloc(spec.name, group_key);
+            defer self.alloc.free(key);
+            const encoded = txn.get(key) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            estimates[i] = hll.estimateEncoded(encoded) catch return error.CorruptHllMaterialization;
+        }
+        return estimates;
     }
 
     /// The materialized group key for a single-field terms bucket whose value
@@ -21963,9 +21952,25 @@ test "algebraic index materializes approximate per-group cardinality" {
     try std.testing.expect(@max(west_estimate.?, 3) - @min(west_estimate.?, 3) <= 1);
     try std.testing.expect(@max(east_estimate.?, 2) - @min(east_estimate.?, 2) <= 1);
 
-    // The grand total is the union of the per-group sketches: 5 distinct customers.
-    const total = try idx.approxCardinalityTotalAlloc(&store, "customers_by_region");
-    try std.testing.expect(@max(total, 5) - @min(total, 5) <= 1);
+    const selected = (try idx.approxCardinalityEstimatesForGroupKeysAlloc(
+        &store,
+        &.{"region"},
+        "customer",
+        &.{west_group},
+        &.{},
+        null,
+    )).?;
+    defer alloc.free(selected);
+    try std.testing.expectEqual(@as(usize, 1), selected.len);
+    try std.testing.expect(selected[0] != null);
+    try std.testing.expect(@max(selected[0].?, 3) - @min(selected[0].?, 3) <= 1);
+
+    // A grouped sketch cannot serve a root query: root cardinality requires its
+    // own ungrouped materialization and never scans/unions every group at read time.
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        try idx.approxCardinalityTotalForFieldAlloc(&store, "customer", &.{}, null),
+    );
 }
 
 test "algebraic HLL materialization preserves multivalued group and value facts" {
@@ -22035,22 +22040,57 @@ test "algebraic HLL readers reject corrupt grouped sketches" {
     ;
     var idx = try Index.open(alloc, "alg_corrupt_hll", cfg);
     defer idx.close();
-    const docs = [_]derived_types.DerivedDocument{.{
-        .key = "o1",
-        .action = .upsert,
-        .cleaned_value = "{\"region\":\"west\",\"customer\":\"alice\"}",
-    }};
+    const docs = [_]derived_types.DerivedDocument{
+        .{
+            .key = "o1",
+            .action = .upsert,
+            .cleaned_value = "{\"region\":\"west\",\"customer\":\"alice\"}",
+        },
+        .{
+            .key = "o2",
+            .action = .upsert,
+            .cleaned_value = "{\"region\":\"east\",\"customer\":\"bob\"}",
+        },
+    };
     try idx.applyBatch(&store, .{ .documents = docs[0..] });
-    const region = try idx.constraintTokenAlloc(alloc, "region", "west");
-    defer alloc.free(region);
-    const group = try token.canonicalTupleAlloc(alloc, &.{region});
-    defer alloc.free(group);
-    const key = try idx.hllCardinalityKeyAlloc("customers_by_region", group);
+    const west_region = try idx.constraintTokenAlloc(alloc, "region", "west");
+    defer alloc.free(west_region);
+    const west_group = try token.canonicalTupleAlloc(alloc, &.{west_region});
+    defer alloc.free(west_group);
+    const east_region = try idx.constraintTokenAlloc(alloc, "region", "east");
+    defer alloc.free(east_region);
+    const east_group = try token.canonicalTupleAlloc(alloc, &.{east_region});
+    defer alloc.free(east_group);
+    const key = try idx.hllCardinalityKeyAlloc("customers_by_region", east_group);
     defer alloc.free(key);
     var txn = try store.beginWriteTxn();
     errdefer txn.abort();
     try txn.put(key, "not-an-hll");
     try txn.commit();
+
+    // Point-reading the selected west bucket does not touch the corrupt east
+    // sketch; selecting east detects the corruption deterministically.
+    const west = (try idx.approxCardinalityEstimatesForGroupKeysAlloc(
+        &store,
+        &.{"region"},
+        "customer",
+        &.{west_group},
+        &.{},
+        null,
+    )).?;
+    defer alloc.free(west);
+    try std.testing.expectEqual(@as(?u64, 1), west[0]);
+    try std.testing.expectError(
+        error.CorruptHllMaterialization,
+        idx.approxCardinalityEstimatesForGroupKeysAlloc(
+            &store,
+            &.{"region"},
+            "customer",
+            &.{east_group},
+            &.{},
+            null,
+        ),
+    );
     try std.testing.expectError(
         error.CorruptHllMaterialization,
         idx.approxCardinalityEntriesAlloc(&store, "customers_by_region"),
@@ -22351,7 +22391,7 @@ test "adaptive HLL registry publication is synchronized with readers" {
         fn run(index: *Index, done: *std.atomic.Value(bool)) void {
             while (!done.load(.acquire)) {
                 _ = index.hllRegistryContains("base");
-                _ = index.hllRegistryContains("adaptive-63");
+                _ = index.hllRegistryContains("adaptive-62");
             }
         }
     };
@@ -22360,12 +22400,12 @@ test "adaptive HLL registry publication is synchronized with readers" {
         stop.store(true, .release);
         reader.join();
     }
-    for (0..64) |i| {
+    for (0..max_hll_cardinality_materializations - 1) |i| {
         const name = try std.fmt.allocPrint(alloc, "adaptive-{d}", .{i});
         defer alloc.free(name);
         try idx.appendHllRegistryEntry(name, &.{}, "customer", 0);
     }
-    try std.testing.expectEqual(@as(usize, 65), idx.hllRegistryCount());
+    try std.testing.expectEqual(max_hll_cardinality_materializations, idx.hllRegistryCount());
 }
 
 test "algebraic HLL cardinality is adaptively promoted from a recurring query shape" {

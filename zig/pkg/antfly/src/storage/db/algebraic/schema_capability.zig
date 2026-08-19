@@ -41,6 +41,19 @@ pub const FieldCapability = struct {
     }
 };
 
+/// One document schema's declaration for a physical path. A null scalar marks
+/// a shape that cannot participate in the bounded, table-wide projection
+/// (object, array, unbounded text, composite schema, or explicitly unindexed).
+const StaticPathClaim = struct {
+    path: []u8,
+    bounded_scalar_type: ?[]const u8,
+
+    fn deinit(self: *StaticPathClaim, alloc: Allocator) void {
+        alloc.free(self.path);
+        self.* = undefined;
+    }
+};
+
 /// A table-level dynamic template compiled into a runtime-adaptive algebraic
 /// rule. Only templates that resolve to a bounded scalar type become rules; the
 /// selectors are carried verbatim and evaluated per-document at ingest time.
@@ -97,6 +110,11 @@ pub fn compilePlanAlloc(alloc: Allocator, schema: schema_mod.ParsedTableSchema) 
     errdefer {
         for (fields.items) |*field| field.deinit(alloc);
         fields.deinit(alloc);
+    }
+    var static_path_claims = std.ArrayListUnmanaged(StaticPathClaim).empty;
+    defer {
+        for (static_path_claims.items) |*claim| claim.deinit(alloc);
+        static_path_claims.deinit(alloc);
     }
     var dynamic_rules = std.ArrayListUnmanaged(DynamicRuleCapability).empty;
     errdefer {
@@ -165,6 +183,7 @@ pub fn compilePlanAlloc(alloc: Allocator, schema: schema_mod.ParsedTableSchema) 
                 property.name,
                 property,
                 &fields,
+                &static_path_claims,
                 &skipped_dynamic_fields,
                 &skipped_complex_fields,
                 &skipped_unbounded_fields,
@@ -172,7 +191,7 @@ pub fn compilePlanAlloc(alloc: Allocator, schema: schema_mod.ParsedTableSchema) 
         }
     }
 
-    try removeConflictingStaticPaths(alloc, &fields, &skipped_complex_fields);
+    try removeConflictingStaticPaths(alloc, &fields, static_path_claims.items, &skipped_complex_fields);
     try qualifyCollidingFieldNames(alloc, fields.items);
 
     return .{
@@ -186,24 +205,30 @@ pub fn compilePlanAlloc(alloc: Allocator, schema: schema_mod.ParsedTableSchema) 
 }
 
 /// Static projections are table-wide and do not carry a document-type
-/// discriminator. If two document schemas assign incompatible scalar types to
-/// the same physical path, projecting either interpretation would make ingest
-/// depend on which schema happened to contribute the field spec. Omit every
-/// role for that ambiguous path and leave it on the schemaless path-fact route.
+/// discriminator. If document schemas assign incompatible scalar types or any
+/// schema declares the same path complex, unbounded, or unindexed, projecting a
+/// bounded interpretation would make ingest depend on which schema contributed
+/// the field spec. Omit every role for that ambiguous physical path and leave it
+/// on the schemaless path-fact route.
 fn removeConflictingStaticPaths(
     alloc: Allocator,
     fields: *std.ArrayListUnmanaged(FieldCapability),
+    claims: []const StaticPathClaim,
     skipped_complex_fields: *u32,
 ) !void {
-    if (fields.items.len < 2) return;
+    if (fields.items.len == 0) return;
     const remove = try alloc.alloc(bool, fields.items.len);
     defer alloc.free(remove);
     @memset(remove, false);
 
     for (fields.items, 0..) |field, i| {
-        for (fields.items, 0..) |other, j| {
-            if (i == j or !std.mem.eql(u8, field.path, other.path)) continue;
-            if (!std.mem.eql(u8, field.scalar_type, other.scalar_type)) {
+        for (claims) |claim| {
+            if (!std.mem.eql(u8, field.path, claim.path)) continue;
+            const claimed_scalar = claim.bounded_scalar_type orelse {
+                remove[i] = true;
+                break;
+            };
+            if (!std.mem.eql(u8, field.scalar_type, claimed_scalar)) {
                 remove[i] = true;
                 break;
             }
@@ -580,11 +605,27 @@ fn collectPropertyCapabilities(
     path: []const u8,
     property: anytype,
     fields: *std.ArrayListUnmanaged(FieldCapability),
+    static_path_claims: *std.ArrayListUnmanaged(StaticPathClaim),
     skipped_dynamic_fields: *u32,
     skipped_complex_fields: *u32,
     skipped_unbounded_fields: *u32,
 ) !void {
-    if (property.antfly_index != null and !property.antfly_index.?) return;
+    const explicitly_unindexed = property.antfly_index != null and !property.antfly_index.?;
+    const composite = property.any_of.len > 0 or property.one_of.len > 0 or property.all_of.len > 0 or property.not_schema != null or property.if_schema != null;
+    const bounded_scalar = if (explicitly_unindexed or
+        property.item != null or
+        property.properties.len > 0 or
+        composite)
+        null
+    else
+        scalarType(property);
+    const claim_path = try alloc.dupe(u8, path);
+    errdefer alloc.free(claim_path);
+    try static_path_claims.append(alloc, .{
+        .path = claim_path,
+        .bounded_scalar_type = bounded_scalar,
+    });
+    if (explicitly_unindexed) return;
 
     if (property.additional_properties_allowed orelse false) {
         skipped_dynamic_fields.* += 1;
@@ -594,7 +635,7 @@ fn collectPropertyCapabilities(
         skipped_dynamic_fields.* += 1;
         skipped_unbounded_fields.* += 1;
     }
-    if (property.any_of.len > 0 or property.one_of.len > 0 or property.all_of.len > 0 or property.not_schema != null or property.if_schema != null) skipped_complex_fields.* += 1;
+    if (composite) skipped_complex_fields.* += 1;
 
     if (property.item != null) {
         skipped_complex_fields.* += 1;
@@ -611,6 +652,7 @@ fn collectPropertyCapabilities(
                 child_path,
                 child,
                 fields,
+                static_path_claims,
                 skipped_dynamic_fields,
                 skipped_complex_fields,
                 skipped_unbounded_fields,
@@ -790,6 +832,30 @@ test "schema capability omits cross-document paths with incompatible scalar type
     try index_mod.validateConfig(parsed_config.value);
     try std.testing.expectEqual(@as(usize, 0), parsed_config.value.group_fields.len);
     try std.testing.expectEqual(@as(usize, 0), parsed_config.value.measure_fields.len);
+}
+
+test "schema capability omits bounded paths claimed as unbounded or complex by another document type" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"version":11,"default_type":"article","document_schemas":{"article":{"schema":{"type":"object","properties":{"status":{"type":"keyword"},"metadata":{"type":"keyword"},"tags":{"type":"keyword"}},"additionalProperties":false}},"event":{"schema":{"type":"object","properties":{"status":{"type":"text"},"metadata":{"type":"object","properties":{"code":{"type":"keyword"}}},"tags":{"type":"array","items":{"type":"keyword"}}},"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+
+    var plan = try compilePlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+    for (plan.fields) |field| {
+        try std.testing.expect(!std.mem.eql(u8, field.path, "status"));
+        try std.testing.expect(!std.mem.eql(u8, field.path, "metadata"));
+        try std.testing.expect(!std.mem.eql(u8, field.path, "tags"));
+    }
+
+    const config_json = try configJsonFromPlanAlloc(alloc, "mixed", plan);
+    defer alloc.free(config_json);
+    var parsed_config = try std.json.parseFromSlice(index_mod.Config, alloc, config_json, .{ .allocate = .alloc_always });
+    defer parsed_config.deinit();
+    try index_mod.validateConfig(parsed_config.value);
+    try std.testing.expectEqual(@as(usize, 1), parsed_config.value.group_fields.len);
+    try std.testing.expectEqualStrings("metadata.code", parsed_config.value.group_fields[0].path);
 }
 
 test "schema capability coalesces compatible paths shared by document types" {
