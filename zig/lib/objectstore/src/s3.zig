@@ -360,14 +360,44 @@ fn checksumFromHeaders(alloc: Allocator, headers: *const httpx.Headers) !?types.
 
     for (candidates) |candidate| {
         if (headers.get(candidate.name)) |value| {
+            const effective_type: types.ObjectChecksumType = if (candidate.algorithm == .crc64nvme_base64)
+                .full_object
+            else
+                checksum_type;
+            const normalized = normalizeS3ChecksumValue(value, effective_type);
             return .{
                 .algorithm = candidate.algorithm,
-                .value = try alloc.dupe(u8, value),
-                .checksum_type = if (candidate.algorithm == .crc64nvme_base64) .full_object else checksum_type,
+                .value = try alloc.dupe(u8, normalized.value),
+                .checksum_type = normalized.checksum_type,
+                .part_count = normalized.part_count,
             };
         }
     }
     return null;
+}
+
+const NormalizedS3ChecksumValue = struct {
+    value: []const u8,
+    checksum_type: types.ObjectChecksumType,
+    part_count: ?u32 = null,
+};
+
+fn normalizeS3ChecksumValue(value: []const u8, checksum_type: types.ObjectChecksumType) NormalizedS3ChecksumValue {
+    var normalized = NormalizedS3ChecksumValue{
+        .value = value,
+        .checksum_type = checksum_type,
+    };
+    if (checksum_type == .full_object) return normalized;
+
+    const separator = std.mem.lastIndexOfScalar(u8, value, '-') orelse return normalized;
+    if (separator == 0 or separator + 1 == value.len) return normalized;
+    const part_count = std.fmt.parseUnsigned(u32, value[separator + 1 ..], 10) catch return normalized;
+    if (part_count == 0) return normalized;
+
+    normalized.value = value[0..separator];
+    normalized.checksum_type = .composite;
+    normalized.part_count = part_count;
+    return normalized;
 }
 
 fn replaceChecksum(alloc: Allocator, destination: *?types.ObjectChecksum, source: ?types.ObjectChecksum) !void {
@@ -381,14 +411,15 @@ test "s3 response checksum parsing preserves provider algorithm and checksum typ
     const alloc = std.testing.allocator;
     var composite_headers = httpx.Headers.init(alloc);
     defer composite_headers.deinit();
-    try composite_headers.append("x-amz-checksum-sha256", "sha256-parts");
+    try composite_headers.append("x-amz-checksum-sha256", "YWJjZA==-3");
     try composite_headers.append("x-amz-checksum-type", "COMPOSITE");
 
     var composite = (try checksumFromHeaders(alloc, &composite_headers)).?;
     defer composite.deinit(alloc);
     try std.testing.expectEqual(types.ObjectChecksumAlgorithm.sha256_base64, composite.algorithm);
-    try std.testing.expectEqualStrings("sha256-parts", composite.value);
+    try std.testing.expectEqualStrings("YWJjZA==", composite.value);
     try std.testing.expectEqual(types.ObjectChecksumType.composite, composite.checksum_type);
+    try std.testing.expectEqual(@as(?u32, 3), composite.part_count);
 
     var default_headers = httpx.Headers.init(alloc);
     defer default_headers.deinit();
@@ -413,9 +444,11 @@ test "s3 checksum replacement retains the old value on allocation failure" {
                 .algorithm = .sha256_base64,
                 .value = @constCast("new"),
                 .checksum_type = .composite,
+                .part_count = 3,
             };
             try replaceChecksum(alloc, &destination, source);
             try std.testing.expectEqualStrings("new", destination.?.value);
+            try std.testing.expectEqual(@as(?u32, 3), destination.?.part_count);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
@@ -936,7 +969,14 @@ pub const Client = struct {
         checksum_headers.appendAssumeCapacity(.{ "x-amz-checksum-mode", "ENABLED" });
         checksum_headers.appendSliceAssumeCapacity(headers);
 
-        var response = try self.performWithResponseLimit(method, target, checksum_headers.items, null, null, max_response_size);
+        var response = self.performWithResponseLimit(method, target, checksum_headers.items, null, null, max_response_size) catch |err| switch (err) {
+            // httpx enforces the caller's body limit before returning the
+            // response status. A checksum-permission 403 can therefore look
+            // like an oversized response; retrying these safe reads without
+            // checksum mode preserves the original limit and disambiguates it.
+            error.ResponseTooLarge => return try self.performWithResponseLimit(method, target, headers, null, null, max_response_size),
+            else => return err,
+        };
         if (response.status != 403) return response;
         response.deinit(self.alloc);
         return try self.performWithResponseLimit(method, target, headers, null, null, max_response_size);
@@ -2387,6 +2427,85 @@ test "s3 metadata reads fall back when checksum mode needs additional permission
     var meta = try client.statObject("bucket", "kms-object");
     defer meta.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 5), meta.content_length);
+    try std.testing.expectEqual(@as(usize, 2), state.calls);
+}
+
+test "s3 bounded reads retry when checksum permission errors exceed the response limit" {
+    const alloc = std.testing.allocator;
+    const State = struct {
+        calls: usize = 0,
+
+        fn request(
+            ptr: ?*anyopaque,
+            request_alloc: Allocator,
+            method: HttpMethod,
+            _: []const u8,
+            headers: []const HeaderPair,
+            _: ?[]const u8,
+            _: ?[]const u8,
+            max_response_size: ?usize,
+        ) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            defer self.calls += 1;
+            try std.testing.expectEqual(HttpMethod.GET, method);
+            try std.testing.expectEqual(@as(?usize, 4), max_response_size);
+            switch (self.calls) {
+                0 => {
+                    try expectHeaderValue(headers, "x-amz-checksum-mode", "ENABLED");
+                    // This is what the real httpx transport returns when the
+                    // XML body of a checksum-mode 403 exceeds the read limit.
+                    return error.ResponseTooLarge;
+                },
+                1 => try expectNoHeader(headers, "x-amz-checksum-mode"),
+                else => return error.UnexpectedCall,
+            }
+            return .{
+                .status = 206,
+                .body = try request_alloc.dupe(u8, "hell"),
+                .etag = try request_alloc.dupe(u8, "\"etag\""),
+            };
+        }
+
+        fn expectHeaderValue(headers: []const HeaderPair, name: []const u8, expected: []const u8) !void {
+            for (headers) |pair| {
+                if (std.ascii.eqlIgnoreCase(pair[0], name)) {
+                    try std.testing.expectEqualStrings(expected, pair[1]);
+                    return;
+                }
+            }
+            return error.MissingHeader;
+        }
+
+        fn expectNoHeader(headers: []const HeaderPair, name: []const u8) !void {
+            for (headers) |pair| {
+                if (std.ascii.eqlIgnoreCase(pair[0], name)) return error.UnexpectedHeader;
+            }
+        }
+    };
+
+    const cfg = Config{
+        .credentials = .{
+            .endpoint = try alloc.dupe(u8, "s3.example.test"),
+            .use_ssl = true,
+            .access_key_id = try alloc.dupe(u8, "access"),
+            .secret_access_key = try alloc.dupe(u8, "secret"),
+            .region = try alloc.dupe(u8, "us-east-1"),
+        },
+        .addressing_style = .path,
+    };
+    var state = State{};
+    var s3_client = Client.initWithRequestFn(alloc, cfg, &state, State.request);
+    var client = s3_client.client();
+    defer client.deinit();
+
+    var result = try client.getObject("bucket", "kms-object", .{
+        .range = .{ .offset = 0, .length = 4 },
+        .skip_metadata_probe = true,
+        .max_response_bytes = 4,
+    });
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("hell", result.body);
+    try std.testing.expectEqualStrings("etag", result.metadata.etag.?);
     try std.testing.expectEqual(@as(usize, 2), state.calls);
 }
 

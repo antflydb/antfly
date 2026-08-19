@@ -39,12 +39,16 @@ pub const ObjectChecksum = struct {
     algorithm: ObjectChecksumAlgorithm,
     value: []u8,
     checksum_type: ObjectChecksumType = .full_object,
+    /// Number of source parts represented by a composite checksum, when the
+    /// provider exposes it separately from the encoded digest.
+    part_count: ?u32 = null,
 
     pub fn clone(self: ObjectChecksum, alloc: Allocator) !ObjectChecksum {
         return .{
             .algorithm = self.algorithm,
             .value = try alloc.dupe(u8, self.value),
             .checksum_type = self.checksum_type,
+            .part_count = self.part_count,
         };
     }
 
