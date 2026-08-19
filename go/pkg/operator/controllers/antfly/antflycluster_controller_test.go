@@ -850,12 +850,12 @@ func TestReconcileLegacyMetadataRuntimeMembershipStatus(t *testing.T) {
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(statefulSet).Build()
 	reconciler := &AntflyClusterReconciler{Client: k8sClient}
 
-	rolled, err := reconciler.reconcileLegacyMetadataRuntimeMembershipStatus(context.Background(), cluster)
+	rolloutState, err := reconciler.reconcileLegacyMetadataRuntimeMembershipStatus(context.Background(), cluster)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !rolled {
-		t.Fatal("expected the legacy metadata runtime image to roll")
+	if rolloutState != metadataMembershipCapabilityRolloutStarted {
+		t.Fatalf("rollout state = %v, want started", rolloutState)
 	}
 	updated := &appsv1.StatefulSet{}
 	if err := k8sClient.Get(context.Background(), client.ObjectKeyFromObject(statefulSet), updated); err != nil {
@@ -878,6 +878,44 @@ func TestReconcileLegacyMetadataRuntimeMembershipStatus(t *testing.T) {
 	}
 	if _, ok := updated.Spec.Template.Annotations[metadataTopologyReplicasAnnotation]; ok {
 		t.Fatal("runtime capability rollout must not record an unverified pod-template topology")
+	}
+
+	rolloutState, err = reconciler.reconcileLegacyMetadataRuntimeMembershipStatus(context.Background(), cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rolloutState != metadataMembershipCapabilityRolloutPending {
+		t.Fatalf("incomplete rollout state = %v, want pending", rolloutState)
+	}
+
+	updated.Status.ObservedGeneration = updated.Generation
+	updated.Status.UpdatedReplicas = replicas
+	updated.Status.ReadyReplicas = replicas
+	updated.Status.CurrentRevision = "revision-2"
+	updated.Status.UpdateRevision = "revision-2"
+	if err := k8sClient.Status().Update(context.Background(), updated); err != nil {
+		t.Fatal(err)
+	}
+	rolloutState, err = reconciler.reconcileLegacyMetadataRuntimeMembershipStatus(context.Background(), cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rolloutState != metadataMembershipCapabilityUnavailable {
+		t.Fatalf("completed rollout state = %v, want unavailable", rolloutState)
+	}
+	if got := rolloutState.requeueAfter(); got != 0 {
+		t.Fatalf("completed incapable rollout requeue = %s, want none", got)
+	}
+}
+
+func TestMetadataMembershipCapabilityRolloutStateRequeue(t *testing.T) {
+	for _, state := range []metadataMembershipCapabilityRolloutState{
+		metadataMembershipCapabilityRolloutStarted,
+		metadataMembershipCapabilityRolloutPending,
+	} {
+		if got := state.requeueAfter(); got != metadataMembershipCapabilityRolloutInterval {
+			t.Fatalf("rollout state %v requeue = %s, want %s", state, got, metadataMembershipCapabilityRolloutInterval)
+		}
 	}
 }
 

@@ -2059,7 +2059,31 @@ func metadataPVCOrdinal(cluster *antflyv1.AntflyCluster, pvc *corev1.PersistentV
 const (
 	metadataMembershipStatusCapabilityAnnotation = "antfly.io/metadata-membership-status-capability"
 	metadataMembershipStatusCapabilityVersion    = "v2"
+	metadataMembershipCapabilityRolloutInterval  = 10 * time.Second
 )
+
+type metadataMembershipCapabilityRolloutState int
+
+const (
+	metadataMembershipCapabilityRolloutStarted metadataMembershipCapabilityRolloutState = iota
+	metadataMembershipCapabilityRolloutPending
+	metadataMembershipCapabilityUnavailable
+)
+
+func metadataMembershipCapabilityRolloutComplete(statefulSet *appsv1.StatefulSet, expectedReplicas int32) bool {
+	return statefulSet.Status.ObservedGeneration >= statefulSet.Generation &&
+		statefulSet.Status.UpdatedReplicas >= expectedReplicas &&
+		statefulSet.Status.ReadyReplicas >= expectedReplicas &&
+		statefulSet.Status.CurrentRevision != "" &&
+		statefulSet.Status.CurrentRevision == statefulSet.Status.UpdateRevision
+}
+
+func (state metadataMembershipCapabilityRolloutState) requeueAfter() time.Duration {
+	if state == metadataMembershipCapabilityUnavailable {
+		return 0
+	}
+	return metadataMembershipCapabilityRolloutInterval
+}
 
 // reconcileLegacyMetadataRuntimeMembershipStatus rolls only the runtime image
 // and its capability marker while exact membership status is unavailable. The
@@ -2068,18 +2092,18 @@ const (
 // cardinality agree. Avoiding every other StatefulSet mutation here prevents
 // an unverified topology from being recorded or changed before the upgraded
 // runtime exposes the exact voter set, joint-consensus state, and learners.
-func (r *AntflyClusterReconciler) reconcileLegacyMetadataRuntimeMembershipStatus(ctx context.Context, cluster *antflyv1.AntflyCluster) (bool, error) {
+func (r *AntflyClusterReconciler) reconcileLegacyMetadataRuntimeMembershipStatus(ctx context.Context, cluster *antflyv1.AntflyCluster) (metadataMembershipCapabilityRolloutState, error) {
 	statefulSet := &appsv1.StatefulSet{}
 	key := types.NamespacedName{Name: cluster.Name + "-metadata", Namespace: cluster.Namespace}
 	if err := r.Get(ctx, key, statefulSet); err != nil {
-		return false, fmt.Errorf("read legacy metadata StatefulSet for runtime upgrade: %w", err)
+		return metadataMembershipCapabilityRolloutPending, fmt.Errorf("read legacy metadata StatefulSet for runtime upgrade: %w", err)
 	}
 	if !metav1.IsControlledBy(statefulSet, cluster) {
-		return false, fmt.Errorf("legacy metadata StatefulSet %s is not controlled by the current AntflyCluster", statefulSet.Name)
+		return metadataMembershipCapabilityRolloutPending, fmt.Errorf("legacy metadata StatefulSet %s is not controlled by the current AntflyCluster", statefulSet.Name)
 	}
 	expectedReplicas := effectiveMetadataNodeReplicas(cluster)
 	if statefulSet.Spec.Replicas == nil || *statefulSet.Spec.Replicas != expectedReplicas {
-		return false, fmt.Errorf("legacy metadata StatefulSet changed during runtime upgrade: replicas must remain %d", expectedReplicas)
+		return metadataMembershipCapabilityRolloutPending, fmt.Errorf("legacy metadata StatefulSet changed during runtime upgrade: replicas must remain %d", expectedReplicas)
 	}
 
 	before := statefulSet.DeepCopy()
@@ -2102,14 +2126,17 @@ func (r *AntflyClusterReconciler) reconcileLegacyMetadataRuntimeMembershipStatus
 			changed = true
 		}
 		if !changed {
-			return false, nil
+			if metadataMembershipCapabilityRolloutComplete(statefulSet, expectedReplicas) {
+				return metadataMembershipCapabilityUnavailable, nil
+			}
+			return metadataMembershipCapabilityRolloutPending, nil
 		}
 		if err := r.Patch(ctx, statefulSet, client.MergeFrom(before)); err != nil {
-			return false, fmt.Errorf("roll metadata runtime for exact membership status: %w", err)
+			return metadataMembershipCapabilityRolloutPending, fmt.Errorf("roll metadata runtime for exact membership status: %w", err)
 		}
-		return true, nil
+		return metadataMembershipCapabilityRolloutStarted, nil
 	}
-	return false, fmt.Errorf("legacy metadata StatefulSet %s has no antfly container", statefulSet.Name)
+	return metadataMembershipCapabilityRolloutPending, fmt.Errorf("legacy metadata StatefulSet %s has no antfly container", statefulSet.Name)
 }
 
 // calculateBackoff calculates exponential backoff duration for validation failures (T027)
@@ -2505,14 +2532,18 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			}
 			if stderrors.Is(err, errMetadataRuntimeMembershipStatusUnavailable) {
 				r.resetValidationAttempts(clusterKey)
-				rolled, rolloutErr := r.reconcileLegacyMetadataRuntimeMembershipStatus(ctx, workingCluster)
+				rolloutState, rolloutErr := r.reconcileLegacyMetadataRuntimeMembershipStatus(ctx, workingCluster)
 				if rolloutErr != nil {
 					return ctrl.Result{}, rolloutErr
 				}
-				if rolled {
+				if rolloutState == metadataMembershipCapabilityRolloutStarted {
 					log.Info("Rolling legacy metadata pods to expose exact Raft membership status", "image", workingCluster.Spec.Image)
 				}
-				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+				if requeueAfter := rolloutState.requeueAfter(); requeueAfter > 0 {
+					return ctrl.Result{RequeueAfter: requeueAfter}, nil
+				}
+				log.Error(err, "Metadata runtime image lacks exact Raft membership status after its rollout completed; waiting for spec.image to change", "image", workingCluster.Spec.Image)
+				return ctrl.Result{}, nil
 			}
 			attempt := r.incrementValidationAttempts(clusterKey)
 			backoff := calculateBackoff(attempt - 1)
