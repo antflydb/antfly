@@ -221,7 +221,7 @@ pub const AntflyApiHandler = struct {
         try ctx.setHeader("content-type", "application/json");
         try ctx.setHeader("Retry-After", "1");
         try ctx.setHeader(http_common.metadata_not_leader_header, http_common.metadata_not_leader_value);
-        _ = ctx.response.body("{\"code\":\"metadata_leader_unavailable\",\"error\":\"metadata_leader_unavailable\",\"message\":\"metadata leader unavailable\",\"retryable\":true,\"retry_after_ms\":1000}");
+        _ = ctx.response.body("{\"code\":\"metadata_leader_unavailable\",\"error\":\"metadata leader unavailable\",\"message\":\"metadata leader unavailable\",\"retryable\":true,\"retry_after_ms\":1000}");
         return ctx.response.build();
     }
 
@@ -4022,7 +4022,16 @@ pub const AntflyApiHandler = struct {
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_table_name);
         const body_data = (try ctx.body()) orelse "";
-        var resp = try public_table_http.handleTableBackup(ctx.allocator, decoded_table_name, body_data, self.api_server.tableApi(operationContext(ctx, authenticated_identity)), self.api_server.cfg.secret_store, self.api_server.cfg.node_config, self.api_server.sharedApiIo());
+        const expected_fence = backups_api.parseTableBackupFenceHeaderValues(
+            ctx.header(backups_api.backup_fence_table_id_header),
+            ctx.header(backups_api.backup_fence_definition_header),
+            ctx.header(backups_api.backup_fence_topology_count_header),
+            ctx.header(backups_api.backup_fence_topology_header),
+        ) catch {
+            _ = ctx.status(400);
+            return ctx.text("invalid backup fence");
+        };
+        var resp = try public_table_http.handleTableBackupExpectedFence(ctx.allocator, decoded_table_name, body_data, expected_fence, self.api_server.tableApi(operationContext(ctx, authenticated_identity)), self.api_server.cfg.secret_store, self.api_server.cfg.node_config, self.api_server.sharedApiIo());
         return respondOwnedApiResponse(ctx, &resp);
     }
 

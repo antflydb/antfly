@@ -3476,6 +3476,7 @@ const LegacyTableWriteSource = struct {
             table_name: []const u8,
             backup_id: []const u8,
             format: backups_api.BackupFormat,
+            fence: backups_api.TableBackupFence,
             location_uri: []const u8,
             connection: []const u8,
             location: *backups_api.BackupLocation,
@@ -3843,12 +3844,13 @@ const LegacyTableWriteSource = struct {
         table_name: []const u8,
         backup_id: []const u8,
         format: backups_api.BackupFormat,
+        fence: backups_api.TableBackupFence,
         location_uri: []const u8,
         connection: []const u8,
         location: *backups_api.BackupLocation,
     ) !?[]backups_api.ShardSnapshot {
         const fn_ptr = self.vtable.backup_table_to_location orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, backup_id, format, location_uri, connection, location);
+        return try fn_ptr(self.ptr, alloc, table_name, backup_id, format, fence, location_uri, connection, location);
     }
 
     pub fn restoreTable(
@@ -13699,13 +13701,15 @@ pub const ProvisionedTableWriteSource = struct {
         plan: backups_api.TableBackupPlan,
     ) !?[]backups_api.ShardSnapshot {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (self.localWriteOwnerSource()) |owner| return try owner.backupTable(alloc, table_name, plan);
-
-        const group_id = (try table_catalog.resolveSingleRangeGroup(alloc, self.catalog, table_name)) orelse return null;
+        const group_id = (try resolveFencedBackupGroup(self.catalog, table_name, plan.fence)) orelse return null;
         self.beginGroupOperation(table_name, group_id);
         defer {
             self.endGroupOperation(table_name, group_id);
         }
+        const guarded_group_id = (try resolveFencedBackupGroup(self.catalog, table_name, plan.fence)) orelse return error.CatalogChanged;
+        if (guarded_group_id != group_id) return error.CatalogChanged;
+
+        if (self.localWriteOwnerSource()) |owner| return try owner.backupTable(alloc, table_name, plan);
 
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
@@ -15875,6 +15879,54 @@ test "hosted backup forwarding preserves external io authority" {
     try std.testing.expectEqualStrings("portable", parsed.value.format);
 }
 
+test "backup storage resolution rejects a reused table name from another incarnation" {
+    const Catalog = struct {
+        table_id: u64 = 7,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const tables = try std.testing.allocator.alloc(metadata_table_manager.TableRecord, 1);
+            errdefer std.testing.allocator.free(tables);
+            tables[0] = .{ .table_id = self.table_id, .name = "docs", .placement_role = "data", .schema_json = "{}", .indexes_json = "{}" };
+            const ranges = try std.testing.allocator.alloc(metadata_table_manager.RangeRecord, 1);
+            ranges[0] = .{ .group_id = 7001, .table_id = self.table_id, .start_key = "", .end_key = null };
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = tables,
+                .ranges = ranges,
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            std.testing.allocator.free(snapshot.tables);
+            std.testing.allocator.free(snapshot.ranges);
+        }
+    };
+
+    var catalog = Catalog{};
+    var admitted = try catalog.iface().adminSnapshot();
+    const fence = backups_api.tableBackupFence(&admitted, &admitted.tables[0]);
+    catalog.iface().freeAdminSnapshot(&admitted);
+    try std.testing.expectEqual(@as(?u64, 7001), try resolveFencedBackupGroup(catalog.iface(), "docs", fence));
+
+    catalog.table_id = 8;
+    try std.testing.expectError(error.CatalogChanged, resolveFencedBackupGroup(catalog.iface(), "docs", fence));
+}
+
 pub const HostedProvisionedTableWriteSource = struct {
     replica_root_dir: []const u8,
     catalog: table_catalog.CatalogSource,
@@ -16613,13 +16665,14 @@ pub const HostedProvisionedTableWriteSource = struct {
         table_name: []const u8,
         backup_id: []const u8,
         format: backups_api.BackupFormat,
+        fence: backups_api.TableBackupFence,
         location_uri: []const u8,
         connection: []const u8,
         location_ptr: *anyopaque,
     ) !?[]backups_api.ShardSnapshot {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const location: *backups_api.BackupLocation = @ptrCast(@alignCast(location_ptr));
-        const group_id = (try table_catalog.resolveSingleRangeGroup(alloc, self.catalog, table_name)) orelse return null;
+        const group_id = (try resolveFencedBackupGroup(self.catalog, table_name, fence)) orelse return null;
         const resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
         var route = resolved_route orelse return null;
         defer route.deinit(alloc);
@@ -16630,7 +16683,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 defer alloc.free(body);
 
                 var client = http_client.ApiHttpClient.init(alloc, self.executor);
-                var response = try client.fetchBackupTable(remote.base_uri, table_name, body);
+                var response = try client.fetchBackupTableFenced(remote.base_uri, table_name, body, fence);
                 response.deinit(alloc);
 
                 var manifest = try backups_api.readManifestFromLocation(alloc, location, backup_id);
@@ -22318,6 +22371,34 @@ fn loadTableManagedMetadata(
         .indexes_json = indexes_json,
         .schema_json = schema_json,
     };
+}
+
+/// Resolves the single storage group while checking the complete table
+/// incarnation carried by backup admission. Callers repeat this after taking
+/// their structural-operation guard so catalog replacement cannot redirect a
+/// snapshot by reusing the same table name.
+fn resolveFencedBackupGroup(
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    expected_fence: ?backups_api.TableBackupFence,
+) !?u64 {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+    if (expected_fence) |expected| {
+        if (!backups_api.tableBackupFenceMatches(expected, &snapshot, table)) return error.CatalogChanged;
+    }
+
+    var group_id: u64 = 0;
+    var range_count: usize = 0;
+    for (snapshot.ranges) |range| {
+        if (range.table_id != table.table_id) continue;
+        group_id = range.group_id;
+        range_count += 1;
+    }
+    if (range_count == 0) return null;
+    if (range_count != 1) return error.UnsupportedMultiRangeTable;
+    return group_id;
 }
 
 fn loadTableIdentityNamespaceForGroup(

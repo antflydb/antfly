@@ -11,6 +11,8 @@ from antfly.client_generated.models.metadata_capability_unavailable_error_requir
     MetadataCapabilityUnavailableErrorRequiredCapability,
 )
 from antfly.client_generated.models.metadata_leader_unavailable_error import MetadataLeaderUnavailableError
+from antfly.client_generated.models.table_backup_conflict_error import TableBackupConflictError
+from antfly.client_generated.models.table_backup_conflict_error_code import TableBackupConflictErrorCode
 
 
 @pytest.mark.parametrize(
@@ -19,7 +21,7 @@ from antfly.client_generated.models.metadata_leader_unavailable_error import Met
         (
             {
                 "code": "metadata_capability_unavailable",
-                "error": "metadata_capability_unavailable",
+                "error": "metadata capability unavailable",
                 "message": "upgrade metadata nodes",
                 "required_capability": "linearizable_snapshot",
                 "retryable": True,
@@ -30,7 +32,7 @@ from antfly.client_generated.models.metadata_leader_unavailable_error import Met
         (
             {
                 "code": "metadata_leader_unavailable",
-                "error": "metadata_leader_unavailable",
+                "error": "metadata leader unavailable",
                 "message": "metadata leader unavailable",
                 "retryable": True,
                 "retry_after_ms": 1000,
@@ -49,3 +51,23 @@ def test_generated_backup_503_is_typed(body: dict[str, object], expected_type: t
             assert (
                 parsed.required_capability is MetadataCapabilityUnavailableErrorRequiredCapability.LINEARIZABLE_SNAPSHOT
             )
+
+
+def test_generated_table_backup_409_exposes_ambiguous_outcome() -> None:
+    client = Client(base_url="http://antfly.invalid", raise_on_unexpected_status=True)
+    parsed = parse_table_backup_response(
+        client=client,
+        response=httpx.Response(
+            409,
+            json={
+                "code": "backup_outcome_ambiguous",
+                "error": "backup outcome is ambiguous; inspect the backup id before retrying",
+                "message": "backup outcome is ambiguous; inspect the backup id before retrying",
+                "retryable": False,
+            },
+        ),
+    )
+
+    assert isinstance(parsed, TableBackupConflictError)
+    assert parsed.code is TableBackupConflictErrorCode.BACKUP_OUTCOME_AMBIGUOUS
+    assert parsed.retryable is False

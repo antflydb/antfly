@@ -1983,6 +1983,7 @@ pub const MergeProfile = struct {
 /// The metadata service does not yet provide the consistency capability required by backup.
 pub const MetadataCapabilityUnavailableError = struct {
     code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
     @"error": []const u8,
     message: []const u8,
     required_capability: []const u8,
@@ -1993,6 +1994,7 @@ pub const MetadataCapabilityUnavailableError = struct {
 /// The request could not establish authority with the current metadata leader.
 pub const MetadataLeaderUnavailableError = struct {
     code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
     @"error": []const u8,
     message: []const u8,
     retryable: bool,
@@ -3126,6 +3128,15 @@ pub const TableArtifactEnrichmentList = struct {
     /// Table containing the configured artifact enrichments.
     table_name: []const u8,
     artifacts: []const antfly_indexes_openapi.EnrichmentConfig,
+};
+
+/// A non-retryable table-backup conflict. For an ambiguous outcome, inspect the requested backup ID before deciding whether to start new work.
+pub const TableBackupConflictError = struct {
+    code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
 };
 
 pub const TableBackupStatus = struct {

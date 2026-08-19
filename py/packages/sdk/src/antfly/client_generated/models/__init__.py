@@ -703,6 +703,8 @@ from .success_message import SuccessMessage
 from .sync_level import SyncLevel
 from .table import Table
 from .table_artifact_enrichment_list import TableArtifactEnrichmentList
+from .table_backup_conflict_error import TableBackupConflictError
+from .table_backup_conflict_error_code import TableBackupConflictErrorCode
 from .table_backup_status import TableBackupStatus
 from .table_backup_status_status import TableBackupStatusStatus
 from .table_indexes import TableIndexes
@@ -1489,6 +1491,8 @@ __all__ = (
     "SyncLevel",
     "Table",
     "TableArtifactEnrichmentList",
+    "TableBackupConflictError",
+    "TableBackupConflictErrorCode",
     "TableBackupStatus",
     "TableBackupStatusStatus",
     "TableIndexes",

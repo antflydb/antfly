@@ -1444,7 +1444,8 @@ components:
           enum: [metadata_capability_unavailable]
         error:
           type: string
-          enum: [metadata_capability_unavailable]
+          description: Legacy human-readable error text. Use `code` for branching.
+          enum: [metadata capability unavailable]
         message:
           type: string
         required_capability:
@@ -1468,7 +1469,8 @@ components:
           enum: [metadata_leader_unavailable]
         error:
           type: string
-          enum: [metadata_leader_unavailable]
+          description: Legacy human-readable error text. Use `code` for branching.
+          enum: [metadata leader unavailable]
         message:
           type: string
         retryable:
@@ -1488,6 +1490,23 @@ components:
       oneOf:
         - $ref: "#/components/schemas/MetadataCapabilityUnavailableError"
         - $ref: "#/components/schemas/MetadataLeaderUnavailableError"
+    TableBackupConflictError:
+      type: object
+      additionalProperties: false
+      description: A non-retryable table-backup conflict. For an ambiguous outcome, inspect the requested backup ID before deciding whether to start new work.
+      required: [code, error, message, retryable]
+      properties:
+        code:
+          type: string
+          enum: [backup_already_exists, table_catalog_changed, backup_outcome_ambiguous]
+        error:
+          type: string
+          description: Legacy human-readable error text. Use `code` for branching.
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum: [false]
     InferenceCapacityError:
       type: object
       description: Actionable retry contract for temporary inference-capacity failures.
@@ -8420,6 +8439,12 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/BackupMetadataUnavailableError"
+    TableBackupConflict:
+      description: Backup ID collision, catalog-incarnation change, or an outcome requiring reconciliation before retry.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/TableBackupConflictError"
     StorageResourceExhausted:
       description: Storage descriptors are temporarily exhausted
       headers:
@@ -10106,7 +10131,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          $ref: "#/components/responses/Conflict"
+          $ref: "#/components/responses/TableBackupConflict"
         "503":
           $ref: "#/components/responses/BackupMetadataUnavailable"
         "500":

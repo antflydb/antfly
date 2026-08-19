@@ -18,7 +18,7 @@ func TestParseBackupMetadataUnavailableResponses(t *testing.T) {
 	}{
 		{
 			name:       "capability",
-			body:       `{"code":"metadata_capability_unavailable","error":"metadata_capability_unavailable","message":"upgrade metadata nodes","required_capability":"linearizable_snapshot","retryable":true,"retry_after_ms":5000}`,
+			body:       `{"code":"metadata_capability_unavailable","error":"metadata capability unavailable","message":"upgrade metadata nodes","required_capability":"linearizable_snapshot","retryable":true,"retry_after_ms":5000}`,
 			retryAfter: "5",
 			assertTypedVariant: func(t *testing.T, value BackupMetadataUnavailable) {
 				decoded, err := value.AsMetadataCapabilityUnavailableError()
@@ -32,7 +32,7 @@ func TestParseBackupMetadataUnavailableResponses(t *testing.T) {
 		},
 		{
 			name:       "leader",
-			body:       `{"code":"metadata_leader_unavailable","error":"metadata_leader_unavailable","message":"metadata leader unavailable","retryable":true,"retry_after_ms":1000}`,
+			body:       `{"code":"metadata_leader_unavailable","error":"metadata leader unavailable","message":"metadata leader unavailable","retryable":true,"retry_after_ms":1000}`,
 			retryAfter: "1",
 			notLeader:  "true",
 			assertTypedVariant: func(t *testing.T, value BackupMetadataUnavailable) {
@@ -98,5 +98,27 @@ func TestParseBackupMetadataUnavailableResponses(t *testing.T) {
 			}
 			test.assertTypedVariant(t, *tableResponse.JSON503)
 		})
+	}
+}
+
+func TestParseTableBackupAmbiguousConflict(t *testing.T) {
+	response, err := ParseBackupTableResponse(&http.Response{
+		StatusCode: http.StatusConflict,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body: io.NopCloser(strings.NewReader(
+			`{"code":"backup_outcome_ambiguous","error":"backup outcome is ambiguous; inspect the backup id before retrying","message":"backup outcome is ambiguous; inspect the backup id before retrying","retryable":false}`,
+		)),
+	})
+	if err != nil {
+		t.Fatalf("parse table backup conflict: %v", err)
+	}
+	if response.JSON409 == nil {
+		t.Fatal("typed table backup conflict was not decoded")
+	}
+	if response.JSON409.Code != TableBackupConflictErrorCodeBackupOutcomeAmbiguous {
+		t.Fatalf("conflict code = %q", response.JSON409.Code)
+	}
+	if bool(response.JSON409.Retryable) {
+		t.Fatal("ambiguous outcome must not advertise an automatic retry")
 	}
 }

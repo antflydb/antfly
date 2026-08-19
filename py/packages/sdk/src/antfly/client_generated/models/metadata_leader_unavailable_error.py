@@ -17,7 +17,7 @@ class MetadataLeaderUnavailableError:
 
     Attributes:
         code (MetadataLeaderUnavailableErrorCode):
-        error (MetadataLeaderUnavailableErrorError):
+        error (MetadataLeaderUnavailableErrorError): Legacy human-readable error text. Use `code` for branching.
         message (str):
         retryable (bool):
         retry_after_ms (int):

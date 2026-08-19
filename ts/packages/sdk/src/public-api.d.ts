@@ -2658,8 +2658,22 @@ export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
         Error: {
-            /** @example An error message */
+            /** @description Optional stable machine-readable error code for programmatic handling. */
+            code?: string;
+            /**
+             * @description Legacy human-readable error text.
+             * @example An error message
+             */
             error: string;
+            /** @description Human-readable error description when supplied by the endpoint. */
+            message?: string;
+            /** @description Whether retrying the operation may succeed without changing the request. */
+            retryable?: boolean;
+            /**
+             * Format: int32
+             * @description Suggested minimum retry delay in milliseconds.
+             */
+            retry_after_ms?: number;
         };
         /** @description The metadata service does not yet provide the consistency capability required by backup. */
         MetadataCapabilityUnavailableError: {
@@ -2668,8 +2682,11 @@ export interface components {
              * @enum {string}
              */
             code: "metadata_capability_unavailable";
-            /** @enum {string} */
-            error: "metadata_capability_unavailable";
+            /**
+             * @description Legacy human-readable error text. Use `code` for branching.
+             * @enum {string}
+             */
+            error: "metadata capability unavailable";
             message: string;
             /** @enum {string} */
             required_capability: "linearizable_snapshot";
@@ -2685,8 +2702,11 @@ export interface components {
              * @enum {string}
              */
             code: "metadata_leader_unavailable";
-            /** @enum {string} */
-            error: "metadata_leader_unavailable";
+            /**
+             * @description Legacy human-readable error text. Use `code` for branching.
+             * @enum {string}
+             */
+            error: "metadata leader unavailable";
             message: string;
             /** @enum {boolean} */
             retryable: true;
@@ -2695,6 +2715,16 @@ export interface components {
         };
         /** @description A retryable metadata-availability failure reported before backup side effects begin. */
         BackupMetadataUnavailableError: components["schemas"]["MetadataCapabilityUnavailableError"] | components["schemas"]["MetadataLeaderUnavailableError"];
+        /** @description A non-retryable table-backup conflict. For an ambiguous outcome, inspect the requested backup ID before deciding whether to start new work. */
+        TableBackupConflictError: {
+            /** @enum {string} */
+            code: "backup_already_exists" | "table_catalog_changed" | "backup_outcome_ambiguous";
+            /** @description Legacy human-readable error text. Use `code` for branching. */
+            error: string;
+            message: string;
+            /** @enum {boolean} */
+            retryable: false;
+        };
         /** @description Actionable retry contract for temporary inference-capacity failures. */
         InferenceCapacityError: {
             /** @description Stable machine-readable error code. */
@@ -13558,6 +13588,15 @@ export interface components {
                 "application/json": components["schemas"]["BackupMetadataUnavailableError"];
             };
         };
+        /** @description Backup ID collision, catalog-incarnation change, or an outcome requiring reconciliation before retry. */
+        TableBackupConflict: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["TableBackupConflictError"];
+            };
+        };
         /** @description Storage descriptors are temporarily exhausted */
         StorageResourceExhausted: {
             headers: {
@@ -15056,7 +15095,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
-            409: components["responses"]["Conflict"];
+            409: components["responses"]["TableBackupConflict"];
             500: components["responses"]["InternalServerError"];
             503: components["responses"]["BackupMetadataUnavailable"];
         };

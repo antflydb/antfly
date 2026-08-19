@@ -10,6 +10,12 @@
 const std = @import("std");
 
 pub const format_version: u32 = 2;
+pub const backup_fence_table_id_header = "X-Antfly-Backup-Table-Id";
+pub const backup_fence_definition_header = "X-Antfly-Backup-Definition-SHA256";
+pub const backup_fence_topology_count_header = "X-Antfly-Backup-Topology-Count";
+pub const backup_fence_topology_header = "X-Antfly-Backup-Topology-SHA256";
+pub const catalog_changed_message = "table changed during backup admission";
+pub const backup_outcome_ambiguous_message = "backup outcome is ambiguous; inspect the backup id before retrying";
 
 pub const BackupFormat = enum {
     native,
@@ -20,6 +26,53 @@ pub const ArtifactIntegrityMode = enum {
     declared,
     derive_after_materialization,
 };
+
+/// Compact, allocation-free catalog identity carried with backup execution.
+/// Storage owners must validate it after acquiring their structural-operation
+/// guard so a drop/recreate or schema/topology change cannot pair artifacts
+/// from one table incarnation with metadata from another.
+pub const TableBackupFence = struct {
+    table_id: u64,
+    definition_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    topology_range_count: u64,
+    topology_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+
+    pub fn eql(left: @This(), right: @This()) bool {
+        return left.table_id == right.table_id and
+            left.topology_range_count == right.topology_range_count and
+            std.crypto.timing_safe.eql(@TypeOf(left.definition_digest), left.definition_digest, right.definition_digest) and
+            std.crypto.timing_safe.eql(@TypeOf(left.topology_digest), left.topology_digest, right.topology_digest);
+    }
+};
+
+fn hashDefinitionField(hasher: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
+    var encoded_len: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded_len, @intCast(value.len), .big);
+    hasher.update(&encoded_len);
+    hasher.update(value);
+}
+
+pub fn tableDefinitionDigest(
+    table_id: u64,
+    name: []const u8,
+    description: []const u8,
+    schema_json: []const u8,
+    read_schema_json: []const u8,
+    indexes_json: []const u8,
+    replication_sources_json: []const u8,
+) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var encoded_table_id: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded_table_id, table_id, .big);
+    hasher.update(&encoded_table_id);
+    hashDefinitionField(&hasher, name);
+    hashDefinitionField(&hasher, description);
+    hashDefinitionField(&hasher, schema_json);
+    hashDefinitionField(&hasher, read_schema_json);
+    hashDefinitionField(&hasher, indexes_json);
+    hashDefinitionField(&hasher, replication_sources_json);
+    return hasher.finalResult();
+}
 
 pub const ShardSnapshot = struct {
     group_id: u64,
@@ -83,6 +136,7 @@ pub const TableBackupPlan = struct {
     backup_id: []const u8,
     format: BackupFormat = .native,
     io: ?std.Io = null,
+    fence: ?TableBackupFence = null,
 };
 
 pub const TableRestorePlan = struct {

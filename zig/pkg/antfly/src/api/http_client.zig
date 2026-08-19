@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const cluster = @import("cluster.zig");
 const metadata_mod = @import("../metadata/domain.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
@@ -30,6 +31,7 @@ const test_contract_helpers = @import("test_contract_helpers.zig");
 const transactions_api = @import("transactions.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const query_response = @import("query_response.zig");
+const backup_contract = @import("backup_contract.zig");
 
 const transition_control_rpc_timeout_ms: u32 = 5_000;
 
@@ -449,6 +451,40 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !TablesResponse {
+        return self.fetchBackupTableWithHeaders(base_uri, table_name, body, &.{}, null);
+    }
+
+    pub fn fetchBackupTableFenced(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        body: []const u8,
+        fence: backup_contract.TableBackupFence,
+    ) !TablesResponse {
+        var table_id_buffer: [20]u8 = undefined;
+        const table_id = try std.fmt.bufPrint(&table_id_buffer, "{d}", .{fence.table_id});
+        var topology_count_buffer: [20]u8 = undefined;
+        const topology_count = try std.fmt.bufPrint(&topology_count_buffer, "{d}", .{fence.topology_range_count});
+        const definition_digest = std.fmt.bytesToHex(fence.definition_digest, .lower);
+        const topology_digest = std.fmt.bytesToHex(fence.topology_digest, .lower);
+        const headers = [_]http_common.RequestHeader{
+            .{ .name = backup_contract.backup_fence_table_id_header, .value = table_id },
+            .{ .name = backup_contract.backup_fence_definition_header, .value = &definition_digest },
+            .{ .name = backup_contract.backup_fence_topology_count_header, .value = topology_count },
+            .{ .name = backup_contract.backup_fence_topology_header, .value = &topology_digest },
+        };
+        var delivery_tracker: http_common.RequestDeliveryTracker = .{};
+        return self.fetchBackupTableWithHeaders(base_uri, table_name, body, &headers, &delivery_tracker);
+    }
+
+    fn fetchBackupTableWithHeaders(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        body: []const u8,
+        headers: []const http_common.RequestHeader,
+        delivery_tracker: ?*http_common.RequestDeliveryTracker,
+    ) !TablesResponse {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -458,14 +494,48 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = self.executor.execute(self.alloc, .{
             .method = .POST,
             .uri = uri,
+            .headers = headers,
             .content_type = "application/json",
             .body = body,
-        });
+            .delivery_tracker = delivery_tracker,
+        }) catch |err| {
+            if (delivery_tracker) |tracker| {
+                const delivery = tracker.load();
+                if (delivery != .not_sent and !(delivery == .unknown and err == error.ConnectionRefused))
+                    return error.BackupOutcomeAmbiguous;
+            }
+            return err;
+        };
         defer resp.deinit(self.alloc);
-        if (resp.status != 201) return error.UnexpectedHttpStatus;
+        if (resp.status != 201) {
+            if (resp.status == 409) {
+                var conflict = ant_json.parseFromSlice(
+                    struct { code: []const u8 },
+                    self.alloc,
+                    resp.body,
+                    .{ .ignore_unknown_fields = true },
+                ) catch return error.UnexpectedHttpStatus;
+                defer conflict.deinit();
+                if (std.mem.eql(u8, conflict.value.code, "backup_already_exists")) return error.BackupAlreadyExists;
+                if (std.mem.eql(u8, conflict.value.code, "table_catalog_changed")) return error.CatalogChanged;
+                if (std.mem.eql(u8, conflict.value.code, "backup_outcome_ambiguous")) return error.BackupOutcomeAmbiguous;
+            }
+            if (resp.status == 503) {
+                var unavailable = ant_json.parseFromSlice(
+                    struct { code: []const u8 },
+                    self.alloc,
+                    resp.body,
+                    .{ .ignore_unknown_fields = true },
+                ) catch return error.UnexpectedHttpStatus;
+                defer unavailable.deinit();
+                if (std.mem.eql(u8, unavailable.value.code, "metadata_leader_unavailable")) return error.NotLeader;
+                if (std.mem.eql(u8, unavailable.value.code, "metadata_capability_unavailable")) return error.MetadataCapabilityUnavailable;
+            }
+            return error.UnexpectedHttpStatus;
+        }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
     }
 
@@ -3493,6 +3563,36 @@ test "api http client requires explicit not-proposed marker and tracks delivery 
 
     executor.mode = .failure_unknown;
     try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, OutcomeExecutor.fetch(&client));
+}
+
+test "fenced backup forwarding treats post-send transport failure as ambiguous" {
+    const Executor = struct {
+        fn iface() http_common.RequestExecutor {
+            return .{ .ptr = undefined, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const tracker = req.delivery_tracker orelse return error.TestExpectedDeliveryTracker;
+            try std.testing.expectEqual(@as(usize, 4), req.headers.len);
+            try std.testing.expectEqualStrings(backup_contract.backup_fence_table_id_header, req.headers[0].name);
+            try std.testing.expectEqualStrings("7", req.headers[0].value);
+            tracker.markMayHaveBeenSent();
+            return error.ConnectionResetByPeer;
+        }
+    };
+
+    var client = ApiHttpClient.init(std.testing.allocator, Executor.iface());
+    try std.testing.expectError(error.BackupOutcomeAmbiguous, client.fetchBackupTableFenced(
+        "http://127.0.0.1:7777",
+        "docs",
+        "{}",
+        .{
+            .table_id = 7,
+            .definition_digest = [_]u8{0x11} ** 32,
+            .topology_range_count = 1,
+            .topology_digest = [_]u8{0x22} ** 32,
+        },
+    ));
 }
 
 test "api http client encodes merge doc identity reassignment action flag" {

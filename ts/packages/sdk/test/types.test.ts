@@ -48,10 +48,11 @@ describe("Antfly Query Type Integration", () => {
       type BackupUnavailable = components["schemas"]["BackupMetadataUnavailableError"];
       type Backup503 = operations["backup"]["responses"][503]["content"]["application/json"];
       type BackupTable503 = operations["backupTable"]["responses"][503]["content"]["application/json"];
+      type BackupTable409 = operations["backupTable"]["responses"][409]["content"]["application/json"];
 
       const capability: BackupUnavailable = {
         code: "metadata_capability_unavailable",
-        error: "metadata_capability_unavailable",
+        error: "metadata capability unavailable",
         message: "upgrade metadata nodes",
         required_capability: "linearizable_snapshot",
         retryable: true,
@@ -59,16 +60,23 @@ describe("Antfly Query Type Integration", () => {
       };
       const leader: BackupUnavailable = {
         code: "metadata_leader_unavailable",
-        error: "metadata_leader_unavailable",
+        error: "metadata leader unavailable",
         message: "metadata leader unavailable",
         retryable: true,
         retry_after_ms: 1000,
+      };
+      const ambiguous: BackupTable409 = {
+        code: "backup_outcome_ambiguous",
+        error: "backup outcome is ambiguous; inspect the backup id before retrying",
+        message: "backup outcome is ambiguous; inspect the backup id before retrying",
+        retryable: false,
       };
 
       expectTypeOf<Backup503>().toEqualTypeOf<BackupUnavailable>();
       expectTypeOf<BackupTable503>().toEqualTypeOf<BackupUnavailable>();
       expect(capability.required_capability).toBe("linearizable_snapshot");
-      expect(leader.error).toBe("metadata_leader_unavailable");
+      expect(leader.error).toBe("metadata leader unavailable");
+      expect(ambiguous.code).toBe("backup_outcome_ambiguous");
     });
   });
 

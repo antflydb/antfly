@@ -18,6 +18,7 @@ const metadata_openapi = @import("antfly_metadata_openapi");
 const fs_paths = @import("../common/fs_paths.zig");
 const group_ids = @import("../common/group_ids.zig");
 const threaded_io_limits = @import("../common/threaded_io_limits.zig");
+const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const object_storage = @import("../storage/object_storage.zig");
 const remote_uri = @import("../serverless/remote_uri.zig");
@@ -99,9 +100,15 @@ const current_go_backup_attempt_max_artifacts: usize = 1_000_000;
 const backup_list_max_pages: usize = 10_000;
 pub const manifest_too_large_message = "backup manifest exceeds 16 MiB limit";
 pub const metadata_capability_unavailable_body =
-    "{\"code\":\"metadata_capability_unavailable\",\"error\":\"metadata_capability_unavailable\",\"message\":\"backup requires metadata capability linearizable_snapshot; upgrade metadata nodes before retrying\",\"required_capability\":\"linearizable_snapshot\",\"retryable\":true,\"retry_after_ms\":5000}";
+    "{\"code\":\"metadata_capability_unavailable\",\"error\":\"metadata capability unavailable\",\"message\":\"backup requires metadata capability linearizable_snapshot; upgrade metadata nodes before retrying\",\"required_capability\":\"linearizable_snapshot\",\"retryable\":true,\"retry_after_ms\":5000}";
 pub const metadata_capability_retry_after_seconds: u32 = 5;
 pub const integrity_failure_message = "backup artifact failed integrity verification";
+pub const backup_already_exists_body =
+    "{\"code\":\"backup_already_exists\",\"error\":\"backup id already exists\",\"message\":\"backup id already exists\",\"retryable\":false}";
+pub const catalog_changed_body =
+    "{\"code\":\"table_catalog_changed\",\"error\":\"table changed during backup admission\",\"message\":\"table changed during backup admission\",\"retryable\":false}";
+pub const backup_outcome_ambiguous_body =
+    "{\"code\":\"backup_outcome_ambiguous\",\"error\":\"backup outcome is ambiguous; inspect the backup id before retrying\",\"message\":\"backup outcome is ambiguous; inspect the backup id before retrying\",\"retryable\":false}";
 
 /// Request-scoped receipts for artifacts already verified byte-for-byte.
 ///
@@ -191,7 +198,82 @@ pub const ArtifactIntegrity = struct {
 };
 
 pub const TableBackupPlan = backup_contract.TableBackupPlan;
+pub const TableBackupFence = backup_contract.TableBackupFence;
 pub const TableRestorePlan = backup_contract.TableRestorePlan;
+
+pub const backup_fence_table_id_header = backup_contract.backup_fence_table_id_header;
+pub const backup_fence_definition_header = backup_contract.backup_fence_definition_header;
+pub const backup_fence_topology_count_header = backup_contract.backup_fence_topology_count_header;
+pub const backup_fence_topology_header = backup_contract.backup_fence_topology_header;
+pub const catalog_changed_message = backup_contract.catalog_changed_message;
+pub const backup_outcome_ambiguous_message = backup_contract.backup_outcome_ambiguous_message;
+
+pub fn parseTableBackupFenceHeaderValues(
+    table_id_value: ?[]const u8,
+    definition_value: ?[]const u8,
+    topology_count_value: ?[]const u8,
+    topology_value: ?[]const u8,
+) !?TableBackupFence {
+    var present_count: u8 = 0;
+    if (table_id_value != null) present_count += 1;
+    if (definition_value != null) present_count += 1;
+    if (topology_count_value != null) present_count += 1;
+    if (topology_value != null) present_count += 1;
+    if (present_count == 0) return null;
+    if (present_count != 4) return error.InvalidBackupFence;
+
+    if (definition_value.?.len != std.crypto.hash.sha2.Sha256.digest_length * 2 or
+        topology_value.?.len != std.crypto.hash.sha2.Sha256.digest_length * 2)
+        return error.InvalidBackupFence;
+    var definition_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    var topology_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    _ = std.fmt.hexToBytes(&definition_digest, definition_value.?) catch return error.InvalidBackupFence;
+    _ = std.fmt.hexToBytes(&topology_digest, topology_value.?) catch return error.InvalidBackupFence;
+    return .{
+        .table_id = std.fmt.parseInt(u64, table_id_value.?, 10) catch return error.InvalidBackupFence,
+        .definition_digest = definition_digest,
+        .topology_range_count = std.fmt.parseInt(u64, topology_count_value.?, 10) catch return error.InvalidBackupFence,
+        .topology_digest = topology_digest,
+    };
+}
+
+test "backup fence headers require a complete canonical fence" {
+    const digest = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    const parsed = (try parseTableBackupFenceHeaderValues("7", digest, "1", digest)).?;
+    try std.testing.expectEqual(@as(u64, 7), parsed.table_id);
+    try std.testing.expectEqual(@as(u64, 1), parsed.topology_range_count);
+    try std.testing.expectError(error.InvalidBackupFence, parseTableBackupFenceHeaderValues("7", null, "1", digest));
+    try std.testing.expectError(error.InvalidBackupFence, parseTableBackupFenceHeaderValues("7", "00", "1", digest));
+}
+
+pub fn tableBackupFence(
+    snapshot: *const metadata_api.AdminSnapshot,
+    table: *const metadata_table_manager.TableRecord,
+) TableBackupFence {
+    const topology = metadata_api.catalogTableTopology(table.table_id, snapshot.ranges);
+    return .{
+        .table_id = table.table_id,
+        .definition_digest = backup_contract.tableDefinitionDigest(
+            table.table_id,
+            table.name,
+            table.description,
+            table.schema_json,
+            table.read_schema_json,
+            table.indexes_json,
+            table.replication_sources_json,
+        ),
+        .topology_range_count = topology.range_count,
+        .topology_digest = topology.digest,
+    };
+}
+
+pub fn tableBackupFenceMatches(
+    expected: TableBackupFence,
+    snapshot: *const metadata_api.AdminSnapshot,
+    table: *const metadata_table_manager.TableRecord,
+) bool {
+    return expected.eql(tableBackupFence(snapshot, table));
+}
 
 pub const max_restore_source_identity_bytes: usize = 4096;
 
@@ -3943,6 +4025,37 @@ pub fn cleanupUnpublishedTableBackupAttemptAtLocation(
         &object_budget,
         false,
     );
+}
+
+/// Removes the temporary manifest and reservation published by a forwarded
+/// storage-owner hop while preserving its payload for the coordinator's
+/// canonical manifest. This is best-effort after canonical publication, but
+/// forms part of confirmed rollback before publication.
+pub fn retireForwardedTableBackupEnvelopeAtLocation(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    backup_id: []const u8,
+) !void {
+    try validateBackupId(backup_id);
+    switch (location.*) {
+        .file => |backup_root| {
+            const manifest_path = try metadataPath(alloc, backup_root, backup_id);
+            defer alloc.free(manifest_path);
+            try deletePathDurably(io, manifest_path);
+            const reservation_path = try reservationPath(alloc, backup_root, backup_id, false);
+            defer alloc.free(reservation_path);
+            try deletePathDurably(io, reservation_path);
+        },
+        .remote => |*store| {
+            const manifest_suffix = try metadataPath(alloc, "", backup_id);
+            defer alloc.free(manifest_suffix);
+            try store.deleteSuffix(alloc, trimLeftSlash(manifest_suffix));
+            const reservation_suffix = try reservationPath(alloc, "", backup_id, false);
+            defer alloc.free(reservation_suffix);
+            try store.deleteSuffix(alloc, trimLeftSlash(reservation_suffix));
+        },
+    }
 }
 
 fn cleanupTableBackupAttemptAtLocationWithBudget(
@@ -9941,6 +10054,30 @@ test "unpublished remote cleanup preserves a conflicting manifest" {
         location.remote.readBytesAllocLimited(alloc, "attempt-artifact.afb", 64),
     );
     try reserveBackupAtLocation(alloc, io, &location, "shared", false);
+}
+
+test "forwarded backup envelope retirement preserves canonical payload" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var location: BackupLocation = .{
+        .remote = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", "backups"),
+    };
+    defer location.deinit(alloc);
+
+    try reserveBackupAtLocation(alloc, io, &location, "forwarded", false);
+    try location.remote.writeBytes(alloc, "forwarded-metadata.json", "temporary-envelope", "application/json");
+    try location.remote.writeBytes(alloc, "forwarded.afb", "canonical-payload", "application/vnd.antfly.backup");
+    try retireForwardedTableBackupEnvelopeAtLocation(alloc, io, &location, "forwarded");
+
+    try std.testing.expectError(error.FileNotFound, location.remote.readBytesAllocLimited(alloc, "forwarded-metadata.json", 64));
+    const payload = try location.remote.readBytesAllocLimited(alloc, "forwarded.afb", 64);
+    defer alloc.free(payload);
+    try std.testing.expectEqualStrings("canonical-payload", payload);
+    try reserveBackupAtLocation(alloc, io, &location, "forwarded", false);
 }
 
 test "cluster backup attempt markers reject overlapping cleanup identities" {

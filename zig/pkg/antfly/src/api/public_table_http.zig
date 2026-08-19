@@ -141,7 +141,9 @@ pub const TableApi = struct {
         MetadataCapabilityUnavailable,
         NotLeader,
         NotFound,
+        CatalogChanged,
         BackupAlreadyExists,
+        BackupOutcomeAmbiguous,
         MethodNotAllowed,
         BackupManifestTooLarge,
         UnsupportedBackupMigrationState,
@@ -311,6 +313,7 @@ pub const TableApi = struct {
             table_name: []const u8,
             backup_id: []const u8,
             format: backups_api.BackupFormat,
+            expected_fence: ?backups_api.TableBackupFence,
             location_uri: []const u8,
             connection: []const u8,
             location: *backups_api.BackupLocation,
@@ -445,12 +448,13 @@ pub const TableApi = struct {
         table_name: []const u8,
         backup_id: []const u8,
         format: backups_api.BackupFormat,
+        expected_fence: ?backups_api.TableBackupFence,
         location_uri: []const u8,
         connection: []const u8,
         location: *backups_api.BackupLocation,
     ) ExecuteBackupError!void {
         try self.ensureActive();
-        return try self.vtable.execute_table_backup(self.ptr, alloc, table_name, backup_id, format, location_uri, connection, location, self.request);
+        return try self.vtable.execute_table_backup(self.ptr, alloc, table_name, backup_id, format, expected_fence, location_uri, connection, location, self.request);
     }
 
     pub fn executeTableRestore(
@@ -1017,6 +1021,19 @@ pub fn handleTableBackup(
     node_config: ?*const common_config.Config,
     io: ?std.Io,
 ) !OwnedResponse {
+    return handleTableBackupExpectedFence(alloc, table_name, body, null, api, secret_store, node_config, io);
+}
+
+pub fn handleTableBackupExpectedFence(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    body: []const u8,
+    expected_fence: ?backups_api.TableBackupFence,
+    api: TableApi,
+    secret_store: ?*common_secrets.FileStore,
+    node_config: ?*const common_config.Config,
+    io: ?std.Io,
+) !OwnedResponse {
     const parsed_req = backups_api.parseBackupRequest(alloc, body) catch {
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid backup request") };
     };
@@ -1042,7 +1059,7 @@ pub fn handleTableBackup(
     };
     defer location.deinit(alloc);
 
-    api.executeTableBackup(alloc, table_name, parsed_req.value.backup_id, backup_format, parsed_req.value.location, parsed_req.value.connection, &location) catch |err| switch (err) {
+    api.executeTableBackup(alloc, table_name, parsed_req.value.backup_id, backup_format, expected_fence, parsed_req.value.location, parsed_req.value.connection, &location) catch |err| switch (err) {
         error.Canceled, error.DeadlineExceeded => return err,
         error.MetadataCapabilityUnavailable => return .{
             .status = 503,
@@ -1052,7 +1069,9 @@ pub fn handleTableBackup(
         },
         error.NotLeader => return err,
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
-        error.BackupAlreadyExists => return .{ .status = 409, .body = try alloc.dupe(u8, "backup id already exists") },
+        error.CatalogChanged => return .{ .status = 409, .body = try alloc.dupe(u8, backups_api.catalog_changed_body), .json = true },
+        error.BackupAlreadyExists => return .{ .status = 409, .body = try alloc.dupe(u8, backups_api.backup_already_exists_body), .json = true },
+        error.BackupOutcomeAmbiguous => return .{ .status = 409, .body = try alloc.dupe(u8, backups_api.backup_outcome_ambiguous_body), .json = true },
         error.BackupManifestTooLarge => return .{ .status = 400, .body = try alloc.dupe(u8, backups_api.manifest_too_large_message) },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.UnsupportedBackupMigrationState => return .{ .status = 400, .body = try alloc.dupe(u8, "backup does not support active schema migration") },
@@ -1725,6 +1744,7 @@ fn unsupportedBackup(
     _: []const u8,
     _: []const u8,
     _: backups_api.BackupFormat,
+    _: ?backups_api.TableBackupFence,
     _: []const u8,
     _: []const u8,
     _: *backups_api.BackupLocation,
@@ -3385,6 +3405,7 @@ test "public table backup handler maps unsupported multi-range error" {
             _: []const u8,
             _: []const u8,
             _: backups_api.BackupFormat,
+            _: ?backups_api.TableBackupFence,
             _: []const u8,
             _: []const u8,
             _: *backups_api.BackupLocation,
@@ -3437,6 +3458,7 @@ test "public table backup handler rejects an existing backup id" {
             _: []const u8,
             _: []const u8,
             _: backups_api.BackupFormat,
+            _: ?backups_api.TableBackupFence,
             _: []const u8,
             _: []const u8,
             _: *backups_api.BackupLocation,
@@ -3459,7 +3481,70 @@ test "public table backup handler rejects an existing backup id" {
     );
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 409), resp.status);
-    try std.testing.expectEqualStrings("backup id already exists", resp.body);
+    try ant_json.testing.expectEqualJsonText(std.testing.allocator, backups_api.backup_already_exists_body, resp.body);
+}
+
+test "public table backup handler exposes non-retryable fenced outcomes" {
+    const Backend = struct {
+        failure: TableApi.ExecuteBackupError,
+
+        fn iface(self: *@This()) TableApi {
+            return .{
+                .ptr = self,
+                .request = .{},
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = executeTableBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableBackup(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: backups_api.BackupFormat,
+            _: ?backups_api.TableBackupFence,
+            _: []const u8,
+            _: []const u8,
+            _: *backups_api.BackupLocation,
+            _: operation.RequestContext,
+        ) TableApi.ExecuteBackupError!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
+        }
+    };
+
+    const cases = [_]struct { failure: TableApi.ExecuteBackupError, expected: []const u8 }{
+        .{ .failure = error.CatalogChanged, .expected = backups_api.catalog_changed_body },
+        .{ .failure = error.BackupOutcomeAmbiguous, .expected = backups_api.backup_outcome_ambiguous_body },
+    };
+    var node_config = try testBackupNodeConfig(std.testing.allocator);
+    defer node_config.deinit();
+    for (cases) |case| {
+        var backend = Backend{ .failure = case.failure };
+        var resp = try handleTableBackup(
+            std.testing.allocator,
+            "docs",
+            "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\",\"connection\":\"test-backups\"}",
+            backend.iface(),
+            null,
+            &node_config,
+            null,
+        );
+        defer resp.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u16, 409), resp.status);
+        try std.testing.expect(resp.json);
+        try ant_json.testing.expectEqualJsonText(std.testing.allocator, case.expected, resp.body);
+    }
 }
 
 test "public table backup handler accepts portable format" {
@@ -3491,6 +3576,7 @@ test "public table backup handler accepts portable format" {
             _: []const u8,
             _: []const u8,
             format: backups_api.BackupFormat,
+            _: ?backups_api.TableBackupFence,
             _: []const u8,
             connection: []const u8,
             _: *backups_api.BackupLocation,

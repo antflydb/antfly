@@ -11,6 +11,7 @@ from ...models.backup_table_response_201 import BackupTableResponse201
 from ...models.error import Error
 from ...models.metadata_capability_unavailable_error import MetadataCapabilityUnavailableError
 from ...models.metadata_leader_unavailable_error import MetadataLeaderUnavailableError
+from ...models.table_backup_conflict_error import TableBackupConflictError
 from ...types import Response
 
 
@@ -38,7 +39,14 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> BackupTableResponse201 | Error | MetadataCapabilityUnavailableError | MetadataLeaderUnavailableError | None:
+) -> (
+    BackupTableResponse201
+    | Error
+    | MetadataCapabilityUnavailableError
+    | MetadataLeaderUnavailableError
+    | TableBackupConflictError
+    | None
+):
     if response.status_code == 201:
         response_201 = BackupTableResponse201.from_dict(response.json())
 
@@ -55,7 +63,7 @@ def _parse_response(
         return response_404
 
     if response.status_code == 409:
-        response_409 = Error.from_dict(response.json())
+        response_409 = TableBackupConflictError.from_dict(response.json())
 
         return response_409
 
@@ -95,7 +103,13 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[BackupTableResponse201 | Error | MetadataCapabilityUnavailableError | MetadataLeaderUnavailableError]:
+) -> Response[
+    BackupTableResponse201
+    | Error
+    | MetadataCapabilityUnavailableError
+    | MetadataLeaderUnavailableError
+    | TableBackupConflictError
+]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -109,7 +123,13 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: BackupRequest,
-) -> Response[BackupTableResponse201 | Error | MetadataCapabilityUnavailableError | MetadataLeaderUnavailableError]:
+) -> Response[
+    BackupTableResponse201
+    | Error
+    | MetadataCapabilityUnavailableError
+    | MetadataLeaderUnavailableError
+    | TableBackupConflictError
+]:
     """Backup a table
 
      Backup IDs are immutable. Reusing an already published ID returns `409` without changing the
@@ -124,7 +144,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[BackupTableResponse201 | Error | MetadataCapabilityUnavailableError | MetadataLeaderUnavailableError]
+        Response[BackupTableResponse201 | Error | MetadataCapabilityUnavailableError | MetadataLeaderUnavailableError | TableBackupConflictError]
     """
 
     kwargs = _get_kwargs(
@@ -144,7 +164,14 @@ def sync(
     *,
     client: AuthenticatedClient,
     body: BackupRequest,
-) -> BackupTableResponse201 | Error | MetadataCapabilityUnavailableError | MetadataLeaderUnavailableError | None:
+) -> (
+    BackupTableResponse201
+    | Error
+    | MetadataCapabilityUnavailableError
+    | MetadataLeaderUnavailableError
+    | TableBackupConflictError
+    | None
+):
     """Backup a table
 
      Backup IDs are immutable. Reusing an already published ID returns `409` without changing the
@@ -159,7 +186,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        BackupTableResponse201 | Error | MetadataCapabilityUnavailableError | MetadataLeaderUnavailableError
+        BackupTableResponse201 | Error | MetadataCapabilityUnavailableError | MetadataLeaderUnavailableError | TableBackupConflictError
     """
 
     return sync_detailed(
@@ -174,7 +201,13 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: BackupRequest,
-) -> Response[BackupTableResponse201 | Error | MetadataCapabilityUnavailableError | MetadataLeaderUnavailableError]:
+) -> Response[
+    BackupTableResponse201
+    | Error
+    | MetadataCapabilityUnavailableError
+    | MetadataLeaderUnavailableError
+    | TableBackupConflictError
+]:
     """Backup a table
 
      Backup IDs are immutable. Reusing an already published ID returns `409` without changing the
@@ -189,7 +222,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[BackupTableResponse201 | Error | MetadataCapabilityUnavailableError | MetadataLeaderUnavailableError]
+        Response[BackupTableResponse201 | Error | MetadataCapabilityUnavailableError | MetadataLeaderUnavailableError | TableBackupConflictError]
     """
 
     kwargs = _get_kwargs(
@@ -207,7 +240,14 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     body: BackupRequest,
-) -> BackupTableResponse201 | Error | MetadataCapabilityUnavailableError | MetadataLeaderUnavailableError | None:
+) -> (
+    BackupTableResponse201
+    | Error
+    | MetadataCapabilityUnavailableError
+    | MetadataLeaderUnavailableError
+    | TableBackupConflictError
+    | None
+):
     """Backup a table
 
      Backup IDs are immutable. Reusing an already published ID returns `409` without changing the
@@ -222,7 +262,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        BackupTableResponse201 | Error | MetadataCapabilityUnavailableError | MetadataLeaderUnavailableError
+        BackupTableResponse201 | Error | MetadataCapabilityUnavailableError | MetadataLeaderUnavailableError | TableBackupConflictError
     """
 
     return (

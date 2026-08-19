@@ -1368,7 +1368,16 @@ pub const EdgesResponse = struct {
 pub const Embedding = std.json.Value;
 
 pub const Error = struct {
+    /// Optional stable machine-readable error code for programmatic handling.
+    code: ?[]const u8 = null,
+    /// Legacy human-readable error text.
     @"error": []const u8,
+    /// Human-readable error description when supplied by the endpoint.
+    message: ?[]const u8 = null,
+    /// Whether retrying the operation may succeed without changing the request.
+    retryable: ?bool = null,
+    /// Suggested minimum retry delay in milliseconds.
+    retry_after_ms: ?i32 = null,
 };
 
 pub const ExactSortError = struct {
@@ -2053,6 +2062,7 @@ pub const MergeProfile = struct {
 /// The metadata service does not yet provide the consistency capability required by backup.
 pub const MetadataCapabilityUnavailableError = struct {
     code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
     @"error": []const u8,
     message: []const u8,
     required_capability: []const u8,
@@ -2063,6 +2073,7 @@ pub const MetadataCapabilityUnavailableError = struct {
 /// The request could not establish authority with the current metadata leader.
 pub const MetadataLeaderUnavailableError = struct {
     code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
     @"error": []const u8,
     message: []const u8,
     retryable: bool,
@@ -3281,6 +3292,15 @@ pub const TableArtifactEnrichmentList = struct {
     /// Table containing the configured artifact enrichments.
     table_name: []const u8,
     artifacts: []const antfly_indexes_openapi.EnrichmentConfig,
+};
+
+/// A non-retryable table-backup conflict. For an ambiguous outcome, inspect the requested backup ID before deciding whether to start new work.
+pub const TableBackupConflictError = struct {
+    code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
 };
 
 pub const TableBackupStatus = struct {

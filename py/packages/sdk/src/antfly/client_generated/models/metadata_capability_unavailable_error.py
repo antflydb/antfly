@@ -20,7 +20,7 @@ class MetadataCapabilityUnavailableError:
 
     Attributes:
         code (MetadataCapabilityUnavailableErrorCode):
-        error (MetadataCapabilityUnavailableErrorError):
+        error (MetadataCapabilityUnavailableErrorError): Legacy human-readable error text. Use `code` for branching.
         message (str):
         required_capability (MetadataCapabilityUnavailableErrorRequiredCapability):
         retryable (bool):

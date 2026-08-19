@@ -4590,6 +4590,7 @@ pub const HttpHandler = struct {
         _: []const u8,
         _: []const u8,
         _: backups_api.BackupFormat,
+        _: ?backups_api.TableBackupFence,
         _: []const u8,
         _: []const u8,
         _: *backups_api.BackupLocation,

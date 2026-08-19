@@ -194,6 +194,7 @@ pub const SuccessMessage = types.SuccessMessage;
 pub const SyncLevel = types.SyncLevel;
 pub const Table = types.Table;
 pub const TableArtifactEnrichmentList = types.TableArtifactEnrichmentList;
+pub const TableBackupConflictError = types.TableBackupConflictError;
 pub const TableBackupStatus = types.TableBackupStatus;
 pub const TableMigration = types.TableMigration;
 pub const TableRepairIssue = types.TableRepairIssue;

@@ -6264,6 +6264,7 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         io: std.Io,
         table: *const metadata_table_manager.TableRecord,
+        fence: backups_api.TableBackupFence,
         table_name: []const u8,
         backup_location: *backups_api.BackupLocation,
         location_uri: []const u8,
@@ -6276,6 +6277,7 @@ pub const ApiHttpServer = struct {
         return try self.backupOwnedTableWithArtifactId(
             io,
             table,
+            fence,
             table_name,
             backup_location,
             location_uri,
@@ -6290,6 +6292,7 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         io: std.Io,
         table: *const metadata_table_manager.TableRecord,
+        fence: backups_api.TableBackupFence,
         table_name: []const u8,
         backup_location: *backups_api.BackupLocation,
         location_uri: []const u8,
@@ -6303,45 +6306,90 @@ pub const ApiHttpServer = struct {
         if (try backups_api.manifestExistsAtLocationWithIo(self.alloc, io, backup_location, backup_id))
             return error.BackupAlreadyExists;
         try backups_api.reserveBackupAtLocation(self.alloc, io, backup_location, backup_id, false);
-        var committed = false;
         var cleanup_safe = true;
-        errdefer if (!committed) {
-            if (cleanup_safe) {
-                backups_api.cleanupUnpublishedTableBackupAttemptAtLocation(
+        var forwarded_envelope_owned = false;
+        self.executeReservedTableBackup(io, table, fence, table_name, backup_location, location_uri, backup_id, artifact_backup_id, format, connection, &cleanup_safe, &forwarded_envelope_owned) catch |err| {
+            if (!cleanup_safe) {
+                std.log.err("table backup publication outcome ambiguous phase=commit class={s}; retaining fenced attempt", .{@errorName(err)});
+                return error.BackupOutcomeAmbiguous;
+            }
+            if (forwarded_envelope_owned and !std.mem.eql(u8, backup_id, artifact_backup_id)) {
+                backups_api.cleanupTableBackupAttemptAtLocation(
                     self.alloc,
                     io,
                     backup_location,
-                    backup_id,
+                    artifact_backup_id,
                     artifact_backup_id,
                     format,
                 ) catch |cleanup_err| {
-                    // A retained reservation fences retries when cleanup
-                    // cannot be confirmed, preventing new work from colliding
-                    // with orphans.
-                    std.log.err("table backup cleanup failed phase=rollback class={s}", .{@errorName(cleanup_err)});
+                    std.log.err("forwarded table backup cleanup failed phase=rollback class={s}", .{@errorName(cleanup_err)});
+                    return error.BackupOutcomeAmbiguous;
                 };
-            } else {
-                // A transport error after starting conditional publication is
-                // ambiguous: the manifest may be visible. Keep both the data
-                // and reservation so no retry can destroy or overwrite a
-                // potentially committed backup.
-                std.log.err("table backup publication outcome ambiguous phase=commit; retaining fenced attempt", .{});
             }
+            backups_api.cleanupUnpublishedTableBackupAttemptAtLocation(
+                self.alloc,
+                io,
+                backup_location,
+                backup_id,
+                artifact_backup_id,
+                format,
+            ) catch |cleanup_err| {
+                // A retained reservation fences retries when cleanup cannot be
+                // confirmed. Surface ambiguity rather than preserving a
+                // retryable authority/storage error from before rollback.
+                std.log.err("table backup cleanup failed phase=rollback class={s}", .{@errorName(cleanup_err)});
+                return error.BackupOutcomeAmbiguous;
+            };
+            return err;
         };
+    }
+
+    fn executeReservedTableBackup(
+        self: *ApiHttpServer,
+        io: std.Io,
+        table: *const metadata_table_manager.TableRecord,
+        fence: backups_api.TableBackupFence,
+        table_name: []const u8,
+        backup_location: *backups_api.BackupLocation,
+        location_uri: []const u8,
+        backup_id: []const u8,
+        artifact_backup_id: []const u8,
+        format: backups_api.BackupFormat,
+        connection: []const u8,
+        cleanup_safe: *bool,
+        forwarded_envelope_owned: *bool,
+    ) !void {
         const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
-        if (try table_writes_source.backupTableToLocation(self.alloc, table_name, artifact_backup_id, format, location_uri, connection, backup_location)) |shards| {
+        const forwarded_shards = table_writes_source.backupTableToLocation(self.alloc, table_name, artifact_backup_id, format, fence, location_uri, connection, backup_location) catch |err| {
+            if (err == error.BackupOutcomeAmbiguous) cleanup_safe.* = false;
+            return err;
+        };
+        if (forwarded_shards) |shards| {
+            forwarded_envelope_owned.* = true;
             defer freeBackupShards(self.alloc, shards);
             var manifest = try backups_api.createManifest(self.alloc, backup_id, format, table, shards);
             defer manifest.deinit(self.alloc);
-            cleanup_safe = false;
+            cleanup_safe.* = false;
             backups_api.writeManifestToLocationWithIo(self.alloc, io, backup_location, &manifest) catch |err| {
-                cleanup_safe = switch (err) {
+                cleanup_safe.* = switch (err) {
                     error.BackupAlreadyExists, error.BackupManifestTooLarge => true,
                     else => false,
                 };
                 return err;
             };
-            committed = true;
+            if (!std.mem.eql(u8, backup_id, artifact_backup_id)) {
+                backups_api.retireForwardedTableBackupEnvelopeAtLocation(
+                    self.alloc,
+                    io,
+                    backup_location,
+                    artifact_backup_id,
+                ) catch |cleanup_err| {
+                    // The canonical manifest is already committed and owns the
+                    // payload. A stale forwarding envelope is harmless and can
+                    // be reclaimed later; never turn success into ambiguity.
+                    std.log.warn("forwarded table backup envelope retirement deferred class={s}", .{@errorName(cleanup_err)});
+                };
+            }
             return;
         }
 
@@ -6354,12 +6402,17 @@ pub const ApiHttpServer = struct {
             .remote => self.destroyBackupStagingRoot(local_backup_root),
         };
 
-        const shards = (try table_writes_source.backupTable(self.alloc, table_name, .{
+        const local_shards = table_writes_source.backupTable(self.alloc, table_name, .{
             .backup_root = local_backup_root,
             .backup_id = artifact_backup_id,
             .format = format,
             .io = io,
-        })) orelse return error.TableNotFound;
+            .fence = fence,
+        }) catch |err| {
+            if (err == error.BackupOutcomeAmbiguous) cleanup_safe.* = false;
+            return err;
+        };
+        const shards = local_shards orelse return error.TableNotFound;
         defer freeBackupShards(self.alloc, shards);
 
         if (switch (backup_location.*) {
@@ -6390,15 +6443,14 @@ pub const ApiHttpServer = struct {
 
         var manifest = try backups_api.createManifest(self.alloc, backup_id, format, table, shards);
         defer manifest.deinit(self.alloc);
-        cleanup_safe = false;
+        cleanup_safe.* = false;
         backups_api.writeManifestToLocationWithIo(self.alloc, io, backup_location, &manifest) catch |err| {
-            cleanup_safe = switch (err) {
+            cleanup_safe.* = switch (err) {
                 error.BackupAlreadyExists, error.BackupManifestTooLarge => true,
                 else => false,
             };
             return err;
         };
-        committed = true;
     }
 
     fn cleanupClusterBackupAttempt(
@@ -8562,6 +8614,7 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         backup_id: []const u8,
         format: backups_api.BackupFormat,
+        expected_fence: ?backups_api.TableBackupFence,
         location_uri: []const u8,
         connection: []const u8,
         location: *backups_api.BackupLocation,
@@ -8569,6 +8622,7 @@ pub const ApiHttpServer = struct {
     ) public_table_http.TableApi.ExecuteBackupError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         try ensureTableOperationActive(request);
+        var admitted_fence: backups_api.TableBackupFence = undefined;
         var table = table: {
             var authoritative_snapshot = (self.source.linearizableSnapshot(request) catch |err| {
                 if (err == error.Canceled or err == error.Cancelled) return error.Canceled;
@@ -8581,6 +8635,10 @@ pub const ApiHttpServer = struct {
             };
             defer self.source.freeAdminSnapshot(&authoritative_snapshot);
             const record = tables_api.findTableByName(&authoritative_snapshot, table_name) orelse return error.NotFound;
+            admitted_fence = backups_api.tableBackupFence(&authoritative_snapshot, record);
+            if (expected_fence) |expected| {
+                if (!expected.eql(admitted_fence)) return error.CatalogChanged;
+            }
             break :table metadata_table_manager.cloneTable(self.alloc, record.*) catch return error.InternalFailure;
         };
         defer metadata_table_manager.freeTable(self.alloc, table);
@@ -8594,14 +8652,24 @@ pub const ApiHttpServer = struct {
         // starts, returning cancellation could invite an unsafe replay after
         // an ambiguous durable outcome.
         try ensureTableOperationActive(request);
-        self.backupOwnedTable(io, &table, table_name, location, location_uri, backup_id, format, connection) catch |err| switch (err) {
+        // A forwarded storage-owner hop must preserve the coordinator's
+        // generation ID. Generating another ID here would leave cleanup unable
+        // to address the actual payload after a failed or ambiguous transport.
+        const backup_result = if (expected_fence != null)
+            self.backupOwnedTableWithArtifactId(io, &table, admitted_fence, table_name, location, location_uri, backup_id, backup_id, format, connection)
+        else
+            self.backupOwnedTable(io, &table, admitted_fence, table_name, location, location_uri, backup_id, format, connection);
+        backup_result catch |err| switch (err) {
             error.NotLeader,
             error.ProposalDropped,
             error.LeaderTransferInProgress,
             error.MetadataLinearizableReadTimeout,
             error.ReconcileLeaseNotHeld,
             => return error.NotLeader,
+            error.MetadataCapabilityUnavailable => return error.MetadataCapabilityUnavailable,
+            error.CatalogChanged => return error.CatalogChanged,
             error.BackupAlreadyExists => return error.BackupAlreadyExists,
+            error.BackupOutcomeAmbiguous => return error.BackupOutcomeAmbiguous,
             error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
             error.TableNotFound => return error.NotFound,
             error.UnsupportedOperation => return error.MethodNotAllowed,
@@ -9815,6 +9883,7 @@ pub const ApiHttpServer = struct {
             self.backupOwnedTableWithArtifactId(
                 backup_io,
                 table,
+                backups_api.tableBackupFence(&authoritative_snapshot, table),
                 table_name,
                 location,
                 req.location,
@@ -9842,6 +9911,8 @@ pub const ApiHttpServer = struct {
                     error.UnsupportedMultiRangeTable => "backup does not support multi-range tables",
                     error.UnsupportedBackupMigrationState => "backup does not support active schema migration",
                     error.BackupManifestTooLarge => backups_api.manifest_too_large_message,
+                    error.CatalogChanged => backups_api.catalog_changed_message,
+                    error.BackupOutcomeAmbiguous => backups_api.backup_outcome_ambiguous_message,
                     else => blk: {
                         std.log.warn("cluster backup table snapshot failed table={s} class={s}", .{
                             table_name,
@@ -32451,7 +32522,7 @@ fn expectPublicMetadataNotLeaderResponse(resp: http_common.HttpResponse) !void {
     try std.testing.expectEqualStrings("application/json", resp.content_type.?);
     try ant_json.testing.expectEqualJsonText(
         std.testing.allocator,
-        "{\"code\":\"metadata_leader_unavailable\",\"error\":\"metadata_leader_unavailable\",\"message\":\"metadata leader unavailable\",\"retryable\":true,\"retry_after_ms\":1000}",
+        "{\"code\":\"metadata_leader_unavailable\",\"error\":\"metadata leader unavailable\",\"message\":\"metadata leader unavailable\",\"retryable\":true,\"retry_after_ms\":1000}",
         resp.body,
     );
     var parsed = try std.json.parseFromSlice(
@@ -32464,7 +32535,7 @@ fn expectPublicMetadataNotLeaderResponse(resp: http_common.HttpResponse) !void {
     switch (parsed.value) {
         .metadata_leader_unavailable_error => |value| {
             try std.testing.expectEqualStrings("metadata_leader_unavailable", value.code);
-            try std.testing.expectEqualStrings("metadata_leader_unavailable", value.@"error");
+            try std.testing.expectEqualStrings("metadata leader unavailable", value.@"error");
             try std.testing.expectEqualStrings("metadata leader unavailable", value.message);
             try std.testing.expect(value.retryable);
             try std.testing.expectEqual(@as(i32, 1000), value.retry_after_ms);
@@ -32490,7 +32561,7 @@ fn expectPublicMetadataNotLeaderResponse(resp: http_common.HttpResponse) !void {
 
 fn expectPublicMetadataCapabilityUnavailableResponse(resp: http_common.HttpResponse) !void {
     const expected_json =
-        \\{"code":"metadata_capability_unavailable","error":"metadata_capability_unavailable","message":"backup requires metadata capability linearizable_snapshot; upgrade metadata nodes before retrying","required_capability":"linearizable_snapshot","retryable":true,"retry_after_ms":5000}
+        \\{"code":"metadata_capability_unavailable","error":"metadata capability unavailable","message":"backup requires metadata capability linearizable_snapshot; upgrade metadata nodes before retrying","required_capability":"linearizable_snapshot","retryable":true,"retry_after_ms":5000}
     ;
     try std.testing.expectEqual(@as(u16, 503), resp.status);
     try std.testing.expectEqualStrings("application/json", resp.content_type.?);
@@ -32509,7 +32580,7 @@ fn expectPublicMetadataCapabilityUnavailableResponse(resp: http_common.HttpRespo
     switch (parsed.value) {
         .metadata_capability_unavailable_error => |value| {
             try std.testing.expectEqualStrings("metadata_capability_unavailable", value.code);
-            try std.testing.expectEqualStrings("metadata_capability_unavailable", value.@"error");
+            try std.testing.expectEqualStrings("metadata capability unavailable", value.@"error");
             try std.testing.expectEqualStrings("linearizable_snapshot", value.required_capability);
             try std.testing.expect(value.retryable);
             try std.testing.expectEqual(@as(i32, 5000), value.retry_after_ms);

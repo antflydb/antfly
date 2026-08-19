@@ -686,7 +686,7 @@ test "linked API dispatch preserves kernel-owned ingress policy" {
     try std.testing.expectEqualStrings("true", responseHeader(retry_response, "X-Antfly-Metadata-Not-Leader").?);
     try ant_json.testing.expectEqualJsonText(
         std.testing.allocator,
-        "{\"code\":\"metadata_leader_unavailable\",\"error\":\"metadata_leader_unavailable\",\"message\":\"metadata leader unavailable\",\"retryable\":true,\"retry_after_ms\":1000}",
+        "{\"code\":\"metadata_leader_unavailable\",\"error\":\"metadata leader unavailable\",\"message\":\"metadata leader unavailable\",\"retryable\":true,\"retry_after_ms\":1000}",
         retry_response.body.slice(),
     );
     try std.testing.expectEqual(@as(u64, 2), api_server.requestStats().request_count);

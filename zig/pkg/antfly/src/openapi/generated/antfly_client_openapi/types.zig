@@ -3168,7 +3168,16 @@ pub const EnrichmentRuntimeStatus = struct {
 };
 
 pub const Error = struct {
+    /// Optional stable machine-readable error code for programmatic handling.
+    code: ?[]const u8 = null,
+    /// Legacy human-readable error text.
     @"error": []const u8,
+    /// Human-readable error description when supplied by the endpoint.
+    message: ?[]const u8 = null,
+    /// Whether retrying the operation may succeed without changing the request.
+    retryable: ?bool = null,
+    /// Suggested minimum retry delay in milliseconds.
+    retry_after_ms: ?i32 = null,
 };
 
 /// Configuration for inline evaluation of query results. Add to RetrievalAgentRequest, QueryRequest, or other evaluation-capable request schemas.
@@ -6560,6 +6569,7 @@ pub const MergeStrategy = enum {
 /// The metadata service does not yet provide the consistency capability required by backup.
 pub const MetadataCapabilityUnavailableError = struct {
     code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
     @"error": []const u8,
     message: []const u8,
     required_capability: []const u8,
@@ -6570,6 +6580,7 @@ pub const MetadataCapabilityUnavailableError = struct {
 /// The request could not establish authority with the current metadata leader.
 pub const MetadataLeaderUnavailableError = struct {
     code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
     @"error": []const u8,
     message: []const u8,
     retryable: bool,
@@ -8569,6 +8580,15 @@ pub const TableArtifactEnrichmentList = struct {
     /// Table containing the configured artifact enrichments.
     table_name: []const u8,
     artifacts: []const EnrichmentConfig,
+};
+
+/// A non-retryable table-backup conflict. For an ambiguous outcome, inspect the requested backup ID before deciding whether to start new work.
+pub const TableBackupConflictError = struct {
+    code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
 };
 
 pub const TableBackupStatus = struct {
