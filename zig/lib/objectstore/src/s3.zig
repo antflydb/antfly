@@ -631,7 +631,8 @@ pub const Client = struct {
 
         var headers = std.ArrayListUnmanaged(HeaderPair).empty;
         defer headers.deinit(alloc);
-        try appendConditionalHeaders(alloc, &headers, opts.if_match_etag, opts.if_none_match);
+        const owned_if_match = try appendConditionalHeaders(alloc, &headers, opts.if_match_etag, opts.if_none_match);
+        defer if (owned_if_match) |value| alloc.free(value);
 
         var response = try self.perform(.PUT, target, headers.items, body, opts.content_type);
         defer response.deinit(alloc);
@@ -798,12 +799,10 @@ pub const Client = struct {
             };
         } else try self.statObjectVersion(alloc, bucket, key, opts.version_id);
         errdefer meta.deinit(alloc);
-        const effective_version_id: ?[]const u8 = if (opts.version_id) |value|
-            value
-        else if (!opts.skip_metadata_probe)
-            meta.version_id
-        else
-            null;
+        // Keep an ordinary current-object read on the ordinary GetObject
+        // permission path. Supplying a probed version ID would require
+        // s3:GetObjectVersion even though the caller did not request one.
+        const effective_version_id = opts.version_id;
         const query = try buildObjectQueryAlloc(alloc, effective_version_id, opts.part_number);
         defer freeQueryPairs(alloc, query);
         var target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, query);
@@ -813,11 +812,12 @@ pub const Client = struct {
         defer headers.deinit(alloc);
         const effective_if_match: ?[]const u8 = if (opts.if_match_etag) |value|
             value
-        else if (!opts.skip_metadata_probe and effective_version_id == null)
+        else if (!opts.skip_metadata_probe and opts.version_id == null)
             meta.etag
         else
             null;
-        try appendConditionalHeaders(alloc, &headers, effective_if_match, false);
+        const owned_if_match = try appendConditionalHeaders(alloc, &headers, effective_if_match, false);
+        defer if (owned_if_match) |value| alloc.free(value);
         if (opts.range) |range| {
             const value = try byteRangeHeaderAlloc(alloc, range);
             errdefer alloc.free(value);
@@ -936,7 +936,8 @@ pub const Client = struct {
 
         var headers = std.ArrayListUnmanaged(HeaderPair).empty;
         defer headers.deinit(self.alloc);
-        try appendConditionalHeaders(self.alloc, &headers, opts.if_match_etag, false);
+        const owned_if_match = try appendConditionalHeaders(self.alloc, &headers, opts.if_match_etag, false);
+        defer if (owned_if_match) |value| self.alloc.free(value);
 
         var response = try self.perform(.DELETE, target, headers.items, null, null);
         defer response.deinit(self.alloc);
@@ -1633,12 +1634,45 @@ fn appendConditionalHeaders(
     headers: *std.ArrayListUnmanaged(HeaderPair),
     if_match_etag: ?[]const u8,
     if_none_match: bool,
-) !void {
+) !?[]u8 {
+    var owned_if_match: ?[]u8 = null;
+    errdefer if (owned_if_match) |value| alloc.free(value);
     if (if_match_etag) |value| {
-        try headers.append(alloc, .{ "If-Match", value });
+        owned_if_match = try ifMatchHeaderValueAlloc(alloc, value);
+        try headers.append(alloc, .{ "If-Match", owned_if_match.? });
     }
     if (if_none_match) {
         try headers.append(alloc, .{ "If-None-Match", "*" });
+    }
+    return owned_if_match;
+}
+
+fn ifMatchHeaderValueAlloc(alloc: Allocator, value: []const u8) ![]u8 {
+    const already_quoted = value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"';
+    const weakly_quoted = value.len >= 4 and std.mem.startsWith(u8, value, "W/\"") and value[value.len - 1] == '"';
+    if (std.mem.eql(u8, value, "*") or already_quoted or weakly_quoted) return try alloc.dupe(u8, value);
+    return try std.fmt.allocPrint(alloc, "\"{s}\"", .{value});
+}
+
+test "s3 If-Match headers preserve HTTP entity-tag syntax" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        input: []const u8,
+        expected: []const u8,
+    }{
+        .{ .input = "etag", .expected = "\"etag\"" },
+        .{ .input = "\"etag\"", .expected = "\"etag\"" },
+        .{ .input = "W/\"etag\"", .expected = "W/\"etag\"" },
+        .{ .input = "*", .expected = "*" },
+    };
+
+    for (cases) |case| {
+        var headers = std.ArrayListUnmanaged(HeaderPair).empty;
+        defer headers.deinit(alloc);
+        const owned_if_match = (try appendConditionalHeaders(alloc, &headers, case.input, false)).?;
+        defer alloc.free(owned_if_match);
+        try std.testing.expectEqual(@as(usize, 1), headers.items.len);
+        try std.testing.expectEqualStrings(case.expected, headers.items[0][1]);
     }
 }
 
@@ -2384,7 +2418,7 @@ test "s3 client signs and issues object operations through request fn" {
     try std.testing.expectEqual(steps.len, fake.index);
 }
 
-test "s3 get object pins probed versions and guards unversioned reads" {
+test "s3 get object guards probed current-object reads without version permission escalation" {
     const alloc = std.testing.allocator;
     const State = struct {
         calls: usize = 0,
@@ -2421,8 +2455,9 @@ test "s3 get object pins probed versions and guards unversioned reads" {
                 },
                 1 => blk: {
                     try std.testing.expectEqual(HttpMethod.GET, method);
-                    try std.testing.expect(std.mem.indexOf(u8, url, "/bucket/versioned?versionId=v1") != null);
-                    try expectNoHeader(headers, "If-Match");
+                    try std.testing.expect(std.mem.indexOf(u8, url, "/bucket/versioned") != null);
+                    try std.testing.expect(std.mem.indexOf(u8, url, "versionId=") == null);
+                    try expectHeaderValue(headers, "If-Match", "\"etag-v1\"");
                     break :blk .{
                         .status = 200,
                         .body = try request_alloc.dupe(u8, "data"),
@@ -2448,7 +2483,7 @@ test "s3 get object pins probed versions and guards unversioned reads" {
                 3 => blk: {
                     try std.testing.expectEqual(HttpMethod.GET, method);
                     try std.testing.expect(std.mem.indexOf(u8, url, "/bucket/unversioned") != null);
-                    try expectHeaderValue(headers, "If-Match", "etag-u1");
+                    try expectHeaderValue(headers, "If-Match", "\"etag-u1\"");
                     break :blk .{
                         .status = 412,
                         .body = try request_alloc.alloc(u8, 0),
