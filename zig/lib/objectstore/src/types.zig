@@ -16,14 +16,37 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const ObjectChecksumAlgorithm = enum {
+    crc32_base64,
+    crc32c_base64,
+    crc64nvme_base64,
+    sha1_base64,
     sha256_hex,
     sha256_base64,
+    sha512_base64,
     md5_base64,
+    xxhash64_base64,
+    xxhash3_base64,
+    xxhash128_base64,
+};
+
+pub const ObjectChecksumType = enum {
+    full_object,
+    composite,
+    unknown,
 };
 
 pub const ObjectChecksum = struct {
     algorithm: ObjectChecksumAlgorithm,
     value: []u8,
+    checksum_type: ObjectChecksumType = .full_object,
+
+    pub fn clone(self: ObjectChecksum, alloc: Allocator) !ObjectChecksum {
+        return .{
+            .algorithm = self.algorithm,
+            .value = try alloc.dupe(u8, self.value),
+            .checksum_type = self.checksum_type,
+        };
+    }
 
     pub fn deinit(self: *ObjectChecksum, alloc: Allocator) void {
         alloc.free(self.value);
@@ -189,6 +212,7 @@ test "object metadata owns strings" {
         .checksum = .{
             .algorithm = .sha256_hex,
             .value = try alloc.dupe(u8, "abcd"),
+            .checksum_type = .full_object,
         },
         .content_length = 1,
     };

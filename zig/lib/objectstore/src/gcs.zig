@@ -454,7 +454,7 @@ pub const JsonApiClient = struct {
                 .key = owned_key,
                 .content_length = 0,
             };
-        } else try self.statObject(alloc, bucket, key);
+        } else try self.statObjectVersion(alloc, bucket, key, opts.version_id);
         errdefer meta.deinit(alloc);
 
         const url = try objectMediaUrlWithGenerationAlloc(alloc, self.cfg, bucket, key, opts.version_id);
@@ -533,7 +533,11 @@ pub const JsonApiClient = struct {
     }
 
     fn statObject(self: *JsonApiClient, alloc: Allocator, bucket: []const u8, key: []const u8) !types.ObjectMetadata {
-        const url = try objectMetadataUrlWithGenerationAlloc(alloc, self.cfg, bucket, key, null);
+        return self.statObjectVersion(alloc, bucket, key, null);
+    }
+
+    fn statObjectVersion(self: *JsonApiClient, alloc: Allocator, bucket: []const u8, key: []const u8, generation: ?[]const u8) !types.ObjectMetadata {
+        const url = try objectMetadataUrlWithGenerationAlloc(alloc, self.cfg, bucket, key, generation);
         defer alloc.free(url);
 
         var response = try self.perform(.GET, url, &.{}, null, null);
@@ -1044,6 +1048,7 @@ fn parseObjectMetadataResponse(alloc: Allocator, bucket: []const u8, body: []con
         size: ?[]const u8 = null,
         contentType: ?[]const u8 = null,
         md5Hash: ?[]const u8 = null,
+        crc32c: ?[]const u8 = null,
     };
 
     var parsed = try std.json.parseFromSlice(Parsed, alloc, body, .{ .ignore_unknown_fields = true });
@@ -1059,15 +1064,21 @@ fn parseObjectMetadataResponse(alloc: Allocator, bucket: []const u8, body: []con
     const version_id = if (parsed.value.generation) |value| try alloc.dupe(u8, value) else null;
     errdefer if (version_id) |value| alloc.free(value);
     const content_type = if (parsed.value.contentType) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (content_type) |value| alloc.free(value);
+    var checksum: ?types.ObjectChecksum = if (parsed.value.md5Hash) |value| .{
+        .algorithm = .md5_base64,
+        .value = try alloc.dupe(u8, value),
+    } else if (parsed.value.crc32c) |value| .{
+        .algorithm = .crc32c_base64,
+        .value = try alloc.dupe(u8, value),
+    } else null;
+    errdefer if (checksum) |*value| value.deinit(alloc);
     return .{
         .bucket = owned_bucket,
         .key = key,
         .etag = etag,
         .version_id = version_id,
-        .checksum = if (parsed.value.md5Hash) |value| .{
-            .algorithm = .md5_base64,
-            .value = try alloc.dupe(u8, value),
-        } else null,
+        .checksum = checksum,
         .content_length = content_length,
         .content_type = content_type,
         .last_modified_unix_ms = null,
@@ -1348,7 +1359,7 @@ test "json api client get object uses metadata then media with auth and range" {
                 0 => {
                     try std.testing.expectEqual(@as(?usize, null), max_response_size);
                     try std.testing.expectEqual(HttpMethod.GET, method);
-                    try std.testing.expectEqualStrings("https://storage.googleapis.com/storage/v1/b/bucket/o/folder%2Fdoc.txt", url);
+                    try std.testing.expectEqualStrings("https://storage.googleapis.com/storage/v1/b/bucket/o/folder%2Fdoc.txt?generation=42", url);
                     try expectHeader(headers, "Authorization", "Bearer token-123");
                     return .{
                         .status = 200,
@@ -1408,6 +1419,7 @@ test "json api client get object uses metadata then media with auth and range" {
     try std.testing.expectEqualStrings("42", result.metadata.version_id.?);
     try std.testing.expectEqual(types.ObjectChecksumAlgorithm.md5_base64, result.metadata.checksum.?.algorithm);
     try std.testing.expectEqualStrings("md5-body", result.metadata.checksum.?.value);
+    try std.testing.expectEqual(types.ObjectChecksumType.full_object, result.metadata.checksum.?.checksum_type);
     try std.testing.expectEqualStrings("text/plain", result.metadata.content_type.?);
 
     var direct = try client.getObject("bucket", "folder/doc.txt", .{
@@ -1424,6 +1436,20 @@ test "json api client get object uses metadata then media with auth and range" {
     try std.testing.expectEqualStrings("etag-media", direct.metadata.etag.?);
     try std.testing.expectEqualStrings("text/plain", direct.metadata.content_type.?);
     try std.testing.expectEqual(@as(usize, 3), state.calls);
+}
+
+test "json api metadata falls back to the always-available crc32c checksum" {
+    const alloc = std.testing.allocator;
+    var meta = try parseObjectMetadataResponse(
+        alloc,
+        "bucket",
+        "{\"name\":\"composite\",\"generation\":\"9\",\"size\":\"4\",\"crc32c\":\"crc-body\"}",
+    );
+    defer meta.deinit(alloc);
+
+    try std.testing.expectEqual(types.ObjectChecksumAlgorithm.crc32c_base64, meta.checksum.?.algorithm);
+    try std.testing.expectEqualStrings("crc-body", meta.checksum.?.value);
+    try std.testing.expectEqual(types.ObjectChecksumType.full_object, meta.checksum.?.checksum_type);
 }
 
 test "json api client put object encodes upload url and returns etag" {

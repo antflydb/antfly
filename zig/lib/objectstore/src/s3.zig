@@ -142,7 +142,7 @@ pub const TransportResponse = struct {
     content_type: ?[]u8 = null,
     content_length: ?u64 = null,
     version_id: ?[]u8 = null,
-    checksum_sha256: ?[]u8 = null,
+    checksum: ?types.ObjectChecksum = null,
     last_modified: ?[]u8 = null,
 
     pub fn deinit(self: *TransportResponse, alloc: Allocator) void {
@@ -150,7 +150,7 @@ pub const TransportResponse = struct {
         if (self.etag) |value| alloc.free(value);
         if (self.content_type) |value| alloc.free(value);
         if (self.version_id) |value| alloc.free(value);
-        if (self.checksum_sha256) |value| alloc.free(value);
+        if (self.checksum) |*value| value.deinit(alloc);
         if (self.last_modified) |value| alloc.free(value);
         self.* = undefined;
     }
@@ -326,9 +326,99 @@ fn httpxRequest(
     if (response.headers.get("Content-Type")) |value| result.content_type = try alloc.dupe(u8, value);
     result.content_length = if (response.headers.get("Content-Length")) |value| std.fmt.parseInt(u64, value, 10) catch null else null;
     if (response.headers.get("x-amz-version-id")) |value| result.version_id = try alloc.dupe(u8, value);
-    if (response.headers.get("x-amz-checksum-sha256")) |value| result.checksum_sha256 = try alloc.dupe(u8, value);
+    result.checksum = try checksumFromHeaders(alloc, &response.headers);
     if (response.headers.get("Last-Modified")) |value| result.last_modified = try alloc.dupe(u8, value);
     return result;
+}
+
+fn checksumFromHeaders(alloc: Allocator, headers: *const httpx.Headers) !?types.ObjectChecksum {
+    const Candidate = struct {
+        name: []const u8,
+        algorithm: types.ObjectChecksumAlgorithm,
+    };
+    const candidates = [_]Candidate{
+        .{ .name = "x-amz-checksum-sha512", .algorithm = .sha512_base64 },
+        .{ .name = "x-amz-checksum-sha256", .algorithm = .sha256_base64 },
+        .{ .name = "x-amz-checksum-sha1", .algorithm = .sha1_base64 },
+        .{ .name = "x-amz-checksum-crc64nvme", .algorithm = .crc64nvme_base64 },
+        .{ .name = "x-amz-checksum-crc32c", .algorithm = .crc32c_base64 },
+        .{ .name = "x-amz-checksum-crc32", .algorithm = .crc32_base64 },
+        .{ .name = "x-amz-checksum-md5", .algorithm = .md5_base64 },
+        .{ .name = "x-amz-checksum-xxhash128", .algorithm = .xxhash128_base64 },
+        .{ .name = "x-amz-checksum-xxhash64", .algorithm = .xxhash64_base64 },
+        .{ .name = "x-amz-checksum-xxhash3", .algorithm = .xxhash3_base64 },
+    };
+    const checksum_type: types.ObjectChecksumType = if (headers.get("x-amz-checksum-type")) |value|
+        if (std.ascii.eqlIgnoreCase(value, "FULL_OBJECT"))
+            .full_object
+        else if (std.ascii.eqlIgnoreCase(value, "COMPOSITE"))
+            .composite
+        else
+            .unknown
+    else
+        .unknown;
+
+    for (candidates) |candidate| {
+        if (headers.get(candidate.name)) |value| {
+            return .{
+                .algorithm = candidate.algorithm,
+                .value = try alloc.dupe(u8, value),
+                .checksum_type = if (candidate.algorithm == .crc64nvme_base64) .full_object else checksum_type,
+            };
+        }
+    }
+    return null;
+}
+
+fn replaceChecksum(alloc: Allocator, destination: *?types.ObjectChecksum, source: ?types.ObjectChecksum) !void {
+    const value = source orelse return;
+    const replacement = try value.clone(alloc);
+    if (destination.*) |*current| current.deinit(alloc);
+    destination.* = replacement;
+}
+
+test "s3 response checksum parsing preserves provider algorithm and checksum type" {
+    const alloc = std.testing.allocator;
+    var composite_headers = httpx.Headers.init(alloc);
+    defer composite_headers.deinit();
+    try composite_headers.append("x-amz-checksum-sha256", "sha256-parts");
+    try composite_headers.append("x-amz-checksum-type", "COMPOSITE");
+
+    var composite = (try checksumFromHeaders(alloc, &composite_headers)).?;
+    defer composite.deinit(alloc);
+    try std.testing.expectEqual(types.ObjectChecksumAlgorithm.sha256_base64, composite.algorithm);
+    try std.testing.expectEqualStrings("sha256-parts", composite.value);
+    try std.testing.expectEqual(types.ObjectChecksumType.composite, composite.checksum_type);
+
+    var default_headers = httpx.Headers.init(alloc);
+    defer default_headers.deinit();
+    try default_headers.append("x-amz-checksum-crc64nvme", "crc64-body");
+    var default = (try checksumFromHeaders(alloc, &default_headers)).?;
+    defer default.deinit(alloc);
+    try std.testing.expectEqual(types.ObjectChecksumAlgorithm.crc64nvme_base64, default.algorithm);
+    try std.testing.expectEqualStrings("crc64-body", default.value);
+    try std.testing.expectEqual(types.ObjectChecksumType.full_object, default.checksum_type);
+}
+
+test "s3 checksum replacement retains the old value on allocation failure" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var destination: ?types.ObjectChecksum = .{
+                .algorithm = .crc64nvme_base64,
+                .value = try alloc.dupe(u8, "old"),
+                .checksum_type = .full_object,
+            };
+            defer if (destination) |*value| value.deinit(alloc);
+            const source = types.ObjectChecksum{
+                .algorithm = .sha256_base64,
+                .value = @constCast("new"),
+                .checksum_type = .composite,
+            };
+            try replaceChecksum(alloc, &destination, source);
+            try std.testing.expectEqualStrings("new", destination.?.value);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 fn remainingRequestTimeoutMs(timeout_ms: u64, elapsed_ns: i96) !u64 {
@@ -663,7 +753,7 @@ pub const Client = struct {
                 .key = owned_key,
                 .content_length = 0,
             };
-        } else try self.statObject(alloc, bucket, key);
+        } else try self.statObjectVersion(alloc, bucket, key, opts.version_id);
         errdefer meta.deinit(alloc);
         const query = try buildObjectQueryAlloc(alloc, opts.version_id, opts.part_number);
         defer freeQueryPairs(alloc, query);
@@ -672,6 +762,7 @@ pub const Client = struct {
 
         var headers = std.ArrayListUnmanaged(HeaderPair).empty;
         defer headers.deinit(alloc);
+        try headers.append(alloc, .{ "x-amz-checksum-mode", "ENABLED" });
         try appendConditionalHeaders(alloc, &headers, opts.if_match_etag, false);
         if (opts.range) |range| {
             const value = try byteRangeHeaderAlloc(alloc, range);
@@ -717,12 +808,12 @@ pub const Client = struct {
             if (meta.version_id) |current| alloc.free(current);
             meta.version_id = next;
         }
-        if (response.checksum_sha256) |value| {
-            if (meta.checksum) |*current| current.deinit(alloc);
-            meta.checksum = .{
-                .algorithm = .sha256_base64,
-                .value = try alloc.dupe(u8, value),
-            };
+        try replaceChecksum(alloc, &meta.checksum, response.checksum);
+        if (response.checksum != null) {
+            meta.checksum_scope = if (response.status == 206 or opts.range != null or opts.part_number != null)
+                .response_body
+            else
+                .object;
         }
 
         const out_body = response.body;
@@ -755,10 +846,17 @@ pub const Client = struct {
     }
 
     fn statObject(self: *Client, alloc: Allocator, bucket: []const u8, key: []const u8) !types.ObjectMetadata {
-        var target = try objectTargetAlloc(alloc, self.cfg, bucket, key);
+        return self.statObjectVersion(alloc, bucket, key, null);
+    }
+
+    fn statObjectVersion(self: *Client, alloc: Allocator, bucket: []const u8, key: []const u8, version_id: ?[]const u8) !types.ObjectMetadata {
+        const query = try buildObjectQueryAlloc(alloc, version_id, null);
+        defer freeQueryPairs(alloc, query);
+        var target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, query);
         defer target.deinit(alloc);
 
-        var response = try self.perform(.HEAD, target, &.{}, null, null);
+        const headers = [_]HeaderPair{.{ "x-amz-checksum-mode", "ENABLED" }};
+        var response = try self.perform(.HEAD, target, &headers, null, null);
         defer response.deinit(alloc);
         switch (response.status) {
             200 => {},
@@ -772,10 +870,7 @@ pub const Client = struct {
             .key = try alloc.dupe(u8, key),
             .etag = if (response.etag) |value| try alloc.dupe(u8, stripQuotes(value)) else null,
             .version_id = if (response.version_id) |value| try alloc.dupe(u8, value) else null,
-            .checksum = if (response.checksum_sha256) |value| .{
-                .algorithm = .sha256_base64,
-                .value = try alloc.dupe(u8, value),
-            } else null,
+            .checksum = if (response.checksum) |value| try value.clone(alloc) else null,
             .content_length = response.content_length orelse 0,
             .content_type = if (response.content_type) |value| try alloc.dupe(u8, value) else null,
             .last_modified_unix_ms = null,
@@ -2060,7 +2155,10 @@ test "s3 client signs and issues object operations through request fn" {
         content_type: ?[]const u8 = null,
         content_length: ?u64 = null,
         version_id: ?[]const u8 = null,
-        checksum_sha256: ?[]const u8 = null,
+        checksum_algorithm: ?types.ObjectChecksumAlgorithm = null,
+        checksum_value: ?[]const u8 = null,
+        checksum_type: types.ObjectChecksumType = .unknown,
+        expect_checksum_mode: bool = false,
         expect_body: ?[]const u8 = null,
         expect_range: ?[]const u8 = null,
         expect_max_response_size: ?usize = null,
@@ -2088,6 +2186,9 @@ test "s3 client signs and issues object operations through request fn" {
             try expectHeader(headers, "Authorization");
             try expectHeader(headers, "x-amz-date");
             try expectHeader(headers, "x-amz-content-sha256");
+            if (step.expect_checksum_mode) {
+                try expectHeaderValue(headers, "x-amz-checksum-mode", "ENABLED");
+            }
             try std.testing.expectEqual(step.expect_max_response_size, max_response_size);
             if (step.expect_body) |expected| {
                 try std.testing.expectEqualStrings(expected, body orelse "");
@@ -2102,7 +2203,11 @@ test "s3 client signs and issues object operations through request fn" {
                 .content_type = if (step.content_type) |value| try req_alloc.dupe(u8, value) else null,
                 .content_length = step.content_length,
                 .version_id = if (step.version_id) |value| try req_alloc.dupe(u8, value) else null,
-                .checksum_sha256 = if (step.checksum_sha256) |value| try req_alloc.dupe(u8, value) else null,
+                .checksum = if (step.checksum_value) |value| .{
+                    .algorithm = step.checksum_algorithm.?,
+                    .value = try req_alloc.dupe(u8, value),
+                    .checksum_type = step.checksum_type,
+                } else null,
             };
         }
 
@@ -2128,10 +2233,10 @@ test "s3 client signs and issues object operations through request fn" {
         .{ .method = .HEAD, .url_contains = "/bucket", .status = 404 },
         .{ .method = .PUT, .url_contains = "/bucket", .status = 200 },
         .{ .method = .PUT, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-put\"", .expect_body = "hello" },
-        .{ .method = .HEAD, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5 },
-        .{ .method = .GET, .url_contains = "partNumber=7&versionId=v2", .status = 206, .body = "ell", .etag = "\"etag-get\"", .content_type = "text/plain", .content_length = 3, .version_id = "v2", .checksum_sha256 = "sha256-get", .expect_range = "bytes=1-3" },
-        .{ .method = .GET, .url_contains = "/bucket/docs/a.txt", .status = 206, .body = "hell", .etag = "\"etag-direct\"", .content_type = "text/plain", .content_length = 4, .expect_max_response_size = 4 },
-        .{ .method = .HEAD, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5, .checksum_sha256 = "sha256-head" },
+        .{ .method = .HEAD, .url_contains = "versionId=v2", .status = 200, .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5, .checksum_algorithm = .crc64nvme_base64, .checksum_value = "crc64-version", .checksum_type = .full_object, .expect_checksum_mode = true },
+        .{ .method = .GET, .url_contains = "partNumber=7&versionId=v2", .status = 206, .body = "ell", .etag = "\"etag-get\"", .content_type = "text/plain", .content_length = 3, .version_id = "v2", .checksum_algorithm = .sha256_base64, .checksum_value = "sha256-get", .checksum_type = .composite, .expect_checksum_mode = true, .expect_range = "bytes=1-3" },
+        .{ .method = .GET, .url_contains = "/bucket/docs/a.txt", .status = 206, .body = "hell", .etag = "\"etag-direct\"", .content_type = "text/plain", .content_length = 4, .expect_checksum_mode = true, .expect_max_response_size = 4 },
+        .{ .method = .HEAD, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5, .checksum_algorithm = .sha256_base64, .checksum_value = "sha256-head", .checksum_type = .full_object, .expect_checksum_mode = true },
         .{ .method = .GET, .url_contains = "list-type=2", .status = 200, .body = "<ListBucketResult><Contents><Key>docs/a.txt</Key><ETag>\"etag-head\"</ETag><Size>5</Size></Contents></ListBucketResult>" },
         .{ .method = .DELETE, .url_contains = "/bucket/docs/a.txt", .status = 204 },
     };
@@ -2172,6 +2277,8 @@ test "s3 client signs and issues object operations through request fn" {
     try std.testing.expectEqual(@as(u64, 3), get.metadata.content_length);
     try std.testing.expectEqual(types.ObjectChecksumAlgorithm.sha256_base64, get.metadata.checksum.?.algorithm);
     try std.testing.expectEqualStrings("sha256-get", get.metadata.checksum.?.value);
+    try std.testing.expectEqual(types.ObjectChecksumType.composite, get.metadata.checksum.?.checksum_type);
+    try std.testing.expectEqual(types.ObjectChecksumScope.response_body, get.metadata.checksum_scope);
 
     var direct = try client.getObject("bucket", "docs/a.txt", .{
         .range = .{ .offset = 0, .length = 4 },
@@ -2187,6 +2294,8 @@ test "s3 client signs and issues object operations through request fn" {
     try std.testing.expectEqual(@as(u64, 5), meta.content_length);
     try std.testing.expectEqual(types.ObjectChecksumAlgorithm.sha256_base64, meta.checksum.?.algorithm);
     try std.testing.expectEqualStrings("sha256-head", meta.checksum.?.value);
+    try std.testing.expectEqual(types.ObjectChecksumType.full_object, meta.checksum.?.checksum_type);
+    try std.testing.expectEqual(types.ObjectChecksumScope.object, meta.checksum_scope);
 
     var listed = try client.listObjects("bucket", .{ .prefix = "docs/" });
     defer listed.deinit(alloc);

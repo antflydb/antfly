@@ -24,6 +24,7 @@ pub const ObjectMetadata = types.ObjectMetadata;
 pub const ObjectChecksum = types.ObjectChecksum;
 pub const ObjectChecksumAlgorithm = types.ObjectChecksumAlgorithm;
 pub const ObjectChecksumScope = types.ObjectChecksumScope;
+pub const ObjectChecksumType = types.ObjectChecksumType;
 pub const PutOptions = types.PutOptions;
 pub const GetOptions = types.GetOptions;
 pub const DeleteOptions = types.DeleteOptions;
