@@ -2526,7 +2526,11 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 		if err := r.updateStatusWithValidationSuccess(ctx, &antflyCluster, metadataTopologyReplicas); err != nil {
 			log.Error(err, "Failed to update status with validation success")
-			// Don't block reconciliation if status update fails
+			// The status checkpoint is the first durable topology record for a new
+			// cluster. Continuing after a conflict could reconcile an older spec and
+			// permanently pin that stale replica count into the StatefulSet/PVC
+			// annotations, so re-read the cluster before touching resources.
+			return ctrl.Result{}, fmt.Errorf("persist validation checkpoint before reconciling resources: %w", err)
 		} else {
 			// Continue with the resource version and durable status record returned
 			// by the status update instead of overwriting it later in reconciliation.

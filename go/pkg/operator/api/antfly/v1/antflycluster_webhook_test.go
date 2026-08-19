@@ -1504,6 +1504,7 @@ func TestValidateUpdate_MetadataReplicaChangesRejected(t *testing.T) {
 	}{
 		{name: "scale up", current: 1, attempted: 3},
 		{name: "scale down", current: 5, attempted: 3},
+		{name: "remove metadata nodes", current: 1, attempted: 0},
 	}
 
 	for _, tt := range tests {
