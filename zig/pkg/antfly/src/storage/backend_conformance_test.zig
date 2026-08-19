@@ -115,6 +115,16 @@ fn expectBoundStoreConformance(runtime: *backend_erased.Store) !void {
         try std.testing.expectEqualStrings("doc:c", (try cur.last()).?.key);
         try std.testing.expectEqualStrings("doc:a", (try cur.seekAtOrBefore("doc:b")).?.key);
         try std.testing.expectEqualStrings("doc:c", (try cur.seekAtOrAfter("doc:b")).?.key);
+
+        try std.testing.expectEqualStrings("doc:a", (try cur.first()).?.key);
+        try std.testing.expect((try cur.prev()) == null);
+        try std.testing.expectEqualStrings("doc:c", (try cur.last()).?.key);
+        try std.testing.expect((try cur.next()) == null);
+
+        try std.testing.expectEqualStrings("doc:a", (try cur.first()).?.key);
+        try std.testing.expectEqualStrings("doc:c", (try cur.next()).?.key);
+        try std.testing.expectEqualStrings("doc:a", (try cur.prev()).?.key);
+        try std.testing.expectEqualStrings("doc:c", (try cur.next()).?.key);
     }
 }
 

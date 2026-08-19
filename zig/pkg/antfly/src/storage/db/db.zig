@@ -72549,6 +72549,14 @@ test "db managed vector admission durably seeds missing enrichment artifacts" {
     try std.testing.expect(db.core.index_manager.repairUnavailable("semantic_idx"));
 }
 
+// Functional repair tests verify durable construction, activation, and reopen,
+// not the production reader-pause SLA. A contended CI worker can exhaust the
+// 250 ms production window, which correctly persists retry backoff that these
+// synchronous completion loops do not wait out.
+const repair_completion_test_options = types.ArtifactRepairRunOptions{
+    .max_activation_pause_ms = 5_000,
+};
+
 test "db managed algebraic admission builds and reopens an isolated generation" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -72583,12 +72591,13 @@ test "db managed algebraic admission builds and reopens an isolated generation" 
 
         var repaired = false;
         for (0..16) |_| {
-            const step = try db.advanceIndexRepairIntent(alloc, repair_id, .{});
+            const step = try db.advanceIndexRepairIntent(alloc, repair_id, repair_completion_test_options);
             if (step.repaired) {
                 repaired = true;
                 break;
             }
             try std.testing.expect(!step.terminal);
+            try std.testing.expectEqual(@as(u64, 0), step.next_retry_at_ms);
         }
         try std.testing.expect(repaired);
         try std.testing.expect(!db.core.index_manager.repairUnavailable(cfg.name));
@@ -72649,13 +72658,6 @@ test "db algebraic generation build yields and resumes from its durable source c
         }
     };
     var yield_token: u8 = 0;
-    const resume_options = types.ArtifactRepairRunOptions{
-        // This test covers durable cursor yield/resume, not the production
-        // activation pause SLA. Give contended CI hosts enough headroom so an
-        // activation timeout cannot arm retry backoff between immediate test
-        // attempts and masquerade as a failure to resume the saved cursor.
-        .max_activation_pause_ms = 5_000,
-    };
     var repair_id: u128 = 0;
     {
         var db = try DB.open(alloc, std.mem.span(path), .{
@@ -72672,7 +72674,7 @@ test "db algebraic generation build yields and resumes from its durable source c
             .sync_level = .write,
         });
         repair_id = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
-        var yield_options = resume_options;
+        var yield_options = repair_completion_test_options;
         yield_options.yield_check = .{ .ptr = &yield_token, .is_requested = Yield.requested };
         const first = try db.advanceIndexRepairIntent(alloc, repair_id, yield_options);
         try std.testing.expect(first.attempted);
@@ -72706,12 +72708,13 @@ test "db algebraic generation build yields and resumes from its durable source c
     try std.testing.expectEqual(repair_id, (try reopened.indexRepairIdForIndex(alloc, cfg.name)).?);
     var repaired = false;
     for (0..16) |_| {
-        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, resume_options);
+        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, repair_completion_test_options);
         if (step.repaired) {
             repaired = true;
             break;
         }
         try std.testing.expect(!step.terminal);
+        try std.testing.expectEqual(@as(u64, 0), step.next_retry_at_ms);
     }
     try std.testing.expect(repaired);
     const active = reopened.core.index_manager.algebraicIndex(cfg.name) orelse return error.TestUnexpectedResult;
@@ -72788,12 +72791,13 @@ test "db forced algebraic repair persists an operator generation intent before e
     try std.testing.expectEqual(repair_id, (try reopened.indexRepairIdForIndex(alloc, cfg.name)).?);
     var repaired = false;
     for (0..16) |_| {
-        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
+        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, repair_completion_test_options);
         if (step.repaired) {
             repaired = true;
             break;
         }
         try std.testing.expect(!step.terminal);
+        try std.testing.expectEqual(@as(u64, 0), step.next_retry_at_ms);
     }
     try std.testing.expect(repaired);
     try std.testing.expect((try reopened.indexRepairIdForIndex(alloc, cfg.name)) == null);
@@ -72856,12 +72860,13 @@ test "db algebraic post-commit activation crash recovers through generation repa
         return error.TestUnexpectedResult;
     var repaired = false;
     for (0..16) |_| {
-        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
+        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, repair_completion_test_options);
         if (step.repaired) {
             repaired = true;
             break;
         }
         try std.testing.expect(!step.terminal);
+        try std.testing.expectEqual(@as(u64, 0), step.next_retry_at_ms);
     }
     try std.testing.expect(repaired);
     try std.testing.expect(!reopened.core.index_manager.repairUnavailable(cfg.name));
@@ -72951,12 +72956,13 @@ test "db managed full text admission survives restart without in-place backfill"
 
     var repaired = false;
     for (0..16) |_| {
-        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
+        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, repair_completion_test_options);
         if (step.repaired) {
             repaired = true;
             break;
         }
         try std.testing.expect(!step.terminal);
+        try std.testing.expectEqual(@as(u64, 0), step.next_retry_at_ms);
     }
     try std.testing.expect(repaired);
     try std.testing.expect(!try reopened.hasPendingIndexRepairIntents(alloc));
