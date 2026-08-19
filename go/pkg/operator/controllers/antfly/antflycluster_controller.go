@@ -1627,11 +1627,13 @@ type metadataRuntimeTopologyStatus struct {
 	MetadataRaftLeaderID            *uint64 `json:"metadata_raft_leader_id"`
 	MetadataRaftLocalVoter          bool    `json:"metadata_raft_local_voter"`
 	MetadataRaftVoterCount          int32   `json:"metadata_raft_voter_count"`
-	MetadataRaftVoterSetFingerprint string  `json:"metadata_raft_voter_set_fingerprint"`
-	MetadataRaftJointConsensus      bool    `json:"metadata_raft_joint_consensus"`
+	MetadataRaftVoterSetFingerprint *string `json:"metadata_raft_voter_set_fingerprint"`
+	MetadataRaftJointConsensus      *bool   `json:"metadata_raft_joint_consensus"`
 }
 
 const maxMetadataRuntimeStatusBytes = 64 * 1024
+
+var errMetadataRuntimeMembershipStatusUnavailable = stderrors.New("metadata runtime does not expose exact Raft membership status")
 
 func (r *AntflyClusterReconciler) validateLegacyMetadataRuntimeTopology(ctx context.Context, cluster *antflyv1.AntflyCluster, replicas int32) error {
 	if replicas < 1 {
@@ -1641,6 +1643,7 @@ func (r *AntflyClusterReconciler) validateLegacyMetadataRuntimeTopology(ctx cont
 	expectedVoterSetFingerprint := metadataRaftVoterSetFingerprint(replicas)
 	var baseline *metadataRuntimeTopologyStatus
 	leaderReports := 0
+	membershipStatusUnavailable := false
 	for ordinal := int32(0); ordinal < replicas; ordinal++ {
 		status, err := r.fetchMetadataRuntimeTopology(ctx, cluster, ordinal)
 		if err != nil {
@@ -1656,11 +1659,13 @@ func (r *AntflyClusterReconciler) validateLegacyMetadataRuntimeTopology(ctx cont
 		if !status.MetadataRaftLocalVoter || status.MetadataRaftVoterCount != replicas {
 			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d reports local_voter=%t and voter_count=%d, expected local_voter=true and voter_count=%d", ordinal, status.MetadataRaftLocalVoter, status.MetadataRaftVoterCount, replicas)
 		}
-		if status.MetadataRaftJointConsensus {
+		if status.MetadataRaftJointConsensus != nil && *status.MetadataRaftJointConsensus {
 			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d reports an active joint-consensus membership transition", ordinal)
 		}
-		if status.MetadataRaftVoterSetFingerprint != expectedVoterSetFingerprint {
-			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d reports voter set fingerprint %q, expected %q", ordinal, status.MetadataRaftVoterSetFingerprint, expectedVoterSetFingerprint)
+		if status.MetadataRaftVoterSetFingerprint == nil || status.MetadataRaftJointConsensus == nil {
+			membershipStatusUnavailable = true
+		} else if *status.MetadataRaftVoterSetFingerprint != expectedVoterSetFingerprint {
+			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d reports voter set fingerprint %q, expected %q", ordinal, *status.MetadataRaftVoterSetFingerprint, expectedVoterSetFingerprint)
 		}
 		if status.MetadataRaftLeaderID == nil || *status.MetadataRaftLeaderID < 1 || *status.MetadataRaftLeaderID > maxNodeID {
 			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d does not report a valid leader", ordinal)
@@ -1685,13 +1690,15 @@ func (r *AntflyClusterReconciler) validateLegacyMetadataRuntimeTopology(ctx cont
 		}
 		if status.MetadataGroupID != baseline.MetadataGroupID ||
 			status.MetadataIncarnation != baseline.MetadataIncarnation ||
-			*status.MetadataRaftLeaderID != *baseline.MetadataRaftLeaderID ||
-			status.MetadataRaftVoterSetFingerprint != baseline.MetadataRaftVoterSetFingerprint {
-			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d disagrees on metadata group, incarnation, leader, or voter set", ordinal)
+			*status.MetadataRaftLeaderID != *baseline.MetadataRaftLeaderID {
+			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d disagrees on metadata group, incarnation, or leader", ordinal)
 		}
 	}
 	if leaderReports != 1 {
 		return fmt.Errorf("cannot safely migrate legacy metadata topology: expected exactly one member to report leader role, got %d", leaderReports)
+	}
+	if membershipStatusUnavailable {
+		return fmt.Errorf("cannot safely migrate legacy metadata topology: %w; update spec.image to a runtime that reports metadata_raft_voter_set_fingerprint and metadata_raft_joint_consensus", errMetadataRuntimeMembershipStatusUnavailable)
 	}
 	return nil
 }
@@ -1766,17 +1773,11 @@ func metadataPVCPrefix(cluster *antflyv1.AntflyCluster) string {
 	return "metadata-storage-" + cluster.Name + "-metadata-"
 }
 
-// metadataPVCOrdinal matches only claims that can canonically belong to this
-// cluster's metadata StatefulSet. Exact labels disambiguate valid cluster names
-// that share a textual prefix; unlabeled claims remain eligible for migration
-// from operator versions that predate the standard labels.
+// metadataPVCOrdinal matches the exact claim-name shape that this cluster's
+// metadata StatefulSet will mount. Labels are deliberately not an ownership
+// gate: Kubernetes attaches an existing claim by name even when its labels are
+// stale or incorrect, so validation must account for every canonical name.
 func metadataPVCOrdinal(cluster *antflyv1.AntflyCluster, pvc *corev1.PersistentVolumeClaim) (int32, bool) {
-	if instance, ok := pvc.Labels["app.kubernetes.io/instance"]; ok && instance != cluster.Name {
-		return 0, false
-	}
-	if component, ok := pvc.Labels["app.kubernetes.io/component"]; ok && component != "metadata" {
-		return 0, false
-	}
 	ordinalText, ok := strings.CutPrefix(pvc.Name, metadataPVCPrefix(cluster))
 	if !ok {
 		return 0, false
@@ -1786,6 +1787,59 @@ func metadataPVCOrdinal(cluster *antflyv1.AntflyCluster, pvc *corev1.PersistentV
 		return 0, false
 	}
 	return int32(ordinal), true
+}
+
+const metadataMembershipStatusCapabilityAnnotation = "antfly.io/metadata-membership-status-capability"
+
+// reconcileLegacyMetadataRuntimeMembershipStatus rolls only the runtime image
+// and its capability marker while exact membership status is unavailable. The
+// legacy topology validator has already proved that the StatefulSet replica
+// count, retained ordinals, local node IDs, incarnation, leader, and voter
+// cardinality agree. Avoiding every other StatefulSet mutation here prevents an
+// unverified topology from being recorded or changed before the upgraded
+// runtime exposes the exact voter set and joint-consensus state.
+func (r *AntflyClusterReconciler) reconcileLegacyMetadataRuntimeMembershipStatus(ctx context.Context, cluster *antflyv1.AntflyCluster) (bool, error) {
+	statefulSet := &appsv1.StatefulSet{}
+	key := types.NamespacedName{Name: cluster.Name + "-metadata", Namespace: cluster.Namespace}
+	if err := r.Get(ctx, key, statefulSet); err != nil {
+		return false, fmt.Errorf("read legacy metadata StatefulSet for runtime upgrade: %w", err)
+	}
+	if !metav1.IsControlledBy(statefulSet, cluster) {
+		return false, fmt.Errorf("legacy metadata StatefulSet %s is not controlled by the current AntflyCluster", statefulSet.Name)
+	}
+	expectedReplicas := effectiveMetadataNodeReplicas(cluster)
+	if statefulSet.Spec.Replicas == nil || *statefulSet.Spec.Replicas != expectedReplicas {
+		return false, fmt.Errorf("legacy metadata StatefulSet changed during runtime upgrade: replicas must remain %d", expectedReplicas)
+	}
+
+	before := statefulSet.DeepCopy()
+	for i := range statefulSet.Spec.Template.Spec.Containers {
+		container := &statefulSet.Spec.Template.Spec.Containers[i]
+		if container.Name != "antfly" {
+			continue
+		}
+		changed := container.Image != cluster.Spec.Image
+		container.Image = cluster.Spec.Image
+		if cluster.Spec.ImagePullPolicy != "" && container.ImagePullPolicy != corev1.PullPolicy(cluster.Spec.ImagePullPolicy) {
+			container.ImagePullPolicy = corev1.PullPolicy(cluster.Spec.ImagePullPolicy)
+			changed = true
+		}
+		if statefulSet.Spec.Template.Annotations == nil {
+			statefulSet.Spec.Template.Annotations = make(map[string]string)
+		}
+		if statefulSet.Spec.Template.Annotations[metadataMembershipStatusCapabilityAnnotation] != "v1" {
+			statefulSet.Spec.Template.Annotations[metadataMembershipStatusCapabilityAnnotation] = "v1"
+			changed = true
+		}
+		if !changed {
+			return false, nil
+		}
+		if err := r.Patch(ctx, statefulSet, client.MergeFrom(before)); err != nil {
+			return false, fmt.Errorf("roll metadata runtime for exact membership status: %w", err)
+		}
+		return true, nil
+	}
+	return false, fmt.Errorf("legacy metadata StatefulSet %s has no antfly container", statefulSet.Name)
 }
 
 // calculateBackoff calculates exponential backoff duration for validation failures (T027)
@@ -2170,6 +2224,17 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			log.Error(err, "Cluster configuration validation failed")
 			if statusErr := r.updateStatusWithValidationError(ctx, &antflyCluster, err); statusErr != nil {
 				log.Error(statusErr, "Failed to update status with validation error")
+			}
+			if stderrors.Is(err, errMetadataRuntimeMembershipStatusUnavailable) {
+				r.resetValidationAttempts(clusterKey)
+				rolled, rolloutErr := r.reconcileLegacyMetadataRuntimeMembershipStatus(ctx, workingCluster)
+				if rolloutErr != nil {
+					return ctrl.Result{}, rolloutErr
+				}
+				if rolled {
+					log.Info("Rolling legacy metadata pods to expose exact Raft membership status", "image", workingCluster.Spec.Image)
+				}
+				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 			}
 			attempt := r.incrementValidationAttempts(clusterKey)
 			backoff := calculateBackoff(attempt - 1)
@@ -3908,6 +3973,10 @@ exec /antfly metadata --id $ID --config /config/config.json \
 				}, secretStoreVolumes(cluster.Spec.SecretStore)...),
 			},
 		}
+		if statefulSet.Spec.Template.Annotations == nil {
+			statefulSet.Spec.Template.Annotations = make(map[string]string)
+		}
+		statefulSet.Spec.Template.Annotations[metadataMembershipStatusCapabilityAnnotation] = "v1"
 
 		// Apply user-specified scheduling constraints first
 		applySchedulingConstraints(&statefulSet.Spec.Template,

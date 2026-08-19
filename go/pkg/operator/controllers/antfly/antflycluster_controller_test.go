@@ -104,6 +104,10 @@ func TestValidateMetadataReplicaTopology(t *testing.T) {
 		return fmt.Sprintf(`{"metadata_group_id":1,"metadata_incarnation":%q,"metadata_raft_local_node_id":%d,"metadata_raft_role":%q,"metadata_raft_leader_id":%d,"metadata_raft_local_voter":true,"metadata_raft_voter_count":%d,"metadata_raft_voter_set_fingerprint":%q,"metadata_raft_joint_consensus":false}`,
 			incarnation, nodeID, role, leaderID, voterCount, metadataRaftVoterSetFingerprint(voterCount))
 	}
+	legacyStatusJSON := func(nodeID uint64, role string, leaderID uint64, incarnation string, voterCount int32) string {
+		return fmt.Sprintf(`{"metadata_group_id":1,"metadata_incarnation":%q,"metadata_raft_local_node_id":%d,"metadata_raft_role":%q,"metadata_raft_leader_id":%d,"metadata_raft_local_voter":true,"metadata_raft_voter_count":%d}`,
+			incarnation, nodeID, role, leaderID, voterCount)
+	}
 	pvc := func(ordinal int, annotation string) *corev1.PersistentVolumeClaim {
 		annotations := map[string]string(nil)
 		if annotation != "" {
@@ -190,6 +194,15 @@ func TestValidateMetadataReplicaTopology(t *testing.T) {
 	if err := newReconciler(foreignPrefixPVC).validateMetadataReplicaTopology(context.Background(), cluster); err != nil {
 		t.Fatalf("expected a prefix-related cluster's PVC to be ignored, got: %v", err)
 	}
+	mislabelledCanonicalPVC := pvc(0, "1")
+	mislabelledCanonicalPVC.Labels = map[string]string{
+		"app.kubernetes.io/component": "data",
+		"app.kubernetes.io/instance":  "another-cluster",
+	}
+	err = newReconciler(mislabelledCanonicalPVC).validateMetadataReplicaTopology(context.Background(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "metadata PVC metadata-storage-example-metadata-0: 1, attempted: 3") {
+		t.Fatalf("expected a canonically named PVC with stale labels to remain authoritative, got: %v", err)
+	}
 
 	unrecordedPVC := annotatedPVC.DeepCopy()
 	unrecordedPVC.Annotations = nil
@@ -229,7 +242,7 @@ func TestValidateMetadataReplicaTopology(t *testing.T) {
 		"example-metadata-2.example-metadata.default.svc.cluster.local": statusJSON(3, "leader", 3, "33333333333333333333333333333333", 3),
 	})
 	err = disagreeingReconciler.validateMetadataReplicaTopology(context.Background(), cluster)
-	if err == nil || !strings.Contains(err.Error(), "disagrees on metadata group, incarnation, leader, or voter set") {
+	if err == nil || !strings.Contains(err.Error(), "disagrees on metadata group, incarnation, or leader") {
 		t.Fatalf("expected disagreeing legacy incarnations to fail closed, got: %v", err)
 	}
 
@@ -254,6 +267,17 @@ func TestValidateMetadataReplicaTopology(t *testing.T) {
 	err = jointConsensusReconciler.validateMetadataReplicaTopology(context.Background(), cluster)
 	if err == nil || !strings.Contains(err.Error(), "joint-consensus") {
 		t.Fatalf("expected joint-consensus legacy topology to fail closed, got: %v", err)
+	}
+
+	legacyRuntimeReconciler := newReconciler(legacyObjects...)
+	legacyRuntimeReconciler.HTTPClient = statusClient(map[string]string{
+		"example-metadata-0.example-metadata.default.svc.cluster.local": legacyStatusJSON(1, "follower", 3, "33333333333333333333333333333333", 3),
+		"example-metadata-1.example-metadata.default.svc.cluster.local": legacyStatusJSON(2, "follower", 3, "33333333333333333333333333333333", 3),
+		"example-metadata-2.example-metadata.default.svc.cluster.local": legacyStatusJSON(3, "leader", 3, "33333333333333333333333333333333", 3),
+	})
+	err = legacyRuntimeReconciler.validateMetadataReplicaTopology(context.Background(), cluster)
+	if !stderrors.Is(err, errMetadataRuntimeMembershipStatusUnavailable) {
+		t.Fatalf("expected an otherwise healthy legacy runtime to request a capability rollout, got: %v", err)
 	}
 
 	malformedReconciler := newReconciler(legacyObjects...)
@@ -284,6 +308,10 @@ func TestRecordMetadataTopologyOnPVCs(t *testing.T) {
 	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
 		Name:      "metadata-storage-example-metadata-0",
 		Namespace: "default",
+		Labels: map[string]string{
+			"app.kubernetes.io/component": "data",
+			"app.kubernetes.io/instance":  "another-cluster",
+		},
 	}}
 	foreignPVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
 		Name:      "metadata-storage-example-metadata-canary-metadata-0",
@@ -318,6 +346,75 @@ func TestRecordMetadataTopologyOnPVCs(t *testing.T) {
 
 	if err := reconciler.recordMetadataTopologyOnPVCs(context.Background(), cluster, 3); err == nil {
 		t.Fatal("expected an existing PVC topology record to be immutable")
+	}
+}
+
+func TestReconcileLegacyMetadataRuntimeMembershipStatus(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	controller := true
+	replicas := int32(3)
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default", UID: types.UID("cluster-uid")},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image:           "antfly:new",
+			ImagePullPolicy: string(corev1.PullAlways),
+			MetadataNodes:   antflyv1.MetadataNodesSpec{Replicas: replicas},
+		},
+	}
+	statefulSet := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "example-metadata",
+			Namespace: "default",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: antflyv1.GroupVersion.String(),
+				Kind:       "AntflyCluster",
+				Name:       cluster.Name,
+				UID:        cluster.UID,
+				Controller: &controller,
+			}},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{
+				{Name: "sidecar", Image: "sidecar:old"},
+				{Name: "antfly", Image: "antfly:old", ImagePullPolicy: corev1.PullIfNotPresent},
+			}}},
+		},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(statefulSet).Build()
+	reconciler := &AntflyClusterReconciler{Client: k8sClient}
+
+	rolled, err := reconciler.reconcileLegacyMetadataRuntimeMembershipStatus(context.Background(), cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rolled {
+		t.Fatal("expected the legacy metadata runtime image to roll")
+	}
+	updated := &appsv1.StatefulSet{}
+	if err := k8sClient.Get(context.Background(), client.ObjectKeyFromObject(statefulSet), updated); err != nil {
+		t.Fatal(err)
+	}
+	if got := updated.Spec.Template.Spec.Containers[0].Image; got != "sidecar:old" {
+		t.Fatalf("sidecar image = %q, want unchanged", got)
+	}
+	if got := updated.Spec.Template.Spec.Containers[1].Image; got != cluster.Spec.Image {
+		t.Fatalf("metadata runtime image = %q, want %q", got, cluster.Spec.Image)
+	}
+	if got := updated.Spec.Template.Spec.Containers[1].ImagePullPolicy; got != corev1.PullAlways {
+		t.Fatalf("metadata runtime pull policy = %q, want %q", got, corev1.PullAlways)
+	}
+	if got := updated.Spec.Template.Annotations[metadataMembershipStatusCapabilityAnnotation]; got != "v1" {
+		t.Fatalf("metadata runtime membership capability annotation = %q, want v1", got)
+	}
+	if _, ok := updated.Annotations[metadataTopologyReplicasAnnotation]; ok {
+		t.Fatal("runtime capability rollout must not record an unverified StatefulSet topology")
+	}
+	if _, ok := updated.Spec.Template.Annotations[metadataTopologyReplicasAnnotation]; ok {
+		t.Fatal("runtime capability rollout must not record an unverified pod-template topology")
 	}
 }
 
@@ -12180,6 +12277,7 @@ var _ = Describe("AntflyCluster Controller", func() {
 			Expect(metadataSts.Annotations).To(HaveKeyWithValue(metadataTopologyReplicasAnnotation, "3"))
 			Expect(metadataSts.Spec.VolumeClaimTemplates).To(HaveLen(1))
 			Expect(metadataSts.Spec.VolumeClaimTemplates[0].Annotations).To(HaveKeyWithValue(metadataTopologyReplicasAnnotation, "3"))
+			Expect(metadataSts.Spec.Template.Annotations).To(HaveKeyWithValue(metadataMembershipStatusCapabilityAnnotation, "v1"))
 			Eventually(func() int32 {
 				observed := &antflyv1.AntflyCluster{}
 				if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), observed); err != nil {
