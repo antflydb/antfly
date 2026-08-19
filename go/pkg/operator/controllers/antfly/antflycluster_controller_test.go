@@ -10,6 +10,7 @@ import (
 	"maps"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -242,7 +243,7 @@ func TestValidateMetadataReplicaTopology(t *testing.T) {
 		"example-metadata-2.example-metadata.default.svc.cluster.local": statusJSON(3, "leader", 3, "33333333333333333333333333333333", 3),
 	})
 	err = disagreeingReconciler.validateMetadataReplicaTopology(context.Background(), cluster)
-	if err == nil || !strings.Contains(err.Error(), "disagrees on metadata group, incarnation, or leader") {
+	if err == nil || !strings.Contains(err.Error(), "disagrees on metadata group or incarnation") {
 		t.Fatalf("expected disagreeing legacy incarnations to fail closed, got: %v", err)
 	}
 
@@ -297,6 +298,60 @@ func TestValidateMetadataReplicaTopology(t *testing.T) {
 	})
 	if err := healthyReconciler.validateMetadataReplicaTopology(context.Background(), cluster); err != nil {
 		t.Fatalf("expected an agreeing legacy runtime topology to migrate, got: %v", err)
+	}
+}
+
+func TestValidateMetadataRuntimeTopologyRetriesElectionObservation(t *testing.T) {
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
+		Spec: antflyv1.AntflyClusterSpec{MetadataNodes: antflyv1.MetadataNodesSpec{
+			Replicas:    3,
+			MetadataAPI: antflyv1.APISpec{Port: 12377},
+		}},
+	}
+
+	var mu sync.Mutex
+	requestCounts := make(map[string]int)
+	reconciler := &AntflyClusterReconciler{HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		host := req.URL.Hostname()
+		mu.Lock()
+		requestCounts[host]++
+		attempt := requestCounts[host]
+		mu.Unlock()
+
+		nodeID := uint64(1)
+		if strings.Contains(host, "-1.") {
+			nodeID = 2
+		} else if strings.Contains(host, "-2.") {
+			nodeID = 3
+		}
+		term := uint64(2)
+		leaderID := uint64(3)
+		role := "follower"
+		if nodeID == leaderID {
+			role = "leader"
+		}
+		// The first concurrent observation straddles an election: ordinal zero
+		// still reports the preceding term and leader. The retry is coherent.
+		if attempt == 1 && nodeID == 1 {
+			term = 1
+			leaderID = 1
+			role = "leader"
+		}
+		body := fmt.Sprintf(`{"metadata_group_id":1,"metadata_incarnation":"33333333333333333333333333333333","metadata_raft_local_node_id":%d,"metadata_raft_role":%q,"metadata_raft_leader_id":%d,"metadata_raft_term":%d,"metadata_raft_local_voter":true,"metadata_raft_voter_count":3,"metadata_raft_voter_set_fingerprint":%q,"metadata_raft_joint_consensus":false}`,
+			nodeID, role, leaderID, term, metadataRaftVoterSetFingerprint(3))
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}}
+
+	if err := reconciler.validateMetadataRuntimeTopology(context.Background(), cluster, 3); err != nil {
+		t.Fatalf("expected a coherent retry to absorb the election observation, got: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for host, count := range requestCounts {
+		if count != 2 {
+			t.Fatalf("metadata member %s request count = %d, want 2 observations", host, count)
+		}
 	}
 }
 
@@ -588,7 +643,7 @@ func TestUpdateStatusRejectsSteadyStateMetadataSplit(t *testing.T) {
 		if condition.Status != metav1.ConditionFalse || condition.Reason != antflyv1.ReasonValidationFailed {
 			t.Fatalf("%s condition = %#v, want false topology validation failure", conditionType, condition)
 		}
-		if !strings.Contains(condition.Message, "disagrees on metadata group, incarnation, or leader") {
+		if !strings.Contains(condition.Message, "disagrees on metadata group or incarnation") {
 			t.Fatalf("%s condition message = %q, want split-incarnation diagnostic", conditionType, condition.Message)
 		}
 	}

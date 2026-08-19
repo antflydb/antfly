@@ -1629,6 +1629,7 @@ type metadataRuntimeTopologyStatus struct {
 	MetadataRaftLocalNodeID         uint64  `json:"metadata_raft_local_node_id"`
 	MetadataRaftRole                string  `json:"metadata_raft_role"`
 	MetadataRaftLeaderID            *uint64 `json:"metadata_raft_leader_id"`
+	MetadataRaftTerm                uint64  `json:"metadata_raft_term"`
 	MetadataRaftLocalVoter          bool    `json:"metadata_raft_local_voter"`
 	MetadataRaftVoterCount          int32   `json:"metadata_raft_voter_count"`
 	MetadataRaftVoterSetFingerprint *string `json:"metadata_raft_voter_set_fingerprint"`
@@ -1651,6 +1652,20 @@ func (e *metadataTopologyValidationError) Unwrap() error {
 	return e.cause
 }
 
+type metadataLeadershipObservationError struct {
+	cause error
+}
+
+func (e *metadataLeadershipObservationError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *metadataLeadershipObservationError) Unwrap() error {
+	return e.cause
+}
+
+const metadataLeadershipObservationRetryDelay = 100 * time.Millisecond
+
 func (r *AntflyClusterReconciler) validateLegacyMetadataRuntimeTopology(ctx context.Context, cluster *antflyv1.AntflyCluster, replicas int32) error {
 	if err := r.validateMetadataRuntimeTopology(ctx, cluster, replicas); err != nil {
 		return fmt.Errorf("cannot safely migrate legacy metadata topology: %w", err)
@@ -1663,20 +1678,55 @@ func (r *AntflyClusterReconciler) validateLegacyMetadataRuntimeTopology(ctx cont
 // is used both while migrating pre-record clusters and when publishing
 // steady-state health.
 func (r *AntflyClusterReconciler) validateMetadataRuntimeTopology(ctx context.Context, cluster *antflyv1.AntflyCluster, replicas int32) error {
+	err := r.validateMetadataRuntimeTopologyOnce(ctx, cluster, replicas)
+	var leadershipErr *metadataLeadershipObservationError
+	if !stderrors.As(err, &leadershipErr) {
+		return err
+	}
+
+	// Member status is observed over multiple requests rather than through a
+	// linearizable cluster-wide snapshot. A normal election can therefore leave
+	// one observation containing two adjacent terms or leaders. Retry that
+	// transient class once; durable identity and membership failures never wait.
+	timer := time.NewTimer(metadataLeadershipObservationRetryDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return r.validateMetadataRuntimeTopologyOnce(ctx, cluster, replicas)
+	}
+}
+
+func (r *AntflyClusterReconciler) validateMetadataRuntimeTopologyOnce(ctx context.Context, cluster *antflyv1.AntflyCluster, replicas int32) error {
 	if replicas < 1 {
 		return fmt.Errorf("invalid replica count %d", replicas)
 	}
 	maxNodeID := uint64(replicas) // #nosec G115 -- replicas is explicitly checked positive above.
 	expectedVoterSetFingerprint := metadataRaftVoterSetFingerprint(replicas)
-	var baseline *metadataRuntimeTopologyStatus
-	leaderReports := 0
-	membershipStatusUnavailable := false
+	statuses := make([]*metadataRuntimeTopologyStatus, replicas)
+	fetchErrors := make([]error, replicas)
+	var waitGroup sync.WaitGroup
 	for ordinal := int32(0); ordinal < replicas; ordinal++ {
-		status, err := r.fetchMetadataRuntimeTopology(ctx, cluster, ordinal)
+		waitGroup.Add(1)
+		go func(ordinal int32) {
+			defer waitGroup.Done()
+			status, err := r.fetchMetadataRuntimeTopology(ctx, cluster, ordinal)
+			statuses[ordinal] = status
+			fetchErrors[ordinal] = err
+		}(ordinal)
+	}
+	waitGroup.Wait()
+	for ordinal, err := range fetchErrors {
 		if err != nil {
 			return fmt.Errorf("member ordinal %d status is unavailable: %w", ordinal, err)
 		}
-		expectedNodeID := uint64(ordinal + 1)
+	}
+
+	var baseline *metadataRuntimeTopologyStatus
+	membershipStatusUnavailable := false
+	for ordinal, status := range statuses {
+		expectedNodeID := uint64(ordinal + 1) // #nosec G115 -- ordinal is bounded by the positive int32 replica count.
 		if status.MetadataGroupID == 0 || !validMetadataIncarnation(status.MetadataIncarnation) {
 			return fmt.Errorf("member ordinal %d returned an invalid group or incarnation", ordinal)
 		}
@@ -1694,35 +1744,40 @@ func (r *AntflyClusterReconciler) validateMetadataRuntimeTopology(ctx context.Co
 		} else if *status.MetadataRaftVoterSetFingerprint != expectedVoterSetFingerprint {
 			return fmt.Errorf("member ordinal %d reports voter set fingerprint %q, expected %q", ordinal, *status.MetadataRaftVoterSetFingerprint, expectedVoterSetFingerprint)
 		}
-		if status.MetadataRaftLeaderID == nil || *status.MetadataRaftLeaderID < 1 || *status.MetadataRaftLeaderID > maxNodeID {
-			return fmt.Errorf("member ordinal %d does not report a valid leader", ordinal)
-		}
-		switch status.MetadataRaftRole {
-		case "leader":
-			if *status.MetadataRaftLeaderID != status.MetadataRaftLocalNodeID {
-				return fmt.Errorf("member ordinal %d reports leader role for node %d but leader %d", ordinal, status.MetadataRaftLocalNodeID, *status.MetadataRaftLeaderID)
-			}
-			leaderReports++
-		case "follower":
-			if *status.MetadataRaftLeaderID == status.MetadataRaftLocalNodeID {
-				return fmt.Errorf("member ordinal %d reports follower role but identifies itself as leader", ordinal)
-			}
-		default:
-			return fmt.Errorf("member ordinal %d is not in a stable Raft role: %q", ordinal, status.MetadataRaftRole)
-		}
 
 		if baseline == nil {
 			baseline = status
 			continue
 		}
-		if status.MetadataGroupID != baseline.MetadataGroupID ||
-			status.MetadataIncarnation != baseline.MetadataIncarnation ||
-			*status.MetadataRaftLeaderID != *baseline.MetadataRaftLeaderID {
-			return fmt.Errorf("member ordinal %d disagrees on metadata group, incarnation, or leader", ordinal)
+		if status.MetadataGroupID != baseline.MetadataGroupID || status.MetadataIncarnation != baseline.MetadataIncarnation {
+			return fmt.Errorf("member ordinal %d disagrees on metadata group or incarnation", ordinal)
+		}
+	}
+
+	leaderReports := 0
+	for ordinal, status := range statuses {
+		if status.MetadataRaftLeaderID == nil || *status.MetadataRaftLeaderID < 1 || *status.MetadataRaftLeaderID > maxNodeID {
+			return &metadataLeadershipObservationError{cause: fmt.Errorf("member ordinal %d does not report a valid leader", ordinal)}
+		}
+		if status.MetadataRaftTerm != baseline.MetadataRaftTerm || *status.MetadataRaftLeaderID != *baseline.MetadataRaftLeaderID {
+			return &metadataLeadershipObservationError{cause: fmt.Errorf("member ordinal %d disagrees on Raft term or leader", ordinal)}
+		}
+		switch status.MetadataRaftRole {
+		case "leader":
+			if *status.MetadataRaftLeaderID != status.MetadataRaftLocalNodeID {
+				return &metadataLeadershipObservationError{cause: fmt.Errorf("member ordinal %d reports leader role for node %d but leader %d", ordinal, status.MetadataRaftLocalNodeID, *status.MetadataRaftLeaderID)}
+			}
+			leaderReports++
+		case "follower":
+			if *status.MetadataRaftLeaderID == status.MetadataRaftLocalNodeID {
+				return &metadataLeadershipObservationError{cause: fmt.Errorf("member ordinal %d reports follower role but identifies itself as leader", ordinal)}
+			}
+		default:
+			return &metadataLeadershipObservationError{cause: fmt.Errorf("member ordinal %d is not in a stable Raft role: %q", ordinal, status.MetadataRaftRole)}
 		}
 	}
 	if leaderReports != 1 {
-		return fmt.Errorf("expected exactly one member to report leader role, got %d", leaderReports)
+		return &metadataLeadershipObservationError{cause: fmt.Errorf("expected exactly one member to report leader role, got %d", leaderReports)}
 	}
 	if membershipStatusUnavailable {
 		return fmt.Errorf("%w; update spec.image to a runtime that reports metadata_raft_voter_set_fingerprint and metadata_raft_joint_consensus", errMetadataRuntimeMembershipStatusUnavailable)
