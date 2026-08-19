@@ -1643,6 +1643,7 @@ type metadataRuntimeTopologyStatus struct {
 	MetadataRaftVoterCount          int32   `json:"metadata_raft_voter_count"`
 	MetadataRaftVoterSetFingerprint *string `json:"metadata_raft_voter_set_fingerprint"`
 	MetadataRaftJointConsensus      *bool   `json:"metadata_raft_joint_consensus"`
+	MetadataRaftLearnerCount        *int32  `json:"metadata_raft_learner_count"`
 }
 
 const (
@@ -1894,7 +1895,10 @@ func (r *AntflyClusterReconciler) validateMetadataRuntimeTopologyOnce(ctx contex
 		if status.MetadataRaftJointConsensus != nil && *status.MetadataRaftJointConsensus {
 			return fmt.Errorf("member ordinal %d reports an active joint-consensus membership transition", ordinal)
 		}
-		if status.MetadataRaftVoterSetFingerprint == nil || status.MetadataRaftJointConsensus == nil {
+		if status.MetadataRaftLearnerCount != nil && *status.MetadataRaftLearnerCount != 0 {
+			return fmt.Errorf("member ordinal %d reports learner_count=%d, expected 0", ordinal, *status.MetadataRaftLearnerCount)
+		}
+		if status.MetadataRaftVoterSetFingerprint == nil || status.MetadataRaftJointConsensus == nil || status.MetadataRaftLearnerCount == nil {
 			membershipStatusUnavailable = true
 		} else if *status.MetadataRaftVoterSetFingerprint != expectedVoterSetFingerprint {
 			return fmt.Errorf("member ordinal %d reports voter set fingerprint %q, expected %q", ordinal, *status.MetadataRaftVoterSetFingerprint, expectedVoterSetFingerprint)
@@ -1935,7 +1939,7 @@ func (r *AntflyClusterReconciler) validateMetadataRuntimeTopologyOnce(ctx contex
 		return &metadataLeadershipObservationError{cause: fmt.Errorf("expected exactly one member to report leader role, got %d", leaderReports)}
 	}
 	if membershipStatusUnavailable {
-		return fmt.Errorf("%w; update spec.image to a runtime that reports metadata_raft_voter_set_fingerprint and metadata_raft_joint_consensus", errMetadataRuntimeMembershipStatusUnavailable)
+		return fmt.Errorf("%w; update spec.image to a runtime that reports metadata_raft_voter_set_fingerprint, metadata_raft_joint_consensus, and metadata_raft_learner_count", errMetadataRuntimeMembershipStatusUnavailable)
 	}
 	return nil
 }
@@ -2052,15 +2056,18 @@ func metadataPVCOrdinal(cluster *antflyv1.AntflyCluster, pvc *corev1.PersistentV
 	return int32(ordinal), true
 }
 
-const metadataMembershipStatusCapabilityAnnotation = "antfly.io/metadata-membership-status-capability"
+const (
+	metadataMembershipStatusCapabilityAnnotation = "antfly.io/metadata-membership-status-capability"
+	metadataMembershipStatusCapabilityVersion    = "v2"
+)
 
 // reconcileLegacyMetadataRuntimeMembershipStatus rolls only the runtime image
 // and its capability marker while exact membership status is unavailable. The
 // legacy topology validator has already proved that the StatefulSet replica
 // count, retained ordinals, local node IDs, incarnation, leader, and voter
-// cardinality agree. Avoiding every other StatefulSet mutation here prevents an
-// unverified topology from being recorded or changed before the upgraded
-// runtime exposes the exact voter set and joint-consensus state.
+// cardinality agree. Avoiding every other StatefulSet mutation here prevents
+// an unverified topology from being recorded or changed before the upgraded
+// runtime exposes the exact voter set, joint-consensus state, and learners.
 func (r *AntflyClusterReconciler) reconcileLegacyMetadataRuntimeMembershipStatus(ctx context.Context, cluster *antflyv1.AntflyCluster) (bool, error) {
 	statefulSet := &appsv1.StatefulSet{}
 	key := types.NamespacedName{Name: cluster.Name + "-metadata", Namespace: cluster.Namespace}
@@ -2090,8 +2097,8 @@ func (r *AntflyClusterReconciler) reconcileLegacyMetadataRuntimeMembershipStatus
 		if statefulSet.Spec.Template.Annotations == nil {
 			statefulSet.Spec.Template.Annotations = make(map[string]string)
 		}
-		if statefulSet.Spec.Template.Annotations[metadataMembershipStatusCapabilityAnnotation] != "v1" {
-			statefulSet.Spec.Template.Annotations[metadataMembershipStatusCapabilityAnnotation] = "v1"
+		if statefulSet.Spec.Template.Annotations[metadataMembershipStatusCapabilityAnnotation] != metadataMembershipStatusCapabilityVersion {
+			statefulSet.Spec.Template.Annotations[metadataMembershipStatusCapabilityAnnotation] = metadataMembershipStatusCapabilityVersion
 			changed = true
 		}
 		if !changed {
@@ -4257,7 +4264,7 @@ exec /antfly metadata --id $ID --config /config/config.json \
 		if statefulSet.Spec.Template.Annotations == nil {
 			statefulSet.Spec.Template.Annotations = make(map[string]string)
 		}
-		statefulSet.Spec.Template.Annotations[metadataMembershipStatusCapabilityAnnotation] = "v1"
+		statefulSet.Spec.Template.Annotations[metadataMembershipStatusCapabilityAnnotation] = metadataMembershipStatusCapabilityVersion
 
 		// Apply user-specified scheduling constraints first
 		applySchedulingConstraints(&statefulSet.Spec.Template,

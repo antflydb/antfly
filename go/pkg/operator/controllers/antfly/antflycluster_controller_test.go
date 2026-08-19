@@ -102,12 +102,15 @@ func TestValidateMetadataReplicaTopology(t *testing.T) {
 		})}
 	}
 	statusJSON := func(nodeID uint64, role string, leaderID uint64, incarnation string, voterCount int32) string {
-		return fmt.Sprintf(`{"metadata_group_id":1,"metadata_incarnation":%q,"metadata_raft_local_node_id":%d,"metadata_raft_role":%q,"metadata_raft_leader_id":%d,"metadata_raft_local_voter":true,"metadata_raft_voter_count":%d,"metadata_raft_voter_set_fingerprint":%q,"metadata_raft_joint_consensus":false}`,
+		return fmt.Sprintf(`{"metadata_group_id":1,"metadata_incarnation":%q,"metadata_raft_local_node_id":%d,"metadata_raft_role":%q,"metadata_raft_leader_id":%d,"metadata_raft_local_voter":true,"metadata_raft_voter_count":%d,"metadata_raft_voter_set_fingerprint":%q,"metadata_raft_joint_consensus":false,"metadata_raft_learner_count":0}`,
 			incarnation, nodeID, role, leaderID, voterCount, metadataRaftVoterSetFingerprint(voterCount))
 	}
 	legacyStatusJSON := func(nodeID uint64, role string, leaderID uint64, incarnation string, voterCount int32) string {
 		return fmt.Sprintf(`{"metadata_group_id":1,"metadata_incarnation":%q,"metadata_raft_local_node_id":%d,"metadata_raft_role":%q,"metadata_raft_leader_id":%d,"metadata_raft_local_voter":true,"metadata_raft_voter_count":%d}`,
 			incarnation, nodeID, role, leaderID, voterCount)
+	}
+	preLearnerStatusJSON := func(nodeID uint64, role string, leaderID uint64, incarnation string, voterCount int32) string {
+		return strings.Replace(statusJSON(nodeID, role, leaderID, incarnation, voterCount), `,"metadata_raft_learner_count":0`, "", 1)
 	}
 	pvc := func(ordinal int, annotation string) *corev1.PersistentVolumeClaim {
 		annotations := map[string]string(nil)
@@ -276,6 +279,28 @@ func TestValidateMetadataReplicaTopology(t *testing.T) {
 		t.Fatalf("expected joint-consensus legacy topology to fail closed, got: %v", err)
 	}
 
+	learnerReconciler := newReconciler(legacyObjects...)
+	learnerReconciler.HTTPClient = statusClient(map[string]string{
+		"example-metadata-0.example-metadata.default.svc.cluster.local": strings.Replace(statusJSON(1, "follower", 3, "33333333333333333333333333333333", 3), `"metadata_raft_learner_count":0`, `"metadata_raft_learner_count":1`, 1),
+		"example-metadata-1.example-metadata.default.svc.cluster.local": statusJSON(2, "follower", 3, "33333333333333333333333333333333", 3),
+		"example-metadata-2.example-metadata.default.svc.cluster.local": statusJSON(3, "leader", 3, "33333333333333333333333333333333", 3),
+	})
+	err = learnerReconciler.validateMetadataReplicaTopology(context.Background(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "learner_count=1") {
+		t.Fatalf("expected learner membership to fail closed, got: %v", err)
+	}
+
+	preLearnerRuntimeReconciler := newReconciler(legacyObjects...)
+	preLearnerRuntimeReconciler.HTTPClient = statusClient(map[string]string{
+		"example-metadata-0.example-metadata.default.svc.cluster.local": preLearnerStatusJSON(1, "follower", 3, "33333333333333333333333333333333", 3),
+		"example-metadata-1.example-metadata.default.svc.cluster.local": preLearnerStatusJSON(2, "follower", 3, "33333333333333333333333333333333", 3),
+		"example-metadata-2.example-metadata.default.svc.cluster.local": preLearnerStatusJSON(3, "leader", 3, "33333333333333333333333333333333", 3),
+	})
+	err = preLearnerRuntimeReconciler.validateMetadataReplicaTopology(context.Background(), cluster)
+	if !stderrors.Is(err, errMetadataRuntimeMembershipStatusUnavailable) {
+		t.Fatalf("expected a pre-learner-status runtime to request a capability rollout, got: %v", err)
+	}
+
 	legacyRuntimeReconciler := newReconciler(legacyObjects...)
 	legacyRuntimeReconciler.HTTPClient = statusClient(map[string]string{
 		"example-metadata-0.example-metadata.default.svc.cluster.local": legacyStatusJSON(1, "follower", 3, "33333333333333333333333333333333", 3),
@@ -345,7 +370,7 @@ func TestValidateMetadataRuntimeTopologyCarriesElectionObservationAcrossReconcil
 			leaderID = 1
 			role = "leader"
 		}
-		body := fmt.Sprintf(`{"metadata_group_id":1,"metadata_incarnation":"33333333333333333333333333333333","metadata_raft_local_node_id":%d,"metadata_raft_role":%q,"metadata_raft_leader_id":%d,"metadata_raft_term":%d,"metadata_raft_local_voter":true,"metadata_raft_voter_count":3,"metadata_raft_voter_set_fingerprint":%q,"metadata_raft_joint_consensus":false}`,
+		body := fmt.Sprintf(`{"metadata_group_id":1,"metadata_incarnation":"33333333333333333333333333333333","metadata_raft_local_node_id":%d,"metadata_raft_role":%q,"metadata_raft_leader_id":%d,"metadata_raft_term":%d,"metadata_raft_local_voter":true,"metadata_raft_voter_count":3,"metadata_raft_voter_set_fingerprint":%q,"metadata_raft_joint_consensus":false,"metadata_raft_learner_count":0}`,
 			nodeID, role, leaderID, term, metadataRaftVoterSetFingerprint(3))
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
 	})}}
@@ -450,7 +475,7 @@ func TestValidateMetadataRuntimeTopologyExpiresElectionGrace(t *testing.T) {
 		case 3:
 			role = "leader"
 		}
-		body := fmt.Sprintf(`{"metadata_group_id":1,"metadata_incarnation":"33333333333333333333333333333333","metadata_raft_local_node_id":%d,"metadata_raft_role":%q,"metadata_raft_leader_id":%d,"metadata_raft_term":%d,"metadata_raft_local_voter":true,"metadata_raft_voter_count":3,"metadata_raft_voter_set_fingerprint":%q,"metadata_raft_joint_consensus":false}`,
+		body := fmt.Sprintf(`{"metadata_group_id":1,"metadata_incarnation":"33333333333333333333333333333333","metadata_raft_local_node_id":%d,"metadata_raft_role":%q,"metadata_raft_leader_id":%d,"metadata_raft_term":%d,"metadata_raft_local_voter":true,"metadata_raft_voter_count":3,"metadata_raft_voter_set_fingerprint":%q,"metadata_raft_joint_consensus":false,"metadata_raft_learner_count":0}`,
 			nodeID, role, leaderID, term, metadataRaftVoterSetFingerprint(3))
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
 	})}}
@@ -513,7 +538,7 @@ func TestValidateMetadataRuntimeTopologyCarriesTransientProbeFailureAcrossReconc
 		if nodeID == 3 {
 			role = "leader"
 		}
-		body := fmt.Sprintf(`{"metadata_group_id":1,"metadata_incarnation":"33333333333333333333333333333333","metadata_raft_local_node_id":%d,"metadata_raft_role":%q,"metadata_raft_leader_id":3,"metadata_raft_term":2,"metadata_raft_local_voter":true,"metadata_raft_voter_count":3,"metadata_raft_voter_set_fingerprint":%q,"metadata_raft_joint_consensus":false}`,
+		body := fmt.Sprintf(`{"metadata_group_id":1,"metadata_incarnation":"33333333333333333333333333333333","metadata_raft_local_node_id":%d,"metadata_raft_role":%q,"metadata_raft_leader_id":3,"metadata_raft_term":2,"metadata_raft_local_voter":true,"metadata_raft_voter_count":3,"metadata_raft_voter_set_fingerprint":%q,"metadata_raft_joint_consensus":false,"metadata_raft_learner_count":0}`,
 			nodeID, role, metadataRaftVoterSetFingerprint(3))
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
 	})}}
@@ -710,10 +735,15 @@ func TestReconcileLegacyMetadataRuntimeMembershipStatus(t *testing.T) {
 		},
 		Spec: appsv1.StatefulSetSpec{
 			Replicas: &replicas,
-			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{
-				{Name: "sidecar", Image: "sidecar:old"},
-				{Name: "antfly", Image: "antfly:old", ImagePullPolicy: corev1.PullIfNotPresent},
-			}}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+					metadataMembershipStatusCapabilityAnnotation: "v1",
+				}},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{
+					{Name: "sidecar", Image: "sidecar:old"},
+					{Name: "antfly", Image: cluster.Spec.Image, ImagePullPolicy: corev1.PullAlways},
+				}},
+			},
 		},
 	}
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(statefulSet).Build()
@@ -739,8 +769,8 @@ func TestReconcileLegacyMetadataRuntimeMembershipStatus(t *testing.T) {
 	if got := updated.Spec.Template.Spec.Containers[1].ImagePullPolicy; got != corev1.PullAlways {
 		t.Fatalf("metadata runtime pull policy = %q, want %q", got, corev1.PullAlways)
 	}
-	if got := updated.Spec.Template.Annotations[metadataMembershipStatusCapabilityAnnotation]; got != "v1" {
-		t.Fatalf("metadata runtime membership capability annotation = %q, want v1", got)
+	if got := updated.Spec.Template.Annotations[metadataMembershipStatusCapabilityAnnotation]; got != "v2" {
+		t.Fatalf("metadata runtime membership capability annotation = %q, want v2", got)
 	}
 	if _, ok := updated.Annotations[metadataTopologyReplicasAnnotation]; ok {
 		t.Fatal("runtime capability rollout must not record an unverified StatefulSet topology")
@@ -886,7 +916,7 @@ func TestUpdateStatusRejectsSteadyStateMetadataSplit(t *testing.T) {
 			nodeID = 3
 			role = "leader"
 		}
-		body := fmt.Sprintf(`{"metadata_group_id":1,"metadata_incarnation":%q,"metadata_raft_local_node_id":%d,"metadata_raft_role":%q,"metadata_raft_leader_id":3,"metadata_raft_local_voter":true,"metadata_raft_voter_count":3,"metadata_raft_voter_set_fingerprint":%q,"metadata_raft_joint_consensus":false}`,
+		body := fmt.Sprintf(`{"metadata_group_id":1,"metadata_incarnation":%q,"metadata_raft_local_node_id":%d,"metadata_raft_role":%q,"metadata_raft_leader_id":3,"metadata_raft_local_voter":true,"metadata_raft_voter_count":3,"metadata_raft_voter_set_fingerprint":%q,"metadata_raft_joint_consensus":false,"metadata_raft_learner_count":0}`,
 			incarnation, nodeID, role, metadataRaftVoterSetFingerprint(3))
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
 	})}
@@ -1017,7 +1047,7 @@ func TestUpdateStatusPreservesHealthyStatusDuringMetadataElectionGrace(t *testin
 		case 3:
 			role = "leader"
 		}
-		body := fmt.Sprintf(`{"metadata_group_id":1,"metadata_incarnation":"33333333333333333333333333333333","metadata_raft_local_node_id":%d,"metadata_raft_role":%q,"metadata_raft_leader_id":%d,"metadata_raft_term":%d,"metadata_raft_local_voter":true,"metadata_raft_voter_count":3,"metadata_raft_voter_set_fingerprint":%q,"metadata_raft_joint_consensus":false}`,
+		body := fmt.Sprintf(`{"metadata_group_id":1,"metadata_incarnation":"33333333333333333333333333333333","metadata_raft_local_node_id":%d,"metadata_raft_role":%q,"metadata_raft_leader_id":%d,"metadata_raft_term":%d,"metadata_raft_local_voter":true,"metadata_raft_voter_count":3,"metadata_raft_voter_set_fingerprint":%q,"metadata_raft_joint_consensus":false,"metadata_raft_learner_count":0}`,
 			nodeID, role, leaderID, term, metadataRaftVoterSetFingerprint(3))
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
 	})}
@@ -12960,7 +12990,7 @@ var _ = Describe("AntflyCluster Controller", func() {
 			Expect(metadataSts.Annotations).To(HaveKeyWithValue(metadataTopologyReplicasAnnotation, "3"))
 			Expect(metadataSts.Spec.VolumeClaimTemplates).To(HaveLen(1))
 			Expect(metadataSts.Spec.VolumeClaimTemplates[0].Annotations).To(HaveKeyWithValue(metadataTopologyReplicasAnnotation, "3"))
-			Expect(metadataSts.Spec.Template.Annotations).To(HaveKeyWithValue(metadataMembershipStatusCapabilityAnnotation, "v1"))
+			Expect(metadataSts.Spec.Template.Annotations).To(HaveKeyWithValue(metadataMembershipStatusCapabilityAnnotation, "v2"))
 			Eventually(func() int32 {
 				observed := &antflyv1.AntflyCluster{}
 				if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), observed); err != nil {

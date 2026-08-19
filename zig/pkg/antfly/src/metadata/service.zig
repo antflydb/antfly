@@ -6928,6 +6928,7 @@ const ServiceGroupRaftObservation = struct {
     voter_count: usize = 0,
     voter_set_fingerprint: ?metadata_api.MetadataRaftVoterSetFingerprint = null,
     joint_consensus: bool = false,
+    learner_count: usize = 0,
     election_elapsed: u32 = 0,
     randomized_election_timeout: u32 = 0,
     votes_granted: usize = 0,
@@ -7000,6 +7001,7 @@ fn applyMetadataRaftTopology(status: *MetadataStatus, observation: ServiceGroupR
     status.metadata_raft_voter_count = observation.voter_count;
     status.metadata_raft_voter_set_fingerprint = observation.voter_set_fingerprint;
     status.metadata_raft_joint_consensus = observation.joint_consensus;
+    status.metadata_raft_learner_count = observation.learner_count;
     status.metadata_raft_election_elapsed = observation.election_elapsed;
     status.metadata_raft_randomized_election_timeout = observation.randomized_election_timeout;
     status.metadata_raft_votes_granted = observation.votes_granted;
@@ -7023,6 +7025,7 @@ fn metadataRuntimeTopology(
         .metadata_raft_voter_count = observation.voter_count,
         .metadata_raft_voter_set_fingerprint = observation.voter_set_fingerprint,
         .metadata_raft_joint_consensus = observation.joint_consensus,
+        .metadata_raft_learner_count = observation.learner_count,
     };
 }
 
@@ -7048,6 +7051,7 @@ fn raftObservationFromStatus(
         .voter_count = raft_status.conf_state.voters.len,
         .voter_set_fingerprint = std.fmt.bytesToHex(voter_set_fingerprint, .lower),
         .joint_consensus = raft_status.conf_state.voters_outgoing.len > 0,
+        .learner_count = raft_status.conf_state.learners.len + raft_status.conf_state.learners_next.len,
         .election_elapsed = raft_status.election_elapsed,
         .randomized_election_timeout = raft_status.randomized_election_timeout,
         .votes_granted = raft_status.votes_granted,
@@ -7056,9 +7060,11 @@ fn raftObservationFromStatus(
     };
 }
 
-test "metadata Raft observation exposes canonical voter configuration" {
+test "metadata service Raft observation exposes canonical membership configuration" {
     var voters = [_]u64{ 3, 1, 2 };
     var outgoing = [_]u64{ 1, 2 };
+    var learners = [_]u64{4};
+    var learners_next = [_]u64{5};
     const observation = raftObservationFromStatus(.{
         .id = 2,
         .group_id = 1,
@@ -7067,11 +7073,14 @@ test "metadata Raft observation exposes canonical voter configuration" {
         .conf_state = .{
             .voters = &voters,
             .voters_outgoing = &outgoing,
+            .learners = &learners,
+            .learners_next = &learners_next,
         },
     }, 2);
     const expected = std.fmt.bytesToHex(metadata_table_manager.voterSetFingerprint(&voters, null), .lower);
     try std.testing.expectEqualStrings(&expected, &(observation.voter_set_fingerprint orelse return error.TestUnexpectedResult));
     try std.testing.expect(observation.joint_consensus);
+    try std.testing.expectEqual(@as(usize, 2), observation.learner_count);
 }
 
 fn raftRoleName(role: raft_engine.core.types.StateRole) []const u8 {
@@ -8818,6 +8827,7 @@ pub fn snapshotStatusWithOptions(
         .metadata_raft_voter_count = metadata_raft.voter_count,
         .metadata_raft_voter_set_fingerprint = metadata_raft.voter_set_fingerprint,
         .metadata_raft_joint_consensus = metadata_raft.joint_consensus,
+        .metadata_raft_learner_count = metadata_raft.learner_count,
         .metadata_raft_election_elapsed = metadata_raft.election_elapsed,
         .metadata_raft_randomized_election_timeout = metadata_raft.randomized_election_timeout,
         .metadata_raft_votes_granted = metadata_raft.votes_granted,
@@ -12551,6 +12561,7 @@ test "metadata http service catalog cache is independent from volatile projectio
     stale_status.metadata_raft_voter_count = 99;
     stale_status.metadata_raft_voter_set_fingerprint = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".*;
     stale_status.metadata_raft_joint_consensus = true;
+    stale_status.metadata_raft_learner_count = 99;
     stale_status.metadata_raft_election_elapsed += 100;
     stale_status.metadata_raft_randomized_election_timeout += 100;
     stale_status.metadata_raft_votes_granted += 100;
@@ -12573,6 +12584,7 @@ test "metadata http service catalog cache is independent from volatile projectio
     try std.testing.expectEqual(live_raft.voter_count, fallback_status.metadata_raft_voter_count);
     try std.testing.expectEqual(live_raft.voter_set_fingerprint, fallback_status.metadata_raft_voter_set_fingerprint);
     try std.testing.expectEqual(live_raft.joint_consensus, fallback_status.metadata_raft_joint_consensus);
+    try std.testing.expectEqual(live_raft.learner_count, fallback_status.metadata_raft_learner_count);
     try std.testing.expectEqual(live_raft.election_elapsed, fallback_status.metadata_raft_election_elapsed);
     try std.testing.expectEqual(live_raft.randomized_election_timeout, fallback_status.metadata_raft_randomized_election_timeout);
     try std.testing.expectEqual(live_raft.votes_granted, fallback_status.metadata_raft_votes_granted);

@@ -3038,6 +3038,7 @@ test "metadata http server serves status and filtered admin routes" {
                 .metadata_raft_local_voter = true,
                 .metadata_raft_voter_count = 3,
                 .metadata_raft_voter_set_fingerprint = voter_set_fingerprint,
+                .metadata_raft_learner_count = 2,
             };
         }
 
@@ -3048,6 +3049,7 @@ test "metadata http server serves status and filtered admin routes" {
                 .metadata_epoch = 5,
                 .metadata_raft_voter_set_fingerprint = voter_set_fingerprint,
                 .metadata_raft_joint_consensus = true,
+                .metadata_raft_learner_count = 2,
                 .metrics = .{},
                 .projected_tables = 1,
                 .projected_tables_with_replication_sources = 1,
@@ -3157,7 +3159,7 @@ test "metadata http server serves status and filtered admin routes" {
     try std.testing.expectEqual(@as(u16, 200), topology_resp.status.code);
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
-        "{\"metadata_group_id\":77,\"metadata_raft_local_node_id\":2,\"metadata_raft_role\":\"follower\",\"metadata_raft_leader_id\":1,\"metadata_raft_term\":9,\"metadata_raft_local_voter\":true,\"metadata_raft_voter_count\":3}",
+        "{\"metadata_group_id\":77,\"metadata_raft_local_node_id\":2,\"metadata_raft_role\":\"follower\",\"metadata_raft_leader_id\":1,\"metadata_raft_term\":9,\"metadata_raft_local_voter\":true,\"metadata_raft_voter_count\":3,\"metadata_raft_learner_count\":2}",
         topology_resp.body.?,
     );
     try std.testing.expect(std.mem.indexOf(u8, topology_resp.body.?, "\"projected_tables\"") == null);
@@ -3168,6 +3170,7 @@ test "metadata http server serves status and filtered admin routes" {
     try std.testing.expect(std.mem.indexOf(u8, status_resp.body.?, "\"metadata_group_id\":77") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_resp.body.?, "\"metadata_raft_voter_set_fingerprint\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_resp.body.?, "\"metadata_raft_joint_consensus\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_resp.body.?, "\"metadata_raft_learner_count\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_resp.body.?, "\"projected_tables_with_replication_sources\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_resp.body.?, "\"projected_replication_sources\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_resp.body.?, "\"projected_replication_source_lag_millis_max\":34") != null);

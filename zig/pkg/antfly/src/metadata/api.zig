@@ -42,6 +42,8 @@ pub const MetadataStatus = struct {
     metadata_raft_voter_count: usize = 0,
     metadata_raft_voter_set_fingerprint: ?MetadataRaftVoterSetFingerprint = null,
     metadata_raft_joint_consensus: bool = false,
+    /// Includes both stable and staged learners (`learners_next`).
+    metadata_raft_learner_count: usize = 0,
     metadata_raft_election_elapsed: u32 = 0,
     metadata_raft_randomized_election_timeout: u32 = 0,
     metadata_raft_votes_granted: usize = 0,
@@ -151,6 +153,8 @@ pub const MetadataRuntimeTopology = struct {
     metadata_raft_voter_count: usize = 0,
     metadata_raft_voter_set_fingerprint: ?MetadataRaftVoterSetFingerprint = null,
     metadata_raft_joint_consensus: bool = false,
+    /// Includes both stable and staged learners (`learners_next`).
+    metadata_raft_learner_count: usize = 0,
 };
 
 pub const ReplicationSourceActionHint = struct {
