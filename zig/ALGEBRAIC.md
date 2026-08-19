@@ -1437,6 +1437,7 @@ algebraic bulk-ingest sessions defer promoted path dictionary FST rebuilds acros
 durable planner default policy remains opt-in and conservative until LSM guardrail evidence covers latency, bytes, write cost, churn, cold reads, fanout, and constrained queries
 schema capability fingerprints, skipped-unbounded-field metadata, and debug lifecycle classification
 schema-derived v2 configs with declared laws and adaptive defaults
+runtime-adaptive dynamic templates: bounded table-level dynamic templates (keyword/numeric/boolean/datetime) compile into capability `dynamic_field_rules` and project template-matched fields into typed docfacts at ingest; accepted template changes advance the schema generation, refresh both durable and live configs (`Index.reloadConfigJson`), and gate query acceleration until a matching generation-local completion marker proves rebuild coverage; unbounded text templates stay on the schemaless path-fact path (cardinality guard)
 public algebraic index requests constrained to schema-derived capability sidecars with internal materialization fields stripped/rejected
 canonical-token shard merge keys for distributed symbol semantics
 distributed partial merge helpers that combine shard results by canonical axis and law

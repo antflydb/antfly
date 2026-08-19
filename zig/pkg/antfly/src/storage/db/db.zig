@@ -13023,6 +13023,15 @@ pub const DB = struct {
         if (manifest_sequence != reached_target) return error.IndexGenerationManifestMismatch;
         try ensureRepairActivationDeadline(activation_deadline_ns);
 
+        if (cfg.kind == .algebraic) {
+            // Certify this physical projection only after the final replay has
+            // converged under the apply fence. The marker lives in the shadow
+            // namespace, so a crash before pointer publication cannot release
+            // the active generation's lifecycle gate.
+            try shadow_manager.persistAlgebraicProjectionConfigReady(self.core.store, cfg.name);
+            try ensureRepairActivationDeadline(activation_deadline_ns);
+        }
+
         // Transfer the already-open runtime for every index family. Pointer
         // publication and in-memory handoff are allocation-free, and the
         // predecessor is retired only after service fences are released.
@@ -13063,7 +13072,6 @@ pub const DB = struct {
             .generation = final_update.generation,
             .config_hash = final_update.config_hash,
         });
-
         // The pointer and clean checkpoint are now ordered before any later
         // foreground apply. Release the write fence before operator hooks,
         // intent cleanup, and generation garbage collection. Capture the
@@ -14697,6 +14705,13 @@ pub const DB = struct {
 
     pub fn getSchemaJson(self: *DB, alloc: Allocator) !?[]u8 {
         return try self.core.getStoreValue(alloc, public_schema_json_key);
+    }
+
+    /// Refresh schema-derived algebraic index configs (notably dynamic-template
+    /// rules) in place from the given table schema JSON, so a dynamic-template
+    /// change applies to a running DB without a reopen.
+    pub fn reloadAlgebraicSchemaConfigs(self: *DB, schema_json: []const u8) !void {
+        try self.core.index_manager.reloadAlgebraicSchemaConfigs(schema_json);
     }
 
     pub fn beginTransaction(self: *DB, timestamp_ns: u64) !transactions_mod.TxnId {
@@ -70718,6 +70733,46 @@ test "db managed vector admission durably seeds missing enrichment artifacts" {
     try std.testing.expect(db.core.index_manager.repairUnavailable("semantic_idx"));
 }
 
+test "db managed algebraic admission builds and reopens requires generation marker" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const cfg = types.IndexConfig{
+        .name = "analytics_idx",
+        .kind = .algebraic,
+        .config_json =
+        \\{"version":1,"table":"docs","capability_lifecycle_status":"rebuild_required","dynamic_rules_backfill_pending":true,"group_fields":[{"name":"category","path":"category","type":"string"}],"dynamic_field_rules":[{"name":"ids","match":"*_id","type":"string"}],"materializations":[]}
+        ,
+    };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.addIndex(cfg);
+        try db.core.saveProjectionCheckpoint(cfg.name, .{
+            .status = .clean,
+            .generation = 9,
+            .config_hash = types.indexConfigHash(cfg),
+        });
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+    const active = reopened.core.index_manager.algebraicIndex(cfg.name) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!active.index.projectionConfigReady());
+    try std.testing.expect(!active.index.plannerLifecycleReady());
+    try std.testing.expect(active.index.resolveField("user_id", .group) == null);
+}
+
 test "db managed algebraic admission builds and reopens an isolated generation" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -70728,7 +70783,7 @@ test "db managed algebraic admission builds and reopens an isolated generation" 
         .name = "analytics_idx",
         .kind = .algebraic,
         .config_json =
-        \\{"version":1,"table":"docs","group_fields":[{"name":"category","path":"category","type":"string"}],"materializations":[]}
+        \\{"version":1,"table":"docs","capability_lifecycle_status":"rebuild_required","dynamic_rules_backfill_pending":true,"group_fields":[{"name":"category","path":"category","type":"string"}],"dynamic_field_rules":[{"name":"ids","match":"*_id","type":"string"}],"materializations":[]}
         ,
     };
     var active_namespace: []u8 = undefined;
@@ -70749,6 +70804,8 @@ test "db managed algebraic admission builds and reopens an isolated generation" 
         try std.testing.expect(try db.hasPendingIndexRepairIntents(alloc));
         const canonical = db.core.index_manager.algebraicIndex(cfg.name) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqualStrings("canonical/analytics_idx", canonical.index.storageNamespace());
+        try std.testing.expect(!canonical.index.plannerLifecycleReady());
+        try std.testing.expect(canonical.index.resolveField("user_id", .group) == null);
 
         var repaired = false;
         for (0..16) |_| {
@@ -70765,6 +70822,8 @@ test "db managed algebraic admission builds and reopens an isolated generation" 
 
         const active = db.core.index_manager.algebraicIndex(cfg.name) orelse return error.TestUnexpectedResult;
         try std.testing.expect(std.mem.startsWith(u8, active.index.storageNamespace(), ".repair-shadow-"));
+        try std.testing.expect(active.index.plannerLifecycleReady());
+        try std.testing.expect(active.index.resolveField("user_id", .group) != null);
         active_namespace = try alloc.dupe(u8, active.index.storageNamespace());
         var resolved = (try active.index.resolvedDocFilterForFilterJsonAlloc(
             db.core.store,
@@ -70786,6 +70845,8 @@ test "db managed algebraic admission builds and reopens an isolated generation" 
     defer reopened.close();
     const active = reopened.core.index_manager.algebraicIndex(cfg.name) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(active_namespace, active.index.storageNamespace());
+    try std.testing.expect(active.index.plannerLifecycleReady());
+    try std.testing.expect(active.index.resolveField("user_id", .group) != null);
     var resolved = (try active.index.resolvedDocFilterForFilterJsonAlloc(
         reopened.core.store,
         "{\"term\":{\"category\":\"tools\"}}",

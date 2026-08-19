@@ -33,6 +33,7 @@ const backend_erased = @import("../../backend_erased.zig");
 const backend_types = @import("../../backend_types.zig");
 const docstore_mod = @import("../../docstore.zig");
 const internal_keys = @import("../../internal_keys.zig");
+const runtime_schema = @import("../../schema.zig");
 const lsm_backend = @import("../../lsm_backend.zig");
 const lsm_storage_io = @import("../../lsm_backend/storage_io.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
@@ -218,6 +219,15 @@ pub const Config = struct {
     group_fields: []const FieldConfig = &.{},
     measure_fields: []const FieldConfig = &.{},
     time_fields: []const FieldConfig = &.{},
+    dynamic_field_rules: []const fact_mod.DynamicRule = &.{},
+    // Set when dynamic_field_rules changed against a table that already holds
+    // documents, so existing docs have not been re-projected through the new
+    // rules. While true, query-time resolution of dynamic-template fields is
+    // withheld (those queries fall back to a complete scan) so aggregates are
+    // never computed over only the post-change subset. Static fields are
+    // unaffected. The durable flag remains conservative; a generation-local
+    // completion marker releases the runtime gate after a full rebuild.
+    dynamic_rules_backfill_pending: bool = false,
     laws: []const LawConfig = &.{},
     joins: []const JoinConfig = &.{},
     materializations: []const MaterializationConfig = &.{},
@@ -346,6 +356,255 @@ pub fn validateConfig(cfg: Config) !void {
         }
     }
     if (cfg.adaptive.observation_decay_retain_percent > 100) return error.InvalidAlgebraicConfig;
+    for (cfg.dynamic_field_rules) |rule| {
+        if (rule.type.len == 0) return error.InvalidAlgebraicConfig;
+        if (dynamicRuleRoleMask(rule.type) == 0) return error.InvalidAlgebraicConfig;
+        // Require a name/path selector (`match` / `path_match`). A rule with no
+        // selector would blanket-match every field, and a `match_mapping_type`-
+        // only rule would project facts at ingest that can never resolve at query
+        // time (no value to classify) — keep ingest and query symmetric by
+        // rejecting both here, matching schema_capability's compile-time guard.
+        if (rule.match == null and rule.path_match == null) return error.InvalidAlgebraicConfig;
+    }
+}
+
+pub const SchemaCapabilityDelta = struct {
+    static_fields_changed: bool = false,
+    dynamic_rules_changed: bool = false,
+
+    pub fn projectionChanged(self: @This()) bool {
+        return self.static_fields_changed or self.dynamic_rules_changed;
+    }
+};
+
+/// Compare only schema-derived projection capabilities. Schema generations and
+/// runtime tuning are deliberately excluded: changing either does not require
+/// re-projecting stored documents when the concrete field/rule layout is
+/// unchanged.
+pub fn schemaCapabilityDelta(current: Config, next: Config) SchemaCapabilityDelta {
+    return .{
+        .static_fields_changed = !fieldConfigSetsEqual(current.group_fields, next.group_fields) or
+            !fieldConfigSetsEqual(current.measure_fields, next.measure_fields) or
+            !fieldConfigSetsEqual(current.time_fields, next.time_fields),
+        // Dynamic-template order is semantic because ingest uses first-match
+        // precedence, so compare this slice positionally.
+        .dynamic_rules_changed = !dynamicRuleSlicesEqual(current.dynamic_field_rules, next.dynamic_field_rules),
+    };
+}
+
+pub fn capabilityLifecycleStatusReady(status: []const u8) bool {
+    return status.len == 0 or
+        std.mem.eql(u8, status, "current") or
+        std.mem.eql(u8, status, "compatible_additive");
+}
+
+fn fieldConfigSetsEqual(lhs: []const FieldConfig, rhs: []const FieldConfig) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs) |left| {
+        var found = false;
+        for (rhs) |right| {
+            if (std.mem.eql(u8, left.name, right.name) and
+                std.mem.eql(u8, left.path, right.path) and
+                std.mem.eql(u8, left.type, right.type))
+            {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+fn dynamicRuleSlicesEqual(lhs: []const fact_mod.DynamicRule, rhs: []const fact_mod.DynamicRule) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        if (!std.mem.eql(u8, left.name, right.name) or
+            !optionalBytesEqual(left.match, right.match) or
+            !optionalBytesEqual(left.unmatch, right.unmatch) or
+            !optionalBytesEqual(left.path_match, right.path_match) or
+            !optionalBytesEqual(left.path_unmatch, right.path_unmatch) or
+            !optionalBytesEqual(left.match_mapping_type, right.match_mapping_type) or
+            !std.mem.eql(u8, left.type, right.type)) return false;
+    }
+    return true;
+}
+
+fn optionalBytesEqual(lhs: ?[]const u8, rhs: ?[]const u8) bool {
+    if (lhs == null or rhs == null) return lhs == null and rhs == null;
+    return std.mem.eql(u8, lhs.?, rhs.?);
+}
+
+// ============================================================================
+// Dynamic-template docfact projection
+//
+// Templates are evaluated against every observed field at ingest time. A field
+// not already covered by a static spec that matches a rule selector is promoted
+// into typed group/measure/time docfacts, so dynamic-template changes take
+// effect for new writes before existing rows are rebuilt. The bounded-type guard
+// is enforced upstream in schema_capability.zig (only keyword/numeric/boolean/
+// datetime templates become rules); open text stays schemaless.
+// ============================================================================
+
+/// Bitmask of roles a resolved scalar type projects into. Mirrors the static
+/// classification in schema_capability.zig (numeric => group+measure, datetime
+/// => group+time, others => group).
+const role_group: u3 = 0b001;
+const role_measure: u3 = 0b010;
+const role_time: u3 = 0b100;
+
+fn dynamicRuleRoleMask(scalar_type: []const u8) u3 {
+    if (std.mem.eql(u8, scalar_type, "integer") or std.mem.eql(u8, scalar_type, "number")) {
+        return role_group | role_measure;
+    }
+    if (std.mem.eql(u8, scalar_type, "datetime")) return role_group | role_time;
+    if (std.mem.eql(u8, scalar_type, "string") or std.mem.eql(u8, scalar_type, "boolean")) return role_group;
+    return 0;
+}
+
+/// Evaluate the value-independent name/path portion of a dynamic-template
+/// selector. Ingest adds `match_mapping_type` below; query resolution uses this
+/// predicate to discover every possible rule and declines when any candidate is
+/// value-dependent.
+fn dynamicRuleNamePathMatches(
+    rule: fact_mod.DynamicRule,
+    path: []const u8,
+    field_name: []const u8,
+) bool {
+    if (rule.match) |pattern| {
+        if (!runtime_schema.globMatch(pattern, field_name)) return false;
+    }
+    if (rule.unmatch) |pattern| {
+        if (runtime_schema.globMatch(pattern, field_name)) return false;
+    }
+    if (rule.path_match) |pattern| {
+        if (!runtime_schema.globMatch(pattern, path)) return false;
+    }
+    if (rule.path_unmatch) |pattern| {
+        if (runtime_schema.globMatch(pattern, path)) return false;
+    }
+    return true;
+}
+
+fn dynamicRuleSelectorMatches(
+    rule: fact_mod.DynamicRule,
+    path: []const u8,
+    field_name: []const u8,
+    json_value: std.json.Value,
+) bool {
+    if (!dynamicRuleNamePathMatches(rule, path, field_name)) return false;
+    if (rule.match_mapping_type) |expected| {
+        const actual = runtime_schema.matchMappingTypeName(json_value) orelse return false;
+        if (!std.mem.eql(u8, expected, actual)) return false;
+    }
+    return true;
+}
+
+fn fieldNameFromQueryPath(path: []const u8) []const u8 {
+    const idx = std.mem.lastIndexOfScalar(u8, path, '.') orelse return path;
+    return path[idx + 1 ..];
+}
+
+fn staticSpecCoversPath(specs: []const fact_mod.FieldSpec, path: []const u8) bool {
+    for (specs) |spec| {
+        if (std.mem.eql(u8, spec.path, path)) return true;
+    }
+    return false;
+}
+
+/// Project dynamic-template-matched docfacts for a document. The fact `field`
+/// identity is the full dotted path (so nested dynamic fields never collide with
+/// each other or with statically-declared leaf-named fields); for the common
+/// top-level template case the path equals the field name.
+fn projectDynamicDocFactsAlloc(
+    alloc: std.mem.Allocator,
+    rules: []const fact_mod.DynamicRule,
+    static_specs: []const fact_mod.FieldSpec,
+    root: std.json.Value,
+) !fact_mod.FactList {
+    var out = std.ArrayListUnmanaged(fact_mod.Fact).empty;
+    errdefer {
+        for (out.items) |*item| item.deinit(alloc);
+        out.deinit(alloc);
+    }
+    if (rules.len > 0 and root == .object) {
+        try walkDynamicDocFacts(alloc, rules, static_specs, &out, "", root);
+    }
+    return .{ .facts = try out.toOwnedSlice(alloc) };
+}
+
+fn walkDynamicDocFacts(
+    alloc: std.mem.Allocator,
+    rules: []const fact_mod.DynamicRule,
+    static_specs: []const fact_mod.FieldSpec,
+    out: *std.ArrayListUnmanaged(fact_mod.Fact),
+    prefix: []const u8,
+    node: std.json.Value,
+) !void {
+    if (node != .object) return;
+    var it = node.object.iterator();
+    while (it.next()) |entry| {
+        const field_name = entry.key_ptr.*;
+        const child_value = entry.value_ptr.*;
+        const path = if (prefix.len == 0)
+            try alloc.dupe(u8, field_name)
+        else
+            try std.fmt.allocPrint(alloc, "{s}.{s}", .{ prefix, field_name });
+        defer alloc.free(path);
+        switch (child_value) {
+            // Descend into nested objects so path_match selectors can target
+            // dotted paths; arrays stay on the schemaless path-fact path.
+            .object => try walkDynamicDocFacts(alloc, rules, static_specs, out, path, child_value),
+            .array => {},
+            else => try projectDynamicLeaf(alloc, rules, static_specs, out, path, field_name, child_value),
+        }
+    }
+}
+
+fn projectDynamicLeaf(
+    alloc: std.mem.Allocator,
+    rules: []const fact_mod.DynamicRule,
+    static_specs: []const fact_mod.FieldSpec,
+    out: *std.ArrayListUnmanaged(fact_mod.Fact),
+    path: []const u8,
+    field_name: []const u8,
+    json_value: std.json.Value,
+) !void {
+    // Explicit schema fields win over dynamic templates (resolution order in
+    // SCHEMA.md): if a static spec already covers this path, skip it.
+    if (staticSpecCoversPath(static_specs, path)) return;
+
+    for (rules) |rule| {
+        if (!dynamicRuleSelectorMatches(rule, path, field_name, json_value)) continue;
+        // First selector-matching rule wins (Elasticsearch dynamic-template
+        // order). Crucially we return after the first *selector* match, NOT
+        // after the first rule that yields a usable fact: a value that does not
+        // coerce under this rule's type simply produces no fact (exactly like a
+        // static typed field given a non-coercible value). Falling through to a
+        // later overlapping rule with a different type would make ingest disagree
+        // with query-time resolution, which also picks the first matching rule.
+        const mask = dynamicRuleRoleMask(rule.type);
+        if (mask & role_group != 0) _ = try appendDynamicFact(alloc, out, .group, path, rule.type, json_value);
+        if (mask & role_measure != 0) _ = try appendDynamicFact(alloc, out, .measure, path, rule.type, json_value);
+        if (mask & role_time != 0) _ = try appendDynamicFact(alloc, out, .time, path, rule.type, json_value);
+        return;
+    }
+}
+
+fn appendDynamicFact(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(fact_mod.Fact),
+    role: fact_mod.Role,
+    field: []const u8,
+    scalar_type: []const u8,
+    json_value: std.json.Value,
+) !bool {
+    const scalar = (try value_mod.scalarFromJsonAlloc(alloc, scalar_type, json_value)) orelse return false;
+    errdefer alloc.free(scalar);
+    const field_copy = try alloc.dupe(u8, field);
+    errdefer alloc.free(field_copy);
+    try out.append(alloc, .{ .role = role, .field = field_copy, .scalar = scalar });
+    return true;
 }
 
 fn validateUniqueFieldNames(fields: []const FieldConfig) !void {
@@ -2376,14 +2635,41 @@ const SymbolCache = struct {
     }
 };
 
+// Running value for one group in a single-law fold. The additive group laws
+// (count/sum/sumsquares/avg) accumulate as native numbers and are formatted to
+// text exactly once in entriesAlloc, instead of round-tripping the running
+// total through decimal text on every contribution. Because encode/parse for
+// i64 and f64 ("{d}") round-trip exactly and contributions are applied in the
+// same order, the formatted result is byte-identical to the previous text
+// merge. The remaining laws (min/max, booleans, set/tuple, timestamps) keep the
+// text-merge path, where order/text identity matters.
+const FoldValue = union(enum) {
+    int: i64,
+    float: f64,
+    avg: algebra.AvgState,
+    text: ?[]u8,
+
+    fn initFor(law_id: law_mod.Id) FoldValue {
+        return switch (law_id) {
+            .count => .{ .int = 0 },
+            .sum, .sumsquares => .{ .float = 0 },
+            .avg => .{ .avg = .{} },
+            else => .{ .text = null },
+        };
+    }
+};
+
 const DerivedJoinFoldAccumulator = struct {
-    values: std.StringHashMapUnmanaged(?[]u8) = .empty,
+    values: std.StringHashMapUnmanaged(FoldValue) = .empty,
 
     fn deinit(self: *@This(), alloc: Allocator) void {
         var it = self.values.iterator();
         while (it.next()) |entry| {
             alloc.free(entry.key_ptr.*);
-            if (entry.value_ptr.*) |value| alloc.free(value);
+            switch (entry.value_ptr.*) {
+                .text => |value| if (value) |bytes| alloc.free(bytes),
+                else => {},
+            }
         }
         self.values.deinit(alloc);
         self.* = .{};
@@ -2403,18 +2689,34 @@ const DerivedJoinFoldAccumulator = struct {
         } else {
             errdefer _ = self.values.remove(group_key);
             gop.key_ptr.* = try alloc.dupe(u8, group_key);
-            gop.value_ptr.* = null;
+            gop.value_ptr.* = FoldValue.initFor(law_id);
         }
-        const next = try tensor_mod.mergeOneSlotValuesAlloc(alloc, law_id, gop.value_ptr.*, contribution);
-        if (gop.value_ptr.*) |old| alloc.free(old);
-        gop.value_ptr.* = next;
+        switch (gop.value_ptr.*) {
+            .int => |*running| running.* += try algebra.parseI64(contribution),
+            .float => |*running| running.* += try algebra.parseF64(contribution),
+            .avg => |*running| {
+                const delta = try algebra.parseAvg(contribution);
+                running.sum += delta.sum;
+                running.count += delta.count;
+            },
+            .text => |*running| {
+                const next = try tensor_mod.mergeOneSlotValuesAlloc(alloc, law_id, running.*, contribution);
+                if (running.*) |old| alloc.free(old);
+                running.* = next;
+            },
+        }
     }
 
     fn entriesAlloc(self: *@This(), alloc: Allocator) ![]FoldEntry {
         var count: usize = 0;
         var count_it = self.values.iterator();
         while (count_it.next()) |entry| {
-            if (entry.value_ptr.* != null) count += 1;
+            switch (entry.value_ptr.*) {
+                .text => |value| if (value != null) {
+                    count += 1;
+                },
+                else => count += 1,
+            }
         }
         const entries = try alloc.alloc(FoldEntry, count);
         var initialized: usize = 0;
@@ -2424,10 +2726,16 @@ const DerivedJoinFoldAccumulator = struct {
         }
         var it = self.values.iterator();
         while (it.next()) |entry| {
-            const value = entry.value_ptr.* orelse continue;
+            const value_bytes = switch (entry.value_ptr.*) {
+                .int => |running| try algebra.encodeI64Alloc(alloc, running),
+                .float => |running| try algebra.encodeF64Alloc(alloc, running),
+                .avg => |running| try algebra.encodeAvgAlloc(alloc, running),
+                .text => |running| try alloc.dupe(u8, running orelse continue),
+            };
+            errdefer alloc.free(value_bytes);
             entries[initialized] = .{
                 .group_key = try alloc.dupe(u8, entry.key_ptr.*),
-                .value = try alloc.dupe(u8, value),
+                .value = value_bytes,
             };
             initialized += 1;
         }
@@ -2650,6 +2958,10 @@ pub const Index = struct {
     /// selected by the active-root pointer.
     storage_namespace: []u8,
     parsed: std.json.Parsed(Config),
+    /// Runtime proof that the active physical generation was completely built
+    /// for `parsed`. Restored only from that generation's completion marker
+    /// with a matching config hash and reset by every config reload.
+    projection_config_ready: bool = false,
     parse_error_count: u64 = 0,
     last_error_doc_key: ?[]u8 = null,
     last_error_reason: ?[]u8 = null,
@@ -2734,6 +3046,13 @@ pub const Index = struct {
 
     pub fn storageNamespace(self: *const Index) []const u8 {
         return self.storage_namespace;
+    }
+
+    /// Generation-local completion marker for the schema-derived projection.
+    /// Because the key includes `storage_namespace`, an inactive or retired
+    /// generation can never make another physical projection appear ready.
+    pub fn projectionConfigReadyMarkerKeyAlloc(self: *Index) ![]u8 {
+        return try self.keyAlloc(&.{"projection-config-ready:v1"});
     }
 
     pub fn storageBytes(self: *const Index, store: *docstore_mod.DocStore) !u64 {
@@ -2915,6 +3234,43 @@ pub const Index = struct {
     fn storageAccountingScope(self: *Index) StorageAccountingScope {
         platform_sync.lockYielding(&self.storage_accounting_mutex);
         return .{ .index = self };
+    }
+
+    /// Swap the index configuration in place from a new config JSON. Used to
+    /// apply a dynamic-template change to a running index without a reopen:
+    /// the next ingest projects facts using the refreshed dynamic_field_rules.
+    /// Persisted sidecar rows are untouched (lazy backfill); only newly written
+    /// or rewritten documents reflect the new rules until a full rebuild.
+    ///
+    /// Concurrency: this frees the old parsed Config (whose slices back the
+    /// FieldConfig/DynamicRule values returned by `config()`/`fieldConfig`). It
+    /// is only safe to call with no concurrent reader of this index. That holds
+    /// today: the sole caller (`IndexManager.reloadAlgebraicSchemaConfigs` via
+    /// `applyLocalTableSchemaJson`) runs under the provisioned write source's
+    /// exclusive structural-mutation lock on a freshly-opened, unshared DB handle
+    /// — query threads read separate read-cache DB handles. This mirrors the
+    /// adjacent `core.setSchema` swap in the same code path. If the index ever
+    /// becomes shared with live readers, this swap must be guarded (e.g. by the
+    /// index apply_mutex with readers taking it too).
+    pub fn reloadConfigJson(self: *Index, config_json: []const u8) !void {
+        var parsed = try std.json.parseFromSlice(Config, self.alloc, config_json, .{ .allocate = .alloc_always });
+        errdefer parsed.deinit();
+        try validateConfig(parsed.value);
+        // Cached adaptive specs are derived from the old config; drop them so
+        // they are recomputed lazily against the new one.
+        self.invalidateAdaptiveReadySpecCache();
+        const old = self.parsed;
+        self.parsed = parsed;
+        self.projection_config_ready = false;
+        old.deinit();
+    }
+
+    pub fn markProjectionConfigReady(self: *Index) void {
+        self.projection_config_ready = true;
+    }
+
+    pub fn projectionConfigReady(self: *const Index) bool {
+        return self.projection_config_ready;
     }
 
     pub fn attachResourceManager(self: *Index, manager: *resource_manager_mod.ResourceManager) void {
@@ -4666,6 +5022,9 @@ pub const Index = struct {
             partials.deinit(self.alloc);
         }
 
+        const child_indexes = (try self.buildChildCardinalityIndexesAlloc(store, child_requests)) orelse return null;
+        defer self.freeChildCardinalityIndexes(child_indexes);
+
         for (ranges) |range| {
             const filter_json = try self.rangeCardinalityFilterJsonAlloc(field_or_path, kind, range);
             defer self.alloc.free(filter_json);
@@ -4685,12 +5044,8 @@ pub const Index = struct {
             const axis = try rangeCardinalityAxisAlloc(self.alloc, kind, range);
             defer self.alloc.free(axis);
             try self.appendDistributedCountPartial(&partials, axis, aggregation_name, @intCast(bucket_ids.len));
-            for (child_requests) |child| {
-                const child_partials = (try self.scanDistributedCardinalityPartialsForDocIds(store, child.name, child.field, bucket_ids)) orelse return null;
-                defer distributed_mod.freePartials(self.alloc, child_partials);
-                for (child_partials) |partial| {
-                    try self.appendDistributedPartialForAxis(&partials, axis, partial.metric, partial.law_id, partial.value);
-                }
+            for (child_requests, child_indexes) |child, *child_index| {
+                try self.appendBucketChildCardinalityPartials(&partials, axis, .raw, child.name, child_index, bucket_ids);
             }
         }
 
@@ -4777,8 +5132,10 @@ pub const Index = struct {
             buckets.deinit(self.alloc);
         }
 
+        var constraint_set = try DocIdConstraintSet.init(self.alloc, constraint_ids);
+        defer constraint_set.deinit(self.alloc);
         for (entries) |entry| {
-            if (!cardinalityDocMatchesConstraints(constraint_ids, entry.doc_id)) continue;
+            if (!constraint_set.matches(entry.doc_id)) continue;
             if (live_txn) |*txn| {
                 if (!try self.docVisibleAtGenerationTxn(txn, entry.doc_id, generation)) continue;
             }
@@ -4820,14 +5177,12 @@ pub const Index = struct {
             partials.deinit(self.alloc);
         }
 
+        const child_indexes = (try self.buildChildCardinalityIndexesAlloc(store, child_requests)) orelse return null;
+        defer self.freeChildCardinalityIndexes(child_indexes);
         for (buckets.items) |bucket| {
             try self.appendDistributedCountPartial(&partials, bucket.axis, aggregation_name, @intCast(bucket.doc_ids.items.len));
-            for (child_requests) |child| {
-                const child_partials = (try self.scanDistributedCardinalityPartialsForDocIds(store, child.name, child.field, bucket.doc_ids.items)) orelse return null;
-                defer distributed_mod.freePartials(self.alloc, child_partials);
-                for (child_partials) |partial| {
-                    try self.appendDistributedPartialForAxis(&partials, bucket.axis, partial.metric, partial.law_id, partial.value);
-                }
+            for (child_requests, child_indexes) |child, *child_index| {
+                try self.appendBucketChildCardinalityPartials(&partials, bucket.axis, .raw, child.name, child_index, bucket.doc_ids.items);
             }
         }
 
@@ -4960,6 +5315,8 @@ pub const Index = struct {
         if (kind == .date and !allow_datetime_string) return null;
         const prefix = try self.keyAlloc(&.{"pathfact"});
         defer self.alloc.free(prefix);
+        var constraint_set = try DocIdConstraintSet.init(self.alloc, constraint_ids);
+        defer constraint_set.deinit(self.alloc);
         var cursor = try txn.openCursor();
         defer cursor.close();
         var entry_opt = try cursor.seekAtOrAfter(prefix);
@@ -4967,7 +5324,7 @@ pub const Index = struct {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
             const doc_component = token.componentAt(entry.key, prefix.len) catch continue;
             if (doc_component.next != entry.key.len) continue;
-            if (!cardinalityDocMatchesConstraints(constraint_ids, doc_component.payload)) continue;
+            if (!constraint_set.matches(doc_component.payload)) continue;
             if (generation != null and !try self.docVisibleAtGenerationTxn(&txn, doc_component.payload, generation)) continue;
             var projection = pathfact_mod.decodeProjectionAlloc(self.alloc, entry.value) catch |err| switch (err) {
                 error.InvalidPathFactList => continue,
@@ -5011,14 +5368,12 @@ pub const Index = struct {
             }
             partials.deinit(self.alloc);
         }
+        const child_indexes = (try self.buildChildCardinalityIndexesAlloc(store, child_requests)) orelse return null;
+        defer self.freeChildCardinalityIndexes(child_indexes);
         for (buckets.items) |bucket| {
             try self.appendDistributedCountPartial(&partials, bucket.axis, aggregation_name, @intCast(bucket.doc_ids.items.len));
-            for (child_requests) |child| {
-                const child_partials = (try self.scanDistributedCardinalityPartialsForDocIds(store, child.name, child.field, bucket.doc_ids.items)) orelse return null;
-                defer distributed_mod.freePartials(self.alloc, child_partials);
-                for (child_partials) |partial| {
-                    try self.appendDistributedPartialForAxis(&partials, bucket.axis, partial.metric, partial.law_id, partial.value);
-                }
+            for (child_requests, child_indexes) |child, *child_index| {
+                try self.appendBucketChildCardinalityPartials(&partials, bucket.axis, .raw, child.name, child_index, bucket.doc_ids.items);
             }
         }
         return try partials.toOwnedSlice(self.alloc);
@@ -5075,8 +5430,10 @@ pub const Index = struct {
         if (generation != null) live_txn = try store.beginReadTxn();
         defer if (live_txn) |*txn| txn.abort();
 
+        var constraint_set = try DocIdConstraintSet.init(self.alloc, constraint_ids);
+        defer constraint_set.deinit(self.alloc);
         for (bucket_entries) |entry| {
-            if (!cardinalityDocMatchesConstraints(constraint_ids, entry.doc_id)) continue;
+            if (!constraint_set.matches(entry.doc_id)) continue;
             if (live_txn) |*txn| {
                 if (!try self.docVisibleAtGenerationTxn(txn, entry.doc_id, generation)) continue;
             }
@@ -5100,14 +5457,12 @@ pub const Index = struct {
             partials.deinit(self.alloc);
         }
 
+        const child_indexes = (try self.buildChildCardinalityIndexesAlloc(store, child_requests)) orelse return null;
+        defer self.freeChildCardinalityIndexes(child_indexes);
         for (buckets.items) |bucket| {
             try self.appendDistributedCountPartial(&partials, bucket.axis, terms_aggregation_name, @intCast(bucket.doc_ids.items.len));
-            for (child_requests) |child| {
-                const child_partials = (try self.scanDistributedCardinalityPartialsForDocIds(store, child.name, child.field, bucket.doc_ids.items)) orelse return null;
-                defer distributed_mod.freePartials(self.alloc, child_partials);
-                for (child_partials) |partial| {
-                    try self.appendDistributedPartialForAxis(&partials, bucket.axis, partial.metric, partial.law_id, partial.value);
-                }
+            for (child_requests, child_indexes) |child, *child_index| {
+                try self.appendBucketChildCardinalityPartials(&partials, bucket.axis, .raw, child.name, child_index, bucket.doc_ids.items);
             }
         }
 
@@ -5154,6 +5509,8 @@ pub const Index = struct {
         defer self.alloc.free(prefix);
         var txn = try store.beginReadTxn();
         defer txn.abort();
+        var constraint_set = try DocIdConstraintSet.init(self.alloc, constraint_ids);
+        defer constraint_set.deinit(self.alloc);
         var cursor = try txn.openCursor();
         defer cursor.close();
         var entry_opt = try cursor.seekAtOrAfter(prefix);
@@ -5161,7 +5518,7 @@ pub const Index = struct {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
             const doc_component = token.componentAt(entry.key, prefix.len) catch continue;
             if (doc_component.next != entry.key.len) continue;
-            if (!cardinalityDocMatchesConstraints(constraint_ids, doc_component.payload)) continue;
+            if (!constraint_set.matches(doc_component.payload)) continue;
             if (generation != null and !try self.docVisibleAtGenerationTxn(&txn, doc_component.payload, generation)) continue;
             var projection = pathfact_mod.decodeProjectionAlloc(self.alloc, entry.value) catch |err| switch (err) {
                 error.InvalidPathFactList => continue,
@@ -5194,20 +5551,184 @@ pub const Index = struct {
             }
             partials.deinit(self.alloc);
         }
+        const child_indexes = (try self.buildChildCardinalityIndexesAlloc(store, child_requests)) orelse return null;
+        defer self.freeChildCardinalityIndexes(child_indexes);
         for (buckets.items) |bucket| {
             const count_value = try algebra.encodeI64Alloc(self.alloc, @intCast(bucket.doc_ids.items.len));
             defer self.alloc.free(count_value);
             try self.appendDistributedPartialForCanonicalAxis(&partials, bucket.axis, terms_aggregation_name, .count, count_value);
-            for (child_requests) |child| {
-                const child_partials = (try self.scanDistributedCardinalityPartialsForDocIds(store, child.name, child.field, bucket.doc_ids.items)) orelse return null;
-                defer distributed_mod.freePartials(self.alloc, child_partials);
-                for (child_partials) |partial| {
-                    try self.appendDistributedPartialForCanonicalAxis(&partials, bucket.axis, partial.metric, partial.law_id, partial.value);
-                }
+            for (child_requests, child_indexes) |child, *child_index| {
+                try self.appendBucketChildCardinalityPartials(&partials, bucket.axis, .canonical, child.name, child_index, bucket.doc_ids.items);
             }
         }
 
         return try partials.toOwnedSlice(self.alloc);
+    }
+
+    // Per-document index of distinct cardinality value-keys for one child
+    // field, populated with a single cursor scan over that field. Bucketed
+    // cardinality (histogram / range / terms children) used to re-scan the
+    // entire child field once per bucket; with this index we scan once and look
+    // up each bucket's documents, turning O(buckets * field_entries) into
+    // O(field_entries + total_bucket_members).
+    const ChildCardinalityIndex = struct {
+        by_doc: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]u8)) = .empty,
+
+        fn deinit(self: *ChildCardinalityIndex, alloc: Allocator) void {
+            var it = self.by_doc.iterator();
+            while (it.next()) |entry| {
+                for (entry.value_ptr.items) |value_key| alloc.free(value_key);
+                entry.value_ptr.deinit(alloc);
+                alloc.free(entry.key_ptr.*);
+            }
+            self.by_doc.deinit(alloc);
+            self.* = .{};
+        }
+
+        fn add(self: *ChildCardinalityIndex, alloc: Allocator, doc_id: []const u8, value_key: []const u8) !void {
+            const gop = try self.by_doc.getOrPut(alloc, doc_id);
+            if (!gop.found_existing) {
+                errdefer _ = self.by_doc.remove(doc_id);
+                gop.key_ptr.* = try alloc.dupe(u8, doc_id);
+                gop.value_ptr.* = .empty;
+            }
+            for (gop.value_ptr.items) |existing| {
+                if (std.mem.eql(u8, existing, value_key)) return;
+            }
+            try gop.value_ptr.append(alloc, try alloc.dupe(u8, value_key));
+        }
+
+        fn valuesFor(self: *const ChildCardinalityIndex, doc_id: []const u8) []const []u8 {
+            const entry = self.by_doc.getPtr(doc_id) orelse return &.{};
+            return entry.items;
+        }
+    };
+
+    fn buildChildCardinalityIndexAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        field_or_path: []const u8,
+    ) !?ChildCardinalityIndex {
+        var index = ChildCardinalityIndex{};
+        errdefer index.deinit(self.alloc);
+        if (isExplicitJsonPointerPath(field_or_path)) {
+            try self.collectPathCardinalityValuesByDoc(store, field_or_path, &index);
+        } else {
+            const field = self.uniqueExistingFactField(field_or_path) orelse return null;
+            try self.collectDocFactCardinalityValuesByDoc(store, field, &index);
+        }
+        return index;
+    }
+
+    // Builds one ChildCardinalityIndex per child request. Returns null (so the
+    // caller falls back to a document scan) if any child field is unsupported,
+    // mirroring the per-bucket scanDistributedCardinalityPartialsForDocIds path.
+    fn buildChildCardinalityIndexesAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        child_requests: []const CardinalityChildRequest,
+    ) !?[]ChildCardinalityIndex {
+        const indexes = try self.alloc.alloc(ChildCardinalityIndex, child_requests.len);
+        var built: usize = 0;
+        errdefer {
+            for (indexes[0..built]) |*index| index.deinit(self.alloc);
+            self.alloc.free(indexes);
+        }
+        for (child_requests, 0..) |child, i| {
+            indexes[i] = (try self.buildChildCardinalityIndexAlloc(store, child.field)) orelse return null;
+            built = i + 1;
+        }
+        return indexes;
+    }
+
+    fn freeChildCardinalityIndexes(self: *Index, indexes: []ChildCardinalityIndex) void {
+        for (indexes) |*index| index.deinit(self.alloc);
+        self.alloc.free(indexes);
+    }
+
+    fn collectDocFactCardinalityValuesByDoc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        field: ExistsFieldSpec,
+        index: *ChildCardinalityIndex,
+    ) !void {
+        const prefix = try self.docFactScalarFieldPrefixAlloc(field.role, field.field);
+        defer self.alloc.free(prefix);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const scalar_component = token.componentAt(entry.key, prefix.len) catch continue;
+            const doc_component = token.componentAt(entry.key, scalar_component.next) catch continue;
+            if (doc_component.next != entry.key.len) continue;
+            try index.add(self.alloc, doc_component.payload, scalar_component.payload);
+        }
+    }
+
+    fn collectPathCardinalityValuesByDoc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        path: []const u8,
+        index: *ChildCardinalityIndex,
+    ) !void {
+        const prefix = try self.pathLookupPathPrefixAlloc(path);
+        defer self.alloc.free(prefix);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const kind_component = token.componentAt(entry.key, prefix.len) catch continue;
+            if (!pathLookupKindIsScalarValue(kind_component.payload)) continue;
+            const value_component = token.componentAt(entry.key, kind_component.next) catch continue;
+            const doc_component = token.componentAt(entry.key, value_component.next) catch continue;
+            if (doc_component.next != entry.key.len) continue;
+            const value_key = try token.canonicalTupleAlloc(self.alloc, &.{ kind_component.payload, value_component.payload });
+            defer self.alloc.free(value_key);
+            try index.add(self.alloc, doc_component.payload, value_key);
+        }
+    }
+
+    const BucketAxisKind = enum { raw, canonical };
+
+    // Emits the distinct-value cardinality partials for one bucket and child,
+    // reproducing scanDistributedCardinalityPartialsForDocIds + the parent's
+    // re-wrap of each child partial, but sourced from a prebuilt
+    // ChildCardinalityIndex instead of a fresh per-bucket field scan. The
+    // `axis_kind` selects whether the bucket axis still needs canonical-tuple
+    // wrapping (raw) or is already canonical (path-terms buckets).
+    fn appendBucketChildCardinalityPartials(
+        self: *Index,
+        partials: *std.ArrayListUnmanaged(distributed_mod.Partial),
+        axis: []const u8,
+        axis_kind: BucketAxisKind,
+        child_name: []const u8,
+        child_index: *const ChildCardinalityIndex,
+        bucket_doc_ids: []const []const u8,
+    ) !void {
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        defer seen.deinit(self.alloc);
+        for (bucket_doc_ids) |doc_id| {
+            for (child_index.valuesFor(doc_id)) |value_key| {
+                const gop = try seen.getOrPut(self.alloc, value_key);
+                if (gop.found_existing) continue;
+                // `value_key` is owned by child_index, which outlives `seen`.
+                gop.key_ptr.* = value_key;
+                const metric = try token.canonicalTupleAlloc(self.alloc, &.{ "cardinality:v1", child_name, value_key });
+                defer self.alloc.free(metric);
+                const value = try algebra.encodeI64Alloc(self.alloc, 1);
+                defer self.alloc.free(value);
+                switch (axis_kind) {
+                    .raw => try self.appendDistributedPartialForAxis(partials, axis, metric, .count, value),
+                    .canonical => try self.appendDistributedPartialForCanonicalAxis(partials, axis, metric, .count, value),
+                }
+            }
+        }
     }
 
     pub fn scanDistributedCardinalityPartialsForDocIds(
@@ -5354,13 +5875,15 @@ pub const Index = struct {
         defer txn.abort();
         var cursor = try txn.openCursor();
         defer cursor.close();
+        var constraint_set = try DocIdConstraintSet.init(self.alloc, constraint_ids);
+        defer constraint_set.deinit(self.alloc);
         var entry_opt = try cursor.seekAtOrAfter(prefix);
         while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
             const scalar_component = token.componentAt(entry.key, prefix.len) catch continue;
             const doc_component = token.componentAt(entry.key, scalar_component.next) catch continue;
             if (doc_component.next != entry.key.len) continue;
-            if (!cardinalityDocMatchesConstraints(constraint_ids, doc_component.payload)) continue;
+            if (!constraint_set.matches(doc_component.payload)) continue;
             const gop = try values.getOrPut(self.alloc, scalar_component.payload);
             if (!gop.found_existing) gop.key_ptr.* = try self.alloc.dupe(u8, scalar_component.payload);
         }
@@ -5380,13 +5903,15 @@ pub const Index = struct {
         defer txn.abort();
         var cursor = try txn.openCursor();
         defer cursor.close();
+        var constraint_set = try DocIdConstraintSet.init(self.alloc, constraint_ids);
+        defer constraint_set.deinit(self.alloc);
         var entry_opt = try cursor.seekAtOrAfter(prefix);
         while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
             const scalar_component = token.componentAt(entry.key, prefix.len) catch continue;
             const doc_component = token.componentAt(entry.key, scalar_component.next) catch continue;
             if (doc_component.next != entry.key.len) continue;
-            if (!cardinalityDocMatchesConstraints(constraint_ids, doc_component.payload)) continue;
+            if (!constraint_set.matches(doc_component.payload)) continue;
             if (!try self.docVisibleAtGenerationTxn(&txn, doc_component.payload, generation)) continue;
             const gop = try values.getOrPut(self.alloc, scalar_component.payload);
             if (!gop.found_existing) gop.key_ptr.* = try self.alloc.dupe(u8, scalar_component.payload);
@@ -5439,6 +5964,8 @@ pub const Index = struct {
         defer txn.abort();
         var cursor = try txn.openCursor();
         defer cursor.close();
+        var constraint_set = try DocIdConstraintSet.init(self.alloc, constraint_ids);
+        defer constraint_set.deinit(self.alloc);
         var entry_opt = try cursor.seekAtOrAfter(prefix);
         while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
@@ -5447,7 +5974,7 @@ pub const Index = struct {
             const value_component = token.componentAt(entry.key, kind_component.next) catch continue;
             const doc_component = token.componentAt(entry.key, value_component.next) catch continue;
             if (doc_component.next != entry.key.len) continue;
-            if (!cardinalityDocMatchesConstraints(constraint_ids, doc_component.payload)) continue;
+            if (!constraint_set.matches(doc_component.payload)) continue;
             const value_key = try token.canonicalTupleAlloc(self.alloc, &.{ kind_component.payload, value_component.payload });
             const gop = try values.getOrPut(self.alloc, value_key);
             if (gop.found_existing) {
@@ -5472,6 +5999,8 @@ pub const Index = struct {
         defer txn.abort();
         var cursor = try txn.openCursor();
         defer cursor.close();
+        var constraint_set = try DocIdConstraintSet.init(self.alloc, constraint_ids);
+        defer constraint_set.deinit(self.alloc);
         var entry_opt = try cursor.seekAtOrAfter(prefix);
         while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
@@ -5480,7 +6009,7 @@ pub const Index = struct {
             const value_component = token.componentAt(entry.key, kind_component.next) catch continue;
             const doc_component = token.componentAt(entry.key, value_component.next) catch continue;
             if (doc_component.next != entry.key.len) continue;
-            if (!cardinalityDocMatchesConstraints(constraint_ids, doc_component.payload)) continue;
+            if (!constraint_set.matches(doc_component.payload)) continue;
             if (!try self.docVisibleAtGenerationTxn(&txn, doc_component.payload, generation)) continue;
             const value_key = try token.canonicalTupleAlloc(self.alloc, &.{ kind_component.payload, value_component.payload });
             const gop = try values.getOrPut(self.alloc, value_key);
@@ -5638,13 +6167,38 @@ pub const Index = struct {
             std.mem.eql(u8, kind, "string");
     }
 
-    fn cardinalityDocMatchesConstraints(constraint_ids: []const []const u8, doc_id: []const u8) bool {
-        if (constraint_ids.len == 0) return true;
-        for (constraint_ids) |candidate| {
-            if (std.mem.eql(u8, candidate, doc_id)) return true;
+    // Membership view over a doc-id constraint slice. The slice owns the keys;
+    // this set only borrows them, so it must not outlive `constraint_ids`.
+    //
+    // The cardinality scans below walk the full doc-fact/path-fact prefix for a
+    // field and test each entry against the active constraint set. When that
+    // set is a bucket's doc-id list (histogram/range children) or a constraint
+    // result set (root cardinality), a linear membership test makes the scan
+    // O(entries * constraints), which is quadratic in the document count. A hash
+    // set turns each test into O(1) and the scan back into a single linear pass.
+    const DocIdConstraintSet = struct {
+        set: std.StringHashMapUnmanaged(void) = .empty,
+        active: bool = false,
+
+        fn init(alloc: Allocator, constraint_ids: []const []const u8) !DocIdConstraintSet {
+            if (constraint_ids.len == 0) return .{};
+            var set = std.StringHashMapUnmanaged(void).empty;
+            errdefer set.deinit(alloc);
+            try set.ensureTotalCapacity(alloc, @intCast(constraint_ids.len));
+            for (constraint_ids) |id| set.putAssumeCapacity(id, {});
+            return .{ .set = set, .active = true };
         }
-        return false;
-    }
+
+        fn deinit(self: *DocIdConstraintSet, alloc: Allocator) void {
+            self.set.deinit(alloc);
+            self.* = .{};
+        }
+
+        fn matches(self: *const DocIdConstraintSet, doc_id: []const u8) bool {
+            if (!self.active) return true;
+            return self.set.contains(doc_id);
+        }
+    };
 
     pub fn rawMetricForResolvedDocIdsAlloc(self: *Index, store: *docstore_mod.DocStore, op: algebra.Op, resolved: ResolvedMeasureField, doc_ids: []const []const u8) !?[]u8 {
         if (op == .count) {
@@ -11707,10 +12261,9 @@ pub const Index = struct {
     }
 
     pub fn plannerLifecycleReady(self: *const Index) bool {
+        if (self.projection_config_ready) return true;
         const status_value = self.config().capability_lifecycle_status;
-        return status_value.len == 0 or
-            std.mem.eql(u8, status_value, "current") or
-            std.mem.eql(u8, status_value, "compatible_additive");
+        return capabilityLifecycleStatusReady(status_value);
     }
 
     pub fn plannerLifecycleBlockingReason(self: *const Index) ?[]const u8 {
@@ -14091,7 +14644,66 @@ pub const Index = struct {
                 if (fieldMatchesQuery(field, query_field)) return field;
             }
         }
-        return null;
+        return self.dynamicFieldConfig(query_field, class);
+    }
+
+    /// Resolve a query field that is not statically declared but matches a
+    /// dynamic template, so group/measure/time queries over template-promoted
+    /// fields route to the algebraic sidecar. The synthesized config keys facts
+    /// by the full query path (matching the ingest-time fact identity).
+    ///
+    /// Lifetime: the returned `name`/`path` alias the caller's `query_field`
+    /// (unlike the static path, whose slices are config-owned). This is safe
+    /// because every consumer is query-scoped — `resolveField` already borrows
+    /// `query_field` into `ResolvedField.public`, and the planner copies the
+    /// field name into owned canonical metadata tuples
+    /// (`termsCardinalityPartialsMetadataAlloc` / `docFactBucketFoldMetadataAlloc`
+    /// via `token.canonicalTupleAlloc`) rather than retaining the borrow. Do not
+    /// stash a resolved dynamic field's name/path beyond the query that produced
+    /// `query_field`.
+    fn dynamicFieldConfig(self: *const Index, query_field: []const u8, class: FieldClass) ?FieldConfig {
+        const cfg = self.config();
+        const rules = cfg.dynamic_field_rules;
+        if (rules.len == 0) return null;
+        // While a dynamic-rule backfill is pending, existing documents have not
+        // been re-projected through the current rules, so resolving a dynamic
+        // field here would route aggregations to facts covering only the
+        // post-change subset. Withhold resolution so such queries fall back to a
+        // complete scan; static fields keep accelerating.
+        if (cfg.dynamic_rules_backfill_pending and !self.projection_config_ready) return null;
+        const field_name = fieldNameFromQueryPath(query_field);
+        // Resolve a dynamic field's type only when every rule whose name/path
+        // selector matches it AGREES on the scalar type. Ingest projects the
+        // first selector-matching rule's type, so a single matching rule (or
+        // several that agree) gives query the exact type ingest stored. When
+        // matching rules disagree (overlapping globs with different types, or a
+        // `match_mapping_type` rule whose applicability is value-dependent and
+        // unknowable here), we cannot know which type ingest stored per document,
+        // so we decline resolution and let the query fall back to a complete scan
+        // rather than read a type that may only cover part of the documents.
+        var resolved_type: ?[]const u8 = null;
+        for (rules) |rule| {
+            if (!dynamicRuleNamePathMatches(rule, query_field, field_name)) continue;
+            // `match_mapping_type` makes applicability value-dependent. Query
+            // resolution has no value, so it must treat any such candidate as
+            // ambiguous instead of silently selecting a later fallback rule.
+            if (rule.match_mapping_type != null) return null;
+            if (resolved_type) |t| {
+                if (!std.mem.eql(u8, t, rule.type)) return null; // ambiguous
+            } else {
+                resolved_type = rule.type;
+            }
+        }
+        const rule_type = resolved_type orelse return null;
+        const mask = dynamicRuleRoleMask(rule_type);
+        const matches_class = switch (class) {
+            .group => mask & role_group != 0,
+            .measure => mask & role_measure != 0,
+            .time => mask & role_time != 0,
+            .any => mask != 0,
+        };
+        if (!matches_class) return null;
+        return .{ .name = query_field, .path = query_field, .type = rule_type };
     }
 
     pub fn resolveField(self: *const Index, query_field: []const u8, class: FieldClass) ?ResolvedField {
@@ -15072,9 +15684,7 @@ pub const Index = struct {
         defer parsed.deinit();
         if (parsed.value != .object) return false;
 
-        const specs = try self.factSpecsAlloc();
-        defer self.alloc.free(specs);
-        var new_facts = try fact_mod.projectDocumentAlloc(self.alloc, specs, parsed.value);
+        var new_facts = try self.projectAllDocFactsAlloc(parsed.value);
         defer new_facts.deinit(self.alloc);
         const new_fact_payload = try fact_mod.encodeListAlloc(self.alloc, new_facts.facts);
         defer self.alloc.free(new_fact_payload);
@@ -15126,13 +15736,40 @@ pub const Index = struct {
         return true;
     }
 
+    /// Project both the statically-declared docfacts and any dynamic
+    /// template-matched docfacts for a document into a single fact list. This is
+    /// the one place ingest derives typed facts so the fresh-write and coalesced-
+    /// update paths stay byte-for-byte consistent in the stored docfact row.
+    fn projectAllDocFactsAlloc(self: *Index, root: std.json.Value) !fact_mod.FactList {
+        const specs = try self.factSpecsAlloc();
+        defer self.alloc.free(specs);
+        var facts = try fact_mod.projectDocumentAlloc(self.alloc, specs, root);
+        errdefer facts.deinit(self.alloc);
+
+        const rules = self.config().dynamic_field_rules;
+        if (rules.len == 0) return facts;
+
+        var dynamic = try projectDynamicDocFactsAlloc(self.alloc, rules, specs, root);
+        defer dynamic.deinit(self.alloc);
+        if (dynamic.facts.len == 0) return facts;
+
+        const combined = try self.alloc.alloc(fact_mod.Fact, facts.facts.len + dynamic.facts.len);
+        @memcpy(combined[0..facts.facts.len], facts.facts);
+        @memcpy(combined[facts.facts.len..], dynamic.facts);
+        // Element ownership transfers into `combined`; free only the backing
+        // slices and neutralize the sources so their deinits are no-ops.
+        if (facts.facts.len > 0) self.alloc.free(facts.facts);
+        if (dynamic.facts.len > 0) self.alloc.free(dynamic.facts);
+        dynamic.facts = &.{};
+        facts.facts = combined;
+        return facts;
+    }
+
     fn writeDocFacts(self: *Index, txn: anytype, doc_key: []const u8, value: []const u8, maintenance_context: ?*BatchMaintenanceContext) !void {
         var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, value, .{}) catch return;
         defer parsed.deinit();
         if (parsed.value != .object) return;
-        const specs = try self.factSpecsAlloc();
-        defer self.alloc.free(specs);
-        var facts = try fact_mod.projectDocumentAlloc(self.alloc, specs, parsed.value);
+        var facts = try self.projectAllDocFactsAlloc(parsed.value);
         defer facts.deinit(self.alloc);
         const encoded = try fact_mod.encodeListAlloc(self.alloc, facts.facts);
         defer self.alloc.free(encoded);
@@ -19285,6 +19922,321 @@ test "algebraic index stores schemaless path facts and lookup rows" {
         else => return err,
     };
     deleted_txn.abort();
+}
+
+fn factHasField(facts: []const fact_mod.Fact, role: fact_mod.Role, field: []const u8) bool {
+    for (facts) |f| {
+        if (f.role == role and std.mem.eql(u8, f.field, field)) return true;
+    }
+    return false;
+}
+
+test "algebraic dynamic templates project typed docfacts without a schema rebuild" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    // Explicit `tenant` group field plus three dynamic-template rules. The
+    // `tenant` rule (number) must lose to the explicit string field; `*_id`
+    // and `metrics.*` promote unknown fields into typed facts at ingest.
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "events",
+        \\  "group_fields": [{"name":"tenant","path":"tenant","type":"string"}],
+        \\  "dynamic_field_rules": [
+        \\    {"name":"explicit_loses","match":"tenant","type":"number"},
+        \\    {"name":"ids","match":"*_id","type":"string"},
+        \\    {"name":"metrics","path_match":"metrics.*","type":"number"}
+        \\  ]
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg_dyn_templates", cfg);
+    defer idx.close();
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "e1", .action = .upsert, .cleaned_value = "{\"tenant\":\"t1\",\"user_id\":\"u42\",\"metrics\":{\"latency\":12}}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+
+    const fact_key = try idx.docFactKey("e1");
+    defer alloc.free(fact_key);
+    var read_txn = try store.beginReadTxn();
+    const payload = try read_txn.get(fact_key);
+    var facts = try fact_mod.decodeListAlloc(alloc, payload);
+    read_txn.abort();
+    defer facts.deinit(alloc);
+
+    // Explicit field wins: tenant is a string group fact, never a number measure.
+    try std.testing.expect(factHasField(facts.facts, .group, "tenant"));
+    try std.testing.expect(!factHasField(facts.facts, .measure, "tenant"));
+    // `user_id` matched `*_id` -> string group fact keyed by its path.
+    try std.testing.expect(factHasField(facts.facts, .group, "user_id"));
+    try std.testing.expect(!factHasField(facts.facts, .measure, "user_id"));
+    // Nested `metrics.latency` matched `metrics.*` -> numeric group + measure.
+    try std.testing.expect(factHasField(facts.facts, .group, "metrics.latency"));
+    try std.testing.expect(factHasField(facts.facts, .measure, "metrics.latency"));
+
+    // Overwriting the document removes stale dynamic facts (symmetric cleanup
+    // through the coalesced update path).
+    const overwrite = [_]derived_types.DerivedDocument{
+        .{ .key = "e1", .action = .upsert, .cleaned_value = "{\"tenant\":\"t1\",\"session_id\":\"s7\"}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = overwrite[0..] });
+    var read_txn2 = try store.beginReadTxn();
+    const payload2 = try read_txn2.get(fact_key);
+    var facts2 = try fact_mod.decodeListAlloc(alloc, payload2);
+    read_txn2.abort();
+    defer facts2.deinit(alloc);
+    try std.testing.expect(!factHasField(facts2.facts, .group, "user_id"));
+    try std.testing.expect(!factHasField(facts2.facts, .group, "metrics.latency"));
+    try std.testing.expect(factHasField(facts2.facts, .group, "session_id"));
+}
+
+test "algebraic reloadConfigJson applies new dynamic template rules to live writes" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg_v1 =
+        \\{"version":1,"table":"events","dynamic_field_rules":[{"name":"score","match":"score","type":"string"}]}
+    ;
+    var idx = try Index.open(alloc, "alg_reload", cfg_v1);
+    defer idx.close();
+
+    const doc_v1 = [_]derived_types.DerivedDocument{
+        .{ .key = "e1", .action = .upsert, .cleaned_value = "{\"score\":42}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = doc_v1[0..] });
+
+    // Template-only change: `score` is now numeric (group + measure) instead of
+    // string. Reload the config in place, then write a new document.
+    const cfg_v2 =
+        \\{"version":1,"table":"events","dynamic_field_rules":[{"name":"score","match":"score","type":"number"}]}
+    ;
+    try idx.reloadConfigJson(cfg_v2);
+
+    const doc_v2 = [_]derived_types.DerivedDocument{
+        .{ .key = "e2", .action = .upsert, .cleaned_value = "{\"score\":7}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = doc_v2[0..] });
+
+    const fact_key = try idx.docFactKey("e2");
+    defer alloc.free(fact_key);
+    var read_txn = try store.beginReadTxn();
+    const payload = try read_txn.get(fact_key);
+    var facts = try fact_mod.decodeListAlloc(alloc, payload);
+    read_txn.abort();
+    defer facts.deinit(alloc);
+
+    // The new write uses the refreshed numeric rule => measure fact present.
+    try std.testing.expect(factHasField(facts.facts, .measure, "score"));
+    try std.testing.expect(factHasField(facts.facts, .group, "score"));
+}
+
+test "algebraic dynamic template fields resolve and aggregate at query time" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{"version":1,"table":"events","dynamic_field_rules":[
+        \\  {"name":"ids","match":"*_id","type":"string"},
+        \\  {"name":"score","match":"score","type":"number"}
+        \\]}
+    ;
+    var idx = try Index.open(alloc, "alg_dyn_query", cfg);
+    defer idx.close();
+
+    // Query-time field resolution now recognizes template-promoted fields so the
+    // planner routes group/measure queries over them to the sidecar.
+    try std.testing.expect(idx.resolveField("user_id", .group) != null);
+    try std.testing.expectEqualStrings("string", idx.fieldConfig("user_id", .group).?.type);
+    try std.testing.expect(idx.resolveField("score", .measure) != null);
+    try std.testing.expectEqualStrings("number", idx.fieldConfig("score", .measure).?.type);
+    // A field matching no template is not algebraic, and a string field is not a
+    // measure (only numeric templates resolve as measures).
+    try std.testing.expect(idx.fieldConfig("unmatched", .group) == null);
+    try std.testing.expect(idx.fieldConfig("user_id", .measure) == null);
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "e1", .action = .upsert, .cleaned_value = "{\"user_id\":\"u1\",\"score\":10}" },
+        .{ .key = "e2", .action = .upsert, .cleaned_value = "{\"user_id\":\"u1\",\"score\":20}" },
+        .{ .key = "e3", .action = .upsert, .cleaned_value = "{\"user_id\":\"u2\",\"score\":5}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+
+    // Terms count grouped by the dynamic `user_id` field, executed through the
+    // docfact fold scan the planner routes to once the field resolves.
+    const fold = DocFactBucketFoldRequest{
+        .kind = .terms,
+        .op = .count,
+        .bucket_field = "user_id",
+        .bucket_role = .group,
+    };
+    const metadata = try docFactBucketFoldMetadataAlloc(alloc, fold);
+    defer alloc.free(metadata);
+    const access_paths = [_]ir.PhysicalAccessPath{ir.docFactAccessPath(idx.name)};
+    const steps = [_]ir.TensorProgramStep{
+        .{ .expr = .{
+            .fragment = .slice,
+            .output_dims = &.{ .doc, .field, .scalar },
+            .owner = idx.name,
+            .layout = .docfact_rows,
+        } },
+        .{
+            .expr = .{
+                .fragment = .reduce,
+                .input_dims = &.{ .doc, .field, .scalar },
+                .output_dims = &distributed_bucket_scalar_output_dims,
+                .semantic_id = "by_user",
+                .law_id = .count,
+                .metadata = metadata,
+            },
+            .inputs = &.{.{ .step = 0 }},
+        },
+    };
+    const program = ir.TensorProgram{ .steps = steps[0..], .output = .{ .step = 1 } };
+    const entries = (try idx.scanDocFactBucketFoldEntriesWithTensorProgram(&store, fold, access_paths[0..], program, .{ .step = 1 })) orelse return error.TestUnexpectedResult;
+    defer {
+        for (entries) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    var u1_count: ?[]const u8 = null;
+    var u2_count: ?[]const u8 = null;
+    for (entries) |entry| {
+        if (std.mem.indexOf(u8, entry.group_key, "u1") != null) u1_count = entry.value;
+        if (std.mem.indexOf(u8, entry.group_key, "u2") != null) u2_count = entry.value;
+    }
+    try std.testing.expectEqualStrings("2", u1_count orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings("1", u2_count orelse return error.TestUnexpectedResult);
+}
+
+test "algebraic withholds dynamic field resolution while backfill pending" {
+    const alloc = std.testing.allocator;
+    // Same rules; the only difference is the backfill-pending flag. While pending,
+    // dynamic-template fields must not resolve (queries fall back to a complete
+    // scan) so aggregates are never computed over a partial post-change subset.
+    const ready_cfg =
+        \\{"version":1,"table":"events","dynamic_field_rules":[{"name":"ids","match":"*_id","type":"string"}]}
+    ;
+    var ready = try Index.open(alloc, "alg_ready", ready_cfg);
+    defer ready.close();
+    try std.testing.expect(ready.resolveField("user_id", .group) != null);
+
+    const pending_cfg =
+        \\{"version":1,"table":"events","dynamic_rules_backfill_pending":true,"dynamic_field_rules":[{"name":"ids","match":"*_id","type":"string"}]}
+    ;
+    var pending = try Index.open(alloc, "alg_pending", pending_cfg);
+    defer pending.close();
+    try std.testing.expect(pending.resolveField("user_id", .group) == null);
+    try std.testing.expect(pending.fieldConfig("user_id", .group) == null);
+    pending.markProjectionConfigReady();
+    try std.testing.expect(pending.resolveField("user_id", .group) != null);
+}
+
+test "algebraic dynamic template rebuild proof releases static lifecycle gate" {
+    const alloc = std.testing.allocator;
+    var idx = try Index.open(alloc, "alg_rebuilt",
+        \\{"version":1,"table":"events","capability_lifecycle_status":"rebuild_required","dynamic_rules_backfill_pending":true,"dynamic_field_rules":[{"name":"ids","match":"*_id","type":"string"}]}
+    );
+    defer idx.close();
+    try std.testing.expect(!idx.plannerLifecycleReady());
+    try std.testing.expect(idx.resolveField("user_id", .group) == null);
+    idx.markProjectionConfigReady();
+    try std.testing.expect(idx.plannerLifecycleReady());
+    try std.testing.expect(idx.resolveField("user_id", .group) != null);
+}
+
+test "algebraic config rejects dynamic rule without a name or path selector" {
+    const alloc = std.testing.allocator;
+    // A match_mapping_type-only rule can be evaluated at ingest but never at query
+    // time, so it must be rejected to keep ingest and query symmetric.
+    try std.testing.expectError(error.InvalidAlgebraicConfig, Index.open(alloc, "bad",
+        \\{"version":1,"table":"events","dynamic_field_rules":[{"name":"dates","match_mapping_type":"date","type":"datetime"}]}
+    ));
+    // An unmatch-only rule (no positive selector) is likewise rejected.
+    try std.testing.expectError(error.InvalidAlgebraicConfig, Index.open(alloc, "bad",
+        \\{"version":1,"table":"events","dynamic_field_rules":[{"name":"x","unmatch":"skip_*","type":"keyword"}]}
+    ));
+}
+
+test "algebraic dynamic field resolution agrees with ingest under overlapping rules" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    // Two overlapping rules match `score` with DIFFERENT types. Ingest projects
+    // the first matching rule (number); query-time resolution must DECLINE
+    // (ambiguous) rather than resolve to a type that may disagree with what
+    // ingest stored — otherwise aggregates would decode the wrong scalar type.
+    // A non-overlapping field (`region`) still resolves cleanly.
+    const cfg =
+        \\{"version":1,"table":"events","dynamic_field_rules":[
+        \\  {"name":"score_num","match":"score","type":"number"},
+        \\  {"name":"score_str","match":"score","type":"string"},
+        \\  {"name":"region","match":"region","type":"string"}
+        \\]}
+    ;
+    var idx = try Index.open(alloc, "alg_overlap", cfg);
+    defer idx.close();
+
+    // Ambiguous field: no resolution for any class.
+    try std.testing.expect(idx.fieldConfig("score", .group) == null);
+    try std.testing.expect(idx.fieldConfig("score", .measure) == null);
+    try std.testing.expect(idx.resolveField("score", .group) == null);
+    // Unambiguous field still resolves.
+    const region = idx.fieldConfig("region", .group) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("string", region.type);
+
+    // Ingest projects the first matching rule's type (number) for `score`.
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "e1", .action = .upsert, .cleaned_value = "{\"score\":10,\"region\":\"us\"}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    const fact_key = try idx.docFactKey("e1");
+    defer alloc.free(fact_key);
+    var read_txn = try store.beginReadTxn();
+    const payload = try read_txn.get(fact_key);
+    var facts = try fact_mod.decodeListAlloc(alloc, payload);
+    read_txn.abort();
+    defer facts.deinit(alloc);
+    // The number rule produces a measure fact; a string rule never would, so the
+    // presence of a `score` measure fact confirms ingest stored it number-typed
+    // (the first matching rule), consistent with query declining the ambiguity.
+    try std.testing.expect(factHasField(facts.facts, .measure, "score"));
+    try std.testing.expect(factHasField(facts.facts, .group, "score"));
+}
+
+test "algebraic dynamic template query declines value-dependent overlap" {
+    const alloc = std.testing.allocator;
+    var idx = try Index.open(alloc, "alg_mapping_overlap",
+        \\{"version":1,"table":"events","dynamic_field_rules":[
+        \\  {"name":"numeric","match":"value","match_mapping_type":"number","type":"number"},
+        \\  {"name":"fallback","match":"value","type":"string"}
+        \\]}
+    );
+    defer idx.close();
+
+    // Ingest may select `numeric` for one document and `fallback` for another.
+    // Query has no value with which to choose, so resolving as the fallback
+    // string type would encode constraints differently from numeric docfacts.
+    try std.testing.expect(idx.fieldConfig("value", .group) == null);
+    try std.testing.expect(idx.resolveField("value", .group) == null);
 }
 
 test "algebraic path profile recomputes max string token count after deleting max row" {
