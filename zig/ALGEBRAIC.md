@@ -2375,3 +2375,15 @@ The planner uses a matching, current sketch when the query shape permits it and
 otherwise falls back to the exact distinct scan. Deletes and overwrites mark
 affected groups dirty; the durable maintenance lane rebuilds those sketches in
 the background.
+
+Array-valued group and value fields use set semantics. A document contributes
+every distinct value to every distinct Cartesian group tuple, while duplicate
+array elements do not inflate the sketch. `mode: exact` always bypasses HLL;
+`mode: approximate` fails explicitly when no current matching sketch exists;
+and `mode: auto` may fall back to an exact scan.
+
+Adaptively promoted sketches share `max_auto_materializations_per_index` with
+other adaptive materializations. Their initial backfill is durable and resumes
+after restart, processing no more than `max_backfill_rows_per_tick` document
+facts per maintenance tick. Reads continue using the exact path until the
+backfill cursor and any concurrent-mutation repair markers commit as complete.
