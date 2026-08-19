@@ -514,6 +514,51 @@ fn addLocalOpenApiCodegen(
     return exe;
 }
 
+fn addLocalYaccCodegen(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Step.Compile {
+    const yacc_mod = b.createModule(.{
+        .root_source_file = b.path("lib/yacc/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const exe = b.addExecutable(.{
+        .name = "yacc-zig",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/yacc/src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    exe.root_module.addImport("yacc", yacc_mod);
+    return exe;
+}
+
+fn addYaccSteps(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    const yacc_codegen = addLocalYaccCodegen(b, target, optimize);
+    const install_yacc_codegen = b.addInstallArtifact(yacc_codegen, .{});
+    const yacc_codegen_step = b.step("yacc-zig", "Build and install the standalone Zig yacc generator");
+    yacc_codegen_step.dependOn(&install_yacc_codegen.step);
+
+    const yacc_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/yacc/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_yacc_tests = b.addRunArtifact(yacc_tests);
+    const yacc_test_step = b.step("yacc-test", "Run standalone lib/yacc parser generator tests");
+    yacc_test_step.dependOn(&run_yacc_tests.step);
+}
+
 fn addLocalHttpxModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -1339,6 +1384,7 @@ pub fn build(b: *std.Build) void {
     addSnowballCheckStep(b);
     const openapi_codegen = addLocalOpenApiCodegen(b, target, optimize, httpx_mod);
     addOpenApiRegenStep(b, openapi_codegen);
+    addYaccSteps(b, target, optimize);
     const openapi_root_check = addOpenApiRootCheckStep(b);
     const antfly_generated_root = "pkg/antfly/src/openapi/generated";
     const public_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_public_openapi", antfly_generated_root ++ "/antfly_public_openapi");
