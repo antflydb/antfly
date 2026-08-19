@@ -17,8 +17,10 @@ limitations under the License.
 package sdk
 
 import (
-	"encoding/json"
 	"fmt"
+
+	"github.com/antflydb/antfly/go/pkg/libaf/json"
+	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 )
 
 func NewEmbedderConfig(config any) (*EmbedderConfig, error) {
@@ -169,32 +171,51 @@ func NewIndexConfig(name string, config any) (*IndexConfig, error) {
 // NewCreateIndexRequest builds the path-identified request body for CreateIndex.
 // The index name is deliberately absent so it cannot disagree with the URL.
 func NewCreateIndexRequest(config any) (*CreateIndexRequest, error) {
-	var t IndexType
-	switch v := config.(type) {
-	case EmbeddingsIndexConfig:
-		t = IndexTypeEmbeddings
-		config = v
-	case FullTextIndexConfig:
-		t = IndexTypeFullText
-		config = v
-	case GraphIndexConfig:
-		t = IndexTypeGraph
-		config = v
-	case AlgebraicIndexConfig:
-		t = IndexTypeAlgebraic
-		config = v
-	default:
-		return nil, fmt.Errorf("unsupported index config type: %T", config)
-	}
+	request := &CreateIndexRequest{}
 	data, err := json.Marshal(config)
 	if err != nil {
 		return nil, fmt.Errorf("marshal index config: %w", err)
 	}
-	request := &CreateIndexRequest{}
-	if err := json.Unmarshal(data, request); err != nil {
-		return nil, fmt.Errorf("build create index request: %w", err)
+	switch config.(type) {
+	case EmbeddingsIndexConfig:
+		var variant oapi.CreateEmbeddingsIndexRequest
+		if err := json.Unmarshal(data, &variant); err != nil {
+			return nil, fmt.Errorf("build embeddings create index request: %w", err)
+		}
+		variant.Type = oapi.CreateEmbeddingsIndexRequestTypeEmbeddings
+		if err := request.FromCreateEmbeddingsIndexRequest(variant); err != nil {
+			return nil, fmt.Errorf("set embeddings create index request: %w", err)
+		}
+	case FullTextIndexConfig:
+		var variant oapi.CreateFullTextIndexRequest
+		if err := json.Unmarshal(data, &variant); err != nil {
+			return nil, fmt.Errorf("build full-text create index request: %w", err)
+		}
+		variant.Type = oapi.CreateFullTextIndexRequestTypeFullText
+		if err := request.FromCreateFullTextIndexRequest(variant); err != nil {
+			return nil, fmt.Errorf("set full-text create index request: %w", err)
+		}
+	case GraphIndexConfig:
+		var variant oapi.CreateGraphIndexRequest
+		if err := json.Unmarshal(data, &variant); err != nil {
+			return nil, fmt.Errorf("build graph create index request: %w", err)
+		}
+		variant.Type = oapi.CreateGraphIndexRequestTypeGraph
+		if err := request.FromCreateGraphIndexRequest(variant); err != nil {
+			return nil, fmt.Errorf("set graph create index request: %w", err)
+		}
+	case AlgebraicIndexConfig:
+		var variant oapi.CreateAlgebraicIndexRequest
+		if err := json.Unmarshal(data, &variant); err != nil {
+			return nil, fmt.Errorf("build algebraic create index request: %w", err)
+		}
+		variant.Type = oapi.CreateAlgebraicIndexRequestTypeAlgebraic
+		if err := request.FromCreateAlgebraicIndexRequest(variant); err != nil {
+			return nil, fmt.Errorf("set algebraic create index request: %w", err)
+		}
+	default:
+		return nil, fmt.Errorf("unsupported index config type: %T", config)
 	}
-	request.Type = t
 	return request, nil
 }
 

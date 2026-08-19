@@ -45,6 +45,7 @@ export {
   type IndexOperations,
   type RestoreOptions,
   StorageReadTemporarilyUnavailableError,
+  StorageResourceExhaustedError,
 } from "./client.js";
 export {
   InferenceAPIError,
@@ -215,6 +216,10 @@ export type {
   GraphResultNode,
   // Index types
   CreateIndexRequest,
+  CreateFullTextIndexRequest,
+  CreateEmbeddingsIndexRequest,
+  CreateGraphIndexRequest,
+  CreateAlgebraicIndexRequest,
   CreatedIndex,
   IndexConfig,
   IndexStatus,

@@ -25,7 +25,7 @@ from antfly.client_generated.models import (
 )
 from antfly.client_generated.types import UNSET
 
-from .exceptions import AntflyException, InferenceAPIError, InferenceCapacityError
+from .exceptions import AntflyException, InferenceAPIError, InferenceCapacityError, StorageResourceExhaustedError
 
 DEFAULT_WRITE_MAX_REQUEST_BYTES = 64 << 20
 DEFAULT_MAX_JSON_RESPONSE_BYTES = 64 << 20
@@ -315,14 +315,45 @@ class AntflyClient:
                     )
                 else:
                     text = body.decode("utf-8", errors="replace")
+                    error_body: dict[str, Any] | None = None
                     try:
-                        error_body = json.loads(body)
+                        parsed_error = json.loads(body)
+                        error_body = parsed_error if isinstance(parsed_error, dict) else None
                         error = error_body.get("error") if isinstance(error_body, dict) else None
                         msg = error if isinstance(error, str) else text
                     except (TypeError, ValueError):
                         msg = text
                     if not msg:
                         msg = response.reason_phrase or f"HTTP {response.status_code}"
+                    if (
+                        response.status_code == 429
+                        and error_body is not None
+                        and error_body.get("code") == "storage_resource_exhausted"
+                        and error_body.get("retryable") is True
+                    ):
+                        retry_after_ms = error_body.get("retry_after_ms")
+                        retry_after_ms = (
+                            retry_after_ms
+                            if isinstance(retry_after_ms, int)
+                            and not isinstance(retry_after_ms, bool)
+                            and retry_after_ms > 0
+                            else 0
+                        )
+                        retry_after_header = response.headers.get("Retry-After")
+                        try:
+                            retry_after_seconds = int(retry_after_header) if retry_after_header else None
+                        except ValueError:
+                            retry_after_seconds = None
+                        if retry_after_seconds is not None and retry_after_seconds <= 0:
+                            retry_after_seconds = None
+                        if retry_after_ms == 0 and retry_after_seconds is not None:
+                            retry_after_ms = retry_after_seconds * 1000
+                        detail = error_body.get("message")
+                        raise StorageResourceExhaustedError(
+                            detail if isinstance(detail, str) and detail else msg,
+                            retry_after_ms,
+                            retry_after_seconds,
+                        )
                 raise AntflyException(f"Request failed ({response.status_code}): {msg}")
             if response.status_code == 204:
                 return None

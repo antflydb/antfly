@@ -64,12 +64,92 @@ components:
               field: text
               source_artifact_name: document_chunks_v1
               expected_dims: 768
-    CreateIndexRequest:
+    CreateIndexCommon:
       type: object
-      description: "Configuration for a new index. The index name is owned by the request path."
+      description: "Fields shared by every create-index variant. The index name is owned by the request path."
+      properties:
+        description:
+          type: string
+          description: "Optional description of the index and its purpose"
+        version:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          default: 0
+          description: "Version of the index implementation. Defaults to 0."
+        enrichments:
+          type: array
+          items:
+            $ref: "#/components/schemas/EnrichmentConfig"
+          x-go-type-skip-optional-pointer: true
+          description: "Inline managed enrichment definitions required by this index."
+    CreateFullTextIndexRequest:
+      description: "Create a full-text index."
+      allOf:
+        - $ref: "#/components/schemas/CreateIndexCommon"
+        - $ref: "#/components/schemas/FullTextIndexConfig"
+        - type: object
+          required: [type]
+          properties:
+            type:
+              type: string
+              enum: [full_text]
+    CreateEmbeddingsIndexRequest:
+      description: "Create a dense or sparse embeddings index."
+      allOf:
+        - $ref: "#/components/schemas/CreateIndexCommon"
+        - $ref: "#/components/schemas/EmbeddingsIndexConfig"
+        - type: object
+          required: [type]
+          properties:
+            type:
+              type: string
+              enum: [embeddings]
+    CreateGraphIndexRequest:
+      description: "Create a graph index."
+      allOf:
+        - $ref: "#/components/schemas/CreateIndexCommon"
+        - $ref: "#/components/schemas/GraphIndexConfig"
+        - type: object
+          required: [type]
+          properties:
+            type:
+              type: string
+              enum: [graph]
+    CreateAlgebraicIndexRequest:
+      description: "Create a schema-derived algebraic index."
+      allOf:
+        - $ref: "#/components/schemas/CreateIndexCommon"
+        - $ref: "#/components/schemas/AlgebraicIndexConfig"
+        - type: object
+          required: [type]
+          properties:
+            type:
+              type: string
+              enum: [algebraic]
+    CreateIndexRequest:
+      description: "Type-safe configuration for a new index. The index name is owned by the request path."
+      oneOf:
+        - $ref: "#/components/schemas/CreateFullTextIndexRequest"
+        - $ref: "#/components/schemas/CreateEmbeddingsIndexRequest"
+        - $ref: "#/components/schemas/CreateGraphIndexRequest"
+        - $ref: "#/components/schemas/CreateAlgebraicIndexRequest"
+      discriminator:
+        propertyName: type
+        mapping:
+          full_text: "#/components/schemas/CreateFullTextIndexRequest"
+          embeddings: "#/components/schemas/CreateEmbeddingsIndexRequest"
+          graph: "#/components/schemas/CreateGraphIndexRequest"
+          algebraic: "#/components/schemas/CreateAlgebraicIndexRequest"
+    CreatedIndex:
+      type: object
+      description: "Normalized effective configuration returned after an index is created. Provider credentials are write-only and are never returned."
       required:
+        - name
         - type
       properties:
+        name:
+          type: string
+          description: "Name of the created index"
         description:
           type: string
           description: "Optional description of the index and its purpose"
@@ -85,7 +165,7 @@ components:
           items:
             $ref: "#/components/schemas/EnrichmentConfig"
           x-go-type-skip-optional-pointer: true
-          description: "Inline managed enrichment definitions required by this index."
+          description: "Normalized inline managed enrichment definitions required by this index."
         mem_only:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -151,17 +231,6 @@ components:
         derive_from_schema:
           x-go-type-skip-optional-pointer: true
           type: boolean
-    CreatedIndex:
-      description: "Normalized effective configuration returned after an index is created."
-      allOf:
-        - $ref: "#/components/schemas/CreateIndexRequest"
-        - type: object
-          required:
-            - name
-          properties:
-            name:
-              type: string
-              description: "Name of the created index"
     EnrichmentKind:
       type: string
       enum:

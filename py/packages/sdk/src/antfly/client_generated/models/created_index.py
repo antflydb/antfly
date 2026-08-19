@@ -25,217 +25,219 @@ T = TypeVar("T", bound="CreatedIndex")
 
 @_attrs_define
 class CreatedIndex:
-    r"""Normalized effective configuration returned after an index is created.
+    r"""Normalized effective configuration returned after an index is created. Provider credentials are write-only and are
+    never returned.
 
-    Attributes:
-        type_ (IndexType): The type of the index.
-        name (str): Name of the created index
-        description (str | Unset): Optional description of the index and its purpose
-        version (int | Unset): Version of the index implementation. Defaults to 0. Default: 0.
-        enrichments (list[EnrichmentConfig] | Unset): Inline managed enrichment definitions required by this index.
-        mem_only (bool | Unset): Whether to use memory-only storage.
-        coverage_policy (DerivedCoveragePolicy | Unset): How generation-scoped source outcomes determine derived-index
-            completeness.
-        external (bool | Unset):  Default: False.
-        sparse (bool | Unset):  Default: False.
-        dimension (int | Unset):
-        field (str | Unset):
-        embedding_name (str | Unset):
-        source_artifact_name (str | Unset):
-        template (str | Unset):
-        distance_metric (DistanceMetric | Unset): Distance metric for the vector index (dense only). Use "cosine" for
-            models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot
-            product similarity. Use "l2_squared" (default) for models trained with Euclidean distance.
-        embedder (EmbedderConfig | Unset): A unified configuration for an embedding provider.
+        Attributes:
+            name (str): Name of the created index
+            type_ (IndexType): The type of the index.
+            description (str | Unset): Optional description of the index and its purpose
+            version (int | Unset): Version of the index implementation. Defaults to 0. Default: 0.
+            enrichments (list[EnrichmentConfig] | Unset): Normalized inline managed enrichment definitions required by this
+                index.
+            mem_only (bool | Unset): Whether to use memory-only storage.
+            coverage_policy (DerivedCoveragePolicy | Unset): How generation-scoped source outcomes determine derived-index
+                completeness.
+            external (bool | Unset):  Default: False.
+            sparse (bool | Unset):  Default: False.
+            dimension (int | Unset):
+            field (str | Unset):
+            embedding_name (str | Unset):
+            source_artifact_name (str | Unset):
+            template (str | Unset):
+            distance_metric (DistanceMetric | Unset): Distance metric for the vector index (dense only). Use "cosine" for
+                models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot
+                product similarity. Use "l2_squared" (default) for models trained with Euclidean distance.
+            embedder (EmbedderConfig | Unset): A unified configuration for an embedding provider.
 
-            Embedders can be configured with templates to customize how documents are
-            converted to text before embedding. Templates use Handlebars syntax and
-            support various built-in helpers.
+                Embedders can be configured with templates to customize how documents are
+                converted to text before embedding. Templates use Handlebars syntax and
+                support various built-in helpers.
 
-            **Template System:**
-            - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/)
-            - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes)
-            - **Context**: Templates receive the full document as context
+                **Template System:**
+                - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/)
+                - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes)
+                - **Context**: Templates receive the full document as context
 
-            **Built-in Helpers:**
+                **Built-in Helpers:**
 
-            1. **scrubHtml** - Remove script/style tags and extract clean text from HTML
-               ```handlebars
-               {{scrubHtml html_content}}
-               ```
-               - Removes `<script>` and `<style>` tags
-               - Adds newlines after block elements (p, div, h1-h6, li, etc.)
-               - Returns plain text with preserved readability
+                1. **scrubHtml** - Remove script/style tags and extract clean text from HTML
+                   ```handlebars
+                   {{scrubHtml html_content}}
+                   ```
+                   - Removes `<script>` and `<style>` tags
+                   - Adds newlines after block elements (p, div, h1-h6, li, etc.)
+                   - Returns plain text with preserved readability
 
-            2. **eq** - Equality comparison for conditionals
-               ```handlebars
-               {{#if (eq status "active")}}Active user{{/if}}
-               {{#if (eq @key "special")}}Special field{{/if}}
-               ```
+                2. **eq** - Equality comparison for conditionals
+                   ```handlebars
+                   {{#if (eq status "active")}}Active user{{/if}}
+                   {{#if (eq @key "special")}}Special field{{/if}}
+                   ```
 
-            3. **media** - GenKit dotprompt media directive for multimodal content
-               ```handlebars
-               {{media url=imageDataURI}}
-               {{media url=this.image_url}}
-               {{media url="https://example.com/image.jpg"}}
-               {{media url="s3://endpoint/bucket/image.png"}}
-               {{media url="file:///path/to/image.jpg"}}
-               ```
+                3. **media** - GenKit dotprompt media directive for multimodal content
+                   ```handlebars
+                   {{media url=imageDataURI}}
+                   {{media url=this.image_url}}
+                   {{media url="https://example.com/image.jpg"}}
+                   {{media url="s3://endpoint/bucket/image.png"}}
+                   {{media url="file:///path/to/image.jpg"}}
+                   ```
 
-               **Supported URL Schemes:**
-               - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`)
-               - `http://` / `https://` - Web URLs with automatic content type detection
-               - `file://` - Local filesystem paths
-               - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`)
+                   **Supported URL Schemes:**
+                   - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`)
+                   - `http://` / `https://` - Web URLs with automatic content type detection
+                   - `file://` - Local filesystem paths
+                   - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`)
 
-               **Automatic Content Processing:**
-               - **Images**: Downloaded, resized (if needed), converted to data URIs
-               - **PDFs**: Text extracted or first page rendered as image
-               - **HTML**: Readable text extracted using Mozilla Readability
+                   **Automatic Content Processing:**
+                   - **Images**: Downloaded, resized (if needed), converted to data URIs
+                   - **PDFs**: Text extracted or first page rendered as image
+                   - **HTML**: Readable text extracted using Mozilla Readability
 
-               **Security Controls:**
-               Downloads are protected by content security settings (see Configuration Reference):
-               - Allowed host whitelist
-               - Private IP blocking (prevents SSRF attacks)
-               - Download size limits (default: 100MB)
-               - HTTP downloads time out after 30 seconds by default; zero disables the deadline
-               - Image dimension limits (default: 2048px, auto-resized)
+                   **Security Controls:**
+                   Downloads are protected by content security settings (see Configuration Reference):
+                   - Allowed host whitelist
+                   - Private IP blocking (prevents SSRF attacks)
+                   - Download size limits (default: 100MB)
+                   - HTTP downloads time out after 30 seconds by default; zero disables the deadline
+                   - Image dimension limits (default: 2048px, auto-resized)
 
-               See: https://antfly.io/docs/configuration#security--cors
+                   See: https://antfly.io/docs/configuration#security--cors
 
-            4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation)
-               ```handlebars
-               {{encodeToon this.fields}}
-               {{encodeToon this.fields lengthMarker=false indent=4}}
-               {{encodeToon this.fields delimiter="\t"}}
-               ```
+                4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation)
+                   ```handlebars
+                   {{encodeToon this.fields}}
+                   {{encodeToon this.fields lengthMarker=false indent=4}}
+                   {{encodeToon this.fields delimiter="\t"}}
+                   ```
 
-               **What is TOON?**
-               TOON is a compact, human-readable format designed for passing structured data to LLMs.
-               It provides **30-60% token reduction** compared to JSON while maintaining high LLM
-               comprehension accuracy.
+                   **What is TOON?**
+                   TOON is a compact, human-readable format designed for passing structured data to LLMs.
+                   It provides **30-60% token reduction** compared to JSON while maintaining high LLM
+                   comprehension accuracy.
 
-               **Key Features:**
-               - Compact syntax using `:` for key-value pairs
-               - Array length markers: `tags[#3]: ai,search,ml`
-               - Tabular format for uniform data structures
-               - Optimized for LLM parsing and understanding
-               - Maintains human readability
+                   **Key Features:**
+                   - Compact syntax using `:` for key-value pairs
+                   - Array length markers: `tags[#3]: ai,search,ml`
+                   - Tabular format for uniform data structures
+                   - Optimized for LLM parsing and understanding
+                   - Maintains human readability
 
-               **Benefits:**
-               - **Lower API costs** - Reduced token usage means lower LLM API costs
-               - **Faster responses** - Less tokens to process
-               - **More context** - Fit more documents within token limits
+                   **Benefits:**
+                   - **Lower API costs** - Reduced token usage means lower LLM API costs
+                   - **Faster responses** - Less tokens to process
+                   - **More context** - Fit more documents within token limits
 
-               **Options:**
-               - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true)
-               - `indent` (int): Indentation spacing for nested objects (default: 2)
-               - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs)
+                   **Options:**
+                   - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true)
+                   - `indent` (int): Indentation spacing for nested objects (default: 2)
+                   - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs)
 
-               **Example output:**
-               ```
-               title: Introduction to Vector Search
-               author: Jane Doe
-               tags[#3]: ai,search,ml
-               metadata:
-                 edition: 2
-                 pages: 450
-               ```
+                   **Example output:**
+                   ```
+                   title: Introduction to Vector Search
+                   author: Jane Doe
+                   tags[#3]: ai,search,ml
+                   metadata:
+                     edition: 2
+                     pages: 450
+                   ```
 
-               **Default in RAG:** TOON is the default format for document rendering in RAG queries.
+                   **Default in RAG:** TOON is the default format for document rendering in RAG queries.
 
-               **References:**
-               - TOON Specification: https://github.com/toon-format/toon
-               - Go Implementation: https://github.com/alpkeskin/gotoon
+                   **References:**
+                   - TOON Specification: https://github.com/toon-format/toon
+                   - Go Implementation: https://github.com/alpkeskin/gotoon
 
-            **Template Examples:**
+                **Template Examples:**
 
-            Document with metadata:
-            ```handlebars
-            Title: {{metadata.title}}
-            Date: {{metadata.date}}
-            Tags: {{#each metadata.tags}}{{this}}, {{/each}}
+                Document with metadata:
+                ```handlebars
+                Title: {{metadata.title}}
+                Date: {{metadata.date}}
+                Tags: {{#each metadata.tags}}{{this}}, {{/each}}
 
-            {{content}}
-            ```
+                {{content}}
+                ```
 
-            HTML content extraction:
-            ```handlebars
-            Product: {{name}}
-            Description: {{scrubHtml description_html}}
-            Price: ${{price}}
-            ```
+                HTML content extraction:
+                ```handlebars
+                Product: {{name}}
+                Description: {{scrubHtml description_html}}
+                Price: ${{price}}
+                ```
 
-            Multimodal with image:
-            ```handlebars
-            Product: {{title}}
-            {{media url=image}}
-            Description: {{description}}
-            ```
+                Multimodal with image:
+                ```handlebars
+                Product: {{title}}
+                {{media url=image}}
+                Description: {{description}}
+                ```
 
-            Conditional formatting:
-            ```handlebars
-            {{title}}
-            {{#if author}}By: {{author}}{{/if}}
-            {{#if (eq category "premium")}}⭐ Premium Content{{/if}}
-            {{body}}
-            ```
+                Conditional formatting:
+                ```handlebars
+                {{title}}
+                {{#if author}}By: {{author}}{{/if}}
+                {{#if (eq category "premium")}}⭐ Premium Content{{/if}}
+                {{body}}
+                ```
 
-            **Environment Variables:**
-            - `GEMINI_API_KEY` - API key for Google AI
-            - `OPENAI_API_KEY` - API key for OpenAI
-            - `OPENAI_BASE_URL` - Base URL for OpenAI-compatible APIs
-            - `OLLAMA_HOST` - Ollama server URL (e.g., http://localhost:11434)
+                **Environment Variables:**
+                - `GEMINI_API_KEY` - API key for Google AI
+                - `OPENAI_API_KEY` - API key for OpenAI
+                - `OPENAI_BASE_URL` - Base URL for OpenAI-compatible APIs
+                - `OLLAMA_HOST` - Ollama server URL (e.g., http://localhost:11434)
 
-            **Importing Pre-computed Embeddings:**
+                **Importing Pre-computed Embeddings:**
 
-            You can import existing embeddings (from OpenAI, Cohere, or any provider), but only
-            for indexes configured with `external: true`. External indexes accept vectors written
-            directly through the document `_embeddings` field and do not generate prompts from
-            `field` or `template`.
+                You can import existing embeddings (from OpenAI, Cohere, or any provider), but only
+                for indexes configured with `external: true`. External indexes accept vectors written
+                directly through the document `_embeddings` field and do not generate prompts from
+                `field` or `template`.
 
-            **Steps:**
-            1. Create an embeddings index with `external: true`
-            2. For dense indexes, set the index `dimension`
-            3. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }`
+                **Steps:**
+                1. Create an embeddings index with `external: true`
+                2. For dense indexes, set the index `dimension`
+                3. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }`
 
-            **Example:**
-            ```json
-            {
-              "title": "My Document",
-              "content": "Document text...",
-              "_embeddings": {
-                "my_vector_index": [0.1, 0.2, 0.3, ...]
-              }
-            }
-            ```
+                **Example:**
+                ```json
+                {
+                  "title": "My Document",
+                  "content": "Document text...",
+                  "_embeddings": {
+                    "my_vector_index": [0.1, 0.2, 0.3, ...]
+                  }
+                }
+                ```
 
-            **Delete Behavior:**
-            - Use `"_embeddings": { "<indexName>": null }` to delete a stored external vector
-            - Omitting `_embeddings[<indexName>]` leaves the existing vector unchanged
+                **Delete Behavior:**
+                - Use `"_embeddings": { "<indexName>": null }` to delete a stored external vector
+                - Omitting `_embeddings[<indexName>]` leaves the existing vector unchanged
 
-            **Use Cases:**
-            - Migrating from another vector database with existing embeddings
-            - Using embeddings generated by external systems
-            - Importing pre-computed OpenAI, Cohere, or other provider embeddings
-            - Batch processing embeddings offline before ingestion Example: {'provider': 'openai', 'model': 'text-
-            embedding-3-small'}.
-        summarizer (GeneratorConfig | Unset): A unified configuration for a generative AI provider.
-             Example: {'provider': 'openai', 'model': 'gpt-4.1', 'temperature': 0.7, 'max_tokens': 2048}.
-        chunker (ChunkerConfig | Unset): A unified configuration for a chunking provider. Example: {'provider':
-            'antfly', 'model': 'fixed', 'text': {'target_tokens': 500, 'overlap_tokens': 50}}.
-        top_k (int | Unset):  Default: 10.
-        min_weight (float | Unset):  Default: 0.0.
-        chunk_size (int | Unset):  Default: 1024.
-        execution (IndexExecutionConfig | Unset): Namespaced execution policy for managed index shorthand. Only
-            namespaces with runtime effects are accepted.
-        edge_types (list[EdgeTypeConfig] | Unset):
-        max_edges_per_document (int | Unset):
-        derive_from_schema (bool | Unset):
+                **Use Cases:**
+                - Migrating from another vector database with existing embeddings
+                - Using embeddings generated by external systems
+                - Importing pre-computed OpenAI, Cohere, or other provider embeddings
+                - Batch processing embeddings offline before ingestion Example: {'provider': 'openai', 'model': 'text-
+                embedding-3-small'}.
+            summarizer (GeneratorConfig | Unset): A unified configuration for a generative AI provider.
+                 Example: {'provider': 'openai', 'model': 'gpt-4.1', 'temperature': 0.7, 'max_tokens': 2048}.
+            chunker (ChunkerConfig | Unset): A unified configuration for a chunking provider. Example: {'provider':
+                'antfly', 'model': 'fixed', 'text': {'target_tokens': 500, 'overlap_tokens': 50}}.
+            top_k (int | Unset):  Default: 10.
+            min_weight (float | Unset):  Default: 0.0.
+            chunk_size (int | Unset):  Default: 1024.
+            execution (IndexExecutionConfig | Unset): Namespaced execution policy for managed index shorthand. Only
+                namespaces with runtime effects are accepted.
+            edge_types (list[EdgeTypeConfig] | Unset):
+            max_edges_per_document (int | Unset):
+            derive_from_schema (bool | Unset):
     """
 
-    type_: IndexType
     name: str
+    type_: IndexType
     description: str | Unset = UNSET
     version: int | Unset = 0
     enrichments: list[EnrichmentConfig] | Unset = UNSET
@@ -262,9 +264,9 @@ class CreatedIndex:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        type_ = self.type_.value
-
         name = self.name
+
+        type_ = self.type_.value
 
         description = self.description
 
@@ -338,8 +340,8 @@ class CreatedIndex:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
-                "type": type_,
                 "name": name,
+                "type": type_,
             }
         )
         if description is not UNSET:
@@ -401,9 +403,9 @@ class CreatedIndex:
         from ..models.index_execution_config import IndexExecutionConfig
 
         d = dict(src_dict)
-        type_ = IndexType(d.pop("type"))
-
         name = d.pop("name")
+
+        type_ = IndexType(d.pop("type"))
 
         description = d.pop("description", UNSET)
 
@@ -496,8 +498,8 @@ class CreatedIndex:
         derive_from_schema = d.pop("derive_from_schema", UNSET)
 
         created_index = cls(
-            type_=type_,
             name=name,
+            type_=type_,
             description=description,
             version=version,
             enrichments=enrichments,

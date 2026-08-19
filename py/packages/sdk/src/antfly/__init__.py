@@ -11,6 +11,7 @@ from .exceptions import (
     AntflyException,
     InferenceAPIError,
     InferenceCapacityError,
+    StorageResourceExhaustedError,
 )
 
 __version__ = "0.1.0"
@@ -23,6 +24,7 @@ __all__ = [
     "AntflyAuthError",
     "InferenceAPIError",
     "InferenceCapacityError",
+    "StorageResourceExhaustedError",
     "SparseEmbedding",
     "PackedSparseEmbedding",
     "__version__",

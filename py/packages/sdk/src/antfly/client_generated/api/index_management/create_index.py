@@ -6,7 +6,10 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.create_index_request import CreateIndexRequest
+from ...models.create_algebraic_index_request import CreateAlgebraicIndexRequest
+from ...models.create_embeddings_index_request import CreateEmbeddingsIndexRequest
+from ...models.create_full_text_index_request import CreateFullTextIndexRequest
+from ...models.create_graph_index_request import CreateGraphIndexRequest
 from ...models.created_index import CreatedIndex
 from ...models.error import Error
 from ...models.storage_resource_exhausted_error import StorageResourceExhaustedError
@@ -17,7 +20,10 @@ def _get_kwargs(
     table_name: str,
     index_name: str,
     *,
-    body: CreateIndexRequest,
+    body: CreateAlgebraicIndexRequest
+    | CreateEmbeddingsIndexRequest
+    | CreateFullTextIndexRequest
+    | CreateGraphIndexRequest,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
@@ -29,7 +35,14 @@ def _get_kwargs(
         ),
     }
 
-    _kwargs["json"] = body.to_dict()
+    if isinstance(body, CreateFullTextIndexRequest):
+        _kwargs["json"] = body.to_dict()
+    elif isinstance(body, CreateEmbeddingsIndexRequest):
+        _kwargs["json"] = body.to_dict()
+    elif isinstance(body, CreateGraphIndexRequest):
+        _kwargs["json"] = body.to_dict()
+    else:
+        _kwargs["json"] = body.to_dict()
 
     headers["Content-Type"] = "application/json"
 
@@ -102,15 +115,19 @@ def sync_detailed(
     index_name: str,
     *,
     client: AuthenticatedClient,
-    body: CreateIndexRequest,
+    body: CreateAlgebraicIndexRequest
+    | CreateEmbeddingsIndexRequest
+    | CreateFullTextIndexRequest
+    | CreateGraphIndexRequest,
 ) -> Response[CreatedIndex | Error | StorageResourceExhaustedError]:
     """Add an index to a table
 
     Args:
         table_name (str):
         index_name (str):
-        body (CreateIndexRequest): Configuration for a new index. The index name is owned by the
-            request path.
+        body (CreateAlgebraicIndexRequest | CreateEmbeddingsIndexRequest |
+            CreateFullTextIndexRequest | CreateGraphIndexRequest): Type-safe configuration for a new
+            index. The index name is owned by the request path.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -138,15 +155,19 @@ def sync(
     index_name: str,
     *,
     client: AuthenticatedClient,
-    body: CreateIndexRequest,
+    body: CreateAlgebraicIndexRequest
+    | CreateEmbeddingsIndexRequest
+    | CreateFullTextIndexRequest
+    | CreateGraphIndexRequest,
 ) -> CreatedIndex | Error | StorageResourceExhaustedError | None:
     """Add an index to a table
 
     Args:
         table_name (str):
         index_name (str):
-        body (CreateIndexRequest): Configuration for a new index. The index name is owned by the
-            request path.
+        body (CreateAlgebraicIndexRequest | CreateEmbeddingsIndexRequest |
+            CreateFullTextIndexRequest | CreateGraphIndexRequest): Type-safe configuration for a new
+            index. The index name is owned by the request path.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -169,15 +190,19 @@ async def asyncio_detailed(
     index_name: str,
     *,
     client: AuthenticatedClient,
-    body: CreateIndexRequest,
+    body: CreateAlgebraicIndexRequest
+    | CreateEmbeddingsIndexRequest
+    | CreateFullTextIndexRequest
+    | CreateGraphIndexRequest,
 ) -> Response[CreatedIndex | Error | StorageResourceExhaustedError]:
     """Add an index to a table
 
     Args:
         table_name (str):
         index_name (str):
-        body (CreateIndexRequest): Configuration for a new index. The index name is owned by the
-            request path.
+        body (CreateAlgebraicIndexRequest | CreateEmbeddingsIndexRequest |
+            CreateFullTextIndexRequest | CreateGraphIndexRequest): Type-safe configuration for a new
+            index. The index name is owned by the request path.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -203,15 +228,19 @@ async def asyncio(
     index_name: str,
     *,
     client: AuthenticatedClient,
-    body: CreateIndexRequest,
+    body: CreateAlgebraicIndexRequest
+    | CreateEmbeddingsIndexRequest
+    | CreateFullTextIndexRequest
+    | CreateGraphIndexRequest,
 ) -> CreatedIndex | Error | StorageResourceExhaustedError | None:
     """Add an index to a table
 
     Args:
         table_name (str):
         index_name (str):
-        body (CreateIndexRequest): Configuration for a new index. The index name is owned by the
-            request path.
+        body (CreateAlgebraicIndexRequest | CreateEmbeddingsIndexRequest |
+            CreateFullTextIndexRequest | CreateGraphIndexRequest): Type-safe configuration for a new
+            index. The index name is owned by the request path.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

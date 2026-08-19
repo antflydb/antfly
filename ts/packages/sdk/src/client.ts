@@ -107,6 +107,22 @@ export class QueryTemporarilyUnavailableError extends Error {
   }
 }
 
+/** A retryable storage-admission rejection with an actionable delay. */
+export class StorageResourceExhaustedError extends Error {
+  readonly status = 429 as const;
+  readonly code = "storage_resource_exhausted" as const;
+  readonly retryable = true as const;
+
+  constructor(
+    message: string,
+    readonly retryAfterMs: number,
+    readonly retryAfterSeconds: number | undefined
+  ) {
+    super(message);
+    this.name = "StorageResourceExhaustedError";
+  }
+}
+
 /** @deprecated Catch QueryTemporarilyUnavailableError to handle every retryable query 503. */
 export class StorageReadTemporarilyUnavailableError extends QueryTemporarilyUnavailableError {
   declare readonly code: "storage_read_temporarily_unavailable";
@@ -1508,14 +1524,45 @@ export class AntflyClient {
      * Create a new index
      */
     create: async (tableName: string, indexName: string, config: CreateIndexRequest) => {
-      const { data, error } = await this.client.POST(
+      const { data, error, response } = await this.client.POST(
         "/db/v1/tables/{tableName}/indexes/{indexName}",
         {
           params: { path: { tableName, indexName } },
           body: config,
         }
       );
-      if (error) throw new Error(`Failed to create index: ${error.error}`);
+      if (error) {
+        const detail = error as {
+          code?: unknown;
+          error?: unknown;
+          message?: unknown;
+          retryable?: unknown;
+          retry_after_ms?: unknown;
+        };
+        if (
+          response?.status === 429 &&
+          detail.code === "storage_resource_exhausted" &&
+          detail.retryable === true
+        ) {
+          const retryAfterHeader = response.headers.get("Retry-After");
+          const parsedRetryAfter = retryAfterHeader && /^[1-9]\d*$/.test(retryAfterHeader)
+            ? Number(retryAfterHeader)
+            : NaN;
+          const retryAfterSeconds = Number.isFinite(parsedRetryAfter) && parsedRetryAfter > 0
+            ? parsedRetryAfter
+            : undefined;
+          const retryAfterMs = typeof detail.retry_after_ms === "number" &&
+            Number.isFinite(detail.retry_after_ms) &&
+            detail.retry_after_ms > 0
+            ? detail.retry_after_ms
+            : (retryAfterSeconds ?? 0) * 1000;
+          const message = typeof detail.message === "string" && detail.message
+            ? detail.message
+            : "storage capacity is temporarily exhausted";
+          throw new StorageResourceExhaustedError(message, retryAfterMs, retryAfterSeconds);
+        }
+        throw new Error(`Failed to create index: ${detail.error}`);
+      }
       if (!data) throw new Error("Failed to create index: unexpected empty response");
       return data;
     },

@@ -8795,7 +8795,7 @@ pub const ApiHttpServer = struct {
         // Reserve the response before consensus. Nothing after the irreversible
         // mutation boundary should fail solely because response memory could
         // not be allocated.
-        const response_body = alloc.dupe(u8, normalized_index_json) catch return error.InternalFailure;
+        const response_body = indexes_api.encodeCreatedIndexConfig(alloc, index_name, normalized_index_json) catch return error.InternalFailure;
         errdefer alloc.free(response_body);
 
         // Materialize catalog-owned fields once. The same exact config is sent
@@ -8826,10 +8826,10 @@ pub const ApiHttpServer = struct {
                 return error.InternalFailure;
             },
         };
+        var projection_ready = true;
         self.waitForIndexMetadataProjection(table_name, index_name, stored_index_json) catch |err| {
-            if (metadata_authority.isRetryableError(err)) return error.NotLeader;
-            std.log.err("public create index metadata projection wait failed table={s} index={s} err={}", .{ table_name, index_name, err });
-            return error.InternalFailure;
+            projection_ready = false;
+            std.log.warn("public create index committed; metadata projection deferred to reconciliation table={s} index={s} err={}", .{ table_name, index_name, err });
         };
         if (self.table_writes) |table_writes_source| {
             // Install the local write capability before the create request
@@ -8837,29 +8837,19 @@ pub const ApiHttpServer = struct {
             // barrier; embedded sources preserve their synchronous contract.
             // Generic reconciliation is separate because the same queue also
             // repairs index deletion.
-            _ = table_writes_source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| {
-                // The catalog mutation is already committed. Even if this
-                // synchronous O(groups) barrier only reached a prefix of local
-                // shards, hand the exact desired-state edge to the bounded
-                // reconciler before preserving the admission error for the
-                // caller.
-                _ = table_writes_source.requestTableIndexStructuralReconcile(alloc, table_name, index_name) catch |reconcile_err| {
-                    std.log.warn("public create index structural reconcile enqueue after admission failure deferred table={s} index={s} err={}", .{ table_name, index_name, reconcile_err });
+            if (projection_ready) {
+                _ = table_writes_source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| {
+                    // Consensus already committed the resource. Local resource
+                    // pressure and partial O(groups) installation are readiness
+                    // conditions, not create failures; the reconciler owns the
+                    // retry without inviting an ambiguous client replay.
+                    std.log.warn("public create index committed; local installation deferred to reconciliation table={s} index={s} err={}", .{ table_name, index_name, err });
                 };
-                switch (err) {
-                    error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
-                    error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
-                    error.PersistentDescriptorAdmissionExhausted, error.ResourceBudgetExceeded => return error.Backpressured,
-                    else => {
-                        std.log.err("public create index local admission failed table={s} index={s} err={}", .{ table_name, index_name, err });
-                        return error.InternalFailure;
-                    },
-                }
-            };
-            // Local write capability is the request's commit boundary. Queue
-            // insertion is an idempotent repair accelerator, so queue pressure
-            // after successful admission must not turn a committed create into
-            // a false HTTP failure that invites ambiguous client retries.
+            }
+            // Consensus is the request's commit boundary. Queue insertion is
+            // an idempotent repair accelerator, so queue pressure after commit
+            // must not turn a created resource into a false HTTP failure that
+            // invites ambiguous client retries.
             _ = table_writes_source.requestTableIndexStructuralReconcile(alloc, table_name, index_name) catch |err| {
                 std.log.warn("public create index structural reconcile enqueue deferred table={s} index={s} err={}", .{ table_name, index_name, err });
             };
@@ -28310,17 +28300,18 @@ test "api http server create index waits for exact target config projection" {
     try std.testing.expectEqual(@as(usize, 2), writes.enqueue_calls);
 
     // Metadata is already committed when local capacity rejects the barrier.
-    // The response preserves backpressure, while convergence is still handed
-    // off for any shards admitted before the failure.
+    // Return the created resource and hand convergence to reconciliation;
+    // reporting 429 here would invite an ambiguous replay after success.
     writes.create_error = error.ResourceBudgetExceeded;
-    var backpressured_resp = try executeHttpxTestRequest(&server, .{
+    var locally_deferred_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/indexes/embed_idx",
         .content_type = "application/json",
         .body = create_index_body,
     });
-    defer backpressured_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 429), backpressured_resp.status);
+    defer locally_deferred_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), locally_deferred_resp.status);
+    try std.testing.expectEqual(@as(usize, 3), writes.create_calls);
     try std.testing.expectEqual(@as(usize, 3), writes.enqueue_calls);
 
     // Queue pressure after the local capability barrier is not a false create

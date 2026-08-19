@@ -8,9 +8,13 @@ import httpx
 import pytest
 from httpx import Timeout
 
-from antfly import AntflyClient, AntflyException  # noqa: E402
+from antfly import AntflyClient, AntflyException, StorageResourceExhaustedError  # noqa: E402
 from antfly.client import normalize_base_url  # noqa: E402
 from antfly.client_generated.models.batch_request import BatchRequest  # noqa: E402
+from antfly.client_generated.models.create_embeddings_index_request import CreateEmbeddingsIndexRequest  # noqa: E402
+from antfly.client_generated.models.create_embeddings_index_request_type import (  # noqa: E402
+    CreateEmbeddingsIndexRequestType,
+)
 from antfly.client_generated.models.inference_chat_message import InferenceChatMessage  # noqa: E402
 from antfly.client_generated.models.inference_generate_request import InferenceGenerateRequest  # noqa: E402
 from antfly.client_generated.models.inference_role import InferenceRole  # noqa: E402
@@ -60,6 +64,16 @@ class TestAntflyClient:
             "MIN": "$min",
             "MAX": "$max",
         }
+
+    def test_generated_create_index_request_is_discriminated_and_path_owned(self) -> None:
+        request = CreateEmbeddingsIndexRequest(
+            type_=CreateEmbeddingsIndexRequestType.EMBEDDINGS,
+            dimension=512,
+        ).to_dict()
+
+        assert request["type"] == "embeddings"
+        assert request["dimension"] == 512
+        assert "name" not in request
 
     def test_min_transform_serializes_from_generated_models(self) -> None:
         request = BatchRequest(
@@ -228,6 +242,33 @@ class TestAntflyClient:
         client = AntflyClient(base_url="http://localhost:8080")
         with pytest.raises(ValueError, match="owned by the path"):
             client.indexes.create("docs", "search", {"name": "other", "type": "full_text"})
+
+    @patch("antfly.client.Client")
+    def test_create_index_preserves_storage_admission_retry(self, mock_client_class: MagicMock) -> None:
+        mock_httpx = MagicMock()
+        response = configure_response(
+            mock_httpx,
+            429,
+            {
+                "code": "storage_resource_exhausted",
+                "error": "storage_resource_exhausted",
+                "message": "storage capacity is temporarily exhausted",
+                "retryable": True,
+                "retry_after_ms": 1250,
+            },
+        )
+        response.headers = {"Retry-After": "2"}
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+
+        client = AntflyClient(base_url="http://localhost:8080")
+        with pytest.raises(StorageResourceExhaustedError) as exc_info:
+            client.indexes.create("docs", "vectors", {"type": "embeddings", "dimension": 512})
+
+        assert exc_info.value.status_code == 429
+        assert exc_info.value.code == "storage_resource_exhausted"
+        assert exc_info.value.retryable is True
+        assert exc_info.value.retry_after_ms == 1250
+        assert exc_info.value.retry_after_seconds == 2
 
     @patch("antfly.client.Client")
     def test_query_preserves_sorted_cursor_contract(self, mock_client_class: MagicMock) -> None:

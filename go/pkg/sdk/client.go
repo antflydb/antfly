@@ -220,6 +220,25 @@ func (e *QueryTemporarilyUnavailableError) Error() string {
 	return e.Code
 }
 
+// StorageResourceExhaustedError reports a retryable storage admission failure.
+// RetryAfterMS is the server's precise delay; RetryAfterSeconds is retained
+// from the HTTP header for schedulers that operate in whole seconds.
+type StorageResourceExhaustedError struct {
+	StatusCode        int
+	Code              string
+	Message           string
+	Retryable         bool
+	RetryAfterMS      int
+	RetryAfterSeconds int
+}
+
+func (e *StorageResourceExhaustedError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return e.Code
+}
+
 type structuredAPIErrorResponse struct {
 	Status         int    `json:"status"`
 	Error          string `json:"error"`
@@ -228,6 +247,7 @@ type structuredAPIErrorResponse struct {
 	Action         string `json:"action"`
 	RestartWithout string `json:"restart_without"`
 	Retryable      *bool  `json:"retryable"`
+	RetryAfterMS   int    `json:"retry_after_ms"`
 }
 
 func queryRetryAfterSeconds(header http.Header) int {
@@ -279,6 +299,23 @@ func readErrorResponse(resp *http.Response) error {
 	var errResp structuredAPIErrorResponse
 	parsedStructuredError := json.Unmarshal(respBody, &errResp) == nil
 	if parsedStructuredError {
+		if resp.StatusCode == http.StatusTooManyRequests &&
+			errResp.Code == "storage_resource_exhausted" &&
+			errResp.Retryable != nil && *errResp.Retryable {
+			retryAfterSeconds := queryRetryAfterSeconds(resp.Header)
+			retryAfterMS := errResp.RetryAfterMS
+			if retryAfterMS <= 0 && retryAfterSeconds > 0 {
+				retryAfterMS = retryAfterSeconds * 1000
+			}
+			return &StorageResourceExhaustedError{
+				StatusCode:        resp.StatusCode,
+				Code:              errResp.Code,
+				Message:           errResp.Message,
+				Retryable:         true,
+				RetryAfterMS:      retryAfterMS,
+				RetryAfterSeconds: retryAfterSeconds,
+			}
+		}
 		if resp.StatusCode == http.StatusConflict &&
 			errResp.Status == http.StatusConflict &&
 			errResp.Error == "hierarchy_cursor_stale" &&

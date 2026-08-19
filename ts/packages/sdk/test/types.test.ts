@@ -13,6 +13,7 @@ import type {
   BooleanQuery,
   BoolFieldQuery,
   ConjunctionQuery,
+  CreateIndexRequest,
   DisjunctionQuery,
   MatchQuery,
   NumericRangeQuery,
@@ -41,6 +42,28 @@ function generatedSortProfileDeclaration(): string {
 }
 
 describe("Antfly Query Type Integration", () => {
+  describe("CreateIndexRequest type safety", () => {
+    it("discriminates index-specific fields", () => {
+      const embeddings: CreateIndexRequest = {
+        type: "embeddings",
+        dimension: 512,
+      };
+      const fullText: CreateIndexRequest = {
+        type: "full_text",
+        mem_only: true,
+      };
+
+      expect(embeddings.type).toBe("embeddings");
+      expect(fullText.type).toBe("full_text");
+    });
+
+    it("rejects fields from a different index kind", () => {
+      // @ts-expect-error dimension is embeddings-only.
+      const invalid: CreateIndexRequest = { type: "full_text", dimension: 512 };
+      expect(invalid.type).toBe("full_text");
+    });
+  });
+
   describe("Batch transform types", () => {
     it("accepts the numeric $min transform operator", () => {
       const request: BatchRequest = {

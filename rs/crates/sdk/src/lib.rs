@@ -31,6 +31,29 @@ pub fn new_client_with_token(
 
 include!(concat!(env!("OUT_DIR"), "/client.rs"));
 
+/// Actionable storage admission detail extracted from a create-index error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageResourceExhaustedError {
+    pub message: String,
+    pub retry_after_ms: u64,
+}
+
+impl types::CreateIndexError {
+    /// Returns typed retry metadata when this is the documented HTTP 429
+    /// storage-admission response.
+    pub fn storage_resource_exhausted(&self) -> Option<StorageResourceExhaustedError> {
+        if self.code.as_deref() != Some("storage_resource_exhausted")
+            || self.retryable != Some(true)
+        {
+            return None;
+        }
+        Some(StorageResourceExhaustedError {
+            message: self.message.clone().unwrap_or_else(|| self.error.clone()),
+            retry_after_ms: self.retry_after_ms?.get(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{normalize_base_url, types};
@@ -70,5 +93,25 @@ mod tests {
         let value = serde_json::to_value(request).expect("serialize create index request");
         assert_eq!(value["type"], "embeddings");
         assert!(value.get("name").is_none());
+    }
+
+    #[test]
+    fn create_index_error_preserves_storage_retry_contract() {
+        let error: types::CreateIndexError = serde_json::from_value(serde_json::json!({
+            "code": "storage_resource_exhausted",
+            "error": "storage_resource_exhausted",
+            "message": "storage capacity is temporarily exhausted",
+            "retryable": true,
+            "retry_after_ms": 1250
+        }))
+        .expect("valid create index error");
+        let exhausted = error
+            .storage_resource_exhausted()
+            .expect("typed storage error");
+        assert_eq!(exhausted.retry_after_ms, 1250);
+        assert_eq!(
+            exhausted.message,
+            "storage capacity is temporarily exhausted"
+        );
     }
 }

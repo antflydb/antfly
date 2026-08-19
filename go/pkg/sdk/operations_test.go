@@ -209,6 +209,34 @@ func TestCreateIndexReturnsNormalizedConfigAndUsesPathIdentity(t *testing.T) {
 	}
 }
 
+func TestCreateIndexPreservesStorageAdmissionRetry(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "2")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"code":"storage_resource_exhausted","error":"storage_resource_exhausted","message":"storage capacity is temporarily exhausted","retryable":true,"retry_after_ms":1250}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	request, err := NewCreateIndexRequest(EmbeddingsIndexConfig{Dimension: 512})
+	if err != nil {
+		t.Fatalf("NewCreateIndexRequest: %v", err)
+	}
+	_, err = client.CreateIndex(context.Background(), "docs", "vectors", *request)
+	var exhausted *StorageResourceExhaustedError
+	if !errors.As(err, &exhausted) {
+		t.Fatalf("CreateIndex error = %T %[1]v, want StorageResourceExhaustedError", err)
+	}
+	if exhausted.StatusCode != http.StatusTooManyRequests || exhausted.Code != "storage_resource_exhausted" ||
+		!exhausted.Retryable || exhausted.RetryAfterMS != 1250 || exhausted.RetryAfterSeconds != 2 {
+		t.Fatalf("StorageResourceExhaustedError = %#v", exhausted)
+	}
+}
+
 func TestBatchSendsContentLengthRequestAndParsesResponse(t *testing.T) {
 	var gotPath string
 	var gotBody string

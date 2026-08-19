@@ -11490,8 +11490,68 @@ export interface components {
             /** @description IDs of retrieved documents (for retrieval metrics) */
             retrieved_ids?: string[];
         };
-        /** @description Configuration for a new index. The index name is owned by the request path. */
-        CreateIndexRequest: {
+        /** @description Fields shared by every create-index variant. The index name is owned by the request path. */
+        CreateIndexCommon: {
+            /** @description Optional description of the index and its purpose */
+            description?: string;
+            /**
+             * @description Version of the index implementation. Defaults to 0.
+             * @default 0
+             */
+            version?: number;
+            /** @description Inline managed enrichment definitions required by this index. */
+            enrichments?: components["schemas"]["EnrichmentConfig"][];
+        };
+        /** @description Create a full-text index. */
+        CreateFullTextIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["FullTextIndexConfig"] & {
+            /** @enum {string} */
+            type: "full_text";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "full_text";
+        };
+        /** @description Create a dense or sparse embeddings index. */
+        CreateEmbeddingsIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["EmbeddingsIndexConfig"] & {
+            /** @enum {string} */
+            type: "embeddings";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "embeddings";
+        };
+        /** @description Create a graph index. */
+        CreateGraphIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["GraphIndexConfig"] & {
+            /** @enum {string} */
+            type: "graph";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "graph";
+        };
+        /** @description Create a schema-derived algebraic index. */
+        CreateAlgebraicIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["AlgebraicIndexConfig"] & {
+            /** @enum {string} */
+            type: "algebraic";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "algebraic";
+        };
+        /** @description Type-safe configuration for a new index. The index name is owned by the request path. */
+        CreateIndexRequest: components["schemas"]["CreateFullTextIndexRequest"] | components["schemas"]["CreateEmbeddingsIndexRequest"] | components["schemas"]["CreateGraphIndexRequest"] | components["schemas"]["CreateAlgebraicIndexRequest"];
+        /** @description Normalized effective configuration returned after an index is created. Provider credentials are write-only and are never returned. */
+        CreatedIndex: {
+            /** @description Name of the created index */
+            name: string;
             /** @description Optional description of the index and its purpose */
             description?: string;
             type: components["schemas"]["IndexType"];
@@ -11500,7 +11560,7 @@ export interface components {
              * @default 0
              */
             version?: number;
-            /** @description Inline managed enrichment definitions required by this index. */
+            /** @description Normalized inline managed enrichment definitions required by this index. */
             enrichments?: components["schemas"]["EnrichmentConfig"][];
             /** @description Whether to use memory-only storage. */
             mem_only?: boolean;
@@ -11531,11 +11591,6 @@ export interface components {
             edge_types?: components["schemas"]["EdgeTypeConfig"][];
             max_edges_per_document?: number;
             derive_from_schema?: boolean;
-        };
-        /** @description Normalized effective configuration returned after an index is created. */
-        CreatedIndex: components["schemas"]["CreateIndexRequest"] & {
-            /** @description Name of the created index */
-            name: string;
         };
         InferenceError: {
             /** @description Stable machine-readable error code */

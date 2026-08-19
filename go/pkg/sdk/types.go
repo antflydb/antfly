@@ -28,15 +28,19 @@ import (
 // Re-export commonly used types from oapi package
 type (
 	// Table and Index types
-	CreateTableRequest = oapi.CreateTableRequest
-	TableStatus        = oapi.TableStatus
-	TableMigration     = oapi.TableMigration
-	TableSchema        = oapi.TableSchema
-	IndexConfig        = oapi.IndexConfig
-	CreateIndexRequest = oapi.CreateIndexRequest
-	CreatedIndex       = oapi.CreatedIndex
-	IndexStatus        = oapi.IndexStatus
-	IndexType          = oapi.IndexType
+	CreateTableRequest           = oapi.CreateTableRequest
+	TableStatus                  = oapi.TableStatus
+	TableMigration               = oapi.TableMigration
+	TableSchema                  = oapi.TableSchema
+	IndexConfig                  = oapi.IndexConfig
+	CreateIndexRequest           = oapi.CreateIndexRequest
+	CreateFullTextIndexRequest   = oapi.CreateFullTextIndexRequest
+	CreateEmbeddingsIndexRequest = oapi.CreateEmbeddingsIndexRequest
+	CreateGraphIndexRequest      = oapi.CreateGraphIndexRequest
+	CreateAlgebraicIndexRequest  = oapi.CreateAlgebraicIndexRequest
+	CreatedIndex                 = oapi.CreatedIndex
+	IndexStatus                  = oapi.IndexStatus
+	IndexType                    = oapi.IndexType
 
 	// Artifact types
 	DocumentArtifactChildRange               = oapi.DocumentArtifactChildRange
@@ -366,10 +370,14 @@ func NewPackedSparseEmbedding(indices []uint32, values []float32) Embedding {
 // Constants from oapi
 const (
 	// IndexType values
-	IndexTypeEmbeddings = oapi.IndexTypeEmbeddings
-	IndexTypeFullText   = oapi.IndexTypeFullText
-	IndexTypeGraph      = oapi.IndexTypeGraph
-	IndexTypeAlgebraic  = oapi.IndexTypeAlgebraic
+	IndexTypeEmbeddings                        = oapi.IndexTypeEmbeddings
+	IndexTypeFullText                          = oapi.IndexTypeFullText
+	IndexTypeGraph                             = oapi.IndexTypeGraph
+	IndexTypeAlgebraic                         = oapi.IndexTypeAlgebraic
+	CreateFullTextIndexRequestTypeFullText     = oapi.CreateFullTextIndexRequestTypeFullText
+	CreateEmbeddingsIndexRequestTypeEmbeddings = oapi.CreateEmbeddingsIndexRequestTypeEmbeddings
+	CreateGraphIndexRequestTypeGraph           = oapi.CreateGraphIndexRequestTypeGraph
+	CreateAlgebraicIndexRequestTypeAlgebraic   = oapi.CreateAlgebraicIndexRequestTypeAlgebraic
 
 	// EnrichmentKind values
 	EnrichmentKindAsset     = oapi.EnrichmentKindAsset

@@ -6,45 +6,51 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.create_embeddings_index_request_type import CreateEmbeddingsIndexRequestType
 from ..models.derived_coverage_policy import DerivedCoveragePolicy
 from ..models.distance_metric import DistanceMetric
-from ..models.index_type import IndexType
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.chunker_config import ChunkerConfig
-    from ..models.edge_type_config import EdgeTypeConfig
     from ..models.embedder_config import EmbedderConfig
     from ..models.enrichment_config import EnrichmentConfig
     from ..models.generator_config import GeneratorConfig
     from ..models.index_execution_config import IndexExecutionConfig
 
 
-T = TypeVar("T", bound="CreateIndexRequest")
+T = TypeVar("T", bound="CreateEmbeddingsIndexRequest")
 
 
 @_attrs_define
-class CreateIndexRequest:
-    r"""Configuration for a new index. The index name is owned by the request path.
+class CreateEmbeddingsIndexRequest:
+    r"""Create a dense or sparse embeddings index.
 
     Attributes:
-        type_ (IndexType): The type of the index.
+        type_ (CreateEmbeddingsIndexRequestType):
         description (str | Unset): Optional description of the index and its purpose
         version (int | Unset): Version of the index implementation. Defaults to 0. Default: 0.
         enrichments (list[EnrichmentConfig] | Unset): Inline managed enrichment definitions required by this index.
-        mem_only (bool | Unset): Whether to use memory-only storage.
         coverage_policy (DerivedCoveragePolicy | Unset): How generation-scoped source outcomes determine derived-index
             completeness.
-        external (bool | Unset):  Default: False.
-        sparse (bool | Unset):  Default: False.
-        dimension (int | Unset):
-        field (str | Unset):
-        embedding_name (str | Unset):
-        source_artifact_name (str | Unset):
-        template (str | Unset):
+        external (bool | Unset): When true, embeddings are supplied externally via _embeddings and the index does not
+            derive prompts from a field or template. Default: False.
+        sparse (bool | Unset): When true, creates a sparse (SPLADE) inverted index. When false (default), creates a
+            dense (HNSW) vector index. Default: False.
+        dimension (int | Unset): Vector dimension for dense indexes. Required for external dense indexes. Can be omitted
+            for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
+        field (str | Unset): Field to extract embeddings from (managed indexes only; not allowed when external=true)
+        embedding_name (str | Unset): Generated embedding artifact name consumed by this vector index. Use with a
+            matching embedding enrichment for artifact-backed managed embeddings.
+        source_artifact_name (str | Unset): Artifact stream consumed by the embedding enrichment backing this vector
+            index. This is descriptive public configuration; the matching enrichment defines the materialized source.
+        template (str | Unset): Handlebars template for generating prompts (managed indexes only; not allowed when
+            external=true). See https://handlebarsjs.com/guide/ for more information. Example: Hello, {{#if (eq Name
+            "John")}}Johnathan{{else}}{{Name}}{{/if}}! You are {{Age}} years old..
         distance_metric (DistanceMetric | Unset): Distance metric for the vector index (dense only). Use "cosine" for
             models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot
             product similarity. Use "l2_squared" (default) for models trained with Euclidean distance.
+        mem_only (bool | Unset): Whether to use in-memory only storage (dense only)
         embedder (EmbedderConfig | Unset): A unified configuration for an embedding provider.
 
             Embedders can be configured with templates to customize how documents are
@@ -223,21 +229,17 @@ class CreateIndexRequest:
              Example: {'provider': 'openai', 'model': 'gpt-4.1', 'temperature': 0.7, 'max_tokens': 2048}.
         chunker (ChunkerConfig | Unset): A unified configuration for a chunking provider. Example: {'provider':
             'antfly', 'model': 'fixed', 'text': {'target_tokens': 500, 'overlap_tokens': 50}}.
-        top_k (int | Unset):  Default: 10.
-        min_weight (float | Unset):  Default: 0.0.
-        chunk_size (int | Unset):  Default: 1024.
+        top_k (int | Unset): Default number of results to return from search (sparse only) Default: 10.
+        min_weight (float | Unset): Minimum weight threshold for sparse vector entries (sparse only) Default: 0.0.
+        chunk_size (int | Unset): Number of documents per posting list chunk (sparse only) Default: 1024.
         execution (IndexExecutionConfig | Unset): Namespaced execution policy for managed index shorthand. Only
             namespaces with runtime effects are accepted.
-        edge_types (list[EdgeTypeConfig] | Unset):
-        max_edges_per_document (int | Unset):
-        derive_from_schema (bool | Unset):
     """
 
-    type_: IndexType
+    type_: CreateEmbeddingsIndexRequestType
     description: str | Unset = UNSET
     version: int | Unset = 0
     enrichments: list[EnrichmentConfig] | Unset = UNSET
-    mem_only: bool | Unset = UNSET
     coverage_policy: DerivedCoveragePolicy | Unset = UNSET
     external: bool | Unset = False
     sparse: bool | Unset = False
@@ -247,6 +249,7 @@ class CreateIndexRequest:
     source_artifact_name: str | Unset = UNSET
     template: str | Unset = UNSET
     distance_metric: DistanceMetric | Unset = UNSET
+    mem_only: bool | Unset = UNSET
     embedder: EmbedderConfig | Unset = UNSET
     summarizer: GeneratorConfig | Unset = UNSET
     chunker: ChunkerConfig | Unset = UNSET
@@ -254,9 +257,6 @@ class CreateIndexRequest:
     min_weight: float | Unset = 0.0
     chunk_size: int | Unset = 1024
     execution: IndexExecutionConfig | Unset = UNSET
-    edge_types: list[EdgeTypeConfig] | Unset = UNSET
-    max_edges_per_document: int | Unset = UNSET
-    derive_from_schema: bool | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -272,8 +272,6 @@ class CreateIndexRequest:
             for enrichments_item_data in self.enrichments:
                 enrichments_item = enrichments_item_data.to_dict()
                 enrichments.append(enrichments_item)
-
-        mem_only = self.mem_only
 
         coverage_policy: str | Unset = UNSET
         if not isinstance(self.coverage_policy, Unset):
@@ -297,6 +295,8 @@ class CreateIndexRequest:
         if not isinstance(self.distance_metric, Unset):
             distance_metric = self.distance_metric.value
 
+        mem_only = self.mem_only
+
         embedder: dict[str, Any] | Unset = UNSET
         if not isinstance(self.embedder, Unset):
             embedder = self.embedder.to_dict()
@@ -319,17 +319,6 @@ class CreateIndexRequest:
         if not isinstance(self.execution, Unset):
             execution = self.execution.to_dict()
 
-        edge_types: list[dict[str, Any]] | Unset = UNSET
-        if not isinstance(self.edge_types, Unset):
-            edge_types = []
-            for edge_types_item_data in self.edge_types:
-                edge_types_item = edge_types_item_data.to_dict()
-                edge_types.append(edge_types_item)
-
-        max_edges_per_document = self.max_edges_per_document
-
-        derive_from_schema = self.derive_from_schema
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -343,8 +332,6 @@ class CreateIndexRequest:
             field_dict["version"] = version
         if enrichments is not UNSET:
             field_dict["enrichments"] = enrichments
-        if mem_only is not UNSET:
-            field_dict["mem_only"] = mem_only
         if coverage_policy is not UNSET:
             field_dict["coverage_policy"] = coverage_policy
         if external is not UNSET:
@@ -363,6 +350,8 @@ class CreateIndexRequest:
             field_dict["template"] = template
         if distance_metric is not UNSET:
             field_dict["distance_metric"] = distance_metric
+        if mem_only is not UNSET:
+            field_dict["mem_only"] = mem_only
         if embedder is not UNSET:
             field_dict["embedder"] = embedder
         if summarizer is not UNSET:
@@ -377,26 +366,19 @@ class CreateIndexRequest:
             field_dict["chunk_size"] = chunk_size
         if execution is not UNSET:
             field_dict["execution"] = execution
-        if edge_types is not UNSET:
-            field_dict["edge_types"] = edge_types
-        if max_edges_per_document is not UNSET:
-            field_dict["max_edges_per_document"] = max_edges_per_document
-        if derive_from_schema is not UNSET:
-            field_dict["derive_from_schema"] = derive_from_schema
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.chunker_config import ChunkerConfig
-        from ..models.edge_type_config import EdgeTypeConfig
         from ..models.embedder_config import EmbedderConfig
         from ..models.enrichment_config import EnrichmentConfig
         from ..models.generator_config import GeneratorConfig
         from ..models.index_execution_config import IndexExecutionConfig
 
         d = dict(src_dict)
-        type_ = IndexType(d.pop("type"))
+        type_ = CreateEmbeddingsIndexRequestType(d.pop("type"))
 
         description = d.pop("description", UNSET)
 
@@ -410,8 +392,6 @@ class CreateIndexRequest:
                 enrichments_item = EnrichmentConfig.from_dict(enrichments_item_data)
 
                 enrichments.append(enrichments_item)
-
-        mem_only = d.pop("mem_only", UNSET)
 
         _coverage_policy = d.pop("coverage_policy", UNSET)
         coverage_policy: DerivedCoveragePolicy | Unset
@@ -440,6 +420,8 @@ class CreateIndexRequest:
             distance_metric = UNSET
         else:
             distance_metric = DistanceMetric(_distance_metric)
+
+        mem_only = d.pop("mem_only", UNSET)
 
         _embedder = d.pop("embedder", UNSET)
         embedder: EmbedderConfig | Unset
@@ -475,25 +457,11 @@ class CreateIndexRequest:
         else:
             execution = IndexExecutionConfig.from_dict(_execution)
 
-        _edge_types = d.pop("edge_types", UNSET)
-        edge_types: list[EdgeTypeConfig] | Unset = UNSET
-        if _edge_types is not UNSET:
-            edge_types = []
-            for edge_types_item_data in _edge_types:
-                edge_types_item = EdgeTypeConfig.from_dict(edge_types_item_data)
-
-                edge_types.append(edge_types_item)
-
-        max_edges_per_document = d.pop("max_edges_per_document", UNSET)
-
-        derive_from_schema = d.pop("derive_from_schema", UNSET)
-
-        create_index_request = cls(
+        create_embeddings_index_request = cls(
             type_=type_,
             description=description,
             version=version,
             enrichments=enrichments,
-            mem_only=mem_only,
             coverage_policy=coverage_policy,
             external=external,
             sparse=sparse,
@@ -503,6 +471,7 @@ class CreateIndexRequest:
             source_artifact_name=source_artifact_name,
             template=template,
             distance_metric=distance_metric,
+            mem_only=mem_only,
             embedder=embedder,
             summarizer=summarizer,
             chunker=chunker,
@@ -510,13 +479,10 @@ class CreateIndexRequest:
             min_weight=min_weight,
             chunk_size=chunk_size,
             execution=execution,
-            edge_types=edge_types,
-            max_edges_per_document=max_edges_per_document,
-            derive_from_schema=derive_from_schema,
         )
 
-        create_index_request.additional_properties = d
-        return create_index_request
+        create_embeddings_index_request.additional_properties = d
+        return create_embeddings_index_request
 
     @property
     def additional_keys(self) -> list[str]:

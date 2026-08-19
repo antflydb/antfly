@@ -31,6 +31,7 @@ const {
   AntflyClient,
   HierarchyCursorStaleError,
   QueryTemporarilyUnavailableError,
+  StorageResourceExhaustedError,
   StorageReadTemporarilyUnavailableError,
   normalizeBaseUrl,
   readLimitedResponseBytes,
@@ -787,6 +788,62 @@ describe("AntflyClient", () => {
           dimension: 512,
         })
       ).rejects.toThrow("unexpected empty response");
+    });
+
+    it("preserves storage admission retry metadata", async () => {
+      mockPost.mockResolvedValueOnce({
+        data: undefined,
+        error: {
+          code: "storage_resource_exhausted",
+          error: "storage_resource_exhausted",
+          message: "storage capacity is temporarily exhausted",
+          retryable: true,
+          retry_after_ms: 1250,
+        },
+        response: {
+          status: 429,
+          headers: new Headers({ "Retry-After": "2" }),
+        },
+      });
+
+      try {
+        await client.indexes.create("wikipedia", "thumbnail", {
+          type: "embeddings",
+          dimension: 512,
+        });
+        expect.fail("expected storage admission failure");
+      } catch (error) {
+        expect(error).toBeInstanceOf(StorageResourceExhaustedError);
+        const exhausted = error as InstanceType<typeof StorageResourceExhaustedError>;
+        expect(exhausted.status).toBe(429);
+        expect(exhausted.code).toBe("storage_resource_exhausted");
+        expect(exhausted.retryable).toBe(true);
+        expect(exhausted.retryAfterMs).toBe(1250);
+        expect(exhausted.retryAfterSeconds).toBe(2);
+      }
+    });
+
+    it("falls back to Retry-After for an invalid body delay", async () => {
+      mockPost.mockResolvedValueOnce({
+        data: undefined,
+        error: {
+          code: "storage_resource_exhausted",
+          error: "storage_resource_exhausted",
+          retryable: true,
+          retry_after_ms: Number.POSITIVE_INFINITY,
+        },
+        response: {
+          status: 429,
+          headers: new Headers({ "Retry-After": "3" }),
+        },
+      });
+
+      await expect(
+        client.indexes.create("wikipedia", "thumbnail", {
+          type: "embeddings",
+          dimension: 512,
+        })
+      ).rejects.toMatchObject({ retryAfterMs: 3000, retryAfterSeconds: 3 });
     });
   });
 

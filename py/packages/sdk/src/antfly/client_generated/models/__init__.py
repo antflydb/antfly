@@ -111,9 +111,17 @@ from .connection import Connection
 from .connection_kind import ConnectionKind
 from .connection_status import ConnectionStatus
 from .connections_response import ConnectionsResponse
+from .create_algebraic_index_request import CreateAlgebraicIndexRequest
+from .create_algebraic_index_request_type import CreateAlgebraicIndexRequestType
 from .create_api_key_request import CreateApiKeyRequest
 from .create_api_key_request_row_filter_type_0 import CreateApiKeyRequestRowFilterType0
-from .create_index_request import CreateIndexRequest
+from .create_embeddings_index_request import CreateEmbeddingsIndexRequest
+from .create_embeddings_index_request_type import CreateEmbeddingsIndexRequestType
+from .create_full_text_index_request import CreateFullTextIndexRequest
+from .create_full_text_index_request_type import CreateFullTextIndexRequestType
+from .create_graph_index_request import CreateGraphIndexRequest
+from .create_graph_index_request_type import CreateGraphIndexRequestType
+from .create_index_common import CreateIndexCommon
 from .create_table_request import CreateTableRequest
 from .create_table_request_indexes import CreateTableRequestIndexes
 from .create_user_request import CreateUserRequest
@@ -874,10 +882,18 @@ __all__ = (
     "ConnectionKind",
     "ConnectionsResponse",
     "ConnectionStatus",
+    "CreateAlgebraicIndexRequest",
+    "CreateAlgebraicIndexRequestType",
     "CreateApiKeyRequest",
     "CreateApiKeyRequestRowFilterType0",
     "CreatedIndex",
-    "CreateIndexRequest",
+    "CreateEmbeddingsIndexRequest",
+    "CreateEmbeddingsIndexRequestType",
+    "CreateFullTextIndexRequest",
+    "CreateFullTextIndexRequestType",
+    "CreateGraphIndexRequest",
+    "CreateGraphIndexRequestType",
+    "CreateIndexCommon",
     "CreateTableRequest",
     "CreateTableRequestIndexes",
     "CreateUserRequest",

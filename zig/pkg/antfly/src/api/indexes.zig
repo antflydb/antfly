@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
@@ -641,6 +642,23 @@ pub fn encodeSingleIndexConfig(
     return try out.toOwnedSlice(alloc);
 }
 
+/// Encode the effective index configuration returned by create. The index
+/// identity is path-owned and public responses must never reflect inline
+/// provider credentials from the stored catalog document.
+pub fn encodeCreatedIndexConfig(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    index_json: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
+    defer parsed.deinit();
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try appendPublicIndexConfig(alloc, &out, index_name, parsed.value, false);
+    return try out.toOwnedSlice(alloc);
+}
+
 pub fn hasIndexConfig(
     alloc: std.mem.Allocator,
     indexes_json: []const u8,
@@ -860,6 +878,16 @@ fn appendIndexConfig(
     index_name: []const u8,
     config: std.json.Value,
 ) !void {
+    return appendPublicIndexConfig(alloc, out, index_name, config, true);
+}
+
+fn appendPublicIndexConfig(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    index_name: []const u8,
+    config: std.json.Value,
+    canonicalize_enrichments: bool,
+) !void {
     if (config != .object) return error.InvalidTableIndexMetadata;
     const index_type = inferIndexType(index_name, config) orelse return error.InvalidTableIndexMetadata;
 
@@ -883,18 +911,89 @@ fn appendIndexConfig(
     while (it.next()) |entry| {
         if (std.mem.eql(u8, entry.key_ptr.*, "name") or
             std.mem.eql(u8, entry.key_ptr.*, coverage_policy_mod.incarnation_field)) continue;
+        if (isSensitivePublicConfigField(entry.key_ptr.*) and !isSecretReference(entry.value_ptr.*)) continue;
         try out.append(alloc, ',');
         try appendJsonString(alloc, out, entry.key_ptr.*);
         try out.append(alloc, ':');
-        if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) {
+        if (canonicalize_enrichments and std.mem.eql(u8, entry.key_ptr.*, "enrichments")) {
             try appendCanonicalIndexEnrichments(alloc, out, entry.value_ptr.*);
         } else {
-            const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(entry.value_ptr.*, .{})});
-            defer alloc.free(encoded);
-            try out.appendSlice(alloc, encoded);
+            try appendPublicConfigValue(alloc, out, entry.value_ptr.*, entry.key_ptr.*);
         }
     }
     try out.append(alloc, '}');
+}
+
+fn isSecretReference(value: std.json.Value) bool {
+    if (value != .string) return false;
+    return std.mem.startsWith(u8, value.string, "${secret:") and std.mem.endsWith(u8, value.string, "}");
+}
+
+fn isSensitivePublicConfigField(field: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(field, "authorization") or
+        std.ascii.eqlIgnoreCase(field, "proxy-authorization") or
+        std.ascii.eqlIgnoreCase(field, "cookie") or
+        std.ascii.eqlIgnoreCase(field, "set-cookie") or
+        std.ascii.eqlIgnoreCase(field, "credentials_path") or
+        std.ascii.eqlIgnoreCase(field, "private_key") or
+        std.ascii.eqlIgnoreCase(field, "secret")) return true;
+    const secret_suffixes = [_][]const u8{
+        "api_key",  "api-key", "apikey",
+        "password", "secret",  "token",
+    };
+    for (secret_suffixes) |suffix| {
+        if (std.ascii.endsWithIgnoreCase(field, suffix)) return true;
+    }
+    return false;
+}
+
+fn appendPublicConfigValue(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    value: std.json.Value,
+    field_name: ?[]const u8,
+) !void {
+    if (field_name) |name| {
+        if (std.ascii.endsWithIgnoreCase(name, "_json") and value == .string) {
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, value.string, .{}) catch {
+                // Opaque producer documents can contain provider credentials.
+                // An invalid document should already have failed validation;
+                // fail closed here instead of reflecting it to a client.
+                return appendJsonString(alloc, out, "[redacted]");
+            };
+            defer parsed.deinit();
+            var nested = std.ArrayListUnmanaged(u8).empty;
+            defer nested.deinit(alloc);
+            try appendPublicConfigValue(alloc, &nested, parsed.value, null);
+            return appendJsonString(alloc, out, nested.items);
+        }
+    }
+
+    switch (value) {
+        .object => |object| {
+            try out.append(alloc, '{');
+            var first = true;
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (isSensitivePublicConfigField(entry.key_ptr.*) and !isSecretReference(entry.value_ptr.*)) continue;
+                if (!first) try out.append(alloc, ',');
+                first = false;
+                try appendJsonString(alloc, out, entry.key_ptr.*);
+                try out.append(alloc, ':');
+                try appendPublicConfigValue(alloc, out, entry.value_ptr.*, entry.key_ptr.*);
+            }
+            try out.append(alloc, '}');
+        },
+        .array => |array| {
+            try out.append(alloc, '[');
+            for (array.items, 0..) |item, i| {
+                if (i > 0) try out.append(alloc, ',');
+                try appendPublicConfigValue(alloc, out, item, null);
+            }
+            try out.append(alloc, ']');
+        },
+        else => try appendJsonValue(alloc, out, value),
+    }
 }
 
 fn appendCanonicalIndexEnrichments(
@@ -3588,6 +3687,36 @@ test "public index config encoders redact coverage incarnation" {
     const encoded_single = (try encodeSingleIndexConfig(std.testing.allocator, indexes_json, "embed_idx")).?;
     defer std.testing.allocator.free(encoded_single);
     try std.testing.expect(std.mem.indexOf(u8, encoded_single, coverage_policy_mod.incarnation_field) == null);
+}
+
+test "public index config encoders redact nested credentials" {
+    const indexes_json =
+        \\{"embed_idx":{"type":"embeddings","dimension":384,"embedder":{"provider":"openai","model":"text-embedding-3-small","api_key":"sk-private"},"summarizer":{"provider":"gemini","model":"gemini-2.5-flash","api_key":"${secret:gemini_key}"},"enrichments":[{"name":"asset_v1","kind":"asset","producer_json":"{\"provider\":\"remote\",\"access_token\":\"private-token\",\"headers\":{\"Authorization\":\"Bearer private-auth\",\"X-Api-Key\":\"private-header-key\",\"Accept\":\"text/html\"},\"format\":\"html\"}"}]}}
+    ;
+
+    const encoded_single = (try encodeSingleIndexConfig(std.testing.allocator, indexes_json, "embed_idx")).?;
+    defer std.testing.allocator.free(encoded_single);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_single, "sk-private") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_single, "private-token") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_single, "${secret:gemini_key}") != null);
+
+    const created = try encodeCreatedIndexConfig(std.testing.allocator, "embed_idx", indexes_json[13 .. indexes_json.len - 1]);
+    defer std.testing.allocator.free(created);
+    try std.testing.expect(std.mem.indexOf(u8, created, "\"name\":\"embed_idx\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, created, "sk-private") == null);
+    try std.testing.expect(std.mem.indexOf(u8, created, "private-token") == null);
+    try std.testing.expect(std.mem.indexOf(u8, created, "private-auth") == null);
+    try std.testing.expect(std.mem.indexOf(u8, created, "private-header-key") == null);
+    try std.testing.expect(std.mem.indexOf(u8, created, "${secret:gemini_key}") != null);
+    var parsed_created = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, created, .{});
+    defer parsed_created.deinit();
+    const created_enrichments = parsed_created.value.object.get("enrichments") orelse return error.TestUnexpectedResult;
+    const producer_json = created_enrichments.array.items[0].object.get("producer_json") orelse return error.TestUnexpectedResult;
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"provider\":\"remote\",\"headers\":{\"Accept\":\"text/html\"},\"format\":\"html\"}",
+        producer_json.string,
+    );
 }
 
 test "identical index mutation retries preserve coverage incarnation" {

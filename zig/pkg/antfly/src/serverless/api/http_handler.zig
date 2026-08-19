@@ -4676,7 +4676,7 @@ pub const HttpHandler = struct {
             else => return error.InternalFailure,
         };
         defer alloc.free(next_indexes_json);
-        const response_body = alloc.dupe(u8, expanded_index_json) catch return error.InternalFailure;
+        const response_body = indexes_api.encodeCreatedIndexConfig(alloc, index_name, expanded_index_json) catch return error.InternalFailure;
         errdefer alloc.free(response_body);
         validateServerlessIndexCatalog(alloc, next_indexes_json) catch |err| switch (err) {
             error.UnsupportedCreateTableRequest, error.InvalidTableIndexMetadata => return error.InvalidIndexRequest,

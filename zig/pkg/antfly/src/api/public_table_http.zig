@@ -1204,19 +1204,19 @@ pub fn handleTableCreateIndex(
     const response_body = api.executeTableCreateIndex(alloc, table_name, index_name, body) catch |err| switch (err) {
         error.Canceled, error.DeadlineExceeded => return err,
         error.NotLeader => return err,
-        error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
-        error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "table mutation conflict; retry request") },
-        error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
-        error.InvalidIndexRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported index configuration") },
-        error.ProbeUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "index validation probe unavailable") },
-        error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}") },
+        error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"not_found\",\"message\":\"not found\",\"retryable\":false}"), .json = true },
+        error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "{\"error\":\"table_mutation_conflict\",\"message\":\"table mutation conflict; retry request\",\"retryable\":true}"), .json = true },
+        error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "{\"error\":\"method_not_allowed\",\"message\":\"method not allowed\",\"retryable\":false}"), .json = true },
+        error.InvalidIndexRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"invalid_index_request\",\"message\":\"unsupported index configuration\",\"retryable\":false}"), .json = true },
+        error.ProbeUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "{\"error\":\"index_probe_unavailable\",\"message\":\"index validation probe unavailable\",\"retryable\":true}"), .json = true },
+        error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"model_not_found\",\"message\":\"model not found\",\"retryable\":false}"), .json = true },
         error.Backpressured => return .{
             .status = 429,
             .body = try alloc.dupe(u8, "{\"code\":\"storage_resource_exhausted\",\"error\":\"storage_resource_exhausted\",\"message\":\"storage descriptors are temporarily exhausted\",\"retryable\":true,\"retry_after_ms\":1000}"),
             .json = true,
             .retry_after_seconds = 1,
         },
-        error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "index create failed") },
+        error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "{\"error\":\"internal_error\",\"message\":\"index create failed\",\"retryable\":false}"), .json = true },
     };
     return .{ .status = 201, .body = response_body, .json = true };
 }

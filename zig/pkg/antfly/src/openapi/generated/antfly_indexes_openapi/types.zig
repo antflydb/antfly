@@ -187,46 +187,159 @@ pub const AntflyType = enum {
     }
 };
 
-/// Configuration for a new index. The index name is owned by the request path.
-pub const CreateIndexRequest = struct {
+/// Create a schema-derived algebraic index.
+pub const CreateAlgebraicIndexRequest = struct {
     /// Optional description of the index and its purpose
     description: ?[]const u8 = null,
-    type: IndexType,
     /// Version of the index implementation. Defaults to 0.
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index.
     enrichments: ?[]const EnrichmentConfig = null,
-    /// Whether to use memory-only storage.
-    mem_only: ?bool = null,
-    coverage_policy: ?DerivedCoveragePolicy = null,
-    external: ?bool = null,
-    sparse: ?bool = null,
-    dimension: ?i64 = null,
-    field: ?[]const u8 = null,
-    embedding_name: ?[]const u8 = null,
-    source_artifact_name: ?[]const u8 = null,
-    template: ?[]const u8 = null,
-    distance_metric: ?DistanceMetric = null,
-    embedder: ?antfly_embeddings_openapi.EmbedderConfig = null,
-    summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
-    chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
-    top_k: ?i64 = null,
-    min_weight: ?f32 = null,
-    chunk_size: ?i64 = null,
-    execution: ?IndexExecutionConfig = null,
-    edge_types: ?[]const EdgeTypeConfig = null,
-    max_edges_per_document: ?i64 = null,
+    /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
     derive_from_schema: ?bool = null,
+    type: []const u8,
 };
 
-/// Normalized effective configuration returned after an index is created.
+/// Create a dense or sparse embeddings index.
+pub const CreateEmbeddingsIndexRequest = struct {
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// Inline managed enrichment definitions required by this index.
+    enrichments: ?[]const EnrichmentConfig = null,
+    /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
+    coverage_policy: ?DerivedCoveragePolicy = null,
+    /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
+    external: ?bool = null,
+    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
+    sparse: ?bool = null,
+    /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
+    dimension: ?i64 = null,
+    /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
+    field: ?[]const u8 = null,
+    /// Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings.
+    embedding_name: ?[]const u8 = null,
+    /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
+    source_artifact_name: ?[]const u8 = null,
+    /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
+    template: ?[]const u8 = null,
+    distance_metric: ?DistanceMetric = null,
+    /// Whether to use in-memory only storage (dense only)
+    mem_only: ?bool = null,
+    /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
+    embedder: ?antfly_embeddings_openapi.EmbedderConfig = null,
+    /// Configuration for the summarizer plugin (dense managed indexes only)
+    summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
+    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
+    chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
+    /// Default number of results to return from search (sparse only)
+    top_k: ?i64 = null,
+    /// Minimum weight threshold for sparse vector entries (sparse only)
+    min_weight: ?f32 = null,
+    /// Number of documents per posting list chunk (sparse only)
+    chunk_size: ?i64 = null,
+    /// Non-semantic execution policy for shorthand-created chunking or embedding producers.
+    execution: ?IndexExecutionConfig = null,
+    type: []const u8,
+};
+
+/// Create a full-text index.
+pub const CreateFullTextIndexRequest = struct {
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// Inline managed enrichment definitions required by this index.
+    enrichments: ?[]const EnrichmentConfig = null,
+    /// Whether to use memory-only storage
+    mem_only: ?bool = null,
+    type: []const u8,
+};
+
+/// Create a graph index.
+pub const CreateGraphIndexRequest = struct {
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// Inline managed enrichment definitions required by this index.
+    enrichments: ?[]const EnrichmentConfig = null,
+    /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
+    summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
+    /// Handlebars template for generating summarizer input text. Uses document fields as template variables. Same pattern as EmbeddingsConfig template.
+    template: ?[]const u8 = null,
+    /// List of edge types with their configurations
+    edge_types: ?[]const EdgeTypeConfig = null,
+    /// Maximum number of edges per document (0 = unlimited)
+    max_edges_per_document: ?i64 = null,
+    type: []const u8,
+};
+
+/// Fields shared by every create-index variant. The index name is owned by the request path.
+pub const CreateIndexCommon = struct {
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// Inline managed enrichment definitions required by this index.
+    enrichments: ?[]const EnrichmentConfig = null,
+};
+
+/// Type-safe configuration for a new index. The index name is owned by the request path.
+pub const CreateIndexRequest = union(enum) {
+    create_full_text_index_request: CreateFullTextIndexRequest,
+    create_embeddings_index_request: CreateEmbeddingsIndexRequest,
+    create_graph_index_request: CreateGraphIndexRequest,
+    create_algebraic_index_request: CreateAlgebraicIndexRequest,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "full_text")) {
+            return .{ .create_full_text_index_request = try std.json.parseFromValueLeaky(CreateFullTextIndexRequest, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "embeddings")) {
+            return .{ .create_embeddings_index_request = try std.json.parseFromValueLeaky(CreateEmbeddingsIndexRequest, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph")) {
+            return .{ .create_graph_index_request = try std.json.parseFromValueLeaky(CreateGraphIndexRequest, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "algebraic")) {
+            return .{ .create_algebraic_index_request = try std.json.parseFromValueLeaky(CreateAlgebraicIndexRequest, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .create_full_text_index_request => |v| try jw.write(v),
+            .create_embeddings_index_request => |v| try jw.write(v),
+            .create_graph_index_request => |v| try jw.write(v),
+            .create_algebraic_index_request => |v| try jw.write(v),
+        }
+    }
+};
+
+/// Normalized effective configuration returned after an index is created. Provider credentials are write-only and are never returned.
 pub const CreatedIndex = struct {
+    /// Name of the created index
+    name: []const u8,
     /// Optional description of the index and its purpose
     description: ?[]const u8 = null,
     type: IndexType,
     /// Version of the index implementation. Defaults to 0.
     version: ?i64 = null,
-    /// Inline managed enrichment definitions required by this index.
+    /// Normalized inline managed enrichment definitions required by this index.
     enrichments: ?[]const EnrichmentConfig = null,
     /// Whether to use memory-only storage.
     mem_only: ?bool = null,
@@ -249,8 +362,6 @@ pub const CreatedIndex = struct {
     edge_types: ?[]const EdgeTypeConfig = null,
     max_edges_per_document: ?i64 = null,
     derive_from_schema: ?bool = null,
-    /// Name of the created index
-    name: []const u8,
 };
 
 /// A structured reason why the coverage projection cannot be treated as globally complete.
