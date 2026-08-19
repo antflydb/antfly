@@ -3854,6 +3854,12 @@ test "chunked dense terminal failure is recorded once per parent request" {
     defer store.deinit();
     var erased_store = try backend_erased.storeFrom(alloc, store);
     defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/chunked-terminal-indexes", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
     var failure_capture = TestFailureCapture{};
     var runtime = EnrichmentRuntime{
         .alloc = alloc,
@@ -3862,7 +3868,7 @@ test "chunked dense terminal failure is recorded once per parent request" {
         .owns_store = false,
         .change_journal = undefined,
         .replay_source = undefined,
-        .index_manager = undefined,
+        .index_manager = &index_manager,
         .write_ctx = undefined,
         .write_fn = undefined,
         .failure_ctx = &failure_capture,
@@ -3935,6 +3941,12 @@ test "malformed chunked dense batch is isolated without failing the worker" {
     defer store.deinit();
     var erased_store = try backend_erased.storeFrom(alloc, store);
     defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/malformed-chunked-indexes", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
     var failure_capture = TestFailureCapture{};
     var runtime = EnrichmentRuntime{
         .alloc = alloc,
@@ -3943,7 +3955,7 @@ test "malformed chunked dense batch is isolated without failing the worker" {
         .owns_store = false,
         .change_journal = undefined,
         .replay_source = undefined,
-        .index_manager = undefined,
+        .index_manager = &index_manager,
         .write_ctx = undefined,
         .write_fn = undefined,
         .failure_ctx = &failure_capture,
