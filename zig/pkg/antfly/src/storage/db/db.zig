@@ -34348,7 +34348,9 @@ test "async context dense catch-up session tracking suppresses local bulk sessio
     try std.testing.expectEqual(@as(u32, 0), ctx.active_dense_catch_up_sessions.load(.monotonic));
     try std.testing.expect(ctx.stats.dense_catch_up.active.load(.monotonic) == 0);
     try std.testing.expect(!ctx.text_merge_deferred.load(.acquire));
-    try std.testing.expect(!resource_manager.shouldDeferSoftCompactionForDerivedReplay());
+    // Session-owned deferral has ended, but the short quiet period still
+    // protects the just-completed publication from an immediate soft rewrite.
+    try std.testing.expect(resource_manager.shouldDeferSoftCompactionForDerivedReplay());
     try std.testing.expect(!shouldDeferAppliedSequenceFlush(&ctx, false));
     try std.testing.expect(denseApplyUsesLocalStreamingSession(&ctx, "vec"));
 

@@ -14197,6 +14197,15 @@ pub const ProvisionedTableWriteSource = struct {
         if (tables.len != 1) return null;
 
         const table_req = tables[0];
+        const has_mutations = table_req.writes.len != 0 or
+            table_req.deletes.len != 0 or
+            table_req.transforms.len != 0;
+        if (!has_mutations and table_req.predicates.len != 0) {
+            // Predicates are validated by the transactional path. `batch`
+            // groups only mutations, so sending a predicate-only request to
+            // it would report success without evaluating the predicate.
+            return null;
+        }
         self.beginTableRequest(table_req.table_name);
         defer self.endTableRequest(table_req.table_name);
 
@@ -18027,6 +18036,43 @@ test "provisioned single-group commit batch uses atomic shard fast path" {
     defer result.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, result.json, "\"alpha\"") != null);
     try std.testing.expect(!try cached.db.hasTopologySensitiveTransactions());
+}
+
+test "provisioned predicate-only batch validates matching and stale versions" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-provisioned-predicate-only-batch";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(path, ProvisionedWriteCoalesceTestCatalog.iface());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+    _ = try source.source().createTable(alloc, "docs", .{});
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .timestamp_ns = 5_000,
+        .sync_level = .write,
+    });
+
+    const matching = (try source.source().commitBatch(alloc, &.{.{
+        .table_name = "docs",
+        .predicates = &.{.{ .key = "doc:a", .expected_version = 5_000 }},
+    }}, .write)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(matching == .committed);
+    try std.testing.expectEqual(@as(usize, 1), matching.committed.participant_count);
+
+    const stale = (try source.source().commitBatch(alloc, &.{.{
+        .table_name = "docs",
+        .predicates = &.{.{ .key = "doc:a", .expected_version = 4_999 }},
+    }}, .write)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(stale == .conflict);
+    try std.testing.expectEqualStrings("docs", stale.conflict.table_name);
+    try std.testing.expectEqualStrings("doc:a", stale.conflict.key);
 }
 
 fn boundConflict(table: distributed_txn.TableCommitRequest, err: anyerror) distributed_txn.CommitConflict {

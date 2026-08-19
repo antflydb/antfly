@@ -5449,6 +5449,7 @@ pub fn build(b: *std.Build) void {
             "db transaction recovery runtime resolves table-group participants through distributed txn resolver",
             "bound stable single-group transaction retry does not reapply transforms",
             "bound single-group batch reports prepared intent conflicts",
+            "provisioned predicate-only batch validates matching and stale versions",
             "api http client preserves group doc identity conflicts",
             "api http client preserves public batch retry safety classifications",
             "api http client forwards bounded raft batch routing context without allocation",
