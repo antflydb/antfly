@@ -12026,15 +12026,22 @@ pub const DataServer = struct {
             const group_id = candidate.group_id;
             const table_name = candidate.table_name;
 
-            // A resident writer owns ordinary async replay and publishes its
-            // runtime status directly. Fallback discovery is for lost/cold
-            // repair debt; auditing a resident writer duplicates catch-up and
-            // can enqueue healthy replay as repair work. Exact durable queue
-            // entries remain authoritative and always bypass this hint.
-            if (!candidate.queued and self.liveRuntimeWriteSource().hasResidentWriterForGroupTableBestEffort(group_id, table_name)) {
-                fallback_advance_count = @max(fallback_advance_count, candidate.cursor_distance + 1);
-                continue;
-            }
+            // Healthy resident writers own ordinary async replay and publish
+            // runtime status directly. A resident writer with repair metadata
+            // or durable intent debt must still be audited, while a contended
+            // writer is retried without consuming the fallback cursor.
+            if (!candidate.queued) switch (self.liveRuntimeWriteSource().residentWriterRepairStateBestEffort(group_id, table_name)) {
+                .clean => {
+                    fallback_advance_count = @max(fallback_advance_count, candidate.cursor_distance + 1);
+                    continue;
+                },
+                .busy => {
+                    found_pending = true;
+                    self.retainProvisionedIndexRepairFallbackForRetry(now_ms);
+                    continue;
+                },
+                .absent, .pending => {},
+            };
 
             var ownership_fence = IndexRepairOwnershipFence{
                 .leadership_source = self.group_leadership_source,

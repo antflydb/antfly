@@ -5115,6 +5115,22 @@ pub const DB = struct {
         }
     }
 
+    /// Applies a one-participant transaction through the ordinary atomic DB
+    /// batch while preserving the distributed transaction's representability
+    /// contract for transforms. This avoids durable 2PC bookkeeping without
+    /// making graph-transform behavior depend on the current shard count.
+    pub fn batchTransactionCompatible(self: *DB, req: types.BatchRequest) anyerror!void {
+        var compatible_req = req;
+        compatible_req.reject_graph_transform_projections = true;
+        if (benchMetricsEnabled()) {
+            var profile = BatchProfile{};
+            try self.batchInternal(compatible_req, &profile, .{});
+            logBatchProfile(compatible_req, profile);
+        } else {
+            try self.batchInternal(compatible_req, null, .{});
+        }
+    }
+
     pub fn batchProfiled(self: *DB, req: types.BatchRequest, profile: *BatchProfile) anyerror!void {
         try self.batchInternal(req, profile, .{});
     }
@@ -5626,6 +5642,14 @@ pub const DB = struct {
         var effective_ops = try coalesceKeyValueRequest(self, types.BatchWrite, req.writes, req.deletes, req.transforms);
         defer effective_ops.deinit(self.alloc);
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.resolve_transforms_ns, resolve_transforms_start_ns);
+
+        // Transaction intents carry primary key/value rows but not projected
+        // graph deltas. Evaluate this after transform expansion so absent
+        // non-upsert documents retain their established no-op semantics, and
+        // before any request mutation is persisted.
+        if (req.reject_graph_transform_projections and effective_ops.graph_writes.items.len != 0) {
+            return error.UnsupportedTransformOperation;
+        }
 
         const merge_effective_req_start_ns = monotonicTimeNs();
 
@@ -17488,7 +17512,7 @@ pub const DB = struct {
         return more;
     }
 
-    fn runArtifactRepairMetadataMaintenanceUntilIdle(self: *DB) !void {
+    pub fn runArtifactRepairMetadataMaintenanceUntilIdle(self: *DB) !void {
         while (try self.runArtifactRepairMetadataMaintenancePass()) {}
     }
 
