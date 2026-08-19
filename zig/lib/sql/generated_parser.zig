@@ -384,9 +384,15 @@ const SourceIndexSink = union(enum) {
 /// Contextual keyword classification runs on every token, so facts that need a
 /// statement scan are computed once and nesting state advances monotonically.
 const TokenMappingContext = struct {
+    // Parenthesis-scoped fields are indexed by paren_depth; fields whose
+    // original grammar context treats brackets as nesting are indexed by
+    // delimiter_depth. Keeping both in one compact array preserves the
+    // allocation-free common path without conflating their depth rules.
     const ScopeState = struct {
         in_select_projection: bool = false,
+        is_cast_scope: bool = false,
         saw_order_by: bool = false,
+        function_argument_name_allowed: bool = false,
     };
 
     paren_depth: usize = 0,
@@ -442,6 +448,14 @@ const TokenMappingContext = struct {
         return self.scopes[self.delimiter_depth].saw_order_by;
     }
 
+    fn inCastScope(self: *const @This()) bool {
+        return self.scopes[self.paren_depth].is_cast_scope;
+    }
+
+    fn functionArgumentNameAllowed(self: *const @This()) bool {
+        return self.scopes[self.delimiter_depth].function_argument_name_allowed;
+    }
+
     fn advance(self: *@This(), tokens: []const token_mod.Token, index: usize) void {
         const token = tokens[index];
         if (self.alter_table_tail_start) |tail_start| {
@@ -470,17 +484,21 @@ const TokenMappingContext = struct {
             .lparen => {
                 self.paren_depth += 1;
                 self.scopes[self.paren_depth].in_select_projection = false;
+                self.scopes[self.paren_depth].is_cast_scope = index > 0 and tokens[index - 1].matchesKeywordTag(.cast);
                 self.delimiter_depth += 1;
                 self.scopes[self.delimiter_depth].saw_order_by = false;
+                self.scopes[self.delimiter_depth].function_argument_name_allowed = index > 0 and tokens[index - 1].kind == .identifier;
                 if (self.paren_depth == 1) self.segment_start = index + 1;
             },
             .lbracket => {
                 self.delimiter_depth += 1;
                 self.scopes[self.delimiter_depth].saw_order_by = false;
+                self.scopes[self.delimiter_depth].function_argument_name_allowed = index > 0 and tokens[index - 1].kind == .identifier;
             },
             .rparen => {
                 if (self.delimiter_depth > 0) {
                     self.scopes[self.delimiter_depth].saw_order_by = false;
+                    self.scopes[self.delimiter_depth].function_argument_name_allowed = false;
                     self.delimiter_depth -= 1;
                 }
                 if (self.paren_depth == 0) {
@@ -489,19 +507,23 @@ const TokenMappingContext = struct {
                     return;
                 }
                 self.scopes[self.paren_depth].in_select_projection = false;
+                self.scopes[self.paren_depth].is_cast_scope = false;
                 self.paren_depth -= 1;
                 if (self.paren_depth == 0) self.segment_start = null;
             },
             .rbracket => if (self.delimiter_depth > 0) {
                 self.scopes[self.delimiter_depth].saw_order_by = false;
+                self.scopes[self.delimiter_depth].function_argument_name_allowed = false;
                 self.delimiter_depth -= 1;
             },
-            .comma => if (self.paren_depth == 1) {
-                self.segment_start = index + 1;
+            .comma => {
+                self.scopes[self.delimiter_depth].function_argument_name_allowed = true;
+                if (self.paren_depth == 1) self.segment_start = index + 1;
             },
             .semicolon => {
                 self.scopes[self.paren_depth].in_select_projection = false;
                 self.scopes[self.delimiter_depth].saw_order_by = false;
+                self.scopes[self.delimiter_depth].function_argument_name_allowed = false;
             },
             else => {},
         }
@@ -682,7 +704,7 @@ fn contextualKeywordSymbolId(
     if (createTriggerDiagnosticIdentifierContext(tokens, index) and createTriggerDiagnosticKeywordAsIdentifier(token)) {
         return generated.tokenId(.IDENT);
     }
-    if (functionArgumentNameIdentifierContext(tokens, index, token, next)) return generated.tokenId(.IDENT);
+    if (functionArgumentNameIdentifierContext(token, next, mapping_context)) return generated.tokenId(.IDENT);
     if (matchKeywordAliasContext(token, previous, next, mapping_context)) return generated.tokenId(.IDENT);
     if (createTableMissingAsSelectContext(tokens, index) and token.matchesKeywordTag(.table)) return generated.tokenId(.IDENT);
     if (systemTimeForKeywordContext(tokens, index) and token.matchesKeywordTag(.@"for")) return generated.tokenId(.SYSTEM_TIME_FOR);
@@ -712,25 +734,14 @@ fn contextualKeywordSymbolId(
     return null;
 }
 
-fn functionArgumentNameIdentifierContext(tokens: []const token_mod.Token, index: usize, token: token_mod.Token, next: ?token_mod.Token) bool {
+fn functionArgumentNameIdentifierContext(
+    token: token_mod.Token,
+    next: ?token_mod.Token,
+    mapping_context: *const TokenMappingContext,
+) bool {
     if (!token.matchesKeywordTag(.@"return")) return false;
     const next_token = next orelse return false;
-    if (next_token.kind != .eq or index == 0) return false;
-    var depth: usize = 0;
-    var cursor = index;
-    while (cursor > 0) {
-        cursor -= 1;
-        switch (tokens[cursor].kind) {
-            .rparen, .rbracket => depth += 1,
-            .lparen, .lbracket => {
-                if (depth == 0) return cursor > 0 and tokens[cursor - 1].kind == .identifier;
-                depth -= 1;
-            },
-            .comma => if (depth == 0) return true,
-            else => {},
-        }
-    }
-    return false;
+    return next_token.kind == .eq and mapping_context.functionArgumentNameAllowed();
 }
 
 fn matchKeywordAliasContext(
@@ -921,25 +932,7 @@ fn typeFunctionNameContext(
     if (next != null and next.?.kind == .lparen) return true;
     if (previous != null and previous.?.kind == .colon_colon) return true;
     if (ddlTypeFunctionNameContext(tokens, index, mapping_context)) return true;
-    if (previous == null or !previous.?.matchesKeywordTag(.as)) return false;
-
-    var depth: usize = 0;
-    var cursor = index - 1;
-    while (cursor > 0) {
-        cursor -= 1;
-        switch (tokens[cursor].kind) {
-            .rparen => depth += 1,
-            .lparen => {
-                if (depth != 0) {
-                    depth -= 1;
-                } else {
-                    return cursor > 0 and tokens[cursor - 1].matchesKeywordTag(.cast);
-                }
-            },
-            else => {},
-        }
-    }
-    return false;
+    return previous != null and previous.?.matchesKeywordTag(.as) and mapping_context.inCastScope();
 }
 
 fn ddlTypeFunctionNameContext(
@@ -1256,6 +1249,92 @@ test "generated parser bridge carries scoped contextual keyword state in one pas
         if (token.matchesKeywordTag(.rows)) try std.testing.expectEqual(generated.tokenId(.ROWS), id);
     }
     try parseTokensAlloc(std.testing.allocator, window_tokens.items);
+
+    var named_argument_tokens = try lexer.tokenizeAlloc(
+        std.testing.allocator,
+        "SELECT score(RETURN = 1, nested(2), RETURN = 3) FROM docs",
+    );
+    defer lexer.freeTokens(std.testing.allocator, &named_argument_tokens);
+    const named_argument_ids = try tokenIdsAlloc(std.testing.allocator, named_argument_tokens.items);
+    defer std.testing.allocator.free(named_argument_ids);
+    for (named_argument_tokens.items, named_argument_ids) |token, id| {
+        if (token.matchesKeywordTag(.@"return")) try std.testing.expectEqual(generated.tokenId(.IDENT), id);
+    }
+    try parseTokensAlloc(std.testing.allocator, named_argument_tokens.items);
+
+    var nested_argument_tokens = try lexer.tokenizeAlloc(std.testing.allocator, "SELECT score((RETURN = 1)) FROM docs");
+    defer lexer.freeTokens(std.testing.allocator, &nested_argument_tokens);
+    const nested_argument_ids = try tokenIdsAlloc(std.testing.allocator, nested_argument_tokens.items);
+    defer std.testing.allocator.free(nested_argument_ids);
+    for (nested_argument_tokens.items, nested_argument_ids) |token, id| {
+        if (token.matchesKeywordTag(.@"return")) try std.testing.expectEqual(generated.tokenId(.RETURN), id);
+    }
+
+    var nested_cast_tokens = try lexer.tokenizeAlloc(std.testing.allocator, "SELECT CAST((payload) AS binary) FROM docs");
+    defer lexer.freeTokens(std.testing.allocator, &nested_cast_tokens);
+    const nested_cast_ids = try tokenIdsAlloc(std.testing.allocator, nested_cast_tokens.items);
+    defer std.testing.allocator.free(nested_cast_ids);
+    for (nested_cast_tokens.items, nested_cast_ids) |token, id| {
+        if (token.matchesKeywordTag(.binary)) try std.testing.expectEqual(generated.tokenId(.IDENT), id);
+    }
+    try parseTokensAlloc(std.testing.allocator, nested_cast_tokens.items);
+
+    var non_cast_tokens = try lexer.tokenizeAlloc(std.testing.allocator, "SELECT (payload AS binary) FROM docs");
+    defer lexer.freeTokens(std.testing.allocator, &non_cast_tokens);
+    const non_cast_ids = try tokenIdsAlloc(std.testing.allocator, non_cast_tokens.items);
+    defer std.testing.allocator.free(non_cast_ids);
+    for (non_cast_tokens.items, non_cast_ids) |token, id| {
+        if (token.matchesKeywordTag(.binary)) try std.testing.expectEqual(generated.tokenId(.BINARY), id);
+    }
+}
+
+test "generated parser bridge maps large contextual input without prefix scans" {
+    var sql: std.ArrayListUnmanaged(u8) = .empty;
+    defer sql.deinit(std.testing.allocator);
+    try sql.appendSlice(std.testing.allocator, "SELECT score(");
+    for (0..600) |index| {
+        if (index != 0) try sql.appendSlice(std.testing.allocator, " + ");
+        try sql.appendSlice(std.testing.allocator, "RETURN = 1");
+    }
+    try sql.appendSlice(std.testing.allocator, ")");
+
+    var tokens = try lexer.tokenizeAlloc(std.testing.allocator, sql.items);
+    defer lexer.freeTokens(std.testing.allocator, &tokens);
+    try std.testing.expect(tokens.items.len > generated_token_id_stack_capacity);
+    const ids = try tokenIdsAlloc(std.testing.allocator, tokens.items);
+    defer std.testing.allocator.free(ids);
+
+    var return_count: usize = 0;
+    for (tokens.items, ids) |token, id| {
+        if (token.matchesKeywordTag(.@"return")) {
+            try std.testing.expectEqual(generated.tokenId(.IDENT), id);
+            return_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 600), return_count);
+
+    var alias_sql: std.ArrayListUnmanaged(u8) = .empty;
+    defer alias_sql.deinit(std.testing.allocator);
+    try alias_sql.appendSlice(std.testing.allocator, "SELECT ");
+    for (0..600) |index| {
+        if (index != 0) try alias_sql.appendSlice(std.testing.allocator, ", ");
+        try alias_sql.appendSlice(std.testing.allocator, "1 AS JOIN");
+    }
+
+    var alias_tokens = try lexer.tokenizeAlloc(std.testing.allocator, alias_sql.items);
+    defer lexer.freeTokens(std.testing.allocator, &alias_tokens);
+    try std.testing.expect(alias_tokens.items.len > generated_token_id_stack_capacity);
+    const alias_ids = try tokenIdsAlloc(std.testing.allocator, alias_tokens.items);
+    defer std.testing.allocator.free(alias_ids);
+
+    var join_count: usize = 0;
+    for (alias_tokens.items, alias_ids) |token, id| {
+        if (token.matchesKeywordTag(.join)) {
+            try std.testing.expectEqual(generated.tokenId(.JOIN), id);
+            join_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 600), join_count);
 }
 
 test "generated parser bridge trims only the trailing semicolon run" {
