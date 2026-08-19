@@ -23304,7 +23304,7 @@ pub const DB = struct {
             if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
             return .{ .req = req };
         }
-        if (try self.searchRequestWithDirectAlgebraicDocFilterAlloc(req, &entry.index)) |direct| return direct;
+        if (try self.searchRequestWithDirectAlgebraicDocFilterAlloc(req, entry.index)) |direct| return direct;
         var filter_doc_ids: [][]u8 = &.{};
         errdefer entry.index.freeDocIds(filter_doc_ids);
         var exclude_doc_ids: [][]u8 = &.{};
@@ -23315,7 +23315,7 @@ pub const DB = struct {
         var filter_supported = req.filter_doc_ids_positive or req.filter_doc_ids.len > 0;
         var filter_bindings = std.ArrayListUnmanaged(@import("algebraic/index.zig").Index.FilterBinding).empty;
         defer {
-            for (filter_bindings.items) |*binding| binding.set.deinit(&entry.index);
+            for (filter_bindings.items) |*binding| binding.set.deinit(entry.index);
             filter_bindings.deinit(entry.index.alloc);
         }
 
@@ -23337,7 +23337,7 @@ pub const DB = struct {
                 if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
                 return .{ .req = req };
             };
-            errdefer set.deinit(&entry.index);
+            errdefer set.deinit(entry.index);
             try filter_bindings.append(entry.index.alloc, .{
                 .name = binding.name,
                 .set = set,
@@ -23348,7 +23348,7 @@ pub const DB = struct {
         if (req.filter_query_json.len > 0) {
             if (try entry.index.docIdSetForFilterJsonWithBindingsAlloc(self.core.store, req.filter_query_json, filter_bindings.items)) |set| {
                 var owned_set = set;
-                defer owned_set.deinit(&entry.index);
+                defer owned_set.deinit(entry.index);
                 if (owned_set.include) |ids| {
                     if (filter_supported) {
                         const intersected = try intersectAlgebraicDocIds(entry.index.alloc, filter_doc_ids, ids);
@@ -23372,7 +23372,7 @@ pub const DB = struct {
         if (req.exclusion_query_json.len > 0) {
             if (try entry.index.docIdSetForFilterJsonWithBindingsAlloc(self.core.store, req.exclusion_query_json, filter_bindings.items)) |set| {
                 var owned_set = set;
-                defer owned_set.deinit(&entry.index);
+                defer owned_set.deinit(entry.index);
                 if (owned_set.include) |ids| {
                     const merged = try unionAlgebraicDocIds(entry.index.alloc, exclude_doc_ids, ids);
                     entry.index.freeDocIds(exclude_doc_ids);
@@ -23417,7 +23417,7 @@ pub const DB = struct {
         entry.index.recordVectorFilterResolved(filter_doc_ids.len, exclude_doc_ids.len);
         return .{
             .req = next,
-            .index = &entry.index,
+            .index = entry.index,
             .filter_doc_ids = filter_doc_ids,
             .exclude_doc_ids = exclude_doc_ids,
             .resolved_doc_filter = resolved_filter,

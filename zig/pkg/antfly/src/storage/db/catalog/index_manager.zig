@@ -1413,7 +1413,9 @@ pub const IndexManager = struct {
     pub const AlgebraicIndex = struct {
         apply_mutex: *std.atomic.Mutex,
         config: types.IndexConfig,
-        index: algebraic_mod.index.Index,
+        // Heap-stable because background HLL jobs retain `*Index` while the
+        // manager's AlgebraicIndex array is free to grow and relocate entries.
+        index: *algebraic_mod.index.Index,
     };
 
     pub const TextMergeSourceSegment = struct {
@@ -2391,6 +2393,9 @@ pub const IndexManager = struct {
             new_parsed.value.max_cardinality_cache_bytes = cur.max_cardinality_cache_bytes;
             new_parsed.value.max_hll_contributions_per_document = cur.max_hll_contributions_per_document;
             new_parsed.value.max_hll_maintenance_rows_per_tick = cur.max_hll_maintenance_rows_per_tick;
+            new_parsed.value.max_pending_hll_observation_entries = cur.max_pending_hll_observation_entries;
+            new_parsed.value.max_pending_hll_observation_bytes = cur.max_pending_hll_observation_bytes;
+            new_parsed.value.hll_cardinalities = cur.hll_cardinalities;
             new_parsed.value.min_max_candidate_cache_size = cur.min_max_candidate_cache_size;
             new_parsed.value.enable_temporal_range_pruning = cur.enable_temporal_range_pruning;
 
@@ -2424,7 +2429,7 @@ pub const IndexManager = struct {
     }
 
     fn freeAlgebraicIndexEntry(self: *IndexManager, entry: *AlgebraicIndex) void {
-        entry.index.close();
+        entry.index.destroy();
         self.destroyIndexApplyMutex(entry.apply_mutex);
         entry.config.deinit(self.alloc);
         entry.* = undefined;
@@ -10764,17 +10769,14 @@ pub const IndexManager = struct {
             .algebraic => {
                 const storage_namespace = try self.algebraicStorageNamespaceAlloc(cfg.name);
                 defer self.alloc.free(storage_namespace);
-                var index = try algebraic_mod.index.Index.openWithStorageNamespace(
+                const index = try algebraic_mod.index.Index.createWithStorageNamespace(
                     self.alloc,
                     cfg.name,
                     storage_namespace,
                     cfg.config_json,
                 );
                 var index_moved = false;
-                errdefer if (!index_moved) {
-                    var doomed = index;
-                    doomed.close();
-                };
+                errdefer if (!index_moved) index.destroy();
                 const ready_key = try index.projectionConfigReadyMarkerKeyAlloc();
                 defer self.alloc.free(ready_key);
                 var runtime_store = try initRuntimeStore(self.alloc, store);
@@ -24029,6 +24031,32 @@ test "removeInMemory drops algebraic rollback index load state" {
     manager.removeInMemory("alg_v1");
     try std.testing.expect(manager.algebraicIndex("alg_v1") == null);
     try std.testing.expectEqual(@as(usize, 0), manager.index_load_states.count());
+}
+
+test "managed algebraic indexes remain pointer-stable as the catalog grows" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "algebraic-pointer-stability");
+    defer cleanupIndexManagerDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    const config_json =
+        \\{"table":"docs","schema_version":1,"capability_fingerprint":"test-capability","group_fields":[{"name":"customer","path":"customer","type":"string"}]}
+    ;
+    try manager.openConfiguredIndex(&store, .{ .name = "alg_0", .kind = .algebraic, .config_json = config_json }, false, false);
+    const stable = manager.algebraicIndex("alg_0").?.index;
+
+    for (1..33) |i| {
+        const name = try std.fmt.allocPrint(alloc, "alg_{d}", .{i});
+        defer alloc.free(name);
+        try manager.openConfiguredIndex(&store, .{ .name = name, .kind = .algebraic, .config_json = config_json }, false, false);
+    }
+    try std.testing.expectEqual(stable, manager.algebraicIndex("alg_0").?.index);
 }
 
 test "index load state tracks generic index names independently" {

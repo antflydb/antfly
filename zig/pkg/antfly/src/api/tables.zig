@@ -883,9 +883,10 @@ fn schemaDerivedAlgebraicIndexValueAlloc(
 /// (and capability fingerprint) without requiring the table to be recreated.
 ///
 /// Public algebraic indexes are always schema-derived, so each is regenerated
-/// in full; only the user-tunable runtime knobs (adaptive policy, planner/result
-/// limits) are preserved from the stored config. Returns the original bytes when
-/// there are no algebraic indexes to refresh.
+/// in full. User-managed runtime policy and materialization definitions are
+/// preserved from the stored config, then revalidated against the regenerated
+/// schema before publication. Returns the original bytes when there are no
+/// algebraic indexes to refresh.
 pub fn regenerateAlgebraicIndexesFromSchemaAlloc(
     alloc: std.mem.Allocator,
     table_name: []const u8,
@@ -936,6 +937,9 @@ fn isAlgebraicUserTunableField(field: []const u8) bool {
         "max_cardinality_cache_bytes",
         "max_hll_contributions_per_document",
         "max_hll_maintenance_rows_per_tick",
+        "max_pending_hll_observation_entries",
+        "max_pending_hll_observation_bytes",
+        "hll_cardinalities",
         "min_max_candidate_cache_size",
         "enable_temporal_range_pruning",
     };
@@ -978,6 +982,7 @@ fn regenerateAlgebraicIndexValueAlloc(
         .ignore_unknown_fields = true,
     });
     defer derived_config.deinit();
+    algebraic_mod.index.validateConfig(derived_config.value) catch return error.InvalidSchemaUpdateRequest;
     const delta = algebraic_mod.index.schemaCapabilityDelta(source_config.value, derived_config.value);
 
     // Static projection changes can leave existing docfacts encoded under the
@@ -4876,6 +4881,35 @@ test "metadata.schema update regenerates algebraic config and preserves user kno
     try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"max_cardinality_cache_bytes\":12345") != null);
     // Capability unchanged (matching fingerprint) => no backfill flag forced on.
     try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"dynamic_rules_backfill_pending\":true") == null);
+}
+
+test "metadata.schema update preserves compatible HLL definitions and rejects removed fields" {
+    const schema =
+        \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"customer":{"type":"keyword"}}}}}}
+    ;
+    const canonical = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(std.testing.allocator, "docs", schema);
+    defer std.testing.allocator.free(canonical);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, canonical, .{});
+    defer parsed.deinit();
+    const fp = parsed.value.object.get("capability_fingerprint").?.string;
+    const stored = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"alg\":{{\"type\":\"algebraic\",\"version\":2,\"table\":\"docs\",\"schema_version\":2,\"capability_fingerprint\":\"{s}\",\"group_fields\":[{{\"name\":\"customer\",\"path\":\"customer\",\"type\":\"string\"}}],\"hll_cardinalities\":[{{\"name\":\"customers\",\"value_field\":\"customer\"}}]}}}}",
+        .{fp},
+    );
+    defer std.testing.allocator.free(stored);
+
+    const refreshed = try regenerateAlgebraicIndexesFromSchemaAlloc(std.testing.allocator, "docs", stored, schema);
+    defer std.testing.allocator.free(refreshed);
+    try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"hll_cardinalities\":[{\"name\":\"customers\"") != null);
+
+    const removed_schema =
+        \\{"version":3,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"region":{"type":"keyword"}}}}}}
+    ;
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        regenerateAlgebraicIndexesFromSchemaAlloc(std.testing.allocator, "docs", stored, removed_schema),
+    );
 }
 
 test "metadata.algebraic schema regeneration gates legacy dynamic templates without fingerprint" {

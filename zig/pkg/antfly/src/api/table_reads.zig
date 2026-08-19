@@ -12600,11 +12600,11 @@ fn tryApplyProvisionedAlgebraicDistributedAggregations(
             pipeline_filled += 1;
             continue;
         }
-        var request_plan = (try algebraicDistributedTensorProgramForAggregationRequestAlloc(alloc, &first_entry.index, request, constraints, req.identity_read_generation)) orelse return false;
+        var request_plan = (try algebraicDistributedTensorProgramForAggregationRequestAlloc(alloc, first_entry.index, request, constraints, req.identity_read_generation)) orelse return false;
         defer request_plan.deinit(alloc);
         var merged = (try collectProvisionedAlgebraicDistributedPartials(self, alloc, group_ids, table_name, req, first_entry.index.name, request_plan.access_paths, request_plan.asProgram(), first_db, required_identity_generations)) orelse return false;
         defer merged.deinit(alloc);
-        var result = (try algebraicAggregationFromDistributedPartialsAlloc(alloc, &first_entry.index, request, constraints, merged)) orelse return false;
+        var result = (try algebraicAggregationFromDistributedPartialsAlloc(alloc, first_entry.index, request, constraints, merged)) orelse return false;
         var result_owned = true;
         errdefer if (result_owned) result.deinit(alloc);
         try db_mod.aggregations.cloneSearchAggregationResultLabelsDeep(alloc, &result);
@@ -12688,7 +12688,10 @@ fn collectProvisionedAlgebraicDistributedPartials(
         if (!(try algebraicIndexFreshEnoughForRequest(alloc, group_req, db))) return null;
         var parsed = try parseAlgebraicPartialsRequest(alloc, body);
         defer parsed.deinit(alloc);
-        const shard_partials = try collectAlgebraicPartialsFromDbForRequest(alloc, db, parsed);
+        const shard_partials = collectAlgebraicPartialsFromDbForRequest(alloc, db, parsed) catch |err| switch (err) {
+            error.HllCardinalityUnavailable => return null,
+            else => return err,
+        };
         defer if (shard_partials.len > 0) alloc.free(shard_partials);
         for (shard_partials) |partial| try partials.append(alloc, partial);
     }
@@ -12818,7 +12821,7 @@ fn tryApplyHostedAlgebraicDistributedAggregations(
             requests,
             meta,
             consistency,
-            &first_entry.index,
+            first_entry.index,
             required_identity_generations,
         );
     }
@@ -12986,7 +12989,7 @@ fn algebraicDistributedTensorProgramForAggregationRequestAlloc(
             request.name,
             request.field,
             ir_constraints,
-            request.cardinality_mode == .approximate,
+            request.cardinality_mode != .exact,
         );
     }
     if (try algebraicTermsCardinalityChildRequestsAlloc(alloc, request)) |children| {
@@ -13768,7 +13771,10 @@ fn collectHostedAlgebraicDistributedPartials(
                 if (!(try algebraicIndexFreshEnoughForRequest(alloc, group_req, &db))) return null;
                 var parsed = try parseAlgebraicPartialsRequest(alloc, body);
                 defer parsed.deinit(alloc);
-                break :blk try collectAlgebraicPartialsFromDbForRequest(alloc, &db, parsed);
+                break :blk collectAlgebraicPartialsFromDbForRequest(alloc, &db, parsed) catch |err| switch (err) {
+                    error.HllCardinalityUnavailable => return null,
+                    else => return err,
+                };
             },
             .remote => |remote| blk: {
                 var response = (algebraicPartialsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, group_req) catch return null) orelse return null;
@@ -14857,7 +14863,7 @@ fn collectAlgebraicPartialsFromDbForRequest(
         if (try entry.index.scanDistributedPartialsForTensorProgramAtGeneration(db.core.store, access_path_values, view.program, generation)) |partials| {
             return partials;
         }
-        const exprs = try algebraicTensorProgramOutputExpressionsForIndexAlloc(alloc, &entry.index, request.tensor_access_paths, program);
+        const exprs = try algebraicTensorProgramOutputExpressionsForIndexAlloc(alloc, entry.index, request.tensor_access_paths, program);
         defer if (exprs.len > 0) alloc.free(exprs);
         return try entry.index.scanDistributedPartialsForExpressions(db.core.store, exprs);
     }
@@ -23607,6 +23613,26 @@ test "algebraic distributed planner selects derived join tensor program for metr
     try std.testing.expectEqual(algebraic_ir.TensorFragment.join, program_plan.steps[1].expr.fragment);
     try std.testing.expectEqual(db_mod.algebraic.law.Id.sum, program_plan.steps[1].expr.law_id.?);
     try std.testing.expectEqualStrings("joined_amount", program_plan.steps[1].expr.semantic_id.?);
+}
+
+test "algebraic distributed cardinality auto attempts HLL before whole-query fallback" {
+    const alloc = std.testing.allocator;
+    var index = try db_mod.algebraic.index.Index.open(alloc, "alg",
+        \\{"version":1,"table":"docs","group_fields":[{"name":"customer","path":"customer","type":"keyword"}]}
+    );
+    defer index.close();
+    const request = db_mod.aggregations.SearchAggregationRequest{
+        .name = "customers",
+        .type = "cardinality",
+        .field = "customer",
+        .cardinality_mode = .auto,
+    };
+    var plan = (try algebraicDistributedTensorProgramForAggregationRequestAlloc(alloc, &index, request, &.{}, null)) orelse return error.TestUnexpectedResult;
+    defer plan.deinit(alloc);
+    try std.testing.expectEqual(db_mod.algebraic.law.Id.hll, plan.steps[1].expr.law_id.?);
+    var decoded = try db_mod.algebraic.index.decodeCardinalityPartialsMetadataAlloc(alloc, plan.steps[1].expr.metadata.?);
+    defer decoded.deinit(alloc);
+    try std.testing.expect(decoded.request.approximate);
 }
 
 test "algebraic distributed planner selects identity-stamped derived join tensor program" {

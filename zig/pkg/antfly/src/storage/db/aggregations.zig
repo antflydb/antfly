@@ -358,7 +358,7 @@ fn computeAlgebraicAggregation(
     const manager = ctx.index_manager orelse return null;
     const store = ctx.doc_store orelse return null;
     const entry = resolveAlgebraicIndex(manager, ctx.algebraic_index_name) orelse return null;
-    const index = &entry.index;
+    const index = entry.index;
     if (index.hasErrors()) {
         index.recordPlannerFallback("index_errors", null, null);
         return null;
@@ -3546,7 +3546,7 @@ pub fn algebraicCardinalityAggregationFromDistributedPartialsAlloc(
     merged: algebraic_mod.distributed.MergeSet,
 ) !?SearchAggregationResult {
     if (!std.mem.eql(u8, request.type, "cardinality") or request.field.len == 0) return null;
-    if (request.cardinality_mode == .approximate) {
+    if (request.cardinality_mode != .exact) {
         var encoded: ?[]const u8 = null;
         for (merged.rows) |row| {
             if (row.law_id != .hll) continue;
@@ -3554,17 +3554,19 @@ pub fn algebraicCardinalityAggregationFromDistributedPartialsAlloc(
             if (encoded != null) return error.InvalidDistributedAlgebraicMerge;
             encoded = row.value;
         }
-        const sketch = encoded orelse return error.UnsupportedAggregation;
-        return .{
-            .name = request.name,
-            .field = request.field,
-            .type = request.type,
-            .value_json = try cardinalityResultJsonAlloc(
-                alloc,
-                try algebraic_mod.hll.estimateEncoded(sketch),
-                try algebraic_mod.hll.relativeErrorEncoded(sketch),
-            ),
-        };
+        if (encoded) |sketch| {
+            return .{
+                .name = request.name,
+                .field = request.field,
+                .type = request.type,
+                .value_json = try cardinalityResultJsonAlloc(
+                    alloc,
+                    try algebraic_mod.hll.estimateEncoded(sketch),
+                    try algebraic_mod.hll.relativeErrorEncoded(sketch),
+                ),
+            };
+        }
+        if (request.cardinality_mode == .approximate) return error.UnsupportedAggregation;
     }
     var count: u64 = 0;
     for (merged.rows) |row| {
@@ -11045,7 +11047,7 @@ test "algebraic aggregation planner answers unfiltered terms with nested metric"
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
@@ -11126,7 +11128,7 @@ test "algebraic aggregation planner answers multi field composite terms" {
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
@@ -11220,7 +11222,7 @@ test "algebraic multi field composite terms sort ties by public key json" {
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
@@ -11395,7 +11397,7 @@ test "algebraic aggregation planner answers schemaless structural path terms" {
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
@@ -11503,7 +11505,7 @@ test "algebraic aggregation planner applies pathfact predicate constraints" {
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
@@ -11591,7 +11593,7 @@ test "algebraic aggregation planner answers exact cardinality from fact rows" {
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
@@ -11680,7 +11682,7 @@ test "algebraic aggregation planner constrains root cardinality by document role
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
@@ -11917,6 +11919,17 @@ test "algebraic distributed approximate cardinality merges HLL partials" {
     try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("value").?.integer);
     try std.testing.expect(parsed.value.object.get("approximate").?.bool);
     try std.testing.expect(parsed.value.object.get("relative_error").?.float > 0);
+
+    var auto_result = (try algebraicCardinalityAggregationFromDistributedPartialsAlloc(alloc, .{
+        .name = "customers",
+        .type = "cardinality",
+        .field = "customer",
+        .cardinality_mode = .auto,
+    }, merged)) orelse return error.TestUnexpectedResult;
+    defer auto_result.deinit(alloc);
+    var auto_parsed = try std.json.parseFromSlice(std.json.Value, alloc, auto_result.value_json.?, .{});
+    defer auto_parsed.deinit();
+    try std.testing.expect(auto_parsed.value.object.get("approximate").?.bool);
 }
 
 test "algebraic terms aggregation answers nested exact cardinality from fact rows" {
@@ -11949,7 +11962,7 @@ test "algebraic terms aggregation answers nested exact cardinality from fact row
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
@@ -12026,7 +12039,7 @@ test "algebraic terms aggregation answers path terms with nested exact cardinali
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
@@ -12105,7 +12118,7 @@ test "algebraic terms aggregation answers array path terms with nested exact car
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
@@ -12190,7 +12203,7 @@ test "algebraic histogram aggregation answers nested exact cardinality from fact
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
@@ -12867,13 +12880,13 @@ test "algebraic aggregation planner can use configured implicit join materializa
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
         .index = alg_index,
     });
-    const index = &manager.algebraic_indexes.items[0].index;
+    const index = manager.algebraic_indexes.items[0].index;
 
     const docs = [_]@import("derived/derived_types.zig").DerivedDocument{
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":1,\"amount\":10}" },
@@ -13079,13 +13092,13 @@ test "cardinality over a join with guaranteed fanout blowup fails fast, not a jo
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
         .index = alg_index,
     });
-    const index = &manager.algebraic_indexes.items[0].index;
+    const index = manager.algebraic_indexes.items[0].index;
 
     // Three customer-side facts over two distinct keys: average right fanout
     // (1.5) exceeds max_fanout (1). No order is ingested (a matching order would
@@ -13146,13 +13159,13 @@ test "metric over a join with zero matched pairs folds to the identity, not an e
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
         .index = alg_index,
     });
-    const index = &manager.algebraic_indexes.items[0].index;
+    const index = manager.algebraic_indexes.items[0].index;
 
     // The order references customer 99, which has no customer-side fact, so the
     // join matches nothing. The fold is empty (not declined), so it must yield
@@ -13501,13 +13514,13 @@ test "algebraic aggregation public request can execute explicit derived join met
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg_public_derived_metric", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg_public_derived_metric", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
         .index = alg_index,
     });
-    const index = &manager.algebraic_indexes.items[0].index;
+    const index = manager.algebraic_indexes.items[0].index;
 
     const docs = [_]@import("derived/derived_types.zig").DerivedDocument{
         .{ .key = "c1", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c1\"}" },
@@ -13585,13 +13598,13 @@ test "algebraic aggregation public request can execute explicit derived join ter
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg_public_derived_join", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg_public_derived_join", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
         .index = alg_index,
     });
-    const index = &manager.algebraic_indexes.items[0].index;
+    const index = manager.algebraic_indexes.items[0].index;
 
     const docs = [_]@import("derived/derived_types.zig").DerivedDocument{
         .{ .key = "c1", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c1\",\"region\":\"west\"}" },
@@ -13664,9 +13677,9 @@ test "algebraic terms over a join answers per-bucket cardinality from HLL folds"
     const mutex = try alloc.create(std.atomic.Mutex);
     mutex.* = .unlocked;
     const config = try types.IndexConfig.clone(alloc, .{ .name = "alg", .kind = .algebraic, .config_json = cfg });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg_join_terms_card", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg_join_terms_card", cfg);
     try manager.algebraic_indexes.append(alloc, .{ .apply_mutex = mutex, .config = config, .index = alg_index });
-    const index = &manager.algebraic_indexes.items[0].index;
+    const index = manager.algebraic_indexes.items[0].index;
 
     const docs = [_]@import("derived/derived_types.zig").DerivedDocument{
         .{ .key = "c1", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c1\",\"region\":\"west\"}" },
@@ -13747,13 +13760,13 @@ test "algebraic aggregation public request can execute explicit derived join dat
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg_public_derived_date", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg_public_derived_date", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
         .index = alg_index,
     });
-    const index = &manager.algebraic_indexes.items[0].index;
+    const index = manager.algebraic_indexes.items[0].index;
 
     const docs = [_]@import("derived/derived_types.zig").DerivedDocument{
         .{ .key = "c1", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c1\"}" },
@@ -13835,13 +13848,13 @@ test "algebraic aggregation public request can execute explicit derived join his
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg_public_derived_histogram", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg_public_derived_histogram", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
         .index = alg_index,
     });
-    const index = &manager.algebraic_indexes.items[0].index;
+    const index = manager.algebraic_indexes.items[0].index;
 
     const docs = [_]@import("derived/derived_types.zig").DerivedDocument{
         .{ .key = "c1", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c1\"}" },
@@ -13924,13 +13937,13 @@ test "algebraic aggregation public request can execute explicit derived join ran
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg_public_derived_range", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg_public_derived_range", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
         .index = alg_index,
     });
-    const index = &manager.algebraic_indexes.items[0].index;
+    const index = manager.algebraic_indexes.items[0].index;
 
     const docs = [_]derived_types.DerivedDocument{
         .{ .key = "c1", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c1\",\"region\":\"west\"}" },
@@ -14017,13 +14030,13 @@ test "algebraic aggregation public request can execute explicit derived join dat
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg_public_derived_date_range", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg_public_derived_date_range", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
         .index = alg_index,
     });
-    const index = &manager.algebraic_indexes.items[0].index;
+    const index = manager.algebraic_indexes.items[0].index;
 
     const docs = [_]derived_types.DerivedDocument{
         .{ .key = "c1", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c1\"}" },
@@ -14110,7 +14123,7 @@ test "algebraic aggregation planner answers constrained root and terms metrics" 
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
@@ -14206,7 +14219,7 @@ test "algebraic aggregation planner answers constrained stats from law folds" {
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
@@ -14292,7 +14305,7 @@ test "algebraic aggregation planner answers terms with nested stats from law fol
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
@@ -14371,7 +14384,7 @@ test "algebraic aggregation planner falls back when rollup scan budget is exceed
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
@@ -14458,7 +14471,7 @@ test "algebraic aggregation planner applies typed numeric constraints" {
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
@@ -14528,7 +14541,7 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
@@ -14843,7 +14856,7 @@ test "algebraic aggregation planner answers cardinality from HLL materialization
     const mutex = try alloc.create(std.atomic.Mutex);
     mutex.* = .unlocked;
     const config = try types.IndexConfig.clone(alloc, .{ .name = "alg", .kind = .algebraic, .config_json = cfg });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{ .apply_mutex = mutex, .config = config, .index = alg_index });
 
     const docs = [_]derived_types.DerivedDocument{
@@ -15001,7 +15014,7 @@ test "recurring terms query adaptively promotes an ungrouped NDV sketch" {
     const mutex = try alloc.create(std.atomic.Mutex);
     mutex.* = .unlocked;
     const config = try types.IndexConfig.clone(alloc, .{ .name = "alg", .kind = .algebraic, .config_json = cfg });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{ .apply_mutex = mutex, .config = config, .index = alg_index });
 
     const docs = [_]derived_types.DerivedDocument{
@@ -15021,7 +15034,7 @@ test "recurring terms query adaptively promotes an ungrouped NDV sketch" {
         .algebraic_available = true,
     };
 
-    const index = &manager.algebraic_indexes.items[0].index;
+    const index = manager.algebraic_indexes.items[0].index;
     const adaptive_name = try index.hllAdaptiveNameAlloc(null, "category");
     defer alloc.free(adaptive_name);
 
@@ -15067,7 +15080,7 @@ test "cardinality_mode approximate errors when no sketch applies" {
     const mutex = try alloc.create(std.atomic.Mutex);
     mutex.* = .unlocked;
     const config = try types.IndexConfig.clone(alloc, .{ .name = "alg", .kind = .algebraic, .config_json = cfg });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{ .apply_mutex = mutex, .config = config, .index = alg_index });
 
     const docs = [_]derived_types.DerivedDocument{
@@ -15139,7 +15152,7 @@ test "algebraic bucket aggregations fall back when nested metrics are unsupporte
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
@@ -15277,7 +15290,7 @@ test "algebraic aggregation planner rolls up date cylinders across extra dimensi
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
@@ -15420,13 +15433,13 @@ test "algebraic aggregation planner reads ready adaptive tensor materializations
         .kind = .algebraic,
         .config_json = cfg,
     });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", cfg);
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
         .index = alg_index,
     });
-    const index = &manager.algebraic_indexes.items[0].index;
+    const index = manager.algebraic_indexes.items[0].index;
 
     const docs = [_]@import("derived/derived_types.zig").DerivedDocument{
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"created_at\":\"2026-05-01T10:00:00Z\",\"amount\":10}" },
