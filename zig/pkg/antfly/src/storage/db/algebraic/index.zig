@@ -36,6 +36,7 @@ const backend_types = @import("../../backend_types.zig");
 const docstore_mod = @import("../../docstore.zig");
 const internal_keys = @import("../../internal_keys.zig");
 const runtime_schema = @import("../../schema.zig");
+const schema_mod = @import("../../../schema/mod.zig");
 const lsm_backend = @import("../../lsm_backend.zig");
 const lsm_storage_io = @import("../../lsm_backend/storage_io.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
@@ -637,6 +638,7 @@ fn walkDynamicValueFacts(
             var it = node.object.iterator();
             while (it.next()) |entry| {
                 const child_name = entry.key_ptr.*;
+                if (schema_mod.shouldIgnoreSchemaValidationField(child_name)) continue;
                 const child_path = if (path.len == 0)
                     try alloc.dupe(u8, child_name)
                 else
@@ -15533,6 +15535,7 @@ pub const Index = struct {
     }
 
     pub fn fieldConfig(self: *const Index, query_field: []const u8, class: FieldClass) ?FieldConfig {
+        if (schema_mod.pathContainsSchemaIgnoredField(query_field)) return null;
         if (class == .group or class == .any) {
             for (self.config().group_fields) |field| {
                 if (fieldMatchesQuery(field, query_field)) return field;
@@ -23382,6 +23385,35 @@ test "algebraic dynamic templates project typed docfacts without a schema rebuil
     try std.testing.expect(!factHasField(facts2.facts, .group, "user_id"));
     try std.testing.expect(!factHasField(facts2.facts, .group, "metrics.latency"));
     try std.testing.expect(factHasField(facts2.facts, .group, "session_id"));
+}
+
+test "algebraic dynamic templates exclude schema ignored paths at ingest and query" {
+    const alloc = std.testing.allocator;
+    const rules = [_]fact_mod.DynamicRule{
+        .{ .name = "all", .match = "*", .type = "string" },
+        .{ .name = "nested", .path_match = "meta.*", .type = "string" },
+    };
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"visible":"yes","_private":"no","meta":{"visible":"yes","_private":"no"}}
+    , .{});
+    defer parsed.deinit();
+
+    var facts = try projectDynamicDocFactsAlloc(alloc, &rules, &.{}, parsed.value);
+    defer facts.deinit(alloc);
+    try std.testing.expect(factHasField(facts.facts, .group, "visible"));
+    try std.testing.expect(factHasField(facts.facts, .group, "meta.visible"));
+    try std.testing.expect(!factHasField(facts.facts, .group, "_private"));
+    try std.testing.expect(!factHasField(facts.facts, .group, "meta._private"));
+
+    const cfg =
+        \\{"version":1,"table":"events","dynamic_field_rules":[{"name":"all","match":"*","type":"string"},{"name":"nested","path_match":"meta.*","type":"string"}]}
+    ;
+    var idx = try Index.open(alloc, "alg_internal_paths", cfg);
+    defer idx.close();
+    try std.testing.expect(idx.resolveField("visible", .group) != null);
+    try std.testing.expect(idx.resolveField("meta.visible", .group) != null);
+    try std.testing.expect(idx.resolveField("_private", .group) == null);
+    try std.testing.expect(idx.resolveField("meta._private", .group) == null);
 }
 
 test "algebraic reloadConfigJson applies new dynamic template rules to live writes" {

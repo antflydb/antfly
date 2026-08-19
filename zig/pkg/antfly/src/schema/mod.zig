@@ -24,6 +24,8 @@ pub const PatternProperty = impl.PatternProperty;
 
 pub const globMatch = impl.globMatch;
 pub const patternPropertyMatches = impl.patternPropertyMatches;
+pub const shouldIgnoreSchemaValidationField = impl.shouldIgnoreSchemaValidationField;
+pub const pathContainsSchemaIgnoredField = impl.pathContainsSchemaIgnoredField;
 
 pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
     return try impl.parseSchemaUpdateRequest(alloc, body);
