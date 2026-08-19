@@ -4023,6 +4023,8 @@ pub const AntflyApiHandler = struct {
         defer ctx.allocator.free(decoded_table_name);
         const body_data = (try ctx.body()) orelse "";
         const expected_fence = backups_api.parseTableBackupFenceHeaderValues(
+            ctx.header(backups_api.backup_fence_metadata_group_id_header),
+            ctx.header(backups_api.backup_fence_metadata_incarnation_header),
             ctx.header(backups_api.backup_fence_table_id_header),
             ctx.header(backups_api.backup_fence_definition_header),
             ctx.header(backups_api.backup_fence_topology_count_header),

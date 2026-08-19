@@ -15882,6 +15882,7 @@ test "hosted backup forwarding preserves external io authority" {
 test "backup storage resolution rejects a reused table name from another incarnation" {
     const Catalog = struct {
         table_id: u64 = 7,
+        metadata_incarnation: metadata_api.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*,
 
         fn iface(self: *@This()) table_catalog.CatalogSource {
             return .{
@@ -15901,7 +15902,7 @@ test "backup storage resolution rejects a reused table name from another incarna
             const ranges = try std.testing.allocator.alloc(metadata_table_manager.RangeRecord, 1);
             ranges[0] = .{ .group_id = 7001, .table_id = self.table_id, .start_key = "", .end_key = null };
             return .{
-                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .status = .{ .metadata_group_id = 1, .metadata_incarnation = self.metadata_incarnation, .metrics = .{} },
                 .tables = tables,
                 .ranges = ranges,
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
@@ -15923,6 +15924,9 @@ test "backup storage resolution rejects a reused table name from another incarna
     catalog.iface().freeAdminSnapshot(&admitted);
     try std.testing.expectEqual(@as(?u64, 7001), try resolveFencedBackupGroup(catalog.iface(), "docs", fence));
 
+    catalog.metadata_incarnation = "fedcba9876543210fedcba9876543210".*;
+    try std.testing.expectError(error.CatalogChanged, resolveFencedBackupGroup(catalog.iface(), "docs", fence));
+    catalog.metadata_incarnation = "0123456789abcdef0123456789abcdef".*;
     catalog.table_id = 8;
     try std.testing.expectError(error.CatalogChanged, resolveFencedBackupGroup(catalog.iface(), "docs", fence));
 }
@@ -22385,20 +22389,15 @@ fn resolveFencedBackupGroup(
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+    const resolution = metadata_api.catalogTableTopologyResolution(table.table_id, snapshot.ranges);
     if (expected_fence) |expected| {
-        if (!backups_api.tableBackupFenceMatches(expected, &snapshot, table)) return error.CatalogChanged;
+        const actual = backups_api.tableBackupFenceWithTopology(&snapshot, table, resolution.topology);
+        if (!expected.matches(actual)) return error.CatalogChanged;
     }
 
-    var group_id: u64 = 0;
-    var range_count: usize = 0;
-    for (snapshot.ranges) |range| {
-        if (range.table_id != table.table_id) continue;
-        group_id = range.group_id;
-        range_count += 1;
-    }
-    if (range_count == 0) return null;
-    if (range_count != 1) return error.UnsupportedMultiRangeTable;
-    return group_id;
+    if (resolution.topology.range_count == 0) return null;
+    if (resolution.topology.range_count != 1) return error.UnsupportedMultiRangeTable;
+    return resolution.single_group_id orelse error.CatalogChanged;
 }
 
 fn loadTableIdentityNamespaceForGroup(

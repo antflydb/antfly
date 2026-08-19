@@ -3294,13 +3294,17 @@ pub const TableArtifactEnrichmentList = struct {
     artifacts: []const antfly_indexes_openapi.EnrichmentConfig,
 };
 
-/// A non-retryable table-backup conflict. For an ambiguous outcome, inspect the requested backup ID before deciding whether to start new work.
+/// A non-retryable table-backup conflict. Ambiguous outcomes include the logical backup ID and, when available, the opaque artifact generation retained for reconciliation.
 pub const TableBackupConflictError = struct {
     code: []const u8,
     /// Legacy human-readable error text. Use `code` for branching.
     @"error": []const u8,
     message: []const u8,
     retryable: bool,
+    /// Logical backup ID whose outcome must be inspected before retrying.
+    backup_id: ?[]const u8 = null,
+    /// Opaque artifact generation retained by an ambiguous attempt. This is for reconciliation, not as a replacement logical backup ID.
+    artifact_backup_id: ?[]const u8 = null,
 };
 
 pub const TableBackupStatus = struct {

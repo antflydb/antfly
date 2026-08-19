@@ -68,8 +68,10 @@ describe("Antfly Query Type Integration", () => {
       const ambiguous: BackupTable409 = {
         code: "backup_outcome_ambiguous",
         error: "backup outcome is ambiguous; inspect the backup id before retrying",
-        message: "backup outcome is ambiguous; inspect the backup id before retrying",
+        message: "backup outcome is ambiguous; inspect the backup id and artifact id before retrying",
         retryable: false,
+        backup_id: "snap",
+        artifact_backup_id: "generation-7",
       };
 
       expectTypeOf<Backup503>().toEqualTypeOf<BackupUnavailable>();

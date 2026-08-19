@@ -2715,7 +2715,7 @@ export interface components {
         };
         /** @description A retryable metadata-availability failure reported before backup side effects begin. */
         BackupMetadataUnavailableError: components["schemas"]["MetadataCapabilityUnavailableError"] | components["schemas"]["MetadataLeaderUnavailableError"];
-        /** @description A non-retryable table-backup conflict. For an ambiguous outcome, inspect the requested backup ID before deciding whether to start new work. */
+        /** @description A non-retryable table-backup conflict. Ambiguous outcomes include the logical backup ID and, when available, the opaque artifact generation retained for reconciliation. */
         TableBackupConflictError: {
             /** @enum {string} */
             code: "backup_already_exists" | "table_catalog_changed" | "backup_outcome_ambiguous";
@@ -2724,6 +2724,10 @@ export interface components {
             message: string;
             /** @enum {boolean} */
             retryable: false;
+            /** @description Logical backup ID whose outcome must be inspected before retrying. */
+            backup_id?: string;
+            /** @description Opaque artifact generation retained by an ambiguous attempt. This is for reconciliation, not as a replacement logical backup ID. */
+            artifact_backup_id?: string;
         };
         /** @description Actionable retry contract for temporary inference-capacity failures. */
         InferenceCapacityError: {

@@ -10,6 +10,8 @@
 const std = @import("std");
 
 pub const format_version: u32 = 2;
+pub const backup_fence_metadata_group_id_header = "X-Antfly-Backup-Metadata-Group-Id";
+pub const backup_fence_metadata_incarnation_header = "X-Antfly-Backup-Metadata-Incarnation";
 pub const backup_fence_table_id_header = "X-Antfly-Backup-Table-Id";
 pub const backup_fence_definition_header = "X-Antfly-Backup-Definition-SHA256";
 pub const backup_fence_topology_count_header = "X-Antfly-Backup-Topology-Count";
@@ -32,16 +34,33 @@ pub const ArtifactIntegrityMode = enum {
 /// guard so a drop/recreate or schema/topology change cannot pair artifacts
 /// from one table incarnation with metadata from another.
 pub const TableBackupFence = struct {
+    metadata_group_id: u64,
+    /// Canonical 128-bit metadata-cluster identity encoded as lowercase hex.
+    /// All zeroes represent a legacy snapshot that did not expose incarnation.
+    metadata_incarnation: [32]u8,
     table_id: u64,
     definition_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
     topology_range_count: u64,
     topology_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
 
-    pub fn eql(left: @This(), right: @This()) bool {
-        return left.table_id == right.table_id and
-            left.topology_range_count == right.topology_range_count and
-            std.crypto.timing_safe.eql(@TypeOf(left.definition_digest), left.definition_digest, right.definition_digest) and
-            std.crypto.timing_safe.eql(@TypeOf(left.topology_digest), left.topology_digest, right.topology_digest);
+    pub fn hasMetadataIdentity(self: @This()) bool {
+        return self.metadata_group_id != 0 and
+            !std.mem.allEqual(u8, &self.metadata_incarnation, 0);
+    }
+
+    /// Checks an observed fence against this expected fence. Legacy expected
+    /// fences intentionally omit metadata identity for one rolling-upgrade
+    /// window. A current expected fence never accepts an observation that
+    /// cannot prove the same metadata-cluster incarnation.
+    pub fn matches(expected: @This(), observed: @This()) bool {
+        const metadata_identity_matches = !expected.hasMetadataIdentity() or
+            (observed.hasMetadataIdentity() and
+                expected.metadata_group_id == observed.metadata_group_id and
+                std.crypto.timing_safe.eql(@TypeOf(expected.metadata_incarnation), expected.metadata_incarnation, observed.metadata_incarnation));
+        return metadata_identity_matches and expected.table_id == observed.table_id and
+            expected.topology_range_count == observed.topology_range_count and
+            std.crypto.timing_safe.eql(@TypeOf(expected.definition_digest), expected.definition_digest, observed.definition_digest) and
+            std.crypto.timing_safe.eql(@TypeOf(expected.topology_digest), expected.topology_digest, observed.topology_digest);
     }
 };
 

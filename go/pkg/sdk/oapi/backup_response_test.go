@@ -106,7 +106,7 @@ func TestParseTableBackupAmbiguousConflict(t *testing.T) {
 		StatusCode: http.StatusConflict,
 		Header:     http.Header{"Content-Type": []string{"application/json"}},
 		Body: io.NopCloser(strings.NewReader(
-			`{"code":"backup_outcome_ambiguous","error":"backup outcome is ambiguous; inspect the backup id before retrying","message":"backup outcome is ambiguous; inspect the backup id before retrying","retryable":false}`,
+			`{"code":"backup_outcome_ambiguous","error":"backup outcome is ambiguous; inspect the backup id before retrying","message":"backup outcome is ambiguous; inspect the backup id and artifact id before retrying","retryable":false,"backup_id":"snap","artifact_backup_id":"generation-7"}`,
 		)),
 	})
 	if err != nil {
@@ -120,5 +120,8 @@ func TestParseTableBackupAmbiguousConflict(t *testing.T) {
 	}
 	if bool(response.JSON409.Retryable) {
 		t.Fatal("ambiguous outcome must not advertise an automatic retry")
+	}
+	if response.JSON409.BackupId != "snap" || response.JSON409.ArtifactBackupId != "generation-7" {
+		t.Fatalf("reconciliation identity = %q/%q", response.JSON409.BackupId, response.JSON409.ArtifactBackupId)
 	}
 }

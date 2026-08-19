@@ -7829,8 +7829,8 @@ components:
     TableBackupConflictError:
       type: object
       additionalProperties: false
-      description: A non-retryable table-backup conflict. For an ambiguous outcome, inspect the requested
-        backup ID before deciding whether to start new work.
+      description: A non-retryable table-backup conflict. Ambiguous outcomes include the logical backup
+        ID and, when available, the opaque artifact generation retained for reconciliation.
       required:
         - code
         - error
@@ -7852,6 +7852,13 @@ components:
           type: boolean
           enum:
             - false
+        backup_id:
+          type: string
+          description: Logical backup ID whose outcome must be inspected before retrying.
+        artifact_backup_id:
+          type: string
+          description: Opaque artifact generation retained by an ambiguous attempt. This is for reconciliation,
+            not as a replacement logical backup ID.
     InferenceCapacityError:
       type: object
       description: Actionable retry contract for temporary inference-capacity failures.

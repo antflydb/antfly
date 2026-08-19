@@ -371,15 +371,42 @@ pub const CatalogTablePublicationContract = struct {
 };
 
 pub fn catalogTableTopology(table_id: u64, ranges: []const table_manager.RangeRecord) CatalogTableTopology {
+    return catalogTableTopologyResolution(table_id, ranges).topology;
+}
+
+pub const CatalogTableTopologyResolution = struct {
+    topology: CatalogTableTopology,
+    single_group_id: ?u64,
+};
+
+/// Computes the order-independent topology fence and the sole storage group in
+/// one catalog pass. `single_group_id` is null for both empty and multi-range
+/// tables; callers distinguish those cases with `topology.range_count`.
+pub fn catalogTableTopologyResolution(
+    table_id: u64,
+    ranges: []const table_manager.RangeRecord,
+) CatalogTableTopologyResolution {
     var accumulator = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
     var range_count: u64 = 0;
+    var single_group_id: ?u64 = null;
     for (ranges) |range| {
         if (range.table_id != table_id) continue;
         range_count += 1;
+        if (range_count == 1) {
+            single_group_id = range.group_id;
+        } else {
+            single_group_id = null;
+        }
         addCatalogTopologyDigest(&accumulator, catalogRangeTopologyDigest(range));
     }
 
-    return .{ .range_count = range_count, .digest = finalizeCatalogTableTopology(table_id, range_count, accumulator) };
+    return .{
+        .topology = .{
+            .range_count = range_count,
+            .digest = finalizeCatalogTableTopology(table_id, range_count, accumulator),
+        },
+        .single_group_id = single_group_id,
+    };
 }
 
 fn catalogRangeTopologyDigest(range: table_manager.RangeRecord) [std.crypto.hash.sha2.Sha256.digest_length]u8 {

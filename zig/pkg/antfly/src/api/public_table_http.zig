@@ -1071,7 +1071,30 @@ pub fn handleTableBackupExpectedFence(
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.CatalogChanged => return .{ .status = 409, .body = try alloc.dupe(u8, backups_api.catalog_changed_body), .json = true },
         error.BackupAlreadyExists => return .{ .status = 409, .body = try alloc.dupe(u8, backups_api.backup_already_exists_body), .json = true },
-        error.BackupOutcomeAmbiguous => return .{ .status = 409, .body = try alloc.dupe(u8, backups_api.backup_outcome_ambiguous_body), .json = true },
+        error.BackupOutcomeAmbiguous => {
+            var fallback_io: ?std.Io.Threaded = if (io == null)
+                std.Io.Threaded.init(std.heap.page_allocator, .{})
+            else
+                null;
+            defer if (fallback_io) |*owned| owned.deinit();
+            const response_io = io orelse fallback_io.?.io();
+            const artifact_backup_id = backups_api.tableBackupAttemptArtifactIdAlloc(
+                alloc,
+                response_io,
+                &location,
+                parsed_req.value.backup_id,
+            ) catch null;
+            defer if (artifact_backup_id) |value| alloc.free(value);
+            return .{
+                .status = 409,
+                .body = try backups_api.encodeBackupOutcomeAmbiguousBody(
+                    alloc,
+                    parsed_req.value.backup_id,
+                    artifact_backup_id,
+                ),
+                .json = true,
+            };
+        },
         error.BackupManifestTooLarge => return .{ .status = 400, .body = try alloc.dupe(u8, backups_api.manifest_too_large_message) },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.UnsupportedBackupMigrationState => return .{ .status = 400, .body = try alloc.dupe(u8, "backup does not support active schema migration") },
@@ -3525,7 +3548,10 @@ test "public table backup handler exposes non-retryable fenced outcomes" {
 
     const cases = [_]struct { failure: TableApi.ExecuteBackupError, expected: []const u8 }{
         .{ .failure = error.CatalogChanged, .expected = backups_api.catalog_changed_body },
-        .{ .failure = error.BackupOutcomeAmbiguous, .expected = backups_api.backup_outcome_ambiguous_body },
+        .{
+            .failure = error.BackupOutcomeAmbiguous,
+            .expected = "{\"code\":\"backup_outcome_ambiguous\",\"error\":\"backup outcome is ambiguous; inspect the backup id before retrying\",\"message\":\"backup outcome is ambiguous; inspect the backup id and artifact id before retrying\",\"retryable\":false,\"backup_id\":\"snap\"}",
+        },
     };
     var node_config = try testBackupNodeConfig(std.testing.allocator);
     defer node_config.deinit();

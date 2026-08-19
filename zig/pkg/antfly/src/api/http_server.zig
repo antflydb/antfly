@@ -6305,7 +6305,15 @@ pub const ApiHttpServer = struct {
         if (table.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
         if (try backups_api.manifestExistsAtLocationWithIo(self.alloc, io, backup_location, backup_id))
             return error.BackupAlreadyExists;
-        try backups_api.reserveBackupAtLocation(self.alloc, io, backup_location, backup_id, false);
+        try backups_api.reserveTableBackupAttemptAtLocation(
+            self.alloc,
+            io,
+            backup_location,
+            backup_id,
+            artifact_backup_id,
+            format,
+            fence,
+        );
         var cleanup_safe = true;
         var forwarded_envelope_owned = false;
         self.executeReservedTableBackup(io, table, fence, table_name, backup_location, location_uri, backup_id, artifact_backup_id, format, connection, &cleanup_safe, &forwarded_envelope_owned) catch |err| {
@@ -8637,7 +8645,7 @@ pub const ApiHttpServer = struct {
             const record = tables_api.findTableByName(&authoritative_snapshot, table_name) orelse return error.NotFound;
             admitted_fence = backups_api.tableBackupFence(&authoritative_snapshot, record);
             if (expected_fence) |expected| {
-                if (!expected.eql(admitted_fence)) return error.CatalogChanged;
+                if (!expected.matches(admitted_fence)) return error.CatalogChanged;
             }
             break :table metadata_table_manager.cloneTable(self.alloc, record.*) catch return error.InternalFailure;
         };
@@ -9814,6 +9822,7 @@ pub const ApiHttpServer = struct {
         };
         var cluster_committed = false;
         var cluster_cleanup_safe = true;
+        var table_outcome_ambiguous = false;
         errdefer if (!cluster_committed) {
             if (cluster_cleanup_safe) {
                 self.cleanupClusterBackupAttempt(
@@ -9892,6 +9901,15 @@ pub const ApiHttpServer = struct {
                 req.format,
                 connection,
             ) catch |err| {
+                if (err == error.BackupOutcomeAmbiguous) {
+                    // The forwarded owner may still be completing work after a
+                    // post-send transport failure. Immediate partial cleanup
+                    // could race that writer and resurrect an unfenced
+                    // manifest. Retain the attempt marker and exact artifact
+                    // identities for bounded stale-attempt reconciliation.
+                    table_outcome_ambiguous = true;
+                    cluster_cleanup_safe = false;
+                }
                 statuses[i].@"error" = switch (err) {
                     // Once table execution begins, the request may already have
                     // published artifacts for an earlier table. Never return
@@ -10008,6 +10026,12 @@ pub const ApiHttpServer = struct {
                 std.log.warn("cluster backup committed with lease already fenced", .{});
             }
             cluster_committed = true;
+        } else if (table_outcome_ambiguous) {
+            trace.enter(.partial_cleanup);
+            lease_heartbeat.stop_event.set(backup_io);
+            lease_future.await(backup_io);
+            lease_future_running = false;
+            std.log.err("cluster backup contains an ambiguous table outcome; retaining attempt for reconciliation", .{});
         } else {
             trace.enter(.partial_cleanup);
             // A partial aggregate is not a restore candidate. Reclaim every
@@ -33153,6 +33177,119 @@ test "api http server does not advertise a retry after cluster backup side effec
         &location,
         "partial-snap",
     )));
+}
+
+test "cluster backup retains its fenced attempt after an ambiguous table outcome" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .linearizable_snapshot = linearizableSnapshot,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn linearizableSnapshot(ptr: *anyopaque, request: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+            try request.ensureActive();
+            return try adminSnapshot(ptr);
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{
+                    .metadata_group_id = 1,
+                    .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+                    .metrics = .{},
+                },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 1,
+                    .name = "docs",
+                    .indexes_json = tables_api.default_indexes_json,
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 1,
+                    .table_id = 1,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    const AmbiguousWrites = struct {
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .backup_table = backupTable,
+                },
+            };
+        }
+
+        fn batch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) !?void {
+            return error.UnsupportedOperation;
+        }
+
+        fn backupTable(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: backups_api.TableBackupPlan,
+        ) !?[]backups_api.ShardSnapshot {
+            return error.BackupOutcomeAmbiguous;
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/ambiguous-cluster", .{tmp.sub_path});
+    defer alloc.free(root);
+    var location: backups_api.BackupLocation = .{ .file = root };
+    var source = FakeSource{};
+    var writes = AmbiguousWrites{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
+    defer server.deinit();
+
+    const body = try ApiHttpServer.executePublicClusterBackup(
+        &server,
+        alloc,
+        .{
+            .backup_id = "ambiguous-cluster",
+            .location = "file:///backups",
+            .connection = "backups",
+            .table_names = &.{"docs"},
+        },
+        &location,
+        .{},
+    );
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, backups_api.backup_outcome_ambiguous_message) != null);
+    try std.testing.expect(!(try backups_api.clusterManifestExistsAtLocation(alloc, &location, "ambiguous-cluster")));
+    try std.testing.expectError(
+        error.BackupAlreadyExists,
+        backups_api.reserveBackupAtLocation(alloc, std.testing.io, &location, "other", true),
+    );
 }
 
 test "api http server rejects restore before persistence without an asynchronous worker" {

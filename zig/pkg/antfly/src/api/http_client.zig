@@ -461,6 +461,8 @@ pub const ApiHttpClient = struct {
         body: []const u8,
         fence: backup_contract.TableBackupFence,
     ) !TablesResponse {
+        var metadata_group_id_buffer: [20]u8 = undefined;
+        const metadata_group_id = try std.fmt.bufPrint(&metadata_group_id_buffer, "{d}", .{fence.metadata_group_id});
         var table_id_buffer: [20]u8 = undefined;
         const table_id = try std.fmt.bufPrint(&table_id_buffer, "{d}", .{fence.table_id});
         var topology_count_buffer: [20]u8 = undefined;
@@ -468,6 +470,8 @@ pub const ApiHttpClient = struct {
         const definition_digest = std.fmt.bytesToHex(fence.definition_digest, .lower);
         const topology_digest = std.fmt.bytesToHex(fence.topology_digest, .lower);
         const headers = [_]http_common.RequestHeader{
+            .{ .name = backup_contract.backup_fence_metadata_group_id_header, .value = metadata_group_id },
+            .{ .name = backup_contract.backup_fence_metadata_incarnation_header, .value = &fence.metadata_incarnation },
             .{ .name = backup_contract.backup_fence_table_id_header, .value = table_id },
             .{ .name = backup_contract.backup_fence_definition_header, .value = &definition_digest },
             .{ .name = backup_contract.backup_fence_topology_count_header, .value = topology_count },
@@ -3573,9 +3577,13 @@ test "fenced backup forwarding treats post-send transport failure as ambiguous" 
 
         fn execute(_: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
             const tracker = req.delivery_tracker orelse return error.TestExpectedDeliveryTracker;
-            try std.testing.expectEqual(@as(usize, 4), req.headers.len);
-            try std.testing.expectEqualStrings(backup_contract.backup_fence_table_id_header, req.headers[0].name);
-            try std.testing.expectEqualStrings("7", req.headers[0].value);
+            try std.testing.expectEqual(@as(usize, 6), req.headers.len);
+            try std.testing.expectEqualStrings(backup_contract.backup_fence_metadata_group_id_header, req.headers[0].name);
+            try std.testing.expectEqualStrings("3", req.headers[0].value);
+            try std.testing.expectEqualStrings(backup_contract.backup_fence_metadata_incarnation_header, req.headers[1].name);
+            try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", req.headers[1].value);
+            try std.testing.expectEqualStrings(backup_contract.backup_fence_table_id_header, req.headers[2].name);
+            try std.testing.expectEqualStrings("7", req.headers[2].value);
             tracker.markMayHaveBeenSent();
             return error.ConnectionResetByPeer;
         }
@@ -3587,6 +3595,8 @@ test "fenced backup forwarding treats post-send transport failure as ambiguous" 
         "docs",
         "{}",
         .{
+            .metadata_group_id = 3,
+            .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
             .table_id = 7,
             .definition_digest = [_]u8{0x11} ** 32,
             .topology_range_count = 1,

@@ -62,8 +62,10 @@ def test_generated_table_backup_409_exposes_ambiguous_outcome() -> None:
             json={
                 "code": "backup_outcome_ambiguous",
                 "error": "backup outcome is ambiguous; inspect the backup id before retrying",
-                "message": "backup outcome is ambiguous; inspect the backup id before retrying",
+                "message": "backup outcome is ambiguous; inspect the backup id and artifact id before retrying",
                 "retryable": False,
+                "backup_id": "snap",
+                "artifact_backup_id": "generation-7",
             },
         ),
     )
@@ -71,3 +73,5 @@ def test_generated_table_backup_409_exposes_ambiguous_outcome() -> None:
     assert isinstance(parsed, TableBackupConflictError)
     assert parsed.code is TableBackupConflictErrorCode.BACKUP_OUTCOME_AMBIGUOUS
     assert parsed.retryable is False
+    assert parsed.backup_id == "snap"
+    assert parsed.artifact_backup_id == "generation-7"
