@@ -4668,6 +4668,10 @@ pub const ApiHttpServer = struct {
                 query_json: []const u8,
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
+                if (runner.authenticated_identity) |identity| {
+                    if (!permissionsAllow(identity.permissions, .table, table_name, .read))
+                        return error.Forbidden;
+                }
                 var semantic_resolver = runner.server.semanticStatusResolver(
                     runner.query_embedding_security_scope.domain,
                     runner.query_embedding_security_scope.value,
@@ -4719,6 +4723,10 @@ pub const ApiHttpServer = struct {
                 exclusion_query_json: ?[]const u8,
             ) !retrieval_agent.QueryRunner.KeyPage {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
+                if (runner.authenticated_identity) |identity| {
+                    if (!permissionsAllow(identity.permissions, .table, table_name, .read))
+                        return error.Forbidden;
+                }
                 return try runner.server.scanRetrievalKeyPage(
                     inner_alloc,
                     runner.source,
@@ -4739,6 +4747,10 @@ pub const ApiHttpServer = struct {
                 keys: []const []const u8,
             ) ![]bool {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
+                if (runner.authenticated_identity) |identity| {
+                    if (!permissionsAllow(identity.permissions, .table, table_name, .read))
+                        return error.Forbidden;
+                }
                 return try runner.server.probeRetrievalIncomingEdges(
                     inner_alloc,
                     runner.source,
@@ -4840,6 +4852,10 @@ pub const ApiHttpServer = struct {
             },
             error.TableNotFound => {
                 try queue.status(alloc, task_id, context_id, "failed", "not found");
+                return;
+            },
+            error.Forbidden => {
+                try queue.status(alloc, task_id, context_id, "failed", "forbidden");
                 return;
             },
             error.DocIdentityNamespaceMismatch => {
@@ -23509,6 +23525,40 @@ test "api http server serves retrieval agent event stream" {
     try std.testing.expect(saw_a2a_hit);
     try std.testing.expect(saw_a2a_result);
     try std.testing.expect(saw_a2a_completed);
+
+    const secret = "a2a-retrieval-trusted-principal-secret";
+    server.cfg.trusted_principal_secret = secret;
+    server.cfg.trusted_principal_issuer = "trusted-upstream";
+    const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+    const denied_payload = try std.fmt.allocPrint(
+        alloc,
+        \\{{"iss":"trusted-upstream","sub":"browser-key","tenant":"tenant-1","tables":["other"],"operations":["read"],"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer alloc.free(denied_payload);
+    const denied_token = try encodeTrustedPrincipalToken(alloc, secret, denied_payload);
+    defer alloc.free(denied_token);
+    var denied_identity = try server.authenticateRequest(.{ .trusted_principal = denied_token });
+    defer denied_identity.deinit(alloc);
+    var denied_arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer denied_arena_impl.deinit();
+    const denied_arena = denied_arena_impl.allocator();
+    var denied_queue = a2a.EventQueue.init(denied_arena);
+    defer denied_queue.deinit(denied_arena);
+    try server.executeA2aRetrieval(
+        denied_arena,
+        "{\"query\":\"find hello\",\"stream\":false,\"queries\":[{\"table\":\"docs\",\"full_text_search\":{\"query\":\"body:hello\"},\"limit\":5}]}",
+        "denied-task",
+        "denied-context",
+        &denied_queue,
+        ApiHttpServer.queryEmbeddingSecurityScope(denied_identity),
+        denied_identity,
+    );
+    const denied_events_json = try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .array = denied_queue.events }, .{});
+    defer alloc.free(denied_events_json);
+    try std.testing.expect(std.mem.indexOf(u8, denied_events_json, "\"state\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, denied_events_json, "forbidden") != null);
 }
 
 test "api http server serves eval response envelope" {
