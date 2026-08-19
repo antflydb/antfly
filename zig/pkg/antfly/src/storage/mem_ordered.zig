@@ -37,6 +37,9 @@ fn priorityFor(name: ?[]const u8, key: []const u8) u64 {
     var hasher = std.hash.Wyhash.init(priority_seed);
     if (name) |namespace| {
         hasher.update(&.{1});
+        var namespace_len: [8]u8 = undefined;
+        std.mem.writeInt(u64, &namespace_len, @intCast(namespace.len), .little);
+        hasher.update(&namespace_len);
         hasher.update(namespace);
     } else {
         hasher.update(&.{0});
@@ -486,6 +489,11 @@ fn entryOf(node: *Node) Entry {
 }
 
 const testing = std.testing;
+
+test "priority encodes namespace and key boundaries unambiguously" {
+    try testing.expect(priorityFor("a", "bc") != priorityFor("ab", "c"));
+    try testing.expectEqual(priorityFor("a", "bc"), priorityFor("a", "bc"));
+}
 
 fn expectGet(tree: Tree, name: ?[]const u8, key: []const u8, expected: ?[]const u8) !void {
     const got = tree.get(name, key);
