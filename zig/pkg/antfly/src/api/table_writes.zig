@@ -32582,20 +32582,86 @@ test "structural reconcile publishes durable index repair debt once per group" {
     var repaired = false;
     var repair_passes: usize = 0;
     {
+        // Exercise the cold-owner path that CI can reach when an idle writer
+        // cache entry is retired between structural handoff and repair.
+        try source.clearWriteCache();
+        try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
+        var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
         const status = source.beginStatusRequest("docs");
-        defer source.endStatusRequest("docs", status);
-        for (0..16) |_| {
-            const repair = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{
-                .indexes_json = indexes_json,
-                .identity_namespace = namespace,
-                .advance_index_repairs = true,
-            });
-            try std.testing.expect(!repair.busy);
-            repair_passes += 1;
-            attempted_repair = attempted_repair or repair.index_repair_attempted;
-            repaired = repaired or repair.index_repair_repaired;
-            if (!repair.index_repair_pending) break;
+        var status_active = true;
+        defer if (status_active) source.endStatusRequest("docs", status);
+        try std.testing.expectEqual(ProvisionedTableWriteSource.StatusRequestAdmission.live, status);
+        const RepairWorker = struct {
+            source: *ProvisionedTableWriteSource,
+            indexes_json: []const u8,
+            namespace: doc_identity.Namespace,
+            completed: std.atomic.Value(bool) = .init(false),
+            attempted_repair: bool = false,
+            repaired: bool = false,
+            repair_passes: usize = 0,
+            err: ?anyerror = null,
+
+            fn run(self: *@This()) void {
+                defer self.completed.store(true, .release);
+                for (0..16) |_| {
+                    const repair = self.source.catchUpTableGroupBestEffortWithMetadata(std.testing.allocator, 7001, "docs", .{
+                        .indexes_json = self.indexes_json,
+                        .identity_namespace = self.namespace,
+                        .advance_index_repairs = true,
+                    }) catch |err| {
+                        self.err = err;
+                        return;
+                    };
+                    if (repair.busy) {
+                        self.err = error.TestUnexpectedResult;
+                        return;
+                    }
+                    self.repair_passes += 1;
+                    self.attempted_repair = self.attempted_repair or repair.index_repair_attempted;
+                    self.repaired = self.repaired or repair.index_repair_repaired;
+                    if (!repair.index_repair_pending) return;
+                }
+            }
+        };
+        var worker = RepairWorker{
+            .source = &source,
+            .indexes_json = indexes_json,
+            .namespace = namespace,
+        };
+        var repair_future = try std.Io.concurrent(io, RepairWorker.run, .{&worker});
+        var repair_awaited = false;
+        defer if (!repair_awaited) {
+            if (status_active) {
+                source.endStatusRequest("docs", status);
+                status_active = false;
+            }
+            repair_future.await(io);
+        };
+
+        // Cold repair queues an exclusive operation behind live status. Model
+        // the production callers as concurrent tasks and release status once
+        // the repair is queued; holding both on this thread makes repair wait
+        // on its own status lease.
+        var repair_waiter_observed = false;
+        for (0..10_000) |_| {
+            if (source.testingGroupOperationWaiterCount("docs", 7001) > 0) {
+                repair_waiter_observed = true;
+                break;
+            }
+            if (worker.completed.load(.acquire)) break;
+            try io.sleep(.fromMilliseconds(1), .awake);
         }
+        source.endStatusRequest("docs", status);
+        status_active = false;
+        repair_future.await(io);
+        repair_awaited = true;
+        if (worker.err) |err| return err;
+        try std.testing.expect(repair_waiter_observed);
+        attempted_repair = worker.attempted_repair;
+        repaired = worker.repaired;
+        repair_passes = worker.repair_passes;
     }
     try std.testing.expect(repair_passes >= 2);
     try std.testing.expect(attempted_repair);
