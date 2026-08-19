@@ -115,13 +115,43 @@ func TestParseTableBackupAmbiguousConflict(t *testing.T) {
 	if response.JSON409 == nil {
 		t.Fatal("typed table backup conflict was not decoded")
 	}
-	if response.JSON409.Code != TableBackupConflictErrorCodeBackupOutcomeAmbiguous {
-		t.Fatalf("conflict code = %q", response.JSON409.Code)
+	ambiguous, err := response.JSON409.AsBackupOutcomeAmbiguousConflict()
+	if err != nil {
+		t.Fatalf("decode ambiguous conflict variant: %v", err)
 	}
-	if bool(response.JSON409.Retryable) {
+	if ambiguous.Code != BackupOutcomeAmbiguousConflictCodeBackupOutcomeAmbiguous {
+		t.Fatalf("conflict code = %q", ambiguous.Code)
+	}
+	if bool(ambiguous.Retryable) {
 		t.Fatal("ambiguous outcome must not advertise an automatic retry")
 	}
-	if response.JSON409.BackupId != "snap" || response.JSON409.ArtifactBackupId != "generation-7" {
-		t.Fatalf("reconciliation identity = %q/%q", response.JSON409.BackupId, response.JSON409.ArtifactBackupId)
+	if ambiguous.BackupId != "snap" || ambiguous.ArtifactBackupId != "generation-7" {
+		t.Fatalf("reconciliation identity = %q/%q", ambiguous.BackupId, ambiguous.ArtifactBackupId)
+	}
+}
+
+func TestParseClusterBackupAmbiguousTableIdentity(t *testing.T) {
+	response, err := ParseBackupResponse(&http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body: io.NopCloser(strings.NewReader(
+			`{"backup_id":"nightly","status":"ambiguous","tables":[{"name":"docs","status":"ambiguous","error":"backup outcome is ambiguous; inspect the backup id before retrying","code":"backup_outcome_ambiguous","retryable":false,"backup_id":"attempt-t-0","artifact_backup_id":"attempt-a-0"}]}`,
+		)),
+	})
+	if err != nil {
+		t.Fatalf("parse cluster backup response: %v", err)
+	}
+	if response.JSON200 == nil || response.JSON200.Status != ClusterBackupResponseStatusAmbiguous {
+		t.Fatal("typed ambiguous cluster backup response was not decoded")
+	}
+	if len(response.JSON200.Tables) != 1 {
+		t.Fatalf("table outcomes = %d", len(response.JSON200.Tables))
+	}
+	table := response.JSON200.Tables[0]
+	if table.Status != TableBackupStatusStatusAmbiguous || table.Code != TableBackupStatusCodeBackupOutcomeAmbiguous {
+		t.Fatalf("table outcome = %q/%q", table.Status, table.Code)
+	}
+	if bool(table.Retryable) || table.BackupId != "attempt-t-0" || table.ArtifactBackupId != "attempt-a-0" {
+		t.Fatalf("table reconciliation identity = %q/%q retryable=%t", table.BackupId, table.ArtifactBackupId, table.Retryable)
 	}
 }

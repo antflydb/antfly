@@ -7827,10 +7827,21 @@ components:
         - $ref: '#/components/schemas/MetadataCapabilityUnavailableError'
         - $ref: '#/components/schemas/MetadataLeaderUnavailableError'
     TableBackupConflictError:
-      type: object
-      additionalProperties: false
       description: A non-retryable table-backup conflict. Ambiguous outcomes include the logical backup
         ID and, when available, the opaque artifact generation retained for reconciliation.
+      discriminator:
+        propertyName: code
+        mapping:
+          backup_already_exists: '#/components/schemas/BackupAlreadyExistsConflict'
+          table_catalog_changed: '#/components/schemas/TableCatalogChangedConflict'
+          backup_outcome_ambiguous: '#/components/schemas/BackupOutcomeAmbiguousConflict'
+      oneOf:
+        - $ref: '#/components/schemas/BackupAlreadyExistsConflict'
+        - $ref: '#/components/schemas/TableCatalogChangedConflict'
+        - $ref: '#/components/schemas/BackupOutcomeAmbiguousConflict'
+    BackupAlreadyExistsConflict:
+      type: object
+      additionalProperties: false
       required:
         - code
         - error
@@ -7841,7 +7852,50 @@ components:
           type: string
           enum:
             - backup_already_exists
+        error:
+          type: string
+          description: Legacy human-readable error text. Use `code` for branching.
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum:
+            - false
+    TableCatalogChangedConflict:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - error
+        - message
+        - retryable
+      properties:
+        code:
+          type: string
+          enum:
             - table_catalog_changed
+        error:
+          type: string
+          description: Legacy human-readable error text. Use `code` for branching.
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum:
+            - false
+    BackupOutcomeAmbiguousConflict:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - error
+        - message
+        - retryable
+        - backup_id
+      properties:
+        code:
+          type: string
+          enum:
             - backup_outcome_ambiguous
         error:
           type: string
@@ -11823,15 +11877,31 @@ components:
           type: string
           enum:
             - completed
+            - successful
             - partial
             - failed
+            - ambiguous
           description: Overall backup status
           example: completed
     TableBackupStatus:
       type: object
+      additionalProperties: false
       required:
         - name
         - status
+      description: >
+        Outcome for one table in a cluster backup. `successful` is the legacy
+
+        spelling emitted by pre-Zig coordinators; new coordinators emit `completed`.
+
+
+        An `ambiguous` outcome includes `error`, `code`, `retryable: false`,
+
+        `backup_id`, and `artifact_backup_id` so callers can reconcile the retained
+
+        generation without retrying blindly. Failed and skipped outcomes may include
+
+        `error`; other fields are omitted when they do not apply.
       properties:
         name:
           type: string
@@ -11841,13 +11911,28 @@ components:
           type: string
           enum:
             - completed
+            - successful
             - failed
             - skipped
-          description: Backup status for this table
+            - ambiguous
           example: completed
         error:
           type: string
-          description: Error message if backup failed
+          description: Human-readable failure, skip reason, or reconciliation guidance.
+        code:
+          type: string
+          enum:
+            - backup_outcome_ambiguous
+          description: Stable machine-readable code for an ambiguous outcome.
+        retryable:
+          type: boolean
+          description: False for an ambiguous outcome; inspect the retained attempt before retrying.
+        backup_id:
+          type: string
+          description: Logical per-table backup ID retained by an ambiguous cluster attempt.
+        artifact_backup_id:
+          type: string
+          description: Opaque artifact generation retained by an ambiguous cluster attempt.
     ClusterRestoreRequest:
       type: object
       additionalProperties: false

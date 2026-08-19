@@ -6285,8 +6285,11 @@ pub const ApiHttpServer = struct {
             artifact_backup_id,
             format,
             connection,
+            .create,
         );
     }
+
+    const TableBackupWriterLeaseRole = enum { create, adopt };
 
     fn backupOwnedTableWithArtifactId(
         self: *ApiHttpServer,
@@ -6300,12 +6303,13 @@ pub const ApiHttpServer = struct {
         artifact_backup_id: []const u8,
         format: backups_api.BackupFormat,
         connection: []const u8,
+        writer_lease_role: TableBackupWriterLeaseRole,
     ) !void {
         if (!std.mem.eql(u8, table.name, table_name)) return error.TableNotFound;
         if (table.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
         if (try backups_api.manifestExistsAtLocationWithIo(self.alloc, io, backup_location, backup_id))
             return error.BackupAlreadyExists;
-        try backups_api.reserveTableBackupAttemptAtLocation(
+        backups_api.reserveTableBackupAttemptAtLocation(
             self.alloc,
             io,
             backup_location,
@@ -6313,26 +6317,80 @@ pub const ApiHttpServer = struct {
             artifact_backup_id,
             format,
             fence,
-        );
-        var cleanup_safe = true;
-        var forwarded_envelope_owned = false;
-        self.executeReservedTableBackup(io, table, fence, table_name, backup_location, location_uri, backup_id, artifact_backup_id, format, connection, &cleanup_safe, &forwarded_envelope_owned) catch |err| {
-            if (!cleanup_safe) {
-                std.log.err("table backup publication outcome ambiguous phase=commit class={s}; retaining fenced attempt", .{@errorName(err)});
-                return error.BackupOutcomeAmbiguous;
-            }
-            if (forwarded_envelope_owned and !std.mem.eql(u8, backup_id, artifact_backup_id)) {
-                backups_api.cleanupTableBackupAttemptAtLocation(
+        ) catch |err| switch (err) {
+            error.BackupAlreadyExists => {
+                const retained_artifact_id = backups_api.tableBackupAttemptArtifactIdAlloc(
                     self.alloc,
                     io,
                     backup_location,
-                    artifact_backup_id,
+                    backup_id,
+                ) catch return error.BackupAlreadyExists;
+                if (retained_artifact_id) |value| {
+                    self.alloc.free(value);
+                    return error.BackupOutcomeAmbiguous;
+                }
+                return error.BackupAlreadyExists;
+            },
+            else => return err,
+        };
+        const initial_writer_lease_expiration =
+            @as(u64, @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds())) +|
+            backups_api.table_backup_writer_lease_duration_ns;
+        var writer_lease_heartbeat: TableBackupWriterLeaseHeartbeat = .{
+            .alloc = self.alloc,
+            .io = io,
+            .location = backup_location,
+            .artifact_backup_id = artifact_backup_id,
+            .expires_at_unix_ns = .init(initial_writer_lease_expiration),
+        };
+        switch (writer_lease_role) {
+            .create => backups_api.reserveTableBackupWriterLeaseAtLocation(
+                self.alloc,
+                io,
+                backup_location,
+                artifact_backup_id,
+                initial_writer_lease_expiration,
+            ) catch |err| {
+                backups_api.cleanupUnpublishedTableBackupAttemptAtLocation(
+                    self.alloc,
+                    io,
+                    backup_location,
+                    backup_id,
                     artifact_backup_id,
                     format,
-                ) catch |cleanup_err| {
-                    std.log.err("forwarded table backup cleanup failed phase=rollback class={s}", .{@errorName(cleanup_err)});
-                    return error.BackupOutcomeAmbiguous;
-                };
+                ) catch {};
+                return err;
+            },
+            .adopt => writer_lease_heartbeat.ensureOwned() catch |err| {
+                backups_api.cleanupUnpublishedTableBackupAttemptAtLocation(
+                    self.alloc,
+                    io,
+                    backup_location,
+                    backup_id,
+                    artifact_backup_id,
+                    format,
+                ) catch {};
+                return err;
+            },
+        }
+        var writer_lease_future = std.Io.async(
+            io,
+            TableBackupWriterLeaseHeartbeat.run,
+            .{&writer_lease_heartbeat},
+        );
+        var writer_lease_future_running = true;
+        defer if (writer_lease_future_running) {
+            writer_lease_heartbeat.stop_event.set(io);
+            writer_lease_future.await(io);
+        };
+        var cleanup_safe = true;
+        self.executeReservedTableBackup(io, table, fence, table_name, backup_location, location_uri, backup_id, artifact_backup_id, format, connection, &writer_lease_heartbeat, &cleanup_safe) catch |err| {
+            writer_lease_heartbeat.stop_event.set(io);
+            writer_lease_future.await(io);
+            writer_lease_future_running = false;
+            if (!cleanup_safe) {
+                std.log.err("table backup publication outcome ambiguous phase=commit class={s}; retaining fenced attempt", .{@errorName(err)});
+                return error.BackupOutcomeAmbiguous;
             }
             backups_api.cleanupUnpublishedTableBackupAttemptAtLocation(
                 self.alloc,
@@ -6348,8 +6406,33 @@ pub const ApiHttpServer = struct {
                 std.log.err("table backup cleanup failed phase=rollback class={s}", .{@errorName(cleanup_err)});
                 return error.BackupOutcomeAmbiguous;
             };
+            if (writer_lease_role == .create) {
+                _ = backups_api.releaseTableBackupWriterLeaseAtLocation(
+                    self.alloc,
+                    io,
+                    backup_location,
+                    artifact_backup_id,
+                ) catch |release_err| blk: {
+                    std.log.warn("table backup writer lease release deferred phase=rollback class={s}", .{@errorName(release_err)});
+                    break :blk false;
+                };
+            }
             return err;
         };
+        writer_lease_heartbeat.stop_event.set(io);
+        writer_lease_future.await(io);
+        writer_lease_future_running = false;
+        if (writer_lease_role == .create) {
+            _ = backups_api.releaseTableBackupWriterLeaseAtLocation(
+                self.alloc,
+                io,
+                backup_location,
+                artifact_backup_id,
+            ) catch |release_err| blk: {
+                std.log.warn("table backup writer lease release deferred phase=commit class={s}", .{@errorName(release_err)});
+                break :blk false;
+            };
+        }
     }
 
     fn executeReservedTableBackup(
@@ -6364,8 +6447,8 @@ pub const ApiHttpServer = struct {
         artifact_backup_id: []const u8,
         format: backups_api.BackupFormat,
         connection: []const u8,
+        writer_lease: *TableBackupWriterLeaseHeartbeat,
         cleanup_safe: *bool,
-        forwarded_envelope_owned: *bool,
     ) !void {
         const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
         const forwarded_shards = table_writes_source.backupTableToLocation(self.alloc, table_name, artifact_backup_id, format, fence, location_uri, connection, backup_location) catch |err| {
@@ -6373,8 +6456,8 @@ pub const ApiHttpServer = struct {
             return err;
         };
         if (forwarded_shards) |shards| {
-            forwarded_envelope_owned.* = true;
             defer freeBackupShards(self.alloc, shards);
+            try writer_lease.ensureOwned();
             var manifest = try backups_api.createManifest(self.alloc, backup_id, format, table, shards);
             defer manifest.deinit(self.alloc);
             cleanup_safe.* = false;
@@ -6422,6 +6505,7 @@ pub const ApiHttpServer = struct {
         };
         const shards = local_shards orelse return error.TableNotFound;
         defer freeBackupShards(self.alloc, shards);
+        try writer_lease.ensureOwned();
 
         if (switch (backup_location.*) {
             .remote => true,
@@ -6451,6 +6535,7 @@ pub const ApiHttpServer = struct {
 
         var manifest = try backups_api.createManifest(self.alloc, backup_id, format, table, shards);
         defer manifest.deinit(self.alloc);
+        try writer_lease.ensureOwned();
         cleanup_safe.* = false;
         backups_api.writeManifestToLocationWithIo(self.alloc, io, backup_location, &manifest) catch |err| {
             cleanup_safe.* = switch (err) {
@@ -6624,6 +6709,74 @@ pub const ApiHttpServer = struct {
                         return;
                     }
                     std.log.warn("cluster repository lease renewal deferred class={s}", .{@errorName(err)});
+                    break :blk true;
+                }) continue;
+                self.lost.store(true, .release);
+                return;
+            }
+        }
+    };
+
+    const TableBackupWriterLeaseHeartbeat = struct {
+        alloc: std.mem.Allocator,
+        io: std.Io,
+        location: *backups_api.BackupLocation,
+        artifact_backup_id: []const u8,
+        stop_event: std.Io.Event = .unset,
+        lost: std.atomic.Value(bool) = .init(false),
+        expires_at_unix_ns: std.atomic.Value(u64),
+
+        fn renewedExpiration(self: *@This()) u64 {
+            const now: u64 = @intCast(std.Io.Timestamp.now(self.io, .real).toNanoseconds());
+            return now +| backups_api.table_backup_writer_lease_duration_ns;
+        }
+
+        fn renew(self: *@This()) !bool {
+            const expiration = self.renewedExpiration();
+            const owned = try backups_api.renewTableBackupWriterLeaseAtLocation(
+                self.alloc,
+                self.io,
+                self.location,
+                self.artifact_backup_id,
+                expiration,
+            );
+            if (owned) self.expires_at_unix_ns.store(expiration, .release);
+            return owned;
+        }
+
+        fn ensureOwned(self: *@This()) !void {
+            if (self.lost.load(.acquire) or !try self.renew()) {
+                self.lost.store(true, .release);
+                return error.BackupAttemptLeaseLost;
+            }
+        }
+
+        fn run(self: *@This()) void {
+            while (!self.stop_event.isSet()) {
+                self.stop_event.waitTimeout(self.io, .{
+                    .duration = .{
+                        .raw = std.Io.Duration.fromNanoseconds(
+                            backups_api.backup_attempt_lease_renew_interval_ns,
+                        ),
+                        .clock = .awake,
+                    },
+                }) catch |err| switch (err) {
+                    error.Timeout => {},
+                    error.Canceled => {
+                        if (self.stop_event.isSet()) return;
+                        self.lost.store(true, .release);
+                        return;
+                    },
+                };
+                if (self.stop_event.isSet()) return;
+                if (self.renew() catch |err| blk: {
+                    const now: u64 = @intCast(std.Io.Timestamp.now(self.io, .real).toNanoseconds());
+                    if (now >= self.expires_at_unix_ns.load(.acquire)) {
+                        std.log.err("table backup writer lease expired after renewal failures class={s}", .{@errorName(err)});
+                        self.lost.store(true, .release);
+                        return;
+                    }
+                    std.log.warn("table backup writer lease renewal deferred class={s}", .{@errorName(err)});
                     break :blk true;
                 }) continue;
                 self.lost.store(true, .release);
@@ -8663,8 +8816,25 @@ pub const ApiHttpServer = struct {
         // A forwarded storage-owner hop must preserve the coordinator's
         // generation ID. Generating another ID here would leave cleanup unable
         // to address the actual payload after a failed or ambiguous transport.
-        const backup_result = if (expected_fence != null)
-            self.backupOwnedTableWithArtifactId(io, &table, admitted_fence, table_name, location, location_uri, backup_id, backup_id, format, connection)
+        const backup_result = if (expected_fence) |forwarded_fence|
+            self.backupOwnedTableWithArtifactId(
+                io,
+                &table,
+                admitted_fence,
+                table_name,
+                location,
+                location_uri,
+                backup_id,
+                backup_id,
+                format,
+                connection,
+                // Legacy coordinators forward only the original four-field
+                // fence and cannot pre-create a writer lease. Preserve that
+                // one rolling-upgrade direction by letting the new owner
+                // create the lease; current coordinators carry metadata
+                // identity and require adoption of their delivery fence.
+                if (forwarded_fence.hasMetadataIdentity()) .adopt else .create,
+            )
         else
             self.backupOwnedTable(io, &table, admitted_fence, table_name, location, location_uri, backup_id, format, connection);
         backup_result catch |err| switch (err) {
@@ -9900,6 +10070,7 @@ pub const ApiHttpServer = struct {
                 attempt_table.artifact_backup_id,
                 req.format,
                 connection,
+                .create,
             ) catch |err| {
                 if (err == error.BackupOutcomeAmbiguous) {
                     // The forwarded owner may still be completing work after a
@@ -9909,6 +10080,11 @@ pub const ApiHttpServer = struct {
                     // identities for bounded stale-attempt reconciliation.
                     table_outcome_ambiguous = true;
                     cluster_cleanup_safe = false;
+                    statuses[i].status = "ambiguous";
+                    statuses[i].code = "backup_outcome_ambiguous";
+                    statuses[i].retryable = false;
+                    statuses[i].backup_id = attempt_table.table_backup_id;
+                    statuses[i].artifact_backup_id = attempt_table.artifact_backup_id;
                 }
                 statuses[i].@"error" = switch (err) {
                     // Once table execution begins, the request may already have
@@ -33284,12 +33460,100 @@ test "cluster backup retains its fenced attempt after an ambiguous table outcome
         .{},
     );
     defer alloc.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, backups_api.backup_outcome_ambiguous_message) != null);
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"status\":\"ambiguous\",\"tables\":[{\"name\":\"docs\",\"status\":\"ambiguous\",\"code\":\"backup_outcome_ambiguous\",\"retryable\":false}]}",
+        body,
+    );
+    var parsed = try ant_json.parseFromSlice(
+        struct {
+            tables: []const struct {
+                backup_id: []const u8,
+                artifact_backup_id: []const u8,
+            },
+        },
+        alloc,
+        body,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.tables.len);
+    try std.testing.expect(parsed.value.tables[0].backup_id.len > 0);
+    try std.testing.expect(parsed.value.tables[0].artifact_backup_id.len > 0);
     try std.testing.expect(!(try backups_api.clusterManifestExistsAtLocation(alloc, &location, "ambiguous-cluster")));
     try std.testing.expectError(
         error.BackupAlreadyExists,
         backups_api.reserveBackupAtLocation(alloc, std.testing.io, &location, "other", true),
     );
+}
+
+test "table backup retry preserves the retained ambiguous generation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/ambiguous-table-retry", .{tmp.sub_path});
+    defer alloc.free(root);
+    var location: backups_api.BackupLocation = .{ .file = root };
+    const fence: backups_api.TableBackupFence = .{
+        .metadata_group_id = 3,
+        .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+        .table_id = 7,
+        .definition_digest = [_]u8{0x11} ** 32,
+        .topology_range_count = 1,
+        .topology_digest = [_]u8{0x22} ** 32,
+    };
+    try backups_api.reserveTableBackupAttemptAtLocation(
+        alloc,
+        std.testing.io,
+        &location,
+        "logical",
+        "retained-generation",
+        .portable,
+        fence,
+    );
+
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .indexes_json = tables_api.default_indexes_json,
+        .placement_role = "data",
+    };
+    try std.testing.expectError(
+        error.BackupOutcomeAmbiguous,
+        server.backupOwnedTableWithArtifactId(
+            std.testing.io,
+            &table,
+            fence,
+            "docs",
+            &location,
+            "file:///backups",
+            "logical",
+            "new-generation",
+            .portable,
+            "backups",
+            .create,
+        ),
+    );
+    const retained = (try backups_api.tableBackupAttemptArtifactIdAlloc(
+        alloc,
+        std.testing.io,
+        &location,
+        "logical",
+    )).?;
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings("retained-generation", retained);
 }
 
 test "api http server rejects restore before persistence without an asynchronous worker" {

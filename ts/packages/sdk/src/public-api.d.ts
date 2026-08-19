@@ -2716,16 +2716,44 @@ export interface components {
         /** @description A retryable metadata-availability failure reported before backup side effects begin. */
         BackupMetadataUnavailableError: components["schemas"]["MetadataCapabilityUnavailableError"] | components["schemas"]["MetadataLeaderUnavailableError"];
         /** @description A non-retryable table-backup conflict. Ambiguous outcomes include the logical backup ID and, when available, the opaque artifact generation retained for reconciliation. */
-        TableBackupConflictError: {
-            /** @enum {string} */
-            code: "backup_already_exists" | "table_catalog_changed" | "backup_outcome_ambiguous";
+        TableBackupConflictError: components["schemas"]["BackupAlreadyExistsConflict"] | components["schemas"]["TableCatalogChangedConflict"] | components["schemas"]["BackupOutcomeAmbiguousConflict"];
+        BackupAlreadyExistsConflict: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            code: "backup_already_exists";
+            /** @description Legacy human-readable error text. Use `code` for branching. */
+            error: string;
+            message: string;
+            /** @enum {boolean} */
+            retryable: false;
+        };
+        TableCatalogChangedConflict: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            code: "table_catalog_changed";
+            /** @description Legacy human-readable error text. Use `code` for branching. */
+            error: string;
+            message: string;
+            /** @enum {boolean} */
+            retryable: false;
+        };
+        BackupOutcomeAmbiguousConflict: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            code: "backup_outcome_ambiguous";
             /** @description Legacy human-readable error text. Use `code` for branching. */
             error: string;
             message: string;
             /** @enum {boolean} */
             retryable: false;
             /** @description Logical backup ID whose outcome must be inspected before retrying. */
-            backup_id?: string;
+            backup_id: string;
             /** @description Opaque artifact generation retained by an ambiguous attempt. This is for reconciliation, not as a replacement logical backup ID. */
             artifact_backup_id?: string;
         };
@@ -5207,8 +5235,17 @@ export interface components {
              * @example completed
              * @enum {string}
              */
-            status: "completed" | "partial" | "failed";
+            status: "completed" | "successful" | "partial" | "failed" | "ambiguous";
         };
+        /**
+         * @description Outcome for one table in a cluster backup. `successful` is the legacy
+         *     spelling emitted by pre-Zig coordinators; new coordinators emit `completed`.
+         *
+         *     An `ambiguous` outcome includes `error`, `code`, `retryable: false`,
+         *     `backup_id`, and `artifact_backup_id` so callers can reconcile the retained
+         *     generation without retrying blindly. Failed and skipped outcomes may include
+         *     `error`; other fields are omitted when they do not apply.
+         */
         TableBackupStatus: {
             /**
              * @description Table name
@@ -5216,13 +5253,23 @@ export interface components {
              */
             name: string;
             /**
-             * @description Backup status for this table
              * @example completed
              * @enum {string}
              */
-            status: "completed" | "failed" | "skipped";
-            /** @description Error message if backup failed */
+            status: "completed" | "successful" | "failed" | "skipped" | "ambiguous";
+            /** @description Human-readable failure, skip reason, or reconciliation guidance. */
             error?: string;
+            /**
+             * @description Stable machine-readable code for an ambiguous outcome.
+             * @enum {string}
+             */
+            code?: "backup_outcome_ambiguous";
+            /** @description False for an ambiguous outcome; inspect the retained attempt before retrying. */
+            retryable?: boolean;
+            /** @description Logical per-table backup ID retained by an ambiguous cluster attempt. */
+            backup_id?: string;
+            /** @description Opaque artifact generation retained by an ambiguous cluster attempt. */
+            artifact_backup_id?: string;
         };
         ClusterRestoreRequest: {
             /**

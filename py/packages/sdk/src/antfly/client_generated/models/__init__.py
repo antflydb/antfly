@@ -47,9 +47,13 @@ from .artifact_repair_reason import ArtifactRepairReason
 from .audio_chunk_options import AudioChunkOptions
 from .auth_subject import AuthSubject
 from .auth_subject_kind import AuthSubjectKind
+from .backup_already_exists_conflict import BackupAlreadyExistsConflict
+from .backup_already_exists_conflict_code import BackupAlreadyExistsConflictCode
 from .backup_info import BackupInfo
 from .backup_info_format import BackupInfoFormat
 from .backup_list_response import BackupListResponse
+from .backup_outcome_ambiguous_conflict import BackupOutcomeAmbiguousConflict
+from .backup_outcome_ambiguous_conflict_code import BackupOutcomeAmbiguousConflictCode
 from .backup_request import BackupRequest
 from .backup_request_format import BackupRequestFormat
 from .backup_table_response_201 import BackupTableResponse201
@@ -703,10 +707,11 @@ from .success_message import SuccessMessage
 from .sync_level import SyncLevel
 from .table import Table
 from .table_artifact_enrichment_list import TableArtifactEnrichmentList
-from .table_backup_conflict_error import TableBackupConflictError
-from .table_backup_conflict_error_code import TableBackupConflictErrorCode
 from .table_backup_status import TableBackupStatus
+from .table_backup_status_code import TableBackupStatusCode
 from .table_backup_status_status import TableBackupStatusStatus
+from .table_catalog_changed_conflict import TableCatalogChangedConflict
+from .table_catalog_changed_conflict_code import TableCatalogChangedConflictCode
 from .table_indexes import TableIndexes
 from .table_migration import TableMigration
 from .table_migration_state import TableMigrationState
@@ -841,9 +846,13 @@ __all__ = (
     "AudioChunkOptions",
     "AuthSubject",
     "AuthSubjectKind",
+    "BackupAlreadyExistsConflict",
+    "BackupAlreadyExistsConflictCode",
     "BackupInfo",
     "BackupInfoFormat",
     "BackupListResponse",
+    "BackupOutcomeAmbiguousConflict",
+    "BackupOutcomeAmbiguousConflictCode",
     "BackupRequest",
     "BackupRequestFormat",
     "BackupTableResponse201",
@@ -1491,10 +1500,11 @@ __all__ = (
     "SyncLevel",
     "Table",
     "TableArtifactEnrichmentList",
-    "TableBackupConflictError",
-    "TableBackupConflictErrorCode",
     "TableBackupStatus",
+    "TableBackupStatusCode",
     "TableBackupStatusStatus",
+    "TableCatalogChangedConflict",
+    "TableCatalogChangedConflictCode",
     "TableIndexes",
     "TableMigration",
     "TableMigrationState",

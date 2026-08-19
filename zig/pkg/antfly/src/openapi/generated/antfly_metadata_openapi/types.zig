@@ -508,6 +508,14 @@ pub const ArtifactRepairReason = enum {
     }
 };
 
+pub const BackupAlreadyExistsConflict = struct {
+    code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+};
+
 pub const BackupInfo = struct {
     /// The backup identifier
     backup_id: []const u8,
@@ -562,6 +570,18 @@ pub const BackupMetadataUnavailableError = union(enum) {
             .metadata_leader_unavailable_error => |v| try jw.write(v),
         }
     }
+};
+
+pub const BackupOutcomeAmbiguousConflict = struct {
+    code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+    /// Logical backup ID whose outcome must be inspected before retrying.
+    backup_id: []const u8,
+    /// Opaque artifact generation retained by an ambiguous attempt. This is for reconciliation, not as a replacement logical backup ID.
+    artifact_backup_id: ?[]const u8 = null,
 };
 
 pub const BackupRequest = struct {
@@ -3131,25 +3151,67 @@ pub const TableArtifactEnrichmentList = struct {
 };
 
 /// A non-retryable table-backup conflict. Ambiguous outcomes include the logical backup ID and, when available, the opaque artifact generation retained for reconciliation.
-pub const TableBackupConflictError = struct {
+pub const TableBackupConflictError = union(enum) {
+    backup_already_exists_conflict: BackupAlreadyExistsConflict,
+    table_catalog_changed_conflict: TableCatalogChangedConflict,
+    backup_outcome_ambiguous_conflict: BackupOutcomeAmbiguousConflict,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("code") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "backup_already_exists")) {
+            return .{ .backup_already_exists_conflict = try std.json.parseFromValueLeaky(BackupAlreadyExistsConflict, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "table_catalog_changed")) {
+            return .{ .table_catalog_changed_conflict = try std.json.parseFromValueLeaky(TableCatalogChangedConflict, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "backup_outcome_ambiguous")) {
+            return .{ .backup_outcome_ambiguous_conflict = try std.json.parseFromValueLeaky(BackupOutcomeAmbiguousConflict, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .backup_already_exists_conflict => |v| try jw.write(v),
+            .table_catalog_changed_conflict => |v| try jw.write(v),
+            .backup_outcome_ambiguous_conflict => |v| try jw.write(v),
+        }
+    }
+};
+
+/// Outcome for one table in a cluster backup. `successful` is the legacy spelling emitted by pre-Zig coordinators; new coordinators emit `completed`. An `ambiguous` outcome includes `error`, `code`, `retryable: false`, `backup_id`, and `artifact_backup_id` so callers can reconcile the retained generation without retrying blindly. Failed and skipped outcomes may include `error`; other fields are omitted when they do not apply.
+pub const TableBackupStatus = struct {
+    /// Table name
+    name: []const u8,
+    status: []const u8,
+    /// Human-readable failure, skip reason, or reconciliation guidance.
+    @"error": ?[]const u8 = null,
+    /// Stable machine-readable code for an ambiguous outcome.
+    code: ?[]const u8 = null,
+    /// False for an ambiguous outcome; inspect the retained attempt before retrying.
+    retryable: ?bool = null,
+    /// Logical per-table backup ID retained by an ambiguous cluster attempt.
+    backup_id: ?[]const u8 = null,
+    /// Opaque artifact generation retained by an ambiguous cluster attempt.
+    artifact_backup_id: ?[]const u8 = null,
+};
+
+pub const TableCatalogChangedConflict = struct {
     code: []const u8,
     /// Legacy human-readable error text. Use `code` for branching.
     @"error": []const u8,
     message: []const u8,
     retryable: bool,
-    /// Logical backup ID whose outcome must be inspected before retrying.
-    backup_id: ?[]const u8 = null,
-    /// Opaque artifact generation retained by an ambiguous attempt. This is for reconciliation, not as a replacement logical backup ID.
-    artifact_backup_id: ?[]const u8 = null,
-};
-
-pub const TableBackupStatus = struct {
-    /// Table name
-    name: []const u8,
-    /// Backup status for this table
-    status: []const u8,
-    /// Error message if backup failed
-    @"error": ?[]const u8 = null,
 };
 
 /// Describes an in-progress schema migration. The table serves reads from read_schema while rebuilding full-text indexes for the new schema.

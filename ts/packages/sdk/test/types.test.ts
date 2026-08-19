@@ -49,6 +49,7 @@ describe("Antfly Query Type Integration", () => {
       type Backup503 = operations["backup"]["responses"][503]["content"]["application/json"];
       type BackupTable503 = operations["backupTable"]["responses"][503]["content"]["application/json"];
       type BackupTable409 = operations["backupTable"]["responses"][409]["content"]["application/json"];
+      type ClusterBackup = components["schemas"]["ClusterBackupResponse"];
 
       const capability: BackupUnavailable = {
         code: "metadata_capability_unavailable",
@@ -73,12 +74,25 @@ describe("Antfly Query Type Integration", () => {
         backup_id: "snap",
         artifact_backup_id: "generation-7",
       };
+      const ambiguousCluster: ClusterBackup = {
+        backup_id: "nightly",
+        status: "ambiguous",
+        tables: [{
+          name: "docs",
+          status: "ambiguous",
+          code: "backup_outcome_ambiguous",
+          retryable: false,
+          backup_id: "attempt-t-0",
+          artifact_backup_id: "attempt-a-0",
+        }],
+      };
 
       expectTypeOf<Backup503>().toEqualTypeOf<BackupUnavailable>();
       expectTypeOf<BackupTable503>().toEqualTypeOf<BackupUnavailable>();
       expect(capability.required_capability).toBe("linearizable_snapshot");
       expect(leader.error).toBe("metadata leader unavailable");
       expect(ambiguous.code).toBe("backup_outcome_ambiguous");
+      expect(ambiguousCluster.tables[0]?.artifact_backup_id).toBe("attempt-a-0");
     });
   });
 
