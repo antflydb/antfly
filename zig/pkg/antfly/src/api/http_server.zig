@@ -23285,6 +23285,56 @@ test "api http server serves retrieval agent response envelope" {
     defer internal_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), internal_resp.status);
     try std.testing.expectEqualStrings("invalid retrieval agent request", internal_resp.body);
+
+    const secret = "retrieval-trusted-principal-secret";
+    server.cfg.trusted_principal_secret = secret;
+    server.cfg.trusted_principal_issuer = "trusted-upstream";
+    const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+
+    const denied_payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"iss":"trusted-upstream","sub":"browser-key","tenant":"tenant-1","tables":["other"],"operations":["read"],"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer std.testing.allocator.free(denied_payload);
+    const denied_token = try encodeTrustedPrincipalToken(std.testing.allocator, secret, denied_payload);
+    defer std.testing.allocator.free(denied_token);
+    const denied_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = denied_token },
+    };
+    var denied = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/agents/retrieval",
+        .content_type = "application/json",
+        .headers = &denied_headers,
+        .body = retrieval_body,
+    });
+    defer denied.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 403), denied.status);
+    try std.testing.expectEqualStrings("forbidden", denied.body);
+
+    const allowed_payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"iss":"trusted-upstream","sub":"browser-key","tenant":"tenant-1","tables":["docs"],"operations":["read"],"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer std.testing.allocator.free(allowed_payload);
+    const allowed_token = try encodeTrustedPrincipalToken(std.testing.allocator, secret, allowed_payload);
+    defer std.testing.allocator.free(allowed_token);
+    const allowed_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = allowed_token },
+    };
+    var allowed = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/agents/retrieval",
+        .content_type = "application/json",
+        .headers = &allowed_headers,
+        .body = retrieval_body,
+    });
+    defer allowed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), allowed.status);
 }
 
 test "api http server maps retrieval agent doc identity mismatch to unavailable" {

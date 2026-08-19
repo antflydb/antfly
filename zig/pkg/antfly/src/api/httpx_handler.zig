@@ -3491,6 +3491,10 @@ pub const AntflyApiHandler = struct {
                 query_json: []const u8,
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
+                if (runner.authenticated_identity) |identity| {
+                    if (!http_server_mod.permissionsAllow(identity.permissions, .table, table_name, .read))
+                        return error.Forbidden;
+                }
                 var semantic_resolver = runner.server.semanticStatusResolver(runner.query_embedding_security_scope.domain, runner.query_embedding_security_scope.value);
                 var query_req = query_api.parsePublicQueryRequest(a, semantic_resolver.iface(), table_name, query_json) catch |err| {
                     if (query_api.isPublicQueryValidationError(err)) {
@@ -3539,6 +3543,10 @@ pub const AntflyApiHandler = struct {
                 exclusion_query_json: ?[]const u8,
             ) !retrieval_agent.QueryRunner.KeyPage {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
+                if (runner.authenticated_identity) |identity| {
+                    if (!http_server_mod.permissionsAllow(identity.permissions, .table, table_name, .read))
+                        return error.Forbidden;
+                }
                 return try runner.server.scanRetrievalKeyPage(
                     a,
                     runner.source,
@@ -3559,6 +3567,10 @@ pub const AntflyApiHandler = struct {
                 keys: []const []const u8,
             ) ![]bool {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
+                if (runner.authenticated_identity) |identity| {
+                    if (!http_server_mod.permissionsAllow(identity.permissions, .table, table_name, .read))
+                        return error.Forbidden;
+                }
                 return try runner.server.probeRetrievalIncomingEdges(
                     a,
                     runner.source,
@@ -3617,6 +3629,10 @@ pub const AntflyApiHandler = struct {
             error.TableNotFound => {
                 _ = ctx.status(404);
                 return ctx.text("not found");
+            },
+            error.Forbidden => {
+                _ = ctx.status(403);
+                return ctx.text("forbidden");
             },
             error.DocIdentityNamespaceMismatch => {
                 _ = ctx.status(503);
