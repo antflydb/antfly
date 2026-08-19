@@ -4487,6 +4487,13 @@ pub const DataServer = struct {
     const lsm_maintenance_worker_bulk_defer_ns = 500 * std.time.ns_per_ms;
     const lsm_maintenance_worker_pressure_defer_ns = 500 * std.time.ns_per_ms;
     const lsm_maintenance_worker_max_steps_per_wake = 8;
+    // A score of 500K is roughly fifty primary L0 runs above the soft limit,
+    // still well below the default 256-run hard limit. If continuous writers
+    // win four consecutive try-lock races at that debt, take one blocking,
+    // fairly queued maintenance turn before the L0 reaches foreground-stall
+    // territory.
+    const lsm_maintenance_fair_turn_score: u64 = 500_000;
+    const lsm_maintenance_fair_turn_deferrals: usize = 4;
     // Dense posting repair is time-driven rather than score-driven: checking
     // the backlog requires a posting-state scan, so the worker probes on a
     // fixed cadence and retries quickly only while repairs are landing.
@@ -6578,6 +6585,7 @@ pub const DataServer = struct {
     }
 
     fn lsmMaintenanceWorkerMain(self: *DataServer) void {
+        var consecutive_lock_deferrals: usize = 0;
         while (!self.lsm_maintenance_stop.load(.acquire)) {
             const woke = self.lsm_maintenance_wake.swap(false, .acq_rel);
             const now_ns = platform_time.monotonicNs();
@@ -6618,7 +6626,13 @@ pub const DataServer = struct {
             var maintenance_progressed_unscoped = false;
             var steps: usize = 0;
             while (steps < lsm_maintenance_worker_max_steps_per_wake and !self.lsm_maintenance_stop.load(.acquire)) : (steps += 1) {
-                const maintenance = live_write_source.runLsmMaintenanceRoundBestEffortDetailed() catch |err| {
+                const observed_score = live_write_source.lsmMaintenanceScoreBestEffort();
+                const force_fair_turn = observed_score >= lsm_maintenance_fair_turn_score and
+                    consecutive_lock_deferrals >= lsm_maintenance_fair_turn_deferrals;
+                const maintenance = (if (force_fair_turn)
+                    live_write_source.runLsmMaintenanceRoundDetailed()
+                else
+                    live_write_source.runLsmMaintenanceRoundBestEffortDetailed()) catch |err| {
                     switch (err) {
                         error.ReadOnly,
                         error.FileNotFound,
@@ -6633,6 +6647,7 @@ pub const DataServer = struct {
                 if (!maintenance.progressed) {
                     if (live_write_source.lsmMaintenanceScoreBestEffort() > 0) {
                         _ = self.lsm_maintenance_lock_deferred.fetchAdd(1, .monotonic);
+                        consecutive_lock_deferrals +|= 1;
                         self.deferLsmMaintenance(platform_time.monotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
                     } else if (live_write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
                         if (delay_ns > 0) self.deferLsmObsoleteReclaim(platform_time.monotonicNs(), delay_ns);
@@ -6640,6 +6655,7 @@ pub const DataServer = struct {
                     completed = true;
                     break;
                 }
+                consecutive_lock_deferrals = 0;
                 maintenance_progressed = true;
                 if (maintenance.group_id) |group_id| {
                     var already_recorded = false;
@@ -12009,6 +12025,16 @@ pub const DataServer = struct {
             }
             const group_id = candidate.group_id;
             const table_name = candidate.table_name;
+
+            // A resident writer owns ordinary async replay and publishes its
+            // runtime status directly. Fallback discovery is for lost/cold
+            // repair debt; auditing a resident writer duplicates catch-up and
+            // can enqueue healthy replay as repair work. Exact durable queue
+            // entries remain authoritative and always bypass this hint.
+            if (!candidate.queued and self.liveRuntimeWriteSource().hasResidentWriterForGroupTableBestEffort(group_id, table_name)) {
+                fallback_advance_count = @max(fallback_advance_count, candidate.cursor_distance + 1);
+                continue;
+            }
 
             var ownership_fence = IndexRepairOwnershipFence{
                 .leadership_source = self.group_leadership_source,

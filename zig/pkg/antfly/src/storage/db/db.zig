@@ -678,6 +678,7 @@ fn managedIndexReplayHint(kind: types.IndexKind) change_journal_mod.TargetHint {
 const AsyncContext = struct {
     alloc: Allocator,
     io: ?std.Io = null,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
     store: *docstore_mod.DocStore,
     snapshot_read_txn: ?*docstore_mod.DocStore.Txn = null,
     applied_sequence_checkpoint_path: ?[]const u8 = null,
@@ -1520,6 +1521,7 @@ const TransactionResolution = struct {
     status: transactions_mod.TxnStatus,
     commit_version: u64,
     expected_intent_revision: u64,
+    intent_keys: []const []const u8,
 };
 
 const ha_applied_lsn_value_len: usize = @sizeOf(u64);
@@ -3637,6 +3639,7 @@ pub const DB = struct {
         const async_resources = self.core.asyncResources();
         self.async_context.* = .{
             .alloc = self.runtime_alloc,
+            .resource_manager = resource_manager,
             .store = async_resources.store,
             .applied_sequence_checkpoint_path = async_resources.applied_sequence_checkpoint_path,
             .index_repair_checkpoint = async_resources.index_repair_checkpoint,
@@ -5591,7 +5594,10 @@ pub const DB = struct {
                     resolution.txn_id,
                     resolution.status,
                     resolution.commit_version,
-                    .{ .expected_intent_revision = resolution.expected_intent_revision },
+                    .{
+                        .expected_intent_revision = resolution.expected_intent_revision,
+                        .known_intent_keys = resolution.intent_keys,
+                    },
                 );
                 self.core.unlockApply();
                 apply_mutex_held = false;
@@ -6276,6 +6282,7 @@ pub const DB = struct {
                     .deletes = delete_keys.items,
                     .replay = if (replay_append) |entry| .{ .sequence = entry.sequence, .payload = entry.payload } else null,
                     .expected_intent_revision = resolution.expected_intent_revision,
+                    .known_intent_keys = resolution.intent_keys,
                 },
             );
             if (outcome.applied) {
@@ -14884,13 +14891,20 @@ pub const DB = struct {
         while (attempts < 8) : (attempts += 1) {
             var intents = try self.core.collectTransactionIntentBatch(self.alloc, txn_id);
             defer intents.deinit(self.alloc);
+            const intent_keys = try self.alloc.alloc([]const u8, intents.writes.len + intents.deletes.len);
+            defer self.alloc.free(intent_keys);
+            for (intents.writes, 0..) |write, i| intent_keys[i] = write.key;
+            for (intents.deletes, 0..) |key, i| intent_keys[intents.writes.len + i] = key;
             if (intents.writes.len == 0 and intents.deletes.len == 0) {
                 lockApply(self);
                 const outcome = self.core.resolveTransactionIntentsWithExtraBatch(
                     txn_id,
                     status,
                     commit_version,
-                    .{ .expected_intent_revision = intents.revision },
+                    .{
+                        .expected_intent_revision = intents.revision,
+                        .known_intent_keys = intent_keys,
+                    },
                 ) catch |err| {
                     self.core.unlockApply();
                     if (err == error.IntentSnapshotChanged) continue;
@@ -14916,6 +14930,7 @@ pub const DB = struct {
                     .status = status,
                     .commit_version = commit_version,
                     .expected_intent_revision = intents.revision,
+                    .intent_keys = intent_keys,
                 },
             }) catch |err| {
                 if (err == error.IntentSnapshotChanged) continue;
@@ -33999,6 +34014,7 @@ fn beginDenseCatchUpSessionTracked(ctx: *AsyncContext, index_name: []const u8) !
     ctx.stats.dense_catch_up.active.store(1, .monotonic);
     ctx.stats.dense_catch_up.phase.store(@intFromEnum(types.DenseCatchUpStats.Phase.replay), .monotonic);
     _ = ctx.active_dense_catch_up_sessions.fetchAdd(1, .release);
+    if (ctx.resource_manager) |manager| manager.beginLatencySensitiveDerivedReplay();
 }
 
 fn finishDenseCatchUpSessionLocked(ctx: *AsyncContext, index_name: []const u8) bool {
@@ -34008,6 +34024,7 @@ fn finishDenseCatchUpSessionLocked(ctx: *AsyncContext, index_name: []const u8) b
         return false;
     }
     ctx.active_dense_catch_up_sessions.store(active - 1, .release);
+    if (ctx.resource_manager) |manager| manager.finishLatencySensitiveDerivedReplay();
     if (active == 1) {
         ctx.stats.dense_catch_up.active.store(0, .monotonic);
         ctx.stats.dense_catch_up.phase.store(@intFromEnum(types.DenseCatchUpStats.Phase.idle), .monotonic);
@@ -34303,8 +34320,11 @@ fn noteTargetAdvanceRepairRun(ctx: *AsyncContext, index_name: []const u8, now_ns
 
 test "async context dense catch-up session tracking suppresses local bulk sessions" {
     var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{});
+    defer resource_manager.deinit(std.testing.allocator);
     var ctx = AsyncContext{
         .alloc = std.testing.allocator,
+        .resource_manager = &resource_manager,
         .store = undefined,
         .index_manager = undefined,
         .apply_mutex = &apply_mutex,
@@ -34318,6 +34338,7 @@ test "async context dense catch-up session tracking suppresses local bulk sessio
     try std.testing.expectEqual(@as(u32, 1), ctx.active_dense_catch_up_sessions.load(.monotonic));
     try std.testing.expect(ctx.stats.dense_catch_up.active.load(.monotonic) != 0);
     try std.testing.expect(asyncContextHasActiveDenseBulkWork(&ctx));
+    try std.testing.expect(resource_manager.shouldDeferSoftCompactionForDerivedReplay());
     try std.testing.expect(ctx.text_merge_deferred.load(.acquire));
     try std.testing.expect(shouldDeferAppliedSequenceFlush(&ctx, false));
     try std.testing.expect(!shouldDeferAppliedSequenceFlush(&ctx, true));
@@ -34327,6 +34348,7 @@ test "async context dense catch-up session tracking suppresses local bulk sessio
     try std.testing.expectEqual(@as(u32, 0), ctx.active_dense_catch_up_sessions.load(.monotonic));
     try std.testing.expect(ctx.stats.dense_catch_up.active.load(.monotonic) == 0);
     try std.testing.expect(!ctx.text_merge_deferred.load(.acquire));
+    try std.testing.expect(!resource_manager.shouldDeferSoftCompactionForDerivedReplay());
     try std.testing.expect(!shouldDeferAppliedSequenceFlush(&ctx, false));
     try std.testing.expect(denseApplyUsesLocalStreamingSession(&ctx, "vec"));
 

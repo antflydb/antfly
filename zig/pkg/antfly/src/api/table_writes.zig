@@ -2700,7 +2700,7 @@ pub const ProvisionedTableWriteCache = struct {
         return delay_ns;
     }
 
-    pub fn leasePrimaryLsmMaintenanceRoundBestEffortLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
+    pub fn leasePrimaryLsmMaintenanceRoundLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
         var best_entry: ?*Entry = null;
         var best_score: u64 = 0;
         for (self.entries.items) |entry| {
@@ -2713,6 +2713,10 @@ pub const ProvisionedTableWriteCache = struct {
         }
         if (best_score == 0) return null;
         return self.leaseEntryLocked(best_entry.?);
+    }
+
+    pub fn leasePrimaryLsmMaintenanceRoundBestEffortLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
+        return self.leasePrimaryLsmMaintenanceRoundLocked();
     }
 
     fn bulkIngestSessionActiveForTable(self: *const ProvisionedTableWriteCache, table_name: []const u8) bool {
@@ -9519,8 +9523,17 @@ pub const ProvisionedTableWriteSource = struct {
                 primary_only = true;
                 break :blk lease;
             }
-            if (cache.maxLsmMaintenanceScoreLocked() == 0) return .{};
-            break :blk cache.leaseLsmMaintenanceRoundLocked() orelse return .{};
+            if (cache.maxLsmMaintenanceScoreLocked() != 0) {
+                if (cache.leaseLsmMaintenanceRoundLocked()) |lease| break :blk lease;
+            }
+            // Dense replay can suppress index-LSM maintenance while the
+            // primary store independently accumulates debt. The blocking
+            // maintenance lane must retain the same primary-only fallback as
+            // the best-effort lane, otherwise a forced fair turn still does
+            // no work under sustained public ingestion.
+            if (cache.maxPrimaryLsmMaintenanceScoreLocked() == 0) return .{};
+            primary_only = true;
+            break :blk cache.leasePrimaryLsmMaintenanceRoundLocked() orelse return .{};
         };
         defer {
             const release_alloc = if (leased.cache) |cache| cache.alloc else std.heap.page_allocator;
@@ -10811,6 +10824,27 @@ pub const ProvisionedTableWriteSource = struct {
         defer self.local_db_mutex.unlock();
         const cache = self.write_cache orelse return 0;
         return cache.entries.items.len;
+    }
+
+    /// Fallback repair discovery must not turn an ordinary resident writer's
+    /// asynchronous replay into duplicate startup/repair work. Explicitly
+    /// queued durable repair debt bypasses this hint; a contended cache is
+    /// conservatively treated as resident-owned and audited on a later
+    /// fallback rotation.
+    pub fn hasResidentWriterForGroupTableBestEffort(
+        self: *ProvisionedTableWriteSource,
+        group_id: u64,
+        table_name: []const u8,
+    ) bool {
+        if (!self.local_db_mutex.tryLock()) return true;
+        defer self.local_db_mutex.unlock();
+        if (self.write_cache) |cache| {
+            if (cache.hasForegroundStateForGroupTableLocked(group_id, table_name)) return true;
+        }
+        if (self.startup_write_cache) |cache| {
+            if (cache.hasForegroundStateForGroupTableLocked(group_id, table_name)) return true;
+        }
+        return false;
     }
 
     pub fn readPreparation(self: *ProvisionedTableWriteSource) table_reads.ReadPreparation {
@@ -13281,14 +13315,33 @@ pub const ProvisionedTableWriteSource = struct {
         }
         self.write_coalesce_mutex.unlock(io);
 
-        if (should_drain) self.drainProvisionedGroupBatchCoalescer(alloc, table_name, group.group_id);
+        while (true) {
+            if (should_drain) {
+                self.drainProvisionedGroupBatchCoalescer(alloc, table_name, group.group_id, &entry);
+                should_drain = false;
+            }
 
-        self.write_coalesce_mutex.lockUncancelable(io);
-        defer self.write_coalesce_mutex.unlock(io);
-        while (!entry.done) {
+            self.write_coalesce_mutex.lockUncancelable(io);
+            if (entry.done) {
+                const entry_err = entry.err;
+                self.write_coalesce_mutex.unlock(io);
+                if (entry_err) |err| return err;
+                return;
+            }
+            const queue_index = self.findWriteCoalesceQueueLocked(table_name, group.group_id) orelse {
+                self.write_coalesce_mutex.unlock(io);
+                return error.WriteCoalesceQueueMissing;
+            };
+            const queue = &self.write_coalesce_queues.items[queue_index];
+            if (!queue.draining) {
+                queue.draining = true;
+                should_drain = true;
+                self.write_coalesce_mutex.unlock(io);
+                continue;
+            }
             self.write_coalesce_ready.waitUncancelable(io, &self.write_coalesce_mutex);
+            self.write_coalesce_mutex.unlock(io);
         }
-        if (entry.err) |err| return err;
     }
 
     fn drainProvisionedGroupBatchCoalescer(
@@ -13296,6 +13349,7 @@ pub const ProvisionedTableWriteSource = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
         group_id: u64,
+        owner_entry: *WriteCoalesceEntry,
     ) void {
         const io = self.table_activity_threaded.io();
         self.beginGroupOperation(table_name, group_id);
@@ -13348,7 +13402,30 @@ pub const ProvisionedTableWriteSource = struct {
             self.write_coalesce_mutex.unlock(io);
 
             self.applyCoalescedEntriesWithIsolation(alloc, table_name, group_id, entries.items);
+            if (self.yieldWriteCoalesceDrainerIfOwnerDone(table_name, group_id, owner_entry)) return;
         }
+    }
+
+    // A request elected as drainer must not remain responsible for a queue
+    // that is continuously replenished after its own entry completes. Hand
+    // ownership to a waiting request so every public API handler can return
+    // with bounded queue residency under sustained concurrency.
+    fn yieldWriteCoalesceDrainerIfOwnerDone(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+        owner_entry: *const WriteCoalesceEntry,
+    ) bool {
+        const io = self.table_activity_threaded.io();
+        self.write_coalesce_mutex.lockUncancelable(io);
+        defer self.write_coalesce_mutex.unlock(io);
+        if (!owner_entry.done) return false;
+
+        const queue_index = self.findWriteCoalesceQueueLocked(table_name, group_id) orelse return true;
+        self.write_coalesce_queues.items[queue_index].draining = false;
+        self.write_coalesce_ready.broadcast(io);
+        self.pruneWriteCoalesceQueueLocked(queue_index);
+        return true;
     }
 
     fn applyCoalescedEntriesWithIsolation(
@@ -14093,11 +14170,89 @@ pub const ProvisionedTableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
-        if (self.raft_batcher != null) {
-            if (try self.commitSingleGroupTransactionViaRaftBatcher(alloc, tables, sync_level)) |outcome| return outcome;
-        }
+        if (try self.commitSingleGroupBatch(alloc, tables, sync_level)) |outcome| return outcome;
         const txn_id = nextTxnId();
         return try commitProvisionedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false);
+    }
+
+    /// A transaction with one participant is already atomic at the shard DB
+    /// boundary. Avoid materializing a durable begin/prepare/resolve protocol
+    /// for that case: it adds three writer admissions, recovery bookkeeping,
+    /// and extra WAL records without strengthening the commit contract.
+    /// Multi-group and multi-table batches still use the distributed
+    /// transaction coordinator below.
+    fn commitSingleGroupBatch(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+    ) !?distributed_txn.CommitOutcome {
+        if (self.raft_batcher != null)
+            return try self.commitSingleGroupTransactionViaRaftBatcher(alloc, tables, sync_level);
+        // A forwarding facade does not own the activity fence for the local
+        // writer. Leave it on the normal participant route until the hosted
+        // path has an equivalent single-shard callback.
+        if (self.localWriteOwnerSource() != null) return null;
+        if (tables.len == 0) return .{ .committed = .{ .participant_count = 0 } };
+        if (tables.len != 1) return null;
+
+        const table_req = tables[0];
+        self.beginTableRequest(table_req.table_name);
+        defer self.endTableRequest(table_req.table_name);
+
+        var routing = (try table_catalog.transactionRoutingSnapshot(
+            alloc,
+            self.catalog,
+            table_req.table_name,
+        )) orelse return null;
+        defer routing.deinit(alloc);
+
+        var group_id_opt: ?u64 = null;
+        const resolveOpGroup = struct {
+            fn run(current: *?u64, route: *const table_catalog.TransactionRoutingSnapshot, key: []const u8) !void {
+                const group_id = route.resolveGroupForKey(key) orelse return error.NotFound;
+                if (current.*) |existing| {
+                    if (existing != group_id) return error.MultipleGroups;
+                } else {
+                    current.* = group_id;
+                }
+            }
+        }.run;
+        for (table_req.writes) |write| resolveOpGroup(&group_id_opt, &routing, write.key) catch |err| switch (err) {
+            error.MultipleGroups => return null,
+            else => return err,
+        };
+        for (table_req.deletes) |key| resolveOpGroup(&group_id_opt, &routing, key) catch |err| switch (err) {
+            error.MultipleGroups => return null,
+            else => return err,
+        };
+        for (table_req.transforms) |transform| resolveOpGroup(&group_id_opt, &routing, transform.key) catch |err| switch (err) {
+            error.MultipleGroups => return null,
+            else => return err,
+        };
+        for (table_req.predicates) |predicate| resolveOpGroup(&group_id_opt, &routing, predicate.key) catch |err| switch (err) {
+            error.MultipleGroups => return null,
+            else => return err,
+        };
+        if (group_id_opt == null) return .{ .committed = .{ .participant_count = 0 } };
+
+        // The outer table request prevents a topology publication between the
+        // one-participant proof above and the ordinary atomic batch admission.
+        // `batch` retains the established schema, cache, coalescing, HA, and
+        // sync-level behavior used by all non-transactional shard writes.
+        const applied = batch(self, alloc, table_req.table_name, .{
+            .writes = transactionWritesAsBatchWrites(table_req.writes),
+            .deletes = table_req.deletes,
+            .transforms = table_req.transforms,
+            .predicates = table_req.predicates,
+            .timestamp_ns = nextTxnTimestamp(),
+            .sync_level = sync_level,
+        }) catch |err| switch (err) {
+            error.IntentConflict, error.VersionConflict => return .{ .conflict = boundConflict(table_req, err) },
+            else => return err,
+        };
+        if (applied == null) return null;
+        return .{ .committed = .{ .participant_count = 1 } };
     }
 
     fn commitSingleGroupTransactionViaRaftBatcher(
@@ -17839,6 +17994,39 @@ test "provisioned stateless batch retries definite aborts to the production boun
     const exhausted = (try source.source().commitBatch(std.testing.allocator, &tables, .write)).?;
     try std.testing.expect(exhausted == .conflict);
     try std.testing.expectEqual(stateless_batch_max_attempts, batcher.attempts);
+}
+
+test "provisioned single-group commit batch uses atomic shard fast path" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-provisioned-single-group-commit-fast-path";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
+    defer alloc.free(db_path);
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(path, ProvisionedWriteCoalesceTestCatalog.iface());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+    _ = try source.source().createTable(alloc, "docs", .{});
+
+    const outcome = (try source.commitSingleGroupBatch(alloc, &.{.{
+        .table_name = "docs",
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+    }}, .write)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(outcome == .committed);
+    try std.testing.expectEqual(@as(usize, 1), outcome.committed.participant_count);
+
+    var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, db_path, 7001, "docs", .default, null, null);
+    defer cached.deinit(alloc);
+    var result = (try cached.db.lookup(alloc, "doc:a", .{})) orelse return error.TestUnexpectedResult;
+    defer result.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, result.json, "\"alpha\"") != null);
+    try std.testing.expect(!try cached.db.hasTopologySensitiveTransactions());
 }
 
 fn boundConflict(table: distributed_txn.TableCommitRequest, err: anyerror) distributed_txn.CommitConflict {
@@ -25619,6 +25807,7 @@ test "auto bulk background finish skips entries with active foreground leases" {
     try write_cache.ensureAutoBulkIngestLocked(7001, "docs", platform_time.monotonicNs());
     const entry = write_cache.entries.items[0];
     try std.testing.expect(entry.auto_bulk_ingest_session_open);
+    try std.testing.expect(source.hasResidentWriterForGroupTableBestEffort(7001, "docs"));
     try write_cache.recordAutoBulkIngestOpsLocked(7001, "docs", auto_bulk_ingest_max_window_ops, platform_time.monotonicNs());
     try std.testing.expect(entry.auto_bulk_ingest_finish_requested);
 
@@ -25741,6 +25930,9 @@ test "auto bulk group writes release leases so idle finish can publish" {
     try std.testing.expect(replay_target > 0);
     try std.testing.expect(!write_cache.entries.items[0].auto_bulk_ingest_session_open);
     try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items[0].active_leases);
+    // The foreground lease is gone, but the resident DB and its async replay
+    // runtime still own this group until cache retirement.
+    try std.testing.expect(source.hasResidentWriterForGroupTableBestEffort(7001, "docs"));
 
     try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, &write_cache.entries.items[0].db));
     var statuses = (try snapshot_cache.snapshot(alloc, "docs")).?;
@@ -27916,9 +28108,11 @@ const ProvisionedWriteCoalesceBatchWorker = struct {
     key: []const u8,
     value: []const u8 = "",
     delete: bool = false,
+    completed: ?*std.atomic.Value(bool) = null,
     err: ?anyerror = null,
 
     fn run(self: *@This()) void {
+        defer if (self.completed) |completed| completed.store(true, .release);
         const writes: []const db_mod.types.BatchWrite = if (self.delete) &.{} else &.{.{ .key = self.key, .value = self.value }};
         const deletes: []const []const u8 = if (self.delete) &.{self.key} else &.{};
         _ = self.source.source().batch(std.heap.page_allocator, "docs", .{
@@ -27928,6 +28122,20 @@ const ProvisionedWriteCoalesceBatchWorker = struct {
         }) catch |err| {
             self.err = err;
         };
+    }
+};
+
+const ProvisionedWriteCoalesceFairnessProbe = struct {
+    calls: std.atomic.Value(u32) = .init(0),
+    entered: [3]std.atomic.Value(bool) = .{ .init(false), .init(false), .init(false) },
+    release: [3]std.atomic.Value(bool) = .{ .init(false), .init(false), .init(false) },
+
+    fn beforeBatch(ptr: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const call = self.calls.fetchAdd(1, .acq_rel);
+        if (call >= self.entered.len) return;
+        self.entered[call].store(true, .release);
+        while (!self.release[call].load(.acquire)) std.atomic.spinLoopHint();
     }
 };
 
@@ -27985,6 +28193,62 @@ test "provisioned table write source coalesces same-group waiters" {
     var gamma = (try cached.db.lookup(alloc, "doc:c", .{})).?;
     defer gamma.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, gamma.json, "\"gamma\"") != null);
+}
+
+test "provisioned table write coalescer hands off after owner completes" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-provisioned-batch-coalesce-fairness";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(path, ProvisionedWriteCoalesceTestCatalog.iface());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+    _ = try source.source().createTable(alloc, "docs", .{});
+
+    var probe = ProvisionedWriteCoalesceFairnessProbe{};
+    test_before_batch_execution_hook = .{ .ptr = &probe, .run = ProvisionedWriteCoalesceFairnessProbe.beforeBatch };
+    defer test_before_batch_execution_hook = null;
+
+    var first = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:a", .value = "{}" };
+    const first_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    while (!probe.entered[0].load(.acquire)) std.atomic.spinLoopHint();
+
+    var owner_completed: std.atomic.Value(bool) = .init(false);
+    var owner = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:b", .value = "{}", .completed = &owner_completed };
+    var peer = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:c", .value = "{}" };
+    const owner_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&owner});
+    const peer_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&peer});
+    try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 2);
+
+    probe.release[0].store(true, .release);
+    while (!probe.entered[1].load(.acquire)) std.atomic.spinLoopHint();
+
+    var successor = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:d", .value = "{}" };
+    const successor_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&successor});
+    try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 1);
+    probe.release[1].store(true, .release);
+    while (!probe.entered[2].load(.acquire)) std.atomic.spinLoopHint();
+
+    const deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
+    while (!owner_completed.load(.acquire) and platform_time.monotonicNs() < deadline_ns) sleepNs(std.time.ns_per_ms);
+    const owner_returned_before_successor_finished = owner_completed.load(.acquire);
+    probe.release[2].store(true, .release);
+
+    first_thread.join();
+    owner_thread.join();
+    peer_thread.join();
+    successor_thread.join();
+    if (first.err) |err| return err;
+    if (owner.err) |err| return err;
+    if (peer.err) |err| return err;
+    if (successor.err) |err| return err;
+    try std.testing.expect(owner_returned_before_successor_finished);
 }
 
 test "provisioned table write source preserves same-key delete then write across coalesced waiters" {

@@ -4111,6 +4111,10 @@ pub fn build(b: *std.Build) void {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
+        // The broad macOS ReleaseFast runtime root has measured at 11.37 GiB.
+        // Keep normal aggregate parallelism while giving the scheduler an
+        // honest reservation instead of forcing this root through -j1.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
     });
     const run_lib_data_runtime_tests = addFilteredTestRunArtifact(b, lib_data_runtime_tests);
     const lib_data_runtime_test_step = b.step("lib-data-runtime-test", "Run focused data runtime tests");
@@ -4705,6 +4709,9 @@ pub fn build(b: *std.Build) void {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
+        // This broad macOS ReleaseFast simulation root has measured above
+        // 12 GiB. Reserve its observed class without serializing the suite.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
     });
     const run_lib_metadata_sim_public_tests = addFilteredTestRunArtifact(b, lib_metadata_sim_public_tests);
     const lib_metadata_sim_public_test_step = b.step("lib-metadata-sim-public-test", "Run metadata public lifecycle/split/merge simulation tests");
@@ -5477,6 +5484,7 @@ pub fn build(b: *std.Build) void {
             "resident DB lease adopts seeded write cache across visible generation bump",
             "provisioned write cache close detaches promotion leadership callback before stats",
             "provisioned table write source coalesces same-group waiters",
+            "provisioned table write coalescer hands off after owner completes",
             "provisioned table write source preserves same-key delete then write across coalesced waiters",
             "provisioned table write coalescer isolates invalid waiter on same-key overlap",
             "provisioned table write coalescer isolates failed waiters",
@@ -6122,6 +6130,7 @@ pub fn build(b: *std.Build) void {
         "lsm backend resource manager rejects before wal apply",
         "derived backlog tracker accounts and releases payload bytes",
         "derived backlog tracker fails closed when sequence accounting allocation fails",
+        "derived backlog tracker bounds sequence-only admission drain window",
         "hbc shared cache namespaces entries",
         "hbc shared cache evicts across namespaces under one resource budget",
         "hbc cache reports byte usage to resource manager",
@@ -9255,20 +9264,26 @@ pub fn build(b: *std.Build) void {
                 // Claims conservatively cover clean production ReleaseFast
                 // peaks measured for both aarch64-linux-musl and explicit
                 // aarch64-macos (including Metal and Accelerate). They are
-                // scheduling reservations, not hard process limits. A 24 GiB
+                // scheduling reservations, not hard process limits. A 48 GiB
                 // budget can overlap all four units while a smaller cgroup
                 // automatically schedules only the subset that fits.
-                // aarch64-macOS includes platform framework codegen and peaks
-                // just above 4 GiB; Linux CI retains the tighter reservation.
-                .api_kernel => @as(usize, if (target.result.os.tag == .macos) 5 else 4) * 1024 * 1024 * 1024,
-                // Clean aarch64-macOS ReleaseFast codegen peaks around
-                // 10.9 GB with the platform frameworks enabled. Keep the
+                // aarch64-macOS ReleaseFast codegen reached 9.95 GB with
+                // platform frameworks; Linux CI retains the tighter claim.
+                .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 4) * 1024 * 1024 * 1024,
+                // Clean aarch64-macOS ReleaseFast storage codegen reached
+                // 17.42 GB (16.23 GiB) with the platform frameworks enabled.
+                // Keep the
                 // tighter Linux reservation, where CI remains below 8 GiB.
-                .distributed => @as(usize, if (target.result.os.tag == .macos) 12 else 8) * 1024 * 1024 * 1024,
-                // Debug codegen currently peaks around 6.7 GB on aarch64
-                // macOS; reserve headroom for mode- and target-dependent IR.
-                .inference => 7 * 1024 * 1024 * 1024,
-                .cli => 2 * 1024 * 1024 * 1024,
+                .distributed => @as(usize, if (target.result.os.tag == .macos) 18 else 8) * 1024 * 1024 * 1024,
+                // The broad aarch64-macOS ReleaseFast inference root now
+                // reaches roughly 13.6 GB after storage/runtime integration.
+                // Reserve enough headroom for mode-dependent IR; the build
+                // scheduler can overlap whichever roots fit without forcing
+                // callers to serialize the whole build.
+                .inference => 16 * 1024 * 1024 * 1024,
+                // Clean aarch64-macOS ReleaseFast codegen currently peaks
+                // around 2.23 GB, just above the former 2 GiB reservation.
+                .cli => 3 * 1024 * 1024 * 1024,
             },
         });
         runtime_library_artifacts[@intFromEnum(unit)] = role_artifact;
