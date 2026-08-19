@@ -178,6 +178,11 @@ pub fn parseSqlAlloc(allocator: std.mem.Allocator, sql: []const u8) !void {
 }
 
 pub fn parseTokensAlloc(allocator: std.mem.Allocator, tokens: []const token_mod.Token) !void {
+    if (tokens.len > generated_token_id_stack_capacity) {
+        var token_ids = try tokenIdsWithFallbackAlloc(allocator, tokens);
+        defer token_ids.deinit(allocator);
+        return parseGeneratedTokenIds(allocator, token_ids.token_ids, token_ids.fallback_token_ids);
+    }
     var token_id_buffer: [generated_token_id_stack_capacity]u16 = undefined;
     var fallback_id_buffer: [generated_token_id_stack_capacity]u16 = undefined;
     if (tokenIdsIntoBuffers(tokens, &token_id_buffer, &fallback_id_buffer)) |token_ids| {
@@ -217,6 +222,11 @@ pub fn diagnosticSqlAlloc(allocator: std.mem.Allocator, sql: []const u8) !?Diagn
 }
 
 pub fn diagnosticTokensAlloc(allocator: std.mem.Allocator, tokens: []const token_mod.Token) !?ParseDiagnostic {
+    if (tokens.len > generated_token_id_stack_capacity) {
+        var diagnostic_tokens = try diagnosticTokenIdsAlloc(allocator, tokens);
+        defer diagnostic_tokens.deinit(allocator);
+        return parseDiagnosticFromTokenIds(allocator, tokens, diagnostic_tokens.token_ids, diagnostic_tokens.fallback_token_ids, diagnostic_tokens.source_indexes);
+    }
     var token_id_buffer: [generated_token_id_stack_capacity]u16 = undefined;
     var fallback_id_buffer: [generated_token_id_stack_capacity]u16 = undefined;
     var source_index_buffer: [generated_token_id_stack_capacity]usize = undefined;
@@ -270,7 +280,7 @@ pub fn tokenIdsAlloc(allocator: std.mem.Allocator, tokens: []const token_mod.Tok
     var ids: std.ArrayListUnmanaged(u16) = .empty;
     errdefer ids.deinit(allocator);
     var sink = TokenIdSink{ .list = .{ .items = &ids, .allocator = allocator } };
-    try appendAllTokenIds(&sink, null, tokens, null);
+    try appendAllTokenIds(&sink, null, tokens, null, allocator);
     return ids.toOwnedSlice(allocator);
 }
 
@@ -282,7 +292,7 @@ const TokenIdSlices = struct {
 fn tokenIdsIntoBuffers(tokens: []const token_mod.Token, buffer: []u16, fallback_buffer: []u16) !TokenIdSlices {
     var sink = TokenIdSink{ .buffer = .{ .items = buffer } };
     var fallback_sink = TokenIdSink{ .buffer = .{ .items = fallback_buffer } };
-    try appendAllTokenIds(&sink, &fallback_sink, tokens, null);
+    try appendAllTokenIds(&sink, &fallback_sink, tokens, null, null);
     return .{
         .token_ids = sink.buffer.items[0..sink.buffer.len],
         .fallback_token_ids = fallback_sink.buffer.items[0..fallback_sink.buffer.len],
@@ -297,7 +307,7 @@ fn tokenIdsWithFallbackAlloc(allocator: std.mem.Allocator, tokens: []const token
 
     var sink = TokenIdSink{ .list = .{ .items = &ids, .allocator = allocator } };
     var fallback_sink = TokenIdSink{ .list = .{ .items = &fallback_ids, .allocator = allocator } };
-    try appendAllTokenIds(&sink, &fallback_sink, tokens, null);
+    try appendAllTokenIds(&sink, &fallback_sink, tokens, null, allocator);
 
     const token_ids = try ids.toOwnedSlice(allocator);
     errdefer allocator.free(token_ids);
@@ -318,7 +328,7 @@ fn diagnosticTokenIdsAlloc(allocator: std.mem.Allocator, tokens: []const token_m
     var sink = TokenIdSink{ .list = .{ .items = &ids, .allocator = allocator } };
     var fallback_sink = TokenIdSink{ .list = .{ .items = &fallback_ids, .allocator = allocator } };
     var source_sink = SourceIndexSink{ .list = .{ .items = &source_indexes, .allocator = allocator } };
-    try appendAllTokenIds(&sink, &fallback_sink, tokens, &source_sink);
+    try appendAllTokenIds(&sink, &fallback_sink, tokens, &source_sink, allocator);
 
     const token_ids = try ids.toOwnedSlice(allocator);
     errdefer allocator.free(token_ids);
@@ -340,7 +350,7 @@ fn diagnosticTokenIdsIntoBuffers(
     var sink = TokenIdSink{ .buffer = .{ .items = token_buffer } };
     var fallback_sink = TokenIdSink{ .buffer = .{ .items = fallback_buffer } };
     var source_sink = SourceIndexSink{ .buffer = .{ .items = source_buffer } };
-    try appendAllTokenIds(&sink, &fallback_sink, tokens, &source_sink);
+    try appendAllTokenIds(&sink, &fallback_sink, tokens, &source_sink, null);
     return .{
         .token_ids = sink.buffer.items[0..sink.buffer.len],
         .fallback_token_ids = fallback_sink.buffer.items[0..fallback_sink.buffer.len],
@@ -374,18 +384,43 @@ const SourceIndexSink = union(enum) {
 /// Contextual keyword classification runs on every token, so facts that need a
 /// statement scan are computed once and nesting state advances monotonically.
 const TokenMappingContext = struct {
+    const ScopeState = struct {
+        in_select_projection: bool = false,
+        saw_order_by: bool = false,
+    };
+
     paren_depth: usize = 0,
+    delimiter_depth: usize = 0,
     balanced_prefix: bool = true,
     segment_start: ?usize = null,
+    scopes: []ScopeState,
+    owned_scopes: []ScopeState = &.{},
     create_table: bool,
     prepare: bool,
     alter_table_tail_start: ?usize,
+    alter_table_delimiter_depth: usize = 0,
     alter_table_saw_top_level_comma: bool = false,
     create_routine_close: ?usize,
     create_index_elements: ?TokenRange,
 
-    fn init(tokens: []const token_mod.Token) @This() {
+    fn init(
+        allocator: ?std.mem.Allocator,
+        tokens: []const token_mod.Token,
+        fixed_scopes: []ScopeState,
+    ) !@This() {
+        const required_scopes = tokens.len + 1;
+        var owned_scopes: []ScopeState = &.{};
+        const scopes = if (required_scopes <= fixed_scopes.len)
+            fixed_scopes[0..required_scopes]
+        else blk: {
+            const dynamic_allocator = allocator orelse return error.NoSpaceLeft;
+            owned_scopes = try dynamic_allocator.alloc(ScopeState, required_scopes);
+            break :blk owned_scopes;
+        };
+        @memset(scopes, .{});
         return .{
+            .scopes = scopes,
+            .owned_scopes = owned_scopes,
             .create_table = tokens.len >= 2 and tokens[0].matchesKeywordTag(.create) and tokens[1].matchesKeywordTag(.table),
             .prepare = tokens.len > 0 and tokens[0].matchesKeywordTag(.prepare),
             .alter_table_tail_start = alterTableTailStart(tokens),
@@ -394,28 +429,79 @@ const TokenMappingContext = struct {
         };
     }
 
-    fn advance(self: *@This(), token: token_mod.Token, index: usize) void {
+    fn deinit(self: *@This(), allocator: ?std.mem.Allocator) void {
+        if (self.owned_scopes.len > 0) allocator.?.free(self.owned_scopes);
+        self.* = undefined;
+    }
+
+    fn inSelectProjection(self: *const @This()) bool {
+        return self.scopes[self.paren_depth].in_select_projection;
+    }
+
+    fn sawOrderBy(self: *const @This()) bool {
+        return self.scopes[self.delimiter_depth].saw_order_by;
+    }
+
+    fn advance(self: *@This(), tokens: []const token_mod.Token, index: usize) void {
+        const token = tokens[index];
         if (self.alter_table_tail_start) |tail_start| {
-            if (index >= tail_start and self.paren_depth == 0 and token.kind == .comma) {
-                self.alter_table_saw_top_level_comma = true;
-            }
+            if (index >= tail_start) switch (token.kind) {
+                .lparen, .lbracket => self.alter_table_delimiter_depth += 1,
+                .rparen, .rbracket => if (self.alter_table_delimiter_depth > 0) {
+                    self.alter_table_delimiter_depth -= 1;
+                },
+                .comma => if (self.alter_table_delimiter_depth == 0) {
+                    self.alter_table_saw_top_level_comma = true;
+                },
+                else => {},
+            };
         }
+
+        if (token.matchesKeywordTag(.select)) {
+            self.scopes[self.paren_depth].in_select_projection = true;
+        } else if (token.matchesKeywordTag(.from) and self.inSelectProjection()) {
+            self.scopes[self.paren_depth].in_select_projection = false;
+        }
+        if (token.matchesKeywordTag(.by) and index > 0 and tokens[index - 1].matchesKeywordTag(.order)) {
+            self.scopes[self.delimiter_depth].saw_order_by = true;
+        }
+
         switch (token.kind) {
             .lparen => {
                 self.paren_depth += 1;
+                self.scopes[self.paren_depth].in_select_projection = false;
+                self.delimiter_depth += 1;
+                self.scopes[self.delimiter_depth].saw_order_by = false;
                 if (self.paren_depth == 1) self.segment_start = index + 1;
             },
+            .lbracket => {
+                self.delimiter_depth += 1;
+                self.scopes[self.delimiter_depth].saw_order_by = false;
+            },
             .rparen => {
+                if (self.delimiter_depth > 0) {
+                    self.scopes[self.delimiter_depth].saw_order_by = false;
+                    self.delimiter_depth -= 1;
+                }
                 if (self.paren_depth == 0) {
                     self.balanced_prefix = false;
                     self.segment_start = null;
                     return;
                 }
+                self.scopes[self.paren_depth].in_select_projection = false;
                 self.paren_depth -= 1;
                 if (self.paren_depth == 0) self.segment_start = null;
             },
+            .rbracket => if (self.delimiter_depth > 0) {
+                self.scopes[self.delimiter_depth].saw_order_by = false;
+                self.delimiter_depth -= 1;
+            },
             .comma => if (self.paren_depth == 1) {
                 self.segment_start = index + 1;
+            },
+            .semicolon => {
+                self.scopes[self.paren_depth].in_select_projection = false;
+                self.scopes[self.delimiter_depth].saw_order_by = false;
             },
             else => {},
         }
@@ -427,10 +513,14 @@ fn appendAllTokenIds(
     fallback_ids: ?*TokenIdSink,
     tokens: []const token_mod.Token,
     source_indexes: ?*SourceIndexSink,
+    allocator: ?std.mem.Allocator,
 ) !void {
-    var mapping_context = TokenMappingContext.init(tokens);
+    var fixed_scopes: [generated_token_id_stack_capacity + 1]TokenMappingContext.ScopeState = undefined;
+    var mapping_context = try TokenMappingContext.init(allocator, tokens, &fixed_scopes);
+    defer mapping_context.deinit(allocator);
+    const trailing_semicolon_start = statementTokenEnd(tokens);
     for (tokens, 0..) |token, index| {
-        if (token.kind == .semicolon and trailingSemicolonOnly(tokens, index)) break;
+        if (index == trailing_semicolon_start) break;
         const previous = if (index > 0) tokens[index - 1] else null;
         const next = if (index + 1 < tokens.len) tokens[index + 1] else null;
         const before = ids.len();
@@ -443,7 +533,7 @@ fn appendAllTokenIds(
         if (source_indexes) |source_sink| {
             for (0..added) |_| try source_sink.append(index);
         }
-        mapping_context.advance(token, index);
+        mapping_context.advance(tokens, index);
     }
 }
 
@@ -593,7 +683,7 @@ fn contextualKeywordSymbolId(
         return generated.tokenId(.IDENT);
     }
     if (functionArgumentNameIdentifierContext(tokens, index, token, next)) return generated.tokenId(.IDENT);
-    if (matchKeywordAliasContext(tokens, index, token, previous, next)) return generated.tokenId(.IDENT);
+    if (matchKeywordAliasContext(token, previous, next, mapping_context)) return generated.tokenId(.IDENT);
     if (createTableMissingAsSelectContext(tokens, index) and token.matchesKeywordTag(.table)) return generated.tokenId(.IDENT);
     if (systemTimeForKeywordContext(tokens, index) and token.matchesKeywordTag(.@"for")) return generated.tokenId(.SYSTEM_TIME_FOR);
     if (analyzeKeywordContext(tokens, index) and token.matchesKeywordTag(.verbose)) return generated.tokenId(.ANALYZE_VERBOSE);
@@ -644,15 +734,14 @@ fn functionArgumentNameIdentifierContext(tokens: []const token_mod.Token, index:
 }
 
 fn matchKeywordAliasContext(
-    tokens: []const token_mod.Token,
-    index: usize,
     token: token_mod.Token,
     previous: ?token_mod.Token,
     next: ?token_mod.Token,
+    mapping_context: *const TokenMappingContext,
 ) bool {
     if (!token.matchesKeywordTag(.match) or previous == null) return false;
     if (previous.?.matchesKeywordTag(.as)) return true;
-    if (!tokenIsInSelectProjectionList(tokens, index)) return false;
+    if (!mapping_context.inSelectProjection()) return false;
     const next_token = next orelse return true;
     return next_token.matchesKeywordTag(.from) or
         next_token.matchesKeywordTag(.order) or
@@ -661,39 +750,6 @@ fn matchKeywordAliasContext(
         next_token.matchesKeywordTag(.limit) or
         next_token.kind == .comma or
         next_token.kind == .semicolon;
-}
-
-fn tokenIsInSelectProjectionList(tokens: []const token_mod.Token, index: usize) bool {
-    var target_depth: usize = 0;
-    for (tokens[0..index]) |token| switch (token.kind) {
-        .lparen => target_depth += 1,
-        .rparen => if (target_depth > 0) {
-            target_depth -= 1;
-        },
-        else => {},
-    };
-
-    var depth: usize = 0;
-    var saw_select = false;
-    var saw_from = false;
-    for (tokens[0..index]) |token| {
-        if (depth == target_depth) {
-            if (token.matchesKeywordTag(.select)) {
-                saw_select = true;
-                saw_from = false;
-            } else if (saw_select and token.matchesKeywordTag(.from)) {
-                saw_from = true;
-            }
-        }
-        switch (token.kind) {
-            .lparen => depth += 1,
-            .rparen => if (depth > 0) {
-                depth -= 1;
-            },
-            else => {},
-        }
-    }
-    return saw_select and !saw_from;
 }
 
 fn sessionKeywordContext(tokens: []const token_mod.Token, index: usize) bool {
@@ -844,7 +900,7 @@ fn generatedParserTreatsKeywordAsIdentifier(
     if (token.matchesKeywordTag(.fetch)) return previous != null and previous.?.matchesKeywordTag(.as);
     if (token.matchesKeywordTag(.start)) return next != null and next.?.kind == .eq;
     if (token.matchesKeywordTag(.rows)) {
-        if (rowsKeywordStartsWindowFrame(tokens, index)) return false;
+        if (mapping_context.sawOrderBy()) return false;
         return previous != null and previous.?.kind == .identifier and next != null and next.?.kind == .number;
     }
     if (token.matchesKeywordTag(.window)) return previous != null and previous.?.kind == .identifier and (next == null or next.?.kind == .semicolon);
@@ -910,25 +966,6 @@ fn ddlTypeFunctionNameContext(
         index == start;
 }
 
-fn rowsKeywordStartsWindowFrame(tokens: []const token_mod.Token, index: usize) bool {
-    var depth: usize = 0;
-    var cursor = index;
-    while (cursor > 0) {
-        cursor -= 1;
-        switch (tokens[cursor].kind) {
-            .rparen, .rbracket => depth += 1,
-            .lparen, .lbracket => {
-                if (depth == 0) break;
-                depth -= 1;
-            },
-            .semicolon => if (depth == 0) break,
-            else => {},
-        }
-        if (depth == 0 and cursor > 0 and tokens[cursor].matchesKeywordTag(.by) and tokens[cursor - 1].matchesKeywordTag(.order)) return true;
-    }
-    return false;
-}
-
 fn appendIdentifierIds(ids: *TokenIdSink, text: []const u8, allow_trailing_dot: bool) !void {
     if (text.len == 0) return error.UnsupportedSqlShape;
     const has_trailing_dot = text[text.len - 1] == '.';
@@ -949,11 +986,6 @@ fn appendIdentifierIds(ids: *TokenIdSink, text: []const u8, allow_trailing_dot: 
 fn keywordSymbolId(token: token_mod.Token) ?u16 {
     const keyword = token.keyword orelse return null;
     return keyword_terminal_ids[@intFromEnum(keyword)];
-}
-
-fn trailingSemicolonOnly(tokens: []const token_mod.Token, index: usize) bool {
-    for (tokens[index..]) |token| if (token.kind != .semicolon) return false;
-    return true;
 }
 
 fn consumeIfExists(tokens: []const token_mod.Token, index: *usize, end: usize) bool {
@@ -1162,6 +1194,17 @@ test "generated parser bridge carries contextual DDL state in one pass" {
     }
     try std.testing.expectEqual(generated.tokenId(.IDENT), alter_ids[match_index.?]);
 
+    var bracket_tokens = try lexer.tokenizeAlloc(
+        std.testing.allocator,
+        "ALTER TABLE docs ADD COLUMN value text[1, 2] MATCH unsupported tail",
+    );
+    defer lexer.freeTokens(std.testing.allocator, &bracket_tokens);
+    const bracket_ids = try tokenIdsAlloc(std.testing.allocator, bracket_tokens.items);
+    defer std.testing.allocator.free(bracket_ids);
+    for (bracket_tokens.items, bracket_ids) |token, id| {
+        if (token.matchesKeywordTag(.match)) try std.testing.expectEqual(generated.tokenId(.MATCH), id);
+    }
+
     var routine_tokens = try lexer.tokenizeAlloc(
         std.testing.allocator,
         "CREATE FUNCTION f() CURRENT FROM ROWS WINDOW",
@@ -1176,6 +1219,54 @@ test "generated parser bridge carries contextual DDL state in one pass" {
             try std.testing.expectEqual(generated.tokenId(.IDENT), id);
         }
     }
+}
+
+test "generated parser bridge carries scoped contextual keyword state in one pass" {
+    var projection_tokens = try lexer.tokenizeAlloc(
+        std.testing.allocator,
+        "SELECT 1 match, (SELECT 2 match FROM docs) match FROM docs",
+    );
+    defer lexer.freeTokens(std.testing.allocator, &projection_tokens);
+    const projection_ids = try tokenIdsAlloc(std.testing.allocator, projection_tokens.items);
+    defer std.testing.allocator.free(projection_ids);
+    var match_count: usize = 0;
+    for (projection_tokens.items, projection_ids) |token, id| {
+        if (token.matchesKeywordTag(.match)) {
+            try std.testing.expectEqual(generated.tokenId(.IDENT), id);
+            match_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), match_count);
+    try parseTokensAlloc(std.testing.allocator, projection_tokens.items);
+
+    var alias_rows_tokens = try lexer.tokenizeAlloc(std.testing.allocator, "SELECT value ROWS 1");
+    defer lexer.freeTokens(std.testing.allocator, &alias_rows_tokens);
+    const alias_rows_ids = try tokenIdsAlloc(std.testing.allocator, alias_rows_tokens.items);
+    defer std.testing.allocator.free(alias_rows_ids);
+    try std.testing.expectEqual(generated.tokenId(.IDENT), alias_rows_ids[2]);
+
+    var window_tokens = try lexer.tokenizeAlloc(
+        std.testing.allocator,
+        "SELECT sum(value) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM docs",
+    );
+    defer lexer.freeTokens(std.testing.allocator, &window_tokens);
+    const window_ids = try tokenIdsAlloc(std.testing.allocator, window_tokens.items);
+    defer std.testing.allocator.free(window_ids);
+    for (window_tokens.items, window_ids) |token, id| {
+        if (token.matchesKeywordTag(.rows)) try std.testing.expectEqual(generated.tokenId(.ROWS), id);
+    }
+    try parseTokensAlloc(std.testing.allocator, window_tokens.items);
+}
+
+test "generated parser bridge trims only the trailing semicolon run" {
+    var tokens = try lexer.tokenizeAlloc(std.testing.allocator, "SELECT 1; SELECT 2;;;");
+    defer lexer.freeTokens(std.testing.allocator, &tokens);
+    const ids = try tokenIdsAlloc(std.testing.allocator, tokens.items);
+    defer std.testing.allocator.free(ids);
+
+    try std.testing.expectEqual(tokens.items.len - 3, ids.len);
+    try std.testing.expectEqual(generated.tokenId(.SEMICOLON), ids[2]);
+    try std.testing.expectEqual(generated.tokenId(.NUMBER), ids[ids.len - 1]);
 }
 
 test "generated parser bridge exposes a single pass parse result" {
