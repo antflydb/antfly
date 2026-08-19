@@ -14108,6 +14108,25 @@ test "generation memory exhaustion is an actionable non-retryable capacity error
     try std.testing.expect(!batch_error.retryable);
 }
 
+test "generation live pressure is an actionable retryable capacity error" {
+    const allocator = std.testing.allocator;
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/generate");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try generationErrorResponse(&ctx, error.ResourceTemporarilyUnavailable);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"error\":\"MODEL_RESOURCE_BUSY\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"retryable\":true") != null);
+
+    const batch_error = batchGenerationError(error.ResourceTemporarilyUnavailable);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", batch_error.code);
+    try std.testing.expect(batch_error.retryable);
+}
+
 test "registerRoutesOn supports alternate prefixes through the shared router" {
     var node = try Node.init(std.testing.allocator, .{});
     defer node.deinit();
@@ -17464,6 +17483,12 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
             .message = memory_budget_exceeded_message,
             .retryable = false,
         },
+        error.ResourceTemporarilyUnavailable => .{
+            .status = 503,
+            .code = "MODEL_RESOURCE_BUSY",
+            .message = "insufficient inference capacity is currently available",
+            .retryable = true,
+        },
         else => null,
     };
 }
@@ -17481,6 +17506,8 @@ fn internalErrorResponse(ctx: *httpx.Context, code: []const u8, err: anyerror) !
 }
 
 fn generationErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (err == error.ResourceTemporarilyUnavailable)
+        return modelResourceBusyResponse(ctx);
     if (generationRequestFailure(err)) |failure| {
         return ctx.status(failure.status).json(.{
             .@"error" = failure.code,

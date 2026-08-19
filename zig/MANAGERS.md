@@ -180,12 +180,25 @@ Lazy native weight caches also cannot size themselves independently from the
 serving owner. Session construction may derive an optimistic cache size from
 the visible node, but ModelManager installs the effective hard host/backend
 limits before publishing the session. Architecture-specific cache floors may
-improve throughput inside that envelope; they never widen past it. Each weight
-handle then reserves its physical representation in the request RunBudget for
-exactly the handle lifetime, while the shared cache evicts cold unpinned
-entries to stay under the installed ceiling. This keeps the Hypura-style
-mapped-artifact and bounded-hot-set behavior without allowing lazy promotion
-to bypass ResourceManager policy.
+improve throughput inside that envelope; they never widen past it. ModelManager
+also binds the session cache to its aggregate AdmissionController. The model's
+resident lease is the baseline credit for encoded weight bytes, so faulting a
+mapped source page is not double-counted. Before a lazy weight, prepared quant
+layout, or dense promotion allocates beyond that baseline, the cache acquires
+an incremental lease from the same controller used by model and request
+admission. In standalone that lease is mirrored into the node ResourceManager;
+in direct and distributed inference it remains process-local. A temporary live
+pressure denial is returned as retryable `MODEL_RESOURCE_BUSY`, while a stable
+policy ceiling remains a non-retryable memory-budget response.
+
+Each weight handle additionally reserves its physical representation in the
+request RunBudget for exactly the handle lifetime. The shared cache evicts cold
+unpinned entries, releases incremental leases only after their physical storage
+is destroyed, and drains any remaining credits before the resident model lease
+is released at session teardown. Offline tools without a serving owner retain
+counter-only cache policy. This keeps the Hypura-style mapped-artifact and
+bounded-hot-set behavior without allowing lazy promotion to bypass
+ResourceManager policy or charging bookkeeping on cache hits.
 
 The process envelope is not another inference slice. One resolved value is
 passed to storage and inference during standalone composition and by the

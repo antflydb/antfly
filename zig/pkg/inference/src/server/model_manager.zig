@@ -3123,14 +3123,23 @@ fn admittedSessionCudaLimit(
 }
 
 fn attachSessionRunAdmission(
+    allocator: std.mem.Allocator,
     session: *backends.Session,
     controller: *runtime.tier.memory.AdmissionController,
     backend_runtime: backends.BackendRuntime,
     limits: runtime.tier.memory.Limits,
     resident: runtime.tier.memory.AdmissionAmounts,
     man: ?*const manifest_mod.ModelManifest,
-) void {
-    session_factory.configureSharedCacheHardLimitsForSession(session.*, limits);
+) !void {
+    const backend_class = admissionBackendClassForRuntime(backend_runtime);
+    try session_factory.configureSharedCacheAdmissionForSession(
+        session.*,
+        allocator,
+        controller,
+        backend_class,
+        limits,
+        resident,
+    );
     const weight_bytes = std.math.add(
         usize,
         resident.host_weight_bytes,
@@ -3138,7 +3147,7 @@ fn attachSessionRunAdmission(
     ) catch std.math.maxInt(usize);
     session.run_admission = .{
         .controller = controller,
-        .backend_class = admissionBackendClassForRuntime(backend_runtime),
+        .backend_class = backend_class,
         .limits = limits,
         .static_workspace_bytes = modelRunWorkspaceAllowance(weight_bytes),
         .backend_workspace_reserved = backend_runtime.backend == .onnx and
@@ -4860,13 +4869,18 @@ pub const ModelManager = struct {
                 }
                 if (self.admission_enabled) {
                     attachSessionRunAdmission(
+                        self.allocator,
                         &session,
                         self.admissionController(),
                         backend_runtime,
                         admission_limits,
                         resident_amounts,
                         null,
-                    );
+                    ) catch |err| {
+                        session.close();
+                        if (resource_lease) |*lease| lease.release();
+                        return err;
+                    };
                 }
                 return .{
                     .session = session,
@@ -6933,13 +6947,18 @@ fn loadSessionForPreferredBackends(
             }
             if (manager.admission_enabled) {
                 attachSessionRunAdmission(
+                    manager.allocator,
                     &session,
                     manager.admissionController(),
                     backend_runtime,
                     admission_limits,
                     resident_amounts,
                     &man,
-                );
+                ) catch |err| {
+                    session.close();
+                    if (resource_lease) |*lease| lease.release();
+                    return err;
+                };
             }
             return .{ .session = session, .resource_lease = resource_lease };
         } else |err| {

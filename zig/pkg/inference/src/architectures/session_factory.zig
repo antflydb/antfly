@@ -5725,27 +5725,41 @@ pub fn widenBudgetLimitsForSession(
 /// capacity during construction and can be much larger than a container or an
 /// explicit serving policy; leaving those defaults in place lets lazy weight
 /// promotion bypass the ModelManager/ResourceManager envelope.
-pub fn configureSharedCacheHardLimitsForSession(
+pub fn configureSharedCacheAdmissionForSession(
     session: Session,
+    allocator: std.mem.Allocator,
+    controller: *runtime.tier.memory.AdmissionController,
+    backend_class: runtime.tier.memory.BackendClass,
     limits: runtime.tier.memory.Limits,
-) void {
+    resident: runtime.tier.memory.AdmissionAmounts,
+) !void {
     if (session.vtable != &arch_vtable) return;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     const hard_budget = runtime.tier.cache.Budget{
         .host_limit_bytes = limits.host_limit_bytes,
         .backend_limit_bytes = limits.backend_limit_bytes,
     };
-    switch (self.backend_type) {
-        .native => if (self.backend_data.native.tier_cache) |*tier_cache|
-            tier_cache.configureHardBudget(hard_budget),
-        .metal => if (build_options.enable_metal) {
-            if (gpuBackendData(self).tier_cache) |*tier_cache|
-                tier_cache.configureHardBudget(hard_budget);
+    const tier_cache: ?*runtime.tier.cache.SharedCache = switch (self.backend_type) {
+        .native => if (self.backend_data.native.tier_cache) |*cache| cache else null,
+        .metal => if (build_options.enable_metal)
+            if (gpuBackendData(self).tier_cache) |*cache| cache else null
+        else
+            null,
+        .pjrt => if (self.backend_data.pjrt.native.tier_cache) |*cache| cache else null,
+        .cuda, .onnx, .wasm => null,
+    };
+    const cache = tier_cache orelse return;
+    cache.configureHardBudget(hard_budget);
+    try cache.configureAdmission(
+        allocator,
+        controller,
+        backend_class,
+        limits,
+        .{
+            .host_limit_bytes = resident.host_weight_bytes,
+            .backend_limit_bytes = resident.backend_weight_bytes,
         },
-        .pjrt => if (self.backend_data.pjrt.native.tier_cache) |*tier_cache|
-            tier_cache.configureHardBudget(hard_budget),
-        .cuda, .onnx, .wasm => {},
-    }
+    );
 }
 
 pub fn memoryBudgetExceededDetail(
@@ -6841,6 +6855,8 @@ fn archClose(ptr: *anyopaque) void {
             native_mod.deinitPrefetchQueue(&self.backend_data.native);
             if (self.backend_data.native.residency) |*residency| residency.deinit();
             if (self.backend_data.native.tensor_store) |tensor_store| tensor_store.deinit();
+            if (self.backend_data.native.tier_cache) |*tier_cache|
+                tier_cache.deinitAdmission();
         },
         .metal => {
             if (comptime build_options.enable_metal) {
@@ -6860,6 +6876,8 @@ fn archClose(ptr: *anyopaque) void {
                 if (gpu_data.residency) |*residency| residency.deinit();
                 if (gpu_data.jina_lora_adapter) |adapter| adapter.destroy();
                 if (gpu_data.tensor_store) |store| store.deinit();
+                if (gpu_data.tier_cache) |*tier_cache|
+                    tier_cache.deinitAdmission();
             }
         },
         .pjrt => {
@@ -6888,6 +6906,8 @@ fn archClose(ptr: *anyopaque) void {
             native_mod.deinitPrefetchQueue(&self.backend_data.pjrt.native);
             if (self.backend_data.pjrt.native.residency) |*residency| residency.deinit();
             if (self.backend_data.pjrt.native.tensor_store) |tensor_store| tensor_store.deinit();
+            if (self.backend_data.pjrt.native.tier_cache) |*tier_cache|
+                tier_cache.deinitAdmission();
         },
         .cuda => {
             if (comptime build_options.enable_cuda) {

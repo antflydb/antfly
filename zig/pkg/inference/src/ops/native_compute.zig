@@ -4657,7 +4657,7 @@ fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     if (self.data.resident_weights.getPtr(name)) |w| {
         if (w.quantized_storage) |*storage| {
-            try ensurePreparedKBlock(self, storage);
+            try ensurePreparedKBlock(self, storage, null);
             const view = if (w.tensor.data.len > 0)
                 try tensorF32View(self, &w.tensor)
             else
@@ -4710,7 +4710,7 @@ fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
         entry.pin_count += 1;
         errdefer entry.pin_count -= 1;
         if (loaded.quantized_storage) |*storage| {
-            try ensurePreparedKBlock(self, storage);
+            try ensurePreparedKBlock(self, storage, &entry.loaded_bytes);
             const view = if (loaded.tensor.data.len > 0)
                 try tensorF32View(self, &loaded.tensor)
             else
@@ -4825,8 +4825,19 @@ pub fn ensureLazyWeightLoadedLocked(data: *WeightStore, run_budget: ?*run_memory
         return;
     }
     const tensor_store = data.tensor_store orelse return error.MissingWeight;
+    var cache_reserved_bytes: usize = 0;
+    errdefer if (cache_reserved_bytes != 0) {
+        if (data.tier_cache) |*tier_cache|
+            tier_cache.noteRelease(.host, cache_reserved_bytes);
+    };
     var direct_quant_storage: ?QuantizedStorage = null;
     errdefer if (direct_quant_storage) |*storage| storage.deinit();
+    errdefer if (entry.loaded) |*loaded| {
+        loaded.deinit();
+        entry.loaded = null;
+        entry.loaded_bytes = 0;
+        entry.active_tier = entry.placement.spill_tier;
+    };
 
     var expected_bytes = if (entry.loaded_bytes != 0) entry.loaded_bytes else entry.tensor_ref.byte_len;
     if (data.allow_direct_quant) {
@@ -4847,17 +4858,22 @@ pub fn ensureLazyWeightLoadedLocked(data: *WeightStore, run_budget: ?*run_memory
             } else {
                 evictColdNonExpertWeightsToFitLocked(data, .host, expected_bytes, entry);
             }
-            if (!tier_cache.canFitAdditional(.host, expected_bytes)) {
-                tier_cache.noteDenied(.host, expected_bytes);
-                noteSharedCacheDenial(run_budget, tier_cache, .host, expected_bytes);
-                return error.MemoryBudgetExceeded;
-            }
         }
+        tier_cache.reserve(.host, expected_bytes) catch |err| {
+            tier_cache.noteDenied(.host, expected_bytes);
+            noteSharedCacheDenial(run_budget, tier_cache, .host, expected_bytes);
+            return err;
+        };
+        cache_reserved_bytes = expected_bytes;
     }
 
     if (data.allow_direct_quant) {
         if (direct_quant_storage) |*storage_ref| {
-            try prepareNativeQuantizedStorageBudgetedLocked(data, run_budget, storage_ref);
+            // The outer load reservation already includes every prepared
+            // representation reported by expectedQuantizedStorageLoadBytes.
+            // Rechecking those bytes here would double-charge the same growth
+            // and can incorrectly suppress preparation near the cache ceiling.
+            try prepareNativeQuantizedStorage(storage_ref);
             entry.loaded = .{
                 .tensor = .{
                     .data = empty_u8[0..],
@@ -4900,7 +4916,18 @@ pub fn ensureLazyWeightLoadedLocked(data: *WeightStore, run_budget: ?*run_memory
     }
     entry.active_tier = .host;
     if (data.tier_cache) |*tier_cache| {
-        tier_cache.noteResident(.host, entry.loaded_bytes);
+        if (entry.loaded_bytes > cache_reserved_bytes) {
+            const additional = entry.loaded_bytes - cache_reserved_bytes;
+            tier_cache.reserve(.host, additional) catch |err| {
+                tier_cache.noteDenied(.host, additional);
+                noteSharedCacheDenial(run_budget, tier_cache, .host, additional);
+                return err;
+            };
+            cache_reserved_bytes = entry.loaded_bytes;
+        } else if (entry.loaded_bytes < cache_reserved_bytes) {
+            tier_cache.noteRelease(.host, cache_reserved_bytes - entry.loaded_bytes);
+            cache_reserved_bytes = entry.loaded_bytes;
+        }
     }
     if (entry.expert_coord) |coord| {
         if (data.residency) |*residency| {
@@ -5585,14 +5612,18 @@ fn cachedQuantDequantDenseWeight(
         return null;
     }
     if (self.data.tier_cache) |*tier_cache| {
-        if (!tier_cache.canFitAdditional(.host, bytes)) {
+        tier_cache.reserve(.host, bytes) catch {
             self.data.quant_dequant_cache_tier_denied += 1;
             tier_cache.noteDenied(.host, bytes);
             noteSharedCacheDenial(self.run_budget, tier_cache, .host, bytes);
             logSharedCacheDenial("quant_dequant_dense_cache", tier_cache, name);
             return null;
-        }
+        };
     }
+    var cache_reserved = self.data.tier_cache != null;
+    errdefer if (cache_reserved) {
+        self.data.tier_cache.?.noteRelease(.host, bytes);
+    };
 
     const owned_name = try self.data.allocator.dupe(u8, name);
     errdefer self.data.allocator.free(owned_name);
@@ -5606,7 +5637,7 @@ fn cachedQuantDequantDenseWeight(
     });
     self.data.gliner_head_dense_cache_bytes += bytes;
     self.data.quant_dequant_cache_inserts += 1;
-    if (self.data.tier_cache) |*tier_cache| tier_cache.noteResident(.host, bytes);
+    cache_reserved = false;
     return dense_weight;
 }
 
@@ -8653,7 +8684,11 @@ fn nativePreparedStorageComplete(storage: *const QuantizedStorage, known: gguf_t
     return true;
 }
 
-fn ensurePreparedKBlock(self: *NativeCompute, storage: *QuantizedStorage) !void {
+fn ensurePreparedKBlock(
+    self: *NativeCompute,
+    storage: *QuantizedStorage,
+    tracked_entry_bytes: ?*usize,
+) !void {
     const known = switch (storage.tensor_type) {
         .known => |value| value,
         else => return,
@@ -8669,12 +8704,11 @@ fn ensurePreparedKBlock(self: *NativeCompute, storage: *QuantizedStorage) !void 
     var reserved_bytes: usize = 0;
     if (self.data.tier_cache) |*tier_cache| {
         if (additional_bytes != 0) {
-            if (!tier_cache.canFitAdditional(.host, additional_bytes)) {
+            tier_cache.reserve(.host, additional_bytes) catch {
                 tier_cache.noteDenied(.host, additional_bytes);
                 noteSharedCacheDenial(self.run_budget, tier_cache, .host, additional_bytes);
                 return;
-            }
-            tier_cache.noteResident(.host, additional_bytes);
+            };
             reserved_bytes = additional_bytes;
         }
     }
@@ -8682,33 +8716,10 @@ fn ensurePreparedKBlock(self: *NativeCompute, storage: *QuantizedStorage) !void 
         if (self.data.tier_cache) |*tier_cache| tier_cache.noteRelease(.host, reserved_bytes);
     };
     try prepareNativeQuantizedStorage(storage);
-}
-
-fn prepareNativeQuantizedStorageBudgetedLocked(
-    data: *WeightStore,
-    run_budget: ?*run_memory.RunBudget,
-    storage: *QuantizedStorage,
-) !void {
-    const known = switch (storage.tensor_type) {
-        .known => |value| value,
-        else => return,
-    };
-    if (known != .Q1_0 and known != .Q4_0 and known != .Q4_1 and known != .Q5_0 and known != .Q5_1 and known != .Q2_K and known != .Q3_K and known != .Q4_K and known != .Q5_K and known != .Q6_K and known != .Q8_0 and known != .Q8_1 and known != .Q8_K) return;
-    if (nativePreparedStorageComplete(storage, known)) return;
-
-    const additional_bytes = preparedKBlockAdditionalBytes(storage);
-    if (additional_bytes == 0) return;
-
-    if (data.tier_cache) |*tier_cache| {
-        evictColdNonExpertWeightsToFitLocked(data, .host, additional_bytes, null);
-        if (!tier_cache.canFitAdditional(.host, additional_bytes)) {
-            tier_cache.noteDenied(.host, additional_bytes);
-            noteSharedCacheDenial(run_budget, tier_cache, .host, additional_bytes);
-            return;
-        }
+    if (tracked_entry_bytes) |bytes| {
+        std.debug.assert(std.math.maxInt(usize) - bytes.* >= additional_bytes);
+        bytes.* += additional_bytes;
     }
-
-    try prepareNativeQuantizedStorage(storage);
 }
 
 fn writePreparedQ4KBlock(
@@ -9647,15 +9658,20 @@ fn ensureQ4Q5QKVPanel16Cache(
         if (weight_buf_a.lazy_entry) |entry| entry.loaded_bytes = quantizedStorageBudgetBytes(storage_a);
     }
 
+    var cache_reserved_bytes: usize = 0;
     if (self.data.tier_cache) |*tier_cache| {
         evictColdNonExpertWeightsToFitLocked(self.data, .host, expected_bytes, weight_buf_a.lazy_entry);
-        if (!tier_cache.canFitAdditional(.host, expected_bytes)) {
+        tier_cache.reserve(.host, expected_bytes) catch {
             tier_cache.noteDenied(.host, expected_bytes);
             noteSharedCacheDenial(self.run_budget, tier_cache, .host, expected_bytes);
             logSharedCacheDenial("q4q5_qkv_panel16_cache", tier_cache, weight_buf_a.name);
             return;
-        }
+        };
+        cache_reserved_bytes = expected_bytes;
     }
+    errdefer if (cache_reserved_bytes != 0) {
+        self.data.tier_cache.?.noteRelease(.host, cache_reserved_bytes);
+    };
 
     const inserted_bytes = try prepareQ4Q5QKVPanel16PackedStorage(
         storage_a,
@@ -9668,8 +9684,14 @@ fn ensureQ4Q5QKVPanel16Cache(
         row_blocks,
     );
     if (inserted_bytes != 0) {
-        if (self.data.tier_cache) |*tier_cache| tier_cache.noteResident(.host, inserted_bytes);
+        if (inserted_bytes < cache_reserved_bytes) {
+            self.data.tier_cache.?.noteRelease(.host, cache_reserved_bytes - inserted_bytes);
+        } else std.debug.assert(inserted_bytes == cache_reserved_bytes);
+        cache_reserved_bytes = 0;
         if (weight_buf_a.lazy_entry) |entry| entry.loaded_bytes = quantizedStorageBudgetBytes(storage_a);
+    } else if (cache_reserved_bytes != 0) {
+        self.data.tier_cache.?.noteRelease(.host, cache_reserved_bytes);
+        cache_reserved_bytes = 0;
     }
 }
 
