@@ -155,6 +155,13 @@ pub const Sketch = struct {
     pub fn estimateRounded(self: Sketch) u64 {
         const value = self.estimate();
         if (value <= 0) return 0;
+        // A structurally valid sketch can still describe a cardinality at or
+        // above the 64-bit hash space (for example, every register at its
+        // maximum value). Converting that float directly to u64 traps in safe
+        // builds and is undefined in optimized builds. Cardinality is bounded
+        // by the hash domain, so saturate at the largest representable result.
+        const u64_exclusive_upper_bound: f64 = 18446744073709551616.0; // 2^64
+        if (!std.math.isFinite(value) or value >= u64_exclusive_upper_bound) return std.math.maxInt(u64);
         return @intFromFloat(@round(value));
     }
 };
@@ -359,4 +366,11 @@ test "corrupt register byte is rejected rather than crashing the estimator" {
     encoded[encoded.len - 1] = 200;
     try testing.expectError(Error.InvalidHllSketch, estimateEncoded(encoded));
     try testing.expectError(Error.InvalidHllSketch, decodeAlloc(alloc, encoded));
+}
+
+test "maximum valid registers saturate instead of trapping" {
+    var sketch = try Sketch.init(testing.allocator, default_precision);
+    defer sketch.deinit(testing.allocator);
+    @memset(sketch.registers, maxRegisterValue(default_precision));
+    try testing.expectEqual(std.math.maxInt(u64), sketch.estimateRounded());
 }

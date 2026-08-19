@@ -22,6 +22,7 @@ comptime {
     _ = @import("db/algebraic/cylinder.zig");
     _ = @import("db/algebraic/distributed.zig");
     _ = @import("db/algebraic/fact.zig");
+    _ = @import("db/algebraic/hll.zig");
     _ = @import("db/algebraic/index.zig");
     _ = @import("db/algebraic/ir.zig");
     _ = @import("db/algebraic/join.zig");

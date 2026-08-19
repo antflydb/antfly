@@ -44032,10 +44032,11 @@ test "db open borrows shared backend runtime" {
     try std.testing.expect(first.backend_owner_id != 0);
     try std.testing.expect(second.backend_owner_id != 0);
     try std.testing.expect(first.backend_owner_id != second.backend_owner_id);
-    // Each DB owns one backend lane and one repair/cleanup lane. Generation
-    // retirement uses the runtime-wide cleanup owner instead.
+    // Each DB owns a backend lane, a repair/cleanup lane, and an algebraic HLL
+    // maintenance lane. Generation retirement uses the runtime-wide cleanup
+    // owner instead.
     try std.testing.expectEqual(
-        second.repair_cleanup_owner_id + 1,
+        second.algebraic_hll_owner_id + 1,
         try runtime.ptr().allocOwnerId(),
     );
 }

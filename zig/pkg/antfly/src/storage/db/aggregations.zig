@@ -982,6 +982,7 @@ fn algebraicDocIdMetricResultsAlloc(
     }
     for (requests, 0..) |request, i| {
         if (std.mem.eql(u8, request.type, "cardinality")) {
+            if (request.cardinality_mode == .approximate) return error.UnsupportedAggregation;
             const value = (try index.exactCardinalityForDocIdsAlloc(store, request.field, doc_ids)) orelse return error.UnsupportedAggregation;
             out[i] = .{
                 .name = request.name,
@@ -2476,6 +2477,13 @@ fn termsChildAggsAllCardinality(requests: []const SearchAggregationRequest) bool
     return true;
 }
 
+fn cardinalityChildrenRequireApproximate(requests: []const SearchAggregationRequest) bool {
+    for (requests) |request| {
+        if (request.cardinality_mode == .approximate) return true;
+    }
+    return false;
+}
+
 fn computeAlgebraicPathFactTermsCardinalityChildrenAggregation(
     alloc: Allocator,
     index: *algebraic_mod.index.Index,
@@ -2596,13 +2604,17 @@ fn computeAlgebraicTermsCardinalityChildrenAggregation(
     for (child_rel_errors) |*e| e.* = null;
     for (child_requests, 0..) |child_request, ci| {
         child_hll_maps[ci] = null;
+        if (child_request.cardinality_mode == .exact) continue;
         // Record the grouped cardinality shape so it can adaptively promote a
         // per-group sketch (no-op unless adaptive.lazy_materialization is on, and
         // only for unconstrained, non-MVCC reads the gate can serve).
         if (constraints.len == 0 and generation == null) {
             index.observeCardinalityForAdaptive(store, bucket_field, child_request.field);
         }
-        const group_entries = (try index.approxCardinalityEntriesForGroupAlloc(store, &.{bucket_field}, child_request.field, constraints, generation)) orelse continue;
+        const group_entries = (try index.approxCardinalityEntriesForGroupAlloc(store, &.{bucket_field}, child_request.field, constraints, generation)) orelse {
+            if (child_request.cardinality_mode == .approximate) return error.UnsupportedAggregation;
+            continue;
+        };
         defer {
             for (group_entries) |*entry| entry.deinit(index.alloc);
             index.alloc.free(group_entries);
@@ -2770,10 +2782,11 @@ fn computeDerivedJoinTermsCardinalityChildrenAggregation(
     for (child_hll_maps) |*m| m.* = null;
     const child_rel_err = algebraic_mod.hll.relativeErrorForPrecision(algebraic_mod.hll.default_precision);
     for (child_requests, 0..) |child_request, ci| {
+        if (child_request.cardinality_mode == .exact) return error.UnsupportedAggregation;
         var hll_fold = count_derived;
         hll_fold.law = .hll;
         hll_fold.measure = child_request.field;
-        const child_entries = (try index.scanDerivedJoinFoldEntriesAtGeneration(store, hll_fold, generation)) orelse continue;
+        const child_entries = (try index.scanDerivedJoinFoldEntriesAtGeneration(store, hll_fold, generation)) orelse return error.UnsupportedAggregation;
         defer {
             for (child_entries) |*entry| entry.deinit(index.alloc);
             if (child_entries.len > 0) index.alloc.free(child_entries);
@@ -2810,7 +2823,8 @@ fn computeDerivedJoinTermsCardinalityChildrenAggregation(
         const group_key = try index.approxCardinalityGroupKeyForScalarAlloc(candidate.key);
         defer index.alloc.free(group_key);
         for (child_requests, 0..) |child_request, child_idx| {
-            const value: u64 = if (child_hll_maps[child_idx]) |map| (map.get(group_key) orelse 0) else 0;
+            const map = child_hll_maps[child_idx] orelse return error.UnsupportedAggregation;
+            const value: u64 = map.get(group_key) orelse 0;
             child_results[child_idx] = .{
                 .name = child_request.name,
                 .field = child_request.field,
@@ -3118,6 +3132,7 @@ pub fn algebraicTermsCardinalityAggregationFromDistributedPartialsAlloc(
     merged: algebraic_mod.distributed.MergeSet,
 ) !?SearchAggregationResult {
     if (!termsChildAggsAllCardinality(child_requests)) return null;
+    if (cardinalityChildrenRequireApproximate(child_requests)) return error.UnsupportedAggregation;
 
     var buckets_accum = std.ArrayListUnmanaged(TermsCardinalityBucketAccum).empty;
     defer {
@@ -3223,6 +3238,7 @@ fn algebraicPathFactTermsCardinalityAggregationFromDistributedPartialsAlloc(
     merged: algebraic_mod.distributed.MergeSet,
 ) !?SearchAggregationResult {
     if (!termsChildAggsAllCardinality(child_requests)) return null;
+    if (cardinalityChildrenRequireApproximate(child_requests)) return error.UnsupportedAggregation;
 
     var buckets_accum = std.ArrayListUnmanaged(TermsCardinalityBucketAccum).empty;
     defer {
@@ -3503,6 +3519,7 @@ pub fn algebraicCardinalityAggregationFromDistributedPartialsAlloc(
     merged: algebraic_mod.distributed.MergeSet,
 ) !?SearchAggregationResult {
     if (!std.mem.eql(u8, request.type, "cardinality") or request.field.len == 0) return null;
+    if (request.cardinality_mode == .approximate) return error.UnsupportedAggregation;
     var count: u64 = 0;
     for (merged.rows) |row| {
         if (row.law_id != .count) continue;
@@ -4504,6 +4521,7 @@ fn algebraicRangeCardinalityAggregationFromDistributedPartialsAlloc(
 ) !?SearchAggregationResult {
     _ = index;
     if (!termsChildAggsAllCardinality(child_requests)) return null;
+    if (cardinalityChildrenRequireApproximate(child_requests)) return error.UnsupportedAggregation;
     const bucket_count = if (numeric) request.ranges.len else request.date_ranges.len;
     if (bucket_count == 0) return null;
     var buckets = try alloc.alloc(SearchAggregationBucket, bucket_count);
@@ -4571,6 +4589,7 @@ fn algebraicHistogramCardinalityAggregationFromDistributedPartialsAlloc(
     merged: algebraic_mod.distributed.MergeSet,
 ) !?SearchAggregationResult {
     if (!termsChildAggsAllCardinality(child_requests)) return null;
+    if (cardinalityChildrenRequireApproximate(child_requests)) return error.UnsupportedAggregation;
     const date_interval = if (date) parseDateInterval(request) catch return null else undefined;
 
     var buckets_accum = std.ArrayListUnmanaged(HistogramCardinalityBucketAccum).empty;
@@ -6849,6 +6868,7 @@ fn computeCardinalityAggregation(
     hits: []const types.SearchHit,
 ) !SearchAggregationResult {
     if (request.field.len == 0) return error.InvalidAggregation;
+    if (request.cardinality_mode == .approximate) return error.UnsupportedAggregation;
 
     var seen = std.StringHashMap(void).init(alloc);
     defer {
@@ -14781,6 +14801,19 @@ test "algebraic aggregation planner answers cardinality from HLL materialization
     try expectApproxCardinality(terms_aggs[0].buckets[0].aggregations[0].value_json.?, 3);
     try expectApproxCardinality(terms_aggs[0].buckets[1].aggregations[0].value_json.?, 1);
 
+    // The nested mode contract is identical to the root contract: exact must
+    // bypass a matching sketch rather than silently returning an estimate.
+    const exact_terms_requests = [_]SearchAggregationRequest{.{
+        .name = "regions_exact",
+        .type = "terms",
+        .field = "region",
+        .aggregations = &.{.{ .name = "unique_customers", .type = "cardinality", .field = "customer", .cardinality_mode = .exact }},
+    }};
+    const exact_terms_aggs = try computeSearchAggregations(alloc, &exact_terms_requests, result, ctx);
+    defer deinitResults(alloc, exact_terms_aggs);
+    try std.testing.expectEqualStrings("{\"value\":3,\"approximate\":false}", exact_terms_aggs[0].buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", exact_terms_aggs[0].buckets[1].aggregations[0].value_json.?);
+
     // cardinality_mode = .exact never consults the sketch — the result is exact
     // and reports approximate:false even though a matching sketch exists.
     const exact_requests = [_]SearchAggregationRequest{.{ .name = "unique_customers", .type = "cardinality", .field = "customer", .cardinality_mode = .exact }};
@@ -14952,13 +14985,28 @@ test "cardinality_mode approximate errors when no sketch applies" {
     };
     try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
 
-    const hits = try alloc.alloc(types.SearchHit, 0);
-    defer alloc.free(hits);
-    const result = types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 0 };
+    const hits = try alloc.alloc(types.SearchHit, 2);
+    defer {
+        for (hits) |*hit| hit.deinit(alloc);
+        alloc.free(hits);
+    }
+    hits[0] = .{ .id = try alloc.dupe(u8, "o1"), .stored_data = try alloc.dupe(u8, "{\"customer\":\"a\"}") };
+    hits[1] = .{ .id = try alloc.dupe(u8, "o2"), .stored_data = try alloc.dupe(u8, "{\"customer\":\"b\"}") };
+    const result = types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 2 };
     const ctx = Context{ .index_manager = &manager, .doc_store = &store, .algebraic_scope = .root, .algebraic_available = true };
 
     const requests = [_]SearchAggregationRequest{.{ .name = "unique_customers", .type = "cardinality", .field = "customer", .cardinality_mode = .approximate }};
     try std.testing.expectError(error.UnsupportedAggregation, computeSearchAggregations(alloc, &requests, result, ctx));
+
+    // Approximate nested requests also require a sketch; they cannot silently
+    // degrade to the exact per-bucket scan.
+    const nested_requests = [_]SearchAggregationRequest{.{
+        .name = "customers",
+        .type = "terms",
+        .field = "customer",
+        .aggregations = &.{.{ .name = "unique_customers", .type = "cardinality", .field = "customer", .cardinality_mode = .approximate }},
+    }};
+    try std.testing.expectError(error.UnsupportedAggregation, computeSearchAggregations(alloc, &nested_requests, result, ctx));
 }
 
 // Asserts a cardinality result was served approximately (from a sketch): it
