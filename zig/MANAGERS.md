@@ -207,6 +207,13 @@ pages that both the kernel and kubelet treat as reclaimable. This avoids making
 build/download cache a permanent admission charge without hiding mapped pages
 that are actually under pressure.
 
+When an mmap-backed model is evicted, teardown issues `MADV_DONTNEED` before
+unmapping and `POSIX_FADV_DONTNEED` after unmapping the whole weight file. These
+best-effort Linux hints release only clean, unshared file-cache residency;
+anonymous, dirty, writeback, and still-shared pages remain charged. This keeps
+sequential model churn from pinning recently active weight pages inside the
+process envelope without weakening admission accounting for live memory.
+
 Resolved bytes and provenance travel together through direct `NodeConfig` and
 the standalone inference ABI. Only an effective `explicit` source selects the
 fixed-reserve policy; cgroup, host, unavailable, and explicit-input-clamped-by-

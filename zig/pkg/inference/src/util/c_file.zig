@@ -169,8 +169,29 @@ pub const MmapRegion = struct {
     }
 
     pub fn deinit(self: *MmapRegion) void {
+        const mapped_len = self.data.len;
+        const fd = self.fd;
+        // Model eviction must release both the process mapping and its clean
+        // page-cache residency. Repeatedly mapping different multi-GiB weight
+        // files can otherwise leave recently active file pages charged to the
+        // cgroup after munmap(), temporarily exhausting an explicit process
+        // envelope even though the evicted model owns no live memory. Both
+        // hints are best effort and affect only clean file-backed pages:
+        // anonymous, dirty, writeback, and still-shared pages remain charged.
+        if (comptime build_options.link_libc and builtin.os.tag == .linux) {
+            advise(self.data.ptr, mapped_len, .dont_need);
+        }
         std.posix.munmap(self.data);
-        closeFd(self.fd);
+        if (comptime build_options.link_libc and builtin.os.tag == .linux) {
+            _ = c.posix_fadvise(
+                fd,
+                0,
+                @intCast(mapped_len),
+                c.POSIX_FADV_DONTNEED,
+            );
+        }
+        closeFd(fd);
+        self.* = undefined;
     }
 };
 
