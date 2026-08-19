@@ -4635,7 +4635,7 @@ const PublicApiStatusSource = struct {
                 .status = status,
                 .admin_snapshot = adminSnapshot,
                 .cached_admin_snapshot = cachedAdminSnapshot,
-                .ensure_linearizable_read = ensureLinearizableRead,
+                .linearizable_snapshot = linearizableSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
                 .create_table = createTable,
                 .drop_table = dropTable,
@@ -4660,12 +4660,12 @@ const PublicApiStatusSource = struct {
         return try adminSnapshot(ptr);
     }
 
-    fn ensureLinearizableRead(ptr: *anyopaque, request: api_operation.RequestContext) !bool {
+    fn linearizableSnapshot(ptr: *anyopaque, request: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
         try request.ensureActive();
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.linearizable_read_driver) |driver| {
             try driver.ensure();
-            return true;
+            return try self.metadataNode().adminSnapshot();
         }
         const target = self.metadataNode();
         const leader_index = self.node.cluster.currentMetadataLeaderIndex() orelse
@@ -4675,7 +4675,7 @@ const PublicApiStatusSource = struct {
         const raft_status = target.sim().raftStatus(self.node.cluster.metadata_group_id) orelse
             return error.MetadataLinearizableReadTimeout;
         if (raft_status.soft.role != .leader) return error.NotLeader;
-        return true;
+        return try target.adminSnapshot();
     }
 
     fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {

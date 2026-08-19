@@ -877,6 +877,40 @@ pub const BackupListResponse = struct {
     next_cursor: ?[]const u8 = null,
 };
 
+/// A retryable metadata-availability failure reported before backup side effects begin.
+pub const BackupMetadataUnavailableError = union(enum) {
+    metadata_capability_unavailable_error: MetadataCapabilityUnavailableError,
+    metadata_leader_unavailable_error: MetadataLeaderUnavailableError,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("code") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "metadata_capability_unavailable")) {
+            return .{ .metadata_capability_unavailable_error = try std.json.parseFromValueLeaky(MetadataCapabilityUnavailableError, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "metadata_leader_unavailable")) {
+            return .{ .metadata_leader_unavailable_error = try std.json.parseFromValueLeaky(MetadataLeaderUnavailableError, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .metadata_capability_unavailable_error => |v| try jw.write(v),
+            .metadata_leader_unavailable_error => |v| try jw.write(v),
+        }
+    }
+};
+
 pub const BackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
@@ -6529,6 +6563,15 @@ pub const MetadataCapabilityUnavailableError = struct {
     @"error": []const u8,
     message: []const u8,
     required_capability: []const u8,
+    retryable: bool,
+    retry_after_ms: i32,
+};
+
+/// The request could not establish authority with the current metadata leader.
+pub const MetadataLeaderUnavailableError = struct {
+    code: []const u8,
+    @"error": []const u8,
+    message: []const u8,
     retryable: bool,
     retry_after_ms: i32,
 };

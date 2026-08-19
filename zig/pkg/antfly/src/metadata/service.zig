@@ -78,6 +78,43 @@ pub const AdminSnapshotFence = struct {
     transition_readiness_epoch: u64 = 0,
 };
 
+pub fn sameAdminSnapshotFence(before: AdminSnapshotFence, after: AdminSnapshotFence) bool {
+    return before.metadata_group_id == after.metadata_group_id and
+        std.meta.eql(before.metadata_incarnation, after.metadata_incarnation) and
+        before.metadata_raft_term == after.metadata_raft_term and
+        before.metadata_raft_commit_index == after.metadata_raft_commit_index and
+        before.metadata_raft_applied_index == after.metadata_raft_applied_index and
+        before.projection_epoch == after.projection_epoch and
+        before.catalog_epoch == after.catalog_epoch and
+        before.placement_epoch == after.placement_epoch and
+        before.reconcile_lease_epoch == after.reconcile_lease_epoch and
+        before.transition_epoch == after.transition_epoch and
+        before.projected_core_epoch == after.projected_core_epoch and
+        before.transition_readiness_epoch == after.transition_readiness_epoch;
+}
+
+/// Return the exact owned snapshot covered by the linearizable read barrier.
+/// The before/after fence makes the multi-collection capture coherent without
+/// holding the Raft runtime lock while a potentially large snapshot is cloned.
+pub fn coherentLinearizableAdminSnapshot(
+    comptime Service: type,
+    svc: *Service,
+    request: api_operation.RequestContext,
+) !metadata_api.AdminSnapshot {
+    try svc.ensureLinearizableReadWithContext(request);
+    for (0..3) |_| {
+        try request.ensureActive();
+        const before = try svc.adminSnapshotFence();
+        var snapshot = try svc.adminSnapshot();
+        errdefer svc.freeAdminSnapshot(&snapshot);
+        try request.ensureActive();
+        const after = try svc.adminSnapshotFence();
+        if (sameAdminSnapshotFence(before, after)) return snapshot;
+        svc.freeAdminSnapshot(&snapshot);
+    }
+    return error.MetadataLinearizableReadTimeout;
+}
+
 fn logMetadataRunRoundPhase(name: []const u8, elapsed_ns: u64) void {
     if (elapsed_ns > metadata_run_round_slow_phase_threshold_ns) {
         std.log.warn("metadata runRound phase slow phase={s} elapsed_ms={d}", .{

@@ -6,6 +6,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, expectTypeOf, it } from "vitest";
+import type { components, operations } from "../src/public-api.js";
 import { match as matchQuery } from "../src/query-helpers.js";
 import type {
   AntflyQuery,
@@ -42,6 +43,35 @@ function generatedSortProfileDeclaration(): string {
 }
 
 describe("Antfly Query Type Integration", () => {
+  describe("Backup metadata availability responses", () => {
+    it("types both retryable 503 variants", () => {
+      type BackupUnavailable = components["schemas"]["BackupMetadataUnavailableError"];
+      type Backup503 = operations["backup"]["responses"][503]["content"]["application/json"];
+      type BackupTable503 = operations["backupTable"]["responses"][503]["content"]["application/json"];
+
+      const capability: BackupUnavailable = {
+        code: "metadata_capability_unavailable",
+        error: "metadata_capability_unavailable",
+        message: "upgrade metadata nodes",
+        required_capability: "linearizable_snapshot",
+        retryable: true,
+        retry_after_ms: 5000,
+      };
+      const leader: BackupUnavailable = {
+        code: "metadata_leader_unavailable",
+        error: "metadata_leader_unavailable",
+        message: "metadata leader unavailable",
+        retryable: true,
+        retry_after_ms: 1000,
+      };
+
+      expectTypeOf<Backup503>().toEqualTypeOf<BackupUnavailable>();
+      expectTypeOf<BackupTable503>().toEqualTypeOf<BackupUnavailable>();
+      expect(capability.required_capability).toBe("linearizable_snapshot");
+      expect(leader.error).toBe("metadata_leader_unavailable");
+    });
+  });
+
   describe("CreateIndexRequest type safety", () => {
     it("discriminates index-specific fields", () => {
       const embeddings: CreateIndexRequest = {

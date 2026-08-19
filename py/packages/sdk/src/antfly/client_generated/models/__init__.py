@@ -540,6 +540,15 @@ from .merge_config import MergeConfig
 from .merge_config_weights import MergeConfigWeights
 from .merge_profile import MergeProfile
 from .merge_strategy import MergeStrategy
+from .metadata_capability_unavailable_error import MetadataCapabilityUnavailableError
+from .metadata_capability_unavailable_error_code import MetadataCapabilityUnavailableErrorCode
+from .metadata_capability_unavailable_error_error import MetadataCapabilityUnavailableErrorError
+from .metadata_capability_unavailable_error_required_capability import (
+    MetadataCapabilityUnavailableErrorRequiredCapability,
+)
+from .metadata_leader_unavailable_error import MetadataLeaderUnavailableError
+from .metadata_leader_unavailable_error_code import MetadataLeaderUnavailableErrorCode
+from .metadata_leader_unavailable_error_error import MetadataLeaderUnavailableErrorError
 from .multi_batch_request import MultiBatchRequest
 from .multi_batch_request_tables import MultiBatchRequestTables
 from .multi_batch_response import MultiBatchResponse
@@ -1319,6 +1328,13 @@ __all__ = (
     "MergeConfigWeights",
     "MergeProfile",
     "MergeStrategy",
+    "MetadataCapabilityUnavailableError",
+    "MetadataCapabilityUnavailableErrorCode",
+    "MetadataCapabilityUnavailableErrorError",
+    "MetadataCapabilityUnavailableErrorRequiredCapability",
+    "MetadataLeaderUnavailableError",
+    "MetadataLeaderUnavailableErrorCode",
+    "MetadataLeaderUnavailableErrorError",
     "MultiBatchRequest",
     "MultiBatchRequestTables",
     "MultiBatchResponse",

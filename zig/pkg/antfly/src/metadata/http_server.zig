@@ -409,18 +409,7 @@ pub const AdminSource = struct {
     }
 
     fn sameSnapshotFence(before: service.AdminSnapshotFence, after: service.AdminSnapshotFence) bool {
-        return before.metadata_group_id == after.metadata_group_id and
-            std.meta.eql(before.metadata_incarnation, after.metadata_incarnation) and
-            before.metadata_raft_term == after.metadata_raft_term and
-            before.metadata_raft_commit_index == after.metadata_raft_commit_index and
-            before.metadata_raft_applied_index == after.metadata_raft_applied_index and
-            before.projection_epoch == after.projection_epoch and
-            before.catalog_epoch == after.catalog_epoch and
-            before.placement_epoch == after.placement_epoch and
-            before.reconcile_lease_epoch == after.reconcile_lease_epoch and
-            before.transition_epoch == after.transition_epoch and
-            before.projected_core_epoch == after.projected_core_epoch and
-            before.transition_readiness_epoch == after.transition_readiness_epoch;
+        return service.sameAdminSnapshotFence(before, after);
     }
 
     /// The read-index barrier establishes authority, while the before/after
@@ -432,18 +421,7 @@ pub const AdminSource = struct {
         svc: *Service,
         request: operation.RequestContext,
     ) !metadata_api.AdminSnapshot {
-        try svc.ensureLinearizableReadWithContext(request);
-        for (0..3) |_| {
-            try request.ensureActive();
-            const before = try svc.adminSnapshotFence();
-            var snapshot = try svc.adminSnapshot();
-            errdefer svc.freeAdminSnapshot(&snapshot);
-            try request.ensureActive();
-            const after = try svc.adminSnapshotFence();
-            if (sameSnapshotFence(before, after)) return snapshot;
-            svc.freeAdminSnapshot(&snapshot);
-        }
-        return error.MetadataLinearizableReadTimeout;
+        return service.coherentLinearizableAdminSnapshot(Service, svc, request);
     }
 
     fn metadataServiceLinearizableHead(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.MetadataHead {

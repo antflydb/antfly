@@ -14312,7 +14312,7 @@ const RemoteMetadataSource = struct {
                 .status = remoteStatus,
                 .admin_snapshot = remoteAdminSnapshot,
                 .cached_admin_snapshot = remoteCachedAdminSnapshot,
-                .ensure_linearizable_read = remoteEnsureLinearizableRead,
+                .linearizable_snapshot = remoteLinearizableSnapshot,
                 .free_admin_snapshot = remoteFreeAdminSnapshot,
                 .create_table = remoteCreateTable,
                 .replace_table_definition = remoteReplaceTableDefinition,
@@ -14372,10 +14372,10 @@ const RemoteMetadataSource = struct {
         return try self.fetchRemoteHead(null);
     }
 
-    fn remoteEnsureLinearizableRead(
+    fn remoteLinearizableSnapshot(
         ptr: *anyopaque,
         request: antfly.public_api.operation.RequestContext,
-    ) !bool {
+    ) !?antfly.metadata_api.AdminSnapshot {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         try request.ensureActive();
         const now_ns = platform_time.monotonicNs();
@@ -14436,26 +14436,33 @@ const RemoteMetadataSource = struct {
                     last_err = err;
                     continue :endpoint_attempts;
                 };
-                var owned = cloneAdminSnapshotOwned(self.alloc, parsed.value) catch |err| {
+                var result = cloneAdminSnapshotOwned(self.alloc, parsed.value) catch |err| {
                     last_err = err;
                     continue :endpoint_attempts;
                 };
-                var ownership_transferred = false;
-                defer if (!ownership_transferred) freeAdminSnapshotOwned(self.alloc, &owned);
-                const acceptance = self.acceptLinearizableSnapshot(owned, ticket) catch |err| {
+                var result_owned = true;
+                defer if (result_owned) freeAdminSnapshotOwned(self.alloc, &result);
+                var cached = cloneAdminSnapshotOwned(self.alloc, parsed.value) catch |err| {
+                    last_err = err;
+                    continue :endpoint_attempts;
+                };
+                var cache_ownership_transferred = false;
+                defer if (!cache_ownership_transferred) freeAdminSnapshotOwned(self.alloc, &cached);
+                const acceptance = self.acceptLinearizableSnapshot(cached, ticket) catch |err| {
                     if (err == error.MetadataSnapshotHeadMismatch and snapshot_attempt == 0) {
                         continue :snapshot_attempts;
                     }
                     last_err = err;
                     continue :endpoint_attempts;
                 };
-                ownership_transferred = acceptance == .published;
+                cache_ownership_transferred = acceptance == .published;
                 self.noteMetadataReadSuccess(index);
-                return true;
+                result_owned = false;
+                return result;
             }
         }
         try request.ensureActive();
-        if (unsupported_count == self.base_uris.len) return false;
+        if (unsupported_count == self.base_uris.len) return null;
         return last_err;
     }
 
@@ -28086,7 +28093,7 @@ test "remote metadata source retains mutation authority across cache invalidatio
     source.invalidateCache();
     try std.testing.expectEqual(@as(u64, 1), source.snapshot_fence_generation);
     try std.testing.expectEqual(@as(usize, 2), source.metadataApiIndexForAttempt(0));
-    try std.testing.expect(source.statusSource().vtable.ensure_linearizable_read != null);
+    try std.testing.expect(source.statusSource().vtable.linearizable_snapshot != null);
 
     source.noteMetadataReadSuccess(1);
     try std.testing.expectEqual(@as(usize, 2), source.metadataApiIndexForAttempt(0));

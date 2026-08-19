@@ -2661,6 +2661,40 @@ export interface components {
             /** @example An error message */
             error: string;
         };
+        /** @description The metadata service does not yet provide the consistency capability required by backup. */
+        MetadataCapabilityUnavailableError: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            code: "metadata_capability_unavailable";
+            /** @enum {string} */
+            error: "metadata_capability_unavailable";
+            message: string;
+            /** @enum {string} */
+            required_capability: "linearizable_snapshot";
+            /** @enum {boolean} */
+            retryable: true;
+            /** Format: int32 */
+            retry_after_ms: number;
+        };
+        /** @description The request could not establish authority with the current metadata leader. */
+        MetadataLeaderUnavailableError: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            code: "metadata_leader_unavailable";
+            /** @enum {string} */
+            error: "metadata_leader_unavailable";
+            message: string;
+            /** @enum {boolean} */
+            retryable: true;
+            /** Format: int32 */
+            retry_after_ms: number;
+        };
+        /** @description A retryable metadata-availability failure reported before backup side effects begin. */
+        BackupMetadataUnavailableError: components["schemas"]["MetadataCapabilityUnavailableError"] | components["schemas"]["MetadataLeaderUnavailableError"];
         /** @description Actionable retry contract for temporary inference-capacity failures. */
         InferenceCapacityError: {
             /** @description Stable machine-readable error code. */
@@ -13511,6 +13545,19 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /** @description Backup could not establish the required metadata authority before starting side effects. */
+        BackupMetadataUnavailable: {
+            headers: {
+                /** @description Minimum number of seconds clients should wait before retrying. */
+                "Retry-After": number;
+                /** @description Present with value `true` only when retrying against the current metadata leader may succeed. */
+                "X-Antfly-Metadata-Not-Leader"?: "true";
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["BackupMetadataUnavailableError"];
+            };
+        };
         /** @description Storage descriptors are temporarily exhausted */
         StorageResourceExhausted: {
             headers: {
@@ -14419,6 +14466,7 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["BackupMetadataUnavailable"];
         };
     };
     restore: {
@@ -15010,6 +15058,7 @@ export interface operations {
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["BackupMetadataUnavailable"];
         };
     };
     restoreTable: {

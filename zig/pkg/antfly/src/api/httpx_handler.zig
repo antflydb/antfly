@@ -221,7 +221,7 @@ pub const AntflyApiHandler = struct {
         try ctx.setHeader("content-type", "application/json");
         try ctx.setHeader("Retry-After", "1");
         try ctx.setHeader(http_common.metadata_not_leader_header, http_common.metadata_not_leader_value);
-        _ = ctx.response.body("{\"error\":\"metadata leader unavailable\"}");
+        _ = ctx.response.body("{\"code\":\"metadata_leader_unavailable\",\"error\":\"metadata_leader_unavailable\",\"message\":\"metadata leader unavailable\",\"retryable\":true,\"retry_after_ms\":1000}");
         return ctx.response.build();
     }
 
@@ -597,12 +597,7 @@ pub const AntflyApiHandler = struct {
             if (metadata_authority.isRetryableError(err) and
                 ApiHttpServer.extensionRouteMutatesMetadata(method, path))
             {
-                _ = ctx.status(503);
-                try ctx.setHeader("content-type", "application/json");
-                try ctx.setHeader("Retry-After", "1");
-                try ctx.setHeader(http_common.metadata_not_leader_header, http_common.metadata_not_leader_value);
-                _ = ctx.response.body("{\"error\":\"metadata leader unavailable\"}");
-                return ctx.response.build();
+                return metadataNotLeaderResponse(ctx);
             }
             return err;
         } orelse return jsonResponse(ctx, 404, "{\"error\":\"not found\"}");
