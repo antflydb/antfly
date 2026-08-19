@@ -869,7 +869,11 @@ fn buildSlrTables(allocator: std.mem.Allocator, grammar: Grammar) !Tables {
         }
     }
 
-    var actions: std.ArrayListUnmanaged(Action) = .empty;
+    const action_slot_count = try std.math.mul(usize, states.items.len, terminal_count);
+    const action_slots = try allocator.alloc(?Action, action_slot_count);
+    defer allocator.free(action_slots);
+    @memset(action_slots, null);
+
     var gotos: std.ArrayListUnmanaged(Goto) = .empty;
     var conflicts: std.ArrayListUnmanaged(Conflict) = .empty;
 
@@ -877,7 +881,7 @@ fn buildSlrTables(allocator: std.mem.Allocator, grammar: Grammar) !Tables {
         for (transitions.items) |transition| {
             if (transition.state != i) continue;
             if (symbols.items[transition.nonterminal].kind == .terminal) {
-                try addAction(allocator, &actions, &conflicts, .{
+                try addAction(allocator, action_slots, terminal_count, &conflicts, .{
                     .state = try tableIndex(i),
                     .terminal = transition.nonterminal,
                     .kind = .shift,
@@ -892,7 +896,7 @@ fn buildSlrTables(allocator: std.mem.Allocator, grammar: Grammar) !Tables {
             const production = productions.items[item.production];
             if (item.dot != production.rhs.len) continue;
             if (item.production == 0) {
-                try addAction(allocator, &actions, &conflicts, .{
+                try addAction(allocator, action_slots, terminal_count, &conflicts, .{
                     .state = try tableIndex(i),
                     .terminal = eof_symbol,
                     .kind = .accept,
@@ -901,7 +905,7 @@ fn buildSlrTables(allocator: std.mem.Allocator, grammar: Grammar) !Tables {
                 continue;
             }
             for (follow[production.lhs]) |terminal| {
-                try addAction(allocator, &actions, &conflicts, .{
+                try addAction(allocator, action_slots, terminal_count, &conflicts, .{
                     .state = try tableIndex(i),
                     .terminal = terminal,
                     .kind = .reduce,
@@ -911,7 +915,15 @@ fn buildSlrTables(allocator: std.mem.Allocator, grammar: Grammar) !Tables {
         }
     }
 
-    sortActions(actions.items);
+    var actions: std.ArrayListUnmanaged(Action) = .empty;
+    var action_count: usize = 0;
+    for (action_slots) |action| {
+        if (action != null) action_count += 1;
+    }
+    try actions.ensureTotalCapacity(allocator, action_count);
+    for (action_slots) |action| {
+        if (action) |present| actions.appendAssumeCapacity(present);
+    }
     sortGotos(gotos.items);
     const symbol_count = symbols.items.len;
     return .{
@@ -1089,21 +1101,24 @@ fn itemNextSymbols(allocator: std.mem.Allocator, productions: []const Production
 
 fn addAction(
     allocator: std.mem.Allocator,
-    actions: *std.ArrayListUnmanaged(Action),
+    action_slots: []?Action,
+    terminal_count: usize,
     conflicts: *std.ArrayListUnmanaged(Conflict),
     candidate: Action,
     productions: []const Production,
     terminal_precedences: []const ?Precedence,
 ) !void {
-    for (actions.items, 0..) |*existing, idx| {
-        if (existing.state != candidate.state or existing.terminal != candidate.terminal) continue;
-        if (std.meta.eql(existing.*, candidate)) return;
-        if (precedenceResolution(candidate, existing.*, productions, terminal_precedences)) |resolution| {
-            switch (resolution) {
-                .candidate => existing.* = candidate,
-                .existing => {},
-                .none => _ = actions.orderedRemove(idx),
-            }
+    const slot_index = @as(usize, candidate.state) * terminal_count + candidate.terminal;
+    std.debug.assert(slot_index < action_slots.len);
+    const slot = &action_slots[slot_index];
+    if (slot.*) |existing| {
+        if (std.meta.eql(existing, candidate)) return;
+        if (precedenceResolution(candidate, existing, productions, terminal_precedences)) |resolution| {
+            slot.* = switch (resolution) {
+                .candidate => candidate,
+                .existing => existing,
+                .none => null,
+            };
             return;
         }
         try conflicts.append(allocator, .{
@@ -1112,10 +1127,10 @@ fn addAction(
             .existing = existing.kind,
             .candidate = candidate.kind,
         });
-        if (preferAction(candidate, existing.*)) existing.* = candidate;
+        if (preferAction(candidate, existing)) slot.* = candidate;
         return;
     }
-    try actions.append(allocator, candidate);
+    slot.* = candidate;
 }
 
 const ActionResolution = enum {
@@ -1279,27 +1294,6 @@ fn emitZigMetadata(
     try out.appendSlice(allocator,
         \\};
         \\
-        \\const Item = struct { production: u16, dot: u16 };
-        \\const state_items = [_]Item{
-        \\
-    );
-    for (tables.states) |state| {
-        for (state.items) |item| try appendFmt(allocator, &out, "    .{{ .production = {d}, .dot = {d} }},\n", .{ item.production, item.dot });
-    }
-    try out.appendSlice(allocator,
-        \\};
-        \\const State = struct { item_start: u32, item_len: u16 };
-        \\const states = [_]State{
-        \\
-    );
-    var item_start: usize = 0;
-    for (tables.states) |state| {
-        try appendFmt(allocator, &out, "    .{{ .item_start = {d}, .item_len = {d} }},\n", .{ item_start, state.items.len });
-        item_start += state.items.len;
-    }
-    try out.appendSlice(allocator,
-        \\};
-        \\
         \\const ActionKind = enum { shift, reduce, accept };
         \\const Action = struct { terminal: u16, kind: ActionKind, target: u16 };
         \\const TableRange = struct { start: u32, len: u16 };
@@ -1331,16 +1325,6 @@ fn emitZigMetadata(
         \\
     );
     try emitTableRanges(allocator, &out, tables.states.len, tables.gotos, gotoState);
-    try out.appendSlice(allocator,
-        \\};
-        \\
-        \\const Conflict = struct { state: u16, terminal: u16, existing: ActionKind, candidate: ActionKind };
-        \\const conflicts = [_]Conflict{
-        \\
-    );
-    for (tables.conflicts) |conflict| {
-        try appendFmt(allocator, &out, "    .{{ .state = {d}, .terminal = {d}, .existing = .{s}, .candidate = .{s} }},\n", .{ conflict.state, conflict.terminal, @tagName(conflict.existing), @tagName(conflict.candidate) });
-    }
     try out.appendSlice(allocator,
         \\};
         \\
@@ -1448,19 +1432,17 @@ fn emitZigMetadata(
         \\    @sizeOf(@TypeOf(nullable_symbols)) +
         \\    @sizeOf(@TypeOf(production_rhs)) +
         \\    @sizeOf(@TypeOf(productions)) +
-        \\    @sizeOf(@TypeOf(state_items)) +
-        \\    @sizeOf(@TypeOf(states)) +
         \\    @sizeOf(@TypeOf(actions)) +
         \\    @sizeOf(@TypeOf(action_ranges)) +
         \\    @sizeOf(@TypeOf(gotos)) +
-        \\    @sizeOf(@TypeOf(goto_ranges)) +
-        \\    @sizeOf(@TypeOf(conflicts));
+        \\    @sizeOf(@TypeOf(goto_ranges));
         \\pub const parse_table_estimated_bytes = parse_table_static_bytes + symbol_name_bytes;
         \\
     , .{ production_rhs_count, state_item_count, symbol_name_bytes, action_range_max, goto_range_max });
     try out.appendSlice(allocator,
         \\
         \\const ParseError = error{
+        \\    InvalidFallbackTokenCount,
         \\    InvalidGoto,
         \\    StackOverflow,
         \\    StackUnderflow,
@@ -1486,13 +1468,29 @@ fn emitZigMetadata(
         \\    var stack = DynamicStateStack.init(allocator);
         \\    defer stack.deinit();
         \\    try stack.push(0);
-        \\    const failure = try parseCore(token_ids, &stack, IgnoreEvents{});
+        \\    const failure = try parseCore(token_ids, null, &stack, IgnoreEvents{});
+        \\    if (failure) |item| return item.parse_error;
+        \\}
+        \\
+        \\pub fn parseWithFallback(allocator: std.mem.Allocator, token_ids: []const u16, fallback_token_ids: []const u16) !void {
+        \\    if (fallback_token_ids.len != token_ids.len) return ParseError.InvalidFallbackTokenCount;
+        \\    var stack = DynamicStateStack.init(allocator);
+        \\    defer stack.deinit();
+        \\    try stack.push(0);
+        \\    const failure = try parseCore(token_ids, fallback_token_ids, &stack, IgnoreEvents{});
         \\    if (failure) |item| return item.parse_error;
         \\}
         \\
         \\pub fn parseWithStackBuffer(token_ids: []const u16, stack_buffer: []u16) !void {
         \\    var stack = try FixedStateStack.init(stack_buffer);
-        \\    const failure = try parseCore(token_ids, &stack, IgnoreEvents{});
+        \\    const failure = try parseCore(token_ids, null, &stack, IgnoreEvents{});
+        \\    if (failure) |item| return item.parse_error;
+        \\}
+        \\
+        \\pub fn parseWithFallbackStackBuffer(token_ids: []const u16, fallback_token_ids: []const u16, stack_buffer: []u16) !void {
+        \\    if (fallback_token_ids.len != token_ids.len) return ParseError.InvalidFallbackTokenCount;
+        \\    var stack = try FixedStateStack.init(stack_buffer);
+        \\    const failure = try parseCore(token_ids, fallback_token_ids, &stack, IgnoreEvents{});
         \\    if (failure) |item| return item.parse_error;
         \\}
         \\
@@ -1528,7 +1526,7 @@ fn emitZigMetadata(
         \\
         \\pub fn parseWithEvents(token_ids: []const u16, stack_buffer: []u16, event_handler: anytype) !void {
         \\    var stack = try FixedStateStack.init(stack_buffer);
-        \\    const failure = try parseCore(token_ids, &stack, event_handler);
+        \\    const failure = try parseCore(token_ids, null, &stack, event_handler);
         \\    if (failure) |item| return item.parse_error;
         \\}
         \\
@@ -1615,16 +1613,26 @@ fn emitZigMetadata(
         \\    };
         \\}
         \\
-        \\fn parseCore(token_ids: []const u16, stack: anytype, event_handler: anytype) !?ParseFailure {
+        \\fn parseCore(token_ids: []const u16, fallback_token_ids: ?[]const u16, stack: anytype, event_handler: anytype) !?ParseFailure {
         \\    var index: usize = 0;
         \\    while (true) {
         \\        const state = stack.top();
         \\        const lookahead: u16 = if (index < token_ids.len) token_ids[index] else 0;
-        \\        const action = findAction(state, lookahead) orelse
+        \\        var effective_lookahead = lookahead;
+        \\        const action = findAction(state, lookahead) orelse action: {
+        \\            if (fallback_token_ids) |fallbacks| {
+        \\                if (index < fallbacks.len and fallbacks[index] != 0) {
+        \\                    if (findAction(state, fallbacks[index])) |fallback_action| {
+        \\                        effective_lookahead = fallbacks[index];
+        \\                        break :action fallback_action;
+        \\                    }
+        \\                }
+        \\            }
         \\            return parseFailure(ParseError.UnexpectedToken, state, lookahead, index);
+        \\        };
         \\        switch (action.kind) {
         \\            .shift => {
-        \\                try event_handler.shift(.{ .token_index = index, .terminal = lookahead });
+        \\                try event_handler.shift(.{ .token_index = index, .terminal = effective_lookahead });
         \\                try stack.push(action.target);
         \\                index += 1;
         \\            },
@@ -1661,17 +1669,33 @@ fn emitZigMetadata(
         \\    return try parseDiagnosticFromInfo(allocator, info);
         \\}
         \\
+        \\pub fn parseDiagnosticWithFallback(allocator: std.mem.Allocator, token_ids: []const u16, fallback_token_ids: []const u16) !?ParseDiagnostic {
+        \\    if (fallback_token_ids.len != token_ids.len) return ParseError.InvalidFallbackTokenCount;
+        \\    var stack = DynamicStateStack.init(allocator);
+        \\    defer stack.deinit();
+        \\    try stack.push(0);
+        \\    const failure = try parseCore(token_ids, fallback_token_ids, &stack, IgnoreEvents{});
+        \\    return if (failure) |item| try parseDiagnosticFromInfo(allocator, item.info) else null;
+        \\}
+        \\
+        \\pub fn parseDiagnosticWithFallbackStackBuffer(allocator: std.mem.Allocator, token_ids: []const u16, fallback_token_ids: []const u16, stack_buffer: []u16) !?ParseDiagnostic {
+        \\    if (fallback_token_ids.len != token_ids.len) return ParseError.InvalidFallbackTokenCount;
+        \\    var stack = try FixedStateStack.init(stack_buffer);
+        \\    const failure = try parseCore(token_ids, fallback_token_ids, &stack, IgnoreEvents{});
+        \\    return if (failure) |item| try parseDiagnosticFromInfo(allocator, item.info) else null;
+        \\}
+        \\
         \\fn parseError(allocator: std.mem.Allocator, token_ids: []const u16) !?ParseErrorInfo {
         \\    var stack = DynamicStateStack.init(allocator);
         \\    defer stack.deinit();
         \\    try stack.push(0);
-        \\    const failure = try parseCore(token_ids, &stack, IgnoreEvents{});
+        \\    const failure = try parseCore(token_ids, null, &stack, IgnoreEvents{});
         \\    return if (failure) |item| item.info else null;
         \\}
         \\
         \\fn parseErrorWithStackBuffer(token_ids: []const u16, stack_buffer: []u16) ParseError!?ParseErrorInfo {
         \\    var stack = try FixedStateStack.init(stack_buffer);
-        \\    const failure = try parseCore(token_ids, &stack, IgnoreEvents{});
+        \\    const failure = try parseCore(token_ids, null, &stack, IgnoreEvents{});
         \\    return if (failure) |item| item.info else null;
         \\}
         \\
@@ -2508,7 +2532,9 @@ test "generateZigMetadata emits deterministic parser table metadata" {
     try std.testing.expect(std.mem.indexOf(u8, first, "const nullable_symbols = [_]bool") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const state_count = ") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "const actions = [_]Action") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first, "const conflicts = [_]Conflict") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "const conflicts = [_]Conflict") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "const state_items = [_]Item") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "const states = [_]State") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const actions") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const conflicts") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const expected_conflict_count: ?usize = 0;") != null);
@@ -2537,16 +2563,18 @@ test "generateZigMetadata emits deterministic parser table metadata" {
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const cockroach_reference") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, ".sql_y = \"https://example.test/cockroach/sql.y\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parse(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseWithFallback(") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseWithStackBuffer(token_ids: []const u16, stack_buffer: []u16) !void") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseWithFallbackStackBuffer(") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const Reduction = struct") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const Shift = struct") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const Accept = struct") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseWithReductions(token_ids: []const u16, stack_buffer: []u16, reducer: anytype) !void") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseWithEvents(token_ids: []const u16, stack_buffer: []u16, event_handler: anytype) !void") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "return parseWithEvents(token_ids, stack_buffer, Adapter{ .inner = reducer });") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first, "fn parseCore(token_ids: []const u16, stack: anytype, event_handler: anytype)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "fn parseCore(token_ids: []const u16, fallback_token_ids: ?[]const u16, stack: anytype, event_handler: anytype)") != null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, "while (true)"));
-    try std.testing.expect(std.mem.indexOf(u8, first, "try event_handler.shift(.{ .token_index = index, .terminal = lookahead });") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "try event_handler.shift(.{ .token_index = index, .terminal = effective_lookahead });") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "try event_handler.reduce(.{") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "try maybeAccept(event_handler, .{ .token_count = index });") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "fn maybeAccept(event_handler: anytype, accept: Accept) !void") != null);
@@ -2555,6 +2583,8 @@ test "generateZigMetadata emits deterministic parser table metadata" {
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const ParseDiagnostic = struct") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseDiagnostic(") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseDiagnosticWithStackBuffer(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseDiagnosticWithFallback(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseDiagnosticWithFallbackStackBuffer(") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub const ParseErrorInfo") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseError(") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseErrorWithStackBuffer(") == null);

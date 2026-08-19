@@ -37,19 +37,7 @@ const keyword_terminal_ids = blk: {
     break :blk result;
 };
 
-const identifier_name_terminals = blk: {
-    @setEvalBranchQuota(500_000);
-    var result: [generated.token_count + 1]bool = @splat(false);
-    for (1..generated.production_count) |production_index| {
-        const production = generated.productionInfo(@intCast(production_index)) orelse continue;
-        if (production.rule != .identifier_name or production.rhs_len != 1) continue;
-        const rhs = generated.productionRhs(@intCast(production_index)) orelse continue;
-        if (rhs[0] < result.len) result[rhs[0]] = true;
-    }
-    break :blk result;
-};
-
-pub const Diagnostic = struct {
+pub const ParseDiagnostic = struct {
     token_index: usize,
     source_start: usize,
     source_end: usize,
@@ -62,14 +50,42 @@ pub const Diagnostic = struct {
     }
 };
 
+pub const Diagnostic = union(enum) {
+    lexical: lexer.LexDiagnostic,
+    syntax: ParseDiagnostic,
+
+    pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+        switch (self) {
+            .lexical => {},
+            .syntax => |diagnostic| diagnostic.deinit(allocator),
+        }
+    }
+
+    pub fn sourceSpan(self: @This()) token_mod.SourceSpan {
+        return switch (self) {
+            .lexical => |diagnostic| diagnostic.sourceSpan(),
+            .syntax => |diagnostic| .{ .start = diagnostic.source_start, .end = diagnostic.source_end },
+        };
+    }
+
+    pub fn message(self: @This()) []const u8 {
+        return switch (self) {
+            .lexical => |diagnostic| diagnostic.message(),
+            .syntax => "unexpected SQL token",
+        };
+    }
+};
+
 const DiagnosticTokenIds = struct {
     token_ids: []u16,
+    fallback_token_ids: []u16,
     source_indexes: []usize,
 
     fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
         allocator.free(self.token_ids);
+        allocator.free(self.fallback_token_ids);
         allocator.free(self.source_indexes);
-        self.* = .{ .token_ids = &.{}, .source_indexes = &.{} };
+        self.* = .{ .token_ids = &.{}, .fallback_token_ids = &.{}, .source_indexes = &.{} };
     }
 
     fn sourceTokenIndex(self: @This(), generated_token_index: usize) usize {
@@ -81,6 +97,17 @@ const DiagnosticTokenIds = struct {
         const end_token = self.sourceTokenIndex(self.source_indexes.len);
         if (end_token == 0 or tokens.len == 0) return 0;
         return tokens[@min(end_token - 1, tokens.len - 1)].source_end;
+    }
+};
+
+const OwnedTokenIds = struct {
+    token_ids: []u16,
+    fallback_token_ids: []u16,
+
+    fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.token_ids);
+        allocator.free(self.fallback_token_ids);
+        self.* = .{ .token_ids = &.{}, .fallback_token_ids = &.{} };
     }
 };
 
@@ -130,34 +157,42 @@ pub fn parseSqlAlloc(allocator: std.mem.Allocator, sql: []const u8) !void {
 
 pub fn parseTokensAlloc(allocator: std.mem.Allocator, tokens: []const token_mod.Token) !void {
     var token_id_buffer: [generated_token_id_stack_capacity]u16 = undefined;
-    if (tokenIdsIntoBuffer(tokens, &token_id_buffer)) |token_ids| {
-        return parseGeneratedTokenIds(allocator, token_ids);
+    var fallback_id_buffer: [generated_token_id_stack_capacity]u16 = undefined;
+    if (tokenIdsIntoBuffers(tokens, &token_id_buffer, &fallback_id_buffer)) |token_ids| {
+        return parseGeneratedTokenIds(allocator, token_ids.token_ids, token_ids.fallback_token_ids);
     } else |err| switch (err) {
         error.NoSpaceLeft => {
-            const token_ids = try tokenIdsAlloc(allocator, tokens);
-            defer allocator.free(token_ids);
-            return parseGeneratedTokenIds(allocator, token_ids);
+            var token_ids = try tokenIdsWithFallbackAlloc(allocator, tokens);
+            defer token_ids.deinit(allocator);
+            return parseGeneratedTokenIds(allocator, token_ids.token_ids, token_ids.fallback_token_ids);
         },
         else => return err,
     }
 }
 
 pub fn diagnosticSqlAlloc(allocator: std.mem.Allocator, sql: []const u8) !?Diagnostic {
-    var tokens = try lexer.tokenizeAlloc(allocator, sql);
+    var tokens = switch (try lexer.tokenizeDiagnosticAlloc(allocator, sql)) {
+        .diagnostic => |diagnostic| return .{ .lexical = diagnostic },
+        .tokens => |tokens| tokens,
+    };
     defer lexer.freeTokens(allocator, &tokens);
     var diagnostic = try diagnosticTokensAlloc(allocator, tokens.items) orelse return null;
     if (diagnostic.token_index >= tokens.items.len) {
         diagnostic.source_start = sql.len;
         diagnostic.source_end = sql.len;
     }
-    return diagnostic;
+    return .{ .syntax = diagnostic };
 }
 
-pub fn diagnosticTokensAlloc(allocator: std.mem.Allocator, tokens: []const token_mod.Token) !?Diagnostic {
+pub fn diagnosticTokensAlloc(allocator: std.mem.Allocator, tokens: []const token_mod.Token) !?ParseDiagnostic {
     var diagnostic_tokens = try diagnosticTokenIdsAlloc(allocator, tokens);
     defer diagnostic_tokens.deinit(allocator);
 
-    const generated_diagnostic = try parseGeneratedTokenIdsDiagnostic(allocator, diagnostic_tokens.token_ids) orelse return null;
+    const generated_diagnostic = try parseGeneratedTokenIdsDiagnostic(
+        allocator,
+        diagnostic_tokens.token_ids,
+        diagnostic_tokens.fallback_token_ids,
+    ) orelse return null;
     errdefer generated_diagnostic.deinit(allocator);
 
     const source_token_index = diagnostic_tokens.sourceTokenIndex(generated_diagnostic.token_index);
@@ -184,29 +219,62 @@ pub fn tokenIdsAlloc(allocator: std.mem.Allocator, tokens: []const token_mod.Tok
     var ids: std.ArrayListUnmanaged(u16) = .empty;
     errdefer ids.deinit(allocator);
     var sink = TokenIdSink{ .list = .{ .items = &ids, .allocator = allocator } };
-    try appendAllTokenIds(&sink, tokens, null);
+    try appendAllTokenIds(&sink, null, tokens, null);
     return ids.toOwnedSlice(allocator);
 }
 
-fn tokenIdsIntoBuffer(tokens: []const token_mod.Token, buffer: []u16) ![]const u16 {
+const TokenIdSlices = struct {
+    token_ids: []const u16,
+    fallback_token_ids: []const u16,
+};
+
+fn tokenIdsIntoBuffers(tokens: []const token_mod.Token, buffer: []u16, fallback_buffer: []u16) !TokenIdSlices {
     var sink = TokenIdSink{ .buffer = .{ .items = buffer } };
-    try appendAllTokenIds(&sink, tokens, null);
-    return sink.buffer.items[0..sink.buffer.len];
+    var fallback_sink = TokenIdSink{ .buffer = .{ .items = fallback_buffer } };
+    try appendAllTokenIds(&sink, &fallback_sink, tokens, null);
+    return .{
+        .token_ids = sink.buffer.items[0..sink.buffer.len],
+        .fallback_token_ids = fallback_sink.buffer.items[0..fallback_sink.buffer.len],
+    };
 }
 
-fn diagnosticTokenIdsAlloc(allocator: std.mem.Allocator, tokens: []const token_mod.Token) !DiagnosticTokenIds {
+fn tokenIdsWithFallbackAlloc(allocator: std.mem.Allocator, tokens: []const token_mod.Token) !OwnedTokenIds {
     var ids: std.ArrayListUnmanaged(u16) = .empty;
-    var source_indexes: std.ArrayListUnmanaged(usize) = .empty;
+    var fallback_ids: std.ArrayListUnmanaged(u16) = .empty;
     errdefer ids.deinit(allocator);
-    errdefer source_indexes.deinit(allocator);
+    errdefer fallback_ids.deinit(allocator);
 
     var sink = TokenIdSink{ .list = .{ .items = &ids, .allocator = allocator } };
-    try appendAllTokenIds(&sink, tokens, .{ .items = &source_indexes, .allocator = allocator });
+    var fallback_sink = TokenIdSink{ .list = .{ .items = &fallback_ids, .allocator = allocator } };
+    try appendAllTokenIds(&sink, &fallback_sink, tokens, null);
 
     const token_ids = try ids.toOwnedSlice(allocator);
     errdefer allocator.free(token_ids);
     return .{
         .token_ids = token_ids,
+        .fallback_token_ids = try fallback_ids.toOwnedSlice(allocator),
+    };
+}
+
+fn diagnosticTokenIdsAlloc(allocator: std.mem.Allocator, tokens: []const token_mod.Token) !DiagnosticTokenIds {
+    var ids: std.ArrayListUnmanaged(u16) = .empty;
+    var fallback_ids: std.ArrayListUnmanaged(u16) = .empty;
+    var source_indexes: std.ArrayListUnmanaged(usize) = .empty;
+    errdefer ids.deinit(allocator);
+    errdefer fallback_ids.deinit(allocator);
+    errdefer source_indexes.deinit(allocator);
+
+    var sink = TokenIdSink{ .list = .{ .items = &ids, .allocator = allocator } };
+    var fallback_sink = TokenIdSink{ .list = .{ .items = &fallback_ids, .allocator = allocator } };
+    try appendAllTokenIds(&sink, &fallback_sink, tokens, .{ .items = &source_indexes, .allocator = allocator });
+
+    const token_ids = try ids.toOwnedSlice(allocator);
+    errdefer allocator.free(token_ids);
+    const fallback_token_ids = try fallback_ids.toOwnedSlice(allocator);
+    errdefer allocator.free(fallback_token_ids);
+    return .{
+        .token_ids = token_ids,
+        .fallback_token_ids = fallback_token_ids,
         .source_indexes = try source_indexes.toOwnedSlice(allocator),
     };
 }
@@ -216,42 +284,64 @@ const SourceIndexSink = struct {
     allocator: std.mem.Allocator,
 };
 
-fn appendAllTokenIds(ids: *TokenIdSink, tokens: []const token_mod.Token, source_indexes: ?SourceIndexSink) !void {
+fn appendAllTokenIds(
+    ids: *TokenIdSink,
+    fallback_ids: ?*TokenIdSink,
+    tokens: []const token_mod.Token,
+    source_indexes: ?SourceIndexSink,
+) !void {
     for (tokens, 0..) |token, index| {
         if (token.kind == .semicolon and trailingSemicolonOnly(tokens, index)) break;
         const previous = if (index > 0) tokens[index - 1] else null;
         const next = if (index + 1 < tokens.len) tokens[index + 1] else null;
         const before = ids.len();
         try appendTokenIds(ids, tokens, index, token, previous, next);
+        const added = ids.len() - before;
+        if (fallback_ids) |fallback_sink| {
+            const fallback_id = fallbackTokenId(token);
+            for (0..added) |_| try fallback_sink.append(fallback_id);
+        }
         if (source_indexes) |source_sink| {
-            const added = ids.len() - before;
             try source_sink.items.ensureUnusedCapacity(source_sink.allocator, added);
             for (0..added) |_| source_sink.items.appendAssumeCapacity(index);
         }
     }
 }
 
-fn parseGeneratedTokenIds(allocator: std.mem.Allocator, token_ids: []const u16) !void {
+fn parseGeneratedTokenIds(allocator: std.mem.Allocator, token_ids: []const u16, fallback_token_ids: []const u16) !void {
     if (token_ids.len + 1 <= generated_parse_stack_capacity) {
         var stack_buffer: [generated_parse_stack_capacity]u16 = undefined;
-        generated.parseWithStackBuffer(token_ids, &stack_buffer) catch |err| switch (err) {
-            error.StackOverflow => return generated.parse(allocator, token_ids),
+        generated.parseWithFallbackStackBuffer(token_ids, fallback_token_ids, &stack_buffer) catch |err| switch (err) {
+            error.StackOverflow => return generated.parseWithFallback(allocator, token_ids, fallback_token_ids),
             else => return err,
         };
         return;
     }
-    return generated.parse(allocator, token_ids);
+    return generated.parseWithFallback(allocator, token_ids, fallback_token_ids);
 }
 
-fn parseGeneratedTokenIdsDiagnostic(allocator: std.mem.Allocator, token_ids: []const u16) !?generated.ParseDiagnostic {
+fn parseGeneratedTokenIdsDiagnostic(
+    allocator: std.mem.Allocator,
+    token_ids: []const u16,
+    fallback_token_ids: []const u16,
+) !?generated.ParseDiagnostic {
     if (token_ids.len + 1 <= generated_parse_stack_capacity) {
         var stack_buffer: [generated_parse_stack_capacity]u16 = undefined;
-        return generated.parseDiagnosticWithStackBuffer(allocator, token_ids, &stack_buffer) catch |err| switch (err) {
-            error.StackOverflow => generated.parseDiagnostic(allocator, token_ids),
+        return generated.parseDiagnosticWithFallbackStackBuffer(allocator, token_ids, fallback_token_ids, &stack_buffer) catch |err| switch (err) {
+            error.StackOverflow => generated.parseDiagnosticWithFallback(allocator, token_ids, fallback_token_ids),
             else => return err,
         };
     }
-    return generated.parseDiagnostic(allocator, token_ids);
+    return generated.parseDiagnosticWithFallback(allocator, token_ids, fallback_token_ids);
+}
+
+fn fallbackTokenId(token: token_mod.Token) u16 {
+    if (token.kind != .identifier) return 0;
+    const keyword = token.keyword orelse return 0;
+    return switch (token_mod.keywordClass(keyword)) {
+        .unreserved, .column_name => generated.tokenId(.IDENT),
+        .type_function_name, .reserved => 0,
+    };
 }
 
 fn appendTokenIds(
@@ -651,19 +741,15 @@ fn generatedParserTreatsKeywordAsIdentifier(
     previous: ?token_mod.Token,
     next: ?token_mod.Token,
 ) bool {
-    // PostgreSQL permits every keyword as an attribute name after DOT, but a
-    // qualified name's first component must still be an identifier-class
-    // keyword. Use the generated identifier_name productions as the source of
-    // truth so reserved forms such as `select.foo` remain syntax errors.
+    // PostgreSQL permits every keyword as an attribute name after DOT. A
+    // qualified name's first component follows ColId rules: IDENT,
+    // unreserved_keyword, or col_name_keyword. The categories come from the
+    // pinned grammar productions rather than an ad hoc exception list.
     if (previous != null and previous.?.kind == .dot) return true;
     if (next != null and next.?.kind == .dot) {
-        // PUBLIC is a PostgreSQL unreserved keyword, but adding its terminal to
-        // this conflict-heavy grammar currently creates new conflicts. Treat
-        // it as IDENT only in the qualified-name head position until the
-        // grammar's keyword categories are modeled directly.
-        if (token.matchesKeywordTag(.public)) return true;
-        const terminal = keywordSymbolId(token) orelse return false;
-        return terminal < identifier_name_terminals.len and identifier_name_terminals[terminal];
+        const keyword = token.keyword orelse return false;
+        const class = token_mod.keywordClass(keyword);
+        return class == .unreserved or class == .column_name;
     }
     if (token.matchesKeywordTag(.conflict)) return previous != null and previous.?.matchesKeywordTag(.as);
     if (token.matchesKeywordTag(.offset)) return next != null and next.?.matchesKeywordTag(.limit);
@@ -791,7 +877,10 @@ test "generated parser bridge parses SQL bytes across statement families" {
             std.debug.print("generated parser bridge rejected corpus SQL: {s}\n", .{sql});
             if (try diagnosticSqlAlloc(std.testing.allocator, sql)) |diagnostic| {
                 defer diagnostic.deinit(std.testing.allocator);
-                std.debug.print("actual={s} token={d} expected={any}\n", .{ diagnostic.actual, diagnostic.token_index, diagnostic.expected });
+                switch (diagnostic) {
+                    .lexical => |lexical| std.debug.print("lexical={s} span={d}..{d}\n", .{ lexical.message(), lexical.source_start, lexical.source_end }),
+                    .syntax => |syntax| std.debug.print("actual={s} token={d} expected={any}\n", .{ syntax.actual, syntax.token_index, syntax.expected }),
+                }
             }
             return err;
         };
@@ -810,6 +899,12 @@ test "generated parser bridge maps contextual synthetic terminals" {
     const history_ids = try tokenIdsAlloc(std.testing.allocator, history_tokens.items);
     defer std.testing.allocator.free(history_ids);
     try std.testing.expect(std.mem.indexOfScalar(u16, history_ids, generated.tokenId(.SYSTEM_TIME_FOR)) != null);
+
+    var identifier_tokens = try lexer.tokenizeAlloc(std.testing.allocator, "SELECT analyze_verbose, system_time_for FROM docs");
+    defer lexer.freeTokens(std.testing.allocator, &identifier_tokens);
+    try std.testing.expectEqual(@as(?token_mod.TokenKeyword, null), identifier_tokens.items[1].keyword);
+    try std.testing.expectEqual(@as(?token_mod.TokenKeyword, null), identifier_tokens.items[3].keyword);
+    try parseTokensAlloc(std.testing.allocator, identifier_tokens.items);
 }
 
 test "generated parser bridge preserves qualified keyword categories" {
@@ -827,25 +922,55 @@ test "generated parser bridge preserves qualified keyword categories" {
     const unreserved_head_ids = try tokenIdsAlloc(std.testing.allocator, unreserved_head_tokens.items);
     defer std.testing.allocator.free(unreserved_head_ids);
     try std.testing.expectEqual(generated.tokenId(.IDENT), unreserved_head_ids[1]);
+
+    const identifier_compatibility = [_][]const u8{
+        "SELECT schema.docs FROM docs",
+        "SELECT role.docs FROM docs",
+        "SELECT set.docs FROM docs",
+        "SELECT server.docs FROM docs",
+        "SELECT session.docs FROM docs",
+        "SELECT 1 AS schema FROM docs",
+        "SELECT * FROM schema",
+    };
+    for (identifier_compatibility) |sql| try parseSqlAlloc(std.testing.allocator, sql);
 }
 
 test "generated parser bridge reports owned source-aware diagnostics" {
     const sql = "SELECT FROM docs";
     const diagnostic = (try diagnosticSqlAlloc(std.testing.allocator, sql)).?;
     defer diagnostic.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), diagnostic.token_index);
-    try std.testing.expectEqual(@as(usize, 7), diagnostic.source_start);
-    try std.testing.expectEqual(@as(usize, 11), diagnostic.source_end);
-    try std.testing.expectEqualStrings("FROM", diagnostic.actual);
-    try std.testing.expect(diagnostic.expected.len > 0);
+    const syntax = switch (diagnostic) {
+        .syntax => |syntax| syntax,
+        .lexical => return error.ExpectedSyntaxDiagnostic,
+    };
+    try std.testing.expectEqual(@as(usize, 1), syntax.token_index);
+    try std.testing.expectEqual(@as(usize, 7), syntax.source_start);
+    try std.testing.expectEqual(@as(usize, 11), syntax.source_end);
+    try std.testing.expectEqualStrings("FROM", syntax.actual);
+    try std.testing.expect(syntax.expected.len > 0);
 
     const trailing_space_sql = "SELECT ";
     const eof_diagnostic = (try diagnosticSqlAlloc(std.testing.allocator, trailing_space_sql)).?;
     defer eof_diagnostic.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), eof_diagnostic.token_index);
-    try std.testing.expectEqual(trailing_space_sql.len, eof_diagnostic.source_start);
-    try std.testing.expectEqual(trailing_space_sql.len, eof_diagnostic.source_end);
-    try std.testing.expectEqualStrings("$end", eof_diagnostic.actual);
+    const eof_syntax = switch (eof_diagnostic) {
+        .syntax => |eof_syntax| eof_syntax,
+        .lexical => return error.ExpectedSyntaxDiagnostic,
+    };
+    try std.testing.expectEqual(@as(usize, 1), eof_syntax.token_index);
+    try std.testing.expectEqual(trailing_space_sql.len, eof_syntax.source_start);
+    try std.testing.expectEqual(trailing_space_sql.len, eof_syntax.source_end);
+    try std.testing.expectEqualStrings("$end", eof_syntax.actual);
+
+    const lexical_diagnostic = (try diagnosticSqlAlloc(std.testing.allocator, "SELECT 'unterminated")).?;
+    defer lexical_diagnostic.deinit(std.testing.allocator);
+    const lexical = switch (lexical_diagnostic) {
+        .lexical => |lexical| lexical,
+        .syntax => return error.ExpectedLexicalDiagnostic,
+    };
+    try std.testing.expectEqual(lexer.LexErrorKind.unterminated_string_literal, lexical.kind);
+    try std.testing.expectEqual(@as(usize, 7), lexical.source_start);
+    try std.testing.expectEqual(@as(usize, 20), lexical.source_end);
+    try std.testing.expectEqualStrings("unterminated string literal", lexical.message());
 }
 
 test "generated parser bridge diagnoses every truncated corpus prefix" {
@@ -883,6 +1008,22 @@ test "generated parser bridge falls back for large and deeply nested statements"
 
     try parseSqlAlloc(std.testing.allocator, sql.items);
     try std.testing.expectEqual(@as(?Diagnostic, null), try diagnosticSqlAlloc(std.testing.allocator, sql.items));
+
+    const Runner = struct {
+        fn run(allocator: std.mem.Allocator, source: []const u8) !void {
+            try parseSqlAlloc(allocator, source);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{sql.items});
+}
+
+test "generated parser bridge is allocation-failure safe" {
+    const Runner = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            try parseSqlAlloc(allocator, "SELECT schema.docs, analyze_verbose FROM schema WHERE role = 'reader'");
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 fn appendFuzzSqlPart(buffer: []u8, len: *usize, part: []const u8) void {
@@ -936,16 +1077,26 @@ fn mutatedFuzzSql(random: std.Random, seed: []const u8, buffer: []u8) []const u8
 
 fn exerciseFuzzSql(sql: []const u8) !void {
     parseSqlAlloc(std.testing.allocator, sql) catch |err| switch (err) {
-        error.UnsupportedSqlShape => return,
-        error.UnexpectedToken => {
-            const diagnostic = (diagnosticSqlAlloc(std.testing.allocator, sql) catch |diagnostic_err| switch (diagnostic_err) {
-                error.UnsupportedSqlShape => return,
-                else => return diagnostic_err,
-            }) orelse return error.ExpectedDiagnostic;
+        error.UnsupportedSqlShape => {
+            const diagnostic = (try diagnosticSqlAlloc(std.testing.allocator, sql)) orelse return error.ExpectedDiagnostic;
             defer diagnostic.deinit(std.testing.allocator);
-            try std.testing.expect(diagnostic.source_end >= diagnostic.source_start);
-            try std.testing.expect(diagnostic.source_end <= sql.len);
-            try std.testing.expect(diagnostic.expected.len > 0);
+            const lexical = switch (diagnostic) {
+                .lexical => |lexical| lexical,
+                .syntax => return error.ExpectedLexicalDiagnostic,
+            };
+            try std.testing.expect(lexical.source_end >= lexical.source_start);
+            try std.testing.expect(lexical.source_end <= sql.len);
+        },
+        error.UnexpectedToken => {
+            const diagnostic = (try diagnosticSqlAlloc(std.testing.allocator, sql)) orelse return error.ExpectedDiagnostic;
+            defer diagnostic.deinit(std.testing.allocator);
+            const span = diagnostic.sourceSpan();
+            try std.testing.expect(span.end >= span.start);
+            try std.testing.expect(span.end <= sql.len);
+            switch (diagnostic) {
+                .lexical => return error.ExpectedSyntaxDiagnostic,
+                .syntax => |syntax| try std.testing.expect(syntax.expected.len > 0),
+            }
         },
         else => return err,
     };

@@ -19,7 +19,71 @@ const token_mod = @import("token.zig");
 pub const Token = token_mod.Token;
 pub const TokenKind = token_mod.TokenKind;
 
+pub const LexErrorKind = enum {
+    unterminated_block_comment,
+    unterminated_quoted_identifier,
+    empty_quoted_identifier,
+    unterminated_string_literal,
+    unterminated_dollar_quote,
+    malformed_numeric_literal,
+    invalid_placeholder,
+    invalid_operator,
+    invalid_character,
+
+    pub fn message(self: @This()) []const u8 {
+        return switch (self) {
+            .unterminated_block_comment => "unterminated block comment",
+            .unterminated_quoted_identifier => "unterminated quoted identifier",
+            .empty_quoted_identifier => "quoted identifiers must not be empty",
+            .unterminated_string_literal => "unterminated string literal",
+            .unterminated_dollar_quote => "unterminated dollar-quoted string",
+            .malformed_numeric_literal => "malformed numeric literal",
+            .invalid_placeholder => "invalid positional placeholder",
+            .invalid_operator => "invalid or incomplete SQL operator",
+            .invalid_character => "invalid character in SQL input",
+        };
+    }
+};
+
+pub const LexDiagnostic = struct {
+    kind: LexErrorKind,
+    source_start: usize,
+    source_end: usize,
+
+    pub fn sourceSpan(self: @This()) token_mod.SourceSpan {
+        return .{ .start = self.source_start, .end = self.source_end };
+    }
+
+    pub fn message(self: @This()) []const u8 {
+        return self.kind.message();
+    }
+};
+
+pub const TokenizeResult = union(enum) {
+    tokens: std.ArrayListUnmanaged(Token),
+    diagnostic: LexDiagnostic,
+};
+
 pub fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUnmanaged(Token) {
+    return switch (try tokenizeDiagnosticAlloc(alloc, sql)) {
+        .tokens => |tokens| tokens,
+        .diagnostic => error.UnsupportedSqlShape,
+    };
+}
+
+/// Tokenizes SQL while returning user-actionable lexical failures as bounded,
+/// allocation-free diagnostics. A caller that receives `.tokens` owns them
+/// and must call `freeTokens`.
+pub fn tokenizeDiagnosticAlloc(alloc: std.mem.Allocator, sql: []const u8) !TokenizeResult {
+    var diagnostic: LexDiagnostic = undefined;
+    const tokens = tokenizeImpl(alloc, sql, &diagnostic) catch |err| switch (err) {
+        error.UnsupportedSqlShape => return .{ .diagnostic = diagnostic },
+        else => return err,
+    };
+    return .{ .tokens = tokens };
+}
+
+fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagnostic) !std.ArrayListUnmanaged(Token) {
     var tokens = std.ArrayListUnmanaged(Token).empty;
     errdefer freeTokens(alloc, &tokens);
     const estimated_capacity = estimateTokenCapacity(sql);
@@ -38,10 +102,11 @@ pub fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUn
             continue;
         }
         if (ch == '/' and i + 1 < sql.len and sql[i + 1] == '*') {
+            const comment_start = i;
             i += 2;
             var depth: usize = 1;
             while (depth != 0) {
-                if (i + 1 >= sql.len) return error.UnsupportedSqlShape;
+                if (i + 1 >= sql.len) return lexError(diagnostic, .unterminated_block_comment, comment_start, sql.len);
                 if (sql[i] == '/' and sql[i + 1] == '*') {
                     depth += 1;
                     i += 2;
@@ -85,8 +150,8 @@ pub fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUn
                 try out.append(alloc, sql[i]);
                 i += 1;
             }
-            if (i >= sql.len) return error.UnsupportedSqlShape;
-            if (out.items.len == 0) return error.UnsupportedSqlShape;
+            if (i >= sql.len) return lexError(diagnostic, .unterminated_quoted_identifier, source_start, sql.len);
+            if (out.items.len == 0) return lexError(diagnostic, .empty_quoted_identifier, source_start, i + 1);
             const owned = try out.toOwnedSlice(alloc);
             var owned_transferred = false;
             errdefer if (!owned_transferred) alloc.free(owned);
@@ -119,7 +184,7 @@ pub fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUn
                 try out.append(alloc, sql[i]);
                 i += 1;
             }
-            if (i >= sql.len) return error.UnsupportedSqlShape;
+            if (i >= sql.len) return lexError(diagnostic, .unterminated_string_literal, source_start, sql.len);
             const owned = try out.toOwnedSlice(alloc);
             var owned_transferred = false;
             errdefer if (!owned_transferred) alloc.free(owned);
@@ -130,14 +195,14 @@ pub fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUn
         }
         if (std.ascii.isDigit(ch) or (ch == '.' and i + 1 < sql.len and std.ascii.isDigit(sql[i + 1]))) {
             const start = i;
-            i = try scanNumberEnd(sql, start);
+            i = try scanNumberEnd(sql, start, diagnostic);
             const end = i;
             try tokens.append(alloc, .{ .kind = .number, .text = sql[start..end] });
             continue;
         }
         if (ch == '$') {
             if (sqlDollarQuoteAt(sql, i)) |quote| {
-                if (!quote.closed) return error.UnsupportedSqlShape;
+                if (!quote.closed) return lexError(diagnostic, .unterminated_dollar_quote, i, sql.len);
                 try tokens.append(alloc, .{
                     .kind = .string,
                     .text = sql[quote.body_start..quote.body_end],
@@ -150,8 +215,10 @@ pub fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUn
             const start = i;
             i += 1;
             while (i < sql.len and std.ascii.isDigit(sql[i])) i += 1;
-            if (i == start + 1) return error.UnsupportedSqlShape;
-            if (i < sql.len and (std.ascii.isAlphanumeric(sql[i]) or sql[i] == '_')) return error.UnsupportedSqlShape;
+            if (i == start + 1) return lexError(diagnostic, .invalid_placeholder, start, @min(start + 1, sql.len));
+            if (i < sql.len and (std.ascii.isAlphanumeric(sql[i]) or sql[i] == '_')) {
+                return lexError(diagnostic, .invalid_placeholder, start, i + 1);
+            }
             try tokens.append(alloc, .{ .kind = .placeholder, .text = sql[start..i] });
             continue;
         }
@@ -206,17 +273,17 @@ pub fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUn
                 i += 1;
             },
             '@' => {
-                if (i + 1 >= sql.len or sql[i + 1] != '>') return error.UnsupportedSqlShape;
+                if (i + 1 >= sql.len or sql[i + 1] != '>') return lexError(diagnostic, .invalid_operator, i, @min(i + 2, sql.len));
                 try tokens.append(alloc, .{ .kind = .at_contains, .text = sql[i .. i + 2] });
                 i += 2;
             },
             '&' => {
-                if (i + 1 >= sql.len or sql[i + 1] != '&') return error.UnsupportedSqlShape;
+                if (i + 1 >= sql.len or sql[i + 1] != '&') return lexError(diagnostic, .invalid_operator, i, @min(i + 2, sql.len));
                 try tokens.append(alloc, .{ .kind = .range_overlap, .text = sql[i .. i + 2] });
                 i += 2;
             },
             '|' => {
-                if (i + 1 >= sql.len or sql[i + 1] != '|') return error.UnsupportedSqlShape;
+                if (i + 1 >= sql.len or sql[i + 1] != '|') return lexError(diagnostic, .invalid_operator, i, @min(i + 2, sql.len));
                 try tokens.append(alloc, .{ .kind = .pipe_concat, .text = sql[i .. i + 2] });
                 i += 2;
             },
@@ -249,7 +316,7 @@ pub fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUn
                     try tokens.append(alloc, .{ .kind = .path_arrow_json, .text = sql[i .. i + 2] });
                     i += 2;
                 } else {
-                    return error.UnsupportedSqlShape;
+                    return lexError(diagnostic, .invalid_operator, i, @min(i + 3, sql.len));
                 }
             },
             ';' => {
@@ -272,7 +339,7 @@ pub fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUn
                         try tokens.append(alloc, .{ .kind = .regex_not_match, .text = sql[i .. i + 2] });
                         i += 2;
                     }
-                } else return error.UnsupportedSqlShape;
+                } else return lexError(diagnostic, .invalid_operator, i, @min(i + 2, sql.len));
             },
             '<' => {
                 if (i + 1 < sql.len and sql[i + 1] == '=') {
@@ -307,7 +374,7 @@ pub fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUn
                     i += 1;
                 }
             },
-            else => return error.UnsupportedSqlShape,
+            else => return lexError(diagnostic, .invalid_character, i, i + 1),
         }
     }
     try finalizeTokenSourceSpans(sql, tokens.items);
@@ -319,7 +386,7 @@ fn estimateTokenCapacity(sql: []const u8) usize {
     return @min(sql.len, sql.len / 4 + 8);
 }
 
-fn scanNumberEnd(sql: []const u8, start: usize) !usize {
+fn scanNumberEnd(sql: []const u8, start: usize, diagnostic: *LexDiagnostic) !usize {
     var i = start;
     var has_decimal_point = false;
 
@@ -332,7 +399,7 @@ fn scanNumberEnd(sql: []const u8, start: usize) !usize {
         std.debug.assert(std.ascii.isDigit(sql[i]));
         while (i < sql.len and std.ascii.isDigit(sql[i])) i += 1;
         if (i < sql.len and sql[i] == '.') {
-            if (i + 1 < sql.len and sql[i + 1] == '.') return error.UnsupportedSqlShape;
+            if (i + 1 < sql.len and sql[i + 1] == '.') return lexError(diagnostic, .malformed_numeric_literal, start, i + 2);
             has_decimal_point = true;
             i += 1;
             while (i < sql.len and std.ascii.isDigit(sql[i])) i += 1;
@@ -342,19 +409,35 @@ fn scanNumberEnd(sql: []const u8, start: usize) !usize {
     if (i < sql.len and (sql[i] == 'e' or sql[i] == 'E')) {
         i += 1;
         if (i < sql.len and (sql[i] == '+' or sql[i] == '-')) i += 1;
-        if (i >= sql.len or !std.ascii.isDigit(sql[i])) return error.UnsupportedSqlShape;
+        if (i >= sql.len or !std.ascii.isDigit(sql[i])) {
+            return lexError(diagnostic, .malformed_numeric_literal, start, @min(i + 1, sql.len));
+        }
         while (i < sql.len and std.ascii.isDigit(sql[i])) i += 1;
     }
 
     // Never split a malformed decimal into two NUMBER tokens: doing so can
     // make invalid input appear valid once optional aliases are considered.
     if (has_decimal_point and i + 1 < sql.len and sql[i] == '.' and std.ascii.isDigit(sql[i + 1])) {
-        return error.UnsupportedSqlShape;
+        return lexError(diagnostic, .malformed_numeric_literal, start, i + 2);
     }
     if (i < sql.len and (std.ascii.isAlphabetic(sql[i]) or sql[i] == '_' or sql[i] == '$')) {
-        return error.UnsupportedSqlShape;
+        return lexError(diagnostic, .malformed_numeric_literal, start, i + 1);
     }
     return i;
+}
+
+fn lexError(
+    diagnostic: *LexDiagnostic,
+    kind: LexErrorKind,
+    source_start: usize,
+    source_end: usize,
+) error{UnsupportedSqlShape} {
+    diagnostic.* = .{
+        .kind = kind,
+        .source_start = source_start,
+        .source_end = source_end,
+    };
+    return error.UnsupportedSqlShape;
 }
 
 pub fn freeTokens(alloc: std.mem.Allocator, tokens: *std.ArrayListUnmanaged(Token)) void {
@@ -370,7 +453,7 @@ fn finalizeTokenSourceSpans(sql: []const u8, tokens: []Token) !void {
     for (tokens) |*token| {
         if (token.source_end > token.source_start or token.text.len == 0) continue;
         const token_start = @intFromPtr(token.text.ptr);
-        if (token_start < sql_start or token_start + token.text.len > sql_end) return error.UnsupportedSqlShape;
+        if (token_start < sql_start or token_start + token.text.len > sql_end) return error.InvalidTokenSourceSpan;
         token.source_start = token_start - sql_start;
         token.source_end = token.source_start + token.text.len;
     }
@@ -420,6 +503,57 @@ fn sqlDollarQuoteTagStart(ch: u8) bool {
 
 fn sqlDollarQuoteTagContinue(ch: u8) bool {
     return std.ascii.isAlphanumeric(ch) or ch == '_';
+}
+
+fn expectLexDiagnostic(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    expected_kind: LexErrorKind,
+    expected_start: usize,
+    expected_end: usize,
+) !void {
+    switch (try tokenizeDiagnosticAlloc(alloc, sql)) {
+        .diagnostic => |diagnostic| {
+            try std.testing.expectEqual(expected_kind, diagnostic.kind);
+            try std.testing.expectEqual(expected_start, diagnostic.source_start);
+            try std.testing.expectEqual(expected_end, diagnostic.source_end);
+            try std.testing.expect(diagnostic.message().len != 0);
+        },
+        .tokens => |tokens_value| {
+            var tokens = tokens_value;
+            freeTokens(alloc, &tokens);
+            return error.ExpectedLexDiagnostic;
+        },
+    }
+}
+
+test "sql adapter lexer returns structured source-aware diagnostics" {
+    const alloc = std.testing.allocator;
+    try expectLexDiagnostic(alloc, "SELECT /* unterminated", .unterminated_block_comment, 7, 22);
+    try expectLexDiagnostic(alloc, "SELECT \"unterminated", .unterminated_quoted_identifier, 7, 20);
+    try expectLexDiagnostic(alloc, "SELECT \"\"", .empty_quoted_identifier, 7, 9);
+    try expectLexDiagnostic(alloc, "SELECT 'unterminated", .unterminated_string_literal, 7, 20);
+    try expectLexDiagnostic(alloc, "SELECT $tag$unterminated", .unterminated_dollar_quote, 7, 24);
+    try expectLexDiagnostic(alloc, "SELECT 1e+", .malformed_numeric_literal, 7, 10);
+    try expectLexDiagnostic(alloc, "SELECT $name", .invalid_placeholder, 7, 8);
+    try expectLexDiagnostic(alloc, "SELECT @", .invalid_operator, 7, 8);
+    try expectLexDiagnostic(alloc, "SELECT \\", .invalid_character, 7, 8);
+}
+
+test "sql adapter lexer is allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            switch (try tokenizeDiagnosticAlloc(alloc, "SELECT \"a\"\"b\", 'it''s safe' FROM schema.docs")) {
+                .diagnostic => return error.UnexpectedLexDiagnostic,
+                .tokens => |tokens_value| {
+                    var tokens = tokens_value;
+                    defer freeTokens(alloc, &tokens);
+                    try std.testing.expect(tokens.items.len != 0);
+                },
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "sql adapter lexer records source spans and dollar quoted literals" {

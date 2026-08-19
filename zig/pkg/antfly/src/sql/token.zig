@@ -412,7 +412,6 @@ pub const TokenKeyword = enum {
     without,
     uuid_generate_v4,
     yes,
-    analyze_verbose,
     binary,
     characteristics,
     committed,
@@ -429,12 +428,144 @@ pub const TokenKeyword = enum {
     scroll,
     serializable,
     session,
-    system_time_for,
     transaction,
     uncommitted,
     work,
     write,
 };
+
+/// PostgreSQL's lexical keyword categories. These are pinned to the PostgreSQL
+/// 19 kwlist.h commit referenced by antfly_sql.y. Antfly-specific extensions
+/// default to unreserved so adding syntax does not unnecessarily take names
+/// away from users.
+pub const KeywordClass = enum {
+    unreserved,
+    column_name,
+    type_function_name,
+    reserved,
+};
+
+// Any TokenKeyword addition must deliberately update the pinned category
+// audit below instead of silently inheriting the unreserved default.
+const audited_keyword_count = 376;
+comptime {
+    if (std.meta.fields(TokenKeyword).len != audited_keyword_count) {
+        @compileError("TokenKeyword changed; audit keywordClass against the pinned PostgreSQL kwlist");
+    }
+}
+
+pub fn keywordClass(keyword: TokenKeyword) KeywordClass {
+    return switch (keyword) {
+        .between,
+        .coalesce,
+        .date,
+        .exists,
+        .extract,
+        .greatest,
+        .interval,
+        .json,
+        .least,
+        .nullif,
+        .overlay,
+        .position,
+        .row,
+        .substring,
+        .timestamp,
+        .timestamptz,
+        .trim,
+        .values,
+        => .column_name,
+
+        .authorization,
+        .binary,
+        .collation,
+        .concurrently,
+        .cross,
+        .freeze,
+        .full,
+        .ilike,
+        .inner,
+        .is,
+        .isnull,
+        .join,
+        .left,
+        .like,
+        .natural,
+        .notnull,
+        .outer,
+        .overlaps,
+        .right,
+        .verbose,
+        => .type_function_name,
+
+        .all,
+        .analyze,
+        .@"and",
+        .any,
+        .array,
+        .as,
+        .asc,
+        .asymmetric,
+        .case,
+        .cast,
+        .check,
+        .collate,
+        .column,
+        .constraint,
+        .create,
+        .current_date,
+        .current_timestamp,
+        .default,
+        .deferrable,
+        .desc,
+        .distinct,
+        .do,
+        .@"else",
+        .end,
+        .except,
+        .false,
+        .fetch,
+        .@"for",
+        .foreign,
+        .from,
+        .grant,
+        .group,
+        .having,
+        .in,
+        .intersect,
+        .into,
+        .lateral,
+        .limit,
+        .not,
+        .null,
+        .offset,
+        .on,
+        .only,
+        .@"or",
+        .order,
+        .placing,
+        .primary,
+        .returning,
+        .select,
+        .some,
+        .symmetric,
+        .table,
+        .then,
+        .to,
+        .true,
+        .@"union",
+        .unique,
+        .user,
+        .using,
+        .when,
+        .where,
+        .window,
+        .with,
+        => .reserved,
+
+        else => .unreserved,
+    };
+}
 
 pub const Token = struct {
     kind: TokenKind,
@@ -486,14 +617,38 @@ pub const SourceSpan = struct {
     end: usize = 0,
 };
 
-pub fn keywordFromIdentifier(identifier: []const u8) ?TokenKeyword {
-    if (identifier.len == 0 or identifier.len > 32) return null;
-    var lower: [32]u8 = undefined;
-    for (identifier, 0..) |ch, i| {
-        if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) return null;
-        lower[i] = std.ascii.toLower(ch);
+const keyword_map = std.StaticStringMapWithEql(
+    TokenKeyword,
+    std.static_string_map.eqlAsciiIgnoreCase,
+).initComptime(blk: {
+    const fields = std.meta.fields(TokenKeyword);
+    var entries: [fields.len]struct { []const u8, TokenKeyword } = undefined;
+    for (fields, 0..) |field, index| {
+        entries[index] = .{ field.name, @enumFromInt(field.value) };
     }
-    return std.meta.stringToEnum(TokenKeyword, lower[0..identifier.len]);
+    break :blk entries;
+});
+
+/// Classifies a source identifier without allocating or scanning every keyword.
+/// StaticStringMap narrows candidates by byte length before doing an
+/// ASCII-case-insensitive comparison.
+pub fn keywordFromIdentifier(identifier: []const u8) ?TokenKeyword {
+    if (identifier.len == 0) return null;
+    for (identifier) |ch| {
+        if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) return null;
+    }
+    return keyword_map.get(identifier);
+}
+
+test "SQL keywords use pinned lexical categories and exclude synthetic terminals" {
+    try std.testing.expectEqual(KeywordClass.unreserved, keywordClass(.schema));
+    try std.testing.expectEqual(KeywordClass.unreserved, keywordClass(.role));
+    try std.testing.expectEqual(KeywordClass.column_name, keywordClass(.timestamp));
+    try std.testing.expectEqual(KeywordClass.type_function_name, keywordClass(.join));
+    try std.testing.expectEqual(KeywordClass.reserved, keywordClass(.select));
+    try std.testing.expectEqual(TokenKeyword.schema, keywordFromIdentifier("ScHeMa").?);
+    try std.testing.expectEqual(@as(?TokenKeyword, null), keywordFromIdentifier("analyze_verbose"));
+    try std.testing.expectEqual(@as(?TokenKeyword, null), keywordFromIdentifier("system_time_for"));
 }
 
 test "SQL grammar keyword terminals are represented by TokenKeyword" {
@@ -502,6 +657,8 @@ test "SQL grammar keyword terminals are represented by TokenKeyword" {
 
     inline for (std.meta.fields(grammar.Token)) |field| {
         if (field.value < first_keyword_value) continue;
+        if (field.value == @intFromEnum(grammar.Token.ANALYZE_VERBOSE) or
+            field.value == @intFromEnum(grammar.Token.SYSTEM_TIME_FOR)) continue;
         if (keywordFromIdentifier(field.name) == null) {
             std.debug.print("grammar keyword terminal {s} is missing from TokenKeyword\n", .{field.name});
             return error.TestUnexpectedResult;

@@ -71,6 +71,12 @@ of these outcomes:
 - an explicit generated unsupported diagnostic with a stable reason
 - a syntax diagnostic from the generated parser
 
+Lexical keyword categories are pinned to the PostgreSQL revision recorded in
+`antfly_sql.y`. Unreserved and column-name keywords may fall back to `IDENT`
+only when the current parser state does not accept their keyword terminal.
+Parser-only synthetic terminals are composed contextually by the SQL facade
+and must never be recognized directly from source text.
+
 Rules for grammar and AST work:
 
 - Preserve source byte spans for every AST node that can produce diagnostics or
@@ -101,9 +107,10 @@ that they are still consistent with the token stream. If retained generated
 metadata is missing, stale, or internally contradictory, generated-owned
 statements must fail closed before legacy token scanners can recover.
 
-Parser diagnostics should be bounded and source-aware. They should report token
-index, byte span, actual token text, and expected terminal names through the SQL
-facade without requiring callers to inspect parse-table internals.
+Parser diagnostics should be bounded and source-aware. The SQL facade unifies
+allocation-free lexer diagnostics (stable reason and byte span) with owned
+syntax diagnostics (token index, byte span, actual token text, and expected
+terminal names) without requiring callers to inspect parse-table internals.
 
 ## Statement Dispatch
 
@@ -175,9 +182,14 @@ Generator choices should be measured.
 - Keep scanning separate from grammar reduction.
 - Use dense token and nonterminal ids.
 - Keep parse tables compact and lookup-friendly.
+- Do not emit parser-construction state items or conflict-detail arrays into
+  runtime source; retain counts and produce details only in generator reports.
 - Allocate AST nodes in an arena owned by `ParsedSql`.
 - Store spans as byte offsets into the original SQL buffer.
-- Classify keywords once during scanning/tokenization and reuse that metadata.
+- Classify keywords once during scanning/tokenization with a length-indexed
+  static lookup and reuse the pinned category metadata.
+- Resolve identifier-compatible keywords through state-aware terminal fallback
+  instead of expanding SLR productions and conflict surfaces.
 - Bound syntax error recovery work.
 - Compile parse tables into the binary; do not load grammar files at runtime.
 - Avoid production double-parsing except for explicit migration/debug paths.
