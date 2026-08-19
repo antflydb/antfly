@@ -762,7 +762,6 @@ pub const Client = struct {
 
         var headers = std.ArrayListUnmanaged(HeaderPair).empty;
         defer headers.deinit(alloc);
-        try headers.append(alloc, .{ "x-amz-checksum-mode", "ENABLED" });
         try appendConditionalHeaders(alloc, &headers, opts.if_match_etag, false);
         if (opts.range) |range| {
             const value = try byteRangeHeaderAlloc(alloc, range);
@@ -775,12 +774,10 @@ pub const Client = struct {
             }
         }
 
-        var response = try self.performWithResponseLimit(
+        var response = try self.performReadWithChecksumFallback(
             .GET,
             target,
             headers.items,
-            null,
-            null,
             opts.max_response_bytes,
         );
         errdefer response.deinit(alloc);
@@ -855,8 +852,7 @@ pub const Client = struct {
         var target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, query);
         defer target.deinit(alloc);
 
-        const headers = [_]HeaderPair{.{ "x-amz-checksum-mode", "ENABLED" }};
-        var response = try self.perform(.HEAD, target, &headers, null, null);
+        var response = try self.performReadWithChecksumFallback(.HEAD, target, &.{}, null);
         defer response.deinit(alloc);
         switch (response.status) {
             200 => {},
@@ -924,6 +920,26 @@ pub const Client = struct {
         content_type: ?[]const u8,
     ) !TransportResponse {
         return try self.performWithResponseLimit(method, target, headers, body, content_type, null);
+    }
+
+    fn performReadWithChecksumFallback(
+        self: *Client,
+        method: HttpMethod,
+        target: RequestTarget,
+        headers: []const HeaderPair,
+        max_response_size: ?usize,
+    ) !TransportResponse {
+        std.debug.assert(method == .GET or method == .HEAD);
+        var checksum_headers = std.ArrayListUnmanaged(HeaderPair).empty;
+        defer checksum_headers.deinit(self.alloc);
+        try checksum_headers.ensureTotalCapacity(self.alloc, headers.len + 1);
+        checksum_headers.appendAssumeCapacity(.{ "x-amz-checksum-mode", "ENABLED" });
+        checksum_headers.appendSliceAssumeCapacity(headers);
+
+        var response = try self.performWithResponseLimit(method, target, checksum_headers.items, null, null, max_response_size);
+        if (response.status != 403) return response;
+        response.deinit(self.alloc);
+        return try self.performWithResponseLimit(method, target, headers, null, null, max_response_size);
     }
 
     fn performWithResponseLimit(
@@ -2304,6 +2320,74 @@ test "s3 client signs and issues object operations through request fn" {
 
     try client.deleteObject("bucket", "docs/a.txt", .{});
     try std.testing.expectEqual(steps.len, fake.index);
+}
+
+test "s3 metadata reads fall back when checksum mode needs additional permission" {
+    const alloc = std.testing.allocator;
+    const State = struct {
+        calls: usize = 0,
+
+        fn request(
+            ptr: ?*anyopaque,
+            request_alloc: Allocator,
+            method: HttpMethod,
+            _: []const u8,
+            headers: []const HeaderPair,
+            _: ?[]const u8,
+            _: ?[]const u8,
+            _: ?usize,
+        ) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            defer self.calls += 1;
+            try std.testing.expectEqual(HttpMethod.HEAD, method);
+            switch (self.calls) {
+                0 => try expectHeaderValue(headers, "x-amz-checksum-mode", "ENABLED"),
+                1 => try expectNoHeader(headers, "x-amz-checksum-mode"),
+                else => return error.UnexpectedCall,
+            }
+            return .{
+                .status = if (self.calls == 0) 403 else 200,
+                .body = try request_alloc.alloc(u8, 0),
+                .content_length = if (self.calls == 0) null else 5,
+            };
+        }
+
+        fn expectHeaderValue(headers: []const HeaderPair, name: []const u8, expected: []const u8) !void {
+            for (headers) |pair| {
+                if (std.ascii.eqlIgnoreCase(pair[0], name)) {
+                    try std.testing.expectEqualStrings(expected, pair[1]);
+                    return;
+                }
+            }
+            return error.MissingHeader;
+        }
+
+        fn expectNoHeader(headers: []const HeaderPair, name: []const u8) !void {
+            for (headers) |pair| {
+                if (std.ascii.eqlIgnoreCase(pair[0], name)) return error.UnexpectedHeader;
+            }
+        }
+    };
+
+    const cfg = Config{
+        .credentials = .{
+            .endpoint = try alloc.dupe(u8, "s3.example.test"),
+            .use_ssl = true,
+            .access_key_id = try alloc.dupe(u8, "access"),
+            .secret_access_key = try alloc.dupe(u8, "secret"),
+            .region = try alloc.dupe(u8, "us-east-1"),
+        },
+        .addressing_style = .path,
+    };
+    var state = State{};
+    var s3_client = Client.initWithRequestFn(alloc, cfg, &state, State.request);
+    var client = s3_client.client();
+    defer client.deinit();
+
+    var meta = try client.statObject("bucket", "kms-object");
+    defer meta.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 5), meta.content_length);
+    try std.testing.expectEqual(@as(usize, 2), state.calls);
 }
 
 test "s3 client refreshes dynamic credentials for every signed request" {
