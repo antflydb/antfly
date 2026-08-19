@@ -8,7 +8,7 @@ The Antfly Operator works on any Kubernetes cluster that meets the basic require
 
 ## Prerequisites
 
-- Kubernetes 1.20+ cluster
+- Kubernetes 1.23+ cluster
 - `kubectl` installed and configured
 - Storage class with dynamic provisioning
 - (Optional) metrics-server for autoscaling
