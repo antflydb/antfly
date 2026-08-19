@@ -768,6 +768,9 @@ pub const WeightStore = struct {
     /// retain a prepared representation while its mmap source would otherwise
     /// accumulate outside cache-residency accounting as tensors are touched.
     discard_file_cache_under_pressure: std.atomic.Value(bool) = .init(false),
+    /// Bound cgroup probing to one caller per interval. Tensor handles are
+    /// released far more frequently than pressure state needs to be sampled.
+    last_file_cache_pressure_probe_ns: std.atomic.Value(u64) = .init(0),
     allow_direct_quant: bool = true,
     gliner_head_dense_cache: std.StringHashMapUnmanaged(DenseDequantCacheEntry) = .{},
     gliner_head_dense_cache_bytes: usize = 0,
@@ -4536,11 +4539,38 @@ fn freeTensor(ctx: *anyopaque, tensor: CT) void {
 fn releaseLazyEntryPinLocked(data: *WeightStore, entry: *LazyWeightEntry) void {
     if (entry.pin_count == 0) return;
     entry.pin_count -= 1;
-    if (entry.pin_count == 0 and
-        data.discard_file_cache_under_pressure.load(.acquire))
-    {
+    if (entry.pin_count == 0 and shouldDiscardFileCacheUnderPressure(data)) {
         discardLazyEntryFileCache(data, entry);
     }
+}
+
+const file_cache_pressure_probe_interval_ns = 100 * std.time.ns_per_ms;
+
+/// Page faults are not allocator calls, so a request can cross the process
+/// envelope during compute without another reservation. Probe at a bounded
+/// cadence on safe last-borrower boundaries and latch pressure mode for the
+/// session once the owner's emergency reserve is reached.
+fn shouldDiscardFileCacheUnderPressure(data: *WeightStore) bool {
+    if (data.discard_file_cache_under_pressure.load(.acquire)) return true;
+    const tier_cache = if (data.tier_cache) |*cache| cache else return false;
+
+    const now_ns = platform.time.monotonicNs();
+    var last_ns = data.last_file_cache_pressure_probe_ns.load(.acquire);
+    while (last_ns == 0 or now_ns -| last_ns >= file_cache_pressure_probe_interval_ns) {
+        last_ns = data.last_file_cache_pressure_probe_ns.cmpxchgWeak(
+            last_ns,
+            now_ns,
+            .acq_rel,
+            .acquire,
+        ) orelse {
+            if (tier_cache.isLiveHostUnderPressure()) {
+                data.discard_file_cache_under_pressure.store(true, .release);
+                return true;
+            }
+            return false;
+        };
+    }
+    return data.discard_file_cache_under_pressure.load(.acquire);
 }
 
 fn acquireWeightReservation(self: *NativeCompute, name: []const u8, bytes: usize) !?run_memory.Reservation {
@@ -5159,6 +5189,14 @@ test "live host cache denial enables mapped-page pressure mode" {
         .{},
     );
     defer store.tier_cache.?.deinitAdmission();
+
+    store.last_file_cache_pressure_probe_ns.store(std.math.maxInt(u64), .release);
+    try std.testing.expect(!shouldDiscardFileCacheUnderPressure(&store));
+    store.last_file_cache_pressure_probe_ns.store(0, .release);
+    try std.testing.expect(shouldDiscardFileCacheUnderPressure(&store));
+    try std.testing.expect(store.discard_file_cache_under_pressure.load(.acquire));
+    store.discard_file_cache_under_pressure.store(false, .release);
+    store.last_file_cache_pressure_probe_ns.store(0, .release);
 
     try std.testing.expectError(
         error.ResourceTemporarilyUnavailable,

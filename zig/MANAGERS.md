@@ -119,12 +119,12 @@ the executor owner and “inference backend runtime descriptor” for the value.
    `ResourceManager` host aggregate on discrete-GPU systems. Unified-memory
    systems charge both components. The inference controller retains the split
    and remains authoritative for device capacity.
-7. A process envelope is charged against raw container usage, not only memory
-   allocated through inference. Page cache, a test harness, storage, and sibling
-   work therefore reduce the capacity available to a new inference allocation.
-   Explicit envelopes use raw leaf-cgroup `memory.current`, matching container
-   eviction accounting; automatically discovered limits use reclaimable working
-   set for capacity sizing.
+7. A process envelope is charged against container working-set usage, not only
+   memory allocated through inference. Active page cache, a test harness,
+   storage, and sibling work therefore reduce the capacity available to a new
+   inference allocation.
+   Linux envelopes use leaf-cgroup working set, matching kubelet pod-eviction
+   accounting while excluding inactive file pages the kernel can reclaim.
 8. Every retained `std.Io` interface has a live owning `BackendRuntime` lane
    lease, and the borrower stops and awaits its tasks before releasing that
    lease.
@@ -211,11 +211,13 @@ test harness, or sibling subsystem consume the process envelope. Native and
 PJRT cache growth therefore treats a live-host denial as a reclaim signal: under
 the lazy-entry residency lock it destroys one cold unpinned entry, releases its
 exact aggregate credit, drops the corresponding clean GGUF file-cache range,
-and retries the pending growth. The session also enters pressure mode: every
-subsequent GGUF tensor drops its clean source range when its last borrower
-releases the handle, bounding mapped-page accumulation that occurs through page
-faults rather than allocator calls. Prepared cache entries remain resident, and
-normal sessions that never encounter live pressure pay no extra I/O.
+and retries the pending growth. Because page faults are not allocator calls,
+last-borrower release boundaries also re-probe the authoritative live signal at
+a bounded cadence. Once the process reserve is reached, the session enters
+pressure mode: every subsequent GGUF tensor drops its clean source range when
+its last borrower releases the handle. Prepared cache entries remain resident,
+and normal sessions that never encounter live pressure pay only the rate-limited
+cgroup probe, with no extra model I/O.
 ModelManager uses the same bounded session capability when request admission is
 denied and no idle model can be removed. Backends own the mechanics and
 pin-safety of reclamation; ModelManager owns victim ordering and retries;
@@ -231,19 +233,17 @@ aggregate managed-host-memory budget from it; every storage slice reservation
 charges that aggregate as well as its local policy slice. Stable model and
 request limits use the same envelope, and immediately before an inference
 allocation the controller checks the requested increment against current leaf
-cgroup usage plus safety headroom. On Linux, an explicit operator envelope is
-charged against raw `memory.current`, including inactive file cache, so the
-configured margin below a Burstable pod request remains real under node-memory
-pressure. When the remaining explicit envelope is the tighter live constraint,
+cgroup working set plus safety headroom. On Linux, when the remaining explicit
+envelope is the tighter live constraint,
 admission keeps a fixed 512 MiB emergency reserve inside that bounded view
 instead of reserving half of the remaining capacity a second time. Automatic
 host/cgroup sizing retains the dynamic pressure reserve. Current node or finite
 cgroup pressure also remains authoritative when it is tighter, so an explicit
-value cannot weaken a physical pressure signal. Automatic sizing uses
-`memory.current - inactive_file`: it excludes file pages that the kernel can
-reclaim, avoiding a permanently smaller stable budget after downloads or
-builds. The raw explicit ceiling deliberately remains stricter because those
-same pages count toward pod eviction before reclamation completes.
+value cannot weaken a physical pressure signal. The working set is
+`memory.current - inactive_file`: it includes anonymous memory, the test
+harness, sibling processes, and active mapped pages while excluding file pages
+that the kernel can reclaim. The kubelet uses the same working-set signal to
+rank memory-pressure evictions.
 
 When an mmap-backed model is evicted, teardown issues `MADV_DONTNEED` before
 unmapping and `POSIX_FADV_DONTNEED` after unmapping the whole weight file. These

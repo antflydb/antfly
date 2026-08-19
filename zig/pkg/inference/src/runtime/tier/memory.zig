@@ -260,7 +260,7 @@ pub const SystemMemoryInfo = struct {
     /// macOS still reports normal memory pressure.
     availability_basis: AvailabilityBasis = .mem_available,
     /// When an operator-owned Linux process envelope is the tighter live
-    /// constraint, it already bounds the complete leaf-cgroup charge.
+    /// constraint, it already bounds the complete leaf-cgroup working set.
     /// Preserve only the emergency reserve inside that bounded view instead
     /// of applying dynamic host headroom a second time.
     live_admission_policy: LiveAdmissionPolicy = .dynamic_pressure,
@@ -836,6 +836,20 @@ pub const AdmissionController = struct {
         std.debug.assert(std.meta.eql(self.admitted, AdmissionAmounts{}));
         self.process_memory_limit_bytes = limit_bytes;
         self.process_memory_limit_provenance = provenance;
+    }
+
+    /// Re-sample the authoritative live-memory signal without acquiring a new
+    /// logical reservation. Long-running mmap-backed inference can grow the
+    /// cgroup working set through page faults after its last allocator-visible
+    /// admission point; backends use this probe to shed clean pages before the
+    /// kubelet's eviction threshold is reached.
+    pub fn isLiveHostUnderPressure(self: *AdmissionController) bool {
+        const info = currentSystemMemoryInfoForLimit(
+            self.process_memory_limit_bytes,
+            self.process_memory_limit_provenance,
+        ) orelse return false;
+        checkLiveHostMemoryWithInfo(info, 1) catch return true;
+        return false;
     }
 
     pub fn configureResourceBudget(
@@ -1563,11 +1577,9 @@ pub fn currentSystemMemoryInfo() ?SystemMemoryInfo {
     };
 }
 
-/// Apply a resolved process/container envelope to the live memory view. On
-/// Linux an explicit operator limit is charged against raw leaf-cgroup usage,
-/// matching the usage that can evict a Burstable pod under node pressure.
-/// Automatically detected host/cgroup limits retain working-set semantics so
-/// reclaimable inactive file pages do not permanently reduce stable capacity.
+/// Apply a resolved process/container envelope to the live memory view. Linux
+/// charges the limit against leaf-cgroup working set, matching the kubelet's
+/// pod-eviction usage signal while excluding reclaimable inactive file pages.
 pub fn currentSystemMemoryInfoForLimit(
     limit_bytes: usize,
     provenance: ProcessMemoryLimitProvenance,
@@ -1578,7 +1590,7 @@ pub fn currentSystemMemoryInfoForLimit(
             break :blk applyOptionalProcessMemoryLimit(
                 sample.info,
                 limit_bytes,
-                processEnvelopeUsageBytes(sample.cgroup, provenance),
+                sample.cgroup.leaf_working_set_bytes,
                 provenance,
             );
         },
@@ -1590,19 +1602,6 @@ pub fn currentSystemMemoryInfoForLimit(
         ),
         else => applyOptionalProcessMemoryLimit(null, limit_bytes, null, provenance),
     };
-}
-
-fn processEnvelopeUsageBytes(
-    cgroup: CgroupMemoryInfo,
-    provenance: ProcessMemoryLimitProvenance,
-) ?usize {
-    // A configured process envelope is an operational ceiling, not a sizing
-    // hint. Charge it the same way the container runtime does so inactive file
-    // cache cannot consume the pod-request margin invisibly. Automatic limits
-    // continue to model reclaimable capacity and therefore use working set.
-    if (provenance == .explicit)
-        return cgroup.leaf_current_bytes orelse cgroup.leaf_working_set_bytes;
-    return cgroup.leaf_working_set_bytes;
 }
 
 fn applyOptionalProcessMemoryLimit(
@@ -1814,7 +1813,8 @@ const CgroupMemoryInfo = struct {
     /// hierarchy tests even when memory.max is unlimited.
     leaf_current_bytes: ?usize = null,
     /// Leaf working set (`current - inactive_file`), retained even when
-    /// memory.max is unlimited for automatic cgroup/host pressure policy.
+    /// memory.max is unlimited so an explicit process envelope can be enforced
+    /// against the same usage signal the kubelet uses to rank pod eviction.
     leaf_working_set_bytes: ?usize = null,
 };
 
@@ -2959,7 +2959,7 @@ test "live memory headroom scales down for constrained containers" {
     );
 }
 
-test "explicit process envelope charges selected leaf cgroup usage" {
+test "explicit process envelope charges leaf cgroup working set" {
     const info = applyProcessMemoryLimit(
         .{
             .total_bytes = gib(64),
@@ -3011,31 +3011,6 @@ test "explicit process envelope charges selected leaf cgroup usage" {
     try std.testing.expectEqual(gib(1), liveHostAdmissionReserve(host_pressure));
 }
 
-test "process envelope usage matches provenance semantics" {
-    const sample = CgroupMemoryInfo{
-        .leaf_current_bytes = gib(15),
-        .leaf_working_set_bytes = gib(12),
-    };
-    try std.testing.expectEqual(
-        @as(?usize, gib(15)),
-        processEnvelopeUsageBytes(sample, .explicit),
-    );
-    try std.testing.expectEqual(
-        @as(?usize, gib(12)),
-        processEnvelopeUsageBytes(sample, .cgroup_v2),
-    );
-    try std.testing.expectEqual(
-        @as(?usize, gib(12)),
-        processEnvelopeUsageBytes(sample, .automatic),
-    );
-
-    const legacy = CgroupMemoryInfo{ .leaf_working_set_bytes = gib(11) };
-    try std.testing.expectEqual(
-        @as(?usize, gib(11)),
-        processEnvelopeUsageBytes(legacy, .explicit),
-    );
-}
-
 test "process envelope provenance preserves automatic cgroup pressure policy" {
     const detected = SystemMemoryInfo{
         .total_bytes = gib(8),
@@ -3071,8 +3046,8 @@ test "process envelope provenance preserves automatic cgroup pressure policy" {
 
 test "explicit Linux envelope does not double reserve bounded availability" {
     // Reproduce the full-E2E runner after earlier models were evicted. The
-    // 13,000 MiB process envelope has 4,253 MiB left after charging the
-    // selected leaf usage. Gemma's measured 3,387 MiB construction peak fits
+    // 13,000 MiB process envelope has 4,253 MiB left after charging the leaf
+    // working set. Gemma's measured 3,387 MiB construction peak fits
     // while retaining the 512 MiB emergency reserve; reserving half of the
     // already-bounded availability incorrectly rejected it.
     const info = applyProcessMemoryLimit(

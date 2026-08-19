@@ -262,6 +262,14 @@ pub const SharedCache = struct {
         self.noteResidentUnchecked(tier, bytes);
     }
 
+    /// Query the serving owner's current physical host-pressure signal. This
+    /// is deliberately independent of cache geometry: mmap page faults can
+    /// increase cgroup working set without changing `host_bytes`.
+    pub fn isLiveHostUnderPressure(self: *const SharedCache) bool {
+        const binding = self.admission orelse return false;
+        return binding.controller.isLiveHostUnderPressure();
+    }
+
     pub fn noteResident(self: *SharedCache, tier: ResidencyTier, bytes: usize) void {
         // Serving sessions use tryReserve so process ownership is established
         // before memory grows. Direct/offline runtimes intentionally retain the
