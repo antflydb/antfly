@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"reflect"
 	"slices"
 	"sort"
 	"strconv"
@@ -1477,7 +1478,10 @@ func (r *AntflyClusterReconciler) validateClusterConfiguration(ctx context.Conte
 		return err
 	}
 
-	return r.validateMetadataReplicaTopology(ctx, cluster)
+	if err := r.validateMetadataReplicaTopology(ctx, cluster); err != nil {
+		return &metadataTopologyValidationError{cause: err}
+	}
+	return nil
 }
 
 // validateMetadataReplicaTopology closes the update-validation gap on clusters
@@ -1634,6 +1638,18 @@ type metadataRuntimeTopologyStatus struct {
 const maxMetadataRuntimeStatusBytes = 64 * 1024
 
 var errMetadataRuntimeMembershipStatusUnavailable = stderrors.New("metadata runtime does not expose exact Raft membership status")
+
+type metadataTopologyValidationError struct {
+	cause error
+}
+
+func (e *metadataTopologyValidationError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *metadataTopologyValidationError) Unwrap() error {
+	return e.cause
+}
 
 func (r *AntflyClusterReconciler) validateLegacyMetadataRuntimeTopology(ctx context.Context, cluster *antflyv1.AntflyCluster, replicas int32) error {
 	if replicas < 1 {
@@ -1877,40 +1893,39 @@ func (r *AntflyClusterReconciler) resetValidationAttempts(key string) {
 }
 
 // updateStatusWithValidationError updates the cluster status with validation error (T026).
-// Skips the API call if the condition already reflects the same error.
+// Skips the API call if the complete failure status already reflects the error.
 func (r *AntflyClusterReconciler) updateStatusWithValidationError(ctx context.Context, cluster *antflyv1.AntflyCluster, validationErr error) error {
 	log := log.FromContext(ctx)
 
 	errMsg := validationErr.Error()
-
-	// Skip update if condition already reflects the same error
-	for _, existing := range cluster.Status.Conditions {
-		if existing.Type == antflyv1.TypeConfigurationValid &&
-			existing.Status == metav1.ConditionFalse &&
-			existing.Message == errMsg {
-			return nil
-		}
-	}
+	before := cluster.Status.DeepCopy()
 
 	condition := metav1.Condition{
 		Type:               antflyv1.TypeConfigurationValid,
 		Status:             metav1.ConditionFalse,
+		ObservedGeneration: cluster.Generation,
 		Reason:             antflyv1.ReasonValidationFailed,
 		Message:            errMsg,
 		LastTransitionTime: metav1.Now(),
 	}
+	meta.SetStatusCondition(&cluster.Status.Conditions, condition)
 
-	// Find and update or append the condition
-	found := false
-	for i, existing := range cluster.Status.Conditions {
-		if existing.Type == antflyv1.TypeConfigurationValid {
-			cluster.Status.Conditions[i] = condition
-			found = true
-			break
+	var topologyErr *metadataTopologyValidationError
+	if stderrors.As(validationErr, &topologyErr) {
+		cluster.Status.Phase = "Degraded"
+		for _, conditionType := range []string{antflyv1.TypeMetadataReady, antflyv1.TypeAvailable} {
+			meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+				Type:               conditionType,
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: cluster.Generation,
+				Reason:             antflyv1.ReasonValidationFailed,
+				Message:            errMsg,
+			})
 		}
 	}
-	if !found {
-		cluster.Status.Conditions = append(cluster.Status.Conditions, condition)
+
+	if reflect.DeepEqual(before, &cluster.Status) {
+		return nil
 	}
 
 	if err := r.Status().Update(ctx, cluster); err != nil {
@@ -1918,7 +1933,9 @@ func (r *AntflyClusterReconciler) updateStatusWithValidationError(ctx context.Co
 		return err
 	}
 
-	r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, antflyv1.ReasonValidationFailed, antflyv1.ReasonValidationFailed, "%s", errMsg)
+	if r.Recorder != nil {
+		r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, antflyv1.ReasonValidationFailed, antflyv1.ReasonValidationFailed, "%s", errMsg)
+	}
 
 	return nil
 }

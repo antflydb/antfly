@@ -425,6 +425,58 @@ func TestMetadataRaftVoterSetFingerprint(t *testing.T) {
 	}
 }
 
+func TestMetadataTopologyValidationErrorFailsClusterHealth(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := antflyv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default", Generation: 7},
+		Status: antflyv1.AntflyClusterStatus{
+			Phase:              "Running",
+			MetadataNodesReady: 3,
+			Conditions: []metav1.Condition{
+				{Type: antflyv1.TypeConfigurationValid, Status: metav1.ConditionFalse, Reason: antflyv1.ReasonValidationFailed, Message: "split metadata topology"},
+				{Type: antflyv1.TypeMetadataReady, Status: metav1.ConditionTrue, Reason: antflyv1.ReasonComponentReady, Message: "metadata is ready"},
+				{Type: antflyv1.TypeAvailable, Status: metav1.ConditionTrue, Reason: antflyv1.ReasonAvailable, Message: "Cluster is available"},
+			},
+		},
+	}
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&antflyv1.AntflyCluster{}).
+		WithObjects(cluster).
+		Build()
+	reconciler := &AntflyClusterReconciler{Client: k8sClient}
+	current := &antflyv1.AntflyCluster{}
+	if err := k8sClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), current); err != nil {
+		t.Fatal(err)
+	}
+	validationErr := &metadataTopologyValidationError{cause: stderrors.New("split metadata topology")}
+	if err := reconciler.updateStatusWithValidationError(context.Background(), current, validationErr); err != nil {
+		t.Fatal(err)
+	}
+	updated := &antflyv1.AntflyCluster{}
+	if err := k8sClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != "Degraded" {
+		t.Fatalf("cluster phase = %q, want Degraded", updated.Status.Phase)
+	}
+	if updated.Status.MetadataNodesReady != 3 {
+		t.Fatalf("ready metadata replica observation = %d, want preserved value 3", updated.Status.MetadataNodesReady)
+	}
+	for _, conditionType := range []string{antflyv1.TypeConfigurationValid, antflyv1.TypeMetadataReady, antflyv1.TypeAvailable} {
+		condition := meta.FindStatusCondition(updated.Status.Conditions, conditionType)
+		if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != antflyv1.ReasonValidationFailed {
+			t.Fatalf("condition %s = %#v, want ValidationFailed=False", conditionType, condition)
+		}
+		if condition.ObservedGeneration != cluster.Generation {
+			t.Fatalf("condition %s observed generation = %d, want %d", conditionType, condition.ObservedGeneration, cluster.Generation)
+		}
+	}
+}
+
 func TestReconcileConfigMapPublishesExactGenerationAndFullHash(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
