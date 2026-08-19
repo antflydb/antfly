@@ -3200,7 +3200,7 @@ test "planner builds cardinality partial tensor programs for docfact and pathfac
     try std.testing.expectEqualStrings("/meta/tier", path_request.request.field_or_path);
     try std.testing.expect((try ir.tensorProgramProof(alloc, path_plan.access_paths, path_plan.asProgram())).safe());
 
-    const children = [_]index_mod.CardinalityChildRequest{.{ .name = "product_cardinality", .field = "product" }};
+    const children = [_]index_mod.CardinalityChildRequest{.{ .name = "product_cardinality", .field = "product", .mode = .approximate }};
     var terms_plan = (try planTermsCardinalityPartialsTensorProgramAlloc(alloc, &index, "by_tier", "/meta/tier", children[0..], constraints[0..])) orelse return error.TestUnexpectedResult;
     defer terms_plan.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), terms_plan.access_paths.len);
@@ -3215,6 +3215,7 @@ test "planner builds cardinality partial tensor programs for docfact and pathfac
     try std.testing.expectEqual(@as(usize, 1), terms_request.request.children.len);
     try std.testing.expectEqualStrings("product_cardinality", terms_request.request.children[0].name);
     try std.testing.expectEqualStrings("product", terms_request.request.children[0].field);
+    try std.testing.expectEqual(index_mod.CardinalityPartialMode.approximate, terms_request.request.children[0].mode);
     try std.testing.expect((try ir.tensorProgramProof(alloc, terms_plan.access_paths, terms_plan.asProgram())).safe());
 
     const ranges = [_]index_mod.CardinalityRangeRequest{.{ .name = "low", .start = "0", .end = "20" }};
@@ -3233,6 +3234,7 @@ test "planner builds cardinality partial tensor programs for docfact and pathfac
     try std.testing.expectEqual(@as(usize, 1), range_request.request.ranges.len);
     try std.testing.expectEqualStrings("low", range_request.request.ranges[0].name);
     try std.testing.expectEqualStrings("0", range_request.request.ranges[0].start.?);
+    try std.testing.expectEqual(index_mod.CardinalityPartialMode.approximate, range_request.request.children[0].mode);
     try std.testing.expectEqualStrings("20", range_request.request.ranges[0].end.?);
     try std.testing.expect((try ir.tensorProgramProof(alloc, range_plan.access_paths, range_plan.asProgram())).safe());
 
@@ -3250,6 +3252,7 @@ test "planner builds cardinality partial tensor programs for docfact and pathfac
     try std.testing.expectEqual(index_mod.CardinalityHistogramKind.numeric, histogram_request.request.kind);
     try std.testing.expectEqual(@as(f64, 10), histogram_request.request.numeric_interval);
     try std.testing.expectEqual(@as(usize, 1), histogram_request.request.children.len);
+    try std.testing.expectEqual(index_mod.CardinalityPartialMode.approximate, histogram_request.request.children[0].mode);
     try std.testing.expect((try ir.tensorProgramProof(alloc, histogram_plan.access_paths, histogram_plan.asProgram())).safe());
 }
 

@@ -172,6 +172,8 @@ pub fn compilePlanAlloc(alloc: Allocator, schema: schema_mod.ParsedTableSchema) 
         }
     }
 
+    try qualifyCollidingFieldNames(alloc, fields.items);
+
     return .{
         .schema_version = schema.version,
         .fields = try fields.toOwnedSlice(alloc),
@@ -180,6 +182,31 @@ pub fn compilePlanAlloc(alloc: Allocator, schema: schema_mod.ParsedTableSchema) 
         .skipped_complex_fields = skipped_complex_fields,
         .skipped_unbounded_fields = skipped_unbounded_fields,
     };
+}
+
+/// Static facts need one table-wide identity per physical path. Preserve the
+/// convenient leaf name while it is unambiguous, but qualify every colliding
+/// leaf with its full dotted path so ordinary schemas such as billing.region +
+/// shipping.region still produce a valid algebraic config.
+fn qualifyCollidingFieldNames(alloc: Allocator, fields: []FieldCapability) !void {
+    const collides = try alloc.alloc(bool, fields.len);
+    defer alloc.free(collides);
+    @memset(collides, false);
+    for (fields, 0..) |field, i| {
+        for (fields, 0..) |other, j| {
+            if (i == j or std.mem.eql(u8, field.path, other.path)) continue;
+            if (std.mem.eql(u8, field.name, other.name)) {
+                collides[i] = true;
+                break;
+            }
+        }
+    }
+    for (fields, collides) |*field, collision| {
+        if (!collision or std.mem.eql(u8, field.name, field.path)) continue;
+        const qualified = try alloc.dupe(u8, field.path);
+        alloc.free(field.name);
+        field.name = qualified;
+    }
 }
 
 fn dupeOptional(alloc: Allocator, value: ?[]const u8) !?[]u8 {
@@ -671,6 +698,27 @@ test "schema capability plan emits non-materializing algebraic config skeleton" 
     try std.testing.expectEqual(@as(usize, 1), parsed_config.value.measure_fields.len);
     try std.testing.expectEqual(@as(usize, 1), parsed_config.value.time_fields.len);
     try std.testing.expectEqual(@as(usize, 0), parsed_config.value.materializations.len);
+}
+
+test "schema capability qualifies colliding nested leaf names" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"version":8,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"billing":{"type":"object","properties":{"region":{"type":"keyword"}}},"shipping":{"type":"object","properties":{"region":{"type":"keyword"}}},"meta":{"type":"object","properties":{"tier":{"type":"keyword"}}}},"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+
+    var plan = try compilePlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+    try expectCapability(plan, "doc", "billing.region", "billing.region", "string", .group);
+    try expectCapability(plan, "doc", "shipping.region", "shipping.region", "string", .group);
+    // Preserve the compact, backwards-compatible alias when the leaf is unique.
+    try expectCapability(plan, "doc", "tier", "meta.tier", "string", .group);
+
+    const config_json = try configJsonFromPlanAlloc(alloc, "orders", plan);
+    defer alloc.free(config_json);
+    var parsed_config = try std.json.parseFromSlice(index_mod.Config, alloc, config_json, .{ .allocate = .alloc_always });
+    defer parsed_config.deinit();
+    try index_mod.validateConfig(parsed_config.value);
 }
 
 test "schema capability plan records unbounded dynamic schema metadata" {

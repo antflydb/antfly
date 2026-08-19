@@ -3159,7 +3159,6 @@ pub fn algebraicTermsCardinalityAggregationFromDistributedPartialsAlloc(
     merged: algebraic_mod.distributed.MergeSet,
 ) !?SearchAggregationResult {
     if (!termsChildAggsAllCardinality(child_requests)) return null;
-    if (cardinalityChildrenRequireApproximate(child_requests)) return error.UnsupportedAggregation;
 
     var buckets_accum = std.ArrayListUnmanaged(TermsCardinalityBucketAccum).empty;
     defer {
@@ -3225,17 +3224,33 @@ pub fn algebraicTermsCardinalityAggregationFromDistributedPartialsAlloc(
         }
         for (child_requests, 0..) |child_request, child_idx| {
             var cardinality: u64 = 0;
-            for (merged.rows) |row| {
-                if (row.law_id != .count) continue;
-                if (!std.mem.eql(u8, row.canonical_axis, axis)) continue;
-                if (!(try distributedCardinalityMetricMatches(alloc, row.metric, child_request.name))) continue;
-                cardinality += 1;
+            var relative_error: ?f64 = null;
+            var found_hll = false;
+            if (child_request.cardinality_mode != .exact) {
+                for (merged.rows) |row| {
+                    if (row.law_id != .hll) continue;
+                    if (!std.mem.eql(u8, row.canonical_axis, axis)) continue;
+                    if (!(try distributedHllCardinalityMetricMatches(alloc, row.metric, child_request.name))) continue;
+                    if (found_hll) return error.InvalidDistributedAlgebraicMerge;
+                    cardinality = try algebraic_mod.hll.estimateEncoded(row.value);
+                    relative_error = try algebraic_mod.hll.relativeErrorEncoded(row.value);
+                    found_hll = true;
+                }
+                if (!found_hll and child_request.cardinality_mode == .approximate) return error.UnsupportedAggregation;
+            }
+            if (!found_hll) {
+                for (merged.rows) |row| {
+                    if (row.law_id != .count) continue;
+                    if (!std.mem.eql(u8, row.canonical_axis, axis)) continue;
+                    if (!(try distributedCardinalityMetricMatches(alloc, row.metric, child_request.name))) continue;
+                    cardinality += 1;
+                }
             }
             child_results[child_idx] = .{
                 .name = child_request.name,
                 .field = child_request.field,
                 .type = child_request.type,
-                .value_json = try cardinalityResultJsonAlloc(alloc, cardinality, null),
+                .value_json = try cardinalityResultJsonAlloc(alloc, cardinality, relative_error),
             };
             child_filled = child_idx + 1;
         }
@@ -11930,6 +11945,74 @@ test "algebraic distributed approximate cardinality merges HLL partials" {
     var auto_parsed = try std.json.parseFromSlice(std.json.Value, alloc, auto_result.value_json.?, .{});
     defer auto_parsed.deinit();
     try std.testing.expect(auto_parsed.value.object.get("approximate").?.bool);
+}
+
+test "algebraic distributed terms cardinality preserves mode and prefers grouped HLL" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+    const cfg =
+        \\{"version":1,"table":"orders","group_fields":[{"name":"customer","path":"customer","type":"string"},{"name":"product","path":"product","type":"string"}],"hll_cardinalities":[{"name":"products_by_customer","group_by":["customer"],"value_field":"product","precision":14}]}
+    ;
+    var index = try algebraic_mod.index.Index.open(alloc, "alg_distributed_grouped_hll", cfg);
+    defer index.close();
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"product\":\"pen\"}" },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"product\":\"book\"}" },
+        .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"customer\":\"bob\",\"product\":\"pen\"}" },
+    };
+    try index.applyBatch(&store, .{ .documents = docs[0..] });
+
+    const partial_children = [_]algebraic_mod.index.CardinalityChildRequest{.{
+        .name = "product_cardinality",
+        .field = "product",
+        .mode = .auto,
+    }};
+    var plan = (try algebraic_mod.planner.planTermsCardinalityPartialsTensorProgramAlloc(
+        alloc,
+        &index,
+        "by_customer",
+        "customer",
+        partial_children[0..],
+        &.{},
+    )) orelse return error.TestUnexpectedResult;
+    defer plan.deinit(alloc);
+    const partials = (try index.scanDistributedPartialsForTensorProgram(
+        &store,
+        plan.access_paths,
+        plan.asProgram(),
+    )) orelse return error.TestUnexpectedResult;
+    defer algebraic_mod.distributed.freePartials(alloc, partials);
+    var merged = try algebraic_mod.distributed.mergePartialsAlloc(alloc, partials);
+    defer merged.deinit(alloc);
+
+    const children = [_]SearchAggregationRequest{.{
+        .name = "product_cardinality",
+        .type = "cardinality",
+        .field = "product",
+        .cardinality_mode = .auto,
+    }};
+    var result = (try algebraicTermsCardinalityAggregationFromDistributedPartialsAlloc(
+        alloc,
+        &index,
+        .{ .name = "by_customer", .type = "terms", .field = "customer" },
+        "customer",
+        children[0..],
+        &.{},
+        merged,
+    )) orelse return error.TestUnexpectedResult;
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), result.buckets.len);
+    for (result.buckets, 0..) |bucket, i| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bucket.aggregations[0].value_json.?, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, if (i == 0) 2 else 1), parsed.value.object.get("value").?.integer);
+        try std.testing.expect(parsed.value.object.get("approximate").?.bool);
+        try std.testing.expect(parsed.value.object.get("relative_error").?.float > 0);
+    }
 }
 
 test "algebraic terms aggregation answers nested exact cardinality from fact rows" {

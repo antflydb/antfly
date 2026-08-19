@@ -2382,6 +2382,15 @@ array elements do not inflate the sketch. `mode: exact` always bypasses HLL;
 `mode: approximate` fails explicitly when no current matching sketch exists;
 and `mode: auto` may fall back to an exact scan.
 
+Ingest batches all distinct values from a document into one dense contribution
+per group tuple. `max_hll_contributions_per_document` bounds the logical
+Cartesian expansion across every configured sketch, while
+`max_hll_contribution_bytes_per_document` (default 8 MiB) independently bounds
+the dense sketch bytes merged and written. An index may publish at most 64 HLL
+materializations, including adaptive promotions. These hard limits keep high
+precision or adversarial multi-valued documents from turning a small logical
+request into unbounded CPU, memory, or write amplification.
+
 Adaptively promoted sketches share `max_auto_materializations_per_index` with
 other adaptive materializations. Their initial backfill is durable and resumes
 after restart, processing no more than `max_backfill_rows_per_tick` document

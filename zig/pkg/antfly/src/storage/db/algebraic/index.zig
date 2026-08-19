@@ -187,6 +187,11 @@ pub const HllCardinalityConfig = struct {
     precision: u8 = 0,
 };
 
+/// Static and adaptive sketches share one runtime registry. Keep the registry
+/// small enough that every foreground mutation has a predictable upper bound
+/// even when each sketch uses the maximum dense precision.
+pub const max_hll_cardinality_materializations: usize = 64;
+
 pub const AdaptiveConfig = struct {
     observe: bool = true,
     lazy_materialization: bool = false,
@@ -257,8 +262,12 @@ pub const Config = struct {
     max_batch_accumulator_entries: ?usize = null,
     max_cardinality_cache_bytes: ?usize = null,
     // Hard ingest/backfill bound for the Cartesian group tuples multiplied by
-    // distinct value tokens contributed by one document to one HLL.
+    // distinct value tokens contributed by one document across every HLL.
     max_hll_contributions_per_document: usize = 4096,
+    // Hard bound on dense sketch bytes merged/written for one document across
+    // every HLL. This closes the gap between a contribution-count limit and the
+    // 2^precision cost of each dense group sketch.
+    max_hll_contribution_bytes_per_document: usize = 8 * 1024 * 1024,
     // Durable HLL repair advances by at most this many document-fact rows per
     // transaction, independently of whether adaptive materialization is on.
     max_hll_maintenance_rows_per_tick: u64 = 10_000,
@@ -386,6 +395,7 @@ pub fn validateConfig(cfg: Config) !void {
             if (!isJoinSide(side)) return error.InvalidAlgebraicConfig;
         }
     }
+    if (cfg.hll_cardinalities.len > max_hll_cardinality_materializations) return error.InvalidAlgebraicConfig;
     for (cfg.hll_cardinalities, 0..) |hcfg, i| {
         if (hcfg.name.len == 0 or hcfg.value_field.len == 0) return error.InvalidAlgebraicConfig;
         if (!hllGroupFieldResolvable(cfg, hcfg.value_field)) return error.InvalidAlgebraicConfig;
@@ -405,6 +415,7 @@ pub fn validateConfig(cfg: Config) !void {
     }
     if (cfg.adaptive.observation_decay_retain_percent > 100) return error.InvalidAlgebraicConfig;
     if (cfg.max_hll_contributions_per_document == 0 or
+        cfg.max_hll_contribution_bytes_per_document == 0 or
         cfg.max_hll_maintenance_rows_per_tick == 0 or
         cfg.max_pending_hll_observation_entries == 0 or
         cfg.max_pending_hll_observation_bytes == 0)
@@ -1124,14 +1135,14 @@ pub fn termsCardinalityPartialsMetadataAlloc(alloc: Allocator, request: TermsCar
     }
 
     try parts.appendSlice(alloc, &.{
-        "terms-cardinality-partials:v1",
+        "terms-cardinality-partials:v2",
         request.aggregation_name,
         request.bucket_field_or_path,
     });
     const child_count = try std.fmt.allocPrint(alloc, "children:{d}", .{request.children.len});
     try appendOwnedMetadataToken(alloc, &parts, &owned, child_count);
     for (request.children) |child| {
-        try parts.appendSlice(alloc, &.{ child.name, child.field });
+        try parts.appendSlice(alloc, &.{ child.name, child.field, @tagName(child.mode) });
     }
     const constraint_count = try std.fmt.allocPrint(alloc, "constraints:{d}", .{request.constraints.len});
     try appendOwnedMetadataToken(alloc, &parts, &owned, constraint_count);
@@ -1147,10 +1158,10 @@ pub fn decodeTermsCardinalityPartialsMetadataAlloc(alloc: Allocator, metadata: [
         for (parts) |part| alloc.free(part);
         alloc.free(parts);
     }
-    if (parts.len < 5 or !std.mem.eql(u8, parts[0], "terms-cardinality-partials:v1")) return error.InvalidAlgebraicTensorExpr;
+    if (parts.len < 5 or !std.mem.eql(u8, parts[0], "terms-cardinality-partials:v2")) return error.InvalidAlgebraicTensorExpr;
     const child_count = parseMetadataCount(parts[3], "children:") orelse return error.InvalidAlgebraicTensorExpr;
     var pos: usize = 4;
-    if (parts.len < pos + child_count * 2 + 1) return error.InvalidAlgebraicTensorExpr;
+    if (parts.len < pos + child_count * 3 + 1) return error.InvalidAlgebraicTensorExpr;
 
     const aggregation_name = try alloc.dupe(u8, parts[1]);
     errdefer alloc.free(aggregation_name);
@@ -1171,10 +1182,14 @@ pub fn decodeTermsCardinalityPartialsMetadataAlloc(alloc: Allocator, metadata: [
         var name_moved = false;
         errdefer if (!name_moved) alloc.free(name);
         const field = try alloc.dupe(u8, parts[pos + 1]);
-        child.* = .{ .name = name, .field = field };
+        var field_moved = false;
+        errdefer if (!field_moved) alloc.free(field);
+        const mode = std.meta.stringToEnum(CardinalityPartialMode, parts[pos + 2]) orelse return error.InvalidAlgebraicTensorExpr;
+        child.* = .{ .name = name, .field = field, .mode = mode };
         name_moved = true;
+        field_moved = true;
         children_initialized += 1;
-        pos += 2;
+        pos += 3;
     }
 
     const constraint_count = parseMetadataCount(parts[pos], "constraints:") orelse return error.InvalidAlgebraicTensorExpr;
@@ -1224,7 +1239,7 @@ pub fn rangeCardinalityPartialsMetadataAlloc(alloc: Allocator, request: RangeCar
     }
 
     try parts.appendSlice(alloc, &.{
-        "range-cardinality-partials:v1",
+        "range-cardinality-partials:v2",
         request.aggregation_name,
         request.field_or_path,
         @tagName(request.kind),
@@ -1243,7 +1258,7 @@ pub fn rangeCardinalityPartialsMetadataAlloc(alloc: Allocator, request: RangeCar
     const child_count = try std.fmt.allocPrint(alloc, "children:{d}", .{request.children.len});
     try appendOwnedMetadataToken(alloc, &parts, &owned, child_count);
     for (request.children) |child| {
-        try parts.appendSlice(alloc, &.{ child.name, child.field });
+        try parts.appendSlice(alloc, &.{ child.name, child.field, @tagName(child.mode) });
     }
     const constraint_count = try std.fmt.allocPrint(alloc, "constraints:{d}", .{request.constraints.len});
     try appendOwnedMetadataToken(alloc, &parts, &owned, constraint_count);
@@ -1259,7 +1274,7 @@ pub fn decodeRangeCardinalityPartialsMetadataAlloc(alloc: Allocator, metadata: [
         for (parts) |part| alloc.free(part);
         alloc.free(parts);
     }
-    if (parts.len < 7 or !std.mem.eql(u8, parts[0], "range-cardinality-partials:v1")) return error.InvalidAlgebraicTensorExpr;
+    if (parts.len < 7 or !std.mem.eql(u8, parts[0], "range-cardinality-partials:v2")) return error.InvalidAlgebraicTensorExpr;
     const kind = std.meta.stringToEnum(CardinalityRangeKind, parts[3]) orelse return error.InvalidAlgebraicTensorExpr;
     const range_count = parseMetadataCount(parts[4], "ranges:") orelse return error.InvalidAlgebraicTensorExpr;
     var pos: usize = 5;
@@ -1312,7 +1327,7 @@ pub fn decodeRangeCardinalityPartialsMetadataAlloc(alloc: Allocator, metadata: [
 
     const child_count = parseMetadataCount(parts[pos], "children:") orelse return error.InvalidAlgebraicTensorExpr;
     pos += 1;
-    if (parts.len < pos + child_count * 2 + 1) return error.InvalidAlgebraicTensorExpr;
+    if (parts.len < pos + child_count * 3 + 1) return error.InvalidAlgebraicTensorExpr;
     const children = try alloc.alloc(CardinalityChildRequest, child_count);
     errdefer if (children.len > 0) alloc.free(children);
     var children_initialized: usize = 0;
@@ -1327,10 +1342,14 @@ pub fn decodeRangeCardinalityPartialsMetadataAlloc(alloc: Allocator, metadata: [
         var name_moved = false;
         errdefer if (!name_moved) alloc.free(name);
         const field = try alloc.dupe(u8, parts[pos + 1]);
-        child.* = .{ .name = name, .field = field };
+        var field_moved = false;
+        errdefer if (!field_moved) alloc.free(field);
+        const mode = std.meta.stringToEnum(CardinalityPartialMode, parts[pos + 2]) orelse return error.InvalidAlgebraicTensorExpr;
+        child.* = .{ .name = name, .field = field, .mode = mode };
         name_moved = true;
+        field_moved = true;
         children_initialized += 1;
-        pos += 2;
+        pos += 3;
     }
 
     const constraint_count = parseMetadataCount(parts[pos], "constraints:") orelse return error.InvalidAlgebraicTensorExpr;
@@ -1385,7 +1404,7 @@ pub fn histogramCardinalityPartialsMetadataAlloc(alloc: Allocator, request: Hist
     const interval = try std.fmt.allocPrint(alloc, "{d}", .{request.numeric_interval});
     try appendOwnedMetadataToken(alloc, &parts, &owned, interval);
     try parts.insertSlice(alloc, 0, &.{
-        "histogram-cardinality-partials:v1",
+        "histogram-cardinality-partials:v2",
         request.aggregation_name,
         request.field_or_path,
         @tagName(request.kind),
@@ -1394,7 +1413,7 @@ pub fn histogramCardinalityPartialsMetadataAlloc(alloc: Allocator, request: Hist
     const child_count = try std.fmt.allocPrint(alloc, "children:{d}", .{request.children.len});
     try appendOwnedMetadataToken(alloc, &parts, &owned, child_count);
     for (request.children) |child| {
-        try parts.appendSlice(alloc, &.{ child.name, child.field });
+        try parts.appendSlice(alloc, &.{ child.name, child.field, @tagName(child.mode) });
     }
     const constraint_count = try std.fmt.allocPrint(alloc, "constraints:{d}", .{request.constraints.len});
     try appendOwnedMetadataToken(alloc, &parts, &owned, constraint_count);
@@ -1410,12 +1429,12 @@ pub fn decodeHistogramCardinalityPartialsMetadataAlloc(alloc: Allocator, metadat
         for (parts) |part| alloc.free(part);
         alloc.free(parts);
     }
-    if (parts.len < 8 or !std.mem.eql(u8, parts[0], "histogram-cardinality-partials:v1")) return error.InvalidAlgebraicTensorExpr;
+    if (parts.len < 8 or !std.mem.eql(u8, parts[0], "histogram-cardinality-partials:v2")) return error.InvalidAlgebraicTensorExpr;
     const kind = std.meta.stringToEnum(CardinalityHistogramKind, parts[3]) orelse return error.InvalidAlgebraicTensorExpr;
     const numeric_interval = std.fmt.parseFloat(f64, parts[4]) catch return error.InvalidAlgebraicTensorExpr;
     const child_count = parseMetadataCount(parts[6], "children:") orelse return error.InvalidAlgebraicTensorExpr;
     var pos: usize = 7;
-    if (parts.len < pos + child_count * 2 + 1) return error.InvalidAlgebraicTensorExpr;
+    if (parts.len < pos + child_count * 3 + 1) return error.InvalidAlgebraicTensorExpr;
 
     const aggregation_name = try alloc.dupe(u8, parts[1]);
     errdefer alloc.free(aggregation_name);
@@ -1438,10 +1457,14 @@ pub fn decodeHistogramCardinalityPartialsMetadataAlloc(alloc: Allocator, metadat
         var name_moved = false;
         errdefer if (!name_moved) alloc.free(name);
         const field = try alloc.dupe(u8, parts[pos + 1]);
-        child.* = .{ .name = name, .field = field };
+        var field_moved = false;
+        errdefer if (!field_moved) alloc.free(field);
+        const mode = std.meta.stringToEnum(CardinalityPartialMode, parts[pos + 2]) orelse return error.InvalidAlgebraicTensorExpr;
+        child.* = .{ .name = name, .field = field, .mode = mode };
         name_moved = true;
+        field_moved = true;
         children_initialized += 1;
-        pos += 2;
+        pos += 3;
     }
 
     const constraint_count = parseMetadataCount(parts[pos], "constraints:") orelse return error.InvalidAlgebraicTensorExpr;
@@ -2113,10 +2136,24 @@ pub const ScalarDocFactEntry = struct {
     }
 };
 
+pub const CardinalityPartialMode = enum {
+    auto,
+    exact,
+    approximate,
+};
+
 pub const CardinalityChildRequest = struct {
     name: []const u8,
     field: []const u8,
+    mode: CardinalityPartialMode = .exact,
 };
+
+fn cardinalityChildRequestsRequireApproximate(requests: []const CardinalityChildRequest) bool {
+    for (requests) |request| {
+        if (request.mode == .approximate) return true;
+    }
+    return false;
+}
 
 pub const CardinalityRangeKind = enum {
     numeric,
@@ -3281,6 +3318,9 @@ pub const Index = struct {
         errdefer self.freeHllRegistryEntry(owned);
         var registry = self.lockHllRegistryForWrite();
         defer registry.deinit();
+        if (registry.items.len >= max_hll_cardinality_materializations) {
+            return error.AlgebraicHllRegistryLimitExceeded;
+        }
         try self.hll_registry.append(self.alloc, owned);
     }
 
@@ -5408,6 +5448,7 @@ pub const Index = struct {
         generation: ?u64,
     ) !?[]distributed_mod.Partial {
         if (ranges.len == 0 or child_requests.len == 0) return null;
+        if (cardinalityChildRequestsRequireApproximate(child_requests)) return null;
         const constraint_ids = (try self.docIdsForSupportedCardinalityConstraintsAlloc(store, constraints)) orelse return null;
         defer self.freeDocIds(constraint_ids);
         var live_txn: ?docstore_mod.DocStore.Txn = null;
@@ -5468,6 +5509,7 @@ pub const Index = struct {
     ) !?[]distributed_mod.Partial {
         if (field_name.len == 0 or child_requests.len == 0) return null;
         if (kind == .numeric and numeric_interval <= 0) return null;
+        if (cardinalityChildRequestsRequireApproximate(child_requests)) return null;
         const constraint_ids = (try self.docIdsForSupportedCardinalityConstraintsAlloc(store, constraints)) orelse return null;
         defer self.freeDocIds(constraint_ids);
 
@@ -5796,6 +5838,7 @@ pub const Index = struct {
     ) !?[]distributed_mod.Partial {
         if (child_requests.len == 0) return null;
         if (isExplicitJsonPointerPath(bucket_field_name)) {
+            if (cardinalityChildRequestsRequireApproximate(child_requests)) return null;
             return try self.scanDistributedPathTermsCardinalityPartials(store, terms_aggregation_name, bucket_field_name, child_requests, constraints, generation);
         }
         const bucket_field = self.fieldConfig(bucket_field_name, .group) orelse return null;
@@ -5865,12 +5908,59 @@ pub const Index = struct {
             partials.deinit(self.alloc);
         }
 
-        var child_indexes = (try self.buildChildCardinalityIndexesAlloc(store, child_requests)) orelse return null;
-        defer child_indexes.deinit(self);
+        const hll_children = try self.alloc.alloc(?ApproxCardinalityGroupPartials, child_requests.len);
+        defer {
+            for (hll_children) |*maybe_partials| {
+                if (maybe_partials.*) |*group_partials| group_partials.deinit(self.alloc);
+            }
+            self.alloc.free(hll_children);
+        }
+        for (hll_children) |*maybe_partials| maybe_partials.* = null;
+
+        var exact_child_count: usize = 0;
+        for (child_requests, 0..) |child, child_idx| {
+            if (child.mode == .exact) {
+                exact_child_count += 1;
+                continue;
+            }
+            const group_partials = try self.approxCardinalityPartialsForGroupAlloc(
+                store,
+                &.{bucket_field.name},
+                child.field,
+                constraints,
+                generation,
+            );
+            if (group_partials) |partials_value| {
+                hll_children[child_idx] = partials_value;
+            } else {
+                if (child.mode == .approximate) return null;
+                exact_child_count += 1;
+            }
+        }
+
+        const exact_children = try self.alloc.alloc(CardinalityChildRequest, exact_child_count);
+        defer self.alloc.free(exact_children);
+        var exact_fill: usize = 0;
+        for (child_requests, hll_children) |child, maybe_hll| {
+            if (maybe_hll != null) continue;
+            exact_children[exact_fill] = child;
+            exact_fill += 1;
+        }
+        var child_indexes = if (exact_children.len > 0)
+            (try self.buildChildCardinalityIndexesAlloc(store, exact_children)) orelse return null
+        else
+            null;
+        defer if (child_indexes) |*indexes| indexes.deinit(self);
         for (buckets.items) |bucket| {
             try self.appendDistributedCountPartial(&partials, bucket.axis, terms_aggregation_name, @intCast(bucket.doc_ids.items.len));
-            for (child_requests, child_indexes.indexes) |child, *child_index| {
-                try self.appendBucketChildCardinalityPartials(&partials, bucket.axis, .raw, child.name, child_index, bucket.doc_ids.items);
+            var exact_idx: usize = 0;
+            for (child_requests, hll_children) |child, maybe_hll| {
+                if (maybe_hll) |group_partials| {
+                    try self.appendBucketChildHllPartial(&partials, bucket.axis, child.name, group_partials);
+                    continue;
+                }
+                try self.appendBucketChildCardinalityPartials(&partials, bucket.axis, .raw, child.name, &child_indexes.?.indexes[exact_idx], bucket.doc_ids.items);
+                exact_idx += 1;
             }
         }
 
@@ -6259,6 +6349,35 @@ pub const Index = struct {
                 }
             }
         }
+    }
+
+    fn appendBucketChildHllPartial(
+        self: *Index,
+        partials: *std.ArrayListUnmanaged(distributed_mod.Partial),
+        axis: []const u8,
+        child_name: []const u8,
+        group_partials: ApproxCardinalityGroupPartials,
+    ) !void {
+        const group_key = try token.canonicalTupleAlloc(self.alloc, &.{axis});
+        defer self.alloc.free(group_key);
+        var encoded = group_partials.empty;
+        var lo: usize = 0;
+        var hi = group_partials.entries.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const entry = group_partials.entries[mid];
+            switch (std.mem.order(u8, entry.group_key, group_key)) {
+                .lt => lo = mid + 1,
+                .gt => hi = mid,
+                .eq => {
+                    encoded = entry.encoded;
+                    break;
+                },
+            }
+        }
+        const metric = try token.canonicalTupleAlloc(self.alloc, &.{ "cardinality-hll:v1", child_name });
+        defer self.alloc.free(metric);
+        try self.appendDistributedPartialForAxis(partials, axis, metric, .hll, encoded);
     }
 
     pub fn scanDistributedCardinalityPartialsForDocIds(
@@ -17713,16 +17832,48 @@ pub const Index = struct {
         return try self.keyAlloc(&.{ "hllcard", name, group_key });
     }
 
+    const HllContributionBudget = struct {
+        remaining_contributions: usize,
+        remaining_bytes: usize,
+
+        fn init(cfg: Config) HllContributionBudget {
+            return .{
+                .remaining_contributions = cfg.max_hll_contributions_per_document,
+                .remaining_bytes = cfg.max_hll_contribution_bytes_per_document,
+            };
+        }
+
+        fn consume(self: *HllContributionBudget, group_count: usize, value_count: usize, encoded_sketch_bytes: usize) !void {
+            const contributions = std.math.mul(usize, group_count, value_count) catch
+                return error.AlgebraicHllContributionLimitExceeded;
+            const bytes = std.math.mul(usize, group_count, encoded_sketch_bytes) catch
+                return error.AlgebraicHllContributionLimitExceeded;
+            if (contributions > self.remaining_contributions or bytes > self.remaining_bytes) {
+                return error.AlgebraicHllContributionLimitExceeded;
+            }
+            self.remaining_contributions -= contributions;
+            self.remaining_bytes -= bytes;
+        }
+    };
+
+    fn hllValuesContributionAlloc(self: *Index, hcfg: HllCardinalityConfig, values: []const []const u8) ![]u8 {
+        var sketch = try hll.Sketch.init(self.alloc, hllCardinalityPrecision(hcfg));
+        defer sketch.deinit(self.alloc);
+        for (values) |value| sketch.add(value);
+        return try hll.encodeAlloc(self.alloc, sketch);
+    }
+
     // Folds a freshly-added document's value into the matching per-group HLL
     // sketches. Driven from the document facts (not the raw JSON) so the group
     // key and value token are byte-identical to what resumable repair derives
     // from stored facts — otherwise incremental and repaired estimates could
     // disagree for the same data.
     fn applyHllCardinalitiesForFactsTxn(self: *Index, txn: anytype, facts: []const fact_mod.Fact) !void {
+        var budget = HllContributionBudget.init(self.config());
         var registry = self.lockHllRegistry();
         defer registry.deinit();
         for (registry.items) |hcfg| {
-            try self.applyHllCardinalityForFactsTxn(txn, facts, hcfg);
+            try self.applyHllCardinalityForFactsTxn(txn, facts, hcfg, &budget);
         }
     }
 
@@ -17735,15 +17886,22 @@ pub const Index = struct {
         old_facts: []const fact_mod.Fact,
         new_facts: []const fact_mod.Fact,
     ) !void {
+        var budget = HllContributionBudget.init(self.config());
         var registry = self.lockHllRegistry();
         defer registry.deinit();
         for (registry.items) |hcfg| {
             if (!hllCardinalityFactsChanged(hcfg, old_facts, new_facts)) continue;
-            try self.applyHllCardinalityForFactsTxn(txn, new_facts, hcfg);
+            try self.applyHllCardinalityForFactsTxn(txn, new_facts, hcfg, &budget);
         }
     }
 
-    fn applyHllCardinalityForFactsTxn(self: *Index, txn: anytype, facts: []const fact_mod.Fact, hcfg: HllCardinalityConfig) !void {
+    fn applyHllCardinalityForFactsTxn(
+        self: *Index,
+        txn: anytype,
+        facts: []const fact_mod.Fact,
+        hcfg: HllCardinalityConfig,
+        budget: *HllContributionBudget,
+    ) !void {
         const contribution_limit = self.config().max_hll_contributions_per_document;
         const group_keys = fact_mod.axisTuplesAllocBounded(self.alloc, facts, hcfg.group_by, contribution_limit) catch |err| switch (err) {
             error.MissingField => return,
@@ -17753,9 +17911,9 @@ pub const Index = struct {
         const value_scalars = try hllValueScalarsAlloc(self.alloc, facts, hcfg.value_field, contribution_limit);
         defer if (value_scalars.len > 0) self.alloc.free(value_scalars);
         if (value_scalars.len == 0) return;
-        const contribution_count = std.math.mul(usize, group_keys.len, value_scalars.len) catch
-            return error.AlgebraicHllContributionLimitExceeded;
-        if (contribution_count > contribution_limit) return error.AlgebraicHllContributionLimitExceeded;
+        const contribution = try self.hllValuesContributionAlloc(hcfg, value_scalars);
+        defer self.alloc.free(contribution);
+        try budget.consume(group_keys.len, value_scalars.len, contribution.len);
 
         for (group_keys) |group_key| {
             // If a prior delete/update is being repaired across bounded ticks,
@@ -17763,16 +17921,11 @@ pub const Index = struct {
             // group's stage in the same mutation transaction so publication can
             // never overwrite the new contribution with an older snapshot.
             try self.restartHllGroupRepairIfDirtyTxn(txn, hcfg.name, group_key);
-            for (value_scalars) |value_scalar| {
-                try self.mergeHllCardinalityValueTxn(txn, hcfg, group_key, value_scalar);
-            }
+            try self.mergeHllCardinalityContributionTxn(txn, hcfg, group_key, contribution);
         }
     }
 
-    fn mergeHllCardinalityValueTxn(self: *Index, txn: anytype, hcfg: HllCardinalityConfig, group_key: []const u8, value_scalar: []const u8) !void {
-        const singleton = try hll.singletonEncodedAlloc(self.alloc, hllCardinalityPrecision(hcfg), value_scalar);
-        defer self.alloc.free(singleton);
-
+    fn mergeHllCardinalityContributionTxn(self: *Index, txn: anytype, hcfg: HllCardinalityConfig, group_key: []const u8, contribution: []const u8) !void {
         const key = try self.hllCardinalityKeyAlloc(hcfg.name, group_key);
         defer self.alloc.free(key);
 
@@ -17782,7 +17935,7 @@ pub const Index = struct {
             error.NotFound => null,
             else => return err,
         };
-        const merged = (try law_mod.combineAlloc(self.alloc, .hll, current, singleton)) orelse return;
+        const merged = (try law_mod.combineAlloc(self.alloc, .hll, current, contribution)) orelse return;
         defer self.alloc.free(merged);
         try txn.put(key, merged);
     }
@@ -18155,15 +18308,12 @@ pub const Index = struct {
                         self.config().max_hll_contributions_per_document,
                     );
                     defer if (values.len > 0) self.alloc.free(values);
-                    const contribution_count = std.math.mul(usize, group_keys.len, values.len) catch
-                        return error.AlgebraicHllContributionLimitExceeded;
-                    if (contribution_count > self.config().max_hll_contributions_per_document) {
-                        return error.AlgebraicHllContributionLimitExceeded;
-                    }
-                    for (values) |value| {
-                        const singleton = try hll.singletonEncodedAlloc(self.alloc, hllCardinalityPrecision(hcfg), value);
-                        defer self.alloc.free(singleton);
-                        const next = try hll.mergeEncodedAlloc(self.alloc, staged, singleton);
+                    if (values.len > 0) {
+                        const contribution = try self.hllValuesContributionAlloc(hcfg, values);
+                        defer self.alloc.free(contribution);
+                        var budget = HllContributionBudget.init(self.config());
+                        try budget.consume(group_keys.len, values.len, contribution.len);
+                        const next = try hll.mergeEncodedAlloc(self.alloc, staged, contribution);
                         if (staged) |old| self.alloc.free(old);
                         staged = next;
                     }
@@ -18419,6 +18569,12 @@ pub const Index = struct {
         active_materializations += try self.adaptiveHllMaterializationCount(store);
         if (active_materializations >= policy.max_auto_materializations_per_index) return 0;
         var remaining_promotions = policy.max_auto_materializations_per_index - active_materializations;
+        const registry_count = self.hllRegistryCount();
+        if (registry_count >= max_hll_cardinality_materializations) return 0;
+        remaining_promotions = @min(
+            remaining_promotions,
+            @as(u64, @intCast(max_hll_cardinality_materializations - registry_count)),
+        );
 
         const prefix = try self.hllAdaptiveObservationPrefixAlloc();
         defer self.alloc.free(prefix);
@@ -18482,6 +18638,7 @@ pub const Index = struct {
                     }
                 }
                 if (already_published) continue;
+                if (registry.items.len >= max_hll_cardinality_materializations) continue;
                 // Reserve while holding the registry lock, before the durable
                 // marker commits. Publication after commit is then infallible.
                 try self.hll_registry.ensureUnusedCapacity(self.alloc, 1);
@@ -18640,7 +18797,8 @@ pub const Index = struct {
             for (rows.items) |row| {
                 var facts = try fact_mod.decodeListAlloc(self.alloc, row.payload);
                 defer facts.deinit(self.alloc);
-                try self.applyHllCardinalityForFactsTxn(&txn, facts.facts, hcfg);
+                var budget = HllContributionBudget.init(self.config());
+                try self.applyHllCardinalityForFactsTxn(&txn, facts.facts, hcfg, &budget);
             }
             if (rows.items.len > 0) {
                 remaining -= rows.items.len;
@@ -18773,6 +18931,29 @@ pub const Index = struct {
 
         pub fn deinit(self: *ApproxCardinalityEntry, alloc: Allocator) void {
             alloc.free(self.group_key);
+            self.* = undefined;
+        }
+    };
+
+    pub const ApproxCardinalityEncodedEntry = struct {
+        group_key: []u8,
+        encoded: []u8,
+
+        pub fn deinit(self: *ApproxCardinalityEncodedEntry, alloc: Allocator) void {
+            alloc.free(self.group_key);
+            alloc.free(self.encoded);
+            self.* = undefined;
+        }
+    };
+
+    pub const ApproxCardinalityGroupPartials = struct {
+        entries: []ApproxCardinalityEncodedEntry,
+        empty: []u8,
+
+        pub fn deinit(self: *ApproxCardinalityGroupPartials, alloc: Allocator) void {
+            for (self.entries) |*entry| entry.deinit(alloc);
+            alloc.free(self.entries);
+            alloc.free(self.empty);
             self.* = undefined;
         }
     };
@@ -19006,6 +19187,73 @@ pub const Index = struct {
     ) !?[]ApproxCardinalityEntry {
         const name = (try self.hllCardinalityNameForField(store, group_fields, field_or_path, constraints, generation)) orelse return null;
         return try self.approxCardinalityEntriesAlloc(store, name);
+    }
+
+    /// Raw, mergeable per-group HLL sketches for distributed
+    /// `terms(group_fields) -> cardinality(field)` execution. An encoded empty
+    /// sketch is returned with the entries so every bucket can emit a lawful
+    /// HLL identity even when it has no child values on a shard.
+    pub fn approxCardinalityPartialsForGroupAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        group_fields: []const []const u8,
+        field_or_path: []const u8,
+        constraints: []const ir.Constraint,
+        generation: ?u64,
+    ) !?ApproxCardinalityGroupPartials {
+        const name = (try self.hllCardinalityNameForField(store, group_fields, field_or_path, constraints, generation)) orelse return null;
+        const prefix = try self.hllCardinalityPrefixAlloc(name);
+        defer self.alloc.free(prefix);
+
+        var precision = hll.default_precision;
+        var found_registry_entry = false;
+        {
+            var registry = self.lockHllRegistry();
+            defer registry.deinit();
+            for (registry.items) |hcfg| {
+                if (!std.mem.eql(u8, hcfg.name, name)) continue;
+                precision = hllCardinalityPrecision(hcfg);
+                found_registry_entry = true;
+                break;
+            }
+        }
+        if (!found_registry_entry) return error.CorruptHllMaterialization;
+
+        var entries = std.ArrayListUnmanaged(ApproxCardinalityEncodedEntry).empty;
+        errdefer {
+            for (entries.items) |*entry| entry.deinit(self.alloc);
+            entries.deinit(self.alloc);
+        }
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const group_component = token.componentAt(entry.key, prefix.len) catch return error.CorruptHllMaterialization;
+            if (group_component.next != entry.key.len) return error.CorruptHllMaterialization;
+            const encoded_precision = hll.precisionEncoded(entry.value) catch return error.CorruptHllMaterialization;
+            if (encoded_precision != precision) return error.CorruptHllMaterialization;
+            const group_key = try self.alloc.dupe(u8, group_component.payload);
+            errdefer self.alloc.free(group_key);
+            const encoded = try self.alloc.dupe(u8, entry.value);
+            errdefer self.alloc.free(encoded);
+            try entries.append(self.alloc, .{ .group_key = group_key, .encoded = encoded });
+        }
+        var empty_sketch = try hll.Sketch.init(self.alloc, precision);
+        defer empty_sketch.deinit(self.alloc);
+        const empty = try hll.encodeAlloc(self.alloc, empty_sketch);
+        errdefer self.alloc.free(empty);
+        std.mem.sort(ApproxCardinalityEncodedEntry, entries.items, {}, struct {
+            fn lessThan(_: void, lhs: ApproxCardinalityEncodedEntry, rhs: ApproxCardinalityEncodedEntry) bool {
+                return std.mem.order(u8, lhs.group_key, rhs.group_key) == .lt;
+            }
+        }.lessThan);
+        return .{
+            .entries = try entries.toOwnedSlice(self.alloc),
+            .empty = empty,
+        };
     }
 
     /// The materialized group key for a single-field terms bucket whose value
@@ -21779,6 +22027,71 @@ test "algebraic HLL bounds per-document expansion and resumes accounted repairs"
         try measuredStorageBytesForTest(alloc, &store, idx.storageNamespace()),
         try idx.storageBytes(&store),
     );
+}
+
+test "algebraic HLL batches values and bounds dense sketch bytes" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "max_hll_contributions_per_document": 16,
+        \\  "max_hll_contribution_bytes_per_document": 300000,
+        \\  "dynamic_field_rules": [
+        \\    {"name":"regions","match":"regions","type":"string"},
+        \\    {"name":"customers","match":"customers","type":"string"}
+        \\  ],
+        \\  "hll_cardinalities": [{"name":"customers_by_region","group_by":["regions"],"value_field":"customers","precision":18}]
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg_hll_byte_budget", cfg);
+    defer idx.close();
+
+    // Multiple values are hashed into one dense contribution and merged once
+    // for the group, so one p18 sketch remains under the 300 KB byte budget.
+    const batched = [_]derived_types.DerivedDocument{.{
+        .key = "batched",
+        .action = .upsert,
+        .cleaned_value = "{\"regions\":\"west\",\"customers\":[\"a\",\"b\",\"c\",\"d\"]}",
+    }};
+    try idx.applyBatch(&store, .{ .documents = batched[0..] });
+
+    // Two group tuples would merge/write two dense p18 sketches (~512 KB), so
+    // the byte budget rejects the document even though its tuple count is tiny.
+    const too_many_bytes = [_]derived_types.DerivedDocument{.{
+        .key = "too-many-bytes",
+        .action = .upsert,
+        .cleaned_value = "{\"regions\":[\"east\",\"north\"],\"customers\":\"e\"}",
+    }};
+    try std.testing.expectError(
+        error.AlgebraicHllContributionLimitExceeded,
+        idx.applyBatch(&store, .{ .documents = too_many_bytes[0..] }),
+    );
+}
+
+test "algebraic HLL registry has a hard materialization limit" {
+    const alloc = std.testing.allocator;
+    var configs: [max_hll_cardinality_materializations + 1]HllCardinalityConfig = undefined;
+    var names: [max_hll_cardinality_materializations + 1][]u8 = undefined;
+    var initialized: usize = 0;
+    defer for (names[0..initialized]) |name| alloc.free(name);
+    for (&configs, 0..) |*hcfg, i| {
+        names[i] = try std.fmt.allocPrint(alloc, "cardinality_{d}", .{i});
+        initialized += 1;
+        hcfg.* = .{ .name = names[i], .group_by = &.{}, .value_field = "value" };
+    }
+    try std.testing.expectError(error.InvalidAlgebraicConfig, validateConfig(.{
+        .version = 1,
+        .table = "docs",
+        .group_fields = &.{.{ .name = "value", .path = "value", .type = "string" }},
+        .hll_cardinalities = &configs,
+    }));
 }
 
 test "adaptive group-key NDV sizes a grouped materialization below the doc-row overestimate" {

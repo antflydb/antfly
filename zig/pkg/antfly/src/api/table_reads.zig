@@ -12948,6 +12948,14 @@ const HistogramCardinalityPlan = struct {
     }
 };
 
+fn algebraicCardinalityPartialMode(mode: db_mod.aggregations.CardinalityMode) db_mod.algebraic.index.CardinalityPartialMode {
+    return switch (mode) {
+        .auto => .auto,
+        .exact => .exact,
+        .approximate => .approximate,
+    };
+}
+
 fn algebraicTermsCardinalityChildRequestsAlloc(
     alloc: std.mem.Allocator,
     request: db_mod.aggregations.SearchAggregationRequest,
@@ -12964,7 +12972,7 @@ fn algebraicTermsCardinalityChildRequestsAlloc(
     var idx: usize = 0;
     for (request.aggregations) |child| {
         if (db_mod.aggregations.isPipelineAggregation(child.type)) continue;
-        children[idx] = .{ .name = child.name, .field = child.field };
+        children[idx] = .{ .name = child.name, .field = child.field, .mode = algebraicCardinalityPartialMode(child.cardinality_mode) };
         idx += 1;
     }
     return children;
@@ -13058,7 +13066,7 @@ fn algebraicHistogramCardinalityPlanAlloc(
     var child_idx: usize = 0;
     for (request.aggregations) |child| {
         if (db_mod.aggregations.isPipelineAggregation(child.type)) continue;
-        children[child_idx] = .{ .name = child.name, .field = child.field };
+        children[child_idx] = .{ .name = child.name, .field = child.field, .mode = algebraicCardinalityPartialMode(child.cardinality_mode) };
         child_idx += 1;
     }
     const date_bucket = if (kind == .date) try alloc.dupe(u8, db_mod.aggregations.algebraicBucketName(request).?) else "";
@@ -13097,7 +13105,7 @@ fn algebraicRangeCardinalityPlanAlloc(
     var child_idx: usize = 0;
     for (request.aggregations) |child| {
         if (db_mod.aggregations.isPipelineAggregation(child.type)) continue;
-        children[child_idx] = .{ .name = child.name, .field = child.field };
+        children[child_idx] = .{ .name = child.name, .field = child.field, .mode = algebraicCardinalityPartialMode(child.cardinality_mode) };
         child_idx += 1;
     }
 
