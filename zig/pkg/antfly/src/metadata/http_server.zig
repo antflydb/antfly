@@ -75,6 +75,7 @@ pub const AdminSource = struct {
     pub const VTable = struct {
         head: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataHead = null,
         linearizable_head: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataHead = null,
+        linearizable_snapshot: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot = null,
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
         validate_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) anyerror!bool = null,
@@ -130,6 +131,11 @@ pub const AdminSource = struct {
 
     pub fn linearizableHead(self: AdminSource) !metadata_api.MetadataHead {
         const fn_ptr = self.vtable.linearizable_head orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr);
+    }
+
+    pub fn linearizableSnapshot(self: AdminSource) !metadata_api.AdminSnapshot {
+        const fn_ptr = self.vtable.linearizable_snapshot orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr);
     }
 
@@ -315,6 +321,7 @@ pub const AdminSource = struct {
             .vtable = &.{
                 .head = metadataServiceHead,
                 .linearizable_head = metadataServiceLinearizableHead,
+                .linearizable_snapshot = metadataServiceLinearizableSnapshot,
                 .status = metadataServiceStatus,
                 .admin_snapshot = metadataServiceAdminSnapshot,
                 .validate_publication = metadataServiceValidatePublication,
@@ -358,6 +365,7 @@ pub const AdminSource = struct {
             .vtable = &.{
                 .head = metadataHttpServiceHead,
                 .linearizable_head = metadataHttpServiceLinearizableHead,
+                .linearizable_snapshot = metadataHttpServiceLinearizableSnapshot,
                 .status = metadataHttpServiceStatus,
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
                 .validate_publication = metadataHttpServiceValidatePublication,
@@ -404,6 +412,12 @@ pub const AdminSource = struct {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         try svc.ensureLinearizableRead();
         return svc.head();
+    }
+
+    fn metadataServiceLinearizableSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLinearizableRead();
+        return try svc.adminSnapshot();
     }
 
     fn metadataServiceStatus(ptr: *anyopaque) !metadata_api.MetadataStatus {
@@ -762,6 +776,12 @@ pub const AdminSource = struct {
         return svc.head();
     }
 
+    fn metadataHttpServiceLinearizableSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLinearizableRead();
+        return try svc.adminSnapshot();
+    }
+
     fn metadataHttpServiceAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         return try svc.adminSnapshot();
@@ -1103,6 +1123,7 @@ pub const MetadataHttpServer = struct {
         // POST prevents intermediary GET caches from bypassing the read-index
         // barrier that gives this endpoint its meaning.
         try server.post(routes.Routes.internal_linearizable_head, httpx.Handler.bind(self, metadataLinearizableHead));
+        try server.post(routes.Routes.internal_linearizable_snapshot, httpx.Handler.bind(self, metadataLinearizableSnapshot));
         try server.get(routes.Routes.status, httpx.Handler.bind(self, metadataStatus));
         try server.get(routes.Routes.admin_snapshot, httpx.Handler.bind(self, metadataSnapshot));
         try server.get(routes.Routes.active_transitions, httpx.Handler.bind(self, metadataActiveTransitions));
@@ -1173,6 +1194,7 @@ pub const MetadataHttpServer = struct {
             .vtable = &.{
                 .head = readHead,
                 .linearizable_head = readLinearizableHead,
+                .linearizable_snapshot = readLinearizableSnapshot,
                 .status = readStatus,
                 .admin_snapshot = readSnapshot,
                 .free_admin_snapshot = freeReadSnapshot,
@@ -1188,6 +1210,11 @@ pub const MetadataHttpServer = struct {
     fn readLinearizableHead(ptr: *anyopaque) !metadata_api.MetadataHead {
         const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
         return self.source.linearizableHead();
+    }
+
+    fn readLinearizableSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.linearizableSnapshot();
     }
 
     fn readStatus(ptr: *anyopaque) !metadata_api.MetadataStatus {
@@ -1251,6 +1278,7 @@ pub const MetadataHttpServer = struct {
         }
         return switch (err) {
             error.InvalidArgument => ctx.status(400).text("invalid path parameter"),
+            error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
             error.Canceled => ctx.status(408).text("request canceled"),
             error.DeadlineExceeded => ctx.status(504).text("request deadline exceeded"),
             else => err,
@@ -1269,6 +1297,13 @@ pub const MetadataHttpServer = struct {
 
     fn metadataLinearizableHead(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const result = self.readOperations().linearizableHead(requestContext(ctx)) catch |err| return metadataReadError(ctx, err);
+        return self.trackedJson(ctx, result);
+    }
+
+    fn metadataLinearizableSnapshot(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const operations = self.readOperations();
+        var result = operations.linearizableSnapshot(requestContext(ctx)) catch |err| return metadataReadError(ctx, err);
+        defer operations.freeSnapshot(&result);
         return self.trackedJson(ctx, result);
     }
 
@@ -4126,6 +4161,96 @@ test "metadata linearizable head uses the fenced source operation" {
         resp.body.?,
     );
     try std.testing.expectEqual(@as(usize, 1), source.calls);
+}
+
+test "metadata linearizable snapshot fences and frees one owned response" {
+    const FakeSource = struct {
+        calls: usize = 0,
+        frees: usize = 0,
+        const incarnation: metadata_api.MetadataClusterIncarnation = "22222222222222222222222222222222".*;
+
+        fn iface(self: *@This()) AdminSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .linearizable_snapshot = linearizableSnapshot,
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn linearizableSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{
+                .status = .{
+                    .metadata_group_id = 77,
+                    .metadata_incarnation = incarnation,
+                    .metadata_epoch = 3,
+                    .metrics = .{},
+                },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.TestUnexpectedResult;
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.TestUnexpectedResult;
+        }
+
+        fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.frees += 1;
+            snapshot.* = undefined;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    var resp = try server.executeTypedHandlerForTest(
+        .POST,
+        routes.Routes.internal_linearizable_snapshot,
+        &.{},
+        MetadataHttpServer.metadataLinearizableSnapshot,
+    );
+    defer resp.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status.code);
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        \\{"status":{"metadata_group_id":77,"metadata_incarnation":"22222222222222222222222222222222","metadata_epoch":3},"tables":[]}
+    ,
+        resp.body.?,
+    );
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    try std.testing.expectEqual(@as(usize, 1), source.frees);
+
+    var legacy_server = MetadataHttpServer.init(std.testing.allocator, .{}, .{
+        .ptr = &source,
+        .vtable = &.{
+            .status = FakeSource.status,
+            .admin_snapshot = FakeSource.adminSnapshot,
+            .free_admin_snapshot = FakeSource.freeAdminSnapshot,
+        },
+    });
+    var legacy_resp = try legacy_server.executeTypedHandlerForTest(
+        .POST,
+        routes.Routes.internal_linearizable_snapshot,
+        &.{},
+        MetadataHttpServer.metadataLinearizableSnapshot,
+    );
+    defer legacy_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 405), legacy_resp.status.code);
 }
 
 test "metadata http server accepts internal reallocate and split merge routes" {

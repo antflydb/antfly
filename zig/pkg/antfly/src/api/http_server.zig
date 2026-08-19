@@ -872,7 +872,7 @@ pub const StatusSource = struct {
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot = null,
         cached_admin_snapshot: ?*const fn (ptr: *anyopaque) anyerror!?metadata_api.AdminSnapshot = null,
-        ensure_linearizable_read: ?*const fn (ptr: *anyopaque) anyerror!void = null,
+        ensure_linearizable_read: ?*const fn (ptr: *anyopaque, request: api_operation.RequestContext) anyerror!bool = null,
         free_admin_snapshot: ?*const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void = null,
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         replace_table_definition: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
@@ -922,9 +922,12 @@ pub const StatusSource = struct {
         return try BoundaryAbi.call("cached_admin_snapshot", self.boundary_dispatch, fn_ptr, .{self.ptr});
     }
 
-    pub fn ensureLinearizableRead(self: StatusSource) !void {
-        const fn_ptr = self.vtable.ensure_linearizable_read orelse return;
-        return try BoundaryAbi.call("ensure_linearizable_read", self.boundary_dispatch, fn_ptr, .{self.ptr});
+    /// Returns whether the source actually established an authoritative read.
+    /// `false` is reserved for sources that do not support the capability,
+    /// which keeps rolling upgrades conservative without failing legacy flows.
+    pub fn ensureLinearizableRead(self: StatusSource, request: api_operation.RequestContext) !bool {
+        const fn_ptr = self.vtable.ensure_linearizable_read orelse return false;
+        return try BoundaryAbi.call("ensure_linearizable_read", self.boundary_dispatch, fn_ptr, .{ self.ptr, request });
     }
 
     pub fn freeAdminSnapshot(self: StatusSource, snapshot: *metadata_api.AdminSnapshot) void {
@@ -1086,8 +1089,10 @@ pub const StatusSource = struct {
                 return try cast(ptr).adminSnapshot();
             }
 
-            fn ensureLinearizableRead(ptr: *anyopaque) anyerror!void {
-                return try cast(ptr).ensureLinearizableRead();
+            fn ensureLinearizableRead(ptr: *anyopaque, request: api_operation.RequestContext) anyerror!bool {
+                try request.ensureActive();
+                try cast(ptr).ensureLinearizableRead();
+                return true;
             }
 
             fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
@@ -8566,7 +8571,9 @@ pub const ApiHttpServer = struct {
     ) public_table_http.TableApi.ExecuteBackupError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         try ensureTableOperationActive(request);
-        self.source.ensureLinearizableRead() catch |err| {
+        _ = self.source.ensureLinearizableRead(request) catch |err| {
+            if (err == error.Canceled or err == error.Cancelled) return error.Canceled;
+            if (err == error.DeadlineExceeded) return error.DeadlineExceeded;
             std.log.warn("table backup metadata read barrier failed phase=admission class={s}", .{@errorName(err)});
             return metadataAccessFailure(err);
         };
@@ -9024,8 +9031,7 @@ pub const ApiHttpServer = struct {
     ) IndexInstallationReconcileResult {
         const writes = self.table_writes orelse return .complete;
         const alloc = std.heap.page_allocator;
-        const authoritative = self.source.vtable.ensure_linearizable_read != null;
-        if (authoritative) self.source.ensureLinearizableRead() catch return .retry;
+        const authoritative = self.source.ensureLinearizableRead(.{}) catch return .retry;
         const maybe_table = self.loadOwnedTableRecord(alloc, pending.table_name) catch return .retry;
         const table = maybe_table orelse return if (authoritative) .complete else .retry;
         defer metadata_table_manager.freeTable(alloc, table);
@@ -9567,7 +9573,7 @@ pub const ApiHttpServer = struct {
         var trace: ClusterBackupExecutionTrace = .{};
         errdefer |err| trace.logFailure(err);
 
-        self.source.ensureLinearizableRead() catch |err| {
+        _ = self.source.ensureLinearizableRead(.{}) catch |err| {
             if (metadata_authority.isRetryableError(err)) return error.NotLeader;
             std.log.warn("cluster backup metadata read barrier failed err={s}", .{@errorName(err)});
             return trace.internal(err);
@@ -28675,13 +28681,15 @@ test "api http server create index installs exact visible config and defers lagg
             }
         }
 
-        fn ensureLinearizableRead(ptr: *anyopaque) !void {
+        fn ensureLinearizableRead(ptr: *anyopaque, request: api_operation.RequestContext) !bool {
+            try request.ensureActive();
             const self: *@This() = @ptrCast(@alignCast(ptr));
             platform_sync.lockYielding(&self.mutex);
             defer self.mutex.unlock();
-            const pending = self.pending_indexes_json orelse return;
+            const pending = self.pending_indexes_json orelse return true;
             self.pending_indexes_json = null;
             self.replaceIndexesJson(std.testing.allocator, pending, true);
+            return true;
         }
 
         fn waitTableProjection(ptr: *anyopaque, _: []const u8, _: ?[]const u8, _: ?[]const u8) !void {
@@ -29998,6 +30006,20 @@ test "schema projection expectation uses backend committed generation" {
     try std.testing.expectEqual(@as(u32, 2), try tables_api.schemaVersion(legacy.schema_json));
     try std.testing.expect(legacy.indexes_json != null);
     try std.testing.expect(std.mem.indexOf(u8, legacy.indexes_json.?, "full_text_index_v2") != null);
+}
+
+test "status source reports an absent linearizable read capability without failing" {
+    const FakeSource = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var fake: u8 = 0;
+    const source = StatusSource{
+        .ptr = &fake,
+        .vtable = &.{ .status = FakeSource.status },
+    };
+    try std.testing.expect(!try source.ensureLinearizableRead(.{}));
 }
 
 test "status source prefers authoritative schema generation result" {
@@ -32582,7 +32604,8 @@ test "api http server returns retryable not leader when cluster backup read barr
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
         }
 
-        fn ensureLinearizableRead(ptr: *anyopaque) !void {
+        fn ensureLinearizableRead(ptr: *anyopaque, request: api_operation.RequestContext) !bool {
+            try request.ensureActive();
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.linearizable_read_calls += 1;
             return error.MetadataLinearizableReadTimeout;
@@ -32708,9 +32731,11 @@ test "api http server cluster backup succeeds after load balanced metadata timeo
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
         }
 
-        fn ensureLinearizableRead(ptr: *anyopaque) !void {
+        fn ensureLinearizableRead(ptr: *anyopaque, request: api_operation.RequestContext) !bool {
+            try request.ensureActive();
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.read_timeout) return error.MetadataLinearizableReadTimeout;
+            return true;
         }
 
         fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
@@ -32823,7 +32848,10 @@ test "api http server does not advertise a retry after cluster backup side effec
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
         }
 
-        fn ensureLinearizableRead(_: *anyopaque) !void {}
+        fn ensureLinearizableRead(_: *anyopaque, request: api_operation.RequestContext) !bool {
+            try request.ensureActive();
+            return true;
+        }
 
         fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));

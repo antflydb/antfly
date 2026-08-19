@@ -28,6 +28,10 @@ const routes = @import("http_routes.zig");
 const max_transport_retries: usize = 1;
 const max_metadata_not_leader_retries: usize = 2;
 const default_request_timeout_ms: u32 = 5_000;
+// The server's read-index barrier is bounded at five seconds. Leave enough
+// transport headroom to receive and decode its terminal response; callers
+// still impose one shared, usually tighter, operation deadline.
+const linearizable_snapshot_request_timeout_ms: u32 = 6_000;
 const default_mutation_authority_retry_delay_ns: u64 = 100 * std.time.ns_per_ms;
 const max_mutation_authority_retry_delay_ns: u64 = std.time.ns_per_s;
 const mutation_authority_retry_cancellation_slice_ns: u64 = 10 * std.time.ns_per_ms;
@@ -122,6 +126,29 @@ pub const MetadataHttpClient = struct {
         );
         defer parsed.deinit();
         return parsed.value;
+    }
+
+    pub fn fetchLinearizableSnapshot(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        budget: ?RequestBudget,
+    ) !std.json.Parsed(metadata_api.AdminSnapshot) {
+        const uri = try join(self.alloc, base_uri, routes.Routes.internal_linearizable_snapshot);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executeWithRetryBudget(.{
+            .method = .POST,
+            .uri = uri,
+            .body = "{}",
+            .content_type = "application/json",
+            .timeout_ms = linearizable_snapshot_request_timeout_ms,
+        }, budget);
+        defer resp.deinit(self.alloc);
+        // Unknown internal routes are the capability signal during a rolling
+        // upgrade. Treat both common server spellings as unsupported.
+        if (resp.status == 404 or resp.status == 405) return error.UnsupportedOperation;
+        try mapStatus(resp.status, null, null, null);
+        return try parseJson(metadata_api.AdminSnapshot, self.alloc, resp.body);
     }
 
     pub fn fetchSnapshot(self: *MetadataHttpClient, base_uri: []const u8) !std.json.Parsed(metadata_api.AdminSnapshot) {
@@ -1083,6 +1110,66 @@ test "metadata http client requests a non-cacheable linearizable head fence" {
     try std.testing.expectEqual(@as(u64, 91), head.metadata_group_id);
     try std.testing.expectEqual(@as(u64, 18), head.metadata_epoch);
     try std.testing.expectEqual(@as(usize, 1), executor.calls);
+}
+
+test "metadata http client fetches one bounded linearizable snapshot" {
+    const FenceExecutor = struct {
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expectEqualStrings(
+                "http://127.0.0.1:9000/internal/v1/catalog/linearizable-snapshot",
+                req.uri,
+            );
+            try std.testing.expectEqual(@as(?u32, linearizable_snapshot_request_timeout_ms), req.timeout_ms);
+            try ant_json.testing.expectEqualJsonText(alloc, "{}", req.body);
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8,
+                    \\{"status":{"metadata_group_id":91,"metadata_incarnation":"11111111111111111111111111111111","metadata_epoch":3,"metrics":{}},"tables":[],"ranges":[],"stores":[],"placement_intents":[],"split_transitions":[],"merge_transitions":[]}
+                ),
+            };
+        }
+    };
+
+    var executor = FenceExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    var snapshot = try client.fetchLinearizableSnapshot("http://127.0.0.1:9000", null);
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(u64, 91), snapshot.value.status.metadata_group_id);
+    try std.testing.expectEqual(@as(u64, 3), snapshot.value.status.metadata_epoch);
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+}
+
+test "metadata http client treats missing linearizable snapshot route as unsupported" {
+    const LegacyExecutor = struct {
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return .{
+                .status = 404,
+                .content_type = try alloc.dupe(u8, "text/plain"),
+                .body = try alloc.dupe(u8, "not found"),
+            };
+        }
+    };
+
+    var executor = LegacyExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expectError(
+        error.UnsupportedOperation,
+        client.fetchLinearizableSnapshot("http://127.0.0.1:9000", null),
+    );
 }
 
 test "metadata http client retries transient connection close on fetch status" {
