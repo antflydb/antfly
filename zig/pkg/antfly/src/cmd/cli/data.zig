@@ -706,6 +706,19 @@ const LoadParseIssue = union(enum) {
 
 const LoadParseResult = union(enum) { value: LoadOptions, issue: LoadParseIssue };
 
+fn takeLoadOptionValue(args: *std.process.Args.Iterator, flag: []const u8) union(enum) {
+    value: []const u8,
+    issue: LoadParseIssue,
+} {
+    const raw = args.next() orelse return .{ .issue = .{ .missing_value = flag } };
+    // Fail closed instead of consuming the next switch as data. In particular,
+    // swallowing --dry-run can turn a validation-only invocation into a write.
+    // Values that intentionally begin with '-' can be expressed with an
+    // explicit relative path (for example ./--input.jsonl).
+    if (std.mem.startsWith(u8, raw, "-")) return .{ .issue = .{ .missing_value = flag } };
+    return .{ .value = raw };
+}
+
 fn parseLoadOptionsIterator(iterator: std.process.Args.Iterator) LoadParseResult {
     var args = iterator;
     var values: LoadOptionValues = .{};
@@ -717,17 +730,32 @@ fn parseLoadOptionsIterator(iterator: std.process.Args.Iterator) LoadParseResult
         seen.insert(option);
 
         switch (option) {
-            .table => values.table_name = args.next() orelse return .{ .issue = .{ .missing_value = arg } },
-            .file => values.file_path = args.next() orelse return .{ .issue = .{ .missing_value = arg } },
-            .id_field => values.id_field = args.next() orelse return .{ .issue = .{ .missing_value = arg } },
-            .id_template => values.id_template = args.next() orelse return .{ .issue = .{ .missing_value = arg } },
-            .checkpoint => values.checkpoint_path = args.next() orelse return .{ .issue = .{ .missing_value = arg } },
+            .table, .file, .id_field, .id_template, .checkpoint => {
+                const raw = switch (takeLoadOptionValue(&args, arg)) {
+                    .value => |value| value,
+                    .issue => |issue| return .{ .issue = issue },
+                };
+                switch (option) {
+                    .table => values.table_name = raw,
+                    .file => values.file_path = raw,
+                    .id_field => values.id_field = raw,
+                    .id_template => values.id_template = raw,
+                    .checkpoint => values.checkpoint_path = raw,
+                    else => unreachable,
+                }
+            },
             .sync_level => {
-                const raw = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
+                const raw = switch (takeLoadOptionValue(&args, arg)) {
+                    .value => |value| value,
+                    .issue => |issue| return .{ .issue = issue },
+                };
                 values.sync_level = parseSyncLevel(raw) orelse return .{ .issue = .{ .invalid_sync_level = raw } };
             },
             .size, .batches, .read_buffer_bytes, .max_line_bytes, .batch_bytes => {
-                const raw = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
+                const raw = switch (takeLoadOptionValue(&args, arg)) {
+                    .value => |value| value,
+                    .issue => |issue| return .{ .issue = issue },
+                };
                 const parsed = std.fmt.parseUnsigned(usize, raw, 10) catch
                     return .{ .issue = .{ .invalid_integer = .{ .flag = arg, .value = raw } } };
                 if (parsed == 0) return .{ .issue = .{ .non_positive = .{ .flag = arg, .value = raw } } };
@@ -741,7 +769,10 @@ fn parseLoadOptionsIterator(iterator: std.process.Args.Iterator) LoadParseResult
                 }
             },
             .max_errors => {
-                const raw = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
+                const raw = switch (takeLoadOptionValue(&args, arg)) {
+                    .value => |value| value,
+                    .issue => |issue| return .{ .issue = issue },
+                };
                 values.max_errors = std.fmt.parseUnsigned(u64, raw, 10) catch
                     return .{ .issue = .{ .invalid_integer = .{ .flag = arg, .value = raw } } };
             },
@@ -1040,6 +1071,10 @@ test "load parser rejects missing duplicate conflicting and malformed options" {
     var missing_id_argv = [_][*:0]const u8{ "--table", "docs", "--file", "docs.jsonl", "--id-field" };
     const missing_id = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = missing_id_argv[0..] }));
     try std.testing.expectEqualStrings("--id-field", missing_id.issue.missing_value);
+
+    var swallowed_dry_run_argv = [_][*:0]const u8{ "--table", "docs", "--file", "docs.jsonl", "--id-field", "--dry-run" };
+    const swallowed_dry_run = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = swallowed_dry_run_argv[0..] }));
+    try std.testing.expectEqualStrings("--id-field", swallowed_dry_run.issue.missing_value);
 
     var duplicate_argv = [_][*:0]const u8{ "--table", "docs", "-t", "other", "--file", "docs.jsonl" };
     const duplicate = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = duplicate_argv[0..] }));

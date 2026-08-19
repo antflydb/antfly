@@ -2680,6 +2680,17 @@ export interface components {
             /** @description Minimum retry delay in milliseconds. */
             retry_after_ms: number;
         };
+        /** @description Actionable retry contract for temporary storage descriptor exhaustion. */
+        StorageResourceExhaustedError: {
+            /** @enum {string} */
+            code: "storage_resource_exhausted";
+            /** @enum {string} */
+            error: "storage_resource_exhausted";
+            message: string;
+            /** @enum {boolean} */
+            retryable: true;
+            retry_after_ms: number;
+        };
         /** @description A non-retryable table-storage integrity or format failure. */
         TableStorageUnreadableError: {
             /**
@@ -11479,6 +11490,53 @@ export interface components {
             /** @description IDs of retrieved documents (for retrieval metrics) */
             retrieved_ids?: string[];
         };
+        /** @description Configuration for a new index. The index name is owned by the request path. */
+        CreateIndexRequest: {
+            /** @description Optional description of the index and its purpose */
+            description?: string;
+            type: components["schemas"]["IndexType"];
+            /**
+             * @description Version of the index implementation. Defaults to 0.
+             * @default 0
+             */
+            version?: number;
+            /** @description Inline managed enrichment definitions required by this index. */
+            enrichments?: components["schemas"]["EnrichmentConfig"][];
+            /** @description Whether to use memory-only storage. */
+            mem_only?: boolean;
+            coverage_policy?: components["schemas"]["DerivedCoveragePolicy"];
+            /** @default false */
+            external?: boolean;
+            /** @default false */
+            sparse?: boolean;
+            dimension?: number;
+            field?: string;
+            embedding_name?: string;
+            source_artifact_name?: string;
+            template?: string;
+            distance_metric?: components["schemas"]["DistanceMetric"];
+            embedder?: components["schemas"]["EmbedderConfig"];
+            summarizer?: components["schemas"]["GeneratorConfig"];
+            chunker?: components["schemas"]["ChunkerConfig"];
+            /** @default 10 */
+            top_k?: number;
+            /**
+             * Format: float
+             * @default 0
+             */
+            min_weight?: number;
+            /** @default 1024 */
+            chunk_size?: number;
+            execution?: components["schemas"]["IndexExecutionConfig"];
+            edge_types?: components["schemas"]["EdgeTypeConfig"][];
+            max_edges_per_document?: number;
+            derive_from_schema?: boolean;
+        };
+        /** @description Normalized effective configuration returned after an index is created. */
+        CreatedIndex: components["schemas"]["CreateIndexRequest"] & {
+            /** @description Name of the created index */
+            name: string;
+        };
         InferenceError: {
             /** @description Stable machine-readable error code */
             error: string;
@@ -13293,6 +13351,16 @@ export interface components {
             };
             content: {
                 "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description Storage descriptors are temporarily exhausted */
+        StorageResourceExhausted: {
+            headers: {
+                "Retry-After": number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["StorageResourceExhaustedError"];
             };
         };
         /** @description Inference capacity is temporarily unavailable */
@@ -15581,7 +15649,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["IndexConfig"];
+                "application/json": components["schemas"]["CreateIndexRequest"];
             };
         };
         responses: {
@@ -15590,10 +15658,17 @@ export interface operations {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["CreatedIndex"];
+                };
             };
             400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            429: components["responses"]["StorageResourceExhausted"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     dropIndex: {

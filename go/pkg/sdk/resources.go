@@ -90,17 +90,21 @@ func (c *AntflyClient) ListTables(ctx context.Context) ([]TableStatus, error) {
 	return tables, nil
 }
 
-// CreateIndex creates a new index on a table
-func (c *AntflyClient) CreateIndex(ctx context.Context, tableName, indexName string, config IndexConfig) error {
+// CreateIndex creates a new index and returns its normalized effective config.
+func (c *AntflyClient) CreateIndex(ctx context.Context, tableName, indexName string, config CreateIndexRequest) (*CreatedIndex, error) {
 	resp, err := c.client.CreateIndex(ctx, tableName, indexName, config)
 	if err != nil {
-		return fmt.Errorf("creating index: %w", err)
+		return nil, fmt.Errorf("creating index: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("creating index: %w", readErrorResponse(resp))
+		return nil, fmt.Errorf("creating index: %w", readErrorResponse(resp))
 	}
-	return nil
+	var created CreatedIndex
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		return nil, fmt.Errorf("parsing create index response: %w", err)
+	}
+	return &created, nil
 }
 
 // DropIndex drops an index from a table

@@ -87,40 +87,16 @@ content:
                             if !code_str.starts_with('4') && !code_str.starts_with('5') {
                                 continue;
                             }
-                            // If it has content with a non-Error schema, replace it
-                            if let Some(content) = resp.get("content").and_then(|c| c.as_mapping())
-                            {
-                                let json_key = serde_yaml::Value::String("application/json".into());
-                                if let Some(media) = content.get(&json_key) {
-                                    if let Some(schema) = media.get("schema") {
-                                        let is_error_ref = schema
-                                            .get("$ref")
-                                            .and_then(|r| r.as_str())
-                                            .is_some_and(|r| r.ends_with("/Error"));
-                                        if !is_error_ref {
-                                            // Replace with Error schema, keep description
-                                            let desc = resp.get("description").cloned();
-                                            if let Some(resp) = resp.as_mapping_mut() {
-                                                resp.remove(&serde_yaml::Value::String(
-                                                    "content".into(),
-                                                ));
-                                                if let Some(ec) = error_schema.as_mapping() {
-                                                    for (k, v) in ec {
-                                                        resp.insert(k.clone(), v.clone());
-                                                    }
-                                                }
-                                                if let Some(d) = desc {
-                                                    resp.insert(
-                                                        serde_yaml::Value::String(
-                                                            "description".into(),
-                                                        ),
-                                                        d,
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                            // Resolve both inline responses and response-level
+                            // $refs to one error shape. Progenitor cannot emit
+                            // an operation with heterogeneous error bodies.
+                            let desc = resp.get("description").cloned().unwrap_or_else(|| {
+                                serde_yaml::Value::String("Error response".into())
+                            });
+                            *resp = error_schema.clone();
+                            if let Some(mapping) = resp.as_mapping_mut() {
+                                mapping
+                                    .insert(serde_yaml::Value::String("description".into()), desc);
                             }
                         }
                     }

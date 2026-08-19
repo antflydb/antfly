@@ -33,7 +33,7 @@ include!(concat!(env!("OUT_DIR"), "/client.rs"));
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_base_url;
+    use super::{normalize_base_url, types};
 
     #[test]
     fn normalizes_local_and_cloud_urls() {
@@ -57,5 +57,18 @@ mod tests {
             normalize_base_url("https://platform.antfly.io/cloud/v1/instance/api/v1"),
             "https://platform.antfly.io/cloud/v1/instance"
         );
+    }
+
+    #[test]
+    fn create_index_request_uses_path_owned_identity() {
+        let request: types::CreateIndexRequest = serde_json::from_value(serde_json::json!({
+            "type": "embeddings",
+            "dimension": 512,
+            "coverage_policy": "partial"
+        }))
+        .expect("valid create index request");
+        let value = serde_json::to_value(request).expect("serialize create index request");
+        assert_eq!(value["type"], "embeddings");
+        assert!(value.get("name").is_none());
     }
 }

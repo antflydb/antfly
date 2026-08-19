@@ -25,7 +25,7 @@ import pytest
 import requests
 
 from conftest import ready_index_status
-from helpers import json_doc, upsert, wait_until
+from helpers import assert_created_index, json_doc, upsert, wait_until
 
 
 def _table_name(created: dict) -> str:
@@ -285,7 +285,7 @@ def test_table_index_lifecycle(table_api):
             "dimension": 384,
         },
     )
-    assert created_index == {}
+    assert_created_index(created_index, index_name, "embeddings")
 
     assert (
         wait_until(
@@ -327,7 +327,7 @@ def test_stateful_table_accepts_public_full_text_create_index(stateful_api):
     created = stateful_api.create_table(table_name, num_shards=1)
     assert _table_name(created) == table_name
 
-    assert (
+    assert_created_index(
         stateful_api.create_index(
             table_name,
             "search_idx",
@@ -335,8 +335,9 @@ def test_stateful_table_accepts_public_full_text_create_index(stateful_api):
                 "name": "search_idx",
                 "type": "full_text",
             },
-        )
-        == {}
+        ),
+        "search_idx",
+        'full_text',
     )
 
     detail = stateful_api.get_index(table_name, "search_idx")
@@ -377,7 +378,7 @@ def test_stateful_managed_algebraic_generation_rebuild_catches_up_and_reopens(st
     )
     assert initial["inserted"] == 2
 
-    assert (
+    assert_created_index(
         stateful_api.create_index(
             table_name,
             index_name,
@@ -386,8 +387,9 @@ def test_stateful_managed_algebraic_generation_rebuild_catches_up_and_reopens(st
                 "type": "algebraic",
                 "derive_from_schema": True,
             },
-        )
-        == {}
+        ),
+        index_name,
+        'algebraic',
     )
     # This write lands after admission while the snapshot generation may still
     # be building. Durable replay must carry it into the activated generation.
@@ -551,7 +553,7 @@ def test_stateful_table_cleans_document_full_text_inline_enrichments_on_index_de
     created = stateful_api.create_table(table_name, num_shards=1)
     assert _table_name(created) == table_name
 
-    assert (
+    assert_created_index(
         stateful_api.create_index(
             table_name,
             "document_text",
@@ -577,8 +579,9 @@ def test_stateful_table_cleans_document_full_text_inline_enrichments_on_index_de
                     },
                 ],
             },
-        )
-        == {}
+        ),
+        "document_text",
+        'full_text',
     )
 
     index = stateful_api.get_index(table_name, "document_text")
@@ -612,7 +615,7 @@ def test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_qu
     created = stateful_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         stateful_api.create_index(
             table_name,
             index_name,
@@ -622,8 +625,9 @@ def test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_qu
                 "external": True,
                 "dimension": 3,
             },
-        )
-        == {}
+        ),
+        index_name,
+        'embeddings',
     )
 
     detail = wait_until(
@@ -779,7 +783,7 @@ def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
     created = stateful_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         stateful_api.create_index(
             table_name,
             index_name,
@@ -794,8 +798,9 @@ def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
                     "url": openai_embedder,
                 },
             },
-        )
-        == {}
+        ),
+        index_name,
+        'embeddings',
     )
     assert wait_until(
         lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
@@ -889,7 +894,9 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_rate_limited
         },
     }
 
-    assert stateful_api.create_index(table_name, index_name, index_payload) == {}
+    assert_created_index(
+        stateful_api.create_index(table_name, index_name, index_payload), index_name, "embeddings"
+    )
     assert wait_until(
         # A metadata snapshot can expose the index config before the table's
         # shard topology and runtime observation arrive. Do not begin the
@@ -944,7 +951,9 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_rate_limited
         is not None
     )
 
-    assert stateful_api.create_index(table_name, index_name, index_payload) == {}
+    assert_created_index(
+        stateful_api.create_index(table_name, index_name, index_payload), index_name, "embeddings"
+    )
 
     recovered = wait_until(
         lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=3),
@@ -1007,7 +1016,9 @@ def test_stateful_drop_tables_with_pending_enrichment_preserves_unrelated_owner(
             assert created["name"] == table_name
         rate_limited_openai_embedder.allow_all_requests()
         for table_name in hot_tables:
-            assert stateful_api.create_index(table_name, index_name, index_payload) == {}
+            assert_created_index(
+                stateful_api.create_index(table_name, index_name, index_payload), index_name, "embeddings"
+            )
             assert wait_until(
                 lambda table_name=table_name: _ready_index(
                     stateful_api, table_name, index_name, expected_docs=0
@@ -1121,7 +1132,9 @@ def test_stateful_managed_embeddings_backfill_recovers_after_rate_limited_enrich
         },
     }
 
-    assert stateful_api.create_index(table_name, index_name, index_payload) == {}
+    assert_created_index(
+        stateful_api.create_index(table_name, index_name, index_payload), index_name, "embeddings"
+    )
     assert wait_until(
         # A metadata snapshot can expose the index config before the table's
         # shard topology and runtime observation arrive. Do not begin the
@@ -1209,7 +1222,7 @@ def test_stateful_managed_embeddings_backfill_resumes_after_process_restart(
 
     created = stateful_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
-    assert (
+    assert_created_index(
         stateful_api.create_index(
             table_name,
             index_name,
@@ -1224,8 +1237,9 @@ def test_stateful_managed_embeddings_backfill_resumes_after_process_restart(
                     "url": rate_limited_openai_embedder.url,
                 },
             },
-        )
-        == {}
+        ),
+        index_name,
+        'embeddings',
     )
     assert wait_until(
         lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
@@ -1310,7 +1324,9 @@ def test_stateful_managed_embeddings_status_reports_partial_retrying_backfill_af
         },
     }
 
-    assert stateful_api.create_index(table_name, index_name, index_payload) == {}
+    assert_created_index(
+        stateful_api.create_index(table_name, index_name, index_payload), index_name, "embeddings"
+    )
     assert wait_until(
         lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
@@ -1410,7 +1426,9 @@ def test_stateful_managed_embeddings_provider_pacing_avoids_rate_limit_bursts(
         },
     }
 
-    assert stateful_api.create_index(table_name, index_name, index_payload) == {}
+    assert_created_index(
+        stateful_api.create_index(table_name, index_name, index_payload), index_name, "embeddings"
+    )
     assert wait_until(
         lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
@@ -1473,7 +1491,9 @@ def test_stateful_managed_embeddings_provider_pacing_is_shared_across_tables(
                 "burst": 1,
             },
         }
-        assert stateful_api.create_index(table_name, index_name, index_payload) == {}
+        assert_created_index(
+            stateful_api.create_index(table_name, index_name, index_payload), index_name, "embeddings"
+        )
         assert wait_until(
             lambda table_name=table_name: ready_index_status(
                 stateful_api.get_index(table_name, index_name),
@@ -1609,7 +1629,9 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_arti
         },
     }
 
-    assert stateful_api.create_index(table_name, index_name, index_payload) == {}
+    assert_created_index(
+        stateful_api.create_index(table_name, index_name, index_payload), index_name, "embeddings"
+    )
     assert wait_until(
         lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
@@ -1661,7 +1683,9 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_arti
         is not None
     )
 
-    assert stateful_api.create_index(table_name, index_name, index_payload) == {}
+    assert_created_index(
+        stateful_api.create_index(table_name, index_name, index_payload), index_name, "embeddings"
+    )
 
     recovered = wait_until(
         lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=2),
@@ -1803,8 +1827,8 @@ def test_table_chunker_full_text_index_routes_template_chunks(table_api, openai_
         if full_text_enabled:
             chunker["full_text_index"] = {}
 
-        assert (
-            table_api.create_index(
+        assert_created_index(
+        table_api.create_index(
                 table_name,
                 index_name,
                 {
@@ -1819,9 +1843,10 @@ def test_table_chunker_full_text_index_routes_template_chunks(table_api, openai_
                     },
                     "chunker": chunker,
                 },
-            )
-            == {}
-        )
+            ),
+        index_name,
+        'embeddings',
+    )
 
         batch = table_api.batch_write(
             table_name,
@@ -1864,7 +1889,7 @@ def test_mutable_table_chunker_without_full_text_index_does_not_persist_chunks(s
     created = stateful_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         stateful_api.create_index(
             table_name,
             index_name,
@@ -1889,8 +1914,9 @@ def test_mutable_table_chunker_without_full_text_index_does_not_persist_chunks(s
                     },
                 },
             },
-        )
-        == {}
+        ),
+        index_name,
+        'embeddings',
     )
 
     batch = stateful_api.batch_write(
@@ -1937,7 +1963,7 @@ def test_mutable_table_chunker_full_text_index_persists_chunks(stateful_api, ope
     created = stateful_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         stateful_api.create_index(
             table_name,
             index_name,
@@ -1963,8 +1989,9 @@ def test_mutable_table_chunker_full_text_index_persists_chunks(stateful_api, ope
                     },
                 },
             },
-        )
-        == {}
+        ),
+        index_name,
+        'embeddings',
     )
 
     batch = stateful_api.batch_write(
@@ -2027,8 +2054,8 @@ def test_serverless_chunker_full_text_index_reports_publication_status(serverles
         if full_text_enabled:
             chunker["full_text_index"] = {}
 
-        assert (
-            serverless_api.create_index(
+        assert_created_index(
+        serverless_api.create_index(
                 table_name,
                 index_name,
                 {
@@ -2044,9 +2071,10 @@ def test_serverless_chunker_full_text_index_reports_publication_status(serverles
                     },
                     "chunker": chunker,
                 },
-            )
-            == {}
-        )
+            ),
+        index_name,
+        'embeddings',
+    )
 
         serverless_api.ingest_table(
             table_name,
@@ -2121,7 +2149,7 @@ def test_serverless_chunked_dense_index_reports_chunk_embeddings_blocker(serverl
         )
         == {}
     )
-    assert (
+    assert_created_index(
         serverless_api.create_index(
             table_name,
             index_name,
@@ -2139,8 +2167,9 @@ def test_serverless_chunked_dense_index_reports_chunk_embeddings_blocker(serverl
                     },
                 },
             },
-        )
-        == {}
+        ),
+        index_name,
+        'embeddings',
     )
 
     serverless_api.ingest_table(
@@ -2224,7 +2253,7 @@ def test_serverless_named_embedding_indexes_report_publication_actions(serverles
     created = serverless_api.ensure_table(table_name, created_at_ns=100)
     assert created["table_name"] == table_name
 
-    assert (
+    assert_created_index(
         serverless_api.create_index(
             table_name,
             "semantic_a",
@@ -2234,10 +2263,11 @@ def test_serverless_named_embedding_indexes_report_publication_actions(serverles
                 "external": True,
                 "dimension": 3,
             },
-        )
-        == {}
+        ),
+        "semantic_a",
+        'embeddings',
     )
-    assert (
+    assert_created_index(
         serverless_api.create_index(
             table_name,
             "sparse_a",
@@ -2247,8 +2277,9 @@ def test_serverless_named_embedding_indexes_report_publication_actions(serverles
                 "external": True,
                 "sparse": True,
             },
-        )
-        == {}
+        ),
+        "sparse_a",
+        'embeddings',
     )
 
     serverless_api.ingest_table(
@@ -2285,7 +2316,7 @@ def test_serverless_named_embedding_indexes_report_publication_actions(serverles
     )
     assert status is not None
 
-    assert (
+    assert_created_index(
         serverless_api.create_index(
             table_name,
             "semantic_b",
@@ -2295,10 +2326,11 @@ def test_serverless_named_embedding_indexes_report_publication_actions(serverles
                 "external": True,
                 "dimension": 3,
             },
-        )
-        == {}
+        ),
+        "semantic_b",
+        'embeddings',
     )
-    assert (
+    assert_created_index(
         serverless_api.create_index(
             table_name,
             "sparse_b",
@@ -2308,8 +2340,9 @@ def test_serverless_named_embedding_indexes_report_publication_actions(serverles
                 "external": True,
                 "sparse": True,
             },
-        )
-        == {}
+        ),
+        "sparse_b",
+        'embeddings',
     )
     assert serverless_api.delete_index(table_name, "semantic_a") == {}
 
@@ -2361,7 +2394,7 @@ def test_serverless_same_name_dense_index_update_republishes_head(serverless_api
     created = serverless_api.ensure_table(table_name, created_at_ns=100)
     assert created["table_name"] == table_name
 
-    assert (
+    assert_created_index(
         serverless_api.create_index(
             table_name,
             "semantic_idx",
@@ -2371,8 +2404,9 @@ def test_serverless_same_name_dense_index_update_republishes_head(serverless_api
                 "external": True,
                 "dimension": 3,
             },
-        )
-        == {}
+        ),
+        "semantic_idx",
+        'embeddings',
     )
 
     serverless_api.ingest_table(
@@ -2476,7 +2510,7 @@ def test_serverless_build_status_reports_head_actions_for_text_only_updates(serv
     created = serverless_api.ensure_table(table_name, created_at_ns=100)
     assert created["table_name"] == table_name
 
-    assert (
+    assert_created_index(
         serverless_api.create_index(
             table_name,
             "semantic_a",
@@ -2486,10 +2520,11 @@ def test_serverless_build_status_reports_head_actions_for_text_only_updates(serv
                 "external": True,
                 "dimension": 3,
             },
-        )
-        == {}
+        ),
+        "semantic_a",
+        'embeddings',
     )
-    assert (
+    assert_created_index(
         serverless_api.create_index(
             table_name,
             "sparse_a",
@@ -2499,8 +2534,9 @@ def test_serverless_build_status_reports_head_actions_for_text_only_updates(serv
                 "external": True,
                 "sparse": True,
             },
-        )
-        == {}
+        ),
+        "sparse_a",
+        'embeddings',
     )
 
     serverless_api.ingest_table(

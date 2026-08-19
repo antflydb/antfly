@@ -222,9 +222,14 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(cli, cli_serve
         )
         assert "thumbnail\tembeddings\tready" in image_wait.stdout
         image_status = parse_json(cli("index", "get", "--table", table, "--index", "thumbnail").stdout)
-        assert image_status["status"]["coverage"]["policy"] == "partial"
-        assert image_status["status"]["coverage"]["complete"] is True
-        assert image_status["status"]["coverage"]["healthy"] is True
+        image_coverage = image_status["status"]["coverage"]
+        assert image_coverage["policy"] == "partial"
+        assert image_coverage["source_total"] == 2
+        assert image_coverage["produced"] == 1
+        assert image_coverage["skipped"] == 1
+        assert image_coverage["terminal_failed"] == 0
+        assert image_coverage["complete"] is True
+        assert image_coverage["healthy"] is True
 
         image_query = cli(
             "query", "--table", table, "--semantic-search", "map of a country",

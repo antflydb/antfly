@@ -1456,6 +1456,26 @@ components:
           type: integer
           minimum: 1
           description: Minimum retry delay in milliseconds.
+    StorageResourceExhaustedError:
+      type: object
+      additionalProperties: false
+      description: Actionable retry contract for temporary storage descriptor exhaustion.
+      required: [code, error, message, retryable, retry_after_ms]
+      properties:
+        code:
+          type: string
+          enum: [storage_resource_exhausted]
+        error:
+          type: string
+          enum: [storage_resource_exhausted]
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum: [true]
+        retry_after_ms:
+          type: integer
+          minimum: 1
     TableStorageUnreadableError:
       type: object
       additionalProperties: false
@@ -8326,6 +8346,18 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    StorageResourceExhausted:
+      description: Storage descriptors are temporarily exhausted
+      headers:
+        Retry-After:
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/StorageResourceExhaustedError"
     InferenceTransientCapacity:
       description: Inference capacity is temporarily unavailable
       headers:
@@ -10982,13 +11014,26 @@ paths:
         content:
           application/json:
             schema:
-              #$ref: "#/components/schemas/CreateIndexRequest"
-              $ref: "indexes.yaml#/components/schemas/IndexConfig"
+              $ref: "indexes.yaml#/components/schemas/CreateIndexRequest"
       responses:
         "201": # Corrected to 201 as per handler
           description: Index added successfully
+          content:
+            application/json:
+              schema:
+                $ref: "indexes.yaml#/components/schemas/CreatedIndex"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/StorageResourceExhausted"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
     delete:

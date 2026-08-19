@@ -42,6 +42,7 @@ export {
   QUERY_TEMPORARILY_UNAVAILABLE_CODES,
   type QueryTemporarilyUnavailableCode,
   QueryTemporarilyUnavailableError,
+  type IndexOperations,
   type RestoreOptions,
   StorageReadTemporarilyUnavailableError,
 } from "./client.js";
@@ -213,6 +214,8 @@ export type {
   GraphQueryType,
   GraphResultNode,
   // Index types
+  CreateIndexRequest,
+  CreatedIndex,
   IndexConfig,
   IndexStatus,
   IndexType,

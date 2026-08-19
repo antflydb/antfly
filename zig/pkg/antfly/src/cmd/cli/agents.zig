@@ -174,7 +174,7 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
         .steps = steps,
     };
 
-    if (semantic_search != null) index_readiness.warnIfSemanticIndexesAreNotReady(client, table, indexes);
+    if (semantic_search != null) index_readiness.warnIfSelectedSemanticIndexesAreNotReadyForRetrieval(client, table, indexes);
     var resp = try client.retrievalAgent(body);
     defer resp.deinit();
     if (resp.body) |response_body| {

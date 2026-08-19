@@ -206,6 +206,30 @@ class TestAntflyClient:
         assert "table already exists" in str(exc_info.value)
 
     @patch("antfly.client.Client")
+    def test_create_index_uses_path_identity_and_returns_config(self, mock_client_class: MagicMock) -> None:
+        mock_httpx = MagicMock()
+        created = {"name": "thumbnail", "type": "embeddings", "dimension": 512}
+        configure_response(mock_httpx, 201, created)
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+
+        client = AntflyClient(base_url="http://localhost:8080")
+        config = {"type": "embeddings", "dimension": 512}
+        result = client.indexes.create("wiki/media", "thumbnail image", config)
+
+        assert result == created
+        assert config == {"type": "embeddings", "dimension": 512}
+        mock_httpx.stream.assert_called_once_with(
+            "POST",
+            "/db/v1/tables/wiki%2Fmedia/indexes/thumbnail%20image",
+            json=config,
+        )
+
+    def test_create_index_rejects_duplicate_body_identity(self) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+        with pytest.raises(ValueError, match="owned by the path"):
+            client.indexes.create("docs", "search", {"name": "other", "type": "full_text"})
+
+    @patch("antfly.client.Client")
     def test_query_preserves_sorted_cursor_contract(self, mock_client_class: MagicMock) -> None:
         """High-level query forwards order_by/search_after/profile and returns generated response model."""
         response_body = {

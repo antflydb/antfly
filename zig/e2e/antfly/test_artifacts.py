@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
-from helpers import wait_until
+from helpers import assert_created_index, wait_until
 
 DOCUMENT_UNITS_ARTIFACT = "document_units_v1"
 
@@ -1143,7 +1143,7 @@ def test_artifact_backed_chunk_embeddings_are_semantic_searchable(stateful_api, 
         )
         is not None
     )
-    assert (
+    assert_created_index(
         stateful_api.create_index(
             table_name,
             "document_vectors",
@@ -1160,8 +1160,9 @@ def test_artifact_backed_chunk_embeddings_are_semantic_searchable(stateful_api, 
                     "url": openai_embedder,
                 },
             },
-        )
-        == {}
+        ),
+        "document_vectors",
+        'embeddings',
     )
     index_detail = stateful_api.get_index(table_name, "document_vectors")
     assert index_detail["config"]["name"] == "document_vectors"

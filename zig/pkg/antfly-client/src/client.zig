@@ -122,11 +122,16 @@ pub const AntflyClient = struct {
     // --- Index operations ---
 
     pub const IndexConfig = @TypeOf(@as(openapi.types.IndexStatus, undefined).config);
+    pub const CreateIndexRequest = openapi.types.CreateIndexRequest;
+    pub const CreatedIndex = openapi.types.CreatedIndex;
 
-    pub fn createIndex(self: *AntflyClient, table_name: []const u8, index_name: []const u8, body: IndexConfig) !void {
+    pub fn createIndex(self: *AntflyClient, table_name: []const u8, index_name: []const u8, body: CreateIndexRequest) !openapi.ApiResponse(CreatedIndex) {
         var resp = try self.inner.createIndex(table_name, index_name, body);
-        defer resp.deinit();
-        if (resp.status_code >= 300) return self.apiErrorFromResponse(&resp);
+        if (resp.status_code >= 300) {
+            defer resp.deinit();
+            return self.apiErrorFromResponse(&resp);
+        }
+        return resp;
     }
 
     pub fn dropIndex(self: *AntflyClient, table_name: []const u8, index_name: []const u8) !void {

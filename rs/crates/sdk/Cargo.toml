@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "Async Rust client for the Antfly API, generated from the OpenAPI spec"
 
+[lib]
+# OpenAPI descriptions contain JSON, YAML, and filesystem examples that rustdoc
+# otherwise misclassifies as Rust doctests in the generated client.
+doctest = false
+
 [dependencies]
 progenitor-client = "0.13"
 reqwest = { version = "0.13", features = ["json"] }

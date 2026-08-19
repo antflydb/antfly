@@ -18,6 +18,10 @@ const antfly_client = @import("antfly-client");
 // Readiness is advisory for a query: keep its control-plane lookup bounded so
 // an unhealthy status endpoint cannot hold the data-plane request hostage.
 const semantic_readiness_timeout_ms: u64 = 1_500;
+// Retrieval agents have their own server-side index selection and readiness
+// checks. Keep the optional CLI advisory on a strict interactive latency bound
+// and only run it when the caller explicitly selected indexes.
+const retrieval_advisory_timeout_ms: u64 = 250;
 
 /// Coverage is an integrity signal, but its completion semantics are policy
 /// specific. External indexes are query-ready once replay is current even when
@@ -94,7 +98,25 @@ pub fn warnIfSemanticIndexesAreNotReady(
     table_name: []const u8,
     selected_indexes: ?[]const []const u8,
 ) void {
-    var resp = client.listIndexesResponseWithTimeout(table_name, semantic_readiness_timeout_ms) catch |err| {
+    warnIfSemanticIndexesAreNotReadyWithTimeout(client, table_name, selected_indexes, semantic_readiness_timeout_ms);
+}
+
+pub fn warnIfSelectedSemanticIndexesAreNotReadyForRetrieval(
+    client: *antfly_client.AntflyClient,
+    table_name: []const u8,
+    selected_indexes: ?[]const []const u8,
+) void {
+    if (selected_indexes == null) return;
+    warnIfSemanticIndexesAreNotReadyWithTimeout(client, table_name, selected_indexes, retrieval_advisory_timeout_ms);
+}
+
+fn warnIfSemanticIndexesAreNotReadyWithTimeout(
+    client: *antfly_client.AntflyClient,
+    table_name: []const u8,
+    selected_indexes: ?[]const []const u8,
+    timeout_ms: u64,
+) void {
+    var resp = client.listIndexesResponseWithTimeout(table_name, timeout_ms) catch |err| {
         std.debug.print("warning: unable to verify semantic index readiness: {s}\n", .{@errorName(err)});
         return;
     };

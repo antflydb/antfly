@@ -5195,12 +5195,26 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/IndexConfig'
+              $ref: '#/components/schemas/CreateIndexRequest'
       responses:
         '201':
           description: Index added successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedIndex'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/StorageResourceExhausted'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -7749,6 +7763,34 @@ components:
           type: integer
           minimum: 1
           description: Minimum retry delay in milliseconds.
+    StorageResourceExhaustedError:
+      type: object
+      additionalProperties: false
+      description: Actionable retry contract for temporary storage descriptor exhaustion.
+      required:
+        - code
+        - error
+        - message
+        - retryable
+        - retry_after_ms
+      properties:
+        code:
+          type: string
+          enum:
+            - storage_resource_exhausted
+        error:
+          type: string
+          enum:
+            - storage_resource_exhausted
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum:
+            - true
+        retry_after_ms:
+          type: integer
+          minimum: 1
     TableStorageUnreadableError:
       type: object
       additionalProperties: false
@@ -21498,6 +21540,104 @@ components:
           items:
             type: string
           description: IDs of retrieved documents (for retrieval metrics)
+    CreateIndexRequest:
+      type: object
+      description: Configuration for a new index. The index name is owned by the request path.
+      required:
+        - type
+      properties:
+        description:
+          type: string
+          description: Optional description of the index and its purpose
+        type:
+          $ref: '#/components/schemas/IndexType'
+        version:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          default: 0
+          description: Version of the index implementation. Defaults to 0.
+        enrichments:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnrichmentConfig'
+          x-go-type-skip-optional-pointer: true
+          description: Inline managed enrichment definitions required by this index.
+        mem_only:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: Whether to use memory-only storage.
+        coverage_policy:
+          $ref: '#/components/schemas/DerivedCoveragePolicy'
+        external:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          default: false
+        sparse:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          default: false
+        dimension:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+        field:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        embedding_name:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        source_artifact_name:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        template:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        distance_metric:
+          $ref: '#/components/schemas/DistanceMetric'
+        embedder:
+          $ref: '#/components/schemas/EmbedderConfig'
+        summarizer:
+          $ref: '#/components/schemas/GeneratorConfig'
+        chunker:
+          $ref: '#/components/schemas/ChunkerConfig'
+        top_k:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          default: 10
+        min_weight:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: float
+          default: 0.0
+        chunk_size:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 64
+          default: 1024
+        execution:
+          $ref: '#/components/schemas/IndexExecutionConfig'
+        edge_types:
+          type: array
+          items:
+            $ref: '#/components/schemas/EdgeTypeConfig'
+        max_edges_per_document:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+        derive_from_schema:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+    CreatedIndex:
+      description: Normalized effective configuration returned after an index is created.
+      allOf:
+        - $ref: '#/components/schemas/CreateIndexRequest'
+        - type: object
+          required:
+            - name
+          properties:
+            name:
+              type: string
+              description: Name of the created index
     InferenceError:
       type: object
       required:
@@ -24534,6 +24674,18 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    StorageResourceExhausted:
+      description: Storage descriptors are temporarily exhausted
+      headers:
+        Retry-After:
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/StorageResourceExhaustedError'
     InferenceTransientCapacity:
       description: Inference capacity is temporarily unavailable
       headers:

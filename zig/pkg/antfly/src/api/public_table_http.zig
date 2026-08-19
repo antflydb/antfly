@@ -345,7 +345,7 @@ pub const TableApi = struct {
             index_name: []const u8,
             body: []const u8,
             request: operation.RequestContext,
-        ) ExecuteCreateIndexError!void,
+        ) ExecuteCreateIndexError![]u8,
         execute_table_delete_index: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -490,7 +490,7 @@ pub const TableApi = struct {
         table_name: []const u8,
         index_name: []const u8,
         body: []const u8,
-    ) ExecuteCreateIndexError!void {
+    ) ExecuteCreateIndexError![]u8 {
         try self.ensureActive();
         return try self.vtable.execute_table_create_index(self.ptr, alloc, table_name, index_name, body, self.request);
     }
@@ -1201,7 +1201,7 @@ pub fn handleTableCreateIndex(
     body: []const u8,
     api: TableApi,
 ) !OwnedResponse {
-    api.executeTableCreateIndex(alloc, table_name, index_name, body) catch |err| switch (err) {
+    const response_body = api.executeTableCreateIndex(alloc, table_name, index_name, body) catch |err| switch (err) {
         error.Canceled, error.DeadlineExceeded => return err,
         error.NotLeader => return err,
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
@@ -1212,13 +1212,13 @@ pub fn handleTableCreateIndex(
         error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}") },
         error.Backpressured => return .{
             .status = 429,
-            .body = try alloc.dupe(u8, "{\"code\":\"storage_resource_exhausted\",\"message\":\"storage descriptors are temporarily exhausted\",\"retryable\":true,\"retry_after_ms\":1000}"),
+            .body = try alloc.dupe(u8, "{\"code\":\"storage_resource_exhausted\",\"error\":\"storage_resource_exhausted\",\"message\":\"storage descriptors are temporarily exhausted\",\"retryable\":true,\"retry_after_ms\":1000}"),
             .json = true,
             .retry_after_seconds = 1,
         },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "index create failed") },
     };
-    return .{ .status = 201, .body = try alloc.dupe(u8, "{}"), .json = true };
+    return .{ .status = 201, .body = response_body, .json = true };
 }
 
 pub fn handleTableDeleteIndex(
@@ -1754,7 +1754,7 @@ fn unsupportedCreateIndex(
     _: []const u8,
     _: []const u8,
     _: operation.RequestContext,
-) TableApi.ExecuteCreateIndexError!void {
+) TableApi.ExecuteCreateIndexError![]u8 {
     return error.InternalFailure;
 }
 
@@ -1931,7 +1931,7 @@ test "public create index exposes retryable storage descriptor exhaustion" {
             _: []const u8,
             _: []const u8,
             _: operation.RequestContext,
-        ) TableApi.ExecuteCreateIndexError!void {
+        ) TableApi.ExecuteCreateIndexError![]u8 {
             return error.Backpressured;
         }
     };
@@ -1943,6 +1943,54 @@ test "public create index exposes retryable storage descriptor exhaustion" {
     try std.testing.expect(resp.json);
     try std.testing.expectEqual(@as(?u32, 1), resp.retry_after_seconds);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "storage_resource_exhausted") != null);
+}
+
+test "public create index returns normalized created resource" {
+    const Backend = struct {
+        fn iface(self: *@This()) TableApi {
+            return .{
+                .ptr = self,
+                .request = .{},
+                .vtable = &.{
+                    .execute_table_batch = executeTableBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = executeCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableBatch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+            _: operation.RequestContext,
+        ) TableApi.ExecuteBatchError!void {}
+
+        fn executeCreateIndex(
+            _: *anyopaque,
+            alloc: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: operation.RequestContext,
+        ) TableApi.ExecuteCreateIndexError![]u8 {
+            return alloc.dupe(u8, "{\"name\":\"search\",\"type\":\"full_text\"}") catch error.InternalFailure;
+        }
+    };
+
+    var backend = Backend{};
+    var resp = try handleTableCreateIndex(std.testing.allocator, "docs", "search", "{\"type\":\"full_text\"}", backend.iface());
+    defer resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 201), resp.status);
+    try std.testing.expect(resp.json);
+    try std.testing.expectEqualStrings("{\"name\":\"search\",\"type\":\"full_text\"}", resp.body);
 }
 
 test "public table batch handler rejects unsupported missing-document transform before execution" {

@@ -755,6 +755,41 @@ describe("AntflyClient", () => {
     });
   });
 
+  describe("indexes", () => {
+    it("uses path-owned identity and returns the normalized created config", async () => {
+      const created = {
+        name: "thumbnail",
+        type: "embeddings" as const,
+        dimension: 512,
+      };
+      mockPost.mockResolvedValueOnce({ data: created, error: undefined });
+
+      const result = await client.indexes.create("wikipedia", "thumbnail", {
+        type: "embeddings",
+        dimension: 512,
+      });
+
+      expect(result).toEqual(created);
+      expect(mockPost).toHaveBeenCalledWith(
+        "/db/v1/tables/{tableName}/indexes/{indexName}",
+        {
+          params: { path: { tableName: "wikipedia", indexName: "thumbnail" } },
+          body: { type: "embeddings", dimension: 512 },
+        }
+      );
+    });
+
+    it("rejects an empty create response", async () => {
+      mockPost.mockResolvedValueOnce({ data: undefined, error: undefined });
+      await expect(
+        client.indexes.create("wikipedia", "thumbnail", {
+          type: "embeddings",
+          dimension: 512,
+        })
+      ).rejects.toThrow("unexpected empty response");
+    });
+  });
+
   describe("setAuth", () => {
     it("should update authentication credentials", () => {
       client.setAuth("newuser", "newpass");

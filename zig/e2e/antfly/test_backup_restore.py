@@ -39,7 +39,7 @@ from conftest import (
     resolve_binary_path,
     wait_for_server,
 )
-from helpers import wait_until
+from helpers import assert_created_index, wait_until
 from port_reservations import LoopbackPortReservations
 
 BACKUP_CONNECTION = "e2e-backups"
@@ -621,7 +621,7 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(backup_api, sl
     created = backup_api.create_table(table_name, num_shards=1, description="chunked semantic backup docs")
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         backup_api.create_index(
             table_name,
             "semantic_chunked_idx",
@@ -646,8 +646,9 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(backup_api, sl
                     },
                 },
             },
-        )
-        == {}
+        ),
+        "semantic_chunked_idx",
+        'embeddings',
     )
 
     backup_api.wait_index_ready(table_name, "semantic_chunked_idx", timeout_s=30.0, interval_s=0.5)

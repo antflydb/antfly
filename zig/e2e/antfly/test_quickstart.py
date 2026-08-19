@@ -19,7 +19,7 @@ import json
 import pytest
 import requests
 
-from helpers import assert_single_top_hit, json_doc, upsert, wait_until
+from helpers import assert_created_index, assert_single_top_hit, json_doc, upsert, wait_until
 
 CLIPCLAP_MODEL = "antflydb/clipclap"
 
@@ -565,7 +565,7 @@ def test_public_managed_semantic_hybrid_quickstart_pipeline(backup_api, openai_e
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         backup_api.create_index(
             table_name,
             "semantic_idx",
@@ -580,8 +580,9 @@ def test_public_managed_semantic_hybrid_quickstart_pipeline(backup_api, openai_e
                     "url": openai_embedder,
                 },
             },
-        )
-        == {}
+        ),
+        "semantic_idx",
+        'embeddings',
     )
 
     ready = wait_until(
@@ -678,7 +679,7 @@ def test_public_managed_semantic_full_index_pipeline(backup_api, openai_embedder
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         backup_api.create_index(
             table_name,
             index_name,
@@ -693,8 +694,9 @@ def test_public_managed_semantic_full_index_pipeline(backup_api, openai_embedder
                     "url": openai_embedder,
                 },
             },
-        )
-        == {}
+        ),
+        index_name,
+        'embeddings',
     )
 
     backup_api.wait_index_ready(table_name, index_name, timeout_s=30.0, interval_s=0.5)
@@ -800,7 +802,7 @@ def test_public_managed_chunked_semantic_full_index_pipeline(backup_api, openai_
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         backup_api.create_index(
             table_name,
             "semantic_chunked_idx",
@@ -825,8 +827,9 @@ def test_public_managed_chunked_semantic_full_index_pipeline(backup_api, openai_
                     },
                 },
             },
-        )
-        == {}
+        ),
+        "semantic_chunked_idx",
+        'embeddings',
     )
 
     backup_api.wait_index_ready(table_name, "semantic_chunked_idx", timeout_s=30.0, interval_s=0.5)
@@ -881,7 +884,7 @@ def test_public_managed_antfly_chunked_semantic_full_index_pipeline(backup_api, 
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         backup_api.create_index(
             table_name,
             "semantic_antfly_idx",
@@ -906,8 +909,9 @@ def test_public_managed_antfly_chunked_semantic_full_index_pipeline(backup_api, 
                     },
                 },
             },
-        )
-        == {}
+        ),
+        "semantic_antfly_idx",
+        'embeddings',
     )
 
     backup_api.wait_index_ready(table_name, "semantic_antfly_idx", timeout_s=30.0, interval_s=0.5)
@@ -974,7 +978,7 @@ def test_public_managed_antfly_clipclap_gguf_embedder_smoke(real_clipclap_backup
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         backup_api.create_index(
             table_name,
             "semantic_clipclap_idx",
@@ -988,8 +992,9 @@ def test_public_managed_antfly_clipclap_gguf_embedder_smoke(real_clipclap_backup
                     "model": CLIPCLAP_MODEL,
                 },
             },
-        )
-        == {}
+        ),
+        "semantic_clipclap_idx",
+        'embeddings',
     )
 
     backup_api.wait_index_ready(table_name, "semantic_clipclap_idx", timeout_s=60.0, interval_s=0.5)
@@ -1012,7 +1017,7 @@ def test_public_managed_antfly_clipclap_gguf_chunked_full_index_pipeline(real_cl
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         backup_api.create_index(
             table_name,
             "semantic_clipclap_idx",
@@ -1036,8 +1041,9 @@ def test_public_managed_antfly_clipclap_gguf_chunked_full_index_pipeline(real_cl
                     },
                 },
             },
-        )
-        == {}
+        ),
+        "semantic_clipclap_idx",
+        'embeddings',
     )
 
     backup_api.wait_index_ready(table_name, "semantic_clipclap_idx", timeout_s=60.0, interval_s=0.5)

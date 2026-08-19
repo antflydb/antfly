@@ -893,7 +893,7 @@ curl -X POST http://localhost:8080/db/v1/tables/wikipedia/indexes/thumbnail \
 
   <TabsContent value="typescript">
 ```typescript
-await client.tables.addIndex('wikipedia', 'thumbnail', {
+const createdIndex = await client.indexes.create('wikipedia', 'thumbnail', {
   type: 'embeddings',
   coverage_policy: 'partial',
   template: '{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}',
@@ -909,58 +909,60 @@ await client.tables.addIndex('wikipedia', 'thumbnail', {
 
   <TabsContent value="python">
 ```python
-client.add_index(
-    table='wikipedia',
-    name='thumbnail',
-    type='embeddings',
-    coverage_policy='partial',
-    template='{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}',
-    embedder={
-        'provider': 'inference',
-        'model': 'antflydb/clipclap',
+created_index = client.indexes.create(
+    'wikipedia',
+    'thumbnail',
+    {
+        'type': 'embeddings',
+        'coverage_policy': 'partial',
+        'template': '{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}',
+        'embedder': {
+            'provider': 'antfly',
+            'model': 'antflydb/clipclap',
+        },
+        'dimension': 512,
+        'distance_metric': 'cosine',
     },
-    dimension=512,
-    distance_metric='cosine',
 )
 ```
   </TabsContent>
 
   <TabsContent value="go">
 ```go
-_, err = client.AddIndexWithResponse(
-	context.Background(),
-	"wikipedia",
-	"thumbnail",
-	antfly.AddIndexJSONRequestBody{
-		Type:           strPtr("embeddings"),
-		CoveragePolicy: antfly.DerivedCoveragePolicyPartial,
-		Template:       strPtr("{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}"),
-		Embedder: &map[string]interface{}{
-			"provider": "antfly",
-			"model":    "antflydb/clipclap",
-		},
-		Dimension:      intPtr(512),
-		DistanceMetric: strPtr("cosine"),
-	},
-)
+embedder, err := antfly.NewEmbedderConfig(antfly.AntflyEmbedderConfig{
+	Model: "antflydb/clipclap",
+})
+if err != nil { return err }
+request, err := antfly.NewCreateIndexRequest(antfly.EmbeddingsIndexConfig{
+	CoveragePolicy: antfly.DerivedCoveragePolicyPartial,
+	Template:       "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}",
+	Embedder:       *embedder,
+	Dimension:      512,
+	DistanceMetric: antfly.DistanceMetricCosine,
+})
+if err != nil { return err }
+createdIndex, err := client.CreateIndex(context.Background(), "wikipedia", "thumbnail", *request)
+if err != nil { return err }
 ```
   </TabsContent>
 
   <TabsContent value="rust">
 ```rust
-client
-    .add_index("wikipedia", "thumbnail", &json!({
-        "type": "embeddings",
-        "coverage_policy": "partial",
-        "template": "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}",
-        "embedder": {
-            "provider": "antfly",
-            "model": "antflydb/clipclap"
-        },
-        "dimension": 512,
-        "distance_metric": "cosine"
-    }))
-    .await?;
+let request: antfly_sdk::types::CreateIndexRequest = serde_json::from_value(json!({
+    "type": "embeddings",
+    "coverage_policy": "partial",
+    "template": "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}",
+    "embedder": {
+        "provider": "antfly",
+        "model": "antflydb/clipclap"
+    },
+    "dimension": 512,
+    "distance_metric": "cosine"
+}))?;
+let created_index = client
+    .create_index("wikipedia", "thumbnail", &request)
+    .await?
+    .into_inner();
 ```
   </TabsContent>
 </Tabs>

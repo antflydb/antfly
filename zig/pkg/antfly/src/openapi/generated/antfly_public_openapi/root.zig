@@ -184,6 +184,7 @@ pub const SortDirection = types.SortDirection;
 pub const SortField = types.SortField;
 pub const SortProfile = types.SortProfile;
 pub const StorageMaintenanceCapabilities = types.StorageMaintenanceCapabilities;
+pub const StorageResourceExhaustedError = types.StorageResourceExhaustedError;
 pub const StorageRuntimeStatus = types.StorageRuntimeStatus;
 pub const StorageStatus = types.StorageStatus;
 pub const SuccessMessage = types.SuccessMessage;

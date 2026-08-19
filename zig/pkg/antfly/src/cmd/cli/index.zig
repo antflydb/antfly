@@ -61,6 +61,22 @@ const Route = struct {
     missing_value_arg: ?[]const u8 = null,
 };
 
+fn nextRouteValue(
+    args: *std.process.Args.Iterator,
+    flag: []const u8,
+    missing_value_arg: *?[]const u8,
+) ?[]const u8 {
+    const value = args.next() orelse {
+        missing_value_arg.* = missing_value_arg.* orelse flag;
+        return null;
+    };
+    if (std.mem.startsWith(u8, value, "-")) {
+        missing_value_arg.* = missing_value_arg.* orelse flag;
+        return null;
+    }
+    return value;
+}
+
 fn parseRoute(iterator: std.process.Args.Iterator) Route {
     var args = iterator;
     var route: Route = .{};
@@ -70,16 +86,10 @@ fn parseRoute(iterator: std.process.Args.Iterator) Route {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
             if (route.table_name != null and route.duplicate_arg == null) route.duplicate_arg = arg;
-            route.table_name = args.next() orelse {
-                route.missing_value_arg = route.missing_value_arg orelse arg;
-                continue;
-            };
+            route.table_name = nextRouteValue(&args, arg, &route.missing_value_arg);
         } else if (std.mem.eql(u8, arg, "--index") or std.mem.eql(u8, arg, "-i")) {
             if (route.index_name != null and route.duplicate_arg == null) route.duplicate_arg = arg;
-            route.index_name = args.next() orelse {
-                route.missing_value_arg = route.missing_value_arg orelse arg;
-                continue;
-            };
+            route.index_name = nextRouteValue(&args, arg, &route.missing_value_arg);
         } else if (std.mem.eql(u8, arg, "--type") or std.mem.eql(u8, arg, "--field") or
             std.mem.eql(u8, arg, "--template") or std.mem.eql(u8, arg, "--embedder") or
             std.mem.eql(u8, arg, "--generator") or std.mem.eql(u8, arg, "--summarizer") or
@@ -87,22 +97,13 @@ fn parseRoute(iterator: std.process.Args.Iterator) Route {
             std.mem.eql(u8, arg, "--coverage-policy"))
         {
             if (create_only_arg == null) create_only_arg = arg;
-            _ = args.next() orelse {
-                route.missing_value_arg = route.missing_value_arg orelse arg;
-                continue;
-            };
+            _ = nextRouteValue(&args, arg, &route.missing_value_arg);
         } else if (std.mem.eql(u8, arg, "--output") or std.mem.eql(u8, arg, "-o")) {
             if (list_only_arg == null) list_only_arg = arg;
-            _ = args.next() orelse {
-                route.missing_value_arg = route.missing_value_arg orelse arg;
-                continue;
-            };
+            _ = nextRouteValue(&args, arg, &route.missing_value_arg);
         } else if (std.mem.eql(u8, arg, "--timeout") or std.mem.eql(u8, arg, "--poll-interval")) {
             if (wait_only_arg == null) wait_only_arg = arg;
-            _ = args.next() orelse {
-                route.missing_value_arg = route.missing_value_arg orelse arg;
-                continue;
-            };
+            _ = nextRouteValue(&args, arg, &route.missing_value_arg);
         } else if (std.mem.eql(u8, arg, "create") or std.mem.eql(u8, arg, "drop") or
             std.mem.eql(u8, arg, "list") or std.mem.eql(u8, arg, "get") or std.mem.eql(u8, arg, "wait"))
         {
@@ -173,13 +174,16 @@ test "index route accepts flags before and after the action" {
     const missing_index = parseRoute(std.process.Args.Iterator.init(.{ .vector = missing_index_argv[0..] }));
     try std.testing.expectEqualStrings("--index", missing_index.missing_value_arg.?);
 
+    var swallowed_dimension_argv = [_][*:0]const u8{ "create", "--table", "docs", "--coverage-policy", "--dimension", "3" };
+    const swallowed_dimension = parseRoute(std.process.Args.Iterator.init(.{ .vector = swallowed_dimension_argv[0..] }));
+    try std.testing.expectEqualStrings("--coverage-policy", swallowed_dimension.missing_value_arg.?);
+
     var typo_argv = [_][*:0]const u8{ "create", "--table", "docs", "--dimensoin", "512" };
     const typo = parseRoute(std.process.Args.Iterator.init(.{ .vector = typo_argv[0..] }));
     try std.testing.expectEqualStrings("--dimensoin", typo.unknown_arg.?);
 }
 
 const IndexCreateConfigInput = struct {
-    name: []const u8,
     index_type: []const u8,
     field: ?[]const u8 = null,
     template: ?[]const u8 = null,
@@ -193,14 +197,16 @@ const IndexCreateConfigInput = struct {
 fn buildIndexCreateConfig(
     allocator: std.mem.Allocator,
     input: IndexCreateConfigInput,
-) !std.json.Parsed(antfly_client.types.IndexConfig) {
+) !std.json.Parsed(antfly_client.types.CreateIndexRequest) {
+    if (input.coverage_policy != null and !std.mem.eql(u8, input.index_type, "embeddings")) {
+        return error.CoveragePolicyRequiresEmbeddingsIndex;
+    }
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     const writer = &out.writer;
 
     try writer.writeAll("{");
-    try writer.print("\"name\":{f}", .{std.json.fmt(input.name, .{})});
-    try writer.print(",\"type\":{f}", .{std.json.fmt(input.index_type, .{})});
+    try writer.print("\"type\":{f}", .{std.json.fmt(input.index_type, .{})});
     if (input.field) |field| try writer.print(",\"field\":{f}", .{std.json.fmt(field, .{})});
     if (input.template) |template| try writer.print(",\"template\":{f}", .{std.json.fmt(template, .{})});
     if (input.embedder_json) |embedder| try writer.print(",\"embedder\":{s}", .{embedder});
@@ -210,7 +216,7 @@ fn buildIndexCreateConfig(
     if (input.coverage_policy) |policy| try writer.print(",\"coverage_policy\":{f}", .{std.json.fmt(policy, .{})});
     try writer.writeAll("}");
 
-    return std.json.parseFromSlice(antfly_client.types.IndexConfig, allocator, out.written(), .{
+    return std.json.parseFromSlice(antfly_client.types.CreateIndexRequest, allocator, out.written(), .{
         .allocate = .alloc_always,
     });
 }
@@ -273,9 +279,11 @@ fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient
 
     const name = idx_name orelse cli.fatal("--index is required", .{});
     const index_type = idx_type orelse cli.fatal("--type is required", .{});
+    if (coverage_policy != null and !std.mem.eql(u8, index_type, "embeddings")) {
+        cli.fatal("--coverage-policy is only valid for embeddings indexes", .{});
+    }
 
     var parsed = buildIndexCreateConfig(allocator, .{
-        .name = name,
         .index_type = index_type,
         .field = field,
         .template = template,
@@ -289,7 +297,8 @@ fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient
     };
     defer parsed.deinit();
 
-    try client.createIndex(table_name, name, parsed.value);
+    var response = try client.createIndex(table_name, name, parsed.value);
+    defer response.deinit();
     std.debug.print("Create index command successful.\n", .{});
 }
 
@@ -808,7 +817,6 @@ test "index wait parses bounded human durations" {
 
 test "index create config preserves dimension escaping and summarizer" {
     var parsed = try buildIndexCreateConfig(std.testing.allocator, .{
-        .name = "title_body",
         .index_type = "embeddings",
         .field = "body\"quoted",
         .template = "{{title}}\n{{body}}",
@@ -827,13 +835,16 @@ test "index create config preserves dimension escaping and summarizer" {
 }
 
 test "index create config rejects malformed nested JSON and unknown types" {
+    try std.testing.expectError(error.CoveragePolicyRequiresEmbeddingsIndex, buildIndexCreateConfig(std.testing.allocator, .{
+        .index_type = "full_text",
+        .coverage_policy = "partial",
+    }));
+
     try std.testing.expectError(error.MissingField, buildIndexCreateConfig(std.testing.allocator, .{
-        .name = "broken",
         .index_type = "embeddings",
         .embedder_json = "{",
     }));
     try std.testing.expectError(error.UnexpectedToken, buildIndexCreateConfig(std.testing.allocator, .{
-        .name = "broken",
         .index_type = "typo",
     }));
 }

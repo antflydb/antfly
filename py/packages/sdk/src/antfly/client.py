@@ -179,6 +179,46 @@ def normalize_base_url(base_url: str) -> str:
     return trimmed
 
 
+class IndexOperations:
+    """Resource-oriented index operations."""
+
+    def __init__(self, client: "AntflyClient") -> None:
+        self._client = client
+
+    def create(self, table: str, name: str, config: dict[str, Any]) -> dict[str, Any]:
+        """Create an index and return its normalized effective configuration."""
+        if "name" in config:
+            raise ValueError("index name is owned by the path; pass it as the name argument")
+        if not isinstance(config.get("type"), str) or not config["type"]:
+            raise ValueError("index config requires a non-empty type")
+        result = self._client._request(
+            "POST",
+            f"/db/v1/tables/{quote(table, safe='')}/indexes/{quote(name, safe='')}",
+            json=dict(config),
+        )
+        if not isinstance(result, dict):
+            raise AntflyException("create index returned an invalid response")
+        return result
+
+    def list(self, table: str) -> list[dict[str, Any]]:
+        """List all indexes on a table."""
+        result = self._client._request("GET", f"/db/v1/tables/{quote(table, safe='')}/indexes")
+        if not isinstance(result, list):
+            raise AntflyException("list indexes returned an invalid response")
+        return result
+
+    def get(self, table: str, name: str) -> dict[str, Any]:
+        """Get index configuration and readiness status."""
+        result = self._client._request("GET", f"/db/v1/tables/{quote(table, safe='')}/indexes/{quote(name, safe='')}")
+        if not isinstance(result, dict):
+            raise AntflyException("get index returned an invalid response")
+        return result
+
+    def drop(self, table: str, name: str) -> None:
+        """Drop an index."""
+        self._client._request("DELETE", f"/db/v1/tables/{quote(table, safe='')}/indexes/{quote(name, safe='')}")
+
+
 class AntflyClient:
     """High-level client for Antfly database and inference APIs."""
 
@@ -249,6 +289,7 @@ class AntflyClient:
                 timeout=Timeout(timeout),
                 httpx_args=httpx_args,
             )
+        self.indexes = IndexOperations(self)
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         """Make an HTTP request using the underlying httpx client.

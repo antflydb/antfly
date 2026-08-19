@@ -17,6 +17,8 @@ import type {
   ChatStreamCallbacks,
   ClusterRestoreRequest,
   ConnectionsResponse,
+  CreateIndexRequest,
+  CreatedIndex,
   CreateTableRequest,
   CreateUserRequest,
   DocumentArtifactManifest,
@@ -27,7 +29,7 @@ import type {
   DocumentArtifactTableReprocessRequest,
   DocumentArtifactTableReprocessResponse,
   EnrichmentConfig,
-  IndexConfig,
+  IndexStatus,
   LinearMergeRequest,
   LinearMergeResult,
   MultiBatchRequest,
@@ -66,6 +68,17 @@ export interface RestoreJobListOptions {
 export interface RestoreJobPage {
   jobs: RestoreJob[];
   next_cursor?: string;
+}
+
+export interface IndexOperations {
+  list(tableName: string): Promise<IndexStatus[]>;
+  get(tableName: string, indexName: string): Promise<IndexStatus>;
+  create(
+    tableName: string,
+    indexName: string,
+    config: CreateIndexRequest
+  ): Promise<CreatedIndex>;
+  drop(tableName: string, indexName: string): Promise<true>;
 }
 
 export const QUERY_TEMPORARILY_UNAVAILABLE_CODES = [
@@ -1463,7 +1476,7 @@ export class AntflyClient {
   /**
    * Index operations
    */
-  indexes = {
+  indexes: IndexOperations = {
     /**
      * List all indexes for a table
      */
@@ -1472,6 +1485,7 @@ export class AntflyClient {
         params: { path: { tableName } },
       });
       if (error) throw new Error(`Failed to list indexes: ${error.error}`);
+      if (!data) throw new Error("Failed to list indexes: unexpected empty response");
       return data;
     },
 
@@ -1486,19 +1500,24 @@ export class AntflyClient {
         }
       );
       if (error) throw new Error(`Failed to get index: ${error.error}`);
+      if (!data) throw new Error("Failed to get index: unexpected empty response");
       return data;
     },
 
     /**
      * Create a new index
      */
-    create: async (tableName: string, config: IndexConfig) => {
-      const { error } = await this.client.POST("/db/v1/tables/{tableName}/indexes/{indexName}", {
-        params: { path: { tableName, indexName: config.name } },
-        body: config,
-      });
+    create: async (tableName: string, indexName: string, config: CreateIndexRequest) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/tables/{tableName}/indexes/{indexName}",
+        {
+          params: { path: { tableName, indexName } },
+          body: config,
+        }
+      );
       if (error) throw new Error(`Failed to create index: ${error.error}`);
-      return true;
+      if (!data) throw new Error("Failed to create index: unexpected empty response");
+      return data;
     },
 
     /**

@@ -167,6 +167,8 @@ export type EnrichmentConfig = components["schemas"]["EnrichmentConfig"];
 
 // Index types
 export type IndexConfig = components["schemas"]["IndexConfig"];
+export type CreateIndexRequest = components["schemas"]["CreateIndexRequest"];
+export type CreatedIndex = components["schemas"]["CreatedIndex"];
 export type IndexType = components["schemas"]["IndexType"];
 export type IndexStatus = components["schemas"]["IndexStatus"];
 

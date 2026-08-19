@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 import requests
 
-from helpers import wait_until
+from helpers import assert_created_index, wait_until
 
 
 def _create_index(api, table_name: str, index_name: str, payload: dict) -> dict:
@@ -119,7 +119,7 @@ def test_sparse_import_and_hybrid_query_with_external_embeddings(backup_api):
     dense_index = "dense_idx"
     sparse_index = "sparse_idx"
 
-    assert (
+    assert_created_index(
         _create_index(
             backup_api,
             table_name,
@@ -130,10 +130,11 @@ def test_sparse_import_and_hybrid_query_with_external_embeddings(backup_api):
                 "external": True,
                 "dimension": 3,
             },
-        )
-        == {}
+        ),
+        dense_index,
+        'embeddings',
     )
-    assert (
+    assert_created_index(
         _create_index(
             backup_api,
             table_name,
@@ -144,8 +145,9 @@ def test_sparse_import_and_hybrid_query_with_external_embeddings(backup_api):
                 "external": True,
                 "sparse": True,
             },
-        )
-        == {}
+        ),
+        sparse_index,
+        'embeddings',
     )
     backup_api.wait_index_ready(
         table_name, dense_index, timeout_s=30.0, interval_s=0.5, require_query_fresh=True
@@ -308,7 +310,7 @@ def test_named_embedding_queries_use_requested_indexes(table_api):
     created = table_api.create_table(table_name)
     assert created.get("name", table_name) == table_name
 
-    assert (
+    assert_created_index(
         table_api.create_index(
             table_name,
             "semantic_a",
@@ -318,10 +320,11 @@ def test_named_embedding_queries_use_requested_indexes(table_api):
                 "external": True,
                 "dimension": 3,
             },
-        )
-        == {}
+        ),
+        "semantic_a",
+        'embeddings',
     )
-    assert (
+    assert_created_index(
         table_api.create_index(
             table_name,
             "semantic_b",
@@ -331,10 +334,11 @@ def test_named_embedding_queries_use_requested_indexes(table_api):
                 "external": True,
                 "dimension": 3,
             },
-        )
-        == {}
+        ),
+        "semantic_b",
+        'embeddings',
     )
-    assert (
+    assert_created_index(
         table_api.create_index(
             table_name,
             "sparse_a",
@@ -344,10 +348,11 @@ def test_named_embedding_queries_use_requested_indexes(table_api):
                 "external": True,
                 "sparse": True,
             },
-        )
-        == {}
+        ),
+        "sparse_a",
+        'embeddings',
     )
-    assert (
+    assert_created_index(
         table_api.create_index(
             table_name,
             "sparse_b",
@@ -357,8 +362,9 @@ def test_named_embedding_queries_use_requested_indexes(table_api):
                 "external": True,
                 "sparse": True,
             },
-        )
-        == {}
+        ),
+        "sparse_b",
+        'embeddings',
     )
     if table_api.backend == "stateful":
         for index_name in ("semantic_a", "semantic_b", "sparse_a", "sparse_b"):
@@ -486,8 +492,8 @@ def test_semantic_query_embedding_template_supports_remote_text(table_api, opena
         transcript_a = f"{text_server.url}/alpha.txt"
         transcript_b = f"{text_server.url}/beta.txt"
 
-        assert (
-            table_api.create_index(
+        assert_created_index(
+        table_api.create_index(
                 table_name,
                 index_name,
                 {
@@ -510,9 +516,10 @@ def test_semantic_query_embedding_template_supports_remote_text(table_api, opena
                         },
                     },
                 },
-            )
-            == {}
-        )
+            ),
+        index_name,
+        'embeddings',
+    )
 
         batch = table_api.batch_write(
             table_name,
@@ -561,7 +568,7 @@ def test_managed_sparse_hybrid_query_with_antfly_embeddings(backup_api, inferenc
     dense_index = "dense_idx"
     sparse_index = "sparse_idx"
 
-    assert (
+    assert_created_index(
         _create_index(
             backup_api,
             table_name,
@@ -577,10 +584,11 @@ def test_managed_sparse_hybrid_query_with_antfly_embeddings(backup_api, inferenc
                     "api_url": inference_embedder,
                 },
             },
-        )
-        == {}
+        ),
+        dense_index,
+        'embeddings',
     )
-    assert (
+    assert_created_index(
         _create_index(
             backup_api,
             table_name,
@@ -596,8 +604,9 @@ def test_managed_sparse_hybrid_query_with_antfly_embeddings(backup_api, inferenc
                     "api_url": inference_embedder,
                 },
             },
-        )
-        == {}
+        ),
+        sparse_index,
+        'embeddings',
     )
 
     batch = backup_api.batch_write(
@@ -691,7 +700,7 @@ def test_sparse_hybrid_query_supports_reranker_and_pruner(backup_api, inference_
 
     sparse_index = "sparse_idx"
 
-    assert (
+    assert_created_index(
         _create_index(
             backup_api,
             table_name,
@@ -702,8 +711,9 @@ def test_sparse_hybrid_query_supports_reranker_and_pruner(backup_api, inference_
                 "external": True,
                 "sparse": True,
             },
-        )
-        == {}
+        ),
+        sparse_index,
+        'embeddings',
     )
 
     docs = {
@@ -804,7 +814,7 @@ def test_sparse_hybrid_query_rejects_invalid_reranker_provider(backup_api):
 
     sparse_index = "sparse_idx"
 
-    assert (
+    assert_created_index(
         _create_index(
             backup_api,
             table_name,
@@ -815,8 +825,9 @@ def test_sparse_hybrid_query_rejects_invalid_reranker_provider(backup_api):
                 "external": True,
                 "sparse": True,
             },
-        )
-        == {}
+        ),
+        sparse_index,
+        'embeddings',
     )
 
     batch = backup_api.batch_write(
@@ -881,7 +892,7 @@ def test_sparse_hybrid_query_rejects_invalid_reranker_config(backup_api, inferen
 
     sparse_index = "sparse_idx"
 
-    assert (
+    assert_created_index(
         _create_index(
             backup_api,
             table_name,
@@ -892,8 +903,9 @@ def test_sparse_hybrid_query_rejects_invalid_reranker_config(backup_api, inferen
                 "external": True,
                 "sparse": True,
             },
-        )
-        == {}
+        ),
+        sparse_index,
+        'embeddings',
     )
 
     batch = backup_api.batch_write(

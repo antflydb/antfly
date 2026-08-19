@@ -1783,6 +1783,38 @@ pub const CreateApiKeyRequest = struct {
     row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
 };
 
+/// Configuration for a new index. The index name is owned by the request path.
+pub const CreateIndexRequest = struct {
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    type: IndexType,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// Inline managed enrichment definitions required by this index.
+    enrichments: ?[]const EnrichmentConfig = null,
+    /// Whether to use memory-only storage.
+    mem_only: ?bool = null,
+    coverage_policy: ?DerivedCoveragePolicy = null,
+    external: ?bool = null,
+    sparse: ?bool = null,
+    dimension: ?i64 = null,
+    field: ?[]const u8 = null,
+    embedding_name: ?[]const u8 = null,
+    source_artifact_name: ?[]const u8 = null,
+    template: ?[]const u8 = null,
+    distance_metric: ?DistanceMetric = null,
+    embedder: ?EmbedderConfig = null,
+    summarizer: ?GeneratorConfig = null,
+    chunker: ?ChunkerConfig = null,
+    top_k: ?i64 = null,
+    min_weight: ?f32 = null,
+    chunk_size: ?i64 = null,
+    execution: ?IndexExecutionConfig = null,
+    edge_types: ?[]const EdgeTypeConfig = null,
+    max_edges_per_document: ?i64 = null,
+    derive_from_schema: ?bool = null,
+};
+
 pub const CreateTableRequest = struct {
     /// Number of shards to create for the table. Data is partitioned across shards based on key ranges. **Sizing Guidelines:** - Small datasets (<100K docs): 1-3 shards - Medium datasets (100K-1M docs): 3-10 shards - Large datasets (>1M docs): 10+ shards More shards enable better parallelism but increase overhead. Choose based on expected data size and query patterns. **When to Add More Shards:** Antfly supports **online shard reallocation** without downtime. Add more shards when: - Individual shards exceed size thresholds (configurable) - Query latency increases due to large shard size - Need better parallelism for write-heavy workloads Use the internal `/reallocate` endpoint to trigger automatic shard splitting: ```bash POST /internal/v1/reallocate ``` This enqueues a reallocation request that the leader processes asynchronously, splitting large shards and redistributing data without service interruption. **Advantages over Elasticsearch:** - Automatic shard splitting (no manual reindexing required) - Online operation (no downtime) - Transparent to applications (keys remain accessible during reallocation)
     num_shards: ?i64 = null,
@@ -1804,6 +1836,40 @@ pub const CreateUserRequest = struct {
     initial_policies: ?[]const Permission = null,
     /// Auth metadata available to stored row-filter policies.
     metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
+};
+
+/// Normalized effective configuration returned after an index is created.
+pub const CreatedIndex = struct {
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    type: IndexType,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// Inline managed enrichment definitions required by this index.
+    enrichments: ?[]const EnrichmentConfig = null,
+    /// Whether to use memory-only storage.
+    mem_only: ?bool = null,
+    coverage_policy: ?DerivedCoveragePolicy = null,
+    external: ?bool = null,
+    sparse: ?bool = null,
+    dimension: ?i64 = null,
+    field: ?[]const u8 = null,
+    embedding_name: ?[]const u8 = null,
+    source_artifact_name: ?[]const u8 = null,
+    template: ?[]const u8 = null,
+    distance_metric: ?DistanceMetric = null,
+    embedder: ?EmbedderConfig = null,
+    summarizer: ?GeneratorConfig = null,
+    chunker: ?ChunkerConfig = null,
+    top_k: ?i64 = null,
+    min_weight: ?f32 = null,
+    chunk_size: ?i64 = null,
+    execution: ?IndexExecutionConfig = null,
+    edge_types: ?[]const EdgeTypeConfig = null,
+    max_edges_per_document: ?i64 = null,
+    derive_from_schema: ?bool = null,
+    /// Name of the created index
+    name: []const u8,
 };
 
 pub const Credentials = struct {
@@ -8065,6 +8131,15 @@ pub const StorageMaintenanceCapabilities = struct {
     vacuum: bool,
     online: bool,
     asynchronous: bool,
+};
+
+/// Actionable retry contract for temporary storage descriptor exhaustion.
+pub const StorageResourceExhaustedError = struct {
+    code: []const u8,
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+    retry_after_ms: i64,
 };
 
 pub const StorageRuntimeStatus = struct {

@@ -910,7 +910,7 @@ pub const HttpHandler = struct {
         var resp = try public_table_http.handleTableCreateIndex(self.alloc, table_name, index_name, body, self.tableApi(.none));
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
-            201 => try typedJsonResponse(struct {}, self.alloc, 201, resp.body),
+            201 => try typedJsonResponse(indexes_openapi.types.CreatedIndex, self.alloc, 201, resp.body),
             else => try textResponse(self.alloc, resp.status, resp.body),
         };
     }
@@ -4649,7 +4649,7 @@ pub const HttpHandler = struct {
         index_name: []const u8,
         body: []const u8,
         request: api_operation.RequestContext,
-    ) public_table_http.TableApi.ExecuteCreateIndexError!void {
+    ) public_table_http.TableApi.ExecuteCreateIndexError![]u8 {
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         if (self.runtime_status.role == .query_only) return error.MethodNotAllowed;
         var table = (self.catalog.getTableAlloc(self.alloc, table_name) catch return error.InternalFailure) orelse return error.NotFound;
@@ -4676,6 +4676,8 @@ pub const HttpHandler = struct {
             else => return error.InternalFailure,
         };
         defer alloc.free(next_indexes_json);
+        const response_body = alloc.dupe(u8, expanded_index_json) catch return error.InternalFailure;
+        errdefer alloc.free(response_body);
         validateServerlessIndexCatalog(alloc, next_indexes_json) catch |err| switch (err) {
             error.UnsupportedCreateTableRequest, error.InvalidTableIndexMetadata => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
@@ -4692,6 +4694,7 @@ pub const HttpHandler = struct {
             next_indexes_json,
         ) catch return error.InternalFailure;
         if (!updated) return error.NotFound;
+        return response_body;
     }
 
     fn executePublicTableDeleteIndex(

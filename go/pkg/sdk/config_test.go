@@ -25,6 +25,27 @@ func TestNewEmbedderConfigSupportsAntfly(t *testing.T) {
 	}
 }
 
+func TestNewCreateIndexRequestOmitsPathIdentity(t *testing.T) {
+	request, err := NewCreateIndexRequest(EmbeddingsIndexConfig{Dimension: 512})
+	if err != nil {
+		t.Fatalf("NewCreateIndexRequest failed: %v", err)
+	}
+	data, err := json.Marshal(request)
+	if err != nil {
+		t.Fatalf("marshal create index request: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatalf("unmarshal create index request: %v", err)
+	}
+	if _, exists := body["name"]; exists {
+		t.Fatalf("request must not duplicate path-owned name: %s", data)
+	}
+	if body["type"] != "embeddings" || body["dimension"] != float64(512) {
+		t.Fatalf("unexpected request: %s", data)
+	}
+}
+
 func TestNewArtifactEmbeddingIndexConfig(t *testing.T) {
 	embedder, err := NewEmbedderConfig(OllamaEmbedderConfig{Model: "embeddinggemma"})
 	if err != nil {

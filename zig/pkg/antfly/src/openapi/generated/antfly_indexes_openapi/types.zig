@@ -187,6 +187,72 @@ pub const AntflyType = enum {
     }
 };
 
+/// Configuration for a new index. The index name is owned by the request path.
+pub const CreateIndexRequest = struct {
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    type: IndexType,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// Inline managed enrichment definitions required by this index.
+    enrichments: ?[]const EnrichmentConfig = null,
+    /// Whether to use memory-only storage.
+    mem_only: ?bool = null,
+    coverage_policy: ?DerivedCoveragePolicy = null,
+    external: ?bool = null,
+    sparse: ?bool = null,
+    dimension: ?i64 = null,
+    field: ?[]const u8 = null,
+    embedding_name: ?[]const u8 = null,
+    source_artifact_name: ?[]const u8 = null,
+    template: ?[]const u8 = null,
+    distance_metric: ?DistanceMetric = null,
+    embedder: ?antfly_embeddings_openapi.EmbedderConfig = null,
+    summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
+    chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
+    top_k: ?i64 = null,
+    min_weight: ?f32 = null,
+    chunk_size: ?i64 = null,
+    execution: ?IndexExecutionConfig = null,
+    edge_types: ?[]const EdgeTypeConfig = null,
+    max_edges_per_document: ?i64 = null,
+    derive_from_schema: ?bool = null,
+};
+
+/// Normalized effective configuration returned after an index is created.
+pub const CreatedIndex = struct {
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    type: IndexType,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// Inline managed enrichment definitions required by this index.
+    enrichments: ?[]const EnrichmentConfig = null,
+    /// Whether to use memory-only storage.
+    mem_only: ?bool = null,
+    coverage_policy: ?DerivedCoveragePolicy = null,
+    external: ?bool = null,
+    sparse: ?bool = null,
+    dimension: ?i64 = null,
+    field: ?[]const u8 = null,
+    embedding_name: ?[]const u8 = null,
+    source_artifact_name: ?[]const u8 = null,
+    template: ?[]const u8 = null,
+    distance_metric: ?DistanceMetric = null,
+    embedder: ?antfly_embeddings_openapi.EmbedderConfig = null,
+    summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
+    chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
+    top_k: ?i64 = null,
+    min_weight: ?f32 = null,
+    chunk_size: ?i64 = null,
+    execution: ?IndexExecutionConfig = null,
+    edge_types: ?[]const EdgeTypeConfig = null,
+    max_edges_per_document: ?i64 = null,
+    derive_from_schema: ?bool = null,
+    /// Name of the created index
+    name: []const u8,
+};
+
 /// A structured reason why the coverage projection cannot be treated as globally complete.
 pub const DerivedCoverageObservationIncompleteReason = enum {
     runtime_unavailable,

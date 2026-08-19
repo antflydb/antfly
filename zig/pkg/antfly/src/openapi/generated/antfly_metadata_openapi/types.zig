@@ -2994,6 +2994,15 @@ pub const StorageMaintenanceCapabilities = struct {
     asynchronous: bool,
 };
 
+/// Actionable retry contract for temporary storage descriptor exhaustion.
+pub const StorageResourceExhaustedError = struct {
+    code: []const u8,
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+    retry_after_ms: i64,
+};
+
 pub const StorageRuntimeStatus = struct {
     engine: []const u8,
     format: ?[]const u8 = null,

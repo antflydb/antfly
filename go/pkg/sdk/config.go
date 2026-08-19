@@ -17,6 +17,7 @@ limitations under the License.
 package sdk
 
 import (
+	"encoding/json"
 	"fmt"
 )
 
@@ -152,12 +153,49 @@ func NewIndexConfig(name string, config any) (*IndexConfig, error) {
 		if err := idxConfig.FromGraphIndexConfig(v); err != nil {
 			return nil, fmt.Errorf("from graph index config: %w", err)
 		}
+	case AlgebraicIndexConfig:
+		t = IndexTypeAlgebraic
+		if err := idxConfig.FromAlgebraicIndexConfig(v); err != nil {
+			return nil, fmt.Errorf("from algebraic index config: %w", err)
+		}
 	default:
 		return nil, fmt.Errorf("unsupported index config type: %T", config)
 	}
 	idxConfig.Type = t
 
 	return idxConfig, nil
+}
+
+// NewCreateIndexRequest builds the path-identified request body for CreateIndex.
+// The index name is deliberately absent so it cannot disagree with the URL.
+func NewCreateIndexRequest(config any) (*CreateIndexRequest, error) {
+	var t IndexType
+	switch v := config.(type) {
+	case EmbeddingsIndexConfig:
+		t = IndexTypeEmbeddings
+		config = v
+	case FullTextIndexConfig:
+		t = IndexTypeFullText
+		config = v
+	case GraphIndexConfig:
+		t = IndexTypeGraph
+		config = v
+	case AlgebraicIndexConfig:
+		t = IndexTypeAlgebraic
+		config = v
+	default:
+		return nil, fmt.Errorf("unsupported index config type: %T", config)
+	}
+	data, err := json.Marshal(config)
+	if err != nil {
+		return nil, fmt.Errorf("marshal index config: %w", err)
+	}
+	request := &CreateIndexRequest{}
+	if err := json.Unmarshal(data, request); err != nil {
+		return nil, fmt.Errorf("build create index request: %w", err)
+	}
+	request.Type = t
+	return request, nil
 }
 
 // ArtifactEmbeddingIndexConfig describes a managed vector index whose vectors

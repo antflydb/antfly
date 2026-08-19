@@ -37,6 +37,11 @@ def assert_single_top_hit(payload: dict, doc_id: str) -> None:
     assert hits[0]["doc_id"] == doc_id
 
 
+def assert_created_index(created: dict, name: str, index_type: str) -> None:
+    assert created["name"] == name
+    assert created["type"] == index_type
+
+
 def query_hits_total_value(hits: dict) -> int:
     total = hits["total"]
     assert isinstance(total, dict), (

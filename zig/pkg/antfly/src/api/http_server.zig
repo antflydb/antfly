@@ -8741,7 +8741,7 @@ pub const ApiHttpServer = struct {
         index_name: []const u8,
         body: []const u8,
         request: api_operation.RequestContext,
-    ) public_table_http.TableApi.ExecuteCreateIndexError!void {
+    ) public_table_http.TableApi.ExecuteCreateIndexError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         try ensureTableOperationActive(request);
         const table_before = (self.loadOwnedTableRecord(alloc, table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
@@ -8791,6 +8791,12 @@ pub const ApiHttpServer = struct {
             error.ModelNotFound => return error.ModelNotFound,
             else => return error.InternalFailure,
         };
+
+        // Reserve the response before consensus. Nothing after the irreversible
+        // mutation boundary should fail solely because response memory could
+        // not be allocated.
+        const response_body = alloc.dupe(u8, normalized_index_json) catch return error.InternalFailure;
+        errdefer alloc.free(response_body);
 
         // Materialize catalog-owned fields once. The same exact config is sent
         // through consensus and used as the projection expectation, making the
@@ -8858,6 +8864,10 @@ pub const ApiHttpServer = struct {
                 std.log.warn("public create index structural reconcile enqueue deferred table={s} index={s} err={}", .{ table_name, index_name, err });
             };
         }
+        // Return the normalized public resource already computed before the
+        // irreversible catalog mutation. This avoids a second fallible status
+        // lookup after commit and exposes inferred settings such as dimension.
+        return response_body;
     }
 
     fn executePublicTableDeleteIndex(

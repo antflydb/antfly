@@ -113,10 +113,12 @@ from .connection_status import ConnectionStatus
 from .connections_response import ConnectionsResponse
 from .create_api_key_request import CreateApiKeyRequest
 from .create_api_key_request_row_filter_type_0 import CreateApiKeyRequestRowFilterType0
+from .create_index_request import CreateIndexRequest
 from .create_table_request import CreateTableRequest
 from .create_table_request_indexes import CreateTableRequestIndexes
 from .create_user_request import CreateUserRequest
 from .create_user_request_metadata_type_0 import CreateUserRequestMetadataType0
+from .created_index import CreatedIndex
 from .credentials import Credentials
 from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
@@ -662,6 +664,9 @@ from .sse_step_started import SSEStepStarted
 from .sse_tool_mode import SSEToolMode
 from .sse_tool_mode_mode import SSEToolModeMode
 from .storage_maintenance_capabilities import StorageMaintenanceCapabilities
+from .storage_resource_exhausted_error import StorageResourceExhaustedError
+from .storage_resource_exhausted_error_code import StorageResourceExhaustedErrorCode
+from .storage_resource_exhausted_error_error import StorageResourceExhaustedErrorError
 from .storage_runtime_status import StorageRuntimeStatus
 from .storage_runtime_status_engine import StorageRuntimeStatusEngine
 from .storage_status import StorageStatus
@@ -871,6 +876,8 @@ __all__ = (
     "ConnectionStatus",
     "CreateApiKeyRequest",
     "CreateApiKeyRequestRowFilterType0",
+    "CreatedIndex",
+    "CreateIndexRequest",
     "CreateTableRequest",
     "CreateTableRequestIndexes",
     "CreateUserRequest",
@@ -1416,6 +1423,9 @@ __all__ = (
     "SSEToolMode",
     "SSEToolModeMode",
     "StorageMaintenanceCapabilities",
+    "StorageResourceExhaustedError",
+    "StorageResourceExhaustedErrorCode",
+    "StorageResourceExhaustedErrorError",
     "StorageRuntimeStatus",
     "StorageRuntimeStatusEngine",
     "StorageStatus",

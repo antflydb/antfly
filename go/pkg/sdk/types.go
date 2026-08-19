@@ -33,6 +33,8 @@ type (
 	TableMigration     = oapi.TableMigration
 	TableSchema        = oapi.TableSchema
 	IndexConfig        = oapi.IndexConfig
+	CreateIndexRequest = oapi.CreateIndexRequest
+	CreatedIndex       = oapi.CreatedIndex
 	IndexStatus        = oapi.IndexStatus
 	IndexType          = oapi.IndexType
 
@@ -57,6 +59,7 @@ type (
 	EnrichmentConfig      = oapi.EnrichmentConfig
 	EnrichmentKind        = oapi.EnrichmentKind
 	FullTextIndexConfig   = oapi.FullTextIndexConfig
+	AlgebraicIndexConfig  = oapi.AlgebraicIndexConfig
 	FullTextIndexStats    = oapi.FullTextIndexStats
 
 	EmbedderProvider         = oapi.EmbedderProvider
@@ -366,6 +369,7 @@ const (
 	IndexTypeEmbeddings = oapi.IndexTypeEmbeddings
 	IndexTypeFullText   = oapi.IndexTypeFullText
 	IndexTypeGraph      = oapi.IndexTypeGraph
+	IndexTypeAlgebraic  = oapi.IndexTypeAlgebraic
 
 	// EnrichmentKind values
 	EnrichmentKindAsset     = oapi.EnrichmentKindAsset
