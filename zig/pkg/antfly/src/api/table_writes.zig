@@ -9872,12 +9872,17 @@ pub const ProvisionedTableWriteSource = struct {
     ) void {
         for (leases) |lease| {
             const entry = lease.entry orelse continue;
-            publishRuntimeStatusSnapshot(self, alloc, entry.table_name, entry.group_id, lease.db) catch |err| {
-                std.log.warn("cached writer runtime status publish failed table={s} group_id={} err={s}", .{
+            publishRuntimeStatusSnapshot(self, alloc, entry.table_name, entry.group_id, lease.db) catch |err| switch (err) {
+                error.RuntimeStatusPublicationFenced, error.WriterLocked => std.log.debug("cached writer runtime status publication deferred table={s} group_id={} err={s}", .{
                     entry.table_name,
                     entry.group_id,
                     @errorName(err),
-                });
+                }),
+                else => std.log.warn("cached writer runtime status publish failed table={s} group_id={} err={s}", .{
+                    entry.table_name,
+                    entry.group_id,
+                    @errorName(err),
+                }),
             };
         }
     }
@@ -13152,6 +13157,27 @@ pub const ProvisionedTableWriteSource = struct {
         self.notifyLocalChange(table_name, .structural);
     }
 
+    fn finishLocalIndexCacheUpdateAndNotify(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        managed_visibility_changed: bool,
+    ) void {
+        self.finishLocalStructuralCacheUpdate(table_name);
+        // Publish outside structural/cache admission, but before the
+        // synchronous structural hook reports store status. A fenced or
+        // skipped snapshot remains best-effort; the structural report and
+        // dirty bit still make it retryable without turning committed DDL into
+        // an API failure.
+        if (managed_visibility_changed) {
+            self.publishWriteCacheRuntimeStatusesForTableBestEffort(alloc, table_name);
+        }
+        self.notifyLocalChange(table_name, .structural);
+        if (managed_visibility_changed) {
+            self.notifyLocalChange(table_name, .data);
+        }
+    }
+
     fn installLocalIndexWriteCapability(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
@@ -13184,7 +13210,7 @@ pub const ProvisionedTableWriteSource = struct {
             group_ids,
             if (self.local_index_repair_debt_hook != null) &repair_group_ids else null,
         );
-        self.finishLocalStructuralCacheUpdate(table_name);
+        self.finishLocalIndexCacheUpdateAndNotify(alloc, table_name, managed_visibility_changed);
 
         // Reconciliation records debt while each DB is already leased. Publish
         // those exact edges only after every structural and DB reservation is
@@ -13192,11 +13218,6 @@ pub const ProvisionedTableWriteSource = struct {
         // wakes for groups that were already clean.
         for (repair_group_ids.items) |group_id| {
             self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue_runnable);
-        }
-        self.notifyLocalChange(table_name, .structural);
-        if (managed_visibility_changed) {
-            self.publishWriteCacheRuntimeStatusesForTableBestEffort(alloc, table_name);
-            self.notifyLocalChange(table_name, .data);
         }
     }
 
@@ -13227,13 +13248,13 @@ pub const ProvisionedTableWriteSource = struct {
         self.beginLocalStructuralIndexCacheUpdate(table_name);
         errdefer self.abortLocalStructuralIndexCacheUpdate(table_name, index_name);
         runTestBeforeDropIndexWorkHook();
-        if (self.write_cache) |cache| {
-            _ = try reconcileCachedLocalTableIndexDrop(self, alloc, cache, table_name, index_name);
-        } else {
+        const managed_visibility_changed = if (self.write_cache) |cache|
+            try reconcileCachedLocalTableIndexDrop(self, alloc, cache, table_name, index_name)
+        else blk: {
             try dropLocalTableIndex(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name, index_name);
-        }
-        self.finishLocalStructuralCacheUpdate(table_name);
-        self.notifyLocalChange(table_name, .structural);
+            break :blk false;
+        };
+        self.finishLocalIndexCacheUpdateAndNotify(alloc, table_name, managed_visibility_changed);
     }
 
     fn dropTable(
@@ -18762,11 +18783,10 @@ fn reconcileCachedLocalTableIndexCreate(
         };
         ProvisionedTableWriteCache.publishEntryManagedConfig(cached.entry.?, metadata.indexes_json);
         recordLocalIndexCreateRepairDebt(alloc, cached.db, group_id, repair_group_ids);
-        publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db) catch |err| {
-            cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
-            cached_active = false;
-            return err;
-        };
+        // The caller publishes one fresh snapshot outside the cache lock and
+        // before its structural notification. Sampling here would be
+        // redundant and lets concurrent repair invalidation turn post-commit
+        // observability into a false DDL error.
         cache.publishCachedLeaseGeneration(&cached, target_generation);
         managed_visibility_changed = true;
     }
@@ -18837,11 +18857,6 @@ fn reconcileCachedLocalTableIndexDrop(
         // global derived/maintenance idle here: unrelated managed workers may be
         // rate-limited or retrying, and delete-index must stay a bounded metadata
         // operation instead of inheriting that background latency.
-        publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db) catch |err| {
-            cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
-            cached_active = false;
-            return err;
-        };
         cache.publishCachedLeaseGeneration(&cached, target_generation);
         managed_visibility_changed = true;
     }
@@ -19033,7 +19048,15 @@ fn reconcileUncachedLocalTableIndexCreate(
         _ = try metadata_table_provisioner.reconcileDbIndexTarget(alloc, &db, indexes_json, index_name);
         recordLocalIndexCreateRepairDebt(alloc, &db, group_id, repair_group_ids);
 
-        try publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, &db);
+        publishPostCommitIndexRuntimeStatusBestEffort(
+            self,
+            alloc,
+            table_name,
+            index_name,
+            group_id,
+            &db,
+            "create",
+        );
         managed_visibility_changed = true;
     }
     return managed_visibility_changed;
@@ -20683,6 +20706,32 @@ fn publishRuntimeStatusSnapshotConsistent(
         .consistent,
         db,
     );
+}
+
+fn publishPostCommitIndexRuntimeStatusBestEffort(
+    source: *ProvisionedTableWriteSource,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    index_name: []const u8,
+    group_id: u64,
+    db: *db_mod.DB,
+    operation: []const u8,
+) void {
+    // Index reconciliation above this boundary has already durably decided
+    // the catalog mutation. Runtime status is an observational cache: repair,
+    // restore, or another refresh may legitimately invalidate its publication
+    // token while the snapshot is being collected. Never turn that expected
+    // race (or another post-commit diagnostic failure) into a false DDL error.
+    publishRuntimeStatusSnapshotConsistent(source, alloc, table_name, group_id, db) catch |err| switch (err) {
+        error.RuntimeStatusPublicationFenced => std.log.debug(
+            "post-index-{s} runtime status publication deferred table={s} index={s} group_id={d} err={s}",
+            .{ operation, table_name, index_name, group_id, @errorName(err) },
+        ),
+        else => std.log.warn(
+            "post-index-{s} runtime status publication failed after commit table={s} index={s} group_id={d} err={s}",
+            .{ operation, table_name, index_name, group_id, @errorName(err) },
+        ),
+    };
 }
 
 fn captureStructuralRuntimeStatusObservation(
@@ -30665,8 +30714,12 @@ test "provisioned create index updates cached writer in place" {
 
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
+    var status_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer status_cache.deinit();
     var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
     source.write_cache = &write_cache;
+    source.runtime_status_cache = &status_cache;
 
     var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .default_async, null, null);
     defer cached.deinit(alloc);
@@ -30674,8 +30727,45 @@ test "provisioned create index updates cached writer in place" {
     try std.testing.expect(cached.db.core.index_manager.denseIndex("semantic_idx") == null);
 
     Catalog.indexes_json_buf = "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3,\"external\":true,\"_coverage_incarnation\":42}}";
-    _ = try source.source().createIndex(alloc, "docs", "semantic_idx", "{\"type\":\"embeddings\",\"dimension\":3,\"external\":true}");
+    const Fence = struct {
+        cache: *runtime_status.TableRuntimeSnapshotCache,
+        calls: usize = 0,
+        structural_calls: usize = 0,
+        publication_attempted_before_structural: bool = false,
 
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == 1) self.cache.invalidateTable("docs");
+        }
+
+        fn onChange(ptr: *anyopaque, _: []const u8, kind: ProvisionedTableWriteSource.LocalChangeKind) void {
+            if (kind != .structural) return;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.structural_calls += 1;
+            self.publication_attempted_before_structural = self.calls != 0;
+        }
+    };
+    var fence = Fence{ .cache = &status_cache };
+    {
+        const previous_hook = test_before_runtime_status_publish_hook;
+        test_before_runtime_status_publish_hook = .{ .ptr = &fence, .run = Fence.run };
+        defer test_before_runtime_status_publish_hook = previous_hook;
+        source.setLocalChangeHook(.{ .ptr = &fence, .on_change = Fence.onChange });
+        defer source.setLocalChangeHook(null);
+        _ = try source.source().createIndex(alloc, "docs", "semantic_idx", "{\"type\":\"embeddings\",\"dimension\":3,\"external\":true}");
+    }
+
+    // Status is sampled only after releasing structural/cache admission. A
+    // concurrent invalidation can fence that observation without retrying or
+    // rolling back the already-committed index admission.
+    try std.testing.expectEqual(@as(usize, 1), fence.calls);
+    try std.testing.expectEqual(@as(usize, 1), fence.structural_calls);
+    try std.testing.expect(fence.publication_attempted_before_structural);
+    source.publishWriteCacheRuntimeStatusesForTableBestEffort(alloc, "docs");
+    var published_status = (try status_cache.snapshotGroupStatus(alloc, "docs", 7001)) orelse
+        return error.TestUnexpectedResult;
+    defer published_status.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
     try std.testing.expect(write_cache.entries.items[0] == original_entry);
@@ -33127,20 +33217,86 @@ test "structural reconcile publishes durable index repair debt once per group" {
     var repaired = false;
     var repair_passes: usize = 0;
     {
+        // Exercise the cold-owner path that CI can reach when an idle writer
+        // cache entry is retired between structural handoff and repair.
+        try source.clearWriteCache();
+        try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
+        var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
         const status = source.beginStatusRequest("docs");
-        defer source.endStatusRequest("docs", status);
-        for (0..16) |_| {
-            const repair = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{
-                .indexes_json = indexes_json,
-                .identity_namespace = namespace,
-                .advance_index_repairs = true,
-            });
-            try std.testing.expect(!repair.busy);
-            repair_passes += 1;
-            attempted_repair = attempted_repair or repair.index_repair_attempted;
-            repaired = repaired or repair.index_repair_repaired;
-            if (!repair.index_repair_pending) break;
+        var status_active = true;
+        defer if (status_active) source.endStatusRequest("docs", status);
+        try std.testing.expectEqual(ProvisionedTableWriteSource.StatusRequestAdmission.live, status);
+        const RepairWorker = struct {
+            source: *ProvisionedTableWriteSource,
+            indexes_json: []const u8,
+            namespace: doc_identity.Namespace,
+            completed: std.atomic.Value(bool) = .init(false),
+            attempted_repair: bool = false,
+            repaired: bool = false,
+            repair_passes: usize = 0,
+            err: ?anyerror = null,
+
+            fn run(self: *@This()) void {
+                defer self.completed.store(true, .release);
+                for (0..16) |_| {
+                    const repair = self.source.catchUpTableGroupBestEffortWithMetadata(std.testing.allocator, 7001, "docs", .{
+                        .indexes_json = self.indexes_json,
+                        .identity_namespace = self.namespace,
+                        .advance_index_repairs = true,
+                    }) catch |err| {
+                        self.err = err;
+                        return;
+                    };
+                    if (repair.busy) {
+                        self.err = error.TestUnexpectedResult;
+                        return;
+                    }
+                    self.repair_passes += 1;
+                    self.attempted_repair = self.attempted_repair or repair.index_repair_attempted;
+                    self.repaired = self.repaired or repair.index_repair_repaired;
+                    if (!repair.index_repair_pending) return;
+                }
+            }
+        };
+        var worker = RepairWorker{
+            .source = &source,
+            .indexes_json = indexes_json,
+            .namespace = namespace,
+        };
+        var repair_future = try std.Io.concurrent(io, RepairWorker.run, .{&worker});
+        var repair_awaited = false;
+        defer if (!repair_awaited) {
+            if (status_active) {
+                source.endStatusRequest("docs", status);
+                status_active = false;
+            }
+            repair_future.await(io);
+        };
+
+        // Cold repair queues an exclusive operation behind live status. Model
+        // the production callers as concurrent tasks and release status once
+        // the repair is queued; holding both on this thread makes repair wait
+        // on its own status lease.
+        var repair_waiter_observed = false;
+        for (0..10_000) |_| {
+            if (source.testingGroupOperationWaiterCount("docs", 7001) > 0) {
+                repair_waiter_observed = true;
+                break;
+            }
+            if (worker.completed.load(.acquire)) break;
+            try io.sleep(.fromMilliseconds(1), .awake);
         }
+        source.endStatusRequest("docs", status);
+        status_active = false;
+        repair_future.await(io);
+        repair_awaited = true;
+        if (worker.err) |err| return err;
+        try std.testing.expect(repair_waiter_observed);
+        attempted_repair = worker.attempted_repair;
+        repaired = worker.repaired;
+        repair_passes = worker.repair_passes;
     }
     try std.testing.expect(repair_passes >= 2);
     try std.testing.expect(attempted_repair);
