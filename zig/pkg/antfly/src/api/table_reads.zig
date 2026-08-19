@@ -12980,7 +12980,14 @@ fn algebraicDistributedTensorProgramForAggregationRequestAlloc(
     defer if (ir_constraints.len > 0) alloc.free(ir_constraints);
 
     if (std.mem.eql(u8, request.type, "cardinality")) {
-        return try algebraic_planner.planCardinalityPartialsTensorProgramAlloc(alloc, index, request.name, request.field, ir_constraints);
+        return try algebraic_planner.planCardinalityPartialsTensorProgramAlloc(
+            alloc,
+            index,
+            request.name,
+            request.field,
+            ir_constraints,
+            request.cardinality_mode == .approximate,
+        );
     }
     if (try algebraicTermsCardinalityChildRequestsAlloc(alloc, request)) |children| {
         defer alloc.free(children);

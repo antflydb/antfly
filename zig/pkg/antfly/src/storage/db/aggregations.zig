@@ -414,7 +414,20 @@ fn computeAlgebraicAggregation(
         }
         // `exact` never consults a sketch; `auto`/`approximate` try one first.
         if (request.cardinality_mode != .exact) {
-            if (try index.approxCardinalityTotalForFieldAlloc(store, request.field, ctx.algebraic_constraints, ctx.identity_read_generation)) |estimate| {
+            const approximate_estimate = index.approxCardinalityTotalForFieldAlloc(
+                store,
+                request.field,
+                ctx.algebraic_constraints,
+                ctx.identity_read_generation,
+            ) catch |err| switch (err) {
+                error.CorruptHllMaterialization => blk: {
+                    index.recordPlannerFallback("hll_materialization_corrupt", null, null);
+                    if (request.cardinality_mode == .approximate) return err;
+                    break :blk null;
+                },
+                else => return err,
+            };
+            if (approximate_estimate) |estimate| {
                 index.recordPlannerSelected(null, estimate);
                 const rel_err = try index.hllRelativeErrorForField(store, null, request.field, ctx.algebraic_constraints, ctx.identity_read_generation);
                 return .{
@@ -2611,7 +2624,21 @@ fn computeAlgebraicTermsCardinalityChildrenAggregation(
         if (constraints.len == 0 and generation == null) {
             index.observeCardinalityForAdaptive(store, bucket_field, child_request.field);
         }
-        const group_entries = (try index.approxCardinalityEntriesForGroupAlloc(store, &.{bucket_field}, child_request.field, constraints, generation)) orelse {
+        const maybe_group_entries = index.approxCardinalityEntriesForGroupAlloc(
+            store,
+            &.{bucket_field},
+            child_request.field,
+            constraints,
+            generation,
+        ) catch |err| switch (err) {
+            error.CorruptHllMaterialization => blk: {
+                index.recordPlannerFallback("hll_materialization_corrupt", null, null);
+                if (child_request.cardinality_mode == .approximate) return err;
+                break :blk null;
+            },
+            else => return err,
+        };
+        const group_entries = maybe_group_entries orelse {
             if (child_request.cardinality_mode == .approximate) return error.UnsupportedAggregation;
             continue;
         };
@@ -2798,7 +2825,7 @@ fn computeDerivedJoinTermsCardinalityChildrenAggregation(
             map.deinit(alloc);
         }
         for (child_entries) |entry| {
-            const estimate = algebraic_mod.hll.estimateEncoded(entry.value) catch continue;
+            const estimate = try algebraic_mod.hll.estimateEncoded(entry.value);
             const gop = try map.getOrPut(alloc, entry.group_key);
             if (!gop.found_existing) gop.key_ptr.* = try alloc.dupe(u8, entry.group_key);
             gop.value_ptr.* = estimate;
@@ -3519,7 +3546,26 @@ pub fn algebraicCardinalityAggregationFromDistributedPartialsAlloc(
     merged: algebraic_mod.distributed.MergeSet,
 ) !?SearchAggregationResult {
     if (!std.mem.eql(u8, request.type, "cardinality") or request.field.len == 0) return null;
-    if (request.cardinality_mode == .approximate) return error.UnsupportedAggregation;
+    if (request.cardinality_mode == .approximate) {
+        var encoded: ?[]const u8 = null;
+        for (merged.rows) |row| {
+            if (row.law_id != .hll) continue;
+            if (!(try distributedHllCardinalityMetricMatches(alloc, row.metric, request.name))) continue;
+            if (encoded != null) return error.InvalidDistributedAlgebraicMerge;
+            encoded = row.value;
+        }
+        const sketch = encoded orelse return error.UnsupportedAggregation;
+        return .{
+            .name = request.name,
+            .field = request.field,
+            .type = request.type,
+            .value_json = try cardinalityResultJsonAlloc(
+                alloc,
+                try algebraic_mod.hll.estimateEncoded(sketch),
+                try algebraic_mod.hll.relativeErrorEncoded(sketch),
+            ),
+        };
+    }
     var count: u64 = 0;
     for (merged.rows) |row| {
         if (row.law_id != .count) continue;
@@ -3532,6 +3578,21 @@ pub fn algebraicCardinalityAggregationFromDistributedPartialsAlloc(
         .type = request.type,
         .value_json = try cardinalityResultJsonAlloc(alloc, count, null),
     };
+}
+
+fn distributedHllCardinalityMetricMatches(
+    alloc: Allocator,
+    metric: []const u8,
+    aggregation_name: []const u8,
+) !bool {
+    const parts = algebraic_mod.token.decodeTupleAlloc(alloc, metric) catch return false;
+    defer {
+        for (parts) |part| alloc.free(part);
+        if (parts.len > 0) alloc.free(parts);
+    }
+    return parts.len == 2 and
+        std.mem.eql(u8, parts[0], "cardinality-hll:v1") and
+        std.mem.eql(u8, parts[1], aggregation_name);
 }
 
 fn distributedCardinalityMetricMatches(
@@ -11826,6 +11887,36 @@ test "algebraic distributed cardinality merges canonical distinct values" {
     var gold_product_agg = (try algebraicCardinalityAggregationFromDistributedPartialsAlloc(alloc, gold_product_request, gold_product_merged)) orelse return error.TestUnexpectedResult;
     defer gold_product_agg.deinit(alloc);
     try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", gold_product_agg.value_json.?);
+}
+
+test "algebraic distributed approximate cardinality merges HLL partials" {
+    const alloc = std.testing.allocator;
+    const axis = try algebraic_mod.token.canonicalTupleAlloc(alloc, &.{});
+    defer alloc.free(axis);
+    const metric = try algebraic_mod.token.canonicalTupleAlloc(alloc, &.{ "cardinality-hll:v1", "customers" });
+    defer alloc.free(metric);
+    const left = try algebraic_mod.hll.singletonEncodedAlloc(alloc, 14, "alice");
+    defer alloc.free(left);
+    const right = try algebraic_mod.hll.singletonEncodedAlloc(alloc, 14, "bob");
+    defer alloc.free(right);
+    const partials = [_]algebraic_mod.distributed.Partial{
+        .{ .canonical_axis = axis, .metric = metric, .law_id = .hll, .value = left },
+        .{ .canonical_axis = axis, .metric = metric, .law_id = .hll, .value = right },
+    };
+    var merged = try algebraic_mod.distributed.mergePartialsAlloc(alloc, partials[0..]);
+    defer merged.deinit(alloc);
+    var result = (try algebraicCardinalityAggregationFromDistributedPartialsAlloc(alloc, .{
+        .name = "customers",
+        .type = "cardinality",
+        .field = "customer",
+        .cardinality_mode = .approximate,
+    }, merged)) orelse return error.TestUnexpectedResult;
+    defer result.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.value_json.?, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("value").?.integer);
+    try std.testing.expect(parsed.value.object.get("approximate").?.bool);
+    try std.testing.expect(parsed.value.object.get("relative_error").?.float > 0);
 }
 
 test "algebraic terms aggregation answers nested exact cardinality from fact rows" {
