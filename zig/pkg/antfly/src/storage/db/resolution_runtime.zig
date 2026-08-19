@@ -28,6 +28,7 @@ const builtin = @import("builtin");
 const resolver_lib = @import("antfly_resolver");
 const matcher = @import("antfly_matcher");
 const resolver_catalog = @import("catalog/resolver_catalog.zig");
+const resolution_handoff = @import("resolution_handoff.zig");
 const internal_keys = @import("../internal_keys.zig");
 const artifact_ids = @import("artifact_ids.zig");
 const derived_types = @import("derived/derived_types.zig");
@@ -50,9 +51,26 @@ const SourceArtifactKind = resolver_catalog.ResolverSourceArtifactKind;
 /// so resolution records survive until the worker consumes them.
 pub const scope_name = "resolution";
 
-/// Appends a derived batch to the replay log, returning its sequence. Matches
-/// the enrichment runtime's writer so the db wires the same callback.
-pub const DerivedRecordWriter = *const fn (ptr: *anyopaque, batch: derived_types.DerivedBatch) anyerror!u64;
+pub const ArtifactWrite = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+/// One resolution-stage commit. Artifact mutations and their replay record are
+/// one durability boundary; `target_hints` is null for hints inferred from the
+/// batch and explicit for a narrower reconciliation such as graph-only replay.
+pub const RecordWrite = struct {
+    batch: derived_types.DerivedBatch,
+    artifact_writes: []const ArtifactWrite = &.{},
+    artifact_deletes: []const []const u8 = &.{},
+    target_hints: ?[]const change_journal_mod.TargetHint = null,
+    /// Publish completion metadata only after the writer finishes the primary,
+    /// split-delta, and HA handoff. The DB writer batches this metadata while
+    /// it still owns the HA mutation/fencing boundary.
+    publish_resolution_handoff: bool = false,
+};
+
+pub const DerivedRecordWriter = *const fn (ptr: *anyopaque, write: RecordWrite) anyerror!u64;
 
 /// Source of candidate entities for blocking, abstracted over locality. The
 /// storage worker calls this; a local source reads the worker's own store
@@ -220,15 +238,20 @@ pub const ProcessOutcome = struct {
     result: resolver_lib.RunResult,
     /// The resolution artifact key the stage acted on; owned by the caller.
     resolution_key: []u8,
+    /// Deferred artifact bytes for an atomic artifact + replay commit.
+    resolution_value: ?[]u8 = null,
 };
+
+const PersistenceMode = enum { immediate, deferred };
 
 /// Process a changed extraction (asset) artifact key: look up the resolver that
 /// consumes it and run the resolution stage to idempotently (re)persist the
 /// resolution artifact through `store`. Returns null when `changed_key` is not
 /// an asset artifact or no configured resolver consumes it. `provider` supplies
-/// blocking candidates (null = deterministic minting only). The returned
-/// `resolution_key` is owned by the caller, which journals it (on written /
-/// cleared) via a `DerivedBatch` so downstream stages (graph materializer) wake.
+/// blocking candidates (null = deterministic minting only). This immediate
+/// helper persists the artifact itself; the managed replay path below uses a
+/// deferred outcome so artifact mutation and downstream replay commit together.
+/// The returned `resolution_key` is owned by the caller.
 pub fn processChangedExtraction(
     gpa: std.mem.Allocator,
     resolvers: []const ResolverConfig,
@@ -242,7 +265,7 @@ pub fn processChangedExtraction(
     defer parsed.deinit(gpa);
 
     const cfg = resolverForArtifactKind(resolvers, parsed.source_artifact_kind, parsed.artifact_name) orelse return null;
-    return try processChangedExtractionWithConfig(gpa, cfg, store, provider, changed_key, candidate_source, embedder);
+    return try processChangedExtractionWithConfig(gpa, cfg, store, provider, changed_key, candidate_source, embedder, .immediate);
 }
 
 fn processChangedExtractionWithConfig(
@@ -253,6 +276,7 @@ fn processChangedExtractionWithConfig(
     changed_key: []const u8,
     candidate_source: ?CandidateSource,
     embedder: ?embedder_mod.DenseEmbedder,
+    persistence: PersistenceMode,
 ) !?ProcessOutcome {
     var parsed = (try parseSourceArtifactKeyAlloc(gpa, changed_key)) orelse return null;
     defer parsed.deinit(gpa);
@@ -334,8 +358,44 @@ fn processChangedExtractionWithConfig(
         .embedder = stage_embedder,
         .overrides = stage_overrides,
     };
-    const result = try stage.run(gpa, store, effective_provider, changed_key, resolution_key);
-    return .{ .result = result, .resolution_key = resolution_key };
+    if (persistence == .immediate) {
+        const result = try stage.run(gpa, store, effective_provider, changed_key, resolution_key);
+        return .{ .result = result, .resolution_key = resolution_key };
+    }
+
+    var computed = try stage.computeAlloc(gpa, store, effective_provider, changed_key);
+    defer if (computed) |bytes| gpa.free(bytes);
+    const existing = try store.get(gpa, resolution_key);
+    defer if (existing) |bytes| gpa.free(bytes);
+
+    if (computed == null) {
+        const stale_handoff = try resolution_handoff.exists(gpa, store, resolution_key);
+        return .{
+            // A retained write marker means a prior delete may have committed
+            // locally but failed its split/HA handoff. Re-emit the full clear;
+            // a successful clear removes the marker instead of retaining a
+            // document-identifying tombstone indefinitely.
+            .result = if (existing == null and !stale_handoff) .source_missing else .cleared,
+            .resolution_key = resolution_key,
+        };
+    }
+    if (existing) |bytes| {
+        if (std.mem.eql(u8, bytes, computed.?)) {
+            if (try resolution_handoff.matches(gpa, store, resolution_key, computed.?)) {
+                return .{ .result = .unchanged, .resolution_key = resolution_key };
+            }
+            // The bytes exist without proof that their full downstream
+            // handoff completed. Rewrite the same value with full replay.
+        }
+    }
+
+    const resolution_value = computed.?;
+    computed = null;
+    return .{
+        .result = .written,
+        .resolution_key = resolution_key,
+        .resolution_value = resolution_value,
+    };
 }
 
 fn processChangedExtractionForAllResolvers(
@@ -346,7 +406,7 @@ fn processChangedExtractionForAllResolvers(
     changed_key: []const u8,
     candidate_source: ?CandidateSource,
     embedder: ?embedder_mod.DenseEmbedder,
-    journal_keys: *std.ArrayListUnmanaged([]const u8),
+    pending: *PendingRecordCommit,
 ) !usize {
     var parsed = (try parseSourceArtifactKeyAlloc(gpa, changed_key)) orelse return 0;
     defer parsed.deinit(gpa);
@@ -354,15 +414,68 @@ fn processChangedExtractionForAllResolvers(
     var processed: usize = 0;
     for (resolvers) |*cfg| {
         if (!resolverMatchesArtifact(cfg, parsed.source_artifact_kind, parsed.artifact_name)) continue;
-        const outcome = (try processChangedExtractionWithConfig(gpa, cfg, store, provider, changed_key, candidate_source, embedder)) orelse continue;
+        const outcome = (try processChangedExtractionWithConfig(gpa, cfg, store, provider, changed_key, candidate_source, embedder, .deferred)) orelse continue;
         processed += 1;
         switch (outcome.result) {
-            .written, .cleared => try journal_keys.append(gpa, outcome.resolution_key),
-            else => gpa.free(outcome.resolution_key),
+            .written => {
+                const value = outcome.resolution_value.?;
+                pending.full_keys.append(gpa, outcome.resolution_key) catch |err| {
+                    gpa.free(outcome.resolution_key);
+                    gpa.free(value);
+                    return err;
+                };
+                pending.artifact_writes.append(gpa, .{
+                    .key = outcome.resolution_key,
+                    .value = value,
+                }) catch |err| {
+                    _ = pending.full_keys.pop();
+                    gpa.free(outcome.resolution_key);
+                    gpa.free(value);
+                    return err;
+                };
+            },
+            .cleared => {
+                pending.full_keys.append(gpa, outcome.resolution_key) catch |err| {
+                    gpa.free(outcome.resolution_key);
+                    return err;
+                };
+                pending.artifact_deletes.append(gpa, outcome.resolution_key) catch |err| {
+                    _ = pending.full_keys.pop();
+                    gpa.free(outcome.resolution_key);
+                    return err;
+                };
+            },
+            // The identity decision and promotion payload are unchanged, but
+            // graph state can still depend on source extraction metadata such
+            // as mention confidence. Reconcile only graph consumers; written
+            // and cleared artifacts use the full graph+promotion handoff above.
+            .unchanged => pending.graph_only_keys.append(gpa, outcome.resolution_key) catch |err| {
+                gpa.free(outcome.resolution_key);
+                return err;
+            },
+            .source_missing => gpa.free(outcome.resolution_key),
         }
     }
     return processed;
 }
+
+const PendingRecordCommit = struct {
+    full_keys: std.ArrayListUnmanaged([]const u8) = .empty,
+    graph_only_keys: std.ArrayListUnmanaged([]const u8) = .empty,
+    artifact_writes: std.ArrayListUnmanaged(ArtifactWrite) = .empty,
+    artifact_deletes: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    fn deinit(self: *PendingRecordCommit, alloc: Allocator) void {
+        for (self.full_keys.items) |key| alloc.free(@constCast(key));
+        for (self.graph_only_keys.items) |key| alloc.free(@constCast(key));
+        for (self.artifact_writes.items) |write| alloc.free(@constCast(write.value));
+        self.full_keys.deinit(alloc);
+        self.graph_only_keys.deinit(alloc);
+        self.artifact_writes.deinit(alloc);
+        self.artifact_deletes.deinit(alloc);
+        self.* = undefined;
+    }
+};
 
 /// Named asset artifact holding a document's review overrides:
 /// `{ "<local_id>": { "decision": "match", "table": "...", "key": "..." } }`.
@@ -839,9 +952,10 @@ fn entityRawFromStore(allocator: std.mem.Allocator, store: resolver_lib.Artifact
     return try store.get(allocator, doc_store_key);
 }
 
-/// Process every changed artifact key in a replay record: resolve each
-/// extraction artifact and journal the resolution keys that actually changed
-/// (written/cleared) in a single `DerivedBatch`, so downstream stages wake.
+/// Process every changed extraction artifact in a replay record. Changed
+/// resolution artifacts are committed atomically with full graph+promotion
+/// replay; unchanged identity decisions emit a graph-only reconciliation for
+/// source-dependent metadata without repeating remote entity promotion.
 pub fn processRecordKeys(
     gpa: std.mem.Allocator,
     resolvers: []const ResolverConfig,
@@ -853,18 +967,26 @@ pub fn processRecordKeys(
     candidate_source: ?CandidateSource,
     embedder: ?embedder_mod.DenseEmbedder,
 ) !void {
-    var journal_keys = std.ArrayListUnmanaged([]const u8).empty;
-    defer {
-        for (journal_keys.items) |k| gpa.free(@constCast(k));
-        journal_keys.deinit(gpa);
-    }
+    var pending: PendingRecordCommit = .{};
+    defer pending.deinit(gpa);
 
     for (changed_artifact_keys) |key| {
-        _ = try processChangedExtractionForAllResolvers(gpa, resolvers, store, provider, key, candidate_source, embedder, &journal_keys);
+        _ = try processChangedExtractionForAllResolvers(gpa, resolvers, store, provider, key, candidate_source, embedder, &pending);
     }
 
-    if (journal_keys.items.len > 0) {
-        _ = try write_fn(write_ctx, .{ .changed_artifact_keys = journal_keys.items });
+    if (pending.full_keys.items.len > 0) {
+        _ = try write_fn(write_ctx, .{
+            .batch = .{ .changed_artifact_keys = pending.full_keys.items },
+            .artifact_writes = pending.artifact_writes.items,
+            .artifact_deletes = pending.artifact_deletes.items,
+            .publish_resolution_handoff = true,
+        });
+    }
+    if (pending.graph_only_keys.items.len > 0) {
+        _ = try write_fn(write_ctx, .{
+            .batch = .{ .changed_artifact_keys = pending.graph_only_keys.items },
+            .target_hints = &.{.graph},
+        });
     }
 }
 
@@ -937,7 +1059,7 @@ fn enqueueChangedArtifactKeys(
     write_fn: DerivedRecordWriter,
 ) !u64 {
     if (keys.items.len == 0) return 0;
-    return try write_fn(write_ctx, .{ .changed_artifact_keys = keys.items });
+    return try write_fn(write_ctx, .{ .batch = .{ .changed_artifact_keys = keys.items } });
 }
 
 /// Record a review decision and enqueue the source extraction artifact(s) for
@@ -1009,20 +1131,19 @@ fn reresolveAll(
         else => return err,
     };
 
-    var journal_keys = std.ArrayListUnmanaged([]const u8).empty;
-    defer {
-        for (journal_keys.items) |k| gpa.free(@constCast(k));
-        journal_keys.deinit(gpa);
-    }
-    var reresolved: usize = 0;
-    for (asset_keys.items) |key| {
-        const processed = try processChangedExtractionForAllResolvers(gpa, resolvers, store, null, key, candidate_source, embedder, &journal_keys);
-        if (processed > 0) reresolved += 1;
-    }
-    if (journal_keys.items.len > 0) {
-        _ = try write_fn(write_ctx, .{ .changed_artifact_keys = journal_keys.items });
-    }
-    return reresolved;
+    if (asset_keys.items.len == 0) return 0;
+    try processRecordKeys(
+        gpa,
+        resolvers,
+        store,
+        null,
+        asset_keys.items,
+        write_ctx,
+        write_fn,
+        candidate_source,
+        embedder,
+    );
+    return asset_keys.items.len;
 }
 
 /// Enqueue one bounded window of existing extraction artifacts for re-resolution.
@@ -1323,9 +1444,9 @@ pub const default_max_records_per_window: usize = 1024;
 
 /// Iterate replay records matching the resolution hint from `from_sequence`,
 /// resolve each record's changed extraction artifacts, and journal the
-/// resolution writes via `write_fn`. Returns the highest sequence processed (or
-/// `from_sequence -| 1` if none), which the caller persists as applied. Pure of
-/// the runtime's threading/state so it is unit-testable.
+/// resolution writes via `write_fn`. Returns the highest sequence processed, or
+/// `from_sequence` when none match, which the caller persists as applied. Pure
+/// of the runtime's threading/state so it is unit-testable.
 pub fn catchUpWindow(
     gpa: Allocator,
     replay_source: replay_source_mod.Source,
@@ -1608,8 +1729,9 @@ pub const ResolutionRuntime = struct {
 
     /// Drain applied -> target. Serialized so the background worker and a
     /// synchronous driver (runUntilIdle) cannot process the same records at
-    /// once; idempotent and safe to retry (the stage skips unchanged
-    /// resolutions). `applied_sequence` is persisted only after durable writes.
+    /// once. Artifact mutation and full downstream replay share one commit;
+    /// unchanged decisions use graph-only reconciliation. `applied_sequence`
+    /// advances only after those durable writes.
     pub fn catchUp(self: *ResolutionRuntime) !void {
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
@@ -2290,23 +2412,197 @@ test "processChangedExtraction runs over a DbArtifactStore" {
 /// Capturing DerivedRecordWriter for tests.
 const CaptureWriter = struct {
     alloc: std.mem.Allocator,
+    store: ?resolver_lib.ArtifactStore = null,
     keys: std.ArrayListUnmanaged([]u8) = .empty,
     calls: u64 = 0,
+    inferred_calls: u64 = 0,
+    graph_only_calls: u64 = 0,
+    handoff_calls: u64 = 0,
 
     fn deinit(self: *CaptureWriter) void {
         for (self.keys.items) |k| self.alloc.free(k);
         self.keys.deinit(self.alloc);
     }
 
-    fn writeFn(ptr: *anyopaque, batch: derived_types.DerivedBatch) anyerror!u64 {
+    fn writeFn(ptr: *anyopaque, write: RecordWrite) anyerror!u64 {
         const self: *CaptureWriter = @ptrCast(@alignCast(ptr));
-        for (batch.changed_artifact_keys) |k| {
+        if (self.store) |store| {
+            for (write.artifact_writes) |artifact| try store.put(artifact.key, artifact.value);
+            for (write.artifact_deletes) |key| try store.delete(key);
+        }
+        for (write.batch.changed_artifact_keys) |k| {
             try self.keys.append(self.alloc, try self.alloc.dupe(u8, k));
+        }
+        if (write.target_hints) |hints| {
+            if (hints.len == 1 and hints[0] == .graph) self.graph_only_calls += 1;
+        } else {
+            self.inferred_calls += 1;
+        }
+        if (write.publish_resolution_handoff) {
+            self.handoff_calls += 1;
+            const store = self.store orelse return error.MissingTestArtifactStore;
+            for (write.artifact_writes) |artifact| {
+                try resolution_handoff.save(self.alloc, store, artifact.key, artifact.value);
+            }
+            for (write.artifact_deletes) |key| {
+                try resolution_handoff.delete(self.alloc, store, key);
+            }
         }
         self.calls += 1;
         return self.calls;
     }
 };
+
+const FailingWriter = struct {
+    fn writeFn(_: *anyopaque, _: RecordWrite) anyerror!u64 {
+        return error.InjectedRecordWriteFailure;
+    }
+};
+
+const CommitThenFailWriter = struct {
+    store: resolver_lib.ArtifactStore,
+
+    fn writeFn(ptr: *anyopaque, write: RecordWrite) anyerror!u64 {
+        const self: *CommitThenFailWriter = @ptrCast(@alignCast(ptr));
+        for (write.artifact_writes) |artifact| try self.store.put(artifact.key, artifact.value);
+        for (write.artifact_deletes) |key| try self.store.delete(key);
+        return error.InjectedPostCommitHandoffFailure;
+    }
+};
+
+test "processRecordKeys leaves resolution mutation uncommitted when replay handoff fails" {
+    const alloc = testing.allocator;
+    const resolvers = [_]ResolverConfig{.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ slug _entity.text }}",
+        .config_generation = 1,
+    }};
+
+    var fake = FakeStore{ .alloc = alloc };
+    defer fake.deinit();
+    var das = DbArtifactStore(FakeStore){ .store = &fake };
+    const store = das.artifactStore();
+    const extraction_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:atomic", "asset", "relations_v1");
+    defer alloc.free(extraction_key);
+    try store.put(extraction_key, test_extraction);
+
+    const changed = [_][]const u8{extraction_key};
+    var unused: u8 = 0;
+    try testing.expectError(
+        error.InjectedRecordWriteFailure,
+        processRecordKeys(alloc, &resolvers, store, null, &changed, &unused, FailingWriter.writeFn, null, null),
+    );
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:atomic", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const uncommitted = try store.get(alloc, resolution_key);
+    defer if (uncommitted) |value| alloc.free(value);
+    try testing.expect(uncommitted == null);
+
+    var writer = CaptureWriter{ .alloc = alloc, .store = store };
+    defer writer.deinit();
+    try processRecordKeys(alloc, &resolvers, store, null, &changed, &writer, CaptureWriter.writeFn, null, null);
+    const committed = (try store.get(alloc, resolution_key)).?;
+    defer alloc.free(committed);
+    try testing.expectEqual(@as(u64, 1), writer.inferred_calls);
+    try testing.expectEqual(@as(u64, 0), writer.graph_only_calls);
+}
+
+test "processRecordKeys retries full handoff after a post-commit failure" {
+    const alloc = testing.allocator;
+    const resolvers = [_]ResolverConfig{.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ slug _entity.text }}",
+        .config_generation = 1,
+    }};
+
+    var fake = FakeStore{ .alloc = alloc };
+    defer fake.deinit();
+    var das = DbArtifactStore(FakeStore){ .store = &fake };
+    const store = das.artifactStore();
+    const extraction_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:post-commit", "asset", "relations_v1");
+    defer alloc.free(extraction_key);
+    try store.put(extraction_key, test_extraction);
+    const changed = [_][]const u8{extraction_key};
+
+    var commit_then_fail = CommitThenFailWriter{ .store = store };
+    try testing.expectError(
+        error.InjectedPostCommitHandoffFailure,
+        processRecordKeys(alloc, &resolvers, store, null, &changed, &commit_then_fail, CommitThenFailWriter.writeFn, null, null),
+    );
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:post-commit", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const locally_committed = (try store.get(alloc, resolution_key)).?;
+    defer alloc.free(locally_committed);
+
+    var retry = CaptureWriter{ .alloc = alloc, .store = store };
+    defer retry.deinit();
+    try processRecordKeys(alloc, &resolvers, store, null, &changed, &retry, CaptureWriter.writeFn, null, null);
+    try testing.expectEqual(@as(u64, 1), retry.inferred_calls);
+    try testing.expectEqual(@as(u64, 0), retry.graph_only_calls);
+
+    retry.calls = 0;
+    try processRecordKeys(alloc, &resolvers, store, null, &changed, &retry, CaptureWriter.writeFn, null, null);
+    try testing.expectEqual(@as(u64, 1), retry.calls);
+    try testing.expectEqual(@as(u64, 1), retry.inferred_calls);
+    try testing.expectEqual(@as(u64, 1), retry.graph_only_calls);
+}
+
+test "processRecordKeys retries a locally committed clear until its handoff completes" {
+    const alloc = testing.allocator;
+    const resolvers = [_]ResolverConfig{.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ slug _entity.text }}",
+        .config_generation = 1,
+    }};
+
+    var fake = FakeStore{ .alloc = alloc };
+    defer fake.deinit();
+    var das = DbArtifactStore(FakeStore){ .store = &fake };
+    const store = das.artifactStore();
+    const extraction_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:clear-retry", "asset", "relations_v1");
+    defer alloc.free(extraction_key);
+    try store.put(extraction_key, test_extraction);
+    const changed = [_][]const u8{extraction_key};
+
+    var initial = CaptureWriter{ .alloc = alloc, .store = store };
+    defer initial.deinit();
+    try processRecordKeys(alloc, &resolvers, store, null, &changed, &initial, CaptureWriter.writeFn, null, null);
+    try testing.expectEqual(@as(u64, 1), initial.inferred_calls);
+
+    try store.delete(extraction_key);
+    var commit_then_fail = CommitThenFailWriter{ .store = store };
+    try testing.expectError(
+        error.InjectedPostCommitHandoffFailure,
+        processRecordKeys(alloc, &resolvers, store, null, &changed, &commit_then_fail, CommitThenFailWriter.writeFn, null, null),
+    );
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:clear-retry", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const locally_cleared = try store.get(alloc, resolution_key);
+    defer if (locally_cleared) |value| alloc.free(value);
+    try testing.expect(locally_cleared == null);
+
+    var retry = CaptureWriter{ .alloc = alloc, .store = store };
+    defer retry.deinit();
+    try processRecordKeys(alloc, &resolvers, store, null, &changed, &retry, CaptureWriter.writeFn, null, null);
+    try testing.expectEqual(@as(u64, 1), retry.inferred_calls);
+    try testing.expectEqual(@as(u64, 0), retry.graph_only_calls);
+
+    retry.calls = 0;
+    try processRecordKeys(alloc, &resolvers, store, null, &changed, &retry, CaptureWriter.writeFn, null, null);
+    try testing.expectEqual(@as(u64, 0), retry.calls);
+}
 
 test "processRecordKeys resolves changed asset keys and journals resolution keys" {
     const alloc = testing.allocator;
@@ -2328,7 +2624,7 @@ test "processRecordKeys resolves changed asset keys and journals resolution keys
     defer alloc.free(extraction_key);
     try store.put(extraction_key, test_extraction);
 
-    var writer = CaptureWriter{ .alloc = alloc };
+    var writer = CaptureWriter{ .alloc = alloc, .store = store };
     defer writer.deinit();
 
     // A record carrying the extraction key plus a non-asset key (ignored).
@@ -2340,12 +2636,18 @@ test "processRecordKeys resolves changed asset keys and journals resolution keys
     try testing.expectEqual(@as(usize, 1), writer.keys.items.len);
     try testing.expectEqualSlices(u8, resolution_key, writer.keys.items[0]);
     try testing.expectEqual(@as(u64, 1), writer.calls);
+    try testing.expectEqual(@as(u64, 1), writer.inferred_calls);
+    try testing.expectEqual(@as(u64, 0), writer.graph_only_calls);
 
-    // Idempotent replay: recomputed bytes match, so nothing is journaled.
+    // Idempotent resolution re-emits only graph reconciliation: source
+    // metadata may have changed, but the entity promotion payload did not.
     writer.calls = 0;
     try processRecordKeys(alloc, &resolvers, store, null, &changed, &writer, CaptureWriter.writeFn, null, null);
-    try testing.expectEqual(@as(usize, 1), writer.keys.items.len);
-    try testing.expectEqual(@as(u64, 0), writer.calls);
+    try testing.expectEqual(@as(usize, 2), writer.keys.items.len);
+    try testing.expectEqualSlices(u8, resolution_key, writer.keys.items[1]);
+    try testing.expectEqual(@as(u64, 1), writer.calls);
+    try testing.expectEqual(@as(u64, 1), writer.inferred_calls);
+    try testing.expectEqual(@as(u64, 1), writer.graph_only_calls);
 }
 
 test "processRecordKeys fans one source artifact out to all consuming resolvers" {
@@ -2378,7 +2680,7 @@ test "processRecordKeys fans one source artifact out to all consuming resolvers"
     defer alloc.free(extraction_key);
     try store.put(extraction_key, test_extraction);
 
-    var writer = CaptureWriter{ .alloc = alloc };
+    var writer = CaptureWriter{ .alloc = alloc, .store = store };
     defer writer.deinit();
     const changed = [_][]const u8{extraction_key};
     try processRecordKeys(alloc, &resolvers, store, null, &changed, &writer, CaptureWriter.writeFn, null, null);
@@ -2390,6 +2692,9 @@ test "processRecordKeys fans one source artifact out to all consuming resolvers"
     try testing.expectEqual(@as(usize, 2), writer.keys.items.len);
     try testing.expectEqualSlices(u8, people_key, writer.keys.items[0]);
     try testing.expectEqualSlices(u8, org_key, writer.keys.items[1]);
+    // Both resolver outputs share one writer handoff; production publishes all
+    // completion markers in one follow-up metadata transaction.
+    try testing.expectEqual(@as(u64, 1), writer.handoff_calls);
 }
 
 /// Minimal replay Source for tests: replays a fixed list of encoded records.
@@ -2475,7 +2780,7 @@ test "catchUpWindow resolves matching records and journals resolution writes" {
     defer alloc.free(payload);
 
     var fake_source = FakeSource{ .records = &.{.{ .sequence = 7, .payload = payload }} };
-    var writer = CaptureWriter{ .alloc = alloc };
+    var writer = CaptureWriter{ .alloc = alloc, .store = store };
     defer writer.deinit();
 
     const max_seen = try catchUpWindow(
@@ -2500,7 +2805,7 @@ test "catchUpWindow resolves matching records and journals resolution writes" {
     try testing.expectEqualSlices(u8, resolution_key, writer.keys.items[0]);
 }
 
-test "catchUpWindow with no matching records returns from-1" {
+test "catchUpWindow with no matching records returns from_sequence" {
     const alloc = testing.allocator;
     const resolvers = [_]ResolverConfig{};
     var fake = FakeStore{ .alloc = alloc };
@@ -2662,7 +2967,7 @@ test "reresolveAll re-resolves the corpus when a resolver config generation bump
         .key_template = "{{ slug _entity.text }}",
         .config_generation = 2,
     }};
-    var writer = CaptureWriter{ .alloc = alloc };
+    var writer = CaptureWriter{ .alloc = alloc, .store = store };
     defer writer.deinit();
     const reresolved = try reresolveAll(alloc, store, &bumped, null, null, &writer, CaptureWriter.writeFn);
     try testing.expectEqual(@as(usize, 1), reresolved);
@@ -2674,12 +2979,15 @@ test "reresolveAll re-resolves the corpus when a resolver config generation bump
     defer alloc.free(restored);
     try testing.expect(std.mem.indexOf(u8, restored, "\"config_generation\":2") != null);
 
-    // Idempotent: a second backfill at the same generation journals nothing.
+    // Idempotent: a second backfill at the same generation reconciles graph
+    // state without repeating entity promotion.
     writer.calls = 0;
     for (writer.keys.items) |k| alloc.free(k);
     writer.keys.clearRetainingCapacity();
     _ = try reresolveAll(alloc, store, &bumped, null, null, &writer, CaptureWriter.writeFn);
-    try testing.expectEqual(@as(u64, 0), writer.calls);
+    try testing.expectEqual(@as(u64, 1), writer.calls);
+    try testing.expectEqual(@as(u64, 1), writer.inferred_calls);
+    try testing.expectEqual(@as(u64, 1), writer.graph_only_calls);
 }
 
 test "enqueueReresolveBacklogWindow queues bounded extraction artifact windows" {

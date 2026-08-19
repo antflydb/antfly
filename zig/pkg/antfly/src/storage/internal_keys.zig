@@ -56,6 +56,7 @@ pub const managed_index_admission_kind: u8 = 0x2b;
 pub const index_artifact_cleanup_kind: u8 = 0x2c;
 pub const range_document_count_key = [_]u8{ replay_namespace, 0xff, 0x2d };
 pub const artifact_repair_completion_kind: u8 = 0x2e;
+// 0x2f is reserved by the private db/resolution_handoff.zig protocol.
 pub const embedding_artifact_repair_issue_kind: u8 = artifact_repair_issue_kind;
 pub const identity_doc_to_ordinal_kind: u8 = 0x01;
 pub const identity_ordinal_to_doc_kind: u8 = 0x02;

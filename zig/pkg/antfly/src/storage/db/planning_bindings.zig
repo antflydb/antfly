@@ -132,7 +132,6 @@ fn validateGraphQueryShape(graph_query: graph_query_mod.GraphQuery) !void {
         },
         .pattern => {
             if (graph_query.pattern.len == 0) return error.InvalidArgument;
-            if (graph_query.target_nodes != null) return error.InvalidArgument;
         },
         .traverse, .neighbors => {
             if (graph_query.pattern.len > 0) return error.InvalidArgument;
