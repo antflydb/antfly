@@ -78,10 +78,14 @@ contract and query surface.
 In `relational` mode the following are implied/enforced:
 
 - `enforce_types = true` (documents must match a declared type).
+- Exactly one non-empty document schema is required; its name must match
+  `default_type` when a default is supplied.
 - Each document type is treated as closed (`additionalProperties: false`)
   unless a field is explicitly typed `json`.
 - `required_fields` declares `NOT NULL` columns.
-- `dynamic_templates` apply only inside `json` columns.
+- Table-level `dynamic_templates` are rejected by the core contract. Scoped
+  dynamic rules inside `json` columns require the later JSON-subdocument
+  lifecycle integration.
 
 `json` is added to `AntflyType`. A `json` column is stored as a `bytes` column
 and indexed like a document subtree (path facts + dynamic templates). It is the
@@ -120,7 +124,7 @@ First-cut physical mapping:
 | `column_type` | `physical`  | notes                                 |
 | ------------- | ----------- | ------------------------------------- |
 | string        | `bytes_val` | keyword / link / text-as-keyword      |
-| integer       | `u64_val`   | zigzag for signed (Phase B detail)    |
+| integer       | `u64_val`   | sign-bit flip for signed ordering     |
 | number        | `f64_val`   |                                       |
 | boolean       | `bool_val`  |                                       |
 | datetime      | `u64_val`   | epoch nanoseconds                     |
@@ -179,10 +183,11 @@ unchanged — they already exist (see `JOINS.md`, `ALGEBRAIC.md`).
 ### Schema evolution
 
 `schema_capability.classifyChange` already distinguishes additive changes
-(new nullable column → no rebuild) from breaking changes (removed or
-type-changed column → rebuild). Relational mode adds: making an existing
-nullable column `NOT NULL` is a breaking change; widening (e.g. integer →
-number) is additive where the physical type is compatible.
+(new algebraic field → no rebuild) from breaking algebraic changes (removed or
+type-changed field → rebuild). A relational-specific lifecycle classifier is a
+later integration seam: it must treat nullable → `NOT NULL` as breaking and
+only classify widening (for example integer → number) as additive when the
+physical representation and backfill plan are compatible.
 
 ## Phased plan
 

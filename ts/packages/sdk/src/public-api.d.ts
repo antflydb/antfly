@@ -9235,6 +9235,7 @@ export interface components {
              *       as typed columns for columnar predicate pushdown and aggregation.
              *       A field typed "json" stores a subtree that is still indexed like a
              *       document. Implies enforce_types and closed document types.
+             * @default document
              * @enum {string}
              */
             storage_mode?: "document" | "relational";

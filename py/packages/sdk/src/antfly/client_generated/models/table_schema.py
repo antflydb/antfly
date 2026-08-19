@@ -32,6 +32,7 @@ class TableSchema:
               as typed columns for columnar predicate pushdown and aggregation.
               A field typed "json" stores a subtree that is still indexed like a
               document. Implies enforce_types and closed document types.
+             Default: TableSchemaStorageMode.DOCUMENT.
         default_type (str | Unset): Default type to use from the document_types.
         enforce_types (bool | Unset): Whether to enforce that documents must match one of the provided document types.
             If false, documents not matching any type will be accepted but not indexed.
@@ -48,7 +49,7 @@ class TableSchema:
     """
 
     version: int | Unset = UNSET
-    storage_mode: TableSchemaStorageMode | Unset = UNSET
+    storage_mode: TableSchemaStorageMode | Unset = TableSchemaStorageMode.DOCUMENT
     default_type: str | Unset = UNSET
     enforce_types: bool | Unset = UNSET
     document_schemas: TableSchemaDocumentSchemas | Unset = UNSET

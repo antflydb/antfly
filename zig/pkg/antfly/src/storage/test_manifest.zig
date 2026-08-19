@@ -31,6 +31,7 @@ comptime {
     _ = @import("db/algebraic/path.zig");
     _ = @import("db/algebraic/pathfact.zig");
     _ = @import("db/algebraic/planner.zig");
+    _ = @import("db/algebraic/relational_row_codec.zig");
     _ = @import("db/algebraic/schema_capability.zig");
     _ = @import("db/algebraic/symbol.zig");
     _ = @import("db/algebraic/tensor.zig");

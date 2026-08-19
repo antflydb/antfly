@@ -69,6 +69,8 @@ pub const magic: [4]u8 = "AROW".*;
 pub const version: u32 = 1;
 
 const flag_is_json: u8 = 1;
+const known_flags: u8 = flag_is_json;
+const min_encoded_cell_len: usize = @sizeOf(u32) + 2 + 1;
 
 /// One reconstructable column value. Owns nothing: `path` and (for `bytes_val`)
 /// the value bytes borrow either the caller's buffers (when serializing) or the
@@ -105,6 +107,7 @@ pub fn serializedLen(cells: []const Cell) !usize {
     _ = count;
     var encoded_len: usize = magic.len + 2 * @sizeOf(u32);
     for (cells) |cell| {
+        if (!cellValueMatchesType(cell) or !cellValueIsSerializable(cell)) return error.InvalidRelationalRow;
         _ = std.math.cast(u32, cell.path.len) orelse return error.InvalidRelationalRow;
         encoded_len = try serializedLenAdd(encoded_len, @sizeOf(u32) + cell.path.len + 2);
         encoded_len = try serializedLenAdd(encoded_len, switch (cell.value) {
@@ -161,7 +164,27 @@ pub fn serializeInto(buf: []u8, cells: []const Cell) ![]u8 {
 }
 
 fn serializedLenAdd(current: usize, additional: usize) !usize {
-    return std.math.add(usize, current, additional) catch error.OutOfMemory;
+    return std.math.add(usize, current, additional) catch error.InvalidRelationalRow;
+}
+
+fn cellValueMatchesType(cell: Cell) bool {
+    const matches = switch (cell.value_type) {
+        .u64_val => cell.value == .u64_val,
+        .i64_val => cell.value == .i64_val,
+        .f64_val => cell.value == .f64_val,
+        .bytes_val => cell.value == .bytes_val,
+        .geo_point => cell.value == .geo_point,
+        .bool_val => cell.value == .bool_val,
+    };
+    return matches and (!cell.is_json or cell.value_type == .bytes_val);
+}
+
+fn cellValueIsSerializable(cell: Cell) bool {
+    return switch (cell.value) {
+        .f64_val => |value| std.math.isFinite(value),
+        .geo_point => |value| std.math.isFinite(value.lat) and std.math.isFinite(value.lon),
+        else => true,
+    };
 }
 
 fn writeU32(buf: []u8, pos: *usize, value: u32) void {
@@ -193,6 +216,7 @@ pub fn deserialize(alloc: Allocator, data: []const u8) !Row {
     const ver = readU32(data, &pos);
     if (ver != version) return error.UnsupportedRelationalRowVersion;
     const count = readU32(data, &pos);
+    try validateCellCount(data.len - pos, count);
 
     const cells = try alloc.alloc(Cell, count);
     errdefer alloc.free(cells);
@@ -201,6 +225,7 @@ pub fn deserialize(alloc: Allocator, data: []const u8) !Row {
     while (i < count) : (i += 1) {
         cells[i] = try readCellAt(data, &pos);
     }
+    if (pos != data.len) return error.InvalidRelationalRow;
 
     return .{ .cells = cells };
 }
@@ -215,10 +240,16 @@ pub fn validate(data: []const u8) !void {
     const ver = readU32(data, &pos);
     if (ver != version) return error.UnsupportedRelationalRowVersion;
     const count = readU32(data, &pos);
+    try validateCellCount(data.len - pos, count);
     var i: usize = 0;
     while (i < count) : (i += 1) {
         _ = try readCellAt(data, &pos);
     }
+    if (pos != data.len) return error.InvalidRelationalRow;
+}
+
+fn validateCellCount(remaining: usize, count: u32) !void {
+    if (count > remaining / min_encoded_cell_len) return error.InvalidRelationalRow;
 }
 
 pub const CellLookup = struct {
@@ -238,6 +269,7 @@ pub fn collectCellsByLookup(value: []const u8, lookups: []const CellLookup, out:
     const ver = readU32(value, &pos);
     if (ver != version) return error.UnsupportedRelationalRowVersion;
     const count = readU32(value, &pos);
+    try validateCellCount(value.len - pos, count);
 
     var i: usize = 0;
     while (i < count) : (i += 1) {
@@ -251,6 +283,7 @@ pub fn collectCellsByLookup(value: []const u8, lookups: []const CellLookup, out:
             }
         }
     }
+    if (pos != value.len) return error.InvalidRelationalRow;
 }
 
 /// Decode the cell at `pos.*`, advancing `pos`. Shared by full deserialization
@@ -261,6 +294,8 @@ fn readCellAt(data: []const u8, pos: *usize) !Cell {
     const flags = data[pos.*];
     const value_type = valueTypeFromByte(data[pos.* + 1]) orelse return error.InvalidRelationalRow;
     pos.* += 2;
+    if (flags & ~known_flags != 0) return error.InvalidRelationalRow;
+    if (flags & flag_is_json != 0 and value_type != .bytes_val) return error.InvalidRelationalRow;
 
     const value: typed_dv.TypedValue = switch (value_type) {
         .u64_val => .{ .u64_val = try readU64Checked(data, pos) },
@@ -268,7 +303,8 @@ fn readCellAt(data: []const u8, pos: *usize) !Cell {
         .f64_val => .{ .f64_val = @bitCast(try readU64Checked(data, pos)) },
         .bool_val => blk: {
             if (pos.* + 1 > data.len) return error.InvalidRelationalRow;
-            const b = data[pos.*] != 0;
+            if (data[pos.*] > 1) return error.InvalidRelationalRow;
+            const b = data[pos.*] == 1;
             pos.* += 1;
             break :blk .{ .bool_val = b };
         },
@@ -287,12 +323,16 @@ fn readCellAt(data: []const u8, pos: *usize) !Cell {
         },
     };
 
-    return .{
+    const cell: Cell = .{
         .path = path,
         .value_type = value_type,
         .is_json = (flags & flag_is_json) != 0,
         .value = value,
     };
+    if (!std.unicode.utf8ValidateSlice(cell.path) or !cellValueIsSerializable(cell)) {
+        return error.InvalidRelationalRow;
+    }
+    return cell;
 }
 
 /// Look up a single column by its JSON path directly from a serialized row,
@@ -308,13 +348,16 @@ pub fn findCellByPath(value: []const u8, path: []const u8) !?Cell {
     const ver = readU32(value, &pos);
     if (ver != version) return error.UnsupportedRelationalRowVersion;
     const count = readU32(value, &pos);
+    try validateCellCount(value.len - pos, count);
 
+    var found: ?Cell = null;
     var i: usize = 0;
     while (i < count) : (i += 1) {
         const cell = try readCellAt(value, &pos);
-        if (std.mem.eql(u8, cell.path, path)) return cell;
+        if (found == null and std.mem.eql(u8, cell.path, path)) found = cell;
     }
-    return null;
+    if (pos != value.len) return error.InvalidRelationalRow;
+    return found;
 }
 
 /// Reconstruct a document's canonical JSON directly from a serialized typed-row
@@ -367,6 +410,13 @@ pub fn appendCellValue(
     value: typed_dv.TypedValue,
     needs_comma: bool,
 ) !void {
+    const cell: Cell = .{
+        .path = path,
+        .value_type = value_type,
+        .is_json = is_json,
+        .value = value,
+    };
+    if (!cellValueMatchesType(cell) or !cellValueIsSerializable(cell)) return error.InvalidRelationalRow;
     if (needs_comma) try out.append(alloc, ',');
     try appendJsonString(alloc, out, path);
     try out.append(alloc, ':');
@@ -378,6 +428,7 @@ pub fn appendCellValue(
         .geo_point => try appendFmt(alloc, out, "{{\"lat\":{d},\"lon\":{d}}}", .{ value.geo_point.lat, value.geo_point.lon }),
         .bytes_val => {
             if (is_json) {
+                if (!(try std.json.validate(alloc, value.bytes_val))) return error.InvalidRelationalRow;
                 try out.appendSlice(alloc, value.bytes_val); // already canonical JSON
             } else {
                 try appendJsonString(alloc, out, value.bytes_val);
@@ -387,6 +438,7 @@ pub fn appendCellValue(
 }
 
 pub fn appendJsonString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidRelationalRow;
     try out.append(alloc, '"');
     for (value) |byte| {
         switch (byte) {
@@ -537,6 +589,62 @@ test "relational row codec rejects bad magic, version, and truncation" {
     std.mem.writeInt(u32, verbuf[8..12], 0, .little);
     try std.testing.expectError(error.UnsupportedRelationalRowVersion, deserialize(alloc, &verbuf));
     try std.testing.expectError(error.UnsupportedRelationalRowVersion, validate(&verbuf));
+
+    // Reject an attacker-controlled count before trying to allocate it.
+    std.mem.writeInt(u32, buf[8..12], std.math.maxInt(u32), .little);
+    try std.testing.expectError(error.InvalidRelationalRow, deserialize(alloc, &buf));
+    try std.testing.expectError(error.InvalidRelationalRow, validate(&buf));
+}
+
+test "relational row codec rejects non-canonical and trailing encodings" {
+    const alloc = std.testing.allocator;
+    const cells = [_]Cell{
+        .{ .path = "", .value_type = .bool_val, .value = .{ .bool_val = true } },
+    };
+    const encoded = try serialize(alloc, &cells);
+    defer alloc.free(encoded);
+
+    var malformed: [20]u8 = undefined;
+    @memcpy(malformed[0..encoded.len], encoded);
+
+    malformed[16] = 0x80; // unknown flag bit
+    try std.testing.expectError(error.InvalidRelationalRow, validate(malformed[0..encoded.len]));
+
+    malformed[16] = 0;
+    malformed[18] = 2; // booleans are canonically 0 or 1
+    try std.testing.expectError(error.InvalidRelationalRow, validate(malformed[0..encoded.len]));
+
+    @memcpy(malformed[0..encoded.len], encoded);
+    malformed[encoded.len] = 0;
+    try std.testing.expectError(error.InvalidRelationalRow, validate(malformed[0 .. encoded.len + 1]));
+    try std.testing.expectError(error.InvalidRelationalRow, deserialize(alloc, malformed[0 .. encoded.len + 1]));
+    try std.testing.expectError(error.InvalidRelationalRow, findCellByPath(malformed[0 .. encoded.len + 1], ""));
+}
+
+test "relational row codec rejects mismatched and non-JSON-safe cells" {
+    const alloc = std.testing.allocator;
+    const mismatched = [_]Cell{
+        .{ .path = "value", .value_type = .u64_val, .value = .{ .bool_val = true } },
+    };
+    try std.testing.expectError(error.InvalidRelationalRow, serializedLen(&mismatched));
+
+    const non_finite = [_]Cell{
+        .{ .path = "value", .value_type = .f64_val, .value = .{ .f64_val = std.math.nan(f64) } },
+    };
+    try std.testing.expectError(error.InvalidRelationalRow, serialize(alloc, &non_finite));
+
+    const invalid_json = [_]Cell{
+        .{ .path = "payload", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = "{" } },
+    };
+    try std.testing.expectError(error.InvalidRelationalRow, reconstructDocumentAlloc(alloc, &invalid_json));
+
+    const finite = [_]Cell{
+        .{ .path = "", .value_type = .f64_val, .value = .{ .f64_val = 1 } },
+    };
+    const corrupted = try serialize(alloc, &finite);
+    defer alloc.free(corrupted);
+    std.mem.writeInt(u64, corrupted[18..26], @bitCast(std.math.nan(f64)), .little);
+    try std.testing.expectError(error.InvalidRelationalRow, validate(corrupted));
 }
 
 test "findCellByPath reads a single column without full deserialization" {

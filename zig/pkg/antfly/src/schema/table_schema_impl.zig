@@ -406,6 +406,10 @@ pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
     try validateSchemaValue(parsed.value);
+    var schema = try parseTableSchemaValue(alloc, parsed.value);
+    defer schema.deinit(alloc);
+    try validateParsedTtlSchema(schema);
+    try validateParsedRelationalSchema(schema);
     return try stringifyJsonValue(alloc, parsed.value);
 }
 
@@ -426,6 +430,7 @@ pub fn parseSchema(alloc: std.mem.Allocator, schema_json: []const u8) !TableSche
         owned.deinit(alloc);
     }
     try validateParsedTtlSchema(schema);
+    try validateParsedRelationalSchema(schema);
     return schema;
 }
 
@@ -1636,6 +1641,12 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
     if (root.get("index_sort")) |index_sort| {
         if (index_sort != .null) parsed.index_sort = try parseIndexSort(alloc, index_sort);
     }
+    if (parsed.storage_mode == .relational) {
+        if (root.get("enforce_types")) |enforce_types| {
+            if (enforce_types != .null and !enforce_types.bool) return error.InvalidSchemaUpdateRequest;
+        }
+        parsed.enforce_types = true;
+    }
     return parsed;
 }
 
@@ -1681,6 +1692,56 @@ fn validateParsedTtlSchema(schema: TableSchema) !void {
             }
         }
     }
+}
+
+fn validateParsedRelationalSchema(schema: TableSchema) !void {
+    if (schema.storage_mode != .relational) return;
+    if (!schema.enforce_types) return error.InvalidSchemaUpdateRequest;
+    if (schema.dynamic_templates.len != 0) return error.InvalidSchemaUpdateRequest;
+    if (schema.document_schemas.len != 1) return error.InvalidSchemaUpdateRequest;
+
+    const document_schema = schema.document_schemas[0];
+    if (schema.default_type.len != 0 and !std.mem.eql(u8, schema.default_type, document_schema.name)) {
+        return error.InvalidSchemaUpdateRequest;
+    }
+    if (document_schema.properties.len == 0) return error.InvalidSchemaUpdateRequest;
+    if (document_schema.additional_properties_allowed orelse false) return error.InvalidSchemaUpdateRequest;
+    if (document_schema.additional_properties_schema != null or
+        document_schema.pattern_properties.len != 0 or
+        document_schema.dynamic_infer_types)
+    {
+        return error.InvalidSchemaUpdateRequest;
+    }
+    for (document_schema.properties) |property| {
+        if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
+    }
+}
+
+fn isRelationalStorageProperty(property: DocumentProperty) bool {
+    if (property.field_type) |field_type| {
+        return std.mem.eql(u8, field_type, "keyword") or
+            std.mem.eql(u8, field_type, "link") or
+            std.mem.eql(u8, field_type, "string") or
+            std.mem.eql(u8, field_type, "text") or
+            std.mem.eql(u8, field_type, "html") or
+            std.mem.eql(u8, field_type, "search_as_you_type") or
+            std.mem.eql(u8, field_type, "blob") or
+            std.mem.eql(u8, field_type, "boolean") or
+            std.mem.eql(u8, field_type, "datetime") or
+            std.mem.eql(u8, field_type, "integer") or
+            std.mem.eql(u8, field_type, "numeric") or
+            std.mem.eql(u8, field_type, "number") or
+            std.mem.eql(u8, field_type, "geopoint") or
+            std.mem.eql(u8, field_type, "geoshape") or
+            std.mem.eql(u8, field_type, "json") or
+            std.mem.eql(u8, field_type, "object") or
+            std.mem.eql(u8, field_type, "array");
+    }
+    return property.integer_only or
+        property.properties.len != 0 or
+        property.item != null or
+        property.const_value != null or
+        property.enum_values.len != 0;
 }
 
 fn parseDocumentSchemas(alloc: std.mem.Allocator, value: std.json.Value) ![]DocumentSchema {
@@ -3624,6 +3685,39 @@ fn jsonValueEqual(left: std.json.Value, right: std.json.Value) bool {
             break :blk true;
         },
     };
+}
+
+test "relational schemas imply type enforcement and require a closed typed shape" {
+    const alloc = std.testing.allocator;
+    var schema = try parseSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"additionalProperties":false}}}}
+    );
+    defer schema.deinit(alloc);
+    try std.testing.expect(schema.storage_mode == .relational);
+    try std.testing.expect(schema.enforce_types);
+    try std.testing.expectEqual(@as(usize, 1), schema.document_schemas.len);
+}
+
+test "relational schemas reject contracts the row codec cannot represent" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
+        \\{"storage_mode":"relational","enforce_types":false,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}}}}}}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
+        \\{"storage_mode":"relational"}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
+        \\{"storage_mode":"relational","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"additionalProperties":true}}}}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
+        \\{"storage_mode":"relational","dynamic_templates":[{"name":"all","match":"*","mapping":{"type":"keyword"}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}}}}}}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
+        \\{"storage_mode":"relational","document_schemas":{"first":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}}}},"second":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}}}}}}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchemaUpdateRequest(alloc,
+        \\{"storage_mode":"relational","document_schemas":{}}
+    ));
 }
 
 fn parseJsonNumber(value: std.json.Value) !f64 {

@@ -17841,6 +17841,7 @@ components:
           enum:
             - document
             - relational
+          default: document
           description: >
             Storage profile for the table.
 

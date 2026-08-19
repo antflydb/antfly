@@ -52,6 +52,7 @@ components:
         storage_mode:
           type: string
           enum: [document, relational]
+          default: document
           description: |
             Storage profile for the table.
             - "document" (default): schemaless JSON documents with optional,

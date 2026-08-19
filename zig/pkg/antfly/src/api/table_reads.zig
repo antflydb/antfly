@@ -3617,7 +3617,7 @@ fn mergeObservedDynamicFieldCapabilitySet(
     for (merged.items) |*existing| {
         if (!std.mem.eql(u8, existing.index_name, incoming.index_name)) continue;
         for (incoming.field_capabilities) |capability| {
-            if (mergeObservedFieldCapabilityIntoSet(existing.field_capabilities, capability)) continue;
+            if (try mergeObservedFieldCapabilityIntoSet(alloc, existing.field_capabilities, capability)) continue;
             const cloned = try storage_schema.cloneFieldCapabilityAlloc(alloc, capability);
             const old_len = existing.field_capabilities.len;
             const expanded = alloc.realloc(existing.field_capabilities, old_len + 1) catch |err| {
@@ -3642,12 +3642,13 @@ fn mergeObservedDynamicFieldCapabilitySet(
 }
 
 fn mergeObservedFieldCapabilityIntoSet(
+    alloc: std.mem.Allocator,
     capabilities: []storage_schema.FieldCapability,
     needle: storage_schema.FieldCapability,
-) bool {
+) !bool {
     for (capabilities) |*capability| {
         if (!fieldCapabilityAggregationKeyEqual(capability.*, needle)) continue;
-        mergeObservedFieldCapability(capability, needle);
+        try mergeObservedFieldCapability(alloc, capability, needle);
         return true;
     }
     return false;
@@ -3667,23 +3668,31 @@ fn fieldCapabilityAggregationKeyEqual(left: storage_schema.FieldCapability, righ
 }
 
 fn mergeObservedFieldCapability(
+    alloc: std.mem.Allocator,
     existing: *storage_schema.FieldCapability,
     incoming: storage_schema.FieldCapability,
-) void {
+) !void {
     existing.searchable = existing.searchable and incoming.searchable;
     existing.filterable = existing.filterable and incoming.filterable;
     existing.aggregatable = existing.aggregatable and incoming.aggregatable;
     existing.doc_values = existing.doc_values and incoming.doc_values;
     existing.sortable = existing.sortable and incoming.sortable;
-    existing.doc_value_coverage = storage_schema.conservativeDocValueCoverage(existing.doc_value_coverage, incoming.doc_value_coverage);
-    existing.queryability_state = storage_schema.conservativeQueryabilityState(existing.queryability_state, incoming.queryability_state);
-    existing.sort_lifecycle_state = storage_schema.conservativeSortLifecycleState(existing.sort_lifecycle_state, incoming.sort_lifecycle_state);
+    try replaceOwnedCapabilityString(alloc, &existing.doc_value_coverage, storage_schema.conservativeDocValueCoverage(existing.doc_value_coverage, incoming.doc_value_coverage));
+    try replaceOwnedCapabilityString(alloc, &existing.queryability_state, storage_schema.conservativeQueryabilityState(existing.queryability_state, incoming.queryability_state));
+    try replaceOwnedCapabilityString(alloc, &existing.sort_lifecycle_state, storage_schema.conservativeSortLifecycleState(existing.sort_lifecycle_state, incoming.sort_lifecycle_state));
     if (!std.mem.eql(u8, existing.missing_null_policy, incoming.missing_null_policy)) {
-        existing.missing_null_policy = "mixed";
+        try replaceOwnedCapabilityString(alloc, &existing.missing_null_policy, "mixed");
     }
     if (!indexSortMembershipEqual(existing.index_sort, incoming.index_sort)) {
         existing.index_sort = null;
     }
+}
+
+fn replaceOwnedCapabilityString(alloc: std.mem.Allocator, target: *[]const u8, replacement: []const u8) !void {
+    if (std.mem.eql(u8, target.*, replacement)) return;
+    const owned = try alloc.dupe(u8, replacement);
+    alloc.free(target.*);
+    target.* = owned;
 }
 
 fn optionalStringsEqual(left: ?[]const u8, right: ?[]const u8) bool {

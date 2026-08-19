@@ -221,25 +221,32 @@ fn appendLawConfig(
 }
 
 pub fn capabilityFingerprintAlloc(alloc: Allocator, plan: Plan) ![]u8 {
-    var canonical = std.ArrayListUnmanaged(u8).empty;
-    defer canonical.deinit(alloc);
-    try appendFmt(alloc, &canonical, "v:{d}|", .{plan.schema_version});
+    var hasher = std.hash.Wyhash.init(0x616e_7466_6c79_6361);
+    hashU64(&hasher, plan.schema_version);
+    hashU64(&hasher, plan.fields.len);
     for (plan.fields) |field| {
-        try appendFmt(alloc, &canonical, "{s}:{s}:{s}:{s}:{s}|", .{
-            @tagName(field.role),
-            field.document_type,
-            field.name,
-            field.path,
-            field.scalar_type,
-        });
+        hashBytes(&hasher, @tagName(field.role));
+        hashBytes(&hasher, field.document_type);
+        hashBytes(&hasher, field.name);
+        hashBytes(&hasher, field.path);
+        hashBytes(&hasher, field.scalar_type);
+        hasher.update(&.{ @intFromBool(field.bounded), @intFromBool(field.dynamic_source) });
     }
-    try appendFmt(alloc, &canonical, "skip:{d}:{d}:{d}", .{
-        plan.skipped_dynamic_fields,
-        plan.skipped_complex_fields,
-        plan.skipped_unbounded_fields,
-    });
-    const hash = std.hash.Wyhash.hash(0, canonical.items);
-    return try std.fmt.allocPrint(alloc, "{x:0>16}", .{hash});
+    hashU64(&hasher, plan.skipped_dynamic_fields);
+    hashU64(&hasher, plan.skipped_complex_fields);
+    hashU64(&hasher, plan.skipped_unbounded_fields);
+    return try std.fmt.allocPrint(alloc, "{x:0>16}", .{hasher.final()});
+}
+
+fn hashBytes(hasher: *std.hash.Wyhash, value: []const u8) void {
+    hashU64(hasher, value.len);
+    hasher.update(value);
+}
+
+fn hashU64(hasher: *std.hash.Wyhash, value: anytype) void {
+    var encoded: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, @intCast(value), .little);
+    hasher.update(&encoded);
 }
 
 fn appendFmt(
@@ -275,6 +282,28 @@ pub fn classifyChange(old: Plan, new: Plan) ChangeImpact {
     impact.requires_rebuild = impact.removed_fields > 0 or impact.changed_type_fields > 0;
     impact.compatible_additive = !impact.requires_rebuild;
     return impact;
+}
+
+test "capability fingerprint uses unambiguous field framing" {
+    var first_fields = [_]FieldCapability{.{
+        .document_type = @constCast("a:b"),
+        .name = @constCast("c"),
+        .path = @constCast("d"),
+        .scalar_type = @constCast("string"),
+        .role = .group,
+    }};
+    var second_fields = [_]FieldCapability{.{
+        .document_type = @constCast("a"),
+        .name = @constCast("b:c"),
+        .path = @constCast("d"),
+        .scalar_type = @constCast("string"),
+        .role = .group,
+    }};
+    const first = try capabilityFingerprintAlloc(std.testing.allocator, .{ .fields = &first_fields });
+    defer std.testing.allocator.free(first);
+    const second = try capabilityFingerprintAlloc(std.testing.allocator, .{ .fields = &second_fields });
+    defer std.testing.allocator.free(second);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
 }
 
 fn findExactField(fields: []const FieldCapability, needle: FieldCapability) ?FieldCapability {
@@ -419,15 +448,36 @@ fn appendCapability(
     scalar_type_value: []const u8,
     role: FieldRole,
 ) !void {
+    const owned_document_type = try alloc.dupe(u8, document_type);
+    errdefer alloc.free(owned_document_type);
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    const owned_path = try alloc.dupe(u8, path);
+    errdefer alloc.free(owned_path);
+    const owned_scalar_type = try alloc.dupe(u8, scalar_type_value);
+    errdefer alloc.free(owned_scalar_type);
     try fields.append(alloc, .{
-        .document_type = try alloc.dupe(u8, document_type),
-        .name = try alloc.dupe(u8, name),
-        .path = try alloc.dupe(u8, path),
-        .scalar_type = try alloc.dupe(u8, scalar_type_value),
+        .document_type = owned_document_type,
+        .name = owned_name,
+        .path = owned_path,
+        .scalar_type = owned_scalar_type,
         .role = role,
         .bounded = true,
         .dynamic_source = false,
     });
+}
+
+fn exerciseAppendCapabilityAllocation(alloc: Allocator) !void {
+    var fields = std.ArrayListUnmanaged(FieldCapability).empty;
+    defer {
+        for (fields.items) |*field| field.deinit(alloc);
+        fields.deinit(alloc);
+    }
+    try appendCapability(alloc, &fields, "document", "field", "nested.field", "string", .group);
+}
+
+test "capability construction is failure atomic" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseAppendCapabilityAllocation, .{});
 }
 
 fn scalarType(property: anytype) ?[]const u8 {
@@ -760,12 +810,22 @@ fn collectRelationalColumn(
     };
     const indexed = if (property.antfly_index) |value| value else true;
     const is_json = std.mem.eql(u8, column_type, "json");
+    const owned_document_type = try alloc.dupe(u8, document_type);
+    errdefer alloc.free(owned_document_type);
+    const owned_name = try alloc.dupe(u8, property.name);
+    errdefer alloc.free(owned_name);
+    const owned_path = try alloc.dupe(u8, property.name);
+    errdefer alloc.free(owned_path);
+    const owned_column_type = try alloc.dupe(u8, column_type);
+    errdefer alloc.free(owned_column_type);
+    const owned_physical = try alloc.dupe(u8, physicalForColumnType(column_type));
+    errdefer alloc.free(owned_physical);
     try columns.append(alloc, .{
-        .document_type = try alloc.dupe(u8, document_type),
-        .name = try alloc.dupe(u8, property.name),
-        .path = try alloc.dupe(u8, property.name),
-        .column_type = try alloc.dupe(u8, column_type),
-        .physical = try alloc.dupe(u8, physicalForColumnType(column_type)),
+        .document_type = owned_document_type,
+        .name = owned_name,
+        .path = owned_path,
+        .column_type = owned_column_type,
+        .physical = owned_physical,
         .nullable = !required,
         .indexed = indexed,
         .is_json = is_json,
@@ -857,6 +917,20 @@ test "relational column plan defaults to document storage mode" {
     try std.testing.expect(!plan.relational);
     try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
     try expectRelationalColumn(plan, "doc", "id", "string", "bytes_val", true, false);
+}
+
+fn exerciseRelationalColumnPlanAllocation(alloc: Allocator, schema: schema_mod.ParsedTableSchema) !void {
+    var plan = try relationalColumnPlanAlloc(alloc, schema);
+    defer plan.deinit(alloc);
+}
+
+test "relational column plan construction is failure atomic" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"payload":{"type":"json"}},"required":["id"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+    try std.testing.checkAllAllocationFailures(alloc, exerciseRelationalColumnPlanAllocation, .{parsed});
 }
 
 test "relational column plan serializes a column catalog" {
@@ -1001,7 +1075,12 @@ pub fn projectRelationalRowAlloc(alloc: Allocator, plan: RelationalPlan, root: s
             continue;
         }
         const coerced = (try coerceColumnValue(alloc, column.column_type, found.?)) orelse return error.InvalidColumnValue;
-        if (coerced.owned) |buffer| try pool.append(alloc, buffer);
+        if (coerced.owned) |buffer| {
+            pool.append(alloc, buffer) catch |err| {
+                alloc.free(buffer);
+                return err;
+            };
+        }
         cells[i] = .{ .column = i, .present = true, .is_json = column.is_json, .value = coerced.value };
     }
 
@@ -1173,6 +1252,22 @@ test "relational projection yields typed cells" {
     var payload_parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload.value.bytes_val, .{});
     defer payload_parsed.deinit();
     try std.testing.expectEqual(@as(usize, 3), payload_parsed.value.array.items.len);
+}
+
+fn exerciseRelationalProjectionAllocation(alloc: Allocator, plan: RelationalPlan, root: std.json.Value) !void {
+    var row = try projectRelationalRowAlloc(alloc, plan, root);
+    defer row.deinit(alloc);
+}
+
+test "relational row projection is failure atomic" {
+    const alloc = std.testing.allocator;
+    var plan = try relationalTestPlanAlloc(alloc);
+    defer plan.deinit(alloc);
+    var doc = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"abc","amount":12.5,"attrs":{"k":"v"},"payload":[1,2,3]}
+    , .{});
+    defer doc.deinit();
+    try std.testing.checkAllAllocationFailures(alloc, exerciseRelationalProjectionAllocation, .{ plan, doc.value });
 }
 
 test "relational integer column preserves signed order under unsigned compare" {
