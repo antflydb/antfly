@@ -27,6 +27,7 @@ const managed_embedder = @import("../inference/managed_embedder.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const enrichment_config_validation = @import("../storage/db/enrichment/config_validation.zig");
+const public_index_contract = @import("public_index_contract.zig");
 
 pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
     if (body.len == 0) return error.InvalidCreateIndexRequest;
@@ -731,12 +732,7 @@ pub fn equivalentIndexConfigJson(
     return true;
 }
 
-const ApiIndexType = enum {
-    full_text,
-    embeddings,
-    graph,
-    algebraic,
-};
+const ApiIndexType = public_index_contract.Kind;
 
 fn indexesJsonSource(indexes_json: []const u8) []const u8 {
     return if (indexes_json.len > 0) indexes_json else tables_api.default_indexes_json;
@@ -911,6 +907,8 @@ fn appendPublicIndexConfig(
     while (it.next()) |entry| {
         if (std.mem.eql(u8, entry.key_ptr.*, "name") or
             std.mem.eql(u8, entry.key_ptr.*, coverage_policy_mod.incarnation_field)) continue;
+        if (!public_index_contract.isAllowedConfigField(index_type, entry.key_ptr.*)) continue;
+        if (public_index_contract.isWriteOnlyConfigField(entry.key_ptr.*)) continue;
         if (isSensitivePublicConfigField(entry.key_ptr.*) and !isSecretReference(entry.value_ptr.*)) continue;
         try out.append(alloc, ',');
         try appendJsonString(alloc, out, entry.key_ptr.*);
@@ -980,7 +978,7 @@ fn appendPublicConfigValue(
                 // deny-list cannot safely project them into a public response,
                 // so preserve the table-status invariant and omit the entire
                 // write-only document.
-                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "producer_json")) continue;
+                if (public_index_contract.isWriteOnlyConfigField(entry.key_ptr.*)) continue;
                 if (isSensitivePublicConfigField(entry.key_ptr.*) and !isSecretReference(entry.value_ptr.*)) continue;
                 if (!first) try out.append(alloc, ',');
                 first = false;
@@ -3724,6 +3722,25 @@ test "public index config encoders redact nested credentials" {
         "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"enrichments\":[{\"name\":\"asset_v1\",\"kind\":\"asset\"}]}",
         created,
     );
+}
+
+test "public index config encoders omit root write-only producer documents" {
+    const config =
+        \\{"type":"embeddings","external":true,"dimension":384,"producer_json":"{\"secret_access_key\":\"private\"}","future_provider_secret":"private-too"}
+    ;
+    const created = try encodeCreatedIndexConfig(std.testing.allocator, "embed_idx", config);
+    defer std.testing.allocator.free(created);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, created, .{});
+    defer parsed.deinit();
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"external\":true,\"dimension\":384}",
+        created,
+    );
+    try std.testing.expect(parsed.value.object.get("producer_json") == null);
+    try std.testing.expect(parsed.value.object.get("future_provider_secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, created, "private") == null);
 }
 
 test "identical index mutation retries preserve coverage incarnation" {

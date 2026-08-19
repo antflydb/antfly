@@ -909,20 +909,25 @@ const createdIndex = await client.indexes.create('wikipedia', 'thumbnail', {
 
   <TabsContent value="python">
 ```python
+from antfly import (
+    CreateEmbeddingsIndexRequest,
+    CreateEmbeddingsIndexRequestType,
+    DerivedCoveragePolicy,
+    DistanceMetric,
+    antfly_embedder,
+)
+
 created_index = client.indexes.create(
     'wikipedia',
     'thumbnail',
-    {
-        'type': 'embeddings',
-        'coverage_policy': 'partial',
-        'template': '{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}',
-        'embedder': {
-            'provider': 'antfly',
-            'model': 'antflydb/clipclap',
-        },
-        'dimension': 512,
-        'distance_metric': 'cosine',
-    },
+    CreateEmbeddingsIndexRequest(
+        type_=CreateEmbeddingsIndexRequestType.EMBEDDINGS,
+        coverage_policy=DerivedCoveragePolicy.PARTIAL,
+        template='{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}',
+        embedder=antfly_embedder('antflydb/clipclap'),
+        dimension=512,
+        distance_metric=DistanceMetric.COSINE,
+    ),
 )
 ```
   </TabsContent>
@@ -948,17 +953,18 @@ if err != nil { return err }
 
   <TabsContent value="rust">
 ```rust
-let request: antfly_sdk::types::CreateIndexRequest = serde_json::from_value(json!({
-    "type": "embeddings",
-    "coverage_policy": "partial",
-    "template": "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}",
-    "embedder": {
-        "provider": "antfly",
-        "model": "antflydb/clipclap"
-    },
-    "dimension": 512,
-    "distance_metric": "cosine"
-}))?;
+use antfly_sdk::types;
+use std::num::NonZeroU64;
+
+let request = types::CreateEmbeddingsIndexRequest {
+    coverage_policy: Some(types::DerivedCoveragePolicy::Partial),
+    template: Some("{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}".into()),
+    embedder: Some(antfly_sdk::antfly_embedder("antflydb/clipclap")),
+    dimension: NonZeroU64::new(512),
+    distance_metric: Some(types::DistanceMetric::Cosine),
+    ..Default::default()
+};
+let request: types::CreateIndexRequest = request.into();
 let created_index = client
     .create_index("wikipedia", "thumbnail", &request)
     .await?

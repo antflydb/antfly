@@ -5706,6 +5706,8 @@ pub fn build(b: *std.Build) void {
             "restore manifest preserves trusted coverage incarnation metadata",
             "public index config encoders redact coverage incarnation",
             "public index config encoders redact nested credentials",
+            "public index config encoders omit root write-only producer documents",
+            "table contract rejects unknown fields for every public index variant",
             "identical index mutation retries preserve coverage incarnation",
             "derived coverage evaluation is policy exact and observation gated",
             "settled terminal enrichment debt is degraded rather than rebuilding",
@@ -5741,6 +5743,7 @@ pub fn build(b: *std.Build) void {
             "api http lifecycle classification preserves catching-up writer beside fresh read snapshot",
             "remote rebuild quarantine preserves its source and index failure",
             "api http server create index installs exact visible config and defers lagging projection",
+            "api http server create index expands schema-derived algebraic config",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

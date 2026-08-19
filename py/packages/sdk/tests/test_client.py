@@ -11,10 +11,11 @@ from httpx import Timeout
 from antfly import (  # noqa: E402
     AntflyClient,
     AntflyException,
-    CreatedIndex,
+    CreatedEmbeddingsIndex,
     CreateEmbeddingsIndexRequest,
     CreateEmbeddingsIndexRequestType,
     StorageResourceExhaustedError,
+    antfly_embedder,
 )
 from antfly.client import normalize_base_url  # noqa: E402
 from antfly.client_generated.models.batch_request import BatchRequest  # noqa: E402
@@ -233,7 +234,7 @@ class TestAntflyClient:
         config = {"type": "embeddings", "dimension": 512}
         result = client.indexes.create("wiki/media", "thumbnail image", config)
 
-        assert isinstance(result, CreatedIndex)
+        assert isinstance(result, CreatedEmbeddingsIndex)
         assert result.name == "thumbnail"
         assert result.type_.value == "embeddings"
         assert result.dimension == 512
@@ -254,10 +255,11 @@ class TestAntflyClient:
         request = CreateEmbeddingsIndexRequest(
             type_=CreateEmbeddingsIndexRequestType.EMBEDDINGS,
             dimension=768,
+            embedder=antfly_embedder("antflydb/clipclap"),
         )
         created = client.indexes.create("docs", "vectors", request)
 
-        assert isinstance(created, CreatedIndex)
+        assert isinstance(created, CreatedEmbeddingsIndex)
         assert created.name == "vectors"
         assert created.dimension == 768
         mock_httpx.stream.assert_called_once_with(
@@ -269,6 +271,7 @@ class TestAntflyClient:
                 "external": False,
                 "sparse": False,
                 "dimension": 768,
+                "embedder": {"provider": "antfly", "model": "antflydb/clipclap"},
                 "top_k": 10,
                 "min_weight": 0.0,
                 "chunk_size": 1024,

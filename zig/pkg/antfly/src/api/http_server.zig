@@ -1834,6 +1834,7 @@ pub const ApiHttpServer = struct {
     session_maintenance_owner_id: u64 = 0,
     session_maintenance_in_flight: std.atomic.Value(bool) = .init(false),
     backup_maintenance_owner_id: u64 = 0,
+    index_installation_owner_id: u64 = 0,
     backup_maintenance_closing: std.atomic.Value(bool) = .init(false),
     backup_maintenance_mutex: std.atomic.Mutex = .unlocked,
     backup_maintenance_queue: ClusterBackupMaintenanceQueue = .{},
@@ -1861,6 +1862,7 @@ pub const ApiHttpServer = struct {
         restore: u64 = 0,
         session_maintenance: u64 = 0,
         backup_maintenance: u64 = 0,
+        index_installation: u64 = 0,
     };
 
     fn allocRuntimeOwnerIds(runtime: ?*db_mod.background_runtime.BackendRuntime) !RuntimeOwnerIds {
@@ -1871,11 +1873,13 @@ pub const ApiHttpServer = struct {
             if (ids.restore != 0) active.durable_jobs.closeOwner(ids.restore);
             if (ids.session_maintenance != 0) active.durable_jobs.closeOwner(ids.session_maintenance);
             if (ids.backup_maintenance != 0) active.durable_jobs.closeOwner(ids.backup_maintenance);
+            if (ids.index_installation != 0) active.durable_jobs.closeOwner(ids.index_installation);
         }
         ids.repair = try active.allocOwnerId();
         ids.restore = try active.allocOwnerId();
         ids.session_maintenance = try active.allocOwnerId();
         ids.backup_maintenance = try active.allocOwnerId();
+        ids.index_installation = try active.allocOwnerId();
         return ids;
     }
 
@@ -2011,6 +2015,7 @@ pub const ApiHttpServer = struct {
             .restore_job_owner_id = .init(owner_ids.restore),
             .session_maintenance_owner_id = owner_ids.session_maintenance,
             .backup_maintenance_owner_id = owner_ids.backup_maintenance,
+            .index_installation_owner_id = owner_ids.index_installation,
             .connections_cache = connections_api.Cache.init(owner_alloc),
             .local_resource_manager = resource_manager_mod.ResourceManager.init(.{}),
             .shared_resource_manager = cfg.resource_manager,
@@ -2189,6 +2194,7 @@ pub const ApiHttpServer = struct {
                 if (owner_ids.restore != 0) runtime.durable_jobs.closeOwner(owner_ids.restore);
                 if (owner_ids.session_maintenance != 0) runtime.durable_jobs.closeOwner(owner_ids.session_maintenance);
                 if (owner_ids.backup_maintenance != 0) runtime.durable_jobs.closeOwner(owner_ids.backup_maintenance);
+                if (owner_ids.index_installation != 0) runtime.durable_jobs.closeOwner(owner_ids.index_installation);
             }
         };
         var server = initWithRequestAllocatorAndOwners(
@@ -2300,6 +2306,7 @@ pub const ApiHttpServer = struct {
             if (restore_owner_id != 0) runtime.durable_jobs.closeOwner(restore_owner_id);
             if (self.session_maintenance_owner_id != 0) runtime.durable_jobs.closeOwner(self.session_maintenance_owner_id);
             if (self.backup_maintenance_owner_id != 0) runtime.durable_jobs.closeOwner(self.backup_maintenance_owner_id);
+            if (self.index_installation_owner_id != 0) runtime.durable_jobs.closeOwner(self.index_installation_owner_id);
         }
         platform_sync.lockYielding(&self.backup_maintenance_mutex);
         self.backup_maintenance_queue.deinit(self.owner_alloc);
@@ -8725,6 +8732,82 @@ pub const ApiHttpServer = struct {
         return indexes_api.encodeArtifactEnrichmentList(alloc, table_name, table.indexes_json) catch return error.InternalFailure;
     }
 
+    const CommittedIndexInstallationWork = struct {
+        source: table_writes.TableWriteSource,
+        table_name: []u8,
+        index_name: []u8,
+        index_json: []u8,
+
+        fn run(ptr: *anyopaque) !void {
+            const work: *CommittedIndexInstallationWork = @ptrCast(@alignCast(ptr));
+            var attempt: usize = 0;
+            var retry_delay_ns: u64 = 25 * std.time.ns_per_ms;
+            while (attempt < 8) : (attempt += 1) {
+                const installed = work.source.createIndex(
+                    std.heap.page_allocator,
+                    work.table_name,
+                    work.index_name,
+                    work.index_json,
+                ) catch |err| {
+                    if (attempt + 1 == 8) return err;
+                    sleepNs(retry_delay_ns);
+                    retry_delay_ns = @min(retry_delay_ns * 2, 2 * std.time.ns_per_s);
+                    continue;
+                };
+                if (installed == null) return error.UnsupportedOperation;
+                return;
+            }
+            unreachable;
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const work: *CommittedIndexInstallationWork = @ptrCast(@alignCast(ptr));
+            const alloc = std.heap.page_allocator;
+            alloc.free(work.table_name);
+            alloc.free(work.index_name);
+            alloc.free(work.index_json);
+            alloc.destroy(work);
+        }
+    };
+
+    fn scheduleCommittedIndexInstallation(
+        self: *ApiHttpServer,
+        source: table_writes.TableWriteSource,
+        table_name: []const u8,
+        index_name: []const u8,
+        index_json: []const u8,
+    ) !bool {
+        const runtime = self.cfg.backend_runtime orelse return false;
+        if (runtime.threaded_jobs == null or self.index_installation_owner_id == 0) return false;
+
+        const alloc = std.heap.page_allocator;
+        const work = try alloc.create(CommittedIndexInstallationWork);
+        errdefer alloc.destroy(work);
+        const owned_table_name = try alloc.dupe(u8, table_name);
+        errdefer alloc.free(owned_table_name);
+        const owned_index_name = try alloc.dupe(u8, index_name);
+        errdefer alloc.free(owned_index_name);
+        const owned_index_json = try alloc.dupe(u8, index_json);
+        errdefer alloc.free(owned_index_json);
+        work.* = .{
+            .source = source,
+            .table_name = owned_table_name,
+            .index_name = owned_index_name,
+            .index_json = owned_index_json,
+        };
+        runtime.durable_jobs.submit(.{
+            .owner_id = self.index_installation_owner_id,
+            .class = .maintenance,
+            .ptr = work,
+            .run = CommittedIndexInstallationWork.run,
+            .deinit = CommittedIndexInstallationWork.deinit,
+        }) catch |err| {
+            CommittedIndexInstallationWork.deinit(work);
+            return err;
+        };
+        return true;
+    }
+
     fn executePublicTableCreateIndex(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -8833,22 +8916,45 @@ pub const ApiHttpServer = struct {
             // barrier; embedded sources preserve their synchronous contract.
             // Generic reconciliation is separate because the same queue also
             // repairs index deletion.
+            var local_installation_complete = false;
             if (projection_ready) {
-                _ = table_writes_source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| {
+                const installed = table_writes_source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| install: {
                     // Consensus already committed the resource. Local resource
                     // pressure and partial O(groups) installation are readiness
                     // conditions, not create failures; the reconciler owns the
                     // retry without inviting an ambiguous client replay.
                     std.log.warn("public create index committed; local installation deferred to reconciliation table={s} index={s} err={}", .{ table_name, index_name, err });
+                    break :install null;
                 };
+                local_installation_complete = installed != null;
             }
             // Consensus is the request's commit boundary. Queue insertion is
             // an idempotent repair accelerator, so queue pressure after commit
             // must not turn a created resource into a false HTTP failure that
             // invites ambiguous client retries.
-            _ = table_writes_source.requestTableIndexStructuralReconcile(alloc, table_name, index_name) catch |err| {
+            const reconcile_requested = table_writes_source.requestTableIndexStructuralReconcile(alloc, table_name, index_name) catch |err| requested: {
                 std.log.warn("public create index structural reconcile enqueue deferred table={s} index={s} err={}", .{ table_name, index_name, err });
+                break :requested null;
             };
+            if (!local_installation_complete and reconcile_requested == null) {
+                const scheduled = self.scheduleCommittedIndexInstallation(
+                    table_writes_source,
+                    table_name,
+                    index_name,
+                    stored_index_json,
+                ) catch |err| scheduled: {
+                    std.log.warn("public create index background installation enqueue deferred table={s} index={s} err={}", .{ table_name, index_name, err });
+                    break :scheduled false;
+                };
+                if (!scheduled) {
+                    // Manual and embedded runtimes have no background executor.
+                    // Preserve their synchronous convergence contract without
+                    // imposing an O(groups) barrier on hosted HTTP workers.
+                    _ = table_writes_source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| {
+                        std.log.warn("public create index committed; fallback installation deferred table={s} index={s} err={}", .{ table_name, index_name, err });
+                    };
+                }
+            }
         }
         // Return the normalized public resource already computed before the
         // irreversible catalog mutation. This avoids a second fallible status
@@ -28343,6 +28449,62 @@ test "api http server create index installs exact visible config and defers lagg
     try std.testing.expectEqual(@as(u16, 201), lagging_projection_resp.status);
     try std.testing.expectEqual(@as(usize, 4), writes.create_calls);
     try std.testing.expectEqual(@as(usize, 5), writes.enqueue_calls);
+
+    // Hosted sources historically exposed create_index without either
+    // structural-reconcile callback. A lagging projection must still install
+    // after commit, and that O(groups) work must not block the HTTP worker.
+    const NoReconcileWrites = struct {
+        create_calls: std.atomic.Value(usize) = .init(0),
+        transient_failures: std.atomic.Value(usize) = .init(1),
+
+        fn iface(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .create_index = createIndex,
+                },
+            };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return error.UnsupportedOperation;
+        }
+
+        fn createIndex(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.create_calls.fetchAdd(1, .monotonic);
+            if (self.transient_failures.swap(0, .acq_rel) != 0) return error.ResourceBudgetExceeded;
+            return {};
+        }
+    };
+
+    var runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var unprojected_source = FakeSource{ .project_create = false };
+    defer unprojected_source.deinit(alloc);
+    var no_reconcile_writes = NoReconcileWrites{};
+    var fallback_server = ApiHttpServer.init(
+        alloc,
+        .{ .backend_runtime = &runtime },
+        unprojected_source.iface(),
+        null,
+        no_reconcile_writes.iface(),
+    );
+    defer fallback_server.deinit();
+
+    const fallback_index_body = try test_contract_helpers.encodeCreateIndexRequest(alloc, "fallback_embed_idx");
+    defer alloc.free(fallback_index_body);
+    var fallback_resp = try executeHttpxTestRequest(&fallback_server, .{
+        .method = .POST,
+        .uri = "/tables/docs/indexes/fallback_embed_idx",
+        .content_type = "application/json",
+        .body = fallback_index_body,
+    });
+    defer fallback_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), fallback_resp.status);
+    runtime.durable_jobs.drainOwner(fallback_server.index_installation_owner_id);
+    try std.testing.expectEqual(@as(usize, 2), no_reconcile_writes.create_calls.load(.acquire));
 }
 
 test "api http server create index expands schema-derived algebraic config" {
@@ -28471,6 +28633,15 @@ test "api http server create index expands schema-derived algebraic config" {
     defer create_index_resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 201), create_index_resp.status);
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"name\":\"sales_rollup\",\"type\":\"algebraic\"}",
+        create_index_resp.body,
+    );
+    var parsed_created = try std.json.parseFromSlice(std.json.Value, alloc, create_index_resp.body, .{});
+    defer parsed_created.deinit();
+    try std.testing.expect(parsed_created.value.object.get("group_fields") == null);
+    try std.testing.expect(parsed_created.value.object.get("materializations") == null);
     try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"derive_from_schema\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"group_fields\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"measure_fields\"") != null);

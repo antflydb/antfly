@@ -140,12 +140,11 @@ components:
           embeddings: "#/components/schemas/CreateEmbeddingsIndexRequest"
           graph: "#/components/schemas/CreateGraphIndexRequest"
           algebraic: "#/components/schemas/CreateAlgebraicIndexRequest"
-    CreatedIndex:
+    CreatedIndexCommon:
       type: object
-      description: "Normalized effective configuration returned after an index is created. Provider credentials are write-only and are never returned."
+      description: "Fields returned for every newly created index. Provider credentials are write-only and are never returned."
       required:
         - name
-        - type
       properties:
         name:
           type: string
@@ -153,8 +152,6 @@ components:
         description:
           type: string
           description: "Optional description of the index and its purpose"
-        type:
-          $ref: "#/components/schemas/IndexType"
         version:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -166,71 +163,64 @@ components:
             $ref: "#/components/schemas/EnrichmentConfig"
           x-go-type-skip-optional-pointer: true
           description: "Normalized inline managed enrichment definitions required by this index."
-        mem_only:
-          x-go-type-skip-optional-pointer: true
-          type: boolean
-          description: "Whether to use memory-only storage."
-        coverage_policy:
-          $ref: "#/components/schemas/DerivedCoveragePolicy"
-        external:
-          x-go-type-skip-optional-pointer: true
-          type: boolean
-          default: false
-        sparse:
-          x-go-type-skip-optional-pointer: true
-          type: boolean
-          default: false
-        dimension:
-          x-go-type-skip-optional-pointer: true
-          type: integer
-          minimum: 1
-        field:
-          x-go-type-skip-optional-pointer: true
-          type: string
-        embedding_name:
-          x-go-type-skip-optional-pointer: true
-          type: string
-        source_artifact_name:
-          x-go-type-skip-optional-pointer: true
-          type: string
-        template:
-          x-go-type-skip-optional-pointer: true
-          type: string
-        distance_metric:
-          $ref: "#/components/schemas/DistanceMetric"
-        embedder:
-          $ref: "embeddings.yaml#/components/schemas/EmbedderConfig"
-        summarizer:
-          $ref: "../shared/generating.yaml#/components/schemas/GeneratorConfig"
-        chunker:
-          $ref: "chunking.yaml#/components/schemas/ChunkerConfig"
-        top_k:
-          x-go-type-skip-optional-pointer: true
-          type: integer
-          minimum: 1
-          default: 10
-        min_weight:
-          x-go-type-skip-optional-pointer: true
-          type: number
-          format: float
-          default: 0.0
-        chunk_size:
-          x-go-type-skip-optional-pointer: true
-          type: integer
-          minimum: 64
-          default: 1024
-        execution:
-          $ref: "#/components/schemas/IndexExecutionConfig"
-        edge_types:
-          type: array
-          items:
-            $ref: "#/components/schemas/EdgeTypeConfig"
-        max_edges_per_document:
-          x-go-type-skip-optional-pointer: true
-          type: integer
-        derive_from_schema:
-          x-go-type-skip-optional-pointer: true
-          type: boolean
+    CreatedFullTextIndex:
+      description: "Normalized effective full-text index configuration returned after creation."
+      allOf:
+        - $ref: "#/components/schemas/CreatedIndexCommon"
+        - $ref: "#/components/schemas/FullTextIndexConfig"
+        - type: object
+          required: [type]
+          properties:
+            type:
+              type: string
+              enum: [full_text]
+    CreatedEmbeddingsIndex:
+      description: "Normalized effective dense or sparse embeddings index configuration returned after creation."
+      allOf:
+        - $ref: "#/components/schemas/CreatedIndexCommon"
+        - $ref: "#/components/schemas/EmbeddingsIndexConfig"
+        - type: object
+          required: [type]
+          properties:
+            type:
+              type: string
+              enum: [embeddings]
+    CreatedGraphIndex:
+      description: "Normalized effective graph index configuration returned after creation."
+      allOf:
+        - $ref: "#/components/schemas/CreatedIndexCommon"
+        - $ref: "#/components/schemas/GraphIndexConfig"
+        - type: object
+          required: [type]
+          properties:
+            type:
+              type: string
+              enum: [graph]
+    CreatedAlgebraicIndex:
+      description: "Normalized effective schema-derived algebraic index configuration returned after creation."
+      allOf:
+        - $ref: "#/components/schemas/CreatedIndexCommon"
+        - $ref: "#/components/schemas/AlgebraicIndexConfig"
+        - type: object
+          required: [type]
+          properties:
+            type:
+              type: string
+              enum: [algebraic]
+    CreatedIndex:
+      description: "Discriminated normalized configuration returned after an index is created."
+      oneOf:
+        - $ref: "#/components/schemas/CreatedFullTextIndex"
+        - $ref: "#/components/schemas/CreatedEmbeddingsIndex"
+        - $ref: "#/components/schemas/CreatedGraphIndex"
+        - $ref: "#/components/schemas/CreatedAlgebraicIndex"
+      discriminator:
+        propertyName: type
+        mapping:
+          full_text: "#/components/schemas/CreatedFullTextIndex"
+          embeddings: "#/components/schemas/CreatedEmbeddingsIndex"
+          graph: "#/components/schemas/CreatedGraphIndex"
+          algebraic: "#/components/schemas/CreatedAlgebraicIndex"
     EnrichmentKind:
       type: string
       enum:
@@ -332,6 +322,14 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: "Whether to use memory-only storage"
+        field:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Document field indexed as text. Omit for the table's default full-document text index."
+        artifact_name:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Generated artifact stream indexed as text. Use with matching inline enrichments."
     AlgebraicIndexConfig:
       type: object
       description: "Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned."

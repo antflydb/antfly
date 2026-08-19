@@ -254,6 +254,10 @@ pub const CreateFullTextIndexRequest = struct {
     enrichments: ?[]const EnrichmentConfig = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
+    /// Document field indexed as text. Omit for the table's default full-document text index.
+    field: ?[]const u8 = null,
+    /// Generated artifact stream indexed as text. Use with matching inline enrichments.
+    artifact_name: ?[]const u8 = null,
     type: []const u8,
 };
 
@@ -330,38 +334,161 @@ pub const CreateIndexRequest = union(enum) {
     }
 };
 
-/// Normalized effective configuration returned after an index is created. Provider credentials are write-only and are never returned.
-pub const CreatedIndex = struct {
+/// Normalized effective schema-derived algebraic index configuration returned after creation.
+pub const CreatedAlgebraicIndex = struct {
     /// Name of the created index
     name: []const u8,
     /// Optional description of the index and its purpose
     description: ?[]const u8 = null,
-    type: IndexType,
     /// Version of the index implementation. Defaults to 0.
     version: ?i64 = null,
     /// Normalized inline managed enrichment definitions required by this index.
     enrichments: ?[]const EnrichmentConfig = null,
-    /// Whether to use memory-only storage.
-    mem_only: ?bool = null,
+    /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
+    derive_from_schema: ?bool = null,
+    type: []const u8,
+};
+
+/// Normalized effective dense or sparse embeddings index configuration returned after creation.
+pub const CreatedEmbeddingsIndex = struct {
+    /// Name of the created index
+    name: []const u8,
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// Normalized inline managed enrichment definitions required by this index.
+    enrichments: ?[]const EnrichmentConfig = null,
+    /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
     coverage_policy: ?DerivedCoveragePolicy = null,
+    /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
+    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
     sparse: ?bool = null,
+    /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
+    /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
     field: ?[]const u8 = null,
+    /// Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings.
     embedding_name: ?[]const u8 = null,
+    /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
     source_artifact_name: ?[]const u8 = null,
+    /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
+    /// Whether to use in-memory only storage (dense only)
+    mem_only: ?bool = null,
+    /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
     embedder: ?antfly_embeddings_openapi.EmbedderConfig = null,
+    /// Configuration for the summarizer plugin (dense managed indexes only)
     summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
+    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
     chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
+    /// Default number of results to return from search (sparse only)
     top_k: ?i64 = null,
+    /// Minimum weight threshold for sparse vector entries (sparse only)
     min_weight: ?f32 = null,
+    /// Number of documents per posting list chunk (sparse only)
     chunk_size: ?i64 = null,
+    /// Non-semantic execution policy for shorthand-created chunking or embedding producers.
     execution: ?IndexExecutionConfig = null,
+    type: []const u8,
+};
+
+/// Normalized effective full-text index configuration returned after creation.
+pub const CreatedFullTextIndex = struct {
+    /// Name of the created index
+    name: []const u8,
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// Normalized inline managed enrichment definitions required by this index.
+    enrichments: ?[]const EnrichmentConfig = null,
+    /// Whether to use memory-only storage
+    mem_only: ?bool = null,
+    /// Document field indexed as text. Omit for the table's default full-document text index.
+    field: ?[]const u8 = null,
+    /// Generated artifact stream indexed as text. Use with matching inline enrichments.
+    artifact_name: ?[]const u8 = null,
+    type: []const u8,
+};
+
+/// Normalized effective graph index configuration returned after creation.
+pub const CreatedGraphIndex = struct {
+    /// Name of the created index
+    name: []const u8,
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// Normalized inline managed enrichment definitions required by this index.
+    enrichments: ?[]const EnrichmentConfig = null,
+    /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
+    summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
+    /// Handlebars template for generating summarizer input text. Uses document fields as template variables. Same pattern as EmbeddingsConfig template.
+    template: ?[]const u8 = null,
+    /// List of edge types with their configurations
     edge_types: ?[]const EdgeTypeConfig = null,
+    /// Maximum number of edges per document (0 = unlimited)
     max_edges_per_document: ?i64 = null,
-    derive_from_schema: ?bool = null,
+    type: []const u8,
+};
+
+/// Discriminated normalized configuration returned after an index is created.
+pub const CreatedIndex = union(enum) {
+    created_full_text_index: CreatedFullTextIndex,
+    created_embeddings_index: CreatedEmbeddingsIndex,
+    created_graph_index: CreatedGraphIndex,
+    created_algebraic_index: CreatedAlgebraicIndex,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "full_text")) {
+            return .{ .created_full_text_index = try std.json.parseFromValueLeaky(CreatedFullTextIndex, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "embeddings")) {
+            return .{ .created_embeddings_index = try std.json.parseFromValueLeaky(CreatedEmbeddingsIndex, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph")) {
+            return .{ .created_graph_index = try std.json.parseFromValueLeaky(CreatedGraphIndex, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "algebraic")) {
+            return .{ .created_algebraic_index = try std.json.parseFromValueLeaky(CreatedAlgebraicIndex, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .created_full_text_index => |v| try jw.write(v),
+            .created_embeddings_index => |v| try jw.write(v),
+            .created_graph_index => |v| try jw.write(v),
+            .created_algebraic_index => |v| try jw.write(v),
+        }
+    }
+};
+
+/// Fields returned for every newly created index. Provider credentials are write-only and are never returned.
+pub const CreatedIndexCommon = struct {
+    /// Name of the created index
+    name: []const u8,
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// Normalized inline managed enrichment definitions required by this index.
+    enrichments: ?[]const EnrichmentConfig = null,
 };
 
 /// A structured reason why the coverage projection cannot be treated as globally complete.
@@ -862,6 +989,10 @@ pub const ExecutionPolicy = struct {
 pub const FullTextIndexConfig = struct {
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
+    /// Document field indexed as text. Omit for the table's default full-document text index.
+    field: ?[]const u8 = null,
+    /// Generated artifact stream indexed as text. Use with matching inline enrichments.
+    artifact_name: ?[]const u8 = null,
 };
 
 /// Discriminator for the index stats variant.
@@ -1218,6 +1349,10 @@ pub const IndexConfig = struct {
     enrichments: ?[]const EnrichmentConfig = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
+    /// Document field indexed as text. Omit for the table's default full-document text index.
+    field: ?[]const u8 = null,
+    /// Generated artifact stream indexed as text. Use with matching inline enrichments.
+    artifact_name: ?[]const u8 = null,
     /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
@@ -1226,8 +1361,6 @@ pub const IndexConfig = struct {
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
-    /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
-    field: ?[]const u8 = null,
     /// Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings.
     embedding_name: ?[]const u8 = null,
     /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
@@ -1278,6 +1411,14 @@ pub const IndexConfig = struct {
             try jw.objectField("mem_only");
             try jw.write(value);
         }
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        }
+        if (self.artifact_name) |value| {
+            try jw.objectField("artifact_name");
+            try jw.write(value);
+        }
         if (self.coverage_policy) |value| {
             try jw.objectField("coverage_policy");
             try jw.write(value);
@@ -1292,10 +1433,6 @@ pub const IndexConfig = struct {
         }
         if (self.dimension) |value| {
             try jw.objectField("dimension");
-            try jw.write(value);
-        }
-        if (self.field) |value| {
-            try jw.objectField("field");
             try jw.write(value);
         }
         if (self.embedding_name) |value| {

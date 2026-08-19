@@ -17,6 +17,7 @@ const metadata_openapi = @import("antfly_metadata_openapi");
 const tables_api = @import("tables.zig");
 const indexes_api = @import("indexes.zig");
 const coverage_policy = @import("coverage_policy.zig");
+const public_index_contract = @import("public_index_contract.zig");
 
 fn stringifyJsonAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
@@ -84,10 +85,10 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     var parsed = metadata_openapi.server.parseCreateTableBody(alloc, body) catch {
         var fallback = try tables_api.parseCreateTableRequest(alloc, body);
         errdefer fallback.deinit(alloc);
-        try validateSupportedPublicIndexesJson(
-            alloc,
-            fallback.indexes_json orelse tables_api.default_indexes_json,
-        );
+        // Raw public fields were validated above. The compatibility parser
+        // adds private coverage incarnations, so re-running the public
+        // allow-list against its normalized output would reject trusted
+        // metadata that the caller never supplied.
         try validateCreateTableArtifactEnrichments(
             alloc,
             fallback.indexes_json orelse tables_api.default_indexes_json,
@@ -390,20 +391,10 @@ fn validatePublicIndexObject(object: anytype) !void {
     if (explicit_type) |value| {
         if (value != .string) return error.InvalidCreateIndexRequest;
     }
-    const index_type = extractPublicIndexType(object) orelse "full_text";
-    if (!isSupportedPublicIndexType(index_type)) return error.InvalidCreateIndexRequest;
+    const index_type = public_index_contract.parseKind(extractPublicIndexType(object) orelse "full_text") orelse
+        return error.InvalidCreateIndexRequest;
     try validatePublicInlineArtifactEnrichments(object);
-    if (std.mem.eql(u8, index_type, "full_text")) {
-        try validatePublicFullTextIndexObject(object);
-        return;
-    }
-    if (std.mem.eql(u8, index_type, "embeddings") or
-        std.mem.eql(u8, index_type, "graph") or
-        std.mem.eql(u8, index_type, "algebraic"))
-    {
-        return;
-    }
-    return error.InvalidCreateIndexRequest;
+    try validatePublicIndexFields(object, index_type);
 }
 
 fn validatePublicInlineArtifactEnrichments(object: anytype) !void {
@@ -431,21 +422,6 @@ fn validateCreateTableIndexesValue(value: std.json.Value) !void {
     while (it.next()) |entry| {
         if (entry.value_ptr.* != .object) return error.InvalidCreateTableRequest;
         try validateCreateTableIndexName(entry.key_ptr.*);
-        validatePublicIndexObject(entry.value_ptr.object) catch return error.InvalidCreateTableRequest;
-    }
-}
-
-fn validateSupportedPublicIndexesJson(alloc: std.mem.Allocator, indexes_json: []const u8) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{}) catch
-        return error.InvalidCreateTableRequest;
-    defer parsed.deinit();
-    const object = switch (parsed.value) {
-        .object => |value| value,
-        else => return error.InvalidCreateTableRequest,
-    };
-    var it = object.iterator();
-    while (it.next()) |entry| {
-        if (entry.value_ptr.* != .object) return error.InvalidCreateTableRequest;
         validatePublicIndexObject(entry.value_ptr.object) catch return error.InvalidCreateTableRequest;
     }
 }
@@ -546,19 +522,19 @@ fn extractPublicIndexType(object: anytype) ?[]const u8 {
     };
 }
 
-fn validatePublicFullTextIndexObject(object: anytype) !void {
+fn validatePublicIndexFields(object: anytype, index_type: public_index_contract.Kind) !void {
     const Object = @TypeOf(object);
     if (@hasField(Object, "map")) {
         var it = object.map.iterator();
         while (it.next()) |entry| {
-            if (!isAllowedPublicFullTextField(entry.key_ptr.*)) return error.InvalidCreateIndexRequest;
+            if (!public_index_contract.isAllowedConfigField(index_type, entry.key_ptr.*)) return error.InvalidCreateIndexRequest;
         }
         return;
     }
 
     var it = object.iterator();
     while (it.next()) |entry| {
-        if (!isAllowedPublicFullTextField(entry.key_ptr.*)) return error.InvalidCreateIndexRequest;
+        if (!public_index_contract.isAllowedConfigField(index_type, entry.key_ptr.*)) return error.InvalidCreateIndexRequest;
     }
 }
 
@@ -568,16 +544,6 @@ fn isArtifactBackedFullTextIndex(object: anytype) bool {
         return object.map.contains("artifact_name") or object.map.contains("enrichments");
     }
     return object.contains("artifact_name") or object.contains("enrichments");
-}
-
-fn isAllowedPublicFullTextField(field_name: []const u8) bool {
-    return std.mem.eql(u8, field_name, "name") or
-        std.mem.eql(u8, field_name, "type") or
-        std.mem.eql(u8, field_name, "description") or
-        std.mem.eql(u8, field_name, "mem_only") or
-        std.mem.eql(u8, field_name, "field") or
-        std.mem.eql(u8, field_name, "artifact_name") or
-        std.mem.eql(u8, field_name, "enrichments");
 }
 
 fn normalizeCreateTableIndexesFromValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
@@ -652,13 +618,6 @@ fn isReservedPublicCreateIndexName(index_name: []const u8) bool {
 
 fn isPublicFullTextType(index_type: []const u8) bool {
     return std.mem.eql(u8, index_type, "full_text");
-}
-
-fn isSupportedPublicIndexType(index_type: []const u8) bool {
-    return isPublicFullTextType(index_type) or
-        std.mem.eql(u8, index_type, "embeddings") or
-        std.mem.eql(u8, index_type, "graph") or
-        std.mem.eql(u8, index_type, "algebraic");
 }
 
 fn appendField(
@@ -1047,6 +1006,29 @@ test "table contract rejects unsupported index kinds before catalog admission" {
             "{\"indexes\":{\"unsupported_idx\":{\"type\":\"unsupported\"}}}",
         ),
     );
+}
+
+test "table contract rejects unknown fields for every public index variant" {
+    const invalid_requests = [_][]const u8{
+        "{\"type\":\"full_text\",\"unknown\":true}",
+        "{\"type\":\"embeddings\",\"external\":true,\"dimension\":384,\"producer_json\":\"{}\"}",
+        "{\"type\":\"graph\",\"unknown\":true}",
+        "{\"type\":\"algebraic\",\"unknown\":true}",
+    };
+    for (invalid_requests) |request| {
+        try std.testing.expectError(
+            error.InvalidCreateIndexRequest,
+            parseCreateIndexRequest(std.testing.allocator, "test_idx", request),
+        );
+    }
+
+    const valid_with_common_fields = try parseCreateIndexRequest(
+        std.testing.allocator,
+        "embed_idx",
+        "{\"type\":\"embeddings\",\"description\":\"semantic search\",\"version\":1,\"external\":true,\"dimension\":384}",
+    );
+    defer std.testing.allocator.free(valid_with_common_fields);
+    try std.testing.expect(std.mem.indexOf(u8, valid_with_common_fields, "\"version\":1") != null);
 }
 
 test "table contract keeps operational create request failures on the internal error path" {

@@ -198,8 +198,12 @@ func TestCreateIndexReturnsNormalizedConfigAndUsesPathIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateIndex: %v", err)
 	}
-	if created.Name != "thumbnail image" || created.Type != IndexTypeEmbeddings {
-		t.Fatalf("created = %#v", created)
+	createdEmbedding, err := created.AsCreatedEmbeddingsIndex()
+	if err != nil {
+		t.Fatalf("created.AsCreatedEmbeddingsIndex: %v", err)
+	}
+	if createdEmbedding.Name != "thumbnail image" || createdEmbedding.Type != CreatedEmbeddingsIndexTypeEmbeddings {
+		t.Fatalf("created = %#v", createdEmbedding)
 	}
 	if gotPath != "/db/v1/tables/wiki%2Fmedia/indexes/thumbnail%20image" {
 		t.Fatalf("path = %q", gotPath)

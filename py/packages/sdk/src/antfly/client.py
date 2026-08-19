@@ -18,10 +18,15 @@ from antfly.client_generated.models import (
     BatchRequest,
     BatchRequestInserts,
     CreateAlgebraicIndexRequest,
-    CreatedIndex,
+    CreatedAlgebraicIndex,
+    CreatedEmbeddingsIndex,
+    CreatedFullTextIndex,
+    CreatedGraphIndex,
     CreateEmbeddingsIndexRequest,
     CreateFullTextIndexRequest,
     CreateGraphIndexRequest,
+    EmbedderConfig,
+    EmbedderProvider,
     Error,
     InferenceGenerateChunk,
     InferenceGenerateRequest,
@@ -43,12 +48,28 @@ MAX_GENERATION_SSE_LINE_BYTES = 16 << 20
 CreateIndexRequest: TypeAlias = (
     CreateFullTextIndexRequest | CreateEmbeddingsIndexRequest | CreateGraphIndexRequest | CreateAlgebraicIndexRequest
 )
+CreatedIndex: TypeAlias = CreatedFullTextIndex | CreatedEmbeddingsIndex | CreatedGraphIndex | CreatedAlgebraicIndex
 _CREATE_INDEX_REQUEST_TYPES = (
     CreateFullTextIndexRequest,
     CreateEmbeddingsIndexRequest,
     CreateGraphIndexRequest,
     CreateAlgebraicIndexRequest,
 )
+_CREATED_INDEX_TYPES = {
+    "full_text": CreatedFullTextIndex,
+    "embeddings": CreatedEmbeddingsIndex,
+    "graph": CreatedGraphIndex,
+    "algebraic": CreatedAlgebraicIndex,
+}
+
+
+def antfly_embedder(model: str, *, api_url: str | None = None) -> EmbedderConfig:
+    """Build a typed Antfly inference embedder configuration."""
+    config = EmbedderConfig(provider=EmbedderProvider.ANTFLY)
+    config["model"] = model
+    if api_url is not None:
+        config["api_url"] = api_url
+    return config
 
 
 def _read_limited_response(response: Response, max_bytes: int) -> tuple[bytes, bool]:
@@ -224,7 +245,13 @@ class IndexOperations:
         if not isinstance(result, dict):
             raise AntflyException("create index returned an invalid response")
         try:
-            return CreatedIndex.from_dict(result)
+            discriminator = result.get("type")
+            if not isinstance(discriminator, str):
+                raise ValueError("missing string discriminator 'type'")
+            response_type = _CREATED_INDEX_TYPES.get(discriminator)
+            if response_type is None:
+                raise ValueError(f"unsupported index type {discriminator!r}")
+            return response_type.from_dict(result)
         except (KeyError, TypeError, ValueError) as exc:
             raise AntflyException(f"create index returned an invalid response: {exc}") from exc
 

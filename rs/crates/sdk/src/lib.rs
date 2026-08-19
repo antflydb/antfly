@@ -4,8 +4,9 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
 pub fn normalize_base_url(base_url: &str) -> String {
     let trimmed = base_url.trim_end_matches('/');
-    trimmed
-        .strip_suffix("/api/v1")
+    ["/db/v1", "/auth/v1", "/ai/v1", "/api/v1"]
+        .into_iter()
+        .find_map(|suffix| trimmed.strip_suffix(suffix))
         .unwrap_or(trimmed)
         .to_string()
 }
@@ -31,11 +32,23 @@ pub fn new_client_with_token(
 
 include!(concat!(env!("OUT_DIR"), "/client.rs"));
 
+/// Build an Antfly inference embedder without exposing generated union variant names.
+pub fn antfly_embedder(model: impl Into<String>) -> types::EmbedderConfig {
+    types::EmbedderConfig::Variant7 {
+        api_url: None,
+        model: model.into(),
+        multimodal: None,
+        provider: types::EmbedderProvider::Antfly,
+    }
+}
+
 impl Default for types::CreateFullTextIndexRequest {
     fn default() -> Self {
         Self {
+            artifact_name: None,
             description: None,
             enrichments: Vec::new(),
+            field: None,
             mem_only: None,
             type_: types::CreateFullTextIndexRequestType::FullText,
             version: 0,
@@ -123,7 +136,7 @@ impl types::CreateIndexError {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_base_url, types};
+    use super::{antfly_embedder, normalize_base_url, types};
 
     #[test]
     fn normalizes_local_and_cloud_urls() {
@@ -140,11 +153,27 @@ mod tests {
             "http://localhost:8080"
         );
         assert_eq!(
+            normalize_base_url("http://localhost:8080/db/v1/"),
+            "http://localhost:8080"
+        );
+        assert_eq!(
             normalize_base_url("https://platform.antfly.io/cloud/v1/instance"),
             "https://platform.antfly.io/cloud/v1/instance"
         );
         assert_eq!(
             normalize_base_url("https://platform.antfly.io/cloud/v1/instance/api/v1"),
+            "https://platform.antfly.io/cloud/v1/instance"
+        );
+        assert_eq!(
+            normalize_base_url("https://platform.antfly.io/cloud/v1/instance/db/v1"),
+            "https://platform.antfly.io/cloud/v1/instance"
+        );
+        assert_eq!(
+            normalize_base_url("https://platform.antfly.io/cloud/v1/instance/auth/v1"),
+            "https://platform.antfly.io/cloud/v1/instance"
+        );
+        assert_eq!(
+            normalize_base_url("https://platform.antfly.io/cloud/v1/instance/ai/v1"),
             "https://platform.antfly.io/cloud/v1/instance"
         );
     }
@@ -162,6 +191,32 @@ mod tests {
         assert_eq!(value["dimension"], 512);
         assert_eq!(value["coverage_policy"], "partial");
         assert!(value.get("name").is_none());
+    }
+
+    #[test]
+    fn antfly_embedder_helper_emits_typed_provider_config() {
+        let value = serde_json::to_value(antfly_embedder("antflydb/clipclap"))
+            .expect("serialize Antfly embedder");
+        assert_eq!(value["provider"], "antfly");
+        assert_eq!(value["model"], "antflydb/clipclap");
+    }
+
+    #[test]
+    fn created_index_response_is_discriminated() {
+        let created: types::CreatedIndex = serde_json::from_value(serde_json::json!({
+            "name": "thumbnail",
+            "type": "embeddings",
+            "dimension": 512,
+            "distance_metric": "cosine"
+        }))
+        .expect("deserialize created embeddings index");
+        match created {
+            types::CreatedIndex::EmbeddingsIndex(index) => {
+                assert_eq!(index.name, "thumbnail");
+                assert_eq!(index.dimension.map(std::num::NonZeroU64::get), Some(512));
+            }
+            other => panic!("unexpected created index variant: {other:?}"),
+        }
     }
 
     #[test]

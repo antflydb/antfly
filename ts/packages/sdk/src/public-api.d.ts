@@ -8073,6 +8073,10 @@ export interface components {
         FullTextIndexConfig: {
             /** @description Whether to use memory-only storage */
             mem_only?: boolean;
+            /** @description Document field indexed as text. Omit for the table's default full-document text index. */
+            field?: string;
+            /** @description Generated artifact stream indexed as text. Use with matching inline enrichments. */
+            artifact_name?: string;
         };
         /**
          * @description How generation-scoped source outcomes determine derived-index completeness.
@@ -11548,13 +11552,12 @@ export interface components {
         };
         /** @description Type-safe configuration for a new index. The index name is owned by the request path. */
         CreateIndexRequest: components["schemas"]["CreateFullTextIndexRequest"] | components["schemas"]["CreateEmbeddingsIndexRequest"] | components["schemas"]["CreateGraphIndexRequest"] | components["schemas"]["CreateAlgebraicIndexRequest"];
-        /** @description Normalized effective configuration returned after an index is created. Provider credentials are write-only and are never returned. */
-        CreatedIndex: {
+        /** @description Fields returned for every newly created index. Provider credentials are write-only and are never returned. */
+        CreatedIndexCommon: {
             /** @description Name of the created index */
             name: string;
             /** @description Optional description of the index and its purpose */
             description?: string;
-            type: components["schemas"]["IndexType"];
             /**
              * @description Version of the index implementation. Defaults to 0.
              * @default 0
@@ -11562,36 +11565,53 @@ export interface components {
             version?: number;
             /** @description Normalized inline managed enrichment definitions required by this index. */
             enrichments?: components["schemas"]["EnrichmentConfig"][];
-            /** @description Whether to use memory-only storage. */
-            mem_only?: boolean;
-            coverage_policy?: components["schemas"]["DerivedCoveragePolicy"];
-            /** @default false */
-            external?: boolean;
-            /** @default false */
-            sparse?: boolean;
-            dimension?: number;
-            field?: string;
-            embedding_name?: string;
-            source_artifact_name?: string;
-            template?: string;
-            distance_metric?: components["schemas"]["DistanceMetric"];
-            embedder?: components["schemas"]["EmbedderConfig"];
-            summarizer?: components["schemas"]["GeneratorConfig"];
-            chunker?: components["schemas"]["ChunkerConfig"];
-            /** @default 10 */
-            top_k?: number;
-            /**
-             * Format: float
-             * @default 0
-             */
-            min_weight?: number;
-            /** @default 1024 */
-            chunk_size?: number;
-            execution?: components["schemas"]["IndexExecutionConfig"];
-            edge_types?: components["schemas"]["EdgeTypeConfig"][];
-            max_edges_per_document?: number;
-            derive_from_schema?: boolean;
         };
+        /** @description Normalized effective full-text index configuration returned after creation. */
+        CreatedFullTextIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["FullTextIndexConfig"] & {
+            /** @enum {string} */
+            type: "full_text";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "full_text";
+        };
+        /** @description Normalized effective dense or sparse embeddings index configuration returned after creation. */
+        CreatedEmbeddingsIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["EmbeddingsIndexConfig"] & {
+            /** @enum {string} */
+            type: "embeddings";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "embeddings";
+        };
+        /** @description Normalized effective graph index configuration returned after creation. */
+        CreatedGraphIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["GraphIndexConfig"] & {
+            /** @enum {string} */
+            type: "graph";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "graph";
+        };
+        /** @description Normalized effective schema-derived algebraic index configuration returned after creation. */
+        CreatedAlgebraicIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["AlgebraicIndexConfig"] & {
+            /** @enum {string} */
+            type: "algebraic";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "algebraic";
+        };
+        /** @description Discriminated normalized configuration returned after an index is created. */
+        CreatedIndex: components["schemas"]["CreatedFullTextIndex"] | components["schemas"]["CreatedEmbeddingsIndex"] | components["schemas"]["CreatedGraphIndex"] | components["schemas"]["CreatedAlgebraicIndex"];
         InferenceError: {
             /** @description Stable machine-readable error code */
             error: string;

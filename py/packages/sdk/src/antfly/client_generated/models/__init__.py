@@ -126,7 +126,15 @@ from .create_table_request import CreateTableRequest
 from .create_table_request_indexes import CreateTableRequestIndexes
 from .create_user_request import CreateUserRequest
 from .create_user_request_metadata_type_0 import CreateUserRequestMetadataType0
-from .created_index import CreatedIndex
+from .created_algebraic_index import CreatedAlgebraicIndex
+from .created_algebraic_index_type import CreatedAlgebraicIndexType
+from .created_embeddings_index import CreatedEmbeddingsIndex
+from .created_embeddings_index_type import CreatedEmbeddingsIndexType
+from .created_full_text_index import CreatedFullTextIndex
+from .created_full_text_index_type import CreatedFullTextIndexType
+from .created_graph_index import CreatedGraphIndex
+from .created_graph_index_type import CreatedGraphIndexType
+from .created_index_common import CreatedIndexCommon
 from .credentials import Credentials
 from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
@@ -886,7 +894,15 @@ __all__ = (
     "CreateAlgebraicIndexRequestType",
     "CreateApiKeyRequest",
     "CreateApiKeyRequestRowFilterType0",
-    "CreatedIndex",
+    "CreatedAlgebraicIndex",
+    "CreatedAlgebraicIndexType",
+    "CreatedEmbeddingsIndex",
+    "CreatedEmbeddingsIndexType",
+    "CreatedFullTextIndex",
+    "CreatedFullTextIndexType",
+    "CreatedGraphIndex",
+    "CreatedGraphIndexType",
+    "CreatedIndexCommon",
     "CreateEmbeddingsIndexRequest",
     "CreateEmbeddingsIndexRequestType",
     "CreateFullTextIndexRequest",

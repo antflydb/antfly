@@ -10,7 +10,10 @@ from ...models.create_algebraic_index_request import CreateAlgebraicIndexRequest
 from ...models.create_embeddings_index_request import CreateEmbeddingsIndexRequest
 from ...models.create_full_text_index_request import CreateFullTextIndexRequest
 from ...models.create_graph_index_request import CreateGraphIndexRequest
-from ...models.created_index import CreatedIndex
+from ...models.created_algebraic_index import CreatedAlgebraicIndex
+from ...models.created_embeddings_index import CreatedEmbeddingsIndex
+from ...models.created_full_text_index import CreatedFullTextIndex
+from ...models.created_graph_index import CreatedGraphIndex
 from ...models.error import Error
 from ...models.storage_resource_exhausted_error import StorageResourceExhaustedError
 from ...types import Response
@@ -52,9 +55,51 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> CreatedIndex | Error | StorageResourceExhaustedError | None:
+) -> (
+    CreatedAlgebraicIndex
+    | CreatedEmbeddingsIndex
+    | CreatedFullTextIndex
+    | CreatedGraphIndex
+    | Error
+    | StorageResourceExhaustedError
+    | None
+):
     if response.status_code == 201:
-        response_201 = CreatedIndex.from_dict(response.json())
+
+        def _parse_response_201(
+            data: object,
+        ) -> CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex:
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_created_index_type_0 = CreatedFullTextIndex.from_dict(data)
+
+                return componentsschemas_created_index_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_created_index_type_1 = CreatedEmbeddingsIndex.from_dict(data)
+
+                return componentsschemas_created_index_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_created_index_type_2 = CreatedGraphIndex.from_dict(data)
+
+                return componentsschemas_created_index_type_2
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            if not isinstance(data, dict):
+                raise TypeError()
+            componentsschemas_created_index_type_3 = CreatedAlgebraicIndex.from_dict(data)
+
+            return componentsschemas_created_index_type_3
+
+        response_201 = _parse_response_201(response.json())
 
         return response_201
 
@@ -101,7 +146,14 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[CreatedIndex | Error | StorageResourceExhaustedError]:
+) -> Response[
+    CreatedAlgebraicIndex
+    | CreatedEmbeddingsIndex
+    | CreatedFullTextIndex
+    | CreatedGraphIndex
+    | Error
+    | StorageResourceExhaustedError
+]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -119,7 +171,14 @@ def sync_detailed(
     | CreateEmbeddingsIndexRequest
     | CreateFullTextIndexRequest
     | CreateGraphIndexRequest,
-) -> Response[CreatedIndex | Error | StorageResourceExhaustedError]:
+) -> Response[
+    CreatedAlgebraicIndex
+    | CreatedEmbeddingsIndex
+    | CreatedFullTextIndex
+    | CreatedGraphIndex
+    | Error
+    | StorageResourceExhaustedError
+]:
     """Add an index to a table
 
     Args:
@@ -134,7 +193,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[CreatedIndex | Error | StorageResourceExhaustedError]
+        Response[CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | StorageResourceExhaustedError]
     """
 
     kwargs = _get_kwargs(
@@ -159,7 +218,15 @@ def sync(
     | CreateEmbeddingsIndexRequest
     | CreateFullTextIndexRequest
     | CreateGraphIndexRequest,
-) -> CreatedIndex | Error | StorageResourceExhaustedError | None:
+) -> (
+    CreatedAlgebraicIndex
+    | CreatedEmbeddingsIndex
+    | CreatedFullTextIndex
+    | CreatedGraphIndex
+    | Error
+    | StorageResourceExhaustedError
+    | None
+):
     """Add an index to a table
 
     Args:
@@ -174,7 +241,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        CreatedIndex | Error | StorageResourceExhaustedError
+        CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | StorageResourceExhaustedError
     """
 
     return sync_detailed(
@@ -194,7 +261,14 @@ async def asyncio_detailed(
     | CreateEmbeddingsIndexRequest
     | CreateFullTextIndexRequest
     | CreateGraphIndexRequest,
-) -> Response[CreatedIndex | Error | StorageResourceExhaustedError]:
+) -> Response[
+    CreatedAlgebraicIndex
+    | CreatedEmbeddingsIndex
+    | CreatedFullTextIndex
+    | CreatedGraphIndex
+    | Error
+    | StorageResourceExhaustedError
+]:
     """Add an index to a table
 
     Args:
@@ -209,7 +283,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[CreatedIndex | Error | StorageResourceExhaustedError]
+        Response[CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | StorageResourceExhaustedError]
     """
 
     kwargs = _get_kwargs(
@@ -232,7 +306,15 @@ async def asyncio(
     | CreateEmbeddingsIndexRequest
     | CreateFullTextIndexRequest
     | CreateGraphIndexRequest,
-) -> CreatedIndex | Error | StorageResourceExhaustedError | None:
+) -> (
+    CreatedAlgebraicIndex
+    | CreatedEmbeddingsIndex
+    | CreatedFullTextIndex
+    | CreatedGraphIndex
+    | Error
+    | StorageResourceExhaustedError
+    | None
+):
     """Add an index to a table
 
     Args:
@@ -247,7 +329,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        CreatedIndex | Error | StorageResourceExhaustedError
+        CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | StorageResourceExhaustedError
     """
 
     return (

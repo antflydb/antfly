@@ -39,6 +39,10 @@ type (
 	CreateGraphIndexRequest      = oapi.CreateGraphIndexRequest
 	CreateAlgebraicIndexRequest  = oapi.CreateAlgebraicIndexRequest
 	CreatedIndex                 = oapi.CreatedIndex
+	CreatedFullTextIndex         = oapi.CreatedFullTextIndex
+	CreatedEmbeddingsIndex       = oapi.CreatedEmbeddingsIndex
+	CreatedGraphIndex            = oapi.CreatedGraphIndex
+	CreatedAlgebraicIndex        = oapi.CreatedAlgebraicIndex
 	IndexStatus                  = oapi.IndexStatus
 	IndexType                    = oapi.IndexType
 
@@ -371,6 +375,7 @@ func NewPackedSparseEmbedding(indices []uint32, values []float32) Embedding {
 const (
 	// IndexType values
 	IndexTypeEmbeddings                        = oapi.IndexTypeEmbeddings
+	CreatedEmbeddingsIndexTypeEmbeddings       = oapi.CreatedEmbeddingsIndexTypeEmbeddings
 	IndexTypeFullText                          = oapi.IndexTypeFullText
 	IndexTypeGraph                             = oapi.IndexTypeGraph
 	IndexTypeAlgebraic                         = oapi.IndexTypeAlgebraic

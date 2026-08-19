@@ -6,41 +6,35 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.create_full_text_index_request_type import CreateFullTextIndexRequestType
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.enrichment_config import EnrichmentConfig
 
 
-T = TypeVar("T", bound="CreateFullTextIndexRequest")
+T = TypeVar("T", bound="CreatedIndexCommon")
 
 
 @_attrs_define
-class CreateFullTextIndexRequest:
-    """Create a full-text index.
+class CreatedIndexCommon:
+    """Fields returned for every newly created index. Provider credentials are write-only and are never returned.
 
     Attributes:
-        type_ (CreateFullTextIndexRequestType):
+        name (str): Name of the created index
         description (str | Unset): Optional description of the index and its purpose
         version (int | Unset): Version of the index implementation. Defaults to 0. Default: 0.
-        enrichments (list[EnrichmentConfig] | Unset): Inline managed enrichment definitions required by this index.
-        mem_only (bool | Unset): Whether to use memory-only storage
-        field (str | Unset): Document field indexed as text. Omit for the table's default full-document text index.
-        artifact_name (str | Unset): Generated artifact stream indexed as text. Use with matching inline enrichments.
+        enrichments (list[EnrichmentConfig] | Unset): Normalized inline managed enrichment definitions required by this
+            index.
     """
 
-    type_: CreateFullTextIndexRequestType
+    name: str
     description: str | Unset = UNSET
     version: int | Unset = 0
     enrichments: list[EnrichmentConfig] | Unset = UNSET
-    mem_only: bool | Unset = UNSET
-    field: str | Unset = UNSET
-    artifact_name: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        type_ = self.type_.value
+        name = self.name
 
         description = self.description
 
@@ -53,17 +47,11 @@ class CreateFullTextIndexRequest:
                 enrichments_item = enrichments_item_data.to_dict()
                 enrichments.append(enrichments_item)
 
-        mem_only = self.mem_only
-
-        field = self.field
-
-        artifact_name = self.artifact_name
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
-                "type": type_,
+                "name": name,
             }
         )
         if description is not UNSET:
@@ -72,12 +60,6 @@ class CreateFullTextIndexRequest:
             field_dict["version"] = version
         if enrichments is not UNSET:
             field_dict["enrichments"] = enrichments
-        if mem_only is not UNSET:
-            field_dict["mem_only"] = mem_only
-        if field is not UNSET:
-            field_dict["field"] = field
-        if artifact_name is not UNSET:
-            field_dict["artifact_name"] = artifact_name
 
         return field_dict
 
@@ -86,7 +68,7 @@ class CreateFullTextIndexRequest:
         from ..models.enrichment_config import EnrichmentConfig
 
         d = dict(src_dict)
-        type_ = CreateFullTextIndexRequestType(d.pop("type"))
+        name = d.pop("name")
 
         description = d.pop("description", UNSET)
 
@@ -101,24 +83,15 @@ class CreateFullTextIndexRequest:
 
                 enrichments.append(enrichments_item)
 
-        mem_only = d.pop("mem_only", UNSET)
-
-        field = d.pop("field", UNSET)
-
-        artifact_name = d.pop("artifact_name", UNSET)
-
-        create_full_text_index_request = cls(
-            type_=type_,
+        created_index_common = cls(
+            name=name,
             description=description,
             version=version,
             enrichments=enrichments,
-            mem_only=mem_only,
-            field=field,
-            artifact_name=artifact_name,
         )
 
-        create_full_text_index_request.additional_properties = d
-        return create_full_text_index_request
+        created_index_common.additional_properties = d
+        return created_index_common
 
     @property
     def additional_keys(self) -> list[str]:
