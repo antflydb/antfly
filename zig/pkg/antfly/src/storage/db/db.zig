@@ -71177,6 +71177,14 @@ test "db managed algebraic admission builds and reopens an isolated generation" 
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
+    const repair_options = types.ArtifactRepairRunOptions{
+        // This test verifies durable generation construction, activation, and
+        // reopen—not the production reader-pause SLA. A contended CI worker
+        // can exhaust the 250 ms production window, which correctly persists
+        // retry backoff that this synchronous test loop does not wait out.
+        .max_activation_pause_ms = 5_000,
+    };
+
     const cfg = types.IndexConfig{
         .name = "analytics_idx",
         .kind = .algebraic,
@@ -71205,12 +71213,13 @@ test "db managed algebraic admission builds and reopens an isolated generation" 
 
         var repaired = false;
         for (0..16) |_| {
-            const step = try db.advanceIndexRepairIntent(alloc, repair_id, .{});
+            const step = try db.advanceIndexRepairIntent(alloc, repair_id, repair_options);
             if (step.repaired) {
                 repaired = true;
                 break;
             }
             try std.testing.expect(!step.terminal);
+            try std.testing.expectEqual(@as(u64, 0), step.next_retry_at_ms);
         }
         try std.testing.expect(repaired);
         try std.testing.expect(!db.core.index_manager.repairUnavailable(cfg.name));
