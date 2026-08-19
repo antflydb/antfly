@@ -866,7 +866,8 @@ Add a ClipClap-based index to embed each article's Wikipedia thumbnail:
 antfly index create --table wikipedia \
   --index thumbnail \
   --type embeddings \
-  --template "{{media url=thumbnail_url}}" \
+  --coverage-policy partial \
+  --template "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}" \
   --embedder '{"provider": "antfly", "model": "antflydb/clipclap"}' \
   --dimension 512
 ```
@@ -878,7 +879,8 @@ curl -X POST http://localhost:8080/db/v1/tables/wikipedia/indexes/thumbnail \
   -H "Content-Type: application/json" \
   -d '{
     "type": "embeddings",
-    "template": "{{media url=thumbnail_url}}",
+    "coverage_policy": "partial",
+    "template": "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}",
     "embedder": {
       "provider": "antfly",
       "model": "antflydb/clipclap"
@@ -893,7 +895,8 @@ curl -X POST http://localhost:8080/db/v1/tables/wikipedia/indexes/thumbnail \
 ```typescript
 await client.tables.addIndex('wikipedia', 'thumbnail', {
   type: 'embeddings',
-  template: '{{media url=thumbnail_url}}',
+  coverage_policy: 'partial',
+  template: '{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}',
   embedder: {
     provider: 'antfly',
     model: 'antflydb/clipclap',
@@ -910,7 +913,8 @@ client.add_index(
     table='wikipedia',
     name='thumbnail',
     type='embeddings',
-    template='{{media url=thumbnail_url}}',
+    coverage_policy='partial',
+    template='{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}',
     embedder={
         'provider': 'inference',
         'model': 'antflydb/clipclap',
@@ -928,8 +932,9 @@ _, err = client.AddIndexWithResponse(
 	"wikipedia",
 	"thumbnail",
 	antfly.AddIndexJSONRequestBody{
-		Type:     strPtr("embeddings"),
-		Template: strPtr("{{media url=thumbnail_url}}"),
+		Type:           strPtr("embeddings"),
+		CoveragePolicy: antfly.DerivedCoveragePolicyPartial,
+		Template:       strPtr("{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}"),
 		Embedder: &map[string]interface{}{
 			"provider": "antfly",
 			"model":    "antflydb/clipclap",
@@ -946,7 +951,8 @@ _, err = client.AddIndexWithResponse(
 client
     .add_index("wikipedia", "thumbnail", &json!({
         "type": "embeddings",
-        "template": "{{media url=thumbnail_url}}",
+        "coverage_policy": "partial",
+        "template": "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}",
         "embedder": {
             "provider": "antfly",
             "model": "antflydb/clipclap"
@@ -959,7 +965,15 @@ client
   </TabsContent>
 </Tabs>
 
-Adding an index to a table with existing data triggers background embedding generation. Articles without a `thumbnail_url` are skipped. Monitor progress with `antfly index list --table wikipedia`.
+Adding an index to a table with existing data triggers background embedding generation. The `partial` coverage policy treats articles without a `thumbnail_url` as intentional skips while still requiring every article to reach a durable outcome. Wait until the image index is queryable before continuing:
+
+```bash
+antfly index wait --table wikipedia \
+  --index thumbnail \
+  --timeout 20m
+```
+
+Use `antfly index list --table wikipedia` to monitor detailed progress.
 
 ### Search by visual content
 

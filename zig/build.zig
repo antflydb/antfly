@@ -3684,6 +3684,7 @@ pub fn build(b: *std.Build) void {
             "cmd.cli.table",
             "cmd.cli.mod",
             "cmd.cli.data.test.mutation parser",
+            "cmd.cli.data.test.load parser",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

@@ -15,6 +15,7 @@
 const std = @import("std");
 const antfly_client = @import("antfly-client");
 const cli = @import("mod.zig");
+const index_readiness = @import("index_readiness.zig");
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const subcommand = args.next() orelse {
@@ -173,6 +174,7 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
         .steps = steps,
     };
 
+    if (semantic_search != null) index_readiness.warnIfSemanticIndexesAreNotReady(client, table, indexes);
     var resp = try client.retrievalAgent(body);
     defer resp.deinit();
     if (resp.body) |response_body| {

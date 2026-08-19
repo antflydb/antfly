@@ -83,7 +83,8 @@ fn parseRoute(iterator: std.process.Args.Iterator) Route {
         } else if (std.mem.eql(u8, arg, "--type") or std.mem.eql(u8, arg, "--field") or
             std.mem.eql(u8, arg, "--template") or std.mem.eql(u8, arg, "--embedder") or
             std.mem.eql(u8, arg, "--generator") or std.mem.eql(u8, arg, "--summarizer") or
-            std.mem.eql(u8, arg, "--chunker") or std.mem.eql(u8, arg, "--dimension"))
+            std.mem.eql(u8, arg, "--chunker") or std.mem.eql(u8, arg, "--dimension") or
+            std.mem.eql(u8, arg, "--coverage-policy"))
         {
             if (create_only_arg == null) create_only_arg = arg;
             _ = args.next() orelse {
@@ -149,6 +150,11 @@ test "index route accepts flags before and after the action" {
     const flags_first = parseRoute(std.process.Args.Iterator.init(.{ .vector = flags_first_argv[0..] }));
     try std.testing.expectEqualStrings("create", flags_first.subcommand.?);
 
+    var policy_argv = [_][*:0]const u8{ "create", "--table", "docs", "--coverage-policy", "partial" };
+    const policy = parseRoute(std.process.Args.Iterator.init(.{ .vector = policy_argv[0..] }));
+    try std.testing.expectEqualStrings("create", policy.subcommand.?);
+    try std.testing.expect(policy.unknown_arg == null);
+
     var shorthand_json_argv = [_][*:0]const u8{ "--table", "docs", "--output", "json" };
     const shorthand_json = parseRoute(std.process.Args.Iterator.init(.{ .vector = shorthand_json_argv[0..] }));
     try std.testing.expect(shorthand_json.subcommand == null);
@@ -181,6 +187,7 @@ const IndexCreateConfigInput = struct {
     summarizer_json: ?[]const u8 = null,
     chunker_json: ?[]const u8 = null,
     dimension: ?i64 = null,
+    coverage_policy: ?[]const u8 = null,
 };
 
 fn buildIndexCreateConfig(
@@ -200,9 +207,12 @@ fn buildIndexCreateConfig(
     if (input.summarizer_json) |summarizer| try writer.print(",\"summarizer\":{s}", .{summarizer});
     if (input.chunker_json) |chunker| try writer.print(",\"chunker\":{s}", .{chunker});
     if (input.dimension) |dimension| try writer.print(",\"dimension\":{d}", .{dimension});
+    if (input.coverage_policy) |policy| try writer.print(",\"coverage_policy\":{f}", .{std.json.fmt(policy, .{})});
     try writer.writeAll("}");
 
-    return std.json.parseFromSlice(antfly_client.types.IndexConfig, allocator, out.written(), .{});
+    return std.json.parseFromSlice(antfly_client.types.IndexConfig, allocator, out.written(), .{
+        .allocate = .alloc_always,
+    });
 }
 
 fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient, table_name: []const u8, args: *std.process.Args.Iterator) !void {
@@ -214,6 +224,7 @@ fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient
     var summarizer_json: ?[]const u8 = null;
     var chunker_json: ?[]const u8 = null;
     var dimension: ?i64 = null;
+    var coverage_policy: ?[]const u8 = null;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "create")) continue;
@@ -243,6 +254,16 @@ fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient
             const raw = args.next() orelse cli.fatal("--dimension requires a value", .{});
             dimension = std.fmt.parseInt(i64, raw, 10) catch cli.fatal("invalid --dimension value: {s}", .{raw});
             if (dimension.? <= 0) cli.fatal("--dimension must be greater than zero", .{});
+        } else if (std.mem.eql(u8, arg, "--coverage-policy")) {
+            if (coverage_policy != null) cli.fatal("--coverage-policy may only be provided once", .{});
+            const raw = args.next() orelse cli.fatal("--coverage-policy requires a value", .{});
+            if (!std.mem.eql(u8, raw, "strict") and
+                !std.mem.eql(u8, raw, "partial") and
+                !std.mem.eql(u8, raw, "best_effort"))
+            {
+                cli.fatal("invalid --coverage-policy value: {s}; expected strict, partial, or best_effort", .{raw});
+            }
+            coverage_policy = raw;
         } else if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
             _ = args.next() orelse cli.fatal("{s} requires a value", .{arg}); // already parsed
         } else {
@@ -262,6 +283,7 @@ fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient
         .summarizer_json = summarizer_json,
         .chunker_json = chunker_json,
         .dimension = dimension,
+        .coverage_policy = coverage_policy,
     }) catch |err| {
         cli.fatal("failed to build index config: {}", .{err});
     };
@@ -793,6 +815,7 @@ test "index create config preserves dimension escaping and summarizer" {
         .dimension = 512,
         .embedder_json = "{\"provider\":\"openai\",\"model\":\"embed\"}",
         .summarizer_json = "{\"provider\":\"openai\",\"model\":\"summary\"}",
+        .coverage_policy = "partial",
     });
     defer parsed.deinit();
 
@@ -800,6 +823,7 @@ test "index create config preserves dimension escaping and summarizer" {
     try std.testing.expectEqualStrings("body\"quoted", parsed.value.field.?);
     try std.testing.expectEqualStrings("{{title}}\n{{body}}", parsed.value.template.?);
     try std.testing.expectEqualStrings("summary", parsed.value.summarizer.?.model.?);
+    try std.testing.expectEqual(antfly_client.types.DerivedCoveragePolicy.partial, parsed.value.coverage_policy.?);
 }
 
 test "index create config rejects malformed nested JSON and unknown types" {

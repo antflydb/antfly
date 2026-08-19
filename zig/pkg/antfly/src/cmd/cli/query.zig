@@ -17,10 +17,6 @@ const antfly_client = @import("antfly-client");
 const cli = @import("mod.zig");
 const index_readiness = @import("index_readiness.zig");
 
-// Readiness is advisory for a query: keep its control-plane lookup bounded so
-// an unhealthy status endpoint cannot hold the data-plane request hostage.
-const semantic_readiness_timeout_ms: u64 = 1_500;
-
 const QueryOptions = struct {
     table_name: ?[]const u8 = null,
     full_text_search: ?[]const u8 = null,
@@ -206,7 +202,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
     };
 
     if (table_name) |tbl| {
-        if (semantic_search != null) warnIfSemanticIndexesAreNotReady(client, tbl, indexes);
+        if (semantic_search != null) index_readiness.warnIfSemanticIndexesAreNotReady(client, tbl, indexes);
         var resp = try client.queryTable(tbl, body);
         defer resp.deinit();
         if (resp.data) |data| {
@@ -217,63 +213,6 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
         defer resp.deinit();
         if (resp.data) |data| {
             try cli.writeJson(allocator, io, data.value);
-        }
-    }
-}
-
-fn warnIfSemanticIndexesAreNotReady(
-    client: *antfly_client.AntflyClient,
-    table_name: []const u8,
-    selected_indexes: ?[]const []const u8,
-) void {
-    var resp = client.listIndexesResponseWithTimeout(table_name, semantic_readiness_timeout_ms) catch |err| {
-        std.debug.print("warning: unable to verify semantic index readiness: {s}\n", .{@errorName(err)});
-        return;
-    };
-    defer resp.deinit();
-    const parsed = resp.data orelse {
-        std.debug.print("warning: unable to verify semantic index readiness (HTTP {d})\n", .{resp.status_code});
-        return;
-    };
-    for (parsed.value) |index| {
-        if (index.config.type != .embeddings) continue;
-        if (selected_indexes) |selected| {
-            var matched = false;
-            for (selected) |name| {
-                if (std.mem.eql(u8, name, index.config.name)) {
-                    matched = true;
-                    break;
-                }
-            }
-            if (!matched) continue;
-        }
-        const stats = switch (index.status) {
-            .embeddings_index_stats => |value| value,
-            else => continue,
-        };
-        if (index_readiness.embeddingIndexReady(stats)) continue;
-
-        const state = if (stats.coverage) |coverage|
-            if (coverage.config_mismatch_group_count > 0) "config_mismatch" else stats.backfill_state orelse "not_ready"
-        else if (stats.backfill_state != null and std.mem.eql(u8, stats.backfill_state.?, "ready"))
-            "coverage_unavailable"
-        else
-            stats.backfill_state orelse if (stats.rebuilding orelse true) "running" else "not_ready";
-        if (stats.coverage) |coverage| {
-            std.debug.print(
-                "warning: semantic index {s} is {s} (coverage {d}/{d}, complete={any}); results may be incomplete. Run `antfly index wait --table {s} --index {s}`.\n",
-                .{ index.config.name, state, coverage.produced, coverage.source_total, coverage.complete, table_name, index.config.name },
-            );
-        } else if (stats.backfill_progress) |progress| {
-            std.debug.print(
-                "warning: semantic index {s} is {s} ({d:.1}%); results may be incomplete. Run `antfly index wait --table {s} --index {s}`.\n",
-                .{ index.config.name, state, @max(0.0, @min(1.0, progress)) * 100.0, table_name, index.config.name },
-            );
-        } else {
-            std.debug.print(
-                "warning: semantic index {s} is {s}; results may be incomplete. Run `antfly index wait --table {s} --index {s}`.\n",
-                .{ index.config.name, state, table_name, index.config.name },
-            );
         }
     }
 }

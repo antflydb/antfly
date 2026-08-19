@@ -618,7 +618,7 @@ const LoadProcessor = struct {
 };
 
 pub fn load(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
-    const opts = parseLoadOptions(allocator, args);
+    const opts = parseLoadOptions(args);
     const checkpoint_path = if (opts.checkpoint_enabled and opts.checkpoint_path == null)
         try defaultCheckpointPath(allocator, opts.file_path)
     else
@@ -629,93 +629,178 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
     _ = try runLoad(allocator, io, client, opts, effective_checkpoint_path);
 }
 
-fn parseLoadOptions(allocator: std.mem.Allocator, args: *std.process.Args.Iterator) LoadOptions {
-    var table_name: ?[]const u8 = null;
-    var file_path: ?[]const u8 = null;
-    var batch_size: usize = default_batch_size;
-    var max_batches: usize = default_max_batches;
-    var id_field: ?[]const u8 = null;
-    var id_template: ?[]const u8 = null;
-    var sync_level: ?antfly_client.types.SyncLevel = null;
-    var read_buffer_bytes: usize = default_read_buffer_bytes;
-    var max_line_bytes: usize = default_max_line_bytes;
-    var batch_bytes: usize = default_batch_bytes;
-    var checkpoint_path: ?[]const u8 = null;
-    var resume_load = false;
-    var checkpoint_enabled = true;
-    var dry_run = false;
-    var max_errors: ?u64 = null;
+const LoadOption = enum {
+    table,
+    file,
+    size,
+    batches,
+    id_field,
+    id_template,
+    sync_level,
+    read_buffer_bytes,
+    max_line_bytes,
+    batch_bytes,
+    checkpoint,
+    resume_load,
+    no_checkpoint,
+    dry_run,
+    max_errors,
+    strict,
+};
 
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
-            table_name = args.next();
-        } else if (std.mem.eql(u8, arg, "--file") or std.mem.eql(u8, arg, "-f")) {
-            file_path = args.next();
-        } else if (std.mem.eql(u8, arg, "--size")) {
-            batch_size = parsePositive(usize, args.next(), "--size");
-        } else if (std.mem.eql(u8, arg, "--batches")) {
-            max_batches = parsePositive(usize, args.next(), "--batches");
-        } else if (std.mem.eql(u8, arg, "--id-field")) {
-            id_field = args.next();
-        } else if (std.mem.eql(u8, arg, "--id-template")) {
-            id_template = args.next();
-        } else if (std.mem.eql(u8, arg, "--sync-level")) {
-            sync_level = parseSyncLevel(args.next() orelse cli.fatal("--sync-level requires a value", .{})) orelse
-                cli.fatal("invalid --sync-level", .{});
-        } else if (std.mem.eql(u8, arg, "--read-buffer-bytes")) {
-            read_buffer_bytes = parsePositive(usize, args.next(), "--read-buffer-bytes");
-        } else if (std.mem.eql(u8, arg, "--max-line-bytes")) {
-            max_line_bytes = parsePositive(usize, args.next(), "--max-line-bytes");
-        } else if (std.mem.eql(u8, arg, "--batch-bytes")) {
-            batch_bytes = parsePositive(usize, args.next(), "--batch-bytes");
-        } else if (std.mem.eql(u8, arg, "--checkpoint")) {
-            checkpoint_path = args.next();
-        } else if (std.mem.eql(u8, arg, "--resume")) {
-            resume_load = true;
-        } else if (std.mem.eql(u8, arg, "--no-checkpoint")) {
-            checkpoint_enabled = false;
-        } else if (std.mem.eql(u8, arg, "--dry-run")) {
-            dry_run = true;
-        } else if (std.mem.eql(u8, arg, "--max-errors")) {
-            max_errors = std.fmt.parseInt(u64, args.next() orelse cli.fatal("--max-errors requires a value", .{}), 10) catch cli.fatal("invalid --max-errors", .{});
-        } else if (std.mem.eql(u8, arg, "--strict")) {
-            max_errors = 0;
-        } else {
-            cli.fatal("unknown load flag: {s}", .{arg});
-        }
-    }
-    _ = allocator;
-
-    if (!checkpoint_enabled and resume_load) cli.fatal("--resume cannot be used with --no-checkpoint", .{});
-    if (id_field != null and id_template != null) cli.fatal("--id-field and --id-template are mutually exclusive", .{});
-    if (batch_size == 0) cli.fatal("--size must be greater than zero", .{});
-    if (max_batches == 0) cli.fatal("--batches must be greater than zero", .{});
-    if (read_buffer_bytes == 0) cli.fatal("--read-buffer-bytes must be greater than zero", .{});
-    if (max_line_bytes == 0) cli.fatal("--max-line-bytes must be greater than zero", .{});
-    if (batch_bytes == 0) cli.fatal("--batch-bytes must be greater than zero", .{});
-
-    return .{
-        .table_name = table_name orelse cli.fatal("--table is required", .{}),
-        .file_path = file_path orelse cli.fatal("--file is required", .{}),
-        .batch_size = batch_size,
-        .max_batches = max_batches,
-        .id_field = id_field,
-        .id_template = id_template,
-        .sync_level = sync_level,
-        .read_buffer_bytes = read_buffer_bytes,
-        .max_line_bytes = max_line_bytes,
-        .batch_bytes = batch_bytes,
-        .checkpoint_path = checkpoint_path,
-        .resume_load = resume_load,
-        .checkpoint_enabled = checkpoint_enabled,
-        .dry_run = dry_run,
-        .max_errors = max_errors,
-    };
+fn loadOption(arg: []const u8) ?LoadOption {
+    if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) return .table;
+    if (std.mem.eql(u8, arg, "--file") or std.mem.eql(u8, arg, "-f")) return .file;
+    if (std.mem.eql(u8, arg, "--size")) return .size;
+    if (std.mem.eql(u8, arg, "--batches")) return .batches;
+    if (std.mem.eql(u8, arg, "--id-field")) return .id_field;
+    if (std.mem.eql(u8, arg, "--id-template")) return .id_template;
+    if (std.mem.eql(u8, arg, "--sync-level")) return .sync_level;
+    if (std.mem.eql(u8, arg, "--read-buffer-bytes")) return .read_buffer_bytes;
+    if (std.mem.eql(u8, arg, "--max-line-bytes")) return .max_line_bytes;
+    if (std.mem.eql(u8, arg, "--batch-bytes")) return .batch_bytes;
+    if (std.mem.eql(u8, arg, "--checkpoint")) return .checkpoint;
+    if (std.mem.eql(u8, arg, "--resume")) return .resume_load;
+    if (std.mem.eql(u8, arg, "--no-checkpoint")) return .no_checkpoint;
+    if (std.mem.eql(u8, arg, "--dry-run")) return .dry_run;
+    if (std.mem.eql(u8, arg, "--max-errors")) return .max_errors;
+    if (std.mem.eql(u8, arg, "--strict")) return .strict;
+    return null;
 }
 
-fn parsePositive(comptime T: type, raw: ?[]const u8, flag: []const u8) T {
-    const text = raw orelse cli.fatal("{s} requires a value", .{flag});
-    return std.fmt.parseInt(T, text, 10) catch cli.fatal("invalid {s}", .{flag});
+const LoadOptionValues = struct {
+    table_name: ?[]const u8 = null,
+    file_path: ?[]const u8 = null,
+    batch_size: usize = default_batch_size,
+    max_batches: usize = default_max_batches,
+    id_field: ?[]const u8 = null,
+    id_template: ?[]const u8 = null,
+    sync_level: ?antfly_client.types.SyncLevel = null,
+    read_buffer_bytes: usize = default_read_buffer_bytes,
+    max_line_bytes: usize = default_max_line_bytes,
+    batch_bytes: usize = default_batch_bytes,
+    checkpoint_path: ?[]const u8 = null,
+    resume_load: bool = false,
+    checkpoint_enabled: bool = true,
+    dry_run: bool = false,
+    max_errors: ?u64 = null,
+};
+
+const LoadConflict = enum {
+    id_selector,
+    checkpoint_disabled,
+    resume_without_checkpoint,
+    error_policy,
+};
+
+const LoadParseIssue = union(enum) {
+    missing_value: []const u8,
+    duplicate: []const u8,
+    unknown: []const u8,
+    invalid_integer: struct { flag: []const u8, value: []const u8 },
+    non_positive: struct { flag: []const u8, value: []const u8 },
+    invalid_sync_level: []const u8,
+    missing_required: []const u8,
+    conflict: LoadConflict,
+};
+
+const LoadParseResult = union(enum) { value: LoadOptions, issue: LoadParseIssue };
+
+fn parseLoadOptionsIterator(iterator: std.process.Args.Iterator) LoadParseResult {
+    var args = iterator;
+    var values: LoadOptionValues = .{};
+    var seen = std.EnumSet(LoadOption).initEmpty();
+
+    while (args.next()) |arg| {
+        const option = loadOption(arg) orelse return .{ .issue = .{ .unknown = arg } };
+        if (seen.contains(option)) return .{ .issue = .{ .duplicate = arg } };
+        seen.insert(option);
+
+        switch (option) {
+            .table => values.table_name = args.next() orelse return .{ .issue = .{ .missing_value = arg } },
+            .file => values.file_path = args.next() orelse return .{ .issue = .{ .missing_value = arg } },
+            .id_field => values.id_field = args.next() orelse return .{ .issue = .{ .missing_value = arg } },
+            .id_template => values.id_template = args.next() orelse return .{ .issue = .{ .missing_value = arg } },
+            .checkpoint => values.checkpoint_path = args.next() orelse return .{ .issue = .{ .missing_value = arg } },
+            .sync_level => {
+                const raw = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
+                values.sync_level = parseSyncLevel(raw) orelse return .{ .issue = .{ .invalid_sync_level = raw } };
+            },
+            .size, .batches, .read_buffer_bytes, .max_line_bytes, .batch_bytes => {
+                const raw = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
+                const parsed = std.fmt.parseUnsigned(usize, raw, 10) catch
+                    return .{ .issue = .{ .invalid_integer = .{ .flag = arg, .value = raw } } };
+                if (parsed == 0) return .{ .issue = .{ .non_positive = .{ .flag = arg, .value = raw } } };
+                switch (option) {
+                    .size => values.batch_size = parsed,
+                    .batches => values.max_batches = parsed,
+                    .read_buffer_bytes => values.read_buffer_bytes = parsed,
+                    .max_line_bytes => values.max_line_bytes = parsed,
+                    .batch_bytes => values.batch_bytes = parsed,
+                    else => unreachable,
+                }
+            },
+            .max_errors => {
+                const raw = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
+                values.max_errors = std.fmt.parseUnsigned(u64, raw, 10) catch
+                    return .{ .issue = .{ .invalid_integer = .{ .flag = arg, .value = raw } } };
+            },
+            .resume_load => values.resume_load = true,
+            .no_checkpoint => values.checkpoint_enabled = false,
+            .dry_run => values.dry_run = true,
+            .strict => values.max_errors = 0,
+        }
+    }
+
+    if (seen.contains(.id_field) and seen.contains(.id_template)) return .{ .issue = .{ .conflict = .id_selector } };
+    if (seen.contains(.checkpoint) and seen.contains(.no_checkpoint)) return .{ .issue = .{ .conflict = .checkpoint_disabled } };
+    if (seen.contains(.resume_load) and seen.contains(.no_checkpoint)) return .{ .issue = .{ .conflict = .resume_without_checkpoint } };
+    if (seen.contains(.strict) and seen.contains(.max_errors)) return .{ .issue = .{ .conflict = .error_policy } };
+    const table_name = values.table_name orelse return .{ .issue = .{ .missing_required = "--table" } };
+    const file_path = values.file_path orelse return .{ .issue = .{ .missing_required = "--file" } };
+
+    return .{ .value = .{
+        .table_name = table_name,
+        .file_path = file_path,
+        .batch_size = values.batch_size,
+        .max_batches = values.max_batches,
+        .id_field = values.id_field,
+        .id_template = values.id_template,
+        .sync_level = values.sync_level,
+        .read_buffer_bytes = values.read_buffer_bytes,
+        .max_line_bytes = values.max_line_bytes,
+        .batch_bytes = values.batch_bytes,
+        .checkpoint_path = values.checkpoint_path,
+        .resume_load = values.resume_load,
+        .checkpoint_enabled = values.checkpoint_enabled,
+        .dry_run = values.dry_run,
+        .max_errors = values.max_errors,
+    } };
+}
+
+fn fatalLoadParseIssue(issue: LoadParseIssue) noreturn {
+    switch (issue) {
+        .missing_value => |flag| cli.fatal("{s} requires a value", .{flag}),
+        .duplicate => |flag| cli.fatal("{s} may only be provided once", .{flag}),
+        .unknown => |flag| cli.fatal("unknown load flag: {s}", .{flag}),
+        .invalid_integer => |value| cli.fatal("invalid {s} value: {s}", .{ value.flag, value.value }),
+        .non_positive => |value| cli.fatal("{s} must be greater than zero", .{value.flag}),
+        .invalid_sync_level => |value| cli.fatal("invalid --sync-level value: {s}", .{value}),
+        .missing_required => |flag| cli.fatal("{s} is required", .{flag}),
+        .conflict => |conflict| switch (conflict) {
+            .id_selector => cli.fatal("--id-field and --id-template are mutually exclusive", .{}),
+            .checkpoint_disabled => cli.fatal("--checkpoint cannot be used with --no-checkpoint", .{}),
+            .resume_without_checkpoint => cli.fatal("--resume cannot be used with --no-checkpoint", .{}),
+            .error_policy => cli.fatal("use only one of --strict or --max-errors", .{}),
+        },
+    }
+}
+
+fn parseLoadOptions(args: *std.process.Args.Iterator) LoadOptions {
+    return switch (parseLoadOptionsIterator(args.*)) {
+        .value => |value| value,
+        .issue => |issue| fatalLoadParseIssue(issue),
+    };
 }
 
 fn parseSyncLevel(text: []const u8) ?antfly_client.types.SyncLevel {
@@ -928,6 +1013,53 @@ test "mutation parser rejects unknown duplicate and missing options" {
     var delete_document_argv = [_][*:0]const u8{ "--document", "{}" };
     const delete_document = parseMutationOptions(std.process.Args.Iterator.init(.{ .vector = delete_document_argv[0..] }), false);
     try std.testing.expectEqualStrings("--document", delete_document.issue.unknown);
+}
+
+test "load parser rejects missing duplicate conflicting and malformed options" {
+    var valid_argv = [_][*:0]const u8{
+        "--table",          "docs",
+        "--file",           "docs.jsonl",
+        "--id-field",       "id",
+        "--size",           "25",
+        "--sync-level",     "full_index",
+        "--checkpoint",     "load.checkpoint",
+        "--max-errors",     "3",
+        "--batch-bytes",    "4096",
+        "--max-line-bytes", "8192",
+    };
+    const valid = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = valid_argv[0..] }));
+    try std.testing.expectEqualStrings("docs", valid.value.table_name);
+    try std.testing.expectEqual(@as(usize, 25), valid.value.batch_size);
+    try std.testing.expectEqual(antfly_client.types.SyncLevel.full_index, valid.value.sync_level.?);
+    try std.testing.expectEqual(@as(?u64, 3), valid.value.max_errors);
+
+    var missing_checkpoint_argv = [_][*:0]const u8{ "--table", "docs", "--file", "docs.jsonl", "--checkpoint" };
+    const missing_checkpoint = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = missing_checkpoint_argv[0..] }));
+    try std.testing.expectEqualStrings("--checkpoint", missing_checkpoint.issue.missing_value);
+
+    var missing_id_argv = [_][*:0]const u8{ "--table", "docs", "--file", "docs.jsonl", "--id-field" };
+    const missing_id = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = missing_id_argv[0..] }));
+    try std.testing.expectEqualStrings("--id-field", missing_id.issue.missing_value);
+
+    var duplicate_argv = [_][*:0]const u8{ "--table", "docs", "-t", "other", "--file", "docs.jsonl" };
+    const duplicate = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = duplicate_argv[0..] }));
+    try std.testing.expectEqualStrings("-t", duplicate.issue.duplicate);
+
+    var conflict_argv = [_][*:0]const u8{ "--table", "docs", "--file", "docs.jsonl", "--checkpoint", "state", "--no-checkpoint" };
+    const conflict = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = conflict_argv[0..] }));
+    try std.testing.expectEqual(LoadConflict.checkpoint_disabled, conflict.issue.conflict);
+
+    var strict_argv = [_][*:0]const u8{ "--table", "docs", "--file", "docs.jsonl", "--strict", "--max-errors", "2" };
+    const strict = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = strict_argv[0..] }));
+    try std.testing.expectEqual(LoadConflict.error_policy, strict.issue.conflict);
+
+    var zero_argv = [_][*:0]const u8{ "--table", "docs", "--file", "docs.jsonl", "--size", "0" };
+    const zero = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = zero_argv[0..] }));
+    try std.testing.expectEqualStrings("--size", zero.issue.non_positive.flag);
+
+    var unknown_argv = [_][*:0]const u8{ "--table", "docs", "--file", "docs.jsonl", "--chekpoint", "state" };
+    const unknown = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = unknown_argv[0..] }));
+    try std.testing.expectEqualStrings("--chekpoint", unknown.issue.unknown);
 }
 
 test "line scanner handles split lines crlf final line and long lines" {

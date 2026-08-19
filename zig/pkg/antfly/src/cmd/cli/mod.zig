@@ -84,6 +84,7 @@ pub fn commandUsage(command: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, command, "index")) return
     \\usage: antfly index <create|drop|list|get|wait> --table <table> [options]
     \\
+    \\  index create --table <table> --index <index> --type <type> [--coverage-policy strict|partial|best_effort]
     \\  index list --table <table> [--output json|--verbose]
     \\  index wait --table <table> --index <index> [--timeout 10m]
     \\
