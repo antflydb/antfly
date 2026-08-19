@@ -2981,6 +2981,7 @@ test "metadata http server reports reallocation protocol upgrade gating" {
 test "metadata http server serves status and filtered admin routes" {
     const FakeSource = struct {
         const incarnation: metadata_api.MetadataClusterIncarnation = "77777777777777777777777777777777".*;
+        const voter_set_fingerprint: metadata_api.MetadataRaftVoterSetFingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".*;
 
         fn iface(_: *@This()) AdminSource {
             return .{
@@ -3005,6 +3006,8 @@ test "metadata http server serves status and filtered admin routes" {
                 .metadata_group_id = 77,
                 .metadata_incarnation = incarnation,
                 .metadata_epoch = 5,
+                .metadata_raft_voter_set_fingerprint = voter_set_fingerprint,
+                .metadata_raft_joint_consensus = true,
                 .metrics = .{},
                 .projected_tables = 1,
                 .projected_tables_with_replication_sources = 1,
@@ -3113,6 +3116,8 @@ test "metadata http server serves status and filtered admin routes" {
     defer status_resp.deinit();
     try std.testing.expectEqual(@as(u16, 200), status_resp.status.code);
     try std.testing.expect(std.mem.indexOf(u8, status_resp.body.?, "\"metadata_group_id\":77") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_resp.body.?, "\"metadata_raft_voter_set_fingerprint\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_resp.body.?, "\"metadata_raft_joint_consensus\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_resp.body.?, "\"projected_tables_with_replication_sources\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_resp.body.?, "\"projected_replication_sources\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_resp.body.?, "\"projected_replication_source_lag_millis_max\":34") != null);

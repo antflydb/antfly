@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	stderrors "errors"
@@ -1529,16 +1530,12 @@ func (r *AntflyClusterReconciler) validateMetadataReplicaTopology(ctx context.Co
 	pvcOrdinals := make(map[int32]string)
 	for i := range pvcList.Items {
 		pvc := &pvcList.Items[i]
-		if !strings.HasPrefix(pvc.Name, pvcPrefix) {
+		ordinal, matches := metadataPVCOrdinal(cluster, pvc)
+		if !matches {
 			continue
 		}
 		metadataPVCsExist = true
-		ordinalText := strings.TrimPrefix(pvc.Name, pvcPrefix)
-		ordinal, err := strconv.ParseInt(ordinalText, 10, 32)
-		if err != nil || ordinal < 0 || strconv.FormatInt(ordinal, 10) != ordinalText {
-			return fmt.Errorf("metadata PVC %s has an invalid StatefulSet ordinal", pvc.Name)
-		}
-		pvcOrdinals[int32(ordinal)] = pvc.Name
+		pvcOrdinals[ordinal] = pvc.Name
 		if raw, ok := pvc.Annotations[metadataTopologyReplicasAnnotation]; ok {
 			replicas, err := parseMetadataTopologyReplicas(raw, fmt.Sprintf("metadata PVC %s annotation", pvc.Name))
 			if err != nil {
@@ -1623,13 +1620,15 @@ func validateMetadataPVCOrdinals(pvcOrdinals map[int32]string, replicas int32) e
 }
 
 type metadataRuntimeTopologyStatus struct {
-	MetadataGroupID         uint64  `json:"metadata_group_id"`
-	MetadataIncarnation     string  `json:"metadata_incarnation"`
-	MetadataRaftLocalNodeID uint64  `json:"metadata_raft_local_node_id"`
-	MetadataRaftRole        string  `json:"metadata_raft_role"`
-	MetadataRaftLeaderID    *uint64 `json:"metadata_raft_leader_id"`
-	MetadataRaftLocalVoter  bool    `json:"metadata_raft_local_voter"`
-	MetadataRaftVoterCount  int32   `json:"metadata_raft_voter_count"`
+	MetadataGroupID                 uint64  `json:"metadata_group_id"`
+	MetadataIncarnation             string  `json:"metadata_incarnation"`
+	MetadataRaftLocalNodeID         uint64  `json:"metadata_raft_local_node_id"`
+	MetadataRaftRole                string  `json:"metadata_raft_role"`
+	MetadataRaftLeaderID            *uint64 `json:"metadata_raft_leader_id"`
+	MetadataRaftLocalVoter          bool    `json:"metadata_raft_local_voter"`
+	MetadataRaftVoterCount          int32   `json:"metadata_raft_voter_count"`
+	MetadataRaftVoterSetFingerprint string  `json:"metadata_raft_voter_set_fingerprint"`
+	MetadataRaftJointConsensus      bool    `json:"metadata_raft_joint_consensus"`
 }
 
 const maxMetadataRuntimeStatusBytes = 64 * 1024
@@ -1639,6 +1638,7 @@ func (r *AntflyClusterReconciler) validateLegacyMetadataRuntimeTopology(ctx cont
 		return fmt.Errorf("cannot safely migrate legacy metadata topology: invalid replica count %d", replicas)
 	}
 	maxNodeID := uint64(replicas) // #nosec G115 -- replicas is explicitly checked positive above.
+	expectedVoterSetFingerprint := metadataRaftVoterSetFingerprint(replicas)
 	var baseline *metadataRuntimeTopologyStatus
 	leaderReports := 0
 	for ordinal := int32(0); ordinal < replicas; ordinal++ {
@@ -1653,11 +1653,14 @@ func (r *AntflyClusterReconciler) validateLegacyMetadataRuntimeTopology(ctx cont
 		if status.MetadataRaftLocalNodeID != expectedNodeID {
 			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d reports local node %d, expected %d", ordinal, status.MetadataRaftLocalNodeID, expectedNodeID)
 		}
-		// The status API reports voter configuration as the local-voter bit and
-		// voter count. Require every deterministic member ID to report itself as
-		// a voter in a configuration with the expected cardinality.
 		if !status.MetadataRaftLocalVoter || status.MetadataRaftVoterCount != replicas {
 			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d reports local_voter=%t and voter_count=%d, expected local_voter=true and voter_count=%d", ordinal, status.MetadataRaftLocalVoter, status.MetadataRaftVoterCount, replicas)
+		}
+		if status.MetadataRaftJointConsensus {
+			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d reports an active joint-consensus membership transition", ordinal)
+		}
+		if status.MetadataRaftVoterSetFingerprint != expectedVoterSetFingerprint {
+			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d reports voter set fingerprint %q, expected %q", ordinal, status.MetadataRaftVoterSetFingerprint, expectedVoterSetFingerprint)
 		}
 		if status.MetadataRaftLeaderID == nil || *status.MetadataRaftLeaderID < 1 || *status.MetadataRaftLeaderID > maxNodeID {
 			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d does not report a valid leader", ordinal)
@@ -1682,8 +1685,9 @@ func (r *AntflyClusterReconciler) validateLegacyMetadataRuntimeTopology(ctx cont
 		}
 		if status.MetadataGroupID != baseline.MetadataGroupID ||
 			status.MetadataIncarnation != baseline.MetadataIncarnation ||
-			*status.MetadataRaftLeaderID != *baseline.MetadataRaftLeaderID {
-			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d disagrees on metadata group, incarnation, or leader", ordinal)
+			*status.MetadataRaftLeaderID != *baseline.MetadataRaftLeaderID ||
+			status.MetadataRaftVoterSetFingerprint != baseline.MetadataRaftVoterSetFingerprint {
+			return fmt.Errorf("cannot safely migrate legacy metadata topology: member ordinal %d disagrees on metadata group, incarnation, leader, or voter set", ordinal)
 		}
 	}
 	if leaderReports != 1 {
@@ -1730,6 +1734,19 @@ func validMetadataIncarnation(value string) bool {
 	return err == nil
 }
 
+func metadataRaftVoterSetFingerprint(replicas int32) string {
+	hasher := sha256.New()
+	_, _ = hasher.Write([]byte("antfly-raft-voter-set-v1\x00"))
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], uint64(replicas)) // #nosec G115 -- callers validate replicas as positive.
+	_, _ = hasher.Write(encoded[:])
+	for nodeID := int32(1); nodeID <= replicas; nodeID++ {
+		binary.BigEndian.PutUint64(encoded[:], uint64(nodeID)) // #nosec G115 -- loop starts at one and is bounded by positive replicas.
+		_, _ = hasher.Write(encoded[:])
+	}
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
 func parseMetadataTopologyReplicas(raw, source string) (int32, error) {
 	parsed, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 32)
 	if err != nil || parsed < 1 {
@@ -1747,6 +1764,28 @@ func effectiveMetadataNodeReplicas(cluster *antflyv1.AntflyCluster) int32 {
 
 func metadataPVCPrefix(cluster *antflyv1.AntflyCluster) string {
 	return "metadata-storage-" + cluster.Name + "-metadata-"
+}
+
+// metadataPVCOrdinal matches only claims that can canonically belong to this
+// cluster's metadata StatefulSet. Exact labels disambiguate valid cluster names
+// that share a textual prefix; unlabeled claims remain eligible for migration
+// from operator versions that predate the standard labels.
+func metadataPVCOrdinal(cluster *antflyv1.AntflyCluster, pvc *corev1.PersistentVolumeClaim) (int32, bool) {
+	if instance, ok := pvc.Labels["app.kubernetes.io/instance"]; ok && instance != cluster.Name {
+		return 0, false
+	}
+	if component, ok := pvc.Labels["app.kubernetes.io/component"]; ok && component != "metadata" {
+		return 0, false
+	}
+	ordinalText, ok := strings.CutPrefix(pvc.Name, metadataPVCPrefix(cluster))
+	if !ok {
+		return 0, false
+	}
+	ordinal, err := strconv.ParseInt(ordinalText, 10, 32)
+	if err != nil || ordinal < 0 || strconv.FormatInt(ordinal, 10) != ordinalText {
+		return 0, false
+	}
+	return int32(ordinal), true
 }
 
 // calculateBackoff calculates exponential backoff duration for validation failures (T027)
@@ -3904,10 +3943,9 @@ func (r *AntflyClusterReconciler) recordMetadataTopologyOnPVCs(ctx context.Conte
 	}
 
 	want := strconv.FormatInt(int64(replicas), 10)
-	prefix := metadataPVCPrefix(cluster)
 	for i := range pvcList.Items {
 		pvc := &pvcList.Items[i]
-		if !strings.HasPrefix(pvc.Name, prefix) {
+		if _, matches := metadataPVCOrdinal(cluster, pvc); !matches {
 			continue
 		}
 		if got, ok := pvc.Annotations[metadataTopologyReplicasAnnotation]; ok {

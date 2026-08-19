@@ -101,8 +101,8 @@ func TestValidateMetadataReplicaTopology(t *testing.T) {
 		})}
 	}
 	statusJSON := func(nodeID uint64, role string, leaderID uint64, incarnation string, voterCount int32) string {
-		return fmt.Sprintf(`{"metadata_group_id":1,"metadata_incarnation":%q,"metadata_raft_local_node_id":%d,"metadata_raft_role":%q,"metadata_raft_leader_id":%d,"metadata_raft_local_voter":true,"metadata_raft_voter_count":%d}`,
-			incarnation, nodeID, role, leaderID, voterCount)
+		return fmt.Sprintf(`{"metadata_group_id":1,"metadata_incarnation":%q,"metadata_raft_local_node_id":%d,"metadata_raft_role":%q,"metadata_raft_leader_id":%d,"metadata_raft_local_voter":true,"metadata_raft_voter_count":%d,"metadata_raft_voter_set_fingerprint":%q,"metadata_raft_joint_consensus":false}`,
+			incarnation, nodeID, role, leaderID, voterCount, metadataRaftVoterSetFingerprint(voterCount))
 	}
 	pvc := func(ordinal int, annotation string) *corev1.PersistentVolumeClaim {
 		annotations := map[string]string(nil)
@@ -178,6 +178,19 @@ func TestValidateMetadataReplicaTopology(t *testing.T) {
 		t.Fatalf("expected out-of-range retained PVC to fail closed, got: %v", err)
 	}
 
+	foreignPrefixPVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name:      "metadata-storage-example-metadata-canary-metadata-0",
+		Namespace: "default",
+		Labels: map[string]string{
+			"app.kubernetes.io/component": "metadata",
+			"app.kubernetes.io/instance":  "example-metadata-canary",
+		},
+		Annotations: map[string]string{metadataTopologyReplicasAnnotation: "1"},
+	}}
+	if err := newReconciler(foreignPrefixPVC).validateMetadataReplicaTopology(context.Background(), cluster); err != nil {
+		t.Fatalf("expected a prefix-related cluster's PVC to be ignored, got: %v", err)
+	}
+
 	unrecordedPVC := annotatedPVC.DeepCopy()
 	unrecordedPVC.Annotations = nil
 	cluster = newCluster(1, 0)
@@ -216,8 +229,31 @@ func TestValidateMetadataReplicaTopology(t *testing.T) {
 		"example-metadata-2.example-metadata.default.svc.cluster.local": statusJSON(3, "leader", 3, "33333333333333333333333333333333", 3),
 	})
 	err = disagreeingReconciler.validateMetadataReplicaTopology(context.Background(), cluster)
-	if err == nil || !strings.Contains(err.Error(), "disagrees on metadata group, incarnation, or leader") {
+	if err == nil || !strings.Contains(err.Error(), "disagrees on metadata group, incarnation, leader, or voter set") {
 		t.Fatalf("expected disagreeing legacy incarnations to fail closed, got: %v", err)
+	}
+
+	mismatchedVoterSetReconciler := newReconciler(legacyObjects...)
+	mismatchedVoterSet := strings.Repeat("a", 64)
+	mismatchedVoterSetReconciler.HTTPClient = statusClient(map[string]string{
+		"example-metadata-0.example-metadata.default.svc.cluster.local": statusJSON(1, "follower", 3, "33333333333333333333333333333333", 3),
+		"example-metadata-1.example-metadata.default.svc.cluster.local": strings.Replace(statusJSON(2, "follower", 3, "33333333333333333333333333333333", 3), metadataRaftVoterSetFingerprint(3), mismatchedVoterSet, 1),
+		"example-metadata-2.example-metadata.default.svc.cluster.local": statusJSON(3, "leader", 3, "33333333333333333333333333333333", 3),
+	})
+	err = mismatchedVoterSetReconciler.validateMetadataReplicaTopology(context.Background(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "voter set fingerprint") {
+		t.Fatalf("expected mismatched legacy voter sets to fail closed, got: %v", err)
+	}
+
+	jointConsensusReconciler := newReconciler(legacyObjects...)
+	jointConsensusReconciler.HTTPClient = statusClient(map[string]string{
+		"example-metadata-0.example-metadata.default.svc.cluster.local": strings.Replace(statusJSON(1, "follower", 3, "33333333333333333333333333333333", 3), `"metadata_raft_joint_consensus":false`, `"metadata_raft_joint_consensus":true`, 1),
+		"example-metadata-1.example-metadata.default.svc.cluster.local": statusJSON(2, "follower", 3, "33333333333333333333333333333333", 3),
+		"example-metadata-2.example-metadata.default.svc.cluster.local": statusJSON(3, "leader", 3, "33333333333333333333333333333333", 3),
+	})
+	err = jointConsensusReconciler.validateMetadataReplicaTopology(context.Background(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "joint-consensus") {
+		t.Fatalf("expected joint-consensus legacy topology to fail closed, got: %v", err)
 	}
 
 	malformedReconciler := newReconciler(legacyObjects...)
@@ -249,7 +285,16 @@ func TestRecordMetadataTopologyOnPVCs(t *testing.T) {
 		Name:      "metadata-storage-example-metadata-0",
 		Namespace: "default",
 	}}
-	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pvc).Build()
+	foreignPVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name:      "metadata-storage-example-metadata-canary-metadata-0",
+		Namespace: "default",
+		Labels: map[string]string{
+			"app.kubernetes.io/component": "metadata",
+			"app.kubernetes.io/instance":  "example-metadata-canary",
+		},
+		Annotations: map[string]string{metadataTopologyReplicasAnnotation: "3"},
+	}}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pvc, foreignPVC).Build()
 	reconciler := &AntflyClusterReconciler{Client: k8sClient}
 	cluster := &antflyv1.AntflyCluster{ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"}}
 
@@ -263,9 +308,23 @@ func TestRecordMetadataTopologyOnPVCs(t *testing.T) {
 	if got := updated.Annotations[metadataTopologyReplicasAnnotation]; got != "1" {
 		t.Fatalf("metadata topology annotation = %q, want 1", got)
 	}
+	foreignUpdated := &corev1.PersistentVolumeClaim{}
+	if err := k8sClient.Get(context.Background(), client.ObjectKeyFromObject(foreignPVC), foreignUpdated); err != nil {
+		t.Fatal(err)
+	}
+	if got := foreignUpdated.Annotations[metadataTopologyReplicasAnnotation]; got != "3" {
+		t.Fatalf("foreign metadata topology annotation = %q, want unchanged value 3", got)
+	}
 
 	if err := reconciler.recordMetadataTopologyOnPVCs(context.Background(), cluster, 3); err == nil {
 		t.Fatal("expected an existing PVC topology record to be immutable")
+	}
+}
+
+func TestMetadataRaftVoterSetFingerprint(t *testing.T) {
+	const want = "dfdd4aa4929437c8f1374d06653ce611ad794fe76e47ec84be3bd85a0d5a3230"
+	if got := metadataRaftVoterSetFingerprint(3); got != want {
+		t.Fatalf("metadata voter set fingerprint = %q, want %q", got, want)
 	}
 }
 

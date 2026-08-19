@@ -25,6 +25,7 @@ const metadata_incarnation = @import("incarnation.zig");
 const reallocation_request = @import("reallocation_request.zig");
 
 pub const MetadataClusterIncarnation = metadata_incarnation.MetadataClusterIncarnation;
+pub const MetadataRaftVoterSetFingerprint = [table_manager.voter_set_fingerprint_len * 2]u8;
 
 pub const MetadataStatus = struct {
     metadata_group_id: u64,
@@ -39,6 +40,8 @@ pub const MetadataStatus = struct {
     metadata_raft_commit_index: u64 = 0,
     metadata_raft_local_voter: bool = false,
     metadata_raft_voter_count: usize = 0,
+    metadata_raft_voter_set_fingerprint: ?MetadataRaftVoterSetFingerprint = null,
+    metadata_raft_joint_consensus: bool = false,
     metadata_raft_election_elapsed: u32 = 0,
     metadata_raft_randomized_election_timeout: u32 = 0,
     metadata_raft_votes_granted: usize = 0,

@@ -6901,6 +6901,8 @@ const ServiceGroupRaftObservation = struct {
     commit_index: u64 = 0,
     local_voter: bool = false,
     voter_count: usize = 0,
+    voter_set_fingerprint: ?metadata_api.MetadataRaftVoterSetFingerprint = null,
+    joint_consensus: bool = false,
     election_elapsed: u32 = 0,
     randomized_election_timeout: u32 = 0,
     votes_granted: usize = 0,
@@ -6964,6 +6966,7 @@ fn raftObservationFromStatus(
             break;
         }
     }
+    const voter_set_fingerprint = metadata_table_manager.voterSetFingerprint(raft_status.conf_state.voters, null);
     return .{
         .local_node_id = local_node_id,
         .role = raftRoleName(raft_status.soft.role),
@@ -6972,12 +6975,32 @@ fn raftObservationFromStatus(
         .commit_index = raft_status.hard.commit_index,
         .local_voter = local_voter,
         .voter_count = raft_status.conf_state.voters.len,
+        .voter_set_fingerprint = std.fmt.bytesToHex(voter_set_fingerprint, .lower),
+        .joint_consensus = raft_status.conf_state.voters_outgoing.len > 0,
         .election_elapsed = raft_status.election_elapsed,
         .randomized_election_timeout = raft_status.randomized_election_timeout,
         .votes_granted = raft_status.votes_granted,
         .votes_rejected = raft_status.votes_rejected,
         .votes_unknown = raft_status.votes_unknown,
     };
+}
+
+test "metadata Raft observation exposes canonical voter configuration" {
+    var voters = [_]u64{ 3, 1, 2 };
+    var outgoing = [_]u64{ 1, 2 };
+    const observation = raftObservationFromStatus(.{
+        .id = 2,
+        .group_id = 1,
+        .soft = .{ .leader_id = 1 },
+        .hard = .{},
+        .conf_state = .{
+            .voters = &voters,
+            .voters_outgoing = &outgoing,
+        },
+    }, 2);
+    const expected = std.fmt.bytesToHex(metadata_table_manager.voterSetFingerprint(&voters, null), .lower);
+    try std.testing.expectEqualStrings(&expected, &(observation.voter_set_fingerprint orelse return error.TestUnexpectedResult));
+    try std.testing.expect(observation.joint_consensus);
 }
 
 fn raftRoleName(role: raft_engine.core.types.StateRole) []const u8 {
@@ -8722,6 +8745,8 @@ pub fn snapshotStatusWithOptions(
         .metadata_raft_commit_index = metadata_raft.commit_index,
         .metadata_raft_local_voter = metadata_raft.local_voter,
         .metadata_raft_voter_count = metadata_raft.voter_count,
+        .metadata_raft_voter_set_fingerprint = metadata_raft.voter_set_fingerprint,
+        .metadata_raft_joint_consensus = metadata_raft.joint_consensus,
         .metadata_raft_election_elapsed = metadata_raft.election_elapsed,
         .metadata_raft_randomized_election_timeout = metadata_raft.randomized_election_timeout,
         .metadata_raft_votes_granted = metadata_raft.votes_granted,
