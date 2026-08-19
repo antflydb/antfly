@@ -36,9 +36,10 @@ Lite behavior, and execution stay in binder, planner, and service layers.
 
 SQL catalog identity, session state, relational row contracts, CTE contracts,
 expression-evaluation contracts, query-function lowering contracts, and native
-requirement fixtures are owned under `pkg/antfly/src/sql` or the neutral query
-package. API callers consume SQL-owned types through re-exports instead of
-owning parser or row-plan contracts.
+requirement fixtures are owned by the production SQL package or the neutral
+query package. The storage-independent scanner, parser facade, grammar, and
+diagnostics live in `zig/lib/sql`; API callers consume SQL-owned types through
+re-exports instead of owning parser or row-plan contracts.
 
 ## Grammar Ownership
 
@@ -48,7 +49,8 @@ library-plus-codegen pattern used by `zig/lib/openapi`. Antfly SQL owns:
 - the SQL grammar input under this directory
 - migration/design documentation
 - checked-in generated parser metadata and facade code
-- SQL corpus and native-requirement fixtures under `pkg/antfly/src/sql`
+- storage-independent scanner, parser, diagnostics, tests, and benchmarks under
+  `zig/lib/sql`
 
 Use `zig build regen-sql-grammar` to refresh checked-in grammar metadata.
 Use `zig build sql-grammar-generated-check` to verify generated output is
@@ -71,9 +73,12 @@ of these outcomes:
 - an explicit generated unsupported diagnostic with a stable reason
 - a syntax diagnostic from the generated parser
 
-Lexical keyword categories are pinned to the PostgreSQL revision recorded in
-`antfly_sql.y`. Unreserved and column-name keywords may fall back to `IDENT`
-only when the current parser state does not accept their keyword terminal.
+Lexical keyword categories are generated from metadata pinned to the PostgreSQL
+revision recorded in `antfly_sql.y`; changing that revision without auditing
+the category metadata fails generation. Unreserved and column-name keywords
+may fall back to `IDENT` only when the current parser state does not accept
+their keyword terminal. Type/function-name keywords are accepted only in
+explicit function- and type-name contexts, never as general `ColId` values.
 Parser-only synthetic terminals are composed contextually by the SQL facade
 and must never be recognized directly from source text.
 
@@ -107,10 +112,12 @@ that they are still consistent with the token stream. If retained generated
 metadata is missing, stale, or internally contradictory, generated-owned
 statements must fail closed before legacy token scanners can recover.
 
-Parser diagnostics should be bounded and source-aware. The SQL facade unifies
+Parser diagnostics should be bounded and source-aware. The SQL facade's
+single-pass result API unifies
 allocation-free lexer diagnostics (stable reason and byte span) with owned
 syntax diagnostics (token index, byte span, actual token text, and expected
-terminal names) without requiring callers to inspect parse-table internals.
+terminal names) without requiring callers to parse invalid input twice or
+inspect parse-table internals.
 
 ## Statement Dispatch
 

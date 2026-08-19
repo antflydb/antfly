@@ -76,6 +76,22 @@ pub const Diagnostic = union(enum) {
     }
 };
 
+/// A single-pass, user-facing parse result. Diagnostics are produced by the
+/// same parser attempt that validates the statement, so interactive callers
+/// never need to parse invalid SQL twice.
+pub const ParseResult = union(enum) {
+    success,
+    diagnostic: Diagnostic,
+
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .success => {},
+            .diagnostic => |diagnostic| diagnostic.deinit(allocator),
+        }
+        self.* = .success;
+    }
+};
+
 const DiagnosticTokenIds = struct {
     token_ids: []u16,
     fallback_token_ids: []u16,
@@ -87,18 +103,24 @@ const DiagnosticTokenIds = struct {
         allocator.free(self.source_indexes);
         self.* = .{ .token_ids = &.{}, .fallback_token_ids = &.{}, .source_indexes = &.{} };
     }
-
-    fn sourceTokenIndex(self: @This(), generated_token_index: usize) usize {
-        if (generated_token_index < self.source_indexes.len) return self.source_indexes[generated_token_index];
-        return if (self.source_indexes.len == 0) 0 else self.source_indexes[self.source_indexes.len - 1] + 1;
-    }
-
-    fn endSourceOffset(self: @This(), tokens: []const token_mod.Token) usize {
-        const end_token = self.sourceTokenIndex(self.source_indexes.len);
-        if (end_token == 0 or tokens.len == 0) return 0;
-        return tokens[@min(end_token - 1, tokens.len - 1)].source_end;
-    }
 };
+
+const DiagnosticTokenSlices = struct {
+    token_ids: []const u16,
+    fallback_token_ids: []const u16,
+    source_indexes: []const usize,
+};
+
+fn sourceTokenIndex(source_indexes: []const usize, generated_token_index: usize) usize {
+    if (generated_token_index < source_indexes.len) return source_indexes[generated_token_index];
+    return if (source_indexes.len == 0) 0 else source_indexes[source_indexes.len - 1] + 1;
+}
+
+fn endSourceOffset(source_indexes: []const usize, tokens: []const token_mod.Token) usize {
+    const end_token = sourceTokenIndex(source_indexes, source_indexes.len);
+    if (end_token == 0 or tokens.len == 0) return 0;
+    return tokens[@min(end_token - 1, tokens.len - 1)].source_end;
+}
 
 const OwnedTokenIds = struct {
     token_ids: []u16,
@@ -170,40 +192,69 @@ pub fn parseTokensAlloc(allocator: std.mem.Allocator, tokens: []const token_mod.
     }
 }
 
-pub fn diagnosticSqlAlloc(allocator: std.mem.Allocator, sql: []const u8) !?Diagnostic {
+pub fn parseSqlResultAlloc(allocator: std.mem.Allocator, sql: []const u8) !ParseResult {
     var tokens = switch (try lexer.tokenizeDiagnosticAlloc(allocator, sql)) {
-        .diagnostic => |diagnostic| return .{ .lexical = diagnostic },
+        .diagnostic => |diagnostic| return .{ .diagnostic = .{ .lexical = diagnostic } },
         .tokens => |tokens| tokens,
     };
     defer lexer.freeTokens(allocator, &tokens);
-    var diagnostic = try diagnosticTokensAlloc(allocator, tokens.items) orelse return null;
+    var diagnostic = try diagnosticTokensAlloc(allocator, tokens.items) orelse return .success;
     if (diagnostic.token_index >= tokens.items.len) {
         diagnostic.source_start = sql.len;
         diagnostic.source_end = sql.len;
     }
-    return .{ .syntax = diagnostic };
+    return .{ .diagnostic = .{ .syntax = diagnostic } };
+}
+
+/// Compatibility helper for callers that only need an optional diagnostic.
+/// New request paths should prefer `parseSqlResultAlloc` so success/failure
+/// and the actionable diagnostic are observed as one operation.
+pub fn diagnosticSqlAlloc(allocator: std.mem.Allocator, sql: []const u8) !?Diagnostic {
+    return switch (try parseSqlResultAlloc(allocator, sql)) {
+        .success => null,
+        .diagnostic => |diagnostic| diagnostic,
+    };
 }
 
 pub fn diagnosticTokensAlloc(allocator: std.mem.Allocator, tokens: []const token_mod.Token) !?ParseDiagnostic {
-    var diagnostic_tokens = try diagnosticTokenIdsAlloc(allocator, tokens);
-    defer diagnostic_tokens.deinit(allocator);
+    var token_id_buffer: [generated_token_id_stack_capacity]u16 = undefined;
+    var fallback_id_buffer: [generated_token_id_stack_capacity]u16 = undefined;
+    var source_index_buffer: [generated_token_id_stack_capacity]usize = undefined;
+    if (diagnosticTokenIdsIntoBuffers(tokens, &token_id_buffer, &fallback_id_buffer, &source_index_buffer)) |diagnostic_tokens| {
+        return parseDiagnosticFromTokenIds(allocator, tokens, diagnostic_tokens.token_ids, diagnostic_tokens.fallback_token_ids, diagnostic_tokens.source_indexes);
+    } else |err| switch (err) {
+        error.NoSpaceLeft => {
+            var diagnostic_tokens = try diagnosticTokenIdsAlloc(allocator, tokens);
+            defer diagnostic_tokens.deinit(allocator);
+            return parseDiagnosticFromTokenIds(allocator, tokens, diagnostic_tokens.token_ids, diagnostic_tokens.fallback_token_ids, diagnostic_tokens.source_indexes);
+        },
+        else => return err,
+    }
+}
 
+fn parseDiagnosticFromTokenIds(
+    allocator: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    token_ids: []const u16,
+    fallback_token_ids: []const u16,
+    source_indexes: []const usize,
+) !?ParseDiagnostic {
     const generated_diagnostic = try parseGeneratedTokenIdsDiagnostic(
         allocator,
-        diagnostic_tokens.token_ids,
-        diagnostic_tokens.fallback_token_ids,
+        token_ids,
+        fallback_token_ids,
     ) orelse return null;
     errdefer generated_diagnostic.deinit(allocator);
 
-    const source_token_index = diagnostic_tokens.sourceTokenIndex(generated_diagnostic.token_index);
+    const source_token_index = sourceTokenIndex(source_indexes, generated_diagnostic.token_index);
     const source_start = if (source_token_index < tokens.len)
         tokens[source_token_index].source_start
     else
-        diagnostic_tokens.endSourceOffset(tokens);
+        endSourceOffset(source_indexes, tokens);
     const source_end = if (source_token_index < tokens.len)
         tokens[source_token_index].source_end
     else
-        diagnostic_tokens.endSourceOffset(tokens);
+        endSourceOffset(source_indexes, tokens);
     const actual = try allocator.dupe(u8, if (source_token_index < tokens.len) tokens[source_token_index].text else "$end");
 
     return .{
@@ -266,7 +317,8 @@ fn diagnosticTokenIdsAlloc(allocator: std.mem.Allocator, tokens: []const token_m
 
     var sink = TokenIdSink{ .list = .{ .items = &ids, .allocator = allocator } };
     var fallback_sink = TokenIdSink{ .list = .{ .items = &fallback_ids, .allocator = allocator } };
-    try appendAllTokenIds(&sink, &fallback_sink, tokens, .{ .items = &source_indexes, .allocator = allocator });
+    var source_sink = SourceIndexSink{ .list = .{ .items = &source_indexes, .allocator = allocator } };
+    try appendAllTokenIds(&sink, &fallback_sink, tokens, &source_sink);
 
     const token_ids = try ids.toOwnedSlice(allocator);
     errdefer allocator.free(token_ids);
@@ -279,16 +331,50 @@ fn diagnosticTokenIdsAlloc(allocator: std.mem.Allocator, tokens: []const token_m
     };
 }
 
-const SourceIndexSink = struct {
-    items: *std.ArrayListUnmanaged(usize),
-    allocator: std.mem.Allocator,
+fn diagnosticTokenIdsIntoBuffers(
+    tokens: []const token_mod.Token,
+    token_buffer: []u16,
+    fallback_buffer: []u16,
+    source_buffer: []usize,
+) !DiagnosticTokenSlices {
+    var sink = TokenIdSink{ .buffer = .{ .items = token_buffer } };
+    var fallback_sink = TokenIdSink{ .buffer = .{ .items = fallback_buffer } };
+    var source_sink = SourceIndexSink{ .buffer = .{ .items = source_buffer } };
+    try appendAllTokenIds(&sink, &fallback_sink, tokens, &source_sink);
+    return .{
+        .token_ids = sink.buffer.items[0..sink.buffer.len],
+        .fallback_token_ids = fallback_sink.buffer.items[0..fallback_sink.buffer.len],
+        .source_indexes = source_sink.buffer.items[0..source_sink.buffer.len],
+    };
+}
+
+const SourceIndexSink = union(enum) {
+    list: struct {
+        items: *std.ArrayListUnmanaged(usize),
+        allocator: std.mem.Allocator,
+    },
+    buffer: struct {
+        items: []usize,
+        len: usize = 0,
+    },
+
+    fn append(self: *@This(), index: usize) !void {
+        switch (self.*) {
+            .list => |list| try list.items.append(list.allocator, index),
+            .buffer => |*buffer| {
+                if (buffer.len == buffer.items.len) return error.NoSpaceLeft;
+                buffer.items[buffer.len] = index;
+                buffer.len += 1;
+            },
+        }
+    }
 };
 
 fn appendAllTokenIds(
     ids: *TokenIdSink,
     fallback_ids: ?*TokenIdSink,
     tokens: []const token_mod.Token,
-    source_indexes: ?SourceIndexSink,
+    source_indexes: ?*SourceIndexSink,
 ) !void {
     for (tokens, 0..) |token, index| {
         if (token.kind == .semicolon and trailingSemicolonOnly(tokens, index)) break;
@@ -302,8 +388,7 @@ fn appendAllTokenIds(
             for (0..added) |_| try fallback_sink.append(fallback_id);
         }
         if (source_indexes) |source_sink| {
-            try source_sink.items.ensureUnusedCapacity(source_sink.allocator, added);
-            for (0..added) |_| source_sink.items.appendAssumeCapacity(index);
+            for (0..added) |_| try source_sink.append(index);
         }
     }
 }
@@ -743,12 +828,14 @@ fn generatedParserTreatsKeywordAsIdentifier(
 ) bool {
     // PostgreSQL permits every keyword as an attribute name after DOT. A
     // qualified name's first component follows ColId rules: IDENT,
-    // unreserved_keyword, or col_name_keyword. The categories come from the
-    // pinned grammar productions rather than an ad hoc exception list.
+    // unreserved_keyword, or col_name_keyword. The categories come from
+    // generated metadata audited against the grammar's pinned PostgreSQL
+    // revision rather than an ad hoc runtime exception list.
+    const keyword = token.keyword orelse return false;
+    const class = token_mod.keywordClass(keyword);
+    if (class == .type_function_name and typeFunctionNameContext(tokens, index, previous, next)) return true;
     if (previous != null and previous.?.kind == .dot) return true;
     if (next != null and next.?.kind == .dot) {
-        const keyword = token.keyword orelse return false;
-        const class = token_mod.keywordClass(keyword);
         return class == .unreserved or class == .column_name;
     }
     if (token.matchesKeywordTag(.conflict)) return previous != null and previous.?.matchesKeywordTag(.as);
@@ -761,6 +848,81 @@ fn generatedParserTreatsKeywordAsIdentifier(
     }
     if (token.matchesKeywordTag(.window)) return previous != null and previous.?.kind == .identifier and (next == null or next.?.kind == .semicolon);
     return false;
+}
+
+fn typeFunctionNameContext(
+    tokens: []const token_mod.Token,
+    index: usize,
+    previous: ?token_mod.Token,
+    next: ?token_mod.Token,
+) bool {
+    // PostgreSQL's type/function-name category is accepted as the unqualified
+    // head of a function name and anywhere a type name is syntactically
+    // explicit. Keep this contextual: treating these words as ColId globally
+    // would incorrectly accept constructs such as `FROM join`.
+    if (next != null and next.?.kind == .lparen) return true;
+    if (previous != null and previous.?.kind == .colon_colon) return true;
+    if (ddlTypeFunctionNameContext(tokens, index)) return true;
+    if (previous == null or !previous.?.matchesKeywordTag(.as)) return false;
+
+    var depth: usize = 0;
+    var cursor = index - 1;
+    while (cursor > 0) {
+        cursor -= 1;
+        switch (tokens[cursor].kind) {
+            .rparen => depth += 1,
+            .lparen => {
+                if (depth != 0) {
+                    depth -= 1;
+                } else {
+                    return cursor > 0 and tokens[cursor - 1].matchesKeywordTag(.cast);
+                }
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn ddlTypeFunctionNameContext(tokens: []const token_mod.Token, index: usize) bool {
+    if (index == 0) return false;
+    if (tokens.len >= 4 and tokens[0].matchesKeywordTag(.create) and tokens[1].matchesKeywordTag(.domain)) {
+        return tokens[index - 1].matchesKeywordTag(.as);
+    }
+    if (tokens.len >= 5 and tokens[0].matchesKeywordTag(.alter) and tokens[1].matchesKeywordTag(.table)) {
+        if (index < 4 or tokens[index - 1].kind != .identifier) return false;
+        return tokens[index - 2].matchesKeywordTag(.add) or
+            (index >= 5 and tokens[index - 2].matchesKeywordTag(.column) and tokens[index - 3].matchesKeywordTag(.add));
+    }
+
+    if (tokens.len < 4) return false;
+    const create_table = tokens[0].matchesKeywordTag(.create) and tokens[1].matchesKeywordTag(.table);
+    const prepare = tokens[0].matchesKeywordTag(.prepare);
+    if (!create_table and !prepare) return false;
+
+    var depth: usize = 0;
+    var segment_start: ?usize = null;
+    for (tokens[0..index], 0..) |candidate, candidate_index| switch (candidate.kind) {
+        .lparen => {
+            depth += 1;
+            if (depth == 1) segment_start = candidate_index + 1;
+        },
+        .rparen => {
+            if (depth == 0) return false;
+            depth -= 1;
+            if (depth == 0) segment_start = null;
+        },
+        .comma => if (depth == 1) {
+            segment_start = candidate_index + 1;
+        },
+        else => {},
+    };
+    if (depth != 1) return false;
+    const start = segment_start orelse return false;
+    return if (create_table)
+        index == start + 1 and start < tokens.len and tokens[start].kind == .identifier
+    else
+        index == start;
 }
 
 fn rowsKeywordStartsWindowFrame(tokens: []const token_mod.Token, index: usize) bool {
@@ -933,6 +1095,60 @@ test "generated parser bridge preserves qualified keyword categories" {
         "SELECT * FROM schema",
     };
     for (identifier_compatibility) |sql| try parseSqlAlloc(std.testing.allocator, sql);
+}
+
+test "generated parser bridge honors PostgreSQL type function keyword contexts" {
+    const valid = [_][]const u8{
+        "SELECT join(id), authorization(id), collation(id), verbose(id) FROM docs",
+        "SELECT payload::binary FROM docs",
+        "SELECT CAST(payload AS binary) FROM docs",
+        "SELECT public.join(id) FROM docs",
+        "CREATE TABLE typed_docs (payload binary)",
+        "CREATE DOMAIN binary_payload AS binary",
+        "PREPARE typed_lookup (binary) AS SELECT 1",
+    };
+    for (valid) |sql| try parseSqlAlloc(std.testing.allocator, sql);
+
+    // Type/function keywords are not general column identifiers (ColId).
+    try std.testing.expectError(error.UnexpectedToken, parseSqlAlloc(std.testing.allocator, "SELECT * FROM join"));
+}
+
+test "generated parser bridge exposes a single pass parse result" {
+    var success = try parseSqlResultAlloc(std.testing.allocator, "SELECT café FROM données");
+    defer success.deinit(std.testing.allocator);
+    switch (success) {
+        .success => {},
+        .diagnostic => return error.ExpectedParseSuccess,
+    }
+
+    var syntax_failure = try parseSqlResultAlloc(std.testing.allocator, "SELECT FROM docs");
+    defer syntax_failure.deinit(std.testing.allocator);
+    switch (syntax_failure) {
+        .success => return error.ExpectedSyntaxDiagnostic,
+        .diagnostic => |diagnostic| switch (diagnostic) {
+            .syntax => |syntax| try std.testing.expectEqualStrings("FROM", syntax.actual),
+            .lexical => return error.ExpectedSyntaxDiagnostic,
+        },
+    }
+
+    var lexical_failure = try parseSqlResultAlloc(std.testing.allocator, "SELECT \xff");
+    defer lexical_failure.deinit(std.testing.allocator);
+    switch (lexical_failure) {
+        .success => return error.ExpectedLexicalDiagnostic,
+        .diagnostic => |diagnostic| switch (diagnostic) {
+            .lexical => |lexical| try std.testing.expectEqual(lexer.LexErrorKind.invalid_utf8, lexical.kind),
+            .syntax => return error.ExpectedLexicalDiagnostic,
+        },
+    }
+
+    const Runner = struct {
+        fn run(allocator: std.mem.Allocator, sql: []const u8) !void {
+            var result = try parseSqlResultAlloc(allocator, sql);
+            defer result.deinit(allocator);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{"SELECT café FROM données"});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{"SELECT FROM docs"});
 }
 
 test "generated parser bridge reports owned source-aware diagnostics" {

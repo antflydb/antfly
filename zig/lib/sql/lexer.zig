@@ -28,6 +28,7 @@ pub const LexErrorKind = enum {
     malformed_numeric_literal,
     invalid_placeholder,
     invalid_operator,
+    invalid_utf8,
     invalid_character,
 
     pub fn message(self: @This()) []const u8 {
@@ -40,6 +41,7 @@ pub const LexErrorKind = enum {
             .malformed_numeric_literal => "malformed numeric literal",
             .invalid_placeholder => "invalid positional placeholder",
             .invalid_operator => "invalid or incomplete SQL operator",
+            .invalid_utf8 => "invalid UTF-8 in SQL input",
             .invalid_character => "invalid character in SQL input",
         };
     }
@@ -119,10 +121,16 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
             }
             continue;
         }
-        if (std.ascii.isAlphabetic(ch) or ch == '_') {
+        if (std.ascii.isAlphabetic(ch) or ch == '_' or ch >= 0x80) {
             const start = i;
-            i += 1;
-            while (i < sql.len and (std.ascii.isAlphanumeric(sql[i]) or sql[i] == '_' or sql[i] == '$')) i += 1;
+            i += if (ch >= 0x80) try utf8SequenceWidthAt(sql, i, diagnostic) else 1;
+            while (i < sql.len) {
+                if (std.ascii.isAlphanumeric(sql[i]) or sql[i] == '_' or sql[i] == '$') {
+                    i += 1;
+                } else if (sql[i] >= 0x80) {
+                    i += try utf8SequenceWidthAt(sql, i, diagnostic);
+                } else break;
+            }
             const end = i;
             try tokens.append(alloc, .{
                 .kind = .identifier,
@@ -420,10 +428,20 @@ fn scanNumberEnd(sql: []const u8, start: usize, diagnostic: *LexDiagnostic) !usi
     if (has_decimal_point and i + 1 < sql.len and sql[i] == '.' and std.ascii.isDigit(sql[i + 1])) {
         return lexError(diagnostic, .malformed_numeric_literal, start, i + 2);
     }
-    if (i < sql.len and (std.ascii.isAlphabetic(sql[i]) or sql[i] == '_' or sql[i] == '$')) {
+    if (i < sql.len and (std.ascii.isAlphabetic(sql[i]) or sql[i] == '_' or sql[i] == '$' or sql[i] >= 0x80)) {
         return lexError(diagnostic, .malformed_numeric_literal, start, i + 1);
     }
     return i;
+}
+
+fn utf8SequenceWidthAt(sql: []const u8, index: usize, diagnostic: *LexDiagnostic) !usize {
+    const width = std.unicode.utf8ByteSequenceLength(sql[index]) catch
+        return lexError(diagnostic, .invalid_utf8, index, index + 1);
+    const end = index + width;
+    if (end > sql.len) return lexError(diagnostic, .invalid_utf8, index, sql.len);
+    _ = std.unicode.utf8Decode(sql[index..end]) catch
+        return lexError(diagnostic, .invalid_utf8, index, end);
+    return width;
 }
 
 fn lexError(
@@ -688,6 +706,20 @@ test "sql adapter lexer accepts dollar signs inside unquoted identifiers" {
     try std.testing.expectEqualStrings("account$region", tokens.items[1].text);
     try std.testing.expectEqual(TokenKind.identifier, tokens.items[1].kind);
     try std.testing.expectEqualStrings("account$region", sql[tokens.items[1].source_start..tokens.items[1].source_end]);
+}
+
+test "sql adapter lexer accepts validated Unicode unquoted identifiers" {
+    var tokens = try tokenizeAlloc(std.testing.allocator, "SELECT café, 日本語 FROM données");
+    defer freeTokens(std.testing.allocator, &tokens);
+    try std.testing.expectEqualStrings("café", tokens.items[1].text);
+    try std.testing.expectEqualStrings("日本語", tokens.items[3].text);
+    try std.testing.expectEqualStrings("données", tokens.items[5].text);
+    try std.testing.expectEqual(@as(?token_mod.TokenKeyword, null), tokens.items[1].keyword);
+}
+
+test "sql adapter lexer diagnoses invalid UTF-8 precisely" {
+    try expectLexDiagnostic(std.testing.allocator, "SELECT \xff", .invalid_utf8, 7, 8);
+    try expectLexDiagnostic(std.testing.allocator, "SELECT \xe2\x82", .invalid_utf8, 7, 9);
 }
 
 test "sql adapter lexer accepts nested block comments" {

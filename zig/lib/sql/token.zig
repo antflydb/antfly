@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const generated = @import("grammar/generated/root.zig");
 
 pub const TokenKind = enum {
     identifier,
@@ -448,123 +449,36 @@ pub const KeywordClass = enum {
 // Any TokenKeyword addition must deliberately update the pinned category
 // audit below instead of silently inheriting the unreserved default.
 const audited_keyword_count = 376;
+const audited_non_unreserved_keyword_count = 101;
 comptime {
     if (std.meta.fields(TokenKeyword).len != audited_keyword_count) {
         @compileError("TokenKeyword changed; audit keywordClass against the pinned PostgreSQL kwlist");
     }
+    if (generated.token_class_count != audited_non_unreserved_keyword_count) {
+        @compileError("generated PostgreSQL keyword categories changed; audit the pinned kwlist metadata");
+    }
 }
 
+const keyword_classes = blk: {
+    @setEvalBranchQuota(250_000);
+    const fields = std.meta.fields(TokenKeyword);
+    var result: [fields.len]KeywordClass = @splat(.unreserved);
+    for (fields, 0..) |field, index| {
+        var terminal_name: [field.name.len]u8 = undefined;
+        for (field.name, 0..) |ch, name_index| terminal_name[name_index] = std.ascii.toUpper(ch);
+        if (generated.tokenClassByName(&terminal_name)) |class| {
+            result[index] = switch (class) {
+                .column_name => .column_name,
+                .type_function_name => .type_function_name,
+                .reserved => .reserved,
+            };
+        }
+    }
+    break :blk result;
+};
+
 pub fn keywordClass(keyword: TokenKeyword) KeywordClass {
-    return switch (keyword) {
-        .between,
-        .coalesce,
-        .date,
-        .exists,
-        .extract,
-        .greatest,
-        .interval,
-        .json,
-        .least,
-        .nullif,
-        .overlay,
-        .position,
-        .row,
-        .substring,
-        .timestamp,
-        .timestamptz,
-        .trim,
-        .values,
-        => .column_name,
-
-        .authorization,
-        .binary,
-        .collation,
-        .concurrently,
-        .cross,
-        .freeze,
-        .full,
-        .ilike,
-        .inner,
-        .is,
-        .isnull,
-        .join,
-        .left,
-        .like,
-        .natural,
-        .notnull,
-        .outer,
-        .overlaps,
-        .right,
-        .verbose,
-        => .type_function_name,
-
-        .all,
-        .analyze,
-        .@"and",
-        .any,
-        .array,
-        .as,
-        .asc,
-        .asymmetric,
-        .case,
-        .cast,
-        .check,
-        .collate,
-        .column,
-        .constraint,
-        .create,
-        .current_date,
-        .current_timestamp,
-        .default,
-        .deferrable,
-        .desc,
-        .distinct,
-        .do,
-        .@"else",
-        .end,
-        .except,
-        .false,
-        .fetch,
-        .@"for",
-        .foreign,
-        .from,
-        .grant,
-        .group,
-        .having,
-        .in,
-        .intersect,
-        .into,
-        .lateral,
-        .limit,
-        .not,
-        .null,
-        .offset,
-        .on,
-        .only,
-        .@"or",
-        .order,
-        .placing,
-        .primary,
-        .returning,
-        .select,
-        .some,
-        .symmetric,
-        .table,
-        .then,
-        .to,
-        .true,
-        .@"union",
-        .unique,
-        .user,
-        .using,
-        .when,
-        .where,
-        .window,
-        .with,
-        => .reserved,
-
-        else => .unreserved,
-    };
+    return keyword_classes[@intFromEnum(keyword)];
 }
 
 pub const Token = struct {

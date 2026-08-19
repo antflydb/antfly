@@ -34,7 +34,7 @@ const corpus = [_][]const u8{
     "SELECT * FROM docs FOR system_time AS OF '2026-01-01'",
 };
 
-const Mode = enum { parse, lex_parse, all };
+const Mode = enum { parse, lex_parse, result, all };
 
 const Config = struct {
     iterations: usize = default_iterations,
@@ -134,12 +134,60 @@ pub fn main(init: std.process.Init) !void {
     switch (config.mode) {
         .parse => try runParse(allocator, stdout, config.iterations),
         .lex_parse => try runLexParse(allocator, stdout, config.iterations),
+        .result => try runResult(allocator, stdout, config.iterations),
         .all => {
             try runParse(allocator, stdout, config.iterations);
             try runLexParse(allocator, stdout, config.iterations);
+            try runResult(allocator, stdout, config.iterations);
         },
     }
     try stdout.flush();
+}
+
+fn runResult(allocator: std.mem.Allocator, stdout: anytype, iterations: usize) !void {
+    const cases = try tokenizeCorpus(allocator);
+    defer freeTokenizedCorpus(allocator, cases);
+    var tokens_per_iteration: usize = 0;
+    for (cases) |case| tokens_per_iteration += case.tokens.len;
+
+    const operation_count = iterations * corpus.len;
+    const durations = try allocator.alloc(u64, operation_count);
+    defer allocator.free(durations);
+    var counting = CountingAllocator{ .backing = allocator };
+    const operation_allocator = counting.allocator();
+    var total_allocated: usize = 0;
+    var peak_live: usize = 0;
+    var sample: usize = 0;
+
+    const started = monotonicNanos();
+    for (0..iterations) |_| {
+        for (corpus) |sql| {
+            counting.reset();
+            const operation_started = monotonicNanos();
+            var result = try generated_parser.parseSqlResultAlloc(operation_allocator, sql);
+            switch (result) {
+                .success => {},
+                .diagnostic => {
+                    result.deinit(operation_allocator);
+                    return error.UnexpectedCorpusDiagnostic;
+                },
+            }
+            result.deinit(operation_allocator);
+            durations[sample] = monotonicNanos() - operation_started;
+            sample += 1;
+            total_allocated += counting.allocated_total;
+            peak_live = @max(peak_live, counting.peak_live_bytes);
+            std.debug.assert(counting.live_bytes == 0);
+        }
+    }
+    try printSummary(stdout, .{
+        .mode = "result",
+        .operations = operation_count,
+        .tokens = tokens_per_iteration * iterations,
+        .elapsed_ns = monotonicNanos() - started,
+        .allocated_bytes = total_allocated,
+        .peak_live_bytes = peak_live,
+    }, durations);
 }
 
 fn runParse(allocator: std.mem.Allocator, stdout: anytype, iterations: usize) !void {
@@ -236,7 +284,7 @@ fn parseArgs(allocator: std.mem.Allocator, args: std.process.Args) !Config {
             config.iterations = try std.fmt.parseUnsigned(usize, iterator.next() orelse return error.MissingIterations, 10);
         } else if (std.mem.eql(u8, arg, "--mode")) {
             const mode = iterator.next() orelse return error.MissingMode;
-            if (std.mem.eql(u8, mode, "parse")) config.mode = .parse else if (std.mem.eql(u8, mode, "lex-parse")) config.mode = .lex_parse else if (std.mem.eql(u8, mode, "all")) config.mode = .all else return error.InvalidMode;
+            if (std.mem.eql(u8, mode, "parse")) config.mode = .parse else if (std.mem.eql(u8, mode, "lex-parse")) config.mode = .lex_parse else if (std.mem.eql(u8, mode, "result")) config.mode = .result else if (std.mem.eql(u8, mode, "all")) config.mode = .all else return error.InvalidMode;
         } else {
             config.iterations = try std.fmt.parseUnsigned(usize, arg, 10);
         }
@@ -246,10 +294,11 @@ fn parseArgs(allocator: std.mem.Allocator, args: std.process.Args) !Config {
 }
 
 const usage =
-    \\usage: zig build sql-parser-bench -- [iterations] [--mode parse|lex-parse|all]
+    \\usage: zig build sql-parser-bench -- [iterations] [--mode parse|lex-parse|result|all]
     \\
     \\  iterations must be between 1 and 100000 (default: 1000)
     \\  parse measures the pre-tokenized hot path; lex-parse includes tokenization
+    \\  result measures the single-pass user-facing parse and diagnostic API
     \\
 ;
 

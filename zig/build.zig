@@ -64,8 +64,8 @@ const snowball_languages = [_][]const u8{
 };
 
 const snowball_generated_root = "pkg/antfly/src/search/snowball/generated";
-const sql_grammar_source = "pkg/antfly/src/sql/grammar/antfly_sql.y";
-const sql_grammar_generated_root = "pkg/antfly/src/sql/grammar/generated/root.zig";
+const sql_grammar_source = "lib/sql/grammar/antfly_sql.y";
+const sql_grammar_generated_root = "lib/sql/grammar/generated/root.zig";
 
 const snowball_compiler_sources = [_][]const u8{
     "compiler/analyser.c",
@@ -601,7 +601,7 @@ fn addYaccSteps(
 
     const parser_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("pkg/antfly/src/sql/parser_root.zig"),
+            .root_source_file = b.path("lib/sql/root.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -613,7 +613,7 @@ fn addYaccSteps(
     const parser_bench = b.addExecutable(.{
         .name = "sql-parser-bench",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("pkg/antfly/src/sql/parser_bench.zig"),
+            .root_source_file = b.path("lib/sql/parser_bench.zig"),
             .target = target,
             .optimize = .ReleaseFast,
         }),
