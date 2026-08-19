@@ -13747,6 +13747,7 @@ pub const ProvisionedTableWriteSource = struct {
                     .writes = group.writes.items,
                     .deletes = group.deletes.items,
                     .transforms = group.transforms.items,
+                    .timestamp_ns = req.timestamp_ns,
                     .sync_level = req.sync_level,
                 }) catch |err| {
                     if (accepted_groups == 0) return err;
@@ -18347,6 +18348,20 @@ test "resident writer repair state distinguishes clean and metadata-pending writ
             ProvisionedTableWriteSource.ResidentWriterRepairState.pending,
             source.residentWriterRepairStateBestEffort(7001, "docs"),
         );
+        try std.testing.expectError(
+            error.DurableIndexRepairStateUnavailable,
+            catchUpManagedDb(
+                &source,
+                alloc,
+                7001,
+                "docs",
+                cached.db,
+                true,
+                .live_writer,
+                .index_repair_only,
+                .{},
+            ),
+        );
         recordLocalIndexCreateRepairDebt(alloc, cached.db, 7001, &captured_repair_groups);
         try std.testing.expectEqualSlices(u64, &.{7001}, captured_repair_groups.items);
         captured_repair_groups.clearRetainingCapacity();
@@ -21966,10 +21981,10 @@ fn catchUpManagedDb(
         return err;
     };
     const initial_index_load_failure = try managedDbHasIndexLoadFailure(alloc, db);
-    const initial_index_repair_intents = db.hasPendingIndexRepairIntents(alloc) catch |err| switch (err) {
-        error.DurableIndexRepairStateUnavailable => false,
-        else => return err,
-    };
+    // An unavailable checkpoint is not proof that repair debt is absent. Let
+    // the scheduler retain this exact route and apply its normal error
+    // backoff instead of publishing a false completion edge.
+    const initial_index_repair_intents = try db.hasPendingIndexRepairIntents(alloc);
     const initial_index_repair_debt = initial_index_load_failure or initial_index_repair_intents;
     const initial_repair_debt = had_debt or
         repair_metadata_rebuild_pending or
@@ -22148,16 +22163,10 @@ fn catchUpManagedDb(
     }
 
     if (initial_index_load_failure) {
-        const discovery = db.discoverRecoverableStartupIndexFailures(alloc, 1) catch |err| switch (err) {
-            error.DurableIndexRepairStateUnavailable => db_mod.DB.StartupIndexRepairDiscovery{},
-            else => return err,
-        };
+        const discovery = try db.discoverRecoverableStartupIndexFailures(alloc, 1);
         made_progress = made_progress or discovery.discovered != 0;
     }
-    var repair_summary = db.indexRepairIntentSummary(alloc) catch |err| switch (err) {
-        error.DurableIndexRepairStateUnavailable => db_mod.DB.IndexRepairIntentSummary{},
-        else => return err,
-    };
+    var repair_summary = try db.indexRepairIntentSummary(alloc);
     if (repair_summary.runnable != 0) {
         progress_ctx.phase = .artifact_rebuild;
         try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
@@ -22242,10 +22251,7 @@ fn catchUpManagedDb(
             };
         }
     }
-    repair_summary = db.indexRepairIntentSummary(alloc) catch |err| switch (err) {
-        error.DurableIndexRepairStateUnavailable => db_mod.DB.IndexRepairIntentSummary{},
-        else => return err,
-    };
+    repair_summary = try db.indexRepairIntentSummary(alloc);
     if (repair_summary.paused != 0) {
         return .{
             .had_debt = true,
@@ -30810,6 +30816,7 @@ test "provisioned create index updates cached writer in place" {
             local_count: usize = 0,
             last_group_id: u64 = 0,
             last_write_count: usize = 0,
+            last_timestamp_ns: u64 = 0,
         };
 
         fn batchGroup(
@@ -30824,6 +30831,7 @@ test "provisioned create index updates cached writer in place" {
             state.batch_count += 1;
             state.last_group_id = group_id;
             state.last_write_count = req.writes.len;
+            state.last_timestamp_ns = req.timestamp_ns;
         }
 
         fn batchGroupLocal(
@@ -30851,12 +30859,14 @@ test "provisioned create index updates cached writer in place" {
     });
     _ = try outer_source.source().batch(alloc, "docs", .{
         .writes = &.{.{ .key = "doc:raft-batch", .value = "{\"body\":\"raft batch\"}" }},
+        .timestamp_ns = 456,
         .sync_level = .write,
     });
     try std.testing.expectEqual(@as(usize, 1), raft_capture.batch_count);
     try std.testing.expectEqual(@as(usize, 0), raft_capture.local_count);
     try std.testing.expectEqual(@as(u64, 7001), raft_capture.last_group_id);
     try std.testing.expectEqual(@as(usize, 1), raft_capture.last_write_count);
+    try std.testing.expectEqual(@as(u64, 456), raft_capture.last_timestamp_ns);
     try std.testing.expectEqual(@as(usize, 0), outer_cache.entries.items.len);
 
     _ = try outer_source.source().batchGroupLocal(alloc, 7001, "docs", .{

@@ -6941,6 +6941,15 @@ pub const DataServer = struct {
         );
     }
 
+    fn materializeRaftBatchTimestamp(req: antfly.db.types.BatchRequest) antfly.db.types.BatchRequest {
+        var proposal_req = req;
+        // DB.batch treats zero as "read realtime now". Materialize that value
+        // once before any forwarding or Raft encoding so every replica applies
+        // identical document versions and TTL deadlines.
+        if (proposal_req.timestamp_ns == 0) proposal_req.timestamp_ns = platform_time.realtimeNs();
+        return proposal_req;
+    }
+
     fn proposeRaftBatchGroupWithLeaderWait(
         self: *DataServer,
         alloc: std.mem.Allocator,
@@ -6951,6 +6960,7 @@ pub const DataServer = struct {
         leader_wait_ns: u64,
     ) !void {
         const raft = self.data_raft orelse return error.UnsupportedOperation;
+        const proposal_req = materializeRaftBatchTimestamp(req);
         const deadline_ns = platform_time.monotonicNs() +| leader_wait_ns;
         try ensureDataRaftBatchRouteActive(route);
         if (route.refresh_metadata) {
@@ -7004,7 +7014,7 @@ pub const DataServer = struct {
                     } else {
                         const proposal_term = (raft.host.http_host.host.raftStatus(group_id) orelse
                             return error.RaftBatchWriteOutcomeUnknown).hard.current_term;
-                        const encoded = try data_raft_batch.encode(alloc, table_name, req);
+                        const encoded = try data_raft_batch.encode(alloc, table_name, proposal_req);
                         defer alloc.free(encoded);
                         var accepted_index: ?u64 = null;
                         raft.host.http_host.proposeWithReceipt(group_id, encoded, &accepted_index) catch |err| {
@@ -7026,7 +7036,7 @@ pub const DataServer = struct {
                         };
                         target_index = target_index orelse accepted_index orelse
                             return error.RaftBatchWriteOutcomeUnknown;
-                        if (req.sync_level != .propose) {
+                        if (proposal_req.sync_level != .propose) {
                             const index = target_index.?;
                             const apply_sm = self.data_raft_apply orelse
                                 return error.RaftBatchWriteOutcomeUnknown;
@@ -7080,7 +7090,7 @@ pub const DataServer = struct {
                 defer if (outcome_waiter_index) |waiter_index|
                     if (self.data_raft_apply) |apply_sm|
                         apply_sm.cancelApplyOutcomeWaiter(group_id, waiter_index);
-                if (req.sync_level != .propose) {
+                if (proposal_req.sync_level != .propose) {
                     self.waitForLocalRaftBatchApply(group_id, index, deadline_ns) catch |err| {
                         std.log.warn("data raft batch outcome unknown after proposal group_id={} index={} phase=apply_wait err={s}", .{
                             group_id,
@@ -7101,7 +7111,7 @@ pub const DataServer = struct {
                     }
                 }
                 const sync_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
-                sync_source.syncReplicatedBatchGroupLocal(alloc, group_id, table_name, req.sync_level) catch |err| {
+                sync_source.syncReplicatedBatchGroupLocal(alloc, group_id, table_name, proposal_req.sync_level) catch |err| {
                     std.log.warn("data raft batch outcome unknown after proposal group_id={} index={} phase=sync_visibility err={s}", .{
                         group_id,
                         index,
@@ -7137,7 +7147,7 @@ pub const DataServer = struct {
                     alloc,
                     group_id,
                     table_name,
-                    req,
+                    proposal_req,
                     local_node_id,
                     deadline_ns,
                     route,
@@ -7164,7 +7174,7 @@ pub const DataServer = struct {
                                 var executor = antfly.raft.transport.StdHttpExecutor.init(alloc, .{});
                                 defer executor.deinit();
                                 var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
-                                const body = try antfly.public_api.batch.encodeBatchRequest(alloc, req);
+                                const body = try antfly.public_api.batch.encodeBatchRequest(alloc, proposal_req);
                                 defer alloc.free(body);
                                 const forwarding = nextDataRaftBatchForwarding(deadline_ns, route, request_campaign_consumed) orelse {
                                     sleepDataRaftBatchLeaderRetry();
@@ -25594,6 +25604,17 @@ test "data server wires configured HA executors into API server" {
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_slot_received_lsn{slot=\"standby-a\"} 0\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_slot_status_code{slot=\"standby-a\"} 2\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_mirror_failures_total 0\n") != null);
+}
+
+test "raft proposal materializes a default batch timestamp exactly once" {
+    const materialized = DataServer.materializeRaftBatchTimestamp(.{});
+    try std.testing.expect(materialized.timestamp_ns != 0);
+
+    const rematerialized = DataServer.materializeRaftBatchTimestamp(materialized);
+    try std.testing.expectEqual(materialized.timestamp_ns, rematerialized.timestamp_ns);
+
+    const explicit = DataServer.materializeRaftBatchTimestamp(.{ .timestamp_ns = 123 });
+    try std.testing.expectEqual(@as(u64, 123), explicit.timestamp_ns);
 }
 
 test "data server mirrors managed primary writes into HA replication log" {
