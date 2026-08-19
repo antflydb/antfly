@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const backups_api = @import("backups.zig");
+const operation = @import("operation.zig");
 const common_secrets = @import("../common/secrets.zig");
 const common_config = @import("../common/config.zig");
 
@@ -29,6 +30,9 @@ pub const ClusterApi = struct {
     };
 
     pub const ExecuteBackupError = error{
+        Canceled,
+        DeadlineExceeded,
+        MetadataCapabilityUnavailable,
         NotLeader,
         InvalidRequest,
         NoTables,
@@ -69,6 +73,7 @@ pub const ClusterApi = struct {
             alloc: std.mem.Allocator,
             req: backups_api.ClusterBackupRequest,
             location: *backups_api.BackupLocation,
+            request: operation.RequestContext,
         ) ExecuteBackupError![]u8,
         execute_cluster_restore: *const fn (
             ptr: *anyopaque,
@@ -94,8 +99,9 @@ pub const ClusterApi = struct {
         alloc: std.mem.Allocator,
         req: backups_api.ClusterBackupRequest,
         location: *backups_api.BackupLocation,
+        request: operation.RequestContext,
     ) ExecuteBackupError![]u8 {
-        return try self.vtable.execute_cluster_backup(self.ptr, alloc, req, location);
+        return try self.vtable.execute_cluster_backup(self.ptr, alloc, req, location, request);
     }
 
     pub fn executeClusterRestore(
@@ -112,6 +118,8 @@ pub const ClusterApi = struct {
 pub const OwnedResponse = struct {
     status: u16,
     body: []u8,
+    json: bool = false,
+    retry_after_seconds: ?u32 = null,
 
     pub fn deinit(self: *OwnedResponse, alloc: std.mem.Allocator) void {
         alloc.free(self.body);
@@ -149,7 +157,7 @@ pub fn handleClusterBackupList(
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "backup list failed") },
     };
-    return .{ .status = 200, .body = body };
+    return .{ .status = 200, .body = body, .json = true };
 }
 
 pub fn handleClusterBackup(
@@ -159,7 +167,9 @@ pub fn handleClusterBackup(
     secret_store: ?*common_secrets.FileStore,
     node_config: ?*const common_config.Config,
     io: ?std.Io,
+    request: operation.RequestContext,
 ) !OwnedResponse {
+    try request.ensureActive();
     var req = backups_api.parseClusterBackupRequest(alloc, body) catch {
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid backup request") };
     };
@@ -168,6 +178,7 @@ pub fn handleClusterBackup(
         return .{ .status = 400, .body = try alloc.dupe(u8, "backup requires a named external_io connection") };
     }
 
+    try request.ensureActive();
     var location = backups_api.openBackupLocationWithOptions(alloc, req.location, .{
         .secret_store = secret_store,
         .node_config = node_config,
@@ -182,7 +193,14 @@ pub fn handleClusterBackup(
     };
     defer location.deinit(alloc);
 
-    const response_body = api.executeClusterBackup(alloc, req, &location) catch |err| switch (err) {
+    const response_body = api.executeClusterBackup(alloc, req, &location, request) catch |err| switch (err) {
+        error.Canceled, error.DeadlineExceeded => return err,
+        error.MetadataCapabilityUnavailable => return .{
+            .status = 503,
+            .body = try alloc.dupe(u8, backups_api.metadata_capability_unavailable_body),
+            .json = true,
+            .retry_after_seconds = backups_api.metadata_capability_retry_after_seconds,
+        },
         error.NotLeader => return err,
         error.InvalidRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid backup request") },
         error.NoTables => return .{ .status = 400, .body = try alloc.dupe(u8, "no tables to backup") },
@@ -192,7 +210,7 @@ pub fn handleClusterBackup(
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "backup failed") },
     };
-    return .{ .status = 200, .body = response_body };
+    return .{ .status = 200, .body = response_body, .json = true };
 }
 
 pub fn handleClusterRestore(
@@ -240,7 +258,11 @@ pub fn handleClusterRestore(
         error.Cancelled => return .{ .status = 409, .body = try alloc.dupe(u8, "restore cancelled") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "restore failed") },
     };
-    return .{ .status = result.status, .body = result.body };
+    return .{
+        .status = result.status,
+        .body = result.body,
+        .json = result.status >= 200 and result.status < 300,
+    };
 }
 
 test "cluster backup APIs require named connections" {
@@ -255,6 +277,7 @@ test "cluster backup APIs require named connections" {
         null,
         null,
         null,
+        .{},
     );
     defer backup.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), backup.status);
@@ -271,4 +294,60 @@ test "cluster backup APIs require named connections" {
     defer restore.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), restore.status);
     try std.testing.expectEqualStrings("invalid restore request", restore.body);
+}
+
+test "cluster backup vtable preserves request context and canceled ingress stops before parsing" {
+    const Fake = struct {
+        called: bool = false,
+        context_matches: bool = false,
+
+        fn execute(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            req: backups_api.ClusterBackupRequest,
+            _: *backups_api.BackupLocation,
+            request: operation.RequestContext,
+        ) ClusterApi.ExecuteBackupError![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.called = true;
+            self.context_matches = std.mem.eql(u8, "snap", req.backup_id) and
+                std.mem.eql(u8, "request-7", request.request_id) and
+                request.deadline_ns == std.math.maxInt(u64);
+            return alloc.dupe(u8, "ok") catch return error.InternalFailure;
+        }
+    };
+
+    var fake = Fake{};
+    const api = ClusterApi{
+        .ptr = &fake,
+        .vtable = &.{
+            .execute_cluster_backup_list = undefined,
+            .execute_cluster_backup = Fake.execute,
+            .execute_cluster_restore = undefined,
+        },
+    };
+    const req = backups_api.ClusterBackupRequest{
+        .backup_id = "snap",
+        .location = "file:///unused",
+        .connection = "test",
+    };
+    const body = try api.executeClusterBackup(std.testing.allocator, req, undefined, .{
+        .deadline_ns = std.math.maxInt(u64),
+        .request_id = "request-7",
+    });
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(fake.called);
+    try std.testing.expect(fake.context_matches);
+    try std.testing.expectEqualStrings("ok", body);
+
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, handleClusterBackup(
+        std.testing.allocator,
+        "not json",
+        undefined,
+        null,
+        null,
+        null,
+        .{ .cancellation = operation.CancellationToken.fromAtomic(&cancelled) },
+    ));
 }

@@ -138,6 +138,7 @@ pub const TableApi = struct {
     pub const ExecuteBackupError = error{
         Canceled,
         DeadlineExceeded,
+        MetadataCapabilityUnavailable,
         NotLeader,
         NotFound,
         BackupAlreadyExists,
@@ -1043,6 +1044,12 @@ pub fn handleTableBackup(
 
     api.executeTableBackup(alloc, table_name, parsed_req.value.backup_id, backup_format, parsed_req.value.location, parsed_req.value.connection, &location) catch |err| switch (err) {
         error.Canceled, error.DeadlineExceeded => return err,
+        error.MetadataCapabilityUnavailable => return .{
+            .status = 503,
+            .body = try alloc.dupe(u8, backups_api.metadata_capability_unavailable_body),
+            .json = true,
+            .retry_after_seconds = backups_api.metadata_capability_retry_after_seconds,
+        },
         error.NotLeader => return err,
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.BackupAlreadyExists => return .{ .status = 409, .body = try alloc.dupe(u8, "backup id already exists") },

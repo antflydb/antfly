@@ -1090,8 +1090,7 @@ pub const StatusSource = struct {
             }
 
             fn ensureLinearizableRead(ptr: *anyopaque, request: api_operation.RequestContext) anyerror!bool {
-                try request.ensureActive();
-                try cast(ptr).ensureLinearizableRead();
+                try cast(ptr).ensureLinearizableReadWithContext(request);
                 return true;
             }
 
@@ -8579,7 +8578,7 @@ pub const ApiHttpServer = struct {
         };
         if (!authoritative) {
             std.log.warn("table backup metadata read barrier unsupported phase=admission", .{});
-            return error.NotLeader;
+            return error.MetadataCapabilityUnavailable;
         }
         var fallback_io: ?std.Io.Threaded = if (self.sharedApiIo() == null)
             std.Io.Threaded.init(std.heap.page_allocator, .{})
@@ -8587,6 +8586,10 @@ pub const ApiHttpServer = struct {
             null;
         defer if (fallback_io) |*owned| owned.deinit();
         const io = self.sharedApiIo() orelse fallback_io.?.io();
+        // This is the last safe cancellation point: once backup publication
+        // starts, returning cancellation could invite an unsafe replay after
+        // an ambiguous durable outcome.
+        try ensureTableOperationActive(request);
         self.backupOwnedTable(io, table_name, location, location_uri, backup_id, format, connection) catch |err| switch (err) {
             error.NotLeader,
             error.ProposalDropped,
@@ -9565,8 +9568,14 @@ pub const ApiHttpServer = struct {
         alloc: std.mem.Allocator,
         req: backups_api.ClusterBackupRequest,
         location: *backups_api.BackupLocation,
+        request: api_operation.RequestContext,
     ) cluster_api_http.ClusterApi.ExecuteBackupError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        request.ensureActive() catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
+            else => return error.InternalFailure,
+        };
         const op_alloc = self.alloc;
         var fallback_io: ?std.Io.Threaded = if (self.sharedApiIo() == null)
             std.Io.Threaded.init(std.heap.page_allocator, .{})
@@ -9577,15 +9586,22 @@ pub const ApiHttpServer = struct {
         var trace: ClusterBackupExecutionTrace = .{};
         errdefer |err| trace.logFailure(err);
 
-        const authoritative = self.source.ensureLinearizableRead(.{}) catch |err| {
+        const authoritative = self.source.ensureLinearizableRead(request) catch |err| {
+            if (err == error.Canceled or err == error.Cancelled) return error.Canceled;
+            if (err == error.DeadlineExceeded) return error.DeadlineExceeded;
             if (metadata_authority.isRetryableError(err)) return error.NotLeader;
             std.log.warn("cluster backup metadata read barrier failed err={s}", .{@errorName(err)});
             return trace.internal(err);
         };
         if (!authoritative) {
             std.log.warn("cluster backup metadata read barrier unsupported", .{});
-            return error.NotLeader;
+            return error.MetadataCapabilityUnavailable;
         }
+        request.ensureActive() catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
+            else => return error.InternalFailure,
+        };
         trace.enter(.manifest_probe);
         if (backups_api.clusterManifestExistsAtLocationWithIo(alloc, backup_io, location, req.backup_id) catch |err| return trace.internal(err))
             return error.BackupAlreadyExists;
@@ -9674,6 +9690,14 @@ pub const ApiHttpServer = struct {
         // This ordering guarantees that a process crash can never leave an
         // undiscoverable reservation: every production reservation has an
         // attempt marker that the bounded stale reclaimer can later retire.
+        // Cancellation is safe through this point because no durable backup
+        // state exists. Once the marker is published, preserve the existing
+        // ambiguous-outcome invariant and let cleanup own failure handling.
+        request.ensureActive() catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
+            else => return error.InternalFailure,
+        };
         trace.enter(.attempt_marker);
         backups_api.writeClusterBackupAttemptMarker(
             op_alloc,
@@ -29770,7 +29794,11 @@ test "api http server serves table create and drop" {
     defer create_index_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 201), create_index_resp.status);
     try std.testing.expectEqualStrings("application/json", create_index_resp.content_type.?);
-    try std.testing.expectEqualStrings("{}", create_index_resp.body);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"external\":true,\"dimension\":384}",
+        create_index_resp.body,
+    );
     try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"embed_idx\"") != null);
 
     var detail_resp = try executeHttpxTestRequest(&server, .{
@@ -29798,7 +29826,10 @@ test "api http server serves table create and drop" {
     try std.testing.expectEqual(@as(u16, 201), drop_index_resp.status);
     try std.testing.expectEqualStrings("application/json", drop_index_resp.content_type.?);
     try std.testing.expectEqualStrings("{}", drop_index_resp.body);
-    try std.testing.expectEqual(@as(u32, 1), source.projection_wait_calls.load(.monotonic));
+    // Catalog commit is the response boundary; local projection and index
+    // installation converge asynchronously so structural UX is not coupled
+    // to control-loop latency.
+    try std.testing.expectEqual(@as(u32, 0), source.projection_wait_calls.load(.monotonic));
 }
 
 test "api http server table visibility helper prefers metadata lifecycle wait" {
@@ -32062,6 +32093,17 @@ test "api http server serves table metadata routes against real metadata service
     }, .{});
     defer svc.deinit();
 
+    // Exercise the production StatusSource adapter, not only the metadata
+    // service method: a canceled backup request must not be replaced with an
+    // empty context at this compiled boundary.
+    var canceled_linearizable_read = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(
+        error.Canceled,
+        StatusSource.fromMetadataService(&svc).ensureLinearizableRead(.{
+            .cancellation = CancellationToken.fromAtomic(&canceled_linearizable_read),
+        }),
+    );
+
     _ = try svc.ensureMetadataReplica(.{
         .group_id = 1988,
         .replica_id = 1,
@@ -32435,6 +32477,26 @@ fn expectPublicMetadataNotLeaderResponse(resp: http_common.HttpResponse) !void {
     try std.testing.expect(metadata_not_leader);
 }
 
+fn expectPublicMetadataCapabilityUnavailableResponse(resp: http_common.HttpResponse) !void {
+    try std.testing.expectEqual(@as(u16, 503), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        backups_api.metadata_capability_unavailable_body,
+        resp.body,
+    );
+
+    var retry_after = false;
+    for (resp.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "Retry-After")) {
+            try std.testing.expectEqualStrings("5", header.value);
+            retry_after = true;
+        }
+        try std.testing.expect(!std.ascii.eqlIgnoreCase(header.name, http_common.metadata_not_leader_header));
+    }
+    try std.testing.expect(retry_after);
+}
+
 test "api http server returns retryable not leader when local reconcile lease is lost" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
@@ -32683,7 +32745,7 @@ test "api http server fails closed when backup fences are unsupported" {
     });
     defer resp.deinit(alloc);
 
-    try expectPublicMetadataNotLeaderResponse(resp);
+    try expectPublicMetadataCapabilityUnavailableResponse(resp);
     try std.testing.expectEqual(@as(usize, 1), source.linearizable_read_calls);
 
     var table_resp = try executeHttpxTestRequest(&server, .{
@@ -32693,7 +32755,7 @@ test "api http server fails closed when backup fences are unsupported" {
         .body = "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/backups\",\"connection\":\"test-backups\"}",
     });
     defer table_resp.deinit(alloc);
-    try expectPublicMetadataNotLeaderResponse(table_resp);
+    try expectPublicMetadataCapabilityUnavailableResponse(table_resp);
     try std.testing.expectEqual(@as(usize, 2), source.linearizable_read_calls);
 }
 

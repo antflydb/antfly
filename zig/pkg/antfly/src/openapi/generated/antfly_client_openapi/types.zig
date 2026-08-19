@@ -6523,6 +6523,16 @@ pub const MergeStrategy = enum {
     }
 };
 
+/// The metadata service does not yet provide the consistency capability required by backup.
+pub const MetadataCapabilityUnavailableError = struct {
+    code: []const u8,
+    @"error": []const u8,
+    message: []const u8,
+    required_capability: []const u8,
+    retryable: bool,
+    retry_after_ms: i32,
+};
+
 /// Cross-table batch operations in a single atomic transaction. Groups batch operations by table name. All operations across all tables are committed atomically using distributed 2-phase commit (2PC). **Atomicity**: Either all operations across all tables succeed, or none do. This enables use cases like transferring a record from one table to another, or maintaining referential integrity across tables.
 pub const MultiBatchRequest = struct {
     /// Map of table names to batch operations for that table. Each entry follows the same format as a single-table BatchRequest.

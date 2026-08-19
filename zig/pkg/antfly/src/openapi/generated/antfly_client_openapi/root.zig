@@ -367,6 +367,7 @@ pub const MediaContentPart = types.MediaContentPart;
 pub const MergeConfig = types.MergeConfig;
 pub const MergeProfile = types.MergeProfile;
 pub const MergeStrategy = types.MergeStrategy;
+pub const MetadataCapabilityUnavailableError = types.MetadataCapabilityUnavailableError;
 pub const MultiBatchRequest = types.MultiBatchRequest;
 pub const MultiBatchResponse = types.MultiBatchResponse;
 pub const MultiMatchBody = types.MultiMatchBody;

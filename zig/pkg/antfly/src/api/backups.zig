@@ -98,6 +98,9 @@ const current_go_backup_attempt_head_max_bytes: usize = 8 * 1024;
 const current_go_backup_attempt_max_artifacts: usize = 1_000_000;
 const backup_list_max_pages: usize = 10_000;
 pub const manifest_too_large_message = "backup manifest exceeds 16 MiB limit";
+pub const metadata_capability_unavailable_body =
+    "{\"code\":\"metadata_capability_unavailable\",\"error\":\"metadata_capability_unavailable\",\"message\":\"backup requires metadata capability linearizable_snapshot; upgrade metadata nodes before retrying\",\"required_capability\":\"linearizable_snapshot\",\"retryable\":true,\"retry_after_ms\":5000}";
+pub const metadata_capability_retry_after_seconds: u32 = 5;
 pub const integrity_failure_message = "backup artifact failed integrity verification";
 
 /// Request-scoped receipts for artifacts already verified byte-for-byte.

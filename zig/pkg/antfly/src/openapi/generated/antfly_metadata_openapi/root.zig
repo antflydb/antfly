@@ -113,6 +113,7 @@ pub const LinearMergeRequest = types.LinearMergeRequest;
 pub const LinearMergeResult = types.LinearMergeResult;
 pub const LsmStorageStatus = types.LsmStorageStatus;
 pub const MergeProfile = types.MergeProfile;
+pub const MetadataCapabilityUnavailableError = types.MetadataCapabilityUnavailableError;
 pub const MultiBatchRequest = types.MultiBatchRequest;
 pub const MultiBatchResponse = types.MultiBatchResponse;
 pub const Path = types.Path;

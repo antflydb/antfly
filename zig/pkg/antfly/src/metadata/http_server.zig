@@ -4327,6 +4327,83 @@ test "metadata linearizable snapshot detects concurrent projection changes" {
     try std.testing.expect(!AdminSource.sameSnapshotFence(before, after));
 }
 
+test "coherent linearizable snapshot retries a torn capture and preserves request context" {
+    const FakeService = struct {
+        barrier_calls: usize = 0,
+        fence_calls: usize = 0,
+        snapshot_calls: usize = 0,
+        frees: usize = 0,
+        saw_request_id: bool = false,
+
+        const incarnation: metadata_api.MetadataClusterIncarnation = "22222222222222222222222222222222".*;
+
+        fn ensureLinearizableReadWithContext(self: *@This(), request: operation.RequestContext) !void {
+            try request.ensureActive();
+            self.barrier_calls += 1;
+            self.saw_request_id = std.mem.eql(u8, request.request_id, "snapshot-test");
+        }
+
+        fn fence(epoch: u64) service.AdminSnapshotFence {
+            return .{
+                .metadata_group_id = 77,
+                .metadata_incarnation = incarnation,
+                .metadata_raft_term = 4,
+                .metadata_raft_commit_index = epoch,
+                .metadata_raft_applied_index = epoch,
+                .projection_epoch = epoch,
+                .catalog_epoch = epoch,
+                .placement_epoch = epoch,
+                .reconcile_lease_epoch = epoch,
+                .transition_epoch = epoch,
+            };
+        }
+
+        fn adminSnapshotFence(self: *@This()) !service.AdminSnapshotFence {
+            defer self.fence_calls += 1;
+            return fence(switch (self.fence_calls) {
+                0 => 1,
+                else => 2,
+            });
+        }
+
+        fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            self.snapshot_calls += 1;
+            return .{
+                .status = .{
+                    .metadata_group_id = 77,
+                    .metadata_incarnation = incarnation,
+                    .metadata_epoch = self.snapshot_calls,
+                    .metrics = .{},
+                },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(self: *@This(), snapshot: *metadata_api.AdminSnapshot) void {
+            self.frees += 1;
+            snapshot.* = undefined;
+        }
+    };
+
+    var fake = FakeService{};
+    var snapshot = try AdminSource.coherentLinearizableSnapshot(FakeService, &fake, .{
+        .request_id = "snapshot-test",
+    });
+
+    try std.testing.expect(fake.saw_request_id);
+    try std.testing.expectEqual(@as(usize, 1), fake.barrier_calls);
+    try std.testing.expectEqual(@as(usize, 2), fake.snapshot_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.frees);
+    try std.testing.expectEqual(@as(u64, 2), snapshot.status.metadata_epoch);
+    fake.freeAdminSnapshot(&snapshot);
+    try std.testing.expectEqual(@as(usize, 2), fake.frees);
+}
+
 test "metadata http server accepts internal reallocate and split merge routes" {
     const FakeSource = struct {
         reallocate_count: usize = 0,

@@ -1433,6 +1433,30 @@ components:
   schemas:
     Error:
       $ref: "../auth/api.yaml#/components/schemas/Error"
+    MetadataCapabilityUnavailableError:
+      type: object
+      additionalProperties: false
+      description: The metadata service does not yet provide the consistency capability required by backup.
+      required: [code, error, message, required_capability, retryable, retry_after_ms]
+      properties:
+        code:
+          type: string
+          enum: [metadata_capability_unavailable]
+        error:
+          type: string
+          enum: [metadata_capability_unavailable]
+        message:
+          type: string
+        required_capability:
+          type: string
+          enum: [linearizable_snapshot]
+        retryable:
+          type: boolean
+          enum: [true]
+        retry_after_ms:
+          type: integer
+          format: int32
+          minimum: 1
     InferenceCapacityError:
       type: object
       description: Actionable retry contract for temporary inference-capacity failures.
@@ -8346,6 +8370,19 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    MetadataCapabilityUnavailable:
+      description: A required metadata consistency capability is temporarily unavailable during a rolling upgrade.
+      headers:
+        Retry-After:
+          required: true
+          description: Minimum number of seconds clients should wait before retrying.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/MetadataCapabilityUnavailableError"
     StorageResourceExhausted:
       description: Storage descriptors are temporarily exhausted
       headers:
@@ -9179,6 +9216,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "409":
           $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/MetadataCapabilityUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /restore:
@@ -10031,6 +10070,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/MetadataCapabilityUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /tables/{tableName}/restore:
