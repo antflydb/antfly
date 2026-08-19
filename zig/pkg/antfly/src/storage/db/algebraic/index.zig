@@ -268,6 +268,12 @@ pub const Config = struct {
     // every HLL. This closes the gap between a contribution-count limit and the
     // 2^precision cost of each dense group sketch.
     max_hll_contribution_bytes_per_document: usize = 8 * 1024 * 1024,
+    // Hard raw-byte budget for HLL sketches exported by one distributed shard
+    // request. The internal wire format base64-encodes these bytes, so the
+    // default leaves headroom below the HTTP executor's 4 MiB response limit.
+    // Exceeding the budget makes the optimized route unavailable and lets auto
+    // mode fall back to the exact execution path.
+    max_distributed_hll_partial_bytes: usize = 2 * 1024 * 1024,
     // Durable HLL repair advances by at most this many document-fact rows per
     // transaction, independently of whether adaptive materialization is on.
     max_hll_maintenance_rows_per_tick: u64 = 10_000,
@@ -416,6 +422,7 @@ pub fn validateConfig(cfg: Config) !void {
     if (cfg.adaptive.observation_decay_retain_percent > 100) return error.InvalidAlgebraicConfig;
     if (cfg.max_hll_contributions_per_document == 0 or
         cfg.max_hll_contribution_bytes_per_document == 0 or
+        cfg.max_distributed_hll_partial_bytes == 0 or
         cfg.max_hll_maintenance_rows_per_tick == 0 or
         cfg.max_pending_hll_observation_entries == 0 or
         cfg.max_pending_hll_observation_bytes == 0)
@@ -3801,6 +3808,32 @@ pub const Index = struct {
             try self.flushBatchMaintenanceTensorDeltasTxn(txn, ctx);
             try self.flushBatchMaintenanceContextTxn(txn, ctx);
         }
+        try self.recordAppliedGenerationTxn(txn, batch.sequence);
+    }
+
+    fn appliedGenerationKeyAlloc(self: *Index) ![]u8 {
+        return try self.keyAlloc(&.{"applied_generation"});
+    }
+
+    // Persist the derived sequence in the same transaction as doc facts and
+    // HLL updates. Identity summaries advance for creates/deletes but not for
+    // ordinary in-place updates, so this watermark is required to reject a
+    // pinned HLL read whose snapshot already contains a newer overwrite.
+    fn recordAppliedGenerationTxn(self: *Index, txn: anytype, generation: u64) !void {
+        if (generation == 0) return;
+        const key = try self.appliedGenerationKeyAlloc();
+        defer self.alloc.free(key);
+        const existing = txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (existing) |raw| {
+            if (raw.len != @sizeOf(u64)) return error.CorruptAlgebraicStorage;
+            if (std.mem.readInt(u64, raw[0..8], .big) >= generation) return;
+        }
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(u64, encoded[0..8], generation, .big);
+        try txn.put(key, encoded[0..]);
     }
 
     fn flushBatchMaintenanceTensorDeltasTxn(self: *Index, txn: anytype, ctx: *BatchMaintenanceContext) !void {
@@ -3972,6 +4005,7 @@ pub const Index = struct {
             self.observeAccumulatorResourceUsage(&self.maintenance_accumulator_resource_bytes, &ctx.tensor_accumulator);
             try self.flushBatchMaintenanceContextTxn(txn, ctx);
         }
+        try self.recordAppliedGenerationTxn(txn, batch.sequence);
 
         try accounting.finish();
         try write_batch.commit();
@@ -5872,22 +5906,18 @@ pub const Index = struct {
             buckets.deinit(self.alloc);
         }
 
-        const bucket_entries = try self.scalarDocFactEntriesForFieldAlloc(store, .group, bucket_field.name);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        const bucket_entries = try self.scalarDocFactEntriesForFieldTxnAlloc(&txn, .group, bucket_field.name);
         defer {
             for (bucket_entries) |*entry| entry.deinit(self.alloc);
             if (bucket_entries.len > 0) self.alloc.free(bucket_entries);
         }
-        var live_txn: ?docstore_mod.DocStore.Txn = null;
-        if (generation != null) live_txn = try store.beginReadTxn();
-        defer if (live_txn) |*txn| txn.abort();
-
         var constraint_set = try DocIdConstraintSet.init(self.alloc, constraint_ids);
         defer constraint_set.deinit(self.alloc);
         for (bucket_entries) |entry| {
             if (!constraint_set.matches(entry.doc_id)) continue;
-            if (live_txn) |*txn| {
-                if (!try self.docVisibleAtGenerationTxn(txn, entry.doc_id, generation)) continue;
-            }
+            if (generation != null and !try self.docVisibleAtGenerationTxn(&txn, entry.doc_id, generation)) continue;
             const bucket = blk: {
                 for (buckets.items) |*bucket| {
                     if (std.mem.eql(u8, bucket.axis, entry.scalar)) break :blk bucket;
@@ -5908,14 +5938,28 @@ pub const Index = struct {
             partials.deinit(self.alloc);
         }
 
-        const hll_children = try self.alloc.alloc(?ApproxCardinalityGroupPartials, child_requests.len);
+        // An empty shard contributes no bucket and therefore cannot introduce a
+        // mixed merge law. Avoid requiring a local HLL materialization solely
+        // to return the lawful empty identity for this shard.
+        if (buckets.items.len == 0) return try partials.toOwnedSlice(self.alloc);
+
+        const hll_children = try self.alloc.alloc(?HllCardinalityReadSpec, child_requests.len);
+        const hll_empty = self.alloc.alloc(?[]u8, child_requests.len) catch |err| {
+            self.alloc.free(hll_children);
+            return err;
+        };
         defer {
-            for (hll_children) |*maybe_partials| {
-                if (maybe_partials.*) |*group_partials| group_partials.deinit(self.alloc);
+            for (hll_children, hll_empty) |*maybe_spec, maybe_empty| {
+                if (maybe_spec.*) |*spec| spec.deinit(self.alloc);
+                if (maybe_empty) |encoded| self.alloc.free(encoded);
             }
             self.alloc.free(hll_children);
+            self.alloc.free(hll_empty);
         }
-        for (hll_children) |*maybe_partials| maybe_partials.* = null;
+        for (hll_children, hll_empty) |*maybe_spec, *maybe_empty| {
+            maybe_spec.* = null;
+            maybe_empty.* = null;
+        }
 
         var exact_child_count: usize = 0;
         for (child_requests, 0..) |child, child_idx| {
@@ -5923,19 +5967,20 @@ pub const Index = struct {
                 exact_child_count += 1;
                 continue;
             }
-            const group_partials = try self.approxCardinalityPartialsForGroupAlloc(
-                store,
+            var spec = (try self.hllCardinalitySpecForFieldAlloc(
                 &.{bucket_field.name},
                 child.field,
                 constraints,
-                generation,
-            );
-            if (group_partials) |partials_value| {
-                hll_children[child_idx] = partials_value;
-            } else {
-                if (child.mode == .approximate) return null;
-                exact_child_count += 1;
-            }
+            )) orelse return error.HllCardinalityUnavailable;
+            errdefer spec.deinit(self.alloc);
+            if (!try self.hllCardinalityAvailableTxn(&txn, spec, generation))
+                return error.HllCardinalityUnavailable;
+            var empty_sketch = try hll.Sketch.init(self.alloc, spec.precision);
+            defer empty_sketch.deinit(self.alloc);
+            const empty = try hll.encodeAlloc(self.alloc, empty_sketch);
+            errdefer self.alloc.free(empty);
+            hll_children[child_idx] = spec;
+            hll_empty[child_idx] = empty;
         }
 
         const exact_children = try self.alloc.alloc(CardinalityChildRequest, exact_child_count);
@@ -5947,16 +5992,25 @@ pub const Index = struct {
             exact_fill += 1;
         }
         var child_indexes = if (exact_children.len > 0)
-            (try self.buildChildCardinalityIndexesAlloc(store, exact_children)) orelse return null
+            (try self.buildChildCardinalityIndexesTxnAlloc(&txn, exact_children)) orelse return null
         else
             null;
         defer if (child_indexes) |*indexes| indexes.deinit(self);
+        var hll_partial_bytes: usize = 0;
         for (buckets.items) |bucket| {
             try self.appendDistributedCountPartial(&partials, bucket.axis, terms_aggregation_name, @intCast(bucket.doc_ids.items.len));
             var exact_idx: usize = 0;
-            for (child_requests, hll_children) |child, maybe_hll| {
-                if (maybe_hll) |group_partials| {
-                    try self.appendBucketChildHllPartial(&partials, bucket.axis, child.name, group_partials);
+            for (child_requests, hll_children, hll_empty) |child, maybe_hll, maybe_empty| {
+                if (maybe_hll) |spec| {
+                    try self.appendBucketChildHllPartialTxn(
+                        &partials,
+                        &txn,
+                        bucket.axis,
+                        child.name,
+                        spec,
+                        maybe_empty.?,
+                        &hll_partial_bytes,
+                    );
                     continue;
                 }
                 try self.appendBucketChildCardinalityPartials(&partials, bucket.axis, .raw, child.name, &child_indexes.?.indexes[exact_idx], bucket.doc_ids.items);
@@ -6221,6 +6275,23 @@ pub const Index = struct {
         return index;
     }
 
+    fn buildChildCardinalityIndexTxnAlloc(
+        self: *Index,
+        txn: anytype,
+        field_or_path: []const u8,
+        cache_alloc: Allocator,
+    ) !?ChildCardinalityIndex {
+        var index = ChildCardinalityIndex{};
+        errdefer index.deinit(cache_alloc);
+        if (isExplicitJsonPointerPath(field_or_path)) {
+            try self.collectPathCardinalityValuesByDocTxn(txn, field_or_path, &index, cache_alloc);
+        } else {
+            const field = self.uniqueExistingFactField(field_or_path) orelse return null;
+            try self.collectDocFactCardinalityValuesByDocTxn(txn, field, &index, cache_alloc);
+        }
+        return index;
+    }
+
     // Builds one ChildCardinalityIndex per child request. Returns null (so the
     // caller falls back to a document scan) if any child field is unsupported or
     // the exact cache working-set budget is exhausted. Normal fallback owns and
@@ -6264,6 +6335,45 @@ pub const Index = struct {
         return .{ .indexes = indexes.?, .cache_allocator = cache_allocator };
     }
 
+    fn buildChildCardinalityIndexesTxnAlloc(
+        self: *Index,
+        txn: anytype,
+        child_requests: []const CardinalityChildRequest,
+    ) !?ChildCardinalityIndexes {
+        const cache_allocator = try self.alloc.create(CardinalityCacheAllocator);
+        cache_allocator.* = .{
+            .backing = self.alloc,
+            .limit_bytes = self.config().max_cardinality_cache_bytes orelse default_child_cardinality_cache_bytes,
+        };
+        const cache_alloc = cache_allocator.allocator();
+        var indexes: ?[]ChildCardinalityIndex = null;
+        var built: usize = 0;
+        var transferred = false;
+        defer if (!transferred) {
+            if (indexes) |items| {
+                for (items[0..built]) |*index| index.deinit(cache_alloc);
+                cache_alloc.free(items);
+            }
+            std.debug.assert(cache_allocator.live_bytes == 0);
+            self.alloc.destroy(cache_allocator);
+        };
+
+        indexes = cache_alloc.alloc(ChildCardinalityIndex, child_requests.len) catch |err| {
+            if (err == error.OutOfMemory and cache_allocator.budget_denied) return null;
+            return err;
+        };
+        for (child_requests, 0..) |child, i| {
+            const child_index = self.buildChildCardinalityIndexTxnAlloc(txn, child.field, cache_alloc) catch |err| {
+                if (err == error.OutOfMemory and cache_allocator.budget_denied) return null;
+                return err;
+            };
+            indexes.?[i] = child_index orelse return null;
+            built = i + 1;
+        }
+        transferred = true;
+        return .{ .indexes = indexes.?, .cache_allocator = cache_allocator };
+    }
+
     fn collectDocFactCardinalityValuesByDoc(
         self: *Index,
         store: *docstore_mod.DocStore,
@@ -6271,10 +6381,20 @@ pub const Index = struct {
         index: *ChildCardinalityIndex,
         cache_alloc: Allocator,
     ) !void {
-        const prefix = try self.docFactScalarFieldPrefixAlloc(field.role, field.field);
-        defer self.alloc.free(prefix);
         var txn = try store.beginReadTxn();
         defer txn.abort();
+        return try self.collectDocFactCardinalityValuesByDocTxn(&txn, field, index, cache_alloc);
+    }
+
+    fn collectDocFactCardinalityValuesByDocTxn(
+        self: *Index,
+        txn: anytype,
+        field: ExistsFieldSpec,
+        index: *ChildCardinalityIndex,
+        cache_alloc: Allocator,
+    ) !void {
+        const prefix = try self.docFactScalarFieldPrefixAlloc(field.role, field.field);
+        defer self.alloc.free(prefix);
         var cursor = try txn.openCursor();
         defer cursor.close();
         var entry_opt = try cursor.seekAtOrAfter(prefix);
@@ -6294,10 +6414,20 @@ pub const Index = struct {
         index: *ChildCardinalityIndex,
         cache_alloc: Allocator,
     ) !void {
-        const prefix = try self.pathLookupPathPrefixAlloc(path);
-        defer self.alloc.free(prefix);
         var txn = try store.beginReadTxn();
         defer txn.abort();
+        return try self.collectPathCardinalityValuesByDocTxn(&txn, path, index, cache_alloc);
+    }
+
+    fn collectPathCardinalityValuesByDocTxn(
+        self: *Index,
+        txn: anytype,
+        path: []const u8,
+        index: *ChildCardinalityIndex,
+        cache_alloc: Allocator,
+    ) !void {
+        const prefix = try self.pathLookupPathPrefixAlloc(path);
+        defer self.alloc.free(prefix);
         var cursor = try txn.openCursor();
         defer cursor.close();
         var entry_opt = try cursor.seekAtOrAfter(prefix);
@@ -6351,30 +6481,31 @@ pub const Index = struct {
         }
     }
 
-    fn appendBucketChildHllPartial(
+    fn appendBucketChildHllPartialTxn(
         self: *Index,
         partials: *std.ArrayListUnmanaged(distributed_mod.Partial),
+        txn: anytype,
         axis: []const u8,
         child_name: []const u8,
-        group_partials: ApproxCardinalityGroupPartials,
+        spec: HllCardinalityReadSpec,
+        empty: []const u8,
+        exported_bytes: *usize,
     ) !void {
         const group_key = try token.canonicalTupleAlloc(self.alloc, &.{axis});
         defer self.alloc.free(group_key);
-        var encoded = group_partials.empty;
-        var lo: usize = 0;
-        var hi = group_partials.entries.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            const entry = group_partials.entries[mid];
-            switch (std.mem.order(u8, entry.group_key, group_key)) {
-                .lt => lo = mid + 1,
-                .gt => hi = mid,
-                .eq => {
-                    encoded = entry.encoded;
-                    break;
-                },
-            }
-        }
+        const key = try self.hllCardinalityKeyAlloc(spec.name, group_key);
+        defer self.alloc.free(key);
+        const encoded = txn.get(key) catch |err| switch (err) {
+            error.NotFound => empty,
+            else => return err,
+        };
+        const encoded_precision = hll.precisionEncoded(encoded) catch return error.CorruptHllMaterialization;
+        if (encoded_precision != spec.precision) return error.CorruptHllMaterialization;
+        const next_bytes = std.math.add(usize, exported_bytes.*, encoded.len) catch
+            return error.HllCardinalityUnavailable;
+        if (next_bytes > self.config().max_distributed_hll_partial_bytes)
+            return error.HllCardinalityUnavailable;
+        exported_bytes.* = next_bytes;
         const metric = try token.canonicalTupleAlloc(self.alloc, &.{ "cardinality-hll:v1", child_name });
         defer self.alloc.free(metric);
         try self.appendDistributedPartialForAxis(partials, axis, metric, .hll, encoded);
@@ -6910,6 +7041,12 @@ pub const Index = struct {
     }
 
     pub fn scalarDocFactEntriesForFieldAlloc(self: *Index, store: *docstore_mod.DocStore, role: fact_mod.Role, field: []const u8) ![]ScalarDocFactEntry {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        return try self.scalarDocFactEntriesForFieldTxnAlloc(&txn, role, field);
+    }
+
+    fn scalarDocFactEntriesForFieldTxnAlloc(self: *Index, txn: anytype, role: fact_mod.Role, field: []const u8) ![]ScalarDocFactEntry {
         const prefix = try self.docFactScalarFieldPrefixAlloc(role, field);
         defer self.alloc.free(prefix);
         var out = std.ArrayListUnmanaged(ScalarDocFactEntry).empty;
@@ -6918,8 +7055,6 @@ pub const Index = struct {
             out.deinit(self.alloc);
         }
 
-        var txn = try store.beginReadTxn();
-        defer txn.abort();
         var cursor = try txn.openCursor();
         defer cursor.close();
         var entry_opt = try cursor.seekAtOrAfter(prefix);
@@ -18935,36 +19070,17 @@ pub const Index = struct {
         }
     };
 
-    pub const ApproxCardinalityEncodedEntry = struct {
-        group_key: []u8,
-        encoded: []u8,
-
-        pub fn deinit(self: *ApproxCardinalityEncodedEntry, alloc: Allocator) void {
-            alloc.free(self.group_key);
-            alloc.free(self.encoded);
-            self.* = undefined;
-        }
-    };
-
-    pub const ApproxCardinalityGroupPartials = struct {
-        entries: []ApproxCardinalityEncodedEntry,
-        empty: []u8,
-
-        pub fn deinit(self: *ApproxCardinalityGroupPartials, alloc: Allocator) void {
-            for (self.entries) |*entry| entry.deinit(alloc);
-            alloc.free(self.entries);
-            alloc.free(self.empty);
-            self.* = undefined;
-        }
-    };
-
     /// Reads one materialized HLL sketch per group and returns its estimated
     /// distinct count. O(groups) cursor reads with no per-document rescan.
     pub fn approxCardinalityEntriesAlloc(self: *Index, store: *docstore_mod.DocStore, name: []const u8) ![]ApproxCardinalityEntry {
-        const prefix = try self.hllCardinalityPrefixAlloc(name);
-        defer self.alloc.free(prefix);
         var txn = try store.beginReadTxn();
         defer txn.abort();
+        return try self.approxCardinalityEntriesTxnAlloc(&txn, name);
+    }
+
+    fn approxCardinalityEntriesTxnAlloc(self: *Index, txn: anytype, name: []const u8) ![]ApproxCardinalityEntry {
+        const prefix = try self.hllCardinalityPrefixAlloc(name);
+        defer self.alloc.free(prefix);
         var cursor = try txn.openCursor();
         defer cursor.close();
         var out = std.ArrayListUnmanaged(ApproxCardinalityEntry).empty;
@@ -19007,11 +19123,9 @@ pub const Index = struct {
     /// Total distinct count across all groups of a materialized HLL cardinality,
     /// computed by merging the per-group sketches (an exact union, not a sum of
     /// per-group estimates).
-    fn mergedHllCardinalityEncodedAlloc(self: *Index, store: *docstore_mod.DocStore, name: []const u8) ![]u8 {
-        const prefix = try self.hllCardinalityPrefixAlloc(name);
+    fn mergedHllCardinalityEncodedTxnAlloc(self: *Index, txn: anytype, spec: HllCardinalityReadSpec) ![]u8 {
+        const prefix = try self.hllCardinalityPrefixAlloc(spec.name);
         defer self.alloc.free(prefix);
-        var txn = try store.beginReadTxn();
-        defer txn.abort();
         var cursor = try txn.openCursor();
         defer cursor.close();
         var merged: ?[]u8 = null;
@@ -19034,22 +19148,28 @@ pub const Index = struct {
         }
         // A valid empty materialization still needs a mergeable HLL identity so
         // every shard contributes the same law and precision.
-        var precision = hll.default_precision;
-        var registry = self.lockHllRegistry();
-        defer registry.deinit();
-        for (registry.items) |hcfg| {
-            if (std.mem.eql(u8, hcfg.name, name)) {
-                precision = hllCardinalityPrecision(hcfg);
-                break;
-            }
-        }
-        var empty = try hll.Sketch.init(self.alloc, precision);
+        var empty = try hll.Sketch.init(self.alloc, spec.precision);
         defer empty.deinit(self.alloc);
         return try hll.encodeAlloc(self.alloc, empty);
     }
 
     pub fn approxCardinalityTotalAlloc(self: *Index, store: *docstore_mod.DocStore, name: []const u8) !u64 {
-        const encoded = try self.mergedHllCardinalityEncodedAlloc(store, name);
+        var precision = hll.default_precision;
+        {
+            var registry = self.lockHllRegistry();
+            defer registry.deinit();
+            for (registry.items) |hcfg| {
+                if (!std.mem.eql(u8, hcfg.name, name)) continue;
+                precision = hllCardinalityPrecision(hcfg);
+                break;
+            }
+        }
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        const encoded = try self.mergedHllCardinalityEncodedTxnAlloc(&txn, .{
+            .name = @constCast(name),
+            .precision = precision,
+        });
         defer self.alloc.free(encoded);
         return try hll.estimateEncoded(encoded);
     }
@@ -19064,24 +19184,26 @@ pub const Index = struct {
         return true;
     }
 
-    // Name of an HLL cardinality materialization that can answer a distinct count
-    // of `field_or_path` grouped exactly by `group_fields` (null = any grouping,
-    // used for the merged total). Returns null when:
-    //   - constraints or an MVCC read generation are present (sketches are
-    //     maintained unconstrained and without per-generation visibility), or
-    //   - the matching materialization is currently dirty (a delete/overwrite
-    //     marked it stale and its background rebuild has not yet run) — the
-    //     caller then falls back to the exact scan rather than reading a stale,
-    //     over-counted sketch.
-    fn hllCardinalityNameForField(
+    const HllCardinalityReadSpec = struct {
+        name: []u8,
+        precision: u6,
+
+        fn deinit(self: *HllCardinalityReadSpec, alloc: Allocator) void {
+            alloc.free(self.name);
+            self.* = undefined;
+        }
+    };
+
+    // Resolve and copy the registry entry while holding the registry lock. The
+    // owned copy remains stable if an adaptive promotion grows the registry
+    // after this function returns.
+    fn hllCardinalitySpecForFieldAlloc(
         self: *Index,
-        store: *docstore_mod.DocStore,
         group_fields: ?[]const []const u8,
         field_or_path: []const u8,
         constraints: []const ir.Constraint,
-        generation: ?u64,
-    ) !?[]const u8 {
-        if (constraints.len != 0 or generation != null) return null;
+    ) !?HllCardinalityReadSpec {
+        if (constraints.len != 0) return null;
         const resolved = self.resolveUniqueField(field_or_path) orelse return null;
         if (resolved.role != .group) return null;
         var registry = self.lockHllRegistry();
@@ -19091,15 +19213,51 @@ pub const Index = struct {
             if (group_fields) |fields| {
                 if (!self.hllGroupByMatches(hcfg.group_by, fields)) continue;
             }
-            if (try self.hllCardinalityUnavailable(store, hcfg.name)) return null;
-            return hcfg.name;
+            return .{
+                .name = try self.alloc.dupe(u8, hcfg.name),
+                .precision = hllCardinalityPrecision(hcfg),
+            };
         }
         return null;
     }
 
+    // Prove freshness and read the sketch from one storage snapshot. A pinned
+    // generation is safe when the transaction contains no identity mutation
+    // newer than it. Public callers already reject historical generations;
+    // this second check closes the race with a write committed after preflight.
+    fn hllCardinalityAvailableTxn(
+        self: *Index,
+        txn: anytype,
+        spec: HllCardinalityReadSpec,
+        generation: ?u64,
+    ) !bool {
+        if (generation) |at| {
+            const applied_key = try self.appliedGenerationKeyAlloc();
+            defer self.alloc.free(applied_key);
+            const applied_raw = txn.get(applied_key) catch |err| switch (err) {
+                // Pre-watermark indexes cannot prove update ordering after an
+                // upgrade; exact fallback remains correct until the next
+                // derived batch records a sequence.
+                error.NotFound => return false,
+                else => return err,
+            };
+            if (applied_raw.len != @sizeOf(u64)) return error.CorruptHllMaterialization;
+            if (std.mem.readInt(u64, applied_raw[0..8], .big) > at) return false;
+            const latest = (try doc_identity.latestGenerationFromTxn(txn)) orelse return false;
+            if (latest > at) return false;
+        }
+        if (try self.hllCardinalityDirtyTxn(txn, spec.name)) return false;
+        const progress_key = try self.hllAdaptiveBackfillKeyAlloc(spec.name);
+        defer self.alloc.free(progress_key);
+        if (txn.get(progress_key)) |_| return false else |err| switch (err) {
+            error.NotFound => return true,
+            else => return err,
+        }
+    }
+
     /// Relative (standard) error of the HLL materialization that would answer a
     /// cardinality of `field_or_path` grouped by `group_fields`, or null when no
-    /// materialization applies. Mirrors hllCardinalityNameForField's matching so
+    /// materialization applies. Mirrors hllCardinalitySpecForFieldAlloc's matching so
     /// the estimate and its error budget always come from the same sketch.
     pub fn hllRelativeErrorForField(
         self: *Index,
@@ -19109,15 +19267,12 @@ pub const Index = struct {
         constraints: []const ir.Constraint,
         generation: ?u64,
     ) !?f64 {
-        const name = (try self.hllCardinalityNameForField(store, group_fields, field_or_path, constraints, generation)) orelse return null;
-        var registry = self.lockHllRegistry();
-        defer registry.deinit();
-        for (registry.items) |hcfg| {
-            if (std.mem.eql(u8, hcfg.name, name)) {
-                return hll.relativeErrorForPrecision(hllCardinalityPrecision(hcfg));
-            }
-        }
-        return null;
+        var spec = (try self.hllCardinalitySpecForFieldAlloc(group_fields, field_or_path, constraints)) orelse return null;
+        defer spec.deinit(self.alloc);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        if (!try self.hllCardinalityAvailableTxn(&txn, spec, generation)) return null;
+        return hll.relativeErrorForPrecision(spec.precision);
     }
 
     // Test helper: whether the (single) configured HLL cardinality is currently
@@ -19156,8 +19311,14 @@ pub const Index = struct {
         constraints: []const ir.Constraint,
         generation: ?u64,
     ) !?u64 {
-        const name = (try self.hllCardinalityNameForField(store, null, field_or_path, constraints, generation)) orelse return null;
-        return try self.approxCardinalityTotalAlloc(store, name);
+        var spec = (try self.hllCardinalitySpecForFieldAlloc(null, field_or_path, constraints)) orelse return null;
+        defer spec.deinit(self.alloc);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        if (!try self.hllCardinalityAvailableTxn(&txn, spec, generation)) return null;
+        const encoded = try self.mergedHllCardinalityEncodedTxnAlloc(&txn, spec);
+        defer self.alloc.free(encoded);
+        return try hll.estimateEncoded(encoded);
     }
 
     /// Raw mergeable HLL partial for a root cardinality query. The matching
@@ -19170,8 +19331,16 @@ pub const Index = struct {
         constraints: []const ir.Constraint,
         generation: ?u64,
     ) !?[]u8 {
-        const name = (try self.hllCardinalityNameForField(store, null, field_or_path, constraints, generation)) orelse return null;
-        return try self.mergedHllCardinalityEncodedAlloc(store, name);
+        var spec = (try self.hllCardinalitySpecForFieldAlloc(null, field_or_path, constraints)) orelse return null;
+        defer spec.deinit(self.alloc);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        if (!try self.hllCardinalityAvailableTxn(&txn, spec, generation)) return null;
+        const encoded = try self.mergedHllCardinalityEncodedTxnAlloc(&txn, spec);
+        errdefer self.alloc.free(encoded);
+        if (encoded.len > self.config().max_distributed_hll_partial_bytes)
+            return error.HllCardinalityUnavailable;
+        return encoded;
     }
 
     /// Per-group distinct-count estimates for a `terms(group_fields) ->
@@ -19185,80 +19354,17 @@ pub const Index = struct {
         constraints: []const ir.Constraint,
         generation: ?u64,
     ) !?[]ApproxCardinalityEntry {
-        const name = (try self.hllCardinalityNameForField(store, group_fields, field_or_path, constraints, generation)) orelse return null;
-        return try self.approxCardinalityEntriesAlloc(store, name);
-    }
-
-    /// Raw, mergeable per-group HLL sketches for distributed
-    /// `terms(group_fields) -> cardinality(field)` execution. An encoded empty
-    /// sketch is returned with the entries so every bucket can emit a lawful
-    /// HLL identity even when it has no child values on a shard.
-    pub fn approxCardinalityPartialsForGroupAlloc(
-        self: *Index,
-        store: *docstore_mod.DocStore,
-        group_fields: []const []const u8,
-        field_or_path: []const u8,
-        constraints: []const ir.Constraint,
-        generation: ?u64,
-    ) !?ApproxCardinalityGroupPartials {
-        const name = (try self.hllCardinalityNameForField(store, group_fields, field_or_path, constraints, generation)) orelse return null;
-        const prefix = try self.hllCardinalityPrefixAlloc(name);
-        defer self.alloc.free(prefix);
-
-        var precision = hll.default_precision;
-        var found_registry_entry = false;
-        {
-            var registry = self.lockHllRegistry();
-            defer registry.deinit();
-            for (registry.items) |hcfg| {
-                if (!std.mem.eql(u8, hcfg.name, name)) continue;
-                precision = hllCardinalityPrecision(hcfg);
-                found_registry_entry = true;
-                break;
-            }
-        }
-        if (!found_registry_entry) return error.CorruptHllMaterialization;
-
-        var entries = std.ArrayListUnmanaged(ApproxCardinalityEncodedEntry).empty;
-        errdefer {
-            for (entries.items) |*entry| entry.deinit(self.alloc);
-            entries.deinit(self.alloc);
-        }
+        var spec = (try self.hllCardinalitySpecForFieldAlloc(group_fields, field_or_path, constraints)) orelse return null;
+        defer spec.deinit(self.alloc);
         var txn = try store.beginReadTxn();
         defer txn.abort();
-        var cursor = try txn.openCursor();
-        defer cursor.close();
-        var entry_opt = try cursor.seekAtOrAfter(prefix);
-        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
-            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
-            const group_component = token.componentAt(entry.key, prefix.len) catch return error.CorruptHllMaterialization;
-            if (group_component.next != entry.key.len) return error.CorruptHllMaterialization;
-            const encoded_precision = hll.precisionEncoded(entry.value) catch return error.CorruptHllMaterialization;
-            if (encoded_precision != precision) return error.CorruptHllMaterialization;
-            const group_key = try self.alloc.dupe(u8, group_component.payload);
-            errdefer self.alloc.free(group_key);
-            const encoded = try self.alloc.dupe(u8, entry.value);
-            errdefer self.alloc.free(encoded);
-            try entries.append(self.alloc, .{ .group_key = group_key, .encoded = encoded });
-        }
-        var empty_sketch = try hll.Sketch.init(self.alloc, precision);
-        defer empty_sketch.deinit(self.alloc);
-        const empty = try hll.encodeAlloc(self.alloc, empty_sketch);
-        errdefer self.alloc.free(empty);
-        std.mem.sort(ApproxCardinalityEncodedEntry, entries.items, {}, struct {
-            fn lessThan(_: void, lhs: ApproxCardinalityEncodedEntry, rhs: ApproxCardinalityEncodedEntry) bool {
-                return std.mem.order(u8, lhs.group_key, rhs.group_key) == .lt;
-            }
-        }.lessThan);
-        return .{
-            .entries = try entries.toOwnedSlice(self.alloc),
-            .empty = empty,
-        };
+        if (!try self.hllCardinalityAvailableTxn(&txn, spec, generation)) return null;
+        return try self.approxCardinalityEntriesTxnAlloc(&txn, spec.name);
     }
 
     /// The materialized group key for a single-field terms bucket whose value
-    /// scalar token is `scalar` — i.e. what groupKeyAlloc produces for that field
-    /// — so callers can look up the bucket's estimate in the entries above.
+    /// scalar token is `scalar` — i.e. what groupKeyAlloc produces for that
+    /// field — so local aggregation callers can look up its estimate.
     pub fn approxCardinalityGroupKeyForScalarAlloc(self: *Index, scalar: []const u8) ![]u8 {
         return try token.canonicalTupleAlloc(self.alloc, &.{scalar});
     }
@@ -26839,7 +26945,18 @@ test "algebraic index executes cardinality partial tensor programs" {
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"tenant\":\"t1\",\"product\":\"p1\",\"amount\":25,\"meta\":{\"tier\":\"silver\"}}" },
         .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"tenant\":\"t2\",\"product\":\"p3\",\"amount\":21,\"meta\":{\"tier\":\"gold\"}}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    const doc_keys = [_][]const u8{ "o1", "o2", "o3", "o4" };
+    var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (identity_writes.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        identity_writes.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(alloc, &store, 0, 0, 7, &identity_writes, doc_keys[0..], &.{});
+    try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
+    try idx.applyBatch(&store, .{ .sequence = 7, .documents = docs[0..] });
 
     const constraints = [_]ir.Constraint{.{ .field = "tenant", .value = "t1" }};
     const doc_request = CardinalityPartialsRequest{
@@ -26924,15 +27041,20 @@ test "algebraic index executes cardinality partial tensor programs" {
         .steps = approximate_steps[0..],
         .output = .{ .step = 1 },
     };
-    const approximate_partials = (try idx.scanDistributedPartialsForTensorProgram(
+    const approximate_partials = (try idx.scanDistributedPartialsForTensorProgramAtGeneration(
         &store,
         doc_access_paths[0..],
         approximate_program,
+        7,
     )) orelse return error.TestUnexpectedResult;
     defer distributed_mod.freePartials(alloc, approximate_partials);
     try std.testing.expectEqual(@as(usize, 1), approximate_partials.len);
     try std.testing.expectEqual(law_mod.Id.hll, approximate_partials[0].law_id);
     try std.testing.expectEqual(@as(u64, 3), try hll.estimateEncoded(approximate_partials[0].value));
+    try std.testing.expectError(
+        error.HllCardinalityUnavailable,
+        idx.scanDistributedPartialsForTensorProgramAtGeneration(&store, doc_access_paths[0..], approximate_program, 6),
+    );
 
     var no_hll = try Index.open(alloc, "alg_cardinality_program",
         \\{"version":1,"table":"orders","group_fields":[{"name":"product","path":"product","type":"string"}]}

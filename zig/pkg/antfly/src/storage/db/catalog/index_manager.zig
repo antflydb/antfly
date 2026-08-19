@@ -2393,6 +2393,7 @@ pub const IndexManager = struct {
             new_parsed.value.max_cardinality_cache_bytes = cur.max_cardinality_cache_bytes;
             new_parsed.value.max_hll_contributions_per_document = cur.max_hll_contributions_per_document;
             new_parsed.value.max_hll_contribution_bytes_per_document = cur.max_hll_contribution_bytes_per_document;
+            new_parsed.value.max_distributed_hll_partial_bytes = cur.max_distributed_hll_partial_bytes;
             new_parsed.value.max_hll_maintenance_rows_per_tick = cur.max_hll_maintenance_rows_per_tick;
             new_parsed.value.max_pending_hll_observation_entries = cur.max_pending_hll_observation_entries;
             new_parsed.value.max_pending_hll_observation_bytes = cur.max_pending_hll_observation_bytes;

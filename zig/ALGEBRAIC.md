@@ -2391,6 +2391,15 @@ materializations, including adaptive promotions. These hard limits keep high
 precision or adversarial multi-valued documents from turning a small logical
 request into unbounded CPU, memory, or write amplification.
 
+Distributed grouped cardinality exports sketches lazily, one selected shard
+bucket at a time, and bounds their aggregate raw size with
+`max_distributed_hll_partial_bytes` (default 2 MiB per shard request). Sketch
+bytes use base64 on the internal HTTP boundary. If any non-exact child lacks a
+fresh sketch or the export budget is reached, the optimized route is rejected
+for the whole query so `auto` can fall back to an exact plan without mixing HLL
+and exact merge laws; `approximate` reports that no supported route is
+available.
+
 Adaptively promoted sketches share `max_auto_materializations_per_index` with
 other adaptive materializations. Their initial backfill is durable and resumes
 after restart, processing no more than `max_backfill_rows_per_tick` document

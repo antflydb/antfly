@@ -172,6 +172,7 @@ pub fn compilePlanAlloc(alloc: Allocator, schema: schema_mod.ParsedTableSchema) 
         }
     }
 
+    try removeConflictingStaticPaths(alloc, &fields, &skipped_complex_fields);
     try qualifyCollidingFieldNames(alloc, fields.items);
 
     return .{
@@ -182,6 +183,55 @@ pub fn compilePlanAlloc(alloc: Allocator, schema: schema_mod.ParsedTableSchema) 
         .skipped_complex_fields = skipped_complex_fields,
         .skipped_unbounded_fields = skipped_unbounded_fields,
     };
+}
+
+/// Static projections are table-wide and do not carry a document-type
+/// discriminator. If two document schemas assign incompatible scalar types to
+/// the same physical path, projecting either interpretation would make ingest
+/// depend on which schema happened to contribute the field spec. Omit every
+/// role for that ambiguous path and leave it on the schemaless path-fact route.
+fn removeConflictingStaticPaths(
+    alloc: Allocator,
+    fields: *std.ArrayListUnmanaged(FieldCapability),
+    skipped_complex_fields: *u32,
+) !void {
+    if (fields.items.len < 2) return;
+    const remove = try alloc.alloc(bool, fields.items.len);
+    defer alloc.free(remove);
+    @memset(remove, false);
+
+    for (fields.items, 0..) |field, i| {
+        for (fields.items, 0..) |other, j| {
+            if (i == j or !std.mem.eql(u8, field.path, other.path)) continue;
+            if (!std.mem.eql(u8, field.scalar_type, other.scalar_type)) {
+                remove[i] = true;
+                break;
+            }
+        }
+    }
+
+    for (fields.items, remove, 0..) |field, should_remove, i| {
+        if (!should_remove) continue;
+        var first_for_path = true;
+        for (fields.items[0..i], remove[0..i]) |prior, prior_remove| {
+            if (prior_remove and std.mem.eql(u8, prior.path, field.path)) {
+                first_for_path = false;
+                break;
+            }
+        }
+        if (first_for_path) skipped_complex_fields.* +|= 1;
+    }
+
+    var write_idx: usize = 0;
+    for (0..fields.items.len) |read_idx| {
+        if (remove[read_idx]) {
+            fields.items[read_idx].deinit(alloc);
+            continue;
+        }
+        if (write_idx != read_idx) fields.items[write_idx] = fields.items[read_idx];
+        write_idx += 1;
+    }
+    fields.items.len = write_idx;
 }
 
 /// Static facts need one table-wide identity per physical path. Preserve the
@@ -719,6 +769,45 @@ test "schema capability qualifies colliding nested leaf names" {
     var parsed_config = try std.json.parseFromSlice(index_mod.Config, alloc, config_json, .{ .allocate = .alloc_always });
     defer parsed_config.deinit();
     try index_mod.validateConfig(parsed_config.value);
+}
+
+test "schema capability omits cross-document paths with incompatible scalar types" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"version":9,"default_type":"article","document_schemas":{"article":{"schema":{"type":"object","properties":{"status":{"type":"keyword"}},"additionalProperties":false}},"event":{"schema":{"type":"object","properties":{"status":{"type":"numeric"}},"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+
+    var plan = try compilePlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+    for (plan.fields) |field| try std.testing.expect(!std.mem.eql(u8, field.path, "status"));
+    try std.testing.expectEqual(@as(u32, 1), plan.skipped_complex_fields);
+
+    const config_json = try configJsonFromPlanAlloc(alloc, "events", plan);
+    defer alloc.free(config_json);
+    var parsed_config = try std.json.parseFromSlice(index_mod.Config, alloc, config_json, .{ .allocate = .alloc_always });
+    defer parsed_config.deinit();
+    try index_mod.validateConfig(parsed_config.value);
+    try std.testing.expectEqual(@as(usize, 0), parsed_config.value.group_fields.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed_config.value.measure_fields.len);
+}
+
+test "schema capability coalesces compatible paths shared by document types" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"version":10,"default_type":"article","document_schemas":{"article":{"schema":{"type":"object","properties":{"status":{"type":"keyword"}},"additionalProperties":false}},"event":{"schema":{"type":"object","properties":{"status":{"type":"keyword"}},"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+
+    var plan = try compilePlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+    const config_json = try configJsonFromPlanAlloc(alloc, "events", plan);
+    defer alloc.free(config_json);
+    var parsed_config = try std.json.parseFromSlice(index_mod.Config, alloc, config_json, .{ .allocate = .alloc_always });
+    defer parsed_config.deinit();
+    try index_mod.validateConfig(parsed_config.value);
+    try std.testing.expectEqual(@as(usize, 1), parsed_config.value.group_fields.len);
+    try std.testing.expectEqualStrings("status", parsed_config.value.group_fields[0].path);
 }
 
 test "schema capability plan records unbounded dynamic schema metadata" {

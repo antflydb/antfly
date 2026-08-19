@@ -1728,7 +1728,11 @@ const AlgebraicPartialResponseInput = struct {
     canonical_axis: []const u8,
     metric: []const u8 = "",
     law: []const u8,
-    value: []const u8,
+    // `value_base64` is the canonical binary-safe wire representation. Keep
+    // `value` optional so rolling upgrades can still read responses from an
+    // older peer.
+    value: ?[]const u8 = null,
+    value_base64: ?[]const u8 = null,
 };
 
 const AlgebraicPartialsResponseInput = struct {
@@ -14264,7 +14268,11 @@ fn encodeAlgebraicPartialsResponse(
         try appendJsonFieldString(alloc, &out, &first, "canonical_axis", partial.canonical_axis);
         try appendJsonFieldString(alloc, &out, &first, "metric", partial.metric);
         try appendJsonFieldString(alloc, &out, &first, "law", @tagName(partial.law_id));
-        try appendJsonFieldString(alloc, &out, &first, "value", partial.value);
+        const encoded_len = std.base64.standard.Encoder.calcSize(partial.value.len);
+        const encoded = try alloc.alloc(u8, encoded_len);
+        defer alloc.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, partial.value);
+        try appendJsonFieldString(alloc, &out, &first, "value_base64", encoded);
         try out.append(alloc, '}');
     }
     try out.appendSlice(alloc, "]}");
@@ -14289,11 +14297,24 @@ fn parseAlgebraicPartialsResponse(
     }
     for (parsed.value.partials, 0..) |partial, i| {
         const law_id = std.meta.stringToEnum(db_mod.algebraic.law.Id, partial.law) orelse return error.InvalidQueryRequest;
+        if ((partial.value == null) == (partial.value_base64 == null)) return error.InvalidQueryRequest;
+        const canonical_axis = try alloc.dupe(u8, partial.canonical_axis);
+        errdefer alloc.free(canonical_axis);
+        const metric = try alloc.dupe(u8, partial.metric);
+        errdefer alloc.free(metric);
+        const value = if (partial.value_base64) |encoded| blk: {
+            const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return error.InvalidQueryRequest;
+            const decoded = try alloc.alloc(u8, decoded_len);
+            errdefer alloc.free(decoded);
+            std.base64.standard.Decoder.decode(decoded, encoded) catch return error.InvalidQueryRequest;
+            break :blk decoded;
+        } else try alloc.dupe(u8, partial.value.?);
+        errdefer alloc.free(value);
         partials[i] = .{
-            .canonical_axis = try alloc.dupe(u8, partial.canonical_axis),
-            .metric = try alloc.dupe(u8, partial.metric),
+            .canonical_axis = canonical_axis,
+            .metric = metric,
             .law_id = law_id,
-            .value = try alloc.dupe(u8, partial.value),
+            .value = value,
         };
         initialized += 1;
     }
@@ -22883,6 +22904,33 @@ test "explicit text stats requests reject stale identity generation" {
     try std.testing.expectError(error.IdentityReadGenerationChanged, collectBackgroundTextStatsFromDbForRequest(alloc, &db, parsed_background));
 }
 
+test "algebraic partial response base64 round trips binary values" {
+    const alloc = std.testing.allocator;
+    const raw = [_]u8{ 0, 1, 2, 127, 128, 255 };
+    const partials = [_]db_mod.algebraic.distributed.Partial{.{
+        .canonical_axis = "axis",
+        .metric = "metric",
+        .law_id = .hll,
+        .value = raw[0..],
+    }};
+    const encoded = try encodeAlgebraicPartialsResponse(alloc, partials[0..]);
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"value_base64\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\\u0000") == null);
+
+    const decoded = try parseAlgebraicPartialsResponse(alloc, encoded);
+    defer db_mod.algebraic.distributed.freePartials(alloc, decoded);
+    try std.testing.expectEqual(@as(usize, 1), decoded.len);
+    try std.testing.expectEqualSlices(u8, raw[0..], decoded[0].value);
+
+    const legacy = try parseAlgebraicPartialsResponse(
+        alloc,
+        "{\"partials\":[{\"canonical_axis\":\"axis\",\"law\":\"count\",\"value\":\"1\"}]}",
+    );
+    defer db_mod.algebraic.distributed.freePartials(alloc, legacy);
+    try std.testing.expectEqualStrings("1", legacy[0].value);
+}
+
 test "algebraic partial request preserves planner-owned materialization tensor programs" {
     const alloc = std.testing.allocator;
 
@@ -23491,6 +23539,67 @@ test "algebraic partial request accepts current identity generation and rejects 
     defer stale.deinit(alloc);
     stale.identity_read_generation = db.core.nextDerivedSequence() + 1;
     try std.testing.expectError(error.IdentityReadGenerationChanged, collectAlgebraicPartialsFromDbForRequest(alloc, &db, stale));
+}
+
+test "algebraic partial request uses HLL at the current identity generation" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-algebraic-partials-current-generation-hll";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "alg",
+        .kind = .algebraic,
+        .config_json =
+        \\{"version":1,"table":"orders","group_fields":[{"name":"customer","path":"customer","type":"string"}],"hll_cardinalities":[{"name":"customers","group_by":[],"value_field":"customer","precision":14}]}
+        ,
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "o1", .value = "{\"customer\":\"alice\"}" },
+            .{ .key = "o2", .value = "{\"customer\":\"bob\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const entry = db.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+    const generation = try db.currentIdentityReadGenerationForRequest(null);
+    const derived_docs = [_]db_mod.derived_types.DerivedDocument{
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\"}" },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"bob\"}" },
+    };
+    try entry.index.applyBatch(db.core.store, .{ .sequence = generation, .documents = derived_docs[0..] });
+    try db.core.saveAppliedSequence("alg", generation);
+    var plan = (try algebraic_planner.planCardinalityPartialsTensorProgramAlloc(
+        alloc,
+        entry.index,
+        "customer_cardinality",
+        "customer",
+        &.{},
+        true,
+    )) orelse return error.TestUnexpectedResult;
+    defer plan.deinit(alloc);
+    const encoded = try encodeAlgebraicPartialsRequestWithProgramAtGeneration(
+        alloc,
+        "alg",
+        generation,
+        plan.access_paths,
+        &.{},
+        plan.asProgram(),
+    );
+    defer alloc.free(encoded);
+    var parsed = try parseAlgebraicPartialsRequest(alloc, encoded);
+    defer parsed.deinit(alloc);
+    const partials = try collectAlgebraicPartialsFromDbForRequest(alloc, &db, parsed);
+    defer db_mod.algebraic.distributed.freePartials(alloc, partials);
+    try std.testing.expectEqual(@as(usize, 1), partials.len);
+    try std.testing.expectEqual(db_mod.algebraic.law.Id.hll, partials[0].law_id);
+    try std.testing.expectEqual(@as(u64, 2), try db_mod.algebraic.hll.estimateEncoded(partials[0].value));
 }
 
 test "algebraic partial request accepts tensor program expression outputs" {

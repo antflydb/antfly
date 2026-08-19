@@ -3238,6 +3238,17 @@ pub fn algebraicTermsCardinalityAggregationFromDistributedPartialsAlloc(
                 }
                 if (!found_hll and child_request.cardinality_mode == .approximate) return error.UnsupportedAggregation;
             }
+            // A child/bucket must use one merge law across every shard. Never
+            // silently prefer an HLL row over exact distinct-token rows: doing
+            // so drops the exact-only shard's contribution and under-counts.
+            if (found_hll) {
+                for (merged.rows) |row| {
+                    if (row.law_id != .count) continue;
+                    if (!std.mem.eql(u8, row.canonical_axis, axis)) continue;
+                    if (try distributedCardinalityMetricMatches(alloc, row.metric, child_request.name))
+                        return error.InvalidDistributedAlgebraicMerge;
+                }
+            }
             if (!found_hll) {
                 for (merged.rows) |row| {
                     if (row.law_id != .count) continue;
@@ -11986,6 +11997,28 @@ test "algebraic distributed terms cardinality preserves mode and prefers grouped
         plan.asProgram(),
     )) orelse return error.TestUnexpectedResult;
     defer algebraic_mod.distributed.freePartials(alloc, partials);
+
+    // Auto mode must reject this entire optimized shard route when the HLL is
+    // unavailable; emitting exact rows here would under-count if another shard
+    // emitted HLL rows for the same child.
+    var no_hll = try algebraic_mod.index.Index.open(alloc, "alg_distributed_grouped_hll",
+        \\{"version":1,"table":"orders","group_fields":[{"name":"customer","path":"customer","type":"string"},{"name":"product","path":"product","type":"string"}]}
+    );
+    defer no_hll.close();
+    try std.testing.expectError(
+        error.HllCardinalityUnavailable,
+        no_hll.scanDistributedPartialsForTensorProgram(&store, plan.access_paths, plan.asProgram()),
+    );
+
+    var bounded_hll = try algebraic_mod.index.Index.open(alloc, "alg_distributed_grouped_hll",
+        \\{"version":1,"table":"orders","max_distributed_hll_partial_bytes":1,"group_fields":[{"name":"customer","path":"customer","type":"string"},{"name":"product","path":"product","type":"string"}],"hll_cardinalities":[{"name":"products_by_customer","group_by":["customer"],"value_field":"product","precision":14}]}
+    );
+    defer bounded_hll.close();
+    try std.testing.expectError(
+        error.HllCardinalityUnavailable,
+        bounded_hll.scanDistributedPartialsForTensorProgram(&store, plan.access_paths, plan.asProgram()),
+    );
+
     var merged = try algebraic_mod.distributed.mergePartialsAlloc(alloc, partials);
     defer merged.deinit(alloc);
 
@@ -12013,6 +12046,49 @@ test "algebraic distributed terms cardinality preserves mode and prefers grouped
         try std.testing.expect(parsed.value.object.get("approximate").?.bool);
         try std.testing.expect(parsed.value.object.get("relative_error").?.float > 0);
     }
+
+    var hll_row: ?algebraic_mod.distributed.Partial = null;
+    for (partials) |partial| {
+        if (partial.law_id == .hll) {
+            hll_row = partial;
+            break;
+        }
+    }
+    const selected_hll = hll_row orelse return error.TestUnexpectedResult;
+    var bucket_count_row: ?algebraic_mod.distributed.Partial = null;
+    for (partials) |partial| {
+        if (partial.law_id == .count and
+            std.mem.eql(u8, partial.metric, "by_customer") and
+            std.mem.eql(u8, partial.canonical_axis, selected_hll.canonical_axis))
+        {
+            bucket_count_row = partial;
+            break;
+        }
+    }
+    const selected_bucket_count = bucket_count_row orelse return error.TestUnexpectedResult;
+    const exact_value_token = try index.constraintTokenAlloc(alloc, "product", "pen");
+    defer alloc.free(exact_value_token);
+    const exact_metric = try algebraic_mod.token.canonicalTupleAlloc(alloc, &.{ "cardinality:v1", "product_cardinality", exact_value_token });
+    defer alloc.free(exact_metric);
+    const mixed_partials = [_]algebraic_mod.distributed.Partial{
+        selected_bucket_count,
+        selected_hll,
+        .{ .canonical_axis = selected_hll.canonical_axis, .metric = exact_metric, .law_id = .count, .value = "1" },
+    };
+    var mixed = try algebraic_mod.distributed.mergePartialsAlloc(alloc, mixed_partials[0..]);
+    defer mixed.deinit(alloc);
+    try std.testing.expectError(
+        error.InvalidDistributedAlgebraicMerge,
+        algebraicTermsCardinalityAggregationFromDistributedPartialsAlloc(
+            alloc,
+            &index,
+            .{ .name = "by_customer", .type = "terms", .field = "customer" },
+            "customer",
+            children[0..],
+            &.{},
+            mixed,
+        ),
+    );
 }
 
 test "algebraic terms aggregation answers nested exact cardinality from fact rows" {
