@@ -40,6 +40,14 @@ import (
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
+type listRejectingReader struct {
+	client.Reader
+}
+
+func (r listRejectingReader) List(context.Context, client.ObjectList, ...client.ListOption) error {
+	return fmt.Errorf("unexpected namespace-wide List")
+}
+
 func TestGeneratedConfigHashAnnotationChangesWithRemoteContentConfig(t *testing.T) {
 	reconciler := &AntflyClusterReconciler{}
 	cluster := &antflyv1.AntflyCluster{
@@ -680,7 +688,10 @@ func TestRecordMetadataTopologyOnPVCs(t *testing.T) {
 		Annotations: map[string]string{metadataTopologyReplicasAnnotation: "3"},
 	}}
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pvc, foreignPVC).Build()
-	reconciler := &AntflyClusterReconciler{Client: k8sClient}
+	reconciler := &AntflyClusterReconciler{
+		Client:         k8sClient,
+		BoundaryReader: listRejectingReader{Reader: k8sClient},
+	}
 	cluster := &antflyv1.AntflyCluster{ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"}}
 
 	if err := reconciler.recordMetadataTopologyOnPVCs(context.Background(), cluster, 1); err != nil {
@@ -703,6 +714,15 @@ func TestRecordMetadataTopologyOnPVCs(t *testing.T) {
 
 	if err := reconciler.recordMetadataTopologyOnPVCs(context.Background(), cluster, 3); err == nil {
 		t.Fatal("expected an existing PVC topology record to be immutable")
+	}
+
+	emptyClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	emptyReconciler := &AntflyClusterReconciler{
+		Client:         emptyClient,
+		BoundaryReader: listRejectingReader{Reader: emptyClient},
+	}
+	if err := emptyReconciler.recordMetadataTopologyOnPVCs(context.Background(), cluster, 3); err != nil {
+		t.Fatalf("expected asynchronously created metadata PVCs to be retried, got: %v", err)
 	}
 }
 

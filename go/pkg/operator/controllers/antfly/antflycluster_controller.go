@@ -4294,16 +4294,25 @@ exec /antfly metadata --id $ID --config /config/config.json \
 }
 
 func (r *AntflyClusterReconciler) recordMetadataTopologyOnPVCs(ctx context.Context, cluster *antflyv1.AntflyCluster, replicas int32) error {
-	var pvcList corev1.PersistentVolumeClaimList
-	if err := r.haBoundaryReader().List(ctx, &pvcList, client.InNamespace(cluster.Namespace)); err != nil {
-		return fmt.Errorf("list metadata PVCs for topology recording: %w", err)
-	}
-
+	// This runs on every steady-state reconciliation, so address only the bounded
+	// expected claim set. The validator retains the namespace-wide scan needed to
+	// detect unexpected retained ordinals before any topology is accepted.
+	topologyReader := r.haBoundaryReader()
+	pvcPrefix := metadataPVCPrefix(cluster)
 	want := strconv.FormatInt(int64(replicas), 10)
-	for i := range pvcList.Items {
-		pvc := &pvcList.Items[i]
-		if _, matches := metadataPVCOrdinal(cluster, pvc); !matches {
-			continue
+	for ordinal := int32(0); ordinal < replicas; ordinal++ {
+		pvc := &corev1.PersistentVolumeClaim{}
+		key := types.NamespacedName{
+			Name:      pvcPrefix + strconv.FormatInt(int64(ordinal), 10),
+			Namespace: cluster.Namespace,
+		}
+		if err := topologyReader.Get(ctx, key, pvc); err != nil {
+			// StatefulSet PVC creation is asynchronous. A later pod/StatefulSet event
+			// or the periodic topology observation will retry the exact claim.
+			if errors.IsNotFound(err) {
+				continue
+			}
+			return fmt.Errorf("read metadata PVC %s for topology recording: %w", key.Name, err)
 		}
 		if got, ok := pvc.Annotations[metadataTopologyReplicasAnnotation]; ok {
 			if got != want {
