@@ -670,6 +670,7 @@ pub const AntflyType2 = enum {
     blob,
     link,
     search_as_you_type,
+    json,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -685,6 +686,7 @@ pub const AntflyType2 = enum {
             .blob => "blob",
             .link => "link",
             .search_as_you_type => "search_as_you_type",
+            .json => "json",
         };
         try jw.write(s);
     }
@@ -707,6 +709,7 @@ pub const AntflyType2 = enum {
             .{ "blob", .blob },
             .{ "link", .link },
             .{ "search_as_you_type", .search_as_you_type },
+            .{ "json", .json },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -8328,6 +8331,8 @@ pub const TableRestoreStatus = struct {
 pub const TableSchema = struct {
     /// Backend-managed schema generation used for migrations. Omit it from create and update requests.
     version: ?i64 = null,
+    /// Storage profile for the table. - "document" (default): schemaless JSON documents with optional, soft schema validation. All indexes are derived from the document. - "relational": required closed schema with typed columns. Documents must match a declared type; declared scalar properties are stored as typed columns for columnar predicate pushdown and aggregation. A field typed "json" stores a subtree that is still indexed like a document. Implies enforce_types and closed document types.
+    storage_mode: ?[]const u8 = null,
     /// Default type to use from the document_types.
     default_type: ?[]const u8 = null,
     /// Whether to enforce that documents must match one of the provided document types. If false, documents not matching any type will be accepted but not indexed.
