@@ -13408,16 +13408,28 @@ test "asset batch fallback keeps the logical request retry budget" {
         }
     };
 
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/asset-retry-indexes", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
     var producer_impl = AlwaysTransientProducer{};
     var failure_capture = TestFailureCapture{};
     var runtime = EnrichmentRuntime{
         .alloc = alloc,
         .io_impl = null,
-        .store = undefined,
+        .store = erased_store,
         .owns_store = false,
         .change_journal = undefined,
         .replay_source = undefined,
-        .index_manager = undefined,
+        .index_manager = &index_manager,
         .write_ctx = undefined,
         .write_fn = undefined,
         .failure_ctx = &failure_capture,
