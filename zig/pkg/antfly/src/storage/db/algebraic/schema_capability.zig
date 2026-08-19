@@ -124,14 +124,28 @@ pub fn compilePlanAlloc(alloc: Allocator, schema: schema_mod.ParsedTableSchema) 
             skipped_unbounded_fields += 1;
             continue;
         }
+        const name = try alloc.dupe(u8, tmpl.name);
+        errdefer alloc.free(name);
+        const match = try dupeOptional(alloc, tmpl.match_pattern);
+        errdefer if (match) |value| alloc.free(value);
+        const unmatch = try dupeOptional(alloc, tmpl.unmatch_pattern);
+        errdefer if (unmatch) |value| alloc.free(value);
+        const path_match = try dupeOptional(alloc, tmpl.path_match);
+        errdefer if (path_match) |value| alloc.free(value);
+        const path_unmatch = try dupeOptional(alloc, tmpl.path_unmatch);
+        errdefer if (path_unmatch) |value| alloc.free(value);
+        const match_mapping_type = try dupeOptional(alloc, tmpl.match_mapping_type);
+        errdefer if (match_mapping_type) |value| alloc.free(value);
+        const scalar_type = try alloc.dupe(u8, scalar.?);
+        errdefer alloc.free(scalar_type);
         try dynamic_rules.append(alloc, .{
-            .name = try alloc.dupe(u8, tmpl.name),
-            .match = try dupeOptional(alloc, tmpl.match_pattern),
-            .unmatch = try dupeOptional(alloc, tmpl.unmatch_pattern),
-            .path_match = try dupeOptional(alloc, tmpl.path_match),
-            .path_unmatch = try dupeOptional(alloc, tmpl.path_unmatch),
-            .match_mapping_type = try dupeOptional(alloc, tmpl.match_mapping_type),
-            .scalar_type = try alloc.dupe(u8, scalar.?),
+            .name = name,
+            .match = match,
+            .unmatch = unmatch,
+            .path_match = path_match,
+            .path_unmatch = path_unmatch,
+            .match_mapping_type = match_mapping_type,
+            .scalar_type = scalar_type,
         });
     }
 
@@ -775,6 +789,25 @@ test "schema capability compiles bounded dynamic templates into runtime rules" {
         }
     }
     try std.testing.expect(found_numeric);
+}
+
+test "schema capability dynamic template compilation is allocation failure atomic" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"version":9,"default_type":"doc","dynamic_templates":[
+        \\{"name":"rich_rule","match":"*_id","unmatch":"private_*","path_match":"items.*","path_unmatch":"items.private.*","match_mapping_type":"string","mapping":{"type":"keyword"}},
+        \\{"name":"metric_rule","path_match":"metrics.*","mapping":{"type":"numeric"}}
+        \\]}
+    );
+    defer parsed.deinit(alloc);
+
+    const Runner = struct {
+        fn run(failing_alloc: Allocator, schema: schema_mod.ParsedTableSchema) !void {
+            var plan = try compilePlanAlloc(failing_alloc, schema);
+            defer plan.deinit(failing_alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Runner.run, .{parsed});
 }
 
 test "schema capability fingerprint reflects dynamic template type change" {

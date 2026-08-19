@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const platform_sync = @import("antfly_platform").sync;
 const adaptive_mod = @import("adaptive.zig");
@@ -23,6 +24,7 @@ const fact_mod = @import("fact.zig");
 const ir = @import("ir.zig");
 const join_mod = @import("join.zig");
 const law_mod = @import("law.zig");
+const hll = @import("hll.zig");
 const lexical_mod = @import("lexical.zig");
 const pathfact_mod = @import("pathfact.zig");
 const tensor_mod = @import("tensor.zig");
@@ -37,6 +39,7 @@ const runtime_schema = @import("../../schema.zig");
 const lsm_backend = @import("../../lsm_backend.zig");
 const lsm_storage_io = @import("../../lsm_backend/storage_io.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
+const background_runtime = @import("../../background_runtime.zig");
 const doc_identity = @import("../doc_identity.zig");
 const doc_set = @import("../doc_set.zig");
 const derived_types = @import("../derived/derived_types.zig");
@@ -169,6 +172,20 @@ pub const LawConfig = struct {
     invertible: bool = false,
 };
 
+// A materialized approximate distinct-count. Per group key, a HyperLogLog
+// sketch over the canonical tokens of `value_field` is maintained incrementally
+// on ingest, so a cardinality query reads one sketch per group instead of
+// rescanning and deduplicating every document's value. `precision` of 0 selects
+// the default; larger precision trades memory (2^precision bytes/sketch) for a
+// smaller standard error. Maintenance is append-only: deletes require a rebuild
+// and are not folded back into the sketch.
+pub const HllCardinalityConfig = struct {
+    name: []const u8,
+    group_by: []const []const u8 = &.{},
+    value_field: []const u8,
+    precision: u8 = 0,
+};
+
 pub const AdaptiveConfig = struct {
     observe: bool = true,
     lazy_materialization: bool = false,
@@ -231,11 +248,13 @@ pub const Config = struct {
     laws: []const LawConfig = &.{},
     joins: []const JoinConfig = &.{},
     materializations: []const MaterializationConfig = &.{},
+    hll_cardinalities: []const HllCardinalityConfig = &.{},
     adaptive: AdaptiveConfig = .{},
     pathfact_policy: PathFactPolicyConfig = .{},
     max_result_buckets: ?usize = null,
     max_planner_scan_rows: ?usize = null,
     max_batch_accumulator_entries: ?usize = null,
+    max_cardinality_cache_bytes: ?usize = null,
     min_max_candidate_cache_size: ?usize = null,
     enable_temporal_range_pruning: bool = true,
 };
@@ -528,36 +547,42 @@ fn projectDynamicDocFactsAlloc(
         out.deinit(alloc);
     }
     if (rules.len > 0 and root == .object) {
-        try walkDynamicDocFacts(alloc, rules, static_specs, &out, "", root);
+        try walkDynamicValueFacts(alloc, rules, static_specs, &out, "", "", root);
     }
     return .{ .facts = try out.toOwnedSlice(alloc) };
 }
 
-fn walkDynamicDocFacts(
+fn walkDynamicValueFacts(
     alloc: std.mem.Allocator,
     rules: []const fact_mod.DynamicRule,
     static_specs: []const fact_mod.FieldSpec,
     out: *std.ArrayListUnmanaged(fact_mod.Fact),
-    prefix: []const u8,
+    path: []const u8,
+    field_name: []const u8,
     node: std.json.Value,
 ) !void {
-    if (node != .object) return;
-    var it = node.object.iterator();
-    while (it.next()) |entry| {
-        const field_name = entry.key_ptr.*;
-        const child_value = entry.value_ptr.*;
-        const path = if (prefix.len == 0)
-            try alloc.dupe(u8, field_name)
-        else
-            try std.fmt.allocPrint(alloc, "{s}.{s}", .{ prefix, field_name });
-        defer alloc.free(path);
-        switch (child_value) {
-            // Descend into nested objects so path_match selectors can target
-            // dotted paths; arrays stay on the schemaless path-fact path.
-            .object => try walkDynamicDocFacts(alloc, rules, static_specs, out, path, child_value),
-            .array => {},
-            else => try projectDynamicLeaf(alloc, rules, static_specs, out, path, field_name, child_value),
-        }
+    switch (node) {
+        .object => {
+            var it = node.object.iterator();
+            while (it.next()) |entry| {
+                const child_name = entry.key_ptr.*;
+                const child_path = if (path.len == 0)
+                    try alloc.dupe(u8, child_name)
+                else
+                    try std.fmt.allocPrint(alloc, "{s}.{s}", .{ path, child_name });
+                defer alloc.free(child_path);
+                try walkDynamicValueFacts(alloc, rules, static_specs, out, child_path, child_name, entry.value_ptr.*);
+            }
+        },
+        // Arrays retain their parent path, matching the document mapper's
+        // multi-value semantics: scalar elements are projected as repeated
+        // facts and object elements continue walking from the array's path.
+        .array => for (node.array.items) |item| {
+            try walkDynamicValueFacts(alloc, rules, static_specs, out, path, field_name, item);
+        },
+        else => {
+            if (path.len > 0) try projectDynamicLeaf(alloc, rules, static_specs, out, path, field_name, node);
+        },
     }
 }
 
@@ -678,6 +703,12 @@ pub const MaterializedExpressionRowEntry = struct {
 pub const DerivedJoinFoldRequest = struct {
     join: ir.JoinRef,
     op: algebra.Op,
+    // Overrides the law derived from `op` when the fold is not an algebra.Op
+    // metric. Used for cardinality-over-join, which folds HLL sketches (.hll)
+    // rather than a scalar reduction. The contribution for .hll is a singleton
+    // sketch of the measure value at `hll_precision`.
+    law: ?law_mod.Id = null,
+    hll_precision: u6 = hll.default_precision,
     group_by: []const []const u8 = &.{},
     histogram_field: ?[]const u8 = null,
     histogram_role: ?fact_mod.Role = null,
@@ -2130,6 +2161,21 @@ const MeasureValue = struct {
     }
 };
 
+const AdaptiveFactProjection = struct {
+    axes: [][]u8 = &.{},
+    buckets: []?[]u8 = &.{},
+    measures: []MeasureValue = &.{},
+
+    fn deinit(self: *AdaptiveFactProjection, alloc: Allocator) void {
+        fact_mod.freeAxisTuples(alloc, self.axes);
+        for (self.buckets) |bucket| if (bucket) |value| alloc.free(value);
+        if (self.buckets.len > 0) alloc.free(self.buckets);
+        for (self.measures) |value| value.deinit(alloc);
+        if (self.measures.len > 0) alloc.free(self.measures);
+        self.* = .{};
+    }
+};
+
 const MinMaxCandidate = struct {
     support_token: []u8,
     raw: []u8,
@@ -2443,6 +2489,29 @@ const ProjectedFact = struct {
             } else if (std.mem.eql(u8, kind, "g") or std.mem.eql(u8, kind, "t")) {
                 if (pos + 2 >= self.parts.len) return error.InvalidAlgebraicFact;
                 pos += 3;
+            } else {
+                return error.InvalidAlgebraicFact;
+            }
+        }
+        return null;
+    }
+
+    // Raw value of `field_name` regardless of role: a group/time field's scalar
+    // token or a measure field's raw value. Used by the HLL cardinality fold,
+    // whose target field is usually a group dimension (which measureAlloc, by
+    // design limited to measure parts, can't see). Returns null if absent.
+    fn valueScalarAlloc(self: ProjectedFact, alloc: Allocator, field_name: []const u8) !?[]u8 {
+        var pos: usize = 1;
+        while (pos < self.parts.len) {
+            const kind = self.parts[pos];
+            if (std.mem.eql(u8, kind, "g") or std.mem.eql(u8, kind, "t")) {
+                if (pos + 2 >= self.parts.len) return error.InvalidAlgebraicFact;
+                if (std.mem.eql(u8, self.parts[pos + 1], field_name)) return try alloc.dupe(u8, self.parts[pos + 2]);
+                pos += 3;
+            } else if (std.mem.eql(u8, kind, "m")) {
+                if (pos + 3 >= self.parts.len) return error.InvalidAlgebraicFact;
+                if (std.mem.eql(u8, self.parts[pos + 1], field_name)) return try alloc.dupe(u8, self.parts[pos + 2]);
+                pos += 4;
             } else {
                 return error.InvalidAlgebraicFact;
             }
@@ -3018,6 +3087,23 @@ pub const Index = struct {
     /// transactions may overlap even though their commits are serialized, so
     /// the lock must be acquired before opening the underlying transaction.
     storage_accounting_mutex: std.atomic.Mutex = .unlocked,
+    // Optional durable-job lane used to rebuild HLL cardinality sketches in the
+    // background after deletes/overwrites (which the append-only sketches cannot
+    // fold back). When unset, callers drive rebuilds via runHllMaintenance.
+    hll_maintenance_lane: ?background_runtime.DurableJobLane = null,
+    hll_maintenance_owner_id: u64 = 0,
+    // Runtime registry of HLL cardinality sketches. Seeded at open() from the
+    // parsed config and extended at runtime when the adaptive subsystem promotes
+    // a recurring cardinality query shape. Owns its strings (config entries are
+    // duped in), so config-derived and adaptive sketches are handled uniformly.
+    // All read/maintenance paths iterate this, not config().hll_cardinalities.
+    hll_registry: std.ArrayListUnmanaged(HllCardinalityConfig) = .empty,
+    // Serializes index write transactions. The store contract is single-writer,
+    // but background HLL maintenance (runHllMaintenance) opens its own write txn
+    // on a separate thread concurrently with foreground applyBatch calls. Both
+    // acquire this so at most one write txn against the index's store is open at
+    // a time; readers are unaffected (they use the store's snapshots).
+    write_mutex: std.atomic.Mutex = .unlocked,
 
     pub fn open(alloc: Allocator, name: []const u8, config_json: []const u8) !Index {
         return try openWithStorageNamespace(alloc, name, name, config_json);
@@ -3036,12 +3122,60 @@ pub const Index = struct {
         errdefer alloc.free(owned_name);
         const owned_storage_namespace = try alloc.dupe(u8, storage_namespace);
         errdefer alloc.free(owned_storage_namespace);
-        return .{
+        var self: Index = .{
             .alloc = alloc,
             .name = owned_name,
             .storage_namespace = owned_storage_namespace,
             .parsed = parsed,
         };
+        errdefer self.freeHllRegistry();
+        // Seed the runtime registry from the static config; adaptive promotions
+        // append to it later. Owned copies so the registry's lifetime is uniform.
+        for (parsed.value.hll_cardinalities) |hcfg| {
+            try self.appendHllRegistryEntry(hcfg.name, hcfg.group_by, hcfg.value_field, hcfg.precision);
+        }
+        return self;
+    }
+
+    // Appends an owned copy of an HLL sketch config to the runtime registry.
+    fn appendHllRegistryEntry(self: *Index, name: []const u8, group_by: []const []const u8, value_field: []const u8, precision: u8) !void {
+        const name_copy = try self.alloc.dupe(u8, name);
+        errdefer self.alloc.free(name_copy);
+        const value_copy = try self.alloc.dupe(u8, value_field);
+        errdefer self.alloc.free(value_copy);
+        const group_copy = try self.alloc.alloc([]const u8, group_by.len);
+        var filled: usize = 0;
+        errdefer {
+            for (group_copy[0..filled]) |g| self.alloc.free(g);
+            self.alloc.free(group_copy);
+        }
+        for (group_by, 0..) |g, i| {
+            group_copy[i] = try self.alloc.dupe(u8, g);
+            filled = i + 1;
+        }
+        try self.hll_registry.append(self.alloc, .{
+            .name = name_copy,
+            .group_by = group_copy,
+            .value_field = value_copy,
+            .precision = precision,
+        });
+    }
+
+    fn freeHllRegistry(self: *Index) void {
+        for (self.hll_registry.items) |hcfg| {
+            self.alloc.free(@constCast(hcfg.name));
+            self.alloc.free(@constCast(hcfg.value_field));
+            for (hcfg.group_by) |g| self.alloc.free(@constCast(g));
+            self.alloc.free(@constCast(hcfg.group_by));
+        }
+        self.hll_registry.deinit(self.alloc);
+        self.hll_registry = .empty;
+    }
+
+    // The set of HLL sketches the engine maintains and reads (config-seeded plus
+    // any adaptively promoted at runtime).
+    fn hllCardinalities(self: *const Index) []const HllCardinalityConfig {
+        return self.hll_registry.items;
     }
 
     pub fn storageNamespace(self: *const Index) []const u8 {
@@ -3277,7 +3411,27 @@ pub const Index = struct {
         self.resource_manager = manager;
     }
 
+    /// Attaches a durable-job lane so HLL cardinality rebuilds (after deletes or
+    /// overwrites) run as background maintenance work rather than on a read.
+    /// `owner_id` is used to drain pending rebuilds when the index closes.
+    pub fn attachHllMaintenanceLane(self: *Index, lane: background_runtime.DurableJobLane, owner_id: u64) void {
+        self.hll_maintenance_lane = lane;
+        self.hll_maintenance_owner_id = owner_id;
+    }
+
+    // Acquires the index write lock, spinning/yielding (the codebase's pattern
+    // for std.atomic.Mutex, which has no blocking lock()). Held only around a
+    // write transaction, so contention is brief.
+    fn lockWrites(self: *Index) void {
+        while (!self.write_mutex.tryLock()) std.Thread.yield() catch {};
+    }
+
+    fn unlockWrites(self: *Index) void {
+        self.write_mutex.unlock();
+    }
+
     pub fn close(self: *Index) void {
+        if (self.hll_maintenance_lane) |lane| lane.drainOwner(self.hll_maintenance_owner_id);
         self.clearAccumulatorResourceUsage(&self.append_only_accumulator_resource_bytes);
         self.clearAccumulatorResourceUsage(&self.maintenance_accumulator_resource_bytes);
         self.alloc.free(self.name);
@@ -3288,6 +3442,7 @@ pub const Index = struct {
         self.clearObservedQueryState();
         self.invalidateAdaptiveReadySpecCache();
         self.clearBulkDirtyPathPromotionDictionaries();
+        self.freeHllRegistry();
         self.parsed.deinit();
         self.* = undefined;
     }
@@ -3356,6 +3511,23 @@ pub const Index = struct {
         batch: derived_types.DerivedBatch,
         options: ApplyOptions,
     ) !void {
+        // Serialize against concurrent background HLL maintenance (which opens
+        // its own write txn on another thread); the store is single-writer.
+        // Scheduling runs after the lock is released — it only opens a read txn
+        // and submits a job, and must not be held while doing so.
+        try self.applyBatchWritesLocked(store, batch, options);
+        self.scheduleHllMaintenanceIfDirty(store);
+    }
+
+    fn applyBatchWritesLocked(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        batch: derived_types.DerivedBatch,
+        options: ApplyOptions,
+    ) !void {
+        self.lockWrites();
+        defer self.unlockWrites();
+
         if (self.canUseAppendOnlyBulkPath(batch, options) and try self.appendOnlyDocFactsAreMissing(store, batch)) {
             return try self.applyAppendOnlyBatchWithOptions(store, batch, options);
         }
@@ -4073,14 +4245,32 @@ pub const Index = struct {
     ) !?[]FoldEntry {
         if (!self.plannerLifecycleReady()) return null;
         const join_cfg = self.joinConfigByName(request.join.name) orelse return null;
-        const law_id = law_mod.fromOp(request.op);
+        const law_id = request.law orelse law_mod.fromOp(request.op);
         const proof = join_mod.queryRewriteProof(join_cfg, request.join, .{
             .kind = .derived_distributive_fold,
             .law_id = law_id,
             .bounded_fanout = join_cfg.max_fanout != null,
         });
         if (!proof.safe()) return null;
-        if (request.op != .count and request.measure == null) return null;
+        // Every law except count reduces a measure field's value, so it must be
+        // present (HLL needs it to build the per-pair singleton sketch).
+        if (law_id != .count and request.measure == null) return null;
+
+        // Adaptive: record the join key as a distinct-count shape so maintenance
+        // promotes an NDV sketch that powers the fanout pre-gate below. Only for
+        // unconstrained, non-MVCC reads (what such a sketch can serve).
+        if (generation == null and request.constraints.len == 0) {
+            if (singleJoinKeyFieldName(join_cfg, .right)) |key_field| {
+                self.observeCardinalityForAdaptive(store, null, key_field);
+            }
+        }
+        // Guaranteed-blowup pre-gate: if the average right-side fanout already
+        // exceeds max_fanout, some join key must exceed it, so the scan is bound
+        // to raise AlgebraicJoinFanoutExceeded. Raise it now, before the O(left x
+        // fanout) scan, rather than after. A join aggregation has no correct
+        // cheaper fallback (a join-free count answers a different question), so
+        // this stays a hard error — just a fast one.
+        if (try self.derivedJoinFanoutGuaranteedExceeds(store, join_cfg)) return error.AlgebraicJoinFanoutExceeded;
 
         var txn = try store.beginReadTxn();
         defer txn.abort();
@@ -5022,8 +5212,8 @@ pub const Index = struct {
             partials.deinit(self.alloc);
         }
 
-        const child_indexes = (try self.buildChildCardinalityIndexesAlloc(store, child_requests)) orelse return null;
-        defer self.freeChildCardinalityIndexes(child_indexes);
+        var child_indexes = (try self.buildChildCardinalityIndexesAlloc(store, child_requests)) orelse return null;
+        defer child_indexes.deinit(self);
 
         for (ranges) |range| {
             const filter_json = try self.rangeCardinalityFilterJsonAlloc(field_or_path, kind, range);
@@ -5044,7 +5234,7 @@ pub const Index = struct {
             const axis = try rangeCardinalityAxisAlloc(self.alloc, kind, range);
             defer self.alloc.free(axis);
             try self.appendDistributedCountPartial(&partials, axis, aggregation_name, @intCast(bucket_ids.len));
-            for (child_requests, child_indexes) |child, *child_index| {
+            for (child_requests, child_indexes.indexes) |child, *child_index| {
                 try self.appendBucketChildCardinalityPartials(&partials, axis, .raw, child.name, child_index, bucket_ids);
             }
         }
@@ -5116,7 +5306,9 @@ pub const Index = struct {
                 for (item.doc_ids.items) |existing| {
                     if (std.mem.eql(u8, existing, doc_id)) return;
                 }
-                try item.doc_ids.append(alloc, try alloc.dupe(u8, doc_id));
+                const owned_doc_id = try alloc.dupe(u8, doc_id);
+                errdefer alloc.free(owned_doc_id);
+                try item.doc_ids.append(alloc, owned_doc_id);
             }
 
             fn deinit(item: *@This(), alloc: Allocator) void {
@@ -5164,7 +5356,7 @@ pub const Index = struct {
                 });
                 break :blk &buckets.items[buckets.items.len - 1];
             };
-            try bucket.doc_ids.append(self.alloc, try self.alloc.dupe(u8, entry.doc_id));
+            try bucket.appendDocId(self.alloc, entry.doc_id);
         }
 
         var partials = std.ArrayListUnmanaged(distributed_mod.Partial).empty;
@@ -5177,11 +5369,11 @@ pub const Index = struct {
             partials.deinit(self.alloc);
         }
 
-        const child_indexes = (try self.buildChildCardinalityIndexesAlloc(store, child_requests)) orelse return null;
-        defer self.freeChildCardinalityIndexes(child_indexes);
+        var child_indexes = (try self.buildChildCardinalityIndexesAlloc(store, child_requests)) orelse return null;
+        defer child_indexes.deinit(self);
         for (buckets.items) |bucket| {
             try self.appendDistributedCountPartial(&partials, bucket.axis, aggregation_name, @intCast(bucket.doc_ids.items.len));
-            for (child_requests, child_indexes) |child, *child_index| {
+            for (child_requests, child_indexes.indexes) |child, *child_index| {
                 try self.appendBucketChildCardinalityPartials(&partials, bucket.axis, .raw, child.name, child_index, bucket.doc_ids.items);
             }
         }
@@ -5292,7 +5484,9 @@ pub const Index = struct {
                 for (item.doc_ids.items) |existing| {
                     if (std.mem.eql(u8, existing, doc_id)) return;
                 }
-                try item.doc_ids.append(alloc, try alloc.dupe(u8, doc_id));
+                const owned_doc_id = try alloc.dupe(u8, doc_id);
+                errdefer alloc.free(owned_doc_id);
+                try item.doc_ids.append(alloc, owned_doc_id);
             }
 
             fn deinit(item: *@This(), alloc: Allocator) void {
@@ -5356,7 +5550,7 @@ pub const Index = struct {
                 try buckets.append(self.alloc, .{ .axis = try self.alloc.dupe(u8, axis) });
                 break :blk &buckets.items[buckets.items.len - 1];
             };
-            try bucket.doc_ids.append(self.alloc, try self.alloc.dupe(u8, doc_component.payload));
+            try bucket.appendDocId(self.alloc, doc_component.payload);
         }
 
         var partials = std.ArrayListUnmanaged(distributed_mod.Partial).empty;
@@ -5368,11 +5562,11 @@ pub const Index = struct {
             }
             partials.deinit(self.alloc);
         }
-        const child_indexes = (try self.buildChildCardinalityIndexesAlloc(store, child_requests)) orelse return null;
-        defer self.freeChildCardinalityIndexes(child_indexes);
+        var child_indexes = (try self.buildChildCardinalityIndexesAlloc(store, child_requests)) orelse return null;
+        defer child_indexes.deinit(self);
         for (buckets.items) |bucket| {
             try self.appendDistributedCountPartial(&partials, bucket.axis, aggregation_name, @intCast(bucket.doc_ids.items.len));
-            for (child_requests, child_indexes) |child, *child_index| {
+            for (child_requests, child_indexes.indexes) |child, *child_index| {
                 try self.appendBucketChildCardinalityPartials(&partials, bucket.axis, .raw, child.name, child_index, bucket.doc_ids.items);
             }
         }
@@ -5405,7 +5599,9 @@ pub const Index = struct {
                 for (item.doc_ids.items) |existing| {
                     if (std.mem.eql(u8, existing, doc_id)) return;
                 }
-                try item.doc_ids.append(alloc, try alloc.dupe(u8, doc_id));
+                const owned_doc_id = try alloc.dupe(u8, doc_id);
+                errdefer alloc.free(owned_doc_id);
+                try item.doc_ids.append(alloc, owned_doc_id);
             }
 
             fn deinit(item: *@This(), alloc: Allocator) void {
@@ -5457,11 +5653,11 @@ pub const Index = struct {
             partials.deinit(self.alloc);
         }
 
-        const child_indexes = (try self.buildChildCardinalityIndexesAlloc(store, child_requests)) orelse return null;
-        defer self.freeChildCardinalityIndexes(child_indexes);
+        var child_indexes = (try self.buildChildCardinalityIndexesAlloc(store, child_requests)) orelse return null;
+        defer child_indexes.deinit(self);
         for (buckets.items) |bucket| {
             try self.appendDistributedCountPartial(&partials, bucket.axis, terms_aggregation_name, @intCast(bucket.doc_ids.items.len));
-            for (child_requests, child_indexes) |child, *child_index| {
+            for (child_requests, child_indexes.indexes) |child, *child_index| {
                 try self.appendBucketChildCardinalityPartials(&partials, bucket.axis, .raw, child.name, child_index, bucket.doc_ids.items);
             }
         }
@@ -5489,7 +5685,9 @@ pub const Index = struct {
                 for (item.doc_ids.items) |existing| {
                     if (std.mem.eql(u8, existing, doc_id)) return;
                 }
-                try item.doc_ids.append(alloc, try alloc.dupe(u8, doc_id));
+                const owned_doc_id = try alloc.dupe(u8, doc_id);
+                errdefer alloc.free(owned_doc_id);
+                try item.doc_ids.append(alloc, owned_doc_id);
             }
 
             fn deinit(item: *@This(), alloc: Allocator) void {
@@ -5551,19 +5749,92 @@ pub const Index = struct {
             }
             partials.deinit(self.alloc);
         }
-        const child_indexes = (try self.buildChildCardinalityIndexesAlloc(store, child_requests)) orelse return null;
-        defer self.freeChildCardinalityIndexes(child_indexes);
+        var child_indexes = (try self.buildChildCardinalityIndexesAlloc(store, child_requests)) orelse return null;
+        defer child_indexes.deinit(self);
         for (buckets.items) |bucket| {
             const count_value = try algebra.encodeI64Alloc(self.alloc, @intCast(bucket.doc_ids.items.len));
             defer self.alloc.free(count_value);
             try self.appendDistributedPartialForCanonicalAxis(&partials, bucket.axis, terms_aggregation_name, .count, count_value);
-            for (child_requests, child_indexes) |child, *child_index| {
+            for (child_requests, child_indexes.indexes) |child, *child_index| {
                 try self.appendBucketChildCardinalityPartials(&partials, bucket.axis, .canonical, child.name, child_index, bucket.doc_ids.items);
             }
         }
 
         return try partials.toOwnedSlice(self.alloc);
     }
+
+    const default_child_cardinality_cache_bytes: usize = 32 * 1024 * 1024;
+
+    // Strict per-query allocator used by the transient child-cardinality cache.
+    // Unlike an entry-count estimate, accounting allocator requests also bounds
+    // hash-table/list capacity and protects against unusually large IDs/values.
+    const CardinalityCacheAllocator = struct {
+        backing: Allocator,
+        limit_bytes: usize,
+        live_bytes: usize = 0,
+        budget_denied: bool = false,
+
+        fn allocator(self: *CardinalityCacheAllocator) Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+
+        fn reserve(self: *CardinalityCacheAllocator, bytes: usize) bool {
+            const next = std.math.add(usize, self.live_bytes, bytes) catch {
+                self.budget_denied = true;
+                return false;
+            };
+            if (next > self.limit_bytes) {
+                self.budget_denied = true;
+                return false;
+            }
+            self.live_bytes = next;
+            return true;
+        }
+
+        fn release(self: *CardinalityCacheAllocator, bytes: usize) void {
+            std.debug.assert(bytes <= self.live_bytes);
+            self.live_bytes -= bytes;
+        }
+
+        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *CardinalityCacheAllocator = @ptrCast(@alignCast(ctx));
+            if (!self.reserve(len)) return null;
+            return self.backing.rawAlloc(len, alignment, ret_addr) orelse {
+                self.release(len);
+                return null;
+            };
+        }
+
+        fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+            const self: *CardinalityCacheAllocator = @ptrCast(@alignCast(ctx));
+            const growth = new_len -| memory.len;
+            if (growth > 0 and !self.reserve(growth)) return false;
+            if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) {
+                if (growth > 0) self.release(growth);
+                return false;
+            }
+            if (new_len < memory.len) self.release(memory.len - new_len);
+            return true;
+        }
+
+        fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+            const self: *CardinalityCacheAllocator = @ptrCast(@alignCast(ctx));
+            const growth = new_len -| memory.len;
+            if (growth > 0 and !self.reserve(growth)) return null;
+            const ptr = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse {
+                if (growth > 0) self.release(growth);
+                return null;
+            };
+            if (new_len < memory.len) self.release(memory.len - new_len);
+            return ptr;
+        }
+
+        fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *CardinalityCacheAllocator = @ptrCast(@alignCast(ctx));
+            self.backing.rawFree(memory, alignment, ret_addr);
+            self.release(memory.len);
+        }
+    };
 
     // Per-document index of distinct cardinality value-keys for one child
     // field, populated with a single cursor scan over that field. Bucketed
@@ -5587,15 +5858,28 @@ pub const Index = struct {
 
         fn add(self: *ChildCardinalityIndex, alloc: Allocator, doc_id: []const u8, value_key: []const u8) !void {
             const gop = try self.by_doc.getOrPut(alloc, doc_id);
+            var inserted = false;
             if (!gop.found_existing) {
-                errdefer _ = self.by_doc.remove(doc_id);
-                gop.key_ptr.* = try alloc.dupe(u8, doc_id);
                 gop.value_ptr.* = .empty;
+                gop.key_ptr.* = alloc.dupe(u8, doc_id) catch |err| {
+                    _ = self.by_doc.remove(doc_id);
+                    return err;
+                };
+                inserted = true;
             }
+            errdefer if (inserted) {
+                const owned_key = gop.key_ptr.*;
+                var owned_values = gop.value_ptr.*;
+                _ = self.by_doc.remove(doc_id);
+                owned_values.deinit(alloc);
+                alloc.free(owned_key);
+            };
             for (gop.value_ptr.items) |existing| {
                 if (std.mem.eql(u8, existing, value_key)) return;
             }
-            try gop.value_ptr.append(alloc, try alloc.dupe(u8, value_key));
+            const owned_value = try alloc.dupe(u8, value_key);
+            errdefer alloc.free(owned_value);
+            try gop.value_ptr.append(alloc, owned_value);
         }
 
         fn valuesFor(self: *const ChildCardinalityIndex, doc_id: []const u8) []const []u8 {
@@ -5604,46 +5888,78 @@ pub const Index = struct {
         }
     };
 
+    const ChildCardinalityIndexes = struct {
+        indexes: []ChildCardinalityIndex,
+        cache_allocator: *CardinalityCacheAllocator,
+
+        fn deinit(self: *ChildCardinalityIndexes, index: *Index) void {
+            const cache_alloc = self.cache_allocator.allocator();
+            for (self.indexes) |*child_index| child_index.deinit(cache_alloc);
+            cache_alloc.free(self.indexes);
+            std.debug.assert(self.cache_allocator.live_bytes == 0);
+            index.alloc.destroy(self.cache_allocator);
+            self.* = undefined;
+        }
+    };
+
     fn buildChildCardinalityIndexAlloc(
         self: *Index,
         store: *docstore_mod.DocStore,
         field_or_path: []const u8,
+        cache_alloc: Allocator,
     ) !?ChildCardinalityIndex {
         var index = ChildCardinalityIndex{};
-        errdefer index.deinit(self.alloc);
+        errdefer index.deinit(cache_alloc);
         if (isExplicitJsonPointerPath(field_or_path)) {
-            try self.collectPathCardinalityValuesByDoc(store, field_or_path, &index);
+            try self.collectPathCardinalityValuesByDoc(store, field_or_path, &index, cache_alloc);
         } else {
             const field = self.uniqueExistingFactField(field_or_path) orelse return null;
-            try self.collectDocFactCardinalityValuesByDoc(store, field, &index);
+            try self.collectDocFactCardinalityValuesByDoc(store, field, &index, cache_alloc);
         }
         return index;
     }
 
     // Builds one ChildCardinalityIndex per child request. Returns null (so the
-    // caller falls back to a document scan) if any child field is unsupported,
-    // mirroring the per-bucket scanDistributedCardinalityPartialsForDocIds path.
+    // caller falls back to a document scan) if any child field is unsupported or
+    // the exact cache working-set budget is exhausted. Normal fallback owns and
+    // releases every partially-built index just like the error path.
     fn buildChildCardinalityIndexesAlloc(
         self: *Index,
         store: *docstore_mod.DocStore,
         child_requests: []const CardinalityChildRequest,
-    ) !?[]ChildCardinalityIndex {
-        const indexes = try self.alloc.alloc(ChildCardinalityIndex, child_requests.len);
+    ) !?ChildCardinalityIndexes {
+        const cache_allocator = try self.alloc.create(CardinalityCacheAllocator);
+        cache_allocator.* = .{
+            .backing = self.alloc,
+            .limit_bytes = self.config().max_cardinality_cache_bytes orelse default_child_cardinality_cache_bytes,
+        };
+        const cache_alloc = cache_allocator.allocator();
+        var indexes: ?[]ChildCardinalityIndex = null;
         var built: usize = 0;
-        errdefer {
-            for (indexes[0..built]) |*index| index.deinit(self.alloc);
-            self.alloc.free(indexes);
-        }
+        var transferred = false;
+        defer if (!transferred) {
+            if (indexes) |items| {
+                for (items[0..built]) |*index| index.deinit(cache_alloc);
+                cache_alloc.free(items);
+            }
+            std.debug.assert(cache_allocator.live_bytes == 0);
+            self.alloc.destroy(cache_allocator);
+        };
+
+        indexes = cache_alloc.alloc(ChildCardinalityIndex, child_requests.len) catch |err| {
+            if (err == error.OutOfMemory and cache_allocator.budget_denied) return null;
+            return err;
+        };
         for (child_requests, 0..) |child, i| {
-            indexes[i] = (try self.buildChildCardinalityIndexAlloc(store, child.field)) orelse return null;
+            const child_index = self.buildChildCardinalityIndexAlloc(store, child.field, cache_alloc) catch |err| {
+                if (err == error.OutOfMemory and cache_allocator.budget_denied) return null;
+                return err;
+            };
+            indexes.?[i] = child_index orelse return null;
             built = i + 1;
         }
-        return indexes;
-    }
-
-    fn freeChildCardinalityIndexes(self: *Index, indexes: []ChildCardinalityIndex) void {
-        for (indexes) |*index| index.deinit(self.alloc);
-        self.alloc.free(indexes);
+        transferred = true;
+        return .{ .indexes = indexes.?, .cache_allocator = cache_allocator };
     }
 
     fn collectDocFactCardinalityValuesByDoc(
@@ -5651,6 +5967,7 @@ pub const Index = struct {
         store: *docstore_mod.DocStore,
         field: ExistsFieldSpec,
         index: *ChildCardinalityIndex,
+        cache_alloc: Allocator,
     ) !void {
         const prefix = try self.docFactScalarFieldPrefixAlloc(field.role, field.field);
         defer self.alloc.free(prefix);
@@ -5664,7 +5981,7 @@ pub const Index = struct {
             const scalar_component = token.componentAt(entry.key, prefix.len) catch continue;
             const doc_component = token.componentAt(entry.key, scalar_component.next) catch continue;
             if (doc_component.next != entry.key.len) continue;
-            try index.add(self.alloc, doc_component.payload, scalar_component.payload);
+            try index.add(cache_alloc, doc_component.payload, scalar_component.payload);
         }
     }
 
@@ -5673,6 +5990,7 @@ pub const Index = struct {
         store: *docstore_mod.DocStore,
         path: []const u8,
         index: *ChildCardinalityIndex,
+        cache_alloc: Allocator,
     ) !void {
         const prefix = try self.pathLookupPathPrefixAlloc(path);
         defer self.alloc.free(prefix);
@@ -5690,7 +6008,7 @@ pub const Index = struct {
             if (doc_component.next != entry.key.len) continue;
             const value_key = try token.canonicalTupleAlloc(self.alloc, &.{ kind_component.payload, value_component.payload });
             defer self.alloc.free(value_key);
-            try index.add(self.alloc, doc_component.payload, value_key);
+            try index.add(cache_alloc, doc_component.payload, value_key);
         }
     }
 
@@ -6224,25 +6542,28 @@ pub const Index = struct {
                 else => return err,
             };
             defer facts.deinit(self.alloc);
-            const measure = (try self.factMeasureAlloc(facts.facts, resolved.field.name)) orelse continue;
-            defer measure.deinit(self.alloc);
-            const contribution = switch (op) {
-                .sum, .min, .max => try self.alloc.dupe(u8, measure.raw),
-                .sumsquares => blk: {
-                    const numeric = try algebra.parseF64(measure.raw);
-                    break :blk try algebra.encodeF64Alloc(self.alloc, numeric * numeric);
-                },
-                .avg => blk: {
-                    const numeric = try algebra.parseF64(measure.raw);
-                    break :blk try algebra.encodeAvgAlloc(self.alloc, .{ .sum = numeric, .count = 1 });
-                },
-                .count => unreachable,
-            };
-            defer self.alloc.free(contribution);
-            const next = try tensor_mod.mergeOneSlotValuesAlloc(self.alloc, law_id, raw, contribution);
-            if (raw) |old| self.alloc.free(old);
-            raw = next;
-            found = true;
+            for (facts.facts) |fact| {
+                if (fact.role != .measure or !std.mem.eql(u8, fact.field, resolved.field.name)) continue;
+                const measure = try self.factMeasureFromScalarAlloc(fact.scalar);
+                defer measure.deinit(self.alloc);
+                const contribution = switch (op) {
+                    .sum, .min, .max => try self.alloc.dupe(u8, measure.raw),
+                    .sumsquares => blk: {
+                        const numeric = try algebra.parseF64(measure.raw);
+                        break :blk try algebra.encodeF64Alloc(self.alloc, numeric * numeric);
+                    },
+                    .avg => blk: {
+                        const numeric = try algebra.parseF64(measure.raw);
+                        break :blk try algebra.encodeAvgAlloc(self.alloc, .{ .sum = numeric, .count = 1 });
+                    },
+                    .count => unreachable,
+                };
+                defer self.alloc.free(contribution);
+                const next = try tensor_mod.mergeOneSlotValuesAlloc(self.alloc, law_id, raw, contribution);
+                if (raw) |old| self.alloc.free(old);
+                raw = next;
+                found = true;
+            }
         }
         if (!found) return null;
         return raw;
@@ -10953,37 +11274,58 @@ pub const Index = struct {
             };
             defer facts.deinit(self.alloc);
             if (!docFactsMatchEncodedDerivedConstraints(facts.facts, encoded_constraints.items)) continue;
-            const bucket_key = (try self.docFactBucketFoldGroupKeyAlloc(facts.facts, request)) orelse continue;
-            defer self.alloc.free(bucket_key);
-            const measure_value = if (request.measure) |measure_name|
-                try self.factMeasureAlloc(facts.facts, measure_name)
-            else
-                null;
-            defer if (measure_value) |value| value.deinit(self.alloc);
-            const contribution = self.docFactBucketFoldContributionAlloc(request.op, measure_value) catch |err| switch (err) {
-                error.MissingField, error.AlgebraicLawNotInvertible => continue,
-                else => return err,
-            };
-            defer self.alloc.free(contribution);
-            try accumulator.add(self.alloc, bucket_key, law_id, contribution);
+            const bucket_keys = try self.docFactBucketFoldGroupKeysAlloc(facts.facts, request);
+            defer {
+                for (bucket_keys) |bucket_key| self.alloc.free(bucket_key);
+                if (bucket_keys.len > 0) self.alloc.free(bucket_keys);
+            }
+            if (bucket_keys.len == 0) continue;
+
+            if (request.op == .count) {
+                const contribution = try algebra.encodeI64Alloc(self.alloc, 1);
+                defer self.alloc.free(contribution);
+                for (bucket_keys) |bucket_key| try accumulator.add(self.alloc, bucket_key, law_id, contribution);
+                continue;
+            }
+
+            const measure_name = request.measure orelse return error.InvalidAlgebraicConfig;
+            for (facts.facts) |fact| {
+                if (fact.role != .measure or !std.mem.eql(u8, fact.field, measure_name)) continue;
+                const measure_value = try self.factMeasureFromScalarAlloc(fact.scalar);
+                defer measure_value.deinit(self.alloc);
+                const contribution = self.docFactBucketFoldContributionAlloc(request.op, measure_value) catch |err| switch (err) {
+                    error.MissingField, error.AlgebraicLawNotInvertible => continue,
+                    else => return err,
+                };
+                defer self.alloc.free(contribution);
+                for (bucket_keys) |bucket_key| try accumulator.add(self.alloc, bucket_key, law_id, contribution);
+            }
         }
         return try accumulator.entriesAlloc(self.alloc);
     }
 
     fn docFactsMatchEncodedDerivedConstraints(facts: []const fact_mod.Fact, constraints: []const EncodedDerivedConstraint) bool {
         for (constraints) |constraint| {
-            const scalar = fact_mod.findScalar(facts, .group, constraint.field) orelse return false;
-            if (!std.mem.eql(u8, scalar, constraint.scalar)) return false;
+            var matched = false;
+            for (facts) |fact| {
+                if (fact.role == .group and
+                    std.mem.eql(u8, fact.field, constraint.field) and
+                    std.mem.eql(u8, fact.scalar, constraint.scalar))
+                {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) return false;
         }
         return true;
     }
 
-    fn docFactBucketFoldGroupKeyAlloc(
+    fn docFactBucketFoldGroupKeyForScalarAlloc(
         self: *Index,
-        facts: []const fact_mod.Fact,
+        scalar: []const u8,
         request: DocFactBucketFoldRequest,
     ) !?[]u8 {
-        const scalar = fact_mod.findScalar(facts, request.bucket_role, request.bucket_field) orelse return null;
         const text = try token.scalarTokenTextAlloc(self.alloc, scalar);
         defer self.alloc.free(text);
         return switch (request.kind) {
@@ -11010,6 +11352,33 @@ pub const Index = struct {
                 break :blk try token.canonicalTupleAlloc(self.alloc, &.{ start, end });
             },
         };
+    }
+
+    fn docFactBucketFoldGroupKeysAlloc(
+        self: *Index,
+        facts: []const fact_mod.Fact,
+        request: DocFactBucketFoldRequest,
+    ) ![][]u8 {
+        var keys = std.ArrayListUnmanaged([]u8).empty;
+        errdefer {
+            for (keys.items) |key| self.alloc.free(key);
+            keys.deinit(self.alloc);
+        }
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        defer seen.deinit(self.alloc);
+
+        for (facts) |fact| {
+            if (fact.role != request.bucket_role or !std.mem.eql(u8, fact.field, request.bucket_field)) continue;
+            const key = (try self.docFactBucketFoldGroupKeyForScalarAlloc(fact.scalar, request)) orelse continue;
+            const gop = try seen.getOrPut(self.alloc, key);
+            if (gop.found_existing) {
+                self.alloc.free(key);
+                continue;
+            }
+            gop.key_ptr.* = key;
+            try keys.append(self.alloc, key);
+        }
+        return try keys.toOwnedSlice(self.alloc);
     }
 
     fn docFactNumericRangeMatches(value: f64, request: DocFactBucketFoldRequest) bool {
@@ -12865,6 +13234,17 @@ pub const Index = struct {
         try raw_txn.commit();
     }
 
+    // Estimated stored-row count for a not-yet-built grouped materialization:
+    // it stores one row per distinct group-key value, i.e. the NDV of the group
+    // key. Returns that from a current HLL sketch when one covers the (single)
+    // group field, else null so the caller falls back to the doc_rows
+    // overestimate. Only the single-field, time-less case has a directly
+    // applicable sketch; this never raises the estimate above doc_rows.
+    fn adaptiveGroupKeyNdvEstimate(self: *Index, store: *docstore_mod.DocStore, spec: AdaptiveMaterializationSpec) !?u64 {
+        if (spec.time != null or spec.group_by.len != 1) return null;
+        return try self.approxCardinalityTotalForFieldAlloc(store, spec.group_by[0], &.{}, null);
+    }
+
     fn adaptiveCostInputs(
         self: *Index,
         store: *docstore_mod.DocStore,
@@ -12922,7 +13302,7 @@ pub const Index = struct {
         else if (spec.group_by.len == 0 and spec.time == null)
             1
         else
-            doc_rows;
+            (try self.adaptiveGroupKeyNdvEstimate(store, spec)) orelse doc_rows;
         const write_amplification = if (spec.path_promotion_path != null)
             @as(u64, 1)
         else
@@ -14073,40 +14453,161 @@ pub const Index = struct {
         facts: []const fact_mod.Fact,
         sign: i8,
     ) !void {
-        const axes_canonical = fact_mod.axisTupleAlloc(self.alloc, facts, spec.group_by) catch |err| switch (err) {
+        var projection = self.adaptiveFactProjectionAlloc(spec, facts) catch |err| switch (err) {
             error.MissingField => return,
             else => return err,
         };
-        defer self.alloc.free(axes_canonical);
+        defer projection.deinit(self.alloc);
+        const law_id = law_mod.fromOp(spec.op);
+        for (projection.axes) |axes_canonical| {
+            for (projection.buckets) |bucket_start| {
+                if (spec.op == .count) {
+                    const delta = try self.adaptiveTensorDeltaAlloc(spec.op, null, sign);
+                    defer self.alloc.free(delta);
+                    try self.applyAdaptiveTensorFactDeltaTxn(txn, spec, axes_canonical, bucket_start, law_id, delta);
+                } else {
+                    for (projection.measures) |measure_value| {
+                        const delta = try self.adaptiveTensorDeltaAlloc(spec.op, measure_value, sign);
+                        defer self.alloc.free(delta);
+                        try self.applyAdaptiveTensorFactDeltaTxn(txn, spec, axes_canonical, bucket_start, law_id, delta);
+                    }
+                }
+            }
+        }
+    }
+
+    fn updateAdaptiveTensorFromFactsAppendOnly(
+        self: *Index,
+        txn: anytype,
+        accumulator: *AppendOnlyAccumulator,
+        spec: AdaptiveMaterializationSpec,
+        facts: []const fact_mod.Fact,
+    ) !void {
+        var projection = self.adaptiveFactProjectionAlloc(spec, facts) catch |err| switch (err) {
+            error.MissingField => return,
+            else => return err,
+        };
+        defer projection.deinit(self.alloc);
+        const law_id = law_mod.fromOp(spec.op);
+        for (projection.axes) |axes_canonical| {
+            for (projection.buckets) |bucket_start| {
+                if (spec.op == .count) {
+                    const delta = try self.adaptiveTensorDeltaAlloc(spec.op, null, 1);
+                    defer self.alloc.free(delta);
+                    try self.accumulateAdaptiveTensorDeltaAppendOnly(txn, accumulator, spec, axes_canonical, bucket_start, law_id, delta);
+                } else {
+                    for (projection.measures) |measure_value| {
+                        const delta = try self.adaptiveTensorDeltaAlloc(spec.op, measure_value, 1);
+                        defer self.alloc.free(delta);
+                        try self.accumulateAdaptiveTensorDeltaAppendOnly(txn, accumulator, spec, axes_canonical, bucket_start, law_id, delta);
+                    }
+                }
+            }
+        }
+    }
+
+    fn updateAdaptiveTensorFromFactsCoalesced(
+        self: *Index,
+        txn: anytype,
+        accumulator: *AppendOnlyAccumulator,
+        spec: AdaptiveMaterializationSpec,
+        facts: []const fact_mod.Fact,
+        sign: i8,
+    ) !void {
+        var projection = self.adaptiveFactProjectionAlloc(spec, facts) catch |err| switch (err) {
+            error.MissingField => return,
+            else => return err,
+        };
+        defer projection.deinit(self.alloc);
+        const law_id = law_mod.fromOp(spec.op);
+        for (projection.axes) |axes_canonical| {
+            for (projection.buckets) |bucket_start| {
+                if (spec.op == .count) {
+                    const delta = try self.adaptiveTensorDeltaAlloc(spec.op, null, sign);
+                    defer self.alloc.free(delta);
+                    try self.accumulateAdaptiveTensorDelta(txn, accumulator, spec, axes_canonical, bucket_start, law_id, delta);
+                } else {
+                    for (projection.measures) |measure_value| {
+                        const delta = try self.adaptiveTensorDeltaAlloc(spec.op, measure_value, sign);
+                        defer self.alloc.free(delta);
+                        try self.accumulateAdaptiveTensorDelta(txn, accumulator, spec, axes_canonical, bucket_start, law_id, delta);
+                    }
+                }
+            }
+        }
+    }
+
+    fn adaptiveFactProjectionAlloc(
+        self: *Index,
+        spec: AdaptiveMaterializationSpec,
+        facts: []const fact_mod.Fact,
+    ) !AdaptiveFactProjection {
+        var projection = AdaptiveFactProjection{};
+        errdefer projection.deinit(self.alloc);
+        projection.axes = try fact_mod.axisTuplesAlloc(self.alloc, facts, spec.group_by);
+
+        var buckets = std.ArrayListUnmanaged(?[]u8).empty;
+        defer buckets.deinit(self.alloc);
+        if (spec.time) |time_name| {
+            const bucket = cylinder.Bucket.parse(spec.bucket orelse return error.MissingField) orelse return error.MissingField;
+            for (facts) |item| {
+                if (item.role != .time or !std.mem.eql(u8, item.field, time_name)) continue;
+                const time_value = try token.scalarTokenTextAlloc(self.alloc, item.scalar);
+                defer self.alloc.free(time_value);
+                const bucket_start = try cylinder.bucketStartAlloc(self.alloc, bucket, time_value);
+                var duplicate = false;
+                for (buckets.items) |existing| {
+                    if (std.mem.eql(u8, existing.?, bucket_start)) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate) {
+                    self.alloc.free(bucket_start);
+                    continue;
+                }
+                errdefer self.alloc.free(bucket_start);
+                try buckets.append(self.alloc, bucket_start);
+            }
+            if (buckets.items.len == 0) return error.MissingField;
+        } else {
+            try buckets.append(self.alloc, null);
+        }
+        projection.buckets = try buckets.toOwnedSlice(self.alloc);
+
+        if (spec.op != .count) {
+            const measure_name = spec.measure orelse return error.MissingField;
+            var measures = std.ArrayListUnmanaged(MeasureValue).empty;
+            defer measures.deinit(self.alloc);
+            for (facts) |item| {
+                if (item.role != .measure or !std.mem.eql(u8, item.field, measure_name)) continue;
+                const measure = try self.factMeasureFromScalarAlloc(item.scalar);
+                errdefer measure.deinit(self.alloc);
+                try measures.append(self.alloc, measure);
+            }
+            if (measures.items.len == 0) return error.MissingField;
+            projection.measures = try measures.toOwnedSlice(self.alloc);
+        }
+        return projection;
+    }
+
+    fn applyAdaptiveTensorFactDeltaTxn(
+        self: *Index,
+        txn: anytype,
+        spec: AdaptiveMaterializationSpec,
+        axes_canonical: []const u8,
+        bucket_start: ?[]const u8,
+        law_id: law_mod.Id,
+        delta: []const u8,
+    ) !void {
         const axes_id = try self.ensureSymbol(txn, axes_canonical);
         self.alloc.free(axes_id);
-
-        const measure_value = if (spec.measure) |measure_name|
-            try self.factMeasureAlloc(facts, measure_name)
-        else
-            null;
-        defer if (measure_value) |value| value.deinit(self.alloc);
-
-        var bucket_start: ?[]u8 = null;
-        defer if (bucket_start) |value| self.alloc.free(value);
-        if (spec.time) |time_name| {
-            const bucket_name = spec.bucket orelse return;
-            const bucket = cylinder.Bucket.parse(bucket_name) orelse return;
-            const time_value = (try self.factTimeTextAlloc(facts, time_name)) orelse return;
-            defer self.alloc.free(time_value);
-            bucket_start = try cylinder.bucketStartAlloc(self.alloc, bucket, time_value);
-        }
-
-        const law_id = law_mod.fromOp(spec.op);
-        const delta = try self.adaptiveTensorDeltaAlloc(spec.op, measure_value, sign);
-        defer self.alloc.free(delta);
         const key = try tensor_mod.keyAlloc(self.alloc, self.storage_namespace, .{
             .materialization = spec.name,
             .axes_canonical = axes_canonical,
             .bucket = bucket_start,
         });
         defer self.alloc.free(key);
-
         const existing = txn.get(key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
@@ -14121,79 +14622,7 @@ pub const Index = struct {
                 else => return err,
             };
         }
-
         try self.applyAdaptiveExpressionDeltaTxn(txn, spec, axes_canonical, bucket_start, law_id, delta);
-    }
-
-    fn updateAdaptiveTensorFromFactsAppendOnly(
-        self: *Index,
-        txn: anytype,
-        accumulator: *AppendOnlyAccumulator,
-        spec: AdaptiveMaterializationSpec,
-        facts: []const fact_mod.Fact,
-    ) !void {
-        const axes_canonical = fact_mod.axisTupleAlloc(self.alloc, facts, spec.group_by) catch |err| switch (err) {
-            error.MissingField => return,
-            else => return err,
-        };
-        defer self.alloc.free(axes_canonical);
-
-        const measure_value = if (spec.measure) |measure_name|
-            try self.factMeasureAlloc(facts, measure_name)
-        else
-            null;
-        defer if (measure_value) |value| value.deinit(self.alloc);
-
-        var bucket_start: ?[]u8 = null;
-        defer if (bucket_start) |value| self.alloc.free(value);
-        if (spec.time) |time_name| {
-            const bucket_name = spec.bucket orelse return;
-            const bucket = cylinder.Bucket.parse(bucket_name) orelse return;
-            const time_value = (try self.factTimeTextAlloc(facts, time_name)) orelse return;
-            defer self.alloc.free(time_value);
-            bucket_start = try cylinder.bucketStartAlloc(self.alloc, bucket, time_value);
-        }
-
-        const law_id = law_mod.fromOp(spec.op);
-        const delta = try self.adaptiveTensorDeltaAlloc(spec.op, measure_value, 1);
-        defer self.alloc.free(delta);
-        try self.accumulateAdaptiveTensorDeltaAppendOnly(txn, accumulator, spec, axes_canonical, bucket_start, law_id, delta);
-    }
-
-    fn updateAdaptiveTensorFromFactsCoalesced(
-        self: *Index,
-        txn: anytype,
-        accumulator: *AppendOnlyAccumulator,
-        spec: AdaptiveMaterializationSpec,
-        facts: []const fact_mod.Fact,
-        sign: i8,
-    ) !void {
-        const axes_canonical = fact_mod.axisTupleAlloc(self.alloc, facts, spec.group_by) catch |err| switch (err) {
-            error.MissingField => return,
-            else => return err,
-        };
-        defer self.alloc.free(axes_canonical);
-
-        const measure_value = if (spec.measure) |measure_name|
-            try self.factMeasureAlloc(facts, measure_name)
-        else
-            null;
-        defer if (measure_value) |value| value.deinit(self.alloc);
-
-        var bucket_start: ?[]u8 = null;
-        defer if (bucket_start) |value| self.alloc.free(value);
-        if (spec.time) |time_name| {
-            const bucket_name = spec.bucket orelse return;
-            const bucket = cylinder.Bucket.parse(bucket_name) orelse return;
-            const time_value = (try self.factTimeTextAlloc(facts, time_name)) orelse return;
-            defer self.alloc.free(time_value);
-            bucket_start = try cylinder.bucketStartAlloc(self.alloc, bucket, time_value);
-        }
-
-        const law_id = law_mod.fromOp(spec.op);
-        const delta = try self.adaptiveTensorDeltaAlloc(spec.op, measure_value, sign);
-        defer self.alloc.free(delta);
-        try self.accumulateAdaptiveTensorDelta(txn, accumulator, spec, axes_canonical, bucket_start, law_id, delta);
     }
 
     fn updateAdaptiveJoinTensorForChangedFact(
@@ -14925,6 +15354,44 @@ pub const Index = struct {
         return try self.keyAlloc(&.{ "path_profile_history", path, sequence_text });
     }
 
+    // The join key field on a side, when it is a single field (composite keys
+    // have no directly-applicable NDV sketch, so callers skip them).
+    fn singleJoinKeyFieldName(join_cfg: JoinConfig, side: join_mod.Side) ?[]const u8 {
+        const fields = if (side == .left) join_cfg.left_fields else join_cfg.right_fields;
+        if (fields.len != 1) return null;
+        return fields[0];
+    }
+
+    // True only when a derived fold over this join is guaranteed to exceed
+    // max_fanout: when the average right-side fanout (right facts / NDV of the
+    // right join key) already exceeds max_fanout, the maximum per-key fanout
+    // must too (max >= mean), so the scan would raise AlgebraicJoinFanoutExceeded.
+    // Conservative — uses the upper end of the sketch's ~2sigma error band for
+    // the NDV so it never fast-fails a join that might actually fit, and returns
+    // false whenever no current sketch covers the join key.
+    fn derivedJoinFanoutGuaranteedExceeds(self: *Index, store: *docstore_mod.DocStore, join_cfg: JoinConfig) !bool {
+        const max = join_cfg.max_fanout orelse return false;
+        if (max == 0) return false;
+        const key_field = singleJoinKeyFieldName(join_cfg, .right) orelse return false;
+        const ndv = (try self.approxCardinalityTotalForFieldAlloc(store, key_field, &.{}, null)) orelse return false;
+        if (ndv == 0) return false;
+        const rel_err = hll.relativeErrorForPrecision(hll.default_precision);
+        const ndv_upper = saturatedAdd(ndv, @intFromFloat(@as(f64, @floatFromInt(ndv)) * rel_err * 2.0));
+        // Fires when total_right / ndv_real > max_fanout. ndv_upper >= ndv_real,
+        // so total_right > max * ndv_upper implies the real mean exceeds max too.
+        const threshold = saturatedMul(max, @max(ndv_upper, 1));
+        // Bounded scan: we only need to know whether the right-side fact count
+        // exceeds the threshold, so stop counting one past it rather than
+        // walking every fact on each query.
+        const prefix = try self.joinSideFactPrefixAlloc(join_cfg, .right);
+        defer self.alloc.free(prefix);
+        const cap: usize = @intCast(@min(saturatedAdd(threshold, 1), @as(u64, std.math.maxInt(usize))));
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        const count = try self.countRowsWithPrefixUpTo(&txn, prefix, cap);
+        return count > threshold;
+    }
+
     fn joinSideFactPrefixAlloc(self: *Index, join_cfg: JoinConfig, side: join_mod.Side) ![]u8 {
         return try self.keyAlloc(&.{ "jf", join_cfg.name, side.tag() });
     }
@@ -15641,6 +16108,7 @@ pub const Index = struct {
         defer facts.deinit(self.alloc);
 
         try self.applyDocFactDelta(txn, doc_key, facts.facts, -1);
+        try self.markHllCardinalitiesDirtyForFactsTxn(txn, facts.facts);
         try self.applyAdaptiveDocFactDelta(txn, facts.facts, -1, maintenance_context);
         if (self.config().joins.len > 0) {
             try self.applyStoredJoinFactsForDocDelta(txn, doc_key, -1, maintenance_context);
@@ -15709,6 +16177,11 @@ pub const Index = struct {
         }
         if (doc_facts_changed) {
             try self.applyDocFactDelta(txn, doc_key, old_facts.facts, -1);
+            // The old value cannot be subtracted from an HLL sketch, so mark a
+            // materialization dirty when this update changed a field it reads;
+            // the maintenance pass then rebuilds it exactly from surviving facts.
+            // Unrelated field changes (e.g. a measure) leave the sketch alone.
+            try self.markHllCardinalitiesDirtyForUpdateTxn(txn, old_facts.facts, new_facts.facts);
             try self.applyAdaptiveDocFactDelta(txn, old_facts.facts, -1, maintenance_context);
         }
         if (self.config().joins.len > 0) {
@@ -15724,6 +16197,12 @@ pub const Index = struct {
         if (doc_facts_changed) {
             try self.applyAdaptiveDocFactDelta(txn, new_facts.facts, 1, maintenance_context);
             try self.applyDocFactDelta(txn, doc_key, new_facts.facts, 1);
+            // Fold the new value into the sketches so warm reads stay close until
+            // the dirty rebuild lands. Only materializations whose group/value
+            // changed were marked dirty above; folding the others is harmless
+            // (idempotent re-union of a value already present) but we skip it for
+            // the unchanged ones via the same change check.
+            try self.applyHllCardinalitiesForUpdatedFactsTxn(txn, old_facts.facts, new_facts.facts);
         }
         if (self.config().joins.len > 0) {
             try self.applyDocJoinDelta(txn, doc_key, parsed.value, 1, maintenance_context);
@@ -15778,6 +16257,12 @@ pub const Index = struct {
         try txn.put(fact_key, encoded);
         try self.writeDocFactLookupRows(txn, doc_key, facts.facts);
         try self.writePathFacts(txn, doc_key, parsed.value, maintenance_context);
+        // Fold the new document into the HLL cardinality sketches from its facts
+        // (rather than the raw JSON), so this add path, the coalesced-update path,
+        // and the delete-triggered rebuild all tokenize values identically. This
+        // is the single add hook for every fresh-document path (plain ingest and
+        // the append-only bulk path both route through writeDocFacts).
+        try self.applyHllCardinalitiesForFactsTxn(txn, facts.facts);
         self.doc_fact_write_count += 1;
     }
 
@@ -16567,6 +17052,9 @@ pub const Index = struct {
                 };
             }
         }
+        // HLL cardinality sketches are maintained from the written facts in
+        // writeDocFacts (add) / updateDocFactRowsCoalesced (update), not here, so
+        // the incremental and rebuild tokenizations stay identical.
         try self.applyDocJoinDelta(txn, doc_key, parsed.value, sign, maintenance_context);
     }
 
@@ -16989,6 +17477,915 @@ pub const Index = struct {
                 try self.applyConfiguredExpressionMutationTxn(txn, mat, op, group_key, measure_value, sign, .cylinder, bucket_start);
             }
         }
+    }
+
+    const hll_default_precision: u6 = 12;
+
+    fn hllCardinalityPrecision(hcfg: HllCardinalityConfig) u6 {
+        if (hcfg.precision == 0) return hll_default_precision;
+        return @intCast(std.math.clamp(hcfg.precision, @as(u8, hll.min_precision), @as(u8, hll.max_precision)));
+    }
+
+    fn hllCardinalityPrefixAlloc(self: *Index, name: []const u8) ![]u8 {
+        return try self.keyAlloc(&.{ "hllcard", name });
+    }
+
+    fn hllCardinalityKeyAlloc(self: *Index, name: []const u8, group_key: []const u8) ![]u8 {
+        return try self.keyAlloc(&.{ "hllcard", name, group_key });
+    }
+
+    // Folds a freshly-added document's value into the matching per-group HLL
+    // sketches. Driven from the document facts (not the raw JSON) so the group
+    // key and value token are byte-identical to what `rebuildHllCardinalityTxn`
+    // derives from the stored facts — otherwise an incremental estimate and a
+    // post-delete rebuilt estimate could disagree for the same data.
+    fn applyHllCardinalitiesForFactsTxn(self: *Index, txn: anytype, facts: []const fact_mod.Fact) !void {
+        for (self.hllCardinalities()) |hcfg| {
+            try self.applyHllCardinalityForFactsTxn(txn, facts, hcfg);
+        }
+    }
+
+    // Warm-folds the new value of an in-place update into only the sketches
+    // whose group/value actually changed (the ones markHllCardinalitiesDirty-
+    // ForUpdateTxn flagged), keeping the read estimate close until the rebuild.
+    fn applyHllCardinalitiesForUpdatedFactsTxn(
+        self: *Index,
+        txn: anytype,
+        old_facts: []const fact_mod.Fact,
+        new_facts: []const fact_mod.Fact,
+    ) !void {
+        for (self.hllCardinalities()) |hcfg| {
+            if (!hllCardinalityFactsChanged(hcfg, old_facts, new_facts)) continue;
+            try self.applyHllCardinalityForFactsTxn(txn, new_facts, hcfg);
+        }
+    }
+
+    fn applyHllCardinalityForFactsTxn(self: *Index, txn: anytype, facts: []const fact_mod.Fact, hcfg: HllCardinalityConfig) !void {
+        const group_key = fact_mod.axisTupleAlloc(self.alloc, facts, hcfg.group_by) catch |err| switch (err) {
+            error.MissingField => return,
+            else => return err,
+        };
+        defer self.alloc.free(group_key);
+        const value_scalar = fact_mod.findScalar(facts, .group, hcfg.value_field) orelse return;
+
+        const singleton = try hll.singletonEncodedAlloc(self.alloc, hllCardinalityPrecision(hcfg), value_scalar);
+        defer self.alloc.free(singleton);
+
+        const key = try self.hllCardinalityKeyAlloc(hcfg.name, group_key);
+        defer self.alloc.free(key);
+
+        // `current` borrows txn-owned bytes (valid until the next txn write);
+        // the union allocates a fresh buffer before we write it back.
+        const current = txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        const merged = (try law_mod.combineAlloc(self.alloc, .hll, current, singleton)) orelse return;
+        defer self.alloc.free(merged);
+        try txn.put(key, merged);
+    }
+
+    // Whole-materialization dirty marker: forces a full rebuild. Used when the
+    // affected group cannot be derived from the available facts.
+    fn hllCardinalityDirtyKeyAlloc(self: *Index, name: []const u8) ![]u8 {
+        return try self.keyAlloc(&.{ "hllcard_dirty", name });
+    }
+
+    // Per-group dirty marker: `hllcard_gdirty:<name>:<group_key>`. Lets
+    // maintenance rebuild only the affected group rather than rescanning every
+    // document fact in the index.
+    fn hllCardinalityGroupDirtyPrefixAlloc(self: *Index, name: []const u8) ![]u8 {
+        return try self.keyAlloc(&.{ "hllcard_gdirty", name });
+    }
+
+    fn hllCardinalityGroupDirtyKeyAlloc(self: *Index, name: []const u8, group_key: []const u8) ![]u8 {
+        return try self.keyAlloc(&.{ "hllcard_gdirty", name, group_key });
+    }
+
+    // Marks every HLL materialization the removed document contributed to as
+    // needing a rebuild. Sketches cannot subtract a value, so a delete/overwrite
+    // can only be reflected by recomputing the affected groups. The doc's own
+    // facts give the exact group key, so mark just that group; if the group key
+    // cannot be derived, fall back to the whole-materialization marker.
+    fn markHllCardinalitiesDirtyForFactsTxn(self: *Index, txn: anytype, facts: []const fact_mod.Fact) !void {
+        for (self.hllCardinalities()) |hcfg| {
+            if (fact_mod.findScalar(facts, .group, hcfg.value_field) == null) continue;
+            try self.markHllCardinalityDirtyForFactsTxn(txn, hcfg, facts);
+        }
+    }
+
+    fn markHllCardinalityDirtyForFactsTxn(self: *Index, txn: anytype, hcfg: HllCardinalityConfig, facts: []const fact_mod.Fact) !void {
+        const group_key = fact_mod.axisTupleAlloc(self.alloc, facts, hcfg.group_by) catch |err| switch (err) {
+            // Group key not derivable from these facts → conservative full rebuild.
+            error.MissingField => return try self.markHllCardinalityDirtyTxn(txn, hcfg),
+            else => return err,
+        };
+        defer self.alloc.free(group_key);
+        const gkey = try self.hllCardinalityGroupDirtyKeyAlloc(hcfg.name, group_key);
+        defer self.alloc.free(gkey);
+        try txn.put(gkey, "1");
+    }
+
+    fn markHllCardinalityDirtyTxn(self: *Index, txn: anytype, hcfg: HllCardinalityConfig) !void {
+        const dirty_key = try self.hllCardinalityDirtyKeyAlloc(hcfg.name);
+        defer self.alloc.free(dirty_key);
+        try txn.put(dirty_key, "1");
+    }
+
+    // True when `old_facts` and `new_facts` differ in any field the
+    // materialization reads (its group_by axes or its value_field). Used by the
+    // coalesced in-place update path to avoid forcing a full rebuild when a
+    // re-upsert only touched fields the sketch does not depend on.
+    fn hllCardinalityFactsChanged(
+        hcfg: HllCardinalityConfig,
+        old_facts: []const fact_mod.Fact,
+        new_facts: []const fact_mod.Fact,
+    ) bool {
+        if (!scalarEqual(fact_mod.findScalar(old_facts, .group, hcfg.value_field), fact_mod.findScalar(new_facts, .group, hcfg.value_field))) return true;
+        for (hcfg.group_by) |axis| {
+            if (!scalarEqual(fact_mod.findScalar(old_facts, .group, axis), fact_mod.findScalar(new_facts, .group, axis))) return true;
+        }
+        return false;
+    }
+
+    fn scalarEqual(a: ?[]const u8, b: ?[]const u8) bool {
+        if (a == null and b == null) return true;
+        if (a == null or b == null) return false;
+        return std.mem.eql(u8, a.?, b.?);
+    }
+
+    // Marks dirty only the materializations whose group_by/value_field actually
+    // changed between the old and new facts of an in-place update.
+    fn markHllCardinalitiesDirtyForUpdateTxn(
+        self: *Index,
+        txn: anytype,
+        old_facts: []const fact_mod.Fact,
+        new_facts: []const fact_mod.Fact,
+    ) !void {
+        for (self.hllCardinalities()) |hcfg| {
+            // Only relevant if the old doc actually contributed a value to this
+            // sketch; a pure add of the value is handled by the warm fold.
+            if (fact_mod.findScalar(old_facts, .group, hcfg.value_field) == null) continue;
+            if (!hllCardinalityFactsChanged(hcfg, old_facts, new_facts)) continue;
+            // The doc's old group must be recomputed (its value may be gone). If
+            // the update also moved the doc to a different group, that group's
+            // existing sketch is still correct (the warm fold adds the new value)
+            // — but a value moving *out* of the old group requires the old group's
+            // rebuild, which marking the old group below covers.
+            try self.markHllCardinalityDirtyForFactsTxn(txn, hcfg, old_facts);
+        }
+    }
+
+    // Recomputes every per-group sketch for one materialization from the current
+    // document facts, replacing any stale sketches and clearing the dirty marker.
+    fn rebuildHllCardinalityTxn(self: *Index, txn: anytype, hcfg: HllCardinalityConfig) !void {
+        const precision = hllCardinalityPrecision(hcfg);
+
+        // Drop the existing sketches (a group emptied by deletes must disappear).
+        {
+            const prefix = try self.hllCardinalityPrefixAlloc(hcfg.name);
+            defer self.alloc.free(prefix);
+            var stale = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (stale.items) |key| self.alloc.free(key);
+                stale.deinit(self.alloc);
+            }
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var entry_opt = try cursor.seekAtOrAfter(prefix);
+            while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+                if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+                try stale.append(self.alloc, try self.alloc.dupe(u8, entry.key));
+            }
+            for (stale.items) |key| txn.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
+
+        // Rebuild per-group sketches from the surviving document facts.
+        var sketches = std.StringHashMapUnmanaged([]u8).empty;
+        defer {
+            var it = sketches.iterator();
+            while (it.next()) |entry| {
+                self.alloc.free(entry.key_ptr.*);
+                self.alloc.free(entry.value_ptr.*);
+            }
+            sketches.deinit(self.alloc);
+        }
+        {
+            const docfact_prefix = try self.keyAlloc(&.{"docfact"});
+            defer self.alloc.free(docfact_prefix);
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var entry_opt = try cursor.seekAtOrAfter(docfact_prefix);
+            while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+                if (!std.mem.startsWith(u8, entry.key, docfact_prefix)) break;
+                var facts = fact_mod.decodeListAlloc(self.alloc, entry.value) catch continue;
+                defer facts.deinit(self.alloc);
+                const group_key = fact_mod.axisTupleAlloc(self.alloc, facts.facts, hcfg.group_by) catch |err| switch (err) {
+                    error.MissingField => continue,
+                    else => return err,
+                };
+                defer self.alloc.free(group_key);
+                const value_scalar = fact_mod.findScalar(facts.facts, .group, hcfg.value_field) orelse continue;
+                const singleton = try hll.singletonEncodedAlloc(self.alloc, precision, value_scalar);
+                defer self.alloc.free(singleton);
+                const gop = try sketches.getOrPut(self.alloc, group_key);
+                if (!gop.found_existing) {
+                    errdefer _ = sketches.remove(group_key);
+                    gop.key_ptr.* = try self.alloc.dupe(u8, group_key);
+                    gop.value_ptr.* = try self.alloc.dupe(u8, singleton);
+                } else {
+                    const merged = (try law_mod.combineAlloc(self.alloc, .hll, gop.value_ptr.*, singleton)) orelse continue;
+                    self.alloc.free(gop.value_ptr.*);
+                    gop.value_ptr.* = merged;
+                }
+            }
+        }
+
+        var write_it = sketches.iterator();
+        while (write_it.next()) |entry| {
+            const key = try self.hllCardinalityKeyAlloc(hcfg.name, entry.key_ptr.*);
+            defer self.alloc.free(key);
+            try txn.put(key, entry.value_ptr.*);
+        }
+
+        // A full rebuild subsumes any pending per-group markers; clear both the
+        // whole-materialization marker and every per-group marker for it.
+        const dirty_key = try self.hllCardinalityDirtyKeyAlloc(hcfg.name);
+        defer self.alloc.free(dirty_key);
+        txn.delete(dirty_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        try self.clearHllCardinalityGroupDirtyMarkersTxn(txn, hcfg.name);
+    }
+
+    fn clearHllCardinalityGroupDirtyMarkersTxn(self: *Index, txn: anytype, name: []const u8) !void {
+        const gprefix = try self.hllCardinalityGroupDirtyPrefixAlloc(name);
+        defer self.alloc.free(gprefix);
+        var stale = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (stale.items) |key| self.alloc.free(key);
+            stale.deinit(self.alloc);
+        }
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(gprefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, gprefix)) break;
+            try stale.append(self.alloc, try self.alloc.dupe(u8, entry.key));
+        }
+        for (stale.items) |key| txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
+    // Rebuilds a single group's sketch from the surviving documents in that
+    // group, resolving members by intersecting the per-axis docfact scalar
+    // postings rather than scanning every document fact in the index. This is
+    // the O(group members) path; the whole-materialization rebuild remains the
+    // O(all docs) fallback for markers without a derivable group key.
+    fn rebuildHllCardinalityGroupTxn(self: *Index, txn: anytype, hcfg: HllCardinalityConfig, group_key: []const u8) !void {
+        const precision = hllCardinalityPrecision(hcfg);
+        const sketch_key = try self.hllCardinalityKeyAlloc(hcfg.name, group_key);
+        defer self.alloc.free(sketch_key);
+
+        // Decode the group key back into its per-axis scalar tokens so we can
+        // resolve the member document set from the secondary indexes.
+        const axes = token.decodeTupleAlloc(self.alloc, group_key) catch {
+            // Unparseable group key (shouldn't happen) → conservative full rebuild.
+            return try self.rebuildHllCardinalityTxn(txn, hcfg);
+        };
+        defer {
+            for (axes) |axis| self.alloc.free(axis);
+            if (axes.len > 0) self.alloc.free(axes);
+        }
+        if (axes.len != hcfg.group_by.len) return try self.rebuildHllCardinalityTxn(txn, hcfg);
+
+        // Member doc ids = intersection of {docs whose axis_i == group's value_i}.
+        var members: ?[][]u8 = null;
+        defer if (members) |ids| self.freeDocIds(ids);
+        for (hcfg.group_by, axes) |axis_field, axis_scalar| {
+            const resolved = self.resolveUniqueField(axis_field) orelse return try self.rebuildHllCardinalityTxn(txn, hcfg);
+            const ids = try self.docIdsForScalarFactPrefixTxn(txn, .group, resolved.name, axis_scalar);
+            if (members) |current| {
+                defer self.freeDocIds(current);
+                defer self.freeDocIds(ids);
+                members = try self.intersectDocIdsAlloc(current, ids);
+            } else {
+                members = ids;
+            }
+        }
+        const member_ids = members orelse &[_][]u8{};
+
+        // Recompute the group's sketch from the surviving members' value tokens.
+        var sketch: ?[]u8 = null;
+        defer if (sketch) |bytes| self.alloc.free(bytes);
+        for (member_ids) |doc_id| {
+            const fact_key = try self.docFactKey(doc_id);
+            defer self.alloc.free(fact_key);
+            const payload = txn.get(fact_key) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            var facts = fact_mod.decodeListAlloc(self.alloc, payload) catch continue;
+            defer facts.deinit(self.alloc);
+            const value_scalar = fact_mod.findScalar(facts.facts, .group, hcfg.value_field) orelse continue;
+            const singleton = try hll.singletonEncodedAlloc(self.alloc, precision, value_scalar);
+            defer self.alloc.free(singleton);
+            const next = (try law_mod.combineAlloc(self.alloc, .hll, sketch, singleton)) orelse continue;
+            if (sketch) |bytes| self.alloc.free(bytes);
+            sketch = next;
+        }
+
+        if (sketch) |bytes| {
+            try txn.put(sketch_key, bytes);
+        } else {
+            // Group emptied by the delete/update: drop its sketch entirely.
+            txn.delete(sketch_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
+
+        const gkey = try self.hllCardinalityGroupDirtyKeyAlloc(hcfg.name, group_key);
+        defer self.alloc.free(gkey);
+        txn.delete(gkey) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
+    // Doc ids whose (role, field) scalar token equals `scalar`, read within an
+    // existing txn (the scalar-posting secondary index keyed by doc id).
+    fn docIdsForScalarFactPrefixTxn(self: *Index, txn: anytype, role: fact_mod.Role, field: []const u8, scalar: []const u8) ![][]u8 {
+        const prefix = try self.docFactScalarPrefixAlloc(role, field, scalar);
+        defer self.alloc.free(prefix);
+        var out = std.ArrayListUnmanaged([]u8).empty;
+        errdefer self.freeDocIds(out.items);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const doc_component = token.componentAt(entry.key, prefix.len) catch continue;
+            if (doc_component.next != entry.key.len) continue;
+            try out.append(self.alloc, try self.alloc.dupe(u8, doc_component.payload));
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn anyHllCardinalityDirty(self: *Index, store: *docstore_mod.DocStore) !bool {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        for (self.hllCardinalities()) |hcfg| {
+            if (try self.hllCardinalityDirtyTxn(&txn, hcfg.name)) return true;
+        }
+        return false;
+    }
+
+    // A materialization is dirty if its whole-materialization marker is set or
+    // any per-group marker exists under its group-dirty prefix.
+    fn hllCardinalityDirtyTxn(self: *Index, txn: anytype, name: []const u8) !bool {
+        const dirty_key = try self.hllCardinalityDirtyKeyAlloc(name);
+        defer self.alloc.free(dirty_key);
+        if (txn.get(dirty_key)) |_| {
+            return true;
+        } else |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        }
+        const gprefix = try self.hllCardinalityGroupDirtyPrefixAlloc(name);
+        defer self.alloc.free(gprefix);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        const first = cursor.seekAtOrAfter(gprefix) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        if (first) |entry| return std.mem.startsWith(u8, entry.key, gprefix);
+        return false;
+    }
+
+    fn runHllMaintenanceTxn(self: *Index, txn: anytype) !bool {
+        var did_work = false;
+        for (self.hllCardinalities()) |hcfg| {
+            // Whole-materialization marker → full rebuild (also clears per-group
+            // markers), so handle it first and skip the scoped pass.
+            const dirty_key = try self.hllCardinalityDirtyKeyAlloc(hcfg.name);
+            defer self.alloc.free(dirty_key);
+            const full = blk: {
+                _ = txn.get(dirty_key) catch |err| switch (err) {
+                    error.NotFound => break :blk false,
+                    else => return err,
+                };
+                break :blk true;
+            };
+            if (full) {
+                try self.rebuildHllCardinalityTxn(txn, hcfg);
+                did_work = true;
+                continue;
+            }
+            // Otherwise rebuild only the groups with a pending per-group marker.
+            if (try self.rebuildDirtyHllCardinalityGroupsTxn(txn, hcfg)) did_work = true;
+        }
+        return did_work;
+    }
+
+    // Rebuilds each group flagged by a per-group dirty marker. Snapshots the
+    // marker keys first so the rebuild's writes/deletes don't disturb the scan.
+    fn rebuildDirtyHllCardinalityGroupsTxn(self: *Index, txn: anytype, hcfg: HllCardinalityConfig) !bool {
+        const gprefix = try self.hllCardinalityGroupDirtyPrefixAlloc(hcfg.name);
+        defer self.alloc.free(gprefix);
+        var group_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (group_keys.items) |key| self.alloc.free(key);
+            group_keys.deinit(self.alloc);
+        }
+        {
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var entry_opt = try cursor.seekAtOrAfter(gprefix);
+            while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+                if (!std.mem.startsWith(u8, entry.key, gprefix)) break;
+                const group_component = token.componentAt(entry.key, gprefix.len) catch continue;
+                if (group_component.next != entry.key.len) continue;
+                try group_keys.append(self.alloc, try self.alloc.dupe(u8, group_component.payload));
+            }
+        }
+        if (group_keys.items.len == 0) return false;
+        for (group_keys.items) |group_key| {
+            try self.rebuildHllCardinalityGroupTxn(txn, hcfg, group_key);
+        }
+        return true;
+    }
+
+    /// Rebuilds any HLL cardinality materialization marked dirty by a delete or
+    /// overwrite. Safe to call repeatedly; a no-op when nothing is dirty. This is
+    /// the unit of work the durable-job lane runs in the background.
+    pub fn runHllMaintenance(self: *Index, store: *docstore_mod.DocStore) !bool {
+        if (self.hllCardinalities().len == 0) return false;
+        if (!try self.anyHllCardinalityDirty(store)) return false;
+        // Runs on a background thread; take the index write lock so the rebuild's
+        // write txn never overlaps a foreground applyBatch write (single-writer
+        // store). The dirty re-check inside the lock collapses redundant jobs.
+        self.lockWrites();
+        defer self.unlockWrites();
+        if (!try self.anyHllCardinalityDirty(store)) return false;
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const did_work = try self.runHllMaintenanceTxn(&txn);
+        try txn.commit();
+        return did_work;
+    }
+
+    // ---- Adaptive (observed) HLL cardinality provisioning ----------------
+    //
+    // A recurring cardinality(value_field) query, optionally grouped by a terms
+    // bucket field, promotes a HyperLogLog sketch once it has been observed at
+    // least `adaptive.min_observations` times. Promotion registers a sketch
+    // config (in the runtime registry, persisted so it survives reopen) and
+    // marks it dirty; the existing maintenance pass backfills it from the stored
+    // document facts. This deliberately keeps its own keyspace rather than going
+    // through the tensor recommendation pipeline, whose recommendation encoding
+    // keys off algebra.Op and has no `cardinality` op.
+
+    // Observation counter key: hllobs:<group_field-or-empty>:<value_field>.
+    fn hllAdaptiveObservationKeyAlloc(self: *Index, group_field: ?[]const u8, value_field: []const u8) ![]u8 {
+        return try self.keyAlloc(&.{ "hllobs", group_field orelse "", value_field });
+    }
+
+    // Persisted registry marker for a promoted adaptive sketch:
+    // hlladaptive:<name> -> "<group_field>\x00<value_field>". Reloaded at open.
+    fn hllAdaptiveConfigPrefixAlloc(self: *Index) ![]u8 {
+        return try self.keyAlloc(&.{"hlladaptive"});
+    }
+
+    fn hllAdaptiveConfigKeyAlloc(self: *Index, name: []const u8) ![]u8 {
+        return try self.keyAlloc(&.{ "hlladaptive", name });
+    }
+
+    // Deterministic sketch name for an adaptively promoted (group, value) pair,
+    // so repeated observation/promotion is idempotent.
+    pub fn hllAdaptiveNameAlloc(self: *Index, group_field: ?[]const u8, value_field: []const u8) ![]u8 {
+        return try std.fmt.allocPrint(self.alloc, "adaptive_hll:{s}:{s}", .{ group_field orelse "", value_field });
+    }
+
+    pub fn hllRegistryContains(self: *const Index, name: []const u8) bool {
+        for (self.hllCardinalities()) |hcfg| {
+            if (std.mem.eql(u8, hcfg.name, name)) return true;
+        }
+        return false;
+    }
+
+    // Records one observation of a cardinality query over `value_field` grouped
+    // by `group_field` (null = ungrouped/root). This only bumps a local, durable
+    // observation counter; it never promotes or backfills on the query path.
+    // Promotion is deferred to the leader-gated maintenance pass
+    // (evaluateHllCardinalityCandidates), mirroring how the tensor adaptive path
+    // records query shapes on reads but decides materializations during
+    // maintenance — so reads stay cheap and promotion is per-shard-deterministic.
+    // Best-effort and infallible: observation is telemetry, never a reason to
+    // fail a query. Only active when adaptive.lazy_materialization is enabled.
+    pub fn observeCardinalityForAdaptive(self: *Index, store: *docstore_mod.DocStore, group_field: ?[]const u8, value_field: []const u8) void {
+        self.recordHllCardinalityObservation(store, group_field, value_field) catch {};
+    }
+
+    fn recordHllCardinalityObservation(self: *Index, store: *docstore_mod.DocStore, group_field: ?[]const u8, value_field: []const u8) !void {
+        if (!self.config().adaptive.lazy_materialization) return;
+        // Only group/value fields the schema actually exposes can back a sketch.
+        const value_resolved = self.resolveUniqueField(value_field) orelse return;
+        if (value_resolved.role != .group) return;
+        if (group_field) |gf| {
+            const g = self.resolveUniqueField(gf) orelse return;
+            if (g.role != .group) return;
+        }
+        const name = try self.hllAdaptiveNameAlloc(group_field, value_resolved.name);
+        defer self.alloc.free(name);
+        if (self.hllRegistryContains(name)) return; // already promoted
+
+        self.lockWrites();
+        defer self.unlockWrites();
+
+        const obs_key = try self.hllAdaptiveObservationKeyAlloc(group_field, value_resolved.name);
+        defer self.alloc.free(obs_key);
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const prior: u64 = blk: {
+            const existing = txn.get(obs_key) catch |err| switch (err) {
+                error.NotFound => break :blk 0,
+                else => return err,
+            };
+            break :blk std.fmt.parseInt(u64, existing, 10) catch 0;
+        };
+        const next = prior + 1;
+        const next_text = try std.fmt.allocPrint(self.alloc, "{d}", .{next});
+        defer self.alloc.free(next_text);
+        try txn.put(obs_key, next_text);
+        try txn.commit();
+    }
+
+    // Prefix for the recorded cardinality observation counters (hllobs:...). Used
+    // by the maintenance pass to scan candidates.
+    fn hllAdaptiveObservationPrefixAlloc(self: *Index) ![]u8 {
+        return try self.keyAlloc(&.{"hllobs"});
+    }
+
+    // Leader-gated maintenance: promote recurring cardinality observations into
+    // materialized sketches and backfill them from stored facts. This is the
+    // counterpart to evaluateAdaptiveCandidates (tensors) for the HLL path — the
+    // read path only records observations; promotion and backfill happen here,
+    // off the query path and only where maintenance runs (the write/leader node),
+    // so a follower serving reads never mutates derived sketch state. Returns the
+    // number of sketches promoted. Only active when adaptive.lazy_materialization
+    // is enabled.
+    pub fn evaluateHllCardinalityCandidates(self: *Index, store: *docstore_mod.DocStore) !u64 {
+        if (!self.config().adaptive.lazy_materialization) return 0;
+        const min_obs = self.config().adaptive.policy().min_observations;
+
+        const prefix = try self.hllAdaptiveObservationPrefixAlloc();
+        defer self.alloc.free(prefix);
+
+        // Collect eligible (group, value) pairs first: promotion opens its own
+        // write txn and mutates the in-memory registry, so it can't run while the
+        // read cursor is open.
+        const Pending = struct { group: ?[]u8, value: []u8 };
+        var pending = std.ArrayListUnmanaged(Pending).empty;
+        defer {
+            for (pending.items) |p| {
+                if (p.group) |g| self.alloc.free(g);
+                self.alloc.free(p.value);
+            }
+            pending.deinit(self.alloc);
+        }
+        {
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var entry_opt = try cursor.seekAtOrAfter(prefix);
+            while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+                if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+                const group_comp = token.componentAt(entry.key, prefix.len) catch continue;
+                const value_comp = token.componentAt(entry.key, group_comp.next) catch continue;
+                if (value_comp.next != entry.key.len) continue; // not an obs key
+                const count = std.fmt.parseInt(u64, entry.value, 10) catch continue;
+                if (count < min_obs) continue;
+                const group_opt: ?[]const u8 = if (group_comp.payload.len > 0) group_comp.payload else null;
+                const name = try self.hllAdaptiveNameAlloc(group_opt, value_comp.payload);
+                defer self.alloc.free(name);
+                if (self.hllRegistryContains(name)) continue; // already promoted
+                try pending.append(self.alloc, .{
+                    .group = if (group_opt) |g| try self.alloc.dupe(u8, g) else null,
+                    .value = try self.alloc.dupe(u8, value_comp.payload),
+                });
+            }
+        }
+
+        var promoted: u64 = 0;
+        for (pending.items) |p| {
+            const name = try self.hllAdaptiveNameAlloc(p.group, p.value);
+            defer self.alloc.free(name);
+            if (self.hllRegistryContains(name)) continue;
+            self.lockWrites();
+            {
+                defer self.unlockWrites();
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                try self.promoteAdaptiveHllTxn(&txn, name, p.group, p.value);
+                try txn.commit();
+            }
+            promoted += 1;
+        }
+
+        // Backfill the freshly promoted (now dirty) sketches in the same pass.
+        if (promoted > 0) _ = try self.runHllMaintenance(store);
+        return promoted;
+    }
+
+    // Registers a promoted adaptive sketch in the runtime registry, persists its
+    // marker, and marks it dirty so the next maintenance pass backfills it.
+    fn promoteAdaptiveHllTxn(self: *Index, txn: anytype, name: []const u8, group_field: ?[]const u8, value_field: []const u8) !void {
+        const group_by: []const []const u8 = if (group_field) |gf| &.{gf} else &.{};
+        try self.appendHllRegistryEntry(name, group_by, value_field, 0);
+        const hcfg = self.hllCardinalities()[self.hllCardinalities().len - 1];
+
+        const marker_key = try self.hllAdaptiveConfigKeyAlloc(name);
+        defer self.alloc.free(marker_key);
+        const marker_val = try std.fmt.allocPrint(self.alloc, "{s}\x00{s}", .{ group_field orelse "", value_field });
+        defer self.alloc.free(marker_val);
+        try txn.put(marker_key, marker_val);
+
+        // Mark dirty so maintenance recomputes it from existing facts (backfill).
+        try self.markHllCardinalityDirtyTxn(txn, hcfg);
+    }
+
+    // Reloads adaptively-promoted sketches into the runtime registry. Call after
+    // open() when reattaching to a store that already has promotions, so the
+    // read gate finds them again across restarts.
+    pub fn loadAdaptiveHllCardinalities(self: *Index, store: *docstore_mod.DocStore) !void {
+        const prefix = try self.hllAdaptiveConfigPrefixAlloc();
+        defer self.alloc.free(prefix);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const name_component = token.componentAt(entry.key, prefix.len) catch continue;
+            if (name_component.next != entry.key.len) continue;
+            const name = name_component.payload;
+            if (self.hllRegistryContains(name)) continue;
+            const sep = std.mem.indexOfScalar(u8, entry.value, 0) orelse continue;
+            const group_field = entry.value[0..sep];
+            const value_field = entry.value[sep + 1 ..];
+            const group_by: []const []const u8 = if (group_field.len > 0) &.{group_field} else &.{};
+            try self.appendHllRegistryEntry(name, group_by, value_field, 0);
+        }
+    }
+
+    const HllMaintenanceJob = struct {
+        index: *Index,
+        store: *docstore_mod.DocStore,
+
+        fn run(ptr: *anyopaque) anyerror!void {
+            const self: *HllMaintenanceJob = @ptrCast(@alignCast(ptr));
+            _ = self.index.runHllMaintenance(self.store) catch {};
+        }
+
+        fn deinitFn(ptr: *anyopaque) void {
+            const self: *HllMaintenanceJob = @ptrCast(@alignCast(ptr));
+            self.index.alloc.destroy(self);
+        }
+    };
+
+    // Submits a background rebuild after a batch that may have invalidated
+    // sketches. With the inline lane this runs synchronously once the batch txn
+    // has committed; with a threaded lane it runs off the write path. When no
+    // lane is attached, callers drive runHllMaintenance themselves.
+    fn scheduleHllMaintenance(self: *Index, store: *docstore_mod.DocStore) void {
+        const lane = self.hll_maintenance_lane orelse return;
+        if (self.hllCardinalities().len == 0) return;
+        const job_ctx = self.alloc.create(HllMaintenanceJob) catch return;
+        job_ctx.* = .{ .index = self, .store = store };
+        lane.submit(.{
+            .owner_id = self.hll_maintenance_owner_id,
+            .class = .maintenance,
+            .ptr = job_ctx,
+            .run = HllMaintenanceJob.run,
+            .deinit = HllMaintenanceJob.deinitFn,
+        }) catch self.alloc.destroy(job_ctx);
+    }
+
+    // Schedules a rebuild iff the just-committed batch left a materialization
+    // dirty. Keyed on the persisted dirty markers rather than the batch shape, so
+    // it also catches in-place coalesced updates (which mark dirty without
+    // appearing in deleted_keys/overwritten_doc_keys).
+    //
+    // Best-effort and infallible: it runs *after* the batch has durably
+    // committed, so it must not turn a transient read-txn error into a failed
+    // apply (a caller retrying would double-apply). If the dirtiness probe fails,
+    // the persisted marker remains set and the next batch — or an explicit
+    // runHllMaintenance — picks it up; meanwhile the dirty-aware read gate keeps
+    // queries correct by falling back to the exact scan.
+    fn scheduleHllMaintenanceIfDirty(self: *Index, store: *docstore_mod.DocStore) void {
+        if (self.hll_maintenance_lane == null) return;
+        if (self.hllCardinalities().len == 0) return;
+        const dirty = self.anyHllCardinalityDirty(store) catch return;
+        if (!dirty) return;
+        self.scheduleHllMaintenance(store);
+    }
+
+    pub const ApproxCardinalityEntry = struct {
+        group_key: []u8,
+        estimate: u64,
+
+        pub fn deinit(self: *ApproxCardinalityEntry, alloc: Allocator) void {
+            alloc.free(self.group_key);
+            self.* = undefined;
+        }
+    };
+
+    /// Reads one materialized HLL sketch per group and returns its estimated
+    /// distinct count. O(groups) cursor reads with no per-document rescan.
+    pub fn approxCardinalityEntriesAlloc(self: *Index, store: *docstore_mod.DocStore, name: []const u8) ![]ApproxCardinalityEntry {
+        const prefix = try self.hllCardinalityPrefixAlloc(name);
+        defer self.alloc.free(prefix);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var out = std.ArrayListUnmanaged(ApproxCardinalityEntry).empty;
+        errdefer {
+            for (out.items) |*entry| entry.deinit(self.alloc);
+            out.deinit(self.alloc);
+        }
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const group_component = token.componentAt(entry.key, prefix.len) catch continue;
+            if (group_component.next != entry.key.len) continue;
+            const estimate = hll.estimateEncoded(entry.value) catch continue;
+            try out.append(self.alloc, .{
+                .group_key = try self.alloc.dupe(u8, group_component.payload),
+                .estimate = estimate,
+            });
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    // Test helper: the estimate for one group of the (single) configured HLL
+    // cardinality, or null if that group has no sketch. Keeps the regression
+    // tests terse without duplicating entry iteration/cleanup.
+    fn approxCardinalityEntriesForGroupTestEstimate(self: *Index, store: *docstore_mod.DocStore, group_key: []const u8) !?u64 {
+        const name = self.hllCardinalities()[0].name;
+        const entries = try self.approxCardinalityEntriesAlloc(store, name);
+        defer {
+            for (entries) |*entry| entry.deinit(self.alloc);
+            self.alloc.free(entries);
+        }
+        for (entries) |entry| {
+            if (std.mem.eql(u8, entry.group_key, group_key)) return entry.estimate;
+        }
+        return null;
+    }
+
+    /// Total distinct count across all groups of a materialized HLL cardinality,
+    /// computed by merging the per-group sketches (an exact union, not a sum of
+    /// per-group estimates).
+    pub fn approxCardinalityTotalAlloc(self: *Index, store: *docstore_mod.DocStore, name: []const u8) !u64 {
+        const prefix = try self.hllCardinalityPrefixAlloc(name);
+        defer self.alloc.free(prefix);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var merged: ?[]u8 = null;
+        defer if (merged) |bytes| self.alloc.free(bytes);
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const group_component = token.componentAt(entry.key, prefix.len) catch continue;
+            if (group_component.next != entry.key.len) continue;
+            const next = (try law_mod.combineAlloc(self.alloc, .hll, merged, entry.value)) orelse continue;
+            if (merged) |bytes| self.alloc.free(bytes);
+            merged = next;
+        }
+        return if (merged) |bytes| try hll.estimateEncoded(bytes) else 0;
+    }
+
+    fn hllGroupByMatches(self: *const Index, mat_group: []const []const u8, query_group: []const []const u8) bool {
+        if (mat_group.len != query_group.len) return false;
+        for (mat_group, query_group) |mat_field, query_field| {
+            const mat_resolved = self.resolveUniqueField(mat_field) orelse return false;
+            const query_resolved = self.resolveUniqueField(query_field) orelse return false;
+            if (!std.mem.eql(u8, mat_resolved.name, query_resolved.name)) return false;
+        }
+        return true;
+    }
+
+    // Name of an HLL cardinality materialization that can answer a distinct count
+    // of `field_or_path` grouped exactly by `group_fields` (null = any grouping,
+    // used for the merged total). Returns null when:
+    //   - constraints or an MVCC read generation are present (sketches are
+    //     maintained unconstrained and without per-generation visibility), or
+    //   - the matching materialization is currently dirty (a delete/overwrite
+    //     marked it stale and its background rebuild has not yet run) — the
+    //     caller then falls back to the exact scan rather than reading a stale,
+    //     over-counted sketch.
+    fn hllCardinalityNameForField(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        group_fields: ?[]const []const u8,
+        field_or_path: []const u8,
+        constraints: []const ir.Constraint,
+        generation: ?u64,
+    ) !?[]const u8 {
+        if (constraints.len != 0 or generation != null) return null;
+        const resolved = self.resolveUniqueField(field_or_path) orelse return null;
+        if (resolved.role != .group) return null;
+        for (self.hllCardinalities()) |hcfg| {
+            if (!std.mem.eql(u8, hcfg.value_field, resolved.name)) continue;
+            if (group_fields) |fields| {
+                if (!self.hllGroupByMatches(hcfg.group_by, fields)) continue;
+            }
+            if (try self.hllCardinalityDirty(store, hcfg.name)) return null;
+            return hcfg.name;
+        }
+        return null;
+    }
+
+    /// Relative (standard) error of the HLL materialization that would answer a
+    /// cardinality of `field_or_path` grouped by `group_fields`, or null when no
+    /// materialization applies. Mirrors hllCardinalityNameForField's matching so
+    /// the estimate and its error budget always come from the same sketch.
+    pub fn hllRelativeErrorForField(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        group_fields: ?[]const []const u8,
+        field_or_path: []const u8,
+        constraints: []const ir.Constraint,
+        generation: ?u64,
+    ) !?f64 {
+        const name = (try self.hllCardinalityNameForField(store, group_fields, field_or_path, constraints, generation)) orelse return null;
+        for (self.hllCardinalities()) |hcfg| {
+            if (std.mem.eql(u8, hcfg.name, name)) {
+                return hll.relativeErrorForPrecision(hllCardinalityPrecision(hcfg));
+            }
+        }
+        return null;
+    }
+
+    // Test helper: whether the (single) configured HLL cardinality is currently
+    // marked dirty (i.e. a maintenance rebuild is pending).
+    fn hllCardinalityDirtyTest(self: *Index, store: *docstore_mod.DocStore) !bool {
+        return try self.hllCardinalityDirty(store, self.hllCardinalities()[0].name);
+    }
+
+    fn hllCardinalityDirty(self: *Index, store: *docstore_mod.DocStore, name: []const u8) !bool {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        return try self.hllCardinalityDirtyTxn(&txn, name);
+    }
+
+    /// Total distinct-count estimate for `field_or_path` from a matching HLL
+    /// materialization (the union of every group's sketch), or null when none
+    /// applies. Used to answer a root `cardinality` aggregation.
+    pub fn approxCardinalityTotalForFieldAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        field_or_path: []const u8,
+        constraints: []const ir.Constraint,
+        generation: ?u64,
+    ) !?u64 {
+        const name = (try self.hllCardinalityNameForField(store, null, field_or_path, constraints, generation)) orelse return null;
+        return try self.approxCardinalityTotalAlloc(store, name);
+    }
+
+    /// Per-group distinct-count estimates for a `terms(group_fields) ->
+    /// cardinality(field)` query, keyed by the materialized group key, or null
+    /// when no HLL materialization matches the group layout and value field.
+    pub fn approxCardinalityEntriesForGroupAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        group_fields: []const []const u8,
+        field_or_path: []const u8,
+        constraints: []const ir.Constraint,
+        generation: ?u64,
+    ) !?[]ApproxCardinalityEntry {
+        const name = (try self.hllCardinalityNameForField(store, group_fields, field_or_path, constraints, generation)) orelse return null;
+        return try self.approxCardinalityEntriesAlloc(store, name);
+    }
+
+    /// The materialized group key for a single-field terms bucket whose value
+    /// scalar token is `scalar` — i.e. what groupKeyAlloc produces for that field
+    /// — so callers can look up the bucket's estimate in the entries above.
+    pub fn approxCardinalityGroupKeyForScalarAlloc(self: *Index, scalar: []const u8) ![]u8 {
+        return try token.canonicalTupleAlloc(self.alloc, &.{scalar});
     }
 
     fn applyDirectMaterializationAppendOnlyPreaggregated(
@@ -17516,6 +18913,22 @@ pub const Index = struct {
             else => return err,
         };
         defer self.alloc.free(group_key);
+        // Cardinality folds a singleton HLL sketch of each matched value (the
+        // accumulator then unions them per group via register-wise max), mirroring
+        // the per-document contribution in the non-join HLL backfill. The target
+        // field is usually a group dimension, so read it role-agnostically.
+        if (law_id == .hll) {
+            const field = request.measure orelse return;
+            const scalar = (measure_fact.valueScalarAlloc(self.alloc, field) catch |err| switch (err) {
+                error.InvalidAlgebraicFact => return,
+                else => return err,
+            }) orelse return;
+            defer self.alloc.free(scalar);
+            const contribution = try hll.singletonEncodedAlloc(self.alloc, request.hll_precision, scalar);
+            defer self.alloc.free(contribution);
+            try accumulator.add(self.alloc, group_key, law_id, contribution);
+            return;
+        }
         const measure_value = if (request.measure) |measure_name|
             try measure_fact.measureAlloc(self.alloc, measure_name)
         else
@@ -18019,6 +19432,10 @@ pub const Index = struct {
 
     fn factMeasureAlloc(self: *Index, facts: []const fact_mod.Fact, field_name: []const u8) !?MeasureValue {
         const scalar = fact_mod.findScalar(facts, .measure, field_name) orelse return null;
+        return try self.factMeasureFromScalarAlloc(scalar);
+    }
+
+    fn factMeasureFromScalarAlloc(self: *Index, scalar: []const u8) !MeasureValue {
         const raw = try token.scalarTokenTextAlloc(self.alloc, scalar);
         errdefer self.alloc.free(raw);
         const support_token = try self.alloc.dupe(u8, scalar);
@@ -19480,6 +20897,572 @@ test "algebraic index maintains direct count sum avg min max" {
     try std.testing.expect((try idx.materializedExpressionRawValueForMaterializationAlloc(&store, "max_by_customer", group, null)) == null);
 }
 
+test "algebraic index materializes approximate per-group cardinality" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "group_fields": [{"name":"region","path":"region","type":"string"},{"name":"customer","path":"customer","type":"string"}],
+        \\  "hll_cardinalities": [{"name":"customers_by_region","group_by":["region"],"value_field":"customer"}]
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg", cfg);
+    defer idx.close();
+
+    // west has 3 distinct customers (a1 repeated), east has 2.
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"a1\"}" },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"a2\"}" },
+        .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"a3\"}" },
+        .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"a1\"}" },
+        .{ .key = "o5", .action = .upsert, .cleaned_value = "{\"region\":\"east\",\"customer\":\"b1\"}" },
+        .{ .key = "o6", .action = .upsert, .cleaned_value = "{\"region\":\"east\",\"customer\":\"b2\"}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+
+    const entries = try idx.approxCardinalityEntriesAlloc(&store, "customers_by_region");
+    defer {
+        for (entries) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+
+    const west_token = try idx.constraintTokenAlloc(alloc, "region", "west");
+    defer alloc.free(west_token);
+    const west_group = try token.canonicalTupleAlloc(alloc, &.{west_token});
+    defer alloc.free(west_group);
+    const east_token = try idx.constraintTokenAlloc(alloc, "region", "east");
+    defer alloc.free(east_token);
+    const east_group = try token.canonicalTupleAlloc(alloc, &.{east_token});
+    defer alloc.free(east_group);
+
+    var west_estimate: ?u64 = null;
+    var east_estimate: ?u64 = null;
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.group_key, west_group)) west_estimate = entry.estimate;
+        if (std.mem.eql(u8, entry.group_key, east_group)) east_estimate = entry.estimate;
+    }
+    // Small cardinalities land within one of the truth (linear counting regime).
+    try std.testing.expect(west_estimate != null and east_estimate != null);
+    try std.testing.expect(@max(west_estimate.?, 3) - @min(west_estimate.?, 3) <= 1);
+    try std.testing.expect(@max(east_estimate.?, 2) - @min(east_estimate.?, 2) <= 1);
+
+    // The grand total is the union of the per-group sketches: 5 distinct customers.
+    const total = try idx.approxCardinalityTotalAlloc(&store, "customers_by_region");
+    try std.testing.expect(@max(total, 5) - @min(total, 5) <= 1);
+}
+
+test "adaptive group-key NDV sizes a grouped materialization below the doc-row overestimate" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "group_fields": [
+        \\    {"name":"region","path":"region","type":"string"},
+        \\    {"name":"customer","path":"customer","type":"string"}
+        \\  ],
+        \\  "hll_cardinalities": [
+        \\    {"name":"regions","group_by":[],"value_field":"region","precision":14}
+        \\  ]
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg", cfg);
+    defer idx.close();
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"a\"}" },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"b\"}" },
+        .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"region\":\"east\",\"customer\":\"c\"}" },
+        .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"region\":\"east\",\"customer\":\"d\"}" },
+        .{ .key = "o5", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"e\"}" },
+        .{ .key = "o6", .action = .upsert, .cleaned_value = "{\"region\":\"east\",\"customer\":\"f\"}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+
+    // 6 docs but only 2 distinct regions: the group-key sketch sizes a
+    // terms(region) materialization at ~2 stored rows, not the doc_rows (6)
+    // overestimate.
+    var region_group = [_][]u8{@constCast(@as([]const u8, "region"))};
+    const region_spec = AdaptiveMaterializationSpec{
+        .name = @constCast(@as([]const u8, "m")),
+        .recommendation = @constCast(@as([]const u8, "r")),
+        .op = .count,
+        .group_by = region_group[0..],
+    };
+    const region_ndv = (try idx.adaptiveGroupKeyNdvEstimate(&store, region_spec)) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(region_ndv >= 1 and region_ndv <= 3);
+
+    // No sketch covers `customer`, so the estimate declines and the cost model
+    // keeps its doc_rows fallback.
+    var customer_group = [_][]u8{@constCast(@as([]const u8, "customer"))};
+    const customer_spec = AdaptiveMaterializationSpec{
+        .name = @constCast(@as([]const u8, "m")),
+        .recommendation = @constCast(@as([]const u8, "r")),
+        .op = .count,
+        .group_by = customer_group[0..],
+    };
+    try std.testing.expect((try idx.adaptiveGroupKeyNdvEstimate(&store, customer_spec)) == null);
+}
+
+test "derived join fanout pre-gate fails soft on a guaranteed blowup" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "mixed",
+        \\  "group_fields": [
+        \\    {"name":"kind","path":"kind","type":"string"},
+        \\    {"name":"customer","path":"customer","type":"string"},
+        \\    {"name":"product","path":"product","type":"string"}
+        \\  ],
+        \\  "joins": [
+        \\    {"name":"orders_customers","left_fields":["customer"],"right_fields":["customer"],"left_type_field":"kind","left_type_value":"order","right_type_field":"kind","right_type_value":"customer","max_fanout":1}
+        \\  ],
+        \\  "hll_cardinalities": [
+        \\    {"name":"customers","group_by":[],"value_field":"customer","precision":14}
+        \\  ]
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg", cfg);
+    defer idx.close();
+
+    // Two customer rows share the key "c1": the right side carries 3 facts over
+    // 2 distinct keys, so the average fanout (1.5) exceeds max_fanout (1) and
+    // some key must exceed it. (No matching order is ingested — that would trip
+    // the ingest-time fanout guard; the pre-gate estimates from fact-count and
+    // NDV without needing an actual match.)
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "c1a", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c1\"}" },
+        .{ .key = "c1b", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c1\"}" },
+        .{ .key = "c2", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c2\"}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+
+    const join_cfg = idx.joinConfigByName("orders_customers") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(try idx.derivedJoinFanoutGuaranteedExceeds(&store, join_cfg));
+
+    // The derived fold fast-fails with the same AlgebraicJoinFanoutExceeded the
+    // scan would have raised — but before the O(left x fanout) scan, not after.
+    const request = DerivedJoinFoldRequest{
+        .join = .{ .name = "orders_customers", .group_side = "right", .measure_side = "left" },
+        .op = .count,
+    };
+    try std.testing.expectError(
+        error.AlgebraicJoinFanoutExceeded,
+        idx.scanDerivedJoinFoldEntriesAtGeneration(&store, request, null),
+    );
+}
+
+test "algebraic HLL cardinality is adaptively promoted from a recurring query shape" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+    var runtime = try background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    // No static hll_cardinalities; adaptive promotion is enabled with a low
+    // observation threshold. A recurring cardinality(customer) grouped by region
+    // should promote a sketch and backfill it from the existing facts.
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "group_fields": [
+        \\    {"name":"region","path":"region","type":"string"},
+        \\    {"name":"customer","path":"customer","type":"string"}
+        \\  ],
+        \\  "adaptive": {"observe": true, "lazy_materialization": true, "min_observations": 2}
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg", cfg);
+    defer idx.close();
+    idx.attachHllMaintenanceLane(runtime.durable_jobs, try runtime.allocOwnerId());
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"a\"}" },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"b\"}" },
+        .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"c\"}" },
+        .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"region\":\"east\",\"customer\":\"a\"}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+
+    const adaptive_name = try idx.hllAdaptiveNameAlloc("region", "customer");
+    defer alloc.free(adaptive_name);
+
+    // Observations only record counters on the (read) path; they never promote.
+    idx.observeCardinalityForAdaptive(&store, "region", "customer");
+    try std.testing.expect(!idx.hllRegistryContains(adaptive_name));
+    idx.observeCardinalityForAdaptive(&store, "region", "customer");
+    try std.testing.expect(!idx.hllRegistryContains(adaptive_name));
+
+    // The leader-gated maintenance pass promotes the over-threshold observation
+    // into a sketch and backfills it from the stored facts in one step.
+    try std.testing.expectEqual(@as(u64, 1), try idx.evaluateHllCardinalityCandidates(&store));
+    try std.testing.expect(idx.hllRegistryContains(adaptive_name));
+
+    // Re-running maintenance is idempotent: nothing new to promote.
+    try std.testing.expectEqual(@as(u64, 0), try idx.evaluateHllCardinalityCandidates(&store));
+
+    const west_token = try idx.constraintTokenAlloc(alloc, "region", "west");
+    defer alloc.free(west_token);
+    const west_group = try token.canonicalTupleAlloc(alloc, &.{west_token});
+    defer alloc.free(west_group);
+    const east_token = try idx.constraintTokenAlloc(alloc, "region", "east");
+    defer alloc.free(east_token);
+    const east_group = try token.canonicalTupleAlloc(alloc, &.{east_token});
+    defer alloc.free(east_group);
+
+    const entries = try idx.approxCardinalityEntriesAlloc(&store, adaptive_name);
+    defer {
+        for (entries) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+    var west: ?u64 = null;
+    var east: ?u64 = null;
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.group_key, west_group)) west = entry.estimate;
+        if (std.mem.eql(u8, entry.group_key, east_group)) east = entry.estimate;
+    }
+    try std.testing.expect(west != null and east != null);
+    try std.testing.expect(@max(west.?, 3) - @min(west.?, 3) <= 1);
+    try std.testing.expect(@max(east.?, 1) - @min(east.?, 1) <= 1);
+
+    // The promotion survives reopen: a fresh Index reloads the adaptive sketch
+    // marker so the read path keeps finding it.
+    var idx2 = try Index.open(alloc, "alg", cfg);
+    defer idx2.close();
+    try std.testing.expect(!idx2.hllRegistryContains(adaptive_name));
+    try idx2.loadAdaptiveHllCardinalities(&store);
+    try std.testing.expect(idx2.hllRegistryContains(adaptive_name));
+}
+
+test "algebraic HLL cardinality rebuilds after deletes via maintenance lane" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    // A manual-backend runtime runs durable jobs inline (synchronously on submit),
+    // so the post-batch maintenance rebuild completes before applyBatch returns.
+    var runtime = try background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "group_fields": [
+        \\    {"name":"region","path":"region","type":"string"},
+        \\    {"name":"customer","path":"customer","type":"string"}
+        \\  ],
+        \\  "hll_cardinalities": [
+        \\    {"name":"customers_by_region","group_by":["region"],"value_field":"customer","precision":14}
+        \\  ]
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg", cfg);
+    defer idx.close();
+    idx.attachHllMaintenanceLane(runtime.durable_jobs, try runtime.allocOwnerId());
+
+    const west_token = try idx.constraintTokenAlloc(alloc, "region", "west");
+    defer alloc.free(west_token);
+    const west_group = try token.canonicalTupleAlloc(alloc, &.{west_token});
+    defer alloc.free(west_group);
+
+    const westEstimate = struct {
+        fn read(index: *Index, doc_store: *docstore_mod.DocStore, group: []const u8, allocator: Allocator) !?u64 {
+            const entries = try index.approxCardinalityEntriesAlloc(doc_store, "customers_by_region");
+            defer {
+                for (entries) |*entry| entry.deinit(allocator);
+                allocator.free(entries);
+            }
+            for (entries) |entry| {
+                if (std.mem.eql(u8, entry.group_key, group)) return entry.estimate;
+            }
+            return null;
+        }
+    }.read;
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"a\"}" },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"b\"}" },
+        .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"c\"}" },
+        .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"region\":\"east\",\"customer\":\"a\"}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try std.testing.expectEqual(@as(?u64, 3), try westEstimate(&idx, &store, west_group, alloc));
+
+    // Delete customers b and c from west; the inline lane rebuilds the sketch so
+    // west collapses to a single distinct customer (a).
+    const deletes = [_][]const u8{ "o2", "o3" };
+    try idx.applyBatch(&store, .{ .deleted_keys = deletes[0..] });
+    try std.testing.expectEqual(@as(?u64, 1), try westEstimate(&idx, &store, west_group, alloc));
+}
+
+test "algebraic HLL cardinality stays correct under a concurrent threaded maintenance lane" {
+    if (builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    // Real threaded lane: maintenance rebuilds run on a background thread,
+    // concurrently with the foreground applyBatch writes below. The index write
+    // lock must serialize them so neither a lost update nor a torn read occurs.
+    var runtime = try background_runtime.BackendRuntime.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "group_fields": [
+        \\    {"name":"region","path":"region","type":"string"},
+        \\    {"name":"customer","path":"customer","type":"string"}
+        \\  ],
+        \\  "hll_cardinalities": [
+        \\    {"name":"customers_by_region","group_by":["region"],"value_field":"customer","precision":14}
+        \\  ]
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg", cfg);
+    defer idx.close();
+    idx.attachHllMaintenanceLane(runtime.durable_jobs, try runtime.allocOwnerId());
+
+    const west_token = try idx.constraintTokenAlloc(alloc, "region", "west");
+    defer alloc.free(west_token);
+    const west_group = try token.canonicalTupleAlloc(alloc, &.{west_token});
+    defer alloc.free(west_group);
+
+    // Insert 200 distinct west customers across many small batches, deleting the
+    // previous batch's docs each round. Every delete schedules a background
+    // rebuild that races the next round's insert.
+    var round: usize = 0;
+    while (round < 40) : (round += 1) {
+        var docs: [5]derived_types.DerivedDocument = undefined;
+        var bufs: [5][64]u8 = undefined;
+        for (0..5) |i| {
+            const n = round * 5 + i;
+            const key = try std.fmt.bufPrint(&bufs[i], "k{d}", .{n});
+            // Reuse the buffer tail for the value via a second format into a dup.
+            const value = try std.fmt.allocPrint(alloc, "{{\"region\":\"west\",\"customer\":\"c{d}\"}}", .{n});
+            docs[i] = .{ .key = try alloc.dupe(u8, key), .action = .upsert, .cleaned_value = value };
+        }
+        defer for (docs) |d| {
+            alloc.free(@constCast(d.key));
+            if (d.cleaned_value) |v| alloc.free(@constCast(v));
+        };
+        try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    }
+
+    // Drain all background rebuilds, then run one final maintenance pass so any
+    // outstanding dirty marker is resolved deterministically before asserting.
+    runtime.durable_jobs.drainOwner(idx.hll_maintenance_owner_id);
+    _ = try idx.runHllMaintenance(&store);
+
+    // All 200 customers are distinct and all in west; the estimate must be close
+    // to 200 (HLL error), and must not be corrupted by a lost update or a torn
+    // read from the concurrent rebuilds.
+    const entries = try idx.approxCardinalityEntriesAlloc(&store, "customers_by_region");
+    defer {
+        for (entries) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+    var west_estimate: ?u64 = null;
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.group_key, west_group)) west_estimate = entry.estimate;
+    }
+    try std.testing.expect(west_estimate != null);
+    const est = west_estimate.?;
+    // Generous bound: p=14 standard error is ~0.8%, allow well beyond that. The
+    // point is to catch corruption (estimate near 0, or far off), not precision.
+    try std.testing.expect(est >= 180 and est <= 220);
+}
+
+test "algebraic HLL cardinality is corrected after an in-place value change" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+    var runtime = try background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "group_fields": [
+        \\    {"name":"region","path":"region","type":"string"},
+        \\    {"name":"customer","path":"customer","type":"string"}
+        \\  ],
+        \\  "hll_cardinalities": [
+        \\    {"name":"customers_by_region","group_by":["region"],"value_field":"customer","precision":14}
+        \\  ]
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg", cfg);
+    defer idx.close();
+    idx.attachHllMaintenanceLane(runtime.durable_jobs, try runtime.allocOwnerId());
+
+    const west_token = try idx.constraintTokenAlloc(alloc, "region", "west");
+    defer alloc.free(west_token);
+    const west_group = try token.canonicalTupleAlloc(alloc, &.{west_token});
+    defer alloc.free(west_group);
+
+    // Three distinct customers in west.
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"a\"}" },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"b\"}" },
+        .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"c\"}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try std.testing.expectEqual(@as(?u64, 3), try idx.approxCardinalityEntriesForGroupTestEstimate(&store, west_group));
+
+    // Re-upsert o1/o2/o3 so every west document shares one customer. This goes
+    // through the in-place coalesced update path (no deleted/overwritten keys);
+    // the rebuild must collapse west to a single distinct customer.
+    const collapsed = [_]derived_types.DerivedDocument{
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"z\"}" },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"z\"}" },
+        .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"z\"}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = collapsed[0..] });
+    try std.testing.expectEqual(@as(?u64, 1), try idx.approxCardinalityEntriesForGroupTestEstimate(&store, west_group));
+}
+
+test "algebraic HLL cardinality is not dirtied by an unrelated field update" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+    var runtime = try background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    // The cardinality groups by region on distinct customer; `amount` is an
+    // unrelated measure the sketch does not read.
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "group_fields": [
+        \\    {"name":"region","path":"region","type":"string"},
+        \\    {"name":"customer","path":"customer","type":"string"}
+        \\  ],
+        \\  "measure_fields": [{"name":"amount","path":"amount","type":"number"}],
+        \\  "hll_cardinalities": [
+        \\    {"name":"customers_by_region","group_by":["region"],"value_field":"customer","precision":14}
+        \\  ]
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg", cfg);
+    defer idx.close();
+    idx.attachHllMaintenanceLane(runtime.durable_jobs, try runtime.allocOwnerId());
+
+    const west_token = try idx.constraintTokenAlloc(alloc, "region", "west");
+    defer alloc.free(west_token);
+    const west_group = try token.canonicalTupleAlloc(alloc, &.{west_token});
+    defer alloc.free(west_group);
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"a\",\"amount\":10}" },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"b\",\"amount\":20}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try std.testing.expectEqual(@as(?u64, 2), try idx.approxCardinalityEntriesForGroupTestEstimate(&store, west_group));
+    try std.testing.expect(!try idx.hllCardinalityDirtyTest(&store));
+
+    // Re-upsert o1 changing only `amount` (region/customer unchanged): the sketch
+    // does not depend on amount, so it must not be marked dirty (no rebuild).
+    const amount_only = [_]derived_types.DerivedDocument{
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"a\",\"amount\":99}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = amount_only[0..] });
+    try std.testing.expect(!try idx.hllCardinalityDirtyTest(&store));
+    try std.testing.expectEqual(@as(?u64, 2), try idx.approxCardinalityEntriesForGroupTestEstimate(&store, west_group));
+}
+
+test "algebraic HLL cardinality tokenizes bytes fields identically on ingest and rebuild" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+    var runtime = try background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    // value_field is a bytes-typed field, where the JSON-token and stored-fact
+    // token paths historically tagged scalars differently ("s" vs "x").
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "events",
+        \\  "group_fields": [
+        \\    {"name":"region","path":"region","type":"string"},
+        \\    {"name":"token","path":"token","type":"bytes"}
+        \\  ],
+        \\  "hll_cardinalities": [
+        \\    {"name":"tokens_by_region","group_by":["region"],"value_field":"token","precision":14}
+        \\  ]
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg", cfg);
+    defer idx.close();
+    idx.attachHllMaintenanceLane(runtime.durable_jobs, try runtime.allocOwnerId());
+
+    const west_token = try idx.constraintTokenAlloc(alloc, "region", "west");
+    defer alloc.free(west_token);
+    const west_group = try token.canonicalTupleAlloc(alloc, &.{west_token});
+    defer alloc.free(west_group);
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "e1", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"token\":\"aa\"}" },
+        .{ .key = "e2", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"token\":\"bb\"}" },
+        .{ .key = "e3", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"token\":\"cc\"}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    const incremental = try idx.approxCardinalityEntriesForGroupTestEstimate(&store, west_group);
+    try std.testing.expectEqual(@as(?u64, 3), incremental);
+
+    // Delete one document to trigger a rebuild from stored facts. If the ingest
+    // and rebuild token tags diverged, the surviving estimate would shift off 2.
+    const deletes = [_][]const u8{"e3"};
+    try idx.applyBatch(&store, .{ .deleted_keys = deletes[0..] });
+    try std.testing.expectEqual(@as(?u64, 2), try idx.approxCardinalityEntriesForGroupTestEstimate(&store, west_group));
+}
+
 test "algebraic raw metric doc id reads canonicalize measure path aliases" {
     const alloc = std.testing.allocator;
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
@@ -19958,7 +21941,7 @@ test "algebraic dynamic templates project typed docfacts without a schema rebuil
     defer idx.close();
 
     const docs = [_]derived_types.DerivedDocument{
-        .{ .key = "e1", .action = .upsert, .cleaned_value = "{\"tenant\":\"t1\",\"user_id\":\"u42\",\"metrics\":{\"latency\":12}}" },
+        .{ .key = "e1", .action = .upsert, .cleaned_value = "{\"tenant\":\"t1\",\"user_id\":[\"u42\",\"u43\"],\"metrics\":{\"latency\":[12,15]},\"items\":[{\"device_id\":\"d1\"},{\"device_id\":\"d2\"}]}" },
     };
     try idx.applyBatch(&store, .{ .documents = docs[0..] });
 
@@ -19979,6 +21962,7 @@ test "algebraic dynamic templates project typed docfacts without a schema rebuil
     // Nested `metrics.latency` matched `metrics.*` -> numeric group + measure.
     try std.testing.expect(factHasField(facts.facts, .group, "metrics.latency"));
     try std.testing.expect(factHasField(facts.facts, .measure, "metrics.latency"));
+    try std.testing.expect(factHasField(facts.facts, .group, "items.device_id"));
 
     // Overwriting the document removes stale dynamic facts (symmetric cleanup
     // through the coalesced update path).
@@ -20072,6 +22056,7 @@ test "algebraic dynamic template fields resolve and aggregate at query time" {
         .{ .key = "e1", .action = .upsert, .cleaned_value = "{\"user_id\":\"u1\",\"score\":10}" },
         .{ .key = "e2", .action = .upsert, .cleaned_value = "{\"user_id\":\"u1\",\"score\":20}" },
         .{ .key = "e3", .action = .upsert, .cleaned_value = "{\"user_id\":\"u2\",\"score\":5}" },
+        .{ .key = "e4", .action = .upsert, .cleaned_value = "{\"user_id\":[\"u1\",\"u3\",\"u3\"],\"score\":[2,3]}" },
     };
     try idx.applyBatch(&store, .{ .documents = docs[0..] });
 
@@ -20112,15 +22097,219 @@ test "algebraic dynamic template fields resolve and aggregate at query time" {
         alloc.free(entries);
     }
 
-    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
     var u1_count: ?[]const u8 = null;
     var u2_count: ?[]const u8 = null;
+    var u3_count: ?[]const u8 = null;
     for (entries) |entry| {
         if (std.mem.indexOf(u8, entry.group_key, "u1") != null) u1_count = entry.value;
         if (std.mem.indexOf(u8, entry.group_key, "u2") != null) u2_count = entry.value;
+        if (std.mem.indexOf(u8, entry.group_key, "u3") != null) u3_count = entry.value;
     }
-    try std.testing.expectEqualStrings("2", u1_count orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings("3", u1_count orelse return error.TestUnexpectedResult);
     try std.testing.expectEqualStrings("1", u2_count orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings("1", u3_count orelse return error.TestUnexpectedResult);
+
+    // Multi-valued measures contribute each scalar to every distinct group
+    // bucket for the document. Duplicate group values still count the document
+    // only once in that bucket.
+    const sum_fold = DocFactBucketFoldRequest{
+        .kind = .terms,
+        .op = .sum,
+        .bucket_field = "user_id",
+        .bucket_role = .group,
+        .measure = "score",
+    };
+    const sum_metadata = try docFactBucketFoldMetadataAlloc(alloc, sum_fold);
+    defer alloc.free(sum_metadata);
+    const sum_steps = [_]ir.TensorProgramStep{
+        .{ .expr = .{
+            .fragment = .slice,
+            .output_dims = &.{ .doc, .field, .scalar },
+            .owner = idx.name,
+            .layout = .docfact_rows,
+        } },
+        .{
+            .expr = .{
+                .fragment = .reduce,
+                .input_dims = &.{ .doc, .field, .scalar },
+                .output_dims = &distributed_bucket_scalar_output_dims,
+                .semantic_id = "score_by_user",
+                .law_id = .sum,
+                .metadata = sum_metadata,
+            },
+            .inputs = &.{.{ .step = 0 }},
+        },
+    };
+    const sum_program = ir.TensorProgram{ .steps = sum_steps[0..], .output = .{ .step = 1 } };
+    const sums = (try idx.scanDocFactBucketFoldEntriesWithTensorProgram(&store, sum_fold, access_paths[0..], sum_program, .{ .step = 1 })) orelse return error.TestUnexpectedResult;
+    defer {
+        for (sums) |*entry| entry.deinit(alloc);
+        alloc.free(sums);
+    }
+    try std.testing.expectEqual(@as(usize, 3), sums.len);
+    var u1_sum: ?[]const u8 = null;
+    var u2_sum: ?[]const u8 = null;
+    var u3_sum: ?[]const u8 = null;
+    for (sums) |entry| {
+        if (std.mem.indexOf(u8, entry.group_key, "u1") != null) u1_sum = entry.value;
+        if (std.mem.indexOf(u8, entry.group_key, "u2") != null) u2_sum = entry.value;
+        if (std.mem.indexOf(u8, entry.group_key, "u3") != null) u3_sum = entry.value;
+    }
+    try std.testing.expectEqualStrings("35", u1_sum orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings("5", u2_sum orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings("5", u3_sum orelse return error.TestUnexpectedResult);
+
+    // Both score values on e4 land in numeric bucket 0. The histogram parent
+    // counts documents, not scalar rows, while its child cardinality still sees
+    // every distinct user_id value in those documents.
+    const histogram_children = [_]CardinalityChildRequest{.{ .name = "users", .field = "user_id" }};
+    const histogram_partials = (try idx.scanDistributedHistogramCardinalityPartials(
+        &store,
+        "score_histogram",
+        "score",
+        .numeric,
+        10,
+        "",
+        histogram_children[0..],
+        &.{},
+        null,
+    )) orelse return error.TestUnexpectedResult;
+    defer distributed_mod.freePartials(alloc, histogram_partials);
+    const bucket_zero_axis = try token.canonicalTupleAlloc(alloc, &.{"0"});
+    defer alloc.free(bucket_zero_axis);
+    var bucket_zero_count: ?[]const u8 = null;
+    var bucket_zero_users: usize = 0;
+    for (histogram_partials) |partial| {
+        if (!std.mem.eql(u8, partial.canonical_axis, bucket_zero_axis)) continue;
+        if (std.mem.eql(u8, partial.metric, "score_histogram")) {
+            bucket_zero_count = partial.value;
+        } else {
+            try std.testing.expectEqualStrings("1", partial.value);
+            bucket_zero_users += 1;
+        }
+    }
+    try std.testing.expectEqualStrings("2", bucket_zero_count orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqual(@as(usize, 3), bucket_zero_users);
+
+    const all_doc_ids = [_][]const u8{ "e1", "e2", "e3", "e4" };
+    const resolved_score = idx.resolveMeasureField("score") orelse return error.TestUnexpectedResult;
+    const total_raw = (try idx.rawMetricForResolvedDocIdsAlloc(&store, .sum, resolved_score, all_doc_ids[0..])) orelse return error.TestUnexpectedResult;
+    defer alloc.free(total_raw);
+    try std.testing.expectEqualStrings("40", total_raw);
+}
+
+test "algebraic dynamic template arrays remain exact after adaptive materialization" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{"version":1,"table":"events",
+        \\ "dynamic_field_rules":[
+        \\   {"name":"users","match":"user_id","type":"string"},
+        \\   {"name":"scores","match":"score","type":"number"},
+        \\   {"name":"times","match":"occurred_at","type":"datetime"}
+        \\ ],
+        \\ "adaptive":{"observe":true,"lazy_materialization":true,"min_observations":1,"max_backfill_rows_per_tick":10,"min_estimated_scan_rows_saved":1},
+        \\ "materializations":[]}
+    ;
+    var idx = try Index.open(alloc, "alg_dynamic_template_adaptive", cfg);
+    defer idx.close();
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "e1", .action = .upsert, .cleaned_value = "{\"user_id\":[\"u1\",\"u2\",\"u2\"],\"score\":[2,3],\"occurred_at\":[\"2026-05-01T10:00:00Z\",\"2026-05-02T10:00:00Z\",\"2026-05-02T10:00:00Z\"]}" },
+        .{ .key = "e2", .action = .upsert, .cleaned_value = "{\"user_id\":\"u1\",\"score\":10,\"occurred_at\":\"2026-05-01T12:00:00Z\"}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+
+    const queries = [_]ir.Query{
+        .{ .kind = .terms, .aggregation_name = "users", .bucket_field = "user_id" },
+        .{ .kind = .terms, .aggregation_name = "score_by_user", .bucket_field = "user_id", .metric = .{ .name = "score_by_user", .op = .sum, .field = "score" } },
+        .{ .kind = .date_histogram, .aggregation_name = "events_by_day", .time_field = "occurred_at", .time_bucket = "day" },
+    };
+    for (queries) |query| idx.recordObservedQueryShapeWithStore(&store, query, "dynamic_template_array_test");
+    try std.testing.expectEqual(@as(u64, queries.len), try idx.evaluateAdaptiveCandidates(&store, 0));
+    while (try idx.runAdaptiveWork(&store, 0) != 0) {}
+
+    const count_rec = try adaptive_mod.recommendationAlloc(alloc, queries[0]);
+    defer alloc.free(count_rec);
+    const count_id = (try idx.readyAdaptiveMaterializationIdAlloc(&store, count_rec)).?;
+    defer alloc.free(count_id);
+    const sum_rec = try adaptive_mod.recommendationAlloc(alloc, queries[1]);
+    defer alloc.free(sum_rec);
+    const sum_id = (try idx.readyAdaptiveMaterializationIdAlloc(&store, sum_rec)).?;
+    defer alloc.free(sum_id);
+    const day_rec = try adaptive_mod.recommendationAlloc(alloc, queries[2]);
+    defer alloc.free(day_rec);
+    const day_id = (try idx.readyAdaptiveMaterializationIdAlloc(&store, day_rec)).?;
+    defer alloc.free(day_id);
+
+    const u1_token = try idx.constraintTokenAlloc(alloc, "user_id", "u1");
+    defer alloc.free(u1_token);
+    const u1_axes = try token.canonicalTupleAlloc(alloc, &.{u1_token});
+    defer alloc.free(u1_axes);
+    const u2_token = try idx.constraintTokenAlloc(alloc, "user_id", "u2");
+    defer alloc.free(u2_token);
+    const u2_axes = try token.canonicalTupleAlloc(alloc, &.{u2_token});
+    defer alloc.free(u2_axes);
+    const u3_token = try idx.constraintTokenAlloc(alloc, "user_id", "u3");
+    defer alloc.free(u3_token);
+    const u3_axes = try token.canonicalTupleAlloc(alloc, &.{u3_token});
+    defer alloc.free(u3_axes);
+    const empty_axes = try token.canonicalTupleAlloc(alloc, &.{});
+    defer alloc.free(empty_axes);
+    const may_first = try cylinder.bucketStartAlloc(alloc, .day, "2026-05-01T00:00:00Z");
+    defer alloc.free(may_first);
+    const may_second = try cylinder.bucketStartAlloc(alloc, .day, "2026-05-02T00:00:00Z");
+    defer alloc.free(may_second);
+
+    const u1_count = (try idx.adaptiveTensorRawValueAlloc(&store, count_id, u1_axes, null)).?;
+    defer alloc.free(u1_count);
+    try std.testing.expectEqual(@as(i64, 2), try algebra.parseI64(u1_count));
+    const u2_count = (try idx.adaptiveTensorRawValueAlloc(&store, count_id, u2_axes, null)).?;
+    defer alloc.free(u2_count);
+    try std.testing.expectEqual(@as(i64, 1), try algebra.parseI64(u2_count));
+    const u1_sum = (try idx.adaptiveTensorRawValueAlloc(&store, sum_id, u1_axes, null)).?;
+    defer alloc.free(u1_sum);
+    try std.testing.expectEqual(@as(f64, 15), try algebra.parseF64(u1_sum));
+    const u2_sum = (try idx.adaptiveTensorRawValueAlloc(&store, sum_id, u2_axes, null)).?;
+    defer alloc.free(u2_sum);
+    try std.testing.expectEqual(@as(f64, 5), try algebra.parseF64(u2_sum));
+    const day_one_count = (try idx.adaptiveTensorRawValueAlloc(&store, day_id, empty_axes, may_first)).?;
+    defer alloc.free(day_one_count);
+    try std.testing.expectEqual(@as(i64, 2), try algebra.parseI64(day_one_count));
+    const day_two_count = (try idx.adaptiveTensorRawValueAlloc(&store, day_id, empty_axes, may_second)).?;
+    defer alloc.free(day_two_count);
+    try std.testing.expectEqual(@as(i64, 1), try algebra.parseI64(day_two_count));
+
+    // Bulk ingest exercises append-only accumulation for every array value.
+    const added = [_]derived_types.DerivedDocument{.{ .key = "e3", .action = .upsert, .cleaned_value = "{\"user_id\":[\"u2\",\"u3\"],\"score\":[4,6],\"occurred_at\":\"2026-05-02T14:00:00Z\"}" }};
+    try idx.applyBatchWithOptions(&store, .{ .documents = added[0..] }, .{ .batch_options = .{ .mode = .bulk_ingest } });
+    const u2_after_add = (try idx.adaptiveTensorRawValueAlloc(&store, sum_id, u2_axes, null)).?;
+    defer alloc.free(u2_after_add);
+    try std.testing.expectEqual(@as(f64, 15), try algebra.parseF64(u2_after_add));
+
+    // Overwrite and delete exercise inverse coalesced maintenance; old array
+    // contributions must disappear from every affected tensor cell.
+    const overwritten = [_]derived_types.DerivedDocument{.{ .key = "e1", .action = .upsert, .cleaned_value = "{\"user_id\":\"u3\",\"score\":1,\"occurred_at\":\"2026-05-01T10:00:00Z\"}" }};
+    try idx.applyBatch(&store, .{ .documents = overwritten[0..] });
+    const u2_after_overwrite = (try idx.adaptiveTensorRawValueAlloc(&store, sum_id, u2_axes, null)).?;
+    defer alloc.free(u2_after_overwrite);
+    try std.testing.expectEqual(@as(f64, 10), try algebra.parseF64(u2_after_overwrite));
+    const u3_after_overwrite = (try idx.adaptiveTensorRawValueAlloc(&store, sum_id, u3_axes, null)).?;
+    defer alloc.free(u3_after_overwrite);
+    try std.testing.expectEqual(@as(f64, 11), try algebra.parseF64(u3_after_overwrite));
+
+    const deleted = [_][]const u8{"e3"};
+    try idx.applyBatch(&store, .{ .deleted_keys = deleted[0..] });
+    try std.testing.expect((try idx.adaptiveTensorRawValueAlloc(&store, sum_id, u2_axes, null)) == null);
+    const u3_after_delete = (try idx.adaptiveTensorRawValueAlloc(&store, sum_id, u3_axes, null)).?;
+    defer alloc.free(u3_after_delete);
+    try std.testing.expectEqual(@as(f64, 1), try algebra.parseF64(u3_after_delete));
 }
 
 test "algebraic withholds dynamic field resolution while backfill pending" {
@@ -23305,6 +25494,61 @@ test "algebraic index executes proven docfact bucket fold tensor program" {
         .output = .{ .step = 1 },
     };
     try std.testing.expect((try idx.scanDocFactBucketFoldEntriesWithTensorProgram(&store, fold, access_paths[0..], tampered_program, .{ .step = 1 })) == null);
+}
+
+test "child cardinality cache releases partial builds and falls back at its byte budget" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{"version":1,"table":"orders","group_fields":[{"name":"product","path":"product","type":"string"}]}
+    ;
+    var idx = try Index.open(alloc, "alg_cardinality_cache", cfg);
+    defer idx.close();
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"product\":\"p1\"}" },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"product\":\"p2\"}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+
+    const mixed_children = [_]CardinalityChildRequest{
+        .{ .name = "products", .field = "product" },
+        .{ .name = "missing", .field = "missing" },
+    };
+    try std.testing.expect((try idx.buildChildCardinalityIndexesAlloc(&store, mixed_children[0..])) == null);
+
+    const bounded_cfg =
+        \\{"version":1,"table":"orders","max_cardinality_cache_bytes":1,"group_fields":[{"name":"product","path":"product","type":"string"}]}
+    ;
+    var bounded = try Index.open(alloc, "alg_cardinality_cache_bounded", bounded_cfg);
+    defer bounded.close();
+    try bounded.applyBatch(&store, .{ .documents = docs[0..] });
+    const supported_children = [_]CardinalityChildRequest{.{ .name = "products", .field = "product" }};
+    try std.testing.expect((try bounded.buildChildCardinalityIndexesAlloc(&store, supported_children[0..])) == null);
+
+    // Force exhaustion after a second map entry and its owned key have been
+    // created, but before the value/list can be retained. Rollback must restore
+    // the exact prior live-byte baseline rather than orphaning nested storage.
+    var cache_allocator = Index.CardinalityCacheAllocator{ .backing = alloc, .limit_bytes = 4096 };
+    const cache_alloc = cache_allocator.allocator();
+    var child_index = Index.ChildCardinalityIndex{};
+    try child_index.add(cache_alloc, "o1", "product-one");
+    const baseline = cache_allocator.live_bytes;
+    cache_allocator.limit_bytes = baseline + "o2".len;
+    try std.testing.expectError(error.OutOfMemory, child_index.add(cache_alloc, "o2", "product-two"));
+    try std.testing.expect(cache_allocator.budget_denied);
+    try std.testing.expectEqual(baseline, cache_allocator.live_bytes);
+    child_index.deinit(cache_alloc);
+    try std.testing.expectEqual(@as(usize, 0), cache_allocator.live_bytes);
+
+    var built = (try idx.buildChildCardinalityIndexesAlloc(&store, supported_children[0..])) orelse return error.TestUnexpectedResult;
+    defer built.deinit(&idx);
+    try std.testing.expectEqual(@as(usize, 1), built.indexes.len);
+    try std.testing.expectEqual(@as(usize, 1), built.indexes[0].valuesFor("o1").len);
 }
 
 test "algebraic index executes cardinality partial tensor programs" {

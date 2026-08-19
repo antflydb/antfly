@@ -8,6 +8,7 @@ from attrs import field as _attrs_field
 
 from ..models.aggregation_type import AggregationType
 from ..models.calendar_interval import CalendarInterval
+from ..models.cardinality_mode import CardinalityMode
 from ..models.distance_unit import DistanceUnit
 from ..models.significance_algorithm import SignificanceAlgorithm
 from ..types import UNSET, Unset
@@ -60,6 +61,11 @@ class AggregationRequest:
             - Analytics: significant_terms
         field (str | Unset): Field to aggregate on. Required unless `fields` is supplied for a multi-field terms
             aggregation.
+        mode (CardinalityMode | Unset): Exact-vs-approximate selection for a cardinality aggregation:
+            - auto: use a materialized HyperLogLog sketch when one applies and is
+              current, else an exact distinct scan (default).
+            - exact: always compute an exact distinct count.
+            - approximate: require a matching sketch; error if none applies.
         fields (list[str] | Unset): Ordered field list for multi-field terms aggregations. Bucket keys are returned as
             JSON arrays in the same order.
         size (int | Unset): Maximum number of buckets to return (for bucketing aggregations) Example: 10.
@@ -94,6 +100,7 @@ class AggregationRequest:
 
     type_: AggregationType
     field: str | Unset = UNSET
+    mode: CardinalityMode | Unset = UNSET
     fields: list[str] | Unset = UNSET
     size: int | Unset = UNSET
     ranges: list[AggregationRange] | Unset = UNSET
@@ -169,6 +176,10 @@ class AggregationRequest:
         type_ = self.type_.value
 
         field = self.field
+
+        mode: str | Unset = UNSET
+        if not isinstance(self.mode, Unset):
+            mode = self.mode.value
 
         fields: list[str] | Unset = UNSET
         if not isinstance(self.fields, Unset):
@@ -290,6 +301,8 @@ class AggregationRequest:
         )
         if field is not UNSET:
             field_dict["field"] = field
+        if mode is not UNSET:
+            field_dict["mode"] = mode
         if fields is not UNSET:
             field_dict["fields"] = fields
         if size is not UNSET:
@@ -361,6 +374,13 @@ class AggregationRequest:
         type_ = AggregationType(d.pop("type"))
 
         field = d.pop("field", UNSET)
+
+        _mode = d.pop("mode", UNSET)
+        mode: CardinalityMode | Unset
+        if isinstance(_mode, Unset):
+            mode = UNSET
+        else:
+            mode = CardinalityMode(_mode)
 
         fields = cast(list[str], d.pop("fields", UNSET))
 
@@ -680,6 +700,7 @@ class AggregationRequest:
         aggregation_request = cls(
             type_=type_,
             field=field,
+            mode=mode,
             fields=fields,
             size=size,
             ranges=ranges,

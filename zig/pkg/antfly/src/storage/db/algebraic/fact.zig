@@ -142,6 +142,67 @@ pub fn axisTupleAlloc(alloc: Allocator, facts: []const Fact, fields: []const []c
     return try token.canonicalTupleAlloc(alloc, axes);
 }
 
+/// Returns every distinct group-axis tuple represented by one document. Dynamic
+/// templates can project arrays as repeated facts for the same field, so a
+/// multi-axis materialization is the Cartesian product of each field's distinct
+/// scalar values. Duplicate array elements must not multiply a document's
+/// contribution to the same tensor cell.
+pub fn axisTuplesAlloc(alloc: Allocator, facts: []const Fact, fields: []const []const u8) ![][]u8 {
+    const dimensions = try alloc.alloc(std.ArrayListUnmanaged([]const u8), fields.len);
+    defer alloc.free(dimensions);
+    for (dimensions) |*dimension| dimension.* = .empty;
+    defer for (dimensions) |*dimension| dimension.deinit(alloc);
+
+    for (fields, dimensions) |field, *dimension| {
+        for (facts) |item| {
+            if (item.role != .group or !std.mem.eql(u8, item.field, field)) continue;
+            var duplicate = false;
+            for (dimension.items) |existing| {
+                if (std.mem.eql(u8, existing, item.scalar)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) try dimension.append(alloc, item.scalar);
+        }
+        if (dimension.items.len == 0) return error.MissingField;
+    }
+
+    const selected = try alloc.alloc([]const u8, fields.len);
+    defer alloc.free(selected);
+    var tuples = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (tuples.items) |tuple| alloc.free(tuple);
+        tuples.deinit(alloc);
+    }
+    try appendAxisTuplesAlloc(alloc, dimensions, selected, 0, &tuples);
+    return try tuples.toOwnedSlice(alloc);
+}
+
+fn appendAxisTuplesAlloc(
+    alloc: Allocator,
+    dimensions: []const std.ArrayListUnmanaged([]const u8),
+    selected: [][]const u8,
+    depth: usize,
+    tuples: *std.ArrayListUnmanaged([]u8),
+) !void {
+    if (depth == dimensions.len) {
+        const tuple = try token.canonicalTupleAlloc(alloc, selected);
+        errdefer alloc.free(tuple);
+        try tuples.append(alloc, tuple);
+        return;
+    }
+    for (dimensions[depth].items) |scalar| {
+        selected[depth] = scalar;
+        try appendAxisTuplesAlloc(alloc, dimensions, selected, depth + 1, tuples);
+    }
+}
+
+pub fn freeAxisTuples(alloc: Allocator, tuples: [][]u8) void {
+    for (tuples) |tuple| alloc.free(tuple);
+    if (tuples.len > 0) alloc.free(tuples);
+}
+
 pub fn findScalar(facts: []const Fact, role: Role, field: []const u8) ?[]const u8 {
     for (facts) |item| {
         if (item.role == role and std.mem.eql(u8, item.field, field)) return item.scalar;
@@ -194,4 +255,18 @@ test "fact axis tuple is independent of document shape" {
     const axis = try axisTupleAlloc(alloc, facts.facts, &.{ "tenant", "product" });
     defer alloc.free(axis);
     try std.testing.expect(axis.len > 0);
+}
+
+test "fact dynamic template axes form a distinct Cartesian product" {
+    const alloc = std.testing.allocator;
+    const facts = [_]Fact{
+        .{ .role = .group, .field = @constCast("region"), .scalar = @constCast("us") },
+        .{ .role = .group, .field = @constCast("region"), .scalar = @constCast("eu") },
+        .{ .role = .group, .field = @constCast("region"), .scalar = @constCast("eu") },
+        .{ .role = .group, .field = @constCast("tier"), .scalar = @constCast("gold") },
+        .{ .role = .group, .field = @constCast("tier"), .scalar = @constCast("silver") },
+    };
+    const tuples = try axisTuplesAlloc(alloc, facts[0..], &.{ "region", "tier" });
+    defer freeAxisTuples(alloc, tuples);
+    try std.testing.expectEqual(@as(usize, 4), tuples.len);
 }

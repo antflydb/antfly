@@ -933,6 +933,7 @@ fn isAlgebraicUserTunableField(field: []const u8) bool {
         "max_result_buckets",
         "max_planner_scan_rows",
         "max_batch_accumulator_entries",
+        "max_cardinality_cache_bytes",
         "min_max_candidate_cache_size",
         "enable_temporal_range_pruning",
     };
@@ -1009,6 +1010,8 @@ fn isAlgebraicInternalConfigField(field: []const u8) bool {
         "group_fields",
         "measure_fields",
         "time_fields",
+        "dynamic_field_rules",
+        "dynamic_rules_backfill_pending",
         "joins",
         "laws",
         "capability_fingerprint",
@@ -4369,7 +4372,7 @@ test "single schema-derived algebraic index expands into explicit capability con
     try std.testing.expect(std.mem.indexOf(u8, expanded, "\"sum_by_customer\"") == null);
 }
 
-test "public algebraic index definitions cannot declare internal materializations" {
+test "public algebraic index definitions cannot override schema-derived capabilities" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(
         error.InvalidCreateTableRequest,
@@ -4382,6 +4385,14 @@ test "public algebraic index definitions cannot declare internal materialization
     try std.testing.expectError(
         error.InvalidCreateTableRequest,
         validatePublicAlgebraicIndexJson(alloc, "{\"type\":\"algebraic\",\"derive_from_schema\":true,\"group_fields\":[]}"),
+    );
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        validatePublicAlgebraicIndexJson(alloc, "{\"type\":\"algebraic\",\"derive_from_schema\":true,\"dynamic_field_rules\":[]}"),
+    );
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        validatePublicAlgebraicIndexJson(alloc, "{\"type\":\"algebraic\",\"derive_from_schema\":true,\"dynamic_rules_backfill_pending\":false}"),
     );
 }
 
@@ -4852,7 +4863,7 @@ test "metadata.schema update regenerates algebraic config and preserves user kno
     defer canon_parsed.deinit();
     const fp = canon_parsed.value.object.get("capability_fingerprint").?.string;
 
-    const stored = try std.fmt.allocPrint(std.testing.allocator, "{{\"alg\":{{\"type\":\"algebraic\",\"capability_fingerprint\":\"{s}\",\"adaptive\":{{\"observe\":false,\"min_observations\":9}},\"dynamic_field_rules\":[{{\"name\":\"ext\",\"match\":\"ext_*\",\"type\":\"string\"}}]}}}}", .{fp});
+    const stored = try std.fmt.allocPrint(std.testing.allocator, "{{\"alg\":{{\"type\":\"algebraic\",\"capability_fingerprint\":\"{s}\",\"adaptive\":{{\"observe\":false,\"min_observations\":9}},\"max_cardinality_cache_bytes\":12345,\"dynamic_field_rules\":[{{\"name\":\"ext\",\"match\":\"ext_*\",\"type\":\"string\"}}]}}}}", .{fp});
     defer std.testing.allocator.free(stored);
 
     const refreshed = try regenerateAlgebraicIndexesFromSchemaAlloc(std.testing.allocator, "docs", stored, schema);
@@ -4860,6 +4871,7 @@ test "metadata.schema update regenerates algebraic config and preserves user kno
 
     // User knob preserved through regeneration.
     try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"min_observations\":9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"max_cardinality_cache_bytes\":12345") != null);
     // Capability unchanged (matching fingerprint) => no backfill flag forced on.
     try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"dynamic_rules_backfill_pending\":true") == null);
 }

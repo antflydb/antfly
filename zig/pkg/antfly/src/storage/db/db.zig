@@ -2973,6 +2973,7 @@ pub const DB = struct {
     backend_runtime: *background_runtime_mod.BackendRuntime,
     backend_owner_id: u64,
     repair_cleanup_owner_id: u64,
+    algebraic_hll_owner_id: u64 = 0,
     owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager,
     capacity_source: ?types.RepairCapacitySource,
@@ -3208,6 +3209,12 @@ pub const DB = struct {
     fn mirrorHASchemaMetadataCommit(self: *DB, table_schema: schema_mod.TableSchema) !void {
         var ctx = self.batchContext();
         try mirrorHASchemaMetadataCommitContext(&ctx, table_schema);
+    }
+
+    fn attachAlgebraicHllMaintenanceLane(self: *DB) !void {
+        const owner_id = try self.backend_runtime.allocOwnerId();
+        self.algebraic_hll_owner_id = owner_id;
+        self.core.index_manager.attachHllMaintenance(self.backend_runtime.durable_jobs, owner_id);
     }
 
     fn hydrateAlgebraicObservationStatusBestEffort(self: *DB) void {
@@ -3460,6 +3467,8 @@ pub const DB = struct {
                 deinitOwnedEnrichmentConfig(alloc, cfg);
                 opts.enrichment = null;
             }
+
+            try db.attachAlgebraicHllMaintenanceLane();
 
             const admission_prefix = try internal_keys.managedIndexAdmissionRootPrefixAlloc(alloc);
             defer alloc.free(admission_prefix);
@@ -4248,6 +4257,10 @@ pub const DB = struct {
         self.setQueryVisibilityHook(null);
         self.async_context.background_closing.store(true, .release);
         self.async_context.enrichment_desired_running.store(false, .release);
+        if (self.algebraic_hll_owner_id != 0) {
+            self.backend_runtime.durable_jobs.closeOwner(self.algebraic_hll_owner_id);
+            self.algebraic_hll_owner_id = 0;
+        }
         self.backend_runtime.durable_jobs.closeOwner(self.repair_cleanup_owner_id);
         self.backend_runtime.durable_jobs.closeOwner(self.backend_owner_id);
         self.clearLiveDocSetCache();
@@ -16265,6 +16278,7 @@ pub const DB = struct {
         var changed: u64 = 0;
         for (self.core.index_manager.algebraic_indexes.items) |*entry| {
             changed += try entry.index.evaluateAdaptiveCandidates(self.core.store, target_sequence);
+            changed += try entry.index.evaluateHllCardinalityCandidates(self.core.store);
         }
         return changed;
     }

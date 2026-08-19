@@ -43,6 +43,7 @@ const db_config = @import("../config.zig");
 const persistent_mod = @import("../../persistent.zig");
 const lsm_backend_mod = @import("../../lsm_backend/mod.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
+const background_runtime_mod = @import("../../background_runtime.zig");
 const docstore_mod = @import("../../docstore.zig");
 const schema_mod = @import("../../schema.zig");
 const analysis_mod = @import("../../../search/analysis.zig");
@@ -1117,6 +1118,11 @@ pub const IndexManager = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager,
     bind_cache_resource_manager: bool,
+    // Background lane used by algebraic indexes to run HLL cardinality
+    // maintenance off the foreground write path. Attached after construction
+    // via attachHllMaintenance(); when null, maintenance runs inline.
+    hll_maintenance_lane: ?background_runtime_mod.DurableJobLane = null,
+    hll_maintenance_owner_id: u64 = 0,
     primary_store: ?*docstore_mod.DocStore,
     applied_sequence_checkpoint_path: ?[]const u8,
     catalog_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
@@ -2290,6 +2296,17 @@ pub const IndexManager = struct {
         self.load_parallelism = if (parallelism) |value| @max(value, 1) else null;
     }
 
+    // Provide the background lane that algebraic indexes use for HLL cardinality
+    // maintenance. Call before loading indexes so newly opened algebraic indexes
+    // pick up the lane; already-open indexes are (re)attached here too.
+    pub fn attachHllMaintenance(self: *IndexManager, lane: background_runtime_mod.DurableJobLane, owner_id: u64) void {
+        self.hll_maintenance_lane = lane;
+        self.hll_maintenance_owner_id = owner_id;
+        for (self.algebraic_indexes.items) |*entry| {
+            entry.index.attachHllMaintenanceLane(lane, owner_id);
+        }
+    }
+
     fn bindPrimaryStore(self: *IndexManager, store: anytype) void {
         const Store = @TypeOf(store);
         if (comptime Store == *docstore_mod.DocStore) {
@@ -2365,6 +2382,7 @@ pub const IndexManager = struct {
             new_parsed.value.max_result_buckets = cur.max_result_buckets;
             new_parsed.value.max_planner_scan_rows = cur.max_planner_scan_rows;
             new_parsed.value.max_batch_accumulator_entries = cur.max_batch_accumulator_entries;
+            new_parsed.value.max_cardinality_cache_bytes = cur.max_cardinality_cache_bytes;
             new_parsed.value.min_max_candidate_cache_size = cur.min_max_candidate_cache_size;
             new_parsed.value.enable_temporal_range_pruning = cur.enable_temporal_range_pruning;
 
@@ -10757,6 +10775,12 @@ pub const IndexManager = struct {
                     }
                 }
                 if (self.resource_manager) |manager| index.attachResourceManager(manager);
+                if (self.hll_maintenance_lane) |lane| {
+                    index.attachHllMaintenanceLane(lane, self.hll_maintenance_owner_id);
+                    if (comptime @TypeOf(store) == *docstore_mod.DocStore) {
+                        index.loadAdaptiveHllCardinalities(store) catch {};
+                    }
+                }
                 const apply_mutex = try self.allocIndexApplyMutex();
                 var apply_mutex_owned = true;
                 errdefer if (apply_mutex_owned) self.destroyIndexApplyMutex(apply_mutex);

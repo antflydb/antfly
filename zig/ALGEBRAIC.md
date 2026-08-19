@@ -1482,7 +1482,10 @@ Planner cost guards are deliberately conservative. `max_result_buckets` bounds
 returned algebraic buckets, while `max_planner_scan_rows` bounds sidecar row
 scans for rollups, terms, and date histograms. If the sidecar would need to scan
 more rows than the configured budget, the planner records an explicit fallback
-reason and lets the existing aggregation path answer the request.
+reason and lets the existing aggregation path answer the request. Nested
+cardinality acceleration has an independent `max_cardinality_cache_bytes`
+working-set limit (32 MiB by default); exhausting it releases the cache and
+falls back instead of allowing query memory to grow with the full corpus.
 
 The current storage model is intentionally direct and debuggable. It is a
 schema-derived algebraic sidecar with a first schemaless fact substrate and
@@ -2342,3 +2345,33 @@ manual user-facing materialization lifecycle or explicit materialization definit
 best-effort approximate MIN/MAX
 using the algebraic sidecar when status indicates incomplete derived state
 ```
+
+## Approximate cardinality (HyperLogLog)
+
+An index can materialize approximate distinct counts so a `cardinality`
+aggregation is answered from a per-group sketch instead of scanning and
+deduplicating every value:
+
+```json
+{
+  "hll_cardinalities": [
+    {"name": "customers_by_region", "group_by": ["region"],
+     "value_field": "customer", "precision": 14}
+  ]
+}
+```
+
+`group_by` contains the bucket axes, `value_field` names the distinct value,
+and `precision` (4–18, default 14) controls sketch size and accuracy. Results
+identify whether they are estimates and include the relative error when
+applicable:
+
+```json
+{"value": 4044, "approximate": true, "relative_error": 0.0081}
+{"value": 4096, "approximate": false}
+```
+
+The planner uses a matching, current sketch when the query shape permits it and
+otherwise falls back to the exact distinct scan. Deletes and overwrites mark
+affected groups dirty; the durable maintenance lane rebuilds those sketches in
+the background.

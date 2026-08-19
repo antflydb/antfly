@@ -5007,6 +5007,8 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "dynamic template",
+            "child cardinality cache",
+            "public algebraic index definitions",
             "metadata.algebraic schema regeneration",
             "db managed algebraic admission builds and reopens",
         },
@@ -5019,7 +5021,7 @@ pub fn build(b: *std.Build) void {
     run_algebraic_dynamic_template_tests.step.dependOn(&openapi_root_check.step);
     const algebraic_dynamic_template_test_step = b.step(
         "algebraic-dynamic-template-test",
-        "Run focused algebraic dynamic-template projection, resolution, lifecycle, and schema-update tests",
+        "Run focused algebraic dynamic-template and cardinality-cache safety tests",
     );
     algebraic_dynamic_template_test_step.dependOn(&run_algebraic_dynamic_template_tests.step);
 
@@ -8568,6 +8570,7 @@ pub fn build(b: *std.Build) void {
     replay_bench_build_options.addOption(bool, "with_tla", with_tla);
     replay_bench_build_options.addOption(bool, "link_libc", true);
     replay_bench_build_options.addOption(bool, "standalone_runtime_focused_test", false);
+    replay_bench_build_options.addOption(bool, "lmdb_enabled", true);
     replay_bench_build_options.addOption(bool, "bench_minimal_deps", true);
 
     const replay_bench_mod = b.createModule(.{
@@ -8728,10 +8731,13 @@ pub fn build(b: *std.Build) void {
     algebraic_bench_root_mod.addImport("bloom", bloom_mod);
     algebraic_bench_root_mod.addImport("antfly_vector", vector_mod);
     algebraic_bench_root_mod.addImport("antfly_vectorindex", vectorindex_mod);
+    algebraic_bench_root_mod.addImport("antfly_matcher", matcher_mod);
     algebraic_bench_root_mod.addImport("antfly_vellum", vellum_mod);
     algebraic_bench_root_mod.addImport("antfly_regex", regex_mod);
     algebraic_bench_root_mod.addImport("antfly_platform", platform_mod);
     algebraic_bench_root_mod.addImport("antfly_reranking", reranking_mod);
+    algebraic_bench_root_mod.addImport("antfly_resolver", resolver_mod);
+    algebraic_bench_root_mod.addImport("antfly_reader_config", reader_config_mod);
     addSnowballModule(b, algebraic_bench_root_mod);
     algebraic_bench_mod.addImport("antfly-zig", algebraic_bench_root_mod);
 
