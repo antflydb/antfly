@@ -130,13 +130,42 @@ First-cut physical mapping:
 
 ### Write path
 
-`writeDocFacts` (`storage/db/algebraic/index.zig`) is extended so a
-relational-mode write also populates the `typed_doc_values` column for every
-declared column (using `columnar.zig` null-backfill for absent nullable
-columns; rejecting absent non-nullable columns). `json` columns are written as
-`bytes` and additionally projected via `pathfact` + dynamic templates. In
-Phase B this is also where the JSON blob write is dropped for non-`json`
-columns.
+`schema_capability.projectRelationalRowAlloc` turns a document into one typed
+cell per declared column (`RelationalRow` / `RelationalCell` / `ColumnValue`),
+ready to hand to `section/typed_doc_values.zig` at segment-build time:
+
+- a missing or null value on a non-nullable column is rejected
+  (`error.MissingRequiredColumn`) — this is `NOT NULL` enforcement;
+- a value that does not match the declared column type is rejected
+  (`error.InvalidColumnValue`) — relational columns are strict;
+- nullable columns absent from a document produce no cell (the typed column is
+  sparse, matching `typed_doc_values` doc-id semantics);
+- `json` columns are stringified to bytes and flagged `is_json` so the write
+  path can additionally project the subtree via `pathfact` + dynamic templates.
+
+Numeric physical encoding matches `typed_doc_values` and is order-preserving so
+range scans work directly on the packed column:
+
+- `number` → `f64` (native);
+- `integer` → `u64` via `orderedU64FromI64` (sign-bit flip, so unsigned range
+  scans yield signed order); round-trips through `orderedI64FromU64`;
+- `datetime` → `u64` from an epoch integer (or integer-string). RFC3339 string
+  parsing to epoch is a follow-up; epoch integers are accepted today;
+- `boolean` → `bool`, `geopoint` → packed lat/lon, `string`/`blob`/`geoshape`
+  → `bytes`.
+
+Round-trip through the real `TypedDocValuesWriter`/`TypedDocValuesReader` is
+covered by unit tests.
+
+**Remaining integration seam:** `TypedDocValuesWriter` is a segment-level
+accumulator (all docs in a segment → one `build()`), not a per-document store,
+so populating columns belongs in the segment builder that owns the write batch,
+not in the per-document `writeDocFacts`. The seam is: add
+`relational_columns: []const FieldConfig` to the index `Config`
+(`storage/db/algebraic/index.zig`), and at segment build collect, per column, a
+`TypedDocValuesWriter` fed by `projectRelationalRowAlloc` for each document in
+the batch, then persist each built section. In Phase B this is also where the
+JSON blob write is dropped for non-`json` columns.
 
 ### Query path
 
@@ -161,8 +190,12 @@ number) is additive where the physical type is compatible.
   `storage_mode` on `TableSchema` (spec + Go + Zig), `json` `AntflyType`, and
   `relationalColumnPlanAlloc` producing the typed-column catalog with tests.
   No behaviour change for document-mode tables.
-- **Phase 2 — write path.** Guarantee typed-column population for relational
-  writes (Phase A); enforce `NOT NULL`; index `json` columns as subtrees.
+- **Phase 2 — write path (projection done).** `projectRelationalRowAlloc`
+  produces order-preserving typed cells per column, enforces `NOT NULL`, and
+  captures `json` subtrees, verified end-to-end against the real
+  `typed_doc_values` writer/reader. Remaining: wire per-column
+  `TypedDocValuesWriter` accumulation into the segment builder and persist the
+  sections (see "Remaining integration seam" above).
 - **Phase 3 — columnar scan + predicate pushdown.** Table-scan operator over
   `typed_doc_values`; route typed-column predicates to it; columnar projection
   on read.
