@@ -9143,7 +9143,7 @@ export interface components {
          * @description Field type annotations for schema fields
          * @enum {string}
          */
-        "AntflyType-2": "text" | "html" | "keyword" | "numeric" | "boolean" | "datetime" | "geopoint" | "geoshape" | "embedding" | "blob" | "link" | "search_as_you_type";
+        "AntflyType-2": "text" | "html" | "keyword" | "numeric" | "boolean" | "datetime" | "geopoint" | "geoshape" | "embedding" | "blob" | "link" | "search_as_you_type" | "json";
         /** @description Field mapping to apply when a dynamic template matches */
         TemplateFieldMapping: {
             type?: components["schemas"]["AntflyType-2"];
@@ -9226,6 +9226,18 @@ export interface components {
              * @description Backend-managed schema generation used for migrations. Omit it from create and update requests.
              */
             readonly version?: number;
+            /**
+             * @description Storage profile for the table.
+             *     - "document" (default): schemaless JSON documents with optional,
+             *       soft schema validation. All indexes are derived from the document.
+             *     - "relational": required closed schema with typed columns. Documents
+             *       must match a declared type; declared scalar properties are stored
+             *       as typed columns for columnar predicate pushdown and aggregation.
+             *       A field typed "json" stores a subtree that is still indexed like a
+             *       document. Implies enforce_types and closed document types.
+             * @enum {string}
+             */
+            storage_mode?: "document" | "relational";
             /** @description Default type to use from the document_types. */
             default_type?: string;
             /**

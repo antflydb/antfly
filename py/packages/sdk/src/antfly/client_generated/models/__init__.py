@@ -686,6 +686,7 @@ from .table_restore_status import TableRestoreStatus
 from .table_restore_status_status import TableRestoreStatusStatus
 from .table_schema import TableSchema
 from .table_schema_document_schemas import TableSchemaDocumentSchemas
+from .table_schema_storage_mode import TableSchemaStorageMode
 from .table_shards import TableShards
 from .table_statistics import TableStatistics
 from .table_statistics_field_stats import TableStatisticsFieldStats
@@ -1440,6 +1441,7 @@ __all__ = (
     "TableRestoreStatusStatus",
     "TableSchema",
     "TableSchemaDocumentSchemas",
+    "TableSchemaStorageMode",
     "TableShards",
     "TableStatistics",
     "TableStatisticsFieldStats",
