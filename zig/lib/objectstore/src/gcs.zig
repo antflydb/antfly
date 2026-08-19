@@ -457,12 +457,24 @@ pub const JsonApiClient = struct {
         } else try self.statObjectVersion(alloc, bucket, key, opts.version_id);
         errdefer meta.deinit(alloc);
 
-        const url = try objectMediaUrlWithGenerationAlloc(alloc, self.cfg, bucket, key, opts.version_id);
+        const effective_generation: ?[]const u8 = if (opts.version_id) |value|
+            value
+        else if (!opts.skip_metadata_probe)
+            meta.version_id
+        else
+            null;
+        const url = try objectMediaUrlWithGenerationAlloc(alloc, self.cfg, bucket, key, effective_generation);
         defer alloc.free(url);
 
         var headers = std.ArrayListUnmanaged(HeaderPair).empty;
         defer headers.deinit(alloc);
-        try appendConditionalHeaders(alloc, &headers, opts.if_match_etag, false);
+        const effective_if_match: ?[]const u8 = if (opts.if_match_etag) |value|
+            value
+        else if (!opts.skip_metadata_probe and effective_generation == null)
+            meta.etag
+        else
+            null;
+        try appendConditionalHeaders(alloc, &headers, effective_if_match, false);
         if (opts.range) |range| {
             const value = try byteRangeHeaderAlloc(alloc, range);
             errdefer alloc.free(value);
@@ -1335,7 +1347,7 @@ test "gcs local grpc reference path can be discovered when present" {
     }
 }
 
-test "json api client get object uses metadata then media with auth and range" {
+test "json api client pins media reads to the generation returned by metadata" {
     const alloc = std.testing.allocator;
     const State = struct {
         calls: usize = 0,
@@ -1359,7 +1371,7 @@ test "json api client get object uses metadata then media with auth and range" {
                 0 => {
                     try std.testing.expectEqual(@as(?usize, null), max_response_size);
                     try std.testing.expectEqual(HttpMethod.GET, method);
-                    try std.testing.expectEqualStrings("https://storage.googleapis.com/storage/v1/b/bucket/o/folder%2Fdoc.txt?generation=42", url);
+                    try std.testing.expectEqualStrings("https://storage.googleapis.com/storage/v1/b/bucket/o/folder%2Fdoc.txt", url);
                     try expectHeader(headers, "Authorization", "Bearer token-123");
                     return .{
                         .status = 200,
@@ -1371,7 +1383,6 @@ test "json api client get object uses metadata then media with auth and range" {
                     try std.testing.expectEqual(HttpMethod.GET, method);
                     try std.testing.expectEqualStrings("https://storage.googleapis.com/storage/v1/b/bucket/o/folder%2Fdoc.txt?generation=42&alt=media", url);
                     try expectHeader(headers, "Authorization", "Bearer token-123");
-                    try expectHeader(headers, "If-Match", "etag-1");
                     try expectHeader(headers, "Range", "bytes=2-5");
                     return .{
                         .status = 206,
@@ -1406,9 +1417,7 @@ test "json api client get object uses metadata then media with auth and range" {
     defer client.deinit();
 
     var result = try client.getObject("bucket", "folder/doc.txt", .{
-        .version_id = "42",
         .range = .{ .offset = 2, .length = 4 },
-        .if_match_etag = "etag-1",
     });
     defer result.deinit(alloc);
 
