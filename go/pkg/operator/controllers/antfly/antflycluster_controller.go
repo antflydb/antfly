@@ -78,10 +78,10 @@ type AntflyClusterReconciler struct {
 	// (namespace/name -> int). Reset on successful validation. Used for
 	// exponential backoff on repeated validation failures.
 	validationAttempts sync.Map
-	// metadataLeadershipObservations tracks the start of a leadership-only
-	// inconsistency so the election grace period can span short reconciliations
-	// without occupying a controller worker while Raft settles.
-	metadataLeadershipObservations sync.Map
+	// metadataTopologyObservations tracks retryable runtime-topology observations
+	// so short grace periods can span reconciliations without occupying a
+	// controller worker while Raft settles or a status probe recovers.
+	metadataTopologyObservations sync.Map
 	// haIsolationGraceStarts is intentionally process-local and unpersisted. A
 	// controller or leader restart must observe the exact Lease transfer again
 	// and wait a fresh full runtime maximum fence latency.
@@ -1494,7 +1494,7 @@ func (r *AntflyClusterReconciler) validateClusterConfiguration(ctx context.Conte
 // the mutable StatefulSet replica field is used only to migrate legacy clusters.
 func (r *AntflyClusterReconciler) validateMetadataReplicaTopology(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
 	if cluster.Spec.Mode != antflyv1.ClusterModeDistributed {
-		r.metadataLeadershipObservations.Delete(metadataLeadershipObservationKey(cluster))
+		r.metadataTopologyObservations.Delete(metadataTopologyObservationKey(cluster))
 		return nil
 	}
 
@@ -1669,23 +1669,38 @@ func (e *metadataLeadershipObservationError) Unwrap() error {
 	return e.cause
 }
 
-type metadataLeadershipObservationPendingError struct {
-	cause      error
-	retryAfter time.Duration
+type metadataRuntimeTopologyProbeError struct {
+	cause error
 }
 
-func (e *metadataLeadershipObservationPendingError) Error() string {
+func (e *metadataRuntimeTopologyProbeError) Error() string {
 	return e.cause.Error()
 }
 
-func (e *metadataLeadershipObservationPendingError) Unwrap() error {
+func (e *metadataRuntimeTopologyProbeError) Unwrap() error {
 	return e.cause
 }
 
-type metadataLeadershipObservationState struct {
-	uid       types.UID
-	startedAt time.Time
-	expired   bool
+type metadataTopologyObservationPendingError struct {
+	cause           error
+	retryAfter      time.Duration
+	conditionReason string
+	waitMessage     string
+}
+
+func (e *metadataTopologyObservationPendingError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *metadataTopologyObservationPendingError) Unwrap() error {
+	return e.cause
+}
+
+type metadataTopologyObservationState struct {
+	uid           types.UID
+	deadline      time.Time
+	retryInterval time.Duration
+	expired       bool
 }
 
 const (
@@ -1695,6 +1710,12 @@ const (
 	// therefore take almost six seconds to begin; allow another second for
 	// votes and the resulting leader observation to propagate.
 	metadataLeadershipObservationGracePeriod = 7 * time.Second
+	// Runtime status probes should fail quickly enough not to monopolize the
+	// cluster controller, while tolerating a brief DNS, connection, or server
+	// interruption without changing an otherwise healthy cluster's status.
+	metadataRuntimeTopologyProbeTimeout       = 2 * time.Second
+	metadataRuntimeTopologyProbeRetryInterval = 250 * time.Millisecond
+	metadataRuntimeTopologyProbeGracePeriod   = 3 * time.Second
 )
 
 func (r *AntflyClusterReconciler) validateLegacyMetadataRuntimeTopology(ctx context.Context, cluster *antflyv1.AntflyCluster, replicas int32) error {
@@ -1728,58 +1749,80 @@ func (r *AntflyClusterReconciler) validateMetadataRuntimeTopologyAt(
 	gracePeriod time.Duration,
 ) error {
 	err := r.validateMetadataRuntimeTopologyOnce(ctx, cluster, replicas)
-	key := metadataLeadershipObservationKey(cluster)
+	key := metadataTopologyObservationKey(cluster)
 	var leadershipErr *metadataLeadershipObservationError
-	if !stderrors.As(err, &leadershipErr) {
-		r.metadataLeadershipObservations.Delete(key)
+	var probeErr *metadataRuntimeTopologyProbeError
+	retry := retryInterval
+	grace := gracePeriod
+	conditionReason := antflyv1.ReasonMetadataLeadershipObservationPending
+	waitMessage := "Waiting for metadata Raft leadership to settle"
+	if stderrors.As(err, &probeErr) {
+		retry = metadataRuntimeTopologyProbeRetryInterval
+		grace = metadataRuntimeTopologyProbeGracePeriod
+		conditionReason = antflyv1.ReasonMetadataTopologyObservationPending
+		waitMessage = "Waiting for metadata runtime status probes to recover"
+	} else if !stderrors.As(err, &leadershipErr) {
+		r.metadataTopologyObservations.Delete(key)
 		return err
 	}
 
 	// Member status is observed over multiple requests rather than through a
-	// linearizable cluster-wide snapshot. Carry leadership-only failures across
-	// reconciliations for a full election window. Durable identity, membership,
-	// and transport failures still return immediately.
-	state := metadataLeadershipObservationState{uid: cluster.UID, startedAt: now}
-	if observed, ok := r.metadataLeadershipObservations.Load(key); ok {
-		candidate := observed.(metadataLeadershipObservationState)
+	// linearizable cluster-wide snapshot. Carry leadership failures for a full
+	// election window and retryable probe failures for a much shorter window.
+	// Durable identity, membership, and payload failures still return immediately.
+	state := metadataTopologyObservationState{
+		uid:           cluster.UID,
+		deadline:      now.Add(grace),
+		retryInterval: retry,
+	}
+	if observed, ok := r.metadataTopologyObservations.Load(key); ok {
+		candidate := observed.(metadataTopologyObservationState)
 		if candidate.uid == cluster.UID {
 			state = candidate
+			// Alternating leadership and probe failures must not restart or extend
+			// an observation window. Use the earliest applicable deadline.
+			if deadline := now.Add(grace); deadline.Before(state.deadline) {
+				state.deadline = deadline
+			}
+			state.retryInterval = min(state.retryInterval, retry)
 		}
 	}
-	r.metadataLeadershipObservations.Store(key, state)
-	remaining := gracePeriod - now.Sub(state.startedAt)
+	r.metadataTopologyObservations.Store(key, state)
+	remaining := state.deadline.Sub(now)
 	if remaining <= 0 {
 		state.expired = true
-		r.metadataLeadershipObservations.Store(key, state)
+		r.metadataTopologyObservations.Store(key, state)
 		return err
 	}
-	return &metadataLeadershipObservationPendingError{
-		cause:      err,
-		retryAfter: min(retryInterval, remaining),
+	return &metadataTopologyObservationPendingError{
+		cause:           err,
+		retryAfter:      min(retry, remaining),
+		conditionReason: conditionReason,
+		waitMessage:     waitMessage,
 	}
 }
 
-func metadataLeadershipObservationKey(cluster *antflyv1.AntflyCluster) string {
+func metadataTopologyObservationKey(cluster *antflyv1.AntflyCluster) string {
 	return types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name}.String()
 }
 
-func (r *AntflyClusterReconciler) metadataLeadershipObservationRequeueAfter(cluster *antflyv1.AntflyCluster) time.Duration {
-	observed, ok := r.metadataLeadershipObservations.Load(metadataLeadershipObservationKey(cluster))
+func (r *AntflyClusterReconciler) metadataTopologyObservationRequeueAfter(cluster *antflyv1.AntflyCluster) time.Duration {
+	observed, ok := r.metadataTopologyObservations.Load(metadataTopologyObservationKey(cluster))
 	if !ok {
 		return 0
 	}
-	state := observed.(metadataLeadershipObservationState)
+	state := observed.(metadataTopologyObservationState)
 	if state.uid != cluster.UID {
 		return 0
 	}
 	if state.expired {
 		return 0
 	}
-	remaining := metadataLeadershipObservationGracePeriod - time.Since(state.startedAt)
+	remaining := time.Until(state.deadline)
 	if remaining <= 0 {
 		return time.Millisecond
 	}
-	return min(metadataLeadershipObservationRetryInterval, remaining)
+	return min(state.retryInterval, remaining)
 }
 
 func (r *AntflyClusterReconciler) validateMetadataRuntimeTopologyOnce(ctx context.Context, cluster *antflyv1.AntflyCluster, replicas int32) error {
@@ -1872,22 +1915,34 @@ func (r *AntflyClusterReconciler) validateMetadataRuntimeTopologyOnce(ctx contex
 func (r *AntflyClusterReconciler) fetchMetadataRuntimeTopology(ctx context.Context, cluster *antflyv1.AntflyCluster, ordinal int32) (*metadataRuntimeTopologyStatus, error) {
 	url := fmt.Sprintf("http://%s-metadata-%d.%s-metadata.%s.svc.cluster.local:%d/metadata/v1/status",
 		cluster.Name, ordinal, cluster.Name, cluster.Namespace, cluster.Spec.MetadataNodes.MetadataAPI.Port)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	probeCtx, cancel := context.WithTimeout(ctx, metadataRuntimeTopologyProbeTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create metadata status request: %w", err)
 	}
 	resp, err := r.httpClient().Do(req) //nolint:gosec // URL is a deterministic cluster-internal pod address.
 	if err != nil {
-		return nil, fmt.Errorf("request metadata status: %w", err)
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("request metadata status: %w", err)
+		}
+		return nil, &metadataRuntimeTopologyProbeError{cause: fmt.Errorf("request metadata status: %w", err)}
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		_, _ = io.Copy(io.Discard, resp.Body)
-		return nil, fmt.Errorf("metadata status returned HTTP %d", resp.StatusCode)
+		err := fmt.Errorf("metadata status returned HTTP %d", resp.StatusCode)
+		if resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= http.StatusInternalServerError {
+			return nil, &metadataRuntimeTopologyProbeError{cause: err}
+		}
+		return nil, err
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxMetadataRuntimeStatusBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("read metadata status: %w", err)
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("read metadata status: %w", err)
+		}
+		return nil, &metadataRuntimeTopologyProbeError{cause: fmt.Errorf("read metadata status: %w", err)}
 	}
 	if len(body) > maxMetadataRuntimeStatusBytes {
 		return nil, fmt.Errorf("metadata status exceeds %d bytes", maxMetadataRuntimeStatusBytes)
@@ -2297,7 +2352,7 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.Get(ctx, req.NamespacedName, &antflyCluster); err != nil {
 		if errors.IsNotFound(err) {
 			r.validationAttempts.Delete(req.String())
-			r.metadataLeadershipObservations.Delete(req.String())
+			r.metadataTopologyObservations.Delete(req.String())
 			log.Info("AntflyCluster resource not found. Ignoring since object must be deleted")
 			return ctrl.Result{}, nil
 		}
@@ -2308,7 +2363,7 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// Handle deletion: if the cluster is being deleted and has our finalizer, clean up storage
 	if !antflyCluster.DeletionTimestamp.IsZero() {
 		r.validationAttempts.Delete(req.String())
-		r.metadataLeadershipObservations.Delete(req.String())
+		r.metadataTopologyObservations.Delete(req.String())
 		if controllerutil.ContainsFinalizer(&antflyCluster, antflyv1.FinalizerPVCCleanup) {
 			// Only run PVC cleanup if the policy still requests deletion.
 			// The finalizer is kept even when the policy changes back to Retain
@@ -2390,10 +2445,10 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	if needsValidation {
 		if err := r.validateClusterConfiguration(ctx, workingCluster); err != nil {
-			var leadershipPending *metadataLeadershipObservationPendingError
-			if stderrors.As(err, &leadershipPending) {
+			var topologyPending *metadataTopologyObservationPendingError
+			if stderrors.As(err, &topologyPending) {
 				r.resetValidationAttempts(clusterKey)
-				return ctrl.Result{RequeueAfter: leadershipPending.retryAfter}, nil
+				return ctrl.Result{RequeueAfter: topologyPending.retryAfter}, nil
 			}
 			log.Error(err, "Cluster configuration validation failed")
 			if statusErr := r.updateStatusWithValidationError(ctx, &antflyCluster, err); statusErr != nil {
@@ -2751,7 +2806,7 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	if requeueAfter := minPositiveDuration(
 		periodicRequeueAfter(workingCluster),
-		r.metadataLeadershipObservationRequeueAfter(workingCluster),
+		r.metadataTopologyObservationRequeueAfter(workingCluster),
 	); requeueAfter > 0 {
 		return ctrl.Result{RequeueAfter: requeueAfter}, nil
 	}
@@ -4741,7 +4796,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	mode := effectiveTopologyMode(cluster)
 
 	if mode == topologyModeStandalone {
-		r.metadataLeadershipObservations.Delete(metadataLeadershipObservationKey(cluster))
+		r.metadataTopologyObservations.Delete(metadataTopologyObservationKey(cluster))
 		standalone := cluster.Spec.Standalone
 		if standalone == nil {
 			return fmt.Errorf("spec.standalone is required when spec.mode=Standalone")
@@ -4925,19 +4980,19 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	metadataFindings := poddiagnostics.DiagnosePods(metadataPods)
 	dataFindings := poddiagnostics.DiagnosePods(dataPods)
 	var metadataTopologyHealthErr error
-	var metadataLeadershipPending *metadataLeadershipObservationPendingError
+	var metadataTopologyPending *metadataTopologyObservationPendingError
 	if cluster.Status.MetadataNodesReady >= metadataReplicas && metadataReplicas > 0 && len(metadataFindings) == 0 {
 		if err := r.validateMetadataRuntimeTopology(ctx, cluster, metadataReplicas); err != nil {
-			if !stderrors.As(err, &metadataLeadershipPending) {
+			if !stderrors.As(err, &metadataTopologyPending) {
 				metadataTopologyHealthErr = fmt.Errorf("metadata runtime topology validation failed: %w", err)
 			}
 		}
 	} else {
-		r.metadataLeadershipObservations.Delete(metadataLeadershipObservationKey(cluster))
+		r.metadataTopologyObservations.Delete(metadataTopologyObservationKey(cluster))
 	}
 	r.setComponentCondition(cluster, antflyv1.TypeMetadataReady, cluster.Status.MetadataNodesReady, metadataReplicas, metadataFindings, "metadata")
-	if metadataLeadershipPending != nil {
-		preserveConditionDuringMetadataLeadershipObservation(cluster, originalConditions, antflyv1.TypeMetadataReady, metadataLeadershipPending)
+	if metadataTopologyPending != nil {
+		preserveConditionDuringMetadataTopologyObservation(cluster, originalConditions, antflyv1.TypeMetadataReady, metadataTopologyPending)
 	} else if metadataTopologyHealthErr != nil {
 		meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
 			Type:               antflyv1.TypeMetadataReady,
@@ -4955,7 +5010,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		cluster.Status.Phase = "Degraded"
 	} else if !componentsReady {
 		cluster.Status.Phase = "Pending"
-	} else if metadataLeadershipPending != nil {
+	} else if metadataTopologyPending != nil {
 		if originalPhase == "" {
 			cluster.Status.Phase = "Pending"
 		} else {
@@ -4967,8 +5022,8 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 
 	r.updateRolloutCondition(cluster, metadataSts, dataSts)
 	r.setAvailableCondition(cluster, allRuntimeFindings, cluster.Status.Phase == "Running")
-	if metadataLeadershipPending != nil && len(allRuntimeFindings) == 0 && componentsReady {
-		preserveConditionDuringMetadataLeadershipObservation(cluster, originalConditions, antflyv1.TypeAvailable, metadataLeadershipPending)
+	if metadataTopologyPending != nil && len(allRuntimeFindings) == 0 && componentsReady {
+		preserveConditionDuringMetadataTopologyObservation(cluster, originalConditions, antflyv1.TypeAvailable, metadataTopologyPending)
 	} else if metadataTopologyHealthErr != nil {
 		meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
 			Type:               antflyv1.TypeAvailable,
@@ -5031,11 +5086,11 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	return r.Status().Update(ctx, cluster)
 }
 
-func preserveConditionDuringMetadataLeadershipObservation(
+func preserveConditionDuringMetadataTopologyObservation(
 	cluster *antflyv1.AntflyCluster,
 	originalConditions []metav1.Condition,
 	conditionType string,
-	pending *metadataLeadershipObservationPendingError,
+	pending *metadataTopologyObservationPendingError,
 ) {
 	if previous := meta.FindStatusCondition(originalConditions, conditionType); previous != nil {
 		for i := range cluster.Status.Conditions {
@@ -5051,8 +5106,8 @@ func preserveConditionDuringMetadataLeadershipObservation(
 		Type:               conditionType,
 		Status:             metav1.ConditionUnknown,
 		ObservedGeneration: cluster.Generation,
-		Reason:             antflyv1.ReasonMetadataLeadershipObservationPending,
-		Message:            fmt.Sprintf("Waiting for metadata Raft leadership to settle: %v", pending),
+		Reason:             pending.conditionReason,
+		Message:            fmt.Sprintf("%s: %v", pending.waitMessage, pending),
 	})
 }
 

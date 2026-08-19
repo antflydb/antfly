@@ -189,6 +189,10 @@ const (
 	// being re-observed through a bounded election grace period.
 	ReasonMetadataLeadershipObservationPending = "MetadataLeadershipObservationPending"
 
+	// ReasonMetadataTopologyObservationPending indicates a transient metadata
+	// runtime status probe is being retried through a bounded grace period.
+	ReasonMetadataTopologyObservationPending = "MetadataTopologyObservationPending"
+
 	// ReasonUnschedulable indicates pods cannot be scheduled.
 	ReasonUnschedulable = "Unschedulable"
 

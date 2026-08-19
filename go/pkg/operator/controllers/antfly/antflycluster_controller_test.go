@@ -355,7 +355,7 @@ func TestValidateMetadataRuntimeTopologyCarriesElectionObservationAcrossReconcil
 			7*time.Second,
 		)
 		if observation < 3 {
-			var pending *metadataLeadershipObservationPendingError
+			var pending *metadataTopologyObservationPendingError
 			if !stderrors.As(err, &pending) {
 				t.Fatalf("observation %d error = %v, want pending leadership observation", observation+1, err)
 			}
@@ -410,7 +410,7 @@ func TestValidateMetadataRuntimeTopologyExpiresElectionGrace(t *testing.T) {
 
 	startedAt := time.Unix(1_700_000_000, 0)
 	err := reconciler.validateMetadataRuntimeTopologyAt(context.Background(), cluster, 3, startedAt, 250*time.Millisecond, 7*time.Second)
-	var pending *metadataLeadershipObservationPendingError
+	var pending *metadataTopologyObservationPendingError
 	if !stderrors.As(err, &pending) {
 		t.Fatalf("initial error = %v, want pending leadership observation", err)
 	}
@@ -426,8 +426,121 @@ func TestValidateMetadataRuntimeTopologyExpiresElectionGrace(t *testing.T) {
 	if !stderrors.As(err, &leadershipErr) {
 		t.Fatalf("expired error = %v, want leadership observation failure", err)
 	}
-	if retryAfter := reconciler.metadataLeadershipObservationRequeueAfter(cluster); retryAfter != 0 {
+	if retryAfter := reconciler.metadataTopologyObservationRequeueAfter(cluster); retryAfter != 0 {
 		t.Fatalf("expired leadership observation retry = %v, want no busy requeue", retryAfter)
+	}
+}
+
+func TestValidateMetadataRuntimeTopologyCarriesTransientProbeFailureAcrossReconciles(t *testing.T) {
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default", UID: "example-uid"},
+		Spec: antflyv1.AntflyClusterSpec{MetadataNodes: antflyv1.MetadataNodesSpec{
+			Replicas:    3,
+			MetadataAPI: antflyv1.APISpec{Port: 12377},
+		}},
+	}
+
+	var mu sync.Mutex
+	requestCounts := make(map[string]int)
+	var observedProbeTimeout time.Duration
+	reconciler := &AntflyClusterReconciler{HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		host := req.URL.Hostname()
+		mu.Lock()
+		requestCounts[host]++
+		attempt := requestCounts[host]
+		if deadline, ok := req.Context().Deadline(); ok {
+			observedProbeTimeout = time.Until(deadline)
+		}
+		mu.Unlock()
+		if strings.Contains(host, "-0.") && attempt == 1 {
+			return nil, fmt.Errorf("temporary connection reset")
+		}
+
+		nodeID := uint64(1)
+		if strings.Contains(host, "-1.") {
+			nodeID = 2
+		} else if strings.Contains(host, "-2.") {
+			nodeID = 3
+		}
+		role := "follower"
+		if nodeID == 3 {
+			role = "leader"
+		}
+		body := fmt.Sprintf(`{"metadata_group_id":1,"metadata_incarnation":"33333333333333333333333333333333","metadata_raft_local_node_id":%d,"metadata_raft_role":%q,"metadata_raft_leader_id":3,"metadata_raft_term":2,"metadata_raft_local_voter":true,"metadata_raft_voter_count":3,"metadata_raft_voter_set_fingerprint":%q,"metadata_raft_joint_consensus":false}`,
+			nodeID, role, metadataRaftVoterSetFingerprint(3))
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}}
+
+	startedAt := time.Unix(1_700_000_000, 0)
+	err := reconciler.validateMetadataRuntimeTopologyAt(
+		context.Background(), cluster, 3, startedAt,
+		metadataLeadershipObservationRetryInterval, metadataLeadershipObservationGracePeriod,
+	)
+	var pending *metadataTopologyObservationPendingError
+	if !stderrors.As(err, &pending) {
+		t.Fatalf("initial transient probe error = %v, want pending topology observation", err)
+	}
+	if pending.conditionReason != antflyv1.ReasonMetadataTopologyObservationPending {
+		t.Fatalf("pending reason = %q, want %q", pending.conditionReason, antflyv1.ReasonMetadataTopologyObservationPending)
+	}
+	if pending.retryAfter != metadataRuntimeTopologyProbeRetryInterval {
+		t.Fatalf("pending retry = %v, want %v", pending.retryAfter, metadataRuntimeTopologyProbeRetryInterval)
+	}
+	mu.Lock()
+	probeTimeout := observedProbeTimeout
+	mu.Unlock()
+	if probeTimeout <= 0 || probeTimeout > metadataRuntimeTopologyProbeTimeout {
+		t.Fatalf("probe context timeout = %v, want within (0, %v]", probeTimeout, metadataRuntimeTopologyProbeTimeout)
+	}
+
+	if err := reconciler.validateMetadataRuntimeTopologyAt(
+		context.Background(), cluster, 3, startedAt.Add(time.Second),
+		metadataLeadershipObservationRetryInterval, metadataLeadershipObservationGracePeriod,
+	); err != nil {
+		t.Fatalf("expected a recovered probe to validate successfully, got: %v", err)
+	}
+	if retryAfter := reconciler.metadataTopologyObservationRequeueAfter(cluster); retryAfter != 0 {
+		t.Fatalf("recovered probe observation retry = %v, want none", retryAfter)
+	}
+}
+
+func TestValidateMetadataRuntimeTopologyExpiresTransientProbeGrace(t *testing.T) {
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default", UID: "example-uid"},
+		Spec: antflyv1.AntflyClusterSpec{MetadataNodes: antflyv1.MetadataNodesSpec{
+			Replicas:    3,
+			MetadataAPI: antflyv1.APISpec{Port: 12377},
+		}},
+	}
+	reconciler := &AntflyClusterReconciler{HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("temporary connection reset")
+	})}}
+	startedAt := time.Unix(1_700_000_000, 0)
+	err := reconciler.validateMetadataRuntimeTopologyAt(
+		context.Background(), cluster, 3, startedAt,
+		metadataLeadershipObservationRetryInterval, metadataLeadershipObservationGracePeriod,
+	)
+	var pending *metadataTopologyObservationPendingError
+	if !stderrors.As(err, &pending) {
+		t.Fatalf("initial transient probe error = %v, want pending topology observation", err)
+	}
+
+	err = reconciler.validateMetadataRuntimeTopologyAt(
+		context.Background(), cluster, 3, startedAt.Add(metadataRuntimeTopologyProbeGracePeriod),
+		metadataLeadershipObservationRetryInterval, metadataLeadershipObservationGracePeriod,
+	)
+	if err == nil {
+		t.Fatal("expected persistent probe failure to fail after the grace period")
+	}
+	if stderrors.As(err, &pending) {
+		t.Fatalf("expired probe error remained pending: %v", err)
+	}
+	var probeErr *metadataRuntimeTopologyProbeError
+	if !stderrors.As(err, &probeErr) {
+		t.Fatalf("expired error = %v, want runtime topology probe failure", err)
+	}
+	if retryAfter := reconciler.metadataTopologyObservationRequeueAfter(cluster); retryAfter != 0 {
+		t.Fatalf("expired probe observation retry = %v, want none", retryAfter)
 	}
 }
 
@@ -853,7 +966,7 @@ func TestUpdateStatusPreservesHealthyStatusDuringMetadataElectionGrace(t *testin
 			t.Fatalf("%s during election grace = %#v, want preserved true", conditionType, condition)
 		}
 	}
-	if retryAfter := reconciler.metadataLeadershipObservationRequeueAfter(updated); retryAfter <= 0 || retryAfter > metadataLeadershipObservationRetryInterval {
+	if retryAfter := reconciler.metadataTopologyObservationRequeueAfter(updated); retryAfter <= 0 || retryAfter > metadataLeadershipObservationRetryInterval {
 		t.Fatalf("leadership observation retry = %v, want within (0, %v]", retryAfter, metadataLeadershipObservationRetryInterval)
 	}
 
@@ -880,14 +993,14 @@ func TestUpdateStatusPreservesHealthyStatusDuringMetadataElectionGrace(t *testin
 		t.Fatalf("Available during overlapping rollout = %#v, want waiting for pods", available)
 	}
 
-	key := metadataLeadershipObservationKey(duringDataRollout)
-	observed, ok := reconciler.metadataLeadershipObservations.Load(key)
+	key := metadataTopologyObservationKey(duringDataRollout)
+	observed, ok := reconciler.metadataTopologyObservations.Load(key)
 	if !ok {
 		t.Fatal("missing pending leadership observation state")
 	}
-	state := observed.(metadataLeadershipObservationState)
-	state.startedAt = time.Now().Add(-metadataLeadershipObservationGracePeriod)
-	reconciler.metadataLeadershipObservations.Store(key, state)
+	state := observed.(metadataTopologyObservationState)
+	state.deadline = time.Now()
+	reconciler.metadataTopologyObservations.Store(key, state)
 	if err := reconciler.updateStatus(context.Background(), duringDataRollout); err != nil {
 		t.Fatal(err)
 	}
