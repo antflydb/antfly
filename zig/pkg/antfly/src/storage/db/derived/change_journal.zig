@@ -294,6 +294,23 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
     };
 }
 
+/// Build the normal key lists from a derived batch while explicitly narrowing
+/// which consumers should observe the record. The copied hint slice follows
+/// `Record` ownership and is released by `deinitRecord`.
+pub fn recordFromDerivedBatchWithTargetHints(
+    alloc: Allocator,
+    batch: derived_types.DerivedBatch,
+    sequence: u64,
+    target_hints: []const TargetHint,
+) !Record {
+    var record = try recordFromDerivedBatch(alloc, batch, sequence);
+    errdefer deinitRecord(alloc, &record);
+    freeTargetHintsIfOwned(alloc, record.target_hints);
+    record.target_hints = &.{};
+    record.target_hints = try alloc.dupe(TargetHint, target_hints);
+    return record;
+}
+
 fn appendUniqueHintAlloc(alloc: Allocator, list: *std.ArrayListUnmanaged(TargetHint), hint: TargetHint) !void {
     for (list.items) |existing| {
         if (existing == hint) return;
@@ -998,6 +1015,22 @@ test "change journal graph-only derived batch encodes graph hint and artifact id
     const payload = try encodeRecord(alloc, record);
     defer alloc.free(payload);
     try std.testing.expectEqual(singleHintMask(.graph), try encodedRecordHintMask(payload));
+}
+
+test "change journal explicit target hints preserve resolution key but suppress promotion" {
+    const alloc = std.testing.allocator;
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+
+    var record = try recordFromDerivedBatchWithTargetHints(alloc, .{
+        .changed_artifact_keys = &.{resolution_key},
+    }, 19, &.{.graph});
+    defer deinitRecord(alloc, &record);
+
+    try std.testing.expectEqual(@as(usize, 1), record.changed_artifact_keys.len);
+    try std.testing.expectEqualStrings(resolution_key, record.changed_artifact_keys[0]);
+    try std.testing.expect(recordHasHint(record, .graph));
+    try std.testing.expect(!recordHasHint(record, .promotion));
 }
 
 test "change journal chunk artifact changes wake full-text replay" {
