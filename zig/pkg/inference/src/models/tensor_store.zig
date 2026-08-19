@@ -109,6 +109,7 @@ pub const TensorStore = struct {
         describeTensorRange: *const fn (*anyopaque, allocator: std.mem.Allocator, name: []const u8) anyerror!?TensorRangeRef,
         loadTensorRef: *const fn (*anyopaque, tensor_ref: *const LazyTensorRef) anyerror!weight_source_mod.LoadedWeight,
         loadQuantizedStorageRef: *const fn (*anyopaque, tensor_ref: *const LazyTensorRef) anyerror!?weight_source_mod.QuantizedStorage,
+        discardTensorFileCache: *const fn (*anyopaque, name: []const u8) void,
         ggufFile: *const fn (*anyopaque) ?*const gguf_mod.format.File,
         deinit: *const fn (*anyopaque) void,
     };
@@ -137,6 +138,13 @@ pub const TensorStore = struct {
         return self.vtable.loadQuantizedStorageRef(self.ptr, tensor_ref);
     }
 
+    /// Best-effort release of clean file-backed pages for a tensor whose last
+    /// runtime borrower has been dropped. Heap-backed stores intentionally do
+    /// nothing; their LoadedWeight teardown already releases physical memory.
+    pub fn discardTensorFileCache(self: TensorStore, name: []const u8) void {
+        self.vtable.discardTensorFileCache(self.ptr, name);
+    }
+
     pub fn ggufFile(self: TensorStore) ?*const gguf_mod.format.File {
         return self.vtable.ggufFile(self.ptr);
     }
@@ -145,6 +153,8 @@ pub const TensorStore = struct {
         self.vtable.deinit(self.ptr);
     }
 };
+
+fn discardTensorFileCacheNoop(_: *anyopaque, _: []const u8) void {}
 
 pub const SafetensorsStore = struct {
     source: *weight_source_mod.SafetensorsSource,
@@ -157,6 +167,7 @@ pub const SafetensorsStore = struct {
         .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
         .loadTensorRef = @ptrCast(&loadTensorRefImpl),
         .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
+        .discardTensorFileCache = &discardTensorFileCacheNoop,
         .ggufFile = @ptrCast(&ggufFileImpl),
         .deinit = @ptrCast(&deinitSelf),
     };
@@ -241,6 +252,7 @@ pub const ShardedSafetensorsStore = struct {
         .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
         .loadTensorRef = @ptrCast(&loadTensorRefImpl),
         .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
+        .discardTensorFileCache = &discardTensorFileCacheNoop,
         .ggufFile = @ptrCast(&ggufFileImpl),
         .deinit = @ptrCast(&deinitSelf),
     };
@@ -327,6 +339,7 @@ pub const GgufStore = struct {
         .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
         .loadTensorRef = @ptrCast(&loadTensorRefImpl),
         .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
+        .discardTensorFileCache = @ptrCast(&discardTensorFileCacheImpl),
         .ggufFile = @ptrCast(&ggufFileImpl),
         .deinit = @ptrCast(&deinitSelf),
     };
@@ -400,6 +413,10 @@ pub const GgufStore = struct {
         const offset = std.math.cast(usize, tensor.data_offset) orelse return;
         const byte_len = std.math.cast(usize, byte_len_u64) orelse return;
         region.discardFileRange(offset, byte_len);
+    }
+
+    fn discardTensorFileCacheImpl(self: *GgufStore, name: []const u8) void {
+        self.discardTensorFileCache(name);
     }
 
     fn rawData(self: *const GgufStore) []const u8 {
@@ -969,6 +986,7 @@ pub const CompositeGlinerStore = struct {
         .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
         .loadTensorRef = @ptrCast(&loadTensorRefImpl),
         .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
+        .discardTensorFileCache = @ptrCast(&discardTensorFileCacheImpl),
         .ggufFile = @ptrCast(&ggufFileImpl),
         .deinit = @ptrCast(&deinitSelf),
     };
@@ -1048,6 +1066,14 @@ pub const CompositeGlinerStore = struct {
             return self.head_gguf.?.loadQuantizedStorageRefImpl(tensor_ref);
         }
         return self.encoder.loadQuantizedStorageRefImpl(tensor_ref);
+    }
+
+    fn discardTensorFileCacheImpl(self: *CompositeGlinerStore, name: []const u8) void {
+        if (self.hasHeadTensor(name)) {
+            if (self.head_gguf) |head| head.discardTensorFileCache(name);
+            return;
+        }
+        self.encoder.discardTensorFileCache(name);
     }
 
     fn ggufFileImpl(self: *CompositeGlinerStore) ?*const gguf_mod.format.File {

@@ -4859,7 +4859,7 @@ pub fn ensureLazyWeightLoadedLocked(data: *WeightStore, run_budget: ?*run_memory
                 evictColdNonExpertWeightsToFitLocked(data, .host, expected_bytes, entry);
             }
         }
-        tier_cache.reserve(.host, expected_bytes) catch |err| {
+        reserveHostCacheWithReclaimLocked(data, expected_bytes, entry) catch |err| {
             tier_cache.noteDenied(.host, expected_bytes);
             noteSharedCacheDenial(run_budget, tier_cache, .host, expected_bytes);
             return err;
@@ -4918,7 +4918,7 @@ pub fn ensureLazyWeightLoadedLocked(data: *WeightStore, run_budget: ?*run_memory
     if (data.tier_cache) |*tier_cache| {
         if (entry.loaded_bytes > cache_reserved_bytes) {
             const additional = entry.loaded_bytes - cache_reserved_bytes;
-            tier_cache.reserve(.host, additional) catch |err| {
+            reserveHostCacheWithReclaimLocked(data, additional, entry) catch |err| {
                 tier_cache.noteDenied(.host, additional);
                 noteSharedCacheDenial(run_budget, tier_cache, .host, additional);
                 return err;
@@ -4965,6 +4965,141 @@ fn evictColdNonExpertWeightsToFitLocked(
         const victim = findNonExpertEvictionVictimLocked(data, tier, protected) orelse break;
         unloadLazyEntryTierLocked(data, victim, tier);
     }
+}
+
+/// Release one cold, unpinned lazy-weight residency while the caller owns the
+/// prefetch mutex. Live process pressure can become tighter after model load as
+/// mmap-backed source pages are faulted in; hard cache geometry alone cannot
+/// detect that transition. Returning exact released bytes lets admission retry
+/// only after useful progress and prevents an unbounded retry loop.
+fn reclaimOneHostCacheEntryLocked(
+    data: *WeightStore,
+    protected: ?*LazyWeightEntry,
+) usize {
+    if (findAnyExpertEvictionVictimLocked(data, .host, protected)) |coord| {
+        var released_bytes: usize = 0;
+        var it = data.lazy_weights.iterator();
+        while (it.next()) |entry| {
+            const entry_coord = entry.value_ptr.expert_coord orelse continue;
+            if (entry_coord.layer_index != coord.layer_index or
+                entry_coord.expert_index != coord.expert_index or
+                !entryResidentAtTier(entry.value_ptr.*, .host))
+            {
+                continue;
+            }
+            released_bytes +|= entry.value_ptr.loaded_bytes;
+        }
+        unloadExpertTierLocked(data, coord, .host);
+        return released_bytes;
+    }
+
+    const victim = findNonExpertEvictionVictimLocked(data, .host, protected) orelse
+        return 0;
+    const released_bytes = victim.loaded_bytes;
+    unloadLazyEntryTierLocked(data, victim, .host);
+    return released_bytes;
+}
+
+/// Retry an exact host-cache reservation after shedding one useful cold entry
+/// per denial. The prefetch mutex is the ownership boundary for lazy entry
+/// residency and pin counts, so callers must already hold it.
+fn reserveHostCacheWithReclaimLocked(
+    data: *WeightStore,
+    bytes: usize,
+    protected: ?*LazyWeightEntry,
+) tier_cache_mod.ReserveError!void {
+    const tier_cache = if (data.tier_cache) |*cache| cache else return;
+    if (tier_cache.budget.host_limit_bytes != 0 and
+        bytes > tier_cache.budget.host_limit_bytes)
+    {
+        return error.MemoryBudgetExceeded;
+    }
+    while (true) {
+        tier_cache.reserve(.host, bytes) catch |err| {
+            if (reclaimOneHostCacheEntryLocked(data, protected) == 0) return err;
+            continue;
+        };
+        return;
+    }
+}
+
+/// Shed one unpinned native/PJRT host-cache entry for process-wide admission.
+/// This is intentionally bounded to one victim so ModelManager can re-probe
+/// the authoritative controller after every physical release.
+pub fn reclaimOneHostCacheEntry(data: *WeightStore) usize {
+    if (!data.prefetch_initialized) return 0;
+    data.prefetch.lock();
+    defer data.prefetch.unlock();
+    return reclaimOneHostCacheEntryLocked(data, null);
+}
+
+test "live host cache reservation reclaims only unpinned lazy weights" {
+    const allocator = std.testing.allocator;
+    const tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 12 });
+    var store = WeightStore{
+        .allocator = allocator,
+        .resident_weights = .{},
+        .lazy_weights = .{},
+        .tier_cache = tier_cache,
+    };
+    try store.lazy_weights.ensureTotalCapacity(allocator, 2);
+    defer {
+        deinitPrefetchQueue(&store);
+        var it = store.lazy_weights.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.loaded) |*loaded| loaded.deinit();
+        }
+        store.lazy_weights.deinit(allocator);
+    }
+
+    const cold_tensor = try tensor_mod.Tensor.initFloat32(
+        allocator,
+        "cold.weight",
+        &.{2},
+        &.{ 1.0, 2.0 },
+    );
+    store.lazy_weights.putAssumeCapacity("cold.weight", .{
+        .tensor_ref = undefined,
+        .loaded = .{ .tensor = cold_tensor },
+        .loaded_bytes = 8,
+        .prefetch_score = 1,
+        .active_tier = .host,
+    });
+    const pinned_tensor = try tensor_mod.Tensor.initFloat32(
+        allocator,
+        "pinned.weight",
+        &.{1},
+        &.{3.0},
+    );
+    store.lazy_weights.putAssumeCapacity("pinned.weight", .{
+        .tensor_ref = undefined,
+        .loaded = .{ .tensor = pinned_tensor },
+        .loaded_bytes = 4,
+        .pin_count = 1,
+        .active_tier = .host,
+    });
+    store.tier_cache.?.noteResident(.host, 12);
+    initPrefetchQueue(&store, allocator);
+
+    store.prefetch.lock();
+    try std.testing.expectError(
+        error.MemoryBudgetExceeded,
+        reserveHostCacheWithReclaimLocked(&store, 13, null),
+    );
+    try std.testing.expect(store.lazy_weights.get("cold.weight").?.loaded != null);
+    try reserveHostCacheWithReclaimLocked(&store, 6, null);
+    store.prefetch.unlock();
+
+    try std.testing.expect(store.lazy_weights.get("cold.weight").?.loaded == null);
+    try std.testing.expect(store.lazy_weights.get("pinned.weight").?.loaded != null);
+    try std.testing.expectEqual(@as(usize, 10), store.tier_cache.?.host_bytes);
+
+    store.tier_cache.?.noteRelease(.host, 6);
+    store.prefetch.lock();
+    const pinned = store.lazy_weights.getPtr("pinned.weight").?;
+    pinned.pin_count = 0;
+    unloadLazyEntryTierLocked(&store, pinned, .host);
+    store.prefetch.unlock();
 }
 
 fn shouldEvictTierLocked(data: *const WeightStore, layer_index: usize, tier: ResidencyTier) bool {
@@ -5022,6 +5157,34 @@ fn findNonExpertEvictionVictimLocked(
     return best;
 }
 
+fn findAnyExpertEvictionVictimLocked(
+    data: *WeightStore,
+    tier: ResidencyTier,
+    protected: ?*LazyWeightEntry,
+) ?ExpertCoord {
+    const protected_coord = if (protected) |entry| entry.expert_coord else null;
+    const residency = data.residency;
+    var best: ?ExpertCoord = null;
+    var it = data.lazy_weights.iterator();
+    while (it.next()) |entry| {
+        const coord = entry.value_ptr.expert_coord orelse continue;
+        if (protected_coord) |kept| {
+            if (coord.layer_index == kept.layer_index and
+                coord.expert_index == kept.expert_index)
+            {
+                continue;
+            }
+        }
+        if (!expertCanEvictLocked(data, coord, tier)) continue;
+        if (best == null or
+            (residency != null and residency.?.isMoreEvictable(coord, best.?)))
+        {
+            best = coord;
+        }
+    }
+    return best;
+}
+
 fn entryResidentAtTier(entry: LazyWeightEntry, tier: ResidencyTier) bool {
     return switch (tier) {
         .disk => false,
@@ -5053,6 +5216,7 @@ fn unloadExpertTierLocked(data: *WeightStore, coord: ExpertCoord, tier: Residenc
                 loaded.deinit();
                 entry.value_ptr.loaded = null;
                 entry.value_ptr.active_tier = entry.value_ptr.placement.spill_tier;
+                discardLazyEntryFileCache(data, entry.value_ptr);
                 if (data.tier_cache) |*tier_cache| {
                     tier_cache.noteRelease(.host, entry.value_ptr.loaded_bytes);
                 }
@@ -5071,12 +5235,18 @@ fn unloadLazyEntryTierLocked(data: *WeightStore, entry: *LazyWeightEntry, tier: 
             loaded.deinit();
             entry.loaded = null;
             entry.active_tier = entry.placement.spill_tier;
+            discardLazyEntryFileCache(data, entry);
             if (data.tier_cache) |*tier_cache| {
                 tier_cache.noteRelease(.host, entry.loaded_bytes);
             }
         },
         else => {},
     }
+}
+
+fn discardLazyEntryFileCache(data: *WeightStore, entry: *const LazyWeightEntry) void {
+    const tensor_store = data.tensor_store orelse return;
+    tensor_store.discardTensorFileCache(entry.tensor_ref.source_name orelse entry.tensor_ref.name);
 }
 
 fn freeLazyWeights(data: *WeightStore, allocator: std.mem.Allocator) void {
@@ -9660,6 +9830,11 @@ fn ensureQ4Q5QKVPanel16Cache(
     ) orelse return;
     if (preparedQKVPanel16GroupCacheMatches(storage_a_const, weight_buf_b.name, weight_buf_c.name, expected_bytes, row_blocks)) return;
 
+    // Match the global lazy-entry lock order (prefetch, then preparation).
+    // Besides protecting pin counts during pressure reclamation, this prevents
+    // the background prefetch worker from immediately restoring a victim.
+    self.data.prefetch.lock();
+    defer self.data.prefetch.unlock();
     while (!self.data.quantized_prepare_lock.tryLock()) {
         platform.time.yieldBriefly();
     }
@@ -9678,7 +9853,7 @@ fn ensureQ4Q5QKVPanel16Cache(
     var cache_reserved_bytes: usize = 0;
     if (self.data.tier_cache) |*tier_cache| {
         evictColdNonExpertWeightsToFitLocked(self.data, .host, expected_owned_bytes, weight_buf_a.lazy_entry);
-        tier_cache.reserve(.host, expected_owned_bytes) catch {
+        reserveHostCacheWithReclaimLocked(self.data, expected_owned_bytes, weight_buf_a.lazy_entry) catch {
             tier_cache.noteDenied(.host, expected_owned_bytes);
             noteSharedCacheDenial(self.run_budget, tier_cache, .host, expected_owned_bytes);
             logSharedCacheDenial("q4q5_qkv_panel16_cache", tier_cache, weight_buf_a.name);

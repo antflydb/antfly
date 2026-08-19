@@ -3556,6 +3556,7 @@ test "Metal JIT scope discovers quantized weights in a secondary GGUF store" {
             .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
             .loadTensorRef = @ptrCast(&loadTensorRefImpl),
             .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
+            .discardTensorFileCache = @ptrCast(&discardTensorFileCacheImpl),
             .ggufFile = @ptrCast(&ggufFileImpl),
             .deinit = @ptrCast(&deinitSelf),
         };
@@ -3604,6 +3605,8 @@ test "Metal JIT scope discovers quantized weights in a secondary GGUF store" {
                 .allocator = self.allocator,
             };
         }
+
+        fn discardTensorFileCacheImpl(_: *@This(), _: []const u8) void {}
 
         fn ggufFileImpl(self: *@This()) ?*const gguf_mod.format.File {
             return &self.encoder_file;
@@ -5760,6 +5763,21 @@ pub fn configureSharedCacheAdmissionForSession(
             .backend_limit_bytes = resident.backend_weight_bytes,
         },
     );
+}
+
+/// Release one backend-owned, unpinned host-cache entry without unloading the
+/// model identity. ModelManager uses this after an authoritative aggregate or
+/// live-host denial, then re-probes admission before choosing another victim.
+/// Unsupported backends return zero and retain their existing whole-model
+/// eviction behavior.
+pub fn reclaimOneHostCacheEntryForSession(session: Session) usize {
+    if (session.vtable != &arch_vtable) return 0;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    return switch (self.backend_type) {
+        .native => native_mod.reclaimOneHostCacheEntry(&self.backend_data.native),
+        .pjrt => native_mod.reclaimOneHostCacheEntry(&self.backend_data.pjrt.native),
+        .metal, .cuda, .onnx, .wasm => 0,
+    };
 }
 
 pub fn memoryBudgetExceededDetail(

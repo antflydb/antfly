@@ -108,9 +108,11 @@ the executor owner and “inference backend runtime descriptor” for the value.
    memory and is released on every teardown path.
 4. A model transition reserves its construction peak before import, retains its
    post-load residency, and acquires any later growth before promotion.
-5. `ModelManager` may satisfy temporary contention by evicting an idle model and
-   retrying. It must not retry a request that is intrinsically larger than the
-   configured hard limit.
+5. `ModelManager` may satisfy temporary contention by evicting an idle model or,
+   for host pressure, asking an active backend session to shed one cold unpinned
+   cache entry before retrying. It re-probes authoritative admission after every
+   useful release and must not retry a request that is intrinsically larger than
+   the configured hard limit.
 6. The external manager sees model residency, KV working set, and scratch
    working set as separate logical slices. Those metrics may contain host plus
    accelerator bytes, while only the physical host component is charged to the
@@ -199,6 +201,20 @@ is released at session teardown. Offline tools without a serving owner retain
 counter-only cache policy. This keeps the Hypura-style mapped-artifact and
 bounded-hot-set behavior without allowing lazy promotion to bypass
 ResourceManager policy or charging bookkeeping on cache hits.
+
+Cache geometry and live pressure are separate constraints. A model can remain
+inside its configured hot-set ceiling while active mmap pages from the model,
+test harness, or sibling subsystem consume the process envelope. Native and
+PJRT cache growth therefore treats a live-host denial as a reclaim signal: under
+the lazy-entry residency lock it destroys one cold unpinned entry, releases its
+exact aggregate credit, drops the corresponding clean GGUF file-cache range,
+and retries the pending growth. ModelManager uses the
+same bounded session capability when request admission is denied and no idle
+model can be removed. Backends own the mechanics and pin-safety of reclamation;
+ModelManager owns victim ordering and retries; ResourceManager remains the
+authoritative capacity decision. This path is identical in direct inference,
+distributed inference, and full standalone—the only difference is whether the
+admission lease is local or mirrored through the external bridge.
 
 The process envelope is not another inference slice. One resolved value is
 passed to storage and inference during standalone composition and by the

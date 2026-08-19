@@ -501,13 +501,26 @@ def api(base_url):
             _check(r)
             return r.json()
 
-        def chat(self, messages: list[dict], model: str = "", stream: bool = False, **kwargs):
+        def chat(
+            self,
+            messages: list[dict],
+            model: str = "",
+            stream: bool = False,
+            *,
+            request_timeout: float | None = None,
+            **kwargs,
+        ):
             body = {"model": model, "messages": messages, "stream": stream, **kwargs}
+            request_kwargs = (
+                {"timeout": request_timeout} if request_timeout is not None else {}
+            )
             if stream:
-                r = self.post("/chat/completions", json=body, stream=True)
+                r = self.post(
+                    "/chat/completions", json=body, stream=True, **request_kwargs
+                )
                 _check(r)
                 return r
-            r = self.post("/chat/completions", json=body)
+            r = self.post("/chat/completions", json=body, **request_kwargs)
             _check(r)
             return r.json()
 

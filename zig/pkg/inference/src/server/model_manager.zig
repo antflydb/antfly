@@ -4327,6 +4327,82 @@ pub const ModelManager = struct {
         return false;
     }
 
+    fn pressureCanBeRelievedByHostCache(
+        pressure: runtime.tier.memory.AdmissionPressure,
+    ) bool {
+        return switch (pressure) {
+            .shared_host, .shared_unified, .external_budget, .live_host => true,
+            .domain_host, .domain_combined => true,
+            .domain_backend, .domain_kv, .domain_scratch => false,
+        };
+    }
+
+    /// Called with eviction_lock held after no idle model remains. Active
+    /// native/PJRT sessions may still own cold, unpinned lazy weights. Reclaim
+    /// one entry and let the caller re-probe the authoritative controller;
+    /// never infer success from cache counters alone.
+    fn reclaimOneActiveCacheForAdmission(
+        self: *ModelManager,
+        pressure: runtime.tier.memory.AdmissionPressure,
+    ) bool {
+        if (!pressureCanBeRelievedByHostCache(pressure)) return false;
+
+        self.lockLoadedModels();
+        defer self.unlockLoadedModels();
+        var candidate: ?*LoadedModel = null;
+        var oldest_ns: u64 = std.math.maxInt(u64);
+        var it = self.loaded.iterator();
+        while (it.next()) |entry| {
+            const model = entry.value_ptr.*;
+            if (model.retired or self.modelIsInFlightLocked(model)) continue;
+            if (!loadedModelAdmissionReclaimRelevant(model, pressure)) continue;
+            if (candidate == null or model.last_used_ns < oldest_ns) {
+                candidate = model;
+                oldest_ns = model.last_used_ns;
+            }
+        }
+        var model = candidate orelse return false;
+        var released_bytes = session_factory.reclaimOneHostCacheEntryForSession(model.session);
+        if (released_bytes == 0) {
+            // A session may have no unpinned victim at this instant. Do not let
+            // one busy model hide reclaimable capacity in another model.
+            var fallback_it = self.loaded.iterator();
+            while (fallback_it.next()) |entry| {
+                const fallback = entry.value_ptr.*;
+                if (fallback == model or fallback.retired or
+                    self.modelIsInFlightLocked(fallback) or
+                    !loadedModelAdmissionReclaimRelevant(fallback, pressure))
+                {
+                    continue;
+                }
+                released_bytes = session_factory.reclaimOneHostCacheEntryForSession(fallback.session);
+                if (released_bytes != 0) {
+                    model = fallback;
+                    break;
+                }
+            }
+        }
+        if (released_bytes == 0) return false;
+        std.log.info(
+            "reclaimed inference host cache path={s} backend={s} bytes={d} pressure={s}",
+            .{
+                model.model_dir,
+                @tagName(model.session.backend()),
+                released_bytes,
+                @tagName(pressure),
+            },
+        );
+        return true;
+    }
+
+    fn reclaimOneForAdmission(
+        self: *ModelManager,
+        pressure: runtime.tier.memory.AdmissionPressure,
+    ) bool {
+        if (self.evictOneIdleForAdmission(pressure)) return true;
+        return self.reclaimOneActiveCacheForAdmission(pressure);
+    }
+
     fn acquireAmountsWithEviction(
         self: *ModelManager,
         backend_class: runtime.tier.memory.BackendClass,
@@ -4356,7 +4432,7 @@ pub const ModelManager = struct {
                         error.ResourceTemporarilyUnavailable => {},
                         else => return retry_err,
                     }
-                    if (!self.evictOneIdleForAdmission(
+                    if (!self.reclaimOneForAdmission(
                         pressure orelse return error.ResourceTemporarilyUnavailable,
                     ))
                         return error.ResourceTemporarilyUnavailable;
@@ -4391,7 +4467,7 @@ pub const ModelManager = struct {
                         error.ResourceTemporarilyUnavailable => {},
                         else => return retry_err,
                     }
-                    if (!self.evictOneIdleForAdmission(
+                    if (!self.reclaimOneForAdmission(
                         pressure orelse return error.ResourceTemporarilyUnavailable,
                     ))
                         return error.ResourceTemporarilyUnavailable;
