@@ -8331,7 +8331,7 @@ pub const TableRestoreStatus = struct {
 pub const TableSchema = struct {
     /// Backend-managed schema generation used for migrations. Omit it from create and update requests.
     version: ?i64 = null,
-    /// Storage profile for the table. - "document" (default): schemaless JSON documents with optional, soft schema validation. All indexes are derived from the document. - "relational": required closed schema with typed columns. Documents must match a declared type; declared scalar properties are stored as typed columns for columnar predicate pushdown and aggregation. A field typed "json" stores a subtree that is still indexed like a document. Implies enforce_types and closed document types.
+    /// Storage profile for the table. - "document" (default): schemaless JSON documents with optional, soft schema validation. All indexes are derived from the document. - "relational": required closed schema with a typed-column storage contract. Documents must match a declared type. A field typed "json" represents a subtree that can retain document-style indexing. Implies enforce_types and closed document types.
     storage_mode: ?[]const u8 = null,
     /// Default type to use from the document_types.
     default_type: ?[]const u8 = null,

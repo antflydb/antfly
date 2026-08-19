@@ -5,7 +5,10 @@ zstd-compressed JSON blob, and every index (`full_text`, `embeddings`,
 `graph`, `algebraic`) is *derived* from that blob. Schema is optional and
 soft.
 
-**Relational mode** is a second table profile on the same engine. It keeps
+**Relational mode** is the target second table profile on the same engine. This
+document describes the contract and phased runtime integration; the core work
+initially establishes schema validation, column planning, projection, and the
+packed-row codec. It keeps
 every piece of the existing machinery — shards, Raft, indexes, enrichers, the
 join planner, and the algebraic fold runtime — but changes two things:
 
@@ -31,7 +34,7 @@ The substrate already exists:
 - **Typed scalars** — `storage/db/algebraic/value.zig` (`Kind`:
   string/integer/number/boolean/datetime/bytes, canonical encodings).
 - **Typed column store** — `section/typed_doc_values.zig`
-  (`u64`/`f64`/`bytes`/`bool`/`geo_point`, chunked, SIMD bulk reads, range
+  (`u64`/`i64`/`f64`/`bytes`/`bool`/`geo_point`, chunked, SIMD bulk reads, range
   scans).
 - **Per-field columnar blob with projection pushdown and null backfill** —
   `columnar.zig`.
@@ -72,8 +75,9 @@ contract and query surface.
 `storage_mode` is added to `TableSchema` (`specs/openapi/antfly/schema.yaml`):
 
 - `document` (default) — current behaviour, unchanged.
-- `relational` — required closed schema, typed columns, columnar predicate
-  pushdown.
+- `relational` — required closed schema and a typed-column storage contract;
+  columnar persistence and predicate pushdown arrive through the runtime phases
+  below.
 
 In `relational` mode the following are implied/enforced:
 
@@ -108,7 +112,7 @@ carrying
 - `column_type` — `string` / `integer` / `number` / `boolean` / `datetime` /
   `geopoint` / `geoshape` / `json`
 - `physical` — the `typed_doc_values` value type it lands in
-  (`bytes_val` / `u64_val` / `f64_val` / `bool_val` / `geo_point`)
+  (`bytes_val` / `i64_val` / `u64_val` / `f64_val` / `bool_val` / `geo_point`)
 - `nullable` — `false` when the field is in the type's `required_fields`
 - `indexed` — whether to maintain an inverted/typed index for the column
 - `is_json` — nested objects, arrays, and `json`-typed fields collapse to a
@@ -124,7 +128,7 @@ First-cut physical mapping:
 | `column_type` | `physical`  | notes                                 |
 | ------------- | ----------- | ------------------------------------- |
 | string        | `bytes_val` | keyword / link / text-as-keyword      |
-| integer       | `u64_val`   | sign-bit flip for signed ordering     |
+| integer       | `i64_val`   | exact signed integer                  |
 | number        | `f64_val`   |                                       |
 | boolean       | `bool_val`  |                                       |
 | datetime      | `u64_val`   | epoch nanoseconds                     |
@@ -151,10 +155,9 @@ Numeric physical encoding matches `typed_doc_values` and is order-preserving so
 range scans work directly on the packed column:
 
 - `number` → `f64` (native);
-- `integer` → `u64` via `orderedU64FromI64` (sign-bit flip, so unsigned range
-  scans yield signed order); round-trips through `orderedI64FromU64`;
-- `datetime` → `u64` from an epoch integer (or integer-string). RFC3339 string
-  parsing to epoch is a follow-up; epoch integers are accepted today;
+- `integer` → `i64` for exact signed round-tripping and native signed reads;
+- `datetime` → `u64` epoch nanoseconds from a non-negative epoch integer,
+  integer-string, RFC3339 timestamp, or date-only string;
 - `boolean` → `bool`, `geopoint` → packed lat/lon, `string`/`blob`/`geoshape`
   → `bytes`.
 

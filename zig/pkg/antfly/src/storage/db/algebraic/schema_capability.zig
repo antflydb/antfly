@@ -15,7 +15,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const index_mod = @import("index.zig");
+const relational_row_codec = @import("relational_row_codec.zig");
 const schema_mod = @import("../../../schema/mod.zig");
+const storage_schema = @import("../../schema.zig");
 
 pub const FieldRole = enum {
     group,
@@ -605,6 +607,19 @@ test "schema capability config can compile directly from schema json" {
     try std.testing.expectEqual(@as(usize, 0), parsed_config.value.materializations.len);
 }
 
+test "schema capability config accepts version zero relational schemas" {
+    const alloc = std.testing.allocator;
+    const config_json = try configJsonFromSchemaJsonAlloc(alloc, "rows",
+        \\{"version":0,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+    );
+    defer alloc.free(config_json);
+
+    var parsed_config = try std.json.parseFromSlice(index_mod.Config, alloc, config_json, .{ .allocate = .alloc_always });
+    defer parsed_config.deinit();
+    try std.testing.expectEqual(@as(u32, 0), parsed_config.value.schema_version);
+    try index_mod.validateConfig(parsed_config.value);
+}
+
 test "schema capability change classification separates additive from rebuild changes" {
     const alloc = std.testing.allocator;
     var old_schema = try schema_mod.parseValidatedTableSchema(alloc,
@@ -865,7 +880,8 @@ fn relationalColumnType(property: anytype) ?[]const u8 {
 }
 
 fn physicalForColumnType(column_type: []const u8) []const u8 {
-    if (std.mem.eql(u8, column_type, "integer") or std.mem.eql(u8, column_type, "datetime")) return "u64_val";
+    if (std.mem.eql(u8, column_type, "integer")) return "i64_val";
+    if (std.mem.eql(u8, column_type, "datetime")) return "u64_val";
     if (std.mem.eql(u8, column_type, "number")) return "f64_val";
     if (std.mem.eql(u8, column_type, "boolean")) return "bool_val";
     if (std.mem.eql(u8, column_type, "geopoint")) return "geo_point";
@@ -882,7 +898,7 @@ fn isRequiredField(required_fields: []const []const u8, name: []const u8) bool {
 test "relational column plan emits one typed column per declared property" {
     const alloc = std.testing.allocator;
     var parsed = try schema_mod.parseValidatedTableSchema(alloc,
-        \\{"version":4,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"datetime"},"active":{"type":"boolean"},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"tags":{"type":"array","items":{"type":"keyword"}},"payload":{"type":"json"}},"required":["id","amount"],"additionalProperties":false}}}}
+        \\{"version":4,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"qty":{"type":"integer"},"created_at":{"type":"datetime"},"active":{"type":"boolean"},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"tags":{"type":"array","items":{"type":"keyword"}},"payload":{"type":"json"}},"required":["id","amount"],"additionalProperties":false}}}}
     );
     defer parsed.deinit(alloc);
 
@@ -891,12 +907,13 @@ test "relational column plan emits one typed column per declared property" {
 
     try std.testing.expect(plan.relational);
     try std.testing.expectEqual(@as(u32, 4), plan.schema_version);
-    try std.testing.expectEqual(@as(usize, 7), plan.columns.len);
+    try std.testing.expectEqual(@as(usize, 8), plan.columns.len);
     try std.testing.expectEqual(@as(u32, 0), plan.skipped_complex_fields);
     try std.testing.expectEqual(@as(u32, 0), plan.skipped_dynamic_fields);
 
     try expectRelationalColumn(plan, "row", "id", "string", "bytes_val", false, false);
     try expectRelationalColumn(plan, "row", "amount", "number", "f64_val", false, false);
+    try expectRelationalColumn(plan, "row", "qty", "integer", "i64_val", true, false);
     try expectRelationalColumn(plan, "row", "created_at", "datetime", "u64_val", true, false);
     try expectRelationalColumn(plan, "row", "active", "boolean", "bool_val", true, false);
     try expectRelationalColumn(plan, "row", "attrs", "json", "bytes_val", true, true);
@@ -988,21 +1005,21 @@ fn expectRelationalColumn(
 //
 // Numeric physical encoding matches typed_doc_values:
 //   - number   -> f64 (native)
-//   - integer  -> u64 via an order-preserving map of i64 (so unsigned range
-//                 scans over the column produce signed order)
-//   - datetime -> u64 from an epoch integer (RFC3339 string parsing is a
-//                 follow-up; epoch integers/integer-strings are accepted today)
+//   - integer  -> i64 (exact signed round-trip)
+//   - datetime -> u64 epoch nanoseconds (epoch integers/integer-strings and
+//                 RFC3339/date-only strings are accepted)
 //   - boolean  -> bool, geopoint -> packed lat/lon, string/blob/geoshape -> bytes
 // ---------------------------------------------------------------------------
 
 const typed_doc_values = @import("../../../section/typed_doc_values.zig");
 
-pub const PhysicalType = enum { u64_val, f64_val, bytes_val, bool_val, geo_point };
+pub const PhysicalType = enum { u64_val, i64_val, f64_val, bytes_val, bool_val, geo_point };
 
 pub const GeoPoint = struct { lat: f64, lon: f64 };
 
 pub const ColumnValue = union(PhysicalType) {
     u64_val: u64,
+    i64_val: i64,
     f64_val: f64,
     bytes_val: []const u8,
     bool_val: bool,
@@ -1035,20 +1052,10 @@ pub const RelationalRow = struct {
     }
 };
 
-/// Order-preserving map from i64 to u64: flips the sign bit so that signed
-/// ordering becomes unsigned ordering (i64 min -> 0, i64 max -> u64 max).
-pub fn orderedU64FromI64(value: i64) u64 {
-    return @as(u64, @bitCast(value)) ^ (@as(u64, 1) << 63);
-}
-
-/// Inverse of orderedU64FromI64.
-pub fn orderedI64FromU64(value: u64) i64 {
-    return @bitCast(value ^ (@as(u64, 1) << 63));
-}
-
 pub fn typedValue(value: ColumnValue) typed_doc_values.TypedValue {
     return switch (value) {
         .u64_val => |v| .{ .u64_val = v },
+        .i64_val => |v| .{ .i64_val = v },
         .f64_val => |v| .{ .f64_val = v },
         .bytes_val => |v| .{ .bytes_val = v },
         .bool_val => |v| .{ .bool_val = v },
@@ -1116,12 +1123,17 @@ fn coerceColumnValue(alloc: Allocator, column_type: []const u8, json_value: std.
         switch (json_value) {
             .float => |number| return Coerced{ .value = .{ .f64_val = number } },
             .integer => |number| return Coerced{ .value = .{ .f64_val = @floatFromInt(number) } },
+            .number_string => |text| return Coerced{ .value = .{ .f64_val = std.fmt.parseFloat(f64, text) catch return null } },
             else => return null,
         }
     }
-    if (std.mem.eql(u8, column_type, "integer") or std.mem.eql(u8, column_type, "datetime")) {
+    if (std.mem.eql(u8, column_type, "integer")) {
         const number = integerFromJson(json_value) orelse return null;
-        return Coerced{ .value = .{ .u64_val = orderedU64FromI64(number) } };
+        return Coerced{ .value = .{ .i64_val = number } };
+    }
+    if (std.mem.eql(u8, column_type, "datetime")) {
+        const timestamp = dateTimeFromJson(json_value) orelse return null;
+        return Coerced{ .value = .{ .u64_val = timestamp } };
     }
     if (std.mem.eql(u8, column_type, "geopoint")) {
         const point = geoPointFromJson(json_value) orelse return null;
@@ -1133,9 +1145,19 @@ fn coerceColumnValue(alloc: Allocator, column_type: []const u8, json_value: std.
 fn integerFromJson(json_value: std.json.Value) ?i64 {
     switch (json_value) {
         .integer => |number| return number,
+        .number_string => |text| return std.fmt.parseInt(i64, text, 10) catch null,
         .string => |text| return std.fmt.parseInt(i64, text, 10) catch null,
         else => return null,
     }
+}
+
+fn dateTimeFromJson(json_value: std.json.Value) ?u64 {
+    return switch (json_value) {
+        .integer => |number| if (number >= 0) @intCast(number) else null,
+        .number_string => |text| std.fmt.parseInt(u64, text, 10) catch null,
+        .string => |text| std.fmt.parseInt(u64, text, 10) catch storage_schema.parseDateTimeToNs(text),
+        else => null,
+    };
 }
 
 fn geoPointFromJson(json_value: std.json.Value) ?GeoPoint {
@@ -1226,11 +1248,20 @@ test "relational projection yields typed cells" {
     const amount = row.cell(relationalColumnIndex(plan, "amount").?).?;
     try std.testing.expectEqual(@as(f64, 12.5), amount.value.f64_val);
     const qty = row.cell(relationalColumnIndex(plan, "qty").?).?;
-    try std.testing.expectEqual(@as(i64, 7), orderedI64FromU64(qty.value.u64_val));
+    try std.testing.expectEqual(@as(i64, 7), qty.value.i64_val);
     const ts = row.cell(relationalColumnIndex(plan, "ts").?).?;
-    try std.testing.expectEqual(@as(i64, 1000), orderedI64FromU64(ts.value.u64_val));
+    try std.testing.expectEqual(@as(u64, 1000), ts.value.u64_val);
     const active = row.cell(relationalColumnIndex(plan, "active").?).?;
     try std.testing.expect(active.value.bool_val);
+
+    const encoded = try relational_row_codec.serialize(alloc, &.{
+        .{ .path = "qty", .value_type = .i64_val, .value = typedValue(qty.value) },
+        .{ .path = "ts", .value_type = .u64_val, .value = typedValue(ts.value) },
+    });
+    defer alloc.free(encoded);
+    const reconstructed = try relational_row_codec.reconstructValueAlloc(alloc, encoded);
+    defer alloc.free(reconstructed);
+    try std.testing.expectEqualStrings("{\"qty\":7,\"ts\":1000}", reconstructed);
 
     // A nullable column omitted from the document yields no cell.
     var sparse = try std.json.parseFromSlice(std.json.Value, alloc,
@@ -1270,7 +1301,7 @@ test "relational row projection is failure atomic" {
     try std.testing.checkAllAllocationFailures(alloc, exerciseRelationalProjectionAllocation, .{ plan, doc.value });
 }
 
-test "relational integer column preserves signed order under unsigned compare" {
+test "relational integer and datetime columns preserve their logical values" {
     const alloc = std.testing.allocator;
     var plan = try relationalTestPlanAlloc(alloc);
     defer plan.deinit(alloc);
@@ -1281,7 +1312,7 @@ test "relational integer column preserves signed order under unsigned compare" {
     , .{});
     defer negative.deinit();
     var positive = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"id":"b","amount":0.0,"qty":5}
+        \\{"id":"b","amount":0.0,"qty":5,"ts":"1970-01-01T00:00:00.000000015Z"}
     , .{});
     defer positive.deinit();
 
@@ -1290,10 +1321,12 @@ test "relational integer column preserves signed order under unsigned compare" {
     var positive_row = try projectRelationalRowAlloc(alloc, plan, positive.value);
     defer positive_row.deinit(alloc);
 
-    const negative_encoded = negative_row.cell(qty_index).?.value.u64_val;
-    const positive_encoded = positive_row.cell(qty_index).?.value.u64_val;
-    try std.testing.expect(negative_encoded < positive_encoded);
-    try std.testing.expectEqual(@as(i64, -5), orderedI64FromU64(negative_encoded));
+    try std.testing.expectEqual(@as(i64, -5), negative_row.cell(qty_index).?.value.i64_val);
+    try std.testing.expectEqual(@as(i64, 5), positive_row.cell(qty_index).?.value.i64_val);
+    try std.testing.expectEqual(
+        @as(u64, 15),
+        positive_row.cell(relationalColumnIndex(plan, "ts").?).?.value.u64_val,
+    );
 }
 
 test "relational cells round-trip through typed_doc_values storage" {
@@ -1310,7 +1343,8 @@ test "relational cells round-trip through typed_doc_values storage" {
     defer row.deinit(alloc);
 
     // Drive the real typed_doc_values writer/reader for each typed-scan column.
-    try expectTypedColumnRoundTrip(alloc, .u64_val, typedValue(row.cell(relationalColumnIndex(plan, "qty").?).?.value));
+    try expectTypedColumnRoundTrip(alloc, .i64_val, typedValue(row.cell(relationalColumnIndex(plan, "qty").?).?.value));
+    try expectTypedColumnRoundTrip(alloc, .u64_val, typedValue(row.cell(relationalColumnIndex(plan, "ts").?).?.value));
     try expectTypedColumnRoundTrip(alloc, .f64_val, typedValue(row.cell(relationalColumnIndex(plan, "amount").?).?.value));
     try expectTypedColumnRoundTrip(alloc, .bool_val, typedValue(row.cell(relationalColumnIndex(plan, "active").?).?.value));
 }
@@ -1329,6 +1363,7 @@ fn expectTypedColumnRoundTrip(
     const reader = try typed_doc_values.TypedDocValuesReader.init(alloc, bytes);
     switch (value_type) {
         .u64_val => try std.testing.expectEqual(value.u64_val, (try reader.getU64(0)).?),
+        .i64_val => try std.testing.expectEqual(value.i64_val, (try reader.getI64(0)).?),
         .f64_val => try std.testing.expectEqual(value.f64_val, (try reader.getF64(0)).?),
         .bool_val => try std.testing.expectEqual(value.bool_val, (try reader.getBool(0)).?),
         else => unreachable,

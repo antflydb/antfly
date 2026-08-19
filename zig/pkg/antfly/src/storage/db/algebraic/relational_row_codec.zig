@@ -48,6 +48,7 @@
 //!     value_type u8          -- typed_doc_values.ValueType tag
 //!     payload:
 //!       u64_val   : 8 bytes
+//!       i64_val   : 8 bytes (two's-complement bit pattern)
 //!       f64_val   : 8 bytes (bitcast)
 //!       bool_val  : 1 byte
 //!       geo_point : 16 bytes (lat f64, lon f64)
@@ -94,20 +95,25 @@ pub fn looksLikeRow(value: []const u8) bool {
 
 /// Serialize a document's cells. Caller owns the result.
 pub fn serialize(alloc: Allocator, cells: []const Cell) ![]u8 {
-    const encoded_len = try serializedLen(cells);
+    const encoded_len = try serializedLenWithAllocator(alloc, cells);
     const buf = try alloc.alloc(u8, encoded_len);
     errdefer alloc.free(buf);
-    _ = try serializeInto(buf, cells);
+    _ = serializeIntoUnchecked(buf, cells);
     return buf;
 }
 
 /// Return the exact number of bytes required by `serializeInto`.
 pub fn serializedLen(cells: []const Cell) !usize {
+    var stack = std.heap.stackFallback(2048, std.heap.page_allocator);
+    return serializedLenWithAllocator(stack.get(), cells);
+}
+
+fn serializedLenWithAllocator(alloc: Allocator, cells: []const Cell) !usize {
+    try validateCells(alloc, cells);
     const count = std.math.cast(u32, cells.len) orelse return error.InvalidRelationalRow;
     _ = count;
     var encoded_len: usize = magic.len + 2 * @sizeOf(u32);
     for (cells) |cell| {
-        if (!cellValueMatchesType(cell) or !cellValueIsSerializable(cell)) return error.InvalidRelationalRow;
         _ = std.math.cast(u32, cell.path.len) orelse return error.InvalidRelationalRow;
         encoded_len = try serializedLenAdd(encoded_len, @sizeOf(u32) + cell.path.len + 2);
         encoded_len = try serializedLenAdd(encoded_len, switch (cell.value) {
@@ -127,6 +133,11 @@ pub fn serializedLen(cells: []const Cell) !usize {
 pub fn serializeInto(buf: []u8, cells: []const Cell) ![]u8 {
     const encoded_len = try serializedLen(cells);
     if (buf.len < encoded_len) return error.NoSpaceLeft;
+    return serializeIntoUnchecked(buf[0..encoded_len], cells);
+}
+
+fn serializeIntoUnchecked(buf: []u8, cells: []const Cell) []u8 {
+    const encoded_len = buf.len;
     const out = buf[0..encoded_len];
     var pos: usize = 0;
     @memcpy(out[pos..][0..magic.len], &magic);
@@ -187,6 +198,26 @@ fn cellValueIsSerializable(cell: Cell) bool {
     };
 }
 
+fn validateCell(alloc: Allocator, cell: Cell) !void {
+    if (!std.unicode.utf8ValidateSlice(cell.path) or
+        !cellValueMatchesType(cell) or
+        !cellValueIsSerializable(cell)) return error.InvalidRelationalRow;
+    if (cell.is_json and !(try std.json.validate(alloc, cell.value.bytes_val))) {
+        return error.InvalidRelationalRow;
+    }
+}
+
+fn validateCells(alloc: Allocator, cells: []const Cell) !void {
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+    try seen.ensureTotalCapacity(alloc, std.math.cast(u32, cells.len) orelse return error.InvalidRelationalRow);
+    for (cells) |cell| {
+        try validateCell(alloc, cell);
+        const entry = try seen.getOrPut(alloc, cell.path);
+        if (entry.found_existing) return error.InvalidRelationalRow;
+    }
+}
+
 fn writeU32(buf: []u8, pos: *usize, value: u32) void {
     std.mem.writeInt(u32, buf[pos.*..][0..@sizeOf(u32)], value, .little);
     pos.* += @sizeOf(u32);
@@ -210,22 +241,13 @@ pub const Row = struct {
 /// Decode a row. The returned cell slice is heap-allocated (free via
 /// `Row.deinit`); `path` and `bytes_val` borrow `data`.
 pub fn deserialize(alloc: Allocator, data: []const u8) !Row {
-    if (data.len < magic.len + 8) return error.InvalidRelationalRow;
-    if (!std.mem.eql(u8, data[0..magic.len], &magic)) return error.InvalidRelationalRow;
-    var pos: usize = magic.len;
-    const ver = readU32(data, &pos);
-    if (ver != version) return error.UnsupportedRelationalRowVersion;
-    const count = readU32(data, &pos);
-    try validateCellCount(data.len - pos, count);
-
-    const cells = try alloc.alloc(Cell, count);
+    var cursor = try RowCursor.init(alloc, data);
+    defer cursor.deinit();
+    const cells = try alloc.alloc(Cell, cursor.count);
     errdefer alloc.free(cells);
 
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        cells[i] = try readCellAt(data, &pos);
-    }
-    if (pos != data.len) return error.InvalidRelationalRow;
+    for (cells) |*cell| cell.* = (try cursor.next()) orelse return error.InvalidRelationalRow;
+    try cursor.finish();
 
     return .{ .cells = cells };
 }
@@ -234,18 +256,11 @@ pub fn deserialize(alloc: Allocator, data: []const u8) !Row {
 /// used by paths that only need a few cells but must still reject malformed
 /// authoritative packed rows before trusting derived index payloads.
 pub fn validate(data: []const u8) !void {
-    if (data.len < magic.len + 8) return error.InvalidRelationalRow;
-    if (!std.mem.eql(u8, data[0..magic.len], &magic)) return error.InvalidRelationalRow;
-    var pos: usize = magic.len;
-    const ver = readU32(data, &pos);
-    if (ver != version) return error.UnsupportedRelationalRowVersion;
-    const count = readU32(data, &pos);
-    try validateCellCount(data.len - pos, count);
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        _ = try readCellAt(data, &pos);
-    }
-    if (pos != data.len) return error.InvalidRelationalRow;
+    var stack = std.heap.stackFallback(2048, std.heap.page_allocator);
+    var cursor = try RowCursor.init(stack.get(), data);
+    defer cursor.deinit();
+    while (try cursor.next()) |_| {}
+    try cursor.finish();
 }
 
 fn validateCellCount(remaining: usize, count: u32) !void {
@@ -263,17 +278,10 @@ pub const CellLookup = struct {
 pub fn collectCellsByLookup(value: []const u8, lookups: []const CellLookup, out: []?Cell) !void {
     if (lookups.len != out.len) return error.InvalidArgument;
     for (out) |*item| item.* = null;
-    if (value.len < magic.len + 8) return error.InvalidRelationalRow;
-    if (!std.mem.eql(u8, value[0..magic.len], &magic)) return error.InvalidRelationalRow;
-    var pos: usize = magic.len;
-    const ver = readU32(value, &pos);
-    if (ver != version) return error.UnsupportedRelationalRowVersion;
-    const count = readU32(value, &pos);
-    try validateCellCount(value.len - pos, count);
-
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        const cell = try readCellAt(value, &pos);
+    var stack = std.heap.stackFallback(2048, std.heap.page_allocator);
+    var cursor = try RowCursor.init(stack.get(), value);
+    defer cursor.deinit();
+    while (try cursor.next()) |cell| {
         for (lookups, 0..) |lookup, lookup_index| {
             if (out[lookup_index] != null) continue;
             if (std.mem.eql(u8, cell.path, lookup.path) or
@@ -283,8 +291,49 @@ pub fn collectCellsByLookup(value: []const u8, lookups: []const CellLookup, out:
             }
         }
     }
-    if (pos != value.len) return error.InvalidRelationalRow;
+    try cursor.finish();
 }
+
+const RowCursor = struct {
+    alloc: Allocator,
+    data: []const u8,
+    pos: usize,
+    count: u32,
+    read_count: u32 = 0,
+    seen: std.StringHashMapUnmanaged(void) = .empty,
+
+    fn init(alloc: Allocator, data: []const u8) !RowCursor {
+        if (data.len < magic.len + 8) return error.InvalidRelationalRow;
+        if (!std.mem.eql(u8, data[0..magic.len], &magic)) return error.InvalidRelationalRow;
+        var pos: usize = magic.len;
+        const ver = readU32(data, &pos);
+        if (ver != version) return error.UnsupportedRelationalRowVersion;
+        const count = readU32(data, &pos);
+        try validateCellCount(data.len - pos, count);
+        var cursor = RowCursor{ .alloc = alloc, .data = data, .pos = pos, .count = count };
+        errdefer cursor.seen.deinit(alloc);
+        try cursor.seen.ensureTotalCapacity(alloc, count);
+        return cursor;
+    }
+
+    fn deinit(self: *RowCursor) void {
+        self.seen.deinit(self.alloc);
+    }
+
+    fn next(self: *RowCursor) !?Cell {
+        if (self.read_count == self.count) return null;
+        const cell = try readCellAt(self.data, &self.pos);
+        try validateCell(self.alloc, cell);
+        const entry = try self.seen.getOrPut(self.alloc, cell.path);
+        if (entry.found_existing) return error.InvalidRelationalRow;
+        self.read_count += 1;
+        return cell;
+    }
+
+    fn finish(self: RowCursor) !void {
+        if (self.read_count != self.count or self.pos != self.data.len) return error.InvalidRelationalRow;
+    }
+};
 
 /// Decode the cell at `pos.*`, advancing `pos`. Shared by full deserialization
 /// and the single-column accessor. The `path`/`bytes_val` slices borrow `data`.
@@ -343,20 +392,14 @@ fn readCellAt(data: []const u8, pos: *usize) !Cell {
 /// document. Returns null for a non-row value.
 pub fn findCellByPath(value: []const u8, path: []const u8) !?Cell {
     if (!looksLikeRow(value)) return null;
-    if (value.len < magic.len + 8) return error.InvalidRelationalRow;
-    var pos: usize = magic.len;
-    const ver = readU32(value, &pos);
-    if (ver != version) return error.UnsupportedRelationalRowVersion;
-    const count = readU32(value, &pos);
-    try validateCellCount(value.len - pos, count);
-
+    var stack = std.heap.stackFallback(2048, std.heap.page_allocator);
+    var cursor = try RowCursor.init(stack.get(), value);
+    defer cursor.deinit();
     var found: ?Cell = null;
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        const cell = try readCellAt(value, &pos);
+    while (try cursor.next()) |cell| {
         if (found == null and std.mem.eql(u8, cell.path, path)) found = cell;
     }
-    if (pos != value.len) return error.InvalidRelationalRow;
+    try cursor.finish();
     return found;
 }
 
@@ -636,7 +679,19 @@ test "relational row codec rejects mismatched and non-JSON-safe cells" {
     const invalid_json = [_]Cell{
         .{ .path = "payload", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = "{" } },
     };
+    try std.testing.expectError(error.InvalidRelationalRow, serialize(alloc, &invalid_json));
     try std.testing.expectError(error.InvalidRelationalRow, reconstructDocumentAlloc(alloc, &invalid_json));
+
+    const invalid_path = [_]Cell{
+        .{ .path = "\xff", .value_type = .bool_val, .value = .{ .bool_val = true } },
+    };
+    try std.testing.expectError(error.InvalidRelationalRow, serialize(alloc, &invalid_path));
+
+    const duplicate_paths = [_]Cell{
+        .{ .path = "value", .value_type = .bool_val, .value = .{ .bool_val = true } },
+        .{ .path = "value", .value_type = .bool_val, .value = .{ .bool_val = false } },
+    };
+    try std.testing.expectError(error.InvalidRelationalRow, serialize(alloc, &duplicate_paths));
 
     const finite = [_]Cell{
         .{ .path = "", .value_type = .f64_val, .value = .{ .f64_val = 1 } },
@@ -645,6 +700,35 @@ test "relational row codec rejects mismatched and non-JSON-safe cells" {
     defer alloc.free(corrupted);
     std.mem.writeInt(u64, corrupted[18..26], @bitCast(std.math.nan(f64)), .little);
     try std.testing.expectError(error.InvalidRelationalRow, validate(corrupted));
+}
+
+test "relational row readers reject corrupt JSON and duplicate paths" {
+    const alloc = std.testing.allocator;
+    const json_row = try serialize(alloc, &.{
+        .{ .path = "payload", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = "{}" } },
+    });
+    defer alloc.free(json_row);
+    const json_offset = std.mem.indexOf(u8, json_row, "{}") orelse return error.TestUnexpectedResult;
+    json_row[json_offset + 1] = 'x';
+    try std.testing.expectError(error.InvalidRelationalRow, validate(json_row));
+    try std.testing.expectError(error.InvalidRelationalRow, deserialize(alloc, json_row));
+    try std.testing.expectError(error.InvalidRelationalRow, findCellByPath(json_row, "payload"));
+
+    const duplicate_row = try serialize(alloc, &.{
+        .{ .path = "a", .value_type = .bool_val, .value = .{ .bool_val = true } },
+        .{ .path = "b", .value_type = .bool_val, .value = .{ .bool_val = false } },
+    });
+    defer alloc.free(duplicate_row);
+    // Header (12) + first bool cell (8) + second path length (4).
+    duplicate_row[24] = 'a';
+    try std.testing.expectError(error.InvalidRelationalRow, validate(duplicate_row));
+    try std.testing.expectError(error.InvalidRelationalRow, deserialize(alloc, duplicate_row));
+    try std.testing.expectError(error.InvalidRelationalRow, findCellByPath(duplicate_row, "a"));
+    var found: [1]?Cell = undefined;
+    try std.testing.expectError(
+        error.InvalidRelationalRow,
+        collectCellsByLookup(duplicate_row, &.{.{ .path = "a" }}, &found),
+    );
 }
 
 test "findCellByPath reads a single column without full deserialization" {

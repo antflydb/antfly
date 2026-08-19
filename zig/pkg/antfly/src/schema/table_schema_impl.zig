@@ -1712,6 +1712,26 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
     {
         return error.InvalidSchemaUpdateRequest;
     }
+    // The relational catalog must be a complete, static description of every
+    // possible row field and its nullability. Root-level JSON Schema
+    // compositions can add evaluated properties or conditional requirements
+    // that are accepted by validation but absent from the physical column
+    // plan. Reject them until the catalog compiler can flatten an effective
+    // schema without losing composition semantics.
+    if (document_schema.unevaluated_properties_allowed != null or
+        document_schema.unevaluated_properties_schema != null or
+        document_schema.dependent_required.len != 0 or
+        document_schema.dependent_schemas.len != 0 or
+        document_schema.any_of.len != 0 or
+        document_schema.one_of.len != 0 or
+        document_schema.all_of.len != 0 or
+        document_schema.not_schema != null or
+        document_schema.if_schema != null or
+        document_schema.then_schema != null or
+        document_schema.else_schema != null)
+    {
+        return error.InvalidSchemaUpdateRequest;
+    }
     for (document_schema.properties) |property| {
         if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
     }
@@ -3715,8 +3735,17 @@ test "relational schemas reject contracts the row codec cannot represent" {
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
         \\{"storage_mode":"relational","document_schemas":{"first":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}}}},"second":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}}}}}}
     ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"allOf":[{"type":"object","properties":{"tenant":{"type":"keyword"}}}],"additionalProperties":false}}}}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"}},"dependentRequired":{"id":["tenant"]},"additionalProperties":false}}}}
+    ));
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchemaUpdateRequest(alloc,
         \\{"storage_mode":"relational","document_schemas":{}}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchemaUpdateRequest(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"if":{"required":["id"]},"then":{"required":["tenant"]},"additionalProperties":false}}}}
     ));
 }
 
