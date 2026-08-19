@@ -152,9 +152,12 @@ pub const Backend = struct {
             const lower = internal_keys.replayRangeLower(lane_ordinal, from_sequence);
             const upper = internal_keys.replayRangeUpper(lane_ordinal);
 
-            lockBackend(self.backend);
-            var snapshot = self.backend.state.?.state.tree.snapshot();
-            self.backend.mutex.unlock();
+            var snapshot = blk: {
+                lockBackend(self.backend);
+                defer self.backend.mutex.unlock();
+                const state = try self.backend.ensureStateLocked();
+                break :blk state.state.tree.snapshot();
+            };
             defer snapshot.release(self.backend.allocator);
 
             var cursor = ordered.Cursor.init(self.backend.allocator);
@@ -470,6 +473,35 @@ test "memory backend runtime erases namespace store handles" {
         try std.testing.expectEqualStrings("1", try txn.get(.{}, "meta:lsn"));
         try std.testing.expectEqualStrings("A", try txn.get(.{ .name = "docs" }, "doc:a"));
     }
+}
+
+test "memory backend replay scan is empty before first transaction" {
+    var backend = Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    const Context = struct {
+        calls: usize = 0,
+
+        fn handle(self: *@This(), _: u64, _: []const u8) !void {
+            self.calls += 1;
+        }
+    };
+
+    var context: Context = .{};
+    const stats = try runtime.forEachReplayLaneFrom(
+        internal_keys.replay_all_kind,
+        1,
+        0,
+        &context,
+        Context.handle,
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), context.calls);
+    try std.testing.expectEqual(@as(usize, 0), stats.scanned_entries);
+    try std.testing.expectEqual(@as(usize, 0), stats.matched_entries);
 }
 
 test "memory backend runtime erases bound store handles with cursor access" {
