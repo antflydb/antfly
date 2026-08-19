@@ -17,12 +17,14 @@ const std = @import("std");
 pub const token = @import("token.zig");
 pub const lexer = @import("lexer.zig");
 pub const parser = @import("parser.zig");
+pub const generated_parser = @import("generated_parser.zig");
 pub const generated = @import("grammar/generated/root.zig");
 
 test {
     _ = token;
     _ = lexer;
     _ = parser;
+    _ = generated_parser;
     _ = generated;
 }
 
