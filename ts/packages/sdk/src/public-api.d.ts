@@ -8065,7 +8065,7 @@ export interface components {
             full_text_index?: boolean;
             /** @description Produced asset content type for asset enrichments. */
             content_type?: string;
-            /** @description Serialized asset producer configuration. */
+            /** @description Write-only serialized asset producer configuration. It may contain provider credentials and is never returned. */
             producer_json?: string;
             /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
             execution?: components["schemas"]["ExecutionPolicy"];

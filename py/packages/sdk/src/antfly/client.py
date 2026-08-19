@@ -2,9 +2,9 @@
 
 import base64
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from typing import Any, cast
+from typing import Any, TypeAlias, cast
 from urllib.parse import quote
 
 from httpx import Response, Timeout
@@ -17,6 +17,11 @@ from antfly.client_generated.client import AuthenticatedClient
 from antfly.client_generated.models import (
     BatchRequest,
     BatchRequestInserts,
+    CreateAlgebraicIndexRequest,
+    CreatedIndex,
+    CreateEmbeddingsIndexRequest,
+    CreateFullTextIndexRequest,
+    CreateGraphIndexRequest,
     Error,
     InferenceGenerateChunk,
     InferenceGenerateRequest,
@@ -34,6 +39,16 @@ MAX_INFERENCE_ERROR_BYTES = 1 << 20
 MAX_GENERATION_RESPONSE_BYTES = 16 << 20
 MAX_GENERATION_SSE_EVENT_BYTES = 16 << 20
 MAX_GENERATION_SSE_LINE_BYTES = 16 << 20
+
+CreateIndexRequest: TypeAlias = (
+    CreateFullTextIndexRequest | CreateEmbeddingsIndexRequest | CreateGraphIndexRequest | CreateAlgebraicIndexRequest
+)
+_CREATE_INDEX_REQUEST_TYPES = (
+    CreateFullTextIndexRequest,
+    CreateEmbeddingsIndexRequest,
+    CreateGraphIndexRequest,
+    CreateAlgebraicIndexRequest,
+)
 
 
 def _read_limited_response(response: Response, max_bytes: int) -> tuple[bytes, bool]:
@@ -185,20 +200,33 @@ class IndexOperations:
     def __init__(self, client: "AntflyClient") -> None:
         self._client = client
 
-    def create(self, table: str, name: str, config: dict[str, Any]) -> dict[str, Any]:
-        """Create an index and return its normalized effective configuration."""
-        if "name" in config:
+    def create(
+        self,
+        table: str,
+        name: str,
+        config: CreateIndexRequest | Mapping[str, Any],
+    ) -> CreatedIndex:
+        """Create an index and return its typed normalized configuration.
+
+        Generated request models provide type checking and editor completion.
+        Mappings remain accepted for compatibility with existing callers.
+        """
+        payload = config.to_dict() if isinstance(config, _CREATE_INDEX_REQUEST_TYPES) else dict(config)
+        if "name" in payload:
             raise ValueError("index name is owned by the path; pass it as the name argument")
-        if not isinstance(config.get("type"), str) or not config["type"]:
+        if not isinstance(payload.get("type"), str) or not payload["type"]:
             raise ValueError("index config requires a non-empty type")
         result = self._client._request(
             "POST",
             f"/db/v1/tables/{quote(table, safe='')}/indexes/{quote(name, safe='')}",
-            json=dict(config),
+            json=payload,
         )
         if not isinstance(result, dict):
             raise AntflyException("create index returned an invalid response")
-        return result
+        try:
+            return CreatedIndex.from_dict(result)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AntflyException(f"create index returned an invalid response: {exc}") from exc
 
     def list(self, table: str) -> list[dict[str, Any]]:
         """List all indexes on a table."""

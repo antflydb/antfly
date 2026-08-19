@@ -176,8 +176,8 @@ func NewCreateIndexRequest(config any) (*CreateIndexRequest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("marshal index config: %w", err)
 	}
-	switch config.(type) {
-	case EmbeddingsIndexConfig:
+	switch typed := config.(type) {
+	case EmbeddingsIndexConfig, CreateEmbeddingsIndexRequest:
 		var variant oapi.CreateEmbeddingsIndexRequest
 		if err := json.Unmarshal(data, &variant); err != nil {
 			return nil, fmt.Errorf("build embeddings create index request: %w", err)
@@ -186,7 +186,16 @@ func NewCreateIndexRequest(config any) (*CreateIndexRequest, error) {
 		if err := request.FromCreateEmbeddingsIndexRequest(variant); err != nil {
 			return nil, fmt.Errorf("set embeddings create index request: %w", err)
 		}
-	case FullTextIndexConfig:
+	case *CreateEmbeddingsIndexRequest:
+		if typed == nil {
+			return nil, fmt.Errorf("embeddings create index request must not be nil")
+		}
+		variant := *typed
+		variant.Type = oapi.CreateEmbeddingsIndexRequestTypeEmbeddings
+		if err := request.FromCreateEmbeddingsIndexRequest(variant); err != nil {
+			return nil, fmt.Errorf("set embeddings create index request: %w", err)
+		}
+	case FullTextIndexConfig, CreateFullTextIndexRequest:
 		var variant oapi.CreateFullTextIndexRequest
 		if err := json.Unmarshal(data, &variant); err != nil {
 			return nil, fmt.Errorf("build full-text create index request: %w", err)
@@ -195,7 +204,16 @@ func NewCreateIndexRequest(config any) (*CreateIndexRequest, error) {
 		if err := request.FromCreateFullTextIndexRequest(variant); err != nil {
 			return nil, fmt.Errorf("set full-text create index request: %w", err)
 		}
-	case GraphIndexConfig:
+	case *CreateFullTextIndexRequest:
+		if typed == nil {
+			return nil, fmt.Errorf("full-text create index request must not be nil")
+		}
+		variant := *typed
+		variant.Type = oapi.CreateFullTextIndexRequestTypeFullText
+		if err := request.FromCreateFullTextIndexRequest(variant); err != nil {
+			return nil, fmt.Errorf("set full-text create index request: %w", err)
+		}
+	case GraphIndexConfig, CreateGraphIndexRequest:
 		var variant oapi.CreateGraphIndexRequest
 		if err := json.Unmarshal(data, &variant); err != nil {
 			return nil, fmt.Errorf("build graph create index request: %w", err)
@@ -204,11 +222,29 @@ func NewCreateIndexRequest(config any) (*CreateIndexRequest, error) {
 		if err := request.FromCreateGraphIndexRequest(variant); err != nil {
 			return nil, fmt.Errorf("set graph create index request: %w", err)
 		}
-	case AlgebraicIndexConfig:
+	case *CreateGraphIndexRequest:
+		if typed == nil {
+			return nil, fmt.Errorf("graph create index request must not be nil")
+		}
+		variant := *typed
+		variant.Type = oapi.CreateGraphIndexRequestTypeGraph
+		if err := request.FromCreateGraphIndexRequest(variant); err != nil {
+			return nil, fmt.Errorf("set graph create index request: %w", err)
+		}
+	case AlgebraicIndexConfig, CreateAlgebraicIndexRequest:
 		var variant oapi.CreateAlgebraicIndexRequest
 		if err := json.Unmarshal(data, &variant); err != nil {
 			return nil, fmt.Errorf("build algebraic create index request: %w", err)
 		}
+		variant.Type = oapi.CreateAlgebraicIndexRequestTypeAlgebraic
+		if err := request.FromCreateAlgebraicIndexRequest(variant); err != nil {
+			return nil, fmt.Errorf("set algebraic create index request: %w", err)
+		}
+	case *CreateAlgebraicIndexRequest:
+		if typed == nil {
+			return nil, fmt.Errorf("algebraic create index request must not be nil")
+		}
+		variant := *typed
 		variant.Type = oapi.CreateAlgebraicIndexRequestTypeAlgebraic
 		if err := request.FromCreateAlgebraicIndexRequest(variant); err != nil {
 			return nil, fmt.Errorf("set algebraic create index request: %w", err)

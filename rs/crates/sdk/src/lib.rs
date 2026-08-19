@@ -31,6 +31,73 @@ pub fn new_client_with_token(
 
 include!(concat!(env!("OUT_DIR"), "/client.rs"));
 
+impl Default for types::CreateFullTextIndexRequest {
+    fn default() -> Self {
+        Self {
+            description: None,
+            enrichments: Vec::new(),
+            mem_only: None,
+            type_: types::CreateFullTextIndexRequestType::FullText,
+            version: 0,
+        }
+    }
+}
+
+impl Default for types::CreateEmbeddingsIndexRequest {
+    fn default() -> Self {
+        Self {
+            chunk_size: 1024,
+            chunker: None,
+            coverage_policy: None,
+            description: None,
+            dimension: None,
+            distance_metric: None,
+            embedder: None,
+            embedding_name: None,
+            enrichments: Vec::new(),
+            execution: None,
+            external: false,
+            field: None,
+            mem_only: None,
+            min_weight: None,
+            source_artifact_name: None,
+            sparse: false,
+            summarizer: None,
+            template: None,
+            top_k: std::num::NonZeroU64::new(10).expect("10 is non-zero"),
+            type_: types::CreateEmbeddingsIndexRequestType::Embeddings,
+            version: 0,
+        }
+    }
+}
+
+impl Default for types::CreateGraphIndexRequest {
+    fn default() -> Self {
+        Self {
+            description: None,
+            edge_types: Vec::new(),
+            enrichments: Vec::new(),
+            max_edges_per_document: None,
+            summarizer: None,
+            template: None,
+            type_: types::CreateGraphIndexRequestType::Graph,
+            version: 0,
+        }
+    }
+}
+
+impl Default for types::CreateAlgebraicIndexRequest {
+    fn default() -> Self {
+        Self {
+            derive_from_schema: None,
+            description: None,
+            enrichments: Vec::new(),
+            type_: types::CreateAlgebraicIndexRequestType::Algebraic,
+            version: 0,
+        }
+    }
+}
+
 /// Actionable storage admission detail extracted from a create-index error.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StorageResourceExhaustedError {
@@ -84,14 +151,16 @@ mod tests {
 
     #[test]
     fn create_index_request_uses_path_owned_identity() {
-        let request: types::CreateIndexRequest = serde_json::from_value(serde_json::json!({
-            "type": "embeddings",
-            "dimension": 512,
-            "coverage_policy": "partial"
-        }))
-        .expect("valid create index request");
+        let request = types::CreateEmbeddingsIndexRequest {
+            dimension: std::num::NonZeroU64::new(512),
+            coverage_policy: Some(types::DerivedCoveragePolicy::Partial),
+            ..Default::default()
+        };
+        let request: types::CreateIndexRequest = request.into();
         let value = serde_json::to_value(request).expect("serialize create index request");
         assert_eq!(value["type"], "embeddings");
+        assert_eq!(value["dimension"], 512);
+        assert_eq!(value["coverage_policy"], "partial");
         assert!(value.get("name").is_none());
     }
 

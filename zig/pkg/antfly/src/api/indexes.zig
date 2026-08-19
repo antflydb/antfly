@@ -975,6 +975,12 @@ fn appendPublicConfigValue(
             var first = true;
             var it = object.iterator();
             while (it.next()) |entry| {
+                // Asset producers are intentionally opaque and may gain new
+                // provider-specific credential fields at any time. A
+                // deny-list cannot safely project them into a public response,
+                // so preserve the table-status invariant and omit the entire
+                // write-only document.
+                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "producer_json")) continue;
                 if (isSensitivePublicConfigField(entry.key_ptr.*) and !isSecretReference(entry.value_ptr.*)) continue;
                 if (!first) try out.append(alloc, ',');
                 first = false;
@@ -3691,7 +3697,7 @@ test "public index config encoders redact coverage incarnation" {
 
 test "public index config encoders redact nested credentials" {
     const indexes_json =
-        \\{"embed_idx":{"type":"embeddings","dimension":384,"embedder":{"provider":"openai","model":"text-embedding-3-small","api_key":"sk-private"},"summarizer":{"provider":"gemini","model":"gemini-2.5-flash","api_key":"${secret:gemini_key}"},"enrichments":[{"name":"asset_v1","kind":"asset","producer_json":"{\"provider\":\"remote\",\"access_token\":\"private-token\",\"headers\":{\"Authorization\":\"Bearer private-auth\",\"X-Api-Key\":\"private-header-key\",\"Accept\":\"text/html\"},\"format\":\"html\"}"}]}}
+        \\{"embed_idx":{"type":"embeddings","dimension":384,"embedder":{"provider":"openai","model":"text-embedding-3-small","api_key":"sk-private"},"summarizer":{"provider":"gemini","model":"gemini-2.5-flash","api_key":"${secret:gemini_key}"},"enrichments":[{"name":"asset_v1","kind":"asset","producer_json":"{\"provider\":\"s3\",\"secret_access_key\":\"unknown-provider-secret\",\"access_token\":\"private-token\",\"headers\":{\"Authorization\":\"Bearer private-auth\",\"X-Auth\":\"future-private-header\",\"Accept\":\"text/html\"},\"format\":\"html\"}"}]}}
     ;
 
     const encoded_single = (try encodeSingleIndexConfig(std.testing.allocator, indexes_json, "embed_idx")).?;
@@ -3706,16 +3712,17 @@ test "public index config encoders redact nested credentials" {
     try std.testing.expect(std.mem.indexOf(u8, created, "sk-private") == null);
     try std.testing.expect(std.mem.indexOf(u8, created, "private-token") == null);
     try std.testing.expect(std.mem.indexOf(u8, created, "private-auth") == null);
-    try std.testing.expect(std.mem.indexOf(u8, created, "private-header-key") == null);
+    try std.testing.expect(std.mem.indexOf(u8, created, "unknown-provider-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, created, "future-private-header") == null);
     try std.testing.expect(std.mem.indexOf(u8, created, "${secret:gemini_key}") != null);
     var parsed_created = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, created, .{});
     defer parsed_created.deinit();
     const created_enrichments = parsed_created.value.object.get("enrichments") orelse return error.TestUnexpectedResult;
-    const producer_json = created_enrichments.array.items[0].object.get("producer_json") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(created_enrichments.array.items[0].object.get("producer_json") == null);
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
-        "{\"provider\":\"remote\",\"headers\":{\"Accept\":\"text/html\"},\"format\":\"html\"}",
-        producer_json.string,
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"enrichments\":[{\"name\":\"asset_v1\",\"kind\":\"asset\"}]}",
+        created,
     );
 }
 

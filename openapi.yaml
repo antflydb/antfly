@@ -16290,7 +16290,9 @@ components:
         producer_json:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: Serialized asset producer configuration.
+          writeOnly: true
+          description: Write-only serialized asset producer configuration. It may contain provider credentials
+            and is never returned.
         execution:
           $ref: '#/components/schemas/ExecutionPolicy'
           description: Non-semantic execution policy for this enrichment producer. This does not participate

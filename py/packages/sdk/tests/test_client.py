@@ -8,13 +8,16 @@ import httpx
 import pytest
 from httpx import Timeout
 
-from antfly import AntflyClient, AntflyException, StorageResourceExhaustedError  # noqa: E402
+from antfly import (  # noqa: E402
+    AntflyClient,
+    AntflyException,
+    CreatedIndex,
+    CreateEmbeddingsIndexRequest,
+    CreateEmbeddingsIndexRequestType,
+    StorageResourceExhaustedError,
+)
 from antfly.client import normalize_base_url  # noqa: E402
 from antfly.client_generated.models.batch_request import BatchRequest  # noqa: E402
-from antfly.client_generated.models.create_embeddings_index_request import CreateEmbeddingsIndexRequest  # noqa: E402
-from antfly.client_generated.models.create_embeddings_index_request_type import (  # noqa: E402
-    CreateEmbeddingsIndexRequestType,
-)
 from antfly.client_generated.models.inference_chat_message import InferenceChatMessage  # noqa: E402
 from antfly.client_generated.models.inference_generate_request import InferenceGenerateRequest  # noqa: E402
 from antfly.client_generated.models.inference_role import InferenceRole  # noqa: E402
@@ -230,12 +233,46 @@ class TestAntflyClient:
         config = {"type": "embeddings", "dimension": 512}
         result = client.indexes.create("wiki/media", "thumbnail image", config)
 
-        assert result == created
+        assert isinstance(result, CreatedIndex)
+        assert result.name == "thumbnail"
+        assert result.type_.value == "embeddings"
+        assert result.dimension == 512
         assert config == {"type": "embeddings", "dimension": 512}
         mock_httpx.stream.assert_called_once_with(
             "POST",
             "/db/v1/tables/wiki%2Fmedia/indexes/thumbnail%20image",
             json=config,
+        )
+
+    @patch("antfly.client.Client")
+    def test_create_index_accepts_generated_request_model(self, mock_client_class: MagicMock) -> None:
+        mock_httpx = MagicMock()
+        configure_response(mock_httpx, 201, {"name": "vectors", "type": "embeddings", "dimension": 768})
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+
+        client = AntflyClient(base_url="http://localhost:8080")
+        request = CreateEmbeddingsIndexRequest(
+            type_=CreateEmbeddingsIndexRequestType.EMBEDDINGS,
+            dimension=768,
+        )
+        created = client.indexes.create("docs", "vectors", request)
+
+        assert isinstance(created, CreatedIndex)
+        assert created.name == "vectors"
+        assert created.dimension == 768
+        mock_httpx.stream.assert_called_once_with(
+            "POST",
+            "/db/v1/tables/docs/indexes/vectors",
+            json={
+                "type": "embeddings",
+                "version": 0,
+                "external": False,
+                "sparse": False,
+                "dimension": 768,
+                "top_k": 10,
+                "min_weight": 0.0,
+                "chunk_size": 1024,
+            },
         )
 
     def test_create_index_rejects_duplicate_body_identity(self) -> None:

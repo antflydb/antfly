@@ -6120,28 +6120,19 @@ pub const ApiHttpServer = struct {
         try self.waitForTableMetadata(table_name, expected_schema_json, expected_indexes_json);
     }
 
-    fn waitForIndexMetadataProjection(
+    fn isIndexMetadataProjected(
         self: *ApiHttpServer,
         table_name: []const u8,
         index_name: []const u8,
         expected_index_json: []const u8,
-    ) !void {
-        const timeout_ns = 30 * std.time.ns_per_s;
-        const poll_interval_ns = 50 * std.time.ns_per_ms;
-        const start_ns = platform_time.monotonicNs();
-        while (true) {
-            const table = try self.loadOwnedTableRecord(self.alloc, table_name);
-            if (table) |record| {
-                defer metadata_table_manager.freeTable(self.alloc, record);
-                const projected = try indexes_api.storedIndexConfigJsonAlloc(self.alloc, record.indexes_json, index_name);
-                if (projected) |config_json| {
-                    defer self.alloc.free(config_json);
-                    if (try jsonDocumentsEqual(self.alloc, config_json, expected_index_json)) return;
-                }
-            }
-            if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
-            sleepNs(poll_interval_ns);
-        }
+    ) !bool {
+        const table = try self.loadOwnedTableRecord(self.alloc, table_name);
+        const record = table orelse return false;
+        defer metadata_table_manager.freeTable(self.alloc, record);
+        const projected = try indexes_api.storedIndexConfigJsonAlloc(self.alloc, record.indexes_json, index_name);
+        const config_json = projected orelse return false;
+        defer self.alloc.free(config_json);
+        return try jsonDocumentsEqual(self.alloc, config_json, expected_index_json);
     }
 
     fn hasLocalTableRuntime(self: *ApiHttpServer, table_name: []const u8) bool {
@@ -8826,12 +8817,17 @@ pub const ApiHttpServer = struct {
                 return error.InternalFailure;
             },
         };
-        var projection_ready = true;
-        self.waitForIndexMetadataProjection(table_name, index_name, stored_index_json) catch |err| {
-            projection_ready = false;
-            std.log.warn("public create index committed; metadata projection deferred to reconciliation table={s} index={s} err={}", .{ table_name, index_name, err });
-        };
         if (self.table_writes) |table_writes_source| {
+            // Never poll after the consensus commit boundary: a slow
+            // projection must not hold an HTTP worker for up to the client's
+            // own timeout and invite an ambiguous retry. One read preserves
+            // the synchronous embedded fast path when the exact committed
+            // config is already visible; otherwise the idempotent reconciler
+            // owns convergence. Avoid even this read for API-only processes.
+            const projection_ready = self.isIndexMetadataProjected(table_name, index_name, stored_index_json) catch |err| projection: {
+                std.log.warn("public create index committed; metadata projection deferred to reconciliation table={s} index={s} err={}", .{ table_name, index_name, err });
+                break :projection false;
+            };
             // Install the local write capability before the create request
             // returns. Provisioned sources make this an O(groups) online-DDL
             // barrier; embedded sources preserve their synchronous contract.
@@ -28142,12 +28138,13 @@ test "api http server serves local index runtime backfill status" {
     try std.testing.expectEqual(@as(?u64, 1), local_shard.doc_count);
 }
 
-test "api http server create index waits for exact target config projection" {
+test "api http server create index installs exact visible config and defers lagging projection" {
     const alloc = std.testing.allocator;
 
     const FakeSource = struct {
         indexes_json: []const u8 = tables_api.default_indexes_json,
         owns_indexes_json: bool = false,
+        project_create: bool = true,
 
         fn iface(self: *@This()) StatusSource {
             return .{
@@ -28211,6 +28208,7 @@ test "api http server create index waits for exact target config projection" {
         fn createIndex(ptr: *anyopaque, allocator: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
+            if (!self.project_create) return;
             const next = try indexes_api.addIndexToTableIndexesJson(allocator, self.indexes_json, index_name, index_json);
             defer allocator.free(next);
             // An unrelated metadata mutation may commit before this projection
@@ -28327,6 +28325,24 @@ test "api http server create index waits for exact target config projection" {
     defer enqueue_deferred_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), enqueue_deferred_resp.status);
     try std.testing.expectEqual(@as(usize, 4), writes.enqueue_calls);
+
+    // A committed proposal whose read projection is not visible yet returns
+    // immediately and relies on the targeted reconciler. In particular, it
+    // must not install against stale catalog state or poll for 30 seconds.
+    source.project_create = false;
+    writes.enqueue_error = null;
+    const lagging_index_body = try test_contract_helpers.encodeCreateIndexRequest(alloc, "lagging_embed_idx");
+    defer alloc.free(lagging_index_body);
+    var lagging_projection_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs/indexes/lagging_embed_idx",
+        .content_type = "application/json",
+        .body = lagging_index_body,
+    });
+    defer lagging_projection_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), lagging_projection_resp.status);
+    try std.testing.expectEqual(@as(usize, 4), writes.create_calls);
+    try std.testing.expectEqual(@as(usize, 5), writes.enqueue_calls);
 }
 
 test "api http server create index expands schema-derived algebraic config" {

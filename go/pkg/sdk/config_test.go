@@ -46,6 +46,27 @@ func TestNewCreateIndexRequestOmitsPathIdentity(t *testing.T) {
 	}
 }
 
+func TestNewCreateIndexRequestPreservesFullTypedRequest(t *testing.T) {
+	request, err := NewCreateIndexRequest(CreateEmbeddingsIndexRequest{
+		Description: "semantic product search",
+		Dimension:   768,
+		External:    true,
+	})
+	if err != nil {
+		t.Fatalf("NewCreateIndexRequest failed: %v", err)
+	}
+	variant, err := request.AsCreateEmbeddingsIndexRequest()
+	if err != nil {
+		t.Fatalf("AsCreateEmbeddingsIndexRequest failed: %v", err)
+	}
+	if variant.Type != CreateEmbeddingsIndexRequestTypeEmbeddings {
+		t.Fatalf("type = %q, want embeddings", variant.Type)
+	}
+	if variant.Description != "semantic product search" || variant.Dimension != 768 || !variant.External {
+		t.Fatalf("common or variant fields were lost: %#v", variant)
+	}
+}
+
 func TestNewArtifactEmbeddingIndexConfig(t *testing.T) {
 	embedder, err := NewEmbedderConfig(OllamaEmbedderConfig{Model: "embeddinggemma"})
 	if err != nil {

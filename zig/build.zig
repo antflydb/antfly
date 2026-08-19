@@ -5740,7 +5740,7 @@ pub fn build(b: *std.Build) void {
             "api http missing index classification requires active rebuild evidence",
             "api http lifecycle classification preserves catching-up writer beside fresh read snapshot",
             "remote rebuild quarantine preserves its source and index failure",
-            "api http server create index waits for exact target config projection",
+            "api http server create index installs exact visible config and defers lagging projection",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
