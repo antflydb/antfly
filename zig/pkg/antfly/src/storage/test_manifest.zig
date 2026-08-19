@@ -184,6 +184,7 @@ comptime {
     _ = @import("lsm_backend_sim_test.zig");
     _ = @import("maintenance.zig");
     _ = @import("mem_backend.zig");
+    _ = @import("mem_ordered.zig");
     _ = @import("object_storage.zig");
     _ = @import("persistent.zig");
     _ = @import("portable_backup.zig");
