@@ -148,6 +148,18 @@ pub fn axisTupleAlloc(alloc: Allocator, facts: []const Fact, fields: []const []c
 /// scalar values. Duplicate array elements must not multiply a document's
 /// contribution to the same tensor cell.
 pub fn axisTuplesAlloc(alloc: Allocator, facts: []const Fact, fields: []const []const u8) ![][]u8 {
+    return try axisTuplesAllocBounded(alloc, facts, fields, std.math.maxInt(usize));
+}
+
+/// Bounded variant used by materializations whose per-document write
+/// amplification must be predictable. The limit is checked before recursively
+/// allocating the Cartesian product.
+pub fn axisTuplesAllocBounded(
+    alloc: Allocator,
+    facts: []const Fact,
+    fields: []const []const u8,
+    max_tuples: usize,
+) ![][]u8 {
     const dimensions = try alloc.alloc(std.ArrayListUnmanaged([]const u8), fields.len);
     defer alloc.free(dimensions);
     for (dimensions) |*dimension| dimension.* = .empty;
@@ -163,9 +175,19 @@ pub fn axisTuplesAlloc(alloc: Allocator, facts: []const Fact, fields: []const []
                     break;
                 }
             }
-            if (!duplicate) try dimension.append(alloc, item.scalar);
+            if (!duplicate) {
+                if (dimension.items.len >= max_tuples) return error.AlgebraicHllContributionLimitExceeded;
+                try dimension.append(alloc, item.scalar);
+            }
         }
         if (dimension.items.len == 0) return error.MissingField;
+    }
+
+    var tuple_count: usize = 1;
+    for (dimensions) |dimension| {
+        tuple_count = std.math.mul(usize, tuple_count, dimension.items.len) catch
+            return error.AlgebraicHllContributionLimitExceeded;
+        if (tuple_count > max_tuples) return error.AlgebraicHllContributionLimitExceeded;
     }
 
     const selected = try alloc.alloc([]const u8, fields.len);

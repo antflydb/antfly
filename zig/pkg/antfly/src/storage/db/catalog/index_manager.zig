@@ -2304,6 +2304,12 @@ pub const IndexManager = struct {
         self.hll_maintenance_owner_id = owner_id;
         for (self.algebraic_indexes.items) |*entry| {
             entry.index.attachHllMaintenanceLane(lane, owner_id);
+            if (self.primary_store) |store| {
+                entry.index.loadAdaptiveHllCardinalities(store) catch |err| {
+                    std.log.warn("adaptive HLL registry recovery failed index={s} err={s}", .{ entry.config.name, @errorName(err) });
+                };
+                entry.index.resumeHllMaintenance(store);
+            }
         }
     }
 
@@ -2383,6 +2389,8 @@ pub const IndexManager = struct {
             new_parsed.value.max_planner_scan_rows = cur.max_planner_scan_rows;
             new_parsed.value.max_batch_accumulator_entries = cur.max_batch_accumulator_entries;
             new_parsed.value.max_cardinality_cache_bytes = cur.max_cardinality_cache_bytes;
+            new_parsed.value.max_hll_contributions_per_document = cur.max_hll_contributions_per_document;
+            new_parsed.value.max_hll_maintenance_rows_per_tick = cur.max_hll_maintenance_rows_per_tick;
             new_parsed.value.min_max_candidate_cache_size = cur.min_max_candidate_cache_size;
             new_parsed.value.enable_temporal_range_pruning = cur.enable_temporal_range_pruning;
 
@@ -10251,6 +10259,16 @@ pub const IndexManager = struct {
         var opened = try self.openConfiguredIndexDetached(store, cfg, allow_backfill, read_only);
         errdefer opened.deinit(self);
         try self.appendOpenedIndex(opened);
+        if (cfg.kind == .algebraic) {
+            if (comptime @TypeOf(store) == *docstore_mod.DocStore) {
+                if (self.algebraicIndex(cfg.name)) |entry| {
+                    entry.index.loadAdaptiveHllCardinalities(store) catch |err| {
+                        std.log.warn("adaptive HLL registry recovery failed index={s} err={s}", .{ cfg.name, @errorName(err) });
+                    };
+                    entry.index.resumeHllMaintenance(store);
+                }
+            }
+        }
     }
 
     fn openConfiguredIndexDetached(self: *IndexManager, store: anytype, cfg_input: types.IndexConfig, allow_backfill: bool, read_only: bool) !OpenedIndex {
@@ -10777,9 +10795,6 @@ pub const IndexManager = struct {
                 if (self.resource_manager) |manager| index.attachResourceManager(manager);
                 if (self.hll_maintenance_lane) |lane| {
                     index.attachHllMaintenanceLane(lane, self.hll_maintenance_owner_id);
-                    if (comptime @TypeOf(store) == *docstore_mod.DocStore) {
-                        index.loadAdaptiveHllCardinalities(store) catch {};
-                    }
                 }
                 const apply_mutex = try self.allocIndexApplyMutex();
                 var apply_mutex_owned = true;

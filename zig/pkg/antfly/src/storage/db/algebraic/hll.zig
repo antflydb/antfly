@@ -189,11 +189,9 @@ fn registersView(bytes: []const u8) Error![]const u8 {
     return registers;
 }
 
-// Structural validation plus a per-register bounds check. Used at the estimate /
-// decode boundary, where `estimate` shifts by the register value: a corrupt byte
-// >= 64 would otherwise be an out-of-range shift (panic in safe builds, UB in
-// release). Merges (register-wise max) never shift, so they use registersView
-// and tolerate a stray byte rather than failing an ingest on stored corruption.
+// Structural validation plus a per-register bounds check. Every trust boundary
+// (decode, estimate, and merge) uses this so stored corruption is reported and
+// never propagated into a newly persisted or distributed sketch.
 fn validatedRegistersView(bytes: []const u8) Error![]const u8 {
     const registers = try registersView(bytes);
     const max_register = maxRegisterValue(@intCast(bytes[magic.len]));
@@ -222,13 +220,19 @@ pub fn singletonEncodedAlloc(alloc: Allocator, precision: u6, value: []const u8)
 /// be null/empty, in which case the other is returned (or an empty result).
 pub fn mergeEncodedAlloc(alloc: Allocator, left: ?[]const u8, right: ?[]const u8) ![]u8 {
     if (left == null) {
-        if (right) |bytes| return try alloc.dupe(u8, bytes);
+        if (right) |bytes| {
+            _ = try validatedRegistersView(bytes);
+            return try alloc.dupe(u8, bytes);
+        }
         return Error.InvalidHllSketch;
     }
-    if (right == null) return try alloc.dupe(u8, left.?);
+    if (right == null) {
+        _ = try validatedRegistersView(left.?);
+        return try alloc.dupe(u8, left.?);
+    }
 
-    const left_registers = try registersView(left.?);
-    const right_registers = try registersView(right.?);
+    const left_registers = try validatedRegistersView(left.?);
+    const right_registers = try validatedRegistersView(right.?);
     if (left_registers.len != right_registers.len) return Error.IncompatibleHllSketch;
     const out = try alloc.dupe(u8, left.?);
     const out_registers = out[magic.len + 1 ..];
@@ -236,6 +240,15 @@ pub fn mergeEncodedAlloc(alloc: Allocator, left: ?[]const u8, right: ?[]const u8
         if (rhs > lhs.*) lhs.* = rhs;
     }
     return out;
+}
+
+pub fn precisionEncoded(bytes: []const u8) !u6 {
+    _ = try validatedRegistersView(bytes);
+    return @intCast(bytes[magic.len]);
+}
+
+pub fn relativeErrorEncoded(bytes: []const u8) !f64 {
+    return relativeErrorForPrecision(try precisionEncoded(bytes));
 }
 
 pub fn estimateEncoded(bytes: []const u8) !u64 {

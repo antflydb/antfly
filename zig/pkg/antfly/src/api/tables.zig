@@ -934,6 +934,8 @@ fn isAlgebraicUserTunableField(field: []const u8) bool {
         "max_planner_scan_rows",
         "max_batch_accumulator_entries",
         "max_cardinality_cache_bytes",
+        "max_hll_contributions_per_document",
+        "max_hll_maintenance_rows_per_tick",
         "min_max_candidate_cache_size",
         "enable_temporal_range_pruning",
     };
