@@ -19,6 +19,7 @@ pub const Source = struct {
 
     pub const VTable = struct {
         head: *const fn (*anyopaque) anyerror!metadata_api.MetadataHead,
+        linearizable_head: ?*const fn (*anyopaque) anyerror!metadata_api.MetadataHead = null,
         status: *const fn (*anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: *const fn (*anyopaque) anyerror!metadata_api.AdminSnapshot,
         free_admin_snapshot: *const fn (*anyopaque, *metadata_api.AdminSnapshot) void,
@@ -26,6 +27,11 @@ pub const Source = struct {
 
     fn head(self: Source) !metadata_api.MetadataHead {
         return self.vtable.head(self.ptr);
+    }
+
+    fn linearizableHead(self: Source) !metadata_api.MetadataHead {
+        const fn_ptr = self.vtable.linearizable_head orelse return error.UnsupportedOperation;
+        return fn_ptr(self.ptr);
     }
 
     fn status(self: Source) !metadata_api.MetadataStatus {
@@ -89,6 +95,11 @@ pub const Operations = struct {
     pub fn head(self: Operations, request: operation.RequestContext) !metadata_api.MetadataHead {
         try request.ensureActive();
         return self.source.head();
+    }
+
+    pub fn linearizableHead(self: Operations, request: operation.RequestContext) !metadata_api.MetadataHead {
+        try request.ensureActive();
+        return self.source.linearizableHead();
     }
 
     pub fn status(self: Operations, request: operation.RequestContext) !metadata_api.MetadataStatus {

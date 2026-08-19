@@ -17,6 +17,7 @@ const std = @import("std");
 pub const Routes = struct {
     pub const health = "/metadata/v1/health";
     pub const head = "/metadata/v1/head";
+    pub const internal_linearizable_head = "/internal/v1/catalog/linearizable-head";
     pub const status = "/metadata/v1/status";
     pub const admin_snapshot = "/metadata/v1/admin/snapshot";
     pub const internal_catalog_publication_check = "/internal/v1/catalog/publication-check";

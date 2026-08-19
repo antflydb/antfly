@@ -29188,9 +29188,16 @@ test "api http server create index expands schema-derived algebraic config" {
         fn createIndex(ptr: *anyopaque, allocator: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
-            try std.testing.expect(std.mem.indexOf(u8, index_json, "\"derive_from_schema\"") == null);
-            try std.testing.expect(std.mem.indexOf(u8, index_json, "\"group_fields\"") != null);
-            try std.testing.expect(std.mem.indexOf(u8, index_json, "\"measure_fields\"") != null);
+            try ant_json.testing.expectSubsetJsonText(
+                allocator,
+                "{\"type\":\"algebraic\",\"table\":\"docs\",\"schema_version\":1,\"materializations\":[]}",
+                index_json,
+            );
+            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, index_json, .{});
+            defer parsed.deinit();
+            try std.testing.expect(parsed.value.object.get("derive_from_schema") == null);
+            try std.testing.expect(parsed.value.object.get("group_fields") != null);
+            try std.testing.expect(parsed.value.object.get("measure_fields") != null);
             const next = try indexes_api.addIndexToTableIndexesJson(allocator, self.indexes_json, index_name, index_json);
             self.replaceIndexesJson(allocator, next, true);
         }
@@ -29211,9 +29218,15 @@ test "api http server create index expands schema-derived algebraic config" {
             return error.UnsupportedOperation;
         }
 
-        fn createIndex(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, index_json: []const u8) anyerror!?void {
-            try std.testing.expect(std.mem.indexOf(u8, index_json, "\"derive_from_schema\"") == null);
-            try std.testing.expect(std.mem.indexOf(u8, index_json, "\"materializations\"") != null);
+        fn createIndex(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []const u8, index_json: []const u8) anyerror!?void {
+            try ant_json.testing.expectSubsetJsonText(
+                allocator,
+                "{\"type\":\"algebraic\",\"table\":\"docs\",\"schema_version\":1,\"materializations\":[]}",
+                index_json,
+            );
+            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, index_json, .{});
+            defer parsed.deinit();
+            try std.testing.expect(parsed.value.object.get("derive_from_schema") == null);
         }
     };
 
@@ -29240,15 +29253,11 @@ test "api http server create index expands schema-derived algebraic config" {
     defer create_index_resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 201), create_index_resp.status);
-    try ant_json.testing.expectSubsetJsonText(
+    try ant_json.testing.expectEqualJsonText(
         alloc,
-        "{\"name\":\"sales_rollup\",\"type\":\"algebraic\"}",
+        "{\"name\":\"sales_rollup\",\"version\":2,\"type\":\"algebraic\"}",
         create_index_resp.body,
     );
-    var parsed_created = try std.json.parseFromSlice(std.json.Value, alloc, create_index_resp.body, .{});
-    defer parsed_created.deinit();
-    try std.testing.expect(parsed_created.value.object.get("group_fields") == null);
-    try std.testing.expect(parsed_created.value.object.get("materializations") == null);
     var parsed_stored = try std.json.parseFromSlice(std.json.Value, alloc, source.indexes_json, .{});
     defer parsed_stored.deinit();
     const stored = parsed_stored.value.object.get("sales_rollup").?.object;

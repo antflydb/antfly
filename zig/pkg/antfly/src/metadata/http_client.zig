@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const platform_time = @import("antfly_platform").time;
 const extension_domain = @import("../extensions/mod.zig");
 const metadata_api = @import("api.zig");
@@ -106,6 +107,21 @@ pub const MetadataHttpClient = struct {
         budget: ?RequestBudget,
     ) !metadata_api.MetadataHead {
         return try self.getJsonValueWithBudget(metadata_api.MetadataHead, base_uri, routes.Routes.head, budget);
+    }
+
+    pub fn fetchLinearizableHead(self: *MetadataHttpClient, base_uri: []const u8) !metadata_api.MetadataHead {
+        var parsed = try self.requestJsonWithBody(
+            metadata_api.MetadataHead,
+            base_uri,
+            .POST,
+            routes.Routes.internal_linearizable_head,
+            "{}",
+            null,
+            null,
+            null,
+        );
+        defer parsed.deinit();
+        return parsed.value;
     }
 
     pub fn fetchSnapshot(self: *MetadataHttpClient, base_uri: []const u8) !std.json.Parsed(metadata_api.AdminSnapshot) {
@@ -1029,6 +1045,44 @@ test "metadata http client replays reallocation only with explicit mutation non-
         ambiguous_client.triggerReallocate("http://127.0.0.1:9000"),
     );
     try std.testing.expectEqual(@as(usize, 1), ambiguous.attempts);
+}
+
+test "metadata http client requests a non-cacheable linearizable head fence" {
+    const FenceExecutor = struct {
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expectEqualStrings(
+                "http://127.0.0.1:9000/internal/v1/catalog/linearizable-head",
+                req.uri,
+            );
+            try ant_json.testing.expectEqualJsonText(alloc, "{}", req.body);
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8,
+                    \\{"metadata_group_id":91,"metadata_incarnation":"11111111111111111111111111111111","metadata_epoch":18}
+                ),
+            };
+        }
+    };
+
+    var executor = FenceExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    const head = try client.fetchLinearizableHead("http://127.0.0.1:9000");
+    try std.testing.expectEqual(@as(u64, 91), head.metadata_group_id);
+    try std.testing.expectEqual(@as(u64, 18), head.metadata_epoch);
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
 }
 
 test "metadata http client retries transient connection close on fetch status" {

@@ -1007,9 +1007,21 @@ fn urlContainsCredentials(url: []const u8) bool {
         if (std.mem.indexOfScalar(u8, url[start..authority_end], '@') != null) return true;
     }
 
-    const query_start = (std.mem.indexOfScalar(u8, url, '?') orelse return false) + 1;
-    const query_end = std.mem.indexOfScalarPos(u8, url, query_start, '#') orelse url.len;
-    var parameters = std.mem.tokenizeAny(u8, url[query_start..query_end], "&;");
+    const fragment_start = std.mem.indexOfScalar(u8, url, '#');
+    if (std.mem.indexOfScalar(u8, url, '?')) |query_marker| {
+        if (fragment_start == null or query_marker < fragment_start.?) {
+            const query_end = fragment_start orelse url.len;
+            if (urlParameterListContainsCredentials(url[query_marker + 1 .. query_end])) return true;
+        }
+    }
+    if (fragment_start) |marker| {
+        return urlParameterListContainsCredentials(url[marker + 1 ..]);
+    }
+    return false;
+}
+
+fn urlParameterListContainsCredentials(encoded_parameters: []const u8) bool {
+    var parameters = std.mem.tokenizeAny(u8, encoded_parameters, "&;");
     while (parameters.next()) |parameter| {
         const key = parameter[0 .. std.mem.indexOfScalar(u8, parameter, '=') orelse parameter.len];
         if (urlQueryKeyIsSensitive(key)) return true;
@@ -3799,7 +3811,7 @@ test "public index config encoders redact coverage incarnation" {
 
 test "public index config encoders redact nested credentials" {
     const indexes_json =
-        \\{"embed_idx":{"type":"embeddings","dimension":384,"embedder":{"provider":"openai","model":"text-embedding-3-small","api_key":"sk-private","secret_key":"private-secret-key","url":"https://alice:private-password@example.com/v1","endpoint":"https://example.com/v1?auth=private-endpoint-auth"},"summarizer":{"provider":"gemini","model":"gemini-2.5-flash","api_key":"${secret:gemini_key}","api_url":"https://example.com/v1?access%5Fkey%5Fid=private-url-key"},"enrichments":[{"name":"asset_v1","kind":"asset","producer_json":"{\"provider\":\"s3\",\"secret_access_key\":\"unknown-provider-secret\",\"access_token\":\"private-token\",\"headers\":{\"Authorization\":\"Bearer private-auth\",\"X-Auth\":\"future-private-header\",\"Accept\":\"text/html\"},\"format\":\"html\"}"}]}}
+        \\{"embed_idx":{"type":"embeddings","dimension":384,"embedder":{"provider":"openai","model":"text-embedding-3-small","api_key":"sk-private","secret_key":"private-secret-key","url":"https://alice:private-password@example.com/v1","endpoint":"https://example.com/v1?auth=private-endpoint-auth","base_url":"https://example.com/oauth/callback#access_token=private-fragment-token"},"summarizer":{"provider":"gemini","model":"gemini-2.5-flash","api_key":"${secret:gemini_key}","api_url":"https://example.com/v1?access%5Fkey%5Fid=private-url-key"},"enrichments":[{"name":"asset_v1","kind":"asset","producer_json":"{\"provider\":\"s3\",\"secret_access_key\":\"unknown-provider-secret\",\"access_token\":\"private-token\",\"headers\":{\"Authorization\":\"Bearer private-auth\",\"X-Auth\":\"future-private-header\",\"Accept\":\"text/html\"},\"format\":\"html\"}"}]}}
     ;
 
     const encoded_single = (try encodeSingleIndexConfig(std.testing.allocator, indexes_json, "embed_idx")).?;
@@ -3821,13 +3833,13 @@ test "public index config encoders redact nested credentials" {
 
 test "public index config encoders retain credential-free provider urls" {
     const config =
-        \\{"type":"embeddings","dimension":384,"embedder":{"provider":"openai","model":"text-embedding-3-small","url":"https://api.example.com/v1?api-version=2026-08-01","endpoint":"https://gateway.example.com/v1?region=us-west-2"}}
+        \\{"type":"embeddings","dimension":384,"embedder":{"provider":"openai","model":"text-embedding-3-small","url":"https://api.example.com/v1?api-version=2026-08-01#documentation","endpoint":"https://gateway.example.com/v1?region=us-west-2"}}
     ;
     const created = try encodeCreatedIndexConfig(std.testing.allocator, "embed_idx", config);
     defer std.testing.allocator.free(created);
     try ant_json.testing.expectEqualJsonText(
         std.testing.allocator,
-        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":384,\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\",\"url\":\"https://api.example.com/v1?api-version=2026-08-01\",\"endpoint\":\"https://gateway.example.com/v1?region=us-west-2\"}}",
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":384,\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\",\"url\":\"https://api.example.com/v1?api-version=2026-08-01#documentation\",\"endpoint\":\"https://gateway.example.com/v1?region=us-west-2\"}}",
         created,
     );
 }

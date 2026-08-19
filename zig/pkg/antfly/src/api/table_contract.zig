@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const tables_api = @import("tables.zig");
 const indexes_api = @import("indexes.zig");
@@ -1028,7 +1029,11 @@ test "table contract rejects unknown fields for every public index variant" {
         "{\"type\":\"embeddings\",\"description\":\"semantic search\",\"version\":1,\"external\":true,\"dimension\":384}",
     );
     defer std.testing.allocator.free(valid_with_common_fields);
-    try std.testing.expect(std.mem.indexOf(u8, valid_with_common_fields, "\"version\":1") != null);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"description\":\"semantic search\",\"version\":1,\"external\":true,\"dimension\":384}",
+        valid_with_common_fields,
+    );
 }
 
 test "table contract keeps operational create request failures on the internal error path" {

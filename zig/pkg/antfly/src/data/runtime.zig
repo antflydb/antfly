@@ -13999,6 +13999,11 @@ const RemoteMetadataSource = struct {
         };
     }
 
+    fn headCovers(candidate: antfly.metadata_api.MetadataHead, required: antfly.metadata_api.MetadataHead) bool {
+        return sameMetadataIncarnation(candidate, required) and
+            candidate.metadata_epoch >= required.metadata_epoch;
+    }
+
     fn acceptMetadataIncarnation(
         self: *RemoteMetadataSource,
         candidate: ?antfly.metadata_api.MetadataClusterIncarnation,
@@ -14061,6 +14066,34 @@ const RemoteMetadataSource = struct {
         self.cached_snapshot_at_ms = 0;
     }
 
+    fn acceptLinearizableHead(
+        self: *RemoteMetadataSource,
+        head: antfly.metadata_api.MetadataHead,
+    ) !void {
+        try self.acceptMetadataIncarnation(head.metadata_incarnation);
+        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+        lockAtomic(&self.cache_mutex);
+        defer self.cache_mutex.unlock();
+
+        const selected = if (self.cached_head) |cached|
+            monotonicMetadataHead(cached, head)
+        else
+            head;
+        if (self.cached_snapshot) |*snapshot| {
+            const snapshot_head = snapshotHead(snapshot);
+            if (!headCovers(snapshot_head, selected)) {
+                freeAdminSnapshotOwned(self.alloc, snapshot);
+                self.cached_snapshot = null;
+                self.cached_snapshot_at_ms = 0;
+            }
+        }
+        // Pin the subsequent snapshot fetch to at least the epoch covered by
+        // the read-index barrier. Keeping this in the normal monotonic cache
+        // path avoids a second fence and never regresses a newer observation.
+        self.cached_head = selected;
+        self.cached_head_at_ms = now_ms;
+    }
+
     fn fetchSnapshot(self: *RemoteMetadataSource) !antfly.metadata_api.AdminSnapshot {
         return try self.fetchSnapshotWithBudget(null);
     }
@@ -14077,7 +14110,12 @@ const RemoteMetadataSource = struct {
                 self.test_faults.force_snapshot_cache_miss
             else
                 false;
+            const covers_cached_head = if (self.cached_head) |head|
+                headCovers(snapshotHead(&snapshot), head)
+            else
+                true;
             if (!force_cache_miss and
+                covers_cached_head and
                 now_ms -| self.cached_snapshot_at_ms <= metadata_snapshot_cache_ttl_ms)
             {
                 defer self.cache_mutex.unlock();
@@ -14129,6 +14167,12 @@ const RemoteMetadataSource = struct {
 
         lockAtomic(&self.cache_mutex);
         defer self.cache_mutex.unlock();
+        // A linearizable fence or newer follower read may have completed
+        // while this snapshot request was in flight. Never let that older
+        // completion repopulate the process-wide cache below the pinned head.
+        if (self.cached_head) |required_head| {
+            if (!headCovers(fresh_head, required_head)) return error.MetadataSnapshotHeadMismatch;
+        }
         if (self.cached_snapshot) |snapshot| {
             const cached_snapshot_head = snapshotHead(&snapshot);
             // Concurrent follower reads may complete after a leader read.
@@ -14170,6 +14214,7 @@ const RemoteMetadataSource = struct {
                 .status = remoteStatus,
                 .admin_snapshot = remoteAdminSnapshot,
                 .cached_admin_snapshot = remoteCachedAdminSnapshot,
+                .ensure_linearizable_read = remoteEnsureLinearizableRead,
                 .free_admin_snapshot = remoteFreeAdminSnapshot,
                 .create_table = remoteCreateTable,
                 .replace_table_definition = remoteReplaceTableDefinition,
@@ -14227,6 +14272,31 @@ const RemoteMetadataSource = struct {
     fn remoteHead(ptr: *anyopaque) !antfly.metadata_api.MetadataHead {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         return try self.fetchRemoteHead(null);
+    }
+
+    fn remoteEnsureLinearizableRead(ptr: *anyopaque) !void {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        var last_err: anyerror = error.MissingMetadataApi;
+        for (0..self.base_uris.len) |attempt| {
+            const index = self.metadataApiIndexForAttempt(attempt);
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(
+                arena.allocator(),
+                self.httpExecutor(),
+            );
+            const head = metadata_client.fetchLinearizableHead(self.base_uris[index]) catch |err| {
+                last_err = err;
+                continue;
+            };
+            self.acceptLinearizableHead(head) catch |err| {
+                last_err = err;
+                continue;
+            };
+            self.noteMetadataAuthoritySuccess(index);
+            return;
+        }
+        return last_err;
     }
 
     fn fetchRemoteHead(
@@ -14308,7 +14378,8 @@ const RemoteMetadataSource = struct {
             const snapshot_incarnation = parsed.value.status.metadata_incarnation orelse unreachable;
             const head_incarnation = expected_head.metadata_incarnation orelse return error.MetadataIncarnationUnavailable;
             if (parsed.value.status.metadata_group_id != expected_head.metadata_group_id or
-                !std.mem.eql(u8, &snapshot_incarnation, &head_incarnation))
+                !std.mem.eql(u8, &snapshot_incarnation, &head_incarnation) or
+                parsed.value.status.metadata_epoch < expected_head.metadata_epoch)
             {
                 last_err = error.MetadataSnapshotHeadMismatch;
                 continue;
@@ -27847,6 +27918,16 @@ test "remote metadata source retains mutation authority across cache invalidatio
     source.cached_head = .{ .metadata_group_id = 9, .metadata_epoch = 17 };
     source.invalidateCache();
     try std.testing.expectEqual(@as(usize, 2), source.metadataApiIndexForAttempt(0));
+    try std.testing.expect(source.statusSource().vtable.ensure_linearizable_read != null);
+
+    const incarnation: antfly.metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
+    const fenced_head = antfly.metadata_api.MetadataHead{
+        .metadata_group_id = 9,
+        .metadata_incarnation = incarnation,
+        .metadata_epoch = 18,
+    };
+    try source.acceptLinearizableHead(fenced_head);
+    try std.testing.expectEqual(fenced_head, source.cached_head.?);
 }
 
 test "remote metadata cache orders heads monotonically within an incarnation" {
@@ -27862,12 +27943,15 @@ test "remote metadata cache orders heads monotonically within an incarnation" {
         .metadata_epoch = 17,
     };
     try std.testing.expect(RemoteMetadataSource.sameMetadataIncarnation(older, newer));
+    try std.testing.expect(RemoteMetadataSource.headCovers(newer, older));
+    try std.testing.expect(!RemoteMetadataSource.headCovers(older, newer));
     try std.testing.expectEqual(newer, RemoteMetadataSource.monotonicMetadataHead(newer, older));
     try std.testing.expectEqual(newer, RemoteMetadataSource.monotonicMetadataHead(older, newer));
 
     var foreign = newer;
     foreign.metadata_group_id = 10;
     try std.testing.expect(!RemoteMetadataSource.sameMetadataIncarnation(newer, foreign));
+    try std.testing.expect(!RemoteMetadataSource.headCovers(foreign, newer));
     try std.testing.expectEqual(foreign, RemoteMetadataSource.monotonicMetadataHead(newer, foreign));
 }
 

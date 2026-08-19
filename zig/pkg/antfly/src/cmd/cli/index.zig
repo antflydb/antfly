@@ -194,12 +194,37 @@ const IndexCreateConfigInput = struct {
     coverage_policy: ?[]const u8 = null,
 };
 
+fn isValidJsonObject(allocator: std.mem.Allocator, raw: []const u8) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    defer parsed.deinit();
+    return parsed.value == .object;
+}
+
 fn buildIndexCreateConfig(
     allocator: std.mem.Allocator,
     input: IndexCreateConfigInput,
 ) !std.json.Parsed(antfly_client.types.CreateIndexRequest) {
+    if (!std.mem.eql(u8, input.index_type, "full_text") and
+        !std.mem.eql(u8, input.index_type, "embeddings") and
+        !std.mem.eql(u8, input.index_type, "graph") and
+        !std.mem.eql(u8, input.index_type, "algebraic"))
+    {
+        return error.InvalidIndexType;
+    }
     if (input.coverage_policy != null and !std.mem.eql(u8, input.index_type, "embeddings")) {
         return error.CoveragePolicyRequiresEmbeddingsIndex;
+    }
+    if (input.embedder_json) |raw| {
+        if (!try isValidJsonObject(allocator, raw)) return error.InvalidEmbedderJson;
+    }
+    if (input.summarizer_json) |raw| {
+        if (!try isValidJsonObject(allocator, raw)) return error.InvalidSummarizerJson;
+    }
+    if (input.chunker_json) |raw| {
+        if (!try isValidJsonObject(allocator, raw)) return error.InvalidChunkerJson;
     }
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -292,8 +317,12 @@ fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient
         .chunker_json = chunker_json,
         .dimension = dimension,
         .coverage_policy = coverage_policy,
-    }) catch |err| {
-        cli.fatal("failed to build index config: {}", .{err});
+    }) catch |err| switch (err) {
+        error.InvalidIndexType => cli.fatal("unsupported --type: {s}; expected full_text, embeddings, graph, or algebraic", .{index_type}),
+        error.InvalidEmbedderJson => cli.fatal("--embedder must be a valid JSON object", .{}),
+        error.InvalidSummarizerJson => cli.fatal("--summarizer must be a valid JSON object", .{}),
+        error.InvalidChunkerJson => cli.fatal("--chunker must be a valid JSON object", .{}),
+        else => cli.fatal("failed to build index config: {}", .{err}),
     };
     defer parsed.deinit();
 
@@ -827,11 +856,15 @@ test "index create config preserves dimension escaping and summarizer" {
     });
     defer parsed.deinit();
 
-    try std.testing.expectEqual(@as(?i64, 512), parsed.value.dimension);
-    try std.testing.expectEqualStrings("body\"quoted", parsed.value.field.?);
-    try std.testing.expectEqualStrings("{{title}}\n{{body}}", parsed.value.template.?);
-    try std.testing.expectEqualStrings("summary", parsed.value.summarizer.?.model.?);
-    try std.testing.expectEqual(antfly_client.types.DerivedCoveragePolicy.partial, parsed.value.coverage_policy.?);
+    const config = switch (parsed.value) {
+        .create_embeddings_index_request => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(?i64, 512), config.dimension);
+    try std.testing.expectEqualStrings("body\"quoted", config.field.?);
+    try std.testing.expectEqualStrings("{{title}}\n{{body}}", config.template.?);
+    try std.testing.expectEqualStrings("summary", config.summarizer.?.model.?);
+    try std.testing.expectEqual(antfly_client.types.DerivedCoveragePolicy.partial, config.coverage_policy.?);
 }
 
 test "index create config rejects malformed nested JSON and unknown types" {
@@ -840,11 +873,19 @@ test "index create config rejects malformed nested JSON and unknown types" {
         .coverage_policy = "partial",
     }));
 
-    try std.testing.expectError(error.MissingField, buildIndexCreateConfig(std.testing.allocator, .{
+    try std.testing.expectError(error.InvalidEmbedderJson, buildIndexCreateConfig(std.testing.allocator, .{
         .index_type = "embeddings",
         .embedder_json = "{",
     }));
-    try std.testing.expectError(error.UnexpectedToken, buildIndexCreateConfig(std.testing.allocator, .{
+    try std.testing.expectError(error.InvalidSummarizerJson, buildIndexCreateConfig(std.testing.allocator, .{
+        .index_type = "embeddings",
+        .summarizer_json = "[]",
+    }));
+    try std.testing.expectError(error.InvalidChunkerJson, buildIndexCreateConfig(std.testing.allocator, .{
+        .index_type = "embeddings",
+        .chunker_json = "null",
+    }));
+    try std.testing.expectError(error.InvalidIndexType, buildIndexCreateConfig(std.testing.allocator, .{
         .index_type = "typo",
     }));
 }

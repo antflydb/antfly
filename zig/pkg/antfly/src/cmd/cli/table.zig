@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const antfly_client = @import("antfly-client");
 const httpx = antfly_client.httpx;
 const cli = @import("mod.zig");
@@ -310,9 +311,11 @@ test "table create inline schema and repeatable indexes build a typed request" {
     };
     const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, request, .{});
     defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"title_body\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"dimension\":512") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"body_text\"") != null);
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"num_shards\":3,\"indexes\":{\"title_body\":{\"type\":\"embeddings\",\"dimension\":512},\"body_text\":{\"type\":\"full_text\"}}}",
+        encoded,
+    );
 }
 
 test "table create inline configs reject malformed unknown and duplicate definitions" {
