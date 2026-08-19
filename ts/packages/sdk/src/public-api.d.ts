@@ -4741,10 +4741,13 @@ export interface components {
         };
         BatchResponse: {
             /**
-             * @description Durable commit and visibility/participant recovery state.
+             * @description Durable commit outcome. `committed_pending` means requested visibility or
+             *     participant propagation is still completing. `committed_repair_required`
+             *     means the primary write committed, but a terminal enrichment failure needs
+             *     operator repair and will not be retried indefinitely.
              * @enum {string}
              */
-            status?: "committed" | "committed_pending";
+            status?: "committed" | "committed_pending" | "committed_repair_required";
             /** @description Number of documents successfully inserted */
             inserted?: number;
             /** @description Number of documents successfully deleted */
@@ -4806,10 +4809,13 @@ export interface components {
         /** @description Response for a cross-table batch operation. Contains per-table results. */
         MultiBatchResponse: {
             /**
-             * @description Durable commit and visibility/propagation state.
+             * @description Durable commit outcome. Pending states mean requested visibility or
+             *     participant propagation is still completing. `committed_repair_required`
+             *     means the primary writes committed, but a terminal enrichment failure needs
+             *     operator repair and will not be retried indefinitely.
              * @enum {string}
              */
-            status?: "committed" | "committed_visibility_pending" | "committed_recovery_pending";
+            status?: "committed" | "committed_visibility_pending" | "committed_recovery_pending" | "committed_repair_required";
             /** @description Per-table batch results */
             tables?: {
                 [key: string]: components["schemas"]["BatchResponse"];
@@ -4908,10 +4914,12 @@ export interface components {
             /**
              * @description Durable transaction outcome. Pending committed states mean the
              *     commit decision is durable while its requested visibility barrier
-             *     or participant recovery is still completing.
+             *     or participant recovery is still completing. `committed_repair_required`
+             *     means the commit decision is durable and coordination may be released, but
+             *     a terminal enrichment failure requires operator repair.
              * @enum {string}
              */
-            status: "committed" | "committed_visibility_pending" | "committed_recovery_pending" | "aborted";
+            status: "committed" | "committed_visibility_pending" | "committed_recovery_pending" | "committed_repair_required" | "aborted";
             /** @description Details about the conflict that caused an abort (only present when status is "aborted") */
             conflict?: components["schemas"]["TransactionConflict"];
             /** @description Per-table batch results (present for every committed status) */

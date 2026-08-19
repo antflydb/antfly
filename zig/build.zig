@@ -4226,6 +4226,10 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db batch truncates replay logs",
             "storage.db.db.test.db async replay truncation retains durable enrichment debt",
             "storage.db.db.test.db restart after provider failure resumes enrichment",
+            "storage.db.db.test.db foreign inference provider failure releases enrichment waiter as terminal",
+            "storage.db.db.test.db terminal enrichment marker cleanup isolates corrupt cross issue reverse entries",
+            "storage.db.db.test.db terminal enrichment marker retirement is bounded and fences stale generations",
+            "storage.db.db.test.db enrichment reconfigure refreshes durable state after old worker joins",
             "storage.db.db.test.db io_threaded executor processes indexed writes",
             "storage.db.db.test.db reopen replays pending derived embeddings",
             "storage.db.db.test.db replay respects per-index applied watermarks",
@@ -4235,6 +4239,26 @@ pub fn build(b: *std.Build) void {
             "remote fetch classification retries only transient failures",
             "remote HTTP failures consume retry budget before terminal coverage",
             "enrichment retries unknown errors and isolates known permanent errors",
+            "enrichment worker attempt budget includes the current request",
+            "pipeline retry fingerprint is stable across alternating errors",
+            "alternating pipeline errors exhaust one durable retry budget",
+            "pipeline failures retain their retry budget across replay pass reset",
+            "pipeline failure replaces stale request retry identity",
+            "mixed request and pipeline failures exhaust one no-progress budget",
+            "durable enrichment retry progress preserves unrelated request debt across restart",
+            "ordinary startup target preserves restored retry debt",
+            "enrichment terminal failure envelope remains conservative across sparse durable debt",
+            "enrichment terminal failure envelope uses exact durable lookup for sparse gaps",
+            "isolated enrichment request error does not mark worker failed",
+            "enrichment runtime status",
+            "enrichment runtime restore",
+            "worker retry preserves only an explicitly authorized request identity",
+            "permanent remote HTTP failure cannot authorize request retry identity",
+            "enrichment visibility wait wakes immediately on applied state",
+            "enrichment visibility wait has a hard liveness timeout",
+            "enrichment visibility wait is cancelable",
+            "enrichment visibility wait observes borrowed request cancellation",
+            "foreground enrichment rejects providers without a bounded-operation contract",
             "document extraction reserves PDF decoder peak memory atomically",
             "PDF decoder credit and OCR transient allocations compose without double charging",
             "reserved PDF working set is bounded without duplicate resource charges",
@@ -5158,6 +5182,9 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "durable session mutations publish only after persistence succeeds",
             "durable transaction sessions retain terminal commit coordinator handoff",
+            "repair-required transaction sessions replay propagation once then release coordination",
+            "committed repair session without coordinator replays a write handoff",
+            "terminal commit response preserves live debt ahead of repair",
             "transaction session commit request is sealed across retries",
             "durable recovery index tracks only validated commit execution and terminal handoff",
             "durable recovery scan rotates fairly beyond one maintenance batch",
@@ -5446,6 +5473,7 @@ pub fn build(b: *std.Build) void {
             "internal batch split identity round trips the full u64 id space",
             "internal batch codec round trips replicated transaction phases",
             "txn resolve codec preserves sync level and accepts legacy requests",
+            "distributed txn classifies local and transported visibility outcomes identically",
             "distributed txn coordinator groups by range and commits all participants",
             "stable distributed transaction retry resumes a durable commit decision",
             "distributed txn retries an ambiguous coordinator decision under the same id",
@@ -5455,11 +5483,14 @@ pub fn build(b: *std.Build) void {
             "distributed txn coordinator never aborts after durable commit decision",
             "distributed txn coordinator never restarts a transaction id on topology change",
             "db transaction recovery runtime resolves table-group participants through distributed txn resolver",
+            "compiled table write boundary transports cancellation and committed failure identity",
             "bound stable single-group transaction retry does not reapply transforms",
             "bound single-group batch reports prepared intent conflicts",
             "api http client preserves group doc identity conflicts",
+            "api http client transports txn resolve cancellation and visibility reason",
             "api http client preserves public batch retry safety classifications",
             "api http client forwards bounded raft batch routing context without allocation",
+            "api http client preserves committed visibility outcomes for forwarded raft batches",
             "api http client rejects unsupported routed batch protocol without legacy replay",
             "api http client requires explicit not-proposed marker and tracks delivery phase",
             "raft batch aggregation makes failures after an accepted group non-retryable",
@@ -9310,9 +9341,10 @@ pub fn build(b: *std.Build) void {
                 // scheduling reservations, not hard process limits. A 24 GiB
                 // budget can overlap all four units while a smaller cgroup
                 // automatically schedules only the subset that fits.
-                // aarch64-macOS includes platform framework codegen and peaks
-                // just above 4 GiB; Linux CI retains the tighter reservation.
-                .api_kernel => @as(usize, if (target.result.os.tag == .macos) 5 else 4) * 1024 * 1024 * 1024,
+                // aarch64-macOS includes platform framework codegen and now
+                // peaks just above 5 GiB; Linux CI retains the tighter
+                // reservation.
+                .api_kernel => @as(usize, if (target.result.os.tag == .macos) 6 else 4) * 1024 * 1024 * 1024,
                 // Clean aarch64-macOS ReleaseFast codegen peaks around
                 // 10.9 GB with the platform frameworks enabled. Keep the
                 // tighter Linux reservation, where CI remains below 8 GiB.
@@ -9320,7 +9352,10 @@ pub fn build(b: *std.Build) void {
                 // Debug codegen currently peaks around 6.7 GB on aarch64
                 // macOS; reserve headroom for mode- and target-dependent IR.
                 .inference => 7 * 1024 * 1024 * 1024,
-                .cli => 2 * 1024 * 1024 * 1024,
+                // Stable boundary diagnostics and public response contracts
+                // lifted the macOS CLI archive above the old 2 GiB claim.
+                // This is scheduler headroom, not a runtime memory allowance.
+                .cli => @as(usize, if (target.result.os.tag == .macos) 3 else 2) * 1024 * 1024 * 1024,
             },
         });
         runtime_library_artifacts[@intFromEnum(unit)] = role_artifact;

@@ -1799,6 +1799,15 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         if (resp.status != 201) {
             const outcome = resp.header(internal_batch_forwarding.outcome_header);
+            if (resp.status == 202) {
+                const outcome_body = std.mem.trim(u8, resp.body, " \t\r\n");
+                if ((outcome != null and std.mem.eql(u8, outcome.?, internal_batch_forwarding.outcome_committed_repair_required_v1)) or
+                    std.mem.eql(u8, outcome_body, internal_batch_forwarding.committed_repair_required_body))
+                    return error.EnrichmentWorkerFailed;
+                if ((outcome != null and std.mem.eql(u8, outcome.?, internal_batch_forwarding.outcome_committed_visibility_pending_v1)) or
+                    std.mem.eql(u8, outcome_body, internal_batch_forwarding.committed_visibility_pending_body))
+                    return error.EnrichmentRetryInProgress;
+            }
             if ((outcome != null and std.mem.eql(u8, outcome.?, internal_batch_forwarding.outcome_unknown_v1)) or
                 std.mem.eql(u8, std.mem.trim(u8, resp.body, " \t\r\n"), "write outcome unknown"))
             {
@@ -2249,7 +2258,18 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !EmptyResponse {
-        return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_resolve_suffix, body);
+        return try self.fetchGroupTxnResolveWithControl(base_uri, group_id, table_name, body, null);
+    }
+
+    pub fn fetchGroupTxnResolveWithControl(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !EmptyResponse {
+        return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_resolve_suffix, body, cancellation);
     }
 
     pub fn fetchGroupTxnAcknowledge(
@@ -2259,7 +2279,7 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !EmptyResponse {
-        return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_acknowledge_suffix, body);
+        return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_acknowledge_suffix, body, null);
     }
 
     pub fn fetchGroupTxnStatus(
@@ -2364,6 +2384,7 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         suffix_name: []const u8,
         body: []const u8,
+        cancellation: ?*const http_common.RequestCancellation,
     ) !EmptyResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
@@ -2381,10 +2402,18 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .cancellation = cancellation,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => return .{},
+            202 => {
+                if (std.mem.eql(u8, resp.body, "committed_repair_required"))
+                    return error.EnrichmentWorkerFailed;
+                if (std.mem.eql(u8, resp.body, "committed_visibility_pending"))
+                    return error.CommitVisibilityNotSatisfied;
+                return error.UnexpectedHttpStatus;
+            },
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupTxnResolveConflictError(resp.body),
@@ -3377,6 +3406,49 @@ test "api http client forwards bounded raft batch routing context without alloca
     response.deinit(std.testing.allocator);
 }
 
+test "api http client preserves committed visibility outcomes for forwarded raft batches" {
+    const OutcomeExecutor = struct {
+        body: []const u8,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.routed_batch_suffix));
+            return .{ .status = 202, .body = try alloc.dupe(u8, self.body) };
+        }
+    };
+
+    var executor = OutcomeExecutor{ .body = "committed_visibility_pending" };
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    const forwarding: internal_batch_forwarding.Context = .{
+        .remaining_ms = 425,
+        .forwards_remaining = 1,
+        .campaign_allowed = false,
+    };
+    try std.testing.expectError(error.EnrichmentRetryInProgress, client.fetchGroupBatchWithForwarding(
+        "http://127.0.0.1:1",
+        7,
+        "docs",
+        "{}",
+        500,
+        forwarding,
+        null,
+    ));
+    executor.body = "committed_repair_required";
+    try std.testing.expectError(error.EnrichmentWorkerFailed, client.fetchGroupBatchWithForwarding(
+        "http://127.0.0.1:1",
+        7,
+        "docs",
+        "{}",
+        500,
+        forwarding,
+        null,
+    ));
+}
+
 test "api http client rejects unsupported routed batch protocol without legacy replay" {
     const UnsupportedExecutor = struct {
         attempts: usize = 0,
@@ -4240,4 +4312,33 @@ test "api http client maps group txn resolve decision conflicts" {
     defer alloc.free(body);
 
     try std.testing.expectError(error.DecisionConflict, client.fetchGroupTxnResolve(base_uri, 7001, "docs", body));
+}
+
+test "api http client transports txn resolve cancellation and visibility reason" {
+    const ResolveExecutor = struct {
+        body: []const u8,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(req.cancellation != null);
+            return .{ .status = 202, .body = try alloc.dupe(u8, self.body) };
+        }
+    };
+
+    var executor = ResolveExecutor{ .body = "committed_visibility_pending" };
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    var cancellation = http_common.RequestCancellation{};
+    try std.testing.expectError(
+        error.CommitVisibilityNotSatisfied,
+        client.fetchGroupTxnResolveWithControl("http://127.0.0.1:1", 7, "docs", "{}", &cancellation),
+    );
+    executor.body = "committed_repair_required";
+    try std.testing.expectError(
+        error.EnrichmentWorkerFailed,
+        client.fetchGroupTxnResolveWithControl("http://127.0.0.1:1", 7, "docs", "{}", &cancellation),
+    );
 }

@@ -18,6 +18,7 @@ const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
+const CancellationToken = @import("../../../common/cancellation.zig").CancellationToken;
 const common_secrets = @import("../../../common/secrets.zig");
 const backend_erased = @import("../../backend_erased.zig");
 const backend_scan = @import("../../backend_scan.zig");
@@ -49,6 +50,7 @@ const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
 const ownership_mod = @import("../ownership.zig");
 const types = @import("../types.zig");
 const platform_clock = @import("antfly_platform").clock;
+const platform_time = @import("antfly_platform").time;
 const background_runtime_mod = @import("../../background_runtime.zig");
 const template = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     @import("../template_stub.zig")
@@ -81,9 +83,19 @@ pub const Config = struct {
     clock: platform_clock.Clock = platform_clock.Clock.real(),
     inline_retry_max_attempts: u32 = transient_embed_retry_max_attempts,
     worker_retry_max_attempts: u32 = transient_worker_retry_max_attempts,
+    /// Hard liveness guard for callers waiting on post-commit enrichment
+    /// visibility. Foreground replay invokes only providers that explicitly
+    /// guarantee finite operation deadlines; custom legacy providers continue
+    /// to work in the supervised background worker but fail closed here.
+    sync_wait_timeout_ms: u64 = default_sync_wait_timeout_ms,
 };
 
-pub const RuntimeError = error{ EnrichmentWorkerFailed, EnrichmentRetryInProgress };
+pub const RuntimeError = error{
+    EnrichmentWorkerFailed,
+    EnrichmentRetryInProgress,
+    EnrichmentWaitCanceled,
+    EnrichmentWaitTimeout,
+};
 
 const ForegroundCatchUpDecision = enum {
     complete,
@@ -175,6 +187,11 @@ pub const FailurePendingCheck = *const fn (
     failure: FailureIdentity,
     index_name: []const u8,
 ) anyerror!bool;
+pub const FailureRangePendingCheck = *const fn (
+    ptr: *anyopaque,
+    after_sequence: u64,
+    through_sequence: u64,
+) anyerror!bool;
 pub const FailurePendingFence = struct {
     ptr: *anyopaque,
     lock_fn: *const fn (ptr: *anyopaque) void,
@@ -214,6 +231,43 @@ const transient_worker_retry_max_attempts: u32 = 6;
 const transient_worker_retry_base_sleep_ms: u64 = 500;
 const transient_worker_retry_max_sleep_ms: u64 = 30_000;
 const lease_denied_retry_sleep_ns: u64 = 100 * std.time.ns_per_ms;
+const default_sync_wait_timeout_ms: u64 = 5 * std.time.ms_per_min;
+const borrowed_cancellation_poll_min_ns: i64 = 25 * std.time.ns_per_ms;
+const borrowed_cancellation_poll_max_ns: i64 = 250 * std.time.ns_per_ms;
+
+const ForegroundCatchUpGuard = struct {
+    cancellation: CancellationToken = .none,
+    deadline_ns: ?u64 = null,
+
+    fn bounded(config: Config, cancellation: CancellationToken) @This() {
+        const timeout_ns = std.math.mul(
+            u64,
+            @max(config.sync_wait_timeout_ms, 1),
+            std.time.ns_per_ms,
+        ) catch std.math.maxInt(u64);
+        return .{
+            .cancellation = cancellation,
+            .deadline_ns = platform_time.monotonicNs() +| timeout_ns,
+        };
+    }
+
+    fn boundedBy(config: Config, cancellation: CancellationToken, deadline_ns: ?u64) @This() {
+        if (deadline_ns) |deadline| return .{
+            .cancellation = cancellation,
+            .deadline_ns = deadline,
+        };
+        return bounded(config, cancellation);
+    }
+
+    fn check(self: @This()) !void {
+        if (self.cancellation.isCancelled())
+            return RuntimeError.EnrichmentWaitCanceled;
+        if (self.deadline_ns) |deadline_ns| {
+            if (platform_time.monotonicNs() >= deadline_ns)
+                return RuntimeError.EnrichmentWaitTimeout;
+        }
+    }
+};
 
 const CoverageOutcome = enum { produced, skipped, terminal_failed };
 const coverage_outcome_count = std.meta.fields(CoverageOutcome).len;
@@ -706,7 +760,6 @@ test "request embedding telemetry preserves an overlapping replay batch snapshot
         .config = .{},
         .ownership = undefined,
     };
-
     noteEmbedBatchStarted(&runtime, 4, 400, 125);
     noteTrackedRequestEmbedBatchStarted(&runtime, 2);
     noteTrackedRequestEmbedBatchFinished(&runtime, 2, 80, 40, 10, true);
@@ -763,6 +816,7 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         => .fatal_worker,
 
         error.InvalidAssetProducerConfig,
+        error.InvalidExtractorResponse,
         error.InvalidDocumentExtractionConfig,
         error.InvalidEnrichmentConfig,
         error.InvalidEmbeddingResponse,
@@ -770,6 +824,7 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.OcrPromptEcho,
         error.TrivialOcrOutput,
         error.UnsupportedEmbeddingProvider,
+        error.UnsupportedExtractionProvider,
         error.UnsupportedReaderProvider,
         error.MissingAssetProducer,
         error.ModelNotSpecified,
@@ -795,6 +850,16 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.DecodedStreamTooLarge,
         error.PdfDecodeWorkingSetTooLarge,
         error.InvalidPdfDecodeLimits,
+        // Crossing a stable runtime boundary without a transportable error
+        // identity is not evidence of transience. Provider boundaries should
+        // normally return InferenceProviderFailure after logging the owner-side
+        // cause; keep RuntimeBoundaryFailure terminal as a fail-closed guard
+        // for every other boundary.
+        error.InferenceProviderFailure,
+        error.KernelJitRequiredDynamicLoad,
+        error.RuntimeBoundaryFailure,
+        error.UnboundedEnrichmentProvider,
+        error.UnexpectedToken,
         => .terminal_request,
 
         // New provider, transport, and decoder errors must not silently drop
@@ -878,6 +943,11 @@ fn setActiveFailureFingerprint(runtime: *EnrichmentRuntime, fingerprint: u64) vo
     if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
     defer if (maybe_io) |io| runtime.mutex.unlock(io);
     runtime.active_failure_fingerprint = fingerprint;
+    // Authorization to reuse a request fingerprint applies only to the error
+    // that just passed shouldYieldRequestError. Starting or clearing any other
+    // scope must invalidate it so stale request identity cannot mask a later
+    // pipeline failure.
+    runtime.retry_error_has_request_identity = false;
 }
 
 fn replaceActiveFailureFingerprint(runtime: *EnrichmentRuntime, fingerprint: u64) u64 {
@@ -886,7 +956,15 @@ fn replaceActiveFailureFingerprint(runtime: *EnrichmentRuntime, fingerprint: u64
     defer if (maybe_io) |io| runtime.mutex.unlock(io);
     const previous = runtime.active_failure_fingerprint;
     runtime.active_failure_fingerprint = fingerprint;
+    runtime.retry_error_has_request_identity = false;
     return previous;
+}
+
+fn clearRequestRetryAuthorization(runtime: *EnrichmentRuntime) void {
+    const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
+    if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
+    defer if (maybe_io) |io| runtime.mutex.unlock(io);
+    runtime.retry_error_has_request_identity = false;
 }
 
 fn requestAttemptNumber(runtime: *EnrichmentRuntime) u64 {
@@ -896,7 +974,7 @@ fn requestAttemptNumber(runtime: *EnrichmentRuntime) u64 {
     const prior_attempts = requestPriorAttempts(
         runtime.active_failure_fingerprint,
         runtime.retry_failure_fingerprint,
-        runtime.consecutive_retry_count,
+        runtime.retry_failure_count,
     );
     return @as(u64, prior_attempts) +| 1;
 }
@@ -914,13 +992,53 @@ fn activeRequestRetryBudgetAllowsYield(runtime: *EnrichmentRuntime) bool {
     const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
     if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
     defer if (maybe_io) |io| runtime.mutex.unlock(io);
-    if (runtime.active_failure_fingerprint == 0) return true;
+    if (runtime.active_failure_fingerprint == 0) {
+        runtime.retry_error_has_request_identity = false;
+        return true;
+    }
     const prior_attempts = requestPriorAttempts(
         runtime.active_failure_fingerprint,
         runtime.retry_failure_fingerprint,
-        runtime.consecutive_retry_count,
+        runtime.retry_failure_count,
     );
-    return retryBudgetAllowsYield(prior_attempts, runtime.config.worker_retry_max_attempts);
+    const allows_yield = retryBudgetAllowsYield(prior_attempts, runtime.config.worker_retry_max_attempts);
+    runtime.retry_error_has_request_identity = allows_yield;
+    return allows_yield;
+}
+
+fn pipelineFailureFingerprint(_: anyerror) u64 {
+    // Pipeline retry accounting is one liveness episode, not one counter per
+    // error spelling. A broken pipeline may alternate failures as it moves
+    // between storage, proposal, and status-persistence phases; allowing the
+    // name to change the identity would reset the durable ceiling forever.
+    // Successful replay progress clears this fingerprint and starts the next
+    // episode with a fresh budget.
+    var hasher = std.hash.Wyhash.init(0x616e74666c795f70);
+    updateFailureFingerprintBytes(&hasher, "pipeline_failure_episode");
+    return finishFailureFingerprint(&hasher);
+}
+
+fn workerLoopRetryBudgetAllowsYield(runtime: *EnrichmentRuntime, err: anyerror) bool {
+    const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
+    if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
+    defer if (maybe_io) |io| runtime.mutex.unlock(io);
+
+    // Only shouldYieldRequestError may authorize reuse of a request identity.
+    // Any other error reaching the worker boundary is a pipeline failure, even
+    // if a previously completed request left its fingerprint active.
+    if (!runtime.retry_error_has_request_identity or runtime.active_failure_fingerprint == 0)
+        runtime.active_failure_fingerprint = pipelineFailureFingerprint(err);
+    runtime.retry_error_has_request_identity = false;
+    const request_prior_attempts = requestPriorAttempts(
+        runtime.active_failure_fingerprint,
+        runtime.retry_failure_fingerprint,
+        runtime.retry_failure_count,
+    );
+    // One durable no-progress ceiling covers request and pipeline failures.
+    // The identity budget additionally prevents one bad document from
+    // consuming every retry in otherwise progressing work.
+    return retryBudgetAllowsYield(runtime.consecutive_retry_count, runtime.config.worker_retry_max_attempts) and
+        retryBudgetAllowsYield(request_prior_attempts, runtime.config.worker_retry_max_attempts);
 }
 
 fn shouldYieldRequestError(runtime: *EnrichmentRuntime, err: anyerror) bool {
@@ -928,9 +1046,10 @@ fn shouldYieldRequestError(runtime: *EnrichmentRuntime, err: anyerror) bool {
     return switch (enrichmentErrorDisposition(err)) {
         .fatal_worker => true,
         .terminal_request => false,
-        // consecutive_retry_count contains failures already persisted by the
-        // supervisor. Count the current failure too, so max_attempts is a true
-        // total-attempt bound rather than an off-by-one retry count.
+        // The identity count contains failures already persisted for this
+        // request. The worker boundary separately enforces the global
+        // no-progress count, so alternating failure identities cannot evade
+        // the supervisor ceiling.
         // Pipeline failures have no request identity and must never consume a
         // document budget or be converted into terminal document coverage.
         .retryable_request => activeRequestRetryBudgetAllowsYield(runtime),
@@ -938,6 +1057,15 @@ fn shouldYieldRequestError(runtime: *EnrichmentRuntime, err: anyerror) bool {
 }
 
 fn shouldYieldRemoteHttpFailure(runtime: *EnrichmentRuntime, status: u16) bool {
+    // Do not ask the request budget before establishing that the status is
+    // transient: activeRequestRetryBudgetAllowsYield grants a one-shot token
+    // consumed by the worker boundary. Leaving that token armed after a
+    // permanent response could misattribute a later pipeline failure to this
+    // document and reset the pipeline's liveness ceiling.
+    if (!document_extraction_mod.remoteHttpStatusIsTransient(status)) {
+        clearRequestRetryAuthorization(runtime);
+        return false;
+    }
     return remoteHttpFailureNeedsRetry(
         status,
         shouldYieldRequestError(runtime, error.RemoteDocumentFetchFailed),
@@ -972,6 +1100,10 @@ test "enrichment retries unknown errors and isolates known permanent errors" {
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.OcrPromptEcho));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.TrivialOcrOutput));
     try std.testing.expectEqual(EnrichmentErrorDisposition.fatal_worker, enrichmentErrorDisposition(error.OutOfMemory));
+    try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.InferenceProviderFailure));
+    try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.KernelJitRequiredDynamicLoad));
+    try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.RuntimeBoundaryFailure));
+    try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.UnexpectedToken));
 }
 
 test "enrichment worker attempt budget includes the current request" {
@@ -984,11 +1116,196 @@ test "enrichment worker attempt budget includes the current request" {
     try std.testing.expectEqual(@as(u32, 0), requestPriorAttempts(0, 41, 2));
 }
 
+test "pipeline retry fingerprint is stable across alternating errors" {
+    try std.testing.expectEqual(
+        pipelineFailureFingerprint(error.StorageReadTemporarilyUnavailable),
+        pipelineFailureFingerprint(error.StorageReadTemporarilyUnavailable),
+    );
+    try std.testing.expectEqual(
+        pipelineFailureFingerprint(error.StorageReadTemporarilyUnavailable),
+        pipelineFailureFingerprint(error.ProposalDropped),
+    );
+}
+
+test "alternating pipeline errors exhaust one durable retry budget" {
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .worker_retry_max_attempts = 3 },
+        .ownership = undefined,
+    };
+
+    try std.testing.expect(workerLoopRetryBudgetAllowsYield(&runtime, error.StorageReadTemporarilyUnavailable));
+    const fingerprint = runtime.active_failure_fingerprint;
+    runtime.retry_failure_fingerprint = fingerprint;
+    runtime.consecutive_retry_count = 1;
+    runtime.active_failure_fingerprint = 0;
+
+    try std.testing.expect(workerLoopRetryBudgetAllowsYield(&runtime, error.ProposalDropped));
+    try std.testing.expectEqual(fingerprint, runtime.active_failure_fingerprint);
+    runtime.retry_failure_fingerprint = runtime.active_failure_fingerprint;
+    runtime.consecutive_retry_count = 2;
+    runtime.active_failure_fingerprint = 0;
+
+    try std.testing.expect(!workerLoopRetryBudgetAllowsYield(&runtime, error.StorageReadTemporarilyUnavailable));
+    try std.testing.expectEqual(fingerprint, runtime.active_failure_fingerprint);
+}
+
+test "pipeline failures retain their retry budget across replay pass reset" {
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .worker_retry_max_attempts = 2 },
+        .ownership = undefined,
+    };
+
+    try std.testing.expect(workerLoopRetryBudgetAllowsYield(&runtime, error.ProposalDropped));
+    const fingerprint = runtime.active_failure_fingerprint;
+    try std.testing.expect(fingerprint != 0);
+
+    // recordRetryableError persists this state after the first failed attempt;
+    // runForegroundCatchUpPassOwned clears only the active fingerprint before
+    // the next pass.
+    runtime.retry_failure_fingerprint = fingerprint;
+    runtime.consecutive_retry_count = 1;
+    runtime.active_failure_fingerprint = 0;
+    try std.testing.expect(!workerLoopRetryBudgetAllowsYield(&runtime, error.ProposalDropped));
+    try std.testing.expectEqual(fingerprint, runtime.active_failure_fingerprint);
+}
+
+test "pipeline failure replaces stale request retry identity" {
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .worker_retry_max_attempts = 2 },
+        .ownership = undefined,
+    };
+
+    const pipeline_fingerprint = pipelineFailureFingerprint(error.ProposalDropped);
+    runtime.retry_failure_fingerprint = pipeline_fingerprint;
+    runtime.consecutive_retry_count = 1;
+    runtime.active_failure_fingerprint = 1234;
+    runtime.retry_error_has_request_identity = false;
+
+    try std.testing.expect(!workerLoopRetryBudgetAllowsYield(&runtime, error.ProposalDropped));
+    try std.testing.expectEqual(pipeline_fingerprint, runtime.active_failure_fingerprint);
+}
+
+test "mixed request and pipeline failures exhaust one no-progress budget" {
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .worker_retry_max_attempts = 3 },
+        .ownership = undefined,
+    };
+
+    runtime.consecutive_retry_count = 1;
+    runtime.retry_failure_fingerprint = 101;
+    runtime.retry_failure_count = 1;
+
+    runtime.active_failure_fingerprint = 0;
+    try std.testing.expect(workerLoopRetryBudgetAllowsYield(&runtime, error.ProposalDropped));
+    runtime.consecutive_retry_count = 2;
+    runtime.retry_failure_fingerprint = runtime.active_failure_fingerprint;
+    runtime.retry_failure_count = 1;
+
+    runtime.active_failure_fingerprint = 101;
+    runtime.retry_error_has_request_identity = true;
+    try std.testing.expect(!workerLoopRetryBudgetAllowsYield(&runtime, error.EmbedRateLimited));
+}
+
+test "worker retry preserves only an explicitly authorized request identity" {
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .worker_retry_max_attempts = 2 },
+        .ownership = undefined,
+    };
+
+    runtime.active_failure_fingerprint = 1234;
+    try std.testing.expect(activeRequestRetryBudgetAllowsYield(&runtime));
+    try std.testing.expect(runtime.retry_error_has_request_identity);
+    try std.testing.expect(workerLoopRetryBudgetAllowsYield(&runtime, error.EmbedRateLimited));
+    try std.testing.expectEqual(@as(u64, 1234), runtime.active_failure_fingerprint);
+    try std.testing.expect(!runtime.retry_error_has_request_identity);
+}
+
 test "remote HTTP failures consume retry budget before terminal coverage" {
     try std.testing.expect(remoteHttpFailureNeedsRetry(503, true));
     try std.testing.expect(remoteHttpFailureNeedsRetry(429, true));
     try std.testing.expect(!remoteHttpFailureNeedsRetry(503, false));
     try std.testing.expect(!remoteHttpFailureNeedsRetry(404, true));
+}
+
+test "permanent remote HTTP failure cannot authorize request retry identity" {
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .worker_retry_max_attempts = 3 },
+        .ownership = undefined,
+    };
+
+    runtime.active_failure_fingerprint = 1234;
+    runtime.retry_error_has_request_identity = true;
+    try std.testing.expect(!shouldYieldRemoteHttpFailure(&runtime, 404));
+    try std.testing.expect(!runtime.retry_error_has_request_identity);
+
+    try std.testing.expect(shouldYieldRemoteHttpFailure(&runtime, 503));
+    try std.testing.expect(runtime.retry_error_has_request_identity);
 }
 
 test "enrichment worker retry delay is exponential and capped" {
@@ -1022,6 +1339,9 @@ fn runtimeStatusSnapshot(runtime: *EnrichmentRuntime) enrichment_state.RuntimeSt
         .consecutive_retry_count = runtime.consecutive_retry_count,
         .next_retry_at_ms = runtime.next_retry_at_ms,
         .retry_failure_fingerprint = runtime.retry_failure_fingerprint,
+        .retry_failure_count = runtime.retry_failure_count,
+        .terminal_failure_min_sequence = runtime.terminal_failure_min_sequence,
+        .terminal_failure_max_sequence = runtime.terminal_failure_max_sequence,
         .retrying = runtime.retrying,
         .worker_failed = runtime.worker_failed,
     };
@@ -1040,6 +1360,9 @@ fn restorePersistedRuntimeStatus(runtime: anytype, persisted_status: enrichment_
     runtime.skipped_source_count = persisted_status.skipped_source_count;
     runtime.consecutive_retry_count = persisted_status.consecutive_retry_count;
     runtime.retry_failure_fingerprint = persisted_status.retry_failure_fingerprint;
+    runtime.retry_failure_count = persisted_status.retry_failure_count;
+    runtime.terminal_failure_min_sequence = persisted_status.terminal_failure_min_sequence;
+    runtime.terminal_failure_max_sequence = persisted_status.terminal_failure_max_sequence;
     runtime.active_failure_fingerprint = 0;
     runtime.retrying = persisted_status.retrying and !persisted_status.worker_failed;
     runtime.next_retry_at_ms = if (runtime.retrying) persisted_status.next_retry_at_ms else 0;
@@ -1058,6 +1381,9 @@ test "enrichment runtime restore preserves retry target across restart" {
         consecutive_retry_count: u32 = 0,
         next_retry_at_ms: u64 = 0,
         retry_failure_fingerprint: u64 = 0,
+        retry_failure_count: u32 = 0,
+        terminal_failure_min_sequence: u64 = 0,
+        terminal_failure_max_sequence: u64 = 0,
         active_failure_fingerprint: u64 = 0,
         retrying: bool = false,
         worker_failed: bool = false,
@@ -1071,6 +1397,9 @@ test "enrichment runtime restore preserves retry target across restart" {
         .consecutive_retry_count = 2,
         .next_retry_at_ms = 1234,
         .retry_failure_fingerprint = 77,
+        .retry_failure_count = 2,
+        .terminal_failure_min_sequence = 8,
+        .terminal_failure_max_sequence = 9,
         .retrying = true,
         .worker_failed = false,
     });
@@ -1081,6 +1410,9 @@ test "enrichment runtime restore preserves retry target across restart" {
     try std.testing.expectEqual(@as(u32, 2), runtime.consecutive_retry_count);
     try std.testing.expectEqual(@as(u64, 1234), runtime.next_retry_at_ms);
     try std.testing.expectEqual(@as(u64, 77), runtime.retry_failure_fingerprint);
+    try std.testing.expectEqual(@as(u32, 2), runtime.retry_failure_count);
+    try std.testing.expectEqual(@as(u64, 8), runtime.terminal_failure_min_sequence);
+    try std.testing.expectEqual(@as(u64, 9), runtime.terminal_failure_max_sequence);
     try std.testing.expectEqual(@as(u64, 0), runtime.active_failure_fingerprint);
     try std.testing.expect(runtime.retrying);
     try std.testing.expect(!runtime.worker_failed);
@@ -1097,6 +1429,9 @@ test "enrichment runtime restore does not resume persisted fatal failure" {
         consecutive_retry_count: u32 = 0,
         next_retry_at_ms: u64 = 0,
         retry_failure_fingerprint: u64 = 0,
+        retry_failure_count: u32 = 0,
+        terminal_failure_min_sequence: u64 = 0,
+        terminal_failure_max_sequence: u64 = 0,
         active_failure_fingerprint: u64 = 0,
         retrying: bool = false,
         worker_failed: bool = false,
@@ -1115,6 +1450,39 @@ test "enrichment runtime restore does not resume persisted fatal failure" {
     try std.testing.expect(!runtime.retrying);
     try std.testing.expectEqual(@as(u64, 0), runtime.next_retry_at_ms);
     try std.testing.expect(runtime.worker_failed);
+}
+
+test "ordinary startup target preserves restored retry debt" {
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+        .target_sequence = 9,
+        .consecutive_retry_count = 4,
+        .next_retry_at_ms = 1234,
+        .retry_failure_fingerprint = 77,
+        .retry_failure_count = 4,
+        .retrying = true,
+    };
+
+    runtime.resumeTargetPreservingRetryDebt(12);
+
+    try std.testing.expectEqual(@as(u64, 12), runtime.target_sequence);
+    try std.testing.expectEqual(@as(u32, 4), runtime.consecutive_retry_count);
+    try std.testing.expectEqual(@as(u64, 1234), runtime.next_retry_at_ms);
+    try std.testing.expectEqual(@as(u64, 77), runtime.retry_failure_fingerprint);
+    try std.testing.expectEqual(@as(u32, 4), runtime.retry_failure_count);
+    try std.testing.expect(runtime.retrying);
 }
 
 fn clearPublishedGeneratedArtifacts(runtime: *EnrichmentRuntime) void {
@@ -1156,6 +1524,89 @@ fn rememberPublishedGeneratedBatch(runtime: *EnrichmentRuntime, batch: derived_t
     }
 }
 
+fn checkProviderInvocation(runtime: *EnrichmentRuntime, foreground_bounded: bool) !void {
+    const guard = runtime.active_provider_guard;
+    if (guard.deadline_ns == null and guard.cancellation.ptr == null) return;
+    try guard.check();
+    if (!foreground_bounded) return error.UnboundedEnrichmentProvider;
+}
+
+fn checkAssetProviderInvocation(
+    runtime: *EnrichmentRuntime,
+    producer: asset_producer_mod.Producer,
+    alloc: Allocator,
+    requests: []const asset_producer_mod.Request,
+) !void {
+    const guard = runtime.active_provider_guard;
+    if (guard.deadline_ns == null and guard.cancellation.ptr == null) return;
+    try guard.check();
+    const foreground_bounded = try producer.foregroundBoundedForRequests(alloc, requests);
+    // Request-aware routing may parse provider configuration. Recheck before
+    // entering the provider so that work done by the contract hook cannot
+    // consume the caller's remaining deadline unnoticed.
+    try guard.check();
+    if (!foreground_bounded)
+        return error.UnboundedEnrichmentProvider;
+}
+
+fn checkProviderFailureGuard(runtime: *EnrichmentRuntime) !void {
+    const guard = runtime.active_provider_guard;
+    if (guard.deadline_ns == null and guard.cancellation.ptr == null) return;
+    try guard.check();
+}
+
+fn assetProducerCanBatchGuarded(
+    runtime: *EnrichmentRuntime,
+    producer: asset_producer_mod.Producer,
+    alloc: Allocator,
+    requests: []const asset_producer_mod.Request,
+) !bool {
+    try checkAssetProviderInvocation(runtime, producer, alloc, requests);
+    const result = producer.canProduceBatch(alloc, requests) catch |err| {
+        try checkProviderFailureGuard(runtime);
+        return err;
+    };
+    try checkProviderFailureGuard(runtime);
+    return result;
+}
+
+fn assetProducerProduceGuarded(
+    runtime: *EnrichmentRuntime,
+    producer: asset_producer_mod.Producer,
+    alloc: Allocator,
+    request: asset_producer_mod.Request,
+) ![]u8 {
+    try checkAssetProviderInvocation(runtime, producer, alloc, &.{request});
+    const produced = producer.produce(alloc, request) catch |err| {
+        try checkProviderFailureGuard(runtime);
+        return err;
+    };
+    checkProviderFailureGuard(runtime) catch |err| {
+        alloc.free(produced);
+        return err;
+    };
+    return produced;
+}
+
+fn assetProducerProduceBatchGuarded(
+    runtime: *EnrichmentRuntime,
+    producer: asset_producer_mod.Producer,
+    alloc: Allocator,
+    requests: []const asset_producer_mod.Request,
+) ![][]u8 {
+    try checkAssetProviderInvocation(runtime, producer, alloc, requests);
+    const produced = producer.produceBatch(alloc, requests) catch |err| {
+        try checkProviderFailureGuard(runtime);
+        return err;
+    };
+    checkProviderFailureGuard(runtime) catch |err| {
+        for (produced) |output| if (output.len > 0) alloc.free(output);
+        alloc.free(produced);
+        return err;
+    };
+    return produced;
+}
+
 fn embedDenseWithRetry(
     dense_embedder: embedder_mod.DenseEmbedder,
     runtime: *EnrichmentRuntime,
@@ -1165,7 +1616,9 @@ fn embedDenseWithRetry(
 ) ![]f32 {
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
+        try checkProviderInvocation(runtime, dense_embedder.foreground_bounded);
         const vector = dense_embedder.embedDense(runtime.alloc, embedding_name, text, dims) catch |err| {
+            try checkProviderFailureGuard(runtime);
             if (!isRetryableEnrichmentError(err)) return err;
             switch (transientEmbedRetryDecision(runtime, attempt)) {
                 .retry_inline => {},
@@ -1175,6 +1628,10 @@ fn embedDenseWithRetry(
             if (attempt == 0) noteTransientEmbedRetry(runtime, err);
             sleepRetryBackoff(transientEmbedRetrySleepNs(attempt));
             continue;
+        };
+        checkProviderFailureGuard(runtime) catch |err| {
+            runtime.alloc.free(vector);
+            return err;
         };
         return vector;
     }
@@ -1189,7 +1646,9 @@ fn embedDenseBatchWithRetry(
 ) ![]const []const f32 {
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
+        try checkProviderInvocation(runtime, dense_embedder.foreground_bounded);
         const vectors = dense_embedder.embedDenseBatch(runtime.alloc, embedding_name, texts, dims) catch |err| {
+            try checkProviderFailureGuard(runtime);
             if (!isRetryableEnrichmentError(err)) return err;
             switch (transientEmbedRetryDecision(runtime, attempt)) {
                 .retry_inline => {},
@@ -1199,6 +1658,10 @@ fn embedDenseBatchWithRetry(
             if (attempt == 0) noteTransientEmbedRetry(runtime, err);
             sleepRetryBackoff(transientEmbedRetrySleepNs(attempt));
             continue;
+        };
+        checkProviderFailureGuard(runtime) catch |err| {
+            embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, vectors);
+            return err;
         };
         return vectors;
     }
@@ -1213,7 +1676,9 @@ fn embedDensePartsWithRetry(
 ) ![]f32 {
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
+        try checkProviderInvocation(runtime, dense_embedder.foreground_bounded);
         const vector = dense_embedder.embedDenseParts(runtime.alloc, embedding_name, parts, dims) catch |err| {
+            try checkProviderFailureGuard(runtime);
             if (!isRetryableEnrichmentError(err)) return err;
             switch (transientEmbedRetryDecision(runtime, attempt)) {
                 .retry_inline => {},
@@ -1223,6 +1688,10 @@ fn embedDensePartsWithRetry(
             if (attempt == 0) noteTransientEmbedRetry(runtime, err);
             sleepRetryBackoff(transientEmbedRetrySleepNs(attempt));
             continue;
+        };
+        checkProviderFailureGuard(runtime) catch |err| {
+            runtime.alloc.free(vector);
+            return err;
         };
         return vector;
     }
@@ -1236,7 +1705,9 @@ fn embedSparseWithRetry(
 ) !embedder_mod.SparseEmbedding {
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
+        try checkProviderInvocation(runtime, sparse_embedder.foreground_bounded);
         const sparse = sparse_embedder.embedSparse(runtime.alloc, embedding_name, text) catch |err| {
+            try checkProviderFailureGuard(runtime);
             if (!isRetryableEnrichmentError(err)) return err;
             switch (transientEmbedRetryDecision(runtime, attempt)) {
                 .retry_inline => {},
@@ -1246,6 +1717,11 @@ fn embedSparseWithRetry(
             if (attempt == 0) noteTransientEmbedRetry(runtime, err);
             sleepRetryBackoff(transientEmbedRetrySleepNs(attempt));
             continue;
+        };
+        var owned_sparse = sparse;
+        checkProviderFailureGuard(runtime) catch |err| {
+            owned_sparse.deinit(runtime.alloc);
+            return err;
         };
         return sparse;
     }
@@ -1259,7 +1735,9 @@ fn embedSparseBatchWithRetry(
 ) ![]embedder_mod.SparseEmbedding {
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
+        try checkProviderInvocation(runtime, sparse_embedder.foreground_bounded);
         const sparse_batch = sparse_embedder.embedSparseBatch(runtime.alloc, embedding_name, texts) catch |err| {
+            try checkProviderFailureGuard(runtime);
             if (!isRetryableEnrichmentError(err)) return err;
             switch (transientEmbedRetryDecision(runtime, attempt)) {
                 .retry_inline => {},
@@ -1269,6 +1747,10 @@ fn embedSparseBatchWithRetry(
             if (attempt == 0) noteTransientEmbedRetry(runtime, err);
             sleepRetryBackoff(transientEmbedRetrySleepNs(attempt));
             continue;
+        };
+        checkProviderFailureGuard(runtime) catch |err| {
+            embedder_mod.freeSparseEmbeddingBatch(runtime.alloc, sparse_batch);
+            return err;
         };
         return sparse_batch;
     }
@@ -1663,6 +2145,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     failure_ctx: ?*anyopaque = null,
     failure_fn: ?FailureRecorder = null,
     failure_pending_fn: ?FailurePendingCheck = null,
+    failure_range_pending_fn: ?FailureRangePendingCheck = null,
     failure_pending_fence: ?FailurePendingFence = null,
     notify_ctx: *anyopaque,
     notify_fn: NotifyFn,
@@ -1676,7 +2159,12 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     consecutive_retry_count: u32 = 0,
     next_retry_at_ms: u64 = 0,
     retry_failure_fingerprint: u64 = 0,
+    retry_failure_count: u32 = 0,
+    terminal_failure_min_sequence: u64 = 0,
+    terminal_failure_max_sequence: u64 = 0,
     active_failure_fingerprint: u64 = 0,
+    active_provider_guard: ForegroundCatchUpGuard = .{},
+    retry_error_has_request_identity: bool = false,
     retrying: bool = false,
     worker_failed: bool = false,
     skip_by_hash_count: u64 = 0,
@@ -1714,6 +2202,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         failure_ctx: ?*anyopaque,
         failure_fn: ?FailureRecorder,
         failure_pending_fn: ?FailurePendingCheck,
+        failure_range_pending_fn: ?FailureRangePendingCheck,
         failure_pending_fence: ?FailurePendingFence,
         notify_ctx: *anyopaque,
         notify_fn: NotifyFn,
@@ -1734,6 +2223,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .failure_ctx = failure_ctx,
             .failure_fn = failure_fn,
             .failure_pending_fn = failure_pending_fn,
+            .failure_range_pending_fn = failure_range_pending_fn,
             .failure_pending_fence = failure_pending_fence,
             .notify_ctx = notify_ctx,
             .notify_fn = notify_fn,
@@ -1749,12 +2239,23 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .clock = config.clock,
                 .inline_retry_max_attempts = config.inline_retry_max_attempts,
                 .worker_retry_max_attempts = config.worker_retry_max_attempts,
+                .sync_wait_timeout_ms = config.sync_wait_timeout_ms,
             },
         };
         runtime.applied_sequence = try enrichment_state.loadAppliedSequence(alloc, store, scope_name);
         const persisted_status = try enrichment_state.loadRuntimeStatus(alloc, store, scope_name);
         restorePersistedRuntimeStatus(&runtime, persisted_status);
         return runtime;
+    }
+
+    /// Refresh a detached runtime after the previously active worker has
+    /// joined. Reconfiguration must not start from a checkpoint/status
+    /// snapshot taken while that worker could still publish progress.
+    pub fn reloadDurableState(self: *@This()) !void {
+        self.applied_sequence = try enrichment_state.loadAppliedSequence(self.alloc, self.store, scope_name);
+        const persisted_status = try enrichment_state.loadRuntimeStatus(self.alloc, self.store, scope_name);
+        restorePersistedRuntimeStatus(self, persisted_status);
+        self.retry_error_has_request_identity = false;
     }
 
     pub fn deinit(self: *@This()) void {
@@ -1802,18 +2303,92 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.consecutive_retry_count = 0;
         self.next_retry_at_ms = 0;
         self.retry_failure_fingerprint = 0;
+        self.retry_failure_count = 0;
         self.active_failure_fingerprint = 0;
+        self.retry_error_has_request_identity = false;
         self.target_sequence = @max(self.target_sequence, @max(target_sequence, next_applied));
+        // Manual/startup replay retirement is durable progress too. Persist
+        // the cleared retry episode even when the applied checkpoint did not
+        // move, otherwise a crash can resurrect exhausted retry debt.
+        try saveRuntimeStatusWithRetry(self, scope_name, runtimeStatusSnapshot(self));
+    }
+
+    /// Discover replay work during an ordinary open without forgiving an
+    /// existing retry episode. Explicit repair/rewind continues to use
+    /// resumeFrom, which intentionally resets the supervisor state.
+    pub fn resumeTargetPreservingRetryDebt(self: *@This(), target_sequence: u64) void {
+        self.notifySequence(target_sequence);
     }
 
     pub fn waitForApplied(self: *@This(), sequence: u64) !void {
-        try self.catchUpUntil(sequence);
+        try self.waitForAppliedWithCancellation(sequence, .none);
+    }
+
+    pub fn waitForAppliedWithCancellation(self: *@This(), sequence: u64, cancellation: CancellationToken) !void {
+        try self.waitForAppliedWithVisibilityDeadline(sequence, cancellation, null);
+    }
+
+    pub fn catchUpUntilWithCancellation(self: *@This(), sequence: u64, cancellation: CancellationToken) !void {
+        try self.catchUpUntilWithVisibilityDeadline(sequence, cancellation, null);
+    }
+
+    pub fn syncWaitTimeoutMs(self: *const @This()) u64 {
+        return @max(self.config.sync_wait_timeout_ms, 1);
+    }
+
+    pub fn waitForAppliedWithVisibilityDeadline(
+        self: *@This(),
+        sequence: u64,
+        cancellation: CancellationToken,
+        deadline_ns: ?u64,
+    ) !void {
+        try self.catchUpUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns);
+    }
+
+    pub fn catchUpUntilWithVisibilityDeadline(
+        self: *@This(),
+        sequence: u64,
+        cancellation: CancellationToken,
+        deadline_ns: ?u64,
+    ) !void {
+        if (sequence == 0) return;
+        const wait_after_sequence = self.applied_sequence;
+        // A completed or terminal prefix wins a racing transport
+        // cancellation. This mirrors the threaded runtime and prevents a
+        // disconnect from obscuring an already-durable visibility outcome.
+        if (self.applied_sequence >= sequence) {
+            const failure_envelope = terminalFailureEnvelopeSnapshot(self);
+            if (terminalFailurePendingInRange(self, failure_envelope, wait_after_sequence, sequence))
+                return RuntimeError.EnrichmentWorkerFailed;
+            return;
+        }
+        const guard = ForegroundCatchUpGuard.boundedBy(self.config, cancellation, deadline_ns);
+        self.catchUpUntilGuarded(sequence, guard) catch |err| {
+            const failure_envelope = terminalFailureEnvelopeSnapshot(self);
+            if ((err == RuntimeError.EnrichmentWaitCanceled or err == RuntimeError.EnrichmentWaitTimeout) and
+                terminalFailurePendingInRange(self, failure_envelope, wait_after_sequence, sequence))
+                return RuntimeError.EnrichmentWorkerFailed;
+            return err;
+        };
+        const failure_envelope = terminalFailureEnvelopeSnapshot(self);
+        if (terminalFailurePendingInRange(self, failure_envelope, wait_after_sequence, sequence))
+            return RuntimeError.EnrichmentWorkerFailed;
     }
 
     pub fn catchUpUntil(self: *@This(), sequence: u64) !void {
+        try self.catchUpUntilGuarded(sequence, .{});
+    }
+
+    fn catchUpUntilGuarded(self: *@This(), sequence: u64, guard: ForegroundCatchUpGuard) !void {
+        if (sequence == 0) return;
         if (self.config.dense_embedder == null and self.config.sparse_embedder == null and self.config.asset_producer == null and !self.config.enable_without_producers) return;
+        try guard.check();
+        const previous_provider_guard = self.active_provider_guard;
+        self.active_provider_guard = guard;
+        defer self.active_provider_guard = previous_provider_guard;
 
         self.active_failure_fingerprint = 0;
+        self.retry_error_has_request_identity = false;
         self.notifySequence(sequence);
         const pending = try enrichment_worker.collectPendingDocumentGroups(self.alloc, self.replay_source, self.applied_sequence);
         defer enrichment_worker.freePendingDocumentGroups(self.alloc, pending);
@@ -1838,13 +2413,18 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
 
         var max_seen = self.applied_sequence;
         for (pending) |group| {
+            try guard.check();
             max_seen = @max(max_seen, group.sequence);
-            try processPendingDocumentGroup(self, group, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, &processed_request_count);
+            try processPendingDocumentGroup(self, group, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, &processed_request_count, guard);
             if (window.itemCount() >= max_window_items) try flushGeneratedReplayWindow(self, &window);
         }
+        try guard.check();
         try flushAssetProducerBatch(self, &deferred_assets, &window);
+        try guard.check();
         try processPlainDenseWindow(self, deferred_plain_dense.items, &window);
+        try guard.check();
         try processChunkedDenseWindow(self, deferred_chunked_dense.items, &chunk_cache, &window);
+        try guard.check();
         try flushGeneratedReplayWindow(self, &window);
         if (pending.len == 0) {
             max_seen = sequence;
@@ -1852,6 +2432,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
 
         if (max_seen > self.applied_sequence) {
             self.active_failure_fingerprint = 0;
+            self.retry_error_has_request_identity = false;
             try saveAppliedSequenceWithRetry(self, scope_name, max_seen);
             self.applied_sequence = max_seen;
             self.processed_requests += processed_request_count;
@@ -1860,7 +2441,9 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             self.consecutive_retry_count = 0;
             self.next_retry_at_ms = 0;
             self.retry_failure_fingerprint = 0;
+            self.retry_failure_count = 0;
             self.active_failure_fingerprint = 0;
+            self.retry_error_has_request_identity = false;
             clearPublishedGeneratedArtifacts(self);
             clearIsolatedFailedIndexes(self);
         }
@@ -1877,7 +2460,9 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.consecutive_retry_count = 0;
         self.next_retry_at_ms = 0;
         self.retry_failure_fingerprint = 0;
+        self.retry_failure_count = 0;
         self.active_failure_fingerprint = 0;
+        self.retry_error_has_request_identity = false;
         clearPublishedGeneratedArtifacts(self);
         clearIsolatedFailedIndexes(self);
     }
@@ -1948,6 +2533,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     failure_ctx: ?*anyopaque = null,
     failure_fn: ?FailureRecorder = null,
     failure_pending_fn: ?FailurePendingCheck = null,
+    failure_range_pending_fn: ?FailureRangePendingCheck = null,
     failure_pending_fence: ?FailurePendingFence = null,
     notify_ctx: *anyopaque,
     notify_fn: NotifyFn,
@@ -1955,6 +2541,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     ownership: ownership_mod.State,
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
+    sync_wait_epoch: std.atomic.Value(u32) = .init(0),
+    sync_waiter_count: std.atomic.Value(u32) = .init(0),
     replay_pass_active: bool = false,
     shutdown: bool = false,
     target_sequence: u64 = 0,
@@ -1966,7 +2554,12 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     consecutive_retry_count: u32 = 0,
     next_retry_at_ms: u64 = 0,
     retry_failure_fingerprint: u64 = 0,
+    retry_failure_count: u32 = 0,
+    terminal_failure_min_sequence: u64 = 0,
+    terminal_failure_max_sequence: u64 = 0,
     active_failure_fingerprint: u64 = 0,
+    active_provider_guard: ForegroundCatchUpGuard = .{},
+    retry_error_has_request_identity: bool = false,
     retrying: bool = false,
     worker_failed: bool = false,
     skip_by_hash_count: u64 = 0,
@@ -2007,6 +2600,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         failure_ctx: ?*anyopaque,
         failure_fn: ?FailureRecorder,
         failure_pending_fn: ?FailurePendingCheck,
+        failure_range_pending_fn: ?FailureRangePendingCheck,
         failure_pending_fence: ?FailurePendingFence,
         notify_ctx: *anyopaque,
         notify_fn: NotifyFn,
@@ -2031,6 +2625,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .failure_ctx = failure_ctx,
             .failure_fn = failure_fn,
             .failure_pending_fn = failure_pending_fn,
+            .failure_range_pending_fn = failure_range_pending_fn,
             .failure_pending_fence = failure_pending_fence,
             .notify_ctx = notify_ctx,
             .notify_fn = notify_fn,
@@ -2046,6 +2641,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .clock = config.clock,
                 .inline_retry_max_attempts = config.inline_retry_max_attempts,
                 .worker_retry_max_attempts = config.worker_retry_max_attempts,
+                .sync_wait_timeout_ms = config.sync_wait_timeout_ms,
             },
             .ownership = try ownership_mod.State.init(alloc, store, enrichment_lease.default_lease_key, .{
                 .lease_owned = true,
@@ -2057,6 +2653,17 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         const persisted_status = try enrichment_state.loadRuntimeStatus(alloc, store, scope_name);
         restorePersistedRuntimeStatus(&runtime, persisted_status);
         return runtime;
+    }
+
+    /// Refresh a detached runtime after the previously active worker has
+    /// joined. Calling this on a live worker would race its in-memory state.
+    pub fn reloadDurableState(self: *EnrichmentRuntime) !void {
+        if (self.future != null) return error.EnrichmentRuntimeStarted;
+        self.applied_sequence = try enrichment_state.loadAppliedSequence(self.alloc, self.store, scope_name);
+        const persisted_status = try enrichment_state.loadRuntimeStatus(self.alloc, self.store, scope_name);
+        restorePersistedRuntimeStatus(self, persisted_status);
+        self.last_error_name = null;
+        self.retry_error_has_request_identity = false;
     }
 
     pub fn deinit(self: *EnrichmentRuntime) void {
@@ -2076,7 +2683,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             const io = io_impl.io();
             self.mutex.lockUncancelable(io);
             self.shutdown = true;
-            self.cond.broadcast(io);
+            broadcastRuntimeStateChanged(self, io);
             self.mutex.unlock(io);
 
             if (self.future) |*future| _ = future.await(io);
@@ -2131,7 +2738,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         if (sequence > self.target_sequence) self.last_error_name = null;
         if (sequence > self.target_sequence) clearIsolatedFailedIndexes(self);
         self.target_sequence = @max(self.target_sequence, sequence);
-        self.cond.broadcast(io);
+        broadcastRuntimeStateChanged(self, io);
         self.mutex.unlock(io);
     }
 
@@ -2149,31 +2756,205 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.consecutive_retry_count = 0;
         self.next_retry_at_ms = 0;
         self.retry_failure_fingerprint = 0;
+        self.retry_failure_count = 0;
         self.active_failure_fingerprint = 0;
+        self.retry_error_has_request_identity = false;
         clearPublishedGeneratedArtifacts(self);
         clearIsolatedFailedIndexes(self);
-        self.cond.broadcast(io);
+        const status = runtimeStatusSnapshot(self);
+        broadcastRuntimeStateChanged(self, io);
         self.mutex.unlock(io);
 
         if (next_applied != current_applied) {
             try saveAppliedSequenceWithRetry(self, scope_name, next_applied);
         }
+        // Persist retry retirement even when resume keeps the same applied
+        // checkpoint; otherwise restart reloads stale failure counters.
+        try saveRuntimeStatusWithRetry(self, scope_name, status);
+    }
+
+    /// Discover replay work during an ordinary open without resetting the
+    /// persisted retry ceiling. This performs no storage write on the healthy
+    /// startup path; the journal remains the durable source of the target.
+    pub fn resumeTargetPreservingRetryDebt(self: *EnrichmentRuntime, target_sequence: u64) void {
+        self.notifySequence(target_sequence);
     }
 
     pub fn waitForApplied(self: *EnrichmentRuntime, sequence: u64) !void {
+        try self.waitForAppliedWithCancellation(sequence, .none);
+    }
+
+    pub fn waitForAppliedWithCancellation(self: *EnrichmentRuntime, sequence: u64, cancellation: CancellationToken) !void {
+        try self.waitForAppliedWithVisibilityDeadline(sequence, cancellation, null);
+    }
+
+    pub fn syncWaitTimeoutMs(self: *const EnrichmentRuntime) u64 {
+        return @max(self.config.sync_wait_timeout_ms, 1);
+    }
+
+    pub fn waitForAppliedWithVisibilityDeadline(
+        self: *EnrichmentRuntime,
+        sequence: u64,
+        cancellation: CancellationToken,
+        deadline_ns: ?u64,
+    ) !void {
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
         const io = io_impl.io();
         self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
+        const wait_after_sequence = self.applied_sequence;
+        self.mutex.unlock(io);
+        const timeout_ns = std.math.mul(
+            u64,
+            @max(self.config.sync_wait_timeout_ms, 1),
+            std.time.ns_per_ms,
+        ) catch std.math.maxInt(u64);
+        const effective_deadline_ns = deadline_ns orelse platform_time.monotonicNs() +| timeout_ns;
+        const now_ns = platform_time.monotonicNs();
+        const remaining_ns = effective_deadline_ns -| now_ns;
+        const deadline = Io.Clock.Timestamp.fromNow(io, .{
+            .clock = .awake,
+            .raw = .fromNanoseconds(@intCast(@min(remaining_ns, @as(u64, std.math.maxInt(i64))))),
+        });
+        var cancellation_poll_ns = borrowed_cancellation_poll_min_ns;
 
-        while (self.applied_sequence < sequence and self.last_error_name == null and !self.retrying) {
-            self.cond.waitUncancelable(io, &self.mutex);
+        while (true) {
+            self.mutex.lockUncancelable(io);
+            if (self.applied_sequence >= sequence) {
+                const failure_envelope = terminalFailureEnvelopeSnapshot(self);
+                self.mutex.unlock(io);
+                // The durable lookup can touch storage, so never perform it
+                // while holding the runtime mutex. The envelope keeps this
+                // lookup entirely off the healthy visibility path.
+                if (terminalFailurePendingInRange(self, failure_envelope, wait_after_sequence, sequence))
+                    return RuntimeError.EnrichmentWorkerFailed;
+                return;
+            }
+            if (self.worker_failed or self.last_error_name != null) {
+                self.mutex.unlock(io);
+                return RuntimeError.EnrichmentWorkerFailed;
+            }
+            if (self.retrying) {
+                self.mutex.unlock(io);
+                return RuntimeError.EnrichmentRetryInProgress;
+            }
+            if (self.shutdown) {
+                self.mutex.unlock(io);
+                return RuntimeError.EnrichmentWaitCanceled;
+            }
+            if (cancellation.isCancelled()) {
+                self.mutex.unlock(io);
+                return RuntimeError.EnrichmentWaitCanceled;
+            }
+            if (platform_time.monotonicNs() >= effective_deadline_ns) {
+                const applied = self.applied_sequence;
+                const target = self.target_sequence;
+                const worker_started = self.future != null;
+                self.mutex.unlock(io);
+                std.log.warn("enrichment visibility wait timed out sequence={d} applied_sequence={d} target_sequence={d} worker_started={}", .{
+                    sequence,
+                    applied,
+                    target,
+                    worker_started,
+                });
+                return RuntimeError.EnrichmentWaitTimeout;
+            }
+
+            const observed_epoch = self.sync_wait_epoch.load(.acquire);
+            _ = self.sync_waiter_count.fetchAdd(1, .release);
+            self.mutex.unlock(io);
+
+            // Borrowed transport cancellation is a callback rather than an
+            // Io future cancellation. Poll only this post-commit barrier at a
+            // short interval; the ordinary no-token path keeps its single
+            // hard-deadline futex wait.
+            const wait_deadline = if (cancellation.ptr != null)
+                Io.Clock.Timestamp.fromNow(io, .{
+                    .clock = .awake,
+                    .raw = .fromNanoseconds(cancellation_poll_ns),
+                })
+            else
+                deadline;
+            const wait_result = Io.futexWaitTimeout(
+                io,
+                u32,
+                &self.sync_wait_epoch.raw,
+                observed_epoch,
+                .{ .deadline = wait_deadline },
+            );
+            const previous_waiters = self.sync_waiter_count.fetchSub(1, .release);
+            std.debug.assert(previous_waiters > 0);
+            wait_result catch |err| switch (err) {
+                error.Canceled => {
+                    // Resolve a terminal transition racing cancellation before
+                    // reporting an ambiguous post-commit wait outcome.
+                    // Timed futex expiry is a successful (possibly spurious)
+                    // wake and is distinguished by the deadline check above.
+                    self.mutex.lockUncancelable(io);
+                    const applied = self.applied_sequence;
+                    const failure_envelope = terminalFailureEnvelopeSnapshot(self);
+                    const failed = self.worker_failed or self.last_error_name != null;
+                    const retrying = self.retrying;
+                    self.mutex.unlock(io);
+                    if (applied >= sequence) {
+                        if (terminalFailurePendingInRange(self, failure_envelope, wait_after_sequence, sequence))
+                            return RuntimeError.EnrichmentWorkerFailed;
+                        return;
+                    }
+                    if (failed) return RuntimeError.EnrichmentWorkerFailed;
+                    if (retrying) return RuntimeError.EnrichmentRetryInProgress;
+                    return RuntimeError.EnrichmentWaitCanceled;
+                },
+            };
+            if (cancellation.ptr != null) {
+                // Preserve fast disconnect response for ordinary waits, then
+                // reduce wake amplification for a wedged provider from 40 Hz
+                // to 4 Hz per waiter. Runtime state transitions still wake the
+                // futex immediately, independent of this polling backoff.
+                cancellation_poll_ns = @min(
+                    cancellation_poll_ns * 2,
+                    borrowed_cancellation_poll_max_ns,
+                );
+            }
         }
-        if (self.last_error_name != null) return RuntimeError.EnrichmentWorkerFailed;
-        if (self.applied_sequence < sequence and self.retrying) return RuntimeError.EnrichmentRetryInProgress;
     }
 
     pub fn catchUpUntil(self: *EnrichmentRuntime, sequence: u64) !void {
+        try self.catchUpUntilGuarded(sequence, .{});
+    }
+
+    pub fn catchUpUntilWithCancellation(self: *EnrichmentRuntime, sequence: u64, cancellation: CancellationToken) !void {
+        try self.catchUpUntilWithVisibilityDeadline(sequence, cancellation, null);
+    }
+
+    pub fn catchUpUntilWithVisibilityDeadline(
+        self: *EnrichmentRuntime,
+        sequence: u64,
+        cancellation: CancellationToken,
+        deadline_ns: ?u64,
+    ) !void {
+        const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
+        const io = io_impl.io();
+        self.mutex.lockUncancelable(io);
+        const wait_after_sequence = self.applied_sequence;
+        self.mutex.unlock(io);
+        const guard = ForegroundCatchUpGuard.boundedBy(self.config, cancellation, deadline_ns);
+        self.catchUpUntilGuarded(sequence, guard) catch |err| {
+            self.mutex.lockUncancelable(io);
+            const failure_envelope = terminalFailureEnvelopeSnapshot(self);
+            self.mutex.unlock(io);
+            if ((err == RuntimeError.EnrichmentWaitCanceled or err == RuntimeError.EnrichmentWaitTimeout) and
+                terminalFailurePendingInRange(self, failure_envelope, wait_after_sequence, sequence))
+                return RuntimeError.EnrichmentWorkerFailed;
+            return err;
+        };
+        self.mutex.lockUncancelable(io);
+        const failure_envelope = terminalFailureEnvelopeSnapshot(self);
+        self.mutex.unlock(io);
+        if (terminalFailurePendingInRange(self, failure_envelope, wait_after_sequence, sequence))
+            return RuntimeError.EnrichmentWorkerFailed;
+    }
+
+    fn catchUpUntilGuarded(self: *EnrichmentRuntime, sequence: u64, guard: ForegroundCatchUpGuard) !void {
         if (sequence == 0) return;
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
         const io = io_impl.io();
@@ -2183,7 +2964,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             self.mutex.lockUncancelable(io);
             const applied = self.applied_sequence;
             const runtime_target = self.target_sequence;
-            const failed = self.last_error_name != null;
+            const failed = self.worker_failed or self.last_error_name != null;
             const retrying = self.retrying;
             const next_retry_at_ms = self.next_retry_at_ms;
             self.mutex.unlock(io);
@@ -2195,8 +2976,11 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .retry_in_progress => return RuntimeError.EnrichmentRetryInProgress,
                 .run_pass => {},
             }
-            runForegroundCatchUpPass(self, io, sequence) catch |err| {
+            try guard.check();
+            runForegroundCatchUpPassGuarded(self, io, sequence, guard) catch |err| {
                 return switch (err) {
+                    RuntimeError.EnrichmentWaitCanceled => RuntimeError.EnrichmentWaitCanceled,
+                    RuntimeError.EnrichmentWaitTimeout => RuntimeError.EnrichmentWaitTimeout,
                     RuntimeError.EnrichmentWorkerFailed => RuntimeError.EnrichmentWorkerFailed,
                     RuntimeError.EnrichmentRetryInProgress => RuntimeError.EnrichmentRetryInProgress,
                     else => switch (enrichmentErrorDisposition(err)) {
@@ -2225,11 +3009,13 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.consecutive_retry_count = 0;
         self.next_retry_at_ms = 0;
         self.retry_failure_fingerprint = 0;
+        self.retry_failure_count = 0;
         self.active_failure_fingerprint = 0;
+        self.retry_error_has_request_identity = false;
         clearPublishedGeneratedArtifacts(self);
         clearIsolatedFailedIndexes(self);
         status = runtimeStatusSnapshot(self);
-        self.cond.broadcast(io);
+        broadcastRuntimeStateChanged(self, io);
         self.mutex.unlock(io);
 
         if (changed) {
@@ -2323,9 +3109,10 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.retrying = false;
         self.next_retry_at_ms = 0;
         self.worker_failed = true;
+        self.retry_error_has_request_identity = false;
         if (self.last_error_name == null) self.last_error_name = @errorName(err);
         status = runtimeStatusSnapshot(self);
-        self.cond.broadcast(io);
+        broadcastRuntimeStateChanged(self, io);
         self.mutex.unlock(io);
         saveRuntimeStatusWithRetry(self, scope_name, status) catch |save_err| {
             std.log.warn("failed to persist enrichment worker failure status: {s}", .{@errorName(save_err)});
@@ -2339,15 +3126,17 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.mutex.lockUncancelable(io);
         self.error_count += 1;
         self.retryable_error_count += 1;
+        self.consecutive_retry_count +|= 1;
         if (self.retry_failure_fingerprint != self.active_failure_fingerprint) {
             self.retry_failure_fingerprint = self.active_failure_fingerprint;
-            self.consecutive_retry_count = 0;
+            self.retry_failure_count = 0;
         }
-        self.consecutive_retry_count +|= 1;
+        self.retry_failure_count +|= 1;
         self.next_retry_at_ms = self.config.clock.nowRealtimeMs() +| workerRetryDelayMs(self.consecutive_retry_count);
         self.retrying = true;
+        self.retry_error_has_request_identity = false;
         status = runtimeStatusSnapshot(self);
-        self.cond.broadcast(io);
+        broadcastRuntimeStateChanged(self, io);
         self.mutex.unlock(io);
         saveRuntimeStatusWithRetry(self, scope_name, status) catch |save_err| {
             std.log.warn("failed to persist enrichment retry status: {s}", .{@errorName(save_err)});
@@ -2369,6 +3158,16 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.notifyStatusHook();
     }
 };
+
+/// Called with runtime.mutex held whenever waiter-visible state changes. The
+/// condition variable retains replay-pass coordination semantics; the epoch
+/// gives synchronous visibility waiters a cancelable, deadline-aware futex.
+fn broadcastRuntimeStateChanged(runtime: *EnrichmentRuntime, io: Io) void {
+    runtime.cond.broadcast(io);
+    if (runtime.sync_waiter_count.load(.acquire) == 0) return;
+    _ = runtime.sync_wait_epoch.fetchAdd(1, .release);
+    Io.futexWake(io, u32, &runtime.sync_wait_epoch.raw, std.math.maxInt(u32));
+}
 
 fn enrichmentWorkerStalled(
     enabled: bool,
@@ -2394,9 +3193,199 @@ test "enrichment runtime status reports worker lifecycle diagnostics" {
     try std.testing.expect(!enrichmentWorkerStalled(false, 5, 1, false, false, false));
 }
 
+test "enrichment visibility wait wakes immediately on applied state" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = &io_impl,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .sync_wait_timeout_ms = 1_000 },
+        .ownership = undefined,
+    };
+    const Waiter = struct {
+        fn run(value: *EnrichmentRuntime) !void {
+            try value.waitForApplied(1);
+        }
+    };
+    var future = try io.concurrent(Waiter.run, .{&runtime});
+
+    while (runtime.sync_waiter_count.load(.acquire) == 0) {
+        try io.sleep(Io.Duration.fromMilliseconds(1), .awake);
+    }
+    runtime.mutex.lockUncancelable(io);
+    runtime.applied_sequence = 1;
+    broadcastRuntimeStateChanged(&runtime, io);
+    runtime.mutex.unlock(io);
+
+    try future.await(io);
+    try std.testing.expectEqual(@as(u32, 0), runtime.sync_waiter_count.load(.acquire));
+}
+
+test "enrichment visibility wait has a hard liveness timeout" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = &io_impl,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .sync_wait_timeout_ms = 10 },
+        .ownership = undefined,
+    };
+
+    try std.testing.expectError(error.EnrichmentWaitTimeout, runtime.waitForApplied(1));
+    try std.testing.expectEqual(@as(u32, 0), runtime.sync_waiter_count.load(.acquire));
+}
+
+test "enrichment visibility wait is cancelable" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = &io_impl,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .sync_wait_timeout_ms = 1_000 },
+        .ownership = undefined,
+    };
+    const Waiter = struct {
+        fn run(value: *EnrichmentRuntime) !void {
+            try value.waitForApplied(1);
+        }
+    };
+    var future = try io.concurrent(Waiter.run, .{&runtime});
+
+    while (runtime.sync_waiter_count.load(.acquire) == 0) {
+        try io.sleep(Io.Duration.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectError(error.EnrichmentWaitCanceled, future.cancel(io));
+    try std.testing.expectEqual(@as(u32, 0), runtime.sync_waiter_count.load(.acquire));
+}
+
+test "enrichment visibility wait observes borrowed request cancellation" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var signal = std.atomic.Value(bool).init(true);
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = &io_impl,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .sync_wait_timeout_ms = 1_000 },
+        .ownership = undefined,
+    };
+
+    try std.testing.expectError(
+        error.EnrichmentWaitCanceled,
+        runtime.waitForAppliedWithCancellation(1, CancellationToken.fromAtomic(&signal)),
+    );
+    try std.testing.expectEqual(@as(u32, 0), runtime.sync_waiter_count.load(.acquire));
+}
+
+test "foreground enrichment catch-up treats cancellation as a waiter outcome" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var signal = std.atomic.Value(bool).init(true);
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = &io_impl,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .sync_wait_timeout_ms = 1_000 },
+        .ownership = undefined,
+    };
+
+    try std.testing.expectError(
+        error.EnrichmentWaitCanceled,
+        runtime.catchUpUntilWithCancellation(1, CancellationToken.fromAtomic(&signal)),
+    );
+    try std.testing.expect(!runtime.worker_failed);
+    try std.testing.expect(!runtime.retrying);
+    try std.testing.expectEqual(@as(u32, 0), runtime.consecutive_retry_count);
+    try std.testing.expectEqual(@as(u64, 0), runtime.error_count);
+}
+
+test "foreground enrichment catch-up guard has a monotonic deadline" {
+    const guard = ForegroundCatchUpGuard{ .deadline_ns = platform_time.monotonicNs() };
+    try std.testing.expectError(error.EnrichmentWaitTimeout, guard.check());
+}
+
+test "foreground enrichment rejects providers without a bounded-operation contract" {
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+        .active_provider_guard = .{ .deadline_ns = std.math.maxInt(u64) },
+    };
+
+    try std.testing.expectError(error.UnboundedEnrichmentProvider, checkProviderInvocation(&runtime, false));
+    try checkProviderInvocation(&runtime, true);
+}
+
 fn handleWorkerLoopError(runtime: *EnrichmentRuntime, io: Io, err: anyerror) void {
     if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return;
-    if (enrichmentErrorDisposition(err) == .retryable_request) {
+    if (enrichmentErrorDisposition(err) == .retryable_request and
+        workerLoopRetryBudgetAllowsYield(runtime, err))
+    {
         runtime.recordRetryableError(io, err);
         return;
     }
@@ -2444,11 +3433,199 @@ fn freeAffectedIndexes(runtime: *EnrichmentRuntime, indexes: [][]u8) void {
     runtime.alloc.free(indexes);
 }
 
-fn runtimeRetryInProgress(runtime: *EnrichmentRuntime) bool {
+/// Clears the supervisor episode only after replay progress: a published
+/// generated batch or a request that has been terminally parked/covered.
+/// Merely changing error identity never calls this function.
+fn noteDurableRetryProgress(runtime: *EnrichmentRuntime, completed_failure_fingerprint: u64) !void {
     const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
     if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
-    defer if (maybe_io) |io| runtime.mutex.unlock(io);
-    return runtime.retrying;
+    const had_retry_debt = runtime.consecutive_retry_count != 0 or
+        runtime.retry_failure_fingerprint != 0 or runtime.retry_failure_count != 0;
+    runtime.consecutive_retry_count = 0;
+    // Generated output from an earlier request may be replayed after a crash
+    // before the request that actually owns retry debt is reached. That is
+    // useful pipeline progress, but it must not forgive the later request's
+    // durable attempt budget. Clear request identity debt only when that exact
+    // request completed. Pipeline debt has no request owner and any durable
+    // progress ends that no-progress episode.
+    const pipeline_fingerprint = pipelineFailureFingerprint(error.RuntimeBoundaryFailure);
+    if (runtime.retry_failure_fingerprint == completed_failure_fingerprint or
+        runtime.retry_failure_fingerprint == pipeline_fingerprint)
+    {
+        runtime.retry_failure_fingerprint = 0;
+        runtime.retry_failure_count = 0;
+    }
+    const status = runtimeStatusSnapshot(runtime);
+    if (maybe_io) |io| runtime.mutex.unlock(io);
+    // The healthy path never pays an extra status write. Persist exactly once
+    // when durable replay progress retires an existing retry episode so a
+    // crash cannot resurrect stale retry debt.
+    if (had_retry_debt) try saveRuntimeStatusWithRetry(runtime, scope_name, status);
+}
+
+fn terminalFailureEnvelopeSnapshot(runtime: *const EnrichmentRuntime) TerminalFailureInterval {
+    return .{
+        .min = runtime.terminal_failure_min_sequence,
+        .max = runtime.terminal_failure_max_sequence,
+    };
+}
+
+fn terminalFailureEnvelopeIntersects(envelope: TerminalFailureInterval, after_sequence: u64, through_sequence: u64) bool {
+    if (envelope.min == 0 or envelope.max == 0) return false;
+    // A delayed idempotent visibility check can begin after its original
+    // source sequence. It still needs an exact point lookup for that write;
+    // treating the inputs as a reversed empty interval would erase durable
+    // repair debt merely because unrelated replay progressed meanwhile.
+    if (after_sequence >= through_sequence) {
+        return envelope.min <= through_sequence and envelope.max >= through_sequence;
+    }
+    return envelope.min <= through_sequence and envelope.max > after_sequence;
+}
+
+fn terminalFailurePendingInRange(
+    runtime: *const EnrichmentRuntime,
+    envelope: TerminalFailureInterval,
+    after_sequence: u64,
+    through_sequence: u64,
+) bool {
+    if (!terminalFailureEnvelopeIntersects(envelope, after_sequence, through_sequence)) return false;
+    const pending_fn = runtime.failure_range_pending_fn orelse return true;
+    const failure_ctx = runtime.failure_ctx orelse return true;
+    return pending_fn(failure_ctx, after_sequence, through_sequence) catch |err| {
+        // Losing the exact lookup must never turn known durable repair debt
+        // into a successful visibility acknowledgement. This is a rare
+        // failure-path probe; fail closed and retain the operator-facing repair
+        // result until the ledger becomes readable again.
+        // Budget exhaustion is deliberate incremental GC, not an operational
+        // fault; avoid one warning per client retry while stale rollback debt
+        // converges. Unexpected storage/corruption errors remain visible.
+        if (err != error.EnrichmentRepairLookupBudgetExceeded) {
+            std.log.warn("failed to inspect terminal enrichment repair range after_sequence={d} through_sequence={d} err={s}", .{
+                after_sequence,
+                through_sequence,
+                @errorName(err),
+            });
+        }
+        return true;
+    };
+}
+
+const TerminalFailureInterval = struct {
+    min: u64,
+    max: u64,
+};
+
+fn mergedTerminalFailureInterval(
+    current_min: u64,
+    current_max: u64,
+    failed_sequence: u64,
+) TerminalFailureInterval {
+    if (current_max == 0) {
+        return .{ .min = failed_sequence, .max = failed_sequence };
+    }
+    return .{
+        .min = @min(current_min, failed_sequence),
+        .max = @max(current_max, failed_sequence),
+    };
+}
+
+test "enrichment terminal failure envelope remains conservative across sparse durable debt" {
+    const retained = mergedTerminalFailureInterval(10, 10, 20);
+    try std.testing.expectEqual(@as(u64, 10), retained.min);
+    try std.testing.expectEqual(@as(u64, 20), retained.max);
+}
+
+test "enrichment terminal failure envelope uses exact durable lookup for sparse gaps" {
+    const FailureState = struct {
+        sequences: []const u64,
+        checks: usize = 0,
+
+        fn check(ptr: *anyopaque, after_sequence: u64, through_sequence: u64) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.checks += 1;
+            for (self.sequences) |sequence| {
+                if (sequence <= through_sequence and
+                    (sequence > after_sequence or sequence == through_sequence)) return true;
+            }
+            return false;
+        }
+    };
+    var failure_state = FailureState{ .sequences = &.{ 10, 20 } };
+    const runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = &failure_state,
+        .failure_range_pending_fn = FailureState.check,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+        .terminal_failure_min_sequence = 10,
+        .terminal_failure_max_sequence = 20,
+    };
+    const envelope = terminalFailureEnvelopeSnapshot(&runtime);
+
+    try std.testing.expect(terminalFailurePendingInRange(&runtime, envelope, 9, 10));
+    try std.testing.expect(!terminalFailurePendingInRange(&runtime, envelope, 10, 15));
+    try std.testing.expect(terminalFailurePendingInRange(&runtime, envelope, 15, 20));
+    try std.testing.expect(!terminalFailurePendingInRange(&runtime, envelope, 21, 30));
+    // Stable recovery can revisit an older write after replay advanced. The
+    // original sequence remains an inclusive point check.
+    try std.testing.expect(terminalFailurePendingInRange(&runtime, envelope, 20, 10));
+    try std.testing.expect(!terminalFailurePendingInRange(&runtime, envelope, 20, 15));
+    // A range outside the cheap envelope never touches durable storage.
+    try std.testing.expectEqual(@as(usize, 5), failure_state.checks);
+}
+
+fn noteTerminalRequestFailure(
+    runtime: *EnrichmentRuntime,
+    sequence: u64,
+    indexes: []const []const u8,
+    completed_failure_fingerprint: u64,
+) !void {
+    const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
+    if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
+    const interval = mergedTerminalFailureInterval(
+        runtime.terminal_failure_min_sequence,
+        runtime.terminal_failure_max_sequence,
+        sequence,
+    );
+    runtime.terminal_failure_min_sequence = interval.min;
+    runtime.terminal_failure_max_sequence = interval.max;
+    runtime.consecutive_retry_count = 0;
+    // Terminally parking this request is durable progress, but it cannot
+    // forgive retry attempts owned by a different request that will be reached
+    // later in crash replay. Pipeline debt is global and any durable progress
+    // closes that no-progress episode.
+    const pipeline_fingerprint = pipelineFailureFingerprint(error.RuntimeBoundaryFailure);
+    if (runtime.retry_failure_fingerprint == completed_failure_fingerprint or
+        runtime.retry_failure_fingerprint == pipeline_fingerprint)
+    {
+        runtime.retry_failure_fingerprint = 0;
+        runtime.retry_failure_count = 0;
+    }
+    runtime.error_count += 1;
+    runtime.fatal_error_count += 1;
+    runtime.retrying = false;
+    runtime.next_retry_at_ms = 0;
+    runtime.worker_failed = false;
+    for (indexes) |index_name| if (index_name.len > 0) markIsolatedFailedIndex(runtime, index_name);
+    const status = runtimeStatusSnapshot(runtime);
+    if (maybe_io) |io| {
+        broadcastRuntimeStateChanged(runtime, io);
+        runtime.mutex.unlock(io);
+    }
+    // The repair ledger entry was published before this call. Persist the
+    // source-sequence interval now so a stable transaction replay after a
+    // process restart retains the committed-repair result.
+    try saveRuntimeStatusWithRetry(runtime, scope_name, status);
 }
 
 fn failureIdentityForRequest(request: enrichment_types.GeneratedEnrichmentRequest) FailureIdentity {
@@ -2478,7 +3655,12 @@ fn skipPersistedRequestFailure(
 ) !bool {
     const pending_fn = runtime.failure_pending_fn orelse return false;
     const failure_ctx = runtime.failure_ctx orelse return false;
-    if (!runtimeRetryInProgress(runtime)) return false;
+    // A terminal marker can be durable before the applied checkpoint advances.
+    // On crash replay `retrying` is deliberately false, so use the persisted
+    // sequence envelope as the zero-I/O healthy-path gate and consult the exact
+    // ledger only for requests that could belong to durable repair debt.
+    const envelope = terminalFailureEnvelopeSnapshot(runtime);
+    if (!terminalFailureEnvelopeIntersects(envelope, request.sequence, request.sequence)) return false;
 
     const indexes = try affectedIndexesForRequestAlloc(runtime, request);
     defer freeAffectedIndexes(runtime, indexes);
@@ -2534,24 +3716,7 @@ fn recordIsolatedRequestError(runtime: *EnrichmentRuntime, window: ?*GeneratedRe
             try markDerivedCoverageTerminalFailedForIndex(runtime, index_name, request);
         }
     }
-    if (runtime.io_impl) |io_impl| {
-        const io = io_impl.io();
-        runtime.mutex.lockUncancelable(io);
-        runtime.error_count += 1;
-        runtime.fatal_error_count += 1;
-        runtime.retrying = false;
-        runtime.next_retry_at_ms = 0;
-        runtime.worker_failed = false;
-        for (indexes) |index_name| if (index_name.len > 0) markIsolatedFailedIndex(runtime, index_name);
-        runtime.mutex.unlock(io);
-    } else {
-        runtime.error_count += 1;
-        runtime.fatal_error_count += 1;
-        runtime.retrying = false;
-        runtime.next_retry_at_ms = 0;
-        runtime.worker_failed = false;
-        for (indexes) |index_name| if (index_name.len > 0) markIsolatedFailedIndex(runtime, index_name);
-    }
+    try noteTerminalRequestFailure(runtime, request.sequence, indexes, requestFailureFingerprint(request));
     runtime.notifyStatusHook();
 }
 
@@ -2608,15 +3773,29 @@ test "isolated enrichment request does not advance when durable parking fails" {
 }
 
 test "isolated enrichment request error does not mark worker failed" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/isolated-indexes", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+
     var failure_capture = TestFailureCapture{};
     var runtime = EnrichmentRuntime{
-        .alloc = std.testing.allocator,
+        .alloc = alloc,
         .io_impl = null,
-        .store = undefined,
+        .store = erased_store,
         .owns_store = false,
         .change_journal = undefined,
         .replay_source = undefined,
-        .index_manager = undefined,
+        .index_manager = &index_manager,
         .write_ctx = undefined,
         .write_fn = undefined,
         .failure_ctx = &failure_capture,
@@ -2626,10 +3805,12 @@ test "isolated enrichment request error does not mark worker failed" {
         .config = .{},
         .ownership = undefined,
     };
+    defer clearIsolatedFailedIndexes(&runtime);
     runtime.retrying = true;
     runtime.worker_failed = true;
     runtime.consecutive_retry_count = 6;
     runtime.retry_failure_fingerprint = 41;
+    runtime.retry_failure_count = 6;
     runtime.active_failure_fingerprint = 41;
     runtime.target_sequence = 17;
 
@@ -2648,6 +3829,14 @@ test "isolated enrichment request error does not mark worker failed" {
     try std.testing.expect(!runtime.worker_failed);
     try std.testing.expect(runtime.indexHasIsolatedFailure("bad_visual"));
     try std.testing.expect(!runtime.indexHasIsolatedFailure("healthy_text"));
+    const persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
+    try std.testing.expectEqual(@as(u64, 1), persisted.error_count);
+    try std.testing.expectEqual(@as(u64, 1), persisted.fatal_error_count);
+    try std.testing.expect(!persisted.retrying);
+    try std.testing.expect(!persisted.worker_failed);
+    try std.testing.expectEqual(@as(u32, 0), persisted.consecutive_retry_count);
+    try std.testing.expectEqual(@as(u64, 11), persisted.terminal_failure_min_sequence);
+    try std.testing.expectEqual(@as(u64, 11), persisted.terminal_failure_max_sequence);
     const failure = failure_capture.failure.?;
     try std.testing.expectEqualStrings("bad_visual", failure.index_name);
     try std.testing.expectEqualStrings("clipclap", failure.artifact_name);
@@ -2655,7 +3844,6 @@ test "isolated enrichment request error does not mark worker failed" {
     try std.testing.expectEqualStrings("UnsupportedEmbeddingProvider", failure.error_name);
     try std.testing.expectEqual(@as(u64, 7), failure.attempts);
     try std.testing.expectEqual(@as(u64, 11), failure.sequence);
-    clearIsolatedFailedIndexes(&runtime);
 }
 
 test "chunked dense terminal failure is recorded once per parent request" {
@@ -2805,7 +3993,7 @@ fn workerMain(runtime: *EnrichmentRuntime) void {
 
     worker_loop: while (true) {
         runtime.mutex.lockUncancelable(io);
-        while (!runtime.shutdown and (runtime.last_error_name != null or (runtime.target_sequence <= runtime.applied_sequence and !runtime.retrying))) {
+        while (!runtime.shutdown and (runtime.worker_failed or runtime.last_error_name != null or (runtime.target_sequence <= runtime.applied_sequence and !runtime.retrying))) {
             runtime.cond.waitUncancelable(io, &runtime.mutex);
         }
         if (runtime.shutdown) {
@@ -2824,16 +4012,32 @@ fn workerMain(runtime: *EnrichmentRuntime) void {
     }
 }
 
-fn beginReplayPass(runtime: *EnrichmentRuntime, io: Io, target_sequence: u64) !bool {
+fn beginReplayPass(
+    runtime: *EnrichmentRuntime,
+    io: Io,
+    target_sequence: u64,
+    guard: ForegroundCatchUpGuard,
+) !bool {
     runtime.mutex.lockUncancelable(io);
     while (runtime.replay_pass_active and !runtime.shutdown) {
-        runtime.cond.waitUncancelable(io, &runtime.mutex);
+        if (guard.deadline_ns == null and guard.cancellation.ptr == null) {
+            runtime.cond.waitUncancelable(io, &runtime.mutex);
+            continue;
+        }
+        // A foreground waiter must not inherit an unbounded provider call from
+        // the pass that currently owns replay. Poll only this rare contention
+        // path; normal worker coordination keeps the zero-wakeup condition wait.
+        runtime.mutex.unlock(io);
+        try guard.check();
+        io.sleep(Io.Duration.fromMilliseconds(25), .awake) catch {};
+        try guard.check();
+        runtime.mutex.lockUncancelable(io);
     }
     if (runtime.shutdown) {
         runtime.mutex.unlock(io);
         return error.EnrichmentRetryAborted;
     }
-    if (runtime.last_error_name != null) {
+    if (runtime.worker_failed or runtime.last_error_name != null) {
         runtime.mutex.unlock(io);
         return RuntimeError.EnrichmentWorkerFailed;
     }
@@ -2859,7 +4063,7 @@ fn endReplayPass(runtime: *EnrichmentRuntime, io: Io) void {
     runtime.mutex.lockUncancelable(io);
     std.debug.assert(runtime.replay_pass_active);
     runtime.replay_pass_active = false;
-    runtime.cond.broadcast(io);
+    broadcastRuntimeStateChanged(runtime, io);
     runtime.mutex.unlock(io);
 }
 
@@ -2894,7 +4098,7 @@ test "enrichment replay passes are single flight" {
 
         fn run(waiter: *@This()) void {
             waiter.entered.set(waiter.io);
-            const owns_pass = beginReplayPass(waiter.runtime, waiter.io, 1) catch |err| {
+            const owns_pass = beginReplayPass(waiter.runtime, waiter.io, 1, .{}) catch |err| {
                 waiter.err = err;
                 waiter.acquired.set(waiter.io);
                 return;
@@ -2918,24 +4122,48 @@ test "enrichment replay passes are single flight" {
     endReplayPass(&runtime, io);
 
     runtime.applied_sequence = 1;
-    try std.testing.expect(!try beginReplayPass(&runtime, io, 1));
+    try std.testing.expect(!try beginReplayPass(&runtime, io, 1, .{}));
     runtime.retrying = true;
     runtime.next_retry_at_ms = 0;
-    try std.testing.expect(try beginReplayPass(&runtime, io, 1));
+    try std.testing.expect(try beginReplayPass(&runtime, io, 1, .{}));
     endReplayPass(&runtime, io);
 }
 
 fn runForegroundCatchUpPass(runtime: *EnrichmentRuntime, io: Io, target_sequence: u64) !void {
-    if (!try beginReplayPass(runtime, io, target_sequence)) return;
-    defer endReplayPass(runtime, io);
+    try runForegroundCatchUpPassGuarded(runtime, io, target_sequence, .{});
+}
 
-    runForegroundCatchUpPassOwned(runtime, io, target_sequence) catch |err| {
+fn runForegroundCatchUpPassGuarded(
+    runtime: *EnrichmentRuntime,
+    io: Io,
+    target_sequence: u64,
+    guard: ForegroundCatchUpGuard,
+) !void {
+    try guard.check();
+    if (!try beginReplayPass(runtime, io, target_sequence, guard)) return;
+    defer endReplayPass(runtime, io);
+    const previous_provider_guard = runtime.active_provider_guard;
+    runtime.active_provider_guard = guard;
+    defer runtime.active_provider_guard = previous_provider_guard;
+
+    runForegroundCatchUpPassOwned(runtime, io, target_sequence, guard) catch |err| {
+        // Request cancellation and the visibility deadline are waiter
+        // outcomes, not provider or pipeline failures. Never persist them into
+        // the durable worker retry budget.
+        if (err == RuntimeError.EnrichmentWaitCanceled or
+            err == RuntimeError.EnrichmentWaitTimeout) return err;
         handleWorkerLoopError(runtime, io, err);
         return err;
     };
 }
 
-fn runForegroundCatchUpPassOwned(runtime: *EnrichmentRuntime, io: Io, target_sequence: u64) !void {
+fn runForegroundCatchUpPassOwned(
+    runtime: *EnrichmentRuntime,
+    io: Io,
+    target_sequence: u64,
+    guard: ForegroundCatchUpGuard,
+) !void {
+    try guard.check();
     setActiveFailureFingerprint(runtime, 0);
     const now_ms = runtime.config.clock.nowRealtimeMs();
     runtime.mutex.lockUncancelable(io);
@@ -2954,11 +4182,13 @@ fn runForegroundCatchUpPassOwned(runtime: *EnrichmentRuntime, io: Io, target_seq
             Io.Duration.fromMilliseconds(@intCast(lease_denied_retry_sleep_ns / std.time.ns_per_ms)),
             .awake,
         ) catch {};
+        try guard.check();
         return;
     }
 
     const pending = try enrichment_worker.collectPendingDocumentGroups(runtime.alloc, runtime.replay_source, runtime.applied_sequence);
     defer enrichment_worker.freePendingDocumentGroups(runtime.alloc, pending);
+    try guard.check();
 
     var processed_request_count: u64 = 0;
     var max_seen = runtime.applied_sequence;
@@ -2986,8 +4216,9 @@ fn runForegroundCatchUpPassOwned(runtime: *EnrichmentRuntime, io: Io, target_seq
         max_seen = runtime.applied_sequence;
 
         for (pending) |group| {
+            try guard.check();
             max_seen = @max(max_seen, group.sequence);
-            processPendingDocumentGroup(runtime, group, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, &processed_request_count) catch |err| {
+            processPendingDocumentGroup(runtime, group, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, &processed_request_count, guard) catch |err| {
                 if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
                 // The embedder already performed its bounded inline retry
                 // budget. Yield durable pending work to the supervised
@@ -3000,18 +4231,22 @@ fn runForegroundCatchUpPassOwned(runtime: *EnrichmentRuntime, io: Io, target_seq
                 return err;
             };
         }
+        try guard.check();
         flushAssetProducerBatch(runtime, &deferred_assets, &window) catch |err| {
             if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
             return err;
         };
+        try guard.check();
         processPlainDenseWindow(runtime, deferred_plain_dense.items, &window) catch |err| {
             if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
             return err;
         };
+        try guard.check();
         processChunkedDenseWindow(runtime, deferred_chunked_dense.items, &chunk_cache, &window) catch |err| {
             if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
             return err;
         };
+        try guard.check();
         flushGeneratedReplayWindow(runtime, &window) catch |err| {
             if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
             return err;
@@ -3034,10 +4269,12 @@ fn runForegroundCatchUpPassOwned(runtime: *EnrichmentRuntime, io: Io, target_seq
         runtime.consecutive_retry_count = 0;
         runtime.next_retry_at_ms = 0;
         runtime.retry_failure_fingerprint = 0;
+        runtime.retry_failure_count = 0;
         runtime.active_failure_fingerprint = 0;
+        runtime.retry_error_has_request_identity = false;
         clearPublishedGeneratedArtifacts(runtime);
         status = runtimeStatusSnapshot(runtime);
-        runtime.cond.broadcast(io);
+        broadcastRuntimeStateChanged(runtime, io);
         runtime.mutex.unlock(io);
         try saveRuntimeStatusWithRetry(runtime, scope_name, status);
         runtime.notifyStatusHook();
@@ -3049,9 +4286,11 @@ fn runForegroundCatchUpPassOwned(runtime: *EnrichmentRuntime, io: Io, target_seq
         runtime.consecutive_retry_count = 0;
         runtime.next_retry_at_ms = 0;
         runtime.retry_failure_fingerprint = 0;
+        runtime.retry_failure_count = 0;
         runtime.active_failure_fingerprint = 0;
+        runtime.retry_error_has_request_identity = false;
         status = runtimeStatusSnapshot(runtime);
-        runtime.cond.broadcast(io);
+        broadcastRuntimeStateChanged(runtime, io);
         runtime.mutex.unlock(io);
         try saveRuntimeStatusWithRetry(runtime, scope_name, status);
         runtime.notifyStatusHook();
@@ -3068,13 +4307,17 @@ fn processPendingDocumentGroup(
     deferred_assets: *std.ArrayListUnmanaged(AssetProducerBatchItem),
     window: *GeneratedReplayWindow,
     processed_request_count: *u64,
+    guard: ForegroundCatchUpGuard,
 ) !void {
+    try guard.check();
     const planned = try getOrCreatePlannedRequests(runtime, pending.doc_key, request_plan_cache);
     for (planned) |planned_request| {
+        try guard.check();
         var request = planned_request;
         request.sequence = pending.sequence;
         // Publish completed generated writes before the next external embedder call can enter retry backoff.
         if (window.hasDerivedItems()) try flushGeneratedReplayWindow(runtime, window);
+        try guard.check();
         processed_request_count.* += 1;
         if (try skipPersistedRequestFailure(runtime, window, request)) continue;
         if (requestCanBatchPlainDense(request)) {
@@ -3277,14 +4520,14 @@ fn flushAssetProducerBatch(
     defer runtime.alloc.free(requests);
     for (items.items, 0..) |*item, idx| requests[idx] = item.asRequest();
 
-    const can_batch = producer.canProduceBatch(runtime.alloc, requests) catch |err| {
+    const can_batch = assetProducerCanBatchGuarded(runtime, producer, runtime.alloc, requests) catch |err| {
         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
         return try flushAssetProducerBatchSequential(runtime, producer, items.items, window);
     };
     if (!can_batch)
         return try flushAssetProducerBatchSequential(runtime, producer, items.items, window);
 
-    var produced = producer.produceBatch(runtime.alloc, requests) catch |err| {
+    var produced = assetProducerProduceBatchGuarded(runtime, producer, runtime.alloc, requests) catch |err| {
         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
         // Batch execution is an optimization boundary, not a logical repair
         // identity. Fall back immediately so durable retry ownership belongs to
@@ -3330,7 +4573,7 @@ fn flushAssetProducerBatchSequential(
     for (items) |item| {
         setActiveFailureFingerprint(runtime, requestFailureFingerprint(item.request));
         const request = item.asRequest();
-        const produced = producer.produce(runtime.alloc, request) catch |err| {
+        const produced = assetProducerProduceGuarded(runtime, producer, runtime.alloc, request) catch |err| {
             if (err == error.OutOfMemory) return err;
             if (shouldYieldRequestError(runtime, err)) return err;
             try recordIsolatedRequestError(runtime, window, item.request, err);
@@ -4400,13 +5643,13 @@ fn flushRuntimeGeneratedTextBatch(
     if (requests.len == 0) return;
     if (requests.len != unit_indices.len) return error.InvalidAssetProducerResponse;
 
-    if (!(try producer.canProduceBatch(alloc, requests))) {
+    if (!(try assetProducerCanBatchGuarded(runtime, producer, alloc, requests))) {
         return try flushRuntimeGeneratedTextBatchSequential(runtime, alloc, working_alloc, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint, "native_batch_unsupported");
     }
 
     const started_ns = runtime.config.clock.nowRealtimeNs();
     const request_bytes = runtimeGeneratedTextBatchBytes(requests);
-    var produced = producer.produceBatch(alloc, requests) catch |err| {
+    var produced = assetProducerProduceBatchGuarded(runtime, producer, alloc, requests) catch |err| {
         logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, unit_indices, requests.len, request_bytes, "serial_fallback", @errorName(err), started_ns);
         if (isUnavailableOcrModelError(kind, err)) {
             for (unit_indices) |unit_idx| {
@@ -4466,7 +5709,7 @@ fn flushRuntimeGeneratedTextBatchSequential(
     if (requests.len != unit_indices.len) return error.InvalidAssetProducerResponse;
     for (requests, unit_indices) |request, unit_idx| {
         const started_ns = runtime.config.clock.nowRealtimeNs();
-        const produced = producer.produce(alloc, request) catch |err| {
+        const produced = assetProducerProduceGuarded(runtime, producer, alloc, request) catch |err| {
             logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, &.{unit_idx}, 1, runtimeGeneratedTextRequestBytes(request), "serial", @errorName(err), started_ns);
             if (isUnavailableOcrModelError(kind, err)) {
                 try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, "inference");
@@ -4595,7 +5838,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextUnit(
     else
         try runtimeDocumentGeneratedTextPartsJsonAlloc(runtime.alloc, route_type, source_content_type, unit.*);
     defer runtime.alloc.free(parts_json);
-    const produced = try producer.produce(runtime.alloc, .{
+    const produced = try assetProducerProduceGuarded(runtime, producer, runtime.alloc, .{
         .producer_type = producer_type,
         .config_json = config_json,
         .source_text = if (rendered != null) "" else source_url,
@@ -7557,6 +8800,7 @@ fn flushGeneratedReplayWindow(
     if (!window.hasDerivedItems()) {
         try applyCoverageOutcomeTransitions(runtime, window.coverage_transitions.items);
         clearQueuedCoverageTransitions(runtime.alloc, &window.coverage_transitions, &window.coverage_transition_keys);
+        try noteDurableRetryProgress(runtime, previous_failure_fingerprint);
         succeeded = true;
         return;
     }
@@ -7571,6 +8815,7 @@ fn flushGeneratedReplayWindow(
     clearQueuedCoverageTransitions(runtime.alloc, &window.coverage_transitions, &window.coverage_transition_keys);
     try rememberPublishedGeneratedBatch(runtime, batch);
     runtime.notify_fn(runtime.notify_ctx, sequence);
+    try noteDurableRetryProgress(runtime, previous_failure_fingerprint);
     succeeded = true;
 }
 
@@ -11299,6 +12544,79 @@ test "enrichment applied checkpoint stays degraded until runtime status clears" 
     try std.testing.expectEqual(enrichment_state.ProjectionStatus.clean, clean_checkpoint.status);
 }
 
+test "durable enrichment retry progress preserves unrelated request debt across restart" {
+    const alloc = std.testing.allocator;
+
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/indexes", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+        .consecutive_retry_count = 6,
+        .retry_failure_fingerprint = 91,
+        .retry_failure_count = 4,
+    };
+
+    try enrichment_state.saveRuntimeStatus(runtime.store, scope_name, runtimeStatusSnapshot(&runtime));
+    // Replaying already-durable output owned by another request may clear the
+    // global no-progress episode, but the failed request must retain its
+    // attempt budget across process restart.
+    try noteDurableRetryProgress(&runtime, 92);
+
+    var persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
+    try std.testing.expectEqual(@as(u32, 0), persisted.consecutive_retry_count);
+    try std.testing.expectEqual(@as(u64, 91), persisted.retry_failure_fingerprint);
+    try std.testing.expectEqual(@as(u32, 4), persisted.retry_failure_count);
+
+    // Completing the owner itself retires the identity budget.
+    try noteDurableRetryProgress(&runtime, 91);
+    persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
+    try std.testing.expectEqual(@as(u64, 0), persisted.retry_failure_fingerprint);
+    try std.testing.expectEqual(@as(u32, 0), persisted.retry_failure_count);
+
+    // Terminally parking a different request is also durable progress, but it
+    // must not reset this request's identity-scoped attempt budget. Otherwise
+    // alternating permanent failures can each receive an unbounded number of
+    // retries across restarts.
+    runtime.consecutive_retry_count = 6;
+    runtime.retry_failure_fingerprint = 91;
+    runtime.retry_failure_count = 4;
+    try noteTerminalRequestFailure(&runtime, 7, &.{}, 92);
+    persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
+    try std.testing.expectEqual(@as(u32, 0), persisted.consecutive_retry_count);
+    try std.testing.expectEqual(@as(u64, 91), persisted.retry_failure_fingerprint);
+    try std.testing.expectEqual(@as(u32, 4), persisted.retry_failure_count);
+
+    // Parking the request which owns the budget retires that debt.
+    try noteTerminalRequestFailure(&runtime, 8, &.{}, 91);
+    persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
+    try std.testing.expectEqual(@as(u64, 0), persisted.retry_failure_fingerprint);
+    try std.testing.expectEqual(@as(u32, 0), persisted.retry_failure_count);
+}
+
 fn appendGeneratedBatchWithRetry(
     runtime: *EnrichmentRuntime,
     batch: derived_types.DerivedBatch,
@@ -12097,6 +13415,7 @@ test "asset batch fallback keeps the logical request retry budget" {
     try std.testing.expectError(error.EmbedRateLimited, flushAssetProducerBatch(&runtime, &first, &window));
     runtime.retry_failure_fingerprint = runtime.active_failure_fingerprint;
     runtime.consecutive_retry_count = 1;
+    runtime.retry_failure_count = 1;
     runtime.retrying = true;
 
     var second = std.ArrayListUnmanaged(AssetProducerBatchItem).empty;

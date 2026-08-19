@@ -553,7 +553,7 @@ pub const BatchRequest = struct {
 };
 
 pub const BatchResponse = struct {
-    /// Durable commit and visibility/participant recovery state.
+    /// Durable commit outcome. `committed_pending` means requested visibility or participant propagation is still completing. `committed_repair_required` means the primary write committed, but a terminal enrichment failure needs operator repair and will not be retried indefinitely.
     status: ?[]const u8 = null,
     /// Number of documents successfully inserted
     inserted: ?i64 = null,
@@ -1955,7 +1955,7 @@ pub const MultiBatchRequest = struct {
 
 /// Response for a cross-table batch operation. Contains per-table results.
 pub const MultiBatchResponse = struct {
-    /// Durable commit and visibility/propagation state.
+    /// Durable commit outcome. Pending states mean requested visibility or participant propagation is still completing. `committed_repair_required` means the primary writes committed, but a terminal enrichment failure needs operator repair and will not be retried indefinitely.
     status: ?[]const u8 = null,
     /// Per-table batch results
     tables: ?std.json.ArrayHashMap(BatchResponse) = null,
@@ -3310,7 +3310,7 @@ pub const TransactionCommitRequest = struct {
 
 /// Result of an OCC transaction commit attempt.
 pub const TransactionCommitResponse = struct {
-    /// Durable transaction outcome. Pending committed states mean the commit decision is durable while its requested visibility barrier or participant recovery is still completing.
+    /// Durable transaction outcome. Pending committed states mean the commit decision is durable while its requested visibility barrier or participant recovery is still completing. `committed_repair_required` means the commit decision is durable and coordination may be released, but a terminal enrichment failure requires operator repair.
     status: []const u8,
     /// Details about the conflict that caused an abort (only present when status is "aborted")
     conflict: ?TransactionConflict = null,
@@ -3371,7 +3371,7 @@ pub const TransactionSessionCleanupResponse = struct {
 };
 
 pub const TransactionSessionCommitResponse = struct {
-    /// Durable transaction outcome. Pending committed states mean the commit decision is durable while its requested visibility barrier or participant recovery is still completing.
+    /// Durable transaction outcome. Pending committed states mean the commit decision is durable while its requested visibility barrier or participant recovery is still completing. `committed_repair_required` means the commit decision is durable and coordination may be released, but a terminal enrichment failure requires operator repair.
     status: []const u8,
     /// Details about the conflict that caused an abort (only present when status is "aborted")
     conflict: ?TransactionConflict = null,

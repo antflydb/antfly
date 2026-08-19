@@ -174,6 +174,7 @@ test {
     // select disjoint test-name prefixes. Keep it unconditional in test mode:
     // an unimported test file must fail the pre-build audit, never disappear.
     _ = @import("storage/test_manifest.zig");
+    _ = @import("runtime_private_error_diagnostics.zig");
 
     if (comptime build_options.standalone_runtime_focused_test) {
         _ = standalone;

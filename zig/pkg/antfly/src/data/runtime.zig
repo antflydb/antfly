@@ -335,6 +335,9 @@ const DataRaftBatchRoute = struct {
     campaign_allowed: bool = true,
     forwards_remaining: u8 = data_raft_batch_initial_forwards,
     cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation = null,
+    /// Borrowed only by the local visibility phase after Raft apply confirms
+    /// the durable outcome. It is never forwarded or serialized.
+    visibility_cancellation: antfly.db.types.CancellationToken = .none,
 };
 
 const DataRaftBatchForwardState = struct {
@@ -6777,7 +6780,9 @@ pub const DataServer = struct {
             .ptr = self,
             .vtable = &.{
                 .batch_group = localRaftBatchGroup,
+                .batch_group_with_cancellation = localRaftBatchGroupWithCancellation,
                 .batch_group_local = localRaftBatchGroupLocal,
+                .batch_group_local_with_cancellation = localRaftBatchGroupLocalWithCancellation,
             },
         };
     }
@@ -6867,6 +6872,21 @@ pub const DataServer = struct {
         try self.proposeRaftBatchGroup(alloc, group_id, table_name, req, .{ .refresh_metadata = true });
     }
 
+    fn localRaftBatchGroupWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: antfly.db.types.BatchRequest,
+        cancellation: antfly.db.types.CancellationToken,
+    ) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try self.proposeRaftBatchGroup(alloc, group_id, table_name, req, .{
+            .refresh_metadata = true,
+            .visibility_cancellation = cancellation,
+        });
+    }
+
     fn localRaftBatchGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -6876,6 +6896,21 @@ pub const DataServer = struct {
     ) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         try self.proposeRaftBatchGroup(alloc, group_id, table_name, req, .{ .refresh_metadata = false });
+    }
+
+    fn localRaftBatchGroupLocalWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: antfly.db.types.BatchRequest,
+        cancellation: antfly.db.types.CancellationToken,
+    ) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try self.proposeRaftBatchGroup(alloc, group_id, table_name, req, .{
+            .refresh_metadata = false,
+            .visibility_cancellation = cancellation,
+        });
     }
 
     fn localRaftBatchGroupForwarded(
@@ -6901,6 +6936,7 @@ pub const DataServer = struct {
                 .campaign_allowed = forwarding.campaign_allowed,
                 .forwards_remaining = forwarding.forwards_remaining,
                 .cancellation = if (cancellation_token.ptr != null) &cancellation else null,
+                .visibility_cancellation = cancellation_token,
             },
             leader_wait_ns,
         );
@@ -7085,7 +7121,19 @@ pub const DataServer = struct {
                     }
                 }
                 const sync_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
-                sync_source.syncReplicatedBatchGroupLocal(alloc, group_id, table_name, req.sync_level) catch |err| {
+                sync_source.syncReplicatedBatchGroupLocalWithCancellation(alloc, group_id, table_name, req.sync_level, route.visibility_cancellation) catch |err| {
+                    // Apply outcome is already confirmed above. Preserve
+                    // visibility-only outcomes so ingress can return an
+                    // explicit committed response instead of the ambiguous
+                    // Raft outcome contract used before apply confirmation.
+                    switch (err) {
+                        error.EnrichmentWaitCanceled,
+                        error.EnrichmentWaitTimeout,
+                        error.EnrichmentRetryInProgress,
+                        error.EnrichmentWorkerFailed,
+                        => return err,
+                        else => {},
+                    }
                     std.log.warn("data raft batch outcome unknown after proposal group_id={} index={} phase=sync_visibility err={s}", .{
                         group_id,
                         index,
@@ -27901,6 +27949,11 @@ test "data raft forwarding distinguishes safe retries from ambiguous outcomes" {
     try std.testing.expectEqual(.outcome_unknown, DataServer.classifyDataRaftForwardError(error.Timeout));
     try std.testing.expectEqual(.outcome_unknown, DataServer.classifyDataRaftForwardError(error.ConnectionResetByPeer));
     try std.testing.expectEqual(.outcome_unknown, DataServer.classifyDataRaftForwardError(error.RaftBatchWriteOutcomeUnknown));
+    // A peer's typed 202 proves the mutation committed. Preserve the pending
+    // visibility/repair result instead of reclassifying it as ambiguous and
+    // risking a transform replay.
+    try std.testing.expectEqual(.terminal, DataServer.classifyDataRaftForwardError(error.EnrichmentRetryInProgress));
+    try std.testing.expectEqual(.terminal, DataServer.classifyDataRaftForwardError(error.EnrichmentWorkerFailed));
     // The HTTP client converts an OOM observed after transmission begins into
     // RaftBatchWriteOutcomeUnknown. A raw OOM can only reach this classifier
     // when request setup was proven not to have sent bytes.

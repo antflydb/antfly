@@ -10975,7 +10975,15 @@ components:
           enum:
             - committed
             - committed_pending
-          description: Durable commit and visibility/participant recovery state.
+            - committed_repair_required
+          description: >
+            Durable commit outcome. `committed_pending` means requested visibility or
+
+            participant propagation is still completing. `committed_repair_required`
+
+            means the primary write committed, but a terminal enrichment failure needs
+
+            operator repair and will not be retried indefinitely.
         inserted:
           type: integer
           description: Number of documents successfully inserted
@@ -11057,11 +11065,19 @@ components:
       properties:
         status:
           type: string
-          description: Durable commit and visibility/propagation state.
+          description: >
+            Durable commit outcome. Pending states mean requested visibility or
+
+            participant propagation is still completing. `committed_repair_required`
+
+            means the primary writes committed, but a terminal enrichment failure needs
+
+            operator repair and will not be retried indefinitely.
           enum:
             - committed
             - committed_visibility_pending
             - committed_recovery_pending
+            - committed_repair_required
         tables:
           type: object
           description: Per-table batch results
@@ -11212,13 +11228,18 @@ components:
             - committed
             - committed_visibility_pending
             - committed_recovery_pending
+            - committed_repair_required
             - aborted
           description: >
             Durable transaction outcome. Pending committed states mean the
 
             commit decision is durable while its requested visibility barrier
 
-            or participant recovery is still completing.
+            or participant recovery is still completing. `committed_repair_required`
+
+            means the commit decision is durable and coordination may be released, but
+
+            a terminal enrichment failure requires operator repair.
         conflict:
           description: Details about the conflict that caused an abort (only present when status is "aborted")
           $ref: '#/components/schemas/TransactionConflict'

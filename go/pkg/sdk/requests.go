@@ -55,9 +55,11 @@ type BatchRequest struct {
 
 // BatchResult represents the result of a batch operation with detailed failure information
 type BatchResult struct {
-	// Status is "committed" or "committed_pending". A pending result has a
-	// durable commit decision but has not yet reached the requested visibility
-	// or participant-recovery barrier.
+	// Status is "committed", "committed_pending", or
+	// "committed_repair_required". A pending result has a durable commit
+	// decision but has not yet reached the requested visibility or
+	// participant-recovery barrier. Repair-required means the primary write
+	// committed but terminal enrichment debt needs operator action.
 	Status string `json:"status,omitempty"`
 
 	// Deleted Number of documents successfully deleted
@@ -349,7 +351,7 @@ type MultiBatchRequest struct {
 // MultiBatchResult represents the result of a cross-table batch operation.
 type MultiBatchResult struct {
 	// Status is "committed", "committed_visibility_pending",
-	// "committed_recovery_pending", or "aborted". "committed_pending" is
+	// "committed_recovery_pending", "committed_repair_required", or "aborted". "committed_pending" is
 	// used as a generic fallback when an older server returns HTTP 202 without
 	// a status field.
 	Status string `json:"status,omitempty"`
@@ -365,7 +367,7 @@ type MultiBatchResult struct {
 // TransactionCommitResult represents the result of an OCC transaction commit.
 type TransactionCommitResult struct {
 	// Status is "committed", "committed_visibility_pending",
-	// "committed_recovery_pending", or "aborted".
+	// "committed_recovery_pending", "committed_repair_required", or "aborted".
 	Status string `json:"status"`
 
 	// Conflict details (only present when status is "aborted").

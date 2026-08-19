@@ -4227,6 +4227,14 @@ pub const RaftBatcher = struct {
             table_name: []const u8,
             req: db_mod.types.BatchRequest,
         ) anyerror!void,
+        batch_group_with_cancellation: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: db_mod.types.BatchRequest,
+            cancellation: db_mod.types.CancellationToken,
+        ) anyerror!void = null,
         batch_group_local: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -4234,6 +4242,14 @@ pub const RaftBatcher = struct {
             table_name: []const u8,
             req: db_mod.types.BatchRequest,
         ) anyerror!void,
+        batch_group_local_with_cancellation: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: db_mod.types.BatchRequest,
+            cancellation: db_mod.types.CancellationToken,
+        ) anyerror!void = null,
     };
 
     pub fn batchGroup(
@@ -4246,6 +4262,19 @@ pub const RaftBatcher = struct {
         return try self.vtable.batch_group(self.ptr, alloc, group_id, table_name, req);
     }
 
+    pub fn batchGroupWithCancellation(
+        self: RaftBatcher,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.BatchRequest,
+        cancellation: db_mod.types.CancellationToken,
+    ) !void {
+        const fn_ptr = self.vtable.batch_group_with_cancellation orelse
+            return try self.batchGroup(alloc, group_id, table_name, req);
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, req, cancellation);
+    }
+
     pub fn batchGroupLocal(
         self: RaftBatcher,
         alloc: std.mem.Allocator,
@@ -4254,6 +4283,19 @@ pub const RaftBatcher = struct {
         req: db_mod.types.BatchRequest,
     ) !void {
         return try self.vtable.batch_group_local(self.ptr, alloc, group_id, table_name, req);
+    }
+
+    pub fn batchGroupLocalWithCancellation(
+        self: RaftBatcher,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.BatchRequest,
+        cancellation: db_mod.types.CancellationToken,
+    ) !void {
+        const fn_ptr = self.vtable.batch_group_local_with_cancellation orelse
+            return try self.batchGroupLocal(alloc, group_id, table_name, req);
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, req, cancellation);
     }
 };
 
@@ -4310,8 +4352,11 @@ pub const BoundTableWriteSource = struct {
                 .backup_table = backupTable,
                 .restore_table = restoreTable,
                 .commit_transaction = commitTransaction,
+                .commit_transaction_with_cancellation = commitTransactionWithCancellation,
                 .commit_batch = commitBatch,
+                .commit_batch_with_cancellation = commitBatchWithCancellation,
                 .commit_transaction_with_id = commitTransactionWithId,
+                .commit_transaction_with_id_with_cancellation = commitTransactionWithIdAndCancellation,
                 .acknowledge_transaction_commit = acknowledgeTransactionCommit,
                 .batch = batch,
                 .begin_bulk_ingest = beginBulkIngest,
@@ -4321,6 +4366,7 @@ pub const BoundTableWriteSource = struct {
                 .txn_begin_group_local = txnBeginGroupLocal,
                 .txn_prepare_group_local = txnPrepareGroupLocal,
                 .txn_resolve_group_local = txnResolveGroupLocal,
+                .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
@@ -4745,8 +4791,18 @@ pub const BoundTableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
+        return try commitTransactionWithCancellation(ptr, alloc, tables, sync_level, .none);
+    }
+
+    fn commitTransactionWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?distributed_txn.CommitOutcome {
         const txn_id = nextTxnId();
-        return try commitBoundTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false);
+        return try commitBoundTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false, cancellation);
     }
 
     fn commitBatch(
@@ -4755,21 +4811,36 @@ pub const BoundTableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
+        return try commitBatchWithCancellation(ptr, alloc, tables, sync_level, .none);
+    }
+
+    fn commitBatchWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?distributed_txn.CommitOutcome {
         if (tables.len == 1 and tables[0].predicates.len == 0) {
             const table = tables[0];
-            _ = (batch(ptr, alloc, table.table_name, .{
+            const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+            if (!std.mem.eql(u8, self.table_name, table.table_name)) return null;
+            const db = try self.activeDb();
+            const req: db_mod.types.BatchRequest = .{
                 .writes = transactionWritesAsBatchWrites(table.writes),
                 .deletes = table.deletes,
                 .transforms = table.transforms,
                 .sync_level = sync_level,
-            }) catch |err| switch (err) {
+            };
+            try validateTableBatchAgainstLocalSchema(alloc, db, req.writes, req.deletes, req.transforms);
+            db.batchWithVisibilityCancellation(req, cancellation) catch |err| switch (err) {
                 error.IntentConflict, error.VersionConflict => return .{ .conflict = boundConflict(table, err) },
                 else => return err,
-            }) orelse return null;
+            };
             return .{ .committed = .{ .participant_count = 1 } };
         }
         const txn_id = nextTxnId();
-        return try commitBoundTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false);
+        return try commitBoundTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false, cancellation);
     }
 
     fn commitTransactionWithId(
@@ -4780,7 +4851,19 @@ pub const BoundTableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
-        return try commitBoundTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true);
+        return try commitTransactionWithIdAndCancellation(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, .none);
+    }
+
+    fn commitTransactionWithIdAndCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?distributed_txn.CommitOutcome {
+        return try commitBoundTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation);
     }
 
     fn acknowledgeTransactionCommit(
@@ -4806,6 +4889,7 @@ pub const BoundTableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
         retain_terminal: bool,
+        cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (tables.len != 1) return error.UnsupportedOperation;
@@ -4829,7 +4913,7 @@ pub const BoundTableWriteSource = struct {
         ) catch |err| switch (err) {
             error.DecisionConflict => switch (try db.getTransactionStatus(txn_id)) {
                 .committed => {
-                    db.resolveTransactionIntentsWithSyncLevel(txn_id, .committed, commit_version, sync_level) catch |barrier_err| {
+                    db.resolveTransactionIntentsWithSyncLevelAndCancellation(txn_id, .committed, commit_version, sync_level, cancellation) catch |barrier_err| {
                         const durable_status = db.getTransactionStatus(txn_id) catch return barrier_err;
                         if (durable_status != .committed) return barrier_err;
                         var propagation_pending = false;
@@ -4844,6 +4928,8 @@ pub const BoundTableWriteSource = struct {
                             .coordinator_table_name = if (retain_terminal) table.table_name else null,
                             .propagation_pending = propagation_pending,
                             .visibility_pending = true,
+                            .visibility_retry_pending = barrier_err != error.EnrichmentWorkerFailed,
+                            .visibility_repair_required = barrier_err == error.EnrichmentWorkerFailed,
                         } };
                     };
                     var propagation_pending = false;
@@ -4907,7 +4993,7 @@ pub const BoundTableWriteSource = struct {
                 else => return err,
             }
         };
-        db.resolveTransactionIntentsWithSyncLevel(txn_id, .committed, commit_version, sync_level) catch |err| {
+        db.resolveTransactionIntentsWithSyncLevelAndCancellation(txn_id, .committed, commit_version, sync_level, cancellation) catch |err| {
             const durable_status = db.getTransactionStatus(txn_id) catch return err;
             if (durable_status == .committed) {
                 std.log.warn("bound transaction acknowledged after durable commit barrier failure txn_id={x} err={s}", .{
@@ -4926,6 +5012,8 @@ pub const BoundTableWriteSource = struct {
                     .coordinator_table_name = if (retain_terminal) table.table_name else null,
                     .propagation_pending = propagation_pending,
                     .visibility_pending = true,
+                    .visibility_retry_pending = err != error.EnrichmentWorkerFailed,
+                    .visibility_repair_required = err == error.EnrichmentWorkerFailed,
                 } };
             }
             return err;
@@ -5057,6 +5145,20 @@ pub const BoundTableWriteSource = struct {
 
     fn txnResolveGroupLocal(
         ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        status: db_mod.types.TxnStatus,
+        commit_version: u64,
+        topology_epoch: u64,
+        sync_level: db_mod.types.SyncLevel,
+    ) !?void {
+        return try txnResolveGroupLocalWithCancellation(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, .none);
+    }
+
+    fn txnResolveGroupLocalWithCancellation(
+        ptr: *anyopaque,
         _: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
@@ -5065,11 +5167,12 @@ pub const BoundTableWriteSource = struct {
         commit_version: u64,
         _: u64,
         sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         const db = try self.activeDb();
-        try db.resolveTransactionIntentsWithSyncLevel(txn_id, status, commit_version, sync_level);
+        try db.resolveTransactionIntentsWithSyncLevelAndCancellation(txn_id, status, commit_version, sync_level, cancellation);
         const participant = try distributed_txn.participantIdForGroup(db.alloc, table_name, group_id);
         defer db.alloc.free(participant);
         db.markTransactionParticipantResolved(txn_id, participant) catch |err| switch (err) {
@@ -12740,8 +12843,11 @@ pub const ProvisionedTableWriteSource = struct {
                 .drop_index = dropIndex,
                 .drop_table = dropTable,
                 .commit_transaction = commitTransaction,
+                .commit_transaction_with_cancellation = commitTransactionWithCancellation,
                 .commit_batch = commitBatch,
+                .commit_batch_with_cancellation = commitBatchWithCancellation,
                 .commit_transaction_with_id = commitTransactionWithId,
+                .commit_transaction_with_id_with_cancellation = commitTransactionWithIdAndCancellation,
                 .acknowledge_transaction_commit = acknowledgeTransactionCommit,
                 .backup_table = backupTable,
                 .restore_table = restoreTable,
@@ -12755,6 +12861,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .txn_begin_group_local = txnBeginGroupLocal,
                 .txn_prepare_group_local = txnPrepareGroupLocal,
                 .txn_resolve_group_local = txnResolveGroupLocal,
+                .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
@@ -14006,8 +14113,18 @@ pub const ProvisionedTableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
+        return try commitTransactionWithCancellation(ptr, alloc, tables, sync_level, .none);
+    }
+
+    fn commitTransactionWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?distributed_txn.CommitOutcome {
         const txn_id = nextTxnId();
-        return try commitProvisionedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false);
+        return try commitProvisionedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false, cancellation);
     }
 
     fn commitTransactionWithId(
@@ -14018,7 +14135,19 @@ pub const ProvisionedTableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
-        return try commitProvisionedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true);
+        return try commitTransactionWithIdAndCancellation(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, .none);
+    }
+
+    fn commitTransactionWithIdAndCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?distributed_txn.CommitOutcome {
+        return try commitProvisionedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation);
     }
 
     fn acknowledgeTransactionCommit(
@@ -14048,6 +14177,7 @@ pub const ProvisionedTableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
         retain_terminal: bool,
+        cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
@@ -14067,6 +14197,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .retain_terminal = retain_terminal,
                 .report_post_commit_failure = false,
                 .fanout_io = self.table_activity_threaded.io(),
+                .post_commit_cancellation = cancellation,
             },
         );
     }
@@ -14077,12 +14208,22 @@ pub const ProvisionedTableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
+        return try commitBatchWithCancellation(ptr, alloc, tables, sync_level, .none);
+    }
+
+    fn commitBatchWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?distributed_txn.CommitOutcome {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
         const retry_conflicts = statelessBatchMayRetry(tables);
         var attempt: u8 = 0;
         while (true) : (attempt += 1) {
-            const outcome = commitProvisionedBatchOnce(self, ptr, alloc, tables, sync_level) catch |err| {
+            const outcome = commitProvisionedBatchOnce(self, ptr, alloc, tables, sync_level, cancellation) catch |err| {
                 if (retry_conflicts and attempt + 1 < stateless_batch_max_attempts and err == error.TopologyChanged) {
                     sleepNs(statelessBatchRetryDelayNs(attempt));
                     continue;
@@ -14113,12 +14254,13 @@ pub const ProvisionedTableWriteSource = struct {
         alloc: std.mem.Allocator,
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
         if (self.raft_batcher != null) {
-            if (try self.commitSingleGroupTransactionViaRaftBatcher(alloc, tables, sync_level)) |outcome| return outcome;
+            if (try self.commitSingleGroupTransactionViaRaftBatcher(alloc, tables, sync_level, cancellation)) |outcome| return outcome;
         }
         const txn_id = nextTxnId();
-        return try commitProvisionedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false);
+        return try commitProvisionedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false, cancellation);
     }
 
     fn commitSingleGroupTransactionViaRaftBatcher(
@@ -14126,6 +14268,7 @@ pub const ProvisionedTableWriteSource = struct {
         alloc: std.mem.Allocator,
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
         if (tables.len == 0) return .{ .committed = .{ .participant_count = 0 } };
         if (tables.len != 1) return null;
@@ -14172,7 +14315,7 @@ pub const ProvisionedTableWriteSource = struct {
             .transforms = table_req.transforms,
             .sync_level = sync_level,
         };
-        batcher.batchGroup(alloc, group_id, table_req.table_name, req) catch |err| switch (err) {
+        batcher.batchGroupWithCancellation(alloc, group_id, table_req.table_name, req, cancellation) catch |err| switch (err) {
             error.IntentConflict, error.VersionConflict => return .{ .conflict = boundConflict(table_req, err) },
             else => return err,
         };
@@ -14554,6 +14697,17 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         sync_level: db_mod.types.SyncLevel,
     ) !void {
+        try self.syncReplicatedBatchGroupLocalWithCancellation(alloc, group_id, table_name, sync_level, .none);
+    }
+
+    pub fn syncReplicatedBatchGroupLocalWithCancellation(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+    ) !void {
         switch (sync_level) {
             .propose, .write => return,
             .enrichments, .full_text, .full_index => {},
@@ -14576,13 +14730,13 @@ pub const ProvisionedTableWriteSource = struct {
                 null,
             );
             defer cached.deinit(alloc);
-            try cached.db.waitForCurrentSyncLevel(sync_level);
+            try cached.db.waitForCurrentSyncLevelWithCancellation(sync_level, cancellation);
             self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
         } else {
             var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-            try db.waitForCurrentSyncLevel(sync_level);
+            try db.waitForCurrentSyncLevelWithCancellation(sync_level, cancellation);
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
         }
         self.notifyLocalChange(table_name, .data);
@@ -14727,6 +14881,21 @@ pub const ProvisionedTableWriteSource = struct {
         topology_epoch: u64,
         sync_level: db_mod.types.SyncLevel,
     ) !?void {
+        return try txnResolveGroupLocalWithCancellation(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, .none);
+    }
+
+    fn txnResolveGroupLocalWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        status: db_mod.types.TxnStatus,
+        commit_version: u64,
+        topology_epoch: u64,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
         // Serialize the final epoch validation with split/merge transition
@@ -14738,14 +14907,14 @@ pub const ProvisionedTableWriteSource = struct {
         if (topology_epoch != 0)
             try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         if (self.raft_batcher) |batcher| {
-            try batcher.batchGroupLocal(alloc, group_id, table_name, .{
+            try batcher.batchGroupLocalWithCancellation(alloc, group_id, table_name, .{
                 .sync_level = sync_level,
                 .transaction = .{ .resolve = .{
                     .txn_id = txn_id,
                     .status = status,
                     .commit_version = commit_version,
                 } },
-            });
+            }, cancellation);
             return {};
         }
         if (status == .committed) {
@@ -14765,10 +14934,10 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.write_cache) |cache| {
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
             defer cached.deinit(alloc);
-            try applyReplicatedTransactionMutation(alloc, cached.db, table_name, group_id, .{
+            try applyReplicatedTransactionMutationWithCancellation(alloc, cached.db, table_name, group_id, .{
                 .sync_level = sync_level,
                 .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
-            });
+            }, cancellation);
             // Transaction resolution already honors the requested sync level.
             // In particular, `.write` must not become coupled to an external
             // enrichment provider merely because the ordinary batch route now
@@ -14780,10 +14949,10 @@ pub const ProvisionedTableWriteSource = struct {
             var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-            try applyReplicatedTransactionMutation(alloc, &db, table_name, group_id, .{
+            try applyReplicatedTransactionMutationWithCancellation(alloc, &db, table_name, group_id, .{
                 .sync_level = sync_level,
                 .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
-            });
+            }, cancellation);
             if (status == .committed) try drainManagedDbBeforeClose(&db);
             if (status == .committed) self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
         }
@@ -16266,8 +16435,11 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .delete_artifact_enrichment = deleteArtifactEnrichment,
                 .drop_index = dropIndex,
                 .commit_transaction = commitTransaction,
+                .commit_transaction_with_cancellation = commitTransactionWithCancellation,
                 .commit_batch = commitBatch,
+                .commit_batch_with_cancellation = commitBatchWithCancellation,
                 .commit_transaction_with_id = commitTransactionWithId,
+                .commit_transaction_with_id_with_cancellation = commitTransactionWithIdAndCancellation,
                 .acknowledge_transaction_commit = acknowledgeTransactionCommit,
                 .backup_table = backupTable,
                 .backup_table_to_location = backupTableToLocation,
@@ -16277,6 +16449,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .txn_begin_group_local = txnBeginGroupLocal,
                 .txn_prepare_group_local = txnPrepareGroupLocal,
                 .txn_resolve_group_local = txnResolveGroupLocal,
+                .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
@@ -16493,8 +16666,18 @@ pub const HostedProvisionedTableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
+        return try commitTransactionWithCancellation(ptr, alloc, tables, sync_level, .none);
+    }
+
+    fn commitTransactionWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?distributed_txn.CommitOutcome {
         const txn_id = nextTxnId();
-        return try commitHostedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false);
+        return try commitHostedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false, cancellation);
     }
 
     fn commitBatch(
@@ -16503,8 +16686,18 @@ pub const HostedProvisionedTableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
+        return try commitBatchWithCancellation(ptr, alloc, tables, sync_level, .none);
+    }
+
+    fn commitBatchWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?distributed_txn.CommitOutcome {
         const txn_id = nextTxnId();
-        return try commitHostedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false);
+        return try commitHostedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false, cancellation);
     }
 
     fn commitTransactionWithId(
@@ -16515,7 +16708,19 @@ pub const HostedProvisionedTableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
-        return try commitHostedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true);
+        return try commitTransactionWithIdAndCancellation(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, .none);
+    }
+
+    fn commitTransactionWithIdAndCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?distributed_txn.CommitOutcome {
+        return try commitHostedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation);
     }
 
     fn acknowledgeTransactionCommit(
@@ -16544,6 +16749,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
         retain_terminal: bool,
+        cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         var worker_impl = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
@@ -16565,6 +16771,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                     if (runtime.apiIoImpl()) |io_impl| io_impl.io() else null
                 else
                     null,
+                .post_commit_cancellation = cancellation,
             },
         );
     }
@@ -16638,6 +16845,18 @@ pub const HostedProvisionedTableWriteSource = struct {
         req: db_mod.types.BatchRequest,
         topology_epoch: u64,
     ) !?void {
+        return try batchGroupLocalFencedWithCancellation(ptr, alloc, group_id, table_name, req, topology_epoch, .none);
+    }
+
+    fn batchGroupLocalFencedWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.BatchRequest,
+        topology_epoch: u64,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
@@ -16652,7 +16871,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, req.writes, req.deletes, req.transforms);
         if (req.transaction != null) {
             try cached.db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
-            try applyReplicatedTransactionMutation(alloc, cached.db, table_name, group_id, req);
+            try applyReplicatedTransactionMutationWithCancellation(alloc, cached.db, table_name, group_id, req, cancellation);
         } else try cached.db.batchReplicatedApply(req);
         if (self.shouldDrainAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(cached.db);
     }
@@ -16709,14 +16928,29 @@ pub const HostedProvisionedTableWriteSource = struct {
         topology_epoch: u64,
         sync_level: db_mod.types.SyncLevel,
     ) !?void {
-        return try batchGroupLocalFenced(ptr, alloc, group_id, table_name, .{
+        return try txnResolveGroupLocalWithCancellation(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, .none);
+    }
+
+    fn txnResolveGroupLocalWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        status: db_mod.types.TxnStatus,
+        commit_version: u64,
+        topology_epoch: u64,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?void {
+        return try batchGroupLocalFencedWithCancellation(ptr, alloc, group_id, table_name, .{
             .sync_level = sync_level,
             .transaction = .{ .resolve = .{
                 .txn_id = txn_id,
                 .status = status,
                 .commit_version = commit_version,
             } },
-        }, topology_epoch);
+        }, topology_epoch, cancellation);
     }
 
     fn txnStatusGroupLocal(
@@ -17444,6 +17678,17 @@ fn applyReplicatedTransactionMutation(
     group_id: u64,
     req: db_mod.types.BatchRequest,
 ) !void {
+    try applyReplicatedTransactionMutationWithCancellation(alloc, db, table_name, group_id, req, .none);
+}
+
+fn applyReplicatedTransactionMutationWithCancellation(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    table_name: []const u8,
+    group_id: u64,
+    req: db_mod.types.BatchRequest,
+    visibility_cancellation: db_mod.types.CancellationToken,
+) !void {
     const mutation = req.transaction orelse return error.InvalidBatchRequest;
     switch (mutation) {
         .begin => |begin| {
@@ -17482,11 +17727,12 @@ fn applyReplicatedTransactionMutation(
             .predicates = req.predicates,
         }),
         .resolve => |resolve| {
-            try db.resolveTransactionIntentsWithSyncLevel(
+            try db.resolveTransactionIntentsWithSyncLevelAndCancellation(
                 resolve.txn_id,
                 resolve.status,
                 resolve.commit_version,
                 req.sync_level,
+                visibility_cancellation,
             );
             const local_participant = try distributed_txn.participantIdForGroup(alloc, table_name, group_id);
             defer alloc.free(local_participant);
@@ -19491,8 +19737,13 @@ fn createManagedDbEnrichments(
     store: ?*common_secrets.FileStore,
     remote: ?*const scraping.RemoteContentConfig,
 ) !ManagedDbEnrichmentSet {
+    // Managed HTTP providers use a concurrent watchdog to enforce the
+    // whole-request deadline. Reuse the table's backend executor so write
+    // enrichment never falls back to the process-global single-threaded I/O,
+    // where starting that watchdog correctly returns ConcurrencyUnavailable.
+    const managed_io = if (runtime) |backend| backend.io() else null;
     const asset_runtime = if (try indexesJsonNeedsAssetProducer(allocator, raw_indexes_json)) blk: {
-        const io = if (runtime) |backend| backend.io() orelse return error.MissingBackendRuntimeIo else return error.MissingBackendRuntimeIo;
+        const io = managed_io orelse return error.MissingBackendRuntimeIo;
         break :blk try asset_producer_runtime.Runtime.createOwned(allocator, io, .{
             .antfly_provider = local_provider,
             .secret_store = store,
@@ -19503,8 +19754,8 @@ fn createManagedDbEnrichments(
         allocator.destroy(owned);
     };
     return .{
-        .dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote, .inference_api_url = inference_api_url }),
-        .sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote, .inference_api_url = inference_api_url }),
+        .dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .io = managed_io, .bounded_http_request = managed_io != null, .secret_store = store, .remote_content = remote, .inference_api_url = inference_api_url }),
+        .sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .io = managed_io, .bounded_http_request = managed_io != null, .secret_store = store, .remote_content = remote, .inference_api_url = inference_api_url }),
         .asset_runtime = asset_runtime,
         .generated = try indexesJsonHasGeneratedEnrichment(allocator, raw_indexes_json),
     };

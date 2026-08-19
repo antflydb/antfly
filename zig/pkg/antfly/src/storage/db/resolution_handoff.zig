@@ -20,7 +20,7 @@ const internal_keys = @import("../internal_keys.zig");
 
 const Allocator = std.mem.Allocator;
 const digest_len = std.crypto.hash.sha2.Sha256.digest_length;
-const key_kind: u8 = 0x2f;
+const key_kind = internal_keys.resolution_handoff_kind;
 
 pub const Value = [digest_len]u8;
 
