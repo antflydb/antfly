@@ -857,7 +857,30 @@ func TestUpdateStatusPreservesHealthyStatusDuringMetadataElectionGrace(t *testin
 		t.Fatalf("leadership observation retry = %v, want within (0, %v]", retryAfter, metadataLeadershipObservationRetryInterval)
 	}
 
-	key := metadataLeadershipObservationKey(updated)
+	// A simultaneous data rollout is independent of the metadata election
+	// grace. Its readiness transition must still make aggregate availability
+	// pending instead of inheriting the previously healthy status.
+	updated.Spec.DataNodes.Replicas = 3
+	if err := reconciler.updateStatus(context.Background(), updated); err != nil {
+		t.Fatal(err)
+	}
+	duringDataRollout := &antflyv1.AntflyCluster{}
+	if err := k8sClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), duringDataRollout); err != nil {
+		t.Fatal(err)
+	}
+	if duringDataRollout.Status.Phase != "Pending" {
+		t.Fatalf("phase during overlapping data rollout = %q, want Pending", duringDataRollout.Status.Phase)
+	}
+	dataReady := meta.FindStatusCondition(duringDataRollout.Status.Conditions, antflyv1.TypeDataReady)
+	if dataReady == nil || dataReady.Status != metav1.ConditionFalse || dataReady.Reason != antflyv1.ReasonWaitingForPods {
+		t.Fatalf("DataReady during overlapping rollout = %#v, want waiting for pods", dataReady)
+	}
+	available := meta.FindStatusCondition(duringDataRollout.Status.Conditions, antflyv1.TypeAvailable)
+	if available == nil || available.Status != metav1.ConditionFalse || available.Reason != antflyv1.ReasonWaitingForPods {
+		t.Fatalf("Available during overlapping rollout = %#v, want waiting for pods", available)
+	}
+
+	key := metadataLeadershipObservationKey(duringDataRollout)
 	observed, ok := reconciler.metadataLeadershipObservations.Load(key)
 	if !ok {
 		t.Fatal("missing pending leadership observation state")
@@ -865,7 +888,7 @@ func TestUpdateStatusPreservesHealthyStatusDuringMetadataElectionGrace(t *testin
 	state := observed.(metadataLeadershipObservationState)
 	state.startedAt = time.Now().Add(-metadataLeadershipObservationGracePeriod)
 	reconciler.metadataLeadershipObservations.Store(key, state)
-	if err := reconciler.updateStatus(context.Background(), updated); err != nil {
+	if err := reconciler.updateStatus(context.Background(), duringDataRollout); err != nil {
 		t.Fatal(err)
 	}
 

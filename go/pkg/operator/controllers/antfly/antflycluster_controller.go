@@ -4949,24 +4949,25 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	}
 	r.setComponentCondition(cluster, antflyv1.TypeDataReady, cluster.Status.DataNodesReady, dataReplicas, dataFindings, "data")
 	allRuntimeFindings := append(append([]poddiagnostics.Finding{}, metadataFindings...), dataFindings...)
+	componentsReady := cluster.Status.MetadataNodesReady >= metadataReplicas && cluster.Status.DataNodesReady >= dataReplicas
 
 	if len(allRuntimeFindings) > 0 || metadataTopologyHealthErr != nil {
 		cluster.Status.Phase = "Degraded"
+	} else if !componentsReady {
+		cluster.Status.Phase = "Pending"
 	} else if metadataLeadershipPending != nil {
 		if originalPhase == "" {
 			cluster.Status.Phase = "Pending"
 		} else {
 			cluster.Status.Phase = originalPhase
 		}
-	} else if cluster.Status.MetadataNodesReady >= metadataReplicas && cluster.Status.DataNodesReady >= dataReplicas {
-		cluster.Status.Phase = "Running"
 	} else {
-		cluster.Status.Phase = "Pending"
+		cluster.Status.Phase = "Running"
 	}
 
 	r.updateRolloutCondition(cluster, metadataSts, dataSts)
 	r.setAvailableCondition(cluster, allRuntimeFindings, cluster.Status.Phase == "Running")
-	if metadataLeadershipPending != nil && len(allRuntimeFindings) == 0 {
+	if metadataLeadershipPending != nil && len(allRuntimeFindings) == 0 && componentsReady {
 		preserveConditionDuringMetadataLeadershipObservation(cluster, originalConditions, antflyv1.TypeAvailable, metadataLeadershipPending)
 	} else if metadataTopologyHealthErr != nil {
 		meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
