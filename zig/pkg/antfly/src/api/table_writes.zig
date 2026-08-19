@@ -13088,6 +13088,27 @@ pub const ProvisionedTableWriteSource = struct {
         self.notifyLocalChange(table_name, .structural);
     }
 
+    fn finishLocalIndexCacheUpdateAndNotify(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        managed_visibility_changed: bool,
+    ) void {
+        self.finishLocalStructuralCacheUpdate(table_name);
+        // Publish outside structural/cache admission, but before the
+        // synchronous structural hook reports store status. A fenced or
+        // skipped snapshot remains best-effort; the structural report and
+        // dirty bit still make it retryable without turning committed DDL into
+        // an API failure.
+        if (managed_visibility_changed) {
+            self.publishWriteCacheRuntimeStatusesForTableBestEffort(alloc, table_name);
+        }
+        self.notifyLocalChange(table_name, .structural);
+        if (managed_visibility_changed) {
+            self.notifyLocalChange(table_name, .data);
+        }
+    }
+
     fn installLocalIndexWriteCapability(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
@@ -13098,12 +13119,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.beginLocalStructuralIndexCacheUpdate(table_name);
         errdefer self.abortLocalStructuralIndexCacheUpdate(table_name, index_name);
         const managed_visibility_changed = try reconcileLocalTableIndexCreate(self, alloc, table_name, index_name);
-        self.finishLocalStructuralCacheUpdate(table_name);
-        self.notifyLocalChange(table_name, .structural);
-        if (managed_visibility_changed) {
-            self.publishWriteCacheRuntimeStatusesForTableBestEffort(alloc, table_name);
-            self.notifyLocalChange(table_name, .data);
-        }
+        self.finishLocalIndexCacheUpdateAndNotify(alloc, table_name, managed_visibility_changed);
     }
 
     fn createIndex(
@@ -13139,12 +13155,7 @@ pub const ProvisionedTableWriteSource = struct {
             try dropLocalTableIndex(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name, index_name);
             break :blk false;
         };
-        self.finishLocalStructuralCacheUpdate(table_name);
-        self.notifyLocalChange(table_name, .structural);
-        if (managed_visibility_changed) {
-            self.publishWriteCacheRuntimeStatusesForTableBestEffort(alloc, table_name);
-            self.notifyLocalChange(table_name, .data);
-        }
+        self.finishLocalIndexCacheUpdateAndNotify(alloc, table_name, managed_visibility_changed);
     }
 
     fn dropTable(
@@ -18232,8 +18243,8 @@ fn reconcileCachedLocalTableIndexCreate(
             return err;
         };
         ProvisionedTableWriteCache.publishEntryManagedConfig(cached.entry.?, metadata.indexes_json);
-        // Structural notification invalidates status before publishing one
-        // fresh snapshot outside the cache lock. Sampling here would be
+        // The caller publishes one fresh snapshot outside the cache lock and
+        // before its structural notification. Sampling here would be
         // redundant and lets concurrent repair invalidation turn post-commit
         // observability into a false DDL error.
         cache.publishCachedLeaseGeneration(&cached, target_generation);
@@ -30084,11 +30095,20 @@ test "provisioned create index updates cached writer in place" {
     const Fence = struct {
         cache: *runtime_status.TableRuntimeSnapshotCache,
         calls: usize = 0,
+        structural_calls: usize = 0,
+        publication_attempted_before_structural: bool = false,
 
         fn run(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             if (self.calls == 1) self.cache.invalidateTable("docs");
+        }
+
+        fn onChange(ptr: *anyopaque, _: []const u8, kind: ProvisionedTableWriteSource.LocalChangeKind) void {
+            if (kind != .structural) return;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.structural_calls += 1;
+            self.publication_attempted_before_structural = self.calls != 0;
         }
     };
     var fence = Fence{ .cache = &status_cache };
@@ -30096,6 +30116,8 @@ test "provisioned create index updates cached writer in place" {
         const previous_hook = test_before_runtime_status_publish_hook;
         test_before_runtime_status_publish_hook = .{ .ptr = &fence, .run = Fence.run };
         defer test_before_runtime_status_publish_hook = previous_hook;
+        source.setLocalChangeHook(.{ .ptr = &fence, .on_change = Fence.onChange });
+        defer source.setLocalChangeHook(null);
         _ = try source.source().createIndex(alloc, "docs", "semantic_idx", "{\"type\":\"embeddings\",\"dimension\":3,\"external\":true}");
     }
 
@@ -30103,6 +30125,8 @@ test "provisioned create index updates cached writer in place" {
     // concurrent invalidation can fence that observation without retrying or
     // rolling back the already-committed index admission.
     try std.testing.expectEqual(@as(usize, 1), fence.calls);
+    try std.testing.expectEqual(@as(usize, 1), fence.structural_calls);
+    try std.testing.expect(fence.publication_attempted_before_structural);
     source.publishWriteCacheRuntimeStatusesForTableBestEffort(alloc, "docs");
     var published_status = (try status_cache.snapshotGroupStatus(alloc, "docs", 7001)) orelse
         return error.TestUnexpectedResult;
