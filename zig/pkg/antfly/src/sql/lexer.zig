@@ -39,15 +39,25 @@ pub fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUn
         }
         if (ch == '/' and i + 1 < sql.len and sql[i + 1] == '*') {
             i += 2;
-            while (i + 1 < sql.len and !(sql[i] == '*' and sql[i + 1] == '/')) i += 1;
-            if (i + 1 >= sql.len) return error.UnsupportedSqlShape;
-            i += 2;
+            var depth: usize = 1;
+            while (depth != 0) {
+                if (i + 1 >= sql.len) return error.UnsupportedSqlShape;
+                if (sql[i] == '/' and sql[i + 1] == '*') {
+                    depth += 1;
+                    i += 2;
+                } else if (sql[i] == '*' and sql[i + 1] == '/') {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
             continue;
         }
         if (std.ascii.isAlphabetic(ch) or ch == '_') {
             const start = i;
             i += 1;
-            while (i < sql.len and (std.ascii.isAlphanumeric(sql[i]) or sql[i] == '_')) i += 1;
+            while (i < sql.len and (std.ascii.isAlphanumeric(sql[i]) or sql[i] == '_' or sql[i] == '$')) i += 1;
             const end = i;
             try tokens.append(alloc, .{
                 .kind = .identifier,
@@ -60,18 +70,36 @@ pub fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUn
         }
         if (ch == '"') {
             const source_start = i;
-            const start = i + 1;
+            var out = std.ArrayListUnmanaged(u8).empty;
+            errdefer out.deinit(alloc);
             i += 1;
-            while (i < sql.len and sql[i] != '"') i += 1;
+            while (i < sql.len) {
+                if (sql[i] == '"') {
+                    if (i + 1 < sql.len and sql[i + 1] == '"') {
+                        try out.append(alloc, '"');
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                try out.append(alloc, sql[i]);
+                i += 1;
+            }
             if (i >= sql.len) return error.UnsupportedSqlShape;
+            if (out.items.len == 0) return error.UnsupportedSqlShape;
+            const owned = try out.toOwnedSlice(alloc);
+            var owned_transferred = false;
+            errdefer if (!owned_transferred) alloc.free(owned);
             i += 1;
             const source_end = i;
             try tokens.append(alloc, .{
                 .kind = .identifier,
-                .text = sql[start .. source_end - 1],
+                .text = owned,
+                .owned = true,
                 .source_start = source_start,
                 .source_end = source_end,
             });
+            owned_transferred = true;
             continue;
         }
         if (ch == '\'') {
@@ -100,10 +128,9 @@ pub fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUn
             owned_transferred = true;
             continue;
         }
-        if (std.ascii.isDigit(ch)) {
+        if (std.ascii.isDigit(ch) or (ch == '.' and i + 1 < sql.len and std.ascii.isDigit(sql[i + 1]))) {
             const start = i;
-            i += 1;
-            while (i < sql.len and (std.ascii.isDigit(sql[i]) or sql[i] == '.')) i += 1;
+            i = try scanNumberEnd(sql, start);
             const end = i;
             try tokens.append(alloc, .{ .kind = .number, .text = sql[start..end] });
             continue;
@@ -292,6 +319,44 @@ fn estimateTokenCapacity(sql: []const u8) usize {
     return @min(sql.len, sql.len / 4 + 8);
 }
 
+fn scanNumberEnd(sql: []const u8, start: usize) !usize {
+    var i = start;
+    var has_decimal_point = false;
+
+    if (sql[i] == '.') {
+        has_decimal_point = true;
+        i += 1;
+        std.debug.assert(i < sql.len and std.ascii.isDigit(sql[i]));
+        while (i < sql.len and std.ascii.isDigit(sql[i])) i += 1;
+    } else {
+        std.debug.assert(std.ascii.isDigit(sql[i]));
+        while (i < sql.len and std.ascii.isDigit(sql[i])) i += 1;
+        if (i < sql.len and sql[i] == '.') {
+            if (i + 1 < sql.len and sql[i + 1] == '.') return error.UnsupportedSqlShape;
+            has_decimal_point = true;
+            i += 1;
+            while (i < sql.len and std.ascii.isDigit(sql[i])) i += 1;
+        }
+    }
+
+    if (i < sql.len and (sql[i] == 'e' or sql[i] == 'E')) {
+        i += 1;
+        if (i < sql.len and (sql[i] == '+' or sql[i] == '-')) i += 1;
+        if (i >= sql.len or !std.ascii.isDigit(sql[i])) return error.UnsupportedSqlShape;
+        while (i < sql.len and std.ascii.isDigit(sql[i])) i += 1;
+    }
+
+    // Never split a malformed decimal into two NUMBER tokens: doing so can
+    // make invalid input appear valid once optional aliases are considered.
+    if (has_decimal_point and i + 1 < sql.len and sql[i] == '.' and std.ascii.isDigit(sql[i + 1])) {
+        return error.UnsupportedSqlShape;
+    }
+    if (i < sql.len and (std.ascii.isAlphabetic(sql[i]) or sql[i] == '_' or sql[i] == '$')) {
+        return error.UnsupportedSqlShape;
+    }
+    return i;
+}
+
 pub fn freeTokens(alloc: std.mem.Allocator, tokens: *std.ArrayListUnmanaged(Token)) void {
     for (tokens.items) |token| {
         if (token.owned) alloc.free(token.text);
@@ -426,6 +491,82 @@ test "sql adapter lexer emits qualified-name and postfix-cast grammar terminals"
 test "sql adapter lexer rejects unterminated dollar quoted literals" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.UnsupportedSqlShape, tokenizeAlloc(alloc, "SELECT $tag$unterminated"));
+}
+
+test "sql adapter lexer handles PostgreSQL numeric literal forms" {
+    const alloc = std.testing.allocator;
+    const sql = "SELECT .5, 1., 1e2, 1.25E-3";
+
+    var tokens = try tokenizeAlloc(alloc, sql);
+    defer freeTokens(alloc, &tokens);
+
+    const expected = [_][]const u8{ ".5", "1.", "1e2", "1.25E-3" };
+    var number_index: usize = 0;
+    for (tokens.items) |token| {
+        if (token.kind != .number) continue;
+        try std.testing.expect(number_index < expected.len);
+        try std.testing.expectEqualStrings(expected[number_index], token.text);
+        try std.testing.expectEqualStrings(token.text, sql[token.source_start..token.source_end]);
+        number_index += 1;
+    }
+    try std.testing.expectEqual(expected.len, number_index);
+}
+
+test "sql adapter lexer rejects malformed numeric literals" {
+    const alloc = std.testing.allocator;
+    const invalid = [_][]const u8{
+        "SELECT 1.2.3",
+        "SELECT .5.6",
+        "SELECT 1e",
+        "SELECT 1e+",
+        "SELECT 1alias",
+        "SELECT .5alias",
+    };
+    for (invalid) |sql| {
+        try std.testing.expectError(error.UnsupportedSqlShape, tokenizeAlloc(alloc, sql));
+    }
+}
+
+test "sql adapter lexer decodes escaped quoted identifiers" {
+    const alloc = std.testing.allocator;
+    const sql = "SELECT \"a\"\"b\" FROM \"select\"";
+
+    var tokens = try tokenizeAlloc(alloc, sql);
+    defer freeTokens(alloc, &tokens);
+
+    try std.testing.expectEqualStrings("a\"b", tokens.items[1].text);
+    try std.testing.expect(tokens.items[1].owned);
+    try std.testing.expectEqual(@as(?token_mod.TokenKeyword, null), tokens.items[1].keyword);
+    try std.testing.expectEqualStrings("\"a\"\"b\"", sql[tokens.items[1].source_start..tokens.items[1].source_end]);
+    try std.testing.expectEqualStrings("select", tokens.items[3].text);
+    try std.testing.expectEqual(@as(?token_mod.TokenKeyword, null), tokens.items[3].keyword);
+    try std.testing.expectError(error.UnsupportedSqlShape, tokenizeAlloc(alloc, "SELECT \"\""));
+    try std.testing.expectError(error.UnsupportedSqlShape, tokenizeAlloc(alloc, "SELECT \"unterminated"));
+}
+
+test "sql adapter lexer accepts dollar signs inside unquoted identifiers" {
+    const alloc = std.testing.allocator;
+    const sql = "SELECT account$region FROM tenants";
+
+    var tokens = try tokenizeAlloc(alloc, sql);
+    defer freeTokens(alloc, &tokens);
+
+    try std.testing.expectEqualStrings("account$region", tokens.items[1].text);
+    try std.testing.expectEqual(TokenKind.identifier, tokens.items[1].kind);
+    try std.testing.expectEqualStrings("account$region", sql[tokens.items[1].source_start..tokens.items[1].source_end]);
+}
+
+test "sql adapter lexer accepts nested block comments" {
+    const alloc = std.testing.allocator;
+    const sql = "SELECT /* outer /* nested */ still outer */ 1";
+
+    var tokens = try tokenizeAlloc(alloc, sql);
+    defer freeTokens(alloc, &tokens);
+
+    try std.testing.expectEqual(@as(usize, 2), tokens.items.len);
+    try std.testing.expectEqualStrings("SELECT", tokens.items[0].text);
+    try std.testing.expectEqualStrings("1", tokens.items[1].text);
+    try std.testing.expectError(error.UnsupportedSqlShape, tokenizeAlloc(alloc, "SELECT /* outer /* nested */"));
 }
 
 test "sql adapter lexer tokenizes graph relationship labels" {

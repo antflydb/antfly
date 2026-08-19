@@ -539,11 +539,16 @@ fn addLocalYaccCodegen(
     return exe;
 }
 
+const YaccSteps = struct {
+    run_yacc_tests: *std.Build.Step.Run,
+    run_parser_tests: *std.Build.Step.Run,
+};
+
 fn addYaccSteps(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-) void {
+) YaccSteps {
     const yacc_codegen = addLocalYaccCodegen(b, target, optimize);
     const install_yacc_codegen = b.addInstallArtifact(yacc_codegen, .{});
     const yacc_codegen_step = b.step("yacc-zig", "Build and install the standalone Zig yacc generator");
@@ -604,6 +609,11 @@ fn addYaccSteps(
     const run_parser_tests = b.addRunArtifact(parser_tests);
     const parser_test_step = b.step("sql-parser-test", "Run the storage-independent SQL lexer and parser tests");
     parser_test_step.dependOn(&run_parser_tests.step);
+
+    return .{
+        .run_yacc_tests = run_yacc_tests,
+        .run_parser_tests = run_parser_tests,
+    };
 }
 
 fn addLocalHttpxModule(
@@ -1431,7 +1441,7 @@ pub fn build(b: *std.Build) void {
     addSnowballCheckStep(b);
     const openapi_codegen = addLocalOpenApiCodegen(b, target, optimize, httpx_mod);
     addOpenApiRegenStep(b, openapi_codegen);
-    addYaccSteps(b, target, optimize);
+    const yacc_steps = addYaccSteps(b, target, optimize);
     const openapi_root_check = addOpenApiRootCheckStep(b);
     const antfly_generated_root = "pkg/antfly/src/openapi/generated";
     const public_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_public_openapi", antfly_generated_root ++ "/antfly_public_openapi");
@@ -4052,6 +4062,8 @@ pub fn build(b: *std.Build) void {
 
     const unit_test_step = b.step("unit-test", "Run hermetic unit and focused integration test buckets without metadata chaos simulations");
     const unit_test_progress_step = b.step("unit-test-progress", "Run labeled major unit test suites to expose slow or stuck phases");
+    unit_test_step.dependOn(&yacc_steps.run_yacc_tests.step);
+    unit_test_step.dependOn(&yacc_steps.run_parser_tests.step);
 
     const lib_db_tests = b.addTest(.{
         .root_module = lib_test_mod,

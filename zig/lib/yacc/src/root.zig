@@ -224,9 +224,12 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
     var skip_brace_block_depth: usize = 0;
     var skip_block_comment = false;
     var pending_declaration: ?PendingDeclaration = null;
+    var section: enum { declarations, rules, epilogue } = .declarations;
 
     var lines = std.mem.splitScalar(u8, source, '\n');
     while (lines.next()) |raw_line| {
+        // The epilogue is arbitrary host-language code, not yacc syntax.
+        if (section == .epilogue) continue;
         if (skip_percent_prologue) {
             if (std.mem.indexOf(u8, raw_line, "%}") != null) skip_percent_prologue = false;
             continue;
@@ -302,6 +305,11 @@ pub fn parseGrammar(allocator: std.mem.Allocator, source: []const u8) !Grammar {
             continue;
         }
         if (std.mem.eql(u8, line, "%%")) {
+            section = switch (section) {
+                .declarations => .rules,
+                .rules => .epilogue,
+                .epilogue => unreachable,
+            };
             active_rule = null;
             pending_declaration = null;
             continue;
@@ -2366,6 +2374,32 @@ test "parseGrammar handles bison empty productions and block comments" {
     try std.testing.expectEqualStrings("\"https://example.test/not//comment\"", grammar.rules.items[0].alternatives.items[1].symbols[0]);
     try std.testing.expectEqual(@as(usize, 0), grammar.rules.items[0].alternatives.items[2].symbols.len);
     try std.testing.expectEqual(@as(usize, 0), grammar.rules.items[0].alternatives.items[3].symbols.len);
+}
+
+test "parseGrammar ignores host-language epilogue after second separator" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const source =
+        \\%{
+        \\#include <stddef.h>
+        \\%}
+        \\%start stmt
+        \\%token IDENT
+        \\%%
+        \\stmt:
+        \\    IDENT
+        \\  ;
+        \\%%
+        \\static int helper(void) {
+        \\    return 0;
+        \\}
+        \\/* This does not need to be valid yacc input. */
+    ;
+    const grammar = try parseGrammar(arena, source);
+    try std.testing.expectEqual(@as(usize, 1), grammar.rules.items.len);
+    try std.testing.expectEqualStrings("stmt", grammar.rules.items[0].name);
+    try validateGrammar(grammar);
 }
 
 test "buildSlrTables builds conflict-free tables for a small grammar" {
