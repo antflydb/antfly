@@ -613,6 +613,12 @@ pub fn globMatch(pattern: []const u8, text: []const u8) bool {
     return pi == pattern.len;
 }
 
+/// Match a field name against a JSON Schema `patternProperties` expression
+/// using the same regex engine and error mapping as runtime validation.
+pub fn patternPropertyMatches(pattern: []const u8, field_name: []const u8) !bool {
+    return try regexMatch(pattern, field_name);
+}
+
 fn stringifyJsonValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
 }

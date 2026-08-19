@@ -41,19 +41,6 @@ pub const FieldCapability = struct {
     }
 };
 
-/// One document schema's declaration for a physical path. A null scalar marks
-/// a shape that cannot participate in the bounded, table-wide projection
-/// (object, array, unbounded text, composite schema, or explicitly unindexed).
-const StaticPathClaim = struct {
-    path: []u8,
-    bounded_scalar_type: ?[]const u8,
-
-    fn deinit(self: *StaticPathClaim, alloc: Allocator) void {
-        alloc.free(self.path);
-        self.* = undefined;
-    }
-};
-
 /// A table-level dynamic template compiled into a runtime-adaptive algebraic
 /// rule. Only templates that resolve to a bounded scalar type become rules; the
 /// selectors are carried verbatim and evaluated per-document at ingest time.
@@ -110,11 +97,6 @@ pub fn compilePlanAlloc(alloc: Allocator, schema: schema_mod.ParsedTableSchema) 
     errdefer {
         for (fields.items) |*field| field.deinit(alloc);
         fields.deinit(alloc);
-    }
-    var static_path_claims = std.ArrayListUnmanaged(StaticPathClaim).empty;
-    defer {
-        for (static_path_claims.items) |*claim| claim.deinit(alloc);
-        static_path_claims.deinit(alloc);
     }
     var dynamic_rules = std.ArrayListUnmanaged(DynamicRuleCapability).empty;
     errdefer {
@@ -183,7 +165,6 @@ pub fn compilePlanAlloc(alloc: Allocator, schema: schema_mod.ParsedTableSchema) 
                 property.name,
                 property,
                 &fields,
-                &static_path_claims,
                 &skipped_dynamic_fields,
                 &skipped_complex_fields,
                 &skipped_unbounded_fields,
@@ -191,7 +172,7 @@ pub fn compilePlanAlloc(alloc: Allocator, schema: schema_mod.ParsedTableSchema) 
         }
     }
 
-    try removeConflictingStaticPaths(alloc, &fields, static_path_claims.items, &skipped_complex_fields);
+    try removeUnsafeStaticPaths(alloc, &fields, schema, &skipped_complex_fields);
     try qualifyCollidingFieldNames(alloc, fields.items);
 
     return .{
@@ -206,33 +187,328 @@ pub fn compilePlanAlloc(alloc: Allocator, schema: schema_mod.ParsedTableSchema) 
 
 /// Static projections are table-wide and do not carry a document-type
 /// discriminator. If document schemas assign incompatible scalar types or any
-/// schema declares the same path complex, unbounded, or unindexed, projecting a
-/// bounded interpretation would make ingest depend on which schema contributed
-/// the field spec. Omit every role for that ambiguous physical path and leave it
-/// on the schemaless path-fact route.
-fn removeConflictingStaticPaths(
+/// schema can admit the same path as complex, unbounded, or unindexed,
+/// projecting a bounded interpretation would make ingest depend on which
+/// schema contributed the field spec. Omit every role for that ambiguous
+/// physical path and leave it on the schemaless path-fact route.
+const StaticPathResolution = union(enum) {
+    /// The schema rejects this physical path, so it cannot conflict.
+    absent,
+    /// The schema admits exactly one bounded scalar interpretation.
+    bounded: []const u8,
+    /// The schema admits an unbounded, complex, unindexed, or ambiguous value.
+    incompatible,
+};
+
+const ObjectSchemaView = struct {
+    properties: []const schema_mod.DocumentProperty,
+    pattern_properties: []const schema_mod.PatternProperty,
+    additional_properties_allowed: ?bool,
+    additional_properties_schema: ?*schema_mod.DocumentProperty,
+    dynamic_infer_types: bool,
+    unevaluated_properties_allowed: ?bool,
+    unevaluated_properties_schema: ?*schema_mod.DocumentProperty,
+    has_composition: bool,
+};
+
+const DynamicPathResolution = struct {
+    resolution: StaticPathResolution = .absent,
+    exhaustive: bool = false,
+};
+
+fn resolveDocumentStaticPath(
+    schema: schema_mod.ParsedTableSchema,
+    document_schema: schema_mod.DocumentSchema,
+    path: []const u8,
+) anyerror!StaticPathResolution {
+    return try resolveObjectStaticPath(
+        schema,
+        .{
+            .properties = document_schema.properties,
+            .pattern_properties = document_schema.pattern_properties,
+            .additional_properties_allowed = document_schema.additional_properties_allowed,
+            .additional_properties_schema = document_schema.additional_properties_schema,
+            .dynamic_infer_types = document_schema.dynamic_infer_types,
+            .unevaluated_properties_allowed = document_schema.unevaluated_properties_allowed,
+            .unevaluated_properties_schema = document_schema.unevaluated_properties_schema,
+            .has_composition = document_schema.any_of.len > 0 or
+                document_schema.one_of.len > 0 or
+                document_schema.all_of.len > 0 or
+                document_schema.not_schema != null or
+                document_schema.if_schema != null or
+                document_schema.then_schema != null or
+                document_schema.else_schema != null or
+                document_schema.dependent_schemas.len > 0,
+        },
+        path,
+        true,
+    );
+}
+
+/// Resolve a candidate path with the same precedence used by schema
+/// validation: explicit property, every matching pattern property, dynamic
+/// template (at the document root), additionalProperties, then
+/// unevaluated/default openness. Composition is conservatively incompatible:
+/// its value-dependent intersections cannot be represented by a single
+/// table-wide scalar fact without carrying the document type through ingest.
+fn resolveObjectStaticPath(
+    schema: schema_mod.ParsedTableSchema,
+    object_schema: ObjectSchemaView,
+    path: []const u8,
+    allow_dynamic_templates: bool,
+) anyerror!StaticPathResolution {
+    if (path.len == 0 or object_schema.has_composition) return .incompatible;
+
+    const dot = std.mem.indexOfScalar(u8, path, '.');
+    const field_name = if (dot) |idx| path[0..idx] else path;
+    const tail: ?[]const u8 = if (dot) |idx| path[idx + 1 ..] else null;
+    if (field_name.len == 0 or (tail != null and tail.?.len == 0)) return .incompatible;
+
+    for (object_schema.properties) |property| {
+        if (!std.mem.eql(u8, property.name, field_name)) continue;
+        return resolvePropertyStaticPath(schema, property, tail);
+    }
+
+    var matched_pattern = false;
+    var pattern_scalar: ?[]const u8 = null;
+    var pattern_incompatible = false;
+    for (object_schema.pattern_properties) |pattern_property| {
+        if (!try schema_mod.patternPropertyMatches(pattern_property.pattern, field_name)) continue;
+        matched_pattern = true;
+        switch (try resolvePropertyStaticPath(schema, pattern_property.property.*, tail)) {
+            // Every matching pattern is an intersecting constraint. If one of
+            // them makes the nested path impossible, the path is absent.
+            .absent => return .absent,
+            .incompatible => pattern_incompatible = true,
+            .bounded => |scalar| {
+                if (pattern_scalar) |existing| {
+                    if (!std.mem.eql(u8, existing, scalar)) pattern_incompatible = true;
+                } else {
+                    pattern_scalar = scalar;
+                }
+            },
+        }
+    }
+    if (matched_pattern) {
+        if (pattern_incompatible) return .incompatible;
+        return if (pattern_scalar) |scalar| .{ .bounded = scalar } else .absent;
+    }
+
+    var dynamic_resolution: DynamicPathResolution = .{};
+    if (allow_dynamic_templates) {
+        dynamic_resolution = resolveDynamicStaticPath(schema.dynamic_templates, field_name, tail);
+        if (dynamic_resolution.exhaustive) return dynamic_resolution.resolution;
+    }
+
+    const fallback = try resolveObjectStaticFallback(schema, object_schema, tail);
+    return mergeAlternativeResolutions(dynamic_resolution.resolution, fallback);
+}
+
+fn resolveObjectStaticFallback(
+    schema: schema_mod.ParsedTableSchema,
+    object_schema: ObjectSchemaView,
+    tail: ?[]const u8,
+) anyerror!StaticPathResolution {
+    if (object_schema.additional_properties_schema) |additional_schema| {
+        return resolvePropertyStaticPath(schema, additional_schema.*, tail);
+    }
+    if (object_schema.additional_properties_allowed) |allowed| {
+        return if (allowed) .incompatible else .absent;
+    }
+    // Dynamic inference is valid only with open additional properties, but
+    // retain the guard here so a future parser relaxation fails closed.
+    if (object_schema.dynamic_infer_types) return .incompatible;
+    if (object_schema.unevaluated_properties_schema) |unevaluated_schema| {
+        return resolvePropertyStaticPath(schema, unevaluated_schema.*, tail);
+    }
+    if (object_schema.unevaluated_properties_allowed) |allowed| {
+        return if (allowed) .incompatible else .absent;
+    }
+    return if (schema.enforce_types) .absent else .incompatible;
+}
+
+fn resolvePropertyStaticPath(
+    schema: schema_mod.ParsedTableSchema,
+    property: schema_mod.DocumentProperty,
+    tail: ?[]const u8,
+) anyerror!StaticPathResolution {
+    if (property.antfly_index != null and !property.antfly_index.?) return .incompatible;
+    if (propertyHasComposition(property)) return .incompatible;
+
+    if (tail == null) {
+        return if (boundedScalarForStaticProperty(property)) |scalar|
+            .{ .bounded = scalar }
+        else
+            .incompatible;
+    }
+
+    // Static path lookup traverses objects only. Scalar and array declarations
+    // therefore make a deeper dotted path impossible rather than ambiguous.
+    if (property.item != null) return .absent;
+    if (property.field_type) |field_type| {
+        if (!std.mem.eql(u8, field_type, "object")) return .absent;
+    } else if (scalarType(property) != null) {
+        return .absent;
+    }
+
+    // A bare object (or unconstrained `{}` property) accepts arbitrary nested
+    // members even when table-level enforce_types is enabled, because runtime
+    // validation has no object-member rule to evaluate.
+    if (!propertyHasObjectRules(property)) return .incompatible;
+
+    return try resolveObjectStaticPath(
+        schema,
+        .{
+            .properties = property.properties,
+            .pattern_properties = property.pattern_properties,
+            .additional_properties_allowed = property.additional_properties_allowed,
+            .additional_properties_schema = property.additional_properties_schema,
+            .dynamic_infer_types = property.dynamic_infer_types,
+            .unevaluated_properties_allowed = property.unevaluated_properties_allowed,
+            .unevaluated_properties_schema = property.unevaluated_properties_schema,
+            .has_composition = false,
+        },
+        tail.?,
+        false,
+    );
+}
+
+fn boundedScalarForStaticProperty(property: schema_mod.DocumentProperty) ?[]const u8 {
+    if (property.antfly_index != null and !property.antfly_index.?) return null;
+    if (property.item != null or property.properties.len > 0 or propertyHasComposition(property)) return null;
+    return scalarType(property);
+}
+
+fn propertyHasComposition(property: schema_mod.DocumentProperty) bool {
+    return property.root_ref or
+        property.any_of.len > 0 or
+        property.one_of.len > 0 or
+        property.all_of.len > 0 or
+        property.not_schema != null or
+        property.if_schema != null or
+        property.then_schema != null or
+        property.else_schema != null or
+        property.dependent_schemas.len > 0;
+}
+
+fn propertyHasObjectRules(property: schema_mod.DocumentProperty) bool {
+    return property.properties.len > 0 or
+        property.pattern_properties.len > 0 or
+        property.required_fields.len > 0 or
+        property.additional_properties_allowed != null or
+        property.additional_properties_schema != null or
+        property.dynamic_infer_types or
+        property.unevaluated_properties_allowed != null or
+        property.unevaluated_properties_schema != null or
+        property.property_names != null or
+        property.dependent_required.len > 0 or
+        property.dependent_schemas.len > 0 or
+        property.min_properties != null or
+        property.max_properties != null or
+        propertyHasComposition(property);
+}
+
+fn resolveDynamicStaticPath(
+    templates: []const schema_mod.DynamicTemplate,
+    field_name: []const u8,
+    tail: ?[]const u8,
+) DynamicPathResolution {
+    var result: DynamicPathResolution = .{};
+    for (templates) |template| {
+        if (!dynamicTemplateNamePathMatches(template, field_name)) continue;
+
+        // A deeper static path requires the dynamically admitted root value to
+        // be an object. Mapping-type constrained rules for other JSON shapes
+        // cannot admit it.
+        if (tail != null) {
+            if (template.match_mapping_type) |mapping_type| {
+                if (!std.mem.eql(u8, mapping_type, "object")) continue;
+            }
+            result.resolution = .incompatible;
+        } else {
+            const scalar = if (template.do_index orelse true)
+                boundedScalarForTemplateType(template.field_type orelse "text")
+            else
+                null;
+            result.resolution = mergeAlternativeResolutions(
+                result.resolution,
+                if (scalar) |bounded| .{ .bounded = bounded } else .incompatible,
+            );
+        }
+
+        // Without a mapping-type selector this is the first matching template
+        // for every possible value, so later templates and fallbacks are
+        // unreachable under runtime first-match semantics.
+        if (template.match_mapping_type == null) {
+            result.exhaustive = true;
+            break;
+        }
+    }
+    return result;
+}
+
+fn dynamicTemplateNamePathMatches(template: schema_mod.DynamicTemplate, path: []const u8) bool {
+    const field_name = fieldNameFromPath(path);
+    if (template.match_pattern) |pattern| {
+        if (!schema_mod.globMatch(pattern, field_name)) return false;
+    }
+    if (template.unmatch_pattern) |pattern| {
+        if (schema_mod.globMatch(pattern, field_name)) return false;
+    }
+    if (template.path_match) |pattern| {
+        if (!schema_mod.globMatch(pattern, path)) return false;
+    }
+    if (template.path_unmatch) |pattern| {
+        if (schema_mod.globMatch(pattern, path)) return false;
+    }
+    return true;
+}
+
+fn mergeAlternativeResolutions(lhs: StaticPathResolution, rhs: StaticPathResolution) StaticPathResolution {
+    return switch (lhs) {
+        .absent => rhs,
+        .incompatible => .incompatible,
+        .bounded => |lhs_scalar| switch (rhs) {
+            .absent => lhs,
+            .incompatible => .incompatible,
+            .bounded => |rhs_scalar| if (std.mem.eql(u8, lhs_scalar, rhs_scalar)) lhs else .incompatible,
+        },
+    };
+}
+
+fn removeUnsafeStaticPaths(
     alloc: Allocator,
     fields: *std.ArrayListUnmanaged(FieldCapability),
-    claims: []const StaticPathClaim,
+    schema: schema_mod.ParsedTableSchema,
     skipped_complex_fields: *u32,
 ) !void {
     if (fields.items.len == 0) return;
     const remove = try alloc.alloc(bool, fields.items.len);
     defer alloc.free(remove);
     @memset(remove, false);
+    var path_safety = std.StringHashMapUnmanaged(bool).empty;
+    defer path_safety.deinit(alloc);
 
     for (fields.items, 0..) |field, i| {
-        for (claims) |claim| {
-            if (!std.mem.eql(u8, field.path, claim.path)) continue;
-            const claimed_scalar = claim.bounded_scalar_type orelse {
-                remove[i] = true;
-                break;
-            };
-            if (!std.mem.eql(u8, field.scalar_type, claimed_scalar)) {
-                remove[i] = true;
-                break;
+        if (path_safety.get(field.path)) |unsafe| {
+            remove[i] = unsafe;
+            continue;
+        }
+        for (schema.document_schemas) |document_schema| {
+            const resolution = try resolveDocumentStaticPath(schema, document_schema, field.path);
+            switch (resolution) {
+                .absent => {},
+                .incompatible => {
+                    remove[i] = true;
+                    break;
+                },
+                .bounded => |scalar| if (!std.mem.eql(u8, field.scalar_type, scalar)) {
+                    remove[i] = true;
+                    break;
+                },
             }
         }
+        try path_safety.put(alloc, field.path, remove[i]);
     }
 
     for (fields.items, remove, 0..) |field, should_remove, i| {
@@ -605,26 +881,12 @@ fn collectPropertyCapabilities(
     path: []const u8,
     property: anytype,
     fields: *std.ArrayListUnmanaged(FieldCapability),
-    static_path_claims: *std.ArrayListUnmanaged(StaticPathClaim),
     skipped_dynamic_fields: *u32,
     skipped_complex_fields: *u32,
     skipped_unbounded_fields: *u32,
 ) !void {
     const explicitly_unindexed = property.antfly_index != null and !property.antfly_index.?;
     const composite = property.any_of.len > 0 or property.one_of.len > 0 or property.all_of.len > 0 or property.not_schema != null or property.if_schema != null;
-    const bounded_scalar = if (explicitly_unindexed or
-        property.item != null or
-        property.properties.len > 0 or
-        composite)
-        null
-    else
-        scalarType(property);
-    const claim_path = try alloc.dupe(u8, path);
-    errdefer alloc.free(claim_path);
-    try static_path_claims.append(alloc, .{
-        .path = claim_path,
-        .bounded_scalar_type = bounded_scalar,
-    });
     if (explicitly_unindexed) return;
 
     if (property.additional_properties_allowed orelse false) {
@@ -652,7 +914,6 @@ fn collectPropertyCapabilities(
                 child_path,
                 child,
                 fields,
-                static_path_claims,
                 skipped_dynamic_fields,
                 skipped_complex_fields,
                 skipped_unbounded_fields,
@@ -858,6 +1119,75 @@ test "schema capability omits bounded paths claimed as unbounded or complex by a
     try std.testing.expectEqualStrings("metadata.code", parsed_config.value.group_fields[0].path);
 }
 
+test "schema capability omits paths admitted by open and dynamic document schemas" {
+    const alloc = std.testing.allocator;
+    const cases = [_][]const u8{
+        // Explicitly open root.
+        "{\"version\":12,\"default_type\":\"article\",\"document_schemas\":{\"article\":{\"schema\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":false}},\"event\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true}}}}",
+        // Inferred dynamic fields are value-dependent and therefore unbounded.
+        "{\"version\":12,\"default_type\":\"article\",\"document_schemas\":{\"article\":{\"schema\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":false}},\"event\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"x-antfly-dynamic-indexing\":{\"mode\":\"infer_types\"}}}}}",
+        // Default-open root when type enforcement is disabled.
+        "{\"version\":12,\"default_type\":\"article\",\"enforce_types\":false,\"document_schemas\":{\"article\":{\"schema\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":false}},\"event\":{\"schema\":{\"type\":\"object\"}}}}",
+        // A matching pattern assigns an incompatible bounded type.
+        "{\"version\":12,\"default_type\":\"article\",\"enforce_types\":true,\"document_schemas\":{\"article\":{\"schema\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":false}},\"event\":{\"schema\":{\"type\":\"object\",\"patternProperties\":{\"^status$\":{\"type\":\"numeric\"}},\"additionalProperties\":false}}}}",
+        // A typed additionalProperties schema assigns an incompatible type.
+        "{\"version\":12,\"default_type\":\"article\",\"enforce_types\":true,\"document_schemas\":{\"article\":{\"schema\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":false}},\"event\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":{\"type\":\"numeric\"}}}}}",
+        // unevaluatedProperties is another path-admission fallback.
+        "{\"version\":12,\"default_type\":\"article\",\"enforce_types\":true,\"document_schemas\":{\"article\":{\"schema\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":false}},\"event\":{\"schema\":{\"type\":\"object\",\"unevaluatedProperties\":true}}}}",
+        // A global template is evaluated before a closed additionalProperties
+        // fallback and can therefore admit the otherwise undeclared path.
+        "{\"version\":12,\"default_type\":\"article\",\"enforce_types\":true,\"document_schemas\":{\"article\":{\"schema\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":false}},\"event\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":false}}},\"dynamic_templates\":[{\"name\":\"numeric_status\",\"match\":\"status\",\"mapping\":{\"type\":\"numeric\"}}]}",
+    };
+
+    for (cases) |schema_json| {
+        var parsed = try schema_mod.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed.deinit(alloc);
+        var plan = try compilePlanAlloc(alloc, parsed);
+        defer plan.deinit(alloc);
+        try expectNoCapabilityPath(plan, "status");
+    }
+}
+
+test "schema capability omits nested paths admitted by open object schemas" {
+    const alloc = std.testing.allocator;
+    const cases = [_][]const u8{
+        "{\"version\":13,\"default_type\":\"article\",\"enforce_types\":true,\"document_schemas\":{\"article\":{\"schema\":{\"type\":\"object\",\"properties\":{\"meta\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":false}},\"additionalProperties\":false}},\"event\":{\"schema\":{\"type\":\"object\",\"properties\":{\"meta\":{\"type\":\"object\",\"additionalProperties\":true}},\"additionalProperties\":false}}}}",
+        // A bare object has no member-validation rule and remains open even
+        // under table-level type enforcement.
+        "{\"version\":13,\"default_type\":\"article\",\"enforce_types\":true,\"document_schemas\":{\"article\":{\"schema\":{\"type\":\"object\",\"properties\":{\"meta\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":false}},\"additionalProperties\":false}},\"event\":{\"schema\":{\"type\":\"object\",\"properties\":{\"meta\":{\"type\":\"object\"}},\"additionalProperties\":false}}}}",
+        "{\"version\":13,\"default_type\":\"article\",\"enforce_types\":true,\"document_schemas\":{\"article\":{\"schema\":{\"type\":\"object\",\"properties\":{\"meta\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":false}},\"additionalProperties\":false}},\"event\":{\"schema\":{\"type\":\"object\",\"properties\":{\"meta\":{\"type\":\"object\",\"patternProperties\":{\"^status$\":{\"type\":\"numeric\"}},\"additionalProperties\":false}},\"additionalProperties\":false}}}}",
+    };
+
+    for (cases) |schema_json| {
+        var parsed = try schema_mod.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed.deinit(alloc);
+        var plan = try compilePlanAlloc(alloc, parsed);
+        defer plan.deinit(alloc);
+        try expectNoCapabilityPath(plan, "meta.status");
+    }
+}
+
+test "schema capability preserves compatible typed open path declarations" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"version":14,"default_type":"explicit","enforce_types":true,
+        \\"document_schemas":{
+        \\"explicit":{"schema":{"type":"object","properties":{"status":{"type":"keyword"},"meta":{"type":"object","properties":{"status":{"type":"keyword"}},"additionalProperties":false}},"additionalProperties":false}},
+        \\"additional":{"schema":{"type":"object","properties":{"meta":{"type":"object","additionalProperties":{"type":"keyword"}}},"additionalProperties":{"type":"keyword"}}},
+        \\"pattern":{"schema":{"type":"object","patternProperties":{"^status$":{"type":"keyword"}},"properties":{"meta":{"type":"object","patternProperties":{"^status$":{"type":"keyword"}},"additionalProperties":false}},"additionalProperties":false}},
+        \\"unevaluated":{"schema":{"type":"object","unevaluatedProperties":{"type":"keyword"}}},
+        \\"template":{"schema":{"type":"object","additionalProperties":false}}},
+        \\"dynamic_templates":[{"name":"status_keyword","match":"status","mapping":{"type":"keyword"}}]
+        \\}
+    );
+    defer parsed.deinit(alloc);
+
+    var plan = try compilePlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+    try expectCapability(plan, "explicit", "status", "status", "string", .group);
+    try expectCapability(plan, "explicit", "meta.status", "meta.status", "string", .group);
+}
+
 test "schema capability coalesces compatible paths shared by document types" {
     const alloc = std.testing.allocator;
     var parsed = try schema_mod.parseValidatedTableSchema(alloc,
@@ -1056,4 +1386,10 @@ fn expectCapability(
         return;
     }
     return error.MissingCapability;
+}
+
+fn expectNoCapabilityPath(plan: Plan, path: []const u8) !void {
+    for (plan.fields) |field| {
+        if (std.mem.eql(u8, field.path, path)) return error.UnexpectedCapability;
+    }
 }

@@ -17,6 +17,13 @@ const storage_schema = @import("../storage/schema.zig");
 const impl = @import("table_schema_impl.zig");
 
 pub const ParsedTableSchema = impl.TableSchema;
+pub const DocumentSchema = impl.DocumentSchema;
+pub const DocumentProperty = impl.DocumentProperty;
+pub const DynamicTemplate = impl.DynamicTemplate;
+pub const PatternProperty = impl.PatternProperty;
+
+pub const globMatch = impl.globMatch;
+pub const patternPropertyMatches = impl.patternPropertyMatches;
 
 pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
     return try impl.parseSchemaUpdateRequest(alloc, body);
