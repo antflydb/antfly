@@ -64,6 +64,8 @@ const snowball_languages = [_][]const u8{
 };
 
 const snowball_generated_root = "pkg/antfly/src/search/snowball/generated";
+const sql_grammar_source = "pkg/antfly/src/sql/grammar/antfly_sql.y";
+const sql_grammar_generated_root = "pkg/antfly/src/sql/grammar/generated/root.zig";
 
 const snowball_compiler_sources = [_][]const u8{
     "compiler/analyser.c",
@@ -557,6 +559,51 @@ fn addYaccSteps(
     const run_yacc_tests = b.addRunArtifact(yacc_tests);
     const yacc_test_step = b.step("yacc-test", "Run standalone lib/yacc parser generator tests");
     yacc_test_step.dependOn(&run_yacc_tests.step);
+
+    const regen_run = b.addRunArtifact(yacc_codegen);
+    regen_run.addFileArg(b.path(sql_grammar_source));
+    const regen_output = regen_run.addOutputFileArg("regen_sql_grammar_root.zig");
+    regen_run.addArg(sql_grammar_source);
+    const update = b.addUpdateSourceFiles();
+    update.addCopyFileToSource(regen_output, sql_grammar_generated_root);
+    const regen_fmt = b.addSystemCommand(&.{ b.graph.zig_exe, "fmt", sql_grammar_generated_root });
+    regen_fmt.step.dependOn(&update.step);
+    const regen_step = b.step("regen-sql-grammar", "Regenerate checked-in Antfly SQL grammar metadata");
+    regen_step.dependOn(&regen_fmt.step);
+
+    const check_run = b.addRunArtifact(yacc_codegen);
+    check_run.addFileArg(b.path(sql_grammar_source));
+    const check_output = check_run.addOutputFileArg("check_sql_grammar_root.zig");
+    check_run.addArg(sql_grammar_source);
+    const check_fmt = b.addSystemCommand(&.{ b.graph.zig_exe, "fmt" });
+    check_fmt.addFileArg(check_output);
+    const compare = b.addRunArtifact(addFileCompareTool(b));
+    compare.step.dependOn(&check_fmt.step);
+    compare.addFileArg(check_output);
+    compare.addFileArg(b.path(sql_grammar_generated_root));
+
+    const generated_compile = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(sql_grammar_generated_root),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_generated_compile = b.addRunArtifact(generated_compile);
+    const check_step = b.step("sql-grammar-generated-check", "Check and compile the generated Antfly SQL grammar metadata");
+    check_step.dependOn(&compare.step);
+    check_step.dependOn(&run_generated_compile.step);
+
+    const parser_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/sql/parser_root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_parser_tests = b.addRunArtifact(parser_tests);
+    const parser_test_step = b.step("sql-parser-test", "Run the storage-independent SQL lexer and parser tests");
+    parser_test_step.dependOn(&run_parser_tests.step);
 }
 
 fn addLocalHttpxModule(

@@ -834,9 +834,9 @@ pub fn buildSlrTables(allocator: std.mem.Allocator, grammar: Grammar) !Tables {
                 break :target states.items.len - 1;
             };
             try transitions.append(allocator, .{
-                .state = @intCast(state_idx),
+                .state = try tableIndex(state_idx),
                 .nonterminal = next_symbol,
-                .target = @intCast(target),
+                .target = try tableIndex(target),
             });
         }
     }
@@ -850,7 +850,7 @@ pub fn buildSlrTables(allocator: std.mem.Allocator, grammar: Grammar) !Tables {
             if (transition.state != i) continue;
             if (symbols.items[transition.nonterminal].kind == .terminal) {
                 try addAction(allocator, &actions, &conflicts, .{
-                    .state = @intCast(i),
+                    .state = try tableIndex(i),
                     .terminal = transition.nonterminal,
                     .kind = .shift,
                     .target = transition.target,
@@ -865,7 +865,7 @@ pub fn buildSlrTables(allocator: std.mem.Allocator, grammar: Grammar) !Tables {
             if (item.dot != production.rhs.len) continue;
             if (item.production == 0) {
                 try addAction(allocator, &actions, &conflicts, .{
-                    .state = @intCast(i),
+                    .state = try tableIndex(i),
                     .terminal = eof_symbol,
                     .kind = .accept,
                     .target = 0,
@@ -874,7 +874,7 @@ pub fn buildSlrTables(allocator: std.mem.Allocator, grammar: Grammar) !Tables {
             }
             for (follow[production.lhs]) |terminal| {
                 try addAction(allocator, &actions, &conflicts, .{
-                    .state = @intCast(i),
+                    .state = try tableIndex(i),
                     .terminal = terminal,
                     .kind = .reduce,
                     .target = item.production,
@@ -899,6 +899,11 @@ pub fn buildSlrTables(allocator: std.mem.Allocator, grammar: Grammar) !Tables {
         .eof_symbol = eof_symbol,
         .augmented_start_symbol = augmented_start_symbol,
     };
+}
+
+fn tableIndex(value: usize) !u16 {
+    if (value > std.math.maxInt(u16)) return error.GrammarTooLarge;
+    return @intCast(value);
 }
 
 fn computeNullable(allocator: std.mem.Allocator, symbol_count: usize, productions: []const Production) ![]bool {
@@ -1450,61 +1455,17 @@ fn emitZigMetadata(
         \\};
         \\
         \\pub fn parse(allocator: std.mem.Allocator, token_ids: []const u16) !void {
-        \\    var stack: std.ArrayListUnmanaged(u16) = .empty;
-        \\    defer stack.deinit(allocator);
-        \\    try stack.append(allocator, 0);
-        \\
-        \\    var index: usize = 0;
-        \\    while (true) {
-        \\        const state = stack.items[stack.items.len - 1];
-        \\        const lookahead: u16 = if (index < token_ids.len) token_ids[index] else 0;
-        \\        const action = findAction(state, lookahead) orelse return ParseError.UnexpectedToken;
-        \\        switch (action.kind) {
-        \\            .shift => {
-        \\                try stack.append(allocator, action.target);
-        \\                index += 1;
-        \\            },
-        \\            .reduce => {
-        \\                const production = productions[action.target];
-        \\                if (production.rhs_len > stack.items.len - 1) return ParseError.StackUnderflow;
-        \\                stack.items.len -= production.rhs_len;
-        \\                const goto_entry = findGoto(stack.items[stack.items.len - 1], production.lhs) orelse return ParseError.InvalidGoto;
-        \\                try stack.append(allocator, goto_entry.target);
-        \\            },
-        \\            .accept => return,
-        \\        }
-        \\    }
+        \\    var stack = DynamicStateStack.init(allocator);
+        \\    defer stack.deinit();
+        \\    try stack.push(0);
+        \\    const failure = try parseCore(token_ids, &stack, IgnoreEvents{});
+        \\    if (failure) |item| return item.parse_error;
         \\}
         \\
         \\pub fn parseWithStackBuffer(token_ids: []const u16, stack_buffer: []u16) !void {
-        \\    if (stack_buffer.len == 0) return ParseError.StackOverflow;
-        \\    var stack_len: usize = 1;
-        \\    stack_buffer[0] = 0;
-        \\
-        \\    var index: usize = 0;
-        \\    while (true) {
-        \\        const state = stack_buffer[stack_len - 1];
-        \\        const lookahead: u16 = if (index < token_ids.len) token_ids[index] else 0;
-        \\        const action = findAction(state, lookahead) orelse return ParseError.UnexpectedToken;
-        \\        switch (action.kind) {
-        \\            .shift => {
-        \\                if (stack_len == stack_buffer.len) return ParseError.StackOverflow;
-        \\                stack_buffer[stack_len] = action.target;
-        \\                stack_len += 1;
-        \\                index += 1;
-        \\            },
-        \\            .reduce => {
-        \\                const production = productions[action.target];
-        \\                if (production.rhs_len > stack_len - 1) return ParseError.StackUnderflow;
-        \\                stack_len -= production.rhs_len;
-        \\                const goto_entry = findGoto(stack_buffer[stack_len - 1], production.lhs) orelse return ParseError.InvalidGoto;
-        \\                if (stack_len == stack_buffer.len) return ParseError.StackOverflow;
-        \\                stack_buffer[stack_len] = goto_entry.target;
-        \\                stack_len += 1;
-        \\            },
-        \\            .accept => return,
-        \\        }
-        \\    }
+        \\    var stack = try FixedStateStack.init(stack_buffer);
+        \\    const failure = try parseCore(token_ids, &stack, IgnoreEvents{});
+        \\    if (failure) |item| return item.parse_error;
         \\}
         \\
         \\pub const Reduction = struct {
@@ -1538,43 +1499,9 @@ fn emitZigMetadata(
         \\}
         \\
         \\pub fn parseWithEvents(token_ids: []const u16, stack_buffer: []u16, event_handler: anytype) !void {
-        \\    if (stack_buffer.len == 0) return ParseError.StackOverflow;
-        \\    var stack_len: usize = 1;
-        \\    stack_buffer[0] = 0;
-        \\
-        \\    var index: usize = 0;
-        \\    while (true) {
-        \\        const state = stack_buffer[stack_len - 1];
-        \\        const lookahead: u16 = if (index < token_ids.len) token_ids[index] else 0;
-        \\        const action = findAction(state, lookahead) orelse return ParseError.UnexpectedToken;
-        \\        switch (action.kind) {
-        \\            .shift => {
-        \\                if (stack_len == stack_buffer.len) return ParseError.StackOverflow;
-        \\                try event_handler.shift(.{ .token_index = index, .terminal = lookahead });
-        \\                stack_buffer[stack_len] = action.target;
-        \\                stack_len += 1;
-        \\                index += 1;
-        \\            },
-        \\            .reduce => {
-        \\                const production = productions[action.target];
-        \\                if (production.rhs_len > stack_len - 1) return ParseError.StackUnderflow;
-        \\                try event_handler.reduce(.{
-        \\                    .production = action.target,
-        \\                    .lhs = production.lhs,
-        \\                    .rhs_len = production.rhs_len,
-        \\                });
-        \\                stack_len -= production.rhs_len;
-        \\                const goto_entry = findGoto(stack_buffer[stack_len - 1], production.lhs) orelse return ParseError.InvalidGoto;
-        \\                if (stack_len == stack_buffer.len) return ParseError.StackOverflow;
-        \\                stack_buffer[stack_len] = goto_entry.target;
-        \\                stack_len += 1;
-        \\            },
-        \\            .accept => {
-        \\                try maybeAccept(event_handler, .{ .token_count = index });
-        \\                return;
-        \\            },
-        \\        }
-        \\    }
+        \\    var stack = try FixedStateStack.init(stack_buffer);
+        \\    const failure = try parseCore(token_ids, &stack, event_handler);
+        \\    if (failure) |item| return item.parse_error;
         \\}
         \\
         \\fn maybeAccept(event_handler: anytype, accept: Accept) !void {
@@ -1583,6 +1510,117 @@ fn emitZigMetadata(
         \\        else => @TypeOf(event_handler),
         \\    };
         \\    if (comptime @hasDecl(Handler, "accept")) try event_handler.accept(accept);
+        \\}
+        \\
+        \\const ParseFailure = struct {
+        \\    parse_error: ParseError,
+        \\    info: ParseErrorInfo,
+        \\};
+        \\
+        \\const DynamicStateStack = struct {
+        \\    allocator: std.mem.Allocator,
+        \\    states: std.ArrayListUnmanaged(u16) = .empty,
+        \\
+        \\    fn init(allocator: std.mem.Allocator) @This() {
+        \\        return .{ .allocator = allocator };
+        \\    }
+        \\
+        \\    fn deinit(self: *@This()) void {
+        \\        self.states.deinit(self.allocator);
+        \\    }
+        \\
+        \\    fn push(self: *@This(), state: u16) !void {
+        \\        try self.states.append(self.allocator, state);
+        \\    }
+        \\
+        \\    fn top(self: *const @This()) u16 {
+        \\        return self.states.items[self.states.items.len - 1];
+        \\    }
+        \\
+        \\    fn canPop(self: *const @This(), count: u16) bool {
+        \\        return count <= self.states.items.len - 1;
+        \\    }
+        \\
+        \\    fn pop(self: *@This(), count: u16) void {
+        \\        self.states.items.len -= count;
+        \\    }
+        \\};
+        \\
+        \\const FixedStateStack = struct {
+        \\    states: []u16,
+        \\    len: usize,
+        \\
+        \\    fn init(buffer: []u16) !@This() {
+        \\        if (buffer.len == 0) return ParseError.StackOverflow;
+        \\        buffer[0] = 0;
+        \\        return .{ .states = buffer, .len = 1 };
+        \\    }
+        \\
+        \\    fn push(self: *@This(), state: u16) !void {
+        \\        if (self.len == self.states.len) return ParseError.StackOverflow;
+        \\        self.states[self.len] = state;
+        \\        self.len += 1;
+        \\    }
+        \\
+        \\    fn top(self: *const @This()) u16 {
+        \\        return self.states[self.len - 1];
+        \\    }
+        \\
+        \\    fn canPop(self: *const @This(), count: u16) bool {
+        \\        return count <= self.len - 1;
+        \\    }
+        \\
+        \\    fn pop(self: *@This(), count: u16) void {
+        \\        self.len -= count;
+        \\    }
+        \\};
+        \\
+        \\const IgnoreEvents = struct {
+        \\    fn shift(_: @This(), _: Shift) !void {}
+        \\    fn reduce(_: @This(), _: Reduction) !void {}
+        \\};
+        \\
+        \\fn parseFailure(parse_error: ParseError, state: u16, lookahead: u16, token_index: usize) ParseFailure {
+        \\    return .{
+        \\        .parse_error = parse_error,
+        \\        .info = .{ .state = state, .lookahead = lookahead, .token_index = token_index },
+        \\    };
+        \\}
+        \\
+        \\fn parseCore(token_ids: []const u16, stack: anytype, event_handler: anytype) !?ParseFailure {
+        \\    var index: usize = 0;
+        \\    while (true) {
+        \\        const state = stack.top();
+        \\        const lookahead: u16 = if (index < token_ids.len) token_ids[index] else 0;
+        \\        const action = findAction(state, lookahead) orelse
+        \\            return parseFailure(ParseError.UnexpectedToken, state, lookahead, index);
+        \\        switch (action.kind) {
+        \\            .shift => {
+        \\                try event_handler.shift(.{ .token_index = index, .terminal = lookahead });
+        \\                try stack.push(action.target);
+        \\                index += 1;
+        \\            },
+        \\            .reduce => {
+        \\                const production = productions[action.target];
+        \\                if (!stack.canPop(production.rhs_len))
+        \\                    return parseFailure(ParseError.StackUnderflow, state, lookahead, index);
+        \\                try event_handler.reduce(.{
+        \\                    .production = action.target,
+        \\                    .lhs = production.lhs,
+        \\                    .rhs_len = production.rhs_len,
+        \\                });
+        \\                stack.pop(production.rhs_len);
+        \\                const goto_state = stack.top();
+        \\                const goto_entry = findGoto(goto_state, production.lhs) orelse
+        \\                    return parseFailure(ParseError.InvalidGoto, goto_state, production.lhs, index);
+        \\                try stack.push(goto_entry.target);
+        \\            },
+        \\            .accept => {
+        \\                try maybeAccept(event_handler, .{ .token_count = index });
+        \\                return null;
+        \\            },
+        \\        }
+        \\    }
         \\}
         \\
         \\pub fn parseDiagnostic(allocator: std.mem.Allocator, token_ids: []const u16) !?ParseDiagnostic {
@@ -1596,61 +1634,17 @@ fn emitZigMetadata(
         \\}
         \\
         \\fn parseError(allocator: std.mem.Allocator, token_ids: []const u16) !?ParseErrorInfo {
-        \\    var stack: std.ArrayListUnmanaged(u16) = .empty;
-        \\    defer stack.deinit(allocator);
-        \\    try stack.append(allocator, 0);
-        \\
-        \\    var index: usize = 0;
-        \\    while (true) {
-        \\        const state = stack.items[stack.items.len - 1];
-        \\        const lookahead: u16 = if (index < token_ids.len) token_ids[index] else 0;
-        \\        const action = findAction(state, lookahead) orelse return .{ .state = state, .lookahead = lookahead, .token_index = index };
-        \\        switch (action.kind) {
-        \\            .shift => {
-        \\                try stack.append(allocator, action.target);
-        \\                index += 1;
-        \\            },
-        \\            .reduce => {
-        \\                const production = productions[action.target];
-        \\                if (production.rhs_len > stack.items.len - 1) return .{ .state = state, .lookahead = lookahead, .token_index = index };
-        \\                stack.items.len -= production.rhs_len;
-        \\                const goto_entry = findGoto(stack.items[stack.items.len - 1], production.lhs) orelse return .{ .state = stack.items[stack.items.len - 1], .lookahead = production.lhs, .token_index = index };
-        \\                try stack.append(allocator, goto_entry.target);
-        \\            },
-        \\            .accept => return null,
-        \\        }
-        \\    }
+        \\    var stack = DynamicStateStack.init(allocator);
+        \\    defer stack.deinit();
+        \\    try stack.push(0);
+        \\    const failure = try parseCore(token_ids, &stack, IgnoreEvents{});
+        \\    return if (failure) |item| item.info else null;
         \\}
         \\
         \\fn parseErrorWithStackBuffer(token_ids: []const u16, stack_buffer: []u16) ParseError!?ParseErrorInfo {
-        \\    if (stack_buffer.len == 0) return ParseError.StackOverflow;
-        \\    var stack_len: usize = 1;
-        \\    stack_buffer[0] = 0;
-        \\
-        \\    var index: usize = 0;
-        \\    while (true) {
-        \\        const state = stack_buffer[stack_len - 1];
-        \\        const lookahead: u16 = if (index < token_ids.len) token_ids[index] else 0;
-        \\        const action = findAction(state, lookahead) orelse return .{ .state = state, .lookahead = lookahead, .token_index = index };
-        \\        switch (action.kind) {
-        \\            .shift => {
-        \\                if (stack_len == stack_buffer.len) return ParseError.StackOverflow;
-        \\                stack_buffer[stack_len] = action.target;
-        \\                stack_len += 1;
-        \\                index += 1;
-        \\            },
-        \\            .reduce => {
-        \\                const production = productions[action.target];
-        \\                if (production.rhs_len > stack_len - 1) return .{ .state = state, .lookahead = lookahead, .token_index = index };
-        \\                stack_len -= production.rhs_len;
-        \\                const goto_entry = findGoto(stack_buffer[stack_len - 1], production.lhs) orelse return .{ .state = stack_buffer[stack_len - 1], .lookahead = production.lhs, .token_index = index };
-        \\                if (stack_len == stack_buffer.len) return ParseError.StackOverflow;
-        \\                stack_buffer[stack_len] = goto_entry.target;
-        \\                stack_len += 1;
-        \\            },
-        \\            .accept => return null,
-        \\        }
-        \\    }
+        \\    var stack = try FixedStateStack.init(stack_buffer);
+        \\    const failure = try parseCore(token_ids, &stack, IgnoreEvents{});
+        \\    return if (failure) |item| item.info else null;
         \\}
         \\
         \\fn parseDiagnosticFromInfo(allocator: std.mem.Allocator, info: ParseErrorInfo) !ParseDiagnostic {
@@ -2496,6 +2490,8 @@ test "generateZigMetadata emits deterministic parser table metadata" {
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseWithReductions(token_ids: []const u16, stack_buffer: []u16, reducer: anytype) !void") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn parseWithEvents(token_ids: []const u16, stack_buffer: []u16, event_handler: anytype) !void") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "return parseWithEvents(token_ids, stack_buffer, Adapter{ .inner = reducer });") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "fn parseCore(token_ids: []const u16, stack: anytype, event_handler: anytype)") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, "while (true)"));
     try std.testing.expect(std.mem.indexOf(u8, first, "try event_handler.shift(.{ .token_index = index, .terminal = lookahead });") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "try event_handler.reduce(.{") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "try maybeAccept(event_handler, .{ .token_count = index });") != null);
@@ -2517,6 +2513,11 @@ test "generateZigMetadata emits deterministic parser table metadata" {
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn expectedTerminalNameForState") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn actionsForState") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "pub fn symbolName") == null);
+}
+
+test "table indices reject grammars larger than u16 with an explicit error" {
+    try std.testing.expectEqual(std.math.maxInt(u16), try tableIndex(std.math.maxInt(u16)));
+    try std.testing.expectError(error.GrammarTooLarge, tableIndex(@as(usize, std.math.maxInt(u16)) + 1));
 }
 
 test "generateZigMetadata rejects unexpected conflict count drift" {
