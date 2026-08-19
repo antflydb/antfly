@@ -117,6 +117,7 @@ const (
 	defaultHADirectAdminRetryMaximum        = 2 * time.Minute
 	defaultHADirectAdminReservation         = 30 * time.Second
 	defaultHADirectPrerequisiteTimeout      = 10 * time.Minute
+	haStatusCheckpointRequeueAfter          = 10 * time.Millisecond
 	haStartupGateReceiptHashAnnotation      = "antfly.io/ha-startup-receipt-hash"
 	haSeedRoleAnnotation                    = "antfly.io/ha-seed-role"
 	haTopologyIDAnnotation                  = "antfly.io/ha-topology-id"
@@ -1910,7 +1911,7 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 		if err := r.updateStatus(ctx, workingCluster); err != nil {
 			if stderrors.Is(err, errHAStatusCheckpointed) {
-				return ctrl.Result{Requeue: true}, nil
+				return ctrl.Result{RequeueAfter: haStatusCheckpointRequeueAfter}, nil
 			}
 			return ctrl.Result{}, err
 		}
@@ -2174,7 +2175,7 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// Update status
 	if err := r.updateStatus(ctx, workingCluster); err != nil {
 		if stderrors.Is(err, errHAStatusCheckpointed) {
-			return ctrl.Result{Requeue: true}, nil
+			return ctrl.Result{RequeueAfter: haStatusCheckpointRequeueAfter}, nil
 		}
 		return ctrl.Result{}, err
 	}
