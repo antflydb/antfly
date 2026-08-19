@@ -28,10 +28,11 @@ const routes = @import("http_routes.zig");
 const max_transport_retries: usize = 1;
 const max_metadata_not_leader_retries: usize = 2;
 const default_request_timeout_ms: u32 = 5_000;
-// The server's read-index barrier is bounded at five seconds. Leave enough
-// transport headroom to receive and decode its terminal response; callers
-// still impose one shared, usually tighter, operation deadline.
-const linearizable_snapshot_request_timeout_ms: u32 = 6_000;
+// The server's read-index barrier is bounded at five seconds. A full catalog
+// snapshot can still require meaningful clone/serialization time, so keep the
+// transport ceiling larger while the caller's shared budget remains the hard
+// end-to-end bound.
+const linearizable_snapshot_request_timeout_ms: u32 = 10_000;
 const default_mutation_authority_retry_delay_ns: u64 = 100 * std.time.ns_per_ms;
 const max_mutation_authority_retry_delay_ns: u64 = std.time.ns_per_s;
 const mutation_authority_retry_cancellation_slice_ns: u64 = 10 * std.time.ns_per_ms;

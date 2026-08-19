@@ -8571,12 +8571,16 @@ pub const ApiHttpServer = struct {
     ) public_table_http.TableApi.ExecuteBackupError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         try ensureTableOperationActive(request);
-        _ = self.source.ensureLinearizableRead(request) catch |err| {
+        const authoritative = self.source.ensureLinearizableRead(request) catch |err| {
             if (err == error.Canceled or err == error.Cancelled) return error.Canceled;
             if (err == error.DeadlineExceeded) return error.DeadlineExceeded;
             std.log.warn("table backup metadata read barrier failed phase=admission class={s}", .{@errorName(err)});
             return metadataAccessFailure(err);
         };
+        if (!authoritative) {
+            std.log.warn("table backup metadata read barrier unsupported phase=admission", .{});
+            return error.NotLeader;
+        }
         var fallback_io: ?std.Io.Threaded = if (self.sharedApiIo() == null)
             std.Io.Threaded.init(std.heap.page_allocator, .{})
         else
@@ -9573,11 +9577,15 @@ pub const ApiHttpServer = struct {
         var trace: ClusterBackupExecutionTrace = .{};
         errdefer |err| trace.logFailure(err);
 
-        _ = self.source.ensureLinearizableRead(.{}) catch |err| {
+        const authoritative = self.source.ensureLinearizableRead(.{}) catch |err| {
             if (metadata_authority.isRetryableError(err)) return error.NotLeader;
             std.log.warn("cluster backup metadata read barrier failed err={s}", .{@errorName(err)});
             return trace.internal(err);
         };
+        if (!authoritative) {
+            std.log.warn("cluster backup metadata read barrier unsupported", .{});
+            return error.NotLeader;
+        }
         trace.enter(.manifest_probe);
         if (backups_api.clusterManifestExistsAtLocationWithIo(alloc, backup_io, location, req.backup_id) catch |err| return trace.internal(err))
             return error.BackupAlreadyExists;
@@ -32405,7 +32413,11 @@ test "api http server lists cluster backups through public route" {
 fn expectPublicMetadataNotLeaderResponse(resp: http_common.HttpResponse) !void {
     try std.testing.expectEqual(@as(u16, 503), resp.status);
     try std.testing.expectEqualStrings("application/json", resp.content_type.?);
-    try std.testing.expectEqualStrings("{\"error\":\"metadata leader unavailable\"}", resp.body);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"error\":\"metadata leader unavailable\"}",
+        resp.body,
+    );
 
     var retry_after = false;
     var metadata_not_leader = false;
@@ -32616,6 +32628,7 @@ test "api http server returns retryable not leader when cluster backup read barr
     var node_config = try testBackupNodeConfig(alloc);
     defer node_config.deinit();
     var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config }, source.iface(), null, null);
+    defer server.deinit();
 
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
@@ -32629,6 +32642,61 @@ test "api http server returns retryable not leader when cluster backup read barr
     try std.testing.expectEqual(@as(usize, 1), source.linearizable_read_calls);
 }
 
+test "api http server fails closed when backup fences are unsupported" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        linearizable_read_calls: usize = 0,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .ensure_linearizable_read = ensureLinearizableRead,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn ensureLinearizableRead(ptr: *anyopaque, request: api_operation.RequestContext) !bool {
+            try request.ensureActive();
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.linearizable_read_calls += 1;
+            return false;
+        }
+    };
+
+    var source = FakeSource{};
+    var node_config = try testBackupNodeConfig(alloc);
+    defer node_config.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config }, source.iface(), null, null);
+    defer server.deinit();
+
+    var resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/backup",
+        .content_type = "application/json",
+        .body = "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/backups\",\"connection\":\"test-backups\",\"table_names\":[\"docs\"]}",
+    });
+    defer resp.deinit(alloc);
+
+    try expectPublicMetadataNotLeaderResponse(resp);
+    try std.testing.expectEqual(@as(usize, 1), source.linearizable_read_calls);
+
+    var table_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs/backup",
+        .content_type = "application/json",
+        .body = "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/backups\",\"connection\":\"test-backups\"}",
+    });
+    defer table_resp.deinit(alloc);
+    try expectPublicMetadataNotLeaderResponse(table_resp);
+    try std.testing.expectEqual(@as(usize, 2), source.linearizable_read_calls);
+}
+
 test "api http server rejects an empty cluster backup without publishing a manifest" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
@@ -32637,6 +32705,7 @@ test "api http server rejects an empty cluster backup without publishing a manif
                 .ptr = self,
                 .vtable = &.{
                     .status = status,
+                    .ensure_linearizable_read = ensureLinearizableRead,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                 },
@@ -32645,6 +32714,11 @@ test "api http server rejects an empty cluster backup without publishing a manif
 
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn ensureLinearizableRead(_: *anyopaque, request: api_operation.RequestContext) !bool {
+            try request.ensureActive();
+            return true;
         }
 
         fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
@@ -33198,6 +33272,7 @@ test "api http server backs up and restores a table through public routes" {
                 .ptr = self,
                 .vtable = &.{
                     .status = status,
+                    .ensure_linearizable_read = ensureLinearizableRead,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .create_table = createTable,
@@ -33208,6 +33283,11 @@ test "api http server backs up and restores a table through public routes" {
 
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn ensureLinearizableRead(_: *anyopaque, request: api_operation.RequestContext) !bool {
+            try request.ensureActive();
+            return true;
         }
 
         fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {

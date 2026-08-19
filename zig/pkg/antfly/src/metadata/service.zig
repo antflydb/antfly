@@ -45,6 +45,7 @@ const raft_transition_service = @import("../raft/transition_service.zig");
 const raft_state_machine = @import("../raft/state_machine/mod.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
+const api_operation = @import("../api/operation.zig");
 const api_table_router = @import("../api/table_router.zig");
 const api_table_writes = @import("../api/table_writes.zig");
 const db_mod = @import("../storage/db/mod.zig");
@@ -61,6 +62,21 @@ const linearizable_metadata_read_prefix = "metadata:linearizable-read:";
 const linearizable_metadata_read_timeout_ns: u64 = 5 * std.time.ns_per_s;
 const linearizable_metadata_read_retry_ns: u64 = 50 * std.time.ns_per_ms;
 const reallocation_protocol_probe_timeout_ns: u64 = 5 * std.time.ns_per_s;
+
+pub const AdminSnapshotFence = struct {
+    metadata_group_id: u64,
+    metadata_incarnation: ?metadata_api.MetadataClusterIncarnation,
+    metadata_raft_term: u64,
+    metadata_raft_commit_index: u64,
+    metadata_raft_applied_index: u64,
+    projection_epoch: u64,
+    catalog_epoch: u64,
+    placement_epoch: u64,
+    reconcile_lease_epoch: u64,
+    transition_epoch: u64,
+    projected_core_epoch: u64 = 0,
+    transition_readiness_epoch: u64 = 0,
+};
 
 fn logMetadataRunRoundPhase(name: []const u8, elapsed_ns: u64) void {
     if (elapsed_ns > metadata_run_round_slow_phase_threshold_ns) {
@@ -1664,6 +1680,14 @@ pub const MetadataService = struct {
     }
 
     pub fn ensureLinearizableRead(self: *MetadataService) !void {
+        return self.ensureLinearizableReadWithContext(.{});
+    }
+
+    pub fn ensureLinearizableReadWithContext(
+        self: *MetadataService,
+        request: api_operation.RequestContext,
+    ) !void {
+        try request.ensureActive();
         const request_id = try self.linearizable_read_tracker.registerRequest();
         defer self.linearizable_read_tracker.finishRequest(request_id);
         var request_ctx_buf: [64]u8 = undefined;
@@ -1673,9 +1697,14 @@ pub const MetadataService = struct {
             .{ linearizable_metadata_read_prefix, request_id },
         );
 
-        const deadline_ns = platform_time.monotonicNs() + linearizable_metadata_read_timeout_ns;
+        const local_deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
+        const deadline_ns = if (request.deadline_ns) |caller_deadline_ns|
+            @min(local_deadline_ns, caller_deadline_ns)
+        else
+            local_deadline_ns;
         var next_request_ns: u64 = 0;
         while (platform_time.monotonicNs() < deadline_ns) {
+            try request.ensureActive();
             if (self.linearizable_read_tracker.isComplete(request_id)) return;
             const now_ns = platform_time.monotonicNs();
             if (now_ns >= next_request_ns) {
@@ -1695,8 +1724,10 @@ pub const MetadataService = struct {
                 try self.raft.runRaftRoundOnly();
             }
             if (self.linearizable_read_tracker.isComplete(request_id)) return;
+            try request.ensureActive();
             platform_clock.Clock.real().sleepMs(1);
         }
+        try request.ensureActive();
         return error.MetadataLinearizableReadTimeout;
     }
 
@@ -2488,6 +2519,22 @@ pub const MetadataService = struct {
 
     pub fn adminSnapshot(self: *MetadataService) !metadata_api.AdminSnapshot {
         return try metadata_api.captureSnapshot(self.alloc, self);
+    }
+
+    pub fn adminSnapshotFence(self: *MetadataService) !AdminSnapshotFence {
+        const raft = serviceGroupRaftObservation(self, self.metadata_group_id);
+        return .{
+            .metadata_group_id = self.metadata_group_id,
+            .metadata_incarnation = try self.metadataIncarnation(),
+            .metadata_raft_term = raft.term,
+            .metadata_raft_commit_index = raft.commit_index,
+            .metadata_raft_applied_index = raft.applied_index,
+            .projection_epoch = self.projection_epoch.load(.acquire),
+            .catalog_epoch = self.catalog_epoch.load(.acquire),
+            .placement_epoch = self.placement_epoch.load(.acquire),
+            .reconcile_lease_epoch = self.reconcile_lease_epoch.load(.acquire),
+            .transition_epoch = self.transition_epoch.load(.acquire),
+        };
     }
 
     pub fn validatePublication(self: *MetadataService, contract: metadata_api.CatalogPublicationContract) !bool {
@@ -4514,6 +4561,14 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn ensureLinearizableRead(self: *MetadataHttpService) !void {
+        return self.ensureLinearizableReadWithContext(.{});
+    }
+
+    pub fn ensureLinearizableReadWithContext(
+        self: *MetadataHttpService,
+        request: api_operation.RequestContext,
+    ) !void {
+        try request.ensureActive();
         const request_id = try self.linearizable_read_tracker.registerRequest();
         defer self.linearizable_read_tracker.finishRequest(request_id);
         var request_ctx_buf: [64]u8 = undefined;
@@ -4523,7 +4578,11 @@ pub const MetadataHttpService = struct {
             .{ linearizable_metadata_read_prefix, request_id },
         );
 
-        const deadline_ns = platform_time.monotonicNs() + linearizable_metadata_read_timeout_ns;
+        const local_deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
+        const deadline_ns = if (request.deadline_ns) |caller_deadline_ns|
+            @min(local_deadline_ns, caller_deadline_ns)
+        else
+            local_deadline_ns;
         var next_request_ns: u64 = 0;
         var request_attempts: usize = 0;
         var not_leader_count: usize = 0;
@@ -4531,6 +4590,7 @@ pub const MetadataHttpService = struct {
         var slowest_round: raft_engine.runtime.multi_raft.HostRound = .{};
         var latest_raft_diagnostics_snapshot: MetadataRaftDiagnosticsSnapshot = .{};
         while (platform_time.monotonicNs() < deadline_ns) {
+            try request.ensureActive();
             if (self.linearizable_read_tracker.isComplete(request_id)) return;
             const now_ns = platform_time.monotonicNs();
             if (now_ns >= next_request_ns) {
@@ -4569,9 +4629,11 @@ pub const MetadataHttpService = struct {
                 logMetadataRaftRoundDiagnostics(round);
             }
             if (self.linearizable_read_tracker.isComplete(request_id)) return;
+            try request.ensureActive();
             platform_clock.Clock.real().sleepMs(1);
         }
         if (self.linearizable_read_tracker.isComplete(request_id)) return;
+        try request.ensureActive();
         self.logLinearizableReadTimeout(request_id, request_attempts, not_leader_count, raft_rounds, slowest_round, latest_raft_diagnostics_snapshot);
         return error.MetadataLinearizableReadTimeout;
     }
@@ -4690,6 +4752,24 @@ pub const MetadataHttpService = struct {
 
     pub fn adminSnapshot(self: *MetadataHttpService) !metadata_api.AdminSnapshot {
         return try self.buildAdminSnapshot(true);
+    }
+
+    pub fn adminSnapshotFence(self: *MetadataHttpService) !AdminSnapshotFence {
+        const raft = serviceGroupRaftObservation(self, self.metadata_group_id);
+        return .{
+            .metadata_group_id = self.metadata_group_id,
+            .metadata_incarnation = try self.metadataIncarnation(),
+            .metadata_raft_term = raft.term,
+            .metadata_raft_commit_index = raft.commit_index,
+            .metadata_raft_applied_index = raft.applied_index,
+            .projection_epoch = self.projection_epoch.load(.acquire),
+            .catalog_epoch = self.catalog_epoch.load(.acquire),
+            .placement_epoch = self.placement_epoch.load(.acquire),
+            .reconcile_lease_epoch = self.reconcile_lease_epoch.load(.acquire),
+            .transition_epoch = self.transition_epoch.load(.acquire),
+            .projected_core_epoch = self.projected_core_epoch.load(.acquire),
+            .transition_readiness_epoch = self.transition_readiness_epoch.load(.acquire),
+        };
     }
 
     fn buildAdminSnapshot(self: *MetadataHttpService, include_detailed_status: bool) !metadata_api.AdminSnapshot {
@@ -6899,6 +6979,7 @@ const ServiceGroupRaftObservation = struct {
     leader_id: ?u64 = null,
     term: u64 = 0,
     commit_index: u64 = 0,
+    applied_index: u64 = 0,
     local_voter: bool = false,
     voter_count: usize = 0,
     election_elapsed: u32 = 0,
@@ -6970,6 +7051,7 @@ fn raftObservationFromStatus(
         .leader_id = raft_status.soft.leader_id,
         .term = raft_status.hard.current_term,
         .commit_index = raft_status.hard.commit_index,
+        .applied_index = raft_status.applied_index,
         .local_voter = local_voter,
         .voter_count = raft_status.conf_state.voters.len,
         .election_elapsed = raft_status.election_elapsed,

@@ -80,7 +80,8 @@ const StoreStatusReportKind = enum { none, heartbeat, full };
 const metadata_head_cache_ttl_ms: u64 = std.time.ms_per_s;
 const metadata_snapshot_cache_ttl_ms: u64 = std.time.ms_per_s;
 const remote_metadata_http_executor_pool_size: usize = 4;
-const remote_metadata_linearizable_snapshot_timeout_ns: u64 = 7 * std.time.ns_per_s;
+const remote_metadata_linearizable_snapshot_timeout_ns: u64 = 12 * std.time.ns_per_s;
+const remote_metadata_linearizable_snapshot_capability_retry_ns: u64 = 5 * std.time.ns_per_s;
 const provision_head_poll_startup_interval_ms: u64 = std.time.ms_per_s;
 const provision_head_poll_interval_ms: u64 = 5 * std.time.ms_per_s;
 const runtime_status_refresh_interval_ms: u64 = std.time.ms_per_s;
@@ -13902,6 +13903,7 @@ const RemoteMetadataSource = struct {
     preferred_read_uri_index: usize = 0,
     cache_mutex: std.atomic.Mutex = .unlocked,
     cached_head: ?antfly.metadata_api.MetadataHead = null,
+    metadata_group_id: ?u64 = null,
     metadata_incarnation: ?antfly.metadata_api.MetadataClusterIncarnation = null,
     cached_head_at_ms: u64 = 0,
     cached_snapshot: ?antfly.metadata_api.AdminSnapshot = null,
@@ -13910,6 +13912,7 @@ const RemoteMetadataSource = struct {
     // ordinary snapshot request captures this before I/O and may not publish
     // across a generation change.
     snapshot_fence_generation: u64 = 0,
+    linearizable_snapshot_unsupported_until_ns: []u64,
     http_executors: []antfly.raft.transport.std_http_executor.StdHttpExecutor,
     next_http_executor: std.atomic.Value(usize) = .init(0),
     test_faults: TestFaults = .{},
@@ -13943,9 +13946,13 @@ const RemoteMetadataSource = struct {
             owned[i] = try alloc.dupe(u8, uri);
             initialized += 1;
         }
+        const unsupported_until = try alloc.alloc(u64, base_uris.len);
+        errdefer alloc.free(unsupported_until);
+        @memset(unsupported_until, 0);
         return .{
             .alloc = alloc,
             .base_uris = owned,
+            .linearizable_snapshot_unsupported_until_ns = unsupported_until,
             .http_executors = http_executors,
         };
     }
@@ -13955,6 +13962,7 @@ const RemoteMetadataSource = struct {
         self.alloc.free(self.http_executors);
         lockAtomic(&self.cache_mutex);
         if (self.cached_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
+        self.alloc.free(self.linearizable_snapshot_unsupported_until_ns);
         for (self.base_uris) |uri| self.alloc.free(uri);
         self.alloc.free(self.base_uris);
         self.cache_mutex.unlock();
@@ -14004,6 +14012,35 @@ const RemoteMetadataSource = struct {
         self.cache_mutex.unlock();
     }
 
+    fn snapshotFenceGeneration(self: *RemoteMetadataSource) u64 {
+        lockAtomic(&self.cache_mutex);
+        defer self.cache_mutex.unlock();
+        return self.snapshot_fence_generation;
+    }
+
+    fn linearizableSnapshotCapabilitySuppressed(
+        self: *RemoteMetadataSource,
+        index: usize,
+        now_ns: u64,
+    ) bool {
+        lockAtomic(&self.cache_mutex);
+        defer self.cache_mutex.unlock();
+        return self.linearizable_snapshot_unsupported_until_ns[index] > now_ns;
+    }
+
+    fn noteLinearizableSnapshotUnsupported(self: *RemoteMetadataSource, index: usize, now_ns: u64) void {
+        lockAtomic(&self.cache_mutex);
+        self.linearizable_snapshot_unsupported_until_ns[index] = now_ns +|
+            remote_metadata_linearizable_snapshot_capability_retry_ns;
+        self.cache_mutex.unlock();
+    }
+
+    fn noteLinearizableSnapshotSupported(self: *RemoteMetadataSource, index: usize) void {
+        lockAtomic(&self.cache_mutex);
+        self.linearizable_snapshot_unsupported_until_ns[index] = 0;
+        self.cache_mutex.unlock();
+    }
+
     fn sameMetadataIncarnation(left: antfly.metadata_api.MetadataHead, right: antfly.metadata_api.MetadataHead) bool {
         return left.metadata_group_id == right.metadata_group_id and
             std.meta.eql(left.metadata_incarnation, right.metadata_incarnation);
@@ -14017,19 +14054,38 @@ const RemoteMetadataSource = struct {
         };
     }
 
-    fn acceptMetadataIncarnation(
-        self: *RemoteMetadataSource,
+    fn requireValidMetadataIncarnation(
         candidate: ?antfly.metadata_api.MetadataClusterIncarnation,
-    ) !void {
+    ) !antfly.metadata_api.MetadataClusterIncarnation {
         const incarnation = candidate orelse return error.MetadataIncarnationUnavailable;
         if (!antfly.metadata.incarnation.isValid(incarnation)) return error.InvalidMetadataIncarnation;
-        lockAtomic(&self.cache_mutex);
-        defer self.cache_mutex.unlock();
+        return incarnation;
+    }
+
+    fn acceptMetadataIdentityLocked(
+        self: *RemoteMetadataSource,
+        metadata_group_id: u64,
+        incarnation: antfly.metadata_api.MetadataClusterIncarnation,
+    ) !void {
+        if (self.metadata_group_id) |expected_group_id| {
+            if (expected_group_id != metadata_group_id) return error.MetadataGroupMismatch;
+        }
         if (self.metadata_incarnation) |expected| {
             if (!std.mem.eql(u8, &expected, &incarnation)) return error.MetadataIncarnationMismatch;
-            return;
         }
+        self.metadata_group_id = metadata_group_id;
         self.metadata_incarnation = incarnation;
+    }
+
+    fn acceptMetadataIdentity(
+        self: *RemoteMetadataSource,
+        metadata_group_id: u64,
+        candidate: ?antfly.metadata_api.MetadataClusterIncarnation,
+    ) !void {
+        const incarnation = try requireValidMetadataIncarnation(candidate);
+        lockAtomic(&self.cache_mutex);
+        defer self.cache_mutex.unlock();
+        try self.acceptMetadataIdentityLocked(metadata_group_id, incarnation);
     }
 
     fn fetchHead(self: *RemoteMetadataSource) !antfly.metadata_api.MetadataHead {
@@ -14084,11 +14140,20 @@ const RemoteMetadataSource = struct {
     fn acceptLinearizableSnapshot(
         self: *RemoteMetadataSource,
         snapshot: antfly.metadata_api.AdminSnapshot,
+        expected_fence_generation: u64,
     ) !void {
-        try self.acceptMetadataIncarnation(snapshot.status.metadata_incarnation);
+        const incarnation = try requireValidMetadataIncarnation(snapshot.status.metadata_incarnation);
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
         var retired_snapshot: ?antfly.metadata_api.AdminSnapshot = null;
         lockAtomic(&self.cache_mutex);
+        if (self.snapshot_fence_generation != expected_fence_generation) {
+            self.cache_mutex.unlock();
+            return error.MetadataSnapshotHeadMismatch;
+        }
+        self.acceptMetadataIdentityLocked(snapshot.status.metadata_group_id, incarnation) catch |err| {
+            self.cache_mutex.unlock();
+            return err;
+        };
         retired_snapshot = self.cached_snapshot;
         self.cached_snapshot = snapshot;
         self.cached_snapshot_at_ms = now_ms;
@@ -14261,7 +14326,7 @@ const RemoteMetadataSource = struct {
                 last_err = err;
                 continue;
             };
-            self.acceptMetadataIncarnation(head.metadata_incarnation) catch |err| {
+            self.acceptMetadataIdentity(head.metadata_group_id, head.metadata_incarnation) catch |err| {
                 last_err = err;
                 continue;
             };
@@ -14306,6 +14371,12 @@ const RemoteMetadataSource = struct {
         for (0..self.base_uris.len) |attempt| {
             try request.ensureActive();
             const index = self.metadataReadApiIndexForAttempt(attempt);
+            const attempt_now_ns = platform_time.monotonicNs();
+            if (self.linearizableSnapshotCapabilitySuppressed(index, attempt_now_ns)) {
+                unsupported_count += 1;
+                continue;
+            }
+            const observed_fence_generation = self.snapshotFenceGeneration();
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(
@@ -14314,6 +14385,7 @@ const RemoteMetadataSource = struct {
             );
             var parsed = metadata_client.fetchLinearizableSnapshot(self.base_uris[index], budget) catch |err| {
                 if (err == error.UnsupportedOperation) {
+                    self.noteLinearizableSnapshotUnsupported(index, platform_time.monotonicNs());
                     unsupported_count += 1;
                     continue;
                 }
@@ -14331,7 +14403,8 @@ const RemoteMetadataSource = struct {
                 continue;
             };
             defer parsed.deinit();
-            self.acceptMetadataIncarnation(parsed.value.status.metadata_incarnation) catch |err| {
+            self.noteLinearizableSnapshotSupported(index);
+            _ = requireValidMetadataIncarnation(parsed.value.status.metadata_incarnation) catch |err| {
                 last_err = err;
                 continue;
             };
@@ -14341,7 +14414,7 @@ const RemoteMetadataSource = struct {
             };
             var ownership_transferred = false;
             defer if (!ownership_transferred) freeAdminSnapshotOwned(self.alloc, &owned);
-            self.acceptLinearizableSnapshot(owned) catch |err| {
+            self.acceptLinearizableSnapshot(owned, observed_fence_generation) catch |err| {
                 last_err = err;
                 continue;
             };
@@ -14370,7 +14443,7 @@ const RemoteMetadataSource = struct {
                 last_err = err;
                 continue;
             };
-            self.acceptMetadataIncarnation(head.metadata_incarnation) catch |err| {
+            self.acceptMetadataIdentity(head.metadata_group_id, head.metadata_incarnation) catch |err| {
                 last_err = err;
                 continue;
             };
@@ -14393,7 +14466,7 @@ const RemoteMetadataSource = struct {
                 last_err = err;
                 continue;
             };
-            self.acceptMetadataIncarnation(status.metadata_incarnation) catch |err| {
+            self.acceptMetadataIdentity(status.metadata_group_id, status.metadata_incarnation) catch |err| {
                 last_err = err;
                 continue;
             };
@@ -14428,7 +14501,10 @@ const RemoteMetadataSource = struct {
                 continue;
             };
             defer parsed.deinit();
-            self.acceptMetadataIncarnation(parsed.value.status.metadata_incarnation) catch |err| {
+            self.acceptMetadataIdentity(
+                parsed.value.status.metadata_group_id,
+                parsed.value.status.metadata_incarnation,
+            ) catch |err| {
                 last_err = err;
                 continue;
             };
@@ -27946,14 +28022,15 @@ test "remote metadata source pins one cluster incarnation across cache invalidat
     );
     defer source.deinit();
 
-    try source.acceptMetadataIncarnation(first);
+    try source.acceptMetadataIdentity(9, first);
     source.invalidateCache();
-    try source.acceptMetadataIncarnation(first);
-    try std.testing.expectError(error.MetadataIncarnationMismatch, source.acceptMetadataIncarnation(foreign));
-    try std.testing.expectError(error.MetadataIncarnationUnavailable, source.acceptMetadataIncarnation(null));
+    try source.acceptMetadataIdentity(9, first);
+    try std.testing.expectError(error.MetadataGroupMismatch, source.acceptMetadataIdentity(10, first));
+    try std.testing.expectError(error.MetadataIncarnationMismatch, source.acceptMetadataIdentity(9, foreign));
+    try std.testing.expectError(error.MetadataIncarnationUnavailable, source.acceptMetadataIdentity(9, null));
     try std.testing.expectError(
         error.InvalidMetadataIncarnation,
-        source.acceptMetadataIncarnation(antfly.metadata.incarnation.zero),
+        source.acceptMetadataIdentity(9, antfly.metadata.incarnation.zero),
     );
 }
 
@@ -28017,11 +28094,108 @@ test "remote metadata source installs fenced snapshot without comparing epoch do
         .merge_transitions = &.{},
     };
     const owned = try cloneAdminSnapshotOwned(std.testing.allocator, fenced);
-    try source.acceptLinearizableSnapshot(owned);
+    try source.acceptLinearizableSnapshot(owned, 0);
 
     try std.testing.expect(source.cached_head == null);
     try std.testing.expectEqual(@as(u64, 1), source.cached_snapshot.?.status.metadata_epoch);
     try std.testing.expectEqual(@as(u64, 1), source.snapshot_fence_generation);
+}
+
+test "remote metadata source rejects fenced snapshot across mutation invalidation" {
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend_runtime.deinit();
+    var source = try RemoteMetadataSource.init(
+        std.testing.allocator,
+        &.{"http://metadata.invalid"},
+        backend_runtime.ptr().apiIoImpl().?,
+    );
+    defer source.deinit();
+
+    const incarnation: antfly.metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
+    const fenced = antfly.metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 9, .metadata_incarnation = incarnation, .metadata_epoch = 1, .metrics = .{} },
+        .tables = &.{},
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+    var owned = try cloneAdminSnapshotOwned(std.testing.allocator, fenced);
+    defer freeAdminSnapshotOwned(std.testing.allocator, &owned);
+    const observed_generation = source.snapshotFenceGeneration();
+    source.invalidateCache();
+
+    try std.testing.expectError(
+        error.MetadataSnapshotHeadMismatch,
+        source.acceptLinearizableSnapshot(owned, observed_generation),
+    );
+    try std.testing.expect(source.cached_snapshot == null);
+    try std.testing.expect(source.metadata_group_id == null);
+    try std.testing.expect(source.metadata_incarnation == null);
+    try std.testing.expectEqual(@as(u64, 1), source.snapshot_fence_generation);
+}
+
+test "remote metadata source rejects out of order fenced snapshot publication" {
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend_runtime.deinit();
+    var source = try RemoteMetadataSource.init(
+        std.testing.allocator,
+        &.{"http://metadata.invalid"},
+        backend_runtime.ptr().apiIoImpl().?,
+    );
+    defer source.deinit();
+
+    const incarnation: antfly.metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
+    const newer = try cloneAdminSnapshotOwned(std.testing.allocator, .{
+        .status = .{ .metadata_group_id = 9, .metadata_incarnation = incarnation, .metadata_epoch = 2, .metrics = .{} },
+        .tables = &.{},
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    });
+    var older = try cloneAdminSnapshotOwned(std.testing.allocator, .{
+        .status = .{ .metadata_group_id = 9, .metadata_incarnation = incarnation, .metadata_epoch = 1, .metrics = .{} },
+        .tables = &.{},
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    });
+    defer freeAdminSnapshotOwned(std.testing.allocator, &older);
+
+    const shared_generation = source.snapshotFenceGeneration();
+    try source.acceptLinearizableSnapshot(newer, shared_generation);
+    try std.testing.expectError(
+        error.MetadataSnapshotHeadMismatch,
+        source.acceptLinearizableSnapshot(older, shared_generation),
+    );
+    try std.testing.expectEqual(@as(u64, 2), source.cached_snapshot.?.status.metadata_epoch);
+}
+
+test "remote metadata source bounds unsupported linearizable snapshot probes" {
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend_runtime.deinit();
+    var source = try RemoteMetadataSource.init(
+        std.testing.allocator,
+        &.{"http://metadata.invalid"},
+        backend_runtime.ptr().apiIoImpl().?,
+    );
+    defer source.deinit();
+
+    const now_ns: u64 = 123;
+    try std.testing.expect(!source.linearizableSnapshotCapabilitySuppressed(0, now_ns));
+    source.noteLinearizableSnapshotUnsupported(0, now_ns);
+    try std.testing.expect(source.linearizableSnapshotCapabilitySuppressed(0, now_ns));
+    try std.testing.expect(!source.linearizableSnapshotCapabilitySuppressed(
+        0,
+        now_ns + remote_metadata_linearizable_snapshot_capability_retry_ns,
+    ));
+    source.noteLinearizableSnapshotSupported(0);
+    try std.testing.expect(!source.linearizableSnapshotCapabilitySuppressed(0, now_ns));
 }
 
 test "remote metadata source shares backend runtime io across a bounded executor pool" {

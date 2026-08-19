@@ -74,8 +74,8 @@ pub const AdminSource = struct {
 
     pub const VTable = struct {
         head: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataHead = null,
-        linearizable_head: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataHead = null,
-        linearizable_snapshot: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot = null,
+        linearizable_head: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.MetadataHead = null,
+        linearizable_snapshot: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.AdminSnapshot = null,
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
         validate_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) anyerror!bool = null,
@@ -129,14 +129,14 @@ pub const AdminSource = struct {
         };
     }
 
-    pub fn linearizableHead(self: AdminSource) !metadata_api.MetadataHead {
+    pub fn linearizableHead(self: AdminSource, request: operation.RequestContext) !metadata_api.MetadataHead {
         const fn_ptr = self.vtable.linearizable_head orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr);
+        return try fn_ptr(self.ptr, request);
     }
 
-    pub fn linearizableSnapshot(self: AdminSource) !metadata_api.AdminSnapshot {
+    pub fn linearizableSnapshot(self: AdminSource, request: operation.RequestContext) !metadata_api.AdminSnapshot {
         const fn_ptr = self.vtable.linearizable_snapshot orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr);
+        return try fn_ptr(self.ptr, request);
     }
 
     pub fn status(self: AdminSource) !metadata_api.MetadataStatus {
@@ -408,16 +408,54 @@ pub const AdminSource = struct {
         return svc.head();
     }
 
-    fn metadataServiceLinearizableHead(ptr: *anyopaque) !metadata_api.MetadataHead {
+    fn sameSnapshotFence(before: service.AdminSnapshotFence, after: service.AdminSnapshotFence) bool {
+        return before.metadata_group_id == after.metadata_group_id and
+            std.meta.eql(before.metadata_incarnation, after.metadata_incarnation) and
+            before.metadata_raft_term == after.metadata_raft_term and
+            before.metadata_raft_commit_index == after.metadata_raft_commit_index and
+            before.metadata_raft_applied_index == after.metadata_raft_applied_index and
+            before.projection_epoch == after.projection_epoch and
+            before.catalog_epoch == after.catalog_epoch and
+            before.placement_epoch == after.placement_epoch and
+            before.reconcile_lease_epoch == after.reconcile_lease_epoch and
+            before.transition_epoch == after.transition_epoch and
+            before.projected_core_epoch == after.projected_core_epoch and
+            before.transition_readiness_epoch == after.transition_readiness_epoch;
+    }
+
+    /// The read-index barrier establishes authority, while the before/after
+    /// status token makes the multi-collection AdminSnapshot capture atomic.
+    /// Optimistic retries avoid holding the Raft runtime lock while cloning a
+    /// potentially large response.
+    fn coherentLinearizableSnapshot(
+        comptime Service: type,
+        svc: *Service,
+        request: operation.RequestContext,
+    ) !metadata_api.AdminSnapshot {
+        try svc.ensureLinearizableReadWithContext(request);
+        for (0..3) |_| {
+            try request.ensureActive();
+            const before = try svc.adminSnapshotFence();
+            var snapshot = try svc.adminSnapshot();
+            errdefer svc.freeAdminSnapshot(&snapshot);
+            try request.ensureActive();
+            const after = try svc.adminSnapshotFence();
+            if (sameSnapshotFence(before, after)) return snapshot;
+            svc.freeAdminSnapshot(&snapshot);
+        }
+        return error.MetadataLinearizableReadTimeout;
+    }
+
+    fn metadataServiceLinearizableHead(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.MetadataHead {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
-        try svc.ensureLinearizableRead();
+        try svc.ensureLinearizableReadWithContext(request);
+        try request.ensureActive();
         return svc.head();
     }
 
-    fn metadataServiceLinearizableSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+    fn metadataServiceLinearizableSnapshot(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.AdminSnapshot {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
-        try svc.ensureLinearizableRead();
-        return try svc.adminSnapshot();
+        return try coherentLinearizableSnapshot(service.MetadataService, svc, request);
     }
 
     fn metadataServiceStatus(ptr: *anyopaque) !metadata_api.MetadataStatus {
@@ -770,16 +808,16 @@ pub const AdminSource = struct {
         return svc.head();
     }
 
-    fn metadataHttpServiceLinearizableHead(ptr: *anyopaque) !metadata_api.MetadataHead {
+    fn metadataHttpServiceLinearizableHead(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.MetadataHead {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        try svc.ensureLinearizableRead();
+        try svc.ensureLinearizableReadWithContext(request);
+        try request.ensureActive();
         return svc.head();
     }
 
-    fn metadataHttpServiceLinearizableSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+    fn metadataHttpServiceLinearizableSnapshot(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.AdminSnapshot {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        try svc.ensureLinearizableRead();
-        return try svc.adminSnapshot();
+        return try coherentLinearizableSnapshot(service.MetadataHttpService, svc, request);
     }
 
     fn metadataHttpServiceAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
@@ -1207,14 +1245,14 @@ pub const MetadataHttpServer = struct {
         return self.source.head();
     }
 
-    fn readLinearizableHead(ptr: *anyopaque) !metadata_api.MetadataHead {
+    fn readLinearizableHead(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.MetadataHead {
         const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
-        return self.source.linearizableHead();
+        return self.source.linearizableHead(request);
     }
 
-    fn readLinearizableSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+    fn readLinearizableSnapshot(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.AdminSnapshot {
         const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
-        return self.source.linearizableSnapshot();
+        return self.source.linearizableSnapshot(request);
     }
 
     fn readStatus(ptr: *anyopaque) !metadata_api.MetadataStatus {
@@ -1296,14 +1334,18 @@ pub const MetadataHttpServer = struct {
     }
 
     fn metadataLinearizableHead(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
-        const result = self.readOperations().linearizableHead(requestContext(ctx)) catch |err| return metadataReadError(ctx, err);
+        const request = requestContext(ctx);
+        const result = self.readOperations().linearizableHead(request) catch |err| return metadataReadError(ctx, err);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
         return self.trackedJson(ctx, result);
     }
 
     fn metadataLinearizableSnapshot(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const operations = self.readOperations();
-        var result = operations.linearizableSnapshot(requestContext(ctx)) catch |err| return metadataReadError(ctx, err);
+        const request = requestContext(ctx);
+        var result = operations.linearizableSnapshot(request) catch |err| return metadataReadError(ctx, err);
         defer operations.freeSnapshot(&result);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
         return self.trackedJson(ctx, result);
     }
 
@@ -4126,7 +4168,8 @@ test "metadata linearizable head uses the fenced source operation" {
             };
         }
 
-        fn linearizableHead(ptr: *anyopaque) !metadata_api.MetadataHead {
+        fn linearizableHead(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.MetadataHead {
+            try request.ensureActive();
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             return .{ .metadata_group_id = 77, .metadata_incarnation = incarnation, .metadata_epoch = 18 };
@@ -4181,7 +4224,8 @@ test "metadata linearizable snapshot fences and frees one owned response" {
             };
         }
 
-        fn linearizableSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+        fn linearizableSnapshot(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.AdminSnapshot {
+            try request.ensureActive();
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             return .{
@@ -4251,6 +4295,36 @@ test "metadata linearizable snapshot fences and frees one owned response" {
     );
     defer legacy_resp.deinit();
     try std.testing.expectEqual(@as(u16, 405), legacy_resp.status.code);
+}
+
+test "metadata linearizable snapshot detects concurrent projection changes" {
+    const incarnation: metadata_api.MetadataClusterIncarnation = "22222222222222222222222222222222".*;
+    const before = service.AdminSnapshotFence{
+        .metadata_group_id = 77,
+        .metadata_incarnation = incarnation,
+        .metadata_raft_term = 4,
+        .metadata_raft_commit_index = 5,
+        .metadata_raft_applied_index = 5,
+        .projection_epoch = 6,
+        .catalog_epoch = 7,
+        .placement_epoch = 8,
+        .reconcile_lease_epoch = 9,
+        .transition_epoch = 10,
+    };
+    var after = before;
+    try std.testing.expect(AdminSource.sameSnapshotFence(before, after));
+
+    after.metadata_raft_commit_index += 1;
+    try std.testing.expect(!AdminSource.sameSnapshotFence(before, after));
+    after.metadata_raft_commit_index = before.metadata_raft_commit_index;
+    after.metadata_raft_applied_index += 1;
+    try std.testing.expect(!AdminSource.sameSnapshotFence(before, after));
+    after.metadata_raft_applied_index = before.metadata_raft_applied_index;
+    after.projection_epoch += 1;
+    try std.testing.expect(!AdminSource.sameSnapshotFence(before, after));
+    after.projection_epoch = before.projection_epoch;
+    after.metadata_group_id += 1;
+    try std.testing.expect(!AdminSource.sameSnapshotFence(before, after));
 }
 
 test "metadata http server accepts internal reallocate and split merge routes" {
