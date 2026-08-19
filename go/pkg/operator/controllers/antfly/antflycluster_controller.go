@@ -1664,7 +1664,14 @@ func (e *metadataLeadershipObservationError) Unwrap() error {
 	return e.cause
 }
 
-const metadataLeadershipObservationRetryDelay = 100 * time.Millisecond
+const (
+	metadataLeadershipObservationRetryInterval = 250 * time.Millisecond
+	// Metadata Raft uses a 30-tick election timeout with up to another 29
+	// ticks of jitter. At the runtime's default 100ms tick, an election can
+	// therefore take almost six seconds to begin; allow another second for
+	// votes and the resulting leader observation to propagate.
+	metadataLeadershipObservationGracePeriod = 7 * time.Second
+)
 
 func (r *AntflyClusterReconciler) validateLegacyMetadataRuntimeTopology(ctx context.Context, cluster *antflyv1.AntflyCluster, replicas int32) error {
 	if err := r.validateMetadataRuntimeTopology(ctx, cluster, replicas); err != nil {
@@ -1678,23 +1685,47 @@ func (r *AntflyClusterReconciler) validateLegacyMetadataRuntimeTopology(ctx cont
 // is used both while migrating pre-record clusters and when publishing
 // steady-state health.
 func (r *AntflyClusterReconciler) validateMetadataRuntimeTopology(ctx context.Context, cluster *antflyv1.AntflyCluster, replicas int32) error {
-	err := r.validateMetadataRuntimeTopologyOnce(ctx, cluster, replicas)
-	var leadershipErr *metadataLeadershipObservationError
-	if !stderrors.As(err, &leadershipErr) {
-		return err
-	}
+	return r.validateMetadataRuntimeTopologyWithRetry(
+		ctx,
+		cluster,
+		replicas,
+		metadataLeadershipObservationRetryInterval,
+		metadataLeadershipObservationGracePeriod,
+	)
+}
 
-	// Member status is observed over multiple requests rather than through a
-	// linearizable cluster-wide snapshot. A normal election can therefore leave
-	// one observation containing two adjacent terms or leaders. Retry that
-	// transient class once; durable identity and membership failures never wait.
-	timer := time.NewTimer(metadataLeadershipObservationRetryDelay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return r.validateMetadataRuntimeTopologyOnce(ctx, cluster, replicas)
+func (r *AntflyClusterReconciler) validateMetadataRuntimeTopologyWithRetry(
+	ctx context.Context,
+	cluster *antflyv1.AntflyCluster,
+	replicas int32,
+	retryInterval time.Duration,
+	gracePeriod time.Duration,
+) error {
+	err := r.validateMetadataRuntimeTopologyOnce(ctx, cluster, replicas)
+	deadline := time.Now().Add(gracePeriod)
+	for {
+		var leadershipErr *metadataLeadershipObservationError
+		if !stderrors.As(err, &leadershipErr) {
+			return err
+		}
+
+		// Member status is observed over multiple requests rather than through a
+		// linearizable cluster-wide snapshot. Keep sampling leadership-only
+		// failures through a full election window. Durable identity and membership
+		// failures still return immediately.
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return err
+		}
+		delay := min(retryInterval, remaining)
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+			err = r.validateMetadataRuntimeTopologyOnce(ctx, cluster, replicas)
+		}
 	}
 }
 

@@ -301,7 +301,7 @@ func TestValidateMetadataReplicaTopology(t *testing.T) {
 	}
 }
 
-func TestValidateMetadataRuntimeTopologyRetriesElectionObservation(t *testing.T) {
+func TestValidateMetadataRuntimeTopologyRetriesElectionObservationUntilSettled(t *testing.T) {
 	cluster := &antflyv1.AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
 		Spec: antflyv1.AntflyClusterSpec{MetadataNodes: antflyv1.MetadataNodesSpec{
@@ -331,9 +331,10 @@ func TestValidateMetadataRuntimeTopologyRetriesElectionObservation(t *testing.T)
 		if nodeID == leaderID {
 			role = "leader"
 		}
-		// The first concurrent observation straddles an election: ordinal zero
-		// still reports the preceding term and leader. The retry is coherent.
-		if attempt == 1 && nodeID == 1 {
+		// Several concurrent observations straddle an election: ordinal zero
+		// still reports the preceding term and leader. A later observation is
+		// coherent, after more than the old single retry could absorb.
+		if attempt < 4 && nodeID == 1 {
 			term = 1
 			leaderID = 1
 			role = "leader"
@@ -343,14 +344,14 @@ func TestValidateMetadataRuntimeTopologyRetriesElectionObservation(t *testing.T)
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
 	})}}
 
-	if err := reconciler.validateMetadataRuntimeTopology(context.Background(), cluster, 3); err != nil {
+	if err := reconciler.validateMetadataRuntimeTopologyWithRetry(context.Background(), cluster, 3, time.Millisecond, 100*time.Millisecond); err != nil {
 		t.Fatalf("expected a coherent retry to absorb the election observation, got: %v", err)
 	}
 	mu.Lock()
 	defer mu.Unlock()
 	for host, count := range requestCounts {
-		if count != 2 {
-			t.Fatalf("metadata member %s request count = %d, want 2 observations", host, count)
+		if count != 4 {
+			t.Fatalf("metadata member %s request count = %d, want 4 observations", host, count)
 		}
 	}
 }
