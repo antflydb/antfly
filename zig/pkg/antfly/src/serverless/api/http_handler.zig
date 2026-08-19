@@ -38,6 +38,7 @@ const db_query_graph = @import("../../storage/db/query/graph_exec.zig");
 const distributed_stats_mod = @import("../../search/distributed_stats.zig");
 const graph_mod = @import("../../graph/graph.zig");
 const graph_pattern_mod = @import("../../graph/pattern.zig");
+const graph_node_identity = @import("../../graph/node_identity.zig");
 const graph_paths = @import("../../graph/paths.zig");
 const graph_query_mod = @import("../../graph/query.zig");
 const http_routes = @import("http_routes.zig");
@@ -3297,6 +3298,16 @@ pub const HttpHandler = struct {
         defer freeOwnedKeySlice(self.alloc, start_keys);
         const start_key_refs = try castOwnedKeysToConst(self.alloc, start_keys);
         defer self.alloc.free(start_key_refs);
+        const target_keys = if (named_query.query.target_nodes) |selector|
+            try public_graph_query.resolveGraphSelectorAlloc(self.alloc, selector, available_sets)
+        else
+            try self.alloc.alloc([]u8, 0);
+        defer freeOwnedKeySlice(self.alloc, target_keys);
+        const target_key_refs = try castOwnedKeysToConst(self.alloc, target_keys);
+        defer self.alloc.free(target_key_refs);
+        const target_nodes = try self.alloc.alloc(graph_node_identity.Ref, target_key_refs.len);
+        defer self.alloc.free(target_nodes);
+        for (target_key_refs, 0..) |key, i| target_nodes[i] = .{ .table = null, .key = key };
 
         const need_docs = named_query.query.include_documents or patternRequiresDocumentFilter(named_query.query.pattern);
         const docs: []const query_materializer.Document = if (need_docs) try self.allocPublishedDocumentsAlloc(session) else &.{};
@@ -3317,15 +3328,18 @@ pub const HttpHandler = struct {
                 alloc: Allocator,
                 table: ?[]const u8,
                 key: []const u8,
+                edge_types: []const []const u8,
                 direction: graph_mod.EdgeDirection,
             ) ![]graph_mod.Edge {
                 // Serverless snapshots contain one table-local graph segment.
                 if (table != null) return try alloc.alloc(graph_mod.Edge, 0);
                 const adjacency = findGraphSegmentAdjacency(reader.segment.adjacencies, key) orelse return try alloc.alloc(graph_mod.Edge, 0);
-                const edge_count: usize = switch (direction) {
-                    .out => adjacency.out_edges.len,
-                    .in => adjacency.in_edges.len,
-                    .both => adjacency.out_edges.len + adjacency.in_edges.len,
+                var edge_count: usize = 0;
+                if (direction == .out or direction == .both) for (adjacency.out_edges) |edge| {
+                    if (patternEdgeTypeRequested(edge.edge_type, edge_types)) edge_count += 1;
+                };
+                if (direction == .in or direction == .both) for (adjacency.in_edges) |edge| {
+                    if (patternEdgeTypeRequested(edge.edge_type, edge_types)) edge_count += 1;
                 };
                 const edges = try alloc.alloc(graph_mod.Edge, edge_count);
                 var initialized: usize = 0;
@@ -3336,10 +3350,17 @@ pub const HttpHandler = struct {
 
                 if (direction == .out or direction == .both) {
                     for (adjacency.out_edges) |edge| {
+                        if (!patternEdgeTypeRequested(edge.edge_type, edge_types)) continue;
+                        const source = try alloc.dupe(u8, adjacency.node_id);
+                        errdefer alloc.free(source);
+                        const target = try alloc.dupe(u8, edge.neighbor_id);
+                        errdefer alloc.free(target);
+                        const edge_type = try alloc.dupe(u8, edge.edge_type);
+                        errdefer alloc.free(edge_type);
                         edges[initialized] = .{
-                            .source = try alloc.dupe(u8, adjacency.node_id),
-                            .target = try alloc.dupe(u8, edge.neighbor_id),
-                            .edge_type = try alloc.dupe(u8, edge.edge_type),
+                            .source = source,
+                            .target = target,
+                            .edge_type = edge_type,
                             .weight = edge.weight,
                             .created_at = 0,
                             .updated_at = 0,
@@ -3350,10 +3371,17 @@ pub const HttpHandler = struct {
                 }
                 if (direction == .in or direction == .both) {
                     for (adjacency.in_edges) |edge| {
+                        if (!patternEdgeTypeRequested(edge.edge_type, edge_types)) continue;
+                        const source = try alloc.dupe(u8, edge.neighbor_id);
+                        errdefer alloc.free(source);
+                        const target = try alloc.dupe(u8, adjacency.node_id);
+                        errdefer alloc.free(target);
+                        const edge_type = try alloc.dupe(u8, edge.edge_type);
+                        errdefer alloc.free(edge_type);
                         edges[initialized] = .{
-                            .source = try alloc.dupe(u8, edge.neighbor_id),
-                            .target = try alloc.dupe(u8, adjacency.node_id),
-                            .edge_type = try alloc.dupe(u8, edge.edge_type),
+                            .source = source,
+                            .target = target,
+                            .edge_type = edge_type,
                             .weight = edge.weight,
                             .created_at = 0,
                             .updated_at = 0,
@@ -3368,6 +3396,50 @@ pub const HttpHandler = struct {
             pub fn freeEdges(_: @This(), alloc: Allocator, edges: []graph_mod.Edge) void {
                 for (edges) |edge| freeOwnedGraphEdge(alloc, edge);
                 if (edges.len > 0) alloc.free(edges);
+            }
+
+            pub fn probeEdges(
+                reader: @This(),
+                alloc: Allocator,
+                table: ?[]const u8,
+                probes: []const graph_mod.EdgeProbe,
+            ) ![]?graph_mod.Edge {
+                const results = try alloc.alloc(?graph_mod.Edge, probes.len);
+                @memset(results, null);
+                errdefer {
+                    for (results) |maybe_edge| if (maybe_edge) |edge| freeOwnedGraphEdge(alloc, edge);
+                    alloc.free(results);
+                }
+                if (table != null) return results;
+                for (probes, 0..) |probe, probe_index| {
+                    const adjacency = findGraphSegmentAdjacency(reader.segment.adjacencies, probe.source) orelse continue;
+                    for (adjacency.out_edges) |edge| {
+                        if (!std.mem.eql(u8, edge.neighbor_id, probe.target) or
+                            !std.mem.eql(u8, edge.edge_type, probe.edge_type)) continue;
+                        const source = try alloc.dupe(u8, probe.source);
+                        errdefer alloc.free(source);
+                        const target = try alloc.dupe(u8, probe.target);
+                        errdefer alloc.free(target);
+                        const edge_type = try alloc.dupe(u8, probe.edge_type);
+                        errdefer alloc.free(edge_type);
+                        results[probe_index] = .{
+                            .source = source,
+                            .target = target,
+                            .edge_type = edge_type,
+                            .weight = edge.weight,
+                            .created_at = 0,
+                            .updated_at = 0,
+                            .metadata = &.{},
+                        };
+                        break;
+                    }
+                }
+                return results;
+            }
+
+            pub fn freeProbedEdges(_: @This(), alloc: Allocator, edges: []?graph_mod.Edge) void {
+                for (edges) |maybe_edge| if (maybe_edge) |edge| freeOwnedGraphEdge(alloc, edge);
+                alloc.free(edges);
             }
         };
 
@@ -3386,6 +3458,9 @@ pub const HttpHandler = struct {
             .{
                 .max_results = named_query.query.params.max_results,
                 .return_aliases = named_query.query.return_aliases,
+                .target_nodes = target_nodes,
+                .target_required = named_query.query.target_nodes != null,
+                .include_paths = named_query.query.params.include_paths,
                 .evaluator = if (need_docs) .{
                     .ctx = @ptrCast(&filter_ctx),
                     .func = publishedPatternNodeFilterEvaluator,
@@ -4736,6 +4811,14 @@ const PatternDocumentFilterContext = struct {
 fn patternRequiresDocumentFilter(pattern: []const graph_pattern_mod.PatternStep) bool {
     for (pattern) |step| {
         if (step.node_filter.filter_query_json != null) return true;
+    }
+    return false;
+}
+
+fn patternEdgeTypeRequested(edge_type: []const u8, requested: []const []const u8) bool {
+    if (requested.len == 0) return true;
+    for (requested) |item| {
+        if (std.mem.eql(u8, edge_type, item)) return true;
     }
     return false;
 }
@@ -9583,7 +9666,7 @@ test "http handler serves published graph query endpoints" {
         .method = .post,
         .path = "/tables/docs/query",
         .body =
-        \\{"graph_searches":{"two_hop":{"type":"pattern","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]},"pattern":[{"alias":"a"},{"alias":"b","node_filter":{"filter_query":{"term":"beta","field":"title"}},"edge":{"types":["cites"],"direction":"out","min_hops":1,"max_hops":1}},{"alias":"c","node_filter":{"filter_query":{"prefix":"ga","field":"title"}},"edge":{"types":["cites"],"direction":"out","min_hops":1,"max_hops":1}}],"include_documents":true,"fields":["title"]}},"limit":10}
+        \\{"graph_searches":{"two_hop":{"type":"pattern","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]},"target_nodes":{"keys":["doc-c"]},"pattern":[{"alias":"a"},{"alias":"b","node_filter":{"filter_query":{"term":"beta","field":"title"}},"edge":{"types":["cites"],"direction":"out","min_hops":1,"max_hops":1}},{"alias":"c","node_filter":{"filter_query":{"prefix":"ga","field":"title"}},"edge":{"types":["cites"],"direction":"out","min_hops":1,"max_hops":1}}],"params":{"include_paths":false},"include_documents":true,"fields":["title"]}},"limit":10}
         ,
     });
     defer pattern.deinit(alloc);
@@ -9594,6 +9677,7 @@ test "http handler serves published graph query endpoints" {
     try std.testing.expectEqual(indexes_openapi.GraphQueryType.pattern, two_hop.type);
     try std.testing.expectEqual(@as(i64, 1), two_hop.total);
     try std.testing.expectEqual(@as(usize, 1), two_hop.matches.?.len);
+    try std.testing.expect(two_hop.matches.?[0].path == null);
     const bindings = two_hop.matches.?[0].bindings.?;
     try std.testing.expect(bindings.map.get("a") != null);
     try std.testing.expect(bindings.map.get("b") != null);
