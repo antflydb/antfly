@@ -434,6 +434,40 @@ const RuntimeLeaseWatchdog = struct {
         try self.applyDecision(alloc, io, data_server, decision);
     }
 
+    const ObservationFailureTransition = struct {
+        decision: antfly.ha.kubernetes_lease_watchdog.Decision,
+        should_log: bool,
+    };
+
+    // Called with proof_mutex held. Separate the deterministic fail-closed
+    // state transition from logging so tests can exercise expected failure
+    // paths without emitting a real production error. The wrapper below
+    // remains the sole logging boundary.
+    fn transitionObservationFailureLocked(
+        self: *RuntimeLeaseWatchdog,
+        stage: ObservationFailureStage,
+        now_ns: u64,
+    ) ObservationFailureTransition {
+        const should_log = switch (stage) {
+            .fetch => first: {
+                const first_failure = !self.fetch_failure_logged;
+                self.fetch_failure_logged = true;
+                break :first first_failure;
+            },
+            .validation => first: {
+                self.proof_active.store(false, .release);
+                self.proof_capability_deadline_ns.store(0, .release);
+                const first_failure = !self.validation_failure_logged;
+                self.validation_failure_logged = true;
+                break :first first_failure;
+            },
+        };
+        return .{
+            .decision = self.watchdog.noteAPIFailure(now_ns),
+            .should_log = should_log,
+        };
+    }
+
     // Called with proof_mutex held. Each failure stage logs at most once per
     // runtime process and includes only the Zig error name: bearer tokens,
     // request headers, and response bodies are never rendered.
@@ -443,23 +477,12 @@ const RuntimeLeaseWatchdog = struct {
         err: anyerror,
         now_ns: u64,
     ) antfly.ha.kubernetes_lease_watchdog.Decision {
-        switch (stage) {
-            .fetch => {
-                if (!self.fetch_failure_logged) {
-                    std.log.err("HA Lease watchdog Kubernetes Lease fetch failed err={s}", .{@errorName(err)});
-                    self.fetch_failure_logged = true;
-                }
-            },
-            .validation => {
-                self.proof_active.store(false, .release);
-                self.proof_capability_deadline_ns.store(0, .release);
-                if (!self.validation_failure_logged) {
-                    std.log.err("HA Lease watchdog Lease response validation failed err={s}", .{@errorName(err)});
-                    self.validation_failure_logged = true;
-                }
-            },
-        }
-        return self.watchdog.noteAPIFailure(now_ns);
+        const transition = self.transitionObservationFailureLocked(stage, now_ns);
+        if (transition.should_log) switch (stage) {
+            .fetch => std.log.err("HA Lease watchdog Kubernetes Lease fetch failed err={s}", .{@errorName(err)}),
+            .validation => std.log.err("HA Lease watchdog Lease response validation failed err={s}", .{@errorName(err)}),
+        };
+        return transition.decision;
     }
 
     fn runIndependent(
@@ -7523,9 +7546,13 @@ test "runtime lease watchdog fetch and validation failures publish no bootstrap 
             .process_boot_id = [_]u8{'a'} ** 64,
         };
         platform_sync.lockYielding(&runtime_watchdog.proof_mutex);
-        const decision = runtime_watchdog.noteObservationFailureLocked(stage, error.TestLeaseObservationFailure, 1);
+        const transition = runtime_watchdog.transitionObservationFailureLocked(stage, 1);
+        const repeated_transition = runtime_watchdog.transitionObservationFailureLocked(stage, 2);
         runtime_watchdog.proof_mutex.unlock();
-        try std.testing.expectEqual(antfly.ha.kubernetes_lease_watchdog.Decision.waiting, decision);
+        try std.testing.expectEqual(antfly.ha.kubernetes_lease_watchdog.Decision.waiting, transition.decision);
+        try std.testing.expect(transition.should_log);
+        try std.testing.expectEqual(antfly.ha.kubernetes_lease_watchdog.Decision.waiting, repeated_transition.decision);
+        try std.testing.expect(!repeated_transition.should_log);
         try std.testing.expectEqual(stage == .fetch, runtime_watchdog.fetch_failure_logged);
         try std.testing.expectEqual(stage == .validation, runtime_watchdog.validation_failure_logged);
 
