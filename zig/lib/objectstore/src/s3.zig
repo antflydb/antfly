@@ -142,6 +142,7 @@ pub const TransportResponse = struct {
     content_type: ?[]u8 = null,
     content_length: ?u64 = null,
     version_id: ?[]u8 = null,
+    checksum: ?types.ObjectChecksum = null,
     last_modified: ?[]u8 = null,
 
     pub fn deinit(self: *TransportResponse, alloc: Allocator) void {
@@ -149,6 +150,7 @@ pub const TransportResponse = struct {
         if (self.etag) |value| alloc.free(value);
         if (self.content_type) |value| alloc.free(value);
         if (self.version_id) |value| alloc.free(value);
+        if (self.checksum) |*value| value.deinit(alloc);
         if (self.last_modified) |value| alloc.free(value);
         self.* = undefined;
     }
@@ -324,8 +326,142 @@ fn httpxRequest(
     if (response.headers.get("Content-Type")) |value| result.content_type = try alloc.dupe(u8, value);
     result.content_length = if (response.headers.get("Content-Length")) |value| std.fmt.parseInt(u64, value, 10) catch null else null;
     if (response.headers.get("x-amz-version-id")) |value| result.version_id = try alloc.dupe(u8, value);
+    result.checksum = try checksumFromHeaders(alloc, &response.headers);
     if (response.headers.get("Last-Modified")) |value| result.last_modified = try alloc.dupe(u8, value);
     return result;
+}
+
+fn checksumFromHeaders(alloc: Allocator, headers: *const httpx.Headers) !?types.ObjectChecksum {
+    const Candidate = struct {
+        name: []const u8,
+        algorithm: types.ObjectChecksumAlgorithm,
+    };
+    const candidates = [_]Candidate{
+        .{ .name = "x-amz-checksum-sha512", .algorithm = .sha512_base64 },
+        .{ .name = "x-amz-checksum-sha256", .algorithm = .sha256_base64 },
+        .{ .name = "x-amz-checksum-sha1", .algorithm = .sha1_base64 },
+        .{ .name = "x-amz-checksum-crc64nvme", .algorithm = .crc64nvme_base64 },
+        .{ .name = "x-amz-checksum-crc32c", .algorithm = .crc32c_base64 },
+        .{ .name = "x-amz-checksum-crc32", .algorithm = .crc32_base64 },
+        .{ .name = "x-amz-checksum-md5", .algorithm = .md5_base64 },
+        .{ .name = "x-amz-checksum-xxhash128", .algorithm = .xxhash128_base64 },
+        .{ .name = "x-amz-checksum-xxhash64", .algorithm = .xxhash64_base64 },
+        .{ .name = "x-amz-checksum-xxhash3", .algorithm = .xxhash3_base64 },
+    };
+    const checksum_type: types.ObjectChecksumType = if (headers.get("x-amz-checksum-type")) |value|
+        if (std.ascii.eqlIgnoreCase(value, "FULL_OBJECT"))
+            .full_object
+        else if (std.ascii.eqlIgnoreCase(value, "COMPOSITE"))
+            .composite
+        else
+            .unknown
+    else
+        .unknown;
+
+    for (candidates) |candidate| {
+        if (headers.get(candidate.name)) |value| {
+            const effective_type: types.ObjectChecksumType = if (candidate.algorithm == .crc64nvme_base64)
+                .full_object
+            else
+                checksum_type;
+            const normalized = normalizeS3ChecksumValue(value, effective_type);
+            return .{
+                .algorithm = candidate.algorithm,
+                .value = try alloc.dupe(u8, normalized.value),
+                .checksum_type = normalized.checksum_type,
+                .part_count = normalized.part_count,
+            };
+        }
+    }
+    return null;
+}
+
+const NormalizedS3ChecksumValue = struct {
+    value: []const u8,
+    checksum_type: types.ObjectChecksumType,
+    part_count: ?u32 = null,
+};
+
+fn normalizeS3ChecksumValue(value: []const u8, checksum_type: types.ObjectChecksumType) NormalizedS3ChecksumValue {
+    var normalized = NormalizedS3ChecksumValue{
+        .value = value,
+        .checksum_type = checksum_type,
+    };
+    if (checksum_type == .full_object) return normalized;
+
+    const separator = std.mem.lastIndexOfScalar(u8, value, '-') orelse return normalized;
+    if (separator == 0 or separator + 1 == value.len) return normalized;
+    const part_count = std.fmt.parseUnsigned(u32, value[separator + 1 ..], 10) catch return normalized;
+    if (part_count == 0) return normalized;
+
+    normalized.value = value[0..separator];
+    normalized.checksum_type = .composite;
+    normalized.part_count = part_count;
+    return normalized;
+}
+
+fn replaceChecksum(alloc: Allocator, destination: *?types.ObjectChecksum, source: ?types.ObjectChecksum) !void {
+    const value = source orelse return;
+    const replacement = try value.clone(alloc);
+    if (destination.*) |*current| current.deinit(alloc);
+    destination.* = replacement;
+}
+
+fn checksumModeFallbackStatus(status: u16) bool {
+    return switch (status) {
+        // AWS can require additional KMS permissions for checksum mode, while
+        // S3-compatible providers commonly report an unsupported request as
+        // Bad Request, Method Not Allowed, or Not Implemented.
+        400, 403, 405, 501 => true,
+        else => false,
+    };
+}
+
+test "s3 response checksum parsing preserves provider algorithm and checksum type" {
+    const alloc = std.testing.allocator;
+    var composite_headers = httpx.Headers.init(alloc);
+    defer composite_headers.deinit();
+    try composite_headers.append("x-amz-checksum-sha256", "YWJjZA==-3");
+    try composite_headers.append("x-amz-checksum-type", "COMPOSITE");
+
+    var composite = (try checksumFromHeaders(alloc, &composite_headers)).?;
+    defer composite.deinit(alloc);
+    try std.testing.expectEqual(types.ObjectChecksumAlgorithm.sha256_base64, composite.algorithm);
+    try std.testing.expectEqualStrings("YWJjZA==", composite.value);
+    try std.testing.expectEqual(types.ObjectChecksumType.composite, composite.checksum_type);
+    try std.testing.expectEqual(@as(?u32, 3), composite.part_count);
+
+    var default_headers = httpx.Headers.init(alloc);
+    defer default_headers.deinit();
+    try default_headers.append("x-amz-checksum-crc64nvme", "crc64-body");
+    var default = (try checksumFromHeaders(alloc, &default_headers)).?;
+    defer default.deinit(alloc);
+    try std.testing.expectEqual(types.ObjectChecksumAlgorithm.crc64nvme_base64, default.algorithm);
+    try std.testing.expectEqualStrings("crc64-body", default.value);
+    try std.testing.expectEqual(types.ObjectChecksumType.full_object, default.checksum_type);
+}
+
+test "s3 checksum replacement retains the old value on allocation failure" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var destination: ?types.ObjectChecksum = .{
+                .algorithm = .crc64nvme_base64,
+                .value = try alloc.dupe(u8, "old"),
+                .checksum_type = .full_object,
+            };
+            defer if (destination) |*value| value.deinit(alloc);
+            const source = types.ObjectChecksum{
+                .algorithm = .sha256_base64,
+                .value = @constCast("new"),
+                .checksum_type = .composite,
+                .part_count = 3,
+            };
+            try replaceChecksum(alloc, &destination, source);
+            try std.testing.expectEqualStrings("new", destination.?.value);
+            try std.testing.expectEqual(@as(?u32, 3), destination.?.part_count);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 fn remainingRequestTimeoutMs(timeout_ms: u64, elapsed_ns: i96) !u64 {
@@ -495,7 +631,8 @@ pub const Client = struct {
 
         var headers = std.ArrayListUnmanaged(HeaderPair).empty;
         defer headers.deinit(alloc);
-        try appendConditionalHeaders(alloc, &headers, opts.if_match_etag, opts.if_none_match);
+        const owned_if_match = try appendConditionalHeaders(alloc, &headers, opts.if_match_etag, opts.if_none_match);
+        defer if (owned_if_match) |value| alloc.free(value);
 
         var response = try self.perform(.PUT, target, headers.items, body, opts.content_type);
         defer response.deinit(alloc);
@@ -660,16 +797,27 @@ pub const Client = struct {
                 .key = owned_key,
                 .content_length = 0,
             };
-        } else try self.statObject(alloc, bucket, key);
+        } else try self.statObjectVersion(alloc, bucket, key, opts.version_id);
         errdefer meta.deinit(alloc);
-        const query = try buildObjectQueryAlloc(alloc, opts.version_id, opts.part_number);
+        // Keep an ordinary current-object read on the ordinary GetObject
+        // permission path. Supplying a probed version ID would require
+        // s3:GetObjectVersion even though the caller did not request one.
+        const effective_version_id = opts.version_id;
+        const query = try buildObjectQueryAlloc(alloc, effective_version_id, opts.part_number);
         defer freeQueryPairs(alloc, query);
         var target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, query);
         defer target.deinit(alloc);
 
         var headers = std.ArrayListUnmanaged(HeaderPair).empty;
         defer headers.deinit(alloc);
-        try appendConditionalHeaders(alloc, &headers, opts.if_match_etag, false);
+        const effective_if_match: ?[]const u8 = if (opts.if_match_etag) |value|
+            value
+        else if (!opts.skip_metadata_probe and opts.version_id == null)
+            meta.etag
+        else
+            null;
+        const owned_if_match = try appendConditionalHeaders(alloc, &headers, effective_if_match, false);
+        defer if (owned_if_match) |value| alloc.free(value);
         if (opts.range) |range| {
             const value = try byteRangeHeaderAlloc(alloc, range);
             errdefer alloc.free(value);
@@ -681,12 +829,10 @@ pub const Client = struct {
             }
         }
 
-        var response = try self.performWithResponseLimit(
+        var response = try self.performReadWithChecksumFallback(
             .GET,
             target,
             headers.items,
-            null,
-            null,
             opts.max_response_bytes,
         );
         errdefer response.deinit(alloc);
@@ -713,6 +859,13 @@ pub const Client = struct {
             const next = try alloc.dupe(u8, value);
             if (meta.version_id) |current| alloc.free(current);
             meta.version_id = next;
+        }
+        try replaceChecksum(alloc, &meta.checksum, response.checksum);
+        if (response.checksum != null) {
+            meta.checksum_scope = if (response.status == 206 or opts.range != null or opts.part_number != null)
+                .response_body
+            else
+                .object;
         }
 
         const out_body = response.body;
@@ -745,10 +898,16 @@ pub const Client = struct {
     }
 
     fn statObject(self: *Client, alloc: Allocator, bucket: []const u8, key: []const u8) !types.ObjectMetadata {
-        var target = try objectTargetAlloc(alloc, self.cfg, bucket, key);
+        return self.statObjectVersion(alloc, bucket, key, null);
+    }
+
+    fn statObjectVersion(self: *Client, alloc: Allocator, bucket: []const u8, key: []const u8, version_id: ?[]const u8) !types.ObjectMetadata {
+        const query = try buildObjectQueryAlloc(alloc, version_id, null);
+        defer freeQueryPairs(alloc, query);
+        var target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, query);
         defer target.deinit(alloc);
 
-        var response = try self.perform(.HEAD, target, &.{}, null, null);
+        var response = try self.performReadWithChecksumFallback(.HEAD, target, &.{}, null);
         defer response.deinit(alloc);
         switch (response.status) {
             200 => {},
@@ -762,6 +921,7 @@ pub const Client = struct {
             .key = try alloc.dupe(u8, key),
             .etag = if (response.etag) |value| try alloc.dupe(u8, stripQuotes(value)) else null,
             .version_id = if (response.version_id) |value| try alloc.dupe(u8, value) else null,
+            .checksum = if (response.checksum) |value| try value.clone(alloc) else null,
             .content_length = response.content_length orelse 0,
             .content_type = if (response.content_type) |value| try alloc.dupe(u8, value) else null,
             .last_modified_unix_ms = null,
@@ -776,7 +936,8 @@ pub const Client = struct {
 
         var headers = std.ArrayListUnmanaged(HeaderPair).empty;
         defer headers.deinit(self.alloc);
-        try appendConditionalHeaders(self.alloc, &headers, opts.if_match_etag, false);
+        const owned_if_match = try appendConditionalHeaders(self.alloc, &headers, opts.if_match_etag, false);
+        defer if (owned_if_match) |value| self.alloc.free(value);
 
         var response = try self.perform(.DELETE, target, headers.items, null, null);
         defer response.deinit(self.alloc);
@@ -815,6 +976,33 @@ pub const Client = struct {
         content_type: ?[]const u8,
     ) !TransportResponse {
         return try self.performWithResponseLimit(method, target, headers, body, content_type, null);
+    }
+
+    fn performReadWithChecksumFallback(
+        self: *Client,
+        method: HttpMethod,
+        target: RequestTarget,
+        headers: []const HeaderPair,
+        max_response_size: ?usize,
+    ) !TransportResponse {
+        std.debug.assert(method == .GET or method == .HEAD);
+        var checksum_headers = std.ArrayListUnmanaged(HeaderPair).empty;
+        defer checksum_headers.deinit(self.alloc);
+        try checksum_headers.ensureTotalCapacity(self.alloc, headers.len + 1);
+        checksum_headers.appendAssumeCapacity(.{ "x-amz-checksum-mode", "ENABLED" });
+        checksum_headers.appendSliceAssumeCapacity(headers);
+
+        var response = self.performWithResponseLimit(method, target, checksum_headers.items, null, null, max_response_size) catch |err| switch (err) {
+            // httpx enforces the caller's body limit before returning the
+            // response status. A checksum-permission 403 can therefore look
+            // like an oversized response; retrying these safe reads without
+            // checksum mode preserves the original limit and disambiguates it.
+            error.ResponseTooLarge => return try self.performWithResponseLimit(method, target, headers, null, null, max_response_size),
+            else => return err,
+        };
+        if (!checksumModeFallbackStatus(response.status)) return response;
+        response.deinit(self.alloc);
+        return try self.performWithResponseLimit(method, target, headers, null, null, max_response_size);
     }
 
     fn performWithResponseLimit(
@@ -1446,12 +1634,45 @@ fn appendConditionalHeaders(
     headers: *std.ArrayListUnmanaged(HeaderPair),
     if_match_etag: ?[]const u8,
     if_none_match: bool,
-) !void {
+) !?[]u8 {
+    var owned_if_match: ?[]u8 = null;
+    errdefer if (owned_if_match) |value| alloc.free(value);
     if (if_match_etag) |value| {
-        try headers.append(alloc, .{ "If-Match", value });
+        owned_if_match = try ifMatchHeaderValueAlloc(alloc, value);
+        try headers.append(alloc, .{ "If-Match", owned_if_match.? });
     }
     if (if_none_match) {
         try headers.append(alloc, .{ "If-None-Match", "*" });
+    }
+    return owned_if_match;
+}
+
+fn ifMatchHeaderValueAlloc(alloc: Allocator, value: []const u8) ![]u8 {
+    const already_quoted = value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"';
+    const weakly_quoted = value.len >= 4 and std.mem.startsWith(u8, value, "W/\"") and value[value.len - 1] == '"';
+    if (std.mem.eql(u8, value, "*") or already_quoted or weakly_quoted) return try alloc.dupe(u8, value);
+    return try std.fmt.allocPrint(alloc, "\"{s}\"", .{value});
+}
+
+test "s3 If-Match headers preserve HTTP entity-tag syntax" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        input: []const u8,
+        expected: []const u8,
+    }{
+        .{ .input = "etag", .expected = "\"etag\"" },
+        .{ .input = "\"etag\"", .expected = "\"etag\"" },
+        .{ .input = "W/\"etag\"", .expected = "W/\"etag\"" },
+        .{ .input = "*", .expected = "*" },
+    };
+
+    for (cases) |case| {
+        var headers = std.ArrayListUnmanaged(HeaderPair).empty;
+        defer headers.deinit(alloc);
+        const owned_if_match = (try appendConditionalHeaders(alloc, &headers, case.input, false)).?;
+        defer alloc.free(owned_if_match);
+        try std.testing.expectEqual(@as(usize, 1), headers.items.len);
+        try std.testing.expectEqualStrings(case.expected, headers.items[0][1]);
     }
 }
 
@@ -2046,6 +2267,10 @@ test "s3 client signs and issues object operations through request fn" {
         content_type: ?[]const u8 = null,
         content_length: ?u64 = null,
         version_id: ?[]const u8 = null,
+        checksum_algorithm: ?types.ObjectChecksumAlgorithm = null,
+        checksum_value: ?[]const u8 = null,
+        checksum_type: types.ObjectChecksumType = .unknown,
+        expect_checksum_mode: bool = false,
         expect_body: ?[]const u8 = null,
         expect_range: ?[]const u8 = null,
         expect_max_response_size: ?usize = null,
@@ -2073,6 +2298,9 @@ test "s3 client signs and issues object operations through request fn" {
             try expectHeader(headers, "Authorization");
             try expectHeader(headers, "x-amz-date");
             try expectHeader(headers, "x-amz-content-sha256");
+            if (step.expect_checksum_mode) {
+                try expectHeaderValue(headers, "x-amz-checksum-mode", "ENABLED");
+            }
             try std.testing.expectEqual(step.expect_max_response_size, max_response_size);
             if (step.expect_body) |expected| {
                 try std.testing.expectEqualStrings(expected, body orelse "");
@@ -2087,6 +2315,11 @@ test "s3 client signs and issues object operations through request fn" {
                 .content_type = if (step.content_type) |value| try req_alloc.dupe(u8, value) else null,
                 .content_length = step.content_length,
                 .version_id = if (step.version_id) |value| try req_alloc.dupe(u8, value) else null,
+                .checksum = if (step.checksum_value) |value| .{
+                    .algorithm = step.checksum_algorithm.?,
+                    .value = try req_alloc.dupe(u8, value),
+                    .checksum_type = step.checksum_type,
+                } else null,
             };
         }
 
@@ -2112,10 +2345,10 @@ test "s3 client signs and issues object operations through request fn" {
         .{ .method = .HEAD, .url_contains = "/bucket", .status = 404 },
         .{ .method = .PUT, .url_contains = "/bucket", .status = 200 },
         .{ .method = .PUT, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-put\"", .expect_body = "hello" },
-        .{ .method = .HEAD, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5 },
-        .{ .method = .GET, .url_contains = "partNumber=7&versionId=v2", .status = 206, .body = "ell", .etag = "\"etag-get\"", .content_type = "text/plain", .content_length = 3, .version_id = "v2", .expect_range = "bytes=1-3" },
-        .{ .method = .GET, .url_contains = "/bucket/docs/a.txt", .status = 206, .body = "hell", .etag = "\"etag-direct\"", .content_type = "text/plain", .content_length = 4, .expect_max_response_size = 4 },
-        .{ .method = .HEAD, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5 },
+        .{ .method = .HEAD, .url_contains = "versionId=v2", .status = 200, .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5, .checksum_algorithm = .crc64nvme_base64, .checksum_value = "crc64-version", .checksum_type = .full_object, .expect_checksum_mode = true },
+        .{ .method = .GET, .url_contains = "partNumber=7&versionId=v2", .status = 206, .body = "ell", .etag = "\"etag-get\"", .content_type = "text/plain", .content_length = 3, .version_id = "v2", .checksum_algorithm = .sha256_base64, .checksum_value = "sha256-get", .checksum_type = .composite, .expect_checksum_mode = true, .expect_range = "bytes=1-3" },
+        .{ .method = .GET, .url_contains = "/bucket/docs/a.txt", .status = 206, .body = "hell", .etag = "\"etag-direct\"", .content_type = "text/plain", .content_length = 4, .expect_checksum_mode = true, .expect_max_response_size = 4 },
+        .{ .method = .HEAD, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5, .checksum_algorithm = .sha256_base64, .checksum_value = "sha256-head", .checksum_type = .full_object, .expect_checksum_mode = true },
         .{ .method = .GET, .url_contains = "list-type=2", .status = 200, .body = "<ListBucketResult><Contents><Key>docs/a.txt</Key><ETag>\"etag-head\"</ETag><Size>5</Size></Contents></ListBucketResult>" },
         .{ .method = .DELETE, .url_contains = "/bucket/docs/a.txt", .status = 204 },
     };
@@ -2154,6 +2387,10 @@ test "s3 client signs and issues object operations through request fn" {
     try std.testing.expectEqualStrings("etag-get", get.metadata.etag.?);
     try std.testing.expectEqualStrings("v2", get.metadata.version_id.?);
     try std.testing.expectEqual(@as(u64, 3), get.metadata.content_length);
+    try std.testing.expectEqual(types.ObjectChecksumAlgorithm.sha256_base64, get.metadata.checksum.?.algorithm);
+    try std.testing.expectEqualStrings("sha256-get", get.metadata.checksum.?.value);
+    try std.testing.expectEqual(types.ObjectChecksumType.composite, get.metadata.checksum.?.checksum_type);
+    try std.testing.expectEqual(types.ObjectChecksumScope.response_body, get.metadata.checksum_scope);
 
     var direct = try client.getObject("bucket", "docs/a.txt", .{
         .range = .{ .offset = 0, .length = 4 },
@@ -2167,6 +2404,10 @@ test "s3 client signs and issues object operations through request fn" {
     var meta = try client.statObject("bucket", "docs/a.txt");
     defer meta.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 5), meta.content_length);
+    try std.testing.expectEqual(types.ObjectChecksumAlgorithm.sha256_base64, meta.checksum.?.algorithm);
+    try std.testing.expectEqualStrings("sha256-head", meta.checksum.?.value);
+    try std.testing.expectEqual(types.ObjectChecksumType.full_object, meta.checksum.?.checksum_type);
+    try std.testing.expectEqual(types.ObjectChecksumScope.object, meta.checksum_scope);
 
     var listed = try client.listObjects("bucket", .{ .prefix = "docs/" });
     defer listed.deinit(alloc);
@@ -2175,6 +2416,273 @@ test "s3 client signs and issues object operations through request fn" {
 
     try client.deleteObject("bucket", "docs/a.txt", .{});
     try std.testing.expectEqual(steps.len, fake.index);
+}
+
+test "s3 get object guards probed current-object reads without version permission escalation" {
+    const alloc = std.testing.allocator;
+    const State = struct {
+        calls: usize = 0,
+
+        fn request(
+            ptr: ?*anyopaque,
+            request_alloc: Allocator,
+            method: HttpMethod,
+            url: []const u8,
+            headers: []const HeaderPair,
+            _: ?[]const u8,
+            _: ?[]const u8,
+            _: ?usize,
+        ) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            defer self.calls += 1;
+            try expectHeaderValue(headers, "x-amz-checksum-mode", "ENABLED");
+            return switch (self.calls) {
+                0 => blk: {
+                    try std.testing.expectEqual(HttpMethod.HEAD, method);
+                    try std.testing.expect(std.mem.indexOf(u8, url, "/bucket/versioned") != null);
+                    break :blk .{
+                        .status = 200,
+                        .body = try request_alloc.alloc(u8, 0),
+                        .etag = try request_alloc.dupe(u8, "\"etag-v1\""),
+                        .version_id = try request_alloc.dupe(u8, "v1"),
+                        .checksum = .{
+                            .algorithm = .crc32c_base64,
+                            .value = try request_alloc.dupe(u8, "sum-v1"),
+                            .checksum_type = .full_object,
+                        },
+                        .content_length = 4,
+                    };
+                },
+                1 => blk: {
+                    try std.testing.expectEqual(HttpMethod.GET, method);
+                    try std.testing.expect(std.mem.indexOf(u8, url, "/bucket/versioned") != null);
+                    try std.testing.expect(std.mem.indexOf(u8, url, "versionId=") == null);
+                    try expectHeaderValue(headers, "If-Match", "\"etag-v1\"");
+                    break :blk .{
+                        .status = 200,
+                        .body = try request_alloc.dupe(u8, "data"),
+                        .etag = try request_alloc.dupe(u8, "\"etag-v1\""),
+                        .version_id = try request_alloc.dupe(u8, "v1"),
+                    };
+                },
+                2 => blk: {
+                    try std.testing.expectEqual(HttpMethod.HEAD, method);
+                    try std.testing.expect(std.mem.indexOf(u8, url, "/bucket/unversioned") != null);
+                    break :blk .{
+                        .status = 200,
+                        .body = try request_alloc.alloc(u8, 0),
+                        .etag = try request_alloc.dupe(u8, "\"etag-u1\""),
+                        .checksum = .{
+                            .algorithm = .crc32c_base64,
+                            .value = try request_alloc.dupe(u8, "sum-u1"),
+                            .checksum_type = .full_object,
+                        },
+                        .content_length = 4,
+                    };
+                },
+                3 => blk: {
+                    try std.testing.expectEqual(HttpMethod.GET, method);
+                    try std.testing.expect(std.mem.indexOf(u8, url, "/bucket/unversioned") != null);
+                    try expectHeaderValue(headers, "If-Match", "\"etag-u1\"");
+                    break :blk .{
+                        .status = 412,
+                        .body = try request_alloc.alloc(u8, 0),
+                    };
+                },
+                else => error.UnexpectedCall,
+            };
+        }
+
+        fn expectHeaderValue(headers: []const HeaderPair, name: []const u8, expected: []const u8) !void {
+            for (headers) |pair| {
+                if (std.ascii.eqlIgnoreCase(pair[0], name)) {
+                    try std.testing.expectEqualStrings(expected, pair[1]);
+                    return;
+                }
+            }
+            return error.MissingHeader;
+        }
+
+        fn expectNoHeader(headers: []const HeaderPair, name: []const u8) !void {
+            for (headers) |pair| {
+                if (std.ascii.eqlIgnoreCase(pair[0], name)) return error.UnexpectedHeader;
+            }
+        }
+    };
+
+    const cfg = Config{
+        .credentials = .{
+            .endpoint = try alloc.dupe(u8, "s3.example.test"),
+            .use_ssl = true,
+            .access_key_id = try alloc.dupe(u8, "access"),
+            .secret_access_key = try alloc.dupe(u8, "secret"),
+            .region = try alloc.dupe(u8, "us-east-1"),
+        },
+        .addressing_style = .path,
+    };
+    var state = State{};
+    var s3_client = Client.initWithRequestFn(alloc, cfg, &state, State.request);
+    var client = s3_client.client();
+    defer client.deinit();
+
+    var pinned = try client.getObject("bucket", "versioned", .{});
+    defer pinned.deinit(alloc);
+    try std.testing.expectEqualStrings("data", pinned.body);
+    try std.testing.expectEqualStrings("v1", pinned.metadata.version_id.?);
+    try std.testing.expectEqualStrings("sum-v1", pinned.metadata.checksum.?.value);
+
+    try std.testing.expectError(error.PreconditionFailed, client.getObject("bucket", "unversioned", .{}));
+    try std.testing.expectEqual(@as(usize, 4), state.calls);
+}
+
+test "s3 metadata reads fall back when checksum mode is forbidden or unsupported" {
+    const alloc = std.testing.allocator;
+    const State = struct {
+        failure_status: u16,
+        calls: usize = 0,
+
+        fn request(
+            ptr: ?*anyopaque,
+            request_alloc: Allocator,
+            method: HttpMethod,
+            _: []const u8,
+            headers: []const HeaderPair,
+            _: ?[]const u8,
+            _: ?[]const u8,
+            _: ?usize,
+        ) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            defer self.calls += 1;
+            try std.testing.expectEqual(HttpMethod.HEAD, method);
+            switch (self.calls) {
+                0 => try expectHeaderValue(headers, "x-amz-checksum-mode", "ENABLED"),
+                1 => try expectNoHeader(headers, "x-amz-checksum-mode"),
+                else => return error.UnexpectedCall,
+            }
+            return .{
+                .status = if (self.calls == 0) self.failure_status else 200,
+                .body = try request_alloc.alloc(u8, 0),
+                .content_length = if (self.calls == 0) null else 5,
+            };
+        }
+
+        fn expectHeaderValue(headers: []const HeaderPair, name: []const u8, expected: []const u8) !void {
+            for (headers) |pair| {
+                if (std.ascii.eqlIgnoreCase(pair[0], name)) {
+                    try std.testing.expectEqualStrings(expected, pair[1]);
+                    return;
+                }
+            }
+            return error.MissingHeader;
+        }
+
+        fn expectNoHeader(headers: []const HeaderPair, name: []const u8) !void {
+            for (headers) |pair| {
+                if (std.ascii.eqlIgnoreCase(pair[0], name)) return error.UnexpectedHeader;
+            }
+        }
+    };
+
+    for ([_]u16{ 400, 403, 405, 501 }) |failure_status| {
+        const cfg = Config{
+            .credentials = .{
+                .endpoint = try alloc.dupe(u8, "s3.example.test"),
+                .use_ssl = true,
+                .access_key_id = try alloc.dupe(u8, "access"),
+                .secret_access_key = try alloc.dupe(u8, "secret"),
+                .region = try alloc.dupe(u8, "us-east-1"),
+            },
+            .addressing_style = .path,
+        };
+        var state = State{ .failure_status = failure_status };
+        var s3_client = Client.initWithRequestFn(alloc, cfg, &state, State.request);
+        var client = s3_client.client();
+        defer client.deinit();
+
+        var meta = try client.statObject("bucket", "kms-object");
+        defer meta.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 5), meta.content_length);
+        try std.testing.expectEqual(@as(usize, 2), state.calls);
+    }
+}
+
+test "s3 bounded reads retry when checksum permission errors exceed the response limit" {
+    const alloc = std.testing.allocator;
+    const State = struct {
+        calls: usize = 0,
+
+        fn request(
+            ptr: ?*anyopaque,
+            request_alloc: Allocator,
+            method: HttpMethod,
+            _: []const u8,
+            headers: []const HeaderPair,
+            _: ?[]const u8,
+            _: ?[]const u8,
+            max_response_size: ?usize,
+        ) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            defer self.calls += 1;
+            try std.testing.expectEqual(HttpMethod.GET, method);
+            try std.testing.expectEqual(@as(?usize, 4), max_response_size);
+            switch (self.calls) {
+                0 => {
+                    try expectHeaderValue(headers, "x-amz-checksum-mode", "ENABLED");
+                    // This is what the real httpx transport returns when the
+                    // XML body of a checksum-mode 403 exceeds the read limit.
+                    return error.ResponseTooLarge;
+                },
+                1 => try expectNoHeader(headers, "x-amz-checksum-mode"),
+                else => return error.UnexpectedCall,
+            }
+            return .{
+                .status = 206,
+                .body = try request_alloc.dupe(u8, "hell"),
+                .etag = try request_alloc.dupe(u8, "\"etag\""),
+            };
+        }
+
+        fn expectHeaderValue(headers: []const HeaderPair, name: []const u8, expected: []const u8) !void {
+            for (headers) |pair| {
+                if (std.ascii.eqlIgnoreCase(pair[0], name)) {
+                    try std.testing.expectEqualStrings(expected, pair[1]);
+                    return;
+                }
+            }
+            return error.MissingHeader;
+        }
+
+        fn expectNoHeader(headers: []const HeaderPair, name: []const u8) !void {
+            for (headers) |pair| {
+                if (std.ascii.eqlIgnoreCase(pair[0], name)) return error.UnexpectedHeader;
+            }
+        }
+    };
+
+    const cfg = Config{
+        .credentials = .{
+            .endpoint = try alloc.dupe(u8, "s3.example.test"),
+            .use_ssl = true,
+            .access_key_id = try alloc.dupe(u8, "access"),
+            .secret_access_key = try alloc.dupe(u8, "secret"),
+            .region = try alloc.dupe(u8, "us-east-1"),
+        },
+        .addressing_style = .path,
+    };
+    var state = State{};
+    var s3_client = Client.initWithRequestFn(alloc, cfg, &state, State.request);
+    var client = s3_client.client();
+    defer client.deinit();
+
+    var result = try client.getObject("bucket", "kms-object", .{
+        .range = .{ .offset = 0, .length = 4 },
+        .skip_metadata_probe = true,
+        .max_response_bytes = 4,
+    });
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("hell", result.body);
+    try std.testing.expectEqualStrings("etag", result.metadata.etag.?);
+    try std.testing.expectEqual(@as(usize, 2), state.calls);
 }
 
 test "s3 client refreshes dynamic credentials for every signed request" {
