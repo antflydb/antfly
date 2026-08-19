@@ -185,6 +185,10 @@ const (
 	// ReasonRuntimeDegraded indicates pod diagnostics found a runtime failure.
 	ReasonRuntimeDegraded = "RuntimeDegraded"
 
+	// ReasonMetadataLeadershipObservationPending indicates Raft leadership is
+	// being re-observed through a bounded election grace period.
+	ReasonMetadataLeadershipObservationPending = "MetadataLeadershipObservationPending"
+
 	// ReasonUnschedulable indicates pods cannot be scheduled.
 	ReasonUnschedulable = "Unschedulable"
 
