@@ -280,6 +280,30 @@ pub const ApiHttpClient = struct {
         return try std.json.parseFromSlice(cluster.ClusterStatus, self.alloc, resp.body, .{ .allocate = .alloc_always });
     }
 
+    pub fn fetchDataRaftBatchProtocolVersion(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !u16 {
+        const uri = try self.joinRoute(base_uri, routes.Routes.internal_capabilities);
+        defer self.alloc.free(uri);
+        var resp = try self.executor.execute(self.alloc, .{
+            .method = .GET,
+            .uri = uri,
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
+        });
+        defer resp.deinit(self.alloc);
+        if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
+        const Parsed = struct { data_raft_batch_protocol_version: u16 = 0 };
+        const parsed = try std.json.parseFromSlice(Parsed, self.alloc, resp.body, .{
+            .ignore_unknown_fields = true,
+        });
+        defer parsed.deinit();
+        return parsed.value.data_raft_batch_protocol_version;
+    }
+
     pub fn fetchLookup(
         self: *ApiHttpClient,
         base_uri: []const u8,
@@ -3528,7 +3552,7 @@ test "api http client encodes merge doc identity reassignment action flag" {
     );
 }
 
-test "api http client round-trips public status route" {
+test "api http client round-trips public status and internal capability routes" {
     const std_http_executor = @import("../raft/transport/std_http_executor.zig");
     const http_test_runtime = @import("http_test_runtime.zig");
     const http_server = @import("http_server.zig");
@@ -3569,6 +3593,10 @@ test "api http client round-trips public status route" {
     var status = try client.fetchClusterStatus(base_uri);
     defer status.deinit();
     try std.testing.expectEqual(cluster.ClusterHealth.degraded, status.value.health);
+    try std.testing.expectEqual(
+        internal_batch_forwarding.raft_batch_protocol_version,
+        try client.fetchDataRaftBatchProtocolVersion(base_uri, null, null),
+    );
 }
 
 test "api http client round-trips shard median key route" {

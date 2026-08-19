@@ -12,6 +12,12 @@
 // License for the specific language governing permissions and limitations.
 
 const std = @import("std");
+
+/// Version 1 adds the internal `_timestamp_ns` field to data-Raft batch log
+/// entries. A leader activates it only after every applying replica reports
+/// at least this version through the internal capability endpoint.
+pub const raft_batch_protocol_version: u16 = 1;
+pub const raft_batch_timestamp_protocol_version: u16 = 1;
 const http_common = @import("../raft/transport/http_common.zig");
 
 pub const remaining_ms_header = "X-Antfly-Raft-Batch-Remaining-Ms";

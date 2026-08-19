@@ -3576,6 +3576,7 @@ pub fn build(b: *std.Build) void {
     root_test_step.dependOn(&run_lib_unit_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "api http client round-trips public status and internal capability routes",
         "api http retryable embedding failures provide retry guidance",
         "api http server obtains query embedding policy from resource manager",
         "api http stale hierarchy cursor response is actionable and machine readable",
@@ -4103,8 +4104,11 @@ pub fn build(b: *std.Build) void {
         "data server can register a store without enabling data raft",
         "data server registered data raft uses wal state backend by default",
         "data raft ticker advances consensus independently of control rounds",
+        "raft batch round trips table batch payload",
         "raft batch round trips deterministic transaction begin",
         "raft proposal materializes a default batch timestamp exactly once",
+        "raft batch protocol preflight fingerprint fences every applying replica set",
+        "raft batch protocol preflight keeps mixed-version voters and learners on legacy encoding",
         "data raft forwarding distinguishes safe retries from ambiguous outcomes",
         "expired data raft deadline snapshots never wait and release before returning",
         "data raft batch forwarding bounds routing campaigns deadlines and deterministic fallback",
@@ -5459,6 +5463,7 @@ pub fn build(b: *std.Build) void {
             "replicated split destination seeds inherited doc identity before range publication",
             "internal batch parser rejects mixed split transition commands",
             "internal batch parser requires source acknowledgements to be metadata-only",
+            "internal batch codec preserves timestamps and rejects public injection",
             "internal batch split identity round trips the full u64 id space",
             "internal batch codec round trips replicated transaction phases",
             "txn resolve codec preserves sync level and accepts legacy requests",

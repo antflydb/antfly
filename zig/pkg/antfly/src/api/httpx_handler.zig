@@ -333,6 +333,7 @@ pub const AntflyApiHandler = struct {
         const group_prefix = routes.internal_groups_prefix ++ ":group_id";
         const table_prefix = group_prefix ++ "/tables/:table_name";
         const internal_table_prefix = routes.internal_tables_prefix ++ ":table_name";
+        try server.get(routes.internal_capabilities, httpx.Handler.bind(self, internalCapabilities));
         try server.get(group_prefix ++ routes.group_db_median_key_suffix, httpx.Handler.bind(self, internalGroupMedianKey));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key", httpx.Handler.bind(self, internalGroupLookup));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_suffix, httpx.Handler.bind(self, internalDocumentArtifactManifests));
@@ -1606,6 +1607,12 @@ pub const AntflyApiHandler = struct {
             .inserted = result.inserted,
             .deleted = result.deleted,
             .transformed = result.transformed,
+        });
+    }
+
+    fn internalCapabilities(_: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return ctx.json(.{
+            .data_raft_batch_protocol_version = internal_batch_forwarding.raft_batch_protocol_version,
         });
     }
 

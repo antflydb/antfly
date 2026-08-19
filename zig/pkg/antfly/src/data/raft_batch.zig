@@ -15,6 +15,10 @@
 const std = @import("std");
 const batch_api = @import("../api/batch.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const internal_batch_forwarding = @import("../api/internal_batch_forwarding.zig");
+
+pub const protocol_version = internal_batch_forwarding.raft_batch_protocol_version;
+pub const timestamp_protocol_version = internal_batch_forwarding.raft_batch_timestamp_protocol_version;
 
 pub const OwnedReplicatedBatch = struct {
     table_name: []u8,
@@ -80,6 +84,7 @@ test "raft batch round trips table batch payload" {
     const encoded = try encode(std.testing.allocator, "docs", .{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
         .deletes = &.{"doc:b"},
+        .timestamp_ns = 123,
         .sync_level = .write,
     });
     defer std.testing.allocator.free(encoded);
@@ -92,6 +97,7 @@ test "raft batch round trips table batch payload" {
     try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", decoded.batch.req.writes[0].value);
     try std.testing.expectEqual(@as(usize, 1), decoded.batch.req.deletes.len);
     try std.testing.expectEqualStrings("doc:b", decoded.batch.req.deletes[0]);
+    try std.testing.expectEqual(@as(u64, 123), decoded.batch.req.timestamp_ns);
     try std.testing.expectEqual(db_mod.types.SyncLevel.write, decoded.batch.req.sync_level);
 }
 
