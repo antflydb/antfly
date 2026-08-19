@@ -3,11 +3,11 @@
 This document turns the work currently accumulated in `combine-pr-141-143-144`
 into a set of reviewable pull requests based on current `origin/main`.
 
-The combined branch remains the integration oracle. New branches must not be
-created from it: each root PR starts from `origin/main`, and dependent PRs start
-from the tip of their declared parent. Final generated files must be rebuilt
-from the specs present in each branch rather than copied wholesale from the
-combined branch.
+The combined branch remains the integration oracle. New branches are rebuilt
+from `origin/main`, but their content is selected from the final tree shape of
+the combined branch rather than reconstructed by replaying an incomplete list
+of historical commits. Dependent PRs start from the tip of their declared
+parent. Generated files are rebuilt from the specs present in each branch.
 
 ## Goals
 
@@ -25,14 +25,18 @@ combined branch.
 2. Root branches start at current `origin/main`.
 3. A child branch starts at its parent branch, not at the combined branch.
 4. The combined branch is read-only source material and a behavioral oracle.
-5. Do not mix semantic changes into mechanical extraction PRs.
-6. Do not copy final generated API clients into an earlier slice. Edit that
+5. Historical commits are an attribution map, not the extraction unit. Compare
+   the complete final tree for every owned path and port the coherent result.
+6. Do not mix semantic changes into mechanical extraction PRs.
+7. Do not copy final generated API clients into an earlier slice. Edit that
    slice's source spec and regenerate.
-7. Every PR must pass `git diff --check` plus the focused gates listed below.
-8. Before publication, rebase each root on the then-current `origin/main` and
+8. Every PR must pass `git diff --check` plus the focused gates listed below.
+9. Before publication, rebase each root on the then-current `origin/main` and
    restack its children.
+10. Publication branches use one or two AJ-authored logical commits, without
+    tool/session trailers or assistant authorship metadata.
 
-## Implementation status (2026-08-18)
+## Implementation status (2026-08-19)
 
 The following branches are implemented in dedicated, clean worktrees. Root
 branches use current `origin/main`; stacked branches use the parent shown in the
@@ -40,18 +44,17 @@ dependency graph:
 
 | Status | Branch | Worktree | Focused verification |
 | --- | --- | --- | --- |
-| Ready | `feature/sql-parser` | `.worktrees/feature-sql-parser` | yacc + deterministic grammar generation + 12 parser tests + 229-test root gate |
-| Ready | `perf/algebraic-cardinality` | `.worktrees/perf-algebraic-cardinality` | 3 algebraic execution tests |
-| Ready | `perf/mem-ordered-snapshots` | `.worktrees/perf-mem-ordered-snapshots` | 3 snapshot/randomized/concurrency tests |
-| Ready | `feature/algebraic-dynamic-templates` | `.worktrees/feature-algebraic-dynamic-templates` | 14 focused projection tests |
-| Ready | `feature/objectstore-checksums` | `.worktrees/feature-objectstore-checksums` | provider and metadata checksum tests |
-| Ready | `feature/relational-core` | `.worktrees/feature-relational-core` | 3 catalog tests; locked OpenAPI check; 5 projection/codec tests |
-| Ready | `feature/graph-metrics-core` | `.worktrees/feature-graph-metrics-core` | 4 PageRank tests; 229-test root gate |
+| Published ([#501](https://github.com/antflydb/antfly/pull/501)) | `feature/sql-parser` | `.worktrees/feature-sql-parser` | yacc + deterministic grammar generation + 12 parser tests + 229-test root gate |
+| Published ([#509](https://github.com/antflydb/antfly/pull/509)) | `feature/algebraic-core` | `.worktrees/feature-algebraic-core` | 40 dynamic/cardinality safety tests; 9 HLL tests; 229 + 36 root tests |
+| Published ([#506](https://github.com/antflydb/antfly/pull/506)) | `perf/mem-ordered-snapshots` | `.worktrees/perf-mem-ordered-snapshots` | 9 snapshot/backend tests |
+| Published ([#504](https://github.com/antflydb/antfly/pull/504)) | `feature/objectstore-checksums` | `.worktrees/feature-objectstore-checksums` | provider and metadata checksum tests |
+| Published ([#502](https://github.com/antflydb/antfly/pull/502)) | `feature/relational-core` | `.worktrees/feature-relational-core` | 11 relational schema/projection/codec tests; deterministic OpenAPI regeneration |
+| Published ([#503](https://github.com/antflydb/antfly/pull/503)) | `feature/graph-metrics-core` | `.worktrees/feature-graph-metrics-core` | 4 PageRank tests; 229-test root gate |
 | Scaffolded | `restructure/build-modules` | `.worktrees/restructure-build-modules` | no changes yet |
-| Scaffolded | `feature/relational-base-rows` | `.worktrees/feature-relational-base-rows` | inherits R1; no unique changes yet |
+| Checkpoint only | `feature/relational-base-rows` | `.worktrees/feature-relational-base-rows` | no unique published changes; future R2 work is outside this extraction |
 
-“Ready” here means locally committed and focused-test green. It does not mean
-published: no branch is pushed and no replacement PR is opened by this plan.
+All published branches above were reconstructed from their final selected tree
+shape and pushed with exact force-with-lease protection after validation.
 
 ## Branch and dependency graph
 
@@ -71,9 +74,8 @@ origin/main
   |                     |           +-- feature/tablespaces
   |
   +-- feature/sql-parser
-  +-- perf/algebraic-cardinality
+  +-- feature/algebraic-core
   +-- perf/mem-ordered-snapshots
-  +-- feature/algebraic-dynamic-templates
   +-- feature/graph-metrics-core
   |     |
   |     +-- feature/graph-metrics-runtime-api
@@ -170,6 +172,9 @@ SQL, and generated-client changes until those prerequisites are available.
     conflict-count drift checks.
   - Source-spanned SQL tokens, keywords, lexer, cursor/parser helpers, semantic
     parser facade, syntax-owned AST nodes, diagnostics, fuzzing, and benchmark.
+  - A single lexer/grammar token contract for qualified names and casts,
+    generated-terminal/keyword consistency coverage, bounded yacc table-index
+    emission, one shared generated parse loop, and complete license headers.
 - Exclude: SQL binding/lowering, storage/runtime types, HTTP, pgwire, row APIs,
   and catalog execution.
 - Gates: `yacc-test`, `sql-grammar-generated-check`, `sql-parser-test`, parser
@@ -181,18 +186,29 @@ but this branch is reviewed and published as one PR. The older
 `feature/sql-semantic-parser` worktrees are extraction/development checkpoints
 only and are not publication branches.
 
-### A1: Exact algebraic cardinality performance
+### A1: Algebraic performance, dynamic projection, and HLL
 
-- Branch: `perf/algebraic-cardinality`
-- Worktree: `.worktrees/perf-algebraic-cardinality`
+- Branch: `feature/algebraic-core`
+- Worktree: `.worktrees/feature-algebraic-core`
 - Base: `origin/main`
-- Historical anchors from PR #141:
-  - `f3ee99b`, `17ffc72`, `195a69e`, `912fa04`, `e8ca68b`
-- Scope: hash-set constraint membership, single-pass child cardinality, and
-  allocation reductions whose results remain byte-identical.
-- Exclude: HLL, adaptive materialization, memory backend replacement, and
-  relational behavior.
-- Gates: algebraic unit tests and benchmark checksum comparison.
+- Historical sources:
+  - PR #141 exact-cardinality anchors:
+    `f3ee99b`, `17ffc72`, `195a69e`, `912fa04`, `e8ca68b`.
+  - PR #144 dynamic-template projection (`538ba13` through `89fe8b6`).
+- Scope: hash-set constraint membership, single-pass child cardinality,
+  allocation reductions, bounded dynamic rules, array-aware ingest/query
+  symmetry, config reload, the backfill-pending gate, adaptive materialization,
+  HLL sketch maintenance, exact/approximate cardinality selection, and its
+  OpenAPI/SDK contract.
+- Exclude: memory backend replacement and relational behavior.
+- Gates: the 40-test dynamic/cardinality safety target, 9 focused HLL tests,
+  229 + 36 root tests, generated OpenAPI comparison, Go SDK tests, and HLL
+  benchmark smoke.
+
+The branch contains two logical AJ-authored commits and all algebraic extraction
+work is reviewed and published as one PR. The older
+`perf/algebraic-cardinality` and
+`feature/algebraic-dynamic-templates` worktrees are extraction checkpoints only.
 
 ### A2: Persistent memory-store snapshots
 
@@ -203,17 +219,6 @@ only and are not publication branches.
 - Scope: O(1) read snapshots and persistent ordered-tree writes.
 - Exclude: HLL and relational features.
 - Gates: storage tests, randomized reference-map test, and concurrency test.
-
-### A3: Dynamic-template algebraic projection
-
-- Branch: `feature/algebraic-dynamic-templates`
-- Worktree: `.worktrees/feature-algebraic-dynamic-templates`
-- Base: `origin/main` or M3 if current file ownership makes that unavoidable.
-- Historical source: PR #144 (`538ba13` through `89fe8b6`).
-- Scope: bounded dynamic rules, ingest/query symmetry, config reload,
-  backfill-pending gate, and tests.
-- Exclude: relational storage and HLL.
-- Gates: algebraic tests and API schema-update logic tests.
 
 ### O1: Object-store checksum provenance
 
@@ -237,13 +242,14 @@ only and are not publication branches.
   order-preserving scalar encoding; and the versioned packed row codec.
 - Exclude: DB keyspace changes, read-path materialization, public row APIs, and
   indexes, SQL, and constraints.
-- Gates: schema tests, generated/OpenAPI checks, and focused relational
-  projection and codec round-trip/corruption tests.
+- Gates: deterministic OpenAPI regeneration and 11 focused relational schema,
+  projection, ordering, codec round-trip, escaping, and corruption tests.
 
-The schema and codec commits remain distinct internally for attribution, but
-they are reviewed and published as one PR. The later base-keyspace work still
-stays separate because its historical commit assumes older DB scan and segment
-reconstruction implementations.
+The schema/contract and projection/codec changes are the branch's two logical
+AJ-authored commits and are reviewed and published as one PR. The existing
+`feature/relational-base-rows` worktree is only a development checkpoint; it
+does not represent another PR in this extraction. Any future authoritative
+base-row keyspace work begins only after R1 and is outside the current split.
 
 ### R2: Authoritative relational base rows
 
@@ -439,18 +445,29 @@ leaking into earlier PRs.
 
 Use three techniques, in this order:
 
-1. Cherry-pick a small historical commit only when it is already coherent and
-   does not import unrelated combined-branch structure.
-2. Otherwise apply a path-limited patch from the combined branch, then remove
-   unrelated declarations and adapt imports to the target branch.
+1. Inventory the complete final tree for the owned paths and compare its blobs
+   and public contracts with the target branch.
+2. Apply a path- or declaration-limited final-tree patch, adapting only the
+   dependencies required by that coherent slice.
 3. For heavily interleaved monoliths, port symbol-by-symbol from the final
-   implementation and use the combined branch tests as the behavioral oracle.
+   implementation and use both final-tree blob checks and combined-branch tests
+   as the behavioral oracle.
+
+Historical commits may explain intent and establish logical commit boundaries,
+but are not treated as a complete substitute for the branch's final state.
 
 Do not merge `combine-pr-141-143-144` into a restructure branch.
 
 ## Publication plan
 
-- Publish root PRs first: M1, T1, A1, A2, A3, and O1.
+- Published root PRs: S1 [#501](https://github.com/antflydb/antfly/pull/501),
+  R1 [#502](https://github.com/antflydb/antfly/pull/502), G1
+  [#503](https://github.com/antflydb/antfly/pull/503), O1
+  [#504](https://github.com/antflydb/antfly/pull/504), A2
+  [#506](https://github.com/antflydb/antfly/pull/506), this plan
+  [#508](https://github.com/antflydb/antfly/pull/508), and A1
+  [#509](https://github.com/antflydb/antfly/pull/509).
+- Publish M1 when its mechanical extraction is implemented.
 - Publish stacked drafts for M2/M3 and the feature chains once their parent is
   stable.
 - Put `Depends on #...` and the exact parent branch in every stacked PR body.
