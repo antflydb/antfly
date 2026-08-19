@@ -330,7 +330,6 @@ const (
 )
 
 // AntflyClusterSpec defines the desired state of AntflyCluster
-// +kubebuilder:validation:XValidation:rule="(has(self.metadataNodes) ? (has(self.metadataNodes.replicas) ? self.metadataNodes.replicas : 3) : 3) == (has(oldSelf.metadataNodes) ? (has(oldSelf.metadataNodes.replicas) ? oldSelf.metadataNodes.replicas : 3) : 3)",message="metadata replica count is immutable; create a differently named cluster with fresh metadata PVCs at the target topology and restore from backup"
 type AntflyClusterSpec struct {
 	// Mode selects the runtime topology managed by the operator.
 	// +optional

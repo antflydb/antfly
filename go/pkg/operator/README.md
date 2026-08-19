@@ -1,7 +1,7 @@
 # Antfly Database Operator
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/antflydb/antfly/go/pkg/operator)](https://goreportcard.com/report/github.com/antflydb/antfly/go/pkg/operator)
-[![Kubernetes](https://img.shields.io/badge/Kubernetes-1.20+-blue.svg)](https://kubernetes.io/)
+[![Kubernetes](https://img.shields.io/badge/Kubernetes-1.23+-blue.svg)](https://kubernetes.io/)
 
 A cloud-native Kubernetes operator for deploying and managing [Antfly](https://github.com/antflydb/antfly) database clusters with built-in high availability, automatic scaling, and operational simplicity.
 
@@ -64,7 +64,7 @@ That's it! You now have a highly available Antfly database cluster running in Ku
 
 #### Required
 
-- **Kubernetes 1.20+** with RBAC enabled
+- **Kubernetes 1.23+** with RBAC enabled
 - **kubectl** configured to access your cluster
 - **Storage class** available for persistent volumes
 - **RBAC enabled** on your cluster
@@ -79,7 +79,7 @@ That's it! You now have a highly available Antfly database cluster running in Ku
 Verify your cluster meets the requirements:
 
 ```bash
-# Check Kubernetes version (should be 1.20 or higher)
+# Check Kubernetes version (should be 1.23 or higher)
 kubectl version --short
 
 # Check storage classes are available
@@ -363,11 +363,18 @@ cluster name or reuse retained metadata PVCs across replica-count changes. The
 operator does not yet perform quorum-aware metadata membership transitions.
 
 The validating webhook and reconciler fallback enforce this rule on all
-supported Kubernetes versions. Kubernetes 1.25+ additionally enforces the
-generated CRD's CEL transition rule at API admission. CEL validation rules were
-alpha in Kubernetes 1.23 and are not relied on for Kubernetes 1.20-1.24.
+supported Kubernetes versions. Kubernetes 1.25+ can additionally enforce the
+CEL transition rule at API admission. CEL validation rules were alpha in
+Kubernetes 1.23 and are not relied on for Kubernetes 1.23-1.24.
 The reconciler records the accepted topology in status and on metadata PVCs so
 StatefulSet drift, deletion, or same-name recreation cannot erase the invariant.
+
+The generated CRD is the Kubernetes 1.23-compatible baseline. On Kubernetes
+1.25+, install the optional CEL validation overlay from a source checkout:
+
+```bash
+kubectl apply -k ./manifests/overlays/kubernetes-1.25
+```
 
 ## 📚 Examples
 
@@ -643,7 +650,7 @@ kubectl get events --sort-by=.metadata.creationTimestamp
 
 ### Generic Kubernetes (Default)
 
-The Antfly operator is designed for cross-platform compatibility and works on any conformant Kubernetes distribution (1.20+) including:
+The Antfly operator is designed for cross-platform compatibility and works on any conformant Kubernetes distribution (1.23+) including:
 - **Minikube** and **kind** (local development)
 - **Vanilla Kubernetes** (self-managed clusters)
 - **Cloud-managed Kubernetes** (GKE, EKS, AKS, and others)
