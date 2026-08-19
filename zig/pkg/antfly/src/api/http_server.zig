@@ -4637,6 +4637,12 @@ pub const ApiHttpServer = struct {
             try queue.status(alloc, task_id, context_id, "failed", "not found");
             return;
         };
+        if (authenticated_identity) |identity| {
+            if (!try retrievalRequestTablesAllowed(alloc, body, identity)) {
+                try queue.status(alloc, task_id, context_id, "failed", "forbidden");
+                return;
+            }
+        }
         comptime std.debug.assert(request_admission_policy.publicOperationClass("retrievalAgent").? == .query);
         if (!self.tryAcquireQuery()) {
             try queue.status(alloc, task_id, context_id, "failed", "query capacity exhausted");
@@ -8269,6 +8275,28 @@ pub const ApiHttpServer = struct {
             .ctx = identity,
             .authorize_table = authorizeGraphTargetTableRead,
         };
+    }
+
+    /// Authorize every statically declared retrieval table before any query
+    /// work or streaming output begins. Full request validation remains owned
+    /// by retrieval_agent; malformed shapes are deliberately left to it.
+    pub fn retrievalRequestTablesAllowed(
+        alloc: std.mem.Allocator,
+        body: []const u8,
+        identity: AuthenticatedIdentity,
+    ) !bool {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return true;
+        defer parsed.deinit();
+        if (parsed.value != .object) return true;
+        const queries = parsed.value.object.get("queries") orelse return true;
+        if (queries != .array) return true;
+        for (queries.array.items) |query| {
+            if (query != .object) continue;
+            const table = query.object.get("table") orelse continue;
+            if (table != .string) continue;
+            if (!permissionsAllow(identity.permissions, .table, table.string, .read)) return false;
+        }
+        return true;
     }
 
     fn authorizeGraphTargetTableRead(
@@ -13510,7 +13538,7 @@ pub fn requiresAdminPermission(path: []const u8) bool {
     if (std.mem.eql(u8, path, routes.Routes.transactions_cleanup)) return true;
     if (std.mem.eql(u8, path, routes.Routes.secrets) or std.mem.startsWith(u8, path, routes.Routes.secrets_prefix)) return true;
     if (std.mem.eql(u8, path, routes.Routes.backup) or std.mem.eql(u8, path, routes.Routes.restore) or std.mem.eql(u8, path, routes.Routes.backups)) return true;
-    if (std.mem.eql(u8, path, routes.Routes.a2a) or std.mem.eql(u8, path, routes.Routes.agents_retrieval)) return true;
+    if (std.mem.eql(u8, path, routes.Routes.a2a)) return true;
     if (std.mem.eql(u8, path, routes.Routes.users_me)) return false;
     if (std.mem.eql(u8, path, routes.Routes.auth_subjects) or std.mem.startsWith(u8, path, routes.Routes.auth_subjects_prefix)) return true;
     return std.mem.eql(u8, path, routes.Routes.users) or std.mem.startsWith(u8, path, routes.Routes.users_prefix);
@@ -20270,6 +20298,11 @@ test "api http server treats only exact extension prefixes as admin routes" {
     try std.testing.expect(!requiresAdminPermission("/extensions/v1/installedXYZ"));
 }
 
+test "retrieval route delegates authorization to referenced tables" {
+    try std.testing.expect(!requiresAdminPermission(routes.Routes.agents_retrieval));
+    try std.testing.expect(requiresAdminPermission(routes.Routes.a2a));
+}
+
 fn encodeBasicAuthorization(alloc: std.mem.Allocator, username: []const u8, password: []const u8) ![]u8 {
     const raw = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ username, password });
     defer alloc.free(raw);
@@ -23276,7 +23309,7 @@ test "api http server serves retrieval agent response envelope" {
     ;
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
-        .uri = "/agents/retrieval",
+        .uri = "/db/v1/agents/retrieval",
         .content_type = "application/json",
         .body = retrieval_body,
     });
@@ -23294,7 +23327,7 @@ test "api http server serves retrieval agent response envelope" {
     ;
     var internal_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
-        .uri = "/agents/retrieval",
+        .uri = "/db/v1/agents/retrieval",
         .content_type = "application/json",
         .body = internal_query_body,
     });
@@ -23303,8 +23336,17 @@ test "api http server serves retrieval agent response envelope" {
     try std.testing.expectEqualStrings("invalid retrieval agent request", internal_resp.body);
 
     const secret = "retrieval-trusted-principal-secret";
-    server.cfg.trusted_principal_secret = secret;
-    server.cfg.trusted_principal_issuer = "trusted-upstream";
+    var auth_server = ApiHttpServer.init(
+        std.testing.allocator,
+        .{
+            .trusted_principal_secret = secret,
+            .trusted_principal_issuer = "trusted-upstream",
+        },
+        source.iface(),
+        table_source.source(),
+        null,
+    );
+    defer auth_server.deinit();
     const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
 
     const denied_payload = try std.fmt.allocPrint(
@@ -23316,12 +23358,15 @@ test "api http server serves retrieval agent response envelope" {
     defer std.testing.allocator.free(denied_payload);
     const denied_token = try encodeTrustedPrincipalToken(std.testing.allocator, secret, denied_payload);
     defer std.testing.allocator.free(denied_token);
+    var denied_identity = try auth_server.authenticateRequest(.{ .trusted_principal = denied_token });
+    defer denied_identity.deinit(std.testing.allocator);
+    try std.testing.expect(!permissionsAllow(denied_identity.permissions, .table, "docs", .read));
     const denied_headers = [_]http_common.RequestHeader{
         .{ .name = trusted_principal_header, .value = denied_token },
     };
-    var denied = try executeHttpxTestRequest(&server, .{
+    var denied = try executeHttpxTestRequest(&auth_server, .{
         .method = .POST,
-        .uri = "/agents/retrieval",
+        .uri = "/db/v1/agents/retrieval",
         .content_type = "application/json",
         .headers = &denied_headers,
         .body = retrieval_body,
@@ -23329,6 +23374,19 @@ test "api http server serves retrieval agent response envelope" {
     defer denied.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 403), denied.status);
     try std.testing.expectEqualStrings("forbidden", denied.body);
+
+    var denied_stream = try executeHttpxTestRequest(&auth_server, .{
+        .method = .POST,
+        .uri = "/db/v1/agents/retrieval",
+        .content_type = "application/json",
+        .headers = &denied_headers,
+        .body =
+        \\{"query":"find hello","stream":true,"queries":[{"table":"docs","full_text_search":{"query":"body:hello"},"limit":5}]}
+        ,
+    });
+    defer denied_stream.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 403), denied_stream.status);
+    try std.testing.expectEqualStrings("forbidden", denied_stream.body);
 
     const allowed_payload = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -23342,9 +23400,9 @@ test "api http server serves retrieval agent response envelope" {
     const allowed_headers = [_]http_common.RequestHeader{
         .{ .name = trusted_principal_header, .value = allowed_token },
     };
-    var allowed = try executeHttpxTestRequest(&server, .{
+    var allowed = try executeHttpxTestRequest(&auth_server, .{
         .method = .POST,
-        .uri = "/agents/retrieval",
+        .uri = "/db/v1/agents/retrieval",
         .content_type = "application/json",
         .headers = &allowed_headers,
         .body = retrieval_body,
@@ -23404,7 +23462,7 @@ test "api http server maps retrieval agent doc identity mismatch to unavailable"
     ;
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
-        .uri = "/agents/retrieval",
+        .uri = "/db/v1/agents/retrieval",
         .content_type = "application/json",
         .body = retrieval_body,
     });
@@ -23456,7 +23514,7 @@ test "api http server serves retrieval agent event stream" {
     ;
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
-        .uri = "/agents/retrieval",
+        .uri = "/db/v1/agents/retrieval",
         .content_type = "application/json",
         .body = retrieval_body,
     });

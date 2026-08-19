@@ -3464,6 +3464,12 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid retrieval agent request");
         };
+        if (authenticated_identity) |identity| {
+            if (!try ApiHttpServer.retrievalRequestTablesAllowed(alloc, body_data, identity)) {
+                _ = ctx.status(403);
+                return ctx.text("forbidden");
+            }
+        }
         if (try self.acquirePublicOperation(ctx, "retrievalAgent")) |response| return response;
         defer self.releasePublicOperation("retrievalAgent");
 
