@@ -314,9 +314,13 @@ pub const Tree = struct {
 /// Stack-based in-order cursor over a `Tree` snapshot. The cursor borrows the
 /// tree's nodes, so the snapshot must outlive the cursor.
 pub const Cursor = struct {
+    const Direction = enum { forward, reverse };
+
     alloc: Allocator,
     stack: std.ArrayListUnmanaged(*Node) = .empty,
     current: ?*Node = null,
+    tree: Tree = .empty,
+    direction: ?Direction = null,
 
     pub fn init(alloc: Allocator) Cursor {
         return .{ .alloc = alloc };
@@ -327,9 +331,11 @@ pub const Cursor = struct {
         self.* = undefined;
     }
 
-    fn reset(self: *Cursor) void {
+    fn reset(self: *Cursor, tree: Tree, direction: Direction) void {
         self.stack.clearRetainingCapacity();
         self.current = null;
+        self.tree = tree;
+        self.direction = direction;
     }
 
     fn pushLeftSpine(self: *Cursor, node: ?*Node) !void {
@@ -349,20 +355,20 @@ pub const Cursor = struct {
     }
 
     pub fn first(self: *Cursor, tree: Tree) !?Entry {
-        self.reset();
+        self.reset(tree, .forward);
         try self.pushLeftSpine(tree.root);
         return self.settle();
     }
 
     pub fn last(self: *Cursor, tree: Tree) !?Entry {
-        self.reset();
+        self.reset(tree, .reverse);
         try self.pushRightSpine(tree.root);
         return self.settleReverse();
     }
 
     /// Positions at the first entry whose key is >= `(name, key)`.
     pub fn seekAtOrAfter(self: *Cursor, tree: Tree, name: ?[]const u8, key: []const u8) !?Entry {
-        self.reset();
+        self.reset(tree, .forward);
         var node = tree.root;
         while (node) |present| {
             if (present.order(name, key) != .lt) {
@@ -377,7 +383,7 @@ pub const Cursor = struct {
 
     /// Positions at the last entry whose key is <= `(name, key)`.
     pub fn seekAtOrBefore(self: *Cursor, tree: Tree, name: ?[]const u8, key: []const u8) !?Entry {
-        self.reset();
+        self.reset(tree, .reverse);
         var node = tree.root;
         while (node) |present| {
             if (present.order(name, key) != .gt) {
@@ -404,15 +410,69 @@ pub const Cursor = struct {
     }
 
     pub fn next(self: *Cursor) !?Entry {
+        if (self.direction == .reverse) return try self.switchToForward();
         const node = self.popCurrent() orelse return null;
         try self.pushLeftSpine(node.right);
-        return self.settle();
+        if (self.settle()) |entry| return entry;
+        self.stack.appendAssumeCapacity(node);
+        self.current = node;
+        return null;
     }
 
     pub fn prev(self: *Cursor) !?Entry {
+        if (self.direction == .forward) return try self.switchToReverse();
         const node = self.popCurrent() orelse return null;
         try self.pushRightSpine(node.left);
+        if (self.settleReverse()) |entry| return entry;
+        self.stack.appendAssumeCapacity(node);
+        self.current = node;
+        return null;
+    }
+
+    fn switchToForward(self: *Cursor) !?Entry {
+        const previous = self.current orelse return null;
+        self.stack.clearRetainingCapacity();
+        self.direction = .forward;
+
+        var node = self.tree.root;
+        while (node) |present| {
+            switch (present.order(previous.name, previous.key)) {
+                .gt => {
+                    try self.stack.append(self.alloc, present);
+                    node = present.left;
+                },
+                .eq, .lt => node = present.right,
+            }
+        }
+        if (self.stack.items.len == 0) {
+            self.stack.appendAssumeCapacity(previous);
+            self.current = previous;
+            return null;
+        }
         return self.settle();
+    }
+
+    fn switchToReverse(self: *Cursor) !?Entry {
+        const previous = self.current orelse return null;
+        self.stack.clearRetainingCapacity();
+        self.direction = .reverse;
+
+        var node = self.tree.root;
+        while (node) |present| {
+            switch (present.order(previous.name, previous.key)) {
+                .lt => {
+                    try self.stack.append(self.alloc, present);
+                    node = present.right;
+                },
+                .eq, .gt => node = present.left,
+            }
+        }
+        if (self.stack.items.len == 0) {
+            self.stack.appendAssumeCapacity(previous);
+            self.current = previous;
+            return null;
+        }
+        return self.settleReverse();
     }
 
     fn popCurrent(self: *Cursor) ?*Node {
@@ -560,6 +620,38 @@ test "cursor seek and ranged forward scan" {
 
     // seek past the end yields nothing.
     try testing.expect((try cursor.seekAtOrAfter(tree, null, "z")) == null);
+}
+
+test "cursor direction changes preserve ordered position" {
+    const alloc = testing.allocator;
+    var tree: Tree = .empty;
+    defer tree.release(alloc);
+    for (0..64) |i| {
+        var buf: [8]u8 = undefined;
+        const key = std.fmt.bufPrint(&buf, "k{d:0>3}", .{i}) catch unreachable;
+        const next_tree = try tree.put(alloc, null, key, "v");
+        tree.release(alloc);
+        tree = next_tree;
+    }
+
+    var cursor = Cursor.init(alloc);
+    defer cursor.deinit();
+
+    try testing.expectEqualStrings("k000", (try cursor.first(tree)).?.key);
+    try testing.expect((try cursor.prev()) == null);
+    try testing.expectEqualStrings("k001", (try cursor.next()).?.key);
+
+    try testing.expectEqualStrings("k063", (try cursor.last(tree)).?.key);
+    try testing.expect((try cursor.next()) == null);
+    try testing.expectEqualStrings("k062", (try cursor.prev()).?.key);
+
+    try testing.expectEqualStrings("k000", (try cursor.first(tree)).?.key);
+    try testing.expectEqualStrings("k001", (try cursor.next()).?.key);
+    try testing.expectEqualStrings("k000", (try cursor.prev()).?.key);
+
+    try testing.expectEqualStrings("k063", (try cursor.last(tree)).?.key);
+    try testing.expectEqualStrings("k062", (try cursor.prev()).?.key);
+    try testing.expectEqualStrings("k063", (try cursor.next()).?.key);
 }
 
 test "randomized operations match a reference map without leaking" {
