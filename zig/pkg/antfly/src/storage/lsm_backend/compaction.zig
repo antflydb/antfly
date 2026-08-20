@@ -677,18 +677,18 @@ fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendT
         return err;
     }
 
-    if (!planRunIdsStillMatch(backend.runs.items, plan, selected_run_ids)) {
+    const publish_plan = relocatePlanIfInputsStillMatch(backend.runs.items, plan, selected_run_ids) orelse {
         if (@hasDecl(BackendType, "releaseReaderKind")) backend.releaseReaderKind(.compaction) else backend.releaseReader();
         reader_retained = false;
         discardOutputRuns(BackendType, backend, &build_result);
         releaseCompactionSnapshots(BackendType, backend, &selected_runs);
         return;
-    }
+    };
 
     try installCompactedRuns(
         BackendType,
         backend,
-        plan,
+        publish_plan,
         selected.len,
         input_bytes,
         start_ns,
@@ -804,19 +804,38 @@ pub fn buildRunsFromStateBorrowedWithReservedIds(
     return runs;
 }
 
-fn planRunIdsStillMatch(runs: []const Run, plan: CompactionPlan, selected_run_ids: []const u64) bool {
-    if (!planInBounds(runs, plan)) return false;
-    if (selected_run_ids.len != plan.source_len + plan.target_len) return false;
-    var idx: usize = 0;
-    for (runs[plan.source_start .. plan.source_start + plan.source_len]) |run| {
-        if (run.id != selected_run_ids[idx]) return false;
-        idx += 1;
+fn relocatePlanIfInputsStillMatch(runs: []const Run, plan: CompactionPlan, selected_run_ids: []const u64) ?CompactionPlan {
+    if (selected_run_ids.len != plan.source_len + plan.target_len or plan.source_len == 0) return null;
+
+    // Building persisted output deliberately releases the backend lock. New
+    // L0 runs sort ahead of the selected older window while that build is in
+    // flight, so positional equality would reject valid work forever under a
+    // continuously replenished writer. Relocate the immutable input IDs, then
+    // rebuild the target overlap closure against the current run version.
+    const source_ids = selected_run_ids[0..plan.source_len];
+    const source_start = findContiguousRunIds(runs, plan.source_level, source_ids) orelse return null;
+    const relocated = buildPlanForSourceRange(runs, plan.source_level, source_start, plan.source_len) orelse return null;
+    if (relocated.source_len != plan.source_len or
+        relocated.output_level != plan.output_level or
+        relocated.target_len != plan.target_len) return null;
+
+    const target_ids = selected_run_ids[plan.source_len..];
+    for (runs[relocated.target_start .. relocated.target_start + relocated.target_len], target_ids) |run, expected_id| {
+        if (run.id != expected_id) return null;
     }
-    for (runs[plan.target_start .. plan.target_start + plan.target_len]) |run| {
-        if (run.id != selected_run_ids[idx]) return false;
-        idx += 1;
+    return relocated;
+}
+
+fn findContiguousRunIds(runs: []const Run, level: u32, ids: []const u64) ?usize {
+    if (ids.len == 0 or ids.len > runs.len) return null;
+    var start: usize = 0;
+    while (start + ids.len <= runs.len) : (start += 1) {
+        if (runs[start].level != level or runs[start].id != ids[0]) continue;
+        for (runs[start .. start + ids.len], ids) |run, expected_id| {
+            if (run.level != level or run.id != expected_id) break;
+        } else return start;
     }
-    return true;
+    return null;
 }
 
 fn installCompactedRuns(
@@ -1686,6 +1705,50 @@ fn testRun(id: u64, level: u32, smallest_key: []const u8, largest_key: []const u
         .owns_bloom_filter = false,
         .state = null,
     };
+}
+
+test "unlocked compaction publication relocates inputs after concurrent L0 prepend" {
+    const before = [_]Run{
+        testRun(5, 0, "doc:a", "doc:m", 10),
+        testRun(4, 0, "doc:n", "doc:z", 10),
+        testRun(1, 1, "doc:a", "doc:z", 20),
+    };
+    const original = buildPlanForSourceRange(&before, 0, 0, 2) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), original.source_start);
+    try std.testing.expectEqual(@as(usize, 2), original.target_start);
+    try std.testing.expectEqual(@as(usize, 1), original.target_len);
+
+    // A writer flushes while the compaction output is built without the
+    // backend lock. L0 is newest-first, so all original inputs move right even
+    // though none of them changed.
+    const after_prepend = [_]Run{
+        testRun(6, 0, "doc:a", "doc:z", 10),
+        testRun(5, 0, "doc:a", "doc:m", 10),
+        testRun(4, 0, "doc:n", "doc:z", 10),
+        testRun(1, 1, "doc:a", "doc:z", 20),
+    };
+    const relocated = relocatePlanIfInputsStillMatch(&after_prepend, original, &.{ 5, 4, 1 }) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), relocated.source_start);
+    try std.testing.expectEqual(@as(usize, 3), relocated.target_start);
+    try std.testing.expectEqual(@as(usize, 1), relocated.target_len);
+}
+
+test "unlocked compaction publication rejects a changed target overlap closure" {
+    const before = [_]Run{
+        testRun(5, 0, "doc:a", "doc:z", 10),
+    };
+    const original = buildPlanForSourceRange(&before, 0, 0, 1) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), original.target_len);
+
+    // A concurrent compaction created an overlapping target-level run. The
+    // selected source still exists, but publishing the old output would create
+    // an invalid overlapping L1 version, so this remains a genuine stale plan.
+    const changed_target = [_]Run{
+        testRun(6, 0, "doc:zz", "doc:zz", 10),
+        testRun(5, 0, "doc:a", "doc:z", 10),
+        testRun(9, 1, "doc:a", "doc:z", 20),
+    };
+    try std.testing.expect(relocatePlanIfInputsStillMatch(&changed_target, original, &.{5}) == null);
 }
 
 test "lsm compaction sizes bloom filters per bounded output run" {

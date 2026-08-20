@@ -166,6 +166,7 @@ pub const DerivedRuntime = struct {
             .kind = .{
                 .name = undefined,
                 .kind = kind.kind,
+                .estimated_dense_vector_bytes = kind.estimated_dense_vector_bytes,
             },
             .applied_sequence = applied_sequence,
             .persisted_sequence = applied_sequence,

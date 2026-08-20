@@ -175,6 +175,12 @@ fn parseBatchRequestWithOptions(
         break :sync_level db_mod.types.SyncLevel.propose;
     };
 
+    const timestamp_ns = timestamp: {
+        const value = root.get("_timestamp_ns") orelse break :timestamp 0;
+        if (!allow_internal) return error.InvalidBatchRequest;
+        break :timestamp try parseInternalU64(value);
+    };
+
     var checkpoint_start: ?[]u8 = null;
     errdefer if (checkpoint_start) |value| alloc.free(value);
     var checkpoint_end: ?[]u8 = null;
@@ -405,6 +411,7 @@ fn parseBatchRequestWithOptions(
             .deletes = deletes,
             .transforms = transforms,
             .predicates = predicates,
+            .timestamp_ns = timestamp_ns,
             .sync_level = sync_level,
             .split_checkpoint = split_checkpoint,
             .split_replication = split_replication,
@@ -566,6 +573,9 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
             },
         }
         try writer.writeByte('}');
+    }
+    if (req.timestamp_ns != 0) {
+        try writer.print(",\"_timestamp_ns\":\"{d}\"", .{req.timestamp_ns});
     }
     try writer.print(",\"sync_level\":\"{s}\"}}", .{syncLevelName(req.sync_level)});
     return try out.toOwnedSlice();
@@ -816,6 +826,27 @@ test "internal batch parser requires source acknowledgements to be metadata-only
             .delta_sequence = 7,
         },
     }));
+}
+
+test "internal batch codec preserves timestamps and rejects public injection" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeBatchRequest(alloc, .{
+        .writes = &.{.{ .key = "doc:a", .value = "{}" }},
+        .timestamp_ns = std.math.maxInt(u64),
+    });
+    defer alloc.free(encoded);
+
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
+    var decoded = try parseInternalBatchRequest(alloc, encoded);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(std.math.maxInt(u64), decoded.req.timestamp_ns);
+
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        parseBatchRequest(alloc,
+            \\{"inserts":{},"_timestamp_ns":"123"}
+        ),
+    );
 }
 
 test "internal batch parser rejects public split replication identity" {

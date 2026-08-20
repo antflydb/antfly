@@ -682,6 +682,7 @@ fn managedIndexReplayHint(kind: types.IndexKind) change_journal_mod.TargetHint {
 const AsyncContext = struct {
     alloc: Allocator,
     io: ?std.Io = null,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
     store: *docstore_mod.DocStore,
     snapshot_read_txn: ?*docstore_mod.DocStore.Txn = null,
     applied_sequence_checkpoint_path: ?[]const u8 = null,
@@ -1527,6 +1528,7 @@ const TransactionResolution = struct {
     status: transactions_mod.TxnStatus,
     commit_version: u64,
     expected_intent_revision: u64,
+    intent_keys: []const []const u8,
 };
 
 const ha_applied_lsn_value_len: usize = @sizeOf(u64);
@@ -2980,6 +2982,7 @@ pub const DB = struct {
     backend_runtime: *background_runtime_mod.BackendRuntime,
     backend_owner_id: u64,
     repair_cleanup_owner_id: u64,
+    algebraic_hll_owner_id: u64 = 0,
     owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager,
     capacity_source: ?types.RepairCapacitySource,
@@ -3215,6 +3218,12 @@ pub const DB = struct {
     fn mirrorHASchemaMetadataCommit(self: *DB, table_schema: schema_mod.TableSchema) !void {
         var ctx = self.batchContext();
         try mirrorHASchemaMetadataCommitContext(&ctx, table_schema);
+    }
+
+    fn attachAlgebraicHllMaintenanceLane(self: *DB) !void {
+        const owner_id = try self.backend_runtime.allocOwnerId();
+        self.algebraic_hll_owner_id = owner_id;
+        self.core.index_manager.attachHllMaintenance(self.backend_runtime.durable_jobs, owner_id);
     }
 
     fn hydrateAlgebraicObservationStatusBestEffort(self: *DB) void {
@@ -3468,6 +3477,8 @@ pub const DB = struct {
                 opts.enrichment = null;
             }
 
+            try db.attachAlgebraicHllMaintenanceLane();
+
             const admission_prefix = try internal_keys.managedIndexAdmissionRootPrefixAlloc(alloc);
             defer alloc.free(admission_prefix);
             const managed_admissions = try db.core.store.scanPrefix(alloc, admission_prefix);
@@ -3644,6 +3655,7 @@ pub const DB = struct {
         const async_resources = self.core.asyncResources();
         self.async_context.* = .{
             .alloc = self.runtime_alloc,
+            .resource_manager = resource_manager,
             .store = async_resources.store,
             .applied_sequence_checkpoint_path = async_resources.applied_sequence_checkpoint_path,
             .index_repair_checkpoint = async_resources.index_repair_checkpoint,
@@ -4285,6 +4297,10 @@ pub const DB = struct {
         self.setQueryVisibilityHook(null);
         self.async_context.background_closing.store(true, .release);
         self.async_context.enrichment_desired_running.store(false, .release);
+        if (self.algebraic_hll_owner_id != 0) {
+            self.backend_runtime.durable_jobs.closeOwner(self.algebraic_hll_owner_id);
+            self.algebraic_hll_owner_id = 0;
+        }
         self.backend_runtime.durable_jobs.closeOwner(self.repair_cleanup_owner_id);
         self.backend_runtime.durable_jobs.closeOwner(self.backend_owner_id);
         self.clearLiveDocSetCache();
@@ -5159,6 +5175,26 @@ pub const DB = struct {
         }
     }
 
+    /// Applies a one-participant transaction through the ordinary atomic DB
+    /// batch while preserving the distributed transaction's representability
+    /// contract for transforms. This avoids durable 2PC bookkeeping without
+    /// making graph-transform behavior depend on the current shard count.
+    pub fn batchTransactionCompatible(self: *DB, req: types.BatchRequest) anyerror!void {
+        try self.batchTransactionCompatibleWithVisibilityCancellation(req, .none);
+    }
+
+    pub fn batchTransactionCompatibleWithVisibilityCancellation(self: *DB, req: types.BatchRequest, cancellation: types.CancellationToken) anyerror!void {
+        var compatible_req = req;
+        compatible_req.reject_graph_transform_projections = true;
+        if (benchMetricsEnabled()) {
+            var profile = BatchProfile{};
+            try self.batchInternal(compatible_req, &profile, .{ .visibility_cancellation = cancellation });
+            logBatchProfile(compatible_req, profile);
+        } else {
+            try self.batchInternal(compatible_req, null, .{ .visibility_cancellation = cancellation });
+        }
+    }
+
     pub fn batchProfiled(self: *DB, req: types.BatchRequest, profile: *BatchProfile) anyerror!void {
         try self.batchInternal(req, profile, .{});
     }
@@ -5638,7 +5674,10 @@ pub const DB = struct {
                     resolution.txn_id,
                     resolution.status,
                     resolution.commit_version,
-                    .{ .expected_intent_revision = resolution.expected_intent_revision },
+                    .{
+                        .expected_intent_revision = resolution.expected_intent_revision,
+                        .known_intent_keys = resolution.intent_keys,
+                    },
                 );
                 self.core.unlockApply();
                 apply_mutex_held = false;
@@ -5667,6 +5706,14 @@ pub const DB = struct {
         var effective_ops = try coalesceKeyValueRequest(self, types.BatchWrite, req.writes, req.deletes, req.transforms);
         defer effective_ops.deinit(self.alloc);
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.resolve_transforms_ns, resolve_transforms_start_ns);
+
+        // Transaction intents carry primary key/value rows but not projected
+        // graph deltas. Evaluate this after transform expansion so absent
+        // non-upsert documents retain their established no-op semantics, and
+        // before any request mutation is persisted.
+        if (req.reject_graph_transform_projections and effective_ops.graph_writes.items.len != 0) {
+            return error.UnsupportedTransformOperation;
+        }
 
         const merge_effective_req_start_ns = monotonicTimeNs();
 
@@ -6323,6 +6370,7 @@ pub const DB = struct {
                     .deletes = delete_keys.items,
                     .replay = if (replay_append) |entry| .{ .sequence = entry.sequence, .payload = entry.payload } else null,
                     .expected_intent_revision = resolution.expected_intent_revision,
+                    .known_intent_keys = resolution.intent_keys,
                 },
             );
             if (outcome.applied) {
@@ -13164,6 +13212,15 @@ pub const DB = struct {
         if (manifest_sequence != reached_target) return error.IndexGenerationManifestMismatch;
         try ensureRepairActivationDeadline(activation_deadline_ns);
 
+        if (cfg.kind == .algebraic) {
+            // Certify this physical projection only after the final replay has
+            // converged under the apply fence. The marker lives in the shadow
+            // namespace, so a crash before pointer publication cannot release
+            // the active generation's lifecycle gate.
+            try shadow_manager.persistAlgebraicProjectionConfigReady(self.core.store, cfg.name);
+            try ensureRepairActivationDeadline(activation_deadline_ns);
+        }
+
         // Transfer the already-open runtime for every index family. Pointer
         // publication and in-memory handoff are allocation-free, and the
         // predecessor is retired only after service fences are released.
@@ -13204,7 +13261,6 @@ pub const DB = struct {
             .generation = final_update.generation,
             .config_hash = final_update.config_hash,
         });
-
         // The pointer and clean checkpoint are now ordered before any later
         // foreground apply. Release the write fence before operator hooks,
         // intent cleanup, and generation garbage collection. Capture the
@@ -14840,6 +14896,13 @@ pub const DB = struct {
         return try self.core.getStoreValue(alloc, public_schema_json_key);
     }
 
+    /// Refresh schema-derived algebraic index configs (notably dynamic-template
+    /// rules) in place from the given table schema JSON, so a dynamic-template
+    /// change applies to a running DB without a reopen.
+    pub fn reloadAlgebraicSchemaConfigs(self: *DB, schema_json: []const u8) !void {
+        try self.core.index_manager.reloadAlgebraicSchemaConfigs(schema_json);
+    }
+
     pub fn beginTransaction(self: *DB, timestamp_ns: u64) !transactions_mod.TxnId {
         const txn_id = makeTxnId(self);
         return try self.beginTransactionWithIdAndParticipants(txn_id, timestamp_ns, &.{});
@@ -15039,13 +15102,20 @@ pub const DB = struct {
         while (attempts < 8) : (attempts += 1) {
             var intents = try self.core.collectTransactionIntentBatch(self.alloc, txn_id);
             defer intents.deinit(self.alloc);
+            const intent_keys = try self.alloc.alloc([]const u8, intents.writes.len + intents.deletes.len);
+            defer self.alloc.free(intent_keys);
+            for (intents.writes, 0..) |write, i| intent_keys[i] = write.key;
+            for (intents.deletes, 0..) |key, i| intent_keys[intents.writes.len + i] = key;
             if (intents.writes.len == 0 and intents.deletes.len == 0) {
                 lockApply(self);
                 const outcome = self.core.resolveTransactionIntentsWithExtraBatch(
                     txn_id,
                     status,
                     commit_version,
-                    .{ .expected_intent_revision = intents.revision },
+                    .{
+                        .expected_intent_revision = intents.revision,
+                        .known_intent_keys = intent_keys,
+                    },
                 ) catch |err| {
                     self.core.unlockApply();
                     if (err == error.IntentSnapshotChanged) continue;
@@ -15072,6 +15142,7 @@ pub const DB = struct {
                     .status = status,
                     .commit_version = commit_version,
                     .expected_intent_revision = intents.revision,
+                    .intent_keys = intent_keys,
                 },
             }) catch |err| {
                 if (err == error.IntentSnapshotChanged) continue;
@@ -16417,6 +16488,7 @@ pub const DB = struct {
         var changed: u64 = 0;
         for (self.core.index_manager.algebraic_indexes.items) |*entry| {
             changed += try entry.index.evaluateAdaptiveCandidates(self.core.store, target_sequence);
+            changed += try entry.index.evaluateHllCardinalityCandidates(self.core.store);
         }
         return changed;
     }
@@ -17732,7 +17804,7 @@ pub const DB = struct {
         return more;
     }
 
-    fn runArtifactRepairMetadataMaintenanceUntilIdle(self: *DB) !void {
+    pub fn runArtifactRepairMetadataMaintenanceUntilIdle(self: *DB) !void {
         while (try self.runArtifactRepairMetadataMaintenancePass()) {}
     }
 
@@ -23555,7 +23627,7 @@ pub const DB = struct {
             if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
             return .{ .req = req };
         }
-        if (try self.searchRequestWithDirectAlgebraicDocFilterAlloc(req, &entry.index)) |direct| return direct;
+        if (try self.searchRequestWithDirectAlgebraicDocFilterAlloc(req, entry.index)) |direct| return direct;
         var filter_doc_ids: [][]u8 = &.{};
         errdefer entry.index.freeDocIds(filter_doc_ids);
         var exclude_doc_ids: [][]u8 = &.{};
@@ -23566,7 +23638,7 @@ pub const DB = struct {
         var filter_supported = req.filter_doc_ids_positive or req.filter_doc_ids.len > 0;
         var filter_bindings = std.ArrayListUnmanaged(@import("algebraic/index.zig").Index.FilterBinding).empty;
         defer {
-            for (filter_bindings.items) |*binding| binding.set.deinit(&entry.index);
+            for (filter_bindings.items) |*binding| binding.set.deinit(entry.index);
             filter_bindings.deinit(entry.index.alloc);
         }
 
@@ -23588,7 +23660,7 @@ pub const DB = struct {
                 if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
                 return .{ .req = req };
             };
-            errdefer set.deinit(&entry.index);
+            errdefer set.deinit(entry.index);
             try filter_bindings.append(entry.index.alloc, .{
                 .name = binding.name,
                 .set = set,
@@ -23599,7 +23671,7 @@ pub const DB = struct {
         if (req.filter_query_json.len > 0) {
             if (try entry.index.docIdSetForFilterJsonWithBindingsAlloc(self.core.store, req.filter_query_json, filter_bindings.items)) |set| {
                 var owned_set = set;
-                defer owned_set.deinit(&entry.index);
+                defer owned_set.deinit(entry.index);
                 if (owned_set.include) |ids| {
                     if (filter_supported) {
                         const intersected = try intersectAlgebraicDocIds(entry.index.alloc, filter_doc_ids, ids);
@@ -23623,7 +23695,7 @@ pub const DB = struct {
         if (req.exclusion_query_json.len > 0) {
             if (try entry.index.docIdSetForFilterJsonWithBindingsAlloc(self.core.store, req.exclusion_query_json, filter_bindings.items)) |set| {
                 var owned_set = set;
-                defer owned_set.deinit(&entry.index);
+                defer owned_set.deinit(entry.index);
                 if (owned_set.include) |ids| {
                     const merged = try unionAlgebraicDocIds(entry.index.alloc, exclude_doc_ids, ids);
                     entry.index.freeDocIds(exclude_doc_ids);
@@ -23668,7 +23740,7 @@ pub const DB = struct {
         entry.index.recordVectorFilterResolved(filter_doc_ids.len, exclude_doc_ids.len);
         return .{
             .req = next,
-            .index = &entry.index,
+            .index = entry.index,
             .filter_doc_ids = filter_doc_ids,
             .exclude_doc_ids = exclude_doc_ids,
             .resolved_doc_filter = resolved_filter,
@@ -34335,6 +34407,7 @@ fn beginDenseCatchUpSessionTracked(ctx: *AsyncContext, index_name: []const u8) !
     ctx.stats.dense_catch_up.active.store(1, .monotonic);
     ctx.stats.dense_catch_up.phase.store(@intFromEnum(types.DenseCatchUpStats.Phase.replay), .monotonic);
     _ = ctx.active_dense_catch_up_sessions.fetchAdd(1, .release);
+    if (ctx.resource_manager) |manager| manager.beginLatencySensitiveDerivedReplay();
 }
 
 fn finishDenseCatchUpSessionLocked(ctx: *AsyncContext, index_name: []const u8) bool {
@@ -34344,6 +34417,7 @@ fn finishDenseCatchUpSessionLocked(ctx: *AsyncContext, index_name: []const u8) b
         return false;
     }
     ctx.active_dense_catch_up_sessions.store(active - 1, .release);
+    if (ctx.resource_manager) |manager| manager.finishLatencySensitiveDerivedReplay();
     if (active == 1) {
         ctx.stats.dense_catch_up.active.store(0, .monotonic);
         ctx.stats.dense_catch_up.phase.store(@intFromEnum(types.DenseCatchUpStats.Phase.idle), .monotonic);
@@ -34639,8 +34713,11 @@ fn noteTargetAdvanceRepairRun(ctx: *AsyncContext, index_name: []const u8, now_ns
 
 test "async context dense catch-up session tracking suppresses local bulk sessions" {
     var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{});
+    defer resource_manager.deinit(std.testing.allocator);
     var ctx = AsyncContext{
         .alloc = std.testing.allocator,
+        .resource_manager = &resource_manager,
         .store = undefined,
         .index_manager = undefined,
         .apply_mutex = &apply_mutex,
@@ -34654,6 +34731,7 @@ test "async context dense catch-up session tracking suppresses local bulk sessio
     try std.testing.expectEqual(@as(u32, 1), ctx.active_dense_catch_up_sessions.load(.monotonic));
     try std.testing.expect(ctx.stats.dense_catch_up.active.load(.monotonic) != 0);
     try std.testing.expect(asyncContextHasActiveDenseBulkWork(&ctx));
+    try std.testing.expect(resource_manager.shouldDeferSoftCompactionForDerivedReplay());
     try std.testing.expect(ctx.text_merge_deferred.load(.acquire));
     try std.testing.expect(shouldDeferAppliedSequenceFlush(&ctx, false));
     try std.testing.expect(!shouldDeferAppliedSequenceFlush(&ctx, true));
@@ -34663,6 +34741,9 @@ test "async context dense catch-up session tracking suppresses local bulk sessio
     try std.testing.expectEqual(@as(u32, 0), ctx.active_dense_catch_up_sessions.load(.monotonic));
     try std.testing.expect(ctx.stats.dense_catch_up.active.load(.monotonic) == 0);
     try std.testing.expect(!ctx.text_merge_deferred.load(.acquire));
+    // Session-owned deferral has ended, but the short quiet period still
+    // protects the just-completed publication from an immediate soft rewrite.
+    try std.testing.expect(resource_manager.shouldDeferSoftCompactionForDerivedReplay());
     try std.testing.expect(!shouldDeferAppliedSequenceFlush(&ctx, false));
     try std.testing.expect(denseApplyUsesLocalStreamingSession(&ctx, "vec"));
 
@@ -45277,10 +45358,11 @@ test "db open borrows shared backend runtime" {
     try std.testing.expect(first.backend_owner_id != 0);
     try std.testing.expect(second.backend_owner_id != 0);
     try std.testing.expect(first.backend_owner_id != second.backend_owner_id);
-    // Each DB owns one backend lane and one repair/cleanup lane. Generation
-    // retirement uses the runtime-wide cleanup owner instead.
+    // Each DB owns a backend lane, a repair/cleanup lane, and an algebraic HLL
+    // maintenance lane. Generation retirement uses the runtime-wide cleanup
+    // owner instead.
     try std.testing.expectEqual(
-        second.repair_cleanup_owner_id + 1,
+        second.algebraic_hll_owner_id + 1,
         try runtime.ptr().allocOwnerId(),
     );
 }
@@ -72589,6 +72671,46 @@ test "db managed vector admission durably seeds missing enrichment artifacts" {
     try std.testing.expect(db.core.index_manager.repairUnavailable("semantic_idx"));
 }
 
+test "db managed algebraic admission builds and reopens requires generation marker" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const cfg = types.IndexConfig{
+        .name = "analytics_idx",
+        .kind = .algebraic,
+        .config_json =
+        \\{"version":1,"table":"docs","capability_lifecycle_status":"rebuild_required","dynamic_rules_backfill_pending":true,"group_fields":[{"name":"category","path":"category","type":"string"}],"dynamic_field_rules":[{"name":"ids","match":"*_id","type":"string"}],"materializations":[]}
+        ,
+    };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.addIndex(cfg);
+        try db.core.saveProjectionCheckpoint(cfg.name, .{
+            .status = .clean,
+            .generation = 9,
+            .config_hash = types.indexConfigHash(cfg),
+        });
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+    const active = reopened.core.index_manager.algebraicIndex(cfg.name) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!active.index.projectionConfigReady());
+    try std.testing.expect(!active.index.plannerLifecycleReady());
+    try std.testing.expect(active.index.resolveField("user_id", .group) == null);
+}
+
 // Functional repair tests verify durable construction, activation, and reopen,
 // not the production reader-pause SLA. A contended CI worker can exhaust the
 // 250 ms production window, which correctly persists retry backoff that these
@@ -72607,7 +72729,7 @@ test "db managed algebraic admission builds and reopens an isolated generation" 
         .name = "analytics_idx",
         .kind = .algebraic,
         .config_json =
-        \\{"version":1,"table":"docs","group_fields":[{"name":"category","path":"category","type":"string"}],"materializations":[]}
+        \\{"version":1,"table":"docs","capability_lifecycle_status":"rebuild_required","dynamic_rules_backfill_pending":true,"group_fields":[{"name":"category","path":"category","type":"string"}],"dynamic_field_rules":[{"name":"ids","match":"*_id","type":"string"}],"materializations":[]}
         ,
     };
     var active_namespace: []u8 = undefined;
@@ -72628,6 +72750,8 @@ test "db managed algebraic admission builds and reopens an isolated generation" 
         try std.testing.expect(try db.hasPendingIndexRepairIntents(alloc));
         const canonical = db.core.index_manager.algebraicIndex(cfg.name) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqualStrings("canonical/analytics_idx", canonical.index.storageNamespace());
+        try std.testing.expect(!canonical.index.plannerLifecycleReady());
+        try std.testing.expect(canonical.index.resolveField("user_id", .group) == null);
 
         var repaired = false;
         for (0..16) |_| {
@@ -72645,6 +72769,8 @@ test "db managed algebraic admission builds and reopens an isolated generation" 
 
         const active = db.core.index_manager.algebraicIndex(cfg.name) orelse return error.TestUnexpectedResult;
         try std.testing.expect(std.mem.startsWith(u8, active.index.storageNamespace(), ".repair-shadow-"));
+        try std.testing.expect(active.index.plannerLifecycleReady());
+        try std.testing.expect(active.index.resolveField("user_id", .group) != null);
         active_namespace = try alloc.dupe(u8, active.index.storageNamespace());
         var resolved = (try active.index.resolvedDocFilterForFilterJsonAlloc(
             db.core.store,
@@ -72666,6 +72792,8 @@ test "db managed algebraic admission builds and reopens an isolated generation" 
     defer reopened.close();
     const active = reopened.core.index_manager.algebraicIndex(cfg.name) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(active_namespace, active.index.storageNamespace());
+    try std.testing.expect(active.index.plannerLifecycleReady());
+    try std.testing.expect(active.index.resolveField("user_id", .group) != null);
     var resolved = (try active.index.resolvedDocFilterForFilterJsonAlloc(
         reopened.core.store,
         "{\"term\":{\"category\":\"tools\"}}",

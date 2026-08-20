@@ -1302,8 +1302,11 @@ pub const DBCore = struct {
     ) !void {
         var manager = try self.initTxnManager();
         defer manager.deinit();
-        for (writes) |write| try manager.checkOrdinaryWriteConflict(write.key);
-        for (deletes) |key| try manager.checkOrdinaryWriteConflict(key);
+        const keys = try self.alloc.alloc([]const u8, writes.len + deletes.len);
+        defer self.alloc.free(keys);
+        for (writes, 0..) |write, i| keys[i] = write.key;
+        for (deletes, 0..) |key, i| keys[writes.len + i] = key;
+        try manager.checkOrdinaryWriteConflicts(keys);
     }
 
     pub fn resolveTransactionIntents(

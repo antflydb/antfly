@@ -412,6 +412,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
             .kind = .{
                 .name = undefined,
                 .kind = kind.kind,
+                .estimated_dense_vector_bytes = kind.estimated_dense_vector_bytes,
             },
             .applied_sequence = applied_sequence,
             .persisted_sequence = applied_sequence,

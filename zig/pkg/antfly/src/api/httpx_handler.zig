@@ -36,6 +36,7 @@ const mcp = @import("antfly_mcp");
 const internal_join_operations = @import("internal_join_operations.zig");
 const internal_repair_operations = @import("internal_repair_operations.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
+const algebraic_partials_wire = @import("algebraic_partials_wire.zig");
 const http_client = @import("http_client.zig");
 const repair_jobs = @import("repair_jobs.zig");
 const ApiHttpServer = http_server_mod.ApiHttpServer;
@@ -333,6 +334,7 @@ pub const AntflyApiHandler = struct {
         const group_prefix = routes.internal_groups_prefix ++ ":group_id";
         const table_prefix = group_prefix ++ "/tables/:table_name";
         const internal_table_prefix = routes.internal_tables_prefix ++ ":table_name";
+        try server.get(routes.internal_capabilities, httpx.Handler.bind(self, internalCapabilities));
         try server.get(group_prefix ++ routes.group_db_median_key_suffix, httpx.Handler.bind(self, internalGroupMedianKey));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key", httpx.Handler.bind(self, internalGroupLookup));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_suffix, httpx.Handler.bind(self, internalDocumentArtifactManifests));
@@ -1625,6 +1627,12 @@ pub const AntflyApiHandler = struct {
         });
     }
 
+    fn internalCapabilities(_: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return ctx.json(.{
+            .data_raft_batch_protocol_version = internal_batch_forwarding.raft_batch_protocol_version,
+        });
+    }
+
     fn internalQueryContext(self: *AntflyApiHandler, ctx: *httpx.Context) internal_query_operations.Context {
         var result = self.api_server.internalQueryContext();
         if (result.query_planning) |*planning| {
@@ -1886,7 +1894,13 @@ pub const AntflyApiHandler = struct {
         var result = self.internalGroupOperations().algebraicPartials(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, body) catch |err|
             return if (err == error.InvalidArgument) textResponse(ctx, 400, "invalid algebraic partials request") else internalGroupErrorResponse(ctx, err);
         defer result.deinit(ctx.allocator);
-        return jsonResponse(ctx, 200, result.json);
+        if (algebraic_partials_wire.acceptsBase64V1(ctx.header(algebraic_partials_wire.response_encoding_header))) {
+            return jsonResponse(ctx, 200, result.json);
+        }
+        const legacy = algebraic_partials_wire.base64V1ToLegacyAlloc(ctx.allocator, result.json) catch
+            return textResponse(ctx, 500, "internal server error");
+        defer ctx.allocator.free(legacy);
+        return jsonResponse(ctx, 200, legacy);
     }
 
     fn internalGroupRoutedBatch(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {

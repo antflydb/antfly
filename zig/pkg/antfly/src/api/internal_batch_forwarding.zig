@@ -12,6 +12,11 @@
 // License for the specific language governing permissions and limitations.
 
 const std = @import("std");
+const data_raft_protocol = @import("../common/data_raft_protocol.zig");
+
+pub const raft_batch_protocol_version = data_raft_protocol.batch_protocol_version;
+pub const raft_batch_timestamp_protocol_version = data_raft_protocol.batch_timestamp_protocol_version;
+pub const raft_batch_activation_barrier_protocol_version = data_raft_protocol.batch_activation_barrier_protocol_version;
 const http_common = @import("../raft/transport/http_common.zig");
 
 pub const remaining_ms_header = "X-Antfly-Raft-Batch-Remaining-Ms";

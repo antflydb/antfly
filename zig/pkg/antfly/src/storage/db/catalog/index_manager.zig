@@ -43,6 +43,7 @@ const db_config = @import("../config.zig");
 const persistent_mod = @import("../../persistent.zig");
 const lsm_backend_mod = @import("../../lsm_backend/mod.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
+const background_runtime_mod = @import("../../background_runtime.zig");
 const docstore_mod = @import("../../docstore.zig");
 const schema_mod = @import("../../schema.zig");
 const analysis_mod = @import("../../../search/analysis.zig");
@@ -244,6 +245,10 @@ pub var test_abort_sparse_backfill_after_batches: ?usize = null;
 pub const ManagedIndexRef = struct {
     name: []const u8,
     kind: types.IndexKind,
+    /// Estimated bytes for one dense vector while replay is materialized.
+    /// Zero preserves the conservative fallback for callers that only know
+    /// the projection kind (for example status-only catalog entries).
+    estimated_dense_vector_bytes: u64 = 0,
 };
 
 pub const IndexBatchOptions = struct {
@@ -1117,6 +1122,11 @@ pub const IndexManager = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager,
     bind_cache_resource_manager: bool,
+    // Background lane used by algebraic indexes to run HLL cardinality
+    // maintenance off the foreground write path. Attached after construction
+    // via attachHllMaintenance(); when null, maintenance runs inline.
+    hll_maintenance_lane: ?background_runtime_mod.DurableJobLane = null,
+    hll_maintenance_owner_id: u64 = 0,
     primary_store: ?*docstore_mod.DocStore,
     applied_sequence_checkpoint_path: ?[]const u8,
     catalog_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
@@ -1407,7 +1417,9 @@ pub const IndexManager = struct {
     pub const AlgebraicIndex = struct {
         apply_mutex: *std.atomic.Mutex,
         config: types.IndexConfig,
-        index: algebraic_mod.index.Index,
+        // Heap-stable because background HLL jobs retain `*Index` while the
+        // manager's AlgebraicIndex array is free to grow and relocate entries.
+        index: *algebraic_mod.index.Index,
     };
 
     pub const TextMergeSourceSegment = struct {
@@ -2290,6 +2302,23 @@ pub const IndexManager = struct {
         self.load_parallelism = if (parallelism) |value| @max(value, 1) else null;
     }
 
+    // Provide the background lane that algebraic indexes use for HLL cardinality
+    // maintenance. Call before loading indexes so newly opened algebraic indexes
+    // pick up the lane; already-open indexes are (re)attached here too.
+    pub fn attachHllMaintenance(self: *IndexManager, lane: background_runtime_mod.DurableJobLane, owner_id: u64) void {
+        self.hll_maintenance_lane = lane;
+        self.hll_maintenance_owner_id = owner_id;
+        for (self.algebraic_indexes.items) |*entry| {
+            entry.index.attachHllMaintenanceLane(lane, owner_id);
+            if (self.primary_store) |store| {
+                entry.index.loadAdaptiveHllCardinalities(store) catch |err| {
+                    std.log.warn("adaptive HLL registry recovery failed index={s} err={s}", .{ entry.config.name, @errorName(err) });
+                };
+                entry.index.resumeHllMaintenance(store);
+            }
+        }
+    }
+
     fn bindPrimaryStore(self: *IndexManager, store: anytype) void {
         const Store = @TypeOf(store);
         if (comptime Store == *docstore_mod.DocStore) {
@@ -2328,8 +2357,85 @@ pub const IndexManager = struct {
         entry.config.deinit(self.alloc);
     }
 
+    /// Regenerate every algebraic index's schema-derived config from `schema_json`
+    /// and apply it in place when the schema-derived capability actually changed.
+    /// Carries forward user-tunable runtime knobs, gates dynamic-only changes at
+    /// field resolution, and gates static type/layout changes at the whole
+    /// planner. A generation-local projection completion marker releases either
+    /// gate after rebuild. No-op when there are no algebraic indexes, no schema,
+    /// or the capability fingerprint is unchanged.
+    pub fn reloadAlgebraicSchemaConfigs(self: *IndexManager, schema_json: []const u8) !void {
+        if (schema_json.len == 0) return;
+        for (self.algebraic_indexes.items) |*entry| {
+            const cur = entry.index.config();
+            const new_config_json = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(self.alloc, cur.table, schema_json);
+            defer self.alloc.free(new_config_json);
+
+            var new_parsed = try std.json.parseFromSlice(algebraic_mod.index.Config, self.alloc, new_config_json, .{ .allocate = .alloc_always });
+            defer new_parsed.deinit();
+
+            // Skip when the schema-derived capability is unchanged. Compare the
+            // capability fingerprint (which encodes schema_version, fields, and
+            // dynamic-template rules) rather than raw bytes: the live and durable
+            // serializations differ in shape and tunable knobs, so a byte compare
+            // would never short-circuit and every reconcile would churn the
+            // live config.
+            if (cur.capability_fingerprint.len > 0 and
+                std.mem.eql(u8, new_parsed.value.capability_fingerprint, cur.capability_fingerprint)) continue;
+
+            const delta = algebraic_mod.index.schemaCapabilityDelta(cur, new_parsed.value);
+            const projection_ready = entry.index.projectionConfigReady();
+
+            // Carry forward user-tunable runtime knobs (the durable regeneration
+            // in api/tables.zig preserves the same set) so a schema/template
+            // change does not silently reset planner/adaptive tuning in place.
+            new_parsed.value.adaptive = cur.adaptive;
+            new_parsed.value.pathfact_policy = cur.pathfact_policy;
+            new_parsed.value.max_result_buckets = cur.max_result_buckets;
+            new_parsed.value.max_planner_scan_rows = cur.max_planner_scan_rows;
+            new_parsed.value.max_batch_accumulator_entries = cur.max_batch_accumulator_entries;
+            new_parsed.value.max_cardinality_cache_bytes = cur.max_cardinality_cache_bytes;
+            new_parsed.value.max_hll_contributions_per_document = cur.max_hll_contributions_per_document;
+            new_parsed.value.max_hll_contribution_bytes_per_document = cur.max_hll_contribution_bytes_per_document;
+            new_parsed.value.max_distributed_hll_partial_bytes = cur.max_distributed_hll_partial_bytes;
+            new_parsed.value.max_hll_maintenance_rows_per_tick = cur.max_hll_maintenance_rows_per_tick;
+            new_parsed.value.max_pending_hll_observation_entries = cur.max_pending_hll_observation_entries;
+            new_parsed.value.max_pending_hll_observation_bytes = cur.max_pending_hll_observation_bytes;
+            new_parsed.value.hll_cardinalities = cur.hll_cardinalities;
+            new_parsed.value.min_max_candidate_cache_size = cur.min_max_candidate_cache_size;
+            new_parsed.value.enable_temporal_range_pruning = cur.enable_temporal_range_pruning;
+
+            // Static type/layout changes can make old docfacts incompatible with
+            // the regenerated config, so gate the whole planner until a shadow
+            // rebuild proves complete coverage. Preserve an older non-ready
+            // lifecycle unless this generation already has such a proof.
+            if (delta.static_fields_changed) {
+                new_parsed.value.capability_lifecycle_status = "rebuild_required";
+            } else if (!projection_ready and !algebraic_mod.index.capabilityLifecycleStatusReady(cur.capability_lifecycle_status)) {
+                new_parsed.value.capability_lifecycle_status = cur.capability_lifecycle_status;
+            }
+
+            // Dynamic-only changes use the narrower gate so unchanged static
+            // fields keep accelerating. A completed matching generation may
+            // clear a conservative catalog flag in runtime; otherwise preserve
+            // pending state until repair publishes a fully rebuilt generation.
+            new_parsed.value.dynamic_rules_backfill_pending =
+                new_parsed.value.dynamic_field_rules.len > 0 and
+                (delta.dynamic_rules_changed or (cur.dynamic_rules_backfill_pending and !projection_ready));
+
+            const merged_json = try std.json.Stringify.valueAlloc(self.alloc, new_parsed.value, .{ .emit_null_optional_fields = false });
+            defer self.alloc.free(merged_json);
+
+            const owned = try self.alloc.dupe(u8, merged_json);
+            errdefer self.alloc.free(owned);
+            try entry.index.reloadConfigJson(merged_json);
+            self.alloc.free(entry.config.config_json);
+            entry.config.config_json = owned;
+        }
+    }
+
     fn freeAlgebraicIndexEntry(self: *IndexManager, entry: *AlgebraicIndex) void {
-        entry.index.close();
+        entry.index.destroy();
         self.destroyIndexApplyMutex(entry.apply_mutex);
         entry.config.deinit(self.alloc);
         entry.* = undefined;
@@ -5886,6 +5992,7 @@ pub const IndexManager = struct {
             refs[initialized] = .{
                 .name = try alloc.dupe(u8, entry.config.name),
                 .kind = .dense_vector,
+                .estimated_dense_vector_bytes = @as(u64, entry.dims) * @sizeOf(f32),
             };
             initialized += 1;
         }
@@ -7995,6 +8102,34 @@ pub const IndexManager = struct {
         return null;
     }
 
+    /// Persist readiness inside the algebraic generation itself. This must only
+    /// be called after a complete, fenced projection build. Ordinary foreground
+    /// apply deliberately never writes this marker, so advancing an applied
+    /// sequence cannot accidentally certify older facts after a config change.
+    pub fn persistAlgebraicProjectionConfigReady(self: *IndexManager, store: anytype, name: []const u8) !void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        for (self.algebraic_indexes.items) |*entry| {
+            if (!std.mem.eql(u8, entry.config.name, name)) continue;
+
+            const key = try entry.index.projectionConfigReadyMarkerKeyAlloc();
+            defer self.alloc.free(key);
+            var value: [@sizeOf(u64)]u8 = undefined;
+            std.mem.writeInt(u64, &value, types.indexConfigHash(entry.config), .little);
+
+            var runtime_store = try initRuntimeStore(self.alloc, store);
+            defer runtime_store.deinit();
+            var txn = try runtime_store.store.beginWrite();
+            errdefer txn.abort();
+            try txn.put(key, &value);
+            try txn.commit();
+
+            entry.index.markProjectionConfigReady();
+            return;
+        }
+        return error.IndexNotFound;
+    }
+
     fn textProjectionOptions(self: *const IndexManager, arena: Allocator) !mapper.TextProjectionOptions {
         return try self.textProjectionOptionsForSchema(arena, false);
     }
@@ -8852,6 +8987,7 @@ pub const IndexManager = struct {
         doc_key: []const u8,
         parent_doc_key: ?[]const u8 = null,
         vector_id: u64,
+        ordinal: ?doc_identity.DocOrdinal = null,
     };
 
     const PendingDenseVectorDelete = struct {
@@ -10136,6 +10272,16 @@ pub const IndexManager = struct {
         var opened = try self.openConfiguredIndexDetached(store, cfg, allow_backfill, read_only);
         errdefer opened.deinit(self);
         try self.appendOpenedIndex(opened);
+        if (cfg.kind == .algebraic) {
+            if (comptime @TypeOf(store) == *docstore_mod.DocStore) {
+                if (self.algebraicIndex(cfg.name)) |entry| {
+                    entry.index.loadAdaptiveHllCardinalities(store) catch |err| {
+                        std.log.warn("adaptive HLL registry recovery failed index={s} err={s}", .{ cfg.name, @errorName(err) });
+                    };
+                    entry.index.resumeHllMaintenance(store);
+                }
+            }
+        }
     }
 
     fn openConfiguredIndexDetached(self: *IndexManager, store: anytype, cfg_input: types.IndexConfig, allow_backfill: bool, read_only: bool) !OpenedIndex {
@@ -10631,18 +10777,35 @@ pub const IndexManager = struct {
             .algebraic => {
                 const storage_namespace = try self.algebraicStorageNamespaceAlloc(cfg.name);
                 defer self.alloc.free(storage_namespace);
-                var index = try algebraic_mod.index.Index.openWithStorageNamespace(
+                const index = try algebraic_mod.index.Index.createWithStorageNamespace(
                     self.alloc,
                     cfg.name,
                     storage_namespace,
                     cfg.config_json,
                 );
                 var index_moved = false;
-                errdefer if (!index_moved) {
-                    var doomed = index;
-                    doomed.close();
+                errdefer if (!index_moved) index.destroy();
+                const ready_key = try index.projectionConfigReadyMarkerKeyAlloc();
+                defer self.alloc.free(ready_key);
+                var runtime_store = try initRuntimeStore(self.alloc, store);
+                defer runtime_store.deinit();
+                var ready_txn = try runtime_store.store.beginProbe();
+                defer ready_txn.abort();
+                const ready_value: ?[]const u8 = ready_txn.get(ready_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
                 };
+                if (ready_value) |value| {
+                    if (value.len == @sizeOf(u64) and
+                        std.mem.readInt(u64, value[0..@sizeOf(u64)], .little) == types.indexConfigHash(cfg))
+                    {
+                        index.markProjectionConfigReady();
+                    }
+                }
                 if (self.resource_manager) |manager| index.attachResourceManager(manager);
+                if (self.hll_maintenance_lane) |lane| {
+                    index.attachHllMaintenanceLane(lane, self.hll_maintenance_owner_id);
+                }
                 const apply_mutex = try self.allocIndexApplyMutex();
                 var apply_mutex_owned = true;
                 errdefer if (apply_mutex_owned) self.destroyIndexApplyMutex(apply_mutex);
@@ -12182,10 +12345,10 @@ pub const IndexManager = struct {
     fn prefetchDenseExistingMetadataTxn(
         self: *IndexManager,
         entry: *DenseIndex,
-        identity_txn: anytype,
         index_txn: anytype,
         writes: []const mapper.DenseEmbeddingWrite,
         keep_write: []const bool,
+        prefetched_ordinals: ?[]const ?doc_identity.DocOrdinal,
         memo: *DenseVectorMetadataPresenceMemo,
     ) !void {
         var candidate_count: usize = 0;
@@ -12216,8 +12379,12 @@ pub const IndexManager = struct {
             vector_ids_storage[filled] = deterministicDenseVectorId(write.doc_key);
             filled += 1;
             if (write.parent_doc_key == null) {
-                if (try doc_identity.lookupOrdinalTxn(self.alloc, identity_txn, write.doc_key)) |ordinal| {
-                    vector_ids_storage[filled] = ordinal;
+                const ordinal = if (prefetched_ordinals) |ordinals|
+                    ordinals[write_index]
+                else
+                    null;
+                if (ordinal) |legacy_ordinal| {
+                    vector_ids_storage[filled] = legacy_ordinal;
                     filled += 1;
                 }
             }
@@ -12363,6 +12530,50 @@ pub const IndexManager = struct {
         };
     }
 
+    fn replaceDenseVectorIdFromPrefetchedState(
+        self: *IndexManager,
+        entry: *DenseIndex,
+        doc_key: []const u8,
+        parent_doc_key: ?[]const u8,
+        mapped_vector_id: ?u64,
+        ordinal: ?doc_identity.DocOrdinal,
+        metadata_presence_memo: *DenseVectorMetadataPresenceMemo,
+    ) !DenseVectorIdAssignment {
+        if (mapped_vector_id) |mapped| {
+            return .{
+                .vector_id = mapped,
+                .needs_mapping = false,
+                .can_assume_absent = false,
+            };
+        }
+        if (parent_doc_key == null) {
+            if (ordinal) |legacy_ordinal| {
+                const legacy_vector_id: u64 = legacy_ordinal;
+                if ((try self.denseVectorIdMetadataState(entry, legacy_vector_id, doc_key, metadata_presence_memo)) == .matches) {
+                    return .{
+                        .vector_id = legacy_vector_id,
+                        .needs_mapping = false,
+                        .can_assume_absent = false,
+                    };
+                }
+            }
+        }
+
+        const vector_id = deterministicDenseVectorId(doc_key);
+        if (try self.denseVectorIdHasExistingMetadata(entry, vector_id, metadata_presence_memo)) {
+            return .{
+                .vector_id = vector_id,
+                .needs_mapping = false,
+                .can_assume_absent = false,
+            };
+        }
+        return .{
+            .vector_id = vector_id,
+            .needs_mapping = false,
+            .can_assume_absent = true,
+        };
+    }
+
     fn reserveDenseVectorIdTxn(self: *IndexManager, txn: anytype, index_name: []const u8) !u64 {
         const mutable_txn = txn;
         const next_key = try denseNextIdKey(self.alloc, index_name);
@@ -12473,6 +12684,76 @@ pub const IndexManager = struct {
         };
         if (raw.len != 8) return error.InvalidDenseVectorMetadata;
         return std.mem.readInt(u64, raw[0..8], .little);
+    }
+
+    fn lookupDenseVectorIdsTxnAlloc(
+        self: *IndexManager,
+        txn: anytype,
+        index_name: []const u8,
+        doc_keys: []const []const u8,
+    ) ![]?u64 {
+        const mutable_txn = txn;
+        const PendingLookup = struct {
+            source_index: usize,
+            legacy: bool,
+            key: []u8,
+
+            fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+                return std.mem.lessThan(u8, lhs.key, rhs.key);
+            }
+        };
+
+        const out = try self.alloc.alloc(?u64, doc_keys.len);
+        errdefer self.alloc.free(out);
+        @memset(out, null);
+        if (doc_keys.len == 0) return out;
+
+        const modern_found = try self.alloc.alloc(bool, doc_keys.len);
+        defer self.alloc.free(modern_found);
+        @memset(modern_found, false);
+        const pending = try self.alloc.alloc(PendingLookup, doc_keys.len * 2);
+        var initialized_pending: usize = 0;
+        defer {
+            for (pending[0..initialized_pending]) |item| self.alloc.free(item.key);
+            self.alloc.free(pending);
+        }
+        for (doc_keys, 0..) |doc_key, i| {
+            pending[i * 2] = .{
+                .source_index = i,
+                .legacy = false,
+                .key = try denseDocMappingKey(self.alloc, index_name, doc_key),
+            };
+            initialized_pending += 1;
+            pending[i * 2 + 1] = .{
+                .source_index = i,
+                .legacy = true,
+                .key = try legacyDenseDocMappingKey(self.alloc, index_name, doc_key),
+            };
+            initialized_pending += 1;
+        }
+        std.sort.pdq(PendingLookup, pending, {}, PendingLookup.lessThan);
+
+        const read_keys = try self.alloc.alloc([]const u8, pending.len);
+        defer self.alloc.free(read_keys);
+        const read_values = try self.alloc.alloc(?[]const u8, pending.len);
+        defer self.alloc.free(read_values);
+        for (pending, 0..) |item, i| read_keys[i] = item.key;
+        try mutable_txn.getManySorted(read_keys, read_values);
+
+        for (pending, read_values) |item, maybe_raw| {
+            const raw = maybe_raw orelse continue;
+            if (raw.len != @sizeOf(u64)) return error.InvalidDenseVectorMetadata;
+            const vector_id = std.mem.readInt(u64, raw[0..8], .little);
+            if (item.legacy) {
+                if (!modern_found[item.source_index] and out[item.source_index] == null) {
+                    out[item.source_index] = vector_id;
+                }
+            } else {
+                out[item.source_index] = vector_id;
+                modern_found[item.source_index] = true;
+            }
+        }
+        return out;
     }
 
     fn resolveDenseVectorIdForDeleteTxn(self: *IndexManager, txn: anytype, index_name: []const u8, doc_key: []const u8) !?u64 {
@@ -13805,10 +14086,23 @@ pub const IndexManager = struct {
             if (maybe_vector) |vector| preloaded_vector_bytes += @as(u64, @intCast(vector.len * @sizeOf(f32)));
         }
         self.observeDenseApplyWorkingBytes(&dense_apply_working_bytes, preloaded_vector_bytes);
+
+        const mapping_doc_keys = try self.alloc.alloc([]const u8, writes.len);
+        defer self.alloc.free(mapping_doc_keys);
+        const ordinal_doc_keys = try self.alloc.alloc([]const u8, writes.len);
+        defer self.alloc.free(ordinal_doc_keys);
+        for (writes, 0..) |write, write_index| {
+            mapping_doc_keys[write_index] = write.doc_key;
+            ordinal_doc_keys[write_index] = write.parent_doc_key orelse write.doc_key;
+        }
+        const prefetched_ordinals = try doc_identity.lookupOrdinalsTxnAlloc(self.alloc, store_txn, ordinal_doc_keys);
+        defer self.alloc.free(prefetched_ordinals);
+        const prefetched_mapped_vector_ids = try self.lookupDenseVectorIdsTxnAlloc(store_txn, entry.config.name, mapping_doc_keys);
+        defer self.alloc.free(prefetched_mapped_vector_ids);
         {
             var existing_index_write_txn = try entry.index.beginRuntimeWriteTxn();
             defer existing_index_write_txn.abort();
-            try self.prefetchDenseExistingMetadataTxn(entry, store_txn, &existing_index_write_txn, writes, keep_write, &metadata_presence_memo);
+            try self.prefetchDenseExistingMetadataTxn(entry, &existing_index_write_txn, writes, keep_write, prefetched_ordinals, &metadata_presence_memo);
 
             for (writes, 0..) |write, write_index| {
                 if (!keep_write[write_index]) continue;
@@ -13816,13 +14110,12 @@ pub const IndexManager = struct {
 
                 if (write.vector.len > 0) {
                     if (entry.dims != write.vector.len) return error.InvalidVectorDimensions;
-                    const assignment = try self.replaceDenseVectorIdTxnWithMemo(
-                        store_txn,
+                    const assignment = try self.replaceDenseVectorIdFromPrefetchedState(
                         entry,
-                        write.index_name,
                         write.doc_key,
                         write.parent_doc_key,
-                        &replacement_deletes,
+                        prefetched_mapped_vector_ids[write_index],
+                        prefetched_ordinals[write_index],
                         &metadata_presence_memo,
                     );
                     const artifact_name = entry.embedding_name orelse entry.config.name;
@@ -13842,16 +14135,16 @@ pub const IndexManager = struct {
                         .doc_key = items.items.items[items.items.items.len - 1].metadata,
                         .parent_doc_key = write.parent_doc_key,
                         .vector_id = assignment.vector_id,
+                        .ordinal = prefetched_ordinals[write_index],
                     });
                 } else if (write.artifact_key != null) {
                     const vector = preloaded_artifact_vectors[write_index] orelse continue;
-                    const assignment = try self.replaceDenseVectorIdTxnWithMemo(
-                        store_txn,
+                    const assignment = try self.replaceDenseVectorIdFromPrefetchedState(
                         entry,
-                        write.index_name,
                         write.doc_key,
                         write.parent_doc_key,
-                        &replacement_deletes,
+                        prefetched_mapped_vector_ids[write_index],
+                        prefetched_ordinals[write_index],
                         &metadata_presence_memo,
                     );
                     if (try self.denseVectorWriteIsNoOp(entry, &existing_index_write_txn, assignment.vector_id, write.doc_key, vector, existing_vector_scratch, &metadata_presence_memo)) continue;
@@ -13868,6 +14161,7 @@ pub const IndexManager = struct {
                         .doc_key = items.items.items[items.items.items.len - 1].metadata,
                         .parent_doc_key = write.parent_doc_key,
                         .vector_id = assignment.vector_id,
+                        .ordinal = prefetched_ordinals[write_index],
                     });
                 } else {
                     continue;
@@ -14174,7 +14468,11 @@ pub const IndexManager = struct {
 
     fn commitDenseVectorMappingsTxn(self: *IndexManager, txn: anytype, index_name: []const u8, pending: []const PendingDenseVectorMapping) !void {
         for (pending) |mapping| {
-            try self.writeDenseVectorMappingTxn(txn, index_name, mapping.doc_key, mapping.parent_doc_key, mapping.vector_id);
+            if (mapping.ordinal) |ordinal| {
+                try self.writeDenseVectorMappingTxnWithOrdinal(txn, index_name, mapping.doc_key, mapping.vector_id, ordinal);
+            } else {
+                try self.writeDenseVectorMappingTxn(txn, index_name, mapping.doc_key, mapping.parent_doc_key, mapping.vector_id);
+            }
         }
     }
 
@@ -14312,8 +14610,10 @@ pub const IndexManager = struct {
         var updates = std.ArrayListUnmanaged(DenseOrdinalVectorCacheUpdate).empty;
         errdefer updates.deinit(alloc);
         for (pending) |mapping| {
-            const ordinal_doc_key = mapping.parent_doc_key orelse mapping.doc_key;
-            const ordinal = (try doc_identity.lookupOrdinalTxn(self.alloc, mutable_txn, ordinal_doc_key)) orelse continue;
+            const ordinal = mapping.ordinal orelse blk: {
+                const ordinal_doc_key = mapping.parent_doc_key orelse mapping.doc_key;
+                break :blk (try doc_identity.lookupOrdinalTxn(self.alloc, mutable_txn, ordinal_doc_key)) orelse continue;
+            };
             try updates.append(alloc, .{
                 .ordinal = ordinal,
                 .vector_id = mapping.vector_id,
@@ -15929,6 +16229,31 @@ pub const IndexManager = struct {
         vector_id: u64,
     ) !void {
         const mutable_txn = txn;
+        const ordinal_doc_key = parent_doc_key orelse doc_key;
+        const ordinal = try doc_identity.lookupOrdinalTxn(self.alloc, mutable_txn, ordinal_doc_key);
+        try self.writeDenseVectorMappingTxnOptionalOrdinal(mutable_txn, index_name, doc_key, vector_id, ordinal);
+    }
+
+    fn writeDenseVectorMappingTxnWithOrdinal(
+        self: *IndexManager,
+        txn: anytype,
+        index_name: []const u8,
+        doc_key: []const u8,
+        vector_id: u64,
+        ordinal: doc_identity.DocOrdinal,
+    ) !void {
+        try self.writeDenseVectorMappingTxnOptionalOrdinal(txn, index_name, doc_key, vector_id, ordinal);
+    }
+
+    fn writeDenseVectorMappingTxnOptionalOrdinal(
+        self: *IndexManager,
+        txn: anytype,
+        index_name: []const u8,
+        doc_key: []const u8,
+        vector_id: u64,
+        ordinal: ?doc_identity.DocOrdinal,
+    ) !void {
+        const mutable_txn = txn;
         const doc_map_key = try denseDocMappingKey(self.alloc, index_name, doc_key);
         defer self.alloc.free(doc_map_key);
         const vector_map_key = try denseVectorIdMappingKey(self.alloc, index_name, vector_id);
@@ -15939,17 +16264,16 @@ pub const IndexManager = struct {
         try mutable_txn.put(doc_map_key, &buf);
         try mutable_txn.put(vector_map_key, doc_key);
 
-        const ordinal_doc_key = parent_doc_key orelse doc_key;
-        if (try doc_identity.lookupOrdinalTxn(self.alloc, mutable_txn, ordinal_doc_key)) |ordinal| {
-            const ordinal_map_key = try denseOrdinalMappingKey(self.alloc, index_name, ordinal);
+        if (ordinal) |doc_ordinal| {
+            const ordinal_map_key = try denseOrdinalMappingKey(self.alloc, index_name, doc_ordinal);
             defer self.alloc.free(ordinal_map_key);
             const vector_ordinal_map_key = try denseVectorOrdinalMappingKey(self.alloc, index_name, vector_id);
             defer self.alloc.free(vector_ordinal_map_key);
-            const ordinal_member_key = try denseOrdinalMemberKey(self.alloc, index_name, ordinal, vector_id);
+            const ordinal_member_key = try denseOrdinalMemberKey(self.alloc, index_name, doc_ordinal, vector_id);
             defer self.alloc.free(ordinal_member_key);
 
             var ordinal_buf: [4]u8 = undefined;
-            std.mem.writeInt(u32, &ordinal_buf, ordinal, .little);
+            std.mem.writeInt(u32, &ordinal_buf, doc_ordinal, .little);
             try mutable_txn.put(ordinal_map_key, &buf);
             try mutable_txn.put(ordinal_member_key, &buf);
             try mutable_txn.put(vector_ordinal_map_key, &ordinal_buf);
@@ -18760,6 +19084,10 @@ test "dense metadata lookups read legacy textual rows" {
     var read_txn = try store.beginProbeTxn();
     defer read_txn.abort();
     try std.testing.expectEqual(@as(?u64, vector_id), try manager.lookupDenseVectorIdTxn(&read_txn, index_name, doc_key));
+    const batch_vector_ids = try manager.lookupDenseVectorIdsTxnAlloc(&read_txn, index_name, &.{ doc_key, "doc:missing" });
+    defer alloc.free(batch_vector_ids);
+    try std.testing.expectEqual(@as(?u64, vector_id), batch_vector_ids[0]);
+    try std.testing.expectEqual(@as(?u64, null), batch_vector_ids[1]);
     const mapped_doc = (try manager.lookupDenseDocKeyByVectorIdTxn(&read_txn, index_name, vector_id)) orelse return error.TestUnexpectedResult;
     defer alloc.free(mapped_doc);
     try std.testing.expectEqualStrings(doc_key, mapped_doc);
@@ -21076,10 +21404,12 @@ test "dense metadata prefetch includes legacy ordinal vector ids" {
     defer identity_txn.abort();
     var index_txn = try entry.index.beginRuntimeWriteTxn();
     defer index_txn.abort();
+    const ordinals = try doc_identity.lookupOrdinalsTxnAlloc(alloc, identity_txn.asTxn(), &.{"doc:legacy"});
+    defer alloc.free(ordinals);
 
     var memo: IndexManager.DenseVectorMetadataPresenceMemo = .{};
     defer memo.deinit(alloc);
-    try manager.prefetchDenseExistingMetadataTxn(entry, identity_txn.asTxn(), &index_txn, &writes, &keep_write, &memo);
+    try manager.prefetchDenseExistingMetadataTxn(entry, &index_txn, &writes, &keep_write, ordinals, &memo);
 
     try std.testing.expectEqualStrings("doc:legacy", memo.getMetadata(1).?);
     try std.testing.expectEqual(@as(?bool, false), memo.get(stable_vector_id));
@@ -23876,6 +24206,32 @@ test "removeInMemory drops algebraic rollback index load state" {
     manager.removeInMemory("alg_v1");
     try std.testing.expect(manager.algebraicIndex("alg_v1") == null);
     try std.testing.expectEqual(@as(usize, 0), manager.index_load_states.count());
+}
+
+test "managed algebraic indexes remain pointer-stable as the catalog grows" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "algebraic-pointer-stability");
+    defer cleanupIndexManagerDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    const config_json =
+        \\{"table":"docs","schema_version":1,"capability_fingerprint":"test-capability","group_fields":[{"name":"customer","path":"customer","type":"string"}]}
+    ;
+    try manager.openConfiguredIndex(&store, .{ .name = "alg_0", .kind = .algebraic, .config_json = config_json }, false, false);
+    const stable = manager.algebraicIndex("alg_0").?.index;
+
+    for (1..33) |i| {
+        const name = try std.fmt.allocPrint(alloc, "alg_{d}", .{i});
+        defer alloc.free(name);
+        try manager.openConfiguredIndex(&store, .{ .name = name, .kind = .algebraic, .config_json = config_json }, false, false);
+    }
+    try std.testing.expectEqual(stable, manager.algebraicIndex("alg_0").?.index);
 }
 
 test "index load state tracks generic index names independently" {

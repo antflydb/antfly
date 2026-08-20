@@ -636,10 +636,149 @@ fn runSelectedMode(io: std.Io, alloc: std.mem.Allocator, cfg: Config) anyerror!v
         try runAdaptiveComparisonCases(io, alloc, cfg);
         try runAdaptiveCoverageCases(io, alloc, cfg);
         try runGraphTraversalGuardrail(io, alloc, cfg, "graph_traversal");
+    } else if (std.mem.eql(u8, cfg.mode, "hll")) {
+        try runHllCardinalityCase(io, alloc, cfg);
     } else {
         std.debug.print("invalid --mode: {s}\n", .{cfg.mode});
         return error.InvalidArgument;
     }
+}
+
+const algebraic_hll_config =
+    \\{
+    \\  "version": 1,
+    \\  "table": "orders",
+    \\  "group_fields": [
+    \\    {"name":"region","path":"region","type":"string"},
+    \\    {"name":"product","path":"product","type":"string"},
+    \\    {"name":"customer","path":"customer_id","type":"integer"}
+    \\  ],
+    \\  "hll_cardinalities": [
+    \\    {"name":"customers_by_region","group_by":["region"],"value_field":"customer"},
+    \\    {"name":"customers_by_product","group_by":["product"],"value_field":"customer"}
+    \\  ]
+    \\}
+;
+
+const region_customer_cardinality_requests = [_]aggregations.SearchAggregationRequest{.{
+    .name = "regions",
+    .type = "terms",
+    .field = "region",
+    .aggregations = &.{.{ .name = "customer_cardinality", .type = "cardinality", .field = "customer_id" }},
+}};
+
+// Demonstrates materialized per-bucket HyperLogLog cardinality: it reads one
+// sketch per region (O(groups)) and compares latency and accuracy against the
+// exact doc-scan distinct count (terms(region) -> cardinality(customer_id)).
+fn runHllCardinalityCase(io: std.Io, alloc: std.mem.Allocator, cfg: Config) !void {
+    var dataset = try buildDataset(alloc, cfg);
+    defer dataset.deinit(alloc);
+
+    var algebraic_backend = try openAlgebraicBackend(io, alloc, cfg, cfg.algebraic_backend, null);
+    defer algebraic_backend.close(io, alloc);
+    const runtime_store = try algebraic_backend.runtimeStore(alloc);
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    var manager = try db_mod.IndexManager.init(alloc, ".");
+    defer manager.deinit();
+    const mutex = try alloc.create(std.atomic.Mutex);
+    mutex.* = .unlocked;
+    const config = try db_mod.types.IndexConfig.clone(alloc, .{
+        .name = "alg",
+        .kind = .algebraic,
+        .config_json = algebraic_hll_config,
+    });
+    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", algebraic_hll_config);
+    try manager.algebraic_indexes.append(alloc, .{ .apply_mutex = mutex, .config = config, .index = alg_index });
+    const index = &manager.algebraic_indexes.items[0].index;
+
+    const build_start = nowNs();
+    var start: usize = 0;
+    while (start < dataset.derived_docs.len) : (start += cfg.batch_size) {
+        const end = @min(start + cfg.batch_size, dataset.derived_docs.len);
+        try index.applyBatchWithOptions(&store, .{ .documents = dataset.derived_docs[start..end] }, .{});
+    }
+    const build_ns = elapsedSince(build_start);
+
+    // Exact distinct customers across the order documents (the ground truth).
+    var exact_customers = std.AutoHashMapUnmanaged(i64, void).empty;
+    defer exact_customers.deinit(alloc);
+    for (dataset.hits) |hit| {
+        const stored = hit.stored_data orelse continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, stored, .{}) catch continue;
+        defer parsed.deinit();
+        const obj = switch (parsed.value) {
+            .object => |object| object,
+            else => continue,
+        };
+        if (obj.get("region") == null) continue; // only order docs carry a region
+        const customer = switch (obj.get("customer_id") orelse continue) {
+            .integer => |value| value,
+            else => continue,
+        };
+        try exact_customers.put(alloc, customer, {});
+    }
+    const exact_total: u64 = exact_customers.count();
+
+    const result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = dataset.hits,
+        .total_hits = @intCast(dataset.hits.len),
+    };
+
+    // doc_scan baseline: terms(region) -> cardinality(customer_id).
+    var doc_stats = QueryStats{};
+    for (0..cfg.repeats) |_| {
+        const started = nowNs();
+        const rows = try aggregations.computeSearchAggregations(alloc, &region_customer_cardinality_requests, result, .{});
+        const elapsed = elapsedSince(started);
+        doc_stats.total_ns += elapsed;
+        doc_stats.min_ns = @min(doc_stats.min_ns, elapsed);
+        doc_stats.max_ns = @max(doc_stats.max_ns, elapsed);
+        aggregations.deinitResults(alloc, rows);
+    }
+
+    // Materialized HLL read: one sketch per region plus the cross-region union.
+    var approx_stats = QueryStats{};
+    var bucket_count: usize = 0;
+    var approx_total: u64 = 0;
+    for (0..cfg.repeats) |i| {
+        const started = nowNs();
+        const entries = try index.approxCardinalityEntriesAlloc(&store, "customers_by_region");
+        const total = try index.approxCardinalityTotalAlloc(&store, "customers_by_region");
+        const elapsed = elapsedSince(started);
+        approx_stats.total_ns += elapsed;
+        approx_stats.min_ns = @min(approx_stats.min_ns, elapsed);
+        approx_stats.max_ns = @max(approx_stats.max_ns, elapsed);
+        if (i == 0) {
+            bucket_count = entries.len;
+            approx_total = total;
+        }
+        for (entries) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+
+    const exact_f: f64 = @floatFromInt(exact_total);
+    const rel_error = if (exact_total == 0) 0.0 else @abs(@as(f64, @floatFromInt(approx_total)) - exact_f) / exact_f;
+    const speedup = @as(f64, @floatFromInt(doc_stats.total_ns)) / @as(f64, @floatFromInt(@max(approx_stats.total_ns, 1)));
+
+    std.debug.print(
+        "{{\"event\":\"hll_cardinality\",\"backend\":\"{s}\",\"docs\":{d},\"repeats\":{d},\"build_ms\":{d:.3},\"buckets\":{d},\"exact_total\":{d},\"approx_total\":{d},\"total_rel_error\":{d:.4},\"doc_scan_avg_ms\":{d:.3},\"approx_avg_ms\":{d:.3},\"speedup\":{d:.2}}}\n",
+        .{
+            cfg.algebraic_backend.label(),
+            cfg.docs,
+            cfg.repeats,
+            nsToMsFloat(build_ns),
+            bucket_count,
+            exact_total,
+            approx_total,
+            rel_error,
+            nsToMsFloat(doc_stats.total_ns / cfg.repeats),
+            nsToMsFloat(approx_stats.total_ns / cfg.repeats),
+            speedup,
+        },
+    );
 }
 
 fn runAdaptiveComparisonCases(io: std.Io, alloc: std.mem.Allocator, cfg: Config) !void {
