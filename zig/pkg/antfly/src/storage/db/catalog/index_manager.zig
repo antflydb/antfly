@@ -43,6 +43,7 @@ const db_config = @import("../config.zig");
 const persistent_mod = @import("../../persistent.zig");
 const lsm_backend_mod = @import("../../lsm_backend/mod.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
+const background_runtime_mod = @import("../../background_runtime.zig");
 const docstore_mod = @import("../../docstore.zig");
 const schema_mod = @import("../../schema.zig");
 const analysis_mod = @import("../../../search/analysis.zig");
@@ -1117,6 +1118,11 @@ pub const IndexManager = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager,
     bind_cache_resource_manager: bool,
+    // Background lane used by algebraic indexes to run HLL cardinality
+    // maintenance off the foreground write path. Attached after construction
+    // via attachHllMaintenance(); when null, maintenance runs inline.
+    hll_maintenance_lane: ?background_runtime_mod.DurableJobLane = null,
+    hll_maintenance_owner_id: u64 = 0,
     primary_store: ?*docstore_mod.DocStore,
     applied_sequence_checkpoint_path: ?[]const u8,
     catalog_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
@@ -1407,7 +1413,9 @@ pub const IndexManager = struct {
     pub const AlgebraicIndex = struct {
         apply_mutex: *std.atomic.Mutex,
         config: types.IndexConfig,
-        index: algebraic_mod.index.Index,
+        // Heap-stable because background HLL jobs retain `*Index` while the
+        // manager's AlgebraicIndex array is free to grow and relocate entries.
+        index: *algebraic_mod.index.Index,
     };
 
     pub const TextMergeSourceSegment = struct {
@@ -2290,6 +2298,23 @@ pub const IndexManager = struct {
         self.load_parallelism = if (parallelism) |value| @max(value, 1) else null;
     }
 
+    // Provide the background lane that algebraic indexes use for HLL cardinality
+    // maintenance. Call before loading indexes so newly opened algebraic indexes
+    // pick up the lane; already-open indexes are (re)attached here too.
+    pub fn attachHllMaintenance(self: *IndexManager, lane: background_runtime_mod.DurableJobLane, owner_id: u64) void {
+        self.hll_maintenance_lane = lane;
+        self.hll_maintenance_owner_id = owner_id;
+        for (self.algebraic_indexes.items) |*entry| {
+            entry.index.attachHllMaintenanceLane(lane, owner_id);
+            if (self.primary_store) |store| {
+                entry.index.loadAdaptiveHllCardinalities(store) catch |err| {
+                    std.log.warn("adaptive HLL registry recovery failed index={s} err={s}", .{ entry.config.name, @errorName(err) });
+                };
+                entry.index.resumeHllMaintenance(store);
+            }
+        }
+    }
+
     fn bindPrimaryStore(self: *IndexManager, store: anytype) void {
         const Store = @TypeOf(store);
         if (comptime Store == *docstore_mod.DocStore) {
@@ -2328,8 +2353,85 @@ pub const IndexManager = struct {
         entry.config.deinit(self.alloc);
     }
 
+    /// Regenerate every algebraic index's schema-derived config from `schema_json`
+    /// and apply it in place when the schema-derived capability actually changed.
+    /// Carries forward user-tunable runtime knobs, gates dynamic-only changes at
+    /// field resolution, and gates static type/layout changes at the whole
+    /// planner. A generation-local projection completion marker releases either
+    /// gate after rebuild. No-op when there are no algebraic indexes, no schema,
+    /// or the capability fingerprint is unchanged.
+    pub fn reloadAlgebraicSchemaConfigs(self: *IndexManager, schema_json: []const u8) !void {
+        if (schema_json.len == 0) return;
+        for (self.algebraic_indexes.items) |*entry| {
+            const cur = entry.index.config();
+            const new_config_json = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(self.alloc, cur.table, schema_json);
+            defer self.alloc.free(new_config_json);
+
+            var new_parsed = try std.json.parseFromSlice(algebraic_mod.index.Config, self.alloc, new_config_json, .{ .allocate = .alloc_always });
+            defer new_parsed.deinit();
+
+            // Skip when the schema-derived capability is unchanged. Compare the
+            // capability fingerprint (which encodes schema_version, fields, and
+            // dynamic-template rules) rather than raw bytes: the live and durable
+            // serializations differ in shape and tunable knobs, so a byte compare
+            // would never short-circuit and every reconcile would churn the
+            // live config.
+            if (cur.capability_fingerprint.len > 0 and
+                std.mem.eql(u8, new_parsed.value.capability_fingerprint, cur.capability_fingerprint)) continue;
+
+            const delta = algebraic_mod.index.schemaCapabilityDelta(cur, new_parsed.value);
+            const projection_ready = entry.index.projectionConfigReady();
+
+            // Carry forward user-tunable runtime knobs (the durable regeneration
+            // in api/tables.zig preserves the same set) so a schema/template
+            // change does not silently reset planner/adaptive tuning in place.
+            new_parsed.value.adaptive = cur.adaptive;
+            new_parsed.value.pathfact_policy = cur.pathfact_policy;
+            new_parsed.value.max_result_buckets = cur.max_result_buckets;
+            new_parsed.value.max_planner_scan_rows = cur.max_planner_scan_rows;
+            new_parsed.value.max_batch_accumulator_entries = cur.max_batch_accumulator_entries;
+            new_parsed.value.max_cardinality_cache_bytes = cur.max_cardinality_cache_bytes;
+            new_parsed.value.max_hll_contributions_per_document = cur.max_hll_contributions_per_document;
+            new_parsed.value.max_hll_contribution_bytes_per_document = cur.max_hll_contribution_bytes_per_document;
+            new_parsed.value.max_distributed_hll_partial_bytes = cur.max_distributed_hll_partial_bytes;
+            new_parsed.value.max_hll_maintenance_rows_per_tick = cur.max_hll_maintenance_rows_per_tick;
+            new_parsed.value.max_pending_hll_observation_entries = cur.max_pending_hll_observation_entries;
+            new_parsed.value.max_pending_hll_observation_bytes = cur.max_pending_hll_observation_bytes;
+            new_parsed.value.hll_cardinalities = cur.hll_cardinalities;
+            new_parsed.value.min_max_candidate_cache_size = cur.min_max_candidate_cache_size;
+            new_parsed.value.enable_temporal_range_pruning = cur.enable_temporal_range_pruning;
+
+            // Static type/layout changes can make old docfacts incompatible with
+            // the regenerated config, so gate the whole planner until a shadow
+            // rebuild proves complete coverage. Preserve an older non-ready
+            // lifecycle unless this generation already has such a proof.
+            if (delta.static_fields_changed) {
+                new_parsed.value.capability_lifecycle_status = "rebuild_required";
+            } else if (!projection_ready and !algebraic_mod.index.capabilityLifecycleStatusReady(cur.capability_lifecycle_status)) {
+                new_parsed.value.capability_lifecycle_status = cur.capability_lifecycle_status;
+            }
+
+            // Dynamic-only changes use the narrower gate so unchanged static
+            // fields keep accelerating. A completed matching generation may
+            // clear a conservative catalog flag in runtime; otherwise preserve
+            // pending state until repair publishes a fully rebuilt generation.
+            new_parsed.value.dynamic_rules_backfill_pending =
+                new_parsed.value.dynamic_field_rules.len > 0 and
+                (delta.dynamic_rules_changed or (cur.dynamic_rules_backfill_pending and !projection_ready));
+
+            const merged_json = try std.json.Stringify.valueAlloc(self.alloc, new_parsed.value, .{ .emit_null_optional_fields = false });
+            defer self.alloc.free(merged_json);
+
+            const owned = try self.alloc.dupe(u8, merged_json);
+            errdefer self.alloc.free(owned);
+            try entry.index.reloadConfigJson(merged_json);
+            self.alloc.free(entry.config.config_json);
+            entry.config.config_json = owned;
+        }
+    }
+
     fn freeAlgebraicIndexEntry(self: *IndexManager, entry: *AlgebraicIndex) void {
-        entry.index.close();
+        entry.index.destroy();
         self.destroyIndexApplyMutex(entry.apply_mutex);
         entry.config.deinit(self.alloc);
         entry.* = undefined;
@@ -7995,6 +8097,34 @@ pub const IndexManager = struct {
         return null;
     }
 
+    /// Persist readiness inside the algebraic generation itself. This must only
+    /// be called after a complete, fenced projection build. Ordinary foreground
+    /// apply deliberately never writes this marker, so advancing an applied
+    /// sequence cannot accidentally certify older facts after a config change.
+    pub fn persistAlgebraicProjectionConfigReady(self: *IndexManager, store: anytype, name: []const u8) !void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        for (self.algebraic_indexes.items) |*entry| {
+            if (!std.mem.eql(u8, entry.config.name, name)) continue;
+
+            const key = try entry.index.projectionConfigReadyMarkerKeyAlloc();
+            defer self.alloc.free(key);
+            var value: [@sizeOf(u64)]u8 = undefined;
+            std.mem.writeInt(u64, &value, types.indexConfigHash(entry.config), .little);
+
+            var runtime_store = try initRuntimeStore(self.alloc, store);
+            defer runtime_store.deinit();
+            var txn = try runtime_store.store.beginWrite();
+            errdefer txn.abort();
+            try txn.put(key, &value);
+            try txn.commit();
+
+            entry.index.markProjectionConfigReady();
+            return;
+        }
+        return error.IndexNotFound;
+    }
+
     fn textProjectionOptions(self: *const IndexManager, arena: Allocator) !mapper.TextProjectionOptions {
         return try self.textProjectionOptionsForSchema(arena, false);
     }
@@ -10136,6 +10266,16 @@ pub const IndexManager = struct {
         var opened = try self.openConfiguredIndexDetached(store, cfg, allow_backfill, read_only);
         errdefer opened.deinit(self);
         try self.appendOpenedIndex(opened);
+        if (cfg.kind == .algebraic) {
+            if (comptime @TypeOf(store) == *docstore_mod.DocStore) {
+                if (self.algebraicIndex(cfg.name)) |entry| {
+                    entry.index.loadAdaptiveHllCardinalities(store) catch |err| {
+                        std.log.warn("adaptive HLL registry recovery failed index={s} err={s}", .{ cfg.name, @errorName(err) });
+                    };
+                    entry.index.resumeHllMaintenance(store);
+                }
+            }
+        }
     }
 
     fn openConfiguredIndexDetached(self: *IndexManager, store: anytype, cfg_input: types.IndexConfig, allow_backfill: bool, read_only: bool) !OpenedIndex {
@@ -10631,18 +10771,35 @@ pub const IndexManager = struct {
             .algebraic => {
                 const storage_namespace = try self.algebraicStorageNamespaceAlloc(cfg.name);
                 defer self.alloc.free(storage_namespace);
-                var index = try algebraic_mod.index.Index.openWithStorageNamespace(
+                const index = try algebraic_mod.index.Index.createWithStorageNamespace(
                     self.alloc,
                     cfg.name,
                     storage_namespace,
                     cfg.config_json,
                 );
                 var index_moved = false;
-                errdefer if (!index_moved) {
-                    var doomed = index;
-                    doomed.close();
+                errdefer if (!index_moved) index.destroy();
+                const ready_key = try index.projectionConfigReadyMarkerKeyAlloc();
+                defer self.alloc.free(ready_key);
+                var runtime_store = try initRuntimeStore(self.alloc, store);
+                defer runtime_store.deinit();
+                var ready_txn = try runtime_store.store.beginProbe();
+                defer ready_txn.abort();
+                const ready_value: ?[]const u8 = ready_txn.get(ready_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
                 };
+                if (ready_value) |value| {
+                    if (value.len == @sizeOf(u64) and
+                        std.mem.readInt(u64, value[0..@sizeOf(u64)], .little) == types.indexConfigHash(cfg))
+                    {
+                        index.markProjectionConfigReady();
+                    }
+                }
                 if (self.resource_manager) |manager| index.attachResourceManager(manager);
+                if (self.hll_maintenance_lane) |lane| {
+                    index.attachHllMaintenanceLane(lane, self.hll_maintenance_owner_id);
+                }
                 const apply_mutex = try self.allocIndexApplyMutex();
                 var apply_mutex_owned = true;
                 errdefer if (apply_mutex_owned) self.destroyIndexApplyMutex(apply_mutex);
@@ -23876,6 +24033,32 @@ test "removeInMemory drops algebraic rollback index load state" {
     manager.removeInMemory("alg_v1");
     try std.testing.expect(manager.algebraicIndex("alg_v1") == null);
     try std.testing.expectEqual(@as(usize, 0), manager.index_load_states.count());
+}
+
+test "managed algebraic indexes remain pointer-stable as the catalog grows" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "algebraic-pointer-stability");
+    defer cleanupIndexManagerDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    const config_json =
+        \\{"table":"docs","schema_version":1,"capability_fingerprint":"test-capability","group_fields":[{"name":"customer","path":"customer","type":"string"}]}
+    ;
+    try manager.openConfiguredIndex(&store, .{ .name = "alg_0", .kind = .algebraic, .config_json = config_json }, false, false);
+    const stable = manager.algebraicIndex("alg_0").?.index;
+
+    for (1..33) |i| {
+        const name = try std.fmt.allocPrint(alloc, "alg_{d}", .{i});
+        defer alloc.free(name);
+        try manager.openConfiguredIndex(&store, .{ .name = name, .kind = .algebraic, .config_json = config_json }, false, false);
+    }
+    try std.testing.expectEqual(stable, manager.algebraicIndex("alg_0").?.index);
 }
 
 test "index load state tracks generic index names independently" {

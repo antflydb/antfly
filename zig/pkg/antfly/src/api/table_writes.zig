@@ -22260,6 +22260,9 @@ fn applyLocalTableSchemaJson(
     defer storage_schema.freeSchema(alloc, runtime_schema);
 
     try db.setSchema(runtime_schema);
+    // Propagate schema-derived changes to live algebraic indexes so dynamic
+    // template updates take effect without a reopen.
+    try db.reloadAlgebraicSchemaConfigs(schema_json);
     if (marker_changed) try db.core.store.put(local_schema_json_key, schema_json);
 }
 

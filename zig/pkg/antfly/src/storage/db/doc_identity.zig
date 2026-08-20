@@ -814,6 +814,15 @@ pub fn latestGenerationFromSummary(summary: VisibilitySummary) u64 {
     return @max(summary.max_created_generation, summary.max_deleted_generation);
 }
 
+/// Returns the latest identity mutation visible in the caller's transaction.
+/// Snapshot-sensitive derived readers use this to prove that their data and
+/// identity visibility were observed atomically rather than racing a write
+/// between separate read transactions.
+pub fn latestGenerationFromTxn(txn: anytype) !?u64 {
+    const summary = (try readVisibilitySummaryTxn(txn)) orelse return null;
+    return latestGenerationFromSummary(summary);
+}
+
 pub fn latestGenerationFromSummaryFast(store: *docstore_mod.DocStore) !?u64 {
     var txn = try store.beginProbeTxn();
     defer txn.abort();

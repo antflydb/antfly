@@ -5144,6 +5144,28 @@ pub fn build(b: *std.Build) void {
     const lib_api_auth_test_step = b.step("lib-api-auth-test", "Run focused API auth/usermgr HTTP tests");
     lib_api_auth_test_step.dependOn(&run_lib_api_auth_tests.step);
 
+    const algebraic_dynamic_template_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "dynamic template",
+            "child cardinality cache",
+            "public algebraic index definitions",
+            "metadata.algebraic schema regeneration",
+            "db managed algebraic admission builds and reopens",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_algebraic_dynamic_template_tests = b.addRunArtifact(algebraic_dynamic_template_tests);
+    run_algebraic_dynamic_template_tests.step.dependOn(&openapi_root_check.step);
+    const algebraic_dynamic_template_test_step = b.step(
+        "algebraic-dynamic-template-test",
+        "Run focused algebraic dynamic-template and cardinality-cache safety tests",
+    );
+    algebraic_dynamic_template_test_step.dependOn(&run_algebraic_dynamic_template_tests.step);
+
     const lib_storage_maintenance_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
@@ -5919,7 +5941,7 @@ pub fn build(b: *std.Build) void {
             "managed structural catch-up delegates durable generation repair without rebuilding inline",
             "managed structural catch-up leaves pending enrichment with the asynchronous owner",
             "db managed vector admission captures writes while durable repair is pending",
-            "db managed algebraic admission builds and reopens an isolated generation",
+            "db managed algebraic admission builds and reopens",
             "db algebraic generation build yields and resumes from its durable source cursor",
             "db forced algebraic repair persists an operator generation intent before execution",
             "db algebraic post-commit activation crash recovers through generation repair",
@@ -6692,6 +6714,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_data_storage_tests.step);
     unit_test_step.dependOn(&run_lib_api_docid_tests.step);
     unit_test_step.dependOn(&run_lib_api_auth_tests.step);
+    unit_test_step.dependOn(&run_algebraic_dynamic_template_tests.step);
     unit_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
     unit_test_step.dependOn(&run_api_restore_jobs_tests.step);
     unit_test_step.dependOn(&run_portable_backup_tests.step);
@@ -8726,6 +8749,7 @@ pub fn build(b: *std.Build) void {
     replay_bench_build_options.addOption(bool, "with_tla", with_tla);
     replay_bench_build_options.addOption(bool, "link_libc", true);
     replay_bench_build_options.addOption(bool, "standalone_runtime_focused_test", false);
+    replay_bench_build_options.addOption(bool, "lmdb_enabled", true);
     replay_bench_build_options.addOption(bool, "bench_minimal_deps", true);
 
     const replay_bench_mod = b.createModule(.{
@@ -8886,10 +8910,13 @@ pub fn build(b: *std.Build) void {
     algebraic_bench_root_mod.addImport("bloom", bloom_mod);
     algebraic_bench_root_mod.addImport("antfly_vector", vector_mod);
     algebraic_bench_root_mod.addImport("antfly_vectorindex", vectorindex_mod);
+    algebraic_bench_root_mod.addImport("antfly_matcher", matcher_mod);
     algebraic_bench_root_mod.addImport("antfly_vellum", vellum_mod);
     algebraic_bench_root_mod.addImport("antfly_regex", regex_mod);
     algebraic_bench_root_mod.addImport("antfly_platform", platform_mod);
     algebraic_bench_root_mod.addImport("antfly_reranking", reranking_mod);
+    algebraic_bench_root_mod.addImport("antfly_resolver", resolver_mod);
+    algebraic_bench_root_mod.addImport("antfly_reader_config", reader_config_mod);
     addSnowballModule(b, algebraic_bench_root_mod);
     algebraic_bench_mod.addImport("antfly-zig", algebraic_bench_root_mod);
 

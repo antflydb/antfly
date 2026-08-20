@@ -2975,6 +2975,7 @@ pub const DB = struct {
     backend_runtime: *background_runtime_mod.BackendRuntime,
     backend_owner_id: u64,
     repair_cleanup_owner_id: u64,
+    algebraic_hll_owner_id: u64 = 0,
     owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager,
     capacity_source: ?types.RepairCapacitySource,
@@ -3210,6 +3211,12 @@ pub const DB = struct {
     fn mirrorHASchemaMetadataCommit(self: *DB, table_schema: schema_mod.TableSchema) !void {
         var ctx = self.batchContext();
         try mirrorHASchemaMetadataCommitContext(&ctx, table_schema);
+    }
+
+    fn attachAlgebraicHllMaintenanceLane(self: *DB) !void {
+        const owner_id = try self.backend_runtime.allocOwnerId();
+        self.algebraic_hll_owner_id = owner_id;
+        self.core.index_manager.attachHllMaintenance(self.backend_runtime.durable_jobs, owner_id);
     }
 
     fn hydrateAlgebraicObservationStatusBestEffort(self: *DB) void {
@@ -3462,6 +3469,8 @@ pub const DB = struct {
                 deinitOwnedEnrichmentConfig(alloc, cfg);
                 opts.enrichment = null;
             }
+
+            try db.attachAlgebraicHllMaintenanceLane();
 
             const admission_prefix = try internal_keys.managedIndexAdmissionRootPrefixAlloc(alloc);
             defer alloc.free(admission_prefix);
@@ -4250,6 +4259,10 @@ pub const DB = struct {
         self.setQueryVisibilityHook(null);
         self.async_context.background_closing.store(true, .release);
         self.async_context.enrichment_desired_running.store(false, .release);
+        if (self.algebraic_hll_owner_id != 0) {
+            self.backend_runtime.durable_jobs.closeOwner(self.algebraic_hll_owner_id);
+            self.algebraic_hll_owner_id = 0;
+        }
         self.backend_runtime.durable_jobs.closeOwner(self.repair_cleanup_owner_id);
         self.backend_runtime.durable_jobs.closeOwner(self.backend_owner_id);
         self.clearLiveDocSetCache();
@@ -13025,6 +13038,15 @@ pub const DB = struct {
         if (manifest_sequence != reached_target) return error.IndexGenerationManifestMismatch;
         try ensureRepairActivationDeadline(activation_deadline_ns);
 
+        if (cfg.kind == .algebraic) {
+            // Certify this physical projection only after the final replay has
+            // converged under the apply fence. The marker lives in the shadow
+            // namespace, so a crash before pointer publication cannot release
+            // the active generation's lifecycle gate.
+            try shadow_manager.persistAlgebraicProjectionConfigReady(self.core.store, cfg.name);
+            try ensureRepairActivationDeadline(activation_deadline_ns);
+        }
+
         // Transfer the already-open runtime for every index family. Pointer
         // publication and in-memory handoff are allocation-free, and the
         // predecessor is retired only after service fences are released.
@@ -13065,7 +13087,6 @@ pub const DB = struct {
             .generation = final_update.generation,
             .config_hash = final_update.config_hash,
         });
-
         // The pointer and clean checkpoint are now ordered before any later
         // foreground apply. Release the write fence before operator hooks,
         // intent cleanup, and generation garbage collection. Capture the
@@ -14701,6 +14722,13 @@ pub const DB = struct {
         return try self.core.getStoreValue(alloc, public_schema_json_key);
     }
 
+    /// Refresh schema-derived algebraic index configs (notably dynamic-template
+    /// rules) in place from the given table schema JSON, so a dynamic-template
+    /// change applies to a running DB without a reopen.
+    pub fn reloadAlgebraicSchemaConfigs(self: *DB, schema_json: []const u8) !void {
+        try self.core.index_manager.reloadAlgebraicSchemaConfigs(schema_json);
+    }
+
     pub fn beginTransaction(self: *DB, timestamp_ns: u64) !transactions_mod.TxnId {
         const txn_id = makeTxnId(self);
         return try self.beginTransactionWithIdAndParticipants(txn_id, timestamp_ns, &.{});
@@ -16263,6 +16291,7 @@ pub const DB = struct {
         var changed: u64 = 0;
         for (self.core.index_manager.algebraic_indexes.items) |*entry| {
             changed += try entry.index.evaluateAdaptiveCandidates(self.core.store, target_sequence);
+            changed += try entry.index.evaluateHllCardinalityCandidates(self.core.store);
         }
         return changed;
     }
@@ -23296,7 +23325,7 @@ pub const DB = struct {
             if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
             return .{ .req = req };
         }
-        if (try self.searchRequestWithDirectAlgebraicDocFilterAlloc(req, &entry.index)) |direct| return direct;
+        if (try self.searchRequestWithDirectAlgebraicDocFilterAlloc(req, entry.index)) |direct| return direct;
         var filter_doc_ids: [][]u8 = &.{};
         errdefer entry.index.freeDocIds(filter_doc_ids);
         var exclude_doc_ids: [][]u8 = &.{};
@@ -23307,7 +23336,7 @@ pub const DB = struct {
         var filter_supported = req.filter_doc_ids_positive or req.filter_doc_ids.len > 0;
         var filter_bindings = std.ArrayListUnmanaged(@import("algebraic/index.zig").Index.FilterBinding).empty;
         defer {
-            for (filter_bindings.items) |*binding| binding.set.deinit(&entry.index);
+            for (filter_bindings.items) |*binding| binding.set.deinit(entry.index);
             filter_bindings.deinit(entry.index.alloc);
         }
 
@@ -23329,7 +23358,7 @@ pub const DB = struct {
                 if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
                 return .{ .req = req };
             };
-            errdefer set.deinit(&entry.index);
+            errdefer set.deinit(entry.index);
             try filter_bindings.append(entry.index.alloc, .{
                 .name = binding.name,
                 .set = set,
@@ -23340,7 +23369,7 @@ pub const DB = struct {
         if (req.filter_query_json.len > 0) {
             if (try entry.index.docIdSetForFilterJsonWithBindingsAlloc(self.core.store, req.filter_query_json, filter_bindings.items)) |set| {
                 var owned_set = set;
-                defer owned_set.deinit(&entry.index);
+                defer owned_set.deinit(entry.index);
                 if (owned_set.include) |ids| {
                     if (filter_supported) {
                         const intersected = try intersectAlgebraicDocIds(entry.index.alloc, filter_doc_ids, ids);
@@ -23364,7 +23393,7 @@ pub const DB = struct {
         if (req.exclusion_query_json.len > 0) {
             if (try entry.index.docIdSetForFilterJsonWithBindingsAlloc(self.core.store, req.exclusion_query_json, filter_bindings.items)) |set| {
                 var owned_set = set;
-                defer owned_set.deinit(&entry.index);
+                defer owned_set.deinit(entry.index);
                 if (owned_set.include) |ids| {
                     const merged = try unionAlgebraicDocIds(entry.index.alloc, exclude_doc_ids, ids);
                     entry.index.freeDocIds(exclude_doc_ids);
@@ -23409,7 +23438,7 @@ pub const DB = struct {
         entry.index.recordVectorFilterResolved(filter_doc_ids.len, exclude_doc_ids.len);
         return .{
             .req = next,
-            .index = &entry.index,
+            .index = entry.index,
             .filter_doc_ids = filter_doc_ids,
             .exclude_doc_ids = exclude_doc_ids,
             .resolved_doc_filter = resolved_filter,
@@ -44398,10 +44427,11 @@ test "db open borrows shared backend runtime" {
     try std.testing.expect(first.backend_owner_id != 0);
     try std.testing.expect(second.backend_owner_id != 0);
     try std.testing.expect(first.backend_owner_id != second.backend_owner_id);
-    // Each DB owns one backend lane and one repair/cleanup lane. Generation
-    // retirement uses the runtime-wide cleanup owner instead.
+    // Each DB owns a backend lane, a repair/cleanup lane, and an algebraic HLL
+    // maintenance lane. Generation retirement uses the runtime-wide cleanup
+    // owner instead.
     try std.testing.expectEqual(
-        second.repair_cleanup_owner_id + 1,
+        second.algebraic_hll_owner_id + 1,
         try runtime.ptr().allocOwnerId(),
     );
 }
@@ -71171,6 +71201,46 @@ test "db managed vector admission durably seeds missing enrichment artifacts" {
     try std.testing.expect(db.core.index_manager.repairUnavailable("semantic_idx"));
 }
 
+test "db managed algebraic admission builds and reopens requires generation marker" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const cfg = types.IndexConfig{
+        .name = "analytics_idx",
+        .kind = .algebraic,
+        .config_json =
+        \\{"version":1,"table":"docs","capability_lifecycle_status":"rebuild_required","dynamic_rules_backfill_pending":true,"group_fields":[{"name":"category","path":"category","type":"string"}],"dynamic_field_rules":[{"name":"ids","match":"*_id","type":"string"}],"materializations":[]}
+        ,
+    };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.addIndex(cfg);
+        try db.core.saveProjectionCheckpoint(cfg.name, .{
+            .status = .clean,
+            .generation = 9,
+            .config_hash = types.indexConfigHash(cfg),
+        });
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+    const active = reopened.core.index_manager.algebraicIndex(cfg.name) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!active.index.projectionConfigReady());
+    try std.testing.expect(!active.index.plannerLifecycleReady());
+    try std.testing.expect(active.index.resolveField("user_id", .group) == null);
+}
+
 // Functional repair tests verify durable construction, activation, and reopen,
 // not the production reader-pause SLA. A contended CI worker can exhaust the
 // 250 ms production window, which correctly persists retry backoff that these
@@ -71189,7 +71259,7 @@ test "db managed algebraic admission builds and reopens an isolated generation" 
         .name = "analytics_idx",
         .kind = .algebraic,
         .config_json =
-        \\{"version":1,"table":"docs","group_fields":[{"name":"category","path":"category","type":"string"}],"materializations":[]}
+        \\{"version":1,"table":"docs","capability_lifecycle_status":"rebuild_required","dynamic_rules_backfill_pending":true,"group_fields":[{"name":"category","path":"category","type":"string"}],"dynamic_field_rules":[{"name":"ids","match":"*_id","type":"string"}],"materializations":[]}
         ,
     };
     var active_namespace: []u8 = undefined;
@@ -71210,6 +71280,8 @@ test "db managed algebraic admission builds and reopens an isolated generation" 
         try std.testing.expect(try db.hasPendingIndexRepairIntents(alloc));
         const canonical = db.core.index_manager.algebraicIndex(cfg.name) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqualStrings("canonical/analytics_idx", canonical.index.storageNamespace());
+        try std.testing.expect(!canonical.index.plannerLifecycleReady());
+        try std.testing.expect(canonical.index.resolveField("user_id", .group) == null);
 
         var repaired = false;
         for (0..16) |_| {
@@ -71227,6 +71299,8 @@ test "db managed algebraic admission builds and reopens an isolated generation" 
 
         const active = db.core.index_manager.algebraicIndex(cfg.name) orelse return error.TestUnexpectedResult;
         try std.testing.expect(std.mem.startsWith(u8, active.index.storageNamespace(), ".repair-shadow-"));
+        try std.testing.expect(active.index.plannerLifecycleReady());
+        try std.testing.expect(active.index.resolveField("user_id", .group) != null);
         active_namespace = try alloc.dupe(u8, active.index.storageNamespace());
         var resolved = (try active.index.resolvedDocFilterForFilterJsonAlloc(
             db.core.store,
@@ -71248,6 +71322,8 @@ test "db managed algebraic admission builds and reopens an isolated generation" 
     defer reopened.close();
     const active = reopened.core.index_manager.algebraicIndex(cfg.name) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(active_namespace, active.index.storageNamespace());
+    try std.testing.expect(active.index.plannerLifecycleReady());
+    try std.testing.expect(active.index.resolveField("user_id", .group) != null);
     var resolved = (try active.index.resolvedDocFilterForFilterJsonAlloc(
         reopened.core.store,
         "{\"term\":{\"category\":\"tools\"}}",
