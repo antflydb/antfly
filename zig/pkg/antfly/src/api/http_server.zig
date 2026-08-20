@@ -23325,6 +23325,18 @@ test "api http server serves retrieval agent response envelope" {
     try std.testing.expectEqual(@as(u16, 400), internal_resp.status);
     try std.testing.expectEqualStrings("invalid retrieval agent request", internal_resp.body);
 
+    // Retrieval has one canonical, authenticated public route. Keeping a
+    // second root-level binding would bypass authorizeRequest and the
+    // per-query table and row-filter checks below.
+    var root_alias = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/agents/retrieval",
+        .content_type = "application/json",
+        .body = retrieval_body,
+    });
+    defer root_alias.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), root_alias.status);
+
     const secret = "retrieval-trusted-principal-secret";
     var auth_server = ApiHttpServer.init(
         std.testing.allocator,

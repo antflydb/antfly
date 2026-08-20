@@ -251,13 +251,11 @@ pub const ApiHttpClient = struct {
     }
 
     /// Public generated operations live below `/db/v1`. Internal forwarding
-    /// and the contextual retrieval operation deliberately remain rooted on
-    /// the listener, so callers continue to pass a node base URI rather than
-    /// having to know which routing namespace an operation belongs to.
+    /// deliberately remains rooted on the listener, so callers continue to
+    /// pass a node base URI rather than having to know which routing namespace
+    /// an operation belongs to.
     fn joinRoute(self: *ApiHttpClient, base_uri: []const u8, path: []const u8) ![]u8 {
-        if (std.mem.startsWith(u8, path, "/internal/v1/") or
-            std.mem.eql(u8, path, routes.Routes.agents_retrieval))
-        {
+        if (std.mem.startsWith(u8, path, "/internal/v1/")) {
             return raft_routes.Routes.join(self.alloc, base_uri, path);
         }
         if (std.mem.eql(u8, path, "/db/v1") or std.mem.startsWith(u8, path, "/db/v1/")) {
