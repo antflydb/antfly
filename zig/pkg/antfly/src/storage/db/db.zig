@@ -35502,7 +35502,8 @@ fn enrichmentRequestFailureRangePending(
         entries_examined += state.candidates.items.len;
 
         const next_scan_lower = try ctx.alloc.dupe(u8, state.candidates.items[state.candidates.items.len - 1].sequence_key);
-        errdefer ctx.alloc.free(next_scan_lower);
+        var next_scan_lower_owned = true;
+        defer if (next_scan_lower_owned) ctx.alloc.free(next_scan_lower);
         var found = false;
         var stale_deletes = std.ArrayListUnmanaged([]const u8).empty;
         defer stale_deletes.deinit(ctx.alloc);
@@ -35568,7 +35569,6 @@ fn enrichmentRequestFailureRangePending(
             };
         }
         if (found) {
-            ctx.alloc.free(next_scan_lower);
             return true;
         }
         // Visibility classification is on the foreground write path and runs
@@ -35577,11 +35577,11 @@ fn enrichmentRequestFailureRangePending(
         // repair-required result; the stale deletes above make retries
         // monotonically converge without extending this request indefinitely.
         if (entries_examined >= enrichment_terminal_failure_lookup_entry_budget) {
-            ctx.alloc.free(next_scan_lower);
             return error.EnrichmentRepairLookupBudgetExceeded;
         }
         if (owned_scan_lower) |value| ctx.alloc.free(value);
         owned_scan_lower = next_scan_lower;
+        next_scan_lower_owned = false;
     }
 }
 
