@@ -104,6 +104,14 @@ pub const DynamicTemplate = struct {
     mapping: FieldMapping = .{},
 };
 
+/// An exact field declaration used for schema introspection and request
+/// diagnostics, but not as an executable indexing template. Document-schema
+/// shorthand already has its own physical full-text/inference lowering.
+pub const DeclaredField = struct {
+    field: []const u8,
+    mapping: FieldMapping = .{},
+};
+
 pub const FullTextField = struct {
     path: []const u8,
     emitted_name: []const u8,
@@ -144,6 +152,7 @@ pub const TableSchema = struct {
     ttl_field: []const u8 = "_timestamp",
     enforce_types: bool = false,
     dynamic_templates: []const DynamicTemplate = &.{},
+    declared_fields: []const DeclaredField = &.{},
     full_text_documents: []const FullTextDocument = &.{},
     index_sort: []const IndexSortField = &.{},
 };
@@ -166,7 +175,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 11); // format version
+    try appendU32(&buf, alloc, 12); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -190,6 +199,21 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         try buf.append(alloc, @intFromEnum(tmpl.mapping.missing_null_policy));
         try buf.append(alloc, if (tmpl.mapping.include_in_all) 1 else 0);
         try appendStr(&buf, alloc, tmpl.mapping.analyzer);
+    }
+
+    // Capability-only exact declarations. These intentionally remain
+    // separate from executable dynamic templates.
+    try appendU32(&buf, alloc, @intCast(schema.declared_fields.len));
+    for (schema.declared_fields) |field| {
+        try appendStr(&buf, alloc, field.field);
+        try buf.append(alloc, @intFromEnum(field.mapping.field_type));
+        try buf.append(alloc, if (field.mapping.do_index) 1 else 0);
+        try buf.append(alloc, if (field.mapping.store) 1 else 0);
+        try buf.append(alloc, if (field.mapping.doc_values) 1 else 0);
+        try buf.append(alloc, if (field.mapping.sortable) 1 else 0);
+        try buf.append(alloc, @intFromEnum(field.mapping.missing_null_policy));
+        try buf.append(alloc, if (field.mapping.include_in_all) 1 else 0);
+        try appendStr(&buf, alloc, field.mapping.analyzer);
     }
 
     try appendU32(&buf, alloc, @intCast(schema.full_text_documents.len));
@@ -239,7 +263,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 11) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 12) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -339,6 +363,62 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             },
         };
         templates_initialized += 1;
+    }
+
+    const declared_fields: []DeclaredField = if (fmt_version >= 12) blk: {
+        const field_count = readU32(data, &pos);
+        const fields = try alloc.alloc(DeclaredField, field_count);
+        var fields_initialized: usize = 0;
+        errdefer {
+            for (fields[0..fields_initialized]) |field| {
+                alloc.free(field.field);
+                alloc.free(field.mapping.analyzer);
+            }
+            alloc.free(fields);
+        }
+        for (fields) |*field| {
+            const field_name = try alloc.dupe(u8, readStr(data, &pos));
+            errdefer alloc.free(field_name);
+            const field_type: AntflyType = @enumFromInt(data[pos]);
+            pos += 1;
+            const do_index = data[pos] == 1;
+            pos += 1;
+            const store = data[pos] == 1;
+            pos += 1;
+            const doc_values = data[pos] == 1;
+            pos += 1;
+            const sortable = data[pos] == 1;
+            pos += 1;
+            const missing_null_policy: MissingNullPolicy = switch (data[pos]) {
+                0 => .missing_rejected,
+                else => return error.InvalidSchema,
+            };
+            pos += 1;
+            const include_in_all = data[pos] == 1;
+            pos += 1;
+            field.* = .{
+                .field = field_name,
+                .mapping = .{
+                    .field_type = field_type,
+                    .do_index = do_index,
+                    .store = store,
+                    .doc_values = doc_values,
+                    .sortable = sortable,
+                    .missing_null_policy = missing_null_policy,
+                    .include_in_all = include_in_all,
+                    .analyzer = try alloc.dupe(u8, readStr(data, &pos)),
+                },
+            };
+            fields_initialized += 1;
+        }
+        break :blk fields;
+    } else &.{};
+    errdefer {
+        for (declared_fields) |field| {
+            alloc.free(field.field);
+            alloc.free(field.mapping.analyzer);
+        }
+        if (declared_fields.len > 0) alloc.free(declared_fields);
     }
 
     const full_text_documents: []FullTextDocument = if (fmt_version >= 2) blk: {
@@ -528,6 +608,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         .ttl_field = ttl_field,
         .enforce_types = enforce_types,
         .dynamic_templates = templates,
+        .declared_fields = declared_fields,
         .full_text_documents = full_text_documents,
         .index_sort = index_sort,
     };
@@ -547,6 +628,11 @@ pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
         alloc.free(t.mapping.analyzer);
     }
     if (s.dynamic_templates.len > 0) alloc.free(s.dynamic_templates);
+    for (s.declared_fields) |field| {
+        alloc.free(field.field);
+        alloc.free(field.mapping.analyzer);
+    }
+    if (s.declared_fields.len > 0) alloc.free(s.declared_fields);
     for (s.full_text_documents) |doc| {
         alloc.free(doc.name);
         for (doc.fields) |field| {
@@ -741,6 +827,9 @@ pub fn resolveDeclaredFieldType(schema: TableSchema, path: []const u8) ?FieldMap
     const field_name = fieldNameFromPath(path);
     for (schema.dynamic_templates) |tmpl| {
         if (dynamicTemplateMatchesDeclaredPath(tmpl, path, field_name)) return tmpl.mapping;
+    }
+    for (schema.declared_fields) |field| {
+        if (std.mem.eql(u8, field.field, path)) return field.mapping;
     }
     return null;
 }
@@ -945,6 +1034,30 @@ pub fn dynamicTemplateFieldCapability(schema: TableSchema, tmpl: DynamicTemplate
     };
 }
 
+pub fn declaredFieldCapability(schema: TableSchema, field: DeclaredField) FieldCapability {
+    const mapping = field.mapping;
+    const index_sort = indexSortMembership(schema, field.field);
+    const sortable = mappingIsSortable(mapping);
+    const queryability_state = mappingQueryabilityStateName(mapping);
+    const doc_value_coverage = if (mapping.doc_values) "schema_declared" else "not_declared";
+    return .{
+        .field = field.field,
+        .field_type = mapping.field_type,
+        .searchable = mapping.do_index,
+        .filterable = mappingIsFilterable(mapping),
+        .aggregatable = mappingIsAggregatable(mapping),
+        .doc_values = mapping.doc_values,
+        .sortable = sortable,
+        .doc_value_coverage = doc_value_coverage,
+        .provenance = "document_schema",
+        .missing_null_policy = missingNullPolicyName(mapping.missing_null_policy),
+        .queryability_state = queryability_state,
+        .sort_lifecycle_state = lifecycleStateFromParts(sortable, mapping.doc_values, doc_value_coverage, queryability_state, index_sort),
+        .analyzer = mapping.analyzer,
+        .index_sort = index_sort,
+    };
+}
+
 pub fn fullTextFieldCapability(schema: TableSchema, document_name: []const u8, field: FullTextField) FieldCapability {
     const exact_keyword = std.mem.eql(u8, field.analyzer, "keyword");
     const capability_field = if (exact_keyword) field.emitted_name else field.path;
@@ -1012,11 +1125,11 @@ fn lifecycleStateFromParts(
 }
 
 pub fn fieldCapabilitiesAlloc(alloc: Allocator, schema: TableSchema) ![]FieldCapability {
-    var count: usize = 1 + schema.dynamic_templates.len;
+    var count: usize = 1 + schema.dynamic_templates.len + schema.declared_fields.len;
     for (schema.full_text_documents) |doc| {
         for (doc.fields) |field| {
             if (std.mem.eql(u8, field.path, "_id")) continue;
-            if (resolveFieldType(schema, field.emitted_name) != null) continue;
+            if (resolveDeclaredFieldType(schema, field.emitted_name) != null) continue;
             count += 1;
         }
     }
@@ -1033,10 +1146,15 @@ pub fn fieldCapabilitiesAlloc(alloc: Allocator, schema: TableSchema) ![]FieldCap
         index += 1;
     }
 
+    for (schema.declared_fields) |field| {
+        capabilities[index] = declaredFieldCapability(schema, field);
+        index += 1;
+    }
+
     for (schema.full_text_documents) |doc| {
         for (doc.fields) |field| {
             if (std.mem.eql(u8, field.path, "_id")) continue;
-            if (resolveFieldType(schema, field.emitted_name) != null) continue;
+            if (resolveDeclaredFieldType(schema, field.emitted_name) != null) continue;
             capabilities[index] = fullTextFieldCapability(schema, doc.name, field);
             index += 1;
         }
@@ -1422,6 +1540,19 @@ test "schema serialize/deserialize round-trip" {
                 },
             },
         },
+        .declared_fields = &.{
+            .{
+                .field = "title.keyword",
+                .mapping = .{
+                    .field_type = .keyword,
+                    .do_index = true,
+                    .store = false,
+                    .doc_values = false,
+                    .sortable = false,
+                    .analyzer = "keyword",
+                },
+            },
+        },
         .full_text_documents = &.{
             .{
                 .name = "my_type",
@@ -1503,6 +1634,10 @@ test "schema serialize/deserialize round-trip" {
     try std.testing.expect(loaded.dynamic_templates[0].mapping.doc_values);
     try std.testing.expect(loaded.dynamic_templates[0].mapping.sortable);
     try std.testing.expectEqual(MissingNullPolicy.missing_rejected, loaded.dynamic_templates[0].mapping.missing_null_policy);
+    try std.testing.expectEqual(@as(usize, 1), loaded.declared_fields.len);
+    try std.testing.expectEqualStrings("title.keyword", loaded.declared_fields[0].field);
+    try std.testing.expectEqual(AntflyType.keyword, loaded.declared_fields[0].mapping.field_type);
+    try std.testing.expect(!loaded.declared_fields[0].mapping.doc_values);
     try std.testing.expectEqual(@as(usize, 1), loaded.full_text_documents.len);
     try std.testing.expectEqualStrings("my_type", loaded.full_text_documents[0].name);
     try std.testing.expectEqual(@as(usize, 4), loaded.full_text_documents[0].fields.len);
@@ -1532,7 +1667,7 @@ test "schema serialize/deserialize round-trip" {
     try std.testing.expect(!loaded.index_sort[1].desc);
 }
 
-test "schema deserialization cleans only initialized dynamic templates on allocation failure" {
+test "schema deserialization cleans initialized mappings on allocation failure" {
     const alloc = std.testing.allocator;
     const templates = [_]DynamicTemplate{
         .{
@@ -1549,7 +1684,13 @@ test "schema deserialization cleans only initialized dynamic templates on alloca
             .mapping = .{ .analyzer = "standard" },
         },
     };
-    const encoded = try serializeSchema(alloc, .{ .dynamic_templates = &templates });
+    const encoded = try serializeSchema(alloc, .{
+        .dynamic_templates = &templates,
+        .declared_fields = &.{.{
+            .field = "title.keyword",
+            .mapping = .{ .field_type = .keyword, .analyzer = "keyword" },
+        }},
+    });
     defer alloc.free(encoded);
 
     const Runner = struct {

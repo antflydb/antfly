@@ -77,6 +77,9 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
     document_field_templates_owned = false;
     if (document_field_templates.len > 0) alloc.free(document_field_templates);
 
+    const declared_fields = try deriveRuntimeDeclaredDocumentFields(alloc, schema);
+    errdefer freeRuntimeDeclaredFields(alloc, declared_fields);
+
     const full_text_documents = try deriveRuntimeFullTextDocuments(alloc, schema);
     errdefer freeRuntimeFullTextDocuments(alloc, full_text_documents);
 
@@ -90,9 +93,18 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .ttl_field = try alloc.dupe(u8, schema.ttl_field),
         .enforce_types = schema.enforce_types,
         .dynamic_templates = dynamic_templates,
+        .declared_fields = declared_fields,
         .full_text_documents = full_text_documents,
         .index_sort = index_sort,
     };
+}
+
+fn freeRuntimeDeclaredFields(alloc: std.mem.Allocator, fields: []storage_schema.DeclaredField) void {
+    for (fields) |field| {
+        alloc.free(field.field);
+        alloc.free(field.mapping.analyzer);
+    }
+    if (fields.len > 0) alloc.free(fields);
 }
 
 fn freeRuntimeDynamicTemplates(alloc: std.mem.Allocator, templates: []storage_schema.DynamicTemplate) void {
@@ -187,20 +199,70 @@ fn appendRuntimeDocumentFieldTemplates(
         try appendRuntimeDocumentFieldMappingTemplates(alloc, out, path, mapping);
         return;
     }
-
-    // x-antfly-types is the compact multi-mapping/search shorthand, while
-    // x-antfly-field carries explicit physical capabilities such as sortable.
-    // Preserve shorthand exact-scalar declarations in the runtime capability
-    // model, but do not silently opt every scalar into typed doc values. That
-    // keeps existing indexing/storage costs stable while allowing sort
-    // validation and table introspection to report non_sortable_field instead
-    // of incorrectly claiming that a declared field is unmapped.
-    try appendShorthandRuntimeDocumentFieldTemplates(alloc, out, path, property.antfly_types);
 }
 
-fn appendShorthandRuntimeDocumentFieldTemplates(
+fn deriveRuntimeDeclaredDocumentFields(
     alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(storage_schema.DynamicTemplate),
+    schema: ParsedTableSchema,
+) ![]storage_schema.DeclaredField {
+    var out = std.ArrayListUnmanaged(storage_schema.DeclaredField).empty;
+    errdefer {
+        for (out.items) |field| {
+            alloc.free(field.field);
+            alloc.free(field.mapping.analyzer);
+        }
+        out.deinit(alloc);
+    }
+    for (schema.document_schemas) |document_schema| {
+        for (document_schema.properties) |property| {
+            try appendRuntimeDeclaredDocumentFields(alloc, &out, property.name, property);
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendRuntimeDeclaredDocumentFields(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(storage_schema.DeclaredField),
+    path: []const u8,
+    property: impl.DocumentProperty,
+) !void {
+    if (property.antfly_index != null and !property.antfly_index.?) return;
+
+    if (property.item) |item| {
+        if (item.antfly_index != null and !item.antfly_index.?) return;
+        if (item.properties.len > 0) {
+            for (item.properties) |child| {
+                const child_path = try appendPath(alloc, path, child.name);
+                defer alloc.free(child_path);
+                try appendRuntimeDeclaredDocumentFields(alloc, out, child_path, child);
+            }
+        } else if (property.antfly_field == null and item.antfly_field == null) {
+            try appendShorthandRuntimeDeclaredFields(alloc, out, path, effectiveAntflyTypes(property, item.*));
+        }
+        return;
+    }
+
+    if (property.properties.len > 0) {
+        for (property.properties) |child| {
+            const child_path = try appendPath(alloc, path, child.name);
+            defer alloc.free(child_path);
+            try appendRuntimeDeclaredDocumentFields(alloc, out, child_path, child);
+        }
+        return;
+    }
+
+    // x-antfly-field is an executable physical mapping. x-antfly-types is
+    // document-schema shorthand whose indexing behavior is lowered through
+    // the full-text/inference model; retain its exact scalar declarations for
+    // capability UX without running them a second time as dynamic templates.
+    if (property.antfly_field != null) return;
+    try appendShorthandRuntimeDeclaredFields(alloc, out, path, property.antfly_types);
+}
+
+fn appendShorthandRuntimeDeclaredFields(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(storage_schema.DeclaredField),
     path: []const u8,
     antfly_types: []const []const u8,
 ) !void {
@@ -218,8 +280,7 @@ fn appendShorthandRuntimeDocumentFieldTemplates(
         defer alloc.free(emitted_path);
 
         try out.append(alloc, .{
-            .name = try alloc.dupe(u8, emitted_path),
-            .path_match = try alloc.dupe(u8, emitted_path),
+            .field = try alloc.dupe(u8, emitted_path),
             .mapping = .{
                 .field_type = field_type,
                 .do_index = true,
@@ -1203,7 +1264,8 @@ test "runtime schema retains shorthand exact scalar declarations as non-sortable
     const runtime = try deriveRuntimeTableSchema(alloc, parsed);
     defer storage_schema.freeSchema(alloc, runtime);
 
-    try std.testing.expectEqual(@as(usize, 4), runtime.dynamic_templates.len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.dynamic_templates.len);
+    try std.testing.expectEqual(@as(usize, 4), runtime.declared_fields.len);
     const keyword_mapping = storage_schema.resolveDeclaredFieldType(runtime, "title_and_keyword.keyword") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(storage_schema.AntflyType.keyword, keyword_mapping.field_type);
     try std.testing.expect(!keyword_mapping.doc_values);
@@ -1224,6 +1286,7 @@ test "runtime schema retains shorthand exact scalar declarations as non-sortable
         try std.testing.expect(!capability.doc_values);
         try std.testing.expect(!capability.sortable);
         try std.testing.expectEqualStrings("not_declared", capability.doc_value_coverage);
+        try std.testing.expectEqualStrings("document_schema", capability.provenance);
         try std.testing.expectEqualStrings("missing_doc_values", capability.queryability_state);
         try std.testing.expectEqualStrings("unsupported", capability.sort_lifecycle_state);
     }

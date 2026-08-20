@@ -14976,16 +14976,15 @@ fn snapshotTypedDocValuesCoverageDetailsForMapping(
     var expected_value_type: ?typed_dv.ValueType = null;
     for (snapshot.segments) |*segment| {
         if (segment.liveDocCount() == 0) continue;
-        const section_data = (try segment.reader.getSection(field, .typed_doc_values)) orelse return .{ .status = .missing_doc_values_section };
-        const reader = typed_dv.TypedDocValuesReader.init(snapshot.alloc, section_data) catch return .{ .status = .malformed_doc_values_section };
-        if (!typedDocValuesTypeMatchesMappedSortField(reader.value_type, mapping)) return .{ .status = .doc_values_kind_mismatch };
+        const cached = segment.typedDocValuesCoverage(field) orelse return .{ .status = .missing_doc_values_section };
+        const value_type = cached.value_type orelse return .{ .status = cached.status };
+        if (!typedDocValuesTypeMatchesMappedSortField(value_type, mapping)) return .{ .status = .doc_values_kind_mismatch };
         if (expected_value_type) |expected| {
-            if (reader.value_type != expected) return .{ .status = .doc_values_kind_mismatch };
+            if (value_type != expected) return .{ .status = .doc_values_kind_mismatch };
         } else {
-            expected_value_type = reader.value_type;
+            expected_value_type = value_type;
         }
-        const live_status = try typed_dv_coverage.readerCoversLiveDocsAlloc(snapshot.alloc, segment, &reader);
-        if (live_status != .covered) return .{ .status = live_status, .value_type = expected_value_type };
+        if (cached.status != .covered) return .{ .status = cached.status, .value_type = expected_value_type };
     }
     return .{ .status = .covered, .value_type = expected_value_type };
 }
@@ -15004,11 +15003,10 @@ fn snapshotGeoPointDocValuesCoverage(
 ) !TypedDocValuesCoverageStatus {
     for (snapshot.segments) |*segment| {
         if (segment.liveDocCount() == 0) continue;
-        const section_data = (try segment.reader.getSection(field, .typed_doc_values)) orelse return .missing_doc_values_section;
-        const reader = typed_dv.TypedDocValuesReader.init(snapshot.alloc, section_data) catch return .malformed_doc_values_section;
-        if (reader.value_type != .geo_point) return .doc_values_kind_mismatch;
-        const live_status = try typed_dv_coverage.readerCoversLiveDocsAlloc(snapshot.alloc, segment, &reader);
-        if (live_status != .covered) return live_status;
+        const cached = segment.typedDocValuesCoverage(field) orelse return .missing_doc_values_section;
+        const value_type = cached.value_type orelse return cached.status;
+        if (value_type != .geo_point) return .doc_values_kind_mismatch;
+        if (cached.status != .covered) return cached.status;
     }
     return .covered;
 }
@@ -20975,6 +20973,18 @@ test "native sort coverage diagnostics classify physical doc value failures" {
         try writer.addSegment(seg_bytes);
         const snapshot = writer.snapshot();
 
+        try std.testing.expectEqual(
+            TypedDocValuesCoverageStatus.sparse_live_doc_values,
+            try snapshotTypedDocValuesCoverageForMapping(snapshot, "price", numeric_mapping),
+        );
+
+        const delete_infos = try writer.deleteAllByIdsTracked(alloc, &.{"doc:b"});
+        defer index_mod.IndexWriter.freeDeleteInfos(alloc, delete_infos);
+        try std.testing.expectEqual(
+            TypedDocValuesCoverageStatus.covered,
+            try snapshotTypedDocValuesCoverageForMapping(snapshot, "price", numeric_mapping),
+        );
+        writer.rollbackDeleteInfos(delete_infos);
         try std.testing.expectEqual(
             TypedDocValuesCoverageStatus.sparse_live_doc_values,
             try snapshotTypedDocValuesCoverageForMapping(snapshot, "price", numeric_mapping),

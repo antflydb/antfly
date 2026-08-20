@@ -17,8 +17,6 @@ from __future__ import annotations
 
 import time
 
-from helpers import wait_until
-
 
 DOCUMENTS = {
     "a": {
@@ -64,7 +62,7 @@ def _create_table_with_schema(stateful_api, table_name: str, schema: dict) -> di
     )
 
 
-def _sorted_query_if_ready(stateful_api, table_name: str, field: str) -> dict | None:
+def _sorted_query(stateful_api, table_name: str, field: str) -> dict:
     response = stateful_api._request(
         "POST",
         f"/tables/{table_name}/query",
@@ -75,7 +73,10 @@ def _sorted_query_if_ready(stateful_api, table_name: str, field: str) -> dict | 
             "profile": True,
         },
     )
-    return response.json() if response.status_code == 200 else None
+    assert response.status_code == 200, (
+        f"sorted query failed with {response.status_code}: {response.text}"
+    )
+    return response.json()
 
 
 def test_public_exact_sort_declares_native_coverage_and_shorthand_fields_are_actionable(
@@ -185,24 +186,15 @@ def test_public_exact_sort_declares_native_coverage_and_shorthand_fields_are_act
         sync_level="full_text",
     )
 
-    ready = wait_until(
-        lambda: (
-            table
-            if all(
-                _capabilities_by_field(table).get(field, {}).get(
-                    "sort_lifecycle_state"
-                )
-                in {"queryable", "accelerated"}
-                for field in ("label", "size", "modified_at")
-            )
-            else None
-        )
-        if (table := stateful_api.get_table(sortable_table))
-        else None,
-        timeout_s=30.0,
-        interval_s=0.25,
-    )
-    assert ready is not None
+    # full_text synchronization is the public visibility barrier. A successful
+    # write must make the exact fields immediately queryable to the next read.
+    ready = stateful_api.get_table(sortable_table)
+    ready_capabilities = _capabilities_by_field(ready)
+    for field in ("label", "size", "modified_at"):
+        assert ready_capabilities[field]["sort_lifecycle_state"] in {
+            "queryable",
+            "accelerated",
+        }, ready_capabilities[field]
 
     for field, expected in (
         ("label", ["a", "b", "c"]),
@@ -230,16 +222,14 @@ def test_public_exact_sort_declares_native_coverage_and_shorthand_fields_are_act
             stateful_api.get_table(sortable_table)
         )
         assert cold_capabilities["modified_at"]["sort_lifecycle_state"] == "declared"
-        cold_result = wait_until(
-            lambda: _sorted_query_if_ready(
-                stateful_api,
-                sortable_table,
-                "modified_at",
-            ),
-            timeout_s=30.0,
-            interval_s=0.25,
+        # The public request performs its own cold-handle preflight and retry;
+        # clients should not need to hide unexpected 4xx/5xx responses behind
+        # a polling loop.
+        cold_result = _sorted_query(
+            stateful_api,
+            sortable_table,
+            "modified_at",
         )
-        assert cold_result is not None
         assert _hit_ids(cold_result) == ["a", "b", "c"]
         assert (
             cold_result["responses"][0]["profile"]["sort"]["plan"]

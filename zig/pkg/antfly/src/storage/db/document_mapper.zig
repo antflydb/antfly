@@ -3471,6 +3471,47 @@ test "document mapper emits schema-derived mapped keyword subfield coverage" {
     try std.testing.expectEqualStrings("Beta Phone", second);
 }
 
+test "document schema shorthand keyword companion is indexed exactly once" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{
+        \\  "default_type": "doc",
+        \\  "document_schemas": {
+        \\    "doc": {
+        \\      "schema": {
+        \\        "type": "object",
+        \\        "properties": {
+        \\          "title": {
+        \\            "type": "string",
+        \\            "x-antfly-types": ["text", "keyword"]
+        \\          }
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    // Shorthand declarations describe capability UX without becoming a
+    // second executable dynamic template.
+    try std.testing.expectEqual(@as(usize, 0), schema.dynamic_templates.len);
+    try std.testing.expectEqual(@as(usize, 1), schema.declared_fields.len);
+
+    const segment = (try buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:1", .value = "{\"title\":\"Alpha Phone\"}" },
+    }, .{}, schema)).?;
+    defer alloc.free(segment);
+
+    var reader = try segment_mod.SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+    const keyword = (try reader.invertedIndex("title.keyword")) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 1), keyword.total_field_len);
+}
+
 test "document mapper emits schema-derived direct keyword postings and typed doc values" {
     const alloc = std.testing.allocator;
     const schema_json =

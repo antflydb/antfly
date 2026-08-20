@@ -2696,6 +2696,29 @@ fn appendRuntimeSchemaObject(
         try appendJsonString(alloc, out, tmpl.mapping.analyzer);
         try out.appendSlice(alloc, "}}");
     }
+    try out.appendSlice(alloc, "],\"declared_fields\":[");
+    for (schema.declared_fields, 0..) |field, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.append(alloc, '{');
+        try appendJsonString(alloc, out, "field");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, field.field);
+        try out.appendSlice(alloc, ",\"mapping\":{");
+        try appendJsonString(alloc, out, "type");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, antflyTypeName(field.mapping.field_type));
+        try out.appendSlice(alloc, ",\"index\":");
+        try out.appendSlice(alloc, if (field.mapping.do_index) "true" else "false");
+        try out.appendSlice(alloc, ",\"store\":");
+        try out.appendSlice(alloc, if (field.mapping.store) "true" else "false");
+        try out.appendSlice(alloc, ",\"sortable\":");
+        try out.appendSlice(alloc, if (field.mapping.sortable) "true" else "false");
+        try out.appendSlice(alloc, ",\"missing_null_policy\":");
+        try appendJsonString(alloc, out, runtime_schema_mod.missingNullPolicyName(field.mapping.missing_null_policy));
+        try out.appendSlice(alloc, ",\"analyzer\":");
+        try appendJsonString(alloc, out, field.mapping.analyzer);
+        try out.appendSlice(alloc, "}}");
+    }
     try out.appendSlice(alloc, "],\"field_capabilities\":[");
     try appendRuntimeFieldCapabilities(alloc, out, schema);
     try out.appendSlice(alloc, "],\"full_text_documents\":[");
