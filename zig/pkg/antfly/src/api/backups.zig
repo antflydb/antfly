@@ -4859,8 +4859,8 @@ fn renameLocalBackupAttemptReclaimTicket(
         destination.basename,
         io,
     );
-    try fs_paths.syncDirectoryFdPortable(source.dir.handle);
-    try fs_paths.syncDirectoryFdPortable(destination.dir.handle);
+    try fs_paths.syncDirectoryHandlePortable(io, source.dir);
+    try fs_paths.syncDirectoryHandlePortable(io, destination.dir);
 }
 
 fn localBackupAttemptReclaimClaimExpired(
@@ -6183,7 +6183,7 @@ fn openBackupRootNoFollowMode(
                     error.PathAlreadyExists => {},
                     else => return create_err,
                 };
-                try fs_paths.syncDirectoryFdPortable(current.handle);
+                try fs_paths.syncDirectoryHandlePortable(io, current);
                 break :blk try current.openDir(io, component.name, .{
                     .follow_symlinks = false,
                 });
@@ -6318,7 +6318,7 @@ fn ensureBackupRelativeDirectoryNoFollow(
                     error.PathAlreadyExists => {},
                     else => return create_err,
                 };
-                try fs_paths.syncDirectoryFdPortable(current.handle);
+                try fs_paths.syncDirectoryHandlePortable(io, current);
                 break :blk try current.openDir(io, component, .{
                     .follow_symlinks = false,
                 });
@@ -6435,7 +6435,7 @@ fn deleteFileDurablyFromBackupRoot(
         error.FileNotFound => {},
         else => return err,
     };
-    try fs_paths.syncDirectoryFdPortable(parent.dir.handle);
+    try fs_paths.syncDirectoryHandlePortable(io, parent.dir);
 }
 
 fn deleteFileDurablyFromDir(
@@ -6458,7 +6458,7 @@ fn deleteFileDurablyFromDir(
         error.FileNotFound => {},
         else => return err,
     };
-    try fs_paths.syncDirectoryFdPortable(dir.handle);
+    try fs_paths.syncDirectoryHandlePortable(io, dir);
 }
 
 fn writeFileToBackupRootIfAbsent(
@@ -6486,7 +6486,7 @@ fn writeFileToBackupRootIfAbsent(
         error.PathAlreadyExists => return false,
         else => return err,
     };
-    try fs_paths.syncDirectoryFdPortable(parent.dir.handle);
+    try fs_paths.syncDirectoryHandlePortable(io, parent.dir);
     return true;
 }
 
@@ -6564,7 +6564,7 @@ fn replaceFileInBackupRootUnderHeldLockWithHook(
     file.close(io);
     file_open = false;
     try std.Io.Dir.rename(parent.dir, tmp_name, parent.dir, parent.basename, io);
-    try fs_paths.syncDirectoryFdPortable(parent.dir.handle);
+    try fs_paths.syncDirectoryHandlePortable(io, parent.dir);
 }
 
 fn replaceFileFromBackupStagingDirUnderHeldLockWithHook(
@@ -6617,8 +6617,8 @@ fn replaceFileFromBackupStagingDirUnderHeldLockWithHook(
         destination.basename,
         io,
     );
-    try fs_paths.syncDirectoryFdPortable(staging.dir.handle);
-    try fs_paths.syncDirectoryFdPortable(destination.dir.handle);
+    try fs_paths.syncDirectoryHandlePortable(io, staging.dir);
+    try fs_paths.syncDirectoryHandlePortable(io, destination.dir);
 }
 
 fn deletePathDurablyFromBackupRootWithBudget(
@@ -6636,7 +6636,7 @@ fn deletePathDurablyFromBackupRootWithBudget(
         relative_path,
         operation_budget,
     )) return error.BackupCleanupBudgetExceeded;
-    try fs_paths.syncDirectoryFdPortable(backup_root.handle);
+    try fs_paths.syncDirectoryHandlePortable(io, backup_root);
 }
 
 pub fn cleanupTableBackupAttemptAtLocation(
@@ -15514,7 +15514,7 @@ test "filesystem reclaim removes invalid POSIX tickets containing backslashes" {
     defer shard_dir.close(io);
     var ticket = try shard_dir.createFile(io, "bad\\ticket", .{});
     ticket.close(io);
-    try fs_paths.syncDirectoryFdPortable(shard_dir.handle);
+    try fs_paths.syncDirectoryHandlePortable(io, shard_dir);
 
     try recoverExpiredLocalBackupAttemptReclaimClaims(
         alloc,

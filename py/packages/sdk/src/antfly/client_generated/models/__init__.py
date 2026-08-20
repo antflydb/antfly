@@ -139,6 +139,7 @@ from .created_embeddings_index_type import CreatedEmbeddingsIndexType
 from .created_enrichment_config import CreatedEnrichmentConfig
 from .created_full_text_index import CreatedFullTextIndex
 from .created_full_text_index_type import CreatedFullTextIndexType
+from .created_graph_artifact_producer_config import CreatedGraphArtifactProducerConfig
 from .created_graph_index import CreatedGraphIndex
 from .created_graph_index_config import CreatedGraphIndexConfig
 from .created_graph_index_type import CreatedGraphIndexType
@@ -293,6 +294,10 @@ from .get_current_user_response_200_metadata_type_0 import GetCurrentUserRespons
 from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDetail
 from .google_embedder_config import GoogleEmbedderConfig
 from .google_generator_config import GoogleGeneratorConfig
+from .graph_artifact_producer_config import GraphArtifactProducerConfig
+from .graph_artifact_producer_config_producer_json import GraphArtifactProducerConfigProducerJson
+from .graph_artifact_source_config import GraphArtifactSourceConfig
+from .graph_artifact_source_config_kind import GraphArtifactSourceConfigKind
 from .graph_index_config import GraphIndexConfig
 from .graph_index_stats import GraphIndexStats
 from .graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
@@ -310,6 +315,10 @@ from .graph_query_params import GraphQueryParams
 from .graph_query_params_algorithm_params import GraphQueryParamsAlgorithmParams
 from .graph_query_result import GraphQueryResult
 from .graph_query_type import GraphQueryType
+from .graph_resolver_config import GraphResolverConfig
+from .graph_resolver_config_candidate_search import GraphResolverConfigCandidateSearch
+from .graph_resolver_config_fusion_combine import GraphResolverConfigFusionCombine
+from .graph_resolver_config_source_artifact_kind import GraphResolverConfigSourceArtifactKind
 from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
@@ -928,6 +937,7 @@ __all__ = (
     "CreatedEnrichmentConfig",
     "CreatedFullTextIndex",
     "CreatedFullTextIndexType",
+    "CreatedGraphArtifactProducerConfig",
     "CreatedGraphIndex",
     "CreatedGraphIndexConfig",
     "CreatedGraphIndexType",
@@ -1091,6 +1101,10 @@ __all__ = (
     "GetDocumentArtifactManifestDetail",
     "GoogleEmbedderConfig",
     "GoogleGeneratorConfig",
+    "GraphArtifactProducerConfig",
+    "GraphArtifactProducerConfigProducerJson",
+    "GraphArtifactSourceConfig",
+    "GraphArtifactSourceConfigKind",
     "GraphIndexConfig",
     "GraphIndexStats",
     "GraphIndexStatsAlgebraicGraph",
@@ -1108,6 +1122,10 @@ __all__ = (
     "GraphQueryParamsAlgorithmParams",
     "GraphQueryResult",
     "GraphQueryType",
+    "GraphResolverConfig",
+    "GraphResolverConfigCandidateSearch",
+    "GraphResolverConfigFusionCombine",
+    "GraphResolverConfigSourceArtifactKind",
     "GraphResultNode",
     "GraphResultNodeDocument",
     "GraphResultNodeEvidence",

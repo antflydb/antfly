@@ -19,7 +19,13 @@ import json
 import pytest
 import requests
 
-from helpers import assert_created_index, assert_single_top_hit, json_doc, upsert, wait_until
+from helpers import (
+    assert_created_index,
+    assert_single_top_hit,
+    json_doc,
+    upsert,
+    wait_until,
+)
 
 CLIPCLAP_MODEL = "antflydb/clipclap"
 
@@ -187,21 +193,33 @@ def test_text_quickstart_and_document_artifact(serverless_api):
     assert public_search is not None
     assert _public_hit_ids(public_search)[0] == "theory-relativity"
 
-    direct_match_search = wait_until(direct_match_search_results, timeout_s=10.0, interval_s=0.1)
+    direct_match_search = wait_until(
+        direct_match_search_results, timeout_s=10.0, interval_s=0.1
+    )
     assert direct_match_search is not None
     assert_single_top_hit(direct_match_search, "theory-relativity")
 
-    direct_prefix_search = wait_until(direct_prefix_search_results, timeout_s=10.0, interval_s=0.1)
+    direct_prefix_search = wait_until(
+        direct_prefix_search_results, timeout_s=10.0, interval_s=0.1
+    )
     assert direct_prefix_search is not None
     assert_single_top_hit(direct_prefix_search, "theory-relativity")
 
-    filtered_public_search = wait_until(filtered_public_search_results, timeout_s=10.0, interval_s=0.1)
+    filtered_public_search = wait_until(
+        filtered_public_search_results, timeout_s=10.0, interval_s=0.1
+    )
     assert filtered_public_search is not None
-    assert [hit["doc_id"] for hit in filtered_public_search["hits"]] == ["theory-relativity"]
+    assert [hit["doc_id"] for hit in filtered_public_search["hits"]] == [
+        "theory-relativity"
+    ]
 
-    prefix_filtered_search = wait_until(prefix_filtered_search_results, timeout_s=10.0, interval_s=0.1)
+    prefix_filtered_search = wait_until(
+        prefix_filtered_search_results, timeout_s=10.0, interval_s=0.1
+    )
     assert prefix_filtered_search is not None
-    assert [hit["doc_id"] for hit in prefix_filtered_search["hits"]] == ["theory-relativity"]
+    assert [hit["doc_id"] for hit in prefix_filtered_search["hits"]] == [
+        "theory-relativity"
+    ]
 
     artifact = serverless_api.query_head_artifact("wikipedia", 1)
     assert artifact["artifact"]["kind"] == "document_segment"
@@ -259,34 +277,35 @@ def test_public_search_fields_projection(serverless_api):
     projected = json.loads(search["hits"][0]["body"])
     assert projected == {"metadata": {"author": "Ada"}, "title": "Alpha"}
 
+
 def test_public_hybrid_quickstart_pipeline(backup_api, inference_reranker):
     table_name = f"quickstart_hybrid_{__import__('time').time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         backup_api.post(
             f"/tables/{table_name}/indexes/dense_idx",
             {
-                "name": "dense_idx",
                 "type": "embeddings",
                 "external": True,
                 "dimension": 3,
             },
-        )
-        == {}
+        ),
+        "dense_idx",
+        "embeddings",
     )
-    assert (
+    assert_created_index(
         backup_api.post(
             f"/tables/{table_name}/indexes/sparse_idx",
             {
-                "name": "sparse_idx",
                 "type": "embeddings",
                 "external": True,
                 "sparse": True,
             },
-        )
-        == {}
+        ),
+        "sparse_idx",
+        "embeddings",
     )
 
     batch = backup_api.batch_write(
@@ -437,34 +456,36 @@ def test_public_hybrid_quickstart_pipeline(backup_api, inference_reranker):
     assert rrf_profile["reranker"]["model"] == "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 
-def test_public_hybrid_quickstart_supports_weighted_merge_and_template_reranking(backup_api, inference_reranker):
+def test_public_hybrid_quickstart_supports_weighted_merge_and_template_reranking(
+    backup_api, inference_reranker
+):
     table_name = f"quickstart_hybrid_template_{__import__('time').time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         backup_api.post(
             f"/tables/{table_name}/indexes/dense_idx",
             {
-                "name": "dense_idx",
                 "type": "embeddings",
                 "external": True,
                 "dimension": 3,
             },
-        )
-        == {}
+        ),
+        "dense_idx",
+        "embeddings",
     )
-    assert (
+    assert_created_index(
         backup_api.post(
             f"/tables/{table_name}/indexes/sparse_idx",
             {
-                "name": "sparse_idx",
                 "type": "embeddings",
                 "external": True,
                 "sparse": True,
             },
-        )
-        == {}
+        ),
+        "sparse_idx",
+        "embeddings",
     )
 
     batch = backup_api.batch_write(
@@ -560,7 +581,9 @@ def test_public_hybrid_quickstart_supports_weighted_merge_and_template_reranking
     assert profile["reranker"]["model"] == "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 
-def test_public_managed_semantic_hybrid_quickstart_pipeline(backup_api, openai_embedder, inference_reranker):
+def test_public_managed_semantic_hybrid_quickstart_pipeline(
+    backup_api, openai_embedder, inference_reranker
+):
     table_name = f"quickstart_managed_hybrid_{__import__('time').time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -582,14 +605,18 @@ def test_public_managed_semantic_hybrid_quickstart_pipeline(backup_api, openai_e
             },
         ),
         "semantic_idx",
-        'embeddings',
+        "embeddings",
     )
 
     ready = wait_until(
         lambda: (
             status
             if (
-                (status := backup_api.get_index(table_name, "semantic_idx").get("status"))
+                (
+                    status := backup_api.get_index(table_name, "semantic_idx").get(
+                        "status"
+                    )
+                )
                 and not status.get("rebuilding", status.get("backfill_active", False))
             )
             else None
@@ -696,7 +723,7 @@ def test_public_managed_semantic_full_index_pipeline(backup_api, openai_embedder
             },
         ),
         index_name,
-        'embeddings',
+        "embeddings",
     )
 
     backup_api.wait_index_ready(table_name, index_name, timeout_s=30.0, interval_s=0.5)
@@ -741,7 +768,9 @@ def test_public_managed_semantic_full_index_pipeline(backup_api, openai_embedder
     assert hits[0]["_id"] == "doc:a"
 
 
-def test_inline_managed_index_create_load_ready_query_pipeline(backup_api, openai_embedder):
+def test_inline_managed_index_create_load_ready_query_pipeline(
+    backup_api, openai_embedder
+):
     """Cover the published create-table path through query-visible readiness."""
     table_name = f"quickstart_inline_semantic_{__import__('time').time_ns()}"
     index_name = "title_body"
@@ -797,7 +826,9 @@ def test_inline_managed_index_create_load_ready_query_pipeline(backup_api, opena
     assert hits[0]["_id"] == "doc:a"
 
 
-def test_public_managed_chunked_semantic_full_index_pipeline(backup_api, openai_embedder):
+def test_public_managed_chunked_semantic_full_index_pipeline(
+    backup_api, openai_embedder
+):
     table_name = f"quickstart_chunked_semantic_{__import__('time').time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -829,10 +860,12 @@ def test_public_managed_chunked_semantic_full_index_pipeline(backup_api, openai_
             },
         ),
         "semantic_chunked_idx",
-        'embeddings',
+        "embeddings",
     )
 
-    backup_api.wait_index_ready(table_name, "semantic_chunked_idx", timeout_s=30.0, interval_s=0.5)
+    backup_api.wait_index_ready(
+        table_name, "semantic_chunked_idx", timeout_s=30.0, interval_s=0.5
+    )
 
     batch = backup_api.batch_write(
         table_name,
@@ -879,7 +912,9 @@ def test_public_managed_chunked_semantic_full_index_pipeline(backup_api, openai_
     assert any(chunk["body"].startswith("beta") for chunk in chunks)
 
 
-def test_public_managed_antfly_chunked_semantic_full_index_pipeline(backup_api, inference_embedder):
+def test_public_managed_antfly_chunked_semantic_full_index_pipeline(
+    backup_api, inference_embedder
+):
     table_name = f"quickstart_antfly_chunked_semantic_{__import__('time').time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -911,10 +946,12 @@ def test_public_managed_antfly_chunked_semantic_full_index_pipeline(backup_api, 
             },
         ),
         "semantic_antfly_idx",
-        'embeddings',
+        "embeddings",
     )
 
-    backup_api.wait_index_ready(table_name, "semantic_antfly_idx", timeout_s=30.0, interval_s=0.5)
+    backup_api.wait_index_ready(
+        table_name, "semantic_antfly_idx", timeout_s=30.0, interval_s=0.5
+    )
 
     batch = backup_api.batch_write(
         table_name,
@@ -967,7 +1004,9 @@ def test_public_managed_antfly_clipclap_gguf_embedder_smoke(real_clipclap_backup
     table_name = f"quickstart_antfly_clipclap_semantic_{__import__('time').time_ns()}"
 
     try:
-        warmup = backup_api.inference_embed(CLIPCLAP_MODEL, "alpha body", timeout_s=120.0)
+        warmup = backup_api.inference_embed(
+            CLIPCLAP_MODEL, "alpha body", timeout_s=120.0
+        )
     except requests.HTTPError as exc:
         if exc.response is not None and exc.response.status_code in {400, 404}:
             pytest.skip(f"Embedded Antfly inference ClipClap model unavailable: {exc}")
@@ -994,19 +1033,25 @@ def test_public_managed_antfly_clipclap_gguf_embedder_smoke(real_clipclap_backup
             },
         ),
         "semantic_clipclap_idx",
-        'embeddings',
+        "embeddings",
     )
 
-    backup_api.wait_index_ready(table_name, "semantic_clipclap_idx", timeout_s=60.0, interval_s=0.5)
+    backup_api.wait_index_ready(
+        table_name, "semantic_clipclap_idx", timeout_s=60.0, interval_s=0.5
+    )
 
 
 @pytest.mark.real_model
-def test_public_managed_antfly_clipclap_gguf_chunked_full_index_pipeline(real_clipclap_backup_api):
+def test_public_managed_antfly_clipclap_gguf_chunked_full_index_pipeline(
+    real_clipclap_backup_api,
+):
     backup_api = real_clipclap_backup_api
     table_name = f"quickstart_antfly_clipclap_chunked_{__import__('time').time_ns()}"
 
     try:
-        warmup = backup_api.inference_embed(CLIPCLAP_MODEL, "alpha body", timeout_s=120.0)
+        warmup = backup_api.inference_embed(
+            CLIPCLAP_MODEL, "alpha body", timeout_s=120.0
+        )
     except requests.HTTPError as exc:
         if exc.response is not None and exc.response.status_code in {400, 404}:
             pytest.skip(f"Embedded Antfly inference ClipClap model unavailable: {exc}")
@@ -1043,10 +1088,12 @@ def test_public_managed_antfly_clipclap_gguf_chunked_full_index_pipeline(real_cl
             },
         ),
         "semantic_clipclap_idx",
-        'embeddings',
+        "embeddings",
     )
 
-    backup_api.wait_index_ready(table_name, "semantic_clipclap_idx", timeout_s=60.0, interval_s=0.5)
+    backup_api.wait_index_ready(
+        table_name, "semantic_clipclap_idx", timeout_s=60.0, interval_s=0.5
+    )
 
     batch = backup_api.batch_write(
         table_name,

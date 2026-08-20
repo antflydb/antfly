@@ -61,8 +61,8 @@ def _new_e2e_deadline() -> "_Deadline":
 DOCUMENTS_INDEXES = {
     # Materializes each document's `relations` field into the `relations_v1`
     # extraction asset the resolver consumes (no LLM needed). The resolver is
-    # declared in a `resolvers` section nested in the index config; the typed
-    # index parse ignores it while the provisioner registers it.
+    # declared in the typed `resolvers` section nested in the index config so
+    # admission validates it before the provisioner registers it.
     "relations_graph": {
         "type": "graph",
         "source": {

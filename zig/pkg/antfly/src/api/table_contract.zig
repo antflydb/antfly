@@ -405,6 +405,7 @@ fn validatePublicInlineArtifactEnrichments(object: anytype) !void {
     else
         object.get("enrichments");
     const value = enrichments orelse return;
+    if (value == .null) return;
     if (value != .array) return error.InvalidCreateIndexRequest;
     for (value.array.items) |item| {
         if (item != .object) return error.InvalidCreateIndexRequest;
@@ -628,15 +629,64 @@ fn appendField(
     value: std.json.Value,
     first: *bool,
 ) !void {
+    // Generated SDKs encode absent optional fields as JSON null. Treat those
+    // exactly like omission so typed and raw callers converge on one stored
+    // configuration.
+    if (value == .null) return;
     if (!first.*) try out.append(alloc, ',');
     first.* = false;
     const encoded_key = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(key, .{})});
     defer alloc.free(encoded_key);
     try out.appendSlice(alloc, encoded_key);
     try out.append(alloc, ':');
-    const encoded_value = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(encoded_value);
-    try out.appendSlice(alloc, encoded_value);
+    try appendCanonicalPublicValue(alloc, out, value, key);
+}
+
+fn appendCanonicalPublicValue(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    value: std.json.Value,
+    field_name: ?[]const u8,
+) !void {
+    // Opaque producer documents are write-only and provider-significant, so
+    // preserve their internal null values while canonicalizing public config.
+    if (field_name) |name| {
+        if (std.mem.eql(u8, name, "producer_json")) {
+            const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+            defer alloc.free(encoded);
+            return out.appendSlice(alloc, encoded);
+        }
+    }
+
+    switch (value) {
+        .object => |object| {
+            try out.append(alloc, '{');
+            var first = true;
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.* == .null) continue;
+                if (!first) try out.append(alloc, ',');
+                first = false;
+                try appendJsonString(alloc, out, entry.key_ptr.*);
+                try out.append(alloc, ':');
+                try appendCanonicalPublicValue(alloc, out, entry.value_ptr.*, entry.key_ptr.*);
+            }
+            try out.append(alloc, '}');
+        },
+        .array => |array| {
+            try out.append(alloc, '[');
+            for (array.items, 0..) |item, index| {
+                if (index > 0) try out.append(alloc, ',');
+                try appendCanonicalPublicValue(alloc, out, item, null);
+            }
+            try out.append(alloc, ']');
+        },
+        else => {
+            const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+        },
+    }
 }
 
 fn appendRawJsonField(
@@ -774,8 +824,11 @@ test "table contract normalizes index create request against path name" {
         "{\"type\":\"embeddings\",\"name\":\"embed_idx\",\"dimension\":3}",
     );
     defer std.testing.allocator.free(config_json);
-    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"name\":\"embed_idx\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"type\":\"embeddings\"") != null);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":3}",
+        config_json,
+    );
 }
 
 test "table contract preserves embeddings create request fields" {
@@ -785,9 +838,55 @@ test "table contract preserves embeddings create request fields" {
         "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"external\":true,\"dimension\":384}",
     );
     defer std.testing.allocator.free(config_json);
-    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"external\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"dimension\":384") != null);
-    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"name\":\"embed_idx\"") != null);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"external\":true,\"dimension\":384}",
+        config_json,
+    );
+}
+
+test "table contract canonicalizes generated optional null fields" {
+    var request = try parseCreateTableRequest(
+        std.testing.allocator,
+        "{\"num_shards\":1,\"description\":null,\"indexes\":{\"title_body\":{\"description\":null,\"version\":null,\"enrichments\":null,\"coverage_policy\":null,\"external\":null,\"sparse\":null,\"dimension\":3,\"field\":null,\"template\":\"{{title}} {{body}}\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"antfly-embed-v1\",\"api_url\":\"http://127.0.0.1:8080/ai/v1\",\"dimensions\":null},\"summarizer\":null,\"chunker\":null,\"type\":\"embeddings\"}},\"schema\":null,\"replication_sources\":null}",
+    );
+    defer request.deinit(std.testing.allocator);
+    var indexes = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, request.indexes_json.?, .{});
+    defer indexes.deinit();
+    const embedding = indexes.value.object.getPtr("title_body") orelse return error.TestUnexpectedResult;
+    switch (embedding.*) {
+        .object => |*object| _ = object.swapRemove(coverage_policy.incarnation_field),
+        else => return error.TestUnexpectedResult,
+    }
+    try ant_json.testing.expectEqualJsonValue(
+        std.testing.allocator,
+        "{\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"},\"title_body\":{\"name\":\"title_body\",\"type\":\"embeddings\",\"dimension\":3,\"template\":\"{{title}} {{body}}\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"antfly-embed-v1\",\"api_url\":\"http://127.0.0.1:8080/ai/v1\"}}}",
+        indexes.value,
+    );
+}
+
+test "table contract preserves typed artifact-backed graph configuration" {
+    const body =
+        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions"},"artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json","producer_json":{"type":"document_extraction","api_key":"write-only"}},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}]}
+    ;
+    const config_json = try parseCreateIndexRequest(std.testing.allocator, "relations_graph", body);
+    defer std.testing.allocator.free(config_json);
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"name\":\"relations_graph\",\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\"},\"resolvers\":[{\"name\":\"kg\",\"candidate_search\":\"prefix\"}]}",
+        config_json,
+    );
+
+    var table_req = try parseCreateTableRequest(
+        std.testing.allocator,
+        "{\"indexes\":{\"relations_graph\":" ++ body ++ "}}",
+    );
+    defer table_req.deinit(std.testing.allocator);
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"relations_graph\":{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\"},\"resolvers\":[{\"name\":\"kg\"}]}}",
+        table_req.indexes_json.?,
+    );
 }
 
 test "table contract rejects unsupported index kinds before admission" {
@@ -871,8 +970,11 @@ test "table contract accepts public full text create index" {
         "{\"type\":\"full_text\"}",
     );
     defer std.testing.allocator.free(config_json);
-    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"name\":\"search_idx\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"type\":\"full_text\"") != null);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"name\":\"search_idx\",\"type\":\"full_text\"}",
+        config_json,
+    );
 
     try std.testing.expectError(
         error.InvalidCreateIndexRequest,

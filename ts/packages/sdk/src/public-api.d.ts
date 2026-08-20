@@ -4011,7 +4011,9 @@ export interface components {
              */
             description?: string;
             /**
-             * @description Map of index name to index configuration. Indexes enable different query capabilities:
+             * @description Map of index name to create-index configuration. The map key owns the
+             *     index name; do not repeat `name` inside the configuration. Indexes enable
+             *     different query capabilities:
              *     - Full-text indexes for BM25 search
              *     - Vector indexes for semantic similarity
              *     - Multimodal indexes for images/audio/video
@@ -4032,7 +4034,7 @@ export interface components {
              *     }
              */
             indexes?: {
-                [key: string]: components["schemas"]["IndexConfig"];
+                [key: string]: components["schemas"]["CreateIndexRequest"];
             };
             /**
              * @description Optional schema definition specifying field types, primary key, and TTL configuration.
@@ -8211,6 +8213,18 @@ export interface components {
             /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
             execution?: components["schemas"]["ExecutionPolicy"];
         };
+        /** @description Fields shared by every create-index variant. The index name is owned by the request path. */
+        CreateIndexCommon: {
+            /** @description Optional description of the index and its purpose */
+            description?: string;
+            /**
+             * @description Version of the index implementation. Defaults to 0.
+             * @default 0
+             */
+            version?: number;
+            /** @description Inline managed enrichment definitions required by this index. */
+            enrichments?: components["schemas"]["EnrichmentConfig"][];
+        };
         FullTextIndexConfig: {
             /** @description Whether to use memory-only storage */
             mem_only?: boolean;
@@ -8218,6 +8232,17 @@ export interface components {
             field?: string;
             /** @description Generated artifact stream indexed as text. Use with matching inline enrichments. */
             artifact_name?: string;
+        };
+        /** @description Create a full-text index. */
+        CreateFullTextIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["FullTextIndexConfig"] & {
+            /** @enum {string} */
+            type: "full_text";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "full_text";
         };
         /**
          * @description How generation-scoped source outcomes determine derived-index completeness.
@@ -9122,6 +9147,11 @@ export interface components {
             full_text_index?: {
                 [key: string]: unknown;
             };
+            max_chunks?: number;
+            /** Format: float */
+            threshold?: number;
+            text?: components["schemas"]["TextChunkOptions"];
+            audio?: components["schemas"]["AudioChunkOptions"];
         };
         /** @description Namespaced execution policy for managed index shorthand. Only namespaces with runtime effects are accepted. */
         IndexExecutionConfig: {
@@ -9185,6 +9215,17 @@ export interface components {
             /** @description Non-semantic execution policy for shorthand-created chunking or embedding producers. */
             execution?: components["schemas"]["IndexExecutionConfig"];
         };
+        /** @description Create a dense or sparse embeddings index. */
+        CreateEmbeddingsIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["EmbeddingsIndexConfig"] & {
+            /** @enum {string} */
+            type: "embeddings";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "embeddings";
+        };
         /** @description Configuration for a specific edge type */
         EdgeTypeConfig: {
             /** @description Edge type name (e.g., 'cites', 'similar_to') */
@@ -9223,6 +9264,61 @@ export interface components {
             /** @description Required metadata fields for this edge type */
             required_metadata?: string[];
         };
+        /** @description Artifact stream materialized into graph edges. */
+        GraphArtifactSourceConfig: {
+            /** @enum {string} */
+            kind: "artifact";
+            artifact: string;
+            path?: string;
+            /** @default extraction_relation */
+            format?: string;
+            mention_edge_type?: string;
+        };
+        /** @description Asset producer used by an artifact-backed graph index. */
+        GraphArtifactProducerConfig: {
+            name: string;
+            kind: components["schemas"]["EnrichmentKind"];
+            field?: string;
+            content_type?: string;
+            /** @description Write-only producer configuration; it may contain credentials and is never returned. */
+            producer_json?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description Versioned entity resolver attached to an artifact-backed graph index. */
+        GraphResolverConfig: {
+            name: string;
+            table: string;
+            source_artifact: string;
+            /**
+             * @default asset
+             * @enum {string}
+             */
+            source_artifact_kind?: "asset" | "chunk" | "any";
+            resolution_artifact: string;
+            key_template: string;
+            /** @default true */
+            type_must_match?: boolean;
+            scorer_json?: string;
+            /** @enum {string} */
+            candidate_search?: "" | "exact_key" | "prefix" | "ann";
+            candidate_ann_index?: string;
+            /** Format: uint */
+            candidate_limit?: number;
+            name_embedding?: string;
+            /** Format: uint */
+            name_embedding_dims?: number;
+            /** @enum {string} */
+            fusion_combine?: "" | "noisy_or" | "max" | "mean";
+            /** Format: double */
+            fusion_trust?: number;
+            /** Format: double */
+            fusion_prior?: number;
+            /** Format: double */
+            fusion_prior_weight?: number;
+            /** Format: uint64 */
+            config_generation?: number;
+        };
         /** @description Configuration for graph index type */
         GraphIndexConfig: {
             /** @description Configuration for generating node summaries (enables tree navigation in Retrieval Agent) */
@@ -9239,50 +9335,39 @@ export interface components {
             edge_types?: components["schemas"]["EdgeTypeConfig"][];
             /** @description Maximum number of edges per document (0 = unlimited) */
             max_edges_per_document?: number;
+            source?: components["schemas"]["GraphArtifactSourceConfig"];
+            artifact?: components["schemas"]["GraphArtifactProducerConfig"];
+            resolvers?: components["schemas"]["GraphResolverConfig"][];
+        };
+        /** @description Create a graph index. */
+        CreateGraphIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["GraphIndexConfig"] & {
+            /** @enum {string} */
+            type: "graph";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "graph";
         };
         /** @description Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned. */
         AlgebraicIndexConfig: {
             /** @description When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API. */
             derive_from_schema?: boolean;
         };
-        /**
-         * @description The type of the index.
-         * @enum {string}
-         */
-        IndexType: "full_text" | "embeddings" | "graph" | "algebraic";
-        /** @description Configuration for an index */
-        IndexConfig: {
-            /** @description Name of the index */
-            name: string;
-            /** @description Optional description of the index and its purpose */
-            description?: string;
-            type: components["schemas"]["IndexType"];
+        /** @description Create a schema-derived algebraic index. */
+        CreateAlgebraicIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["AlgebraicIndexConfig"] & {
+            /** @enum {string} */
+            type: "algebraic";
+        } & {
             /**
-             * @description Version of the index implementation. Defaults to 0.
-             * @default 0
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
              */
-            version?: number;
-            /**
-             * @description Inline managed enrichment definitions required by this index. Enrichments are table-level generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact stream.
-             * @example [
-             *       {
-             *         "name": "document_chunks_v1",
-             *         "kind": "chunk",
-             *         "field": "text",
-             *         "source_artifact_name": "document_units_v1",
-             *         "chunk_size": 512
-             *       },
-             *       {
-             *         "name": "document_chunk_dense_v1",
-             *         "kind": "embedding",
-             *         "field": "text",
-             *         "source_artifact_name": "document_chunks_v1",
-             *         "expected_dims": 768
-             *       }
-             *     ]
-             */
-            enrichments?: components["schemas"]["EnrichmentConfig"][];
-        } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"]);
+            type: "algebraic";
+        };
+        /** @description Type-safe configuration for a new index. The index name is owned by the request path. */
+        CreateIndexRequest: components["schemas"]["CreateFullTextIndexRequest"] | components["schemas"]["CreateEmbeddingsIndexRequest"] | components["schemas"]["CreateGraphIndexRequest"] | components["schemas"]["CreateAlgebraicIndexRequest"];
         /** @description Defines the structure of a document type */
         DocumentSchema: {
             /** @description A description of the document type. */
@@ -9410,6 +9495,44 @@ export interface components {
              */
             dynamic_templates?: components["schemas"]["DynamicTemplate"][];
         };
+        /**
+         * @description The type of the index.
+         * @enum {string}
+         */
+        IndexType: "full_text" | "embeddings" | "graph" | "algebraic";
+        /** @description Configuration for an index */
+        IndexConfig: {
+            /** @description Name of the index */
+            name: string;
+            /** @description Optional description of the index and its purpose */
+            description?: string;
+            type: components["schemas"]["IndexType"];
+            /**
+             * @description Version of the index implementation. Defaults to 0.
+             * @default 0
+             */
+            version?: number;
+            /**
+             * @description Inline managed enrichment definitions required by this index. Enrichments are table-level generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact stream.
+             * @example [
+             *       {
+             *         "name": "document_chunks_v1",
+             *         "kind": "chunk",
+             *         "field": "text",
+             *         "source_artifact_name": "document_units_v1",
+             *         "chunk_size": 512
+             *       },
+             *       {
+             *         "name": "document_chunk_dense_v1",
+             *         "kind": "embedding",
+             *         "field": "text",
+             *         "source_artifact_name": "document_chunks_v1",
+             *         "expected_dims": 768
+             *       }
+             *     ]
+             */
+            enrichments?: components["schemas"]["EnrichmentConfig"][];
+        } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"]);
         /** @description Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics. */
         IndexRepairStatus: {
             /**
@@ -11635,64 +11758,6 @@ export interface components {
             /** @description IDs of retrieved documents (for retrieval metrics) */
             retrieved_ids?: string[];
         };
-        /** @description Fields shared by every create-index variant. The index name is owned by the request path. */
-        CreateIndexCommon: {
-            /** @description Optional description of the index and its purpose */
-            description?: string;
-            /**
-             * @description Version of the index implementation. Defaults to 0.
-             * @default 0
-             */
-            version?: number;
-            /** @description Inline managed enrichment definitions required by this index. */
-            enrichments?: components["schemas"]["EnrichmentConfig"][];
-        };
-        /** @description Create a full-text index. */
-        CreateFullTextIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["FullTextIndexConfig"] & {
-            /** @enum {string} */
-            type: "full_text";
-        } & {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "full_text";
-        };
-        /** @description Create a dense or sparse embeddings index. */
-        CreateEmbeddingsIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["EmbeddingsIndexConfig"] & {
-            /** @enum {string} */
-            type: "embeddings";
-        } & {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "embeddings";
-        };
-        /** @description Create a graph index. */
-        CreateGraphIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["GraphIndexConfig"] & {
-            /** @enum {string} */
-            type: "graph";
-        } & {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "graph";
-        };
-        /** @description Create a schema-derived algebraic index. */
-        CreateAlgebraicIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["AlgebraicIndexConfig"] & {
-            /** @enum {string} */
-            type: "algebraic";
-        } & {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "algebraic";
-        };
-        /** @description Type-safe configuration for a new index. The index name is owned by the request path. */
-        CreateIndexRequest: components["schemas"]["CreateFullTextIndexRequest"] | components["schemas"]["CreateEmbeddingsIndexRequest"] | components["schemas"]["CreateGraphIndexRequest"] | components["schemas"]["CreateAlgebraicIndexRequest"];
         /** @description Credential-free normalized enrichment configuration returned after index creation. */
         CreatedEnrichmentConfig: {
             name: string;
@@ -11805,12 +11870,22 @@ export interface components {
              */
             type: "embeddings";
         };
+        /** @description Credential-free graph artifact producer configuration returned after creation. */
+        CreatedGraphArtifactProducerConfig: {
+            name: string;
+            kind: components["schemas"]["EnrichmentKind"];
+            field?: string;
+            content_type?: string;
+        };
         /** @description Credential-free normalized graph configuration returned after creation. */
         CreatedGraphIndexConfig: {
             summarizer?: components["schemas"]["CreatedProviderConfig"];
             template?: string;
             edge_types?: components["schemas"]["EdgeTypeConfig"][];
             max_edges_per_document?: number;
+            source?: components["schemas"]["GraphArtifactSourceConfig"];
+            artifact?: components["schemas"]["CreatedGraphArtifactProducerConfig"];
+            resolvers?: components["schemas"]["GraphResolverConfig"][];
         };
         /** @description Normalized effective graph index configuration returned after creation. */
         CreatedGraphIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["CreatedGraphIndexConfig"] & {

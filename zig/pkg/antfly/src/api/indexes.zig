@@ -1465,6 +1465,7 @@ const AggregatedIndexStatus = struct {
     kind: ?db_mod.types.IndexKind = null,
     load_error: ?[]const u8 = null,
     repair_state: ?[]const u8 = null,
+    repair_wait_is_completed_admission: bool = true,
     backfill_active: bool = false,
     backfill_progress: f64 = 0.0,
     enrichment_failed: bool = false,
@@ -1656,6 +1657,11 @@ fn aggregateIndexStatusIndexed(
         }
         materialization_count += 1;
         if (publicIndexRepairState(item)) |state| {
+            aggregate.repair_wait_is_completed_admission =
+                aggregate.repair_wait_is_completed_admission and
+                std.mem.eql(u8, state, "waiting") and
+                std.mem.eql(u8, item.index_repair_phase, "detected") and
+                std.mem.eql(u8, item.index_repair_wait_reason, "bounded_maintenance");
             if (aggregate.repair_state == null or repairStateRank(state) > repairStateRank(aggregate.repair_state.?)) {
                 aggregate.repair_state = state;
             }
@@ -2328,6 +2334,61 @@ test "index status exposes compact repair state without internal diagnostics" {
     var waiting = item;
     waiting.index_repair_wait_reason = "backoff";
     try std.testing.expectEqualStrings("waiting", publicIndexRepairState(waiting).?);
+}
+
+test "complete partial embeddings coverage is ready while background repair waits" {
+    const item = db_mod.types.DBIndexStats{
+        .name = "thumbnail",
+        .kind = .dense_vector,
+        .doc_count = 1,
+        .node_count = 1,
+        .root_node = 1,
+        .coverage_produced_count = 1,
+        .coverage_skipped_count = 1,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .replay_applied_sequence = 7,
+        .replay_target_sequence = 7,
+        .backfill_active = true,
+        .backfill_progress = 1.0,
+        .repair_degraded = true,
+        .index_repair_id = 1,
+        .index_repair_phase = "detected",
+        .index_repair_automation = "enabled",
+        .index_repair_wait_reason = "bounded_maintenance",
+    };
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &encoded,
+        .embeddings,
+        item,
+        2,
+        .partial,
+        false,
+        42,
+        99,
+        null,
+        .{},
+        .{
+            .enabled = true,
+            .target_sequence = 7,
+            .applied_sequence = 7,
+            .skipped_source_count = 1,
+        },
+        null,
+        null,
+        .{},
+        null,
+        true,
+    );
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"rebuilding\":false,\"backfill_active\":false,\"backfill_state\":\"ready\",\"repair\":{\"state\":\"waiting\",\"action_required\":false},\"coverage\":{\"policy\":\"partial\",\"complete\":true,\"healthy\":true,\"pending\":0}}",
+        encoded.items,
+    );
 }
 
 test "derived coverage aggregation rejects stale index incarnations" {
@@ -3012,12 +3073,27 @@ fn appendSingleIndexRuntimeStatus(
     // at the same time would incorrectly tell clients to drop/recreate.
     const raw_load_error: ?[]const u8 = if (@hasField(@TypeOf(item), "load_error")) item.load_error else null;
     const load_error: ?[]const u8 = if (repair_state == null) raw_load_error else null;
+    const repair_wait_is_completed_admission = if (@hasField(@TypeOf(item), "index_repair_phase"))
+        std.mem.eql(u8, item.index_repair_phase, "detected") and
+            std.mem.eql(u8, item.index_repair_wait_reason, "bounded_maintenance")
+    else if (@hasField(@TypeOf(item), "repair_wait_is_completed_admission"))
+        item.repair_wait_is_completed_admission
+    else
+        false;
+    const completed_admission_wait = repair_state != null and
+        std.mem.eql(u8, repair_state.?, "waiting") and
+        repair_wait_is_completed_admission and
+        embeddings_view != null and
+        !embeddings_view.?.backfill_active;
+    const repair_blocks_readiness = repair_state != null and
+        (raw_load_error != null or !completed_admission_wait);
     if (load_error != null) {
         backfill_active = false;
         catch_up_active = false;
         replay_catch_up_required = false;
         catch_up_phase = .idle;
-    } else if (repair_state) |state| {
+    } else if (repair_blocks_readiness) {
+        const state = repair_state.?;
         backfill_active = std.mem.eql(u8, state, "rebuilding") or std.mem.eql(u8, state, "waiting");
     }
 
@@ -3058,7 +3134,7 @@ fn appendSingleIndexRuntimeStatus(
         (std.mem.eql(u8, repair_state.?, "paused") or std.mem.eql(u8, repair_state.?, "failed"))))
     {
         try appendJsonString(alloc, out, "failed");
-    } else if (repair_state != null and std.mem.eql(u8, repair_state.?, "waiting")) {
+    } else if (repair_blocks_readiness and repair_state != null and std.mem.eql(u8, repair_state.?, "waiting")) {
         try appendJsonString(alloc, out, "retrying");
     } else {
         const enrichment_degraded = (embeddings_materialization_current and item.enrichment_failed) or
@@ -3853,6 +3929,19 @@ test "public index config encoders omit root write-only producer documents" {
     try ant_json.testing.expectEqualJsonText(
         std.testing.allocator,
         "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"external\":true,\"dimension\":384}",
+        created,
+    );
+}
+
+test "created graph index response omits write-only artifact producer fields" {
+    const config =
+        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]"},"artifact":{"name":"relations_v1","kind":"asset","field":"relations","producer_json":{"provider":"private","api_key":"private-key"}},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_search":"prefix"}]}
+    ;
+    const created = try encodeCreatedIndexConfig(std.testing.allocator, "relations_graph", config);
+    defer std.testing.allocator.free(created);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"name\":\"relations_graph\",\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"field\":\"relations\"},\"edge_types\":[{\"name\":\"mentions\"}],\"resolvers\":[{\"name\":\"kg\",\"table\":\"entities\",\"source_artifact\":\"relations_v1\",\"resolution_artifact\":\"resolution_v1\",\"key_template\":\"{{label}}\",\"candidate_search\":\"prefix\"}]}",
         created,
     );
 }

@@ -70,7 +70,9 @@ def cli(cli_server):
     env = os.environ.copy()
     env["ANTFLY_URL"] = cli_server.url
 
-    def run_cli(*args: str, check: bool = True, timeout_s: float = 30.0) -> subprocess.CompletedProcess[str]:
+    def run_cli(
+        *args: str, check: bool = True, timeout_s: float = 30.0
+    ) -> subprocess.CompletedProcess[str]:
         cmd = [binary] + list(args)
         result = subprocess.run(
             cmd,
@@ -142,7 +144,9 @@ def test_table_create_list_get_drop(cli):
         pytest.fail(f"table {table} still present after drop")
 
 
-def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(cli, cli_server, tmp_path):
+def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
+    cli, cli_server, tmp_path
+):
     """Exercise the documented CLI path across parsing, readiness, and retrieval."""
     table = f"cli_quickstart_{time.time_ns()}"
     embedder_url = cli_server.cli_inference_urls["embedder"]
@@ -186,29 +190,74 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(cli, cli_serve
     )
 
     try:
-        cli("table", "create", "--table", table, "--shards", "1", "--index", inline_index)
-        cli("load", "--table", table, "--file", str(records), "--id-field", "id", "--no-checkpoint")
+        cli(
+            "table",
+            "create",
+            "--table",
+            table,
+            "--shards",
+            "1",
+            "--index",
+            inline_index,
+        )
+        cli(
+            "load",
+            "--table",
+            table,
+            "--file",
+            str(records),
+            "--id-field",
+            "id",
+            "--no-checkpoint",
+        )
 
         text_wait = cli(
-            "index", "wait", "--table", table, "--index", "title_body",
-            "--timeout", "20s", "--poll-interval", "25ms", timeout_s=30.0,
+            "index",
+            "wait",
+            "--table",
+            table,
+            "--index",
+            "title_body",
+            "--timeout",
+            "20s",
+            "--poll-interval",
+            "25ms",
+            timeout_s=30.0,
         )
         assert "title_body\tembeddings\tready" in text_wait.stdout
 
         text_query = cli(
-            "query", "--table", table, "--semantic-search", "alpha concept",
-            "--indexes", "title_body", "--limit", "2",
+            "query",
+            "--table",
+            table,
+            "--semantic-search",
+            "alpha concept",
+            "--indexes",
+            "title_body",
+            "--limit",
+            "2",
         )
         assert "warning:" not in text_query.stderr.lower()
         text_hits = parse_json(text_query.stdout)["responses"][0]["hits"]["hits"]
         assert text_hits[0]["_id"] == "doc:alpha"
 
         cli(
-            "index", "create", "--table", table, "--index", "thumbnail",
-            "--type", "embeddings", "--coverage-policy", "partial",
-            "--template", "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}",
-            "--dimension", "3",
-            "--embedder", json.dumps(
+            "index",
+            "create",
+            "--table",
+            table,
+            "--index",
+            "thumbnail",
+            "--type",
+            "embeddings",
+            "--coverage-policy",
+            "partial",
+            "--template",
+            "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}",
+            "--dimension",
+            "3",
+            "--embedder",
+            json.dumps(
                 {
                     "provider": "antfly",
                     "model": "antflydb/clipclap",
@@ -217,11 +266,27 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(cli, cli_serve
             ),
         )
         image_wait = cli(
-            "index", "wait", "--table", table, "--index", "thumbnail",
-            "--timeout", "20s", "--poll-interval", "25ms", timeout_s=30.0,
+            "index",
+            "wait",
+            "--table",
+            table,
+            "--index",
+            "thumbnail",
+            "--timeout",
+            "20s",
+            "--poll-interval",
+            "25ms",
+            timeout_s=30.0,
+            check=False,
+        )
+        assert image_wait.returncode == 0, (
+            f"{image_wait.stderr}\nindex diagnostics:\n"
+            f"{cli('index', 'list', '--table', table, '--output', 'json').stdout}"
         )
         assert "thumbnail\tembeddings\tready" in image_wait.stdout
-        image_status = parse_json(cli("index", "get", "--table", table, "--index", "thumbnail").stdout)
+        image_status = parse_json(
+            cli("index", "get", "--table", table, "--index", "thumbnail").stdout
+        )
         image_coverage = image_status["status"]["coverage"]
         assert image_coverage["policy"] == "partial"
         assert image_coverage["source_total"] == 2
@@ -232,18 +297,35 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(cli, cli_serve
         assert image_coverage["healthy"] is True
 
         image_query = cli(
-            "query", "--table", table, "--semantic-search", "map of a country",
-            "--indexes", "thumbnail", "--limit", "2",
+            "query",
+            "--table",
+            table,
+            "--semantic-search",
+            "map of a country",
+            "--indexes",
+            "thumbnail",
+            "--limit",
+            "2",
         )
         assert "warning:" not in image_query.stderr.lower()
         image_hits = parse_json(image_query.stdout)["responses"][0]["hits"]["hits"]
         assert image_hits[0]["_id"] == "doc:alpha"
 
         rag = cli(
-            "agents", "retrieval", "--table", table,
-            "--semantic-search", "alpha concept", "--indexes", "title_body",
-            "--prompt", "Summarize the alpha document", "--fields", "title,body",
-            "--generator", json.dumps(
+            "agents",
+            "retrieval",
+            "--table",
+            table,
+            "--semantic-search",
+            "alpha concept",
+            "--indexes",
+            "title_body",
+            "--prompt",
+            "Summarize the alpha document",
+            "--fields",
+            "title,body",
+            "--generator",
+            json.dumps(
                 {
                     "provider": "antfly",
                     "model": "local-generator",
@@ -251,7 +333,9 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(cli, cli_serve
                     "api_key": "test-key",
                 }
             ),
-            "--generate", "--no-streaming", timeout_s=60.0,
+            "--generate",
+            "--no-streaming",
+            timeout_s=60.0,
         )
         assert "warning:" not in rag.stderr.lower()
         rag_result = parse_json(rag.stdout)
@@ -312,7 +396,17 @@ def test_insert_lookup_delete(cli):
 @pytest.mark.parametrize(
     "args",
     [
-        ("insert", "--table", "docs", "--key", "doc:a", "--document", "{}", "--typo", "value"),
+        (
+            "insert",
+            "--table",
+            "docs",
+            "--key",
+            "doc:a",
+            "--document",
+            "{}",
+            "--typo",
+            "value",
+        ),
         ("delete", "--table", "docs", "--key", "doc:a", "--typo", "value"),
         ("lookup", "--table", "docs", "--key", "doc:a", "--typo", "value"),
         ("artifact", "list", "--table", "docs", "--typo", "value"),
@@ -337,15 +431,32 @@ def test_client_commands_reject_unknown_options_before_network_work(cli, args):
 @pytest.mark.parametrize(
     ("args", "message"),
     [
-        (("load", "--table", "docs", "--file", "missing.jsonl", "--checkpoint"), "--checkpoint requires a value"),
-        (("load", "--table", "docs", "-t", "other", "--file", "missing.jsonl"), "-t may only be provided once"),
         (
-            ("load", "--table", "docs", "--file", "missing.jsonl", "--checkpoint", "state", "--no-checkpoint"),
+            ("load", "--table", "docs", "--file", "missing.jsonl", "--checkpoint"),
+            "--checkpoint requires a value",
+        ),
+        (
+            ("load", "--table", "docs", "-t", "other", "--file", "missing.jsonl"),
+            "-t may only be provided once",
+        ),
+        (
+            (
+                "load",
+                "--table",
+                "docs",
+                "--file",
+                "missing.jsonl",
+                "--checkpoint",
+                "state",
+                "--no-checkpoint",
+            ),
             "--checkpoint cannot be used with --no-checkpoint",
         ),
     ],
 )
-def test_load_rejects_missing_duplicate_and_conflicting_options_before_io(cli, args, message):
+def test_load_rejects_missing_duplicate_and_conflicting_options_before_io(
+    cli, args, message
+):
     result = cli(*args, check=False)
     assert result.returncode != 0
     assert message in result.stderr
@@ -362,24 +473,50 @@ def test_semantic_preflight_reports_missing_selected_index(cli):
     try:
         cli("table", "create", "--table", table, "--shards", "1")
         missing = cli(
-            "query", "--table", table, "--semantic-search", "alpha",
-            "--indexes", "missing_dense", check=False,
+            "query",
+            "--table",
+            table,
+            "--semantic-search",
+            "alpha",
+            "--indexes",
+            "missing_dense",
+            check=False,
         )
         assert missing.returncode != 0
-        assert f"selected semantic index missing_dense was not found on table {table}" in missing.stderr
+        assert (
+            f"selected semantic index missing_dense was not found on table {table}"
+            in missing.stderr
+        )
 
         wrong_type = cli(
-            "query", "--table", table, "--semantic-search", "alpha",
-            "--indexes", "full_text_index_v0", check=False,
+            "query",
+            "--table",
+            table,
+            "--semantic-search",
+            "alpha",
+            "--indexes",
+            "full_text_index_v0",
+            check=False,
         )
         assert wrong_type.returncode != 0
-        assert "selected semantic index full_text_index_v0 is type full_text, not embeddings" in wrong_type.stderr
+        assert (
+            "selected semantic index full_text_index_v0 is type full_text, not embeddings"
+            in wrong_type.stderr
+        )
 
         none_available = cli(
-            "query", "--table", table, "--semantic-search", "alpha", check=False,
+            "query",
+            "--table",
+            table,
+            "--semantic-search",
+            "alpha",
+            check=False,
         )
         assert none_available.returncode != 0
-        assert f"table {table} has no embeddings indexes available for semantic search" in none_available.stderr
+        assert (
+            f"table {table} has no embeddings indexes available for semantic search"
+            in none_available.stderr
+        )
     finally:
         cli("table", "drop", "--table", table, check=False)
 
@@ -403,9 +540,12 @@ def test_query_full_text_search(cli):
     def query_hits() -> dict | None:
         r = cli(
             "query",
-            "--table", table,
-            "--full-text-search", "content:alpha",
-            "--limit", "5",
+            "--table",
+            table,
+            "--full-text-search",
+            "content:alpha",
+            "--limit",
+            "5",
             check=False,
         )
         if r.returncode != 0:

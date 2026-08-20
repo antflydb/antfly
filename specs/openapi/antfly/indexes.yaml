@@ -115,6 +115,75 @@ components:
             type:
               type: string
               enum: [graph]
+    GraphArtifactSourceConfig:
+      type: object
+      additionalProperties: false
+      required: [kind, artifact]
+      description: "Artifact stream materialized into graph edges."
+      properties:
+        kind:
+          type: string
+          enum: [artifact]
+        artifact: { type: string }
+        path: { type: string }
+        format: { type: string, default: extraction_relation }
+        mention_edge_type: { type: string }
+    GraphArtifactProducerConfig:
+      type: object
+      additionalProperties: false
+      required: [name, kind]
+      description: "Asset producer used by an artifact-backed graph index."
+      properties:
+        name: { type: string }
+        kind: { $ref: "#/components/schemas/EnrichmentKind" }
+        field: { type: string }
+        content_type: { type: string }
+        producer_json:
+          type: object
+          additionalProperties: true
+          writeOnly: true
+          description: "Write-only producer configuration; it may contain credentials and is never returned."
+    CreatedGraphArtifactProducerConfig:
+      type: object
+      additionalProperties: false
+      required: [name, kind]
+      description: "Credential-free graph artifact producer configuration returned after creation."
+      properties:
+        name: { type: string }
+        kind: { $ref: "#/components/schemas/EnrichmentKind" }
+        field: { type: string }
+        content_type: { type: string }
+    GraphResolverConfig:
+      type: object
+      additionalProperties: false
+      required: [name, table, source_artifact, resolution_artifact, key_template]
+      description: "Versioned entity resolver attached to an artifact-backed graph index."
+      properties:
+        name: { type: string }
+        table: { type: string }
+        source_artifact: { type: string }
+        source_artifact_kind:
+          type: string
+          enum: [asset, chunk, any]
+          default: asset
+        resolution_artifact: { type: string }
+        key_template: { type: string }
+        type_must_match: { type: boolean, default: true }
+        scorer_json: { type: string }
+        candidate_search:
+          type: string
+          enum: ["", exact_key, prefix, ann]
+        candidate_ann_index: { type: string }
+        candidate_limit: { type: integer, format: uint, minimum: 0 }
+        name_embedding: { type: string }
+        name_embedding_dims: { type: integer, format: uint, minimum: 0 }
+        fusion_combine:
+          type: string
+          enum: ["", noisy_or, max, mean]
+        fusion_trust: { type: number, format: double, minimum: 0, maximum: 1 }
+        fusion_prior: { type: number, format: double, minimum: 0, maximum: 1 }
+        fusion_prior_weight: { type: number, format: double, minimum: 0 }
+        config_generation: { type: integer, format: uint64, minimum: 0 }
     CreateAlgebraicIndexRequest:
       description: "Create a schema-derived algebraic index."
       allOf:
@@ -245,6 +314,11 @@ components:
           type: array
           items: { $ref: "#/components/schemas/EdgeTypeConfig" }
         max_edges_per_document: { type: integer }
+        source: { $ref: "#/components/schemas/GraphArtifactSourceConfig" }
+        artifact: { $ref: "#/components/schemas/CreatedGraphArtifactProducerConfig" }
+        resolvers:
+          type: array
+          items: { $ref: "#/components/schemas/GraphResolverConfig" }
     CreatedFullTextIndex:
       description: "Normalized effective full-text index configuration returned after creation."
       allOf:
@@ -1670,6 +1744,14 @@ components:
           x-go-type-skip-optional-pointer: true
           type: integer
           description: "Maximum number of edges per document (0 = unlimited)"
+        source:
+          $ref: "#/components/schemas/GraphArtifactSourceConfig"
+        artifact:
+          $ref: "#/components/schemas/GraphArtifactProducerConfig"
+        resolvers:
+          type: array
+          items:
+            $ref: "#/components/schemas/GraphResolverConfig"
     EdgeTypeConfig:
       type: object
       description: "Configuration for a specific edge type"

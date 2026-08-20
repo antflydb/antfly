@@ -10,7 +10,9 @@ from ..models.chunker_provider import ChunkerProvider
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.audio_chunk_options import AudioChunkOptions
     from ..models.chunker_config_full_text_index import ChunkerConfigFullTextIndex
+    from ..models.text_chunk_options import TextChunkOptions
 
 
 T = TypeVar("T", bound="ChunkerConfig")
@@ -31,11 +33,19 @@ class ChunkerConfig:
         full_text_index (ChunkerConfigFullTextIndex | Unset): Configuration for full-text indexing of chunks in Bleve.
             When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's _chunks field.
             When absent, chunks use :c: suffix and are only used for vector embeddings.
+        max_chunks (int | Unset):
+        threshold (float | Unset):
+        text (TextChunkOptions | Unset): Options specific to text chunking.
+        audio (AudioChunkOptions | Unset): Options specific to audio chunking.
     """
 
     provider: ChunkerProvider
     store_chunks: bool | Unset = False
     full_text_index: ChunkerConfigFullTextIndex | Unset = UNSET
+    max_chunks: int | Unset = UNSET
+    threshold: float | Unset = UNSET
+    text: TextChunkOptions | Unset = UNSET
+    audio: AudioChunkOptions | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -46,6 +56,18 @@ class ChunkerConfig:
         full_text_index: dict[str, Any] | Unset = UNSET
         if not isinstance(self.full_text_index, Unset):
             full_text_index = self.full_text_index.to_dict()
+
+        max_chunks = self.max_chunks
+
+        threshold = self.threshold
+
+        text: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.text, Unset):
+            text = self.text.to_dict()
+
+        audio: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.audio, Unset):
+            audio = self.audio.to_dict()
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -58,12 +80,22 @@ class ChunkerConfig:
             field_dict["store_chunks"] = store_chunks
         if full_text_index is not UNSET:
             field_dict["full_text_index"] = full_text_index
+        if max_chunks is not UNSET:
+            field_dict["max_chunks"] = max_chunks
+        if threshold is not UNSET:
+            field_dict["threshold"] = threshold
+        if text is not UNSET:
+            field_dict["text"] = text
+        if audio is not UNSET:
+            field_dict["audio"] = audio
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.audio_chunk_options import AudioChunkOptions
         from ..models.chunker_config_full_text_index import ChunkerConfigFullTextIndex
+        from ..models.text_chunk_options import TextChunkOptions
 
         d = dict(src_dict)
         provider = ChunkerProvider(d.pop("provider"))
@@ -77,10 +109,32 @@ class ChunkerConfig:
         else:
             full_text_index = ChunkerConfigFullTextIndex.from_dict(_full_text_index)
 
+        max_chunks = d.pop("max_chunks", UNSET)
+
+        threshold = d.pop("threshold", UNSET)
+
+        _text = d.pop("text", UNSET)
+        text: TextChunkOptions | Unset
+        if isinstance(_text, Unset):
+            text = UNSET
+        else:
+            text = TextChunkOptions.from_dict(_text)
+
+        _audio = d.pop("audio", UNSET)
+        audio: AudioChunkOptions | Unset
+        if isinstance(_audio, Unset):
+            audio = UNSET
+        else:
+            audio = AudioChunkOptions.from_dict(_audio)
+
         chunker_config = cls(
             provider=provider,
             store_chunks=store_chunks,
             full_text_index=full_text_index,
+            max_chunks=max_chunks,
+            threshold=threshold,
+            text=text,
+            audio=audio,
         )
 
         chunker_config.additional_properties = d

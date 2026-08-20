@@ -27,6 +27,10 @@ pub const ChunkerConfig = struct {
     store_chunks: ?bool = null,
     /// Configuration for full-text indexing of chunks in Bleve. When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's _chunks field. When absent, chunks use :c: suffix and are only used for vector embeddings.
     full_text_index: ?std.json.Value = null,
+    max_chunks: ?i64 = null,
+    threshold: ?f32 = null,
+    text: ?antfly_chunking_api_openapi.TextChunkOptions = null,
+    audio: ?antfly_chunking_api_openapi.AudioChunkOptions = null,
 };
 
 /// The chunking provider to use.

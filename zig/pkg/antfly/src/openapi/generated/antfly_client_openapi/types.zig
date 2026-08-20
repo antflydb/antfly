@@ -1962,6 +1962,9 @@ pub const CreateGraphIndexRequest = struct {
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of edges per document (0 = unlimited)
     max_edges_per_document: ?i64 = null,
+    source: ?GraphArtifactSourceConfig = null,
+    artifact: ?GraphArtifactProducerConfig = null,
+    resolvers: ?[]const GraphResolverConfig = null,
     type: []const u8,
 };
 
@@ -2024,8 +2027,8 @@ pub const CreateTableRequest = struct {
     num_shards: ?i64 = null,
     /// Optional human-readable description of the table and its purpose. Useful for documentation and team collaboration.
     description: ?[]const u8 = null,
-    /// Map of index name to index configuration. Indexes enable different query capabilities: - Full-text indexes for BM25 search - Vector indexes for semantic similarity - Multimodal indexes for images/audio/video You can add multiple indexes to support different query patterns.
-    indexes: ?std.json.ArrayHashMap(IndexConfig) = null,
+    /// Map of index name to create-index configuration. The map key owns the index name; do not repeat `name` inside the configuration. Indexes enable different query capabilities: - Full-text indexes for BM25 search - Vector indexes for semantic similarity - Multimodal indexes for images/audio/video You can add multiple indexes to support different query patterns.
+    indexes: ?std.json.ArrayHashMap(CreateIndexRequest) = null,
     /// Optional schema definition specifying field types, primary key, and TTL configuration. While optional, defining a schema provides type safety, optimized indexing, and better search performance. **Schema Features:** - **Field Types**: Define document structure using JSON Schema with `x-antfly-types` extensions - **Document TTL**: Configure automatic expiration via `ttl_duration` and optional `ttl_field` - **Primary Keys**: Specify unique identifier fields - **Validation**: Enforce schema constraints on writes **TTL Example:** ```json { "ttl_duration": "7d", "ttl_field": "_timestamp", "document_schemas": {...} } ``` See the Table Management documentation for comprehensive TTL configuration and use cases.
     schema: ?TableSchema = null,
     /// PostgreSQL CDC replication sources. Streams INSERT/UPDATE/DELETE changes from PostgreSQL tables into this Antfly table via logical replication. Multiple sources can feed into a single table (e.g., `users` + `scores` → Antfly `users`). Each source uses `on_update`/`on_delete` transforms to control how PG events map to Antfly document operations. Requires `wal_level=logical` on the PostgreSQL source.
@@ -2143,6 +2146,14 @@ pub const CreatedFullTextIndex = struct {
     type: []const u8,
 };
 
+/// Credential-free graph artifact producer configuration returned after creation.
+pub const CreatedGraphArtifactProducerConfig = struct {
+    name: []const u8,
+    kind: EnrichmentKind,
+    field: ?[]const u8 = null,
+    content_type: ?[]const u8 = null,
+};
+
 /// Normalized effective graph index configuration returned after creation.
 pub const CreatedGraphIndex = struct {
     /// Name of the created index
@@ -2157,6 +2168,9 @@ pub const CreatedGraphIndex = struct {
     template: ?[]const u8 = null,
     edge_types: ?[]const EdgeTypeConfig = null,
     max_edges_per_document: ?i64 = null,
+    source: ?GraphArtifactSourceConfig = null,
+    artifact: ?CreatedGraphArtifactProducerConfig = null,
+    resolvers: ?[]const GraphResolverConfig = null,
     type: []const u8,
 };
 
@@ -2166,6 +2180,9 @@ pub const CreatedGraphIndexConfig = struct {
     template: ?[]const u8 = null,
     edge_types: ?[]const EdgeTypeConfig = null,
     max_edges_per_document: ?i64 = null,
+    source: ?GraphArtifactSourceConfig = null,
+    artifact: ?CreatedGraphArtifactProducerConfig = null,
+    resolvers: ?[]const GraphResolverConfig = null,
 };
 
 /// Discriminated normalized configuration returned after an index is created.
@@ -4177,6 +4194,25 @@ pub const GoogleGeneratorConfig = struct {
     url: ?[]const u8 = null,
 };
 
+/// Asset producer used by an artifact-backed graph index.
+pub const GraphArtifactProducerConfig = struct {
+    name: []const u8,
+    kind: EnrichmentKind,
+    field: ?[]const u8 = null,
+    content_type: ?[]const u8 = null,
+    /// Write-only producer configuration; it may contain credentials and is never returned.
+    producer_json: ?std.json.Value = null,
+};
+
+/// Artifact stream materialized into graph edges.
+pub const GraphArtifactSourceConfig = struct {
+    kind: []const u8,
+    artifact: []const u8,
+    path: ?[]const u8 = null,
+    format: ?[]const u8 = null,
+    mention_edge_type: ?[]const u8 = null,
+};
+
 /// Configuration for graph index type
 pub const GraphIndexConfig = struct {
     /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
@@ -4187,6 +4223,9 @@ pub const GraphIndexConfig = struct {
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of edges per document (0 = unlimited)
     max_edges_per_document: ?i64 = null,
+    source: ?GraphArtifactSourceConfig = null,
+    artifact: ?GraphArtifactProducerConfig = null,
+    resolvers: ?[]const GraphResolverConfig = null,
 };
 
 /// Discriminator for the index stats variant.
@@ -4397,6 +4436,28 @@ pub const GraphQueryType = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+/// Versioned entity resolver attached to an artifact-backed graph index.
+pub const GraphResolverConfig = struct {
+    name: []const u8,
+    table: []const u8,
+    source_artifact: []const u8,
+    source_artifact_kind: ?[]const u8 = null,
+    resolution_artifact: []const u8,
+    key_template: []const u8,
+    type_must_match: ?bool = null,
+    scorer_json: ?[]const u8 = null,
+    candidate_search: ?[]const u8 = null,
+    candidate_ann_index: ?[]const u8 = null,
+    candidate_limit: ?i64 = null,
+    name_embedding: ?[]const u8 = null,
+    name_embedding_dims: ?i64 = null,
+    fusion_combine: ?[]const u8 = null,
+    fusion_trust: ?f64 = null,
+    fusion_prior: ?f64 = null,
+    fusion_prior_weight: ?f64 = null,
+    config_generation: ?i64 = null,
 };
 
 /// A node in graph query results
@@ -4616,6 +4677,9 @@ pub const IndexConfig = struct {
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of edges per document (0 = unlimited)
     max_edges_per_document: ?i64 = null,
+    source: ?GraphArtifactSourceConfig = null,
+    artifact: ?GraphArtifactProducerConfig = null,
+    resolvers: ?[]const GraphResolverConfig = null,
     /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
     derive_from_schema: ?bool = null,
 
@@ -4715,6 +4779,18 @@ pub const IndexConfig = struct {
         }
         if (self.max_edges_per_document) |value| {
             try jw.objectField("max_edges_per_document");
+            try jw.write(value);
+        }
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.artifact) |value| {
+            try jw.objectField("artifact");
+            try jw.write(value);
+        }
+        if (self.resolvers) |value| {
+            try jw.objectField("resolvers");
             try jw.write(value);
         }
         if (self.derive_from_schema) |value| {

@@ -36,6 +36,21 @@ components:
                 When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's _chunks field.
                 When absent, chunks use :c: suffix and are only used for vector embeddings.
               additionalProperties: true
+            # Repeat ChunkOptions here instead of relying only on the nested
+            # AntflyChunkerConfig allOf. Several generators flatten a single
+            # allOf level and otherwise drop these supported fields.
+            max_chunks:
+              type: integer
+              minimum: 1
+            threshold:
+              type: number
+              format: float
+              minimum: 0
+              maximum: 1
+            text:
+              $ref: "../shared/chunking.yaml#/components/schemas/TextChunkOptions"
+            audio:
+              $ref: "../shared/chunking.yaml#/components/schemas/AudioChunkOptions"
           required:
             - provider
       example:

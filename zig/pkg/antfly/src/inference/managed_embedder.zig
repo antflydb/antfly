@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
@@ -1180,6 +1181,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
 
     const sparse = cfg.sparse orelse false;
     const external = cfg.external orelse false;
+    if (external and cfg.coverage_policy != null) return error.InvalidCreateTableRequest;
 
     if (root.get("summarizer") != null) return error.UnsupportedCreateTableRequest;
 
@@ -1222,6 +1224,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
             defer out.deinit(alloc);
             try out.appendSlice(alloc, "{\"field\":");
             try appendJsonString(alloc, &out, source_field);
+            try appendCoveragePolicyIfPresent(alloc, &out, cfg.coverage_policy);
             try appendExecutionObjectIfPresent(alloc, &out, root);
             try out.append(alloc, '}');
             return try out.toOwnedSlice(alloc);
@@ -1240,6 +1243,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
 
         try out.appendSlice(alloc, "{\"field\":");
         try appendJsonString(alloc, &out, source_field);
+        try appendCoveragePolicyIfPresent(alloc, &out, cfg.coverage_policy);
         if (cfg.top_k) |top_k| {
             try out.appendSlice(alloc, ",\"top_k\":");
             const top_k_json = try std.fmt.allocPrint(alloc, "{d}", .{top_k});
@@ -1314,6 +1318,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     try appendJsonString(alloc, &out, metric);
     try out.appendSlice(alloc, ",\"embedding_name\":");
     try appendJsonString(alloc, &out, artifact_embedding_name orelse index_name);
+    try appendCoveragePolicyIfPresent(alloc, &out, cfg.coverage_policy);
 
     if (artifact_embedding_name != null) {
         if (chunker_json != null or template_value != null) return error.InvalidCreateTableRequest;
@@ -2605,6 +2610,16 @@ fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), 
     try out.appendSlice(alloc, encoded);
 }
 
+fn appendCoveragePolicyIfPresent(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    policy: ?indexes_openapi.DerivedCoveragePolicy,
+) !void {
+    const value = policy orelse return;
+    try out.appendSlice(alloc, ",\"coverage_policy\":");
+    try appendJsonString(alloc, out, @tagName(value));
+}
+
 fn appendExecutionObjectIfPresent(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -2842,6 +2857,29 @@ test "managed embedder rejects invalid execution batch policy" {
     defer parsed.deinit();
 
     try std.testing.expectError(error.InvalidCreateTableRequest, translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{ .antfly_provider = local.provider() }));
+}
+
+test "managed embedder preserves coverage policy in storage config" {
+    var local = TestLocalDenseProvider{ .dimensions = 384 };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"type":"embeddings","coverage_policy":"partial","template":"{{#if image_url}}{{remoteMedia url=image_url}}{{/if}}","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
+    , .{});
+    defer parsed.deinit();
+
+    const config_json = try translateEmbeddingsIndexConfigJsonWithOptions(
+        std.testing.allocator,
+        "thumbnail",
+        parsed.value,
+        .{ .antfly_provider = local.provider() },
+    );
+    defer std.testing.allocator.free(config_json);
+
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        \\{"field":"body","dims":384,"embedding_name":"thumbnail","coverage_policy":"partial"}
+    ,
+        config_json,
+    );
 }
 
 test "managed embedder rejects unsupported execution namespaces" {

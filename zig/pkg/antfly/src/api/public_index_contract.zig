@@ -58,7 +58,10 @@ pub fn isAllowedConfigField(kind: Kind, field: []const u8) bool {
         .graph => std.mem.eql(u8, field, "summarizer") or
             std.mem.eql(u8, field, "template") or
             std.mem.eql(u8, field, "edge_types") or
-            std.mem.eql(u8, field, "max_edges_per_document"),
+            std.mem.eql(u8, field, "max_edges_per_document") or
+            std.mem.eql(u8, field, "source") or
+            std.mem.eql(u8, field, "artifact") or
+            std.mem.eql(u8, field, "resolvers"),
         .algebraic => std.mem.eql(u8, field, "derive_from_schema"),
     };
 }

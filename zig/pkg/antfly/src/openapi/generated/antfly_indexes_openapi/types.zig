@@ -277,6 +277,9 @@ pub const CreateGraphIndexRequest = struct {
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of edges per document (0 = unlimited)
     max_edges_per_document: ?i64 = null,
+    source: ?GraphArtifactSourceConfig = null,
+    artifact: ?GraphArtifactProducerConfig = null,
+    resolvers: ?[]const GraphResolverConfig = null,
     type: []const u8,
 };
 
@@ -435,6 +438,14 @@ pub const CreatedFullTextIndex = struct {
     type: []const u8,
 };
 
+/// Credential-free graph artifact producer configuration returned after creation.
+pub const CreatedGraphArtifactProducerConfig = struct {
+    name: []const u8,
+    kind: EnrichmentKind,
+    field: ?[]const u8 = null,
+    content_type: ?[]const u8 = null,
+};
+
 /// Normalized effective graph index configuration returned after creation.
 pub const CreatedGraphIndex = struct {
     /// Name of the created index
@@ -449,6 +460,9 @@ pub const CreatedGraphIndex = struct {
     template: ?[]const u8 = null,
     edge_types: ?[]const EdgeTypeConfig = null,
     max_edges_per_document: ?i64 = null,
+    source: ?GraphArtifactSourceConfig = null,
+    artifact: ?CreatedGraphArtifactProducerConfig = null,
+    resolvers: ?[]const GraphResolverConfig = null,
     type: []const u8,
 };
 
@@ -458,6 +472,9 @@ pub const CreatedGraphIndexConfig = struct {
     template: ?[]const u8 = null,
     edge_types: ?[]const EdgeTypeConfig = null,
     max_edges_per_document: ?i64 = null,
+    source: ?GraphArtifactSourceConfig = null,
+    artifact: ?CreatedGraphArtifactProducerConfig = null,
+    resolvers: ?[]const GraphResolverConfig = null,
 };
 
 /// Discriminated normalized configuration returned after an index is created.
@@ -1142,6 +1159,25 @@ pub const FullTextIndexStats = struct {
     promotion: ?std.json.Value = null,
 };
 
+/// Asset producer used by an artifact-backed graph index.
+pub const GraphArtifactProducerConfig = struct {
+    name: []const u8,
+    kind: EnrichmentKind,
+    field: ?[]const u8 = null,
+    content_type: ?[]const u8 = null,
+    /// Write-only producer configuration; it may contain credentials and is never returned.
+    producer_json: ?std.json.Value = null,
+};
+
+/// Artifact stream materialized into graph edges.
+pub const GraphArtifactSourceConfig = struct {
+    kind: []const u8,
+    artifact: []const u8,
+    path: ?[]const u8 = null,
+    format: ?[]const u8 = null,
+    mention_edge_type: ?[]const u8 = null,
+};
+
 /// Configuration for graph index type
 pub const GraphIndexConfig = struct {
     /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
@@ -1152,6 +1188,9 @@ pub const GraphIndexConfig = struct {
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of edges per document (0 = unlimited)
     max_edges_per_document: ?i64 = null,
+    source: ?GraphArtifactSourceConfig = null,
+    artifact: ?GraphArtifactProducerConfig = null,
+    resolvers: ?[]const GraphResolverConfig = null,
 };
 
 /// Discriminator for the index stats variant.
@@ -1364,6 +1403,28 @@ pub const GraphQueryType = enum {
     }
 };
 
+/// Versioned entity resolver attached to an artifact-backed graph index.
+pub const GraphResolverConfig = struct {
+    name: []const u8,
+    table: []const u8,
+    source_artifact: []const u8,
+    source_artifact_kind: ?[]const u8 = null,
+    resolution_artifact: []const u8,
+    key_template: []const u8,
+    type_must_match: ?bool = null,
+    scorer_json: ?[]const u8 = null,
+    candidate_search: ?[]const u8 = null,
+    candidate_ann_index: ?[]const u8 = null,
+    candidate_limit: ?i64 = null,
+    name_embedding: ?[]const u8 = null,
+    name_embedding_dims: ?i64 = null,
+    fusion_combine: ?[]const u8 = null,
+    fusion_trust: ?f64 = null,
+    fusion_prior: ?f64 = null,
+    fusion_prior_weight: ?f64 = null,
+    config_generation: ?i64 = null,
+};
+
 /// A node in graph query results
 pub const GraphResultNode = struct {
     /// Document key
@@ -1438,6 +1499,9 @@ pub const IndexConfig = struct {
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of edges per document (0 = unlimited)
     max_edges_per_document: ?i64 = null,
+    source: ?GraphArtifactSourceConfig = null,
+    artifact: ?GraphArtifactProducerConfig = null,
+    resolvers: ?[]const GraphResolverConfig = null,
     /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
     derive_from_schema: ?bool = null,
 
@@ -1537,6 +1601,18 @@ pub const IndexConfig = struct {
         }
         if (self.max_edges_per_document) |value| {
             try jw.objectField("max_edges_per_document");
+            try jw.write(value);
+        }
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.artifact) |value| {
+            try jw.objectField("artifact");
+            try jw.write(value);
+        }
+        if (self.resolvers) |value| {
+            try jw.objectField("resolvers");
             try jw.write(value);
         }
         if (self.derive_from_schema) |value| {

@@ -23,11 +23,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 import requests
 
-from helpers import assert_created_index, wait_until
+from helpers import assert_created_index, create_index_payload, wait_until
 
 
 def _create_index(api, table_name: str, index_name: str, payload: dict) -> dict:
-    return api.post(f"/tables/{table_name}/indexes/{index_name}", payload)
+    return api.post(
+        f"/tables/{table_name}/indexes/{index_name}",
+        create_index_payload(payload, index_name),
+    )
 
 
 def _get_index(api, table_name: str, index_name: str) -> dict:
@@ -41,7 +44,9 @@ def _index_stats(api, table_name: str, index_name: str) -> dict | None:
         return None
 
 
-def _ready_index(api, table_name: str, index_name: str, *, expected_docs: int) -> dict | None:
+def _ready_index(
+    api, table_name: str, index_name: str, *, expected_docs: int
+) -> dict | None:
     stats = _index_stats(api, table_name, index_name)
     if not stats:
         return None
@@ -132,7 +137,7 @@ def test_sparse_import_and_hybrid_query_with_external_embeddings(backup_api):
             },
         ),
         dense_index,
-        'embeddings',
+        "embeddings",
     )
     assert_created_index(
         _create_index(
@@ -147,13 +152,21 @@ def test_sparse_import_and_hybrid_query_with_external_embeddings(backup_api):
             },
         ),
         sparse_index,
-        'embeddings',
+        "embeddings",
     )
     backup_api.wait_index_ready(
-        table_name, dense_index, timeout_s=30.0, interval_s=0.5, require_query_fresh=True
+        table_name,
+        dense_index,
+        timeout_s=30.0,
+        interval_s=0.5,
+        require_query_fresh=True,
     )
     backup_api.wait_index_ready(
-        table_name, sparse_index, timeout_s=30.0, interval_s=0.5, require_query_fresh=True
+        table_name,
+        sparse_index,
+        timeout_s=30.0,
+        interval_s=0.5,
+        require_query_fresh=True,
     )
 
     docs = {
@@ -227,7 +240,9 @@ def test_sparse_import_and_hybrid_query_with_external_embeddings(backup_api):
         interval_s=0.5,
     )
     sparse_stats = wait_until(
-        lambda: _ready_index(backup_api, table_name, sparse_index, expected_docs=len(docs)),
+        lambda: _ready_index(
+            backup_api, table_name, sparse_index, expected_docs=len(docs)
+        ),
         timeout_s=30.0,
         interval_s=0.5,
     )
@@ -322,7 +337,7 @@ def test_named_embedding_queries_use_requested_indexes(table_api):
             },
         ),
         "semantic_a",
-        'embeddings',
+        "embeddings",
     )
     assert_created_index(
         table_api.create_index(
@@ -336,7 +351,7 @@ def test_named_embedding_queries_use_requested_indexes(table_api):
             },
         ),
         "semantic_b",
-        'embeddings',
+        "embeddings",
     )
     assert_created_index(
         table_api.create_index(
@@ -350,7 +365,7 @@ def test_named_embedding_queries_use_requested_indexes(table_api):
             },
         ),
         "sparse_a",
-        'embeddings',
+        "embeddings",
     )
     assert_created_index(
         table_api.create_index(
@@ -364,7 +379,7 @@ def test_named_embedding_queries_use_requested_indexes(table_api):
             },
         ),
         "sparse_b",
-        'embeddings',
+        "embeddings",
     )
     if table_api.backend == "stateful":
         for index_name in ("semantic_a", "semantic_b", "sparse_a", "sparse_b"):
@@ -475,7 +490,9 @@ def test_named_embedding_queries_use_requested_indexes(table_api):
 
 
 @pytest.mark.parametrize("table_api", ["stateful", "serverless"], indirect=True)
-def test_semantic_query_embedding_template_supports_remote_text(table_api, openai_embedder):
+def test_semantic_query_embedding_template_supports_remote_text(
+    table_api, openai_embedder
+):
     table_name = f"semantic_template_remote_text_{time.time_ns()}"
     created = table_api.create_table(table_name)
     assert created.get("name", table_name) == table_name
@@ -493,7 +510,7 @@ def test_semantic_query_embedding_template_supports_remote_text(table_api, opena
         transcript_b = f"{text_server.url}/beta.txt"
 
         assert_created_index(
-        table_api.create_index(
+            table_api.create_index(
                 table_name,
                 index_name,
                 {
@@ -517,9 +534,9 @@ def test_semantic_query_embedding_template_supports_remote_text(table_api, opena
                     },
                 },
             ),
-        index_name,
-        'embeddings',
-    )
+            index_name,
+            "embeddings",
+        )
 
         batch = table_api.batch_write(
             table_name,
@@ -560,7 +577,9 @@ def test_semantic_query_embedding_template_supports_remote_text(table_api, opena
         text_server.stop()
 
 
-def test_managed_sparse_hybrid_query_with_antfly_embeddings(backup_api, inference_embedder, inference_reranker):
+def test_managed_sparse_hybrid_query_with_antfly_embeddings(
+    backup_api, inference_embedder, inference_reranker
+):
     table_name = f"sparse_hybrid_managed_{time.time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -586,7 +605,7 @@ def test_managed_sparse_hybrid_query_with_antfly_embeddings(backup_api, inferenc
             },
         ),
         dense_index,
-        'embeddings',
+        "embeddings",
     )
     assert_created_index(
         _create_index(
@@ -606,7 +625,7 @@ def test_managed_sparse_hybrid_query_with_antfly_embeddings(backup_api, inferenc
             },
         ),
         sparse_index,
-        'embeddings',
+        "embeddings",
     )
 
     batch = backup_api.batch_write(
@@ -693,7 +712,9 @@ def test_managed_sparse_hybrid_query_with_antfly_embeddings(backup_api, inferenc
     assert profile["reranker"]["model"] == "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 
-def test_sparse_hybrid_query_supports_reranker_and_pruner(backup_api, inference_reranker):
+def test_sparse_hybrid_query_supports_reranker_and_pruner(
+    backup_api, inference_reranker
+):
     table_name = f"sparse_hybrid_rerank_{time.time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -713,38 +734,40 @@ def test_sparse_hybrid_query_supports_reranker_and_pruner(backup_api, inference_
             },
         ),
         sparse_index,
-        'embeddings',
+        "embeddings",
     )
 
     docs = {
-            "doc:a": {
-                "title": "Alpha",
-                "content": "alpha body",
-                "_embeddings": {
-                    sparse_index: {"7": 1.5, "42": 0.5},
-                },
+        "doc:a": {
+            "title": "Alpha",
+            "content": "alpha body",
+            "_embeddings": {
+                sparse_index: {"7": 1.5, "42": 0.5},
             },
-            "doc:b": {
-                "title": "Beta",
-                "content": "beta body",
-                "_embeddings": {
-                    sparse_index: {"7": 1.4, "42": 0.4},
-                },
+        },
+        "doc:b": {
+            "title": "Beta",
+            "content": "beta body",
+            "_embeddings": {
+                sparse_index: {"7": 1.4, "42": 0.4},
             },
-            "doc:c": {
-                "title": "Plain",
-                "content": "body body",
-                "_embeddings": {
-                    sparse_index: {"99": 2.0},
-                },
+        },
+        "doc:c": {
+            "title": "Plain",
+            "content": "body body",
+            "_embeddings": {
+                sparse_index: {"99": 2.0},
             },
-        }
+        },
+    }
 
     batch = backup_api.batch_write(table_name, inserts=docs, sync_level="full_index")
     assert batch["inserted"] == len(docs)
 
     sparse_stats = wait_until(
-        lambda: _ready_index(backup_api, table_name, sparse_index, expected_docs=len(docs)),
+        lambda: _ready_index(
+            backup_api, table_name, sparse_index, expected_docs=len(docs)
+        ),
         timeout_s=30.0,
         interval_s=0.5,
     )
@@ -783,18 +806,21 @@ def test_sparse_hybrid_query_supports_reranker_and_pruner(backup_api, inference_
     }
 
     reranked_query = wait_until(
-            lambda: (
-                response
-                if (
-                    (response := backup_api.query_table(table_name, query_payload))
-                    and _top_hit_ids(response) == ["doc:b", "doc:a"]
-                    and response["responses"][0]["profile"]["reranker"]["documents_reranked"] == 2
-                )
-                else None
-            ),
-            timeout_s=30.0,
-            interval_s=0.5,
-        )
+        lambda: (
+            response
+            if (
+                (response := backup_api.query_table(table_name, query_payload))
+                and _top_hit_ids(response) == ["doc:b", "doc:a"]
+                and response["responses"][0]["profile"]["reranker"][
+                    "documents_reranked"
+                ]
+                == 2
+            )
+            else None
+        ),
+        timeout_s=30.0,
+        interval_s=0.5,
+    )
     assert reranked_query is not None
 
     responses = reranked_query["responses"]
@@ -827,7 +853,7 @@ def test_sparse_hybrid_query_rejects_invalid_reranker_provider(backup_api):
             },
         ),
         sparse_index,
-        'embeddings',
+        "embeddings",
     )
 
     batch = backup_api.batch_write(
@@ -885,7 +911,9 @@ def test_sparse_hybrid_query_rejects_invalid_reranker_provider(backup_api):
         raise AssertionError("expected invalid reranker provider to fail")
 
 
-def test_sparse_hybrid_query_rejects_invalid_reranker_config(backup_api, inference_reranker):
+def test_sparse_hybrid_query_rejects_invalid_reranker_config(
+    backup_api, inference_reranker
+):
     table_name = f"sparse_hybrid_invalid_reranker_cfg_{time.time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -905,7 +933,7 @@ def test_sparse_hybrid_query_rejects_invalid_reranker_config(backup_api, inferen
             },
         ),
         sparse_index,
-        'embeddings',
+        "embeddings",
     )
 
     batch = backup_api.batch_write(

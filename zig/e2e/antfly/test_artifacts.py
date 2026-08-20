@@ -170,7 +170,9 @@ def test_document_artifact_manifest_and_reprocess_job_e2e(stateful_api):
         f"{_artifact_list_path(table_name, first_doc)}?detail=raw"
     )
     assert artifact_list["document_id"] == first_doc
-    artifact_names = {artifact["artifact_name"] for artifact in artifact_list["artifacts"]}
+    artifact_names = {
+        artifact["artifact_name"] for artifact in artifact_list["artifacts"]
+    }
     assert DOCUMENT_UNITS_ARTIFACT in artifact_names
 
     lookup = stateful_api.lookup_key(table_name, first_doc)
@@ -187,7 +189,8 @@ def test_document_artifact_manifest_and_reprocess_job_e2e(stateful_api):
         lambda: (
             current
             if (
-                (current := _manifest_ready(stateful_api, table_name, first_doc)) is not None
+                (current := _manifest_ready(stateful_api, table_name, first_doc))
+                is not None
                 and current.get("generation", 0) > first_manifest["generation"]
             )
             else None
@@ -690,7 +693,6 @@ def test_artifact_backed_embedding_table_provisions_atomically(
                     ],
                 },
                 "document_vectors": {
-                    "name": "document_vectors",
                     "type": "embeddings",
                     "field": "embedding",
                     "dimension": 3,
@@ -813,8 +815,7 @@ def test_artifact_backed_embedding_table_provisions_atomically(
                 == 2
                 and status["status"]["coverage"].get("produced") == 2
                 and status["status"]["coverage"].get("covered") == 2
-                and status["status"]["coverage"].get("observation_complete")
-                is True
+                and status["status"]["coverage"].get("observation_complete") is True
                 and status["status"]["coverage"].get("complete") is True
                 and status["status"]["coverage"].get("healthy") is True
             )
@@ -876,8 +877,7 @@ def test_artifact_backed_embedding_table_provisions_atomically(
                 == 2
                 and status["status"]["coverage"].get("produced") == 2
                 and status["status"]["coverage"].get("covered") == 2
-                and status["status"]["coverage"].get("observation_complete")
-                is True
+                and status["status"]["coverage"].get("observation_complete") is True
                 and status["status"]["coverage"].get("complete") is True
                 and status["status"]["coverage"].get("healthy") is True
             )
@@ -926,7 +926,6 @@ def test_artifact_coverage_terminal_outcomes_by_policy_after_restart(
                 ],
             },
             "document_vectors": {
-                "name": "document_vectors",
                 "type": "embeddings",
                 "coverage_policy": policy,
                 "field": "embedding",
@@ -1013,7 +1012,9 @@ def test_artifact_coverage_terminal_outcomes_by_policy_after_restart(
             f"/tables/{table_name}",
             {"num_shards": 1, "indexes": indexes_for_policy(policy)},
         )
-        assert created.get("name") == table_name or created.get("table_name") == table_name
+        assert (
+            created.get("name") == table_name or created.get("table_name") == table_name
+        )
         merged = stateful_api.linear_merge(
             table_name, records=records, sync_level="full_index"
         )
@@ -1039,7 +1040,10 @@ def test_artifact_coverage_terminal_outcomes_by_policy_after_restart(
         f"{_document_artifact_path(tables['strict'], 'failed', DOCUMENT_UNITS_ARTIFACT)}?detail=raw"
     )
     assert failed_manifest["merge_status"] == "failed"
-    assert json.loads(failed_manifest["manifest_json"])["last_error"]["stage"] == "pdf_structure"
+    assert (
+        json.loads(failed_manifest["manifest_json"])["last_error"]["stage"]
+        == "pdf_structure"
+    )
     skipped_manifest = stateful_api.get(
         f"{_document_artifact_path(tables['strict'], 'skipped', DOCUMENT_UNITS_ARTIFACT)}?detail=raw"
     )
@@ -1059,7 +1063,9 @@ def test_artifact_coverage_terminal_outcomes_by_policy_after_restart(
         )
 
 
-def test_artifact_backed_chunk_embeddings_are_semantic_searchable(stateful_api, openai_embedder):
+def test_artifact_backed_chunk_embeddings_are_semantic_searchable(
+    stateful_api, openai_embedder
+):
     table_name = f"artifact_backed_chunk_embeddings_{time.time_ns()}"
     created = stateful_api.create_table(table_name, num_shards=1)
     assert created.get("name") == table_name or created.get("table_name") == table_name
@@ -1162,7 +1168,7 @@ def test_artifact_backed_chunk_embeddings_are_semantic_searchable(stateful_api, 
             },
         ),
         "document_vectors",
-        'embeddings',
+        "embeddings",
     )
     index_detail = stateful_api.get_index(table_name, "document_vectors")
     assert index_detail["config"]["name"] == "document_vectors"
@@ -1279,7 +1285,8 @@ def test_artifact_backed_chunk_embeddings_are_semantic_searchable(stateful_api, 
         lambda: (
             current
             if (
-                (current := _manifest_ready(stateful_api, table_name, doc_key)) is not None
+                (current := _manifest_ready(stateful_api, table_name, doc_key))
+                is not None
                 and current.get("generation", 0) > manifest.get("generation", 0)
             )
             else None
@@ -1378,18 +1385,14 @@ def test_artifact_backed_chunk_embeddings_are_semantic_searchable(stateful_api, 
                 .get("total_indexed")
                 == 2
                 and index.get("status", {}).get("query_visible_doc_count") == 2
-                and index.get("status", {}).get("coverage", {}).get("source_total")
-                == 2
-                and index.get("status", {}).get("coverage", {}).get("produced")
-                == 2
+                and index.get("status", {}).get("coverage", {}).get("source_total") == 2
+                and index.get("status", {}).get("coverage", {}).get("produced") == 2
                 and index.get("status", {})
                 .get("coverage", {})
                 .get("observation_complete")
                 is True
-                and index.get("status", {}).get("coverage", {}).get("complete")
-                is True
-                and index.get("status", {}).get("coverage", {}).get("healthy")
-                is True
+                and index.get("status", {}).get("coverage", {}).get("complete") is True
+                and index.get("status", {}).get("coverage", {}).get("healthy") is True
                 and index.get("status", {})
                 .get("enrichment_runtime", {})
                 .get("embed_batches_completed", 0)

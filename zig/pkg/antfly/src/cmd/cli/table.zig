@@ -38,23 +38,44 @@ fn parseInlineSchemaConfig(allocator: std.mem.Allocator, raw: []const u8) !antfl
     );
 }
 
-fn parseInlineIndexConfig(allocator: std.mem.Allocator, raw: []const u8) !antfly_client.types.IndexConfig {
-    return std.json.parseFromSliceLeaky(
-        antfly_client.types.IndexConfig,
-        allocator,
-        raw,
-        .{ .allocate = .alloc_always },
-    );
+const InlineIndexConfig = struct {
+    name: []const u8,
+    request: antfly_client.types.CreateIndexRequest,
+};
+
+fn parseInlineIndexConfig(allocator: std.mem.Allocator, raw: []const u8) !InlineIndexConfig {
+    var value = try std.json.parseFromSliceLeaky(std.json.Value, allocator, raw, .{
+        .allocate = .alloc_always,
+    });
+    const object = switch (value) {
+        .object => |*object| object,
+        else => return error.UnexpectedToken,
+    };
+    const name_value = object.get("name") orelse return error.MissingField;
+    const name = switch (name_value) {
+        .string => |string| string,
+        else => return error.UnexpectedToken,
+    };
+    _ = object.swapRemove("name");
+    return .{
+        .name = name,
+        .request = try std.json.parseFromValueLeaky(
+            antfly_client.types.CreateIndexRequest,
+            allocator,
+            value,
+            .{},
+        ),
+    };
 }
 
 fn putInlineIndexConfig(
     allocator: std.mem.Allocator,
-    indexes: *std.json.ArrayHashMap(antfly_client.types.IndexConfig),
-    index: antfly_client.types.IndexConfig,
+    indexes: *std.json.ArrayHashMap(antfly_client.types.CreateIndexRequest),
+    index: InlineIndexConfig,
 ) !void {
     if (index.name.len == 0) return error.EmptyIndexName;
     if (indexes.map.contains(index.name)) return error.DuplicateIndexName;
-    try indexes.map.put(allocator, index.name, index);
+    try indexes.map.put(allocator, index.name, index.request);
 }
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
@@ -172,7 +193,7 @@ fn createTable(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.
         body.schema = parseInlineSchemaConfig(arena.allocator(), raw) catch |err| cli.fatal("invalid JSON for --schema: {}", .{err});
     }
     if (inline_indexes.items.len != 0) {
-        var indexes = std.json.ArrayHashMap(antfly_client.types.IndexConfig){};
+        var indexes = std.json.ArrayHashMap(antfly_client.types.CreateIndexRequest){};
         for (inline_indexes.items) |raw| {
             const index = parseInlineIndexConfig(arena.allocator(), raw) catch |err| cli.fatal("invalid JSON for --index: {}", .{err});
             putInlineIndexConfig(arena.allocator(), &indexes, index) catch |err| switch (err) {
@@ -294,7 +315,7 @@ test "table create inline schema and repeatable indexes build a typed request" {
     );
     try std.testing.expectEqualStrings("doc", schema.default_type.?);
 
-    var indexes = std.json.ArrayHashMap(antfly_client.types.IndexConfig){};
+    var indexes = std.json.ArrayHashMap(antfly_client.types.CreateIndexRequest){};
     const dense = try parseInlineIndexConfig(alloc,
         \\{"name":"title_body","type":"embeddings","field":"body","dimension":512}
     );
@@ -328,7 +349,7 @@ test "table create inline configs reject malformed unknown and duplicate definit
         \\{"name":"bad","type":"embeddings","typo":true}
     ));
 
-    var indexes = std.json.ArrayHashMap(antfly_client.types.IndexConfig){};
+    var indexes = std.json.ArrayHashMap(antfly_client.types.CreateIndexRequest){};
     const first = try parseInlineIndexConfig(alloc,
         \\{"name":"duplicate","type":"full_text"}
     );

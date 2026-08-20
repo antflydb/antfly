@@ -22,7 +22,7 @@ import time
 import pytest
 import requests
 
-from helpers import wait_until
+from helpers import assert_created_index, wait_until
 
 
 def _parse_sse_events(body: str) -> list[tuple[str, object]]:
@@ -77,7 +77,8 @@ def _post_until_hit_ids(
     result = wait_until(
         lambda: (
             response
-            if _hit_ids(response := backup_api.post("/agents/retrieval", payload)) == expected_ids
+            if _hit_ids(response := backup_api.post("/agents/retrieval", payload))
+            == expected_ids
             else None
         ),
         timeout_s=timeout_s,
@@ -94,7 +95,9 @@ def _index_status(api, table_name: str, index_name: str) -> dict | None:
         return None
 
 
-def _ready_index(api, table_name: str, index_name: str, *, expected_docs: int) -> dict | None:
+def _ready_index(
+    api, table_name: str, index_name: str, *, expected_docs: int
+) -> dict | None:
     status = _index_status(api, table_name, index_name)
     if not status:
         return None
@@ -155,12 +158,12 @@ def test_retrieval_agent_pipeline_query(backup_api):
                 "query": "find retrieval docs",
                 "stream": False,
                 "queries": [
-                        {
-                            "table": table_name,
-                            "full_text_search": {"query": "body:retrieval"},
-                            "limit": 5,
-                        }
-                    ],
+                    {
+                        "table": table_name,
+                        "full_text_search": {"query": "body:retrieval"},
+                        "limit": 5,
+                    }
+                ],
             },
         ),
         timeout_s=30.0,
@@ -364,7 +367,10 @@ def test_retrieval_agent_streaming_eval_sse(backup_api, inference_generator):
         },
     )
     if response.status_code >= 400:
-        raise requests.HTTPError(f"{response.status_code} {response.reason} body={response.text}", response=response)
+        raise requests.HTTPError(
+            f"{response.status_code} {response.reason} body={response.text}",
+            response=response,
+        )
 
     body = response.text
     assert response.headers["Content-Type"].startswith("text/event-stream")
@@ -380,29 +386,35 @@ def test_retrieval_agent_semantic_and_hybrid_queries(backup_api):
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert backup_api.post(
-        f"/tables/{table_name}/indexes/dense_idx",
-        {
-            "name": "dense_idx",
-            "type": "embeddings",
-            "external": True,
-            "dimension": 3,
-        },
-    ) == {}
-    assert backup_api.post(
-        f"/tables/{table_name}/indexes/sparse_idx",
-        {
-            "name": "sparse_idx",
-            "type": "embeddings",
-            "external": True,
-            "sparse": True,
-        },
-    ) == {}
-    backup_api.wait_index_ready(
-        table_name, "dense_idx", timeout_s=30.0, interval_s=0.5, require_query_fresh=True
+    assert_created_index(
+        backup_api.post(
+            f"/tables/{table_name}/indexes/dense_idx",
+            {"type": "embeddings", "external": True, "dimension": 3},
+        ),
+        "dense_idx",
+        "embeddings",
+    )
+    assert_created_index(
+        backup_api.post(
+            f"/tables/{table_name}/indexes/sparse_idx",
+            {"type": "embeddings", "external": True, "sparse": True},
+        ),
+        "sparse_idx",
+        "embeddings",
     )
     backup_api.wait_index_ready(
-        table_name, "sparse_idx", timeout_s=30.0, interval_s=0.5, require_query_fresh=True
+        table_name,
+        "dense_idx",
+        timeout_s=30.0,
+        interval_s=0.5,
+        require_query_fresh=True,
+    )
+    backup_api.wait_index_ready(
+        table_name,
+        "sparse_idx",
+        timeout_s=30.0,
+        interval_s=0.5,
+        require_query_fresh=True,
     )
 
     batch = backup_api.batch_write(
@@ -456,7 +468,9 @@ def test_retrieval_agent_semantic_and_hybrid_queries(backup_api):
         lambda: (
             response
             if (
-                (response := backup_api.post("/agents/retrieval", semantic_payload)).get("hits")
+                (
+                    response := backup_api.post("/agents/retrieval", semantic_payload)
+                ).get("hits")
                 and response["hits"][0]["_id"] == "doc:a"
             )
             else None
@@ -491,7 +505,9 @@ def test_retrieval_agent_semantic_and_hybrid_queries(backup_api):
         lambda: (
             response
             if (
-                (response := backup_api.post("/agents/retrieval", hybrid_payload)).get("hits")
+                (response := backup_api.post("/agents/retrieval", hybrid_payload)).get(
+                    "hits"
+                )
                 and response["hits"][0]["_id"] == "doc:a"
             )
             else None
@@ -526,16 +542,16 @@ def test_retrieval_agent_tree_search_pipeline(backup_api):
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         backup_api.post(
             f"/tables/{table_name}/indexes/doc_hierarchy",
             {
-                "name": "doc_hierarchy",
                 "type": "graph",
                 "edge_types": [{"name": "contains", "topology": "tree"}],
             },
-        )
-        == {}
+        ),
+        "doc_hierarchy",
+        "graph",
     )
 
     batch = backup_api.batch_write(
@@ -607,16 +623,16 @@ def test_retrieval_agent_tree_search_from_roots(backup_api):
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         backup_api.post(
             f"/tables/{table_name}/indexes/doc_hierarchy",
             {
-                "name": "doc_hierarchy",
                 "type": "graph",
                 "edge_types": [{"name": "contains", "topology": "tree"}],
             },
-        )
-        == {}
+        ),
+        "doc_hierarchy",
+        "graph",
     )
 
     batch = backup_api.batch_write(
@@ -681,16 +697,16 @@ def test_retrieval_agent_tree_search_generation(backup_api, inference_generator)
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         backup_api.post(
             f"/tables/{table_name}/indexes/doc_hierarchy",
             {
-                "name": "doc_hierarchy",
                 "type": "graph",
                 "edge_types": [{"name": "contains", "topology": "tree"}],
             },
-        )
-        == {}
+        ),
+        "doc_hierarchy",
+        "graph",
     )
 
     batch = backup_api.batch_write(
@@ -731,22 +747,23 @@ def test_retrieval_agent_tree_search_generation(backup_api, inference_generator)
         lambda: (
             response
             if (
-                (response := backup_api.post(
-                    "/agents/retrieval",
-                    {
-                        "query": "summarize the architecture tree",
-                        "stream": False,
-                        "generator": {
-                            "provider": "antfly",
-                            "model": "local-generator",
-                            "api_url": inference_generator,
-                            "api_key": "test-key",
-                        },
-                        "steps": {
-                            "generation": {"enabled": True},
-                            "followup": {"enabled": True, "count": 2},
-                        },
-                        "queries": [
+                (
+                    response := backup_api.post(
+                        "/agents/retrieval",
+                        {
+                            "query": "summarize the architecture tree",
+                            "stream": False,
+                            "generator": {
+                                "provider": "antfly",
+                                "model": "local-generator",
+                                "api_url": inference_generator,
+                                "api_key": "test-key",
+                            },
+                            "steps": {
+                                "generation": {"enabled": True},
+                                "followup": {"enabled": True, "count": 2},
+                            },
+                            "queries": [
                                 {
                                     "table": table_name,
                                     "tree_search": {
@@ -757,9 +774,10 @@ def test_retrieval_agent_tree_search_generation(backup_api, inference_generator)
                                     },
                                     "limit": 5,
                                 }
-                        ],
-                    },
-                )).get("hits")
+                            ],
+                        },
+                    )
+                ).get("hits")
                 and response.get("generation")
             )
             else None
@@ -770,12 +788,17 @@ def test_retrieval_agent_tree_search_generation(backup_api, inference_generator)
     assert result is not None
     assert result["strategy_used"] == "tree"
     assert _hit_ids(result) == ["doc:child"]
-    assert result["generation"] == "Generated tree answer citing doc:child from root doc:root along path doc:root > doc:child"
+    assert (
+        result["generation"]
+        == "Generated tree answer citing doc:child from root doc:root along path doc:root > doc:child"
+    )
     assert result["steps"][-1]["name"] == "generation"
     assert len(result["followup_questions"]) == 2
 
 
-def test_retrieval_agent_classification_confidence_followup(backup_api, inference_generator):
+def test_retrieval_agent_classification_confidence_followup(
+    backup_api, inference_generator
+):
     table_name = f"retrieval_classify_{time.time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -926,7 +949,10 @@ def test_retrieval_agent_streaming_sse(backup_api, inference_generator):
         },
     )
     if response.status_code >= 400:
-        raise requests.HTTPError(f"{response.status_code} {response.reason} body={response.text}", response=response)
+        raise requests.HTTPError(
+            f"{response.status_code} {response.reason} body={response.text}",
+            response=response,
+        )
 
     assert response.headers["Content-Type"].startswith("text/event-stream")
     body = response.text
@@ -943,11 +969,23 @@ def test_retrieval_agent_streaming_sse(backup_api, inference_generator):
     tool_modes = [data for event, data in events if event == "tool_mode"]
     started = [data for event, data in events if event == "step_started"]
     reasoning_chunks = [data for event, data in events if event == "reasoning"]
-    assert generation_chunks and all(isinstance(chunk, str) for chunk in generation_chunks)
+    assert generation_chunks and all(
+        isinstance(chunk, str) for chunk in generation_chunks
+    )
     assert followups and all(isinstance(question, str) for question in followups)
     assert all(isinstance(chunk, str) for chunk in reasoning_chunks)
-    assert all(isinstance(mode, dict) and "mode" in mode and "tools_count" not in mode for mode in tool_modes)
-    assert started and all(isinstance(step, dict) and "id" in step and "name" in step and "action" in step and "details" not in step for step in started)
+    assert all(
+        isinstance(mode, dict) and "mode" in mode and "tools_count" not in mode
+        for mode in tool_modes
+    )
+    assert started and all(
+        isinstance(step, dict)
+        and "id" in step
+        and "name" in step
+        and "action" in step
+        and "details" not in step
+        for step in started
+    )
 
 
 def test_retrieval_agent_streaming_clarification_sse(backup_api):
@@ -958,7 +996,11 @@ def test_retrieval_agent_streaming_clarification_sse(backup_api):
     batch = backup_api.batch_write(
         table_name,
         inserts={
-            "doc:a": {"title": "raft", "body": "raft consensus in antfly", "status": "active"},
+            "doc:a": {
+                "title": "raft",
+                "body": "raft consensus in antfly",
+                "status": "active",
+            },
             "doc:b": {"title": "other", "body": "unrelated notes", "status": "draft"},
         },
         sync_level="full_index",
@@ -989,7 +1031,10 @@ def test_retrieval_agent_streaming_clarification_sse(backup_api):
         },
     )
     if response.status_code >= 400:
-        raise requests.HTTPError(f"{response.status_code} {response.reason} body={response.text}", response=response)
+        raise requests.HTTPError(
+            f"{response.status_code} {response.reason} body={response.text}",
+            response=response,
+        )
 
     assert response.headers["Content-Type"].startswith("text/event-stream")
     body = response.text
@@ -1010,8 +1055,16 @@ def test_retrieval_agent_streaming_decompose_progress(backup_api):
     batch = backup_api.batch_write(
         table_name,
         inserts={
-            "doc:a": {"title": "raft", "body": "raft consensus in antfly", "status": "draft"},
-            "doc:b": {"title": "status", "body": "secondary document", "status": "active"},
+            "doc:a": {
+                "title": "raft",
+                "body": "raft consensus in antfly",
+                "status": "draft",
+            },
+            "doc:b": {
+                "title": "status",
+                "body": "secondary document",
+                "status": "active",
+            },
         },
         sync_level="full_index",
     )
@@ -1039,7 +1092,10 @@ def test_retrieval_agent_streaming_decompose_progress(backup_api):
         },
     )
     if response.status_code >= 400:
-        raise requests.HTTPError(f"{response.status_code} {response.reason} body={response.text}", response=response)
+        raise requests.HTTPError(
+            f"{response.status_code} {response.reason} body={response.text}",
+            response=response,
+        )
 
     assert response.headers["Content-Type"].startswith("text/event-stream")
     body = response.text
@@ -1055,17 +1111,17 @@ def test_retrieval_agent_streaming_probe_progress(backup_api):
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         backup_api.post(
             f"/tables/{table_name}/indexes/dense_idx",
             {
-                "name": "dense_idx",
                 "type": "embeddings",
                 "external": True,
                 "dimension": 3,
             },
-        )
-        == {}
+        ),
+        "dense_idx",
+        "embeddings",
     )
 
     batch = backup_api.batch_write(
@@ -1158,7 +1214,10 @@ def test_retrieval_agent_streaming_probe_progress(backup_api):
         },
     )
     if response.status_code >= 400:
-        raise requests.HTTPError(f"{response.status_code} {response.reason} body={response.text}", response=response)
+        raise requests.HTTPError(
+            f"{response.status_code} {response.reason} body={response.text}",
+            response=response,
+        )
 
     body = response.text
     assert response.headers["Content-Type"].startswith("text/event-stream")
@@ -1179,7 +1238,11 @@ def test_retrieval_agent_streaming_fallback_progress(backup_api):
     batch = backup_api.batch_write(
         table_name,
         inserts={
-            "doc:a": {"title": "raft", "body": "raft consensus in antfly", "status": "active"},
+            "doc:a": {
+                "title": "raft",
+                "body": "raft consensus in antfly",
+                "status": "active",
+            },
             "doc:b": {"title": "other", "body": "unrelated notes", "status": "draft"},
         },
         sync_level="full_index",
@@ -1208,7 +1271,10 @@ def test_retrieval_agent_streaming_fallback_progress(backup_api):
         },
     )
     if response.status_code >= 400:
-        raise requests.HTTPError(f"{response.status_code} {response.reason} body={response.text}", response=response)
+        raise requests.HTTPError(
+            f"{response.status_code} {response.reason} body={response.text}",
+            response=response,
+        )
 
     body = response.text
     assert response.headers["Content-Type"].startswith("text/event-stream")
@@ -1227,16 +1293,16 @@ def test_retrieval_agent_streaming_tree_progress(backup_api):
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         backup_api.post(
             f"/tables/{table_name}/indexes/doc_hierarchy",
             {
-                "name": "doc_hierarchy",
                 "type": "graph",
                 "edge_types": [{"name": "contains", "topology": "tree"}],
             },
-        )
-        == {}
+        ),
+        "doc_hierarchy",
+        "graph",
     )
 
     batch = backup_api.batch_write(
@@ -1284,7 +1350,8 @@ def test_retrieval_agent_streaming_tree_progress(backup_api):
                         ],
                     },
                 )
-            ).status_code < 400
+            ).status_code
+            < 400
             and "event: hit" in streamed.text
             else None
         ),
@@ -1293,7 +1360,10 @@ def test_retrieval_agent_streaming_tree_progress(backup_api):
     )
     assert response is not None
     if response.status_code >= 400:
-        raise requests.HTTPError(f"{response.status_code} {response.reason} body={response.text}", response=response)
+        raise requests.HTTPError(
+            f"{response.status_code} {response.reason} body={response.text}",
+            response=response,
+        )
 
     body = response.text
     assert response.headers["Content-Type"].startswith("text/event-stream")
@@ -1324,7 +1394,10 @@ def test_retrieval_agent_streaming_error_sse(backup_api):
         },
     )
     if response.status_code >= 400:
-        raise requests.HTTPError(f"{response.status_code} {response.reason} body={response.text}", response=response)
+        raise requests.HTTPError(
+            f"{response.status_code} {response.reason} body={response.text}",
+            response=response,
+        )
 
     assert response.headers["Content-Type"].startswith("text/event-stream")
     body = response.text
@@ -1376,17 +1449,17 @@ def test_retrieval_agent_bounded_agentic_can_probe_ambiguous_candidates(backup_a
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         backup_api.post(
             f"/tables/{table_name}/indexes/dense_idx",
             {
-                "name": "dense_idx",
                 "type": "embeddings",
                 "external": True,
                 "dimension": 3,
             },
-        )
-        == {}
+        ),
+        "dense_idx",
+        "embeddings",
     )
 
     batch = backup_api.batch_write(
@@ -1444,12 +1517,17 @@ def test_retrieval_agent_bounded_agentic_can_probe_ambiguous_candidates(backup_a
     )
     assert result["tool_calls_made"] == 1
     assert result["strategy_used"] == "hybrid"
-    selection_step = next(step for step in result["steps"] if step["name"] == "select_strategy")
+    selection_step = next(
+        step for step in result["steps"] if step["name"] == "select_strategy"
+    )
     assert selection_step["details"]["selection_source"] == "probe"
     assert len(selection_step["details"]["candidate_scores"]) == 2
     assert selection_step["details"]["candidate_scores"][0]["probe_hits"] >= 0
     assert selection_step["details"]["candidate_scores"][1]["probe_hits"] >= 0
-    assert any("probe_relevance" in candidate for candidate in selection_step["details"]["candidate_scores"])
+    assert any(
+        "probe_relevance" in candidate
+        for candidate in selection_step["details"]["candidate_scores"]
+    )
 
 
 def test_retrieval_agent_bounded_agentic_selects_best_query(backup_api):
@@ -1460,7 +1538,11 @@ def test_retrieval_agent_bounded_agentic_selects_best_query(backup_api):
     batch = backup_api.batch_write(
         table_name,
         inserts={
-            "doc:a": {"title": "raft", "body": "raft consensus in antfly", "status": "active"},
+            "doc:a": {
+                "title": "raft",
+                "body": "raft consensus in antfly",
+                "status": "active",
+            },
             "doc:b": {"title": "other", "body": "unrelated notes", "status": "draft"},
         },
         sync_level="full_index",
@@ -1492,7 +1574,9 @@ def test_retrieval_agent_bounded_agentic_selects_best_query(backup_api):
     assert _hit_ids(result) == ["doc:a"]
 
 
-def test_retrieval_agent_bounded_agentic_can_fallback_after_an_empty_first_pass(backup_api):
+def test_retrieval_agent_bounded_agentic_can_fallback_after_an_empty_first_pass(
+    backup_api,
+):
     table_name = f"retrieval_agentic_fallback_{time.time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -1500,7 +1584,11 @@ def test_retrieval_agent_bounded_agentic_can_fallback_after_an_empty_first_pass(
     batch = backup_api.batch_write(
         table_name,
         inserts={
-            "doc:a": {"title": "raft", "body": "raft consensus in antfly", "status": "active"},
+            "doc:a": {
+                "title": "raft",
+                "body": "raft consensus in antfly",
+                "status": "active",
+            },
             "doc:b": {"title": "other", "body": "unrelated notes", "status": "draft"},
         },
         sync_level="full_index",
@@ -1561,22 +1649,24 @@ def test_retrieval_agent_bounded_agentic_can_fallback_after_an_empty_first_pass(
     assert evaluation_select
 
 
-def test_retrieval_agent_bounded_agentic_can_fallback_after_a_weak_first_pass(backup_api):
+def test_retrieval_agent_bounded_agentic_can_fallback_after_a_weak_first_pass(
+    backup_api,
+):
     table_name = f"retrieval_agentic_weak_fallback_{time.time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         backup_api.post(
             f"/tables/{table_name}/indexes/dense_idx",
             {
-                "name": "dense_idx",
                 "type": "embeddings",
                 "external": True,
                 "dimension": 3,
             },
-        )
-        == {}
+        ),
+        "dense_idx",
+        "embeddings",
     )
 
     batch = backup_api.batch_write(
@@ -1666,8 +1756,13 @@ def test_retrieval_agent_bounded_agentic_can_fallback_after_a_weak_first_pass(ba
         lambda: (
             response
             if (
-                (response := backup_api.post("/agents/retrieval", payload)).get("status") == "completed"
-                and any(step.get("name") == "evaluate" for step in response.get("steps", []))
+                (response := backup_api.post("/agents/retrieval", payload)).get(
+                    "status"
+                )
+                == "completed"
+                and any(
+                    step.get("name") == "evaluate" for step in response.get("steps", [])
+                )
             )
             else None
         ),
@@ -1686,33 +1781,43 @@ def test_retrieval_agent_bounded_agentic_can_fallback_after_a_weak_first_pass(ba
     assert "current_planner_score" in evaluation_details
     if "candidate_scores" in evaluation_details:
         assert "best_fallback_score" in evaluation_details
-        assert any("probe_hits" in candidate for candidate in evaluation_details["candidate_scores"])
+        assert any(
+            "probe_hits" in candidate
+            for candidate in evaluation_details["candidate_scores"]
+        )
     else:
         assert evaluation_details["planner_decision"] == "refine_query"
         assert "best_fallback_score" in evaluation_details
     if result["tool_calls_made"] == 3:
         assert "doc:semantic" in _hit_ids(result)
-        refine_steps = [step for step in result["steps"] if step["name"] == "refine_query"]
+        refine_steps = [
+            step for step in result["steps"] if step["name"] == "refine_query"
+        ]
         assert refine_steps
-        assert any(step.get("details", {}).get("phase") == "evaluation_refine" for step in refine_steps)
+        assert any(
+            step.get("details", {}).get("phase") == "evaluation_refine"
+            for step in refine_steps
+        )
 
 
-def test_retrieval_agent_bounded_agentic_can_fallback_after_a_weak_multi_hit_first_pass(backup_api):
+def test_retrieval_agent_bounded_agentic_can_fallback_after_a_weak_multi_hit_first_pass(
+    backup_api,
+):
     table_name = f"retrieval_agentic_weak_multi_fallback_{time.time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         backup_api.post(
             f"/tables/{table_name}/indexes/dense_idx",
             {
-                "name": "dense_idx",
                 "type": "embeddings",
                 "external": True,
                 "dimension": 3,
             },
-        )
-        == {}
+        ),
+        "dense_idx",
+        "embeddings",
     )
 
     batch = backup_api.batch_write(
@@ -1800,8 +1905,13 @@ def test_retrieval_agent_bounded_agentic_can_fallback_after_a_weak_multi_hit_fir
         lambda: (
             response
             if (
-                (response := backup_api.post("/agents/retrieval", payload)).get("status") == "completed"
-                and any(step.get("name") == "evaluate" for step in response.get("steps", []))
+                (response := backup_api.post("/agents/retrieval", payload)).get(
+                    "status"
+                )
+                == "completed"
+                and any(
+                    step.get("name") == "evaluate" for step in response.get("steps", [])
+                )
             )
             else None
         ),
@@ -1820,15 +1930,23 @@ def test_retrieval_agent_bounded_agentic_can_fallback_after_a_weak_multi_hit_fir
     assert "current_planner_score" in evaluation_details
     if "candidate_scores" in evaluation_details:
         assert "best_fallback_score" in evaluation_details
-        assert any("probe_hits" in candidate for candidate in evaluation_details["candidate_scores"])
+        assert any(
+            "probe_hits" in candidate
+            for candidate in evaluation_details["candidate_scores"]
+        )
     else:
         assert evaluation_details["planner_decision"] == "refine_query"
         assert "best_fallback_score" in evaluation_details
     if result["tool_calls_made"] == 3:
         assert "doc:semantic" in _hit_ids(result)
-        refine_steps = [step for step in result["steps"] if step["name"] == "refine_query"]
+        refine_steps = [
+            step for step in result["steps"] if step["name"] == "refine_query"
+        ]
         assert refine_steps
-        assert any(step.get("details", {}).get("phase") == "evaluation_refine" for step in refine_steps)
+        assert any(
+            step.get("details", {}).get("phase") == "evaluation_refine"
+            for step in refine_steps
+        )
 
 
 def test_retrieval_agent_bounded_agentic_can_decompose_queries(backup_api):
@@ -1839,8 +1957,16 @@ def test_retrieval_agent_bounded_agentic_can_decompose_queries(backup_api):
     batch = backup_api.batch_write(
         table_name,
         inserts={
-            "doc:a": {"title": "raft", "body": "raft consensus in antfly", "status": "draft"},
-            "doc:b": {"title": "status", "body": "secondary document", "status": "active"},
+            "doc:a": {
+                "title": "raft",
+                "body": "raft consensus in antfly",
+                "status": "draft",
+            },
+            "doc:b": {
+                "title": "status",
+                "body": "secondary document",
+                "status": "active",
+            },
         },
         sync_level="full_index",
     )
@@ -1881,7 +2007,11 @@ def test_retrieval_agent_can_require_clarification_and_continue(backup_api):
     batch = backup_api.batch_write(
         table_name,
         inserts={
-            "doc:a": {"title": "raft", "body": "raft consensus in antfly", "status": "active"},
+            "doc:a": {
+                "title": "raft",
+                "body": "raft consensus in antfly",
+                "status": "active",
+            },
             "doc:b": {"title": "other", "body": "unrelated notes", "status": "draft"},
         },
         sync_level="full_index",
@@ -1953,7 +2083,9 @@ def test_retrieval_agent_can_require_clarification_and_continue(backup_api):
     assert _hit_ids(continued) == ["doc:a"]
 
 
-def test_retrieval_agent_can_ask_to_broaden_after_a_user_selected_query_misses(backup_api):
+def test_retrieval_agent_can_ask_to_broaden_after_a_user_selected_query_misses(
+    backup_api,
+):
     table_name = f"retrieval_agentic_broaden_{time.time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -1961,7 +2093,11 @@ def test_retrieval_agent_can_ask_to_broaden_after_a_user_selected_query_misses(b
     batch = backup_api.batch_write(
         table_name,
         inserts={
-            "doc:a": {"title": "raft", "body": "raft consensus in antfly", "status": "active"},
+            "doc:a": {
+                "title": "raft",
+                "body": "raft consensus in antfly",
+                "status": "active",
+            },
             "doc:b": {"title": "other", "body": "unrelated notes", "status": "draft"},
         },
         sync_level="full_index",
@@ -2032,7 +2168,9 @@ def test_retrieval_agent_can_ask_to_broaden_after_a_user_selected_query_misses(b
     assert _hit_ids(continued) == ["doc:a"]
 
 
-def test_retrieval_agent_rejects_tree_search_without_start_nodes_or_seed_hits(backup_api):
+def test_retrieval_agent_rejects_tree_search_without_start_nodes_or_seed_hits(
+    backup_api,
+):
     table_name = f"retrieval_invalid_{time.time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
