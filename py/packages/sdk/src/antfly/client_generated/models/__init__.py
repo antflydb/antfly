@@ -37,7 +37,6 @@ from .antfly_embedder_config import AntflyEmbedderConfig
 from .antfly_generator_config import AntflyGeneratorConfig
 from .antfly_reranker_config import AntflyRerankerConfig
 from .antfly_type import AntflyType
-from .antfly_type_2 import AntflyType2
 from .anthropic_generator_config import AnthropicGeneratorConfig
 from .api_key import ApiKey
 from .api_key_row_filter_type_0 import ApiKeyRowFilterType0
@@ -235,6 +234,7 @@ from .field_capability import FieldCapability
 from .field_capability_index_sort_order import FieldCapabilityIndexSortOrder
 from .field_capability_query_modes_item import FieldCapabilityQueryModesItem
 from .field_capability_sort_lifecycle_state import FieldCapabilitySortLifecycleState
+from .field_mapping_type import FieldMappingType
 from .field_statistics import FieldStatistics
 from .filter_spec import FilterSpec
 from .filter_spec_operator import FilterSpecOperator
@@ -796,7 +796,6 @@ __all__ = (
     "AntflyGeneratorConfig",
     "AntflyRerankerConfig",
     "AntflyType",
-    "AntflyType2",
     "AnthropicGeneratorConfig",
     "ApiKey",
     "ApiKeyRowFilterType0",
@@ -992,6 +991,7 @@ __all__ = (
     "FieldCapabilityIndexSortOrder",
     "FieldCapabilityQueryModesItem",
     "FieldCapabilitySortLifecycleState",
+    "FieldMappingType",
     "FieldStatistics",
     "FilterSpec",
     "FilterSpecOperator",

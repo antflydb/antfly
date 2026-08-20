@@ -9168,13 +9168,17 @@ export interface components {
             };
         };
         /**
-         * @description Field type annotations for schema fields
+         * @description Field types accepted by detailed `x-antfly-field` and dynamic-template
+         *     mappings. JSON-schema-oriented aliases are normalized to Antfly's
+         *     corresponding runtime type: number/integer to numeric, bool to boolean,
+         *     date/timestamp to datetime, geo_point to geopoint, and geo_shape to
+         *     geoshape.
          * @enum {string}
          */
-        "AntflyType-2": "text" | "html" | "keyword" | "numeric" | "boolean" | "datetime" | "geopoint" | "geoshape" | "embedding" | "blob" | "link" | "search_as_you_type";
+        FieldMappingType: "text" | "html" | "keyword" | "numeric" | "number" | "integer" | "boolean" | "bool" | "datetime" | "date" | "timestamp" | "geopoint" | "geo_point" | "geoshape" | "geo_shape" | "embedding" | "blob" | "link" | "search_as_you_type";
         /** @description Field mapping used by a dynamic template or a document property's `x-antfly-field` annotation. */
         TemplateFieldMapping: {
-            type?: components["schemas"]["AntflyType-2"];
+            type?: components["schemas"]["FieldMappingType"];
             /**
              * @description Analyzer name (e.g., "standard", "keyword", "en", "html_analyzer").
              *     Used for text fields to control tokenization and normalization.

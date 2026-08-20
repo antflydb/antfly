@@ -6,5 +6,6 @@ pub const types = @import("types.zig");
 pub const AntflyType = types.AntflyType;
 pub const DocumentSchema = types.DocumentSchema;
 pub const DynamicTemplate = types.DynamicTemplate;
+pub const FieldMappingType = types.FieldMappingType;
 pub const TableSchema = types.TableSchema;
 pub const TemplateFieldMapping = types.TemplateFieldMapping;

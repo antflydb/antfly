@@ -3857,12 +3857,25 @@ pub const ApiHttpServer = struct {
         return tables_api.lsmStorageStatusFromStats(aggregate);
     }
 
-    fn bestEffortObservedDynamicFieldCapabilitySets(
+    fn observedDynamicFieldCapabilitySets(
         self: *ApiHttpServer,
         table_name: []const u8,
     ) ![]table_reads.ObservedDynamicFieldCapabilitySet {
         const source = self.table_reads orelse return &.{};
         return (try source.observedDynamicFieldCapabilitySets(self.alloc, table_name)) orelse &.{};
+    }
+
+    fn bestEffortObservedDynamicFieldCapabilitySets(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+    ) ![]table_reads.ObservedDynamicFieldCapabilitySet {
+        return self.observedDynamicFieldCapabilitySets(table_name) catch |err| switch (err) {
+            // Observability and query-builder callers can still provide the
+            // declared schema when a cold query DB has no physical evidence
+            // yet. They must not warm storage merely to enrich metadata.
+            error.StorageReadTemporarilyUnavailable => &.{},
+            else => return err,
+        };
     }
 
     fn freeObservedDynamicFieldCapabilitySets(
@@ -5115,7 +5128,7 @@ pub const ApiHttpServer = struct {
         query_req: db_mod.types.SearchRequest,
     ) ![]table_reads.ObservedDynamicFieldCapabilitySet {
         const source = self.table_reads orelse return &.{};
-        return self.bestEffortObservedDynamicFieldCapabilitySets(table_name) catch |err| switch (err) {
+        return self.observedDynamicFieldCapabilitySets(table_name) catch |err| switch (err) {
             error.StorageReadTemporarilyUnavailable => {
                 // A cold provisioned table has not installed a resident query
                 // handle yet. Let the normal preflight retry protocol prepare
@@ -5129,7 +5142,7 @@ pub const ApiHttpServer = struct {
                     0,
                 )) orelse return error.StorageReadTemporarilyUnavailable;
                 defer summary.deinit(self.alloc);
-                return self.bestEffortObservedDynamicFieldCapabilitySets(table_name) catch |retry_err| switch (retry_err) {
+                return self.observedDynamicFieldCapabilitySets(table_name) catch |retry_err| switch (retry_err) {
                     error.StorageReadTemporarilyUnavailable => error.StorageReadTemporarilyUnavailable,
                     else => retry_err,
                 };
@@ -24085,8 +24098,63 @@ test "api http server query builder loads structured table index metadata" {
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
+    const ColdReads = struct {
+        fn source() table_reads.TableReadSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .observed_dynamic_field_capability_sets = observedDynamicFieldCapabilitySets,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?query_api.QueryResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn observedDynamicFieldCapabilitySets(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+        ) anyerror!?[]table_reads.ObservedDynamicFieldCapabilitySet {
+            return error.StorageReadTemporarilyUnavailable;
+        }
+    };
+
     var source = FakeSource{};
-    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), ColdReads.source(), null);
     const context = try server.loadQueryBuilderTableContext("docs");
     defer freeQueryBuilderTableContext(alloc, context);
 

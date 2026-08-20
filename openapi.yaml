@@ -17830,18 +17830,34 @@ components:
             A valid JSON Schema defining the document's structure.
 
             This is used to infer indexing rules and field types.
-    AntflyType-2:
+    FieldMappingType:
       type: string
-      description: Field type annotations for schema fields
+      description: >
+        Field types accepted by detailed `x-antfly-field` and dynamic-template
+
+        mappings. JSON-schema-oriented aliases are normalized to Antfly's
+
+        corresponding runtime type: number/integer to numeric, bool to boolean,
+
+        date/timestamp to datetime, geo_point to geopoint, and geo_shape to
+
+        geoshape.
       enum:
         - text
         - html
         - keyword
         - numeric
+        - number
+        - integer
         - boolean
+        - bool
         - datetime
+        - date
+        - timestamp
         - geopoint
+        - geo_point
         - geoshape
+        - geo_shape
         - embedding
         - blob
         - link
@@ -17853,7 +17869,7 @@ components:
         annotation.
       properties:
         type:
-          $ref: '#/components/schemas/AntflyType-2'
+          $ref: '#/components/schemas/FieldMappingType'
         analyzer:
           type: string
           description: >

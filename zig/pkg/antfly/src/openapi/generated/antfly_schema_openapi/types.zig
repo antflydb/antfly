@@ -3,7 +3,7 @@
 
 const std = @import("std");
 
-/// Field type annotations for schema fields
+/// Canonical Antfly field type used by compact `x-antfly-types` annotations and runtime capability reporting
 pub const AntflyType = enum {
     text,
     html,
@@ -84,6 +84,83 @@ pub const DynamicTemplate = struct {
     mapping: ?TemplateFieldMapping = null,
 };
 
+/// Field types accepted by detailed `x-antfly-field` and dynamic-template mappings. JSON-schema-oriented aliases are normalized to Antfly's corresponding runtime type: number/integer to numeric, bool to boolean, date/timestamp to datetime, geo_point to geopoint, and geo_shape to geoshape.
+pub const FieldMappingType = enum {
+    text,
+    html,
+    keyword,
+    numeric,
+    number,
+    integer,
+    boolean,
+    bool,
+    datetime,
+    date,
+    timestamp,
+    geopoint,
+    geo_point,
+    geoshape,
+    geo_shape,
+    embedding,
+    blob,
+    link,
+    search_as_you_type,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .text => "text",
+            .html => "html",
+            .keyword => "keyword",
+            .numeric => "numeric",
+            .number => "number",
+            .integer => "integer",
+            .boolean => "boolean",
+            .bool => "bool",
+            .datetime => "datetime",
+            .date => "date",
+            .timestamp => "timestamp",
+            .geopoint => "geopoint",
+            .geo_point => "geo_point",
+            .geoshape => "geoshape",
+            .geo_shape => "geo_shape",
+            .embedding => "embedding",
+            .blob => "blob",
+            .link => "link",
+            .search_as_you_type => "search_as_you_type",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "text", .text },
+            .{ "html", .html },
+            .{ "keyword", .keyword },
+            .{ "numeric", .numeric },
+            .{ "number", .number },
+            .{ "integer", .integer },
+            .{ "boolean", .boolean },
+            .{ "bool", .bool },
+            .{ "datetime", .datetime },
+            .{ "date", .date },
+            .{ "timestamp", .timestamp },
+            .{ "geopoint", .geopoint },
+            .{ "geo_point", .geo_point },
+            .{ "geoshape", .geoshape },
+            .{ "geo_shape", .geo_shape },
+            .{ "embedding", .embedding },
+            .{ "blob", .blob },
+            .{ "link", .link },
+            .{ "search_as_you_type", .search_as_you_type },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Schema definition for a table with multiple document types
 pub const TableSchema = struct {
     /// Backend-managed schema generation used for migrations. Omit it from create and update requests.
@@ -104,7 +181,7 @@ pub const TableSchema = struct {
 
 /// Field mapping used by a dynamic template or a document property's `x-antfly-field` annotation.
 pub const TemplateFieldMapping = struct {
-    type: ?AntflyType = null,
+    type: ?FieldMappingType = null,
     /// Analyzer name (e.g., "standard", "keyword", "en", "html_analyzer"). Used for text fields to control tokenization and normalization.
     analyzer: ?[]const u8 = null,
     /// Whether to index the field (default true)

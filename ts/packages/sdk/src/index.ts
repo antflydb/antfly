@@ -180,6 +180,7 @@ export type {
   DocumentArtifactTableReprocessResponse,
   // Schema types
   DocumentSchema,
+  DynamicTemplate,
   // Graph index types
   Edge,
   EdgeDirection,
@@ -201,6 +202,7 @@ export type {
   ExternalIoConnection,
   ExternalIoProtocol,
   FetchConfig,
+  FieldMappingType,
   FilterSpec,
   GenerationConfidence,
   GeneratorConfig,
@@ -270,6 +272,7 @@ export type {
   TableMigration,
   TableSchema,
   TableStatus,
+  TemplateFieldMapping,
   ToolCall,
   ToolCallFunction,
   TraversalResult,

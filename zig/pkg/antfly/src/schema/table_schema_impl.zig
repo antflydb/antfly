@@ -1485,7 +1485,13 @@ fn validateFieldMappingObject(mapping: std.json.Value, allow_fields: bool) !void
     while (keys.next()) |entry| {
         if (!isKnownFieldMappingKey(entry.key_ptr.*, allow_fields)) return error.InvalidSchemaUpdateRequest;
     }
-    if (mapping.object.get("type")) |mapping_type| if (mapping_type != .null and mapping_type != .string) return error.InvalidSchemaUpdateRequest;
+    if (mapping.object.get("type")) |mapping_type| {
+        if (mapping_type != .null and
+            (mapping_type != .string or !mappingTypeIsKnown(mapping_type.string)))
+        {
+            return error.InvalidSchemaUpdateRequest;
+        }
+    }
     if (mapping.object.get("analyzer")) |analyzer| if (analyzer != .null and analyzer != .string) return error.InvalidSchemaUpdateRequest;
     if (mapping.object.get("index")) |index| if (index != .null and index != .bool) return error.InvalidSchemaUpdateRequest;
     if (mapping.object.get("store")) |store| if (store != .null and store != .bool) return error.InvalidSchemaUpdateRequest;
@@ -1567,6 +1573,19 @@ fn mappingTypeCanSort(mapping_type: []const u8) bool {
         std.mem.eql(u8, mapping_type, "date") or
         std.mem.eql(u8, mapping_type, "timestamp") or
         std.mem.eql(u8, mapping_type, "link");
+}
+
+fn mappingTypeIsKnown(mapping_type: []const u8) bool {
+    return mappingTypeCanSort(mapping_type) or
+        std.mem.eql(u8, mapping_type, "text") or
+        std.mem.eql(u8, mapping_type, "html") or
+        std.mem.eql(u8, mapping_type, "embedding") or
+        std.mem.eql(u8, mapping_type, "geopoint") or
+        std.mem.eql(u8, mapping_type, "geo_point") or
+        std.mem.eql(u8, mapping_type, "geoshape") or
+        std.mem.eql(u8, mapping_type, "geo_shape") or
+        std.mem.eql(u8, mapping_type, "blob") or
+        std.mem.eql(u8, mapping_type, "search_as_you_type");
 }
 
 fn validateNonNegativeInteger(value: std.json.Value) !void {
@@ -3938,6 +3957,20 @@ test "parse accepts sortable without public doc values and rejects unsupported s
         parseSchema(
             std.testing.allocator,
             "{\"dynamic_templates\":[{\"name\":\"rank\",\"path_match\":\"rank\",\"mapping\":{\"type\":\"numeric\",\"doc_values\":false,\"sortable\":true}}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"dynamic_templates\":[{\"name\":\"mystery\",\"path_match\":\"mystery\",\"mapping\":{\"type\":\"unknown\"}}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"mystery\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"unknown\"}}}}}}}",
         ),
     );
     try std.testing.expectError(

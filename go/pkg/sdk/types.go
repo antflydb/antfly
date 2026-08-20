@@ -122,10 +122,13 @@ type (
 	PackedSparseEmbedding = oapi.Embedding3 // {PackedIndices, PackedValues} as base64 LE bytes
 
 	// Other types
-	AntflyType     = oapi.AntflyType
-	MergeStrategy  = oapi.MergeStrategy
-	MergeConfig    = oapi.MergeConfig
-	DocumentSchema = oapi.DocumentSchema
+	AntflyType           = oapi.AntflyType
+	FieldMappingType     = oapi.FieldMappingType
+	TemplateFieldMapping = oapi.TemplateFieldMapping
+	DynamicTemplate      = oapi.DynamicTemplate
+	MergeStrategy        = oapi.MergeStrategy
+	MergeConfig          = oapi.MergeConfig
+	DocumentSchema       = oapi.DocumentSchema
 
 	// Validation types
 	ValidationError  = oapi.ValidationError

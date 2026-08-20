@@ -10,7 +10,7 @@ components:
   schemas:
     AntflyType:
       type: string
-      description: Field type annotations for schema fields
+      description: Canonical Antfly field type used by compact `x-antfly-types` annotations and runtime capability reporting
       enum:
         - text
         - html
@@ -20,6 +20,35 @@ components:
         - datetime
         - geopoint
         - geoshape
+        - embedding
+        - blob
+        - link
+        - search_as_you_type
+
+    FieldMappingType:
+      type: string
+      description: |
+        Field types accepted by detailed `x-antfly-field` and dynamic-template
+        mappings. JSON-schema-oriented aliases are normalized to Antfly's
+        corresponding runtime type: number/integer to numeric, bool to boolean,
+        date/timestamp to datetime, geo_point to geopoint, and geo_shape to
+        geoshape.
+      enum:
+        - text
+        - html
+        - keyword
+        - numeric
+        - number
+        - integer
+        - boolean
+        - bool
+        - datetime
+        - date
+        - timestamp
+        - geopoint
+        - geo_point
+        - geoshape
+        - geo_shape
         - embedding
         - blob
         - link
@@ -121,7 +150,7 @@ components:
       description: Field mapping used by a dynamic template or a document property's `x-antfly-field` annotation.
       properties:
         type:
-          $ref: "#/components/schemas/AntflyType"
+          $ref: "#/components/schemas/FieldMappingType"
         analyzer:
           type: string
           description: |
