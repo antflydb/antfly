@@ -1911,7 +1911,13 @@ fn writeLsmWriteMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Backend.W
     try health_metrics.appendPromMetric(writer, "antfly_lsm_sorted_ingest_runs_total", "counter", "Runs published through cached write LSM sorted ingest", stats.sorted_ingest_runs);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_sorted_ingest_bytes_total", "counter", "Run bytes published through cached write LSM sorted ingest", stats.sorted_ingest_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_sorted_ingest_ns_total", "counter", "Nanoseconds spent in cached write LSM sorted ingest", stats.sorted_ingest_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_compactions_total", "counter", "Completed cached write LSM compaction jobs", stats.compactions);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_input_bytes_total", "counter", "Input bytes consumed by cached write LSM compaction jobs", stats.compaction_input_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_output_bytes_total", "counter", "Output bytes produced by cached write LSM compaction jobs", stats.compaction_output_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_ns_total", "counter", "Nanoseconds spent compacting cached write LSM runs", stats.compaction_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_max_input_bytes", "gauge", "Largest cached write LSM compaction job input in bytes", stats.compaction_max_input_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_max_output_bytes", "gauge", "Largest cached write LSM compaction job output in bytes", stats.compaction_max_output_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_max_ns", "gauge", "Longest completed cached write LSM compaction job in nanoseconds", stats.compaction_max_ns);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_manifest_writes_total", "counter", "Cached write LSM manifest writes", stats.manifest_writes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_manifest_bytes_total", "counter", "Cached write LSM manifest bytes written", stats.manifest_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_manifest_ns_total", "counter", "Nanoseconds spent writing cached write LSM manifests", stats.manifest_ns);

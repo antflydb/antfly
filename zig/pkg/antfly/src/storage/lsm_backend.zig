@@ -661,7 +661,13 @@ pub const Backend = struct {
         sorted_ingest_runs: u64 = 0,
         sorted_ingest_bytes: u64 = 0,
         sorted_ingest_ns: u64 = 0,
+        compactions: u64 = 0,
+        compaction_input_bytes: u64 = 0,
+        compaction_output_bytes: u64 = 0,
         compaction_ns: u64 = 0,
+        compaction_max_input_bytes: u64 = 0,
+        compaction_max_output_bytes: u64 = 0,
+        compaction_max_ns: u64 = 0,
         manifest_writes: u64 = 0,
         manifest_bytes: u64 = 0,
         manifest_ns: u64 = 0,
@@ -964,6 +970,11 @@ pub const Backend = struct {
         inline for (@typeInfo(WriteStats).@"struct".fields) |field| {
             if (comptime std.mem.eql(u8, field.name, "table_file_compression_codec_mask")) {
                 @field(dst, field.name) |= @field(src, field.name);
+            } else if (comptime std.mem.eql(u8, field.name, "compaction_max_input_bytes") or
+                std.mem.eql(u8, field.name, "compaction_max_output_bytes") or
+                std.mem.eql(u8, field.name, "compaction_max_ns"))
+            {
+                @field(dst, field.name) = @max(@field(dst, field.name), @field(src, field.name));
             } else {
                 @field(dst, field.name) +|= @field(src, field.name);
             }
@@ -2598,7 +2609,12 @@ pub const Backend = struct {
     fn cloneMutableStateWithReason(self: *Backend, reason: MutableSnapshotReason) !State {
         var snapshot = try self.mutable.cloneArena(self.allocator);
         errdefer snapshot.deinit(self.allocator);
-        const snapshot_bytes = estimateStateBytes(&snapshot);
+        self.recordMutableSnapshotClone(&snapshot, reason);
+        return snapshot;
+    }
+
+    fn recordMutableSnapshotClone(self: *Backend, snapshot: *const State, reason: MutableSnapshotReason) void {
+        const snapshot_bytes = estimateStateBytes(snapshot);
         self.mutable_snapshot_clone_calls +|= 1;
         self.mutable_snapshot_clone_bytes_total +|= snapshot_bytes;
         self.mutable_snapshot_clone_peak_bytes = @max(self.mutable_snapshot_clone_peak_bytes, snapshot_bytes);
@@ -2606,6 +2622,21 @@ pub const Backend = struct {
         self.mutable_snapshot_clone_by_reason[reason_index].calls +|= 1;
         self.mutable_snapshot_clone_by_reason[reason_index].bytes_total +|= snapshot_bytes;
         self.mutable_snapshot_clone_by_reason[reason_index].peak_bytes = @max(self.mutable_snapshot_clone_by_reason[reason_index].peak_bytes, snapshot_bytes);
+    }
+
+    /// Snapshot only the mutable replay-lane range needed by an async-index
+    /// pass. Replay keys are append-only, so a range snapshot plus generation-
+    /// pinned immutable/run state provides the same consistency as cloning the
+    /// complete mutable memtable without duplicating unrelated user records.
+    pub fn cloneReplayLaneMutableRange(
+        self: *Backend,
+        namespace: backend_types.Namespace,
+        lower: []const u8,
+        upper: []const u8,
+    ) !State {
+        var snapshot = try self.mutable.cloneRangeArena(self.allocator, namespace, lower, upper);
+        errdefer snapshot.deinit(self.allocator);
+        self.recordMutableSnapshotClone(&snapshot, .current_scan);
         return snapshot;
     }
 
@@ -2681,7 +2712,7 @@ pub const Backend = struct {
             self.bulk_ingest_current_scan_clone_budget_denials +|= 1;
             return null;
         }
-        var snapshot = self.cloneMutableStateWithReason(.other) catch |err| switch (err) {
+        var snapshot = self.cloneMutableStateWithReason(.current_scan) catch |err| switch (err) {
             error.OutOfMemory => {
                 self.bulk_ingest_current_scan_clone_oom_fallbacks +|= 1;
                 return null;
@@ -4149,15 +4180,23 @@ pub const Backend = struct {
         }
     }
 
-    pub fn recordCompactionWriteStats(self: *Backend, output_runs: []const Run, elapsed_ns: u64) void {
-        self.write_stats.compaction_ns += elapsed_ns;
+    pub fn recordCompactionWriteStats(self: *Backend, input_bytes: u64, output_runs: []const Run, elapsed_ns: u64) void {
+        var output_bytes: u64 = 0;
+        self.write_stats.compactions +|= 1;
+        self.write_stats.compaction_input_bytes +|= input_bytes;
+        self.write_stats.compaction_ns +|= elapsed_ns;
+        self.write_stats.compaction_max_input_bytes = @max(self.write_stats.compaction_max_input_bytes, input_bytes);
+        self.write_stats.compaction_max_ns = @max(self.write_stats.compaction_max_ns, elapsed_ns);
         for (output_runs) |run| {
+            output_bytes +|= run.size_bytes;
             if (run.path != null) {
                 self.write_stats.table_file_writes += 1;
                 self.write_stats.table_file_bytes += run.size_bytes;
                 self.recordTableCompressionWriteStats(run.compression_stats);
             }
         }
+        self.write_stats.compaction_output_bytes +|= output_bytes;
+        self.write_stats.compaction_max_output_bytes = @max(self.write_stats.compaction_max_output_bytes, output_bytes);
     }
 
     fn recordSortedIngestWriteStats(self: *Backend, output_runs: []const Run, elapsed_ns: u64) void {
@@ -6640,6 +6679,35 @@ fn waitSignalForTest(fd: std.posix.fd_t) !void {
             else => return error.Unexpected,
         }
     }
+}
+
+test "lsm backend aggregates compaction totals and preserves per-job maxima" {
+    var aggregate: Backend.WriteStats = .{
+        .compactions = 2,
+        .compaction_input_bytes = 300,
+        .compaction_output_bytes = 200,
+        .compaction_ns = 30,
+        .compaction_max_input_bytes = 200,
+        .compaction_max_output_bytes = 125,
+        .compaction_max_ns = 20,
+    };
+    Backend.accumulateWriteStats(&aggregate, .{
+        .compactions = 1,
+        .compaction_input_bytes = 250,
+        .compaction_output_bytes = 150,
+        .compaction_ns = 40,
+        .compaction_max_input_bytes = 250,
+        .compaction_max_output_bytes = 150,
+        .compaction_max_ns = 40,
+    });
+
+    try std.testing.expectEqual(@as(u64, 3), aggregate.compactions);
+    try std.testing.expectEqual(@as(u64, 550), aggregate.compaction_input_bytes);
+    try std.testing.expectEqual(@as(u64, 350), aggregate.compaction_output_bytes);
+    try std.testing.expectEqual(@as(u64, 70), aggregate.compaction_ns);
+    try std.testing.expectEqual(@as(u64, 250), aggregate.compaction_max_input_bytes);
+    try std.testing.expectEqual(@as(u64, 150), aggregate.compaction_max_output_bytes);
+    try std.testing.expectEqual(@as(u64, 40), aggregate.compaction_max_ns);
 }
 
 test "lsm backend default base level target absorbs L0 pressure output" {
@@ -11267,7 +11335,13 @@ test "lsm backend opt-in hard L0 pressure applies during active bulk flush" {
     try std.testing.expect(backend.bulkIngestActive());
     try std.testing.expect(countLevelRuns(backend.runs.items, 0) < 5);
     try std.testing.expect(backend.compaction_stats.compactions > 0);
-    try std.testing.expect(backend.snapshotWriteStats().write_pressure_compactions > 0);
+    const write_stats = backend.snapshotWriteStats();
+    try std.testing.expect(write_stats.write_pressure_compactions > 0);
+    try std.testing.expectEqual(@as(u64, @intCast(backend.compaction_stats.compactions)), write_stats.compactions);
+    try std.testing.expect(write_stats.compaction_input_bytes > 0);
+    try std.testing.expect(write_stats.compaction_output_bytes > 0);
+    try std.testing.expect(write_stats.compaction_max_input_bytes > 0);
+    try std.testing.expect(write_stats.compaction_max_output_bytes > 0);
 
     try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
     bulk_active = false;
@@ -15839,6 +15913,65 @@ test "lsm backend reopen reclaim stress preserves manifest referenced runs" {
     var txn = try runtime.beginRead();
     defer txn.abort();
     try std.testing.expectEqualStrings("value-7-updated", try txn.get("doc:stable"));
+}
+
+test "lsm backend replay lane snapshots exclude unrelated mutable values" {
+    const alloc = std.testing.allocator;
+    var backend = Backend.init(alloc, .{ .flush_threshold = 1024 * 1024 });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+
+    const unrelated = try alloc.alloc(u8, 256 * 1024);
+    defer alloc.free(unrelated);
+    @memset(unrelated, 'x');
+    const full_text_lane: u8 = 1;
+    const other_lane: u8 = 2;
+    const first_key = internal_keys.replayEntryKey(full_text_lane, 1);
+    const second_key = internal_keys.replayEntryKey(full_text_lane, 3);
+    const other_key = internal_keys.replayEntryKey(other_lane, 2);
+    {
+        var txn = try runtime.beginWrite();
+        try txn.put("doc:large", unrelated);
+        try txn.put(first_key[0..], "first");
+        try txn.put(other_key[0..], "other");
+        try txn.put(second_key[0..], "second");
+        try txn.commit();
+    }
+
+    const before = backend.snapshotMaintenanceStats();
+    try std.testing.expect(before.mutable_bytes > unrelated.len);
+
+    const Capture = struct {
+        calls: usize = 0,
+        sequence: u64 = 0,
+        value_matches: bool = false,
+
+        fn consume(self: *@This(), sequence: u64, value: []const u8) !void {
+            self.calls += 1;
+            self.sequence = sequence;
+            self.value_matches = std.mem.eql(u8, value, "first");
+        }
+    };
+    var capture = Capture{};
+    const stats = try runtime.forEachReplayLaneFrom(
+        full_text_lane,
+        1,
+        1,
+        &capture,
+        Capture.consume,
+    );
+    try std.testing.expectEqual(@as(usize, 1), capture.calls);
+    try std.testing.expectEqual(@as(u64, 1), capture.sequence);
+    try std.testing.expect(capture.value_matches);
+    try std.testing.expectEqual(@as(usize, 1), stats.matched_entries);
+
+    const after = backend.snapshotMaintenanceStats();
+    const reason = after.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.current_scan)];
+    try std.testing.expectEqual(@as(u64, 1), reason.calls);
+    try std.testing.expect(reason.bytes_total < before.mutable_bytes / 4);
+    try std.testing.expectEqual(@as(u64, 0), after.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.other)].calls);
 }
 
 test "lsm backend reader release reclaims expired clean obsolete paths" {

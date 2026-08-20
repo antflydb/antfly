@@ -210,6 +210,57 @@ runtime test and 14 GiB for the metadata public simulation. These are scheduling
 claims, not process memory limits; they let the build graph overlap roots that
 fit without requiring a global `-j1` workaround.
 
+### Replay readers should snapshot only their append-only lane
+
+The public table API creates `full_text_index_v0` by default. `sync_level=write`
+does not wait for that index, but its replay worker still runs and previously
+opened a broad current-scan transaction on every wake. That transaction cloned
+the complete mutable primary state even though the worker only needed one
+append-only replay-key range. At 50K with both full-text and dense indexing,
+this produced 3.51 GB of cumulative copying across 296 calls.
+
+The runtime LSM now snapshots only the requested mutable replay lane and pins
+the immutable/run generation at the same backend-lock linearization point. The
+merge cursor, tombstone handling, ordering, callback lifetime, and generic
+backend fallback remain unchanged. Exact replay visibility also uses the
+bounded all-lane iterator and compares the returned sequence; it does not infer
+that sequence gaps are visible. A legacy store without replay lanes retains the
+old current-scan fallback.
+
+With both default full-text and dense indexing enabled, the final 50K check
+copied 16.8 MB rather than 3.51 GB (about 208x less), completed in 40.64 seconds
+rather than 46.32 seconds, and published all 50,001 full-text documents and all
+50,000 vectors. This removes unrelated copying from the general default-index
+product path; it is not a VectorDBBench-only full-text disable.
+
+### A lower checkpoint floor remains counterproductive
+
+After the lane snapshot fix removed the original confounder, a controlled 50K
+vector-only A/B compared the 32 MiB product default with a 1 MiB floor. The
+32 MiB build completed in 38.35 seconds with 59 final L0 runs. The 1 MiB build
+took 41.75 seconds, produced 147 final L0 runs and 86 flushes, and had the same
+roughly 591 MB physical-footprint peak. It reduced cumulative clone bytes from
+about 107 MB to 81 MB, but increased rotations and flush fragmentation. The
+32 MiB default is retained.
+
+### Compaction needs job-level high-water telemetry
+
+Cumulative compaction time did not reveal whether maintenance consisted of
+many bounded jobs or one user-visible latency and working-set spike. The LSM
+now reports completed-job count, input/output byte totals, and the largest
+completed input, output, and duration. Aggregation adds counters while
+preserving maxima across primary and derived backends.
+
+The instrumented 1M runs completed with full query visibility and zero final
+hard debt, but observed largest jobs of 2.57--2.99 GB lasting 52.6--63.9
+seconds. The 2.99 GB job exceeded the configured 2 GiB target through the
+intentional oversized-single-job progress escape hatch. Simply changing the
+numeric cap to 512 MiB would not bound this case: a single broad L0 source can
+overlap several gigabytes of target-level runs, and rejecting the minimum
+overlap-closed plan would reintroduce compaction starvation. The next design
+experiment must make those closures partition-aware while retaining the
+oversized escape hatch for guaranteed progress.
+
 ## Measurements
 
 All times below are one-machine diagnostics, not publication-grade means.
@@ -231,11 +282,17 @@ All times below are one-machine diagnostics, not publication-grade means.
 | 50K, fair public coalescer | 41.40 s | 48.36 s | 157.2 MB clones; 636 MB demand, 1.79 GB RSS; timing contaminated by concurrent host compilation |
 | 50K, fair maintenance + rate-limited sampler | 27.78 s | 29.88 s | 249.0 MB clones; 673 MB demand, 1.89 GB RSS; zero final replay lag |
 | 50K, relocated compaction publication | 25.05 s | 27.53 s | 103.7 MB clones; 708.5 MB demand, 1.96 GB RSS; 59 final L0 runs / zero debt |
+| 50K, clean merged control, vector-only | 27.14 s | 40.35 s | 168.5 MB clones; 601.9 MB physical footprint, 1.85 GB RSS |
+| 50K, replay-lane snapshot, vector-only | 27.42 s | 36.07 s | 53.7 MB clones; 571.7 MB physical footprint, 1.64 GB RSS; zero debt |
+| 50K, clean merged control, full-text + dense | 41.79 s | 46.32 s | 3.51 GB clones; both indexes ready |
+| 50K, replay-lane snapshot, full-text + dense | 33.73 s | 40.64 s | 16.8 MB clones; 692 MB physical footprint, 1.70 GB RSS; both indexes ready |
+| 50K, replay-lane snapshot, 1 MiB checkpoint floor (rejected) | 28.40 s | 41.75 s | 80.5 MB clones; 147 final L0 runs / 86 flushes; no physical-footprint benefit |
 | 1M Cohere, batch 100, four workers, original public path | incomplete | projected about 45–50 min | Throughput fell from about 30.8K docs/min in minute one to about 21.1K docs/min in minute four |
 | 1M, bounded clones + fair coalescer control | incomplete at 783,201 rows / 1,867 s | -- | Two exact 120 s timeouts from primary L0 pressure; 3.83 GB clones, 1.40 GB demand, 3.76 GB peak RSS; 200 ms `vmmap` and overlapping compilers contaminate speed |
 | 1M, rate-limited sampler + maintenance fair turn | incomplete at 592,001 rows / about 725 s | -- | No timeout, but live dense bulk mode still reached 537 aggregate L0 runs; 1.59 GB clones, 888 MB demand, 3.02 GB peak RSS |
 | 1M, primary + dense hard pressure before relocation | 1,536.04 s | 1,644.37 s | 825 final L0 runs / 582 debt; 16 compactions from 26 pressure events, 1.60 GB demand, 3.89 GB RSS |
 | 1M, relocated compaction publication | 1,099.85 s | 1,110.66 s | Full E2E completion; 10.81 s catch-up, 111 final L0 runs / zero debt, 1.20 GB demand, 4.21 GB RSS |
+| 1M, instrumented replay-lane snapshot | 1,605.87 s | 1,617.08 s | Full E2E completion; 1.65 GB clones, 1.30 GB physical footprint, 3.19 GB RSS; zero debt; 2.57 GB / 52.6 s largest compaction |
 
 The original partial 1M run reached about 105K documents with 542 flushes, 212 L0 runs,
 and roughly 23.6 GB of cumulative mutable-snapshot clone bytes. Dense HBC work
@@ -301,6 +358,16 @@ with zero replay lag and zero L0 hard debt. The recovered result confirms that
 the 30--40-second target was conservative; 87 seconds was not redefined as
 success.
 
+The follow-up 1M lifecycle is not evidence that 1,617 seconds is the new
+expected throughput. A same-code point-visibility variant completed in 1,572
+seconds, while the earlier relocated-publication lifecycle completed in 1,111
+seconds; both follow-up runs performed roughly 21--29 GB of compaction input
+and admitted multi-gigabyte individual jobs. Their dense indexes stayed close
+to the source, both finished with complete visibility and zero debt, and the
+visibility variants differed by only about 3%. The large run-to-run wall-time
+spread therefore remains a compaction scheduling/rewrite-amplification finding,
+not a reason to weaken replay correctness or redefine the target upward.
+
 ## Memory methodology
 
 Use Circus's native `footprint_sampler.py` against the Antfly server process
@@ -325,12 +392,13 @@ published.
 
 ## Next checks
 
-1. Run the same build with the default full-text index retained to measure the
-   remaining mixed-index cost.
-2. Re-evaluate the 1 MiB versus 32 MiB WAL checkpoint floor after clone work is
-   removed; keep the safer/faster general policy rather than a benchmark env
-   override.
-3. Bound the remaining individual large-compaction latency near the end of the
-   1M load without reintroducing discarded work or aggregate L0 debt.
-4. Publish three fresh 50K and 1M lifecycle measurements through Circus on a
-   controlled host, reporting mean plus range.
+1. Partition broad L0-to-level overlap closures so ordinary compaction jobs can
+   stay near a soft byte target without disabling the oversized progress escape
+   hatch or reintroducing discarded work and hard L0 debt.
+2. Attribute the remaining bound-read snapshot clones separately from replay
+   lanes; do not replace those multi-operation snapshots with unsafe live
+   probes merely to improve a cumulative counter.
+3. Publish three fresh 50K and 1M lifecycle measurements through Circus on a
+   controlled host, reporting mean plus range. The single follow-up 1M
+   lifecycle is diagnostic because compaction scheduling produced materially
+   different curves on the same host.

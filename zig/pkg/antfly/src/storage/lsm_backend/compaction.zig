@@ -594,7 +594,7 @@ fn compactPlanAtLockedOnly(comptime BackendType: type, backend: *BackendType, pl
     }
     if (@hasDecl(BackendType, "recordCompactionWriteStats")) {
         const elapsed_ns = if (@hasDecl(BackendType, "writeStatsNowNs")) elapsedNs(BackendType, backend, start_ns) else 0;
-        backend.recordCompactionWriteStats(compacted_runs.items, elapsed_ns);
+        backend.recordCompactionWriteStats(input_bytes, compacted_runs.items, elapsed_ns);
     }
     disarmRunList(&compacted_runs);
     compacted_runs.deinit(backend.allocator);
@@ -897,7 +897,7 @@ fn installCompactedRuns(
     }
     if (@hasDecl(BackendType, "recordCompactionWriteStats")) {
         const elapsed_ns = if (@hasDecl(BackendType, "writeStatsNowNs")) elapsedNs(BackendType, backend, start_ns) else 0;
-        backend.recordCompactionWriteStats(compacted_runs.items, elapsed_ns);
+        backend.recordCompactionWriteStats(input_bytes, compacted_runs.items, elapsed_ns);
     }
     disarmRunList(compacted_runs);
     compacted_runs.deinit(backend.allocator);

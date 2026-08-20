@@ -392,6 +392,18 @@ pub fn BoundStore(comptime BackendType: type) type {
             ctx: *anyopaque,
             callback: backend_erased.Store.ReplayCallback,
         ) !backend_types.ReplayLaneIterationStats {
+            if (@hasDecl(BackendType, "cloneReplayLaneMutableRange")) {
+                return try forEachReplayLaneFromRangeSnapshot(
+                    BackendType,
+                    self.backend,
+                    self.namespace,
+                    lane_ordinal,
+                    from_sequence,
+                    max_entries,
+                    ctx,
+                    callback,
+                );
+            }
             var scan = try LocalCurrentScanTxn.open(self.backend, self.namespace);
             defer scan.abort();
 
@@ -463,6 +475,61 @@ pub fn BoundStore(comptime BackendType: type) type {
             }
         }
     };
+}
+
+fn forEachReplayLaneFromRangeSnapshot(
+    comptime BackendType: type,
+    backend: *BackendType,
+    namespace: backend_types.Namespace,
+    lane_ordinal: u8,
+    from_sequence: u64,
+    max_entries: usize,
+    ctx: *anyopaque,
+    callback: backend_erased.Store.ReplayCallback,
+) !backend_types.ReplayLaneIterationStats {
+    const LocalCursor = MergeCursor(BackendType, State);
+    const lower = internal_keys.replayRangeLower(lane_ordinal, from_sequence);
+    const upper = internal_keys.replayRangeUpper(lane_ordinal);
+
+    var mutable_range: State = .{};
+    var layout: CurrentReadLayout(BackendType) = blk: {
+        const locked = lockBackend(BackendType, backend);
+        defer unlockBackend(BackendType, backend, locked);
+        mutable_range = try backend.cloneReplayLaneMutableRange(namespace, lower[0..], upper[0..]);
+        errdefer mutable_range.deinit(backend.allocator);
+        break :blk try CurrentReadLayout(BackendType).capture(backend, backend.allocator);
+    };
+    defer mutable_range.deinit(backend.allocator);
+    defer layout.deinitAfterUnlockedRead();
+    try layout.prepare();
+
+    var cursor = try LocalCursor.init(
+        layout.metadata_allocator,
+        backend,
+        &mutable_range,
+        layout.immutable_memtables,
+        layout.runs,
+        layout.l0_groups,
+        layout.levels,
+        namespace,
+        false,
+    );
+    defer cursor.close();
+    cursor.setUpperBound(upper[0..]);
+
+    var stats = backend_types.ReplayLaneIterationStats{ .scan_batches = 1 };
+    var entry = try cursor.seekAtOrAfter(lower[0..]);
+    while (entry) |kv| {
+        if (std.mem.order(u8, kv.key, upper[0..]) != .lt) break;
+        const sequence = internal_keys.parseReplayEntrySequence(kv.key, lane_ordinal) orelse break;
+        try callback(ctx, sequence, kv.value);
+        stats.scanned_entries += 1;
+        stats.matched_entries += 1;
+        stats.last_sequence = sequence;
+        if (max_entries != 0 and stats.matched_entries >= max_entries) break;
+        entry = try cursor.next();
+    }
+    return stats;
 }
 
 pub fn BoundCursor(comptime StateType: type) type {

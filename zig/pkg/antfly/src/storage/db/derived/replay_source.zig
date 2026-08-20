@@ -594,6 +594,30 @@ fn primaryStoreCollectEnrichmentDocumentGroups(ptr: *anyopaque, alloc: Allocator
 
 fn primaryStoreIsSequenceVisible(ptr: *anyopaque, sequence: u64) !bool {
     const store: *docstore_mod.DocStore = @ptrCast(@alignCast(ptr));
+    const Context = struct {
+        expected: u64,
+        visible: bool = false,
+
+        fn consume(self: *@This(), found_sequence: u64, payload: []const u8) !void {
+            _ = payload;
+            self.visible = found_sequence == self.expected;
+        }
+    };
+    var ctx = Context{ .expected = sequence };
+    _ = store.forEachReplayLaneFrom(
+        internal_keys.replay_all_kind,
+        sequence,
+        1,
+        &ctx,
+        Context.consume,
+    ) catch |err| switch (err) {
+        error.ReplayIndexUnavailable => return try primaryStoreIsSequenceVisibleFallback(store, sequence),
+        else => return err,
+    };
+    return ctx.visible;
+}
+
+fn primaryStoreIsSequenceVisibleFallback(store: *docstore_mod.DocStore, sequence: u64) !bool {
     var txn = try store.beginCurrentScanTxn();
     defer txn.abort();
 
@@ -1345,4 +1369,34 @@ test "replay source primary store missing replay index behaves as empty stream" 
     try std.testing.expectEqual(@as(usize, 0), ctx.calls);
     try std.testing.expectEqual(@as(usize, 0), stats.matched_entries);
     try std.testing.expectEqual(@as(u64, 0), stats.last_sequence);
+}
+
+test "replay source primary visibility checks the exact replay sequence" {
+    const alloc = std.testing.allocator;
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const first_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:one"},
+    });
+    defer alloc.free(first_payload);
+    try store.appendReplayOpaque(alloc, 1, first_payload);
+
+    const third_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 3,
+        .changed_doc_keys = &.{"doc:three"},
+    });
+    defer alloc.free(third_payload);
+    try store.appendReplayOpaque(alloc, 3, third_payload);
+
+    const source = Source.fromPrimaryStore(&store, null, null);
+    try std.testing.expect(try source.isSequenceVisible(1));
+    try std.testing.expect(!(try source.isSequenceVisible(2)));
+    try std.testing.expect(try source.isSequenceVisible(3));
+    try std.testing.expect(!(try source.isSequenceVisible(4)));
 }

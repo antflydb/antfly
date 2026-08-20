@@ -583,7 +583,11 @@ pub const TableRuntimeSnapshotCache = struct {
         }
         var it = state.groups.valueIterator();
         while (it.next()) |status| : (initialized += 1) items[initialized] = try status.clone(alloc);
-        std.mem.sort(LocalTableRuntimeStatus, items, {}, lessThanGroupId);
+        // Runtime status embeds the full DB/LSM statistics payload and can be
+        // wider than std.mem.sort's SIMD element-size limit. Group counts are
+        // small, so insertion sort avoids that compile-time size constraint
+        // without allocating or changing the stable group-id ordering.
+        std.sort.insertion(LocalTableRuntimeStatus, items, {}, lessThanGroupId);
         return .{ .items = items };
     }
 
