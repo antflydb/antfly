@@ -2704,8 +2704,30 @@ pub const ApiHttpServer = struct {
                         // a new leader may discard it before apply. Upgrade
                         // only the weakest level, preserving stronger caller
                         // visibility contracts without extra hot-path work.
-                        if (commit.sync_level == .propose) .write else commit.sync_level,
+                        if (commit.repair_handoff_needs_coordinator or commit.sync_level == .propose)
+                            .write
+                        else
+                            commit.sync_level,
                     ) catch |err| switch (err) {
+                        error.EnrichmentWorkerFailed => {
+                            // Older records and third-party sources may expose a
+                            // committed terminal repair only as an error. Persist
+                            // that fact now; the next claim uses write durability
+                            // to recover coordinator metadata without calling the
+                            // failed provider again.
+                            _ = (self.txn_sessions.recordTerminalCommitWithRepair(
+                                self.alloc,
+                                txn_id,
+                                .committed,
+                                true,
+                                null,
+                                null,
+                            ) catch |persist_err| {
+                                std.log.warn("stable transaction repair handoff persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(persist_err) });
+                                continue;
+                            }) orelse continue;
+                            continue;
+                        },
                         error.InvalidBatchRequest,
                         error.InvalidArgument,
                         error.InvalidGraphEdges,
@@ -2732,16 +2754,18 @@ pub const ApiHttpServer = struct {
                             _ = self.txn_sessions.remove(self.alloc, txn_id);
                         },
                         .committed => |committed| {
-                            const status: transactions_api.TerminalCommitStatus = if (committed.propagation_pending)
-                                .committed_recovery_pending
-                            else if (committed.visibility_pending)
-                                .committed_visibility_pending
-                            else
-                                .committed;
-                            _ = (self.txn_sessions.recordTerminalCommit(
+                            const repair_required = commit.repair_required or committed.visibility_repair_required;
+                            const status = transactions_api.terminalCommitStatusForOutcome(
+                                committed.propagation_pending,
+                                committed.visibility_pending,
+                                committed.visibility_retry_pending,
+                                committed.visibility_repair_required,
+                            );
+                            _ = (self.txn_sessions.recordTerminalCommitWithRepair(
                                 self.alloc,
                                 txn_id,
                                 status,
+                                repair_required,
                                 committed.coordinator_group_id,
                                 committed.coordinator_table_name,
                             ) catch |err| {
@@ -7445,7 +7469,7 @@ pub const ApiHttpServer = struct {
         // the transaction protocol, preserve its typed outcome instead of
         // reporting cancellation for a write that may already be durable.
         try ensureTableOperationActive(request);
-        const outcome = (source.commitBatch(alloc, &tables, req.sync_level) catch |err| switch (err) {
+        const outcome = (source.commitBatchWithCancellation(alloc, &tables, req.sync_level, request.cancellation) catch |err| switch (err) {
             error.InvalidBatchRequest,
             error.InvalidArgument,
             error.InvalidGraphEdges,
@@ -7459,14 +7483,17 @@ pub const ApiHttpServer = struct {
             => return error.Conflict,
             error.CommitVisibilityNotSatisfied,
             error.CommitPropagationIncomplete,
+            error.EnrichmentWaitCanceled,
+            error.EnrichmentWaitTimeout,
+            error.EnrichmentRetryInProgress,
             => return error.CommittedPending,
+            error.EnrichmentWorkerFailed => return error.CommittedRepairRequired,
             error.AbortDecisionNotDurable,
             error.TransactionBeginFailed,
             => return error.WriteUnavailable,
             error.CommitDecisionUnknown => return error.OutcomeUnknown,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
-            error.EnrichmentRetryInProgress,
             error.ResourceBudgetExceeded,
             error.PersistentDescriptorAdmissionExhausted,
             error.TextMergeBackpressureTimeout,
@@ -7495,7 +7522,17 @@ pub const ApiHttpServer = struct {
             },
         }) orelse return error.NotFound;
         switch (outcome) {
-            .committed => |committed| if (committed.propagation_pending or committed.visibility_pending) return error.CommittedPending,
+            .committed => |committed| {
+                const status = transactions_api.terminalCommitStatusForOutcome(
+                    committed.propagation_pending,
+                    committed.visibility_pending,
+                    committed.visibility_retry_pending,
+                    committed.visibility_repair_required,
+                );
+                if (status != .committed) return error.CommittedPending;
+                if (committed.visibility_repair_required)
+                    return error.CommittedRepairRequired;
+            },
             .conflict => return error.Conflict,
         }
     }
@@ -8808,7 +8845,10 @@ pub const ApiHttpServer = struct {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
             error.ModelNotFound => return error.ModelNotFound,
-            else => return error.InternalFailure,
+            else => {
+                std.log.err("public create index normalization failed table={s} index={s} err={}", .{ table_name, index_name, err });
+                return error.InternalFailure;
+            },
         };
         defer alloc.free(normalized_index_json);
 
@@ -8823,7 +8863,10 @@ pub const ApiHttpServer = struct {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
             error.ModelNotFound => return error.ModelNotFound,
-            else => return error.InternalFailure,
+            else => {
+                std.log.err("public create index validation failed table={s} index={s} err={}", .{ table_name, index_name, err });
+                return error.InternalFailure;
+            },
         };
 
         // Materialize catalog-owned fields once. The same exact config is sent
@@ -24610,6 +24653,9 @@ test "api http server routes table batches through the batch commit hook" {
         batch_calls: usize = 0,
         transaction_calls: usize = 0,
         batch_commit_calls: usize = 0,
+        commit_error: ?anyerror = null,
+        repair_outcome: bool = false,
+        legacy_visibility_pending_outcome: bool = false,
 
         fn source(self: *@This()) table_writes.TableWriteSource {
             return .{
@@ -24660,6 +24706,15 @@ test "api http server routes table batches through the batch commit hook" {
             try std.testing.expectEqual(@as(usize, 1), tables[0].deletes.len);
             try std.testing.expectEqualStrings("doc:gone", tables[0].deletes[0]);
             try std.testing.expectEqual(db_mod.types.SyncLevel.write, sync_level);
+            if (self.commit_error) |err| return err;
+            if (self.repair_outcome) return .{ .committed = .{
+                .participant_count = 2,
+                .visibility_repair_required = true,
+            } };
+            if (self.legacy_visibility_pending_outcome) return .{ .committed = .{
+                .participant_count = 2,
+                .visibility_pending = true,
+            } };
             return .{ .committed = .{ .participant_count = 2 } };
         }
     };
@@ -24689,6 +24744,52 @@ test "api http server routes table batches through the batch commit hook" {
     try std.testing.expectEqual(@as(usize, 1), writes.batch_commit_calls);
     try std.testing.expectEqual(@as(usize, 0), writes.transaction_calls);
     try std.testing.expectEqual(@as(usize, 0), writes.batch_calls);
+
+    for ([_]anyerror{ error.EnrichmentWaitCanceled, error.EnrichmentWaitTimeout, error.EnrichmentRetryInProgress }) |wait_err| {
+        writes.commit_error = wait_err;
+        var pending_resp = try executeHttpxTestRequest(&server, .{
+            .method = .POST,
+            .uri = "/tables/docs/batch",
+            .content_type = "application/json",
+            .body = batch_body,
+        });
+        defer pending_resp.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u16, 202), pending_resp.status);
+        try std.testing.expect(std.mem.indexOf(u8, pending_resp.body, "\"status\":\"committed_pending\"") != null);
+    }
+    writes.commit_error = error.EnrichmentWorkerFailed;
+    var repair_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs/batch",
+        .content_type = "application/json",
+        .body = batch_body,
+    });
+    defer repair_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), repair_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, repair_resp.body, "\"status\":\"committed_repair_required\"") != null);
+    writes.commit_error = null;
+    writes.repair_outcome = true;
+    var repair_outcome_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs/batch",
+        .content_type = "application/json",
+        .body = batch_body,
+    });
+    defer repair_outcome_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), repair_outcome_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, repair_outcome_resp.body, "\"status\":\"committed_repair_required\"") != null);
+    writes.repair_outcome = false;
+    writes.legacy_visibility_pending_outcome = true;
+    var legacy_pending_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs/batch",
+        .content_type = "application/json",
+        .body = batch_body,
+    });
+    defer legacy_pending_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), legacy_pending_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, legacy_pending_resp.body, "\"status\":\"committed_pending\"") != null);
+    try std.testing.expectEqual(@as(usize, 7), writes.batch_commit_calls);
 }
 
 test "api http server serves table batch transforms" {
