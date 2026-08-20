@@ -1868,7 +1868,7 @@ fn expectRelationalColumn(
 //
 // Numeric physical encoding matches typed_doc_values:
 //   - number   -> f64 (native)
-//   - integer  -> i64 (exact signed round-trip, including integral JSON floats)
+//   - integer  -> i64 (exact signed round-trip from the original JSON lexeme)
 //   - datetime -> u64 epoch nanoseconds (epoch integers/integer-strings and
 //                 RFC3339/date-only strings are accepted)
 //   - boolean  -> bool, geopoint -> packed lat/lon, string/blob/geoshape -> bytes
@@ -1925,6 +1925,16 @@ pub fn typedValue(value: ColumnValue) typed_doc_values.TypedValue {
         .bool_val => |v| .{ .bool_val = v },
         .geo_point => |v| .{ .geo_point = .{ .lat = v.lat, .lon = v.lon } },
     };
+}
+
+/// Parse and project a relational document without allowing std.json to round
+/// decimal or exponent-form integers through f64 first. Raw write paths should
+/// use this boundary; the Value overload remains useful to callers that already
+/// hold a lossless parse tree.
+pub fn projectRelationalRowJsonAlloc(alloc: Allocator, plan: RelationalPlan, document_json: []const u8) !RelationalRow {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, document_json, .{ .parse_numbers = false });
+    defer parsed.deinit();
+    return projectRelationalRowAlloc(alloc, plan, parsed.value);
 }
 
 pub fn projectRelationalRowAlloc(alloc: Allocator, plan: RelationalPlan, root: std.json.Value) !RelationalRow {
@@ -2030,6 +2040,10 @@ fn jsonNumber(json_value: std.json.Value) ?f64 {
     switch (json_value) {
         .float => |number| return number,
         .integer => |number| return @floatFromInt(number),
+        .number_string => |text| {
+            const number = std.fmt.parseFloat(f64, text) catch return null;
+            return if (std.math.isFinite(number)) number else null;
+        },
         else => return null,
     }
 }
@@ -2110,7 +2124,7 @@ test "relational projection enforces required columns and types" {
 test "relational integer validation and projection share exact i64 conversion" {
     const alloc = std.testing.allocator;
     var parsed = try schema_mod.parseValidatedTableSchema(alloc,
-        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"qty":{"type":"integer","maximum":9007199254740992,"multipleOf":2}},"required":["qty"],"additionalProperties":false}}}}
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"qty":{"type":"integer","maximum":9007199254740992.0,"multipleOf":2.0}},"required":["qty"],"additionalProperties":false}}}}
     );
     defer parsed.deinit(alloc);
     var plan = try relationalColumnPlanAlloc(alloc, parsed);
@@ -2118,20 +2132,18 @@ test "relational integer validation and projection share exact i64 conversion" {
     const qty_index = relationalColumnIndex(plan, "qty").?;
 
     const accepted =
-        \\{"qty":9007199254740992}
+        \\{"qty":9007199254740992.0}
     ;
     try schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = accepted }});
-    var accepted_value = try std.json.parseFromSlice(std.json.Value, alloc, accepted, .{});
-    defer accepted_value.deinit();
-    var row = try projectRelationalRowAlloc(alloc, plan, accepted_value.value);
+    var row = try projectRelationalRowJsonAlloc(alloc, plan, accepted);
     defer row.deinit(alloc);
     try std.testing.expectEqual(@as(i64, 9_007_199_254_740_992), row.cell(qty_index).?.value.i64_val);
 
     const constraint_violations = [_][]const u8{
         // Both values collapse onto adjacent f64 representations, so these
         // checks must use the exact relational i64 value and schema token.
-        "{\"qty\":9007199254740993}",
-        "{\"qty\":9007199254740991}",
+        "{\"qty\":9007199254740993.0}",
+        "{\"qty\":9007199254740991.0}",
     };
     for (constraint_violations) |document| {
         try std.testing.expectError(
@@ -2150,10 +2162,29 @@ test "relational integer validation and projection share exact i64 conversion" {
             error.InvalidBatchRequest,
             schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = document }}),
         );
-        var value = try std.json.parseFromSlice(std.json.Value, alloc, document, .{});
-        defer value.deinit();
-        try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, value.value));
+        try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowJsonAlloc(alloc, plan, document));
     }
+
+    // Callers that already discarded the number token cannot safely recover an
+    // exact integer. Rejecting the rounded f64 prevents storing a different row
+    // value than the client sent.
+    var rounded = try std.json.parseFromSlice(std.json.Value, alloc, "{\"qty\":9007199254740993.0}", .{});
+    defer rounded.deinit();
+    try std.testing.expect(rounded.value.object.get("qty").? == .float);
+    try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, rounded.value));
+
+    var unconstrained = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"qty":{"type":"integer"}},"required":["qty"],"additionalProperties":false}}}}
+    );
+    defer unconstrained.deinit(alloc);
+    var unconstrained_plan = try relationalColumnPlanAlloc(alloc, unconstrained);
+    defer unconstrained_plan.deinit(alloc);
+    var exact_row = try projectRelationalRowJsonAlloc(alloc, unconstrained_plan, "{\"qty\":9007199254740993.0}");
+    defer exact_row.deinit(alloc);
+    try std.testing.expectEqual(
+        @as(i64, 9_007_199_254_740_993),
+        exact_row.cell(relationalColumnIndex(unconstrained_plan, "qty").?).?.value.i64_val,
+    );
 }
 
 test "relational number validation rejects values the row codec cannot encode" {

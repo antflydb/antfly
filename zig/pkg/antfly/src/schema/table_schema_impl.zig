@@ -410,7 +410,7 @@ const RootRefGuard = struct {
 
 pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
     if (body.len == 0) return error.InvalidSchemaUpdateRequest;
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
     defer parsed.deinit();
     try validateSchemaValue(parsed.value);
     var schema = try parseTableSchemaValue(alloc, parsed.value);
@@ -434,7 +434,7 @@ pub fn parseSchema(alloc: std.mem.Allocator, schema_json: []const u8) !TableSche
         };
     }
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{ .parse_numbers = false });
     defer parsed.deinit();
     try validateSchemaValue(parsed.value);
     const schema = try parseTableSchemaValue(alloc, parsed.value);
@@ -453,9 +453,9 @@ pub fn validateJsonSchemaJson(
     schema_json: []const u8,
     value_json: []const u8,
 ) !void {
-    var schema_parsed = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{});
+    var schema_parsed = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{ .parse_numbers = false });
     defer schema_parsed.deinit();
-    var value_parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
+    var value_parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{ .parse_numbers = false });
     defer value_parsed.deinit();
     try validateJsonSchemaValue(alloc, schema_parsed.value, value_parsed.value);
 }
@@ -497,7 +497,7 @@ pub fn documentTtlTimestampNs(
 ) !?u64 {
     if (schema.ttl_duration_ns == 0) return null;
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{ .parse_numbers = false });
     defer parsed.deinit();
     const root = switch (parsed.value) {
         .object => |object| object,
@@ -555,7 +555,7 @@ pub fn validateDocumentJson(
 ) !void {
     if (schema.document_schemas.len == 0 and !schema.enforce_types and schema.ttl_duration_ns == 0 and schema.dynamic_templates.len == 0) return;
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{ .parse_numbers = false });
     defer parsed.deinit();
     const root = switch (parsed.value) {
         .object => |object| object,
@@ -580,17 +580,20 @@ pub fn validateDocumentJson(
     var it = root.iterator();
     while (it.next()) |entry| {
         const field_name = entry.key_ptr.*;
-        if (schema.ttl_duration_ns > 0 and std.mem.eql(u8, field_name, schema.ttl_field)) {
+        const is_ttl_field = schema.ttl_duration_ns > 0 and std.mem.eql(u8, field_name, schema.ttl_field);
+        if (is_ttl_field) {
             try validateTtlFieldValue(entry.value_ptr.*);
-            continue;
         }
-        if (shouldIgnoreSchemaValidationField(field_name)) continue;
 
         if (document_schema) |resolved_document_schema| {
             if (findDocumentProperty(resolved_document_schema.properties, field_name)) |property| {
                 try validateDocumentFieldValueWithContext(&validation_context, property, entry.value_ptr, schema.enforce_types);
                 continue;
             }
+        }
+        if (is_ttl_field or shouldIgnoreSchemaValidationField(field_name)) continue;
+
+        if (document_schema) |resolved_document_schema| {
             if (try validatePatternProperties(&validation_context, field_name, entry.value_ptr, resolved_document_schema.pattern_properties, schema.enforce_types)) {
                 continue;
             }
@@ -1636,11 +1639,7 @@ pub fn runtimeFieldTypeFromName(field_type: []const u8) ?storage_schema.AntflyTy
 }
 
 fn validateNonNegativeInteger(value: std.json.Value) !void {
-    const integer = switch (value) {
-        .integer => |integer| integer,
-        else => return error.InvalidSchemaUpdateRequest,
-    };
-    if (integer < 0) return error.InvalidSchemaUpdateRequest;
+    _ = exactU64JsonNumber(value) orelse return error.InvalidSchemaUpdateRequest;
 }
 
 fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !TableSchema {
@@ -1653,7 +1652,7 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
     errdefer parsed.deinit(alloc);
 
     if (root.get("version")) |version| {
-        if (version != .null) parsed.version = std.math.cast(u32, version.integer) orelse return error.InvalidSchemaUpdateRequest;
+        if (version != .null) parsed.version = std.math.cast(u32, exactU64JsonNumber(version) orelse return error.InvalidSchemaUpdateRequest) orelse return error.InvalidSchemaUpdateRequest;
     }
     if (root.get("storage_mode")) |storage_mode| {
         if (storage_mode != .null) {
@@ -1668,7 +1667,7 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
         }
     }
     if (root.get("ttl_duration_ns")) |ttl_duration_ns| {
-        if (ttl_duration_ns != .null) parsed.ttl_duration_ns = std.math.cast(u64, ttl_duration_ns.integer) orelse return error.InvalidSchemaUpdateRequest;
+        if (ttl_duration_ns != .null) parsed.ttl_duration_ns = exactU64JsonNumber(ttl_duration_ns) orelse return error.InvalidSchemaUpdateRequest;
     }
     if (root.get("ttl_field")) |ttl_field| {
         if (ttl_field != .null) {
@@ -1832,8 +1831,42 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
         return error.InvalidSchemaUpdateRequest;
     }
     for (document_schema.properties) |property| {
-        if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
+        if (!isRelationalStorageProperty(property) or !relationalIntegerConstraintsAreExact(property)) {
+            return error.InvalidSchemaUpdateRequest;
+        }
     }
+}
+
+fn relationalIntegerConstraintsAreExact(property: DocumentProperty) bool {
+    const integer_property = property.integer_only or
+        (property.field_type != null and std.mem.eql(u8, property.field_type.?, "integer"));
+    if (integer_property) {
+        if (property.minimum != null and property.minimum_i64 == null) return false;
+        if (property.maximum != null and property.maximum_i64 == null) return false;
+        if (property.exclusive_minimum != null and property.exclusive_minimum_i64 == null) return false;
+        if (property.exclusive_maximum != null and property.exclusive_maximum_i64 == null) return false;
+        if (property.multiple_of != null and property.multiple_of_i64 == null) return false;
+    }
+
+    for (property.prefix_items) |child| if (!relationalIntegerConstraintsAreExact(child)) return false;
+    for (property.properties) |child| if (!relationalIntegerConstraintsAreExact(child)) return false;
+    for (property.pattern_properties) |child| if (!relationalIntegerConstraintsAreExact(child.property.*)) return false;
+    for (property.dependent_schemas) |child| if (!relationalIntegerConstraintsAreExact(child.schema.*)) return false;
+    for (property.any_of) |child| if (!relationalIntegerConstraintsAreExact(child)) return false;
+    for (property.one_of) |child| if (!relationalIntegerConstraintsAreExact(child)) return false;
+    for (property.all_of) |child| if (!relationalIntegerConstraintsAreExact(child)) return false;
+
+    if (property.additional_properties_schema) |child| if (!relationalIntegerConstraintsAreExact(child.*)) return false;
+    if (property.unevaluated_properties_schema) |child| if (!relationalIntegerConstraintsAreExact(child.*)) return false;
+    if (property.property_names) |child| if (!relationalIntegerConstraintsAreExact(child.*)) return false;
+    if (property.not_schema) |child| if (!relationalIntegerConstraintsAreExact(child.*)) return false;
+    if (property.if_schema) |child| if (!relationalIntegerConstraintsAreExact(child.*)) return false;
+    if (property.then_schema) |child| if (!relationalIntegerConstraintsAreExact(child.*)) return false;
+    if (property.else_schema) |child| if (!relationalIntegerConstraintsAreExact(child.*)) return false;
+    if (property.contains_schema) |child| if (!relationalIntegerConstraintsAreExact(child.*)) return false;
+    if (property.item) |child| if (!relationalIntegerConstraintsAreExact(child.*)) return false;
+    if (property.unevaluated_items_schema) |child| if (!relationalIntegerConstraintsAreExact(child.*)) return false;
+    return true;
 }
 
 fn isRelationalStorageProperty(property: DocumentProperty) bool {
@@ -2100,19 +2133,19 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
     else
         null;
     const min_length = if (object.get("minLength")) |min_length_value|
-        if (min_length_value == .null) null else std.math.cast(u64, min_length_value.integer) orelse return error.InvalidSchemaUpdateRequest
+        if (min_length_value == .null) null else exactU64JsonNumber(min_length_value) orelse return error.InvalidSchemaUpdateRequest
     else
         null;
     const max_length = if (object.get("maxLength")) |max_length_value|
-        if (max_length_value == .null) null else std.math.cast(u64, max_length_value.integer) orelse return error.InvalidSchemaUpdateRequest
+        if (max_length_value == .null) null else exactU64JsonNumber(max_length_value) orelse return error.InvalidSchemaUpdateRequest
     else
         null;
     const min_properties = if (object.get("minProperties")) |min_properties_value|
-        if (min_properties_value == .null) null else std.math.cast(u64, min_properties_value.integer) orelse return error.InvalidSchemaUpdateRequest
+        if (min_properties_value == .null) null else exactU64JsonNumber(min_properties_value) orelse return error.InvalidSchemaUpdateRequest
     else
         null;
     const max_properties = if (object.get("maxProperties")) |max_properties_value|
-        if (max_properties_value == .null) null else std.math.cast(u64, max_properties_value.integer) orelse return error.InvalidSchemaUpdateRequest
+        if (max_properties_value == .null) null else exactU64JsonNumber(max_properties_value) orelse return error.InvalidSchemaUpdateRequest
     else
         null;
     const pattern = if (object.get("pattern")) |pattern_value|
@@ -2125,19 +2158,19 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         null;
     errdefer if (pattern) |owned| alloc.free(owned);
     const min_items = if (object.get("minItems")) |min_items_value|
-        if (min_items_value == .null) null else std.math.cast(u64, min_items_value.integer) orelse return error.InvalidSchemaUpdateRequest
+        if (min_items_value == .null) null else exactU64JsonNumber(min_items_value) orelse return error.InvalidSchemaUpdateRequest
     else
         null;
     const max_items = if (object.get("maxItems")) |max_items_value|
-        if (max_items_value == .null) null else std.math.cast(u64, max_items_value.integer) orelse return error.InvalidSchemaUpdateRequest
+        if (max_items_value == .null) null else exactU64JsonNumber(max_items_value) orelse return error.InvalidSchemaUpdateRequest
     else
         null;
     const min_contains = if (object.get("minContains")) |min_contains_value|
-        if (min_contains_value == .null) null else std.math.cast(u64, min_contains_value.integer) orelse return error.InvalidSchemaUpdateRequest
+        if (min_contains_value == .null) null else exactU64JsonNumber(min_contains_value) orelse return error.InvalidSchemaUpdateRequest
     else
         null;
     const max_contains = if (object.get("maxContains")) |max_contains_value|
-        if (max_contains_value == .null) null else std.math.cast(u64, max_contains_value.integer) orelse return error.InvalidSchemaUpdateRequest
+        if (max_contains_value == .null) null else exactU64JsonNumber(max_contains_value) orelse return error.InvalidSchemaUpdateRequest
     else
         null;
     const unique_items = if (object.get("uniqueItems")) |unique_items_value|
@@ -3164,20 +3197,30 @@ fn validateDocumentFieldValueWithContext(
     }
 
     if (property.const_value) |const_value| {
-        const rendered = try stringifyJsonValue(std.heap.page_allocator, value.*);
-        defer std.heap.page_allocator.free(rendered);
-        if (!std.mem.eql(u8, const_value, rendered)) return error.InvalidBatchRequest;
+        const rendered = try stringifyJsonValue(context.alloc, value.*);
+        defer context.alloc.free(rendered);
+        if (!std.mem.eql(u8, const_value, rendered) and !try jsonLiteralEqualsValue(context.alloc, const_value, value.*)) {
+            return error.InvalidBatchRequest;
+        }
     }
 
     if (property.enum_values.len > 0) {
-        const rendered = try stringifyJsonValue(std.heap.page_allocator, value.*);
-        defer std.heap.page_allocator.free(rendered);
+        const rendered = try stringifyJsonValue(context.alloc, value.*);
+        defer context.alloc.free(rendered);
 
         var matched = false;
         for (property.enum_values) |enum_value| {
             if (std.mem.eql(u8, enum_value, rendered)) {
                 matched = true;
                 break;
+            }
+        }
+        if (!matched) {
+            for (property.enum_values) |enum_value| {
+                if (try jsonLiteralEqualsValue(context.alloc, enum_value, value.*)) {
+                    matched = true;
+                    break;
+                }
             }
         }
         if (!matched) return error.InvalidBatchRequest;
@@ -3309,9 +3352,9 @@ fn validateDocumentFieldValueWithContext(
             .object => |object| object,
             else => return error.InvalidBatchRequest,
         };
-        try validateObjectCardinality(object, property.min_properties, property.max_properties);
+        try validateObjectCardinality(object, property.properties, property.min_properties, property.max_properties);
         try validateRequiredFieldsPresent(object, property.required_fields);
-        if (property.property_names) |property_names| try validatePropertyNames(context, object, property_names.*, enforce_types);
+        if (property.property_names) |property_names| try validatePropertyNames(context, object, property.properties, property_names.*, enforce_types);
         try validateDependentRequired(object, property.dependent_required);
         try validateDependentSchemas(context, object, property.dependent_schemas, composed_enforce_types);
         var composition_evaluated_fields = std.StringHashMapUnmanaged(void).empty;
@@ -3319,11 +3362,11 @@ fn validateDocumentFieldValueWithContext(
         try collectComposedObjectFieldCoverage(context, property, object, enforce_types, &composition_evaluated_fields, false);
         var it = object.iterator();
         while (it.next()) |entry| {
-            if (shouldIgnoreSchemaValidationField(entry.key_ptr.*)) continue;
             if (findDocumentProperty(property.properties, entry.key_ptr.*)) |child_property| {
                 try validateDocumentFieldValueWithContext(context, child_property, entry.value_ptr, enforce_types);
                 continue;
             }
+            if (shouldIgnoreSchemaValidationField(entry.key_ptr.*)) continue;
             if (try validatePatternProperties(context, entry.key_ptr.*, entry.value_ptr, property.pattern_properties, enforce_types)) continue;
             if (property.additional_properties_schema) |additional_properties_schema| {
                 try validateDocumentFieldValueWithContext(context, additional_properties_schema.*, entry.value_ptr, enforce_types);
@@ -3498,18 +3541,11 @@ pub fn documentDateTimeToNs(value: std.json.Value) ?u64 {
 /// this shared between validation and projection prevents valid writes from
 /// failing later when the row is materialized.
 pub fn documentIntegerToI64(value: std.json.Value) ?i64 {
-    return switch (value) {
-        .integer => |number| number,
-        .number_string => |text| std.fmt.parseInt(i64, text, 10) catch null,
-        .float => |number| blk: {
-            if (!std.math.isFinite(number) or std.math.floor(number) != number) break :blk null;
-            // maxInt(i64) rounds up when represented as f64, so use the exact
-            // exclusive 2^63 boundary instead of converting maxInt(i64).
-            if (number < -9223372036854775808.0 or number >= 9223372036854775808.0) break :blk null;
-            break :blk @intFromFloat(number);
-        },
-        else => null,
-    };
+    // A std.json.Value.float has already discarded the original decimal
+    // lexeme, so even an integral-looking f64 may be a rounded non-integer or a
+    // different integer above 2^53. Relational callers parse with
+    // parse_numbers=false and arrive here as number_string instead.
+    return exactI64JsonNumber(value);
 }
 
 /// Convert every JSON number accepted by a relational floating-point column
@@ -3598,13 +3634,18 @@ fn validateRequiredFieldsPresent(object: std.json.ObjectMap, required_fields: []
     }
 }
 
-fn validateObjectCardinality(object: std.json.ObjectMap, min_properties: ?u64, max_properties: ?u64) !void {
+fn validateObjectCardinality(
+    object: std.json.ObjectMap,
+    properties: []const DocumentProperty,
+    min_properties: ?u64,
+    max_properties: ?u64,
+) !void {
     if (min_properties == null and max_properties == null) return;
 
     var count: u64 = 0;
     var it = object.iterator();
     while (it.next()) |entry| {
-        if (shouldIgnoreSchemaValidationField(entry.key_ptr.*)) continue;
+        if (shouldIgnoreSchemaValidationField(entry.key_ptr.*) and findDocumentProperty(properties, entry.key_ptr.*) == null) continue;
         count += 1;
     }
 
@@ -3646,12 +3687,13 @@ fn makeRootDocumentProperty(document_schema: DocumentSchema) DocumentProperty {
 fn validatePropertyNames(
     context: *RuntimeValidationContext,
     object: std.json.ObjectMap,
+    properties: []const DocumentProperty,
     property_names: DocumentProperty,
     enforce_types: bool,
 ) anyerror!void {
     var it = object.iterator();
     while (it.next()) |entry| {
-        if (shouldIgnoreSchemaValidationField(entry.key_ptr.*)) continue;
+        if (shouldIgnoreSchemaValidationField(entry.key_ptr.*) and findDocumentProperty(properties, entry.key_ptr.*) == null) continue;
         const key_value: std.json.Value = .{ .string = entry.key_ptr.* };
         try validateDocumentFieldValueWithContext(context, property_names, &key_value, enforce_types);
     }
@@ -3735,11 +3777,11 @@ fn markDirectObjectFieldCoverage(
 
     var it = object.iterator();
     while (it.next()) |entry| {
-        if (shouldIgnoreSchemaValidationField(entry.key_ptr.*)) continue;
         if (findDocumentProperty(property.properties, entry.key_ptr.*) != null) {
             try evaluated_fields.put(context.alloc, entry.key_ptr.*, {});
             continue;
         }
+        if (shouldIgnoreSchemaValidationField(entry.key_ptr.*)) continue;
         if (try validatePatternProperties(context, entry.key_ptr.*, entry.value_ptr, property.pattern_properties, enforce_types)) {
             try evaluated_fields.put(context.alloc, entry.key_ptr.*, {});
             continue;
@@ -3913,7 +3955,21 @@ fn collectEvaluatedArrayIndices(
     }
 }
 
+fn jsonLiteralEqualsValue(alloc: std.mem.Allocator, literal: []const u8, value: std.json.Value) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, literal, .{ .parse_numbers = false });
+    defer parsed.deinit();
+    return jsonValueEqual(parsed.value, value);
+}
+
+fn isJsonNumber(value: std.json.Value) bool {
+    return switch (value) {
+        .integer, .float, .number_string => true,
+        else => false,
+    };
+}
+
 fn jsonValueEqual(left: std.json.Value, right: std.json.Value) bool {
+    if (isJsonNumber(left) and isJsonNumber(right)) return jsonNumberEqual(left, right);
     if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
 
     return switch (left) {
@@ -3939,6 +3995,143 @@ fn jsonValueEqual(left: std.json.Value, right: std.json.Value) bool {
             }
             break :blk true;
         },
+    };
+}
+
+fn jsonNumberEqual(left: std.json.Value, right: std.json.Value) bool {
+    if (left == .number_string and right == .number_string) {
+        return normalizedJsonDecimalsEqual(left.number_string, right.number_string);
+    }
+    if (left == .number_string and right == .integer) return jsonNumberStringEqualsInteger(left.number_string, right.integer);
+    if (left == .integer and right == .number_string) return jsonNumberStringEqualsInteger(right.number_string, left.integer);
+
+    const left_number = parseJsonNumber(left) catch return false;
+    const right_number = parseJsonNumber(right) catch return false;
+    return left_number == right_number;
+}
+
+fn jsonNumberStringEqualsInteger(text: []const u8, integer: i64) bool {
+    const exact = parseExactJsonInteger(text) orelse return false;
+    if (integer < 0) {
+        if (!exact.negative) return false;
+        const magnitude: u64 = if (integer == std.math.minInt(i64))
+            @as(u64, @intCast(std.math.maxInt(i64))) + 1
+        else
+            @intCast(-integer);
+        return exact.magnitude == magnitude;
+    }
+    return !exact.negative and exact.magnitude == @as(u64, @intCast(integer));
+}
+
+const NormalizedJsonDecimal = struct {
+    text: []const u8,
+    negative: bool,
+    first_significant: usize,
+    significant_digits: usize,
+    scale: i64,
+    zero: bool,
+};
+
+fn normalizedJsonDecimalsEqual(left_text: []const u8, right_text: []const u8) bool {
+    const left = normalizeJsonDecimal(left_text) orelse return std.mem.eql(u8, left_text, right_text);
+    const right = normalizeJsonDecimal(right_text) orelse return std.mem.eql(u8, left_text, right_text);
+    if (left.zero or right.zero) return left.zero and right.zero;
+    if (left.negative != right.negative or left.scale != right.scale or left.significant_digits != right.significant_digits) return false;
+
+    var left_index = left.first_significant;
+    var right_index = right.first_significant;
+    var compared: usize = 0;
+    while (compared < left.significant_digits) : (compared += 1) {
+        while (left.text[left_index] == '.') left_index += 1;
+        while (right.text[right_index] == '.') right_index += 1;
+        if (left.text[left_index] != right.text[right_index]) return false;
+        left_index += 1;
+        right_index += 1;
+    }
+    return true;
+}
+
+fn normalizeJsonDecimal(text: []const u8) ?NormalizedJsonDecimal {
+    if (text.len == 0) return null;
+    var index: usize = 0;
+    const negative = text[index] == '-';
+    if (negative) index += 1;
+    if (index == text.len) return null;
+
+    const mantissa_start = index;
+    var decimal_index: ?usize = null;
+    var first_significant: ?usize = null;
+    var last_significant: ?usize = null;
+    var fractional_digits: usize = 0;
+    while (index < text.len and text[index] != 'e' and text[index] != 'E') : (index += 1) {
+        const byte = text[index];
+        if (byte == '.') {
+            if (decimal_index != null) return null;
+            decimal_index = index;
+            continue;
+        }
+        if (byte < '0' or byte > '9') return null;
+        if (decimal_index != null) fractional_digits += 1;
+        if (byte != '0') {
+            if (first_significant == null) first_significant = index;
+            last_significant = index;
+        }
+    }
+    const mantissa_end = index;
+    if (mantissa_end == mantissa_start or (mantissa_end == mantissa_start + 1 and decimal_index != null)) return null;
+
+    var exponent: i64 = 0;
+    if (index < text.len) {
+        index += 1;
+        var exponent_negative = false;
+        if (index < text.len and (text[index] == '+' or text[index] == '-')) {
+            exponent_negative = text[index] == '-';
+            index += 1;
+        }
+        if (index == text.len) return null;
+        var magnitude: i64 = 0;
+        while (index < text.len) : (index += 1) {
+            const byte = text[index];
+            if (byte < '0' or byte > '9') return null;
+            magnitude = std.math.mul(i64, magnitude, 10) catch return null;
+            magnitude = std.math.add(i64, magnitude, @as(i64, byte - '0')) catch return null;
+        }
+        exponent = if (exponent_negative) -magnitude else magnitude;
+    }
+
+    const first = first_significant orelse return .{
+        .text = text,
+        .negative = false,
+        .first_significant = mantissa_start,
+        .significant_digits = 0,
+        .scale = 0,
+        .zero = true,
+    };
+    const last = last_significant.?;
+    var significant_digits = last - first + 1;
+    if (decimal_index) |dot| {
+        if (dot > first and dot < last) significant_digits -= 1;
+    }
+
+    var trailing_zeros: usize = 0;
+    var reverse = mantissa_end;
+    while (reverse > mantissa_start) {
+        reverse -= 1;
+        if (text[reverse] == '.') continue;
+        if (text[reverse] != '0') break;
+        trailing_zeros += 1;
+    }
+    const fractional_i64 = std.math.cast(i64, fractional_digits) orelse return null;
+    const trailing_i64 = std.math.cast(i64, trailing_zeros) orelse return null;
+    const scale_without_zeros = std.math.sub(i64, exponent, fractional_i64) catch return null;
+    const scale = std.math.add(i64, scale_without_zeros, trailing_i64) catch return null;
+    return .{
+        .text = text,
+        .negative = negative,
+        .first_significant = first,
+        .significant_digits = significant_digits,
+        .scale = scale,
+        .zero = false,
     };
 }
 
@@ -4023,6 +4216,38 @@ test "relational schemas reject contracts the row codec cannot represent" {
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
         \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id","tenant"],"additionalProperties":false}}}}
     ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"qty":{"type":"integer","minimum":0.5}},"additionalProperties":false}}}}
+    ));
+}
+
+test "declared underscore properties are validated while system metadata stays exempt" {
+    const alloc = std.testing.allocator;
+    var schema = try parseSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","minProperties":1,"maxProperties":1,"propertyNames":{"pattern":"^_rank$"},"properties":{"_rank":{"type":"integer","maximum":0}},"required":["_rank"],"additionalProperties":false}}}}
+    );
+    defer schema.deinit(alloc);
+
+    try validateWritesAgainstSchema(alloc, schema, &.{.{ .value = "{\"_rank\":0,\"_id\":\"row-a\"}" }});
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateWritesAgainstSchema(alloc, schema, &.{.{ .value = "{\"_rank\":1}" }}),
+    );
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateWritesAgainstSchema(alloc, schema, &.{.{ .value = "{\"_rank\":\"0\"}" }}),
+    );
+}
+
+test "numeric const and enum comparison preserves exact JSON semantics" {
+    const alloc = std.testing.allocator;
+    try validateJsonSchemaJson(alloc, "{\"const\":1.0}", "1");
+    try validateJsonSchemaJson(alloc, "{\"enum\":[1.00,2e0]}", "2.000");
+    try validateJsonSchemaJson(alloc, "{\"const\":9007199254740993.0}", "9007199254740993");
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateJsonSchemaJson(alloc, "{\"const\":9007199254740993.0}", "9007199254740992.0"),
+    );
 }
 
 test "public schema mutations gate relational storage until runtime wiring lands" {
@@ -4043,9 +4268,58 @@ fn parseJsonNumber(value: std.json.Value) !f64 {
 fn exactI64JsonNumber(value: std.json.Value) ?i64 {
     return switch (value) {
         .integer => |integer| integer,
-        .number_string => |text| std.fmt.parseInt(i64, text, 10) catch null,
+        .number_string => |text| blk: {
+            const exact = parseExactJsonInteger(text) orelse break :blk null;
+            if (exact.negative) {
+                if (exact.magnitude > @as(u64, @intCast(std.math.maxInt(i64))) + 1) break :blk null;
+                if (exact.magnitude == @as(u64, @intCast(std.math.maxInt(i64))) + 1) break :blk std.math.minInt(i64);
+                break :blk -@as(i64, @intCast(exact.magnitude));
+            }
+            break :blk std.math.cast(i64, exact.magnitude);
+        },
         else => null,
     };
+}
+
+fn exactU64JsonNumber(value: std.json.Value) ?u64 {
+    return switch (value) {
+        .integer => |integer| if (integer >= 0) @intCast(integer) else null,
+        .number_string => |text| blk: {
+            const exact = parseExactJsonInteger(text) orelse break :blk null;
+            break :blk if (exact.negative and exact.magnitude != 0) null else exact.magnitude;
+        },
+        else => null,
+    };
+}
+
+const ExactJsonInteger = struct {
+    negative: bool,
+    magnitude: u64,
+};
+
+/// Parse a JSON number lexeme as an exact mathematical integer without first
+/// passing through floating point. Decimal and exponent spellings are accepted
+/// when their value is integral and representable as a u64 magnitude.
+fn parseExactJsonInteger(text: []const u8) ?ExactJsonInteger {
+    const normalized = normalizeJsonDecimal(text) orelse return null;
+    if (normalized.zero) return .{ .negative = false, .magnitude = 0 };
+    if (normalized.scale < 0) return null;
+
+    var magnitude: u64 = 0;
+    var index = normalized.first_significant;
+    var consumed: usize = 0;
+    while (consumed < normalized.significant_digits) : (consumed += 1) {
+        while (text[index] == '.') index += 1;
+        const byte = text[index];
+        magnitude = std.math.mul(u64, magnitude, 10) catch return null;
+        magnitude = std.math.add(u64, magnitude, @as(u64, byte - '0')) catch return null;
+        index += 1;
+    }
+    const appended_zeros = std.math.cast(usize, normalized.scale) orelse return null;
+    for (0..appended_zeros) |_| {
+        magnitude = std.math.mul(u64, magnitude, 10) catch return null;
+    }
+    return .{ .negative = normalized.negative, .magnitude = magnitude };
 }
 
 fn exactPositiveI64JsonNumber(value: std.json.Value) ?i64 {
@@ -4057,8 +4331,8 @@ fn isIntegralJsonNumber(value: std.json.Value, numeric_value: f64) bool {
     return switch (value) {
         .integer => true,
         .number_string => |text| blk: {
-            _ = std.fmt.parseInt(i64, text, 10) catch break :blk false;
-            break :blk true;
+            const normalized = normalizeJsonDecimal(text) orelse break :blk false;
+            break :blk normalized.zero or normalized.scale >= 0;
         },
         .float => std.math.floor(numeric_value) == numeric_value,
         else => false,
