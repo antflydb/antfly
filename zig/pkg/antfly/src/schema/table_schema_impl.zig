@@ -160,10 +160,15 @@ pub const DocumentProperty = struct {
     allows_null: bool = false,
     const_value: ?[]const u8 = null,
     minimum: ?f64 = null,
+    minimum_i64: ?i64 = null,
     maximum: ?f64 = null,
+    maximum_i64: ?i64 = null,
     exclusive_minimum: ?f64 = null,
+    exclusive_minimum_i64: ?i64 = null,
     exclusive_maximum: ?f64 = null,
+    exclusive_maximum_i64: ?i64 = null,
     multiple_of: ?f64 = null,
+    multiple_of_i64: ?i64 = null,
     min_length: ?u64 = null,
     max_length: ?u64 = null,
     min_properties: ?u64 = null,
@@ -1730,7 +1735,11 @@ fn validateParsedTtlSchema(schema: TableSchema) !void {
     for (schema.document_schemas) |document_schema| {
         if (findDocumentProperty(document_schema.properties, schema.ttl_field)) |property| {
             const field_type = property.field_type orelse return error.InvalidSchemaUpdateRequest;
-            if (!std.mem.eql(u8, field_type, "datetime") and !std.mem.eql(u8, field_type, "numeric")) {
+            const valid_type = if (schema.storage_mode == .relational)
+                std.mem.eql(u8, field_type, "datetime")
+            else
+                std.mem.eql(u8, field_type, "datetime") or std.mem.eql(u8, field_type, "numeric");
+            if (!valid_type) {
                 return error.InvalidSchemaUpdateRequest;
             }
         }
@@ -1785,10 +1794,15 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
     }
     if (document_schema.properties.len == 0) return error.InvalidSchemaUpdateRequest;
     if (schema.ttl_duration_ns > 0 and
-        !shouldIgnoreSchemaValidationField(schema.ttl_field) and
+        !std.mem.eql(u8, schema.ttl_field, "_timestamp") and
         findDocumentProperty(document_schema.properties, schema.ttl_field) == null)
     {
         return error.InvalidSchemaUpdateRequest;
+    }
+    for (document_schema.required_fields) |required_field| {
+        if (findDocumentProperty(document_schema.properties, required_field) == null) {
+            return error.InvalidSchemaUpdateRequest;
+        }
     }
     if (document_schema.additional_properties_allowed orelse false) return error.InvalidSchemaUpdateRequest;
     if (document_schema.additional_properties_schema != null or
@@ -2045,16 +2059,32 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         if (minimum_value == .null) null else parseJsonNumber(minimum_value) catch return error.InvalidSchemaUpdateRequest
     else
         null;
+    const minimum_i64 = if (object.get("minimum")) |minimum_value|
+        if (minimum_value == .null) null else exactI64JsonNumber(minimum_value)
+    else
+        null;
     const maximum = if (object.get("maximum")) |maximum_value|
         if (maximum_value == .null) null else parseJsonNumber(maximum_value) catch return error.InvalidSchemaUpdateRequest
+    else
+        null;
+    const maximum_i64 = if (object.get("maximum")) |maximum_value|
+        if (maximum_value == .null) null else exactI64JsonNumber(maximum_value)
     else
         null;
     const exclusive_minimum = if (object.get("exclusiveMinimum")) |exclusive_minimum_value|
         if (exclusive_minimum_value == .null) null else parseJsonNumber(exclusive_minimum_value) catch return error.InvalidSchemaUpdateRequest
     else
         null;
+    const exclusive_minimum_i64 = if (object.get("exclusiveMinimum")) |exclusive_minimum_value|
+        if (exclusive_minimum_value == .null) null else exactI64JsonNumber(exclusive_minimum_value)
+    else
+        null;
     const exclusive_maximum = if (object.get("exclusiveMaximum")) |exclusive_maximum_value|
         if (exclusive_maximum_value == .null) null else parseJsonNumber(exclusive_maximum_value) catch return error.InvalidSchemaUpdateRequest
+    else
+        null;
+    const exclusive_maximum_i64 = if (object.get("exclusiveMaximum")) |exclusive_maximum_value|
+        if (exclusive_maximum_value == .null) null else exactI64JsonNumber(exclusive_maximum_value)
     else
         null;
     const multiple_of = if (object.get("multipleOf")) |multiple_of_value|
@@ -2063,6 +2093,10 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
             if (parsed <= 0) return error.InvalidSchemaUpdateRequest;
             break :blk parsed;
         }
+    else
+        null;
+    const multiple_of_i64 = if (object.get("multipleOf")) |multiple_of_value|
+        if (multiple_of_value == .null) null else exactPositiveI64JsonNumber(multiple_of_value)
     else
         null;
     const min_length = if (object.get("minLength")) |min_length_value|
@@ -2429,10 +2463,15 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         .allows_null = allows_null,
         .const_value = const_value,
         .minimum = minimum,
+        .minimum_i64 = minimum_i64,
         .maximum = maximum,
+        .maximum_i64 = maximum_i64,
         .exclusive_minimum = exclusive_minimum,
+        .exclusive_minimum_i64 = exclusive_minimum_i64,
         .exclusive_maximum = exclusive_maximum,
+        .exclusive_maximum_i64 = exclusive_maximum_i64,
         .multiple_of = multiple_of,
+        .multiple_of_i64 = multiple_of_i64,
         .min_length = min_length,
         .max_length = max_length,
         .min_properties = min_properties,
@@ -3339,31 +3378,56 @@ fn validateDocumentFieldValueWithContext(
         std.mem.eql(u8, field_type, "number") or
         std.mem.eql(u8, field_type, "integer"))
     {
+        const integer_property = property.integer_only or std.mem.eql(u8, field_type, "integer");
+        const exact_integer_value = if (context.require_physical_encoding and integer_property)
+            documentIntegerToI64(value.*)
+        else
+            null;
         const numeric_value = if (context.require_physical_encoding)
             documentNumberToF64(value.*) orelse return error.InvalidBatchRequest
         else
             parseJsonNumber(value.*) catch return error.InvalidBatchRequest;
-        if (property.integer_only or std.mem.eql(u8, field_type, "integer")) {
+        if (integer_property) {
             const is_integer = if (context.require_physical_encoding)
-                documentIntegerToI64(value.*) != null
+                exact_integer_value != null
             else
                 isIntegralJsonNumber(value.*, numeric_value);
             if (!is_integer) return error.InvalidBatchRequest;
         }
         if (property.minimum) |minimum| {
-            if (numeric_value < minimum) return error.InvalidBatchRequest;
+            if (exact_integer_value) |integer_value| {
+                if (property.minimum_i64) |exact_minimum| {
+                    if (integer_value < exact_minimum) return error.InvalidBatchRequest;
+                } else if (numeric_value < minimum) return error.InvalidBatchRequest;
+            } else if (numeric_value < minimum) return error.InvalidBatchRequest;
         }
         if (property.maximum) |maximum| {
-            if (numeric_value > maximum) return error.InvalidBatchRequest;
+            if (exact_integer_value) |integer_value| {
+                if (property.maximum_i64) |exact_maximum| {
+                    if (integer_value > exact_maximum) return error.InvalidBatchRequest;
+                } else if (numeric_value > maximum) return error.InvalidBatchRequest;
+            } else if (numeric_value > maximum) return error.InvalidBatchRequest;
         }
         if (property.exclusive_minimum) |exclusive_minimum| {
-            if (numeric_value <= exclusive_minimum) return error.InvalidBatchRequest;
+            if (exact_integer_value) |integer_value| {
+                if (property.exclusive_minimum_i64) |exact_minimum| {
+                    if (integer_value <= exact_minimum) return error.InvalidBatchRequest;
+                } else if (numeric_value <= exclusive_minimum) return error.InvalidBatchRequest;
+            } else if (numeric_value <= exclusive_minimum) return error.InvalidBatchRequest;
         }
         if (property.exclusive_maximum) |exclusive_maximum| {
-            if (numeric_value >= exclusive_maximum) return error.InvalidBatchRequest;
+            if (exact_integer_value) |integer_value| {
+                if (property.exclusive_maximum_i64) |exact_maximum| {
+                    if (integer_value >= exact_maximum) return error.InvalidBatchRequest;
+                } else if (numeric_value >= exclusive_maximum) return error.InvalidBatchRequest;
+            } else if (numeric_value >= exclusive_maximum) return error.InvalidBatchRequest;
         }
         if (property.multiple_of) |multiple_of| {
-            if (!isMultipleOf(numeric_value, multiple_of)) return error.InvalidBatchRequest;
+            if (exact_integer_value) |integer_value| {
+                if (property.multiple_of_i64) |exact_multiple_of| {
+                    if (@rem(integer_value, exact_multiple_of) != 0) return error.InvalidBatchRequest;
+                } else if (!isMultipleOf(numeric_value, multiple_of)) return error.InvalidBatchRequest;
+            } else if (!isMultipleOf(numeric_value, multiple_of)) return error.InvalidBatchRequest;
         }
         return;
     }
@@ -3902,6 +3966,11 @@ test "relational schemas imply type enforcement and require a closed typed shape
         \\{"storage_mode":"relational","ttl_duration_ns":1,"ttl_field":"expires_at","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"expires_at":{"type":"datetime"}},"additionalProperties":false}}}}
     );
     defer declared_ttl.deinit(alloc);
+
+    var declared_custom_metadata_ttl = try parseSchema(alloc,
+        \\{"storage_mode":"relational","ttl_duration_ns":1,"ttl_field":"_expires_at","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"_expires_at":{"type":"datetime"}},"additionalProperties":false}}}}
+    );
+    defer declared_custom_metadata_ttl.deinit(alloc);
 }
 
 test "relational schemas reject contracts the row codec cannot represent" {
@@ -3945,6 +4014,15 @@ test "relational schemas reject contracts the row codec cannot represent" {
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
         \\{"storage_mode":"relational","ttl_duration_ns":1,"ttl_field":"expires_at","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}}}}}}
     ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
+        \\{"storage_mode":"relational","ttl_duration_ns":1,"ttl_field":"_expires_at","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"additionalProperties":false}}}}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
+        \\{"storage_mode":"relational","ttl_duration_ns":1,"ttl_field":"expires_at","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"expires_at":{"type":"numeric"}},"additionalProperties":false}}}}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id","tenant"],"additionalProperties":false}}}}
+    ));
 }
 
 test "public schema mutations gate relational storage until runtime wiring lands" {
@@ -3960,6 +4038,19 @@ fn parseJsonNumber(value: std.json.Value) !f64 {
         .number_string => |num| std.fmt.parseFloat(f64, num),
         else => error.InvalidNumber,
     };
+}
+
+fn exactI64JsonNumber(value: std.json.Value) ?i64 {
+    return switch (value) {
+        .integer => |integer| integer,
+        .number_string => |text| std.fmt.parseInt(i64, text, 10) catch null,
+        else => null,
+    };
+}
+
+fn exactPositiveI64JsonNumber(value: std.json.Value) ?i64 {
+    const integer = exactI64JsonNumber(value) orelse return null;
+    return if (integer > 0) integer else null;
 }
 
 fn isIntegralJsonNumber(value: std.json.Value, numeric_value: f64) bool {
@@ -4946,6 +5037,12 @@ test "validate ttl field values and schema bindings" {
         error.InvalidBatchRequest,
         validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"expires_at\":-1}" }}),
     );
+
+    var numeric_ttl = try parseSchema(
+        std.testing.allocator,
+        "{\"default_type\":\"doc\",\"ttl_duration_ns\":1,\"ttl_field\":\"expires_at\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"expires_at\":{\"type\":\"numeric\"}}}}}}",
+    );
+    defer numeric_ttl.deinit(std.testing.allocator);
 }
 
 test "validate escaped ref tokens and direct fragment refs" {

@@ -2110,7 +2110,7 @@ test "relational projection enforces required columns and types" {
 test "relational integer validation and projection share exact i64 conversion" {
     const alloc = std.testing.allocator;
     var parsed = try schema_mod.parseValidatedTableSchema(alloc,
-        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"qty":{"type":"integer"}},"required":["qty"],"additionalProperties":false}}}}
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"qty":{"type":"integer","maximum":9007199254740992,"multipleOf":2}},"required":["qty"],"additionalProperties":false}}}}
     );
     defer parsed.deinit(alloc);
     var plan = try relationalColumnPlanAlloc(alloc, parsed);
@@ -2118,14 +2118,27 @@ test "relational integer validation and projection share exact i64 conversion" {
     const qty_index = relationalColumnIndex(plan, "qty").?;
 
     const accepted =
-        \\{"qty":5.0}
+        \\{"qty":9007199254740992}
     ;
     try schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = accepted }});
     var accepted_value = try std.json.parseFromSlice(std.json.Value, alloc, accepted, .{});
     defer accepted_value.deinit();
     var row = try projectRelationalRowAlloc(alloc, plan, accepted_value.value);
     defer row.deinit(alloc);
-    try std.testing.expectEqual(@as(i64, 5), row.cell(qty_index).?.value.i64_val);
+    try std.testing.expectEqual(@as(i64, 9_007_199_254_740_992), row.cell(qty_index).?.value.i64_val);
+
+    const constraint_violations = [_][]const u8{
+        // Both values collapse onto adjacent f64 representations, so these
+        // checks must use the exact relational i64 value and schema token.
+        "{\"qty\":9007199254740993}",
+        "{\"qty\":9007199254740991}",
+    };
+    for (constraint_violations) |document| {
+        try std.testing.expectError(
+            error.InvalidBatchRequest,
+            schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = document }}),
+        );
+    }
 
     const invalid_documents = [_][]const u8{
         "{\"qty\":\"5\"}",
@@ -2421,14 +2434,14 @@ test "relational datetime validation and projection reject invalid or unencodabl
 test "relational custom ttl column validates and projects" {
     const alloc = std.testing.allocator;
     var parsed = try schema_mod.parseValidatedTableSchema(alloc,
-        \\{"storage_mode":"relational","ttl_duration_ns":1,"ttl_field":"expires_at","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"expires_at":{"type":"datetime"}},"required":["id","expires_at"],"additionalProperties":false}}}}
+        \\{"storage_mode":"relational","ttl_duration_ns":1,"ttl_field":"_expires_at","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"_expires_at":{"type":"datetime"}},"required":["id","_expires_at"],"additionalProperties":false}}}}
     );
     defer parsed.deinit(alloc);
     var plan = try relationalColumnPlanAlloc(alloc, parsed);
     defer plan.deinit(alloc);
 
     const document =
-        \\{"id":"a","expires_at":"1970-01-01T00:00:00Z"}
+        \\{"id":"a","_expires_at":"1970-01-01T00:00:00Z"}
     ;
     try schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = document }});
     var value = try std.json.parseFromSlice(std.json.Value, alloc, document, .{});
@@ -2436,7 +2449,7 @@ test "relational custom ttl column validates and projects" {
     var row = try projectRelationalRowAlloc(alloc, plan, value.value);
     defer row.deinit(alloc);
 
-    const ttl_index = relationalColumnIndex(plan, "expires_at") orelse return error.TestExpectedEqual;
+    const ttl_index = relationalColumnIndex(plan, "_expires_at") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 0), row.cell(ttl_index).?.value.u64_val);
 }
 
