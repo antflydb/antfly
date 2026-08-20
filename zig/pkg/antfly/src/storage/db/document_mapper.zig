@@ -1873,7 +1873,7 @@ fn jsonValueToMappedGeoPoint(value: std.json.Value) ?typed_dv.GeoPoint {
     const lon_value = value.object.get("lon") orelse return null;
     const lat = jsonValueToFiniteF64(lat_value) orelse return null;
     const lon = jsonValueToFiniteF64(lon_value) orelse return null;
-    if (!mappedGeoLatitudeValid(lat) or !mappedGeoLongitudeValid(lon)) return null;
+    if (!geo_mod.latitudeIsValid(lat) or !geo_mod.longitudeIsValid(lon)) return null;
     return .{ .lat = lat, .lon = lon };
 }
 
@@ -1886,14 +1886,6 @@ fn jsonValueToFiniteF64(value: std.json.Value) ?f64 {
     };
     if (!std.math.isFinite(number)) return null;
     return number;
-}
-
-fn mappedGeoLatitudeValid(value: f64) bool {
-    return value >= -90.0 and value <= 90.0;
-}
-
-fn mappedGeoLongitudeValid(value: f64) bool {
-    return value >= -180.0 and value <= 180.0;
 }
 
 fn typedValueType(value: typed_dv.TypedValue) typed_dv.ValueType {

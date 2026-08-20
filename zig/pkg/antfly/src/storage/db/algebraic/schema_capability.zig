@@ -17,6 +17,7 @@ const Allocator = std.mem.Allocator;
 const index_mod = @import("index.zig");
 const relational_row_codec = @import("relational_row_codec.zig");
 const schema_mod = @import("../../../schema/mod.zig");
+const geo_mod = @import("../../../search/geo.zig");
 const storage_schema = @import("../../schema.zig");
 
 pub const FieldRole = enum {
@@ -222,6 +223,10 @@ fn appendLawConfig(
     try out.append(alloc, '}');
 }
 
+/// Version 2 replaces the delimiter-based legacy framing with length-prefixed
+/// fields and includes capability flags. The prefix is a persistence boundary:
+/// unversioned fingerprints created by older binaries intentionally mismatch so
+/// adaptive materializations take the existing rebuild-required migration path.
 pub fn capabilityFingerprintAlloc(alloc: Allocator, plan: Plan) ![]u8 {
     var hasher = std.hash.Wyhash.init(0x616e_7466_6c79_6361);
     hashU64(&hasher, plan.schema_version);
@@ -237,7 +242,7 @@ pub fn capabilityFingerprintAlloc(alloc: Allocator, plan: Plan) ![]u8 {
     hashU64(&hasher, plan.skipped_dynamic_fields);
     hashU64(&hasher, plan.skipped_complex_fields);
     hashU64(&hasher, plan.skipped_unbounded_fields);
-    return try std.fmt.allocPrint(alloc, "{x:0>16}", .{hasher.final()});
+    return try std.fmt.allocPrint(alloc, "v2:{x:0>16}", .{hasher.final()});
 }
 
 fn hashBytes(hasher: *std.hash.Wyhash, value: []const u8) void {
@@ -305,6 +310,8 @@ test "capability fingerprint uses unambiguous field framing" {
     defer std.testing.allocator.free(first);
     const second = try capabilityFingerprintAlloc(std.testing.allocator, .{ .fields = &second_fields });
     defer std.testing.allocator.free(second);
+    try std.testing.expect(std.mem.startsWith(u8, first, "v2:"));
+    try std.testing.expectEqual(@as(usize, 19), first.len);
     try std.testing.expect(!std.mem.eql(u8, first, second));
 }
 
@@ -1163,8 +1170,10 @@ fn dateTimeFromJson(json_value: std.json.Value) ?u64 {
 fn geoPointFromJson(json_value: std.json.Value) ?GeoPoint {
     switch (json_value) {
         .object => |object| {
+            if (object.count() != 2) return null;
             const lat = jsonNumber(object.get("lat") orelse return null) orelse return null;
             const lon = jsonNumber(object.get("lon") orelse return null) orelse return null;
+            if (!geo_mod.latitudeIsValid(lat) or !geo_mod.longitudeIsValid(lon)) return null;
             return GeoPoint{ .lat = lat, .lon = lon };
         },
         else => return null,
@@ -1197,7 +1206,7 @@ fn valueAtJsonPath(root: std.json.Value, path: []const u8) ?std.json.Value {
 
 fn relationalTestPlanAlloc(alloc: Allocator) !RelationalPlan {
     var parsed = try schema_mod.parseValidatedTableSchema(alloc,
-        \\{"version":4,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"qty":{"type":"integer"},"ts":{"type":"datetime"},"active":{"type":"boolean"},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id","amount"],"additionalProperties":false}}}}
+        \\{"version":4,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"qty":{"type":"integer"},"ts":{"type":"datetime"},"active":{"type":"boolean"},"location":{"type":"geopoint"},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id","amount"],"additionalProperties":false}}}}
     );
     defer parsed.deinit(alloc);
     return try relationalColumnPlanAlloc(alloc, parsed);
@@ -1228,6 +1237,24 @@ test "relational projection enforces required columns and types" {
     , .{});
     defer wrong.deinit();
     try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, wrong.value));
+
+    var invalid_latitude = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"a","amount":1.0,"location":{"lat":91,"lon":0}}
+    , .{});
+    defer invalid_latitude.deinit();
+    try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, invalid_latitude.value));
+
+    var invalid_longitude = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"a","amount":1.0,"location":{"lat":0,"lon":181}}
+    , .{});
+    defer invalid_longitude.deinit();
+    try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, invalid_longitude.value));
+
+    var lossy_extra_member = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"a","amount":1.0,"location":{"lat":0,"lon":0,"altitude":10}}
+    , .{});
+    defer lossy_extra_member.deinit();
+    try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, lossy_extra_member.value));
 }
 
 test "relational projection yields typed cells" {

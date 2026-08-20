@@ -93,11 +93,11 @@ const path_fact_geo_distance_constraint_tag = "pathfact-geo-distance:v1";
 const path_fact_geo_shape_constraint_tag = "pathfact-geo-shape:v1";
 
 fn validGeoLatitude(lat: f64) bool {
-    return std.math.isFinite(lat) and lat >= -90.0 and lat <= 90.0;
+    return geo_mod.latitudeIsValid(lat);
 }
 
 fn validGeoLongitude(lon: f64) bool {
-    return std.math.isFinite(lon) and lon >= -180.0 and lon <= 180.0;
+    return geo_mod.longitudeIsValid(lon);
 }
 const distributed_materialized_tensor_fragments = [_]ir.TensorFragment{ .slice, .reduce, .merge };
 const distributed_join_materialized_tensor_fragments = [_]ir.TensorFragment{ .slice, .join, .reduce, .merge };
@@ -11627,6 +11627,9 @@ pub const Index = struct {
 
     fn adaptiveProgressMatchesCurrentConfig(self: *const Index, progress: PersistedAdaptiveProgress) bool {
         const cfg = self.config();
+        // Fingerprints are opaque, versioned persistence identities. A format
+        // upgrade must not reinterpret collision-prone legacy hashes as the new
+        // format: an exact mismatch drives the normal rebuild-required path.
         return progress.schema_version == cfg.schema_version and std.mem.eql(u8, progress.capability_fingerprint, cfg.capability_fingerprint);
     }
 
@@ -25307,6 +25310,38 @@ test "algebraic adaptive scans skip corrupt sidecar state rows" {
     defer read_txn.abort();
     try std.testing.expect(try idx.persistedMaterializationStateReadyTxn(&read_txn, good_recommendation));
     try std.testing.expect(!try idx.persistedMaterializationStateReadyTxn(&read_txn, corrupt_recommendation));
+}
+
+test "algebraic adaptive progress treats fingerprint format upgrades as rebuild boundaries" {
+    const alloc = std.testing.allocator;
+    const cfg =
+        \\{
+        \\  "version": 2,
+        \\  "table": "orders",
+        \\  "schema_version": 7,
+        \\  "capability_fingerprint": "v2:0123456789abcdef",
+        \\  "materializations": []
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg_adaptive_fingerprint_version", cfg);
+    defer idx.close();
+
+    const current = PersistedAdaptiveProgress{
+        .recommendation = @constCast("recommendation"),
+        .materialization_id = @constCast("materialization"),
+        .lifecycle = .ready,
+        .target_sequence = 0,
+        .applied_sequence = 0,
+        .rows_processed = 0,
+        .target_rows = 0,
+        .schema_version = 7,
+        .capability_fingerprint = @constCast("v2:0123456789abcdef"),
+    };
+    try std.testing.expect(idx.adaptiveProgressMatchesCurrentConfig(current));
+
+    var legacy = current;
+    legacy.capability_fingerprint = @constCast("0123456789abcdef");
+    try std.testing.expect(!idx.adaptiveProgressMatchesCurrentConfig(legacy));
 }
 
 test "algebraic adaptive progress marks rebuild required on schema drift" {

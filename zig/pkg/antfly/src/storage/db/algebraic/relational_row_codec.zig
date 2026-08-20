@@ -64,6 +64,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const geo_mod = @import("../../../search/geo.zig");
 const typed_dv = @import("../../../section/typed_doc_values.zig");
 
 pub const magic: [4]u8 = "AROW".*;
@@ -193,7 +194,7 @@ fn cellValueMatchesType(cell: Cell) bool {
 fn cellValueIsSerializable(cell: Cell) bool {
     return switch (cell.value) {
         .f64_val => |value| std.math.isFinite(value),
-        .geo_point => |value| std.math.isFinite(value.lat) and std.math.isFinite(value.lon),
+        .geo_point => |value| geo_mod.latitudeIsValid(value.lat) and geo_mod.longitudeIsValid(value.lon),
         else => true,
     };
 }
@@ -202,8 +203,12 @@ fn validateCell(alloc: Allocator, cell: Cell) !void {
     if (!std.unicode.utf8ValidateSlice(cell.path) or
         !cellValueMatchesType(cell) or
         !cellValueIsSerializable(cell)) return error.InvalidRelationalRow;
-    if (cell.is_json and !(try std.json.validate(alloc, cell.value.bytes_val))) {
-        return error.InvalidRelationalRow;
+    if (cell.value == .bytes_val) {
+        if (cell.is_json) {
+            if (!(try std.json.validate(alloc, cell.value.bytes_val))) return error.InvalidRelationalRow;
+        } else if (!std.unicode.utf8ValidateSlice(cell.value.bytes_val)) {
+            return error.InvalidRelationalRow;
+        }
     }
 }
 
@@ -682,6 +687,17 @@ test "relational row codec rejects mismatched and non-JSON-safe cells" {
     try std.testing.expectError(error.InvalidRelationalRow, serialize(alloc, &invalid_json));
     try std.testing.expectError(error.InvalidRelationalRow, reconstructDocumentAlloc(alloc, &invalid_json));
 
+    const invalid_utf8 = [_]Cell{
+        .{ .path = "value", .value_type = .bytes_val, .value = .{ .bytes_val = "\xff" } },
+    };
+    try std.testing.expectError(error.InvalidRelationalRow, serialize(alloc, &invalid_utf8));
+    try std.testing.expectError(error.InvalidRelationalRow, reconstructDocumentAlloc(alloc, &invalid_utf8));
+
+    const invalid_geopoint = [_]Cell{
+        .{ .path = "location", .value_type = .geo_point, .value = .{ .geo_point = .{ .lat = 91, .lon = 0 } } },
+    };
+    try std.testing.expectError(error.InvalidRelationalRow, serialize(alloc, &invalid_geopoint));
+
     const invalid_path = [_]Cell{
         .{ .path = "\xff", .value_type = .bool_val, .value = .{ .bool_val = true } },
     };
@@ -704,6 +720,15 @@ test "relational row codec rejects mismatched and non-JSON-safe cells" {
 
 test "relational row readers reject corrupt JSON and duplicate paths" {
     const alloc = std.testing.allocator;
+    const text_row = try serialize(alloc, &.{
+        .{ .path = "title", .value_type = .bytes_val, .value = .{ .bytes_val = "a" } },
+    });
+    defer alloc.free(text_row);
+    text_row[text_row.len - 1] = 0xff;
+    try std.testing.expectError(error.InvalidRelationalRow, validate(text_row));
+    try std.testing.expectError(error.InvalidRelationalRow, deserialize(alloc, text_row));
+    try std.testing.expectError(error.InvalidRelationalRow, findCellByPath(text_row, "title"));
+
     const json_row = try serialize(alloc, &.{
         .{ .path = "payload", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = "{}" } },
     });

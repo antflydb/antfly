@@ -9,7 +9,6 @@ class AntflyType2(str, Enum):
     GEOPOINT = "geopoint"
     GEOSHAPE = "geoshape"
     HTML = "html"
-    JSON = "json"
     KEYWORD = "keyword"
     LINK = "link"
     NUMERIC = "numeric"

@@ -104,7 +104,7 @@ fn freeRuntimeDynamicTemplateItems(alloc: std.mem.Allocator, templates: []storag
 }
 
 fn runtimeDynamicTemplateFromParsed(alloc: std.mem.Allocator, template: impl.DynamicTemplate) !storage_schema.DynamicTemplate {
-    const field_type = parseRuntimeFieldType(template.field_type orelse "text");
+    const field_type = impl.runtimeFieldTypeFromName(template.field_type orelse "text") orelse return error.InvalidSchemaUpdateRequest;
     const sortable = template.sortable orelse false;
     const do_index = template.do_index orelse true;
     try validateRuntimeSortableMapping(field_type, sortable);
@@ -197,7 +197,7 @@ fn runtimeDocumentFieldTemplateFromParsed(
     path: []const u8,
     mapping: impl.DynamicTemplate,
 ) !storage_schema.DynamicTemplate {
-    const field_type = parseRuntimeFieldType(mapping.field_type orelse "text");
+    const field_type = impl.runtimeFieldTypeFromName(mapping.field_type orelse "text") orelse return error.InvalidSchemaUpdateRequest;
     const sortable = mapping.sortable orelse false;
     const do_index = mapping.do_index orelse true;
     try validateRuntimeSortableMapping(field_type, sortable);
@@ -218,28 +218,6 @@ fn runtimeDocumentFieldTemplateFromParsed(
             .analyzer = try alloc.dupe(u8, mapping.analyzer orelse defaultDynamicTemplateAnalyzer(field_type)),
         },
     };
-}
-
-fn parseRuntimeFieldType(field_type: []const u8) storage_schema.AntflyType {
-    if (std.mem.eql(u8, field_type, "text")) return .text;
-    if (std.mem.eql(u8, field_type, "keyword")) return .keyword;
-    if (std.mem.eql(u8, field_type, "numeric") or
-        std.mem.eql(u8, field_type, "number") or
-        std.mem.eql(u8, field_type, "integer"))
-        return .numeric;
-    if (std.mem.eql(u8, field_type, "embedding")) return .embedding;
-    if (std.mem.eql(u8, field_type, "link")) return .link;
-    if (std.mem.eql(u8, field_type, "boolean") or std.mem.eql(u8, field_type, "bool")) return .boolean;
-    if (std.mem.eql(u8, field_type, "datetime") or
-        std.mem.eql(u8, field_type, "date") or
-        std.mem.eql(u8, field_type, "timestamp"))
-        return .datetime;
-    if (std.mem.eql(u8, field_type, "geopoint") or std.mem.eql(u8, field_type, "geo_point")) return .geopoint;
-    if (std.mem.eql(u8, field_type, "geoshape") or std.mem.eql(u8, field_type, "geo_shape")) return .geoshape;
-    if (std.mem.eql(u8, field_type, "blob")) return .blob;
-    if (std.mem.eql(u8, field_type, "html")) return .html;
-    if (std.mem.eql(u8, field_type, "search_as_you_type")) return .search_as_you_type;
-    return .text;
 }
 
 fn validateRuntimeSortableMapping(field_type: storage_schema.AntflyType, sortable: bool) !void {

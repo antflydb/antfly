@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const schema_regex = @import("antfly_regex");
+const geo_mod = @import("../search/geo.zig");
 const storage_schema = @import("../storage/schema.zig");
 
 pub const StorageMode = enum {
@@ -1233,6 +1234,8 @@ fn validateTypeName(schema_type_name: []const u8, require_object_only: bool) ![]
         std.mem.eql(u8, schema_type_name, "numeric") or
         std.mem.eql(u8, schema_type_name, "boolean") or
         std.mem.eql(u8, schema_type_name, "datetime") or
+        std.mem.eql(u8, schema_type_name, "geopoint") or
+        std.mem.eql(u8, schema_type_name, "geoshape") or
         std.mem.eql(u8, schema_type_name, "json") or
         std.mem.eql(u8, schema_type_name, "object") or
         std.mem.eql(u8, schema_type_name, "array"))
@@ -1503,7 +1506,10 @@ fn validateFieldMappingObject(mapping: std.json.Value, allow_fields: bool) !void
     while (keys.next()) |entry| {
         if (!isKnownFieldMappingKey(entry.key_ptr.*, allow_fields)) return error.InvalidSchemaUpdateRequest;
     }
-    if (mapping.object.get("type")) |mapping_type| if (mapping_type != .null and mapping_type != .string) return error.InvalidSchemaUpdateRequest;
+    if (mapping.object.get("type")) |mapping_type| {
+        if (mapping_type != .null and mapping_type != .string) return error.InvalidSchemaUpdateRequest;
+        if (mapping_type == .string and runtimeFieldTypeFromName(mapping_type.string) == null) return error.InvalidSchemaUpdateRequest;
+    }
     if (mapping.object.get("analyzer")) |analyzer| if (analyzer != .null and analyzer != .string) return error.InvalidSchemaUpdateRequest;
     if (mapping.object.get("index")) |index| if (index != .null and index != .bool) return error.InvalidSchemaUpdateRequest;
     if (mapping.object.get("store")) |store| if (store != .null and store != .bool) return error.InvalidSchemaUpdateRequest;
@@ -1585,6 +1591,26 @@ fn mappingTypeCanSort(mapping_type: []const u8) bool {
         std.mem.eql(u8, mapping_type, "date") or
         std.mem.eql(u8, mapping_type, "timestamp") or
         std.mem.eql(u8, mapping_type, "link");
+}
+
+pub fn runtimeFieldTypeFromName(field_type: []const u8) ?storage_schema.AntflyType {
+    if (std.mem.eql(u8, field_type, "text")) return .text;
+    if (std.mem.eql(u8, field_type, "keyword")) return .keyword;
+    if (std.mem.eql(u8, field_type, "numeric") or
+        std.mem.eql(u8, field_type, "number") or
+        std.mem.eql(u8, field_type, "integer")) return .numeric;
+    if (std.mem.eql(u8, field_type, "embedding")) return .embedding;
+    if (std.mem.eql(u8, field_type, "link")) return .link;
+    if (std.mem.eql(u8, field_type, "boolean") or std.mem.eql(u8, field_type, "bool")) return .boolean;
+    if (std.mem.eql(u8, field_type, "datetime") or
+        std.mem.eql(u8, field_type, "date") or
+        std.mem.eql(u8, field_type, "timestamp")) return .datetime;
+    if (std.mem.eql(u8, field_type, "geopoint") or std.mem.eql(u8, field_type, "geo_point")) return .geopoint;
+    if (std.mem.eql(u8, field_type, "geoshape") or std.mem.eql(u8, field_type, "geo_shape")) return .geoshape;
+    if (std.mem.eql(u8, field_type, "blob")) return .blob;
+    if (std.mem.eql(u8, field_type, "html")) return .html;
+    if (std.mem.eql(u8, field_type, "search_as_you_type")) return .search_as_you_type;
+    return null;
 }
 
 fn validateNonNegativeInteger(value: std.json.Value) !void {
@@ -3248,6 +3274,17 @@ fn validateDocumentFieldValueWithContext(
             else => return error.InvalidBatchRequest,
         }
     }
+    if (std.mem.eql(u8, field_type, "geopoint")) {
+        if (value.* != .object or value.object.count() != 2) return error.InvalidBatchRequest;
+        const lat = parseJsonNumber(value.object.get("lat") orelse return error.InvalidBatchRequest) catch return error.InvalidBatchRequest;
+        const lon = parseJsonNumber(value.object.get("lon") orelse return error.InvalidBatchRequest) catch return error.InvalidBatchRequest;
+        if (!geo_mod.latitudeIsValid(lat) or !geo_mod.longitudeIsValid(lon)) return error.InvalidBatchRequest;
+        return;
+    }
+    if (std.mem.eql(u8, field_type, "geoshape")) {
+        if (value.* != .string) return error.InvalidBatchRequest;
+        return;
+    }
     if (std.mem.eql(u8, field_type, "object")) {
         if (value.* != .object) return error.InvalidBatchRequest;
         return;
@@ -4057,6 +4094,21 @@ test "parse accepts sortable without public doc values and rejects unsupported s
     defer sortable_document_field.deinit(std.testing.allocator);
     const rank = sortable_document_field.document_schemas[0].properties[0].antfly_field orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(true, rank.sortable.?);
+
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"dynamic_templates\":[{\"name\":\"payload\",\"path_match\":\"payload\",\"mapping\":{\"type\":\"json\"}}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"payload\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"unknown\"}}}}}}}",
+        ),
+    );
 
     try std.testing.expectError(
         error.InvalidSchemaUpdateRequest,

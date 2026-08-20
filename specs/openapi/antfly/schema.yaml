@@ -24,7 +24,6 @@ components:
         - blob
         - link
         - search_as_you_type
-        - json
 
     DocumentSchema:
       type: object

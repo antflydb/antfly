@@ -17727,7 +17727,6 @@ components:
         - blob
         - link
         - search_as_you_type
-        - json
     TemplateFieldMapping:
       type: object
       additionalProperties: false
