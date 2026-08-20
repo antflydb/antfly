@@ -212,12 +212,16 @@ PJRT cache growth therefore treats a live-host denial as a reclaim signal: under
 the lazy-entry residency lock it destroys one cold unpinned entry, releases its
 exact aggregate credit, drops the corresponding clean GGUF file-cache range,
 and retries the pending growth. Because page faults are not allocator calls,
-last-borrower release boundaries also re-probe the authoritative live signal at
-a bounded cadence. Once the process reserve is reached, the session enters
-pressure mode: every subsequent GGUF tensor drops its clean source range when
-its last borrower releases the handle. Prepared cache entries remain resident,
-and normal sessions that never encounter live pressure pay only the rate-limited
-cgroup probe, with no extra model I/O.
+completed weight operations and last-borrower release boundaries also re-probe
+the authoritative live signal at a bounded cadence. Once the process reserve is
+reached, the session enters pressure mode: each completed GGUF weight operation
+drops its clean source range immediately, even if a graph scope retains the
+handle, and release repeats the hint after the final borrower. `MADV_DONTNEED`
+does not invalidate the mapping, so concurrent readers remain correct and may
+refault a discarded page; pressure mode deliberately trades that I/O for process
+survival. Prepared cache entries remain resident, and normal sessions that never
+encounter live pressure pay only the rate-limited cgroup probe, with no extra
+model I/O.
 ModelManager uses the same bounded session capability when request admission is
 denied and no idle model can be removed. Backends own the mechanics and
 pin-safety of reclamation; ModelManager owns victim ordering and retries;

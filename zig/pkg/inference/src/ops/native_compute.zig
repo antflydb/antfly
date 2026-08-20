@@ -4573,6 +4573,25 @@ fn shouldDiscardFileCacheUnderPressure(data: *WeightStore) bool {
     return data.discard_file_cache_under_pressure.load(.acquire);
 }
 
+/// A completed weight operation is the earliest safe point at which its source
+/// pages are no longer needed by that operation. This boundary is intentionally
+/// independent of handle lifetime: graph scopes may retain a pinned handle long
+/// after the mapped range was consumed, allowing working set to outrun a
+/// release-only pressure probe.
+fn maybeDiscardLazyEntryFileCacheAfterUse(
+    data: *WeightStore,
+    entry: *const LazyWeightEntry,
+) bool {
+    if (!shouldDiscardFileCacheUnderPressure(data)) return false;
+    discardLazyEntryFileCache(data, entry);
+    return true;
+}
+
+fn maybeDiscardMappedWeightAfterUse(self: *NativeCompute, weight: CT) void {
+    const entry = toBuf(weight).lazy_entry orelse return;
+    _ = maybeDiscardLazyEntryFileCacheAfterUse(self.data, entry);
+}
+
 fn acquireWeightReservation(self: *NativeCompute, name: []const u8, bytes: usize) !?run_memory.Reservation {
     if (self.run_budget == null or name.len == 0 or bytes == 0) return null;
     if (self.weight_reservations.getPtr(name)) |state| {
@@ -5195,6 +5214,12 @@ test "live host cache denial enables mapped-page pressure mode" {
     store.last_file_cache_pressure_probe_ns.store(0, .release);
     try std.testing.expect(shouldDiscardFileCacheUnderPressure(&store));
     try std.testing.expect(store.discard_file_cache_under_pressure.load(.acquire));
+    var active_entry = LazyWeightEntry{
+        .tensor_ref = undefined,
+        .pin_count = 1,
+    };
+    try std.testing.expect(maybeDiscardLazyEntryFileCacheAfterUse(&store, &active_entry));
+    try std.testing.expectEqual(@as(usize, 1), active_entry.pin_count);
     store.discard_file_cache_under_pressure.store(false, .release);
     store.last_file_cache_pressure_probe_ns.store(0, .release);
 
@@ -5369,6 +5394,7 @@ fn freeLazyWeights(data: *WeightStore, allocator: std.mem.Allocator) void {
 
 fn embeddingLookup(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, dim: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, weight);
     const out_len = std.math.mul(usize, total, dim) catch return error.UnsupportedShape;
     const out = try self.allocator.alloc(f32, out_len);
     errdefer self.allocator.free(out);
@@ -5634,6 +5660,7 @@ fn dispatchQuantizedLinear(request: QuantLinearRequest) !bool {
 
 fn linearOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, weight);
     const output = try self.allocator.alloc(f32, rows * out_dim);
     errdefer self.allocator.free(output);
     const weight_buf = toBuf(weight);
@@ -5943,6 +5970,9 @@ fn linearLoRAOp(
     out_dim: usize,
 ) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, base_weight);
+    defer maybeDiscardMappedWeightAfterUse(self, lora_a);
+    defer maybeDiscardMappedWeightAfterUse(self, lora_b);
     _ = rank;
 
     const input_data = getData(input);
@@ -5986,6 +6016,8 @@ fn linearLoRAOp(
 
 fn layerNormOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, gamma);
+    defer maybeDiscardMappedWeightAfterUse(self, beta);
     const output = try self.allocator.dupe(f32, getData(input));
     activations_mod.layerNorm(output, getData(gamma), getData(beta), dim, eps);
     const result = try self.makeOwnedBuf(output);
@@ -5993,7 +6025,10 @@ fn layerNormOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dim: usize, eps:
     return propagateLogicalShapeLike(self, result, input);
 }
 
-fn layerNormConsumeInputOp(_: *anyopaque, input: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?CT {
+fn layerNormConsumeInputOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, gamma);
+    defer maybeDiscardMappedWeightAfterUse(self, beta);
     const buf = uniqueOwnedDenseBuf(input) orelse return null;
     activations_mod.layerNorm(buf.data, getData(gamma), getData(beta), dim, eps);
     return input;
@@ -6836,6 +6871,7 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
 
 fn linearNoBiasOp(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, weight);
     const output = try self.allocator.alloc(f32, rows * out_dim);
     errdefer self.allocator.free(output);
     @memset(output, 0.0);
@@ -6883,6 +6919,7 @@ fn linearNoBiasPlannedOp(ctx: *anyopaque, request: *const ops.LinearNoBiasPlanne
     const weight_buf = toBuf(request.weight);
     const storage = weight_buf.quantized_storage orelse
         return linearNoBiasOp(ctx, request.input, request.weight, request.rows, request.in_dim, request.out_dim);
+    defer maybeDiscardMappedWeightAfterUse(self, request.weight);
     try validateQuantLinearPlan(request.operator_plan, storage, request.rows, request.in_dim, request.out_dim);
 
     var output_opt: ?[]f32 = try self.allocator.alloc(f32, request.rows * request.out_dim);
@@ -6913,6 +6950,7 @@ fn linearPlannedOp(ctx: *anyopaque, request: *const ops.LinearPlannedRequest) an
     const weight_buf = toBuf(request.weight);
     const storage = weight_buf.quantized_storage orelse
         return linearOp(ctx, request.input, request.weight, request.bias, request.rows, request.in_dim, request.out_dim);
+    defer maybeDiscardMappedWeightAfterUse(self, request.weight);
     try validateQuantLinearPlan(request.operator_plan, storage, request.rows, request.in_dim, request.out_dim);
 
     var output_opt: ?[]f32 = try self.allocator.alloc(f32, request.rows * request.out_dim);
@@ -6960,6 +6998,8 @@ fn linearNoBiasPairOp(
     const weight_buf_b = toBuf(weight_b);
     if (weight_buf_a.quantized_storage) |storage_a| {
         if (weight_buf_b.quantized_storage) |storage_b| {
+            defer maybeDiscardMappedWeightAfterUse(self, weight_a);
+            defer maybeDiscardMappedWeightAfterUse(self, weight_b);
             var first_output: ?[]f32 = try self.allocator.alloc(f32, rows * out_dim);
             errdefer if (first_output) |output| self.allocator.free(output);
             var second_output: ?[]f32 = try self.allocator.alloc(f32, rows * out_dim);
@@ -7159,6 +7199,7 @@ fn mulMatIdQuantizedOp(
 
 fn mulMatIdOp(ctx: *anyopaque, request: *const ops.MulMatIdRequest) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, request.weight);
     if (request.expert_ids.len != request.rows) return error.InvalidPackedExpertTensor;
     const input = getData(request.input);
     if (input.len < request.rows * request.in_dim) return error.UnexpectedOutputShape;
@@ -7218,6 +7259,8 @@ fn linearPairOp(
 
     if (weight_buf_a.quantized_storage) |storage_a| {
         if (weight_buf_b.quantized_storage) |storage_b| {
+            defer maybeDiscardMappedWeightAfterUse(self, weight_a);
+            defer maybeDiscardMappedWeightAfterUse(self, weight_b);
             var first_raw: ?[]f32 = try self.allocator.alloc(f32, rows * out_dim);
             errdefer if (first_raw) |raw| self.allocator.free(raw);
             var second_raw: ?[]f32 = try self.allocator.alloc(f32, rows * out_dim);
@@ -7283,6 +7326,9 @@ fn linearTripleOp(
     if (weight_buf_a.quantized_storage) |storage_a| {
         if (weight_buf_b.quantized_storage) |storage_b| {
             if (weight_buf_c.quantized_storage) |storage_c| {
+                defer maybeDiscardMappedWeightAfterUse(self, weight_a);
+                defer maybeDiscardMappedWeightAfterUse(self, weight_b);
+                defer maybeDiscardMappedWeightAfterUse(self, weight_c);
                 var first_raw: ?[]f32 = try self.allocator.alloc(f32, rows * out_dim);
                 errdefer if (first_raw) |raw| self.allocator.free(raw);
                 var second_raw: ?[]f32 = try self.allocator.alloc(f32, rows * out_dim);
@@ -34559,6 +34605,7 @@ fn decodeF32Le(b0: u8, b1: u8, b2: u8, b3: u8) f32 {
 
 fn rmsNormOp(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, weight);
     const output = try self.allocator.dupe(f32, getData(input));
     activations_mod.rmsNorm(output, getData(weight), dim, eps);
     const result = try self.makeOwnedBuf(output);
@@ -34566,7 +34613,9 @@ fn rmsNormOp(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyer
     return propagateLogicalShapeLike(self, result, input);
 }
 
-fn rmsNormConsumeInputOp(_: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!?CT {
+fn rmsNormConsumeInputOp(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, weight);
     const buf = uniqueOwnedDenseBuf(input) orelse return null;
     activations_mod.rmsNorm(buf.data, getData(weight), dim, eps);
     return input;
@@ -34634,6 +34683,8 @@ fn linearRowsNative(
     weight: CT,
     bias: CT,
 ) ![]f32 {
+    defer maybeDiscardMappedWeightAfterUse(self, weight);
+    defer maybeDiscardMappedWeightAfterUse(self, bias);
     const weight_view = try denseWeightView(self, weight);
     defer if (weight_view.owned) |owned| self.allocator.free(owned);
     const bias_view = try denseWeightView(self, bias);
@@ -34785,6 +34836,8 @@ fn tokenGridConv2dOp(
     groups: usize,
 ) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, weight);
+    defer maybeDiscardMappedWeightAfterUse(self, bias);
     const input_tokens = getData(input);
     const out_h = (height + 2 * padding_h - kernel_h) / stride_h + 1;
     const out_w = (width + 2 * padding_w - kernel_w) / stride_w + 1;
@@ -34888,6 +34941,7 @@ fn crossAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, enc_mask: []c
 
 fn relativePositionBiasOp(ctx: *anyopaque, weight: CT, q_len: usize, k_len: usize, num_heads: usize, num_buckets: usize, max_distance: usize, bidirectional: bool) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, weight);
     const table = getData(weight); // [num_heads, num_buckets]
 
     // Output: [num_heads, q_len, k_len]
@@ -35593,6 +35647,7 @@ fn multiplyOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
 
 fn conv1dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_channels: usize, out_channels: usize, time_steps: usize, kernel_size: usize, stride: usize, padding: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, weight);
     const in_data = getData(input);
     const w_data = getData(weight);
     const b_data = getData(bias);
@@ -35639,6 +35694,7 @@ fn conv1dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_c
 
 fn conv2dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_channels: usize, out_channels: usize, height: usize, width: usize, kernel_h: usize, kernel_w: usize, stride_h: usize, stride_w: usize, padding_h: usize, padding_w: usize, groups: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, weight);
     if (batch == 0 or in_channels == 0 or out_channels == 0 or height == 0 or width == 0 or kernel_h == 0 or kernel_w == 0 or stride_h == 0 or stride_w == 0 or groups == 0 or in_channels % groups != 0 or out_channels % groups != 0) return error.InvalidInputShape;
 
     const padded_h = std.math.add(usize, height, std.math.mul(usize, padding_h, 2) catch return error.InvalidInputShape) catch return error.InvalidInputShape;
