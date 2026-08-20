@@ -2056,22 +2056,10 @@ fn geoPointFromJson(json_value: std.json.Value) ?GeoPoint {
     switch (json_value) {
         .object => |object| {
             if (object.count() != 2) return null;
-            const lat = jsonNumber(object.get("lat") orelse return null) orelse return null;
-            const lon = jsonNumber(object.get("lon") orelse return null) orelse return null;
+            const lat = schema_mod.documentNumberToF64(object.get("lat") orelse return null) orelse return null;
+            const lon = schema_mod.documentNumberToF64(object.get("lon") orelse return null) orelse return null;
             if (!geo_mod.latitudeIsValid(lat) or !geo_mod.longitudeIsValid(lon)) return null;
             return GeoPoint{ .lat = lat, .lon = lon };
-        },
-        else => return null,
-    }
-}
-
-fn jsonNumber(json_value: std.json.Value) ?f64 {
-    switch (json_value) {
-        .float => |number| return number,
-        .integer => |number| return @floatFromInt(number),
-        .number_string => |text| {
-            const number = std.fmt.parseFloat(f64, text) catch return null;
-            return if (std.math.isFinite(number)) number else null;
         },
         else => return null,
     }
@@ -2280,6 +2268,36 @@ test "relational number validation rejects values the row codec cannot preserve"
     var preserved_row = try projectRelationalRowJsonAlloc(alloc, plan, preserved);
     defer preserved_row.deinit(alloc);
     try std.testing.expectEqual(@as(f64, 0.1), preserved_row.cell(relationalColumnIndex(plan, "amount").?).?.value.f64_val);
+}
+
+test "relational geopoint validation and projection share lossless f64 conversion" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"location":{"type":"geopoint"}},"required":["location"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+    var plan = try relationalColumnPlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+
+    const invalid_documents = [_][]const u8{
+        "{\"location\":{\"lat\":0.10000000000000001,\"lon\":0}}",
+        "{\"location\":{\"lat\":0,\"lon\":0.10000000000000001}}",
+    };
+    for (invalid_documents) |document| {
+        try std.testing.expectError(
+            error.InvalidBatchRequest,
+            schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = document }}),
+        );
+        try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowJsonAlloc(alloc, plan, document));
+    }
+
+    const preserved = "{\"location\":{\"lat\":0.1,\"lon\":-0.1}}";
+    try schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = preserved }});
+    var row = try projectRelationalRowJsonAlloc(alloc, plan, preserved);
+    defer row.deinit(alloc);
+    const location = row.cell(relationalColumnIndex(plan, "location").?).?.value.geo_point;
+    try std.testing.expectEqual(@as(f64, 0.1), location.lat);
+    try std.testing.expectEqual(@as(f64, -0.1), location.lon);
 }
 
 test "relational json columns preserve nested numeric domains" {
