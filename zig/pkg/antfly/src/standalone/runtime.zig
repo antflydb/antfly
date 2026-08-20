@@ -4389,13 +4389,14 @@ fn invokeInferenceProvider(
     defer alloc.free(request_json);
     var response_handle: ?*anyopaque = null;
     var response_json: inference_bridge.String = undefined;
+    const effective_deadline_ns = deadline_ns orelse platform_time.monotonicNs() +| 5 * std.time.ns_per_min;
     const context = inference_bridge.ProviderInvokeContext{
         .abi_version = inference_bridge.abi_version,
         .handle = handle,
         .operation = @intFromEnum(operation),
         .request_json = inference_bridge.String.init(request_json),
-        .deadline_ns = deadline_ns orelse 0,
-        .has_deadline = @intFromBool(deadline_ns != null),
+        .deadline_ns = effective_deadline_ns,
+        .has_deadline = 1,
         .out_response_handle = &response_handle,
         .out_response_json = &response_json,
     };

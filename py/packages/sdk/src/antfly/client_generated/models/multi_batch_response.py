@@ -21,7 +21,10 @@ class MultiBatchResponse:
     """Response for a cross-table batch operation. Contains per-table results.
 
     Attributes:
-        status (MultiBatchResponseStatus | Unset): Durable commit and visibility/propagation state.
+        status (MultiBatchResponseStatus | Unset): Durable commit outcome. Pending states mean requested visibility or
+            participant propagation is still completing. `committed_repair_required`
+            means the primary writes committed, but a terminal enrichment failure needs
+            operator repair and will not be retried indefinitely.
         tables (MultiBatchResponseTables | Unset): Per-table batch results
     """
 

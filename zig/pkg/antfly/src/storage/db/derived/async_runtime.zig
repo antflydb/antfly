@@ -739,6 +739,9 @@ fn closeWorkerCatchUpState(runtime: *DerivedRuntime, worker: *Worker, success: b
 fn isRecoverablePublishError(worker: *const Worker, err: anyerror) bool {
     if (catch_up_policy.isRecoverableAdmissionError(err)) return true;
     return switch (err) {
+        // A structural owner may already have retired this streaming session.
+        // No applied checkpoint has been published yet, so reopen and replay.
+        error.NoActiveWriteSession => true,
         error.NotFound => catch_up_policy.forIndex(worker.kind, worker.runtime.backlog.resource_manager).not_found_is_recoverable,
         error.ReplayDocumentNotVisible, error.ArtifactRepairRequired => true,
         else => false,

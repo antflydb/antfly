@@ -25,6 +25,8 @@ pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
 pub const statusFromError = error_abi.statusFromError;
+pub const statusFromErrorWithFallback = error_abi.statusFromErrorWithFallback;
+pub const errorHasStableDetail = error_abi.errorHasStableDetail;
 pub const errorFromStatus = error_abi.errorFromStatus;
 
 pub const String = extern struct {

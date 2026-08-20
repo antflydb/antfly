@@ -16,7 +16,10 @@ T = TypeVar("T", bound="BatchResponse")
 class BatchResponse:
     """
     Attributes:
-        status (BatchResponseStatus | Unset): Durable commit and visibility/participant recovery state.
+        status (BatchResponseStatus | Unset): Durable commit outcome. `committed_pending` means requested visibility or
+            participant propagation is still completing. `committed_repair_required`
+            means the primary write committed, but a terminal enrichment failure needs
+            operator repair and will not be retried indefinitely.
         inserted (int | Unset): Number of documents successfully inserted
         deleted (int | Unset): Number of documents successfully deleted
         transformed (int | Unset): Number of documents successfully transformed

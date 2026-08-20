@@ -288,6 +288,15 @@ pub const Detail = enum(c_int) {
     body_too_large,
     body_capacity_exceeded,
     body_read_failed,
+    // Stable provider-boundary outcomes. Inference internals may grow new
+    // unit-private errors without making those failures look transient to
+    // callers that cannot reconstruct their compilation-local identities.
+    inference_provider_failure,
+    kernel_jit_required_dynamic_load,
+    unexpected_token,
+    enrichment_wait_canceled,
+    enrichment_wait_timeout,
+    enrichment_worker_failed,
 };
 
 pub const Status = extern struct {
@@ -486,6 +495,15 @@ pub fn statusFromError(err: anyerror) Status {
         error.BodyTooLarge => status(.invalid_argument, .body_too_large),
         error.BodyCapacityExceeded => status(.retryable, .body_capacity_exceeded),
         error.BodyReadFailed => status(.unavailable, .body_read_failed),
+        error.InferenceProviderFailure => status(.internal, .inference_provider_failure),
+        error.KernelJitRequiredDynamicLoad => status(.unsupported, .kernel_jit_required_dynamic_load),
+        error.UnexpectedToken => status(.internal, .unexpected_token),
+        error.EnrichmentWaitCanceled => status(.cancelled, .enrichment_wait_canceled),
+        error.EnrichmentWaitTimeout => status(.timeout, .enrichment_wait_timeout),
+        // This can be reported only after a write's primary mutation is
+        // durable. Preserve it across the API/storage partition so ingress
+        // can return committed_repair_required instead of an unsafe 500.
+        error.EnrichmentWorkerFailed => status(.internal, .enrichment_worker_failed),
         error.BackupMaintenanceUnavailable => status(.unavailable, .backup_maintenance_unavailable),
         error.ConnectionNotFound => status(.not_found, .connection_not_found),
         error.EmbedRequestFailed => status(.unavailable, .embed_request_failed),
@@ -563,6 +581,24 @@ pub fn statusFromError(err: anyerror) Status {
         error.UserExists => status(.already_exists, .user_exists),
         else => status(.internal, .none),
     };
+}
+
+/// Preserve an explicitly classified error and replace an untransportable,
+/// compilation-local error with a stable boundary-specific outcome.
+///
+/// Callers should log `err` on the owning side before using this helper: the
+/// fallback intentionally carries behavior and a diagnosable boundary name,
+/// not an arbitrary error string across the stable ABI.
+pub fn statusFromErrorWithFallback(err: anyerror, fallback: anyerror) Status {
+    const value = statusFromError(err);
+    if (value.detail != @intFromEnum(Detail.none)) return value;
+    const fallback_value = statusFromError(fallback);
+    std.debug.assert(fallback_value.detail != @intFromEnum(Detail.none));
+    return fallback_value;
+}
+
+pub fn errorHasStableDetail(err: anyerror) bool {
+    return statusFromError(err).detail != @intFromEnum(Detail.none);
 }
 
 fn status(code: Code, detail: Detail) Status {
@@ -840,6 +876,12 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .body_too_large => "BodyTooLarge",
         .body_capacity_exceeded => "BodyCapacityExceeded",
         .body_read_failed => "BodyReadFailed",
+        .inference_provider_failure => "InferenceProviderFailure",
+        .kernel_jit_required_dynamic_load => "KernelJitRequiredDynamicLoad",
+        .unexpected_token => "UnexpectedToken",
+        .enrichment_wait_canceled => "EnrichmentWaitCanceled",
+        .enrichment_wait_timeout => "EnrichmentWaitTimeout",
+        .enrichment_worker_failed => "EnrichmentWorkerFailed",
     };
 }
 
@@ -852,6 +894,12 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, errorFromStatus(statusFromError(error.ResourceTemporarilyUnavailable)));
     try std.testing.expectEqual(error.QueueFull, errorFromStatus(statusFromError(error.QueueFull)));
     try std.testing.expectEqual(error.ResourceLimitExceeded, errorFromStatus(statusFromError(error.ResourceLimitExceeded)));
+    try std.testing.expectEqual(error.InferenceProviderFailure, errorFromStatus(statusFromError(error.InferenceProviderFailure)));
+    try std.testing.expectEqual(error.KernelJitRequiredDynamicLoad, errorFromStatus(statusFromError(error.KernelJitRequiredDynamicLoad)));
+    try std.testing.expectEqual(error.UnexpectedToken, errorFromStatus(statusFromError(error.UnexpectedToken)));
+    try std.testing.expectEqual(error.EnrichmentWaitCanceled, errorFromStatus(statusFromError(error.EnrichmentWaitCanceled)));
+    try std.testing.expectEqual(error.EnrichmentWaitTimeout, errorFromStatus(statusFromError(error.EnrichmentWaitTimeout)));
+    try std.testing.expectEqual(error.EnrichmentWorkerFailed, errorFromStatus(statusFromError(error.EnrichmentWorkerFailed)));
     try std.testing.expectEqual(error.UnsupportedPlatform, errorFromStatus(statusFromError(error.UnsupportedPlatform)));
     try std.testing.expectEqual(error.UnsupportedTransformOperation, errorFromStatus(statusFromError(error.UnsupportedTransformOperation)));
     try std.testing.expectEqual(error.HAReadRequiresPrimary, errorFromStatus(statusFromError(error.HAReadRequiresPrimary)));
@@ -860,6 +908,22 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.AbortDecisionNotDurable, errorFromStatus(statusFromError(error.AbortDecisionNotDurable)));
     try std.testing.expectEqual(error.LeaderUnavailable, errorFromStatus(statusFromError(error.LeaderUnavailable)));
     try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(statusFromError(error.UnitPrivateError)));
+}
+
+test "stable status replaces private provider errors with a named fallback" {
+    try std.testing.expectEqual(
+        error.InferenceProviderFailure,
+        errorFromStatus(statusFromErrorWithFallback(error.UnitPrivateInferenceError, error.InferenceProviderFailure)),
+    );
+    try std.testing.expectEqual(
+        error.ResourceTemporarilyUnavailable,
+        errorFromStatus(statusFromErrorWithFallback(error.ResourceTemporarilyUnavailable, error.InferenceProviderFailure)),
+    );
+}
+
+test "stable detail detection distinguishes private errors" {
+    try std.testing.expect(errorHasStableDetail(error.UnexpectedToken));
+    try std.testing.expect(!errorHasStableDetail(error.UnitPrivateInferenceError));
 }
 
 test "every classified boundary outcome retains its identity" {

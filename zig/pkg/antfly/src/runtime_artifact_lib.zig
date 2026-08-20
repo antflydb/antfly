@@ -20,6 +20,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const platform = @import("antfly_platform");
 const bridge = @import("runtime_bridge.zig");
+const private_error_diagnostics = @import("runtime_private_error_diagnostics.zig");
 const unit_options = @import("runtime_library_options");
 const standalone_inference_bridge = @import("standalone/inference_bridge.zig");
 const restore_staging_exports = if (unit_options.unit == .distributed)
@@ -337,6 +338,22 @@ fn standaloneInferenceConfigure(context: *const standalone_inference_bridge.Conf
     return .ok;
 }
 
+const inference_provider_operation_slots = 13;
+var inference_private_failure_counts = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** inference_provider_operation_slots;
+
+// Private inference errors are normalized at this archive boundary, so this is
+// the only place their original identity is available. Keep a fixed-size set
+// of per-operation/error/model counters: one noisy model must not consume the
+// first diagnostic for a different model, while model names supplied by a
+// client must never grow process memory or produce unbounded first-error logs.
+var inference_private_failure_diagnostics = [_]private_error_diagnostics.Diagnostic{.{}} ** private_error_diagnostics.slots_count;
+
+fn shouldLogInferencePrivateFailure(count: u64) bool {
+    // Keep the first few failures for diagnosis, then retain logarithmic
+    // visibility without allowing a bad model to amplify logs per request.
+    return count <= 4 or std.math.isPowerOfTwo(count);
+}
+
 fn standaloneInferenceInvokeProvider(context: *const standalone_inference_bridge.ProviderInvokeContext) callconv(.c) standalone_inference_bridge.Status {
     if (!standalone_inference_bridge.validContext(
         standalone_inference_bridge.ProviderInvokeContext,
@@ -345,7 +362,55 @@ fn standaloneInferenceInvokeProvider(context: *const standalone_inference_bridge
     ))
         return standalone_inference_bridge.statusFromError(error.UnsupportedVersion);
     standalone_inference_host.linkedInferenceInvokeProvider(context) catch |err| {
-        return standalone_inference_bridge.statusFromError(err);
+        // Stable errors retain their exact identity at the caller, which owns
+        // the request correlation and can log them once with table context.
+        // Only private inference-unit errors need an owner-side diagnostic
+        // before they are normalized to the stable provider failure.
+        if (standalone_inference_bridge.errorHasStableDetail(err))
+            return standalone_inference_bridge.statusFromError(err);
+        const provider_operation = std.enums.fromInt(
+            standalone_inference_bridge.ProviderOperation,
+            context.operation,
+        );
+        const operation_slot: usize = if (context.operation > 0 and context.operation < inference_provider_operation_slots)
+            @intCast(context.operation)
+        else
+            0;
+        const diagnostic_fingerprint = private_error_diagnostics.fingerprint(
+            context.operation,
+            err,
+            context.request_json.slice(),
+        );
+        if (private_error_diagnostics.note(
+            &inference_private_failure_diagnostics,
+            diagnostic_fingerprint,
+        )) |failure_count| {
+            if (shouldLogInferencePrivateFailure(failure_count)) {
+                std.log.err("standalone inference bridge failed operation=invoke_provider provider_operation={s} request_bytes={d} has_deadline={} diagnostic_fingerprint={x} observed_diagnostic_failures={d} err={}", .{
+                    if (provider_operation) |value| @tagName(value) else "unknown",
+                    context.request_json.len,
+                    context.has_deadline != 0,
+                    diagnostic_fingerprint,
+                    failure_count,
+                    err,
+                });
+            }
+        } else {
+            // Once the bounded fingerprint table is full, retain logarithmic
+            // aggregate visibility without allocating or logging once per new
+            // client-controlled model name.
+            const failure_count = inference_private_failure_counts[operation_slot].fetchAdd(1, .monotonic) +% 1;
+            if (shouldLogInferencePrivateFailure(failure_count)) {
+                std.log.err("standalone inference bridge failed operation=invoke_provider provider_operation={s} request_bytes={d} has_deadline={} diagnostic_table_saturated=true observed_overflow_failures={d} err={}", .{
+                    if (provider_operation) |value| @tagName(value) else "unknown",
+                    context.request_json.len,
+                    context.has_deadline != 0,
+                    failure_count,
+                    err,
+                });
+            }
+        }
+        return standalone_inference_bridge.statusFromErrorWithFallback(err, error.InferenceProviderFailure);
     };
     return .ok;
 }

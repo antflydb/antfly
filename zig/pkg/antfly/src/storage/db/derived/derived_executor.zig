@@ -23,6 +23,19 @@ const runtime_backend = @import("../../runtime_backend.zig");
 const background_runtime_mod = @import("../../background_runtime.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
 const types = @import("../types.zig");
+const platform_time = @import("antfly_platform").time;
+
+pub const VisibilityWait = struct {
+    cancellation: types.CancellationToken = .none,
+    deadline_ns: ?u64 = null,
+
+    pub fn check(self: @This()) !void {
+        if (self.cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
+        if (self.deadline_ns) |deadline_ns| {
+            if (platform_time.monotonicNs() >= deadline_ns) return error.EnrichmentWaitTimeout;
+        }
+    }
+};
 
 const ApplyFnType = *const fn (ctx: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) anyerror!bool;
 const PersistFnType = *const fn (ctx: *anyopaque, index_name: []const u8, sequence: u64, force: bool) anyerror!bool;
@@ -191,8 +204,8 @@ pub const Executor = struct {
         track_backlog_bytes: *const fn (ptr: *anyopaque, sequence: u64, bytes: u64) anyerror!void,
         backlog_throttle_target_sequence: *const fn (ptr: *anyopaque) ?u64,
         release_backlog_through: *const fn (ptr: *anyopaque, sequence: u64) void,
-        wait_for_all: *const fn (ptr: *anyopaque, sequence: u64) anyerror!void,
-        wait_for_indexes: *const fn (ptr: *anyopaque, sequence: u64, index_names: []const []const u8) anyerror!void,
+        wait_for_all: *const fn (ptr: *anyopaque, sequence: u64, wait: VisibilityWait) anyerror!void,
+        wait_for_indexes: *const fn (ptr: *anyopaque, sequence: u64, index_names: []const []const u8, wait: VisibilityWait) anyerror!void,
     };
 
     pub fn deinit(self: *Executor, alloc: Allocator) void {
@@ -253,11 +266,19 @@ pub const Executor = struct {
     }
 
     pub fn waitForAll(self: *Executor, sequence: u64) !void {
-        return try self.vtable.wait_for_all(self.ptr, sequence);
+        return try self.waitForAllWithVisibilityWait(sequence, .{});
+    }
+
+    pub fn waitForAllWithVisibilityWait(self: *Executor, sequence: u64, wait: VisibilityWait) !void {
+        return try self.vtable.wait_for_all(self.ptr, sequence, wait);
     }
 
     pub fn waitForIndexes(self: *Executor, sequence: u64, index_names: []const []const u8) !void {
-        return try self.vtable.wait_for_indexes(self.ptr, sequence, index_names);
+        return try self.waitForIndexesWithVisibilityWait(sequence, index_names, .{});
+    }
+
+    pub fn waitForIndexesWithVisibilityWait(self: *Executor, sequence: u64, index_names: []const []const u8, wait: VisibilityWait) !void {
+        return try self.vtable.wait_for_indexes(self.ptr, sequence, index_names, wait);
     }
 };
 
@@ -420,12 +441,14 @@ const ManualRuntime = struct {
         );
     }
 
-    fn waitForAll(self: *ManualRuntime, sequence: u64) !void {
+    fn waitForAll(self: *ManualRuntime, sequence: u64, wait: VisibilityWait) !void {
         for (self.workers.items) |*worker| {
             worker.target_sequence = @max(worker.target_sequence, sequence);
             if (worker.target_sequence <= worker.applied_sequence) continue;
+            try wait.check();
 
             const stats = try self.catchUpWorker(worker);
+            try wait.check();
             const caught_up_sequence = if (stats.appliedSequenceAdvance(worker.applied_sequence)) |applied_sequence|
                 applied_sequence
             else if (stats.shouldTryTargetAdvance(worker.applied_sequence, worker.target_sequence) and
@@ -435,6 +458,7 @@ const ManualRuntime = struct {
                 worker.applied_sequence;
             if (caught_up_sequence > worker.applied_sequence) {
                 while (!try self.persist_fn(self.ctx, worker.name, caught_up_sequence, true)) {
+                    try wait.check();
                     std.atomic.spinLoopHint();
                 }
                 worker.applied_sequence = caught_up_sequence;
@@ -449,14 +473,16 @@ const ManualRuntime = struct {
         }
     }
 
-    fn waitForIndexes(self: *ManualRuntime, sequence: u64, index_names: []const []const u8) !void {
+    fn waitForIndexes(self: *ManualRuntime, sequence: u64, index_names: []const []const u8, wait: VisibilityWait) !void {
         if (index_names.len == 0) return;
         for (self.workers.items) |*worker| {
             if (!indexNameInList(worker.name, index_names)) continue;
             worker.target_sequence = @max(worker.target_sequence, sequence);
             if (worker.target_sequence <= worker.applied_sequence) continue;
+            try wait.check();
 
             const stats = try self.catchUpWorker(worker);
+            try wait.check();
             const caught_up_sequence = if (stats.appliedSequenceAdvance(worker.applied_sequence)) |applied_sequence|
                 applied_sequence
             else if (stats.shouldTryTargetAdvance(worker.applied_sequence, worker.target_sequence) and
@@ -466,6 +492,7 @@ const ManualRuntime = struct {
                 worker.applied_sequence;
             if (caught_up_sequence > worker.applied_sequence) {
                 while (!try self.persist_fn(self.ctx, worker.name, caught_up_sequence, true)) {
+                    try wait.check();
                     std.atomic.spinLoopHint();
                 }
                 worker.applied_sequence = caught_up_sequence;
@@ -621,14 +648,14 @@ fn manualReleaseBacklogThrough(ptr: *anyopaque, sequence: u64) void {
     runtime.releaseBacklogThrough(sequence);
 }
 
-fn manualWaitForAll(ptr: *anyopaque, sequence: u64) !void {
+fn manualWaitForAll(ptr: *anyopaque, sequence: u64, wait: VisibilityWait) !void {
     const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
-    return try runtime.waitForAll(sequence);
+    return try runtime.waitForAll(sequence, wait);
 }
 
-fn manualWaitForIndexes(ptr: *anyopaque, sequence: u64, index_names: []const []const u8) !void {
+fn manualWaitForIndexes(ptr: *anyopaque, sequence: u64, index_names: []const []const u8, wait: VisibilityWait) !void {
     const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
-    return try runtime.waitForIndexes(sequence, index_names);
+    return try runtime.waitForIndexes(sequence, index_names, wait);
 }
 
 fn initIoThreaded(
@@ -751,12 +778,12 @@ fn ioThreadedReleaseBacklogThrough(ptr: *anyopaque, sequence: u64) void {
     runtime.releaseBacklogThrough(sequence);
 }
 
-fn ioThreadedWaitForAll(ptr: *anyopaque, sequence: u64) !void {
+fn ioThreadedWaitForAll(ptr: *anyopaque, sequence: u64, wait: VisibilityWait) !void {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
-    return try runtime.waitForAll(sequence);
+    return try runtime.waitForAllWithVisibilityWait(sequence, wait.cancellation, wait.deadline_ns);
 }
 
-fn ioThreadedWaitForIndexes(ptr: *anyopaque, sequence: u64, index_names: []const []const u8) !void {
+fn ioThreadedWaitForIndexes(ptr: *anyopaque, sequence: u64, index_names: []const []const u8, wait: VisibilityWait) !void {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
-    return try runtime.waitForIndexes(sequence, index_names);
+    return try runtime.waitForIndexesWithVisibilityWait(sequence, index_names, wait.cancellation, wait.deadline_ns);
 }
