@@ -344,6 +344,52 @@ general default for this memory reduction. A future HBC change should make
 leaf normalization incrementally publishable or schedulable while preserving
 one replay transaction, rather than fragmenting replay or its apply operation.
 
+### Foreground pressure must honor the compaction-input budget
+
+Background compaction selection honored `max_compaction_input_bytes`, but the
+hard write-pressure path invoked an unbounded L0 selector. This made the option
+ineffective precisely when L0 crossed its hard limit and public writes were
+most exposed to compaction latency. The pressure path now uses the same input
+budget while preserving its direct, scheduler-independent progress lane and
+the oversized minimum-closure escape. Tests cover a fitting bounded window,
+explicit no-oversize overload, and minimum-job progress when no correct closure
+fits.
+
+A 50K public-API gate with a 768 MiB experimental budget completed in 42.23
+seconds (35.53 seconds inserting and 6.70 seconds catching up), essentially
+unchanged from the 42.08-second external-admission result. Its one pressure job
+was 235.8 MB, all 50,000 vectors were visible, and there was no overload.
+
+The 1M lifecycle rejected 768 MiB as the product default. It completed with all
+1,000,000 vectors visible and zero final hard debt, but took 1,854.21 seconds
+(1,830.20 seconds inserting plus 24.01 seconds catching up). Twenty pressure
+events completed 21 steps without overload, yet the smaller windows rewrote
+27.08 GB and a late indivisible closure still reached 2.753 GB / 58.5 seconds.
+Peak RSS was 3.64 GB, the process physical-footprint ledger peaked at 1.40 GB,
+and cumulative mutable-snapshot copies were 1.96 GB. The experiment therefore
+keeps the foreground-budget correctness fix but restores the 2 GiB product
+default; lowering the number alone increases rewrite frequency without solving
+broad shuffled-key L0 ranges.
+
+The 2 GiB/default-budget 50K gate completed in 41.63 seconds (32.50 seconds
+inserting plus 9.13 seconds catching up). It did not reach hard pressure, all
+50,000 vectors were published and query-visible, and conservative attributable
+demand peaked at 1.31 GB.
+
+The isolated 2 GiB/default-budget 1M control retained the option fix and
+completed in 1,603.35 seconds (1,545.39 seconds inserting plus 57.95 seconds
+catching up). All 1,000,000 vectors were published and query-visible, replay reached
+10,001/10,001, and repair remained clean. Eighteen pressure events completed 19
+steps with no overload and left 57 L0 runs / zero hard debt. Compactions
+consumed 29.31 GB and produced 22.48 GB; the largest minimum closure was still
+2.599 GB / 51.60 seconds because the oversized progress escape correctly
+admits an indivisible closure. Mutable-snapshot copies totaled 1.81 GB. Peak
+RSS was 5.63 GB including reclaimable file cache, while the process physical-
+footprint ledger peaked at 896 MB and conservative attributable demand at 1.90
+GB. This is within the timing band of the 1,617.08-second instrumented control,
+but makes the documented input-budget policy effective under hard pressure and
+preserves liveness without changing the general default.
+
 ## Measurements
 
 Unless a row explicitly reports a mean and range, the times below are
@@ -375,6 +421,8 @@ one-machine diagnostics rather than publication-grade means.
 | 50K, external-coverage admission fence | 34.99 s | 42.08 s | Zero repair attempts; 177.95 MB clones, 974.7 MB demand, 1.42 GB RSS |
 | 50K, 4,096-item replay windows (rejected) | 55.46 s | 92.41 s | 27 replay finalizations; 769 MB demand, 1.48 GB RSS |
 | 50K, internal 4,096-item HBC applies (rejected) | 39.13 s | 46.45 s | 1.11 GB RSS but slower and more complex; prototype reverted |
+| 50K, foreground 768 MiB pressure budget | 35.53 s | 42.23 s | One 235.8 MB pressure job; zero overload; 722 MB demand, 1.55 GB RSS |
+| 50K, foreground budget wired, 2 GiB default | 32.50 s | 41.63 s | No hard-pressure event; 186.3 MB table clones, 1.31 GB demand, 1.50 GB RSS |
 | 1M Cohere, batch 100, four workers, original public path | incomplete | projected about 45–50 min | Throughput fell from about 30.8K docs/min in minute one to about 21.1K docs/min in minute four |
 | 1M, bounded clones + fair coalescer control | incomplete at 783,201 rows / 1,867 s | -- | Two exact 120 s timeouts from primary L0 pressure; 3.83 GB clones, 1.40 GB demand, 3.76 GB peak RSS; 200 ms `vmmap` and overlapping compilers contaminate speed |
 | 1M, rate-limited sampler + maintenance fair turn | incomplete at 592,001 rows / about 725 s | -- | No timeout, but live dense bulk mode still reached 537 aggregate L0 runs; 1.59 GB clones, 888 MB demand, 3.02 GB peak RSS |
@@ -382,6 +430,8 @@ one-machine diagnostics rather than publication-grade means.
 | 1M, relocated compaction publication | 1,099.85 s | 1,110.66 s | Full E2E completion; 10.81 s catch-up, 111 final L0 runs / zero debt, 1.20 GB demand, 4.21 GB RSS |
 | 1M, instrumented replay-lane snapshot | 1,605.87 s | 1,617.08 s | Full E2E completion; 1.65 GB clones, 1.30 GB physical footprint, 3.19 GB RSS; zero debt; 2.57 GB / 52.6 s largest compaction |
 | 1M, 128 MiB preferred primary runs (rejected) | 1,751.71 s | 1,753.77 s | 2.07 GB clones, 1.50 GB physical footprint, 3.72 GB RSS; zero debt; 2.562 GB / 55.15 s largest compaction |
+| 1M, foreground 768 MiB pressure budget (rejected) | 1,830.20 s | 1,854.21 s | 27.08 GB compaction input; 2.753 GB / 58.5 s largest minimum closure; 1.40 GB ledger, 3.64 GB RSS; zero debt |
+| 1M, foreground budget wired, 2 GiB default | 1,545.39 s | 1,603.35 s | 29.31 GB compaction input; 2.599 GB / 51.60 s largest minimum closure; 896 MB ledger, 1.90 GB demand; 57 L0 runs / zero debt |
 
 The original partial 1M run reached about 105K documents with 542 flushes, 212 L0 runs,
 and roughly 23.6 GB of cumulative mutable-snapshot clone bytes. Dense HBC work

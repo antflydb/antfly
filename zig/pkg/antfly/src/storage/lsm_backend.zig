@@ -5422,7 +5422,7 @@ pub const Backend = struct {
         var steps: usize = 0;
         while (pressure.overHardLimit(hard_runs, hard_bytes) and steps < max_steps) {
             const before_step_compactions = self.compaction_stats.compactions;
-            try compaction_mod.compactL0ToLimit(Backend, self, target_runs);
+            _ = try compaction_mod.compactL0ToLimit(Backend, self, target_runs);
             if (self.compaction_stats.compactions == before_step_compactions) break;
             steps += self.compaction_stats.compactions - before_step_compactions;
             pressure = self.snapshotL0PressureLocked();
@@ -5712,7 +5712,7 @@ pub const Backend = struct {
             return;
         }
         while (countLevelRuns(self.runs.items, 0) > limit) {
-            try compaction_mod.compactL0ToLimit(Backend, self, limit);
+            if (!try compaction_mod.compactL0ToLimit(Backend, self, limit)) break;
         }
     }
 
@@ -10229,7 +10229,9 @@ test "lsm backend write pressure records bounded overload when input budget deni
         try txn.commit();
     }
 
+    backend.options.l0_soft_limit_runs = 2;
     backend.options.l0_hard_limit_runs = 2;
+    backend.options.max_compaction_input_allow_oversized_single_job = false;
     try backend.finalizeDeferredStorageWork();
 
     const stats = backend.snapshotWriteStats();
@@ -10265,7 +10267,9 @@ test "lsm backend write pressure can reject when overload remains after budget" 
         try txn.commit();
     }
 
+    backend.options.l0_soft_limit_runs = 2;
     backend.options.l0_hard_limit_runs = 2;
+    backend.options.max_compaction_input_allow_oversized_single_job = false;
     try std.testing.expectError(error.WritePressureExceeded, backend.finalizeDeferredStorageWork());
 
     const stats = backend.snapshotWriteStats();
@@ -10274,6 +10278,74 @@ test "lsm backend write pressure can reject when overload remains after budget" 
     try std.testing.expect(stats.write_pressure_l0_run_debt > 0);
     try std.testing.expect(stats.write_pressure_overload_l0_run_debt > 0);
     try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_rejections);
+}
+
+test "lsm backend write pressure honors the configured compaction input budget" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 100,
+        .l0_hard_limit_runs = 100,
+        .write_pressure_max_compaction_steps = 1,
+        .max_compaction_input_allow_oversized_single_job = false,
+    });
+    defer backend.close();
+
+    const value = [_]u8{'x'} ** 64;
+    for (0..10) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, key, value[0..]);
+        try txn.commit();
+    }
+    const l0_count = countLevelRuns(backend.runs.items, 0);
+    try std.testing.expectEqual(@as(usize, 10), l0_count);
+    const oldest_pair_budget = backend.runs.items[l0_count - 2].size_bytes +|
+        backend.runs.items[l0_count - 1].size_bytes;
+    backend.options.l0_soft_limit_runs = 2;
+    backend.options.l0_hard_limit_runs = 2;
+    backend.options.max_compaction_input_bytes = oldest_pair_budget;
+
+    try backend.finalizeDeferredStorageWork();
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_compactions);
+    try std.testing.expect(stats.compaction_max_input_bytes <= oldest_pair_budget);
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) < l0_count);
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) > backend.options.l0_hard_limit_runs);
+    try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_overloads);
+}
+
+test "lsm backend write pressure preserves oversized minimum job progress" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 100,
+        .l0_hard_limit_runs = 100,
+        .write_pressure_max_compaction_steps = 1,
+        .max_compaction_input_bytes = 1,
+    });
+    defer backend.close();
+
+    const value = [_]u8{'x'} ** 64;
+    for (0..10) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, key, value[0..]);
+        try txn.commit();
+    }
+    backend.options.l0_soft_limit_runs = 2;
+    backend.options.l0_hard_limit_runs = 2;
+
+    try backend.finalizeDeferredStorageWork();
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_compactions);
+    try std.testing.expect(stats.compaction_max_input_bytes > backend.options.max_compaction_input_bytes);
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) < 10);
+    try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_overloads);
 }
 
 test "lsm backend maintenance step compacts soft L0 debt" {

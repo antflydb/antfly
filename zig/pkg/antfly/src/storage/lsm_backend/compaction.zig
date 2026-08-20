@@ -202,9 +202,21 @@ pub fn compactOldestPair(comptime BackendType: type, backend: *BackendType) !voi
     try compactPlanAt(BackendType, backend, plan);
 }
 
-pub fn compactL0ToLimit(comptime BackendType: type, backend: *BackendType, l0_limit: usize) !void {
-    const plan = selectL0Compaction(backend.runs.items, l0_limit, 0, false) orelse return;
+pub fn compactL0ToLimit(comptime BackendType: type, backend: *BackendType, l0_limit: usize) !bool {
+    var selection_stats: CompactionSelectionStats = .{};
+    const plan = selectL0CompactionWithStats(
+        backend.runs.items,
+        l0_limit,
+        backend.options.max_compaction_input_bytes,
+        allowOversizedSingleCompactionInput(backend),
+        &selection_stats,
+    ) orelse {
+        noteCompactionSelectionStats(BackendType, backend, selection_stats);
+        return false;
+    };
+    noteCompactionSelectionStats(BackendType, backend, selection_stats);
     try compactPlanAt(BackendType, backend, plan);
+    return true;
 }
 
 pub fn compactL0ToLimitScheduled(comptime BackendType: type, backend: *BackendType, l0_limit: usize, score: u64) !bool {
