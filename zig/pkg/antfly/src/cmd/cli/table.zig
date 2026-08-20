@@ -370,16 +370,19 @@ test "table create sends the exact quickstart inline index through the HTTP clie
 
     const Assert = struct {
         fn request(info: httpx.testing_mod.RequestInfo) !void {
-            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, info.body, .{});
+            try ant_json.testing.expectSubsetJsonText(
+                std.testing.allocator,
+                "{\"indexes\":{\"title_body\":{\"type\":\"embeddings\",\"template\":\"{{title}} {{body}}\",\"embedder\":{\"model\":\"antflydb/clipclap\"},\"chunker\":{\"text\":{\"target_tokens\":200}}}}}",
+                info.body,
+            );
+            var parsed = try ant_json.parseFromSlice(ant_json.Value, std.testing.allocator, info.body, .{});
             defer parsed.deinit();
             const root = parsed.value.object;
             const indexes = root.get("indexes") orelse return error.MissingIndexes;
             const title_body = indexes.object.get("title_body") orelse return error.MissingTitleBody;
-            try std.testing.expectEqualStrings("title_body", title_body.object.get("name").?.string);
-            try std.testing.expectEqualStrings("embeddings", title_body.object.get("type").?.string);
-            try std.testing.expectEqualStrings("{{title}} {{body}}", title_body.object.get("template").?.string);
-            try std.testing.expectEqualStrings("antflydb/clipclap", title_body.object.get("embedder").?.object.get("model").?.string);
-            try std.testing.expectEqual(@as(i64, 200), title_body.object.get("chunker").?.object.get("text").?.object.get("target_tokens").?.integer);
+            // The map key owns the index name in the breaking-major table
+            // contract. Do not regress to two independently mutable names.
+            try std.testing.expect(title_body.object.get("name") == null);
         }
     };
 

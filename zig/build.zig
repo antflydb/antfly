@@ -3523,6 +3523,7 @@ pub fn build(b: *std.Build) void {
         "backend runtime inference lane has an isolated bounded executor",
         "backend runtime rejects control lane leases after shutdown begins",
         "provisioned table write cache retires stale db when index metadata changes",
+        "table runtime snapshot cache preserves active managed admission proof",
         "managed startup catch-up advances counterless incomplete dense repair",
         "db completed partial managed admission serves and retires redundant repair",
         "provisioned leader admission rejects uncommitted writes under dense repair pressure",
