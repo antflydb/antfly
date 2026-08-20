@@ -262,6 +262,8 @@ test {
     _ = public_api;
     _ = public_api.http_server;
     _ = public_api.internal_query_operations;
+    _ = public_api.tables;
+    _ = public_api.indexes;
 
     // Raft integration
     _ = raft;

@@ -15,6 +15,7 @@
 const std = @import("std");
 const raft_engine = @import("raft_engine");
 const common_http = @import("../../common/http/mod.zig");
+const data_raft_protocol = @import("../../common/data_raft_protocol.zig");
 const common = @import("http_common.zig");
 const http_snapshot = @import("http_snapshot.zig");
 const routes = @import("routes.zig");
@@ -121,6 +122,19 @@ pub const HttpServer = struct {
                 .status = 200,
                 .content_type = try self.alloc.dupe(u8, "text/plain"),
                 .body = try self.alloc.dupe(u8, "ok"),
+            };
+        }
+        if (std.mem.eql(u8, req.uri, routes.Routes.capabilities) and req.method == .GET) {
+            const content_type = try self.alloc.dupe(u8, "application/json");
+            errdefer self.alloc.free(content_type);
+            return .{
+                .status = 200,
+                .content_type = content_type,
+                .body = try std.fmt.allocPrint(
+                    self.alloc,
+                    "{{\"data_raft_batch_protocol_version\":{d}}}",
+                    .{data_raft_protocol.batch_protocol_version},
+                ),
             };
         }
         if (std.mem.eql(u8, req.uri, routes.Routes.raft_batch) and req.method == .POST) {
@@ -239,7 +253,7 @@ test "http server module compiles" {
     _ = HttpServer;
 }
 
-test "http server exposes request executor" {
+test "http server exposes health and data raft protocol capabilities" {
     const Handler = struct {
         fn iface(_: *@This()) BatchHandler {
             return .{
@@ -264,6 +278,20 @@ test "http server exposes request executor" {
     });
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
+
+    var capabilities = try executor.execute(std.testing.allocator, .{
+        .method = .GET,
+        .uri = routes.Routes.capabilities,
+    });
+    defer capabilities.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), capabilities.status);
+    const Parsed = struct { data_raft_batch_protocol_version: u16 };
+    const parsed = try std.json.parseFromSlice(Parsed, std.testing.allocator, capabilities.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(
+        data_raft_protocol.batch_protocol_version,
+        parsed.value.data_raft_batch_protocol_version,
+    );
 }
 
 test "http server decodes raft batch requests and dispatches them" {

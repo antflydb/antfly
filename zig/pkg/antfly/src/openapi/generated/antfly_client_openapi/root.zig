@@ -55,6 +55,7 @@ pub const ByteRange = types.ByteRange;
 pub const CalendarInterval = types.CalendarInterval;
 pub const Capability = types.Capability;
 pub const CapabilityName = types.CapabilityName;
+pub const CardinalityMode = types.CardinalityMode;
 pub const CdcConnection = types.CdcConnection;
 pub const ChainCondition = types.ChainCondition;
 pub const ChainLink = types.ChainLink;

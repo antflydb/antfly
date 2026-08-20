@@ -42,6 +42,20 @@ pub fn Store(
             return try ops.begin_read(self.impl);
         }
 
+        pub fn beginProbe(self: *@This()) !ReadHandle {
+            if (comptime @hasField(@TypeOf(ops), "begin_probe")) {
+                return try ops.begin_probe(self.impl);
+            }
+            return try ops.begin_read(self.impl);
+        }
+
+        pub fn beginCurrentScan(self: *@This()) !ReadHandle {
+            if (comptime @hasField(@TypeOf(ops), "begin_current_scan")) {
+                return try ops.begin_current_scan(self.impl);
+            }
+            return try ops.begin_read(self.impl);
+        }
+
         pub fn beginWrite(self: *@This()) !WriteHandle {
             return try ops.begin_write(self.impl);
         }

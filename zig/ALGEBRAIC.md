@@ -1437,6 +1437,7 @@ algebraic bulk-ingest sessions defer promoted path dictionary FST rebuilds acros
 durable planner default policy remains opt-in and conservative until LSM guardrail evidence covers latency, bytes, write cost, churn, cold reads, fanout, and constrained queries
 schema capability fingerprints, skipped-unbounded-field metadata, and debug lifecycle classification
 schema-derived v2 configs with declared laws and adaptive defaults
+runtime-adaptive dynamic templates: bounded table-level dynamic templates (keyword/numeric/boolean/datetime) compile into capability `dynamic_field_rules` and project template-matched fields into typed docfacts at ingest; accepted template changes advance the schema generation, refresh both durable and live configs (`Index.reloadConfigJson`), and gate query acceleration until a matching generation-local completion marker proves rebuild coverage; unbounded text templates stay on the schemaless path-fact path (cardinality guard)
 public algebraic index requests constrained to schema-derived capability sidecars with internal materialization fields stripped/rejected
 canonical-token shard merge keys for distributed symbol semantics
 distributed partial merge helpers that combine shard results by canonical axis and law
@@ -1481,7 +1482,10 @@ Planner cost guards are deliberately conservative. `max_result_buckets` bounds
 returned algebraic buckets, while `max_planner_scan_rows` bounds sidecar row
 scans for rollups, terms, and date histograms. If the sidecar would need to scan
 more rows than the configured budget, the planner records an explicit fallback
-reason and lets the existing aggregation path answer the request.
+reason and lets the existing aggregation path answer the request. Nested
+cardinality acceleration has an independent `max_cardinality_cache_bytes`
+working-set limit (32 MiB by default); exhausting it releases the cache and
+falls back instead of allowing query memory to grow with the full corpus.
 
 The current storage model is intentionally direct and debuggable. It is a
 schema-derived algebraic sidecar with a first schemaless fact substrate and
@@ -2341,3 +2345,63 @@ manual user-facing materialization lifecycle or explicit materialization definit
 best-effort approximate MIN/MAX
 using the algebraic sidecar when status indicates incomplete derived state
 ```
+
+## Approximate cardinality (HyperLogLog)
+
+An index can materialize approximate distinct counts so a `cardinality`
+aggregation is answered from a per-group sketch instead of scanning and
+deduplicating every value:
+
+```json
+{
+  "hll_cardinalities": [
+    {"name": "customers_by_region", "group_by": ["region"],
+     "value_field": "customer", "precision": 14}
+  ]
+}
+```
+
+`group_by` contains the bucket axes, `value_field` names the distinct value,
+and `precision` (4–18, default 14) controls sketch size and accuracy. Results
+identify whether they are estimates and include the relative error when
+applicable:
+
+```json
+{"value": 4044, "approximate": true, "relative_error": 0.0081}
+{"value": 4096, "approximate": false}
+```
+
+The planner uses a matching, current sketch when the query shape permits it and
+otherwise falls back to the exact distinct scan. Deletes and overwrites mark
+affected groups dirty; the durable maintenance lane rebuilds those sketches in
+the background.
+
+Array-valued group and value fields use set semantics. A document contributes
+every distinct value to every distinct Cartesian group tuple, while duplicate
+array elements do not inflate the sketch. `mode: exact` always bypasses HLL;
+`mode: approximate` fails explicitly when no current matching sketch exists;
+and `mode: auto` may fall back to an exact scan.
+
+Ingest batches all distinct values from a document into one dense contribution
+per group tuple. `max_hll_contributions_per_document` bounds the logical
+Cartesian expansion across every configured sketch, while
+`max_hll_contribution_bytes_per_document` (default 8 MiB) independently bounds
+the dense sketch bytes merged and written. An index may publish at most 64 HLL
+materializations, including adaptive promotions. These hard limits keep high
+precision or adversarial multi-valued documents from turning a small logical
+request into unbounded CPU, memory, or write amplification.
+
+Distributed grouped cardinality exports sketches lazily, one selected shard
+bucket at a time, and bounds their aggregate raw size with
+`max_distributed_hll_partial_bytes` (default 2 MiB per shard request). Sketch
+bytes use base64 on the internal HTTP boundary. If any non-exact child lacks a
+fresh sketch or the export budget is reached, the optimized route is rejected
+for the whole query so `auto` can fall back to an exact plan without mixing HLL
+and exact merge laws; `approximate` reports that no supported route is
+available.
+
+Adaptively promoted sketches share `max_auto_materializations_per_index` with
+other adaptive materializations. Their initial backfill is durable and resumes
+after restart, processing no more than `max_backfill_rows_per_tick` document
+facts per maintenance tick. Reads continue using the exact path until the
+backfill cursor and any concurrent-mutation repair markers commit as complete.

@@ -2382,15 +2382,15 @@ fn CurrentReadLayout(comptime BackendType: type) type {
         runs: []Run = &.{},
         l0_groups: []RunGroup = &.{},
         levels: []RunLevel = &.{},
+        prepared: bool = false,
 
-        fn init(backend: *BackendType, allocator: Allocator) !@This() {
+        /// Capture only the generation-pinned pieces that must be selected
+        /// while the backend lock is held. Run grouping and table reads can be
+        /// prepared after releasing the writer lock.
+        fn capture(backend: *BackendType, allocator: Allocator) !@This() {
             const metadata_allocator = runtimeScratchAllocator(allocator);
             const runs = try borrowRunSnapshotList(BackendType, backend, metadata_allocator, backend.runs.items);
             errdefer freeRunSnapshotList(BackendType, backend, metadata_allocator, runs);
-            const l0_groups = try buildL0RunGroupsWithStats(backend, metadata_allocator, runs);
-            errdefer deinitRunGroups(metadata_allocator, l0_groups);
-            const levels = try buildLowerLevels(metadata_allocator, runs);
-            errdefer metadata_allocator.free(levels);
             const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
                 try backend.snapshotImmutableMemtables()
             else
@@ -2401,16 +2401,49 @@ fn CurrentReadLayout(comptime BackendType: type) type {
                 .metadata_allocator = metadata_allocator,
                 .immutable_memtables = immutable_memtables,
                 .runs = runs,
-                .l0_groups = l0_groups,
-                .levels = levels,
             };
         }
 
+        fn prepare(self: *@This()) !void {
+            if (self.prepared) return;
+            const l0_groups = try buildL0RunGroupsWithStats(self.backend, self.metadata_allocator, self.runs);
+            errdefer deinitRunGroups(self.metadata_allocator, l0_groups);
+            const levels = try buildLowerLevels(self.metadata_allocator, self.runs);
+            self.l0_groups = l0_groups;
+            self.levels = levels;
+            self.prepared = true;
+        }
+
+        fn init(backend: *BackendType, allocator: Allocator) !@This() {
+            var layout = try @This().capture(backend, allocator);
+            errdefer layout.deinit();
+            try layout.prepare();
+            return layout;
+        }
+
         fn deinit(self: *@This()) void {
-            deinitRunGroups(self.metadata_allocator, self.l0_groups);
-            self.metadata_allocator.free(self.levels);
+            if (self.prepared) {
+                deinitRunGroups(self.metadata_allocator, self.l0_groups);
+                self.metadata_allocator.free(self.levels);
+            }
             freeRunSnapshotList(BackendType, self.backend, self.metadata_allocator, self.runs);
             releaseImmutableMemtableSnapshotList(BackendType, self.backend, self.immutable_memtables);
+            self.* = undefined;
+        }
+
+        /// Run refs use their own registry lock, while immutable-generation
+        /// pins are backend-owned. Release the expensive metadata outside the
+        /// writer lock and reacquire it only for the exact pin handoff.
+        fn deinitAfterUnlockedRead(self: *@This()) void {
+            const backend = self.backend;
+            if (self.prepared) {
+                deinitRunGroups(self.metadata_allocator, self.l0_groups);
+                self.metadata_allocator.free(self.levels);
+            }
+            freeRunSnapshotList(BackendType, backend, self.metadata_allocator, self.runs);
+            const locked = lockBackend(BackendType, backend);
+            defer unlockBackend(BackendType, backend, locked);
+            releaseImmutableMemtableSnapshotList(BackendType, backend, self.immutable_memtables);
             self.* = undefined;
         }
     };
@@ -2801,13 +2834,46 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                     },
                 }
             }
-            const locked = lockBackend(BackendType, self.backend);
-            defer unlockBackend(BackendType, self.backend, locked);
-            const keys = [_][]const u8{key};
-            var values = [_]?[]const u8{null};
-            const result = try readManyCurrentPointLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_blocks, &self.held_values, &keys, &values);
-            if (result.hits == 0) return error.NotFound;
-            return try self.ownValue(values[0].?);
+            self.backend.recordPointGet();
+
+            // Resolve the only mutable structure while holding the backend
+            // lock. If it does not decide this key, pin the immutable/run
+            // generation at the same linearization point and do all table IO
+            // after releasing the writer lock.
+            var layout: CurrentReadLayout(BackendType) = blk: {
+                const locked = lockBackend(BackendType, self.backend);
+                defer unlockBackend(BackendType, self.backend, locked);
+                if (self.backend.mutable.findIndex(self.namespace, key)) |idx| {
+                    const entry = self.backend.mutable.entries.items[idx];
+                    if (entry.tombstone) return error.NotFound;
+                    self.backend.recordMutableHit();
+                    recordPointValueCopy(self.backend);
+                    return try self.ownValue(entry.value);
+                }
+                break :blk try CurrentReadLayout(BackendType).capture(self.backend, self.allocator);
+            };
+            defer layout.deinitAfterUnlockedRead();
+            try layout.prepare();
+
+            const value = try getFromSnapshotRuns(
+                self.backend,
+                &self.empty_state,
+                layout.immutable_memtables,
+                layout.runs,
+                layout.l0_groups,
+                layout.levels,
+                &self.last_l0_group_index,
+                &self.read_hint,
+                &self.held_blocks,
+                &self.held_values,
+                self.allocator,
+                self.namespace,
+                key,
+                false,
+                null,
+            );
+            recordPointValueCopy(self.backend);
+            return try self.ownValue(value);
         }
 
         pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
@@ -2861,21 +2927,59 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                 }
                 try self.ownValues(values);
             } else {
-                const locked = lockBackend(BackendType, self.backend);
-                defer unlockBackend(BackendType, self.backend, locked);
-                var layout = try CurrentReadLayout(BackendType).init(self.backend, self.allocator);
-                defer layout.deinit();
+                const resolved = try self.metadata_allocator.alloc(bool, keys.len);
+                defer self.metadata_allocator.free(resolved);
+                @memset(resolved, false);
 
-                var offset: usize = 0;
-                while (offset < keys.len) {
-                    const end = @min(offset + max_current_batch_read_keys_per_backend_lock, keys.len);
-                    const plan = chooseMultiGetPlan(keys[offset..end], .current_live);
+                var unresolved_count: usize = keys.len;
+                var maybe_layout: ?CurrentReadLayout(BackendType) = null;
+                {
+                    const locked = lockBackend(BackendType, self.backend);
+                    defer unlockBackend(BackendType, self.backend, locked);
+                    for (keys, 0..) |key, i| {
+                        const idx = self.backend.mutable.findIndex(self.namespace, key) orelse continue;
+                        const entry = self.backend.mutable.entries.items[idx];
+                        resolved[i] = true;
+                        unresolved_count -= 1;
+                        if (entry.tombstone) {
+                            result.misses += 1;
+                            continue;
+                        }
+                        values[i] = try self.ownValue(entry.value);
+                        recordPointValueCopy(self.backend);
+                        self.backend.recordMutableHit();
+                        result.hits += 1;
+                    }
+                    self.backend.recordPointGets(keys.len - unresolved_count);
+                    if (unresolved_count > 0) {
+                        maybe_layout = try CurrentReadLayout(BackendType).capture(self.backend, self.allocator);
+                    }
+                }
+
+                if (maybe_layout) |*layout| {
+                    defer layout.deinitAfterUnlockedRead();
+                    try layout.prepare();
+
+                    const unresolved_keys = try self.metadata_allocator.alloc([]const u8, unresolved_count);
+                    defer self.metadata_allocator.free(unresolved_keys);
+                    const unresolved_values = try self.metadata_allocator.alloc(?[]const u8, unresolved_count);
+                    defer self.metadata_allocator.free(unresolved_values);
+                    const unresolved_indexes = try self.metadata_allocator.alloc(usize, unresolved_count);
+                    defer self.metadata_allocator.free(unresolved_indexes);
+                    var unresolved_index: usize = 0;
+                    for (keys, 0..) |key, i| {
+                        if (resolved[i]) continue;
+                        unresolved_keys[unresolved_index] = key;
+                        unresolved_indexes[unresolved_index] = i;
+                        unresolved_index += 1;
+                    }
+
+                    const plan = chooseMultiGetPlan(unresolved_keys, .stable_probe);
                     recordMultiGetPlan(self.backend, plan);
-                    const chunk_result = switch (plan) {
-                        .cursor => try readManySortedCurrentWithLayoutLocked(BackendType, self.backend, &layout, self.namespace, self.allocator, &self.held_blocks, &self.held_values, keys[offset..end], values[offset..end]),
+                    const unresolved_result = switch (plan) {
                         .sorted_by_run => try readManySortedByRunFromSnapshot(
                             self.backend,
-                            &self.backend.mutable,
+                            &self.empty_state,
                             layout.immutable_memtables,
                             layout.runs,
                             layout.l0_groups,
@@ -2884,18 +2988,33 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                             &self.held_blocks,
                             &self.held_values,
                             self.namespace,
-                            keys[offset..end],
-                            values[offset..end],
-                            true,
+                            unresolved_keys,
+                            unresolved_values,
+                            false,
                         ),
-                        .point => try readManySortedCurrentWithLayoutLocked(BackendType, self.backend, &layout, self.namespace, self.allocator, &self.held_blocks, &self.held_values, keys[offset..end], values[offset..end]),
+                        .cursor, .point => try readManySortedPointFromSnapshot(
+                            self.backend,
+                            &self.empty_state,
+                            layout.immutable_memtables,
+                            layout.runs,
+                            layout.l0_groups,
+                            layout.levels,
+                            self.allocator,
+                            &self.held_blocks,
+                            &self.held_values,
+                            self.namespace,
+                            unresolved_keys,
+                            unresolved_values,
+                            false,
+                        ),
                     };
-                    result.add(chunk_result);
-                    offset = end;
+                    try self.ownValues(unresolved_values);
+                    for (unresolved_values) |value| {
+                        if (value != null) recordPointValueCopy(self.backend);
+                    }
+                    for (unresolved_values, unresolved_indexes) |value, index| values[index] = value;
+                    result.add(unresolved_result);
                 }
-                // Own every result before CurrentReadLayout releases its exact
-                // immutable-generation pins at the end of this scope.
-                try self.ownValues(values);
             }
             self.backend.recordGetManySortedResults(result.hits, result.misses);
         }
@@ -3751,6 +3870,59 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             if (self.cursor_runs.len > 0) {
                 freeRunSnapshotList(BackendType, self.backend, self.metadata_allocator, self.cursor_runs);
                 self.cursor_runs = &.{};
+            }
+        }
+    };
+}
+
+/// Current-tip point reads across dynamic namespaces. Values are copied into
+/// transaction-owned storage, so callers may issue several namespace probes
+/// without pinning or cloning the mutable LSM generation.
+pub fn NamespaceProbeTxn(comptime BackendType: type) type {
+    const LocalProbeTxn = BoundProbeTxn(BackendType);
+    return struct {
+        allocator: Allocator,
+        backend: *BackendType,
+        held_values: std.ArrayListUnmanaged([]u8) = .empty,
+
+        pub fn open(backend: *BackendType) @This() {
+            return .{
+                .allocator = runtimeScratchAllocator(backend.allocator),
+                .backend = backend,
+            };
+        }
+
+        pub fn abort(self: *@This()) void {
+            releaseHeldValues(&self.held_values, self.allocator);
+            self.* = undefined;
+        }
+
+        fn ownValue(self: *@This(), value: []const u8) ![]const u8 {
+            const owned = try self.allocator.dupe(u8, value);
+            errdefer self.allocator.free(owned);
+            try self.held_values.append(self.allocator, owned);
+            return owned;
+        }
+
+        pub fn get(self: *@This(), namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
+            var probe = try LocalProbeTxn.open(self.backend, namespace);
+            defer probe.abort();
+            return try self.ownValue(try probe.get(key));
+        }
+
+        pub fn getManySorted(
+            self: *@This(),
+            namespace: backend_types.Namespace,
+            keys: []const []const u8,
+            values: []?[]const u8,
+        ) !void {
+            if (keys.len != values.len) return error.InvalidBatch;
+            var probe = try LocalProbeTxn.open(self.backend, namespace);
+            defer probe.abort();
+            try probe.getManySorted(keys, values);
+            for (values) |*value| {
+                const present = value.* orelse continue;
+                value.* = try self.ownValue(present);
             }
         }
     };
@@ -5238,9 +5410,13 @@ fn findExactEntryInBatchBlocks(
         backend.recordBloomNegative();
         return null;
     }
-    if (try findExactEntryInCachedCompressedPrefixBlock(backend, run, index, block_index, held_values, value_allocator, namespace, key)) |entry| {
-        return entry;
-    }
+    // A single point lookup can search a prefix-compressed physical block
+    // without retaining its decoded form. Repeating that work for every key
+    // in a batch is much more expensive than decoding the block once. Keep
+    // the decoded block in this run's batch state and reuse it until sorted
+    // iteration advances to another block.
+    _ = held_values;
+    _ = value_allocator;
     const block_bytes = try loadBatchBlock(backend, run, index, state, held_blocks, block_index);
     const positioned = try lsm_table_file.findExactEntryInBlock(
         index,
@@ -6242,6 +6418,65 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 return try getCurrentPointRetainedLocked(BackendType, self.backend, namespace, self.allocator, null, &self.held_values, key) orelse error.NotFound;
             }
             return self.backend.getMergedWithOverlay(&self.backend.mutable, &self.mutable, namespace, key);
+        }
+
+        /// Resolve a sorted batch against the transaction overlay first, then
+        /// probe the current durable view once for all misses. Keeping this on
+        /// the namespace write transaction is important for HBC mutations:
+        /// split maintenance often needs dozens of sibling range records, and
+        /// scalar `get` calls otherwise reread and decompress the same table
+        /// block for every child.
+        pub fn getManySorted(
+            self: *@This(),
+            namespace: backend_types.Namespace,
+            keys: []const []const u8,
+            values: []?[]const u8,
+        ) !void {
+            if (keys.len != values.len) return error.InvalidBatch;
+            @memset(values, null);
+
+            const miss_keys = try self.metadata_allocator.alloc([]const u8, keys.len);
+            defer self.metadata_allocator.free(miss_keys);
+            const miss_indexes = try self.metadata_allocator.alloc(usize, keys.len);
+            defer self.metadata_allocator.free(miss_indexes);
+
+            var miss_count: usize = 0;
+            var overlay_point_gets: usize = 0;
+            for (keys, 0..) |key, i| {
+                var bulk_idx = self.bulk_appends.entries.items.len;
+                while (bulk_idx > 0) {
+                    bulk_idx -= 1;
+                    const entry = self.bulk_appends.entries.items[bulk_idx];
+                    if (compareEntryTo(entry, namespace, key) == .eq) {
+                        overlay_point_gets += 1;
+                        if (!entry.tombstone) values[i] = entry.value;
+                        break;
+                    }
+                } else if (self.mutable.findIndex(namespace, key)) |idx| {
+                    overlay_point_gets += 1;
+                    const entry = self.mutable.entries.items[idx];
+                    if (!entry.tombstone) values[i] = entry.value;
+                } else {
+                    miss_keys[miss_count] = key;
+                    miss_indexes[miss_count] = i;
+                    miss_count += 1;
+                }
+            }
+            self.backend.recordPointGets(overlay_point_gets);
+            if (miss_count == 0) return;
+
+            const miss_values = try self.metadata_allocator.alloc(?[]const u8, miss_count);
+            defer self.metadata_allocator.free(miss_values);
+            var probe = NamespaceProbeTxn(BackendType).open(self.backend);
+            defer probe.abort();
+            try probe.getManySorted(namespace, miss_keys[0..miss_count], miss_values);
+            for (miss_values, 0..) |maybe_value, miss_index| {
+                const value = maybe_value orelse continue;
+                const owned = try self.allocator.dupe(u8, value);
+                errdefer self.allocator.free(owned);
+                try self.held_values.append(self.allocator, owned);
+                values[miss_indexes[miss_index]] = owned;
+            }
         }
 
         pub fn put(self: *@This(), namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {

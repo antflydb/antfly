@@ -396,6 +396,8 @@ pub const DocStore = struct {
     pub const BackendStore = backend_adapter.Store(DocStore, Txn, Txn, Batch, .{
         .capabilities = backendCapabilities,
         .begin_read = beginReadTxn,
+        .begin_probe = beginProbeTxn,
+        .begin_current_scan = beginCurrentScanTxn,
         .begin_write = beginWriteTxn,
         .begin_batch = beginWriteBatch,
     });
@@ -1023,7 +1025,11 @@ pub const DocStore = struct {
 
     /// Get a value by key. Caller owns the returned slice.
     pub fn get(self: *DocStore, alloc: Allocator, key: []const u8) ![]u8 {
-        var txn = try self.beginReadTxn();
+        // A one-key lookup has no multi-operation snapshot to preserve, and
+        // the result is copied before this function returns. Use the live
+        // point-probe contract so the runtime LSM does not clone its complete
+        // mutable generation for every metadata/artifact lookup.
+        var txn = try self.beginProbeTxn();
         defer txn.abort();
         const val = if (supports_lmdb)
             txn.get(key) catch |err| switch (err) {
@@ -2933,6 +2939,24 @@ test "docstore indexes replay rows by hint and truncates them" {
         alloc.free(after);
     }
     try std.testing.expectEqual(@as(usize, 0), after.len);
+}
+
+test "docstore runtime point get does not clone mutable snapshot" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1024 });
+    defer backend.close();
+
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    try store.put("doc:a", "alpha");
+    const before = backend.snapshotMaintenanceStats();
+    const value = try store.get(alloc, "doc:a");
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("alpha", value);
+    const after = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(before.mutable_snapshot_clone_calls, after.mutable_snapshot_clone_calls);
 }
 
 test "docstore runtime lsm hint replay iteration avoids ordinary read snapshots" {
