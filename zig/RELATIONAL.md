@@ -150,6 +150,8 @@ ready to hand to `section/typed_doc_values.zig` at segment-build time:
   (`error.InvalidColumnValue`) — relational columns are strict;
 - nullable columns absent from a document produce no cell (the typed column is
   sparse, matching `typed_doc_values` doc-id semantics);
+- an explicit null produces a cell with `is_null = true`; segment storage must
+  preserve that state separately from a sparse/absent value;
 - `json` columns are stringified to bytes and flagged `is_json` so the write
   path can additionally project the subtree via `pathfact` + dynamic templates.
 
@@ -173,8 +175,12 @@ not in the per-document `writeDocFacts`. The seam is: add
 `relational_columns: []const FieldConfig` to the index `Config`
 (`storage/db/algebraic/index.zig`), and at segment build collect, per column, a
 `TypedDocValuesWriter` fed by `projectRelationalRowAlloc` for each document in
-the batch, then persist each built section. In Phase B this is also where the
-JSON blob write is dropped for non-`json` columns.
+the batch, plus a per-column null bitmap for explicit null document IDs, then
+persist each built section. The typed value stream identifies present values,
+the null bitmap identifies explicit nulls, and membership in neither means the
+column was absent. Segment reconstruction must pass that null state through
+`relational_row_codec.appendCellValue`. In Phase B this is also where the JSON
+blob write is dropped for non-`json` columns.
 
 ### Query path
 

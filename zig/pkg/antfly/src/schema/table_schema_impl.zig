@@ -1775,6 +1775,12 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
 }
 
 fn isRelationalStorageProperty(property: DocumentProperty) bool {
+    // A root reference is context-sensitive: validation resolves it against
+    // the enclosing document schema, while the physical column catalog only
+    // sees this property. Reject recursive relational shapes until the catalog
+    // can carry and evaluate that root context without changing nullability or
+    // the stored representation.
+    if (relationalPropertyContainsRootRef(property)) return false;
     if (property.field_type) |field_type| {
         return std.mem.eql(u8, field_type, "keyword") or
             std.mem.eql(u8, field_type, "link") or
@@ -1797,6 +1803,30 @@ fn isRelationalStorageProperty(property: DocumentProperty) bool {
     return property.integer_only or
         property.properties.len != 0 or
         property.item != null;
+}
+
+fn relationalPropertyContainsRootRef(property: DocumentProperty) bool {
+    if (property.root_ref) return true;
+
+    for (property.prefix_items) |child| if (relationalPropertyContainsRootRef(child)) return true;
+    for (property.properties) |child| if (relationalPropertyContainsRootRef(child)) return true;
+    for (property.pattern_properties) |child| if (relationalPropertyContainsRootRef(child.property.*)) return true;
+    for (property.dependent_schemas) |child| if (relationalPropertyContainsRootRef(child.schema.*)) return true;
+    for (property.any_of) |child| if (relationalPropertyContainsRootRef(child)) return true;
+    for (property.one_of) |child| if (relationalPropertyContainsRootRef(child)) return true;
+    for (property.all_of) |child| if (relationalPropertyContainsRootRef(child)) return true;
+
+    if (property.additional_properties_schema) |child| if (relationalPropertyContainsRootRef(child.*)) return true;
+    if (property.unevaluated_properties_schema) |child| if (relationalPropertyContainsRootRef(child.*)) return true;
+    if (property.property_names) |child| if (relationalPropertyContainsRootRef(child.*)) return true;
+    if (property.not_schema) |child| if (relationalPropertyContainsRootRef(child.*)) return true;
+    if (property.if_schema) |child| if (relationalPropertyContainsRootRef(child.*)) return true;
+    if (property.then_schema) |child| if (relationalPropertyContainsRootRef(child.*)) return true;
+    if (property.else_schema) |child| if (relationalPropertyContainsRootRef(child.*)) return true;
+    if (property.contains_schema) |child| if (relationalPropertyContainsRootRef(child.*)) return true;
+    if (property.item) |child| if (relationalPropertyContainsRootRef(child.*)) return true;
+    if (property.unevaluated_items_schema) |child| if (relationalPropertyContainsRootRef(child.*)) return true;
+    return false;
 }
 
 fn parseDocumentSchemas(alloc: std.mem.Allocator, value: std.json.Value) ![]DocumentSchema {
@@ -3288,10 +3318,8 @@ fn validateDocumentFieldValueWithContext(
     }
     if (std.mem.eql(u8, field_type, "null")) return error.InvalidBatchRequest;
     if (std.mem.eql(u8, field_type, "datetime")) {
-        switch (value.*) {
-            .string, .integer, .number_string => return,
-            else => return error.InvalidBatchRequest,
-        }
+        if (documentDateTimeToNs(value.*) == null) return error.InvalidBatchRequest;
+        return;
     }
     if (std.mem.eql(u8, field_type, "geopoint")) {
         if (value.* != .object or value.object.count() != 2) return error.InvalidBatchRequest;
@@ -3321,6 +3349,21 @@ fn validateDocumentFieldValueWithContext(
         }
         return;
     }
+}
+
+/// Parse every document representation accepted for a datetime field into its
+/// canonical epoch-nanosecond value. Validation and relational projection both
+/// call this function so accepted writes are always physically encodable.
+pub fn documentDateTimeToNs(value: std.json.Value) ?u64 {
+    return switch (value) {
+        .integer => |number| if (number >= 0) @intCast(number) else null,
+        .number_string => |text| std.fmt.parseInt(u64, std.mem.trim(u8, text, " \t\r\n"), 10) catch null,
+        .string => |text| blk: {
+            const trimmed = std.mem.trim(u8, text, " \t\r\n");
+            break :blk std.fmt.parseInt(u64, trimmed, 10) catch storage_schema.parseDateTimeToNs(trimmed);
+        },
+        else => null,
+    };
 }
 
 pub fn documentPropertyAllowsNull(property: DocumentProperty) bool {
@@ -3803,6 +3846,9 @@ test "relational schemas reject contracts the row codec cannot represent" {
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchemaUpdateRequest(alloc,
         \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"if":{"required":["id"]},"then":{"required":["tenant"]},"additionalProperties":false}}}}
     ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"parent":{"$ref":"#","type":["object","null"]}},"additionalProperties":false}}}}
+    ));
 }
 
 test "public schema mutations gate relational storage until runtime wiring lands" {
@@ -3845,10 +3891,7 @@ fn parseTtlTimestampNs(value: std.json.Value) !u64 {
 }
 
 fn parseTtlStringTimestampNs(text: []const u8) !u64 {
-    const trimmed = std.mem.trim(u8, text, " \t\r\n");
-    if (trimmed.len == 0) return error.InvalidBatchRequest;
-    if (std.fmt.parseInt(u64, trimmed, 10)) |ts| return ts else |_| {}
-    return parseRfc3339ToNs(trimmed) orelse error.InvalidBatchRequest;
+    return documentDateTimeToNs(.{ .string = text }) orelse error.InvalidBatchRequest;
 }
 
 fn parseRfc3339ToNs(text: []const u8) ?u64 {
@@ -4801,6 +4844,8 @@ test "validate ttl field values and schema bindings" {
 
     try validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"expires_at\":1700000000000000000}" }});
     try validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"expires_at\":\"2024-01-02T03:04:05Z\"}" }});
+    try validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"expires_at\":\"1970-01-01\"}" }});
+    try validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"expires_at\":\" 15 \"}" }});
     try std.testing.expectEqual(
         @as(?u64, 1_700_000_000_000_000_000),
         try documentTtlTimestampNs(std.testing.allocator, parsed, "{\"expires_at\":1700000000000000000}"),
@@ -4808,6 +4853,10 @@ test "validate ttl field values and schema bindings" {
     try std.testing.expectError(
         error.InvalidBatchRequest,
         validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"expires_at\":\"not-a-time\"}" }}),
+    );
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"expires_at\":-1}" }}),
     );
 }
 

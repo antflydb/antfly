@@ -491,6 +491,7 @@ pub fn appendCellValue(
     path: []const u8,
     value_type: typed_dv.ValueType,
     is_json: bool,
+    is_null: bool,
     value: typed_dv.TypedValue,
     needs_comma: bool,
 ) !void {
@@ -498,6 +499,7 @@ pub fn appendCellValue(
         .path = path,
         .value_type = value_type,
         .is_json = is_json,
+        .is_null = is_null,
         .value = value,
     };
     try validateCell(alloc, cell);
@@ -665,6 +667,14 @@ test "relational row codec preserves explicit null cells" {
     const reconstructed = try reconstructValueAlloc(alloc, encoded);
     defer alloc.free(reconstructed);
     try std.testing.expectEqualStrings("{\"name\":null,\"payload\":null,\"active\":null}", reconstructed);
+
+    var segment_json = std.ArrayListUnmanaged(u8).empty;
+    defer segment_json.deinit(alloc);
+    try segment_json.append(alloc, '{');
+    try appendCellValue(alloc, &segment_json, "name", .bytes_val, false, true, .{ .bytes_val = "ignored" }, false);
+    try appendCellValue(alloc, &segment_json, "active", .bool_val, false, true, .{ .bool_val = true }, true);
+    try segment_json.append(alloc, '}');
+    try std.testing.expectEqualStrings("{\"name\":null,\"active\":null}", segment_json.items);
 }
 
 test "relational row codec escapes string paths and values" {

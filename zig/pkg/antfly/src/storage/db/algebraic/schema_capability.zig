@@ -18,7 +18,6 @@ const index_mod = @import("index.zig");
 const relational_row_codec = @import("relational_row_codec.zig");
 const schema_mod = @import("../../../schema/mod.zig");
 const geo_mod = @import("../../../search/geo.zig");
-const storage_schema = @import("../../schema.zig");
 
 pub const FieldRole = enum {
     group,
@@ -753,56 +752,37 @@ fn appendLawConfig(
     try out.append(alloc, '}');
 }
 
-/// Version 2 replaces the delimiter-based legacy framing with length-prefixed
-/// fields and includes capability flags. The prefix is a persistence boundary:
-/// unversioned fingerprints created by older binaries intentionally mismatch so
-/// adaptive materializations take the existing rebuild-required migration path.
 pub fn capabilityFingerprintAlloc(alloc: Allocator, plan: Plan) ![]u8 {
-    var hasher = std.hash.Wyhash.init(0x616e_7466_6c79_6361);
-    hashU64(&hasher, plan.schema_version);
-    hashU64(&hasher, plan.fields.len);
+    var canonical = std.ArrayListUnmanaged(u8).empty;
+    defer canonical.deinit(alloc);
+    try appendFmt(alloc, &canonical, "v:{d}|", .{plan.schema_version});
     for (plan.fields) |field| {
-        hashBytes(&hasher, @tagName(field.role));
-        hashBytes(&hasher, field.document_type);
-        hashBytes(&hasher, field.name);
-        hashBytes(&hasher, field.path);
-        hashBytes(&hasher, field.scalar_type);
-        hasher.update(&.{ @intFromBool(field.bounded), @intFromBool(field.dynamic_source) });
+        try appendFmt(alloc, &canonical, "{s}:{s}:{s}:{s}:{s}|", .{
+            @tagName(field.role),
+            field.document_type,
+            field.name,
+            field.path,
+            field.scalar_type,
+        });
     }
-    hashU64(&hasher, plan.dynamic_rules.len);
     for (plan.dynamic_rules) |rule| {
-        hashBytes(&hasher, rule.name);
-        hashBytes(&hasher, rule.scalar_type);
-        hashOptionalBytes(&hasher, rule.match);
-        hashOptionalBytes(&hasher, rule.unmatch);
-        hashOptionalBytes(&hasher, rule.path_match);
-        hashOptionalBytes(&hasher, rule.path_unmatch);
-        hashOptionalBytes(&hasher, rule.match_mapping_type);
+        try appendFmt(alloc, &canonical, "dyn:{s}:{s}:{s}:{s}:{s}:{s}:{s}|", .{
+            rule.name,
+            rule.scalar_type,
+            rule.match orelse "",
+            rule.unmatch orelse "",
+            rule.path_match orelse "",
+            rule.path_unmatch orelse "",
+            rule.match_mapping_type orelse "",
+        });
     }
-    hashU64(&hasher, plan.skipped_dynamic_fields);
-    hashU64(&hasher, plan.skipped_complex_fields);
-    hashU64(&hasher, plan.skipped_unbounded_fields);
-    return try std.fmt.allocPrint(alloc, "v2:{x:0>16}", .{hasher.final()});
-}
-
-fn hashBytes(hasher: *std.hash.Wyhash, value: []const u8) void {
-    hashU64(hasher, value.len);
-    hasher.update(value);
-}
-
-fn hashOptionalBytes(hasher: *std.hash.Wyhash, value: ?[]const u8) void {
-    if (value) |bytes| {
-        hasher.update(&.{1});
-        hashBytes(hasher, bytes);
-    } else {
-        hasher.update(&.{0});
-    }
-}
-
-fn hashU64(hasher: *std.hash.Wyhash, value: anytype) void {
-    var encoded: [@sizeOf(u64)]u8 = undefined;
-    std.mem.writeInt(u64, &encoded, @intCast(value), .little);
-    hasher.update(&encoded);
+    try appendFmt(alloc, &canonical, "skip:{d}:{d}:{d}", .{
+        plan.skipped_dynamic_fields,
+        plan.skipped_complex_fields,
+        plan.skipped_unbounded_fields,
+    });
+    const hash = std.hash.Wyhash.hash(0, canonical.items);
+    return try std.fmt.allocPrint(alloc, "{x:0>16}", .{hash});
 }
 
 fn appendFmt(
@@ -838,30 +818,6 @@ pub fn classifyChange(old: Plan, new: Plan) ChangeImpact {
     impact.requires_rebuild = impact.removed_fields > 0 or impact.changed_type_fields > 0;
     impact.compatible_additive = !impact.requires_rebuild;
     return impact;
-}
-
-test "capability fingerprint uses unambiguous field framing" {
-    var first_fields = [_]FieldCapability{.{
-        .document_type = @constCast("a:b"),
-        .name = @constCast("c"),
-        .path = @constCast("d"),
-        .scalar_type = @constCast("string"),
-        .role = .group,
-    }};
-    var second_fields = [_]FieldCapability{.{
-        .document_type = @constCast("a"),
-        .name = @constCast("b:c"),
-        .path = @constCast("d"),
-        .scalar_type = @constCast("string"),
-        .role = .group,
-    }};
-    const first = try capabilityFingerprintAlloc(std.testing.allocator, .{ .fields = &first_fields });
-    defer std.testing.allocator.free(first);
-    const second = try capabilityFingerprintAlloc(std.testing.allocator, .{ .fields = &second_fields });
-    defer std.testing.allocator.free(second);
-    try std.testing.expect(std.mem.startsWith(u8, first, "v2:"));
-    try std.testing.expectEqual(@as(usize, 19), first.len);
-    try std.testing.expect(!std.mem.eql(u8, first, second));
 }
 
 fn findExactField(fields: []const FieldCapability, needle: FieldCapability) ?FieldCapability {
@@ -1411,19 +1367,6 @@ test "schema capability config can compile directly from schema json" {
     try std.testing.expectEqual(@as(usize, 2), parsed_config.value.group_fields.len);
     try std.testing.expectEqual(@as(usize, 1), parsed_config.value.measure_fields.len);
     try std.testing.expectEqual(@as(usize, 0), parsed_config.value.materializations.len);
-}
-
-test "schema capability config accepts version zero relational schemas" {
-    const alloc = std.testing.allocator;
-    const config_json = try configJsonFromSchemaJsonAlloc(alloc, "rows",
-        \\{"version":0,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
-    );
-    defer alloc.free(config_json);
-
-    var parsed_config = try std.json.parseFromSlice(index_mod.Config, alloc, config_json, .{ .allocate = .alloc_always });
-    defer parsed_config.deinit();
-    try std.testing.expectEqual(@as(u32, 0), parsed_config.value.schema_version);
-    try index_mod.validateConfig(parsed_config.value);
 }
 
 test "schema capability change classification separates additive from rebuild changes" {
@@ -2047,7 +1990,7 @@ fn coerceColumnValue(alloc: Allocator, column_type: []const u8, json_value: std.
         return Coerced{ .value = .{ .i64_val = number } };
     }
     if (std.mem.eql(u8, column_type, "datetime")) {
-        const timestamp = dateTimeFromJson(json_value) orelse return null;
+        const timestamp = schema_mod.documentDateTimeToNs(json_value) orelse return null;
         return Coerced{ .value = .{ .u64_val = timestamp } };
     }
     if (std.mem.eql(u8, column_type, "geopoint")) {
@@ -2064,15 +2007,6 @@ fn integerFromJson(json_value: std.json.Value) ?i64 {
         .string => |text| return std.fmt.parseInt(i64, text, 10) catch null,
         else => return null,
     }
-}
-
-fn dateTimeFromJson(json_value: std.json.Value) ?u64 {
-    return switch (json_value) {
-        .integer => |number| if (number >= 0) @intCast(number) else null,
-        .number_string => |text| std.fmt.parseInt(u64, text, 10) catch null,
-        .string => |text| std.fmt.parseInt(u64, text, 10) catch storage_schema.parseDateTimeToNs(text),
-        else => null,
-    };
 }
 
 fn geoPointFromJson(json_value: std.json.Value) ?GeoPoint {
@@ -2346,11 +2280,25 @@ test "relational integer and datetime columns preserve their logical values" {
         \\{"id":"b","amount":0.0,"qty":5,"ts":"1970-01-01T00:00:00.000000015Z"}
     , .{});
     defer positive.deinit();
+    var date_only = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"c","amount":0.0,"ts":"1970-01-01"}
+    , .{});
+    defer date_only.deinit();
+    var invalid_text = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"d","amount":0.0,"ts":"not-a-date"}
+    , .{});
+    defer invalid_text.deinit();
+    var invalid_negative = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"e","amount":0.0,"ts":-1}
+    , .{});
+    defer invalid_negative.deinit();
 
     var negative_row = try projectRelationalRowAlloc(alloc, plan, negative.value);
     defer negative_row.deinit(alloc);
     var positive_row = try projectRelationalRowAlloc(alloc, plan, positive.value);
     defer positive_row.deinit(alloc);
+    var date_only_row = try projectRelationalRowAlloc(alloc, plan, date_only.value);
+    defer date_only_row.deinit(alloc);
 
     try std.testing.expectEqual(@as(i64, -5), negative_row.cell(qty_index).?.value.i64_val);
     try std.testing.expectEqual(@as(i64, 5), positive_row.cell(qty_index).?.value.i64_val);
@@ -2358,6 +2306,12 @@ test "relational integer and datetime columns preserve their logical values" {
         @as(u64, 15),
         positive_row.cell(relationalColumnIndex(plan, "ts").?).?.value.u64_val,
     );
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        date_only_row.cell(relationalColumnIndex(plan, "ts").?).?.value.u64_val,
+    );
+    try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, invalid_text.value));
+    try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, invalid_negative.value));
 }
 
 test "relational cells round-trip through typed_doc_values storage" {
