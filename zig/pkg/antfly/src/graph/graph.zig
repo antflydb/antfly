@@ -10331,6 +10331,7 @@ pub const GraphIndex = struct {
 
     pub fn graphMetricTopK(self: *GraphIndex, metric_name: []const u8, limit: usize) ![]GraphMetricScore {
         if (limit == 0) return try self.alloc.alloc(GraphMetricScore, 0);
+        if (limit > 10_000) return error.InvalidGraphMetricTopK;
         _ = self.metricConfig(metric_name) orelse return error.MetricNotReady;
         var txn = try self.beginReadReverseTxn();
         defer txn.abort();
@@ -10338,32 +10339,56 @@ pub const GraphIndex = struct {
         if (generation == 0) return error.MetricNotReady;
         const prefix = try self.graphMetricScorePrefixAlloc(metric_name, generation);
         defer self.alloc.free(prefix);
-        var scores = std.ArrayListUnmanaged(GraphMetricScore).empty;
-        errdefer {
-            for (scores.items) |*score| score.deinit(self.alloc);
-            scores.deinit(self.alloc);
-        }
+        var scores = std.PriorityQueue(GraphMetricScore, void, graphMetricScoreWorstFirst).initContext({});
+        defer scores.deinit(self.alloc);
+        errdefer for (scores.items) |*score| score.deinit(self.alloc);
+        try scores.ensureTotalCapacity(self.alloc, limit);
         var cur = try txn.openCursor();
         defer cur.close();
         var entry_opt = try cur.seekAtOrAfter(prefix);
         while (entry_opt) |entry| : (entry_opt = try cur.next()) {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
             const score_value = decodeF64(entry.value) orelse continue;
+            // Once the heap is full, a strictly lower score cannot enter it;
+            // avoid decoding and allocating that node key on the common path.
+            if (scores.peek()) |worst| {
+                if (scores.items.len == limit and score_value < worst.score) continue;
+            }
             const node = (try self.graphMetricNodeFromScoreKeyAlloc(entry.key, prefix)) orelse continue;
             errdefer self.alloc.free(node);
-            try scores.append(self.alloc, .{ .node = node, .score = score_value });
-        }
-        std.mem.sort(GraphMetricScore, scores.items, {}, struct {
-            fn lessThan(_: void, a: GraphMetricScore, b: GraphMetricScore) bool {
-                if (a.score == b.score) return std.mem.lessThan(u8, a.node, b.node);
-                return a.score > b.score;
+            const candidate = GraphMetricScore{ .node = node, .score = score_value };
+            if (scores.items.len < limit) {
+                try scores.push(self.alloc, candidate);
+                continue;
             }
-        }.lessThan);
-        const out_len = @min(limit, scores.items.len);
-        const out = try self.alloc.dupe(GraphMetricScore, scores.items[0..out_len]);
-        for (scores.items[out_len..]) |*score| score.deinit(self.alloc);
-        scores.deinit(self.alloc);
+            const worst = scores.peek().?;
+            if (!graphMetricScoreComesBefore(candidate, worst)) {
+                self.alloc.free(node);
+                continue;
+            }
+            var removed = scores.pop().?;
+            removed.deinit(self.alloc);
+            try scores.push(self.alloc, candidate);
+        }
+        std.mem.sort(GraphMetricScore, scores.items, {}, graphMetricScoreLessThan);
+        const out = try self.alloc.dupe(GraphMetricScore, scores.items);
+        scores.items.len = 0;
         return out;
+    }
+
+    fn graphMetricScoreComesBefore(a: GraphMetricScore, b: GraphMetricScore) bool {
+        if (a.score == b.score) return std.mem.lessThan(u8, a.node, b.node);
+        return a.score > b.score;
+    }
+
+    fn graphMetricScoreLessThan(_: void, a: GraphMetricScore, b: GraphMetricScore) bool {
+        return graphMetricScoreComesBefore(a, b);
+    }
+
+    fn graphMetricScoreWorstFirst(_: void, a: GraphMetricScore, b: GraphMetricScore) std.math.Order {
+        if (graphMetricScoreComesBefore(a, b)) return .gt;
+        if (graphMetricScoreComesBefore(b, a)) return .lt;
+        return .eq;
     }
 
     pub fn graphMetricScore(self: *GraphIndex, metric_name: []const u8, node: []const u8) !?f64 {
@@ -10379,6 +10404,34 @@ pub const GraphIndex = struct {
             else => return err,
         };
         return decodeF64(raw);
+    }
+
+    /// Reads a metric for a node batch from one stable read snapshot. This is
+    /// the query hot path: opening a transaction per node makes metric filters
+    /// and ordering scale with candidates times metrics.
+    pub fn graphMetricScoresAtGenerationAlloc(
+        self: *GraphIndex,
+        metric_name: []const u8,
+        generation: u64,
+        nodes: []const []const u8,
+    ) ![]?f64 {
+        const scores = try self.alloc.alloc(?f64, nodes.len);
+        errdefer self.alloc.free(scores);
+        @memset(scores, null);
+        if (generation == 0 or nodes.len == 0) return scores;
+        _ = self.metricConfig(metric_name) orelse return error.MetricNotReady;
+        var txn = try self.beginReadReverseTxn();
+        defer txn.abort();
+        for (nodes, 0..) |node, i| {
+            const score_key = try self.graphMetricScoreKeyAlloc(metric_name, generation, node);
+            defer self.alloc.free(score_key);
+            const raw = txn.get(score_key) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            scores[i] = decodeF64(raw);
+        }
+        return scores;
     }
 
     /// Free an edge's allocated fields.

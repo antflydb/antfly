@@ -205,6 +205,11 @@ pub const TableApi = struct {
     };
 
     pub const ExecuteGraphMetricActionError = error{
+        Canceled,
+        DeadlineExceeded,
+        NotLeader,
+        Conflict,
+        Backpressured,
         InvalidGraphMetricAction,
         NotFound,
         MethodNotAllowed,
@@ -368,6 +373,7 @@ pub const TableApi = struct {
             index_name: []const u8,
             metric_name: []const u8,
             action: []const u8,
+            request: operation.RequestContext,
         ) ExecuteGraphMetricActionError![]u8 = null,
         execute_put_artifact_enrichment: ?*const fn (
             ptr: *anyopaque,
@@ -529,8 +535,9 @@ pub const TableApi = struct {
         metric_name: []const u8,
         action: []const u8,
     ) ExecuteGraphMetricActionError![]u8 {
+        try self.ensureActive();
         const fn_ptr = self.vtable.execute_table_graph_metric_action orelse return error.MethodNotAllowed;
-        return try fn_ptr(self.ptr, alloc, table_name, index_name, metric_name, action);
+        return try fn_ptr(self.ptr, alloc, table_name, index_name, metric_name, action, self.request);
     }
 
     pub fn executePutArtifactEnrichment(
@@ -1280,6 +1287,15 @@ pub fn handleTableGraphMetricAction(
     api: TableApi,
 ) !OwnedResponse {
     const response_body = api.executeTableGraphMetricAction(alloc, table_name, index_name, metric_name, action) catch |err| switch (err) {
+        error.Canceled, error.DeadlineExceeded => return err,
+        error.NotLeader => return err,
+        error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "table mutation conflict; retry request") },
+        error.Backpressured => return .{
+            .status = 429,
+            .body = try alloc.dupe(u8, "{\"code\":\"storage_resource_exhausted\",\"message\":\"storage descriptors are temporarily exhausted\",\"retryable\":true,\"retry_after_ms\":1000}"),
+            .json = true,
+            .retry_after_seconds = 1,
+        },
         error.InvalidGraphMetricAction => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid graph metric action") },
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
@@ -4254,6 +4270,7 @@ test "public table graph metric action handler returns status response" {
             index_name: []const u8,
             metric_name: []const u8,
             action: []const u8,
+            _: operation.RequestContext,
         ) TableApi.ExecuteGraphMetricActionError![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!std.mem.eql(u8, table_name, "docs")) return error.InternalFailure;

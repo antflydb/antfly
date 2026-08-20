@@ -1342,7 +1342,7 @@ fn mergeGraphMetricRerankStatus(
     return merged;
 }
 
-fn mergeGraphMetricStatusInto(alloc: std.mem.Allocator, target: *db_mod.types.GraphMetricStatus, source: db_mod.types.GraphMetricStatus) !void {
+pub fn mergeGraphMetricStatusInto(alloc: std.mem.Allocator, target: *db_mod.types.GraphMetricStatus, source: db_mod.types.GraphMetricStatus) !void {
     target.state = mergeGraphMetricState(target.state, source.state);
     target.phase = mergeGraphMetricPhase(target.phase, source.phase);
     target.metadata_version = mergeGraphMetricMetadataVersion(target.metadata_version, source.metadata_version);
@@ -1940,7 +1940,7 @@ fn cloneGraphSearchResult(
     };
 }
 
-fn cloneGraphMetricStatus(
+pub fn cloneGraphMetricStatus(
     alloc: std.mem.Allocator,
     source: db_mod.types.GraphMetricStatus,
 ) !db_mod.types.GraphMetricStatus {

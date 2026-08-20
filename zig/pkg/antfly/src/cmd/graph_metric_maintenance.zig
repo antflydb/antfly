@@ -477,6 +477,9 @@ pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.pro
         printUsage(argv0);
         return;
     }
+    const owner_incarnation = try ownerIncarnationAlloc(alloc, if (cli.owner_id.len != 0) cli.owner_id else cli.runtime_id);
+    defer alloc.free(owner_incarnation);
+    cli.owner_id = owner_incarnation;
     const summary = if (try cli.serviceTarget()) |target| blk: {
         if (cli.db_path != null) return error.InvalidArguments;
         break :blk try runServiceConfigured(alloc, target, cli);
@@ -488,6 +491,15 @@ pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.pro
     if (cli.summary_file) |path| {
         try writeJsonFile(init.io, alloc, path, summary);
     }
+}
+
+fn ownerIncarnationAlloc(alloc: std.mem.Allocator, logical_owner_id: []const u8) ![]u8 {
+    if (logical_owner_id.len == 0) return error.InvalidArguments;
+    return try std.fmt.allocPrint(alloc, "{s}:pid-{d}:start-{x}", .{
+        logical_owner_id,
+        platform.process.currentId() orelse 0,
+        platform.time.monotonicNs(),
+    });
 }
 
 fn runConfigured(alloc: std.mem.Allocator, db_path: []const u8, cli: CliConfig) !RunSummary {
@@ -1739,7 +1751,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --table-name <table>
         \\  --role <combined|coordinator|worker|worker_pool>
         \\  --runtime-id <id>
-        \\  --owner-id <id>
+        \\  --owner-id <id>  logical owner label (a process-incarnation fence is appended)
         \\  --worker-id <id>
         \\  --worker-ids <id,id,...>
         \\  --lease-owned <true|false>

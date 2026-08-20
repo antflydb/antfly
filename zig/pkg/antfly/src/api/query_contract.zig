@@ -8615,7 +8615,7 @@ fn parseGraphMetricQueriesAlloc(
         metric_name;
     if (result_name.len == 0) return error.InvalidQueryRequest;
     const top_k = if (metric_value.object.get("top_k")) |value| try parseOptionalU32FieldValue(value) else 10;
-    if (top_k == 0) return error.InvalidQueryRequest;
+    if (top_k == 0 or top_k > 10_000) return error.InvalidQueryRequest;
     const freshness = if (metric_value.object.get("metric_freshness")) |value|
         try parseGraphMetricFreshness(value)
     else if (metric_value.object.get("freshness")) |value|
@@ -14277,6 +14277,20 @@ test "api query contract rejects invalid timeout_ms" {
     ));
     try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
         \\{"query":{"match_all":{}},"timeout_ms":1.5}
+    ));
+}
+
+test "api query contract bounds graph metric top k" {
+    const alloc = std.testing.allocator;
+    const accepted = try parseGraphMetricQueriesAlloc(alloc,
+        \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","top_k":10000}}
+    );
+    defer freeNamedGraphMetricQueries(alloc, accepted);
+    try std.testing.expectEqual(@as(usize, 1), accepted.len);
+    try std.testing.expectEqual(@as(u32, 10_000), accepted[0].query.top_k);
+
+    try std.testing.expectError(error.InvalidQueryRequest, parseGraphMetricQueriesAlloc(alloc,
+        \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","top_k":10001}}
     ));
 }
 

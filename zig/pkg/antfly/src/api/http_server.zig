@@ -9196,10 +9196,19 @@ pub const ApiHttpServer = struct {
         index_name: []const u8,
         metric_name: []const u8,
         action: []const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteGraphMetricActionError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         const source = self.table_writes orelse return error.MethodNotAllowed;
-        var status = (source.graphMetricAction(alloc, table_name, index_name, metric_name, action) catch |err| switch (err) {
+        var status = (source.graphMetricActionWithCancellation(alloc, table_name, index_name, metric_name, action, request.cancellation) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.HAReadOnlyStandby,
+            error.HAPromotedStandbyRequiresPrimaryOpen,
+            error.HAFencedPrimary,
+            => return error.NotLeader,
+            error.TableTransitionActive, error.TableGenerationChanged => return error.Conflict,
+            error.PersistentDescriptorAdmissionExhausted, error.ResourceBudgetExceeded => return error.Backpressured,
             error.InvalidGraphMetricAction => return error.InvalidGraphMetricAction,
             error.TableNotFound, error.IndexNotFound, error.MetricNotReady => return error.NotFound,
             else => {

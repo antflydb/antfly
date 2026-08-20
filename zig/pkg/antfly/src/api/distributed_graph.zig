@@ -1707,6 +1707,9 @@ fn executeDistributedTraverse(
             .{ .table = item.table, .key = item.key },
             {},
         );
+        if (defer_result_limit and state.seen.count() > graph_query_mod.graph_metric_candidate_limit) {
+            return error.QueryCandidateBudgetExceeded;
+        }
     }
 
     while (frontier.len > 0) {
@@ -1800,6 +1803,7 @@ fn executeDistributedTraverse(
                             if (return_node) {
                                 try state.nodes.append(alloc, merged_node);
                                 merged_node_owned = false;
+                                if (defer_result_limit and state.nodes.items.len > graph_query_mod.graph_metric_candidate_limit) return error.QueryCandidateBudgetExceeded;
                                 if (!defer_result_limit and graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
                             } else {
                                 merged_node.deinit(alloc);
@@ -1882,6 +1886,7 @@ fn executeDistributedTraverse(
                             if (return_node) {
                                 try state.nodes.append(alloc, merged_node);
                                 merged_node_owned = false;
+                                if (defer_result_limit and state.nodes.items.len > graph_query_mod.graph_metric_candidate_limit) return error.QueryCandidateBudgetExceeded;
                                 if (!defer_result_limit and graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
                             } else {
                                 merged_node.deinit(alloc);
@@ -1957,6 +1962,7 @@ fn executeDistributedTraverse(
                         if (return_node) {
                             try state.nodes.append(alloc, merged_node);
                             merged_node_owned = false;
+                            if (defer_result_limit and state.nodes.items.len > graph_query_mod.graph_metric_candidate_limit) return error.QueryCandidateBudgetExceeded;
                             if (!defer_result_limit and graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
                         } else {
                             merged_node.deinit(alloc);
@@ -4695,7 +4701,7 @@ pub fn frontierItemToSearchRequest(
     var params = req.params;
     params.edge_types = try dupConstStrings(alloc, req.params.edge_types);
     errdefer freeConstStrings(alloc, params.edge_types);
-    if (req.defer_result_limit) params.max_results = 0;
+    if (req.defer_result_limit) params.max_results = graph_query_mod.graph_metric_candidate_limit + 1;
 
     const name = try alloc.dupe(u8, req.name);
     errdefer alloc.free(name);
@@ -7407,7 +7413,7 @@ test "distributed graph expand request carries constrained semiring target progr
     try std.testing.expectError(error.InvalidQueryRequest, validateGraphExpandTensorAccessPath(alloc, parsed));
 }
 
-test "distributed graph expand request defers worker result limit for metric post processing" {
+test "distributed graph expand request bounds deferred worker metric candidates" {
     const alloc = std.testing.allocator;
     var frontier = [_]FrontierState{.{
         .key = try alloc.dupe(u8, "doc:a"),
@@ -7447,7 +7453,7 @@ test "distributed graph expand request defers worker result limit for metric pos
 
     const search_req = try frontierItemToSearchRequest(alloc, parsed, parsed.frontier[0]);
     defer freeExpandSearchRequest(alloc, search_req);
-    try std.testing.expectEqual(@as(u32, 0), search_req.graph_queries[0].query.params.max_results);
+    try std.testing.expectEqual(graph_query_mod.graph_metric_candidate_limit + 1, search_req.graph_queries[0].query.params.max_results);
     try std.testing.expect(search_req.graph_queries[0].query.include_metric_status);
     try std.testing.expectEqual(@as(usize, 1), search_req.graph_queries[0].query.metrics.len);
     try std.testing.expectEqualStrings("pagerank", search_req.graph_queries[0].query.metrics[0].name);

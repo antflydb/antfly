@@ -7228,6 +7228,7 @@ pub fn build(b: *std.Build) void {
     const graph_metric_fan_in_filters = [_][]const u8{
         "query parser accepts direct graph metric reads",
         "query parser accepts graph metric rerank",
+        "api query contract bounds graph metric top k",
         "query encoder emits graph metric results",
         "query profile reports failed graph metric status across read surfaces",
         "query encoder emits graph metric rerank score details",
@@ -7257,7 +7258,7 @@ pub fn build(b: *std.Build) void {
         "query merge requires comparable graph metric rerank generations across shards",
         "query merge rejects malformed graph metric rerank score details",
         "query merge rejects missing or unpublished graph metric rerank shard status",
-        "distributed graph expand request defers worker result limit for metric post processing",
+        "distributed graph expand request bounds deferred worker metric candidates",
         "distributed graph metric status merge validates metadata compatibility",
         "distributed graph metric post processing applies max results after filter and order",
         "public index contract exposes runtime status metadata",

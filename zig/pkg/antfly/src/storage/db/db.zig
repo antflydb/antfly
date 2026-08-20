@@ -18171,6 +18171,40 @@ pub const DB = struct {
         return try cloneGraphMetricStatusFromGraph(alloc, status);
     }
 
+    /// Durably enqueue metric work and return immediately. Public control-plane
+    /// actions use this path so request latency is independent of graph size;
+    /// the bounded maintenance runtime performs and checkpoints the build.
+    pub fn scheduleGraphMetricBuild(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        metric_name: []const u8,
+        force: bool,
+    ) !types.GraphMetricStatus {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        const owned_status = blk: {
+            lockApply(self);
+            defer self.core.unlockApply();
+            const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
+            var current = try entry.index.graphMetricStatus(metric_name);
+            defer current.deinit(entry.index.alloc);
+            if (!force and current.state == .fresh) {
+                break :blk try cloneGraphMetricStatusFromGraph(alloc, current);
+            }
+            const target_generation = @max(current.edge_generation, current.target_edge_generation);
+            // Score generations are keyed by the graph edge generation. A
+            // forced rebuild therefore must unpublish the old materialization
+            // before workers rewrite that generation; readers can never
+            // observe a partially replaced score set.
+            if (force) try entry.index.deleteGraphMetricMaterialization(metric_name);
+            var scheduled = try self.core.index_manager.ensureGraphMetricPlannedBuild(index_name, metric_name, target_generation);
+            defer scheduled.deinit(self.core.index_manager.alloc);
+            break :blk try cloneGraphMetricStatusFromGraph(alloc, scheduled);
+        };
+        if (self.graph_metric_runtime) |runtime| runtime.notify();
+        return owned_status;
+    }
+
     pub fn deleteGraphMetricMaterialization(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);

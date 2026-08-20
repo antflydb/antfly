@@ -49,12 +49,21 @@ pub const Config = struct {
     role: Role = .combined,
     runtime_id: []const u8 = "",
     lease_owned: bool = false,
+    /// Process-incarnation identity used to fence the runtime lease. This must
+    /// be unique across concurrent processes and process restarts.
     owner_id: []const u8 = "local",
     lease_ttl_ms: u64 = 30_000,
     coordinator_start_background_builds: bool = true,
     idle_interval_ms: u64 = 50,
     error_interval_ms: u64 = 250,
-    planned_options: index_manager_mod.IndexManager.GraphMetricPlannedMaintenanceOptions = .{},
+    // One bounded unit of durable work per runtime tick keeps foreground
+    // writer latency predictable. Dedicated maintenance commands can opt into
+    // larger batches explicitly.
+    planned_options: index_manager_mod.IndexManager.GraphMetricPlannedMaintenanceOptions = .{
+        .max_rounds = 1,
+        .max_metrics_per_round = 8,
+        .max_pages_per_round = 1,
+    },
     clock: platform_clock.Clock = platform_clock.Clock.real(),
 };
 
@@ -343,7 +352,7 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
     lease_key: []u8,
     ownership: ownership_mod.State,
     mutex: Io.Mutex = .init,
-    cond: Io.Condition = .init,
+    wake_event: Io.Event = .unset,
     shutdown: bool = false,
     notified: bool = false,
     future: ?Io.Future(void) = null,
@@ -384,8 +393,8 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
             self.mutex.lockUncancelable(io);
             self.shutdown = true;
             self.notified = true;
-            self.cond.broadcast(io);
             self.mutex.unlock(io);
+            self.wake_event.set(io);
 
             if (self.future) |*future| _ = future.await(io);
         }
@@ -420,8 +429,8 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
         const io = io_impl.io();
         self.mutex.lockUncancelable(io);
         self.notified = true;
-        self.cond.broadcast(io);
         self.mutex.unlock(io);
+        self.wake_event.set(io);
     }
 
     pub fn stats(self: *GraphMetricRuntime) Stats {
@@ -753,6 +762,11 @@ pub fn runBoundaryTick(
 fn validateConfig(config: Config) !void {
     if (!config.enabled) return;
     if (config.lease_ttl_ms == 0) return error.InvalidGraphMetricRuntimeConfig;
+    if (config.lease_owned and
+        (config.owner_id.len == 0 or std.mem.eql(u8, config.owner_id, "local")))
+    {
+        return error.InvalidGraphMetricRuntimeConfig;
+    }
     if (config.planned_options.max_rounds == 0) return error.InvalidGraphMetricRuntimeConfig;
     if (config.planned_options.max_metrics_per_round == 0) return error.InvalidGraphMetricRuntimeConfig;
     if (config.planned_options.max_pages_per_round == 0) return error.InvalidGraphMetricRuntimeConfig;
@@ -841,6 +855,18 @@ test "graph metric runtime config rejects zero lease and maintenance budgets whe
             .max_metrics_per_round = 0,
             .max_pages_per_round = 0,
         },
+    });
+}
+
+test "graph metric runtime requires an explicit incarnation owner for leased operation" {
+    try std.testing.expectError(error.InvalidGraphMetricRuntimeConfig, validateConfig(.{
+        .enabled = true,
+        .lease_owned = true,
+    }));
+    try validateConfig(.{
+        .enabled = true,
+        .lease_owned = true,
+        .owner_id = "runtime-a:pid-42:start-100",
     });
 }
 
@@ -1122,15 +1148,30 @@ fn waitForWork(runtime: *GraphMetricRuntime) void {
     runtime.mutex.lockUncancelable(io);
     if (runtime.notified or runtime.shutdown) {
         runtime.notified = false;
+        runtime.wake_event.reset();
         runtime.mutex.unlock(io);
         return;
     }
+    runtime.wake_event.reset();
     runtime.mutex.unlock(io);
+
+    if (runtime.config.clock.isReal()) {
+        runtime.wake_event.waitTimeout(io, .{ .duration = .{
+            .raw = std.Io.Duration.fromMilliseconds(@intCast(remaining_ms)),
+            .clock = .awake,
+        } }) catch |err| switch (err) {
+            error.Timeout, error.Canceled => {},
+        };
+        runtime.mutex.lockUncancelable(io);
+        runtime.notified = false;
+        runtime.mutex.unlock(io);
+        return;
+    }
 
     while (remaining_ms > 0) {
         if (isShutdown(runtime)) return;
         const slice_ms: u64 = @min(remaining_ms, 10);
-        runtime.config.clock.sleepMs(slice_ms);
+        runtimeSleepSlice(runtime, slice_ms);
         remaining_ms -= slice_ms;
         runtime.mutex.lockUncancelable(io);
         const notified = runtime.notified;
@@ -1145,9 +1186,24 @@ fn sleepMs(runtime: *GraphMetricRuntime, ms: u64) void {
     while (remaining_ms > 0) {
         if (isShutdown(runtime)) return;
         const slice_ms: u64 = @min(remaining_ms, 10);
-        runtime.config.clock.sleepMs(slice_ms);
+        runtimeSleepSlice(runtime, slice_ms);
         remaining_ms -= slice_ms;
     }
+}
+
+fn runtimeSleepSlice(runtime: *GraphMetricRuntime, ms: u64) void {
+    if (!runtime.config.clock.isReal()) {
+        runtime.config.clock.sleepMs(ms);
+        return;
+    }
+    const io_impl = runtime.io_impl orelse {
+        runtime.config.clock.sleepMs(ms);
+        return;
+    };
+    std.Io.Clock.Duration.sleep(.{
+        .clock = .awake,
+        .raw = .fromMilliseconds(@intCast(if (ms == 0) @as(u64, 1) else ms)),
+    }, io_impl.io()) catch {};
 }
 
 fn isShutdown(runtime: *GraphMetricRuntime) bool {

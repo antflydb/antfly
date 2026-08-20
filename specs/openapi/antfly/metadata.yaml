@@ -8919,6 +8919,8 @@ paths:
       description: |
         Refresh, rebuild, delete, pause, or resume maintenance for a configured
         graph metric. The metric configuration remains owned by the graph index.
+        Refresh and rebuild durably enqueue bounded, resumable maintenance and
+        return the aggregate shard status without waiting for graph-sized work.
         `delete` clears materialized metric state and maintenance controls; a
         later refresh or rebuild can publish a new generation.
       tags:
@@ -8926,13 +8928,25 @@ paths:
       operationId: executeGraphMetricAction
       responses:
         "200":
-          description: Updated graph metric status
+          description: Aggregate graph metric status after the action is durably accepted
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/GraphMetricActionResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "409":
+          description: The table topology or write-owner generation changed; retry the action
+          content:
+            text/plain:
+              schema:
+                type: string
+        "429":
+          description: Local storage resources are temporarily exhausted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "404":
           $ref: "#/components/responses/NotFound"
         "405":

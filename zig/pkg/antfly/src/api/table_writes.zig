@@ -60,6 +60,21 @@ const query_api = @import("query.zig");
 const public_table_http = @import("public_table_http.zig");
 const runtime_status = @import("runtime_status.zig");
 
+fn applyGraphMetricActionToDb(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    index_name: []const u8,
+    metric_name: []const u8,
+    action: []const u8,
+) !db_mod.types.GraphMetricStatus {
+    if (std.mem.eql(u8, action, "refresh")) return try db.scheduleGraphMetricBuild(alloc, index_name, metric_name, false);
+    if (std.mem.eql(u8, action, "rebuild")) return try db.scheduleGraphMetricBuild(alloc, index_name, metric_name, true);
+    if (std.mem.eql(u8, action, "delete")) return try db.deleteGraphMetricMaterialization(alloc, index_name, metric_name);
+    if (std.mem.eql(u8, action, "pause")) return try db.pauseGraphMetricMaintenance(alloc, index_name, metric_name);
+    if (std.mem.eql(u8, action, "resume")) return try db.resumeGraphMetricMaintenance(alloc, index_name, metric_name);
+    return error.InvalidGraphMetricAction;
+}
+
 fn publishRuntimeStatusGroupForTest(
     cache: *runtime_status.TableRuntimeSnapshotCache,
     table_name: []const u8,
@@ -4355,6 +4370,7 @@ pub const BoundTableWriteSource = struct {
                 .delete_artifact_enrichment = deleteArtifactEnrichment,
                 .drop_index = dropIndex,
                 .graph_metric_action = graphMetricAction,
+                .graph_metric_action_with_cancellation = graphMetricActionWithCancellation,
                 .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .backup_table = backupTable,
                 .restore_table = restoreTable,
@@ -5109,15 +5125,22 @@ pub const BoundTableWriteSource = struct {
         metric_name: []const u8,
         action: []const u8,
     ) !?db_mod.types.GraphMetricStatus {
+        return try graphMetricActionWithCancellation(ptr, alloc, table_name, index_name, metric_name, action, .none);
+    }
+
+    fn graphMetricActionWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?db_mod.types.GraphMetricStatus {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-        const db = try self.activeDb();
-        if (std.mem.eql(u8, action, "refresh")) return try db.refreshGraphMetric(alloc, index_name, metric_name);
-        if (std.mem.eql(u8, action, "rebuild")) return try db.rebuildGraphMetric(alloc, index_name, metric_name);
-        if (std.mem.eql(u8, action, "delete")) return try db.deleteGraphMetricMaterialization(alloc, index_name, metric_name);
-        if (std.mem.eql(u8, action, "pause")) return try db.pauseGraphMetricMaintenance(alloc, index_name, metric_name);
-        if (std.mem.eql(u8, action, "resume")) return try db.resumeGraphMetricMaintenance(alloc, index_name, metric_name);
-        return error.InvalidGraphMetricAction;
+        if (cancellation.isCancelled()) return error.Canceled;
+        return try applyGraphMetricActionToDb(alloc, try self.activeDb(), index_name, metric_name, action);
     }
 
     fn graphMetricMaintenanceGroupLocal(
@@ -12943,6 +12966,8 @@ pub const ProvisionedTableWriteSource = struct {
                 .put_artifact_enrichment = putArtifactEnrichment,
                 .delete_artifact_enrichment = deleteArtifactEnrichment,
                 .drop_index = dropIndex,
+                .graph_metric_action = graphMetricAction,
+                .graph_metric_action_with_cancellation = graphMetricActionWithCancellation,
                 .drop_table = dropTable,
                 .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .commit_transaction = commitTransaction,
@@ -13014,6 +13039,61 @@ pub const ProvisionedTableWriteSource = struct {
         };
         defer db.close();
         return try db.runGraphMetricServiceMaintenanceJsonAlloc(alloc, body);
+    }
+
+    fn graphMetricAction(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+    ) !?db_mod.types.GraphMetricStatus {
+        return try graphMetricActionWithCancellation(ptr, alloc, table_name, index_name, metric_name, action, .none);
+    }
+
+    fn graphMetricActionWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?db_mod.types.GraphMetricStatus {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.graphMetricActionWithCancellation(alloc, table_name, index_name, metric_name, action, cancellation);
+        try enforceHAWriteGateOptional(self.ha_write_gate);
+        const group_ids = try table_catalog.resolveGroupsForSpanEventually(alloc, self.catalog, table_name, "", "", 5 * std.time.ns_per_s, 10);
+        defer alloc.free(group_ids);
+        if (group_ids.len == 0) return null;
+
+        var aggregate: ?db_mod.types.GraphMetricStatus = null;
+        errdefer if (aggregate) |*status| status.deinit(alloc);
+        for (group_ids) |group_id| {
+            if (cancellation.isCancelled()) return error.Canceled;
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+            defer alloc.free(path);
+            self.beginGroupOperation(table_name, group_id);
+            defer self.endGroupOperation(table_name, group_id);
+            var shard_status = if (self.write_cache) |cache| blk: {
+                var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
+                defer cached.deinit(alloc);
+                break :blk try applyGraphMetricActionToDb(alloc, cached.db, index_name, metric_name, action);
+            } else blk: {
+                var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
+                defer db.close();
+                break :blk try applyGraphMetricActionToDb(alloc, &db, index_name, metric_name, action);
+            };
+            if (aggregate) |*status| {
+                query_api.mergeGraphMetricStatusInto(alloc, status, shard_status) catch |err| {
+                    shard_status.deinit(alloc);
+                    return err;
+                };
+                shard_status.deinit(alloc);
+            } else aggregate = shard_status;
+        }
+        return aggregate;
     }
 
     fn putArtifactEnrichment(
@@ -16743,6 +16823,8 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .put_artifact_enrichment = putArtifactEnrichment,
                 .delete_artifact_enrichment = deleteArtifactEnrichment,
                 .drop_index = dropIndex,
+                .graph_metric_action = graphMetricAction,
+                .graph_metric_action_with_cancellation = graphMetricActionWithCancellation,
                 .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .commit_transaction = commitTransaction,
                 .commit_transaction_with_cancellation = commitTransactionWithCancellation,
@@ -16796,6 +16878,54 @@ pub const HostedProvisionedTableWriteSource = struct {
         var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default_async);
         defer cached.deinit(hosted_cache.write_cache.alloc);
         return try cached.db.runGraphMetricServiceMaintenanceJsonAlloc(alloc, body);
+    }
+
+    fn graphMetricAction(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+    ) !?db_mod.types.GraphMetricStatus {
+        return try graphMetricActionWithCancellation(ptr, alloc, table_name, index_name, metric_name, action, .none);
+    }
+
+    fn graphMetricActionWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?db_mod.types.GraphMetricStatus {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const group_ids = try table_catalog.resolveGroupsForSpanEventually(alloc, self.catalog, table_name, "", "", 5 * std.time.ns_per_s, 10);
+        defer alloc.free(group_ids);
+        var aggregate: ?db_mod.types.GraphMetricStatus = null;
+        errdefer if (aggregate) |*status| status.deinit(alloc);
+        var handled: usize = 0;
+        for (group_ids) |group_id| {
+            if (cancellation.isCancelled()) return error.Canceled;
+            if (self.router.localStatus(group_id) != .active) continue;
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+            defer alloc.free(path);
+            const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+            var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default_async);
+            defer cached.deinit(hosted_cache.write_cache.alloc);
+            var shard_status = try applyGraphMetricActionToDb(alloc, cached.db, index_name, metric_name, action);
+            handled += 1;
+            if (aggregate) |*status| {
+                query_api.mergeGraphMetricStatusInto(alloc, status, shard_status) catch |err| {
+                    shard_status.deinit(alloc);
+                    return err;
+                };
+                shard_status.deinit(alloc);
+            } else aggregate = shard_status;
+        }
+        if (handled == 0) return null;
+        return aggregate;
     }
 
     fn createIndex(
