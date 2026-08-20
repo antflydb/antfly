@@ -222,18 +222,12 @@ pub fn mergeOneSlotValuesAlloc(
     left: ?[]const u8,
     right: ?[]const u8,
 ) ![]u8 {
-    var left_row = try rowAlloc(alloc, &.{law_id});
-    defer left_row.deinit(alloc);
-    if (left) |value| left_row.slots[0].value = try alloc.dupe(u8, value);
-
-    var right_row = try rowAlloc(alloc, &.{law_id});
-    defer right_row.deinit(alloc);
-    if (right) |value| right_row.slots[0].value = try alloc.dupe(u8, value);
-
-    var merged = try mergeRowsAlloc(alloc, left_row, right_row);
-    defer merged.deinit(alloc);
-    const value = merged.slots[0].value orelse return try law.identityAlloc(alloc, law_id);
-    return try alloc.dupe(u8, value);
+    // Equivalent to merging two single-slot rows, but without allocating the
+    // surrounding Row/Slot scaffolding (two rows, two value dupes, and a final
+    // dupe). `law.combineAlloc` already returns a freshly owned buffer, so on
+    // the per-contribution fold hot path this drops ~6 allocations down to 1.
+    return (try law.combineAlloc(alloc, law_id, left, right)) orelse
+        try law.identityAlloc(alloc, law_id);
 }
 
 pub fn encodeRowAlloc(alloc: Allocator, row: Row) ![]u8 {

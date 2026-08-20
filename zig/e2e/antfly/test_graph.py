@@ -636,6 +636,7 @@ def test_serverless_graph_pattern_two_hop_and_documents(serverless_api):
                 "type": "pattern",
                 "index_name": "graph_idx",
                 "start_nodes": {"keys": ["doc-a"]},
+                "params": {"include_paths": True},
                 "pattern": [
                     {"alias": "a"},
                     {
@@ -942,6 +943,7 @@ def test_stateful_graph_pattern_two_hop_and_documents(backup_api):
                 "type": "pattern",
                 "index_name": "graph_idx",
                 "start_nodes": {"keys": ["doc-a"]},
+                "params": {"include_paths": True},
                 "pattern": [
                     {"alias": "a"},
                     {
@@ -1055,6 +1057,7 @@ def test_stateful_graph_pattern_variable_length_and_cycle(backup_api):
                 "type": "pattern",
                 "index_name": "graph_idx",
                 "start_nodes": {"keys": ["doc-a"]},
+                "params": {"include_paths": True},
                 "pattern": [
                     {"alias": "x"},
                     {

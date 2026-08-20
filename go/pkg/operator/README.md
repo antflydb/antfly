@@ -1,7 +1,7 @@
 # Antfly Database Operator
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/antflydb/antfly/go/pkg/operator)](https://goreportcard.com/report/github.com/antflydb/antfly/go/pkg/operator)
-[![Kubernetes](https://img.shields.io/badge/Kubernetes-1.20+-blue.svg)](https://kubernetes.io/)
+[![Kubernetes](https://img.shields.io/badge/Kubernetes-1.23+-blue.svg)](https://kubernetes.io/)
 
 A cloud-native Kubernetes operator for deploying and managing [Antfly](https://github.com/antflydb/antfly) database clusters with built-in high availability, automatic scaling, and operational simplicity.
 
@@ -64,7 +64,7 @@ That's it! You now have a highly available Antfly database cluster running in Ku
 
 #### Required
 
-- **Kubernetes 1.20+** with RBAC enabled
+- **Kubernetes 1.23+** with RBAC enabled
 - **kubectl** configured to access your cluster
 - **Storage class** available for persistent volumes
 - **RBAC enabled** on your cluster
@@ -79,7 +79,7 @@ That's it! You now have a highly available Antfly database cluster running in Ku
 Verify your cluster meets the requirements:
 
 ```bash
-# Check Kubernetes version (should be 1.20 or higher)
+# Check Kubernetes version (should be 1.23 or higher)
 kubectl version --short
 
 # Check storage classes are available
@@ -349,14 +349,35 @@ spec:
 # Scale data nodes to 5 replicas
 kubectl patch antflycluster my-database --type='merge' -p='{"spec":{"dataNodes":{"replicas":5}}}'
 
-# Scale metadata nodes (must be odd number for Raft consensus)
-kubectl patch antflycluster my-database --type='merge' -p='{"spec":{"metadataNodes":{"replicas":5}}}'
-
 # Pause data nodes while retaining PVCs
 kubectl patch antflycluster my-database --type='merge' -p='{"spec":{"dataNodes":{"suspend":true},"storage":{"pvcRetentionPolicy":{"whenScaled":"Retain"}}}}'
 ```
 
 Use `spec.dataNodes.suspend=true` for scale-to-zero pause/resume. Do not use `dataNodes.replicas: 0` for suspension; `0` or omitted uses the controller default. Suspension requires retained PVCs and cannot be combined with data-node autoscaling.
+
+Metadata replica counts are immutable after cluster creation. Choose the target
+odd replica count when creating the cluster. To change it, back up the cluster,
+create a differently named `AntflyCluster` at the target topology so it receives
+fresh metadata PVCs, restore the backup, and cut over. Do not recreate the same
+cluster name or reuse retained metadata PVCs across replica-count changes. The
+operator does not yet perform quorum-aware metadata membership transitions.
+
+The validating webhook and reconciler fallback enforce this rule on all
+supported Kubernetes versions. Kubernetes 1.25+ can additionally enforce the
+CEL transition rule at API admission. CEL validation rules were alpha in
+Kubernetes 1.23 and are not relied on for Kubernetes 1.23-1.24.
+The reconciler records the accepted topology in status and on metadata PVCs so
+StatefulSet drift, deletion, or same-name recreation cannot erase the invariant.
+
+The generated CRDs are the Kubernetes 1.23-compatible baseline. Automatic
+operator bootstrap and programmatic consumers of `manifests.AllCRDsYAML()` use
+this baseline; they do not select an overlay based on the cluster version. On
+Kubernetes 1.25+, install the optional CEL validation overlay from a source
+checkout:
+
+```bash
+kubectl apply -k ./kustomize/overlays/kubernetes-1.25
+```
 
 ## 📚 Examples
 
@@ -632,7 +653,7 @@ kubectl get events --sort-by=.metadata.creationTimestamp
 
 ### Generic Kubernetes (Default)
 
-The Antfly operator is designed for cross-platform compatibility and works on any conformant Kubernetes distribution (1.20+) including:
+The Antfly operator is designed for cross-platform compatibility and works on any conformant Kubernetes distribution (1.23+) including:
 - **Minikube** and **kind** (local development)
 - **Vanilla Kubernetes** (self-managed clusters)
 - **Cloud-managed Kubernetes** (GKE, EKS, AKS, and others)

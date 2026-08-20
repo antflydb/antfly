@@ -4808,10 +4808,13 @@ fn parseSingleAggregationRequestAlloc(
         center_lon = std.fmt.parseFloat(f64, std.mem.trim(u8, lon_text, &std.ascii.whitespace)) catch return error.InvalidQueryRequest;
     }
 
+    const cardinality_mode = try parseCardinalityModeJson(alloc, aggregation.mode);
+
     return .{
         .name = try alloc.dupe(u8, name),
         .type = try alloc.dupe(u8, @tagName(aggregation.type)),
         .field = try alloc.dupe(u8, primary_field),
+        .cardinality_mode = cardinality_mode,
         .fields = fields,
         .size = aggregation.size orelse 0,
         .interval = if (aggregation.interval) |value| value else 0,
@@ -4871,6 +4874,13 @@ fn jsonValueToFlatStringAlloc(alloc: std.mem.Allocator, value: std.json.Value) !
         .string => |text| try alloc.dupe(u8, text),
         else => return error.UnsupportedQueryRequest,
     };
+}
+
+fn parseCardinalityModeJson(alloc: std.mem.Allocator, value_opt: ?std.json.Value) !aggregations_mod.CardinalityMode {
+    const value = value_opt orelse return .auto;
+    const text = try jsonValueToFlatStringAlloc(alloc, value);
+    defer alloc.free(text);
+    return std.meta.stringToEnum(aggregations_mod.CardinalityMode, text) orelse error.InvalidQueryRequest;
 }
 
 fn parseAggregationBackgroundQueryAlloc(
@@ -4946,6 +4956,10 @@ fn toOpenApiAggregationResult(
             .integer => |value| out.value = @floatFromInt(value),
             .object => |object| {
                 if (object.get("value")) |value| out.value = try jsonValueToF32(value);
+                if (object.get("approximate")) |value| {
+                    if (value == .bool) out.approximate = value.bool;
+                }
+                if (object.get("relative_error")) |value| out.relative_error = try jsonValueToF32(value);
                 if (object.get("count")) |value| out.count = try jsonValueToI64(value);
                 if (object.get("min")) |value| out.min = try jsonValueToF32(value);
                 if (object.get("max")) |value| out.max = try jsonValueToF32(value);
@@ -5071,9 +5085,26 @@ fn buildGraphQueryResults(
 
     for (result.graph_results) |graph_result| {
         const query_type = findGraphQueryType(req.graph_queries, graph_result.name) orelse continue;
-        try out.map.put(alloc, graph_result.name, try toOpenApiGraphQueryResult(alloc, query_type, meta, graph_result));
+        try out.map.put(alloc, graph_result.name, try toOpenApiGraphQueryResult(
+            alloc,
+            query_type,
+            findGraphQueryIncludePaths(req.graph_queries, graph_result.name),
+            meta,
+            graph_result,
+        ));
     }
     return out;
+}
+
+fn findGraphQueryIncludePaths(
+    graph_queries: []const db_mod.types.NamedGraphQuery,
+    name: []const u8,
+) bool {
+    for (graph_queries) |graph_query| {
+        if (std.mem.eql(u8, graph_query.name, name))
+            return graph_query.query.params.include_paths;
+    }
+    return false;
 }
 
 fn findGraphQueryType(
@@ -5096,6 +5127,7 @@ fn findGraphQueryType(
 fn toOpenApiGraphQueryResult(
     alloc: std.mem.Allocator,
     query_type: indexes_openapi.GraphQueryType,
+    include_paths: bool,
     meta: QueryResponseMeta,
     graph_result: db_mod.types.GraphSearchResult,
 ) !indexes_openapi.GraphQueryResult {
@@ -5103,7 +5135,7 @@ fn toOpenApiGraphQueryResult(
         .type = query_type,
         .nodes = try toOpenApiGraphNodes(alloc, graph_result),
         .paths = try toOpenApiPaths(alloc, graph_result.paths),
-        .matches = try toOpenApiPatternMatches(alloc, graph_result),
+        .matches = try toOpenApiPatternMatches(alloc, graph_result, include_paths),
         .total = @intCast(graph_result.total_hits),
         .took = meta.took_ms,
     };
@@ -5112,6 +5144,7 @@ fn toOpenApiGraphQueryResult(
 fn toOpenApiPatternMatches(
     alloc: std.mem.Allocator,
     graph_result: db_mod.types.GraphSearchResult,
+    include_paths: bool,
 ) !?[]const indexes_openapi.PatternMatch {
     if (graph_result.matches.len == 0) return null;
     const out = try alloc.alloc(indexes_openapi.PatternMatch, graph_result.matches.len);
@@ -5139,10 +5172,48 @@ fn toOpenApiPatternMatches(
         }
         out[i] = .{
             .bindings = bindings,
-            .path = try toOpenApiPathEdges(alloc, match.path),
+            .path = if (include_paths) try toOpenApiPathEdges(alloc, match.path) else null,
         };
     }
     return out;
+}
+
+test "pattern response omits paths unless requested" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const bindings = [_]db_mod.types.GraphPatternBinding{.{
+        .alias = @constCast("node"),
+        .node = .{
+            .key = @constCast("doc:a"),
+            .depth = 0,
+            .distance = 0,
+            .path = null,
+            .path_edges = null,
+        },
+    }};
+    const path = [_]graph_query_mod.PathEdgeInfo{.{
+        .source = @constCast("doc:a"),
+        .target = @constCast("doc:b"),
+        .edge_type = @constCast("links"),
+        .weight = 1,
+        .metadata = "",
+    }};
+    const matches = [_]db_mod.types.GraphPatternMatch{.{
+        .bindings = @constCast(bindings[0..]),
+        .path = @constCast(path[0..]),
+    }};
+    const graph_result = db_mod.types.GraphSearchResult{
+        .name = @constCast("pattern"),
+        .matches = @constCast(matches[0..]),
+        .hits = &.{},
+        .total_hits = 1,
+    };
+
+    const without_paths = (try toOpenApiPatternMatches(alloc, graph_result, false)).?;
+    try std.testing.expect(without_paths[0].path == null);
+    const with_paths = (try toOpenApiPatternMatches(alloc, graph_result, true)).?;
+    try std.testing.expectEqual(@as(usize, 1), with_paths[0].path.?.len);
 }
 
 fn toOpenApiGraphNodes(
@@ -8244,7 +8315,6 @@ fn parseGraphQuery(
 
     if (query.type == .pattern) {
         if (pattern.len == 0) return error.UnsupportedQueryRequest;
-        if (target_nodes != null) return error.UnsupportedQueryRequest;
     } else {
         if (pattern.len > 0 or return_aliases.len > 0) return error.UnsupportedQueryRequest;
     }

@@ -818,14 +818,16 @@ Attempted change: "%s"`,
 	}
 
 	if newMode == ClusterModeDistributed && oldMode == ClusterModeDistributed {
-		if r.Spec.MetadataNodes.Replicas < old.Spec.MetadataNodes.Replicas {
+		oldMetadataReplicas := effectiveMetadataReplicasForValidation(old)
+		newMetadataReplicas := effectiveMetadataReplicasForValidation(r)
+		if newMetadataReplicas != oldMetadataReplicas {
 			errors = append(errors, fmt.Sprintf(
-				`field 'spec.metadataNodes.replicas' cannot be decreased yet (current: %d, attempted: %d)
+				`field 'spec.metadataNodes.replicas' is immutable after cluster creation (current: %d, attempted: %d)
 
-Problem: Metadata nodes are quorum-bearing. The operator does not yet have a quorum-aware metadata scale-down workflow.
+Problem: Metadata nodes are quorum-bearing. The operator does not yet have a quorum-aware metadata membership-change workflow. Changing the StatefulSet topology with retained PVCs can start divergent Raft incarnations.
 
-Solution: Keep the existing metadata replica count, or recreate the cluster with the smaller topology.`,
-				old.Spec.MetadataNodes.Replicas, r.Spec.MetadataNodes.Replicas))
+Solution: Keep the existing metadata replica count. To change topology, back up the cluster, create a differently named AntflyCluster at the target replica count so it receives fresh metadata PVCs, restore the backup, and cut over. Do not reuse retained metadata PVCs across replica-count changes.`,
+				oldMetadataReplicas, newMetadataReplicas))
 		}
 
 		// Data-node scale-down is mutable: the controller drains and deregisters
@@ -898,6 +900,13 @@ Problem: PVC storage size cannot be reduced. Kubernetes only supports volume exp
 	}
 
 	return nil
+}
+
+func effectiveMetadataReplicasForValidation(cluster *AntflyCluster) int32 {
+	if cluster != nil && cluster.Spec.MetadataNodes.Replicas > 0 {
+		return cluster.Spec.MetadataNodes.Replicas
+	}
+	return 3
 }
 
 func effectiveStorageEngine(storage StorageSpec) string {

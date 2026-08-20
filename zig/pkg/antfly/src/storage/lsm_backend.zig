@@ -1493,6 +1493,7 @@ pub const Backend = struct {
     const BoundReadTxn = runtime_mod.BoundReadTxn(Backend);
     const BoundWriteTxn = runtime_mod.BoundWriteTxn(Backend);
     const NamespaceReadTxn = runtime_mod.NamespaceReadTxn(Backend);
+    const NamespaceProbeTxn = runtime_mod.NamespaceProbeTxn(Backend);
     const NamespaceWriteTxn = runtime_mod.NamespaceWriteTxn(Backend);
     pub const BulkIngestFinishOptions = backend_types.BulkIngestFinishOptions;
 
@@ -2398,13 +2399,22 @@ pub const Backend = struct {
             // pressure selection, so a 3.2x L0 backlog rewrote an 8.5x-overfull
             // L1 before L1 could be promoted. Use the soft L0 bound as the
             // pressure denominator while retaining overlap-triggered L0 work.
-            _ = try compaction_mod.maybeCompactRunsScheduledWithL0Limit(
-                Backend,
-                self,
-                if (soft_l0_runs > 0) soft_l0_runs else self.options.compact_threshold_runs,
-                score,
-            );
+            const defer_soft_compaction = if (self.options.resource_manager) |manager|
+                manager.shouldDeferSoftCompactionForDerivedReplay()
+            else
+                false;
+            if (!defer_soft_compaction) {
+                _ = try compaction_mod.maybeCompactRunsScheduledWithL0Limit(
+                    Backend,
+                    self,
+                    if (soft_l0_runs > 0) soft_l0_runs else self.options.compact_threshold_runs,
+                    score,
+                );
+            }
         }
+        // Hard L0/WAL bounds remain authoritative even while latency-sensitive
+        // derived replay is active. This path may compact or reject writes when
+        // debt crosses those limits; only optional soft compaction is deferred.
         try self.enforceWritePressure();
         if (self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked())) {
             try self.persistManifest();
@@ -2935,6 +2945,10 @@ pub const Backend = struct {
 
     pub fn beginRead(self: *Backend) !NamespaceReadTxn {
         return try NamespaceReadTxn.open(self);
+    }
+
+    pub fn beginProbe(self: *Backend) !NamespaceProbeTxn {
+        return NamespaceProbeTxn.open(self);
     }
 
     pub fn beginWrite(self: *Backend) !NamespaceWriteTxn {
@@ -10221,6 +10235,40 @@ test "lsm backend maintenance step compacts soft L0 debt" {
     try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 1);
 }
 
+test "lsm backend defers soft compaction behind latency-sensitive derived replay" {
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(std.testing.allocator);
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 1,
+        .l0_hard_limit_runs = 100,
+        .resource_manager = &manager,
+    });
+    defer backend.close();
+
+    for (0..3) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, key, "value");
+        try txn.commit();
+    }
+    while (backend.activeImmutableMemtableCount() > 0) {
+        try std.testing.expect(try backend.runMaintenanceStep());
+    }
+
+    manager.beginLatencySensitiveDerivedReplay();
+    try std.testing.expect(!(try backend.runMaintenanceStep()));
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) > 1);
+    manager.finishLatencySensitiveDerivedReplay();
+
+    try std.testing.expect(!(try backend.runMaintenanceStep()));
+    sleepForTest(550 * std.time.ns_per_ms);
+    try std.testing.expect(try backend.runMaintenanceStep());
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 1);
+}
+
 test "lsm backend public maintenance mutators serialize on backend mutex" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
@@ -12805,8 +12853,11 @@ test "lsm backend cached cursor scan avoids whole-run table reads" {
 
         const read_stats = backend.snapshotReadStats();
         try std.testing.expectEqual(@as(u64, 1), read_stats.point_gets);
-        try std.testing.expectEqual(@as(u64, 1), read_stats.point_value_borrows);
-        try std.testing.expectEqual(@as(u64, 0), read_stats.point_value_copies);
+        // Probe point reads release the backend writer lock before table IO,
+        // so their returned value is transaction-owned rather than borrowed
+        // from the pinned block generation.
+        try std.testing.expectEqual(@as(u64, 0), read_stats.point_value_borrows);
+        try std.testing.expectEqual(@as(u64, 1), read_stats.point_value_copies);
     }
 
     try std.testing.expectEqual(@as(usize, 0), ctx.run_file_reads);
@@ -13765,6 +13816,32 @@ test "lsm backend write batch getManySorted merges overlay and committed cursor 
     try std.testing.expectEqual(@as(u64, 2), stats.get_many_sorted_misses);
 }
 
+test "lsm backend namespace write batch getManySorted merges overlay and committed reads" {
+    var backend = Backend.init(std.testing.allocator, .{ .flush_threshold = 1 });
+    defer backend.close();
+    const namespace = backend_types.Namespace{ .name = "nodes" };
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(namespace, "range:a", "A");
+        try txn.put(namespace, "range:c", "C");
+        try txn.commit();
+    }
+
+    var batch = try backend.beginBatch();
+    defer batch.abort();
+    try batch.put(namespace, "range:b", "B-overlay");
+    try batch.delete(namespace, "range:c");
+
+    const keys = [_][]const u8{ "range:a", "range:b", "range:c", "range:d" };
+    var values = [_]?[]const u8{ null, null, null, null };
+    try batch.getManySorted(namespace, &keys, &values);
+    try std.testing.expectEqualStrings("A", values[0].?);
+    try std.testing.expectEqualStrings("B-overlay", values[1].?);
+    try std.testing.expectEqual(@as(?[]const u8, null), values[2]);
+    try std.testing.expectEqual(@as(?[]const u8, null), values[3]);
+}
+
 test "lsm backend bound read txn getManySorted uses sorted-by-run path for leaf-sized sparse batches" {
     var backend = Backend.init(std.testing.allocator, .{ .flush_threshold = 1 });
     defer backend.close();
@@ -14004,7 +14081,7 @@ test "lsm backend cache-backed batch probes do not require the backend mutex" {
     try std.testing.expectEqualStrings("value-0", ctx.value.?);
 }
 
-test "lsm backend getManySorted searches prefix-compressed physical blocks directly" {
+test "lsm backend getManySorted decodes prefix-compressed blocks once for batch reuse" {
     const alloc = std.testing.allocator;
     var storage = storage_io.MemoryStorage.init(alloc);
     defer storage.deinit();
@@ -14062,8 +14139,8 @@ test "lsm backend getManySorted searches prefix-compressed physical blocks direc
     try std.testing.expectEqual(@as(u64, 0), stats.cursor_block_loads);
 
     const cache_stats = cache.snapshotStats();
-    try std.testing.expect(cache_stats.run_table_physical_block.inserts > 0);
-    try std.testing.expectEqual(@as(u64, 0), cache_stats.run_table_block.inserts);
+    try std.testing.expect(cache_stats.run_table_block.inserts > 0);
+    try std.testing.expectEqual(@as(u64, 0), cache_stats.run_table_physical_block.inserts);
 }
 
 test "lsm backend probe getManySorted uses point path for large sparse batches" {

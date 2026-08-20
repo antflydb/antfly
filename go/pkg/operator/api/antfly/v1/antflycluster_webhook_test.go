@@ -1496,19 +1496,47 @@ func TestValidateCreate_ProductTierInferenceTierRequiresInferenceSpec(t *testing
 	}
 }
 
-func TestValidateUpdate_MetadataScaleDownRejected(t *testing.T) {
-	old := baseCluster()
-	old.Spec.MetadataNodes.Replicas = 5
-
-	new := baseCluster()
-	new.Spec.MetadataNodes.Replicas = 3
-
-	err := new.ValidateUpdate(old)
-	if err == nil {
-		t.Fatal("expected error when decreasing metadata replicas")
+func TestValidateUpdate_MetadataReplicaChangesRejected(t *testing.T) {
+	tests := []struct {
+		name      string
+		current   int32
+		attempted int32
+	}{
+		{name: "scale up", current: 1, attempted: 3},
+		{name: "scale down", current: 5, attempted: 3},
+		{name: "remove metadata nodes", current: 1, attempted: 0},
 	}
-	if !strings.Contains(err.Error(), "metadataNodes.replicas") {
-		t.Fatalf("expected metadata replica error, got: %v", err)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			old := baseCluster()
+			old.Spec.MetadataNodes.Replicas = tt.current
+
+			updated := baseCluster()
+			updated.Spec.MetadataNodes.Replicas = tt.attempted
+
+			err := updated.ValidateUpdate(old)
+			if err == nil {
+				t.Fatalf("expected error when changing metadata replicas from %d to %d", tt.current, tt.attempted)
+			}
+			for _, want := range []string{"metadataNodes.replicas", "immutable", "divergent Raft incarnations", "differently named AntflyCluster", "fresh metadata PVCs", "Do not reuse retained metadata PVCs"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("expected metadata replica error to contain %q, got: %v", want, err)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateUpdate_MetadataReplicaDefaultEquivalentAllowed(t *testing.T) {
+	old := baseCluster()
+	old.Spec.MetadataNodes.Replicas = 0
+
+	updated := baseCluster()
+	updated.Spec.MetadataNodes.Replicas = 3
+
+	if err := updated.ValidateUpdate(old); err != nil {
+		t.Fatalf("expected omitted and default metadata replica counts to be equivalent, got: %v", err)
 	}
 }
 

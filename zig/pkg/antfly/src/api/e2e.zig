@@ -2996,7 +2996,7 @@ test "split data runtime serves retrieval agent pipeline queries" {
     const retrieval_body =
         \\{"query":"find retrieval docs","stream":false,"queries":[{"table":"docs","full_text_search":{"query":"body:hello"},"limit":5}]}
     ;
-    const retrieval_uri = try raft_routes.Routes.join(std.testing.allocator, base_uri, routes.Routes.agents_retrieval);
+    const retrieval_uri = try raft_routes.Routes.join(std.testing.allocator, base_uri, "/db/v1" ++ routes.Routes.agents_retrieval);
     defer std.testing.allocator.free(retrieval_uri);
     var retrieval_resp = try executor.executor().execute(std.testing.allocator, .{
         .method = .POST,

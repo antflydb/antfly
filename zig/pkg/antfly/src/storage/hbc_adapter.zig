@@ -4808,6 +4808,31 @@ pub const HBCIndex = struct {
         );
     }
 
+    pub fn loadPostingVectorsTransformed(
+        self: *HBCIndex,
+        txn: anytype,
+        vector_ids: []const u64,
+        matrix: []f32,
+    ) !void {
+        try vectorindex_hbc_index.loadPostingVectorsTransformed(self, txn, vector_ids, matrix);
+    }
+
+    pub fn loadPostingVectorsTransformedWithOptions(
+        self: *HBCIndex,
+        txn: anytype,
+        vector_ids: []const u64,
+        matrix: []f32,
+        options: anytype,
+    ) !void {
+        try vectorindex_hbc_index.loadPostingVectorsTransformedWithOptions(
+            self,
+            txn,
+            vector_ids,
+            matrix,
+            options,
+        );
+    }
+
     fn loadExternalVectorsTransformedIntoMatrixUncached(
         self: *HBCIndex,
         txn: anytype,

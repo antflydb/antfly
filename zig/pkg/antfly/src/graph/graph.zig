@@ -58,6 +58,15 @@ pub const Edge = struct {
     metadata: []const u8, // raw JSON bytes
 };
 
+/// A physical, table-local relationship identity. Graph edge keys are laid out
+/// by this tuple, so a batch of probes can be answered without materializing
+/// either endpoint's complete adjacency list.
+pub const EdgeProbe = struct {
+    source: []const u8,
+    target: []const u8,
+    edge_type: []const u8,
+};
+
 pub const BatchWrite = struct {
     source: []const u8,
     target: []const u8,
@@ -446,6 +455,10 @@ pub const GraphIndex = struct {
 
     fn beginWriteOutgoingBatch(self: *GraphIndex) !backend_erased.Batch {
         return try self.outgoing_store.beginBatch();
+    }
+
+    fn beginReadOutgoingTxn(self: *GraphIndex) !backend_erased.ReadTxn {
+        return try self.outgoing_store.beginRead();
     }
 
     fn beginReadReverseTxn(self: *GraphIndex) !backend_erased.ReadTxn {
@@ -1004,9 +1017,115 @@ pub const GraphIndex = struct {
             try self.scanIncomingEdges(alloc, &results, key, edge_type);
         }
 
-        const owned = try alloc.dupe(Edge, results.items);
-        results.deinit(alloc);
-        return owned;
+        return try results.toOwnedSlice(alloc);
+    }
+
+    /// Get edges connected to a key, restricting storage scans to the requested
+    /// relationship types. An empty type list retains the unfiltered behavior.
+    pub fn getEdgesByTypes(self: *GraphIndex, alloc: Allocator, key: []const u8, edge_types: []const []const u8, direction: EdgeDirection) ![]Edge {
+        if (edge_types.len == 0) return try self.getEdges(alloc, key, "", direction);
+
+        var results = std.ArrayListUnmanaged(Edge).empty;
+        errdefer {
+            for (results.items) |e| freeEdge(alloc, e);
+            results.deinit(alloc);
+        }
+        for (edge_types, 0..) |edge_type, type_index| {
+            var duplicate = false;
+            for (edge_types[0..type_index]) |prior| {
+                if (std.mem.eql(u8, edge_type, prior)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+            if (direction == .out or direction == .both) {
+                try self.scanOutgoingEdges(alloc, &results, key, edge_type);
+            }
+            if (direction == .in or direction == .both) {
+                try self.scanIncomingEdges(alloc, &results, key, edge_type);
+            }
+        }
+        return try results.toOwnedSlice(alloc);
+    }
+
+    /// Resolve exact physical relationships with one snapshot and one sorted
+    /// backend multi-get. Results remain aligned with `probes`; null means the
+    /// relationship does not exist. Only found edges allocate edge payloads.
+    pub fn probeEdgesAlloc(self: *GraphIndex, alloc: Allocator, probes: []const EdgeProbe) ![]?Edge {
+        const ProbeKey = struct {
+            encoded: []u8,
+            result_index: usize,
+
+            fn lessThan(_: void, left: @This(), right: @This()) bool {
+                return std.mem.order(u8, left.encoded, right.encoded) == .lt;
+            }
+        };
+
+        const results = try alloc.alloc(?Edge, probes.len);
+        errdefer alloc.free(results);
+        @memset(results, null);
+        if (probes.len == 0) return results;
+
+        const keys = try alloc.alloc(ProbeKey, probes.len);
+        var initialized_keys: usize = 0;
+        defer {
+            for (keys[0..initialized_keys]) |item| alloc.free(item.encoded);
+            alloc.free(keys);
+        }
+        for (probes, 0..) |probe, i| {
+            keys[i] = .{
+                .encoded = try edgeKeyAlloc(alloc, probe.source, self.index_name, probe.edge_type, probe.target),
+                .result_index = i,
+            };
+            initialized_keys += 1;
+        }
+        std.mem.sort(ProbeKey, keys, {}, ProbeKey.lessThan);
+
+        const sorted_key_refs = try alloc.alloc([]const u8, keys.len);
+        defer alloc.free(sorted_key_refs);
+        for (keys, 0..) |item, i| sorted_key_refs[i] = item.encoded;
+        const values = try alloc.alloc(?[]const u8, keys.len);
+        defer alloc.free(values);
+
+        var txn = try self.beginReadOutgoingTxn();
+        defer txn.abort();
+        try txn.getManySorted(sorted_key_refs, values);
+
+        errdefer {
+            for (results) |maybe_edge| if (maybe_edge) |edge| freeEdge(alloc, edge);
+        }
+        for (keys, values) |item, maybe_value| {
+            const value = maybe_value orelse continue;
+            const decoded = try decodeEdgeValue(value);
+            const probe = probes[item.result_index];
+            const source = try alloc.dupe(u8, probe.source);
+            errdefer alloc.free(source);
+            const target = try alloc.dupe(u8, probe.target);
+            errdefer alloc.free(target);
+            const edge_type = try alloc.dupe(u8, probe.edge_type);
+            errdefer alloc.free(edge_type);
+            const metadata = if (decoded.metadata.len > 0)
+                try alloc.dupe(u8, decoded.metadata)
+            else
+                "";
+            errdefer if (metadata.len > 0) alloc.free(metadata);
+            results[item.result_index] = .{
+                .source = source,
+                .target = target,
+                .edge_type = edge_type,
+                .weight = decoded.weight,
+                .created_at = decoded.created_at,
+                .updated_at = decoded.updated_at,
+                .metadata = metadata,
+            };
+        }
+        return results;
+    }
+
+    pub fn freeProbedEdges(alloc: Allocator, edges: []?Edge) void {
+        for (edges) |maybe_edge| if (maybe_edge) |edge| freeEdge(alloc, edge);
+        alloc.free(edges);
     }
 
     /// Probe incoming-edge existence for a key batch using one reverse-store
@@ -1039,22 +1158,17 @@ pub const GraphIndex = struct {
         const prefix = try edgePrefixAlloc(alloc, key, self.index_name, edge_type);
         defer alloc.free(prefix);
 
-        const pairs = try self.mainStoreScanPrefix(alloc, prefix);
-        defer backend_scan.freeResults(alloc, pairs);
+        var txn = try self.beginReadOutgoingTxn();
+        defer txn.abort();
+        var cur = try txn.openCursor();
+        defer cur.close();
 
-        for (pairs) |pair| {
-            var parsed = (try parseOutgoingEdgeKeyAlloc(alloc, pair.key)) orelse continue;
-            defer parsed.deinit(alloc);
-            const decoded = try decodeEdgeValue(pair.value);
-            try results.append(alloc, .{
-                .source = try alloc.dupe(u8, parsed.source),
-                .target = try alloc.dupe(u8, parsed.target),
-                .edge_type = try alloc.dupe(u8, parsed.edge_type),
-                .weight = decoded.weight,
-                .created_at = decoded.created_at,
-                .updated_at = decoded.updated_at,
-                .metadata = try alloc.dupe(u8, decoded.metadata),
-            });
+        const first = (try cur.seekAtOrAfter(prefix)) orelse return;
+        if (!std.mem.startsWith(u8, first.key, prefix)) return;
+        try appendEdgeFromKV(alloc, results, first.key, first.value);
+        while (try cur.next()) |entry| {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            try appendEdgeFromKV(alloc, results, entry.key, entry.value);
         }
     }
 
@@ -1096,14 +1210,22 @@ pub const GraphIndex = struct {
 
     fn appendParsedEdge(alloc: Allocator, results: *std.ArrayListUnmanaged(Edge), parsed: ParsedGraphEdgeKey, value: []const u8) !void {
         const decoded = try decodeEdgeValue(value);
+        const source = try alloc.dupe(u8, parsed.source);
+        errdefer alloc.free(source);
+        const target = try alloc.dupe(u8, parsed.target);
+        errdefer alloc.free(target);
+        const edge_type = try alloc.dupe(u8, parsed.edge_type);
+        errdefer alloc.free(edge_type);
+        const metadata = if (decoded.metadata.len > 0) try alloc.dupe(u8, decoded.metadata) else "";
+        errdefer if (metadata.len > 0) alloc.free(metadata);
         try results.append(alloc, .{
-            .source = try alloc.dupe(u8, parsed.source),
-            .target = try alloc.dupe(u8, parsed.target),
-            .edge_type = try alloc.dupe(u8, parsed.edge_type),
+            .source = source,
+            .target = target,
+            .edge_type = edge_type,
             .weight = decoded.weight,
             .created_at = decoded.created_at,
             .updated_at = decoded.updated_at,
-            .metadata = try alloc.dupe(u8, decoded.metadata),
+            .metadata = metadata,
         });
     }
 
@@ -1487,6 +1609,39 @@ test "graph addEdge and getEdges in (reverse index)" {
     const incoming = try graph.hasIncomingEdgesManyAlloc(alloc, &keys);
     defer alloc.free(incoming);
     try std.testing.expectEqualSlices(bool, &.{ false, true, false, false }, incoming);
+}
+
+test "graph exact edge probes stay aligned and preserve payloads" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-probes");
+    defer cleanupTmp(store_path);
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-probes");
+    defer cleanupTmp(rev_path);
+
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{});
+    defer graph.close();
+    try graph.addEdge("post:2", "tag", "HAS_TAG", 0.75, 10, 11, "{\"rank\":1}");
+    try graph.addEdge("post:1", "other", "HAS_TAG", 1, 10, 11, "");
+
+    const probed = try graph.probeEdgesAlloc(alloc, &.{
+        .{ .source = "post:1", .target = "tag", .edge_type = "HAS_TAG" },
+        .{ .source = "post:2", .target = "tag", .edge_type = "HAS_TAG" },
+        .{ .source = "missing", .target = "tag", .edge_type = "HAS_TAG" },
+        .{ .source = "post:2", .target = "tag", .edge_type = "HAS_TAG" },
+    });
+    defer GraphIndex.freeProbedEdges(alloc, probed);
+
+    try std.testing.expect(probed[0] == null);
+    try std.testing.expect(probed[1] != null);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.75), probed[1].?.weight, 0.001);
+    try std.testing.expectEqualStrings("{\"rank\":1}", probed[1].?.metadata);
+    try std.testing.expect(probed[2] == null);
+    try std.testing.expect(probed[3] != null);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.75), probed[3].?.weight, 0.001);
 }
 
 test "graph edge keys support arbitrary document ids and edge types" {
