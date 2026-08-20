@@ -469,12 +469,13 @@ pub fn materializeOwnedDocumentValueAlloc(alloc: Allocator, value: []u8) ![]u8 {
 /// Reconstruct a document's canonical JSON from decoded cells. Schema-free.
 /// Caller owns the returned bytes.
 pub fn reconstructDocumentAlloc(alloc: Allocator, cells: []const Cell) ![]u8 {
+    try validateCells(alloc, cells);
+
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
 
     try out.append(alloc, '{');
     for (cells, 0..) |c, i| {
-        try validateCell(alloc, c);
         try appendValidatedCellValue(alloc, &out, c, i > 0);
     }
     try out.append(alloc, '}');
@@ -787,6 +788,7 @@ test "relational row codec rejects mismatched and non-JSON-safe cells" {
         .{ .path = "value", .value_type = .bool_val, .value = .{ .bool_val = false } },
     };
     try std.testing.expectError(error.InvalidRelationalRow, serialize(alloc, &duplicate_paths));
+    try std.testing.expectError(error.InvalidRelationalRow, reconstructDocumentAlloc(alloc, &duplicate_paths));
 
     const finite = [_]Cell{
         .{ .path = "", .value_type = .f64_val, .value = .{ .f64_val = 1 } },

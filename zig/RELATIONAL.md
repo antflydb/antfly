@@ -115,7 +115,8 @@ carrying
   `geopoint` / `geoshape` / `json`
 - `physical` — the `typed_doc_values` value type it lands in
   (`bytes_val` / `i64_val` / `u64_val` / `f64_val` / `bool_val` / `geo_point`)
-- `nullable` — `false` when the field is in the type's `required_fields`
+- `nullable` — `true` when the field is optional or its schema explicitly
+  permits `null`
 - `indexed` — whether to maintain an inverted/typed index for the column
 - `is_json` — nested objects, arrays, and `json`-typed fields collapse to a
   single `json` column at their path instead of recursing

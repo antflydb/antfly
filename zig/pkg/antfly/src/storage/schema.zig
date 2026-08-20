@@ -1305,7 +1305,10 @@ fn civilDateTimeToNs(year: i64, month: i64, day: i64, hour: i64, minute: i64, se
     if (day < 1 or day > max_day) return null;
     if (hour < 0 or hour > 23) return null;
     if (minute < 0 or minute > 59) return null;
-    if (second < 0 or second > 60) return null;
+    // Leap-second validation requires an up-to-date leap-second table. Reject
+    // `:60` instead of accepting it at arbitrary minutes and silently
+    // normalizing it to the following minute.
+    if (second < 0 or second > 59) return null;
     if (nanos >= std.time.ns_per_s) return null;
 
     const days = daysFromCivil(year, month, day);
@@ -2094,6 +2097,8 @@ test "parseDateTimeToNs accepts rfc3339 and date-only values" {
     try std.testing.expect(parseDateTimeToNs("2024-04-31") == null);
     try std.testing.expect(parseDateTimeToNs("2024-01-01T24:00:00Z") == null);
     try std.testing.expect(parseDateTimeToNs("2024-01-01T00:60:00Z") == null);
+    try std.testing.expect(parseDateTimeToNs("2024-01-01T12:34:60Z") == null);
+    try std.testing.expect(parseDateTimeToNs("2024-01-01T23:59:60Z") == null);
     try std.testing.expect(parseDateTimeToNs("9999-12-31") == null);
 
     const formatted = try formatDateTimeNsAlloc(std.testing.allocator, 15);
