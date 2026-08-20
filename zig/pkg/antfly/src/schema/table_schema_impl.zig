@@ -382,6 +382,7 @@ const RuntimeValidationContext = struct {
     alloc: std.mem.Allocator,
     root_property: ?*const DocumentProperty = null,
     require_physical_encoding: bool = false,
+    physical_numeric_kind: ?RelationalNumericKind = null,
     active_root_ref_values: std.ArrayListUnmanaged(usize) = .{ .items = &.{}, .capacity = 0 },
 
     fn deinit(self: *RuntimeValidationContext) void {
@@ -3203,10 +3204,19 @@ fn validateDocumentFieldValueWithContext(
     enforce_types: bool,
 ) !void {
     const require_physical_encoding = context.require_physical_encoding;
-    if (require_physical_encoding and documentPropertyUsesJsonEncoding(property)) {
-        context.require_physical_encoding = false;
+    const physical_numeric_kind = context.physical_numeric_kind;
+    if (require_physical_encoding) {
+        if (documentPropertyUsesJsonEncoding(property)) {
+            context.require_physical_encoding = false;
+            context.physical_numeric_kind = null;
+        } else if (context.physical_numeric_kind == null) {
+            context.physical_numeric_kind = relationalNumericKind(property);
+        }
     }
-    defer context.require_physical_encoding = require_physical_encoding;
+    defer {
+        context.require_physical_encoding = require_physical_encoding;
+        context.physical_numeric_kind = physical_numeric_kind;
+    }
 
     const composed_enforce_types = false;
 
@@ -3466,6 +3476,8 @@ fn validateDocumentFieldValueWithContext(
         for (array.items[start_index..]) |item_value| try validateDocumentFieldValueWithContext(context, item.*, &item_value, enforce_types);
     }
 
+    try validateNumericKeywordsWithContext(context, property, value.*);
+
     const field_type = property.field_type orelse return;
 
     if (std.mem.eql(u8, field_type, "text") or
@@ -3484,33 +3496,8 @@ fn validateDocumentFieldValueWithContext(
         std.mem.eql(u8, field_type, "integer"))
     {
         const integer_property = property.integer_only or std.mem.eql(u8, field_type, "integer");
-        if (context.require_physical_encoding and integer_property) {
-            const integer_value = documentIntegerToI64(value.*) orelse return error.InvalidBatchRequest;
-            if (property.minimum != null and
-                integer_value < (property.minimum_i64 orelse return error.InvalidBatchRequest))
-            {
-                return error.InvalidBatchRequest;
-            }
-            if (property.maximum != null and
-                integer_value > (property.maximum_i64 orelse return error.InvalidBatchRequest))
-            {
-                return error.InvalidBatchRequest;
-            }
-            if (property.exclusive_minimum != null and
-                integer_value <= (property.exclusive_minimum_i64 orelse return error.InvalidBatchRequest))
-            {
-                return error.InvalidBatchRequest;
-            }
-            if (property.exclusive_maximum != null and
-                integer_value >= (property.exclusive_maximum_i64 orelse return error.InvalidBatchRequest))
-            {
-                return error.InvalidBatchRequest;
-            }
-            if (property.multiple_of != null and
-                @rem(integer_value, property.multiple_of_i64 orelse return error.InvalidBatchRequest) != 0)
-            {
-                return error.InvalidBatchRequest;
-            }
+        if (context.require_physical_encoding and context.physical_numeric_kind == .integer) {
+            _ = documentIntegerToI64(value.*) orelse return error.InvalidBatchRequest;
             return;
         }
         const numeric_value = if (context.require_physical_encoding)
@@ -3519,25 +3506,6 @@ fn validateDocumentFieldValueWithContext(
             parseJsonNumber(value.*) catch return error.InvalidBatchRequest;
         if (integer_property) {
             if (!isIntegralJsonNumber(value.*, numeric_value)) return error.InvalidBatchRequest;
-        }
-        if (property.minimum) |minimum| {
-            if (numeric_value < minimum) return error.InvalidBatchRequest;
-        }
-        if (property.maximum) |maximum| {
-            if (numeric_value > maximum) return error.InvalidBatchRequest;
-        }
-        if (property.exclusive_minimum) |exclusive_minimum| {
-            if (numeric_value <= exclusive_minimum) return error.InvalidBatchRequest;
-        }
-        if (property.exclusive_maximum) |exclusive_maximum| {
-            if (numeric_value >= exclusive_maximum) return error.InvalidBatchRequest;
-        }
-        if (property.multiple_of) |multiple_of| {
-            const matches = if (context.require_physical_encoding)
-                exactF64MultipleOf(numeric_value, multiple_of)
-            else
-                isMultipleOf(numeric_value, multiple_of);
-            if (!matches) return error.InvalidBatchRequest;
         }
         return;
     }
@@ -3585,6 +3553,80 @@ fn validateDocumentFieldValueWithContext(
             if (array.items.len > max_items) return error.InvalidBatchRequest;
         }
         return;
+    }
+}
+
+fn validateNumericKeywordsWithContext(
+    context: *const RuntimeValidationContext,
+    property: DocumentProperty,
+    value: std.json.Value,
+) !void {
+    if (property.minimum == null and
+        property.maximum == null and
+        property.exclusive_minimum == null and
+        property.exclusive_maximum == null and
+        property.multiple_of == null)
+    {
+        return;
+    }
+
+    switch (value) {
+        .integer, .float, .number_string => {},
+        else => return,
+    }
+
+    if (context.require_physical_encoding and context.physical_numeric_kind == .integer) {
+        const integer_value = documentIntegerToI64(value) orelse return error.InvalidBatchRequest;
+        if (property.minimum != null and
+            integer_value < (property.minimum_i64 orelse return error.InvalidBatchRequest))
+        {
+            return error.InvalidBatchRequest;
+        }
+        if (property.maximum != null and
+            integer_value > (property.maximum_i64 orelse return error.InvalidBatchRequest))
+        {
+            return error.InvalidBatchRequest;
+        }
+        if (property.exclusive_minimum != null and
+            integer_value <= (property.exclusive_minimum_i64 orelse return error.InvalidBatchRequest))
+        {
+            return error.InvalidBatchRequest;
+        }
+        if (property.exclusive_maximum != null and
+            integer_value >= (property.exclusive_maximum_i64 orelse return error.InvalidBatchRequest))
+        {
+            return error.InvalidBatchRequest;
+        }
+        if (property.multiple_of != null and
+            @rem(integer_value, property.multiple_of_i64 orelse return error.InvalidBatchRequest) != 0)
+        {
+            return error.InvalidBatchRequest;
+        }
+        return;
+    }
+
+    const numeric_value = if (context.require_physical_encoding)
+        documentNumberToF64(value) orelse return error.InvalidBatchRequest
+    else
+        parseJsonNumber(value) catch return error.InvalidBatchRequest;
+    if (property.minimum) |minimum| {
+        if (numeric_value < minimum) return error.InvalidBatchRequest;
+    }
+    if (property.maximum) |maximum| {
+        if (numeric_value > maximum) return error.InvalidBatchRequest;
+    }
+    if (property.exclusive_minimum) |exclusive_minimum| {
+        if (numeric_value <= exclusive_minimum) return error.InvalidBatchRequest;
+    }
+    if (property.exclusive_maximum) |exclusive_maximum| {
+        if (numeric_value >= exclusive_maximum) return error.InvalidBatchRequest;
+    }
+    if (property.multiple_of) |multiple_of| {
+        const matches = if (context.require_physical_encoding)
+            exactF64MultipleOf(numeric_value, multiple_of)
+        else
+            isMultipleOf(numeric_value, multiple_of);
+        if (!matches) return error.InvalidBatchRequest;
     }
 }
 
@@ -4535,6 +4577,35 @@ test "relational multipleOf validation uses exact decimal arithmetic" {
     try std.testing.expect(!exactF64MultipleOf(0.5, 2));
 }
 
+test "relational composed numeric constraints inherit physical type" {
+    const alloc = std.testing.allocator;
+    var schema = try parseSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"score":{"type":"number","allOf":[{"minimum":5},{"maximum":10}]},"quantity":{"type":"integer","anyOf":[{"maximum":0},{"minimum":10}]},"overlap":{"type":"number","oneOf":[{"maximum":10},{"minimum":0}]},"blocked":{"type":"integer","not":{"minimum":5}},"conditional":{"type":"number","if":{"minimum":0},"then":{"maximum":10},"else":{"minimum":-10}}},"additionalProperties":false}}}}
+    );
+    defer schema.deinit(alloc);
+
+    try validateWritesAgainstSchema(alloc, schema, &.{
+        .{ .value = "{\"score\":5,\"quantity\":-1,\"overlap\":-1,\"blocked\":4,\"conditional\":5}" },
+        .{ .value = "{\"score\":10,\"quantity\":10,\"overlap\":11,\"conditional\":-5}" },
+    });
+
+    const rejected_values = [_][]const u8{
+        "{\"score\":4}",
+        "{\"score\":11}",
+        "{\"quantity\":5}",
+        "{\"overlap\":5}",
+        "{\"blocked\":5}",
+        "{\"conditional\":11}",
+        "{\"conditional\":-11}",
+    };
+    for (rejected_values) |value| {
+        try std.testing.expectError(
+            error.InvalidBatchRequest,
+            validateWritesAgainstSchema(alloc, schema, &.{.{ .value = value }}),
+        );
+    }
+}
+
 test "numeric const and enum comparison preserves exact JSON semantics" {
     const alloc = std.testing.allocator;
     try validateJsonSchemaJson(alloc, "{\"const\":1.0}", "1");
@@ -4552,6 +4623,16 @@ test "numeric const and enum comparison preserves exact JSON semantics" {
         error.InvalidBatchRequest,
         validateJsonSchemaJson(alloc, "{\"const\":1e99999999999999999999}", "1e99999999999999999998"),
     );
+}
+
+test "schema.composed numeric keywords apply without a local type" {
+    const alloc = std.testing.allocator;
+    try validateJsonSchemaJson(alloc, "{\"type\":\"number\",\"allOf\":[{\"minimum\":5}]}", "5");
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateJsonSchemaJson(alloc, "{\"type\":\"number\",\"allOf\":[{\"minimum\":5}]}", "1"),
+    );
+    try validateJsonSchemaJson(alloc, "{\"allOf\":[{\"minimum\":5}]}", "\"not-a-number\"");
 }
 
 test "public schema mutations gate relational storage until runtime wiring lands" {
