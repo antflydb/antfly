@@ -3582,19 +3582,26 @@ pub fn documentNumberToF64(value: std.json.Value) ?f64 {
 }
 
 pub fn documentPropertyAllowsNull(property: DocumentProperty) bool {
-    const has_all_of = property.all_of.len > 0;
+    // JSON Schema keywords at the same schema location are conjunctive. Work
+    // out whether the literal null satisfies each applicable keyword instead
+    // of returning as soon as one composition happens to admit it.
+    if (property.field_type) |field_type| {
+        if (!property.allows_null and !std.mem.eql(u8, field_type, "null")) return false;
+    }
 
-    if (has_all_of) {
-        for (property.all_of) |variant| {
-            if (!documentPropertyAllowsNull(variant)) return false;
-        }
+    for (property.all_of) |variant| {
+        if (!documentPropertyAllowsNull(variant)) return false;
     }
 
     if (property.any_of.len > 0) {
+        var matches = false;
         for (property.any_of) |variant| {
-            if (documentPropertyAllowsNull(variant)) return true;
+            if (documentPropertyAllowsNull(variant)) {
+                matches = true;
+                break;
+            }
         }
-        return false;
+        if (!matches) return false;
     }
 
     if (property.one_of.len > 0) {
@@ -3602,7 +3609,7 @@ pub fn documentPropertyAllowsNull(property: DocumentProperty) bool {
         for (property.one_of) |variant| {
             if (documentPropertyAllowsNull(variant)) matches += 1;
         }
-        return matches == 1;
+        if (matches != 1) return false;
     }
 
     if (property.not_schema) |not_schema| {
@@ -3611,24 +3618,32 @@ pub fn documentPropertyAllowsNull(property: DocumentProperty) bool {
 
     if (property.if_schema) |if_schema| {
         if (documentPropertyAllowsNull(if_schema.*)) {
-            if (property.then_schema) |then_schema| return documentPropertyAllowsNull(then_schema.*);
-            return true;
+            if (property.then_schema) |then_schema| {
+                if (!documentPropertyAllowsNull(then_schema.*)) return false;
+            }
+        } else if (property.else_schema) |else_schema| {
+            if (!documentPropertyAllowsNull(else_schema.*)) return false;
         }
-        if (property.else_schema) |else_schema| return documentPropertyAllowsNull(else_schema.*);
     }
 
-    if (property.const_value) |const_value| return std.mem.eql(u8, const_value, "null");
+    if (property.const_value) |const_value| {
+        if (!std.mem.eql(u8, const_value, "null")) return false;
+    }
 
     if (property.enum_values.len > 0) {
+        var matches = false;
         for (property.enum_values) |enum_value| {
-            if (std.mem.eql(u8, enum_value, "null")) return true;
+            if (std.mem.eql(u8, enum_value, "null")) {
+                matches = true;
+                break;
+            }
         }
-        return false;
+        if (!matches) return false;
     }
 
-    if (property.allows_null) return true;
-    if (property.field_type) |field_type| return std.mem.eql(u8, field_type, "null");
-    return has_all_of;
+    // With no explicit type, null is admitted unless another keyword above
+    // excludes it, matching an unconstrained JSON Schema.
+    return true;
 }
 
 fn validateNullValueWithContext(

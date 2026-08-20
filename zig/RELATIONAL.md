@@ -143,7 +143,7 @@ First-cut physical mapping:
 
 ### Write path
 
-`schema_capability.projectRelationalRowAlloc` turns a document into one typed
+`schema_capability.projectRelationalRowJsonAlloc` parses and turns a document into one typed
 cell per declared column (`RelationalRow` / `RelationalCell` / `ColumnValue`),
 ready to hand to `section/typed_doc_values.zig` at segment-build time:
 
@@ -166,7 +166,10 @@ range scans work directly on the packed column:
 - `number` → `f64` (native);
 - `integer` → `i64` for exact signed round-tripping and native signed reads;
 - `datetime` → `u64` epoch nanoseconds from a non-negative epoch integer,
-  integer-string, RFC3339 timestamp, or date-only string;
+  integer-string, or date-only string; timestamp strings use the RFC 3339
+  profile representable by this encoding (at most nine fractional-second
+  digits and no leap-second `:60` values), with numeric offsets normalized to
+  UTC;
 - `boolean` → `bool`, `geopoint` → packed lat/lon, `string`/`blob`/`geoshape`
   → `bytes`.
 
@@ -179,7 +182,7 @@ so populating columns belongs in the segment builder that owns the write batch,
 not in the per-document `writeDocFacts`. The seam is: add
 `relational_columns: []const FieldConfig` to the index `Config`
 (`storage/db/algebraic/index.zig`), and at segment build collect, per column, a
-`TypedDocValuesWriter` fed by `projectRelationalRowAlloc` for each document in
+`TypedDocValuesWriter` fed by `projectRelationalRowJsonAlloc` for each document in
 the batch, plus a per-column null bitmap for explicit null document IDs, then
 persist each built section. The typed value stream identifies present values,
 the null bitmap identifies explicit nulls, and membership in neither means the
@@ -212,7 +215,7 @@ physical representation and backfill plan are compatible.
   `relationalColumnPlanAlloc` producing the typed-column catalog with tests.
   Public schema mutations remain gated, and there is no behaviour change for
   document-mode tables.
-- **Phase 2 — write path (projection done).** `projectRelationalRowAlloc`
+- **Phase 2 — write path (projection done).** `projectRelationalRowJsonAlloc`
   produces order-preserving typed cells per column, enforces required presence
   and non-null schemas, and captures `json` subtrees, verified end-to-end
   against the real `typed_doc_values` writer/reader. Remaining: wire per-column

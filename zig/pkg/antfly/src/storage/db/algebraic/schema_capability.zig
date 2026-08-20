@@ -1857,8 +1857,9 @@ fn expectRelationalColumn(
 // ---------------------------------------------------------------------------
 // Relational write-path projection (Phase 2, see zig/RELATIONAL.md)
 //
-// projectRelationalRowAlloc turns a document into one typed cell per declared
-// column, ready to hand to section/typed_doc_values.zig at segment-build time:
+// projectRelationalRowJsonAlloc parses a document losslessly and turns it into
+// one typed cell per declared column, ready to hand to
+// section/typed_doc_values.zig at segment-build time:
 //   - a missing required value -> error.MissingRequiredColumn
 //   - an explicit null not admitted by the JSON Schema -> error.InvalidColumnValue
 //   - an undeclared non-metadata field -> error.UnknownColumn
@@ -1869,8 +1870,8 @@ fn expectRelationalColumn(
 // Numeric physical encoding matches typed_doc_values:
 //   - number   -> f64 (native)
 //   - integer  -> i64 (exact signed round-trip from the original JSON lexeme)
-//   - datetime -> u64 epoch nanoseconds (epoch integers/integer-strings and
-//                 RFC3339/date-only strings are accepted)
+//   - datetime -> u64 epoch nanoseconds (epoch integers/integer-strings,
+//                 date-only strings, and the documented RFC 3339 profile)
 //   - boolean  -> bool, geopoint -> packed lat/lon, string/blob/geoshape -> bytes
 // ---------------------------------------------------------------------------
 
@@ -1928,16 +1929,16 @@ pub fn typedValue(value: ColumnValue) typed_doc_values.TypedValue {
 }
 
 /// Parse and project a relational document without allowing std.json to round
-/// decimal or exponent-form integers through f64 first. Raw write paths should
-/// use this boundary; the Value overload remains useful to callers that already
-/// hold a lossless parse tree.
+/// decimal or exponent-form numbers through f64 first. This is the public
+/// projection boundary; accepting an arbitrary Value would make it impossible
+/// to prove that its numeric tokens had not already been rounded.
 pub fn projectRelationalRowJsonAlloc(alloc: Allocator, plan: RelationalPlan, document_json: []const u8) !RelationalRow {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, document_json, .{ .parse_numbers = false });
     defer parsed.deinit();
     return projectRelationalRowAlloc(alloc, plan, parsed.value);
 }
 
-pub fn projectRelationalRowAlloc(alloc: Allocator, plan: RelationalPlan, root: std.json.Value) !RelationalRow {
+fn projectRelationalRowAlloc(alloc: Allocator, plan: RelationalPlan, root: std.json.Value) !RelationalRow {
     if (root != .object) return error.NotAnObject;
 
     var fields = root.object.iterator();
@@ -2262,7 +2263,7 @@ test "relational projection preserves explicit null separately from absence" {
 test "relational projection shares composed null semantics with schema validation" {
     const alloc = std.testing.allocator;
     var parsed = try schema_mod.parseValidatedTableSchema(alloc,
-        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"enum_nullable":{"type":"keyword","enum":["ready",null]},"const_nullable":{"type":"keyword","const":null},"any_nullable":{"type":"keyword","anyOf":[{"const":null},{"const":"ready"}]},"one_nullable":{"type":"keyword","oneOf":[{"const":null},{"const":"ready"}]},"not_nullable":{"type":["keyword","null"],"not":{"const":null}}},"required":["enum_nullable","const_nullable","any_nullable","one_nullable"],"additionalProperties":false}}}}
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"enum_nullable":{"type":["keyword","null"],"enum":["ready",null]},"const_nullable":{"type":["keyword","null"],"const":null},"any_nullable":{"type":["keyword","null"],"anyOf":[{"const":null},{"const":"ready"}]},"one_nullable":{"type":["keyword","null"],"oneOf":[{"const":null},{"const":"ready"}]},"any_not_forbidden":{"type":["keyword","null"],"anyOf":[{"const":null},{"const":"ready"}],"not":{"const":null}},"conditional_forbidden":{"type":["keyword","null"],"if":{"const":null},"then":{"const":"ready"}}},"required":["enum_nullable","const_nullable","any_nullable","one_nullable"],"additionalProperties":false}}}}
     );
     defer parsed.deinit(alloc);
     var plan = try relationalColumnPlanAlloc(alloc, parsed);
@@ -2283,16 +2284,20 @@ test "relational projection shares composed null semantics with schema validatio
         try std.testing.expect(row.cell(column_index).?.is_null);
     }
 
-    const rejected =
-        \\{"enum_nullable":null,"const_nullable":null,"any_nullable":null,"one_nullable":null,"not_nullable":null}
-    ;
-    try std.testing.expectError(
-        error.InvalidBatchRequest,
-        schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = rejected }}),
-    );
-    var rejected_value = try std.json.parseFromSlice(std.json.Value, alloc, rejected, .{});
-    defer rejected_value.deinit();
-    try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, rejected_value.value));
+    for ([_][]const u8{ "any_not_forbidden", "conditional_forbidden" }) |name| {
+        const column_index = relationalColumnIndex(plan, name).?;
+        try std.testing.expect(!plan.columns[column_index].allows_null);
+
+        const rejected = try std.fmt.allocPrint(alloc,
+            \\{{"enum_nullable":null,"const_nullable":null,"any_nullable":null,"one_nullable":null,"{s}":null}}
+        , .{name});
+        defer alloc.free(rejected);
+        try std.testing.expectError(
+            error.InvalidBatchRequest,
+            schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = rejected }}),
+        );
+        try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowJsonAlloc(alloc, plan, rejected));
+    }
 }
 
 test "relational projection preserves literal top-level property names" {

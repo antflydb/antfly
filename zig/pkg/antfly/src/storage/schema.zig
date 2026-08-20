@@ -2122,6 +2122,7 @@ test "parseDateTimeToNs accepts rfc3339 and date-only values" {
     try std.testing.expect(parseDateTimeToNs("2024-01-01T00:60:00Z") == null);
     try std.testing.expect(parseDateTimeToNs("2024-01-01T12:34:60Z") == null);
     try std.testing.expect(parseDateTimeToNs("2024-01-01T23:59:60Z") == null);
+    try std.testing.expect(parseDateTimeToNs("2024-01-01T00:00:00.1234567890Z") == null);
     try std.testing.expect(parseDateTimeToNs("1970-01-01T00:00:00+01:00") == null);
     try std.testing.expect(parseDateTimeToNs("1970-01-01T00:00:00+24:00") == null);
     try std.testing.expect(parseDateTimeToNs("1970-01-01T00:00:00+00:60") == null);
