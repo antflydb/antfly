@@ -1533,6 +1533,13 @@ fn expectCapability(
 // subtree) rather than recursing.
 // ---------------------------------------------------------------------------
 
+pub const RelationalJsonKind = enum {
+    none,
+    any,
+    object,
+    array,
+};
+
 pub const RelationalColumn = struct {
     document_type: []u8,
     name: []u8,
@@ -1544,6 +1551,7 @@ pub const RelationalColumn = struct {
     nullable: bool = true,
     indexed: bool = true,
     is_json: bool = false,
+    json_kind: RelationalJsonKind = .none,
 
     pub fn deinit(self: *RelationalColumn, alloc: Allocator) void {
         alloc.free(self.document_type);
@@ -1661,7 +1669,10 @@ pub fn relationalColumnsJsonAlloc(alloc: Allocator, table_name: []const u8, plan
         try appendJsonString(alloc, &out, "indexed");
         try out.appendSlice(alloc, if (column.indexed) ":true," else ":false,");
         try appendJsonString(alloc, &out, "is_json");
-        try out.appendSlice(alloc, if (column.is_json) ":true" else ":false");
+        try out.appendSlice(alloc, if (column.is_json) ":true," else ":false,");
+        try appendJsonString(alloc, &out, "json_kind");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, &out, @tagName(column.json_kind));
         try out.append(alloc, '}');
     }
     try out.appendSlice(alloc, "]}");
@@ -1683,6 +1694,7 @@ fn collectRelationalColumn(
     };
     const indexed = if (property.antfly_index) |value| value else true;
     const is_json = std.mem.eql(u8, column_type, "json");
+    const json_kind = relationalJsonKind(property);
     const owned_document_type = try alloc.dupe(u8, document_type);
     errdefer alloc.free(owned_document_type);
     const owned_name = try alloc.dupe(u8, property.name);
@@ -1705,7 +1717,20 @@ fn collectRelationalColumn(
         .nullable = !required or allows_null,
         .indexed = indexed,
         .is_json = is_json,
+        .json_kind = json_kind,
     });
+}
+
+fn relationalJsonKind(property: anytype) RelationalJsonKind {
+    if (!schema_mod.documentPropertyUsesJsonEncoding(property)) return .none;
+    if (property.field_type) |field_type| {
+        if (std.mem.eql(u8, field_type, "object")) return .object;
+        if (std.mem.eql(u8, field_type, "array")) return .array;
+        if (std.mem.eql(u8, field_type, "json")) return .any;
+    }
+    if (property.properties.len > 0) return .object;
+    if (property.item != null or property.prefix_items.len > 0) return .array;
+    return .any;
 }
 
 fn relationalColumnType(property: anytype) ?[]const u8 {
@@ -1773,6 +1798,9 @@ test "relational column plan emits one typed column per declared property" {
     try expectRelationalColumn(plan, "row", "attrs", "json", "bytes_val", true, true);
     try expectRelationalColumn(plan, "row", "tags", "json", "bytes_val", true, true);
     try expectRelationalColumn(plan, "row", "payload", "json", "bytes_val", true, true);
+    try std.testing.expectEqual(RelationalJsonKind.object, plan.columns[relationalColumnIndex(plan, "attrs").?].json_kind);
+    try std.testing.expectEqual(RelationalJsonKind.array, plan.columns[relationalColumnIndex(plan, "tags").?].json_kind);
+    try std.testing.expectEqual(RelationalJsonKind.any, plan.columns[relationalColumnIndex(plan, "payload").?].json_kind);
 }
 
 test "relational column plan defaults to document storage mode" {
@@ -1824,6 +1852,7 @@ test "relational column plan serializes a column catalog" {
     try std.testing.expectEqual(@as(i64, 9), root.get("schema_version").?.integer);
     try std.testing.expect(root.get("relational").?.bool);
     try std.testing.expectEqual(@as(usize, 2), root.get("columns").?.array.items.len);
+    try std.testing.expectEqualStrings("none", root.get("columns").?.array.items[0].object.get("json_kind").?.string);
 }
 
 fn expectRelationalColumn(
@@ -1960,7 +1989,7 @@ fn projectRelationalRowAlloc(alloc: Allocator, plan: RelationalPlan, root: std.j
             cells[i] = .{ .column = i, .present = true, .is_null = true, .is_json = column.is_json };
             continue;
         }
-        const coerced = (try coerceColumnValue(alloc, column.column_type, found.?)) orelse return error.InvalidColumnValue;
+        const coerced = (try coerceColumnValue(alloc, column, found.?)) orelse return error.InvalidColumnValue;
         if (coerced.owned) |buffer| {
             pool.append(alloc, buffer) catch |err| {
                 alloc.free(buffer);
@@ -1975,14 +2004,20 @@ fn projectRelationalRowAlloc(alloc: Allocator, plan: RelationalPlan, root: std.j
 
 const Coerced = struct { value: ColumnValue, owned: ?[]u8 = null };
 
-fn coerceColumnValue(alloc: Allocator, column_type: []const u8, json_value: std.json.Value) !?Coerced {
-    if (std.mem.eql(u8, column_type, "json")) {
+fn coerceColumnValue(alloc: Allocator, column: RelationalColumn, json_value: std.json.Value) !?Coerced {
+    if (std.mem.eql(u8, column.column_type, "json")) {
+        switch (column.json_kind) {
+            .object => if (json_value != .object) return null,
+            .array => if (json_value != .array) return null,
+            .any => {},
+            .none => return null,
+        }
         const bytes = try stringifyJsonValueAlloc(alloc, json_value);
         return Coerced{ .value = .{ .bytes_val = bytes }, .owned = bytes };
     }
-    if (std.mem.eql(u8, column_type, "string") or
-        std.mem.eql(u8, column_type, "blob") or
-        std.mem.eql(u8, column_type, "geoshape"))
+    if (std.mem.eql(u8, column.column_type, "string") or
+        std.mem.eql(u8, column.column_type, "blob") or
+        std.mem.eql(u8, column.column_type, "geoshape"))
     {
         switch (json_value) {
             .string => |text| {
@@ -1992,25 +2027,25 @@ fn coerceColumnValue(alloc: Allocator, column_type: []const u8, json_value: std.
             else => return null,
         }
     }
-    if (std.mem.eql(u8, column_type, "boolean")) {
+    if (std.mem.eql(u8, column.column_type, "boolean")) {
         switch (json_value) {
             .bool => |flag| return Coerced{ .value = .{ .bool_val = flag } },
             else => return null,
         }
     }
-    if (std.mem.eql(u8, column_type, "number")) {
+    if (std.mem.eql(u8, column.column_type, "number")) {
         const number = schema_mod.documentNumberToF64(json_value) orelse return null;
         return Coerced{ .value = .{ .f64_val = number } };
     }
-    if (std.mem.eql(u8, column_type, "integer")) {
+    if (std.mem.eql(u8, column.column_type, "integer")) {
         const number = schema_mod.documentIntegerToI64(json_value) orelse return null;
         return Coerced{ .value = .{ .i64_val = number } };
     }
-    if (std.mem.eql(u8, column_type, "datetime")) {
+    if (std.mem.eql(u8, column.column_type, "datetime")) {
         const timestamp = schema_mod.documentDateTimeToNs(json_value) orelse return null;
         return Coerced{ .value = .{ .u64_val = timestamp } };
     }
-    if (std.mem.eql(u8, column_type, "geopoint")) {
+    if (std.mem.eql(u8, column.column_type, "geopoint")) {
         const point = geoPointFromJson(json_value) orelse return null;
         return Coerced{ .value = .{ .geo_point = point } };
     }
@@ -2115,6 +2150,41 @@ test "relational projection enforces required columns and types" {
     try std.testing.expectEqualStrings("a", metadata_row.cell(relationalColumnIndex(plan, "id").?).?.value.bytes_val);
 }
 
+test "relational projection enforces json-backed logical container types" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"attrs":{"type":"object","properties":{"k":{"type":"keyword"}},"additionalProperties":false},"tags":{"type":"array","items":{"type":"keyword"}},"payload":{"type":"json"}},"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+    var plan = try relationalColumnPlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+
+    const accepted = [_][]const u8{
+        "{\"attrs\":{\"k\":\"v\"},\"tags\":[\"a\"],\"payload\":42}",
+        "{\"payload\":[1,2,3]}",
+        "{\"payload\":{\"nested\":true}}",
+    };
+    for (accepted) |document| {
+        try schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = document }});
+        var row = try projectRelationalRowJsonAlloc(alloc, plan, document);
+        row.deinit(alloc);
+    }
+
+    const rejected = [_][]const u8{
+        "{\"attrs\":[]}",
+        "{\"attrs\":\"not-an-object\"}",
+        "{\"tags\":{}}",
+        "{\"tags\":1}",
+    };
+    for (rejected) |document| {
+        try std.testing.expectError(
+            error.InvalidBatchRequest,
+            schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = document }}),
+        );
+        try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowJsonAlloc(alloc, plan, document));
+    }
+}
+
 test "relational integer validation and projection share exact i64 conversion" {
     const alloc = std.testing.allocator;
     var parsed = try schema_mod.parseValidatedTableSchema(alloc,
@@ -2173,7 +2243,9 @@ test "relational integer validation and projection share exact i64 conversion" {
     defer unconstrained.deinit(alloc);
     var unconstrained_plan = try relationalColumnPlanAlloc(alloc, unconstrained);
     defer unconstrained_plan.deinit(alloc);
-    var exact_row = try projectRelationalRowJsonAlloc(alloc, unconstrained_plan, "{\"qty\":9007199254740993.0}");
+    const exact_document = "{\"qty\":9007199254740993.0}";
+    try schema_mod.validateWritesAgainstTableSchema(alloc, unconstrained, &.{.{ .value = exact_document }});
+    var exact_row = try projectRelationalRowJsonAlloc(alloc, unconstrained_plan, exact_document);
     defer exact_row.deinit(alloc);
     try std.testing.expectEqual(
         @as(i64, 9_007_199_254_740_993),

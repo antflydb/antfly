@@ -122,6 +122,9 @@ carrying
 - `indexed` — whether to maintain an inverted/typed index for the column
 - `is_json` — nested objects, arrays, and `json`-typed fields collapse to a
   single `json` column at their path instead of recursing
+- `json_kind` — retains whether a JSON-backed column was declared as an
+  `object`, `array`, or unconstrained `json`, so projection can enforce the
+  logical container type without reparsing the schema
 
 This reuses the existing `schema_capability` traversal. Unlike the algebraic
 `Plan` (which emits group/measure/time *fact* roles and may emit a field under

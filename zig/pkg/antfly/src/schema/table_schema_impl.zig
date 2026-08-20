@@ -3428,55 +3428,56 @@ fn validateDocumentFieldValueWithContext(
         std.mem.eql(u8, field_type, "integer"))
     {
         const integer_property = property.integer_only or std.mem.eql(u8, field_type, "integer");
-        const exact_integer_value = if (context.require_physical_encoding and integer_property)
-            documentIntegerToI64(value.*)
-        else
-            null;
+        if (context.require_physical_encoding and integer_property) {
+            const integer_value = documentIntegerToI64(value.*) orelse return error.InvalidBatchRequest;
+            if (property.minimum != null and
+                integer_value < (property.minimum_i64 orelse return error.InvalidBatchRequest))
+            {
+                return error.InvalidBatchRequest;
+            }
+            if (property.maximum != null and
+                integer_value > (property.maximum_i64 orelse return error.InvalidBatchRequest))
+            {
+                return error.InvalidBatchRequest;
+            }
+            if (property.exclusive_minimum != null and
+                integer_value <= (property.exclusive_minimum_i64 orelse return error.InvalidBatchRequest))
+            {
+                return error.InvalidBatchRequest;
+            }
+            if (property.exclusive_maximum != null and
+                integer_value >= (property.exclusive_maximum_i64 orelse return error.InvalidBatchRequest))
+            {
+                return error.InvalidBatchRequest;
+            }
+            if (property.multiple_of != null and
+                @rem(integer_value, property.multiple_of_i64 orelse return error.InvalidBatchRequest) != 0)
+            {
+                return error.InvalidBatchRequest;
+            }
+            return;
+        }
         const numeric_value = if (context.require_physical_encoding)
             documentNumberToF64(value.*) orelse return error.InvalidBatchRequest
         else
             parseJsonNumber(value.*) catch return error.InvalidBatchRequest;
         if (integer_property) {
-            const is_integer = if (context.require_physical_encoding)
-                exact_integer_value != null
-            else
-                isIntegralJsonNumber(value.*, numeric_value);
-            if (!is_integer) return error.InvalidBatchRequest;
+            if (!isIntegralJsonNumber(value.*, numeric_value)) return error.InvalidBatchRequest;
         }
         if (property.minimum) |minimum| {
-            if (exact_integer_value) |integer_value| {
-                if (property.minimum_i64) |exact_minimum| {
-                    if (integer_value < exact_minimum) return error.InvalidBatchRequest;
-                } else if (numeric_value < minimum) return error.InvalidBatchRequest;
-            } else if (numeric_value < minimum) return error.InvalidBatchRequest;
+            if (numeric_value < minimum) return error.InvalidBatchRequest;
         }
         if (property.maximum) |maximum| {
-            if (exact_integer_value) |integer_value| {
-                if (property.maximum_i64) |exact_maximum| {
-                    if (integer_value > exact_maximum) return error.InvalidBatchRequest;
-                } else if (numeric_value > maximum) return error.InvalidBatchRequest;
-            } else if (numeric_value > maximum) return error.InvalidBatchRequest;
+            if (numeric_value > maximum) return error.InvalidBatchRequest;
         }
         if (property.exclusive_minimum) |exclusive_minimum| {
-            if (exact_integer_value) |integer_value| {
-                if (property.exclusive_minimum_i64) |exact_minimum| {
-                    if (integer_value <= exact_minimum) return error.InvalidBatchRequest;
-                } else if (numeric_value <= exclusive_minimum) return error.InvalidBatchRequest;
-            } else if (numeric_value <= exclusive_minimum) return error.InvalidBatchRequest;
+            if (numeric_value <= exclusive_minimum) return error.InvalidBatchRequest;
         }
         if (property.exclusive_maximum) |exclusive_maximum| {
-            if (exact_integer_value) |integer_value| {
-                if (property.exclusive_maximum_i64) |exact_maximum| {
-                    if (integer_value >= exact_maximum) return error.InvalidBatchRequest;
-                } else if (numeric_value >= exclusive_maximum) return error.InvalidBatchRequest;
-            } else if (numeric_value >= exclusive_maximum) return error.InvalidBatchRequest;
+            if (numeric_value >= exclusive_maximum) return error.InvalidBatchRequest;
         }
         if (property.multiple_of) |multiple_of| {
-            if (exact_integer_value) |integer_value| {
-                if (property.multiple_of_i64) |exact_multiple_of| {
-                    if (@rem(integer_value, exact_multiple_of) != 0) return error.InvalidBatchRequest;
-                } else if (!isMultipleOf(numeric_value, multiple_of)) return error.InvalidBatchRequest;
-            } else if (!isMultipleOf(numeric_value, multiple_of)) return error.InvalidBatchRequest;
+            if (!isMultipleOf(numeric_value, multiple_of)) return error.InvalidBatchRequest;
         }
         return;
     }
