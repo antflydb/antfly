@@ -26,6 +26,21 @@ require() {
     fi
 }
 
+download_archive() {
+    case "${ANTFLY_DOWNLOAD_CLASS:-}" in
+        employee|ci)
+            curl -A "antfly-installer/1" -H "X-Antfly-Audience: ${ANTFLY_DOWNLOAD_CLASS}" "$@"
+            ;;
+        ""|external)
+            curl -A "antfly-installer/1" "$@"
+            ;;
+        *)
+            warning "Ignoring invalid ANTFLY_DOWNLOAD_CLASS; expected external, employee, or ci"
+            curl -A "antfly-installer/1" "$@"
+            ;;
+    esac
+}
+
 # Detect OS and architecture
 detect_platform() {
     OS=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -88,7 +103,7 @@ EOF
     DOWNLOAD_URL="https://releases.antfly.io/antfly/${TAG}/${ARCHIVE_NAME}"
 
     status "Downloading from $DOWNLOAD_URL..."
-    if ! curl -fsSL "$DOWNLOAD_URL" -o "$TEMP_DIR/$ARCHIVE_NAME"; then
+    if ! download_archive -fsSL "$DOWNLOAD_URL" -o "$TEMP_DIR/$ARCHIVE_NAME"; then
         error "Failed to download Antfly. Please check your internet connection and the version number."
     fi
 
@@ -204,6 +219,10 @@ Options:
 Environment:
   This script will automatically detect your OS and architecture,
   download the appropriate binaries, and install them.
+
+  ANTFLY_DOWNLOAD_CLASS may be external, employee, or ci. Employee and CI
+  archive requests carry a metric label; missing or invalid values are treated
+  as external. The label is not an authentication credential.
 
   By default, it installs to:
     - /usr/local/bin (if running as root)
