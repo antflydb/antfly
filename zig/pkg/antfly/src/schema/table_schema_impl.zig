@@ -1519,7 +1519,6 @@ fn validateFieldMappingObject(mapping: std.json.Value, allow_fields: bool) !void
     }
     if (mapping.object.get("type")) |mapping_type| {
         if (mapping_type != .null and mapping_type != .string) return error.InvalidSchemaUpdateRequest;
-        if (mapping_type == .string and runtimeFieldTypeFromName(mapping_type.string) == null) return error.InvalidSchemaUpdateRequest;
     }
     if (mapping.object.get("analyzer")) |analyzer| if (analyzer != .null and analyzer != .string) return error.InvalidSchemaUpdateRequest;
     if (mapping.object.get("index")) |index| if (index != .null and index != .bool) return error.InvalidSchemaUpdateRequest;
@@ -3292,7 +3291,7 @@ fn validateDocumentFieldValueWithContext(
         std.mem.eql(u8, field_type, "integer"))
     {
         const numeric_value = parseJsonNumber(value.*) catch return error.InvalidBatchRequest;
-        if ((property.integer_only or std.mem.eql(u8, field_type, "integer")) and !isIntegralJsonNumber(value.*, numeric_value)) {
+        if ((property.integer_only or std.mem.eql(u8, field_type, "integer")) and documentIntegerToI64(value.*) == null) {
             return error.InvalidBatchRequest;
         }
         if (property.minimum) |minimum| {
@@ -3366,6 +3365,25 @@ pub fn documentDateTimeToNs(value: std.json.Value) ?u64 {
     };
 }
 
+/// Convert every JSON number that satisfies the JSON Schema `integer` type and
+/// is physically representable by the relational i64 column encoding. Keeping
+/// this shared between validation and projection prevents valid writes from
+/// failing later when the row is materialized.
+pub fn documentIntegerToI64(value: std.json.Value) ?i64 {
+    return switch (value) {
+        .integer => |number| number,
+        .number_string => |text| std.fmt.parseInt(i64, text, 10) catch null,
+        .float => |number| blk: {
+            if (!std.math.isFinite(number) or std.math.floor(number) != number) break :blk null;
+            // maxInt(i64) rounds up when represented as f64, so use the exact
+            // exclusive 2^63 boundary instead of converting maxInt(i64).
+            if (number < -9223372036854775808.0 or number >= 9223372036854775808.0) break :blk null;
+            break :blk @intFromFloat(number);
+        },
+        else => null,
+    };
+}
+
 pub fn documentPropertyAllowsNull(property: DocumentProperty) bool {
     const has_all_of = property.all_of.len > 0;
 
@@ -3426,18 +3444,6 @@ fn validateNullValueWithContext(
     _ = value;
     _ = enforce_types;
     if (!documentPropertyAllowsNull(property)) return error.InvalidBatchRequest;
-}
-
-fn isIntegralJsonNumber(value: std.json.Value, numeric_value: f64) bool {
-    return switch (value) {
-        .integer => true,
-        .number_string => |text| blk: {
-            _ = std.fmt.parseInt(i64, text, 10) catch break :blk false;
-            break :blk true;
-        },
-        .float => std.math.floor(numeric_value) == numeric_value,
-        else => false,
-    };
 }
 
 fn validateTtlFieldValue(value: std.json.Value) !void {
@@ -4170,12 +4176,14 @@ test "parse accepts sortable without public doc values and rejects unsupported s
             "{\"dynamic_templates\":[{\"name\":\"payload\",\"path_match\":\"payload\",\"mapping\":{\"type\":\"json\"}}]}",
         ),
     );
-    try std.testing.expectError(
-        error.InvalidSchemaUpdateRequest,
-        parseSchema(
-            std.testing.allocator,
-            "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"payload\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"unknown\"}}}}}}}",
-        ),
+    var legacy_unknown_mapping = try parseSchema(
+        std.testing.allocator,
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"payload\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"unknown\"}}}}}}}",
+    );
+    defer legacy_unknown_mapping.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "unknown",
+        legacy_unknown_mapping.document_schemas[0].properties[0].antfly_field.?.field_type.?,
     );
 
     try std.testing.expectError(

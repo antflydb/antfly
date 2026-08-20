@@ -56,6 +56,7 @@ pub fn documentPropertyAllowsNull(property: impl.DocumentProperty) bool {
 }
 
 pub const documentDateTimeToNs = impl.documentDateTimeToNs;
+pub const documentIntegerToI64 = impl.documentIntegerToI64;
 
 pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSchema) !storage_schema.TableSchema {
     const document_field_templates = try deriveRuntimeDocumentFieldTemplates(alloc, schema);
@@ -119,7 +120,7 @@ fn freeRuntimeDynamicTemplateItems(alloc: std.mem.Allocator, templates: []storag
 }
 
 fn runtimeDynamicTemplateFromParsed(alloc: std.mem.Allocator, template: impl.DynamicTemplate) !storage_schema.DynamicTemplate {
-    const field_type = impl.runtimeFieldTypeFromName(template.field_type orelse "text") orelse return error.InvalidSchemaUpdateRequest;
+    const field_type = runtimeFieldTypeFromParsed(template.field_type);
     const sortable = template.sortable orelse false;
     const do_index = template.do_index orelse true;
     try validateRuntimeSortableMapping(field_type, sortable);
@@ -212,7 +213,7 @@ fn runtimeDocumentFieldTemplateFromParsed(
     path: []const u8,
     mapping: impl.DynamicTemplate,
 ) !storage_schema.DynamicTemplate {
-    const field_type = impl.runtimeFieldTypeFromName(mapping.field_type orelse "text") orelse return error.InvalidSchemaUpdateRequest;
+    const field_type = runtimeFieldTypeFromParsed(mapping.field_type);
     const sortable = mapping.sortable orelse false;
     const do_index = mapping.do_index orelse true;
     try validateRuntimeSortableMapping(field_type, sortable);
@@ -233,6 +234,13 @@ fn runtimeDocumentFieldTemplateFromParsed(
             .analyzer = try alloc.dupe(u8, mapping.analyzer orelse defaultDynamicTemplateAnalyzer(field_type)),
         },
     };
+}
+
+fn runtimeFieldTypeFromParsed(field_type: ?[]const u8) storage_schema.AntflyType {
+    // Unknown mapping names were historically interpreted as text. Preserve
+    // that behavior when loading existing table schemas; sortable validation
+    // still rejects combinations that text cannot represent.
+    return impl.runtimeFieldTypeFromName(field_type orelse "text") orelse .text;
 }
 
 fn validateRuntimeSortableMapping(field_type: storage_schema.AntflyType, sortable: bool) !void {
@@ -979,6 +987,35 @@ test "runtime schema derives internal doc values from sortable scalar mappings" 
     try std.testing.expectEqual(storage_schema.AntflyType.geopoint, runtime.dynamic_templates[4].mapping.field_type);
     try std.testing.expect(!runtime.dynamic_templates[4].mapping.doc_values);
     try std.testing.expect(!runtime.dynamic_templates[4].mapping.sortable);
+}
+
+test "runtime schema preserves legacy unknown mapping types as text" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{
+        \\  "dynamic_templates": [
+        \\    {"name":"legacy_dynamic","path_match":"dynamic","mapping":{"type":"legacy_custom"}}
+        \\  ],
+        \\  "document_schemas": {
+        \\    "doc": {
+        \\      "schema": {
+        \\        "type": "object",
+        \\        "properties": {
+        \\          "declared": {"type":"string","x-antfly-field":{"type":"legacy_custom"}}
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    );
+    defer parsed.deinit(alloc);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+
+    try std.testing.expectEqual(@as(usize, 2), runtime.dynamic_templates.len);
+    try std.testing.expectEqual(storage_schema.AntflyType.text, runtime.dynamic_templates[0].mapping.field_type);
+    try std.testing.expectEqual(storage_schema.AntflyType.text, runtime.dynamic_templates[1].mapping.field_type);
 }
 
 test "schema rejects sortable non-scalar dynamic mappings" {
