@@ -26,6 +26,8 @@ const backup_contract = @import("backup_contract.zig");
 const distributed_txn = @import("distributed_txn_contract.zig");
 const runtime_status = @import("runtime_status.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
+const runtime_error_abi = @import("../runtime_error_abi.zig");
+const runtime_native_abi = @import("../runtime_native_abi.zig");
 
 pub const TableWriteSource = struct {
     ptr: *anyopaque,
@@ -337,6 +339,44 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             index_name: []const u8,
         ) anyerror!?void = null,
+        /// Tail extensions retain the established vtable prefix. Cancellation
+        /// tokens are transport-neutral borrowed callbacks and are valid over
+        /// the private same-process native runtime boundary.
+        commit_batch_with_cancellation: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+            cancellation: db_mod.types.CancellationToken,
+        ) anyerror!?distributed_txn.CommitOutcome = null,
+        txn_resolve_group_local_with_cancellation: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+            status: db_mod.types.TxnStatus,
+            commit_version: u64,
+            topology_epoch: u64,
+            sync_level: db_mod.types.SyncLevel,
+            cancellation: db_mod.types.CancellationToken,
+        ) anyerror!?void = null,
+        commit_transaction_with_id_with_cancellation: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            txn_id: db_mod.types.TxnId,
+            begin_timestamp: u64,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+            cancellation: db_mod.types.CancellationToken,
+        ) anyerror!?distributed_txn.CommitOutcome = null,
+        commit_transaction_with_cancellation: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+            cancellation: db_mod.types.CancellationToken,
+        ) anyerror!?distributed_txn.CommitOutcome = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -522,6 +562,18 @@ pub const TableWriteSource = struct {
         return try BoundaryAbi.call("commit_transaction", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, tables, sync_level });
     }
 
+    pub fn commitTransactionWithCancellation(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?distributed_txn.CommitOutcome {
+        const fn_ptr = self.vtable.commit_transaction_with_cancellation orelse
+            return try self.commitTransaction(alloc, tables, sync_level);
+        return try BoundaryAbi.call("commit_transaction_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, tables, sync_level, cancellation });
+    }
+
     pub fn commitBatch(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -530,6 +582,18 @@ pub const TableWriteSource = struct {
     ) !?distributed_txn.CommitOutcome {
         const fn_ptr = self.vtable.commit_batch orelse self.vtable.commit_transaction orelse return null;
         return try BoundaryAbi.call("commit_batch", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, tables, sync_level });
+    }
+
+    pub fn commitBatchWithCancellation(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?distributed_txn.CommitOutcome {
+        const fn_ptr = self.vtable.commit_batch_with_cancellation orelse
+            return try self.commitBatch(alloc, tables, sync_level);
+        return try BoundaryAbi.call("commit_batch_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, tables, sync_level, cancellation });
     }
 
     pub fn commitTransactionWithId(
@@ -542,6 +606,20 @@ pub const TableWriteSource = struct {
     ) !?distributed_txn.CommitOutcome {
         const fn_ptr = self.vtable.commit_transaction_with_id orelse return null;
         return try BoundaryAbi.call("commit_transaction_with_id", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, txn_id, begin_timestamp, tables, sync_level });
+    }
+
+    pub fn commitTransactionWithIdAndCancellation(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?distributed_txn.CommitOutcome {
+        const fn_ptr = self.vtable.commit_transaction_with_id_with_cancellation orelse
+            return try self.commitTransactionWithId(alloc, txn_id, begin_timestamp, tables, sync_level);
+        return try BoundaryAbi.call("commit_transaction_with_id_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, txn_id, begin_timestamp, tables, sync_level, cancellation });
     }
 
     pub fn acknowledgeTransactionCommit(
@@ -607,6 +685,23 @@ pub const TableWriteSource = struct {
     ) !?void {
         const fn_ptr = self.vtable.txn_resolve_group_local orelse return null;
         return try BoundaryAbi.call("txn_resolve_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level });
+    }
+
+    pub fn txnResolveGroupLocalWithCancellation(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        status: db_mod.types.TxnStatus,
+        commit_version: u64,
+        topology_epoch: u64,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?void {
+        const fn_ptr = self.vtable.txn_resolve_group_local_with_cancellation orelse
+            return try self.txnResolveGroupLocal(alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level);
+        return try BoundaryAbi.call("txn_resolve_group_local_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, cancellation });
     }
 
     pub fn txnStatusGroupLocal(
@@ -839,3 +934,105 @@ pub const TableWriteSource = struct {
         return try BoundaryAbi.call("request_table_index_structural_reconcile", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, index_name });
     }
 };
+
+test "compiled table write boundary transports cancellation and committed failure identity" {
+    const Fake = struct {
+        calls: usize = 0,
+        transaction_calls: usize = 0,
+        stateless_transaction_calls: usize = 0,
+        failure: ?anyerror = null,
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return null;
+        }
+
+        fn commitBatch(_: *anyopaque, _: std.mem.Allocator, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel) anyerror!?distributed_txn.CommitOutcome {
+            return error.TestUnexpectedResult;
+        }
+
+        fn commitBatchWithCancellation(ptr: *anyopaque, _: std.mem.Allocator, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) anyerror!?distributed_txn.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
+            if (self.failure) |err| return err;
+            return .{ .committed = .{ .participant_count = 1 } };
+        }
+
+        fn commitTransactionWithId(_: *anyopaque, _: std.mem.Allocator, _: db_mod.types.TxnId, _: u64, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel) anyerror!?distributed_txn.CommitOutcome {
+            return error.TestUnexpectedResult;
+        }
+
+        fn commitTransactionWithIdAndCancellation(ptr: *anyopaque, _: std.mem.Allocator, _: db_mod.types.TxnId, _: u64, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) anyerror!?distributed_txn.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.transaction_calls += 1;
+            if (cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
+            return .{ .committed = .{ .participant_count = 1 } };
+        }
+
+        fn commitTransactionWithCancellation(ptr: *anyopaque, _: std.mem.Allocator, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) anyerror!?distributed_txn.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.stateless_transaction_calls += 1;
+            if (cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
+            return .{ .committed = .{ .participant_count = 1 } };
+        }
+
+        fn foreignDispatch(
+            contract: *const runtime_native_abi.CallContract,
+            callback: *const anyopaque,
+            args: *const anyopaque,
+            output: ?*anyopaque,
+        ) callconv(.c) runtime_error_abi.Status {
+            return TableWriteSource.BoundaryAbi.local_dispatch(contract, callback, args, output);
+        }
+    };
+
+    var fake = Fake{};
+    const source: TableWriteSource = .{
+        .ptr = &fake,
+        .vtable = &.{
+            .batch = Fake.batch,
+            .commit_batch = Fake.commitBatch,
+            .commit_batch_with_cancellation = Fake.commitBatchWithCancellation,
+            .commit_transaction_with_id = Fake.commitTransactionWithId,
+            .commit_transaction_with_id_with_cancellation = Fake.commitTransactionWithIdAndCancellation,
+            .commit_transaction_with_cancellation = Fake.commitTransactionWithCancellation,
+        },
+        .boundary_dispatch = Fake.foreignDispatch,
+    };
+
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(
+        error.EnrichmentWaitCanceled,
+        source.commitBatchWithCancellation(std.testing.allocator, &.{}, .enrichments, db_mod.types.CancellationToken.fromAtomic(&canceled)),
+    );
+    canceled.store(false, .release);
+    fake.failure = error.EnrichmentWorkerFailed;
+    try std.testing.expectError(
+        error.EnrichmentWorkerFailed,
+        source.commitBatchWithCancellation(std.testing.allocator, &.{}, .enrichments, db_mod.types.CancellationToken.fromAtomic(&canceled)),
+    );
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    canceled.store(true, .release);
+    try std.testing.expectError(
+        error.EnrichmentWaitCanceled,
+        source.commitTransactionWithIdAndCancellation(
+            std.testing.allocator,
+            std.mem.zeroes(db_mod.types.TxnId),
+            1,
+            &.{},
+            .enrichments,
+            db_mod.types.CancellationToken.fromAtomic(&canceled),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.transaction_calls);
+    try std.testing.expectError(
+        error.EnrichmentWaitCanceled,
+        source.commitTransactionWithCancellation(
+            std.testing.allocator,
+            &.{},
+            .enrichments,
+            db_mod.types.CancellationToken.fromAtomic(&canceled),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.stateless_transaction_calls);
+}

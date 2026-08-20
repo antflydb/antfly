@@ -159,17 +159,13 @@ const RequestWatchdogOutcome = enum {
 /// Waits for request completion, application cancellation, or the
 /// whole-request deadline.
 ///
-/// Keep these signals in one select branch. `std.Io.Threaded` may implement a
-/// sleep with a blocking worker, and a select with separate cancellation and
-/// timeout sleepers can leave one losing sleeper alive until the full request
-/// timeout after a successful response. The request winner explicitly stops
-/// this short-interval watchdog because cancelling a select does not
-/// necessarily interrupt a sleeper using the parent `Io`. This bounds
-/// successful-request cleanup while retaining cancellation and deadline
-/// enforcement for DNS, connect, TLS, and response work.
+/// Keep these signals in one select branch. The no-cancellation path parks on
+/// one wakeable deadline; callback-backed cancellation polls the same futex at
+/// a short interval. The request winner explicitly wakes the watchdog, so a
+/// successful response never waits for either interval or the request timeout.
 fn waitForRequestCancellationOrTimeout(
     io: Io,
-    stop: *const std.atomic.Value(bool),
+    stop: *const std.atomic.Value(u32),
     cancellation: ?CancellationToken,
     timeout_ms: u64,
 ) anyerror!RequestWatchdogOutcome {
@@ -179,21 +175,44 @@ fn waitForRequestCancellationOrTimeout(
         Io.Clock.awake.now(io).nanoseconds +| @as(i128, timeout_ms) * std.time.ns_per_ms;
 
     while (true) {
-        if (stop.load(.acquire)) return .stopped;
+        if (stop.load(.acquire) != 0) return .stopped;
         if (cancellation) |signal| {
             if (signal.isCancelled()) return .cancelled;
         }
-        const sleep_ms = if (deadline_ns) |deadline| blk: {
+        const wait_ms = if (deadline_ns) |deadline| blk: {
             const now_ns = Io.Clock.awake.now(io).nanoseconds;
             if (now_ns >= deadline) return .timed_out;
             const remaining_ms = @max(
                 @as(i128, 1),
                 @divFloor(deadline - now_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms),
             );
-            break :blk @min(cancellation_poll_interval_ms, @as(u64, @intCast(remaining_ms)));
+            const bounded_remaining_ms: u64 = @intCast(remaining_ms);
+            break :blk if (cancellation != null)
+                @min(cancellation_poll_interval_ms, bounded_remaining_ms)
+            else
+                bounded_remaining_ms;
         } else cancellation_poll_interval_ms;
-        try io.sleep(Io.Duration.fromMilliseconds(@intCast(sleep_ms)), .awake);
+        // A futex keeps the ordinary no-cancellation path parked until its
+        // actual deadline, while request completion can wake it immediately.
+        // Callback-backed cancellation still gets the bounded poll interval.
+        Io.futexWaitTimeout(
+            io,
+            u32,
+            &stop.raw,
+            0,
+            .{ .duration = .{
+                .clock = .awake,
+                .raw = .fromMilliseconds(@intCast(wait_ms)),
+            } },
+        ) catch |err| switch (err) {
+            error.Canceled => return .stopped,
+        };
     }
+}
+
+fn stopRequestWatchdog(io: Io, stop: *std.atomic.Value(u32)) void {
+    stop.store(1, .release);
+    Io.futexWake(io, u32, &stop.raw, std.math.maxInt(u32));
 }
 
 fn shouldUseHttp2(config: ClientConfig) bool {
@@ -835,7 +854,7 @@ pub const Client = struct {
                 return client.executeRequestWithRetries(request_value, socket_timeout_ms, request_deadline_ms, request_interrupt);
             }
 
-            fn watchdogTask(io: Io, stop: *const std.atomic.Value(bool), request_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
+            fn watchdogTask(io: Io, stop: *const std.atomic.Value(u32), request_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
                 return waitForRequestCancellationOrTimeout(io, stop, null, request_timeout_ms);
             }
 
@@ -854,14 +873,26 @@ pub const Client = struct {
 
         var select_buffer: [2]SelectResult = undefined;
         var select = Io.Select(SelectResult).init(self.io, &select_buffer);
-        var watchdog_stop = std.atomic.Value(bool).init(false);
+        var watchdog_stop = std.atomic.Value(u32).init(0);
         try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, &interrupt });
-        select.async(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, timeout_ms });
+        // The watchdog must own concurrency. `Io.async` is allowed to run it
+        // eagerly once the async pool is saturated; an eager watchdog cannot
+        // observe request completion because this caller has not reached
+        // `select.await` yet, turning a fast request into a full timeout.
+        select.concurrent(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, timeout_ms }) catch |err| {
+            interrupt.cancel(self.io);
+            while (select.cancel()) |late| Task.drainLateResult(late);
+            return err;
+        };
+        errdefer {
+            interrupt.cancel(self.io);
+            while (select.cancel()) |late| Task.drainLateResult(late);
+        }
 
         const first = try select.await();
         switch (first) {
             .request => |request_result| {
-                watchdog_stop.store(true, .release);
+                stopRequestWatchdog(self.io, &watchdog_stop);
                 select.cancelDiscard();
                 return try request_result;
             },
@@ -900,7 +931,7 @@ pub const Client = struct {
                 return client.executeRequestWithRetries(request_value, socket_timeout_ms, request_deadline_ms, request_interrupt);
             }
 
-            fn watchdogTask(io: Io, stop: *const std.atomic.Value(bool), signal: CancellationToken, request_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
+            fn watchdogTask(io: Io, stop: *const std.atomic.Value(u32), signal: CancellationToken, request_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
                 return waitForRequestCancellationOrTimeout(io, stop, signal, request_timeout_ms);
             }
 
@@ -917,13 +948,21 @@ pub const Client = struct {
 
         var select_buffer: [2]SelectResult = undefined;
         var select = Io.Select(SelectResult).init(self.io, &select_buffer);
-        var watchdog_stop = std.atomic.Value(bool).init(false);
+        var watchdog_stop = std.atomic.Value(u32).init(0);
         try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, &interrupt });
-        select.async(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, cancellation, timeout_ms });
+        select.concurrent(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, cancellation, timeout_ms }) catch |err| {
+            interrupt.cancel(self.io);
+            while (select.cancel()) |late| Task.drainLateResult(late);
+            return err;
+        };
+        errdefer {
+            interrupt.cancel(self.io);
+            while (select.cancel()) |late| Task.drainLateResult(late);
+        }
         const first = try select.await();
         switch (first) {
             .request => |request_result| {
-                watchdog_stop.store(true, .release);
+                stopRequestWatchdog(self.io, &watchdog_stop);
                 select.cancelDiscard();
                 if (cancellation.isCancelled()) {
                     if (request_result) |response_value| {
@@ -1021,7 +1060,7 @@ pub const Client = struct {
                 return client.executeRequestToWriterWithRetries(request_value, socket_timeout_ms, request_deadline_ms, output, callback, callback_context, request_interrupt);
             }
 
-            fn watchdogTask(io: Io, stop: *const std.atomic.Value(bool), request_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
+            fn watchdogTask(io: Io, stop: *const std.atomic.Value(u32), request_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
                 return waitForRequestCancellationOrTimeout(io, stop, null, request_timeout_ms);
             }
 
@@ -1040,14 +1079,22 @@ pub const Client = struct {
 
         var select_buffer: [2]SelectResult = undefined;
         var select = Io.Select(SelectResult).init(self.io, &select_buffer);
-        var watchdog_stop = std.atomic.Value(bool).init(false);
+        var watchdog_stop = std.atomic.Value(u32).init(0);
         try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, &interrupt });
-        select.async(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, timeout_ms });
+        select.concurrent(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, timeout_ms }) catch |err| {
+            interrupt.cancel(self.io);
+            while (select.cancel()) |late| Task.drainLateResult(late);
+            return err;
+        };
+        errdefer {
+            interrupt.cancel(self.io);
+            while (select.cancel()) |late| Task.drainLateResult(late);
+        }
 
         const first = try select.await();
         switch (first) {
             .request => |request_result| {
-                watchdog_stop.store(true, .release);
+                stopRequestWatchdog(self.io, &watchdog_stop);
                 select.cancelDiscard();
                 return try request_result;
             },
@@ -1086,7 +1133,7 @@ pub const Client = struct {
                 return client.executeRequestToWriterWithRetries(request_value, socket_timeout_ms, request_deadline_ms, output, callback, callback_context, request_interrupt);
             }
 
-            fn watchdogTask(io: Io, stop: *const std.atomic.Value(bool), signal: CancellationToken, request_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
+            fn watchdogTask(io: Io, stop: *const std.atomic.Value(u32), signal: CancellationToken, request_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
                 return waitForRequestCancellationOrTimeout(io, stop, signal, request_timeout_ms);
             }
 
@@ -1103,13 +1150,21 @@ pub const Client = struct {
 
         var select_buffer: [2]SelectResult = undefined;
         var select = Io.Select(SelectResult).init(self.io, &select_buffer);
-        var watchdog_stop = std.atomic.Value(bool).init(false);
+        var watchdog_stop = std.atomic.Value(u32).init(0);
         try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, &interrupt });
-        select.async(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, cancellation, timeout_ms });
+        select.concurrent(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, cancellation, timeout_ms }) catch |err| {
+            interrupt.cancel(self.io);
+            while (select.cancel()) |late| Task.drainLateResult(late);
+            return err;
+        };
+        errdefer {
+            interrupt.cancel(self.io);
+            while (select.cancel()) |late| Task.drainLateResult(late);
+        }
         const first = try select.await();
         switch (first) {
             .request => |request_result| {
-                watchdog_stop.store(true, .release);
+                stopRequestWatchdog(self.io, &watchdog_stop);
                 select.cancelDiscard();
                 if (cancellation.isCancelled()) {
                     if (request_result) |response_value| {
@@ -4115,7 +4170,12 @@ test "per-request response limit rejects the body before allocation" {
 
 test "successful H1 requests do not wait for their timeout deadline" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
+    // Reproduce a saturated async pool deterministically. A watchdog submitted
+    // with `Io.async` runs eagerly in this configuration and blocks its caller
+    // before the completed request result can be observed.
+    var io_impl = std.Io.Threaded.init(allocator, .{ .async_limit = .nothing });
+    defer io_impl.deinit();
+    const io = io_impl.io();
     const port = try reserveEphemeralPort(io);
 
     var tmp = std.testing.tmpDir(.{});

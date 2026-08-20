@@ -96,6 +96,10 @@ var defaultOperatorHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
 const maxHASeededSlotActivationReceiptBytes = 64 * 1024
 
+// A checkpoint is successful durable progress, so it should restart
+// reconciliation promptly without consuming the error rate limiter.
+const haStatusCheckpointRequeueAfter = 5 * time.Millisecond
+
 const (
 	antflyRuntimeUID int64 = 10001
 	antflyRuntimeGID int64 = 10001
@@ -2619,7 +2623,7 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 		if err := r.updateStatus(ctx, workingCluster); err != nil {
 			if stderrors.Is(err, errHAStatusCheckpointed) {
-				return ctrl.Result{Requeue: true}, nil
+				return ctrl.Result{RequeueAfter: haStatusCheckpointRequeueAfter}, nil
 			}
 			return ctrl.Result{}, err
 		}
@@ -2883,7 +2887,7 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// Update status
 	if err := r.updateStatus(ctx, workingCluster); err != nil {
 		if stderrors.Is(err, errHAStatusCheckpointed) {
-			return ctrl.Result{Requeue: true}, nil
+			return ctrl.Result{RequeueAfter: haStatusCheckpointRequeueAfter}, nil
 		}
 		return ctrl.Result{}, err
 	}
