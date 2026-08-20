@@ -1965,7 +1965,6 @@ fn projectRelationalRowAlloc(alloc: Allocator, plan: RelationalPlan, root: std.j
 
     var fields = root.object.iterator();
     while (fields.next()) |entry| {
-        if (schema_mod.shouldIgnoreSchemaValidationField(entry.key_ptr.*)) continue;
         if (!plan.column_indexes.contains(entry.key_ptr.*)) return error.UnknownColumn;
     }
 
@@ -2127,15 +2126,13 @@ test "relational projection enforces required columns and types" {
     defer undeclared.deinit();
     try std.testing.expectError(error.UnknownColumn, projectRelationalRowAlloc(alloc, plan, undeclared.value));
 
-    // Reserved metadata is intentionally not a relational column, matching
-    // schema validation's treatment of top-level underscore-prefixed fields.
+    // Relational rows cannot silently discard metadata that has no declared
+    // physical column.
     var metadata = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"_id":"row-a","id":"a","amount":1.0}
     , .{});
     defer metadata.deinit();
-    var metadata_row = try projectRelationalRowAlloc(alloc, plan, metadata.value);
-    defer metadata_row.deinit(alloc);
-    try std.testing.expectEqualStrings("a", metadata_row.cell(relationalColumnIndex(plan, "id").?).?.value.bytes_val);
+    try std.testing.expectError(error.UnknownColumn, projectRelationalRowAlloc(alloc, plan, metadata.value));
 }
 
 test "relational projection enforces json-backed logical container types" {
@@ -2642,6 +2639,19 @@ test "relational custom ttl column validates and projects" {
 
     const ttl_index = relationalColumnIndex(plan, "_expires_at") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 0), row.cell(ttl_index).?.value.u64_val);
+
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value =
+            \\{"id":"a","_expires_at":"1970-01-01T00:00:00Z","_private":true}
+        }}),
+    );
+    try std.testing.expectError(
+        error.UnknownColumn,
+        projectRelationalRowJsonAlloc(alloc, plan,
+            \\{"id":"a","_expires_at":"1970-01-01T00:00:00Z","_private":true}
+        ),
+    );
 }
 
 test "relational cells round-trip through typed_doc_values storage" {

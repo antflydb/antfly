@@ -86,8 +86,13 @@ In `relational` mode the following are implied/enforced:
   `default_type` when a default is supplied.
 - Each document type is treated as closed (`additionalProperties: false`)
   unless a field is explicitly typed `json`.
+- Underscore-prefixed fields are not an implicit metadata escape hatch: any
+  such value carried in the document must have a declared column. The document
+  key remains out-of-band and must not be copied into the value as `_id`.
 - `required_fields` requires column presence. A required column is `NOT NULL`
   only when its property schema also excludes `null`.
+- A configured TTL field, including the default `_timestamp`, must be declared
+  as a `datetime` column so authoritative-row reconstruction cannot drop it.
 - Table-level `dynamic_templates` are rejected by the core contract. Scoped
   dynamic rules inside `json` columns require the later JSON-subdocument
   lifecycle integration.
@@ -175,6 +180,12 @@ range scans work directly on the packed column:
   UTC;
 - `boolean` → `bool`, `geopoint` → packed lat/lon, `string`/`blob`/`geoshape`
   → `bytes`.
+
+Numeric schema literals that govern a physical `number` column (bounds,
+`multipleOf`, `const`, and `enum`) must round-trip through that same `f64`
+representation without changing their mathematical value. Schemas containing
+an unrepresentable literal are rejected up front. `multipleOf` is evaluated in
+the canonical decimal domain without a floating-point tolerance.
 
 Round-trip through the real `TypedDocValuesWriter`/`TypedDocValuesReader` is
 covered by unit tests.

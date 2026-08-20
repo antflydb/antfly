@@ -169,6 +169,7 @@ pub const DocumentProperty = struct {
     exclusive_maximum_i64: ?i64 = null,
     multiple_of: ?f64 = null,
     multiple_of_i64: ?i64 = null,
+    numeric_constraints_are_lossless_f64: bool = true,
     min_length: ?u64 = null,
     max_length: ?u64 = null,
     min_properties: ?u64 = null,
@@ -591,7 +592,12 @@ pub fn validateDocumentJson(
                 continue;
             }
         }
-        if (is_ttl_field or shouldIgnoreSchemaValidationField(field_name)) continue;
+        if (is_ttl_field) continue;
+        // Document mode preserves the historical convention that underscore
+        // fields are out-of-band metadata. A relational row has no generic
+        // metadata payload, so accepting an undeclared underscore field would
+        // make projection silently discard part of the authoritative value.
+        if (schema.storage_mode != .relational and shouldIgnoreSchemaValidationField(field_name)) continue;
 
         if (document_schema) |resolved_document_schema| {
             if (try validatePatternProperties(&validation_context, field_name, entry.value_ptr, resolved_document_schema.pattern_properties, schema.enforce_types)) {
@@ -1793,7 +1799,6 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
     }
     if (document_schema.properties.len == 0) return error.InvalidSchemaUpdateRequest;
     if (schema.ttl_duration_ns > 0 and
-        !std.mem.eql(u8, schema.ttl_field, "_timestamp") and
         findDocumentProperty(document_schema.properties, schema.ttl_field) == null)
     {
         return error.InvalidSchemaUpdateRequest;
@@ -1831,47 +1836,81 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
         return error.InvalidSchemaUpdateRequest;
     }
     for (document_schema.properties) |property| {
-        if (!isRelationalStorageProperty(property) or !relationalIntegerConstraintsAreExact(property)) {
+        if (!isRelationalStorageProperty(property) or !relationalPhysicalConstraintsAreExact(property)) {
             return error.InvalidSchemaUpdateRequest;
         }
     }
 }
 
-fn relationalIntegerConstraintsAreExact(property: DocumentProperty) bool {
+const RelationalNumericKind = enum { integer, number };
+
+fn relationalPhysicalConstraintsAreExact(property: DocumentProperty) bool {
+    return relationalPhysicalConstraintsAreExactForKind(property, null);
+}
+
+fn relationalPhysicalConstraintsAreExactForKind(property: DocumentProperty, inherited_kind: ?RelationalNumericKind) bool {
     // A JSON-backed property is one lossless bytes column. Its descendants are
-    // validated as JSON but never lowered into physical i64 cells, so their
-    // integer constraints do not need to fit the relational scalar encoding.
+    // validated as JSON but never lowered into physical numeric cells, so their
+    // constraints do not need to fit a relational scalar encoding.
     if (documentPropertyUsesJsonEncoding(property)) return true;
 
-    const integer_property = property.integer_only or
-        (property.field_type != null and std.mem.eql(u8, property.field_type.?, "integer"));
-    if (integer_property) {
-        if (property.minimum != null and property.minimum_i64 == null) return false;
-        if (property.maximum != null and property.maximum_i64 == null) return false;
-        if (property.exclusive_minimum != null and property.exclusive_minimum_i64 == null) return false;
-        if (property.exclusive_maximum != null and property.exclusive_maximum_i64 == null) return false;
-        if (property.multiple_of != null and property.multiple_of_i64 == null) return false;
+    const kind = inherited_kind orelse relationalNumericKind(property);
+    if (kind) |numeric_kind| {
+        switch (numeric_kind) {
+            .integer => {
+                if (property.minimum != null and property.minimum_i64 == null) return false;
+                if (property.maximum != null and property.maximum_i64 == null) return false;
+                if (property.exclusive_minimum != null and property.exclusive_minimum_i64 == null) return false;
+                if (property.exclusive_maximum != null and property.exclusive_maximum_i64 == null) return false;
+                if (property.multiple_of != null and property.multiple_of_i64 == null) return false;
+            },
+            .number => {
+                if (!property.numeric_constraints_are_lossless_f64) return false;
+            },
+        }
+        if (property.const_value) |literal| {
+            if (!relationalNumericLiteralIsEncodable(literal, numeric_kind)) return false;
+        }
+        for (property.enum_values) |literal| {
+            if (!relationalNumericLiteralIsEncodable(literal, numeric_kind)) return false;
+        }
     }
 
-    for (property.prefix_items) |child| if (!relationalIntegerConstraintsAreExact(child)) return false;
-    for (property.properties) |child| if (!relationalIntegerConstraintsAreExact(child)) return false;
-    for (property.pattern_properties) |child| if (!relationalIntegerConstraintsAreExact(child.property.*)) return false;
-    for (property.dependent_schemas) |child| if (!relationalIntegerConstraintsAreExact(child.schema.*)) return false;
-    for (property.any_of) |child| if (!relationalIntegerConstraintsAreExact(child)) return false;
-    for (property.one_of) |child| if (!relationalIntegerConstraintsAreExact(child)) return false;
-    for (property.all_of) |child| if (!relationalIntegerConstraintsAreExact(child)) return false;
+    for (property.prefix_items) |child| if (!relationalPhysicalConstraintsAreExactForKind(child, kind)) return false;
+    for (property.properties) |child| if (!relationalPhysicalConstraintsAreExactForKind(child, kind)) return false;
+    for (property.pattern_properties) |child| if (!relationalPhysicalConstraintsAreExactForKind(child.property.*, kind)) return false;
+    for (property.dependent_schemas) |child| if (!relationalPhysicalConstraintsAreExactForKind(child.schema.*, kind)) return false;
+    for (property.any_of) |child| if (!relationalPhysicalConstraintsAreExactForKind(child, kind)) return false;
+    for (property.one_of) |child| if (!relationalPhysicalConstraintsAreExactForKind(child, kind)) return false;
+    for (property.all_of) |child| if (!relationalPhysicalConstraintsAreExactForKind(child, kind)) return false;
 
-    if (property.additional_properties_schema) |child| if (!relationalIntegerConstraintsAreExact(child.*)) return false;
-    if (property.unevaluated_properties_schema) |child| if (!relationalIntegerConstraintsAreExact(child.*)) return false;
-    if (property.property_names) |child| if (!relationalIntegerConstraintsAreExact(child.*)) return false;
-    if (property.not_schema) |child| if (!relationalIntegerConstraintsAreExact(child.*)) return false;
-    if (property.if_schema) |child| if (!relationalIntegerConstraintsAreExact(child.*)) return false;
-    if (property.then_schema) |child| if (!relationalIntegerConstraintsAreExact(child.*)) return false;
-    if (property.else_schema) |child| if (!relationalIntegerConstraintsAreExact(child.*)) return false;
-    if (property.contains_schema) |child| if (!relationalIntegerConstraintsAreExact(child.*)) return false;
-    if (property.item) |child| if (!relationalIntegerConstraintsAreExact(child.*)) return false;
-    if (property.unevaluated_items_schema) |child| if (!relationalIntegerConstraintsAreExact(child.*)) return false;
+    if (property.additional_properties_schema) |child| if (!relationalPhysicalConstraintsAreExactForKind(child.*, kind)) return false;
+    if (property.unevaluated_properties_schema) |child| if (!relationalPhysicalConstraintsAreExactForKind(child.*, kind)) return false;
+    if (property.property_names) |child| if (!relationalPhysicalConstraintsAreExactForKind(child.*, kind)) return false;
+    if (property.not_schema) |child| if (!relationalPhysicalConstraintsAreExactForKind(child.*, kind)) return false;
+    if (property.if_schema) |child| if (!relationalPhysicalConstraintsAreExactForKind(child.*, kind)) return false;
+    if (property.then_schema) |child| if (!relationalPhysicalConstraintsAreExactForKind(child.*, kind)) return false;
+    if (property.else_schema) |child| if (!relationalPhysicalConstraintsAreExactForKind(child.*, kind)) return false;
+    if (property.contains_schema) |child| if (!relationalPhysicalConstraintsAreExactForKind(child.*, kind)) return false;
+    if (property.item) |child| if (!relationalPhysicalConstraintsAreExactForKind(child.*, kind)) return false;
+    if (property.unevaluated_items_schema) |child| if (!relationalPhysicalConstraintsAreExactForKind(child.*, kind)) return false;
     return true;
+}
+
+fn relationalNumericKind(property: DocumentProperty) ?RelationalNumericKind {
+    if (property.integer_only) return .integer;
+    const field_type = property.field_type orelse return null;
+    if (std.mem.eql(u8, field_type, "integer")) return .integer;
+    if (std.mem.eql(u8, field_type, "numeric") or std.mem.eql(u8, field_type, "number")) return .number;
+    return null;
+}
+
+fn relationalNumericLiteralIsEncodable(literal: []const u8, kind: RelationalNumericKind) bool {
+    if (normalizeJsonDecimal(literal) == null) return true;
+    return switch (kind) {
+        .integer => exactI64JsonNumber(.{ .number_string = literal }) != null,
+        .number => losslessJsonNumberTextToF64(literal) != null,
+    };
 }
 
 fn isRelationalStorageProperty(property: DocumentProperty) bool {
@@ -2068,6 +2107,11 @@ fn parseAnonymousProperty(alloc: std.mem.Allocator, context: SchemaContext, unre
     return try parseAnonymousPropertyKeywords(alloc, current_context, unresolved_object);
 }
 
+fn jsonNumberKeywordIsLosslessF64(object: std.json.ObjectMap, name: []const u8) bool {
+    const value = object.get(name) orelse return true;
+    return value == .null or documentNumberToF64(value) != null;
+}
+
 fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaContext, object: std.json.ObjectMap) anyerror!*DocumentProperty {
     const property = try alloc.create(DocumentProperty);
     errdefer alloc.destroy(property);
@@ -2133,6 +2177,12 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         }
     else
         null;
+    const numeric_constraints_are_lossless_f64 =
+        jsonNumberKeywordIsLosslessF64(object, "minimum") and
+        jsonNumberKeywordIsLosslessF64(object, "maximum") and
+        jsonNumberKeywordIsLosslessF64(object, "exclusiveMinimum") and
+        jsonNumberKeywordIsLosslessF64(object, "exclusiveMaximum") and
+        jsonNumberKeywordIsLosslessF64(object, "multipleOf");
     const multiple_of_i64 = if (object.get("multipleOf")) |multiple_of_value|
         if (multiple_of_value == .null) null else exactPositiveI64JsonNumber(multiple_of_value)
     else
@@ -2510,6 +2560,7 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         .exclusive_maximum_i64 = exclusive_maximum_i64,
         .multiple_of = multiple_of,
         .multiple_of_i64 = multiple_of_i64,
+        .numeric_constraints_are_lossless_f64 = numeric_constraints_are_lossless_f64,
         .min_length = min_length,
         .max_length = max_length,
         .min_properties = min_properties,
@@ -3482,7 +3533,11 @@ fn validateDocumentFieldValueWithContext(
             if (numeric_value >= exclusive_maximum) return error.InvalidBatchRequest;
         }
         if (property.multiple_of) |multiple_of| {
-            if (!isMultipleOf(numeric_value, multiple_of)) return error.InvalidBatchRequest;
+            const matches = if (context.require_physical_encoding)
+                exactF64MultipleOf(numeric_value, multiple_of)
+            else
+                isMultipleOf(numeric_value, multiple_of);
+            if (!matches) return error.InvalidBatchRequest;
         }
         return;
     }
@@ -3564,33 +3619,31 @@ pub fn documentIntegerToI64(value: std.json.Value) ?i64 {
 /// into its finite f64 representation. Validation and projection share this
 /// boundary so a validated write is always encodable by the row codec.
 pub fn documentNumberToF64(value: std.json.Value) ?f64 {
-    const number = switch (value) {
-        .integer => |integer| @as(f64, @floatFromInt(integer)),
-        .float => |float| float,
-        .number_string => |text| std.fmt.parseFloat(f64, text) catch return null,
-        else => return null,
+    return switch (value) {
+        .integer => |integer| blk: {
+            var integer_buf: [32]u8 = undefined;
+            const text = std.fmt.bufPrint(&integer_buf, "{d}", .{integer}) catch break :blk null;
+            break :blk losslessJsonNumberTextToF64(text);
+        },
+        // A Value.float has already chosen binary64 semantics, so there is no
+        // original decimal token left to compare.
+        .float => |float| if (std.math.isFinite(float)) float else null,
+        .number_string => |text| losslessJsonNumberTextToF64(text),
+        else => null,
     };
+}
+
+fn losslessJsonNumberTextToF64(text: []const u8) ?f64 {
+    const number = std.fmt.parseFloat(f64, text) catch return null;
     if (!std.math.isFinite(number)) return null;
 
     // Raw relational writes retain JSON number tokens as number_string. Make
     // sure the shortest JSON spelling of the physical f64 still denotes the
     // same mathematical number; otherwise authoritative-column reads would
     // silently return a different value (including non-zero underflow to 0).
-    // A Value.float has already chosen binary64 semantics, so there is no
-    // original decimal token left to compare.
-    if (value == .float) return number;
     var physical_buf: [128]u8 = undefined;
     const physical_text = std.fmt.bufPrint(&physical_buf, "{d}", .{number}) catch return null;
-    const original_text = switch (value) {
-        .integer => |integer| blk: {
-            var integer_buf: [32]u8 = undefined;
-            const text = std.fmt.bufPrint(&integer_buf, "{d}", .{integer}) catch return null;
-            break :blk normalizedJsonDecimalsEqual(text, physical_text);
-        },
-        .number_string => |text| normalizedJsonDecimalsEqual(text, physical_text),
-        else => unreachable,
-    };
-    return if (original_text) number else null;
+    return if (normalizedJsonDecimalsEqual(text, physical_text)) number else null;
 }
 
 pub fn documentPropertyAllowsNull(property: DocumentProperty) bool {
@@ -4341,7 +4394,7 @@ test "relational schemas imply type enforcement and require a closed typed shape
     defer typed_enum.deinit(alloc);
 
     var metadata_ttl = try parseSchema(alloc,
-        \\{"storage_mode":"relational","ttl_duration_ns":1,"default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"additionalProperties":false}}}}
+        \\{"storage_mode":"relational","ttl_duration_ns":1,"default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"_timestamp":{"type":"datetime"}},"additionalProperties":false}}}}
     );
     defer metadata_ttl.deinit(alloc);
 
@@ -4401,6 +4454,9 @@ test "relational schemas reject contracts the row codec cannot represent" {
         \\{"storage_mode":"relational","ttl_duration_ns":1,"ttl_field":"_expires_at","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"additionalProperties":false}}}}
     ));
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
+        \\{"storage_mode":"relational","ttl_duration_ns":1,"default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"additionalProperties":false}}}}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
         \\{"storage_mode":"relational","ttl_duration_ns":1,"ttl_field":"expires_at","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"expires_at":{"type":"numeric"}},"additionalProperties":false}}}}
     ));
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
@@ -4411,14 +4467,14 @@ test "relational schemas reject contracts the row codec cannot represent" {
     ));
 }
 
-test "declared underscore properties are validated while system metadata stays exempt" {
+test "relational schemas validate declared underscore properties and reject undeclared metadata" {
     const alloc = std.testing.allocator;
     var schema = try parseSchema(alloc,
         \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","minProperties":1,"maxProperties":1,"propertyNames":{"pattern":"^_rank$"},"properties":{"_rank":{"type":"integer","maximum":0}},"required":["_rank"],"additionalProperties":false}}}}
     );
     defer schema.deinit(alloc);
 
-    try validateWritesAgainstSchema(alloc, schema, &.{.{ .value = "{\"_rank\":0,\"_id\":\"row-a\"}" }});
+    try validateWritesAgainstSchema(alloc, schema, &.{.{ .value = "{\"_rank\":0}" }});
     try std.testing.expectError(
         error.InvalidBatchRequest,
         validateWritesAgainstSchema(alloc, schema, &.{.{ .value = "{\"_rank\":1}" }}),
@@ -4427,6 +4483,56 @@ test "declared underscore properties are validated while system metadata stays e
         error.InvalidBatchRequest,
         validateWritesAgainstSchema(alloc, schema, &.{.{ .value = "{\"_rank\":\"0\"}" }}),
     );
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateWritesAgainstSchema(alloc, schema, &.{.{ .value = "{\"_rank\":0,\"_id\":\"row-a\"}" }}),
+    );
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateWritesAgainstSchema(alloc, schema, &.{.{ .value = "{\"_rank\":0,\"_private\":true}" }}),
+    );
+}
+
+test "relational number schemas require lossless physical constraints" {
+    const alloc = std.testing.allocator;
+
+    var accepted = try parseSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"score":{"type":"number","minimum":0.1,"maximum":10.5,"multipleOf":0.1,"const":0.3,"enum":[0.3,0.4]}},"additionalProperties":false}}}}
+    );
+    defer accepted.deinit(alloc);
+
+    const rejected_schemas = [_][]const u8{
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"score":{"type":"number","minimum":0.10000000000000001}},"additionalProperties":false}}}}
+        ,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"score":{"type":"number","multipleOf":0.10000000000000001}},"additionalProperties":false}}}}
+        ,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"score":{"type":"number","const":0.10000000000000001}},"additionalProperties":false}}}}
+        ,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"score":{"type":"number","enum":[0.1,0.10000000000000001]}},"additionalProperties":false}}}}
+        ,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"qty":{"type":"integer","const":9223372036854775808}},"additionalProperties":false}}}}
+        ,
+    };
+    for (rejected_schemas) |schema_json| {
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc, schema_json));
+    }
+}
+
+test "relational multipleOf validation uses exact decimal arithmetic" {
+    const alloc = std.testing.allocator;
+    var schema = try parseSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"score":{"type":"number","multipleOf":1}},"required":["score"],"additionalProperties":false}}}}
+    );
+    defer schema.deinit(alloc);
+
+    try validateWritesAgainstSchema(alloc, schema, &.{.{ .value = "{\"score\":2}" }});
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateWritesAgainstSchema(alloc, schema, &.{.{ .value = "{\"score\":1.0000000001}" }}),
+    );
+    try std.testing.expect(exactF64MultipleOf(0.3, 0.1));
+    try std.testing.expect(exactF64MultipleOf(0.5, 0.25));
+    try std.testing.expect(!exactF64MultipleOf(0.5, 2));
 }
 
 test "numeric const and enum comparison preserves exact JSON semantics" {
@@ -4541,6 +4647,70 @@ fn isIntegralJsonNumber(value: std.json.Value, numeric_value: f64) bool {
 fn isMultipleOf(value: f64, divisor: f64) bool {
     const quotient = value / divisor;
     return std.math.approxEqAbs(f64, quotient, @round(quotient), 1e-9);
+}
+
+/// Relational numbers are persisted as f64 and reconstructed using Zig's
+/// shortest round-trippable decimal. Check `multipleOf` in that exact decimal
+/// domain instead of applying a tolerance to the quotient: a tolerance admits
+/// nearby non-multiples and becomes increasingly permissive for small values.
+fn exactF64MultipleOf(value: f64, divisor: f64) bool {
+    if (!std.math.isFinite(value) or !std.math.isFinite(divisor) or divisor <= 0) return false;
+    if (value == 0) return true;
+
+    var value_buf: [128]u8 = undefined;
+    const value_text = std.fmt.bufPrint(&value_buf, "{d}", .{value}) catch return false;
+    var divisor_buf: [128]u8 = undefined;
+    const divisor_text = std.fmt.bufPrint(&divisor_buf, "{d}", .{divisor}) catch return false;
+    const normalized_value = normalizeJsonDecimal(value_text) orelse return false;
+    const normalized_divisor = normalizeJsonDecimal(divisor_text) orelse return false;
+    if (normalized_divisor.zero) return false;
+
+    const numerator = normalizedJsonSignificandToU128(normalized_value) orelse return false;
+    var denominator = normalizedJsonSignificandToU128(normalized_divisor) orelse return false;
+    const value_scale = normalizedJsonScaleToI128(normalized_value) orelse return false;
+    const divisor_scale = normalizedJsonScaleToI128(normalized_divisor) orelse return false;
+    const decimal_zeros = std.math.sub(i128, value_scale, divisor_scale) catch return false;
+    if (decimal_zeros < 0) return false;
+
+    const common = unsignedGreatestCommonDivisor(numerator, denominator);
+    denominator /= common;
+
+    var twos: i128 = 0;
+    while (denominator % 2 == 0) {
+        denominator /= 2;
+        twos += 1;
+    }
+    var fives: i128 = 0;
+    while (denominator % 5 == 0) {
+        denominator /= 5;
+        fives += 1;
+    }
+    return denominator == 1 and twos <= decimal_zeros and fives <= decimal_zeros;
+}
+
+fn normalizedJsonSignificandToU128(normalized: NormalizedJsonDecimal) ?u128 {
+    if (normalized.zero) return 0;
+    var value: u128 = 0;
+    var index = normalized.first_significant;
+    var consumed: usize = 0;
+    while (consumed < normalized.significant_digits) : (consumed += 1) {
+        while (normalized.text[index] == '.') index += 1;
+        value = std.math.mul(u128, value, 10) catch return null;
+        value = std.math.add(u128, value, normalized.text[index] - '0') catch return null;
+        index += 1;
+    }
+    return value;
+}
+
+fn unsignedGreatestCommonDivisor(left: u128, right: u128) u128 {
+    var a = left;
+    var b = right;
+    while (b != 0) {
+        const remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    return a;
 }
 
 fn regexMatch(pattern: []const u8, text: []const u8) !bool {
