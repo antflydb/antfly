@@ -1389,13 +1389,13 @@ pub const FieldCapability = struct {
     type: AntflyType,
     /// Query modes supported by this concrete field variant. These modes are derived from Antfly field types such as `text`, `keyword`, `datetime`, `geopoint`, and `search_as_you_type`; they are not separate schema toggles.
     query_modes: []const []const u8,
-    /// Whether this concrete field is declared sortable in the effective capability model. Public exact order_by accepts it only when sort_lifecycle_state is queryable or accelerated.
+    /// Whether this concrete field is declared sortable in the effective capability model. A cold declared field is validated on first exact order_by use; clients do not need to poll lifecycle status.
     sortable: bool,
     /// Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
     provenance: []const u8,
     /// Current missing/null handling policy for this field.
     missing_null_policy: []const u8,
-    /// Operational lifecycle state for exact sort use. Queryable fields are accepted by public exact sort; accelerated fields are queryable and participate in the configured index_sort tuple.
+    /// Cached operational lifecycle state for exact sort use. Declared or indexed fields are validated on first public exact-sort use; queryable fields have validated native coverage; accelerated fields are queryable and participate in the configured index_sort tuple.
     sort_lifecycle_state: []const u8,
     /// Analyzer name for text/searchable fields, when applicable.
     analyzer: ?[]const u8 = null,

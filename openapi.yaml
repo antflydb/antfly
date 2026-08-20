@@ -234,13 +234,15 @@ tags:
 
       Adding `sortable: true` to an existing table is a physical mapping
 
-      change: exact sort becomes available only after the active index
+      change. Once the write or rebuild visibility barrier completes, clients
 
-      generation reports complete native coverage through
+      may issue `order_by` directly. Antfly validates cold physical coverage on
 
-      `field_capabilities.sort_lifecycle_state` (`queryable` or
+      first use and fails closed when it is incomplete; status reads do not
 
-      `accelerated`).
+      warm columns, so `sort_lifecycle_state` may remain `declared` until that
+
+      validation succeeds.
 
 
       ### `x-antfly-index`
@@ -9903,9 +9905,9 @@ components:
           description: >
             Whether this concrete field is declared sortable in the effective
 
-            capability model. Public exact order_by accepts it only when
+            capability model. A cold declared field is validated on first
 
-            sort_lifecycle_state is queryable or accelerated.
+            exact order_by use; clients do not need to poll lifecycle status.
         provenance:
           type: string
           description: Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
@@ -9921,9 +9923,9 @@ components:
             - covered
             - queryable
             - accelerated
-          description: Operational lifecycle state for exact sort use. Queryable fields are accepted by
-            public exact sort; accelerated fields are queryable and participate in the configured index_sort
-            tuple.
+          description: Cached operational lifecycle state for exact sort use. Declared or indexed fields
+            are validated on first public exact-sort use; queryable fields have validated native coverage;
+            accelerated fields are queryable and participate in the configured index_sort tuple.
         analyzer:
           type: string
           description: Analyzer name for text/searchable fields, when applicable.

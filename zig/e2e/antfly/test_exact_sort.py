@@ -186,15 +186,13 @@ def test_public_exact_sort_declares_native_coverage_and_shorthand_fields_are_act
         sync_level="full_text",
     )
 
-    # full_text synchronization is the public visibility barrier. A successful
-    # write must make the exact fields immediately queryable to the next read.
+    # Status is observational and must not scan cold columns. full_text remains
+    # the public visibility barrier: the first sorted query validates only its
+    # requested column and succeeds without a client-side status polling loop.
     ready = stateful_api.get_table(sortable_table)
     ready_capabilities = _capabilities_by_field(ready)
     for field in ("label", "size", "modified_at"):
-        assert ready_capabilities[field]["sort_lifecycle_state"] in {
-            "queryable",
-            "accelerated",
-        }, ready_capabilities[field]
+        assert ready_capabilities[field]["sort_lifecycle_state"] == "declared"
 
     for field, expected in (
         ("label", ["a", "b", "c"]),
@@ -215,6 +213,14 @@ def test_public_exact_sort_declares_native_coverage_and_shorthand_fields_are_act
         assert sort_profile["plan"] == "native_doc_values_top_n"
         assert sort_profile["source"] == "doc_values_collector"
         assert sort_profile["source_load"] == "projected_source_after_page"
+
+        warmed_capabilities = _capabilities_by_field(
+            stateful_api.get_table(sortable_table)
+        )
+        assert warmed_capabilities[field]["sort_lifecycle_state"] in {
+            "queryable",
+            "accelerated",
+        }
 
     if stateful_api.supports_restart:
         stateful_api.restart_server()

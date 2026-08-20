@@ -3984,8 +3984,8 @@ export interface components {
             query_modes: ("full_text" | "exact" | "range" | "geo" | "autocomplete")[];
             /**
              * @description Whether this concrete field is declared sortable in the effective
-             *     capability model. Public exact order_by accepts it only when
-             *     sort_lifecycle_state is queryable or accelerated.
+             *     capability model. A cold declared field is validated on first
+             *     exact order_by use; clients do not need to poll lifecycle status.
              */
             sortable: boolean;
             /** @description Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic. */
@@ -3993,7 +3993,7 @@ export interface components {
             /** @description Current missing/null handling policy for this field. */
             missing_null_policy: string;
             /**
-             * @description Operational lifecycle state for exact sort use. Queryable fields are accepted by public exact sort; accelerated fields are queryable and participate in the configured index_sort tuple.
+             * @description Cached operational lifecycle state for exact sort use. Declared or indexed fields are validated on first public exact-sort use; queryable fields have validated native coverage; accelerated fields are queryable and participate in the configured index_sort tuple.
              * @enum {string}
              */
             sort_lifecycle_state: "unsupported" | "declared" | "indexed" | "covered" | "queryable" | "accelerated";

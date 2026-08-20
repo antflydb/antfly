@@ -219,10 +219,11 @@ tags:
       Sort the examples above with `created_at` and `title.keyword`,
       respectively. An analyzed `text` field is never directly sortable.
       Adding `sortable: true` to an existing table is a physical mapping
-      change: exact sort becomes available only after the active index
-      generation reports complete native coverage through
-      `field_capabilities.sort_lifecycle_state` (`queryable` or
-      `accelerated`).
+      change. Once the write or rebuild visibility barrier completes, clients
+      may issue `order_by` directly. Antfly validates cold physical coverage on
+      first use and fails closed when it is incomplete; status reads do not
+      warm columns, so `sort_lifecycle_state` may remain `declared` until that
+      validation succeeds.
 
       ### `x-antfly-index`
       Boolean to disable indexing for a field:
@@ -3393,8 +3394,8 @@ components:
           type: boolean
           description: |
             Whether this concrete field is declared sortable in the effective
-            capability model. Public exact order_by accepts it only when
-            sort_lifecycle_state is queryable or accelerated.
+            capability model. A cold declared field is validated on first
+            exact order_by use; clients do not need to poll lifecycle status.
         provenance:
           type: string
           description: Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
@@ -3404,7 +3405,7 @@ components:
         sort_lifecycle_state:
           type: string
           enum: [unsupported, declared, indexed, covered, queryable, accelerated]
-          description: Operational lifecycle state for exact sort use. Queryable fields are accepted by public exact sort; accelerated fields are queryable and participate in the configured index_sort tuple.
+          description: Cached operational lifecycle state for exact sort use. Declared or indexed fields are validated on first public exact-sort use; queryable fields have validated native coverage; accelerated fields are queryable and participate in the configured index_sort tuple.
         analyzer:
           type: string
           description: Analyzer name for text/searchable fields, when applicable.

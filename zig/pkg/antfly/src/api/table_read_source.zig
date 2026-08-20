@@ -66,6 +66,7 @@ pub const BackgroundTextStatsResponse = struct {
 
 pub const LsmStorageStats = runtime_status.LsmStorageStats;
 pub const ObservedDynamicFieldCapabilitySet = dynamic_field_capability.ObservedDynamicFieldCapabilitySet;
+pub const DynamicFieldObservationQuery = dynamic_field_capability.ObservationQuery;
 
 pub const ParsedTextStatsHttpResponse = union(enum) {
     fields: TextStatsResponse,
@@ -280,6 +281,7 @@ pub const TableReadSource = struct {
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             table_name: []const u8,
+            observation: DynamicFieldObservationQuery,
         ) anyerror!?[]ObservedDynamicFieldCapabilitySet = null,
         document_artifact_manifest: ?*const fn (
             ptr: *anyopaque,
@@ -668,8 +670,9 @@ pub const TableReadSource = struct {
         self: TableReadSource,
         alloc: std.mem.Allocator,
         table_name: []const u8,
+        observation: DynamicFieldObservationQuery,
     ) !?[]ObservedDynamicFieldCapabilitySet {
         const fn_ptr = self.vtable.observed_dynamic_field_capability_sets orelse return null;
-        return try BoundaryAbi.call("observed_dynamic_field_capability_sets", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name });
+        return try BoundaryAbi.call("observed_dynamic_field_capability_sets", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, observation });
     }
 };

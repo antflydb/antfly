@@ -258,6 +258,7 @@ pub const TextStatsResponse = table_read_source.TextStatsResponse;
 pub const BackgroundTextStatsResponse = table_read_source.BackgroundTextStatsResponse;
 pub const LsmStorageStats = table_read_source.LsmStorageStats;
 pub const ObservedDynamicFieldCapabilitySet = table_read_source.ObservedDynamicFieldCapabilitySet;
+pub const DynamicFieldObservationQuery = table_read_source.DynamicFieldObservationQuery;
 pub const ParsedTextStatsHttpResponse = table_read_source.ParsedTextStatsHttpResponse;
 
 pub const testing = if (builtin.is_test) struct {
@@ -2126,10 +2127,11 @@ pub const BoundTableReadSource = struct {
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
+        observation: DynamicFieldObservationQuery,
     ) !?[]ObservedDynamicFieldCapabilitySet {
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table_name)) return null;
-        return try self.db.observedDynamicFieldCapabilitySetsAlloc(alloc);
+        return try self.db.observedDynamicFieldCapabilitySetsAlloc(alloc, observation);
     }
 
     fn localRuntimeStatuses(
@@ -3600,6 +3602,7 @@ pub const ProvisionedTableReadSource = struct {
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
+        observation: DynamicFieldObservationQuery,
     ) !?[]ObservedDynamicFieldCapabilitySet {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var read_activity = self.beginPreparedRead(table_name, .general);
@@ -3638,7 +3641,7 @@ pub const ProvisionedTableReadSource = struct {
             }) orelse return error.StorageReadTemporarilyUnavailable;
             defer owner.deinit();
 
-            const group_sets = try owner.db().observedDynamicFieldCapabilitySetsAlloc(alloc);
+            const group_sets = try owner.db().observedDynamicFieldCapabilitySetsAlloc(alloc, observation);
             defer freeObservedDynamicFieldCapabilitySets(alloc, group_sets);
             for (group_sets) |set| try mergeObservedDynamicFieldCapabilitySet(alloc, &merged, set);
         }
@@ -26769,7 +26772,7 @@ test "provisioned storage inspection uses table read admission" {
     source.prepare_for_read = tracker.iface();
 
     try std.testing.expect((try source.source().lsmStorageStats(std.testing.allocator, "docs")) == null);
-    try std.testing.expect((try source.source().observedDynamicFieldCapabilitySets(std.testing.allocator, "docs")) == null);
+    try std.testing.expect((try source.source().observedDynamicFieldCapabilitySets(std.testing.allocator, "docs", .{})) == null);
     try std.testing.expectEqual(@as(usize, 2), tracker.begins);
     try std.testing.expectEqual(@as(usize, 2), tracker.ends);
 }

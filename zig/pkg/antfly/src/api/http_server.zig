@@ -3860,16 +3860,17 @@ pub const ApiHttpServer = struct {
     fn observedDynamicFieldCapabilitySets(
         self: *ApiHttpServer,
         table_name: []const u8,
+        observation: table_reads.DynamicFieldObservationQuery,
     ) ![]table_reads.ObservedDynamicFieldCapabilitySet {
         const source = self.table_reads orelse return &.{};
-        return (try source.observedDynamicFieldCapabilitySets(self.alloc, table_name)) orelse &.{};
+        return (try source.observedDynamicFieldCapabilitySets(self.alloc, table_name, observation)) orelse &.{};
     }
 
     fn bestEffortObservedDynamicFieldCapabilitySets(
         self: *ApiHttpServer,
         table_name: []const u8,
     ) ![]table_reads.ObservedDynamicFieldCapabilitySet {
-        return self.observedDynamicFieldCapabilitySets(table_name) catch |err| switch (err) {
+        return self.observedDynamicFieldCapabilitySets(table_name, .{ .coverage_read_mode = .cached_only }) catch |err| switch (err) {
             // Observability and query-builder callers can still provide the
             // declared schema when a cold query DB has no physical evidence
             // yet. They must not warm storage merely to enrich metadata.
@@ -5100,6 +5101,9 @@ pub const ApiHttpServer = struct {
         query_req: db_mod.types.SearchRequest,
     ) !void {
         if (!publicSearchRequestHasSortPageControls(query_req)) return;
+        // Reject shape/source errors and finish synthetic-only sorts before
+        // opening table state or validating any physical column.
+        if (try validatePublicQuerySortRequestContract(query_req)) return;
 
         var snapshot = (try self.source.adminSnapshot()) orelse return;
         defer self.source.freeAdminSnapshot(&snapshot);
@@ -5114,10 +5118,16 @@ pub const ApiHttpServer = struct {
         const runtime_schema = try schema_mod.deriveRuntimeTableSchema(self.alloc, parsed_schema);
         defer storage_schema.freeSchema(self.alloc, runtime_schema);
 
-        const observed_dynamic_capability_sets = try self.queryObservedDynamicFieldCapabilitySets(
-            table_name,
-            query_req,
-        );
+        const physical_sort_fields = try publicPhysicalSortFieldsAlloc(self.alloc, query_req.order_by);
+        defer if (physical_sort_fields.len > 0) self.alloc.free(physical_sort_fields);
+        const observed_dynamic_capability_sets: []table_reads.ObservedDynamicFieldCapabilitySet = if (physical_sort_fields.len == 0)
+            &.{}
+        else
+            try self.queryObservedDynamicFieldCapabilitySets(table_name, query_req, .{
+                .index_name = query_req.primary_text_index_name orelse query_req.index_name,
+                .fields = physical_sort_fields,
+                .coverage_read_mode = .validate,
+            });
         defer self.freeObservedDynamicFieldCapabilitySets(observed_dynamic_capability_sets);
         try validatePublicQuerySortCapabilitiesAgainstRuntime(query_req, runtime_schema, observed_dynamic_capability_sets);
     }
@@ -5126,9 +5136,10 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         table_name: []const u8,
         query_req: db_mod.types.SearchRequest,
+        observation: table_reads.DynamicFieldObservationQuery,
     ) ![]table_reads.ObservedDynamicFieldCapabilitySet {
         const source = self.table_reads orelse return &.{};
-        return self.observedDynamicFieldCapabilitySets(table_name) catch |err| switch (err) {
+        return self.observedDynamicFieldCapabilitySets(table_name, observation) catch |err| switch (err) {
             error.StorageReadTemporarilyUnavailable => {
                 // A cold provisioned table has not installed a resident query
                 // handle yet. Let the normal preflight retry protocol prepare
@@ -5142,7 +5153,7 @@ pub const ApiHttpServer = struct {
                     0,
                 )) orelse return error.StorageReadTemporarilyUnavailable;
                 defer summary.deinit(self.alloc);
-                return self.observedDynamicFieldCapabilitySets(table_name) catch |retry_err| switch (retry_err) {
+                return self.observedDynamicFieldCapabilitySets(table_name, observation) catch |retry_err| switch (retry_err) {
                     error.StorageReadTemporarilyUnavailable => error.StorageReadTemporarilyUnavailable,
                     else => retry_err,
                 };
@@ -12308,35 +12319,8 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntime(
     runtime_schema: storage_schema.TableSchema,
     observed_dynamic_capability_sets: []const table_reads.ObservedDynamicFieldCapabilitySet,
 ) !void {
+    if (try validatePublicQuerySortRequestContract(query_req)) return;
     const cursor = if (query_req.search_after.len > 0) query_req.search_after else query_req.search_before;
-    if (query_req.order_by.len == 0 and cursor.len == 0) return;
-    try validatePublicCountOnlySortPageContract(query_req);
-    try validatePublicSortCursorContract(query_req);
-    if (query_req.hierarchy_children != null) {
-        // `_hierarchy.position` is produced by the traversal planner, not by a
-        // mapped document field. The query contract has already selected the
-        // dedicated child-navigation mode; validate its exact synthetic order
-        // here instead of sending it through the native doc-value capability
-        // gate used by ordinary search sorts.
-        if (query_req.order_by.len != 2 or
-            !std.mem.eql(u8, query_req.order_by[0].field, "_hierarchy.position") or
-            query_req.order_by[0].desc or
-            !std.mem.eql(u8, query_req.order_by[1].field, "_id") or
-            query_req.order_by[1].desc or
-            query_req.search_before.len != 0 or
-            (query_req.search_after.len > 0 and
-                (query_req.search_after.len != 2 or
-                    query_req.search_after[0] != .string or
-                    query_req.search_after[1] != .string)))
-        {
-            recordPublicSortCapabilityRejection("_hierarchy.position", "invalid_cursor_arity", "invalid_hierarchy_navigation_order");
-            return error.InvalidQueryRequest;
-        }
-        return;
-    }
-    try validatePublicScoreSortSource(query_req);
-    try validatePublicApproximateSortSource(query_req);
-    if (query_req.order_by.len == 0) return;
     for (query_req.order_by, 0..) |field, i| {
         if (std.mem.eql(u8, field.field, "_id")) continue;
         if (std.mem.eql(u8, field.field, "_score")) continue;
@@ -12370,10 +12354,70 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntime(
     }
 }
 
+/// Validate everything that does not require physical typed-doc-values
+/// evidence. Returning true means the request is fully handled by synthetic
+/// sort keys and query admission can avoid table/index access entirely.
+fn validatePublicQuerySortRequestContract(query_req: db_mod.types.SearchRequest) !bool {
+    const cursor = if (query_req.search_after.len > 0) query_req.search_after else query_req.search_before;
+    if (query_req.order_by.len == 0 and cursor.len == 0) return true;
+    try validatePublicCountOnlySortPageContract(query_req);
+    try validatePublicSortCursorContract(query_req);
+    if (query_req.hierarchy_children != null) {
+        // `_hierarchy.position` is produced by the traversal planner, not by a
+        // mapped document field. The query contract has already selected the
+        // dedicated child-navigation mode; validate its exact synthetic order
+        // here instead of sending it through the native doc-value capability
+        // gate used by ordinary search sorts.
+        if (query_req.order_by.len != 2 or
+            !std.mem.eql(u8, query_req.order_by[0].field, "_hierarchy.position") or
+            query_req.order_by[0].desc or
+            !std.mem.eql(u8, query_req.order_by[1].field, "_id") or
+            query_req.order_by[1].desc or
+            query_req.search_before.len != 0 or
+            (query_req.search_after.len > 0 and
+                (query_req.search_after.len != 2 or
+                    query_req.search_after[0] != .string or
+                    query_req.search_after[1] != .string)))
+        {
+            recordPublicSortCapabilityRejection("_hierarchy.position", "invalid_cursor_arity", "invalid_hierarchy_navigation_order");
+            return error.InvalidQueryRequest;
+        }
+        return true;
+    }
+    try validatePublicScoreSortSource(query_req);
+    try validatePublicApproximateSortSource(query_req);
+    for (query_req.order_by) |field| {
+        if (!std.mem.eql(u8, field.field, "_id") and !std.mem.eql(u8, field.field, "_score")) return false;
+    }
+    return true;
+}
+
 fn publicSearchRequestHasSortPageControls(query_req: db_mod.types.SearchRequest) bool {
     return query_req.order_by.len > 0 or
         query_req.search_after.len > 0 or
         query_req.search_before.len > 0;
+}
+
+fn publicPhysicalSortFieldsAlloc(
+    alloc: std.mem.Allocator,
+    order_by: []const db_mod.types.SortField,
+) ![]const []const u8 {
+    var fields = std.ArrayListUnmanaged([]const u8).empty;
+    defer fields.deinit(alloc);
+    for (order_by) |sort_field| {
+        if (std.mem.eql(u8, sort_field.field, "_id") or
+            std.mem.eql(u8, sort_field.field, "_score") or
+            std.mem.eql(u8, sort_field.field, "_hierarchy.position")) continue;
+        var duplicate = false;
+        for (fields.items) |field| {
+            if (std.mem.eql(u8, field, sort_field.field)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) try fields.append(alloc, sort_field.field);
+    }
+    return try fields.toOwnedSlice(alloc);
 }
 
 fn validatePublicCountOnlySortPageContract(query_req: db_mod.types.SearchRequest) !void {
@@ -17462,6 +17506,22 @@ test "api http public table dispatch preserves unsupported sorted query as exact
         alloc,
         "{\"join\":{}}",
     ));
+}
+
+test "api http exact sort observation selects only unique physical fields" {
+    const order = [_]db_mod.types.SortField{
+        .{ .field = "price" },
+        .{ .field = "_score" },
+        .{ .field = "price", .desc = true },
+        .{ .field = "quantity" },
+        .{ .field = "_id" },
+        .{ .field = "_hierarchy.position" },
+    };
+    const fields = try publicPhysicalSortFieldsAlloc(std.testing.allocator, &order);
+    defer if (fields.len > 0) std.testing.allocator.free(fields);
+    try std.testing.expectEqual(@as(usize, 2), fields.len);
+    try std.testing.expectEqualStrings("price", fields[0]);
+    try std.testing.expectEqualStrings("quantity", fields[1]);
 }
 
 test "api http public sort gate accepts synthetic hierarchy child positions" {
@@ -24148,6 +24208,7 @@ test "api http server query builder loads structured table index metadata" {
             _: *anyopaque,
             _: std.mem.Allocator,
             _: []const u8,
+            _: table_reads.DynamicFieldObservationQuery,
         ) anyerror!?[]table_reads.ObservedDynamicFieldCapabilitySet {
             return error.StorageReadTemporarilyUnavailable;
         }

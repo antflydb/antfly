@@ -113,16 +113,19 @@ multi-field search mappings, but does not implicitly enable exact sort. Use
 `x-antfly-field` as the detailed form when a field needs physical options such
 as `sortable: true`. This intentionally avoids adding doc-value storage and
 build cost to every scalar field. The mapping change rebuilds physical
-coverage; issue `order_by` only after the field's reported lifecycle becomes
-`queryable` or `accelerated`.
+coverage. Once the write or rebuild visibility barrier completes, clients may
+issue `order_by` directly: Antfly validates a cold field on first use and fails
+closed if physical coverage is incomplete. Status reads never warm columns, so
+a safe but not-yet-validated field can remain `declared` until that first sort.
 
 Field capabilities report what the planner can safely do with a concrete field:
 
 - `query_modes` describes modes such as `full_text`, `exact`, `range`, `geo`,
   and `autocomplete`.
 - `sortable` says the field is declared sortable.
-- `sort_lifecycle_state` says whether the field is accepted for exact public
-  sort. Public sort requires `queryable` or `accelerated`.
+- `sort_lifecycle_state` reports cached physical evidence. `queryable` and
+  `accelerated` are already validated; `declared` or `indexed` can be validated
+  by the first exact-sort request. `unsupported` is not sortable.
 - `index_sort_position` and `index_sort_order` identify fields participating in
   the table's physical index sort.
 

@@ -4840,19 +4840,21 @@ pub const DB = struct {
     pub fn observedDynamicFieldCapabilitySetsAlloc(
         self: *DB,
         alloc: Allocator,
+        observation: index_manager_mod.IndexManager.DynamicFieldObservationQuery,
     ) ![]index_manager_mod.IndexManager.ObservedDynamicFieldCapabilitySet {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
-        return try self.core.index_manager.observedDynamicFieldCapabilitySetsAlloc(alloc);
+        return try self.core.index_manager.observedDynamicFieldCapabilitySetsAlloc(alloc, observation);
     }
 
     pub fn tryObservedDynamicFieldCapabilitySetsAlloc(
         self: *DB,
         alloc: Allocator,
+        observation: index_manager_mod.IndexManager.DynamicFieldObservationQuery,
     ) ?[]index_manager_mod.IndexManager.ObservedDynamicFieldCapabilitySet {
         if (!self.core.tryLockApplyShared()) return null;
         defer self.core.unlockApplyShared();
-        return self.core.index_manager.observedDynamicFieldCapabilitySetsAlloc(alloc) catch null;
+        return self.core.index_manager.observedDynamicFieldCapabilitySetsAlloc(alloc, observation) catch null;
     }
 
     pub fn snapshotTextMergeStats(self: *DB) types.TextMergeStats {

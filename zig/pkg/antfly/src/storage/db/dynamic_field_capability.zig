@@ -17,6 +17,34 @@
 const std = @import("std");
 const schema_mod = @import("../schema.zig");
 
+pub const CoverageReadMode = enum(u8) {
+    /// Return only coverage summaries that have already been validated. This
+    /// is the observability path: it must never turn a status read into an
+    /// O(documents) column scan.
+    cached_only,
+    /// Validate uncached coverage for the selected fields. Query admission
+    /// uses this fail-closed path before an exact sort reaches execution.
+    validate,
+};
+
+pub const ObservationQuery = struct {
+    /// When set, observe only this text index. A null index intentionally
+    /// preserves the existing cross-index conservative merge semantics.
+    index_name: ?[]const u8 = null,
+    /// Empty means all fields. Query admission supplies its de-duplicated
+    /// physical sort fields so unrelated columns remain cold.
+    fields: []const []const u8 = &.{},
+    coverage_read_mode: CoverageReadMode = .cached_only,
+
+    pub fn includesField(self: ObservationQuery, field: []const u8) bool {
+        if (self.fields.len == 0) return true;
+        for (self.fields) |selected| {
+            if (std.mem.eql(u8, selected, field)) return true;
+        }
+        return false;
+    }
+};
+
 pub const ObservedDynamicFieldCapabilitySet = struct {
     index_name: []u8,
     field_capabilities: []schema_mod.FieldCapability,

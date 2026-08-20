@@ -154,8 +154,9 @@ pub const SegmentShared = struct {
     /// Lazily populated physical column summaries plus an atomically
     /// maintained count of missing values that still belong to live
     /// documents. Segment admission records only the typed-column names;
-    /// decoding is deferred until exact-sort admission or status asks about a
-    /// concrete field. Deletion transitions preserve exact-sort safety.
+    /// decoding is deferred until exact-sort admission asks about a concrete
+    /// field. Status reads only summaries already published by that path.
+    /// Deletion transitions preserve exact-sort safety.
     typed_doc_values_coverage: []TypedDocValuesFieldCoverage = &.{},
     /// Set when the segment is replaced/removed from the live index. Runs
     /// once the last reference dies, after resources are deinited.
@@ -213,14 +214,17 @@ pub const TypedDocValuesFieldCoverage = struct {
     membership_is_missing: bool = true,
     missing_live_count: std.atomic.Value(u32) = .init(0),
     initialized: std.atomic.Value(bool) = .init(false),
-    initialization_lock: std.atomic.Value(u8) = .init(0),
+    initialization_mutex: std.Io.Mutex = .init,
 
     fn lockInitialization(self: *TypedDocValuesFieldCoverage) void {
-        while (self.initialization_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) spinOrYield();
+        // The winner can spend meaningful time validating and decompressing a
+        // large column. Park concurrent request workers instead of repeatedly
+        // yielding them for the duration of that scan.
+        std.Io.Threaded.mutexLock(&self.initialization_mutex);
     }
 
     fn unlockInitialization(self: *TypedDocValuesFieldCoverage) void {
-        self.initialization_lock.store(0, .release);
+        std.Io.Threaded.mutexUnlock(&self.initialization_mutex);
     }
 
     fn status(self: *const TypedDocValuesFieldCoverage) TypedDocValuesCoverageStatus {
@@ -506,6 +510,39 @@ pub const SegmentEntry = struct {
         status: TypedDocValuesCoverageStatus,
         value_type: ?typed_dv.ValueType,
     };
+
+    pub const CachedTypedDocValuesCoverage = union(enum) {
+        /// The segment metadata contains no typed-doc-values column for the
+        /// requested field.
+        missing,
+        /// The column exists but no query has paid to validate it yet.
+        uninitialized,
+        initialized: TypedDocValuesCoverage,
+    };
+
+    /// Inspect the cheap per-segment metadata and any already-published
+    /// summary without initiating column decoding. Status and query-builder
+    /// paths use this to remain bounded independently of document count.
+    pub fn cachedTypedDocValuesCoverage(self: *const SegmentEntry, field: []const u8) CachedTypedDocValuesCoverage {
+        var low: usize = 0;
+        var high = self.shared.typed_doc_values_coverage.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            const coverage = &self.shared.typed_doc_values_coverage[mid];
+            switch (std.mem.order(u8, coverage.field, field)) {
+                .lt => low = mid + 1,
+                .gt => high = mid,
+                .eq => {
+                    if (!coverage.initialized.load(.acquire)) return .uninitialized;
+                    return .{ .initialized = .{
+                        .status = coverage.status(),
+                        .value_type = coverage.value_type,
+                    } };
+                },
+            }
+        }
+        return .missing;
+    }
 
     /// Return coverage for a physical typed-doc-values column. The first call
     /// for a concrete field validates and caches its compact membership;
@@ -2273,6 +2310,8 @@ test "typed doc values coverage is lazy and retains compact sparse membership" {
     // document-cardinality coverage structure.
     try std.testing.expect(!cached.initialized.load(.acquire));
     try std.testing.expect(cached.membership_doc_ids == null);
+    try std.testing.expect(segment.cachedTypedDocValuesCoverage("rank") == .uninitialized);
+    try std.testing.expect(segment.cachedTypedDocValuesCoverage("not-indexed") == .missing);
 
     const coverage = (try segment.typedDocValuesCoverage("rank")).?;
     try std.testing.expectEqual(TypedDocValuesCoverageStatus.sparse_live_doc_values, coverage.status);
@@ -2280,6 +2319,10 @@ test "typed doc values coverage is lazy and retains compact sparse membership" {
     try std.testing.expect(!cached.membership_is_missing);
     try std.testing.expectEqual(@as(usize, 1), cached.membership_doc_ids.?.cardinality());
     try std.testing.expectEqual(@as(u32, 63), cached.missing_live_count.load(.acquire));
+    switch (segment.cachedTypedDocValuesCoverage("rank")) {
+        .initialized => |initialized| try std.testing.expectEqual(TypedDocValuesCoverageStatus.sparse_live_doc_values, initialized.status),
+        else => return error.TestUnexpectedResult,
+    }
 
     // With present-ID polarity, deleting an absent value decrements coverage;
     // deleting the one present value does not.
@@ -2287,6 +2330,55 @@ test "typed doc values coverage is lazy and retains compact sparse membership" {
     try std.testing.expectEqual(@as(u32, 62), cached.missing_live_count.load(.acquire));
     try std.testing.expect(try writer.deleteById("doc:0"));
     try std.testing.expectEqual(@as(u32, 62), cached.missing_live_count.load(.acquire));
+}
+
+test "concurrent typed doc values coverage initialization publishes one stable summary" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const alloc = std.heap.smp_allocator;
+    const segment_bytes = try buildSparseTypedDocValuesTestSegment(alloc, 8192);
+    defer alloc.free(segment_bytes);
+
+    var writer = try IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(segment_bytes);
+    const segment = &writer.snapshot().segments[0];
+
+    const Reader = struct {
+        segment: *const SegmentEntry,
+        start: *std.atomic.Value(bool),
+        failed: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            while (!self.start.load(.acquire)) spinOrYield();
+            const coverage = (self.segment.typedDocValuesCoverage("rank") catch {
+                self.failed.store(true, .release);
+                return;
+            }) orelse {
+                self.failed.store(true, .release);
+                return;
+            };
+            if (coverage.status != .sparse_live_doc_values or coverage.value_type != .u64_val) {
+                self.failed.store(true, .release);
+            }
+        }
+    };
+
+    var start = std.atomic.Value(bool).init(false);
+    var failed = std.atomic.Value(bool).init(false);
+    var reader_a = Reader{ .segment = segment, .start = &start, .failed = &failed };
+    var reader_b = Reader{ .segment = segment, .start = &start, .failed = &failed };
+    const thread_a = try std.Thread.spawn(.{}, Reader.run, .{&reader_a});
+    const thread_b = try std.Thread.spawn(.{}, Reader.run, .{&reader_b});
+    start.store(true, .release);
+    thread_a.join();
+    thread_b.join();
+
+    try std.testing.expect(!failed.load(.acquire));
+    const cached = &segment.shared.typed_doc_values_coverage[0];
+    try std.testing.expect(cached.initialized.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 8191), cached.missing_live_count.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), cached.membership_doc_ids.?.cardinality());
 }
 
 test "typed doc values corruption is classified lazily without rejecting segment admission" {
