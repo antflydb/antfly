@@ -239,15 +239,36 @@ func (e *StorageResourceExhaustedError) Error() string {
 	return e.Code
 }
 
+// BackupOutcomeAmbiguousError reports that a table backup may have committed
+// after the client lost the terminal response. Retrying blindly is unsafe;
+// callers should inspect BackupID and ArtifactBackupID first.
+type BackupOutcomeAmbiguousError struct {
+	StatusCode       int
+	Code             string
+	Message          string
+	Retryable        bool
+	BackupID         string
+	ArtifactBackupID string
+}
+
+func (e *BackupOutcomeAmbiguousError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return e.Code
+}
+
 type structuredAPIErrorResponse struct {
-	Status         int    `json:"status"`
-	Error          string `json:"error"`
-	Code           string `json:"code"`
-	Message        string `json:"message"`
-	Action         string `json:"action"`
-	RestartWithout string `json:"restart_without"`
-	Retryable      *bool  `json:"retryable"`
-	RetryAfterMS   int    `json:"retry_after_ms"`
+	Status           int    `json:"status"`
+	Error            string `json:"error"`
+	Code             string `json:"code"`
+	Message          string `json:"message"`
+	Action           string `json:"action"`
+	RestartWithout   string `json:"restart_without"`
+	Retryable        *bool  `json:"retryable"`
+	RetryAfterMS     int    `json:"retry_after_ms"`
+	BackupID         string `json:"backup_id"`
+	ArtifactBackupID string `json:"artifact_backup_id"`
 }
 
 func queryRetryAfterSeconds(header http.Header) int {
@@ -299,6 +320,19 @@ func readErrorResponse(resp *http.Response) error {
 	var errResp structuredAPIErrorResponse
 	parsedStructuredError := json.Unmarshal(respBody, &errResp) == nil
 	if parsedStructuredError {
+		if resp.StatusCode == http.StatusConflict &&
+			errResp.Code == "backup_outcome_ambiguous" &&
+			errResp.Retryable != nil && !*errResp.Retryable &&
+			errResp.BackupID != "" {
+			return &BackupOutcomeAmbiguousError{
+				StatusCode:       resp.StatusCode,
+				Code:             errResp.Code,
+				Message:          errResp.Message,
+				Retryable:        false,
+				BackupID:         errResp.BackupID,
+				ArtifactBackupID: errResp.ArtifactBackupID,
+			}
+		}
 		if resp.StatusCode == http.StatusTooManyRequests &&
 			errResp.Code == "storage_resource_exhausted" &&
 			errResp.Retryable != nil && *errResp.Retryable {

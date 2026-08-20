@@ -482,9 +482,13 @@ type ClusterBackupResult struct {
 
 // TableBackupStatus represents backup status for a single table
 type TableBackupStatus struct {
-	Name   string
-	Status string
-	Error  string
+	Name             string
+	Status           string
+	Error            string
+	Code             string
+	Retryable        bool
+	BackupID         string
+	ArtifactBackupID string
 }
 
 // ClusterBackup backs up multiple tables or all tables in the cluster
@@ -514,9 +518,13 @@ func (c *AntflyClient) ClusterBackup(ctx context.Context, backupID, location, co
 	tables := make([]TableBackupStatus, len(result.Tables))
 	for i, t := range result.Tables {
 		tables[i] = TableBackupStatus{
-			Name:   t.Name,
-			Status: string(t.Status),
-			Error:  t.Error,
+			Name:             t.Name,
+			Status:           string(t.Status),
+			Error:            t.Error,
+			Code:             string(t.Code),
+			Retryable:        t.Retryable,
+			BackupID:         t.BackupId,
+			ArtifactBackupID: t.ArtifactBackupId,
 		}
 	}
 

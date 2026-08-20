@@ -6309,30 +6309,51 @@ pub const ApiHttpServer = struct {
         if (table.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
         if (try backups_api.manifestExistsAtLocationWithIo(self.alloc, io, backup_location, backup_id))
             return error.BackupAlreadyExists;
-        backups_api.reserveTableBackupAttemptAtLocation(
-            self.alloc,
-            io,
-            backup_location,
-            backup_id,
-            artifact_backup_id,
-            format,
-            fence,
-        ) catch |err| switch (err) {
-            error.BackupAlreadyExists => {
-                const retained_artifact_id = backups_api.tableBackupAttemptArtifactIdAlloc(
-                    self.alloc,
-                    io,
-                    backup_location,
-                    backup_id,
-                ) catch return error.BackupAlreadyExists;
-                if (retained_artifact_id) |value| {
-                    self.alloc.free(value);
-                    return error.BackupOutcomeAmbiguous;
-                }
-                return error.BackupAlreadyExists;
-            },
-            else => return err,
-        };
+        var reclaimed_stale_attempt = false;
+        while (true) {
+            backups_api.reserveTableBackupAttemptAtLocation(
+                self.alloc,
+                io,
+                backup_location,
+                backup_id,
+                artifact_backup_id,
+                format,
+                fence,
+            ) catch |err| switch (err) {
+                error.BackupAlreadyExists => {
+                    const retained_artifact_id = backups_api.tableBackupAttemptArtifactIdAlloc(
+                        self.alloc,
+                        io,
+                        backup_location,
+                        backup_id,
+                    ) catch return error.BackupAlreadyExists;
+                    if (retained_artifact_id) |value| {
+                        defer self.alloc.free(value);
+                        if (!reclaimed_stale_attempt) {
+                            const now_unix_ns: u64 = @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
+                            switch (backups_api.reclaimExpiredTableBackupAttemptAtLocation(
+                                self.alloc,
+                                io,
+                                backup_location,
+                                backup_id,
+                                now_unix_ns,
+                            ) catch return error.BackupOutcomeAmbiguous) {
+                                .reclaimed => {
+                                    reclaimed_stale_attempt = true;
+                                    continue;
+                                },
+                                .committed => return error.BackupAlreadyExists,
+                                .active => {},
+                            }
+                        }
+                        return error.BackupOutcomeAmbiguous;
+                    }
+                    return error.BackupAlreadyExists;
+                },
+                else => return err,
+            };
+            break;
+        }
         const initial_writer_lease_expiration =
             @as(u64, @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds())) +|
             backups_api.table_backup_writer_lease_duration_ns;
@@ -6372,6 +6393,24 @@ pub const ApiHttpServer = struct {
                 ) catch {};
                 return err;
             },
+        }
+        const reservation_owned = backups_api.tableBackupAttemptMatchesAtLocation(
+            self.alloc,
+            io,
+            backup_location,
+            backup_id,
+            artifact_backup_id,
+        ) catch return error.BackupOutcomeAmbiguous;
+        if (!reservation_owned) {
+            if (writer_lease_role == .create) {
+                _ = backups_api.releaseTableBackupWriterLeaseAtLocation(
+                    self.alloc,
+                    io,
+                    backup_location,
+                    artifact_backup_id,
+                ) catch false;
+            }
+            return error.BackupAttemptLeaseLost;
         }
         var writer_lease_future = std.Io.async(
             io,
