@@ -3558,7 +3558,27 @@ pub fn documentNumberToF64(value: std.json.Value) ?f64 {
         .number_string => |text| std.fmt.parseFloat(f64, text) catch return null,
         else => return null,
     };
-    return if (std.math.isFinite(number)) number else null;
+    if (!std.math.isFinite(number)) return null;
+
+    // Raw relational writes retain JSON number tokens as number_string. Make
+    // sure the shortest JSON spelling of the physical f64 still denotes the
+    // same mathematical number; otherwise authoritative-column reads would
+    // silently return a different value (including non-zero underflow to 0).
+    // A Value.float has already chosen binary64 semantics, so there is no
+    // original decimal token left to compare.
+    if (value == .float) return number;
+    var physical_buf: [128]u8 = undefined;
+    const physical_text = std.fmt.bufPrint(&physical_buf, "{d}", .{number}) catch return null;
+    const original_text = switch (value) {
+        .integer => |integer| blk: {
+            var integer_buf: [32]u8 = undefined;
+            const text = std.fmt.bufPrint(&integer_buf, "{d}", .{integer}) catch return null;
+            break :blk normalizedJsonDecimalsEqual(text, physical_text);
+        },
+        .number_string => |text| normalizedJsonDecimalsEqual(text, physical_text),
+        else => unreachable,
+    };
+    return if (original_text) number else null;
 }
 
 pub fn documentPropertyAllowsNull(property: DocumentProperty) bool {

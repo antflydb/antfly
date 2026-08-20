@@ -1260,7 +1260,9 @@ pub fn formatDateTimeNsAlloc(alloc: Allocator, ns: u64) ![]u8 {
 
 pub fn parseRfc3339ToNs(text: []const u8) ?u64 {
     if (text.len < 20) return null;
-    if (text[4] != '-' or text[7] != '-' or text[10] != 'T' or text[13] != ':' or text[16] != ':') return null;
+    if (text[4] != '-' or text[7] != '-' or
+        (text[10] != 'T' and text[10] != 't') or
+        text[13] != ':' or text[16] != ':') return null;
 
     const year = std.fmt.parseInt(i64, text[0..4], 10) catch return null;
     const month = std.fmt.parseInt(i64, text[5..7], 10) catch return null;
@@ -1282,9 +1284,26 @@ pub fn parseRfc3339ToNs(text: []const u8) ?u64 {
         while (scale < 9) : (scale += 1) frac_ns *= 10;
         nanos = frac_ns;
     }
-    if (idx >= text.len or text[idx] != 'Z' or idx + 1 != text.len) return null;
+    if (idx >= text.len) return null;
+    var offset_seconds: i64 = 0;
+    if (text[idx] == 'Z' or text[idx] == 'z') {
+        idx += 1;
+    } else if (text[idx] == '+' or text[idx] == '-') {
+        if (idx + 6 > text.len or text[idx + 3] != ':') return null;
+        const offset_hour = std.fmt.parseInt(i64, text[idx + 1 .. idx + 3], 10) catch return null;
+        const offset_minute = std.fmt.parseInt(i64, text[idx + 4 .. idx + 6], 10) catch return null;
+        if (offset_hour > 23 or offset_minute > 59) return null;
+        offset_seconds = offset_hour * 3_600 + offset_minute * 60;
+        if (text[idx] == '-') offset_seconds = -offset_seconds;
+        idx += 6;
+    } else {
+        return null;
+    }
+    if (idx != text.len) return null;
 
-    return civilDateTimeToNs(year, month, day, hour, minute, second, nanos);
+    const local_ns = civilDateTimeToSignedNs(year, month, day, hour, minute, second, nanos) orelse return null;
+    const offset_ns = @as(i128, offset_seconds) * std.time.ns_per_s;
+    return std.math.cast(u64, local_ns - offset_ns);
 }
 
 pub fn parseDateToNs(value: []const u8) ?u64 {
@@ -1300,6 +1319,10 @@ fn isValidDate(value: []const u8) bool {
 }
 
 fn civilDateTimeToNs(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64, nanos: u64) ?u64 {
+    return std.math.cast(u64, civilDateTimeToSignedNs(year, month, day, hour, minute, second, nanos) orelse return null);
+}
+
+fn civilDateTimeToSignedNs(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64, nanos: u64) ?i128 {
     if (month < 1 or month > 12) return null;
     const max_day = daysInMonth(year, month) orelse return null;
     if (day < 1 or day > max_day) return null;
@@ -1312,11 +1335,8 @@ fn civilDateTimeToNs(year: i64, month: i64, day: i64, hour: i64, minute: i64, se
     if (nanos >= std.time.ns_per_s) return null;
 
     const days = daysFromCivil(year, month, day);
-    const days_u64 = std.math.cast(u64, days) orelse return null;
-    var seconds = std.math.mul(u64, days_u64, 86_400) catch return null;
-    seconds = std.math.add(u64, seconds, @intCast(hour * 3_600 + minute * 60 + second)) catch return null;
-    const base_ns = std.math.mul(u64, seconds, std.time.ns_per_s) catch return null;
-    return std.math.add(u64, base_ns, nanos) catch null;
+    const seconds = @as(i128, days) * 86_400 + hour * 3_600 + minute * 60 + second;
+    return seconds * std.time.ns_per_s + nanos;
 }
 
 fn daysInMonth(year: i64, month: i64) ?i64 {
@@ -2089,6 +2109,9 @@ test "dynamic template selector and mapping-option resolution" {
 
 test "parseDateTimeToNs accepts rfc3339 and date-only values" {
     try std.testing.expectEqual(@as(?u64, 15), parseDateTimeToNs("1970-01-01T00:00:00.000000015Z"));
+    try std.testing.expectEqual(@as(?u64, 0), parseDateTimeToNs("1970-01-01T01:00:00+01:00"));
+    try std.testing.expectEqual(@as(?u64, 0), parseDateTimeToNs("1969-12-31T23:00:00-01:00"));
+    try std.testing.expectEqual(@as(?u64, std.time.ns_per_hour), parseDateTimeToNs("1970-01-01t00:00:00-01:00"));
     try std.testing.expectEqual(@as(?u64, 0), parseDateTimeToNs("1970-01-01"));
     try std.testing.expect(parseDateTimeToNs("2024-02-29") != null);
     try std.testing.expect(parseDateTimeToNs("not-a-date") == null);
@@ -2099,6 +2122,9 @@ test "parseDateTimeToNs accepts rfc3339 and date-only values" {
     try std.testing.expect(parseDateTimeToNs("2024-01-01T00:60:00Z") == null);
     try std.testing.expect(parseDateTimeToNs("2024-01-01T12:34:60Z") == null);
     try std.testing.expect(parseDateTimeToNs("2024-01-01T23:59:60Z") == null);
+    try std.testing.expect(parseDateTimeToNs("1970-01-01T00:00:00+01:00") == null);
+    try std.testing.expect(parseDateTimeToNs("1970-01-01T00:00:00+24:00") == null);
+    try std.testing.expect(parseDateTimeToNs("1970-01-01T00:00:00+00:60") == null);
     try std.testing.expect(parseDateTimeToNs("9999-12-31") == null);
 
     const formatted = try formatDateTimeNsAlloc(std.testing.allocator, 15);

@@ -2187,7 +2187,7 @@ test "relational integer validation and projection share exact i64 conversion" {
     );
 }
 
-test "relational number validation rejects values the row codec cannot encode" {
+test "relational number validation rejects values the row codec cannot preserve" {
     const alloc = std.testing.allocator;
     var parsed = try schema_mod.parseValidatedTableSchema(alloc,
         \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"numeric"}},"required":["amount"],"additionalProperties":false}}}}
@@ -2196,17 +2196,24 @@ test "relational number validation rejects values the row codec cannot encode" {
     var plan = try relationalColumnPlanAlloc(alloc, parsed);
     defer plan.deinit(alloc);
 
-    const overflowed_number =
-        \\{"amount":1e5000}
-    ;
-    try std.testing.expectError(
-        error.InvalidBatchRequest,
-        schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = overflowed_number }}),
-    );
-    var value = try std.json.parseFromSlice(std.json.Value, alloc, overflowed_number, .{});
-    defer value.deinit();
-    try std.testing.expect(value.value.object.get("amount").? == .number_string);
-    try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, value.value));
+    const invalid_numbers = [_][]const u8{
+        "{\"amount\":1e5000}", // overflows f64
+        "{\"amount\":1e-5000}", // non-zero value underflows to zero
+        "{\"amount\":9007199254740993}", // rounds to the adjacent f64 integer
+    };
+    for (invalid_numbers) |document| {
+        try std.testing.expectError(
+            error.InvalidBatchRequest,
+            schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = document }}),
+        );
+        try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowJsonAlloc(alloc, plan, document));
+    }
+
+    const preserved = "{\"amount\":0.1}";
+    try schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = preserved }});
+    var preserved_row = try projectRelationalRowJsonAlloc(alloc, plan, preserved);
+    defer preserved_row.deinit(alloc);
+    try std.testing.expectEqual(@as(f64, 0.1), preserved_row.cell(relationalColumnIndex(plan, "amount").?).?.value.f64_val);
 }
 
 test "relational projection preserves explicit null separately from absence" {
@@ -2406,6 +2413,11 @@ test "relational integer and datetime columns preserve their logical values" {
         \\{"id":"c","amount":0.0,"ts":"1970-01-01"}
     , .{});
     defer date_only.deinit();
+    const offset_json =
+        \\{"id":"offset","amount":0.0,"ts":"1970-01-01T01:00:00.000000015+01:00"}
+    ;
+    var offset = try std.json.parseFromSlice(std.json.Value, alloc, offset_json, .{});
+    defer offset.deinit();
     var invalid_text = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"id":"d","amount":0.0,"ts":"not-a-date"}
     , .{});
@@ -2421,6 +2433,8 @@ test "relational integer and datetime columns preserve their logical values" {
     defer positive_row.deinit(alloc);
     var date_only_row = try projectRelationalRowAlloc(alloc, plan, date_only.value);
     defer date_only_row.deinit(alloc);
+    var offset_row = try projectRelationalRowAlloc(alloc, plan, offset.value);
+    defer offset_row.deinit(alloc);
 
     try std.testing.expectEqual(@as(i64, -5), negative_row.cell(qty_index).?.value.i64_val);
     try std.testing.expectEqual(@as(i64, 5), positive_row.cell(qty_index).?.value.i64_val);
@@ -2431,6 +2445,10 @@ test "relational integer and datetime columns preserve their logical values" {
     try std.testing.expectEqual(
         @as(u64, 0),
         date_only_row.cell(relationalColumnIndex(plan, "ts").?).?.value.u64_val,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 15),
+        offset_row.cell(relationalColumnIndex(plan, "ts").?).?.value.u64_val,
     );
     try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, invalid_text.value));
     try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, invalid_negative.value));
@@ -2445,10 +2463,17 @@ test "relational datetime validation and projection reject invalid or unencodabl
     var plan = try relationalColumnPlanAlloc(alloc, parsed);
     defer plan.deinit(alloc);
 
+    const offset_document = "{\"ts\":\"1970-01-01T01:00:00.000000015+01:00\"}";
+    try schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = offset_document }});
+    var offset_row = try projectRelationalRowJsonAlloc(alloc, plan, offset_document);
+    defer offset_row.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 15), offset_row.cell(relationalColumnIndex(plan, "ts").?).?.value.u64_val);
+
     const invalid_documents = [_][]const u8{
         "{\"ts\":\"2023-02-29\"}",
         "{\"ts\":\"2024-13-01\"}",
         "{\"ts\":\"2024-01-01T24:00:00Z\"}",
+        "{\"ts\":\"2024-01-01T00:00:00+24:00\"}",
         "{\"ts\":\"9999-12-31\"}",
     };
     for (invalid_documents) |document| {

@@ -86,7 +86,8 @@ In `relational` mode the following are implied/enforced:
   `default_type` when a default is supplied.
 - Each document type is treated as closed (`additionalProperties: false`)
   unless a field is explicitly typed `json`.
-- `required_fields` declares `NOT NULL` columns.
+- `required_fields` requires column presence. A required column is `NOT NULL`
+  only when its property schema also excludes `null`.
 - Table-level `dynamic_templates` are rejected by the core contract. Scoped
   dynamic rules inside `json` columns require the later JSON-subdocument
   lifecycle integration.
@@ -97,8 +98,9 @@ column and later indexed like a document subtree (path facts + dynamic
 templates). It is the escape hatch for semi-structured data inside an
 otherwise typed row.
 
-Constraints in scope for v1: primary key is the existing document key;
-`NOT NULL` via `required_fields`. **Out of scope for v1:** cross-document unique
+Constraints in scope for v1: primary key is the existing document key; required
+column presence via `required_fields`; and `NOT NULL` when a required property's
+schema excludes `null`. **Out of scope for v1:** cross-document unique
 constraints, multi-document transactions, foreign-key enforcement (use the
 `graph` index / join planner for relationships).
 
@@ -145,8 +147,10 @@ First-cut physical mapping:
 cell per declared column (`RelationalRow` / `RelationalCell` / `ColumnValue`),
 ready to hand to `section/typed_doc_values.zig` at segment-build time:
 
-- a missing or null value on a non-nullable column is rejected
-  (`error.MissingRequiredColumn`) — this is `NOT NULL` enforcement;
+- a missing required column is rejected with `error.MissingRequiredColumn`;
+- an explicit null that the property schema does not admit is rejected with
+  `error.InvalidColumnValue` — together with required presence, this enforces
+  `NOT NULL`;
 - a value that does not match the declared column type is rejected
   (`error.InvalidColumnValue`) — relational columns are strict;
 - nullable columns absent from a document produce no cell (the typed column is
@@ -209,9 +213,9 @@ physical representation and backfill plan are compatible.
   Public schema mutations remain gated, and there is no behaviour change for
   document-mode tables.
 - **Phase 2 — write path (projection done).** `projectRelationalRowAlloc`
-  produces order-preserving typed cells per column, enforces `NOT NULL`, and
-  captures `json` subtrees, verified end-to-end against the real
-  `typed_doc_values` writer/reader. Remaining: wire per-column
+  produces order-preserving typed cells per column, enforces required presence
+  and non-null schemas, and captures `json` subtrees, verified end-to-end
+  against the real `typed_doc_values` writer/reader. Remaining: wire per-column
   `TypedDocValuesWriter` accumulation into the segment builder and persist the
   sections (see "Remaining integration seam" above).
 - **Phase 3 — columnar scan + predicate pushdown.** Table-scan operator over
