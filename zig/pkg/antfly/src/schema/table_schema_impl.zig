@@ -3146,6 +3146,12 @@ fn validateDocumentFieldValueWithContext(
     value: *const std.json.Value,
     enforce_types: bool,
 ) !void {
+    const require_physical_encoding = context.require_physical_encoding;
+    if (require_physical_encoding and documentPropertyUsesJsonEncoding(property)) {
+        context.require_physical_encoding = false;
+    }
+    defer context.require_physical_encoding = require_physical_encoding;
+
     const composed_enforce_types = false;
 
     if (property.root_ref) {
@@ -3646,6 +3652,22 @@ pub fn documentPropertyAllowsNull(property: DocumentProperty) bool {
     return true;
 }
 
+/// Whether relational storage represents this property as one lossless JSON
+/// byte column rather than encoding its descendants as physical scalar cells.
+pub fn documentPropertyUsesJsonEncoding(property: DocumentProperty) bool {
+    if (property.field_type) |field_type| {
+        return std.mem.eql(u8, field_type, "json") or
+            std.mem.eql(u8, field_type, "object") or
+            std.mem.eql(u8, field_type, "array");
+    }
+    return property.properties.len > 0 or
+        property.item != null or
+        (property.additional_properties_allowed orelse false) or
+        property.additional_properties_schema != null or
+        property.pattern_properties.len > 0 or
+        property.dynamic_infer_types;
+}
+
 fn validateNullValueWithContext(
     context: *RuntimeValidationContext,
     property: DocumentProperty,
@@ -4063,15 +4085,24 @@ const NormalizedJsonDecimal = struct {
     negative: bool,
     first_significant: usize,
     significant_digits: usize,
-    scale: i64,
+    exponent: SignedJsonExponent,
+    scale_adjustment: i128,
     zero: bool,
+};
+
+const SignedJsonExponent = struct {
+    negative: bool = false,
+    /// Canonical unsigned magnitude: no leading zeroes, or empty for zero.
+    digits: []const u8 = "",
 };
 
 fn normalizedJsonDecimalsEqual(left_text: []const u8, right_text: []const u8) bool {
     const left = normalizeJsonDecimal(left_text) orelse return std.mem.eql(u8, left_text, right_text);
     const right = normalizeJsonDecimal(right_text) orelse return std.mem.eql(u8, left_text, right_text);
     if (left.zero or right.zero) return left.zero and right.zero;
-    if (left.negative != right.negative or left.scale != right.scale or left.significant_digits != right.significant_digits) return false;
+    if (left.negative != right.negative or
+        !normalizedJsonScalesEqual(left, right) or
+        left.significant_digits != right.significant_digits) return false;
 
     var left_index = left.first_significant;
     var right_index = right.first_significant;
@@ -4084,6 +4115,119 @@ fn normalizedJsonDecimalsEqual(left_text: []const u8, right_text: []const u8) bo
         right_index += 1;
     }
     return true;
+}
+
+fn normalizedJsonScalesEqual(left: NormalizedJsonDecimal, right: NormalizedJsonDecimal) bool {
+    // exponent_left + adjustment_left == exponent_right + adjustment_right
+    return signedJsonExponentDifferenceEquals(
+        left.exponent,
+        right.exponent,
+        right.scale_adjustment - left.scale_adjustment,
+    );
+}
+
+fn compareUnsignedDecimalDigits(left: []const u8, right: []const u8) std.math.Order {
+    if (left.len < right.len) return .lt;
+    if (left.len > right.len) return .gt;
+    return std.mem.order(u8, left, right);
+}
+
+fn unsignedDecimalDifferenceEquals(larger: []const u8, smaller: []const u8, expected: u128) bool {
+    var larger_index = larger.len;
+    var smaller_index = smaller.len;
+    var borrow: u8 = 0;
+    var remaining = expected;
+    while (larger_index > 0 or smaller_index > 0) {
+        const larger_digit: u8 = if (larger_index > 0) blk: {
+            larger_index -= 1;
+            break :blk larger[larger_index] - '0';
+        } else 0;
+        const smaller_digit: u8 = if (smaller_index > 0) blk: {
+            smaller_index -= 1;
+            break :blk smaller[smaller_index] - '0';
+        } else 0;
+        var difference = @as(i16, larger_digit) - @as(i16, smaller_digit) - @as(i16, borrow);
+        if (difference < 0) {
+            difference += 10;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        if (remaining % 10 != @as(u128, @intCast(difference))) return false;
+        remaining /= 10;
+    }
+    return borrow == 0 and remaining == 0;
+}
+
+fn unsignedDecimalSumEquals(left: []const u8, right: []const u8, expected: u128) bool {
+    var left_index = left.len;
+    var right_index = right.len;
+    var carry: u8 = 0;
+    var remaining = expected;
+    while (left_index > 0 or right_index > 0 or carry != 0) {
+        const left_digit: u8 = if (left_index > 0) blk: {
+            left_index -= 1;
+            break :blk left[left_index] - '0';
+        } else 0;
+        const right_digit: u8 = if (right_index > 0) blk: {
+            right_index -= 1;
+            break :blk right[right_index] - '0';
+        } else 0;
+        const sum = left_digit + right_digit + carry;
+        if (remaining % 10 != sum % 10) return false;
+        remaining /= 10;
+        carry = sum / 10;
+    }
+    return remaining == 0;
+}
+
+fn i128Magnitude(value: i128) u128 {
+    if (value == std.math.minInt(i128)) return @as(u128, std.math.maxInt(i128)) + 1;
+    return @intCast(if (value < 0) -value else value);
+}
+
+/// Compare an arbitrary-width signed decimal difference to a bounded delta
+/// without allocating or parsing either exponent into a machine integer.
+fn signedJsonExponentDifferenceEquals(left: SignedJsonExponent, right: SignedJsonExponent, expected: i128) bool {
+    const expected_negative = expected < 0;
+    const expected_magnitude = i128Magnitude(expected);
+    if (left.negative != right.negative) {
+        if (expected_magnitude == 0 or left.negative != expected_negative) return false;
+        return unsignedDecimalSumEquals(left.digits, right.digits, expected_magnitude);
+    }
+
+    const order = compareUnsignedDecimalDigits(left.digits, right.digits);
+    if (order == .eq) return expected_magnitude == 0;
+    const actual_negative = if (left.negative) order == .gt else order == .lt;
+    if (expected_magnitude == 0 or actual_negative != expected_negative) return false;
+    return if (order == .gt)
+        unsignedDecimalDifferenceEquals(left.digits, right.digits, expected_magnitude)
+    else
+        unsignedDecimalDifferenceEquals(right.digits, left.digits, expected_magnitude);
+}
+
+fn signedJsonExponentToI128(exponent: SignedJsonExponent) ?i128 {
+    var magnitude: u128 = 0;
+    for (exponent.digits) |byte| {
+        magnitude = std.math.mul(u128, magnitude, 10) catch return null;
+        magnitude = std.math.add(u128, magnitude, @as(u128, byte - '0')) catch return null;
+    }
+    if (!exponent.negative) return std.math.cast(i128, magnitude);
+
+    const minimum_magnitude = @as(u128, std.math.maxInt(i128)) + 1;
+    if (magnitude > minimum_magnitude) return null;
+    if (magnitude == minimum_magnitude) return std.math.minInt(i128);
+    return -@as(i128, @intCast(magnitude));
+}
+
+fn normalizedJsonScaleToI128(normalized: NormalizedJsonDecimal) ?i128 {
+    const exponent = signedJsonExponentToI128(normalized.exponent) orelse return null;
+    return std.math.add(i128, exponent, normalized.scale_adjustment) catch return null;
+}
+
+fn normalizedJsonScaleIsNonNegative(normalized: NormalizedJsonDecimal) bool {
+    const scale = normalizedJsonScaleToI128(normalized) orelse return !normalized.exponent.negative;
+    return scale >= 0;
 }
 
 fn normalizeJsonDecimal(text: []const u8) ?NormalizedJsonDecimal {
@@ -4115,7 +4259,7 @@ fn normalizeJsonDecimal(text: []const u8) ?NormalizedJsonDecimal {
     const mantissa_end = index;
     if (mantissa_end == mantissa_start or (mantissa_end == mantissa_start + 1 and decimal_index != null)) return null;
 
-    var exponent: i64 = 0;
+    var exponent = SignedJsonExponent{};
     if (index < text.len) {
         index += 1;
         var exponent_negative = false;
@@ -4124,14 +4268,19 @@ fn normalizeJsonDecimal(text: []const u8) ?NormalizedJsonDecimal {
             index += 1;
         }
         if (index == text.len) return null;
-        var magnitude: i64 = 0;
+        const exponent_start = index;
         while (index < text.len) : (index += 1) {
             const byte = text[index];
             if (byte < '0' or byte > '9') return null;
-            magnitude = std.math.mul(i64, magnitude, 10) catch return null;
-            magnitude = std.math.add(i64, magnitude, @as(i64, byte - '0')) catch return null;
         }
-        exponent = if (exponent_negative) -magnitude else magnitude;
+        var first_exponent_digit = exponent_start;
+        while (first_exponent_digit < text.len and text[first_exponent_digit] == '0') first_exponent_digit += 1;
+        if (first_exponent_digit < text.len) {
+            exponent = .{
+                .negative = exponent_negative,
+                .digits = text[first_exponent_digit..],
+            };
+        }
     }
 
     const first = first_significant orelse return .{
@@ -4139,7 +4288,8 @@ fn normalizeJsonDecimal(text: []const u8) ?NormalizedJsonDecimal {
         .negative = false,
         .first_significant = mantissa_start,
         .significant_digits = 0,
-        .scale = 0,
+        .exponent = .{},
+        .scale_adjustment = 0,
         .zero = true,
     };
     const last = last_significant.?;
@@ -4156,16 +4306,15 @@ fn normalizeJsonDecimal(text: []const u8) ?NormalizedJsonDecimal {
         if (text[reverse] != '0') break;
         trailing_zeros += 1;
     }
-    const fractional_i64 = std.math.cast(i64, fractional_digits) orelse return null;
-    const trailing_i64 = std.math.cast(i64, trailing_zeros) orelse return null;
-    const scale_without_zeros = std.math.sub(i64, exponent, fractional_i64) catch return null;
-    const scale = std.math.add(i64, scale_without_zeros, trailing_i64) catch return null;
+    const fractional_i128: i128 = @intCast(fractional_digits);
+    const trailing_i128: i128 = @intCast(trailing_zeros);
     return .{
         .text = text,
         .negative = negative,
         .first_significant = first,
         .significant_digits = significant_digits,
-        .scale = scale,
+        .exponent = exponent,
+        .scale_adjustment = trailing_i128 - fractional_i128,
         .zero = false,
     };
 }
@@ -4279,9 +4428,17 @@ test "numeric const and enum comparison preserves exact JSON semantics" {
     try validateJsonSchemaJson(alloc, "{\"const\":1.0}", "1");
     try validateJsonSchemaJson(alloc, "{\"enum\":[1.00,2e0]}", "2.000");
     try validateJsonSchemaJson(alloc, "{\"const\":9007199254740993.0}", "9007199254740993");
+    try validateJsonSchemaJson(alloc, "{\"const\":1e1}", "1000e-2");
+    try validateJsonSchemaJson(alloc, "{\"const\":0e99999999999999999999}", "0");
+    try validateJsonSchemaJson(alloc, "{\"const\":1e99999999999999999999}", "10e99999999999999999998");
+    try validateJsonSchemaJson(alloc, "{\"const\":1e-99999999999999999999}", "10e-100000000000000000000");
     try std.testing.expectError(
         error.InvalidBatchRequest,
         validateJsonSchemaJson(alloc, "{\"const\":9007199254740993.0}", "9007199254740992.0"),
+    );
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateJsonSchemaJson(alloc, "{\"const\":1e99999999999999999999}", "1e99999999999999999998"),
     );
 }
 
@@ -4338,7 +4495,7 @@ const ExactJsonInteger = struct {
 fn parseExactJsonInteger(text: []const u8) ?ExactJsonInteger {
     const normalized = normalizeJsonDecimal(text) orelse return null;
     if (normalized.zero) return .{ .negative = false, .magnitude = 0 };
-    if (normalized.scale < 0) return null;
+    if (!normalizedJsonScaleIsNonNegative(normalized)) return null;
 
     var magnitude: u64 = 0;
     var index = normalized.first_significant;
@@ -4350,7 +4507,8 @@ fn parseExactJsonInteger(text: []const u8) ?ExactJsonInteger {
         magnitude = std.math.add(u64, magnitude, @as(u64, byte - '0')) catch return null;
         index += 1;
     }
-    const appended_zeros = std.math.cast(usize, normalized.scale) orelse return null;
+    const scale = normalizedJsonScaleToI128(normalized) orelse return null;
+    const appended_zeros = std.math.cast(usize, scale) orelse return null;
     for (0..appended_zeros) |_| {
         magnitude = std.math.mul(u64, magnitude, 10) catch return null;
     }
@@ -4367,7 +4525,7 @@ fn isIntegralJsonNumber(value: std.json.Value, numeric_value: f64) bool {
         .integer => true,
         .number_string => |text| blk: {
             const normalized = normalizeJsonDecimal(text) orelse break :blk false;
-            break :blk normalized.zero or normalized.scale >= 0;
+            break :blk normalized.zero or normalizedJsonScaleIsNonNegative(normalized);
         },
         .float => std.math.floor(numeric_value) == numeric_value,
         else => false,

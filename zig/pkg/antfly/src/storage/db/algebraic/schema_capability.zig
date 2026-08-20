@@ -1710,6 +1710,7 @@ fn collectRelationalColumn(
 
 fn relationalColumnType(property: anytype) ?[]const u8 {
     if (property.field_type) |field_type| {
+        if (schema_mod.documentPropertyUsesJsonEncoding(property)) return "json";
         if (std.mem.eql(u8, field_type, "keyword") or
             std.mem.eql(u8, field_type, "link") or
             std.mem.eql(u8, field_type, "string") or
@@ -1723,19 +1724,11 @@ fn relationalColumnType(property: anytype) ?[]const u8 {
         if (std.mem.eql(u8, field_type, "numeric") or std.mem.eql(u8, field_type, "number")) return "number";
         if (std.mem.eql(u8, field_type, "geopoint")) return "geopoint";
         if (std.mem.eql(u8, field_type, "geoshape")) return "geoshape";
-        if (std.mem.eql(u8, field_type, "json") or
-            std.mem.eql(u8, field_type, "object") or
-            std.mem.eql(u8, field_type, "array")) return "json";
         if (property.integer_only) return "integer";
         return null;
     }
     if (property.integer_only) return "integer";
-    if (property.properties.len > 0 or
-        property.item != null or
-        (property.additional_properties_allowed orelse false) or
-        property.additional_properties_schema != null or
-        property.pattern_properties.len > 0 or
-        property.dynamic_infer_types) return "json";
+    if (schema_mod.documentPropertyUsesJsonEncoding(property)) return "json";
     if (property.const_value != null or property.enum_values.len > 0) return "string";
     return null;
 }
@@ -2215,6 +2208,41 @@ test "relational number validation rejects values the row codec cannot preserve"
     var preserved_row = try projectRelationalRowJsonAlloc(alloc, plan, preserved);
     defer preserved_row.deinit(alloc);
     try std.testing.expectEqual(@as(f64, 0.1), preserved_row.cell(relationalColumnIndex(plan, "amount").?).?.value.f64_val);
+}
+
+test "relational json columns preserve nested numeric domains" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"attrs":{"type":"object","properties":{"counter":{"type":"integer"},"amount":{"type":"numeric"}},"required":["counter","amount"],"additionalProperties":false},"samples":{"type":"array","items":{"type":"integer"}},"qty":{"type":"integer"}},"required":["attrs","samples"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+    var plan = try relationalColumnPlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+
+    const document =
+        \\{"attrs":{"counter":9223372036854775808,"amount":9007199254740993},"samples":[9223372036854775808]}
+    ;
+    try schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = document }});
+    var row = try projectRelationalRowJsonAlloc(alloc, plan, document);
+    defer row.deinit(alloc);
+    const attrs = row.cell(relationalColumnIndex(plan, "attrs").?).?;
+    try std.testing.expect(attrs.is_json);
+    try std.testing.expectEqualStrings(
+        "{\"counter\":9223372036854775808,\"amount\":9007199254740993}",
+        attrs.value.bytes_val,
+    );
+    const samples = row.cell(relationalColumnIndex(plan, "samples").?).?;
+    try std.testing.expect(samples.is_json);
+    try std.testing.expectEqualStrings("[9223372036854775808]", samples.value.bytes_val);
+
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        schema_mod.validateWritesAgainstTableSchema(
+            alloc,
+            parsed,
+            &.{.{ .value = "{\"attrs\":{\"counter\":1,\"amount\":1},\"samples\":[1],\"qty\":9223372036854775808}" }},
+        ),
+    );
 }
 
 test "relational projection preserves explicit null separately from absence" {

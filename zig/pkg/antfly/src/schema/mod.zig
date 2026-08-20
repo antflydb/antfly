@@ -55,6 +55,10 @@ pub fn documentPropertyAllowsNull(property: impl.DocumentProperty) bool {
     return impl.documentPropertyAllowsNull(property);
 }
 
+pub fn documentPropertyUsesJsonEncoding(property: impl.DocumentProperty) bool {
+    return impl.documentPropertyUsesJsonEncoding(property);
+}
+
 pub const documentDateTimeToNs = impl.documentDateTimeToNs;
 pub const documentIntegerToI64 = impl.documentIntegerToI64;
 pub const documentNumberToF64 = impl.documentNumberToF64;
