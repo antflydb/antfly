@@ -52,6 +52,13 @@ const LocalSchemaProgressProvider = struct {
 const default_public_port: u16 = 8080;
 const cors_default_methods = [_][]const u8{ "GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH" };
 const cors_default_headers = [_][]const u8{ "Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin" };
+const cors_default_exposed_headers = [_][]const u8{
+    "X-Request-ID",
+    "Retry-After",
+    "X-RateLimit-Limit",
+    "X-RateLimit-Remaining",
+    "X-RateLimit-Reset",
+};
 const cors_default_max_age: u32 = 3600;
 const antfarm_max_file_bytes: usize = 64 * 1024 * 1024;
 const standalone_session_ttl_ns: u64 = std.time.ns_per_hour;
@@ -2825,7 +2832,7 @@ fn appendCorsPreflightVary(headers: *httpx.Headers, include_origin: bool) !void 
 }
 
 fn applyCorsExposedHeaders(ctx: *httpx.Context, config: *const antfly.common.config.Config.CorsConfig) !void {
-    const exposed = config.exposed_headers orelse return;
+    const exposed = config.exposed_headers orelse &cors_default_exposed_headers;
     if (exposed.len == 0) return;
     const joined = try joinCorsValues(ctx.allocator, exposed);
     defer ctx.allocator.free(joined);
@@ -5392,6 +5399,10 @@ test "standalone CORS middleware enforces dynamic configuration" {
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 209), response.status.code);
         try std.testing.expectEqualStrings("*", response.headers.get("Access-Control-Allow-Origin").?);
+        try std.testing.expectEqualStrings(
+            "X-Request-ID, Retry-After, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset",
+            response.headers.get("Access-Control-Expose-Headers").?,
+        );
     }
     {
         var response = try Harness.execute(

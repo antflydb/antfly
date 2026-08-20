@@ -4654,11 +4654,27 @@ pub const ApiHttpServer = struct {
                 return .{
                     .ptr = runner,
                     .vtable = &.{
+                        .authorize_query = authorizeQuery,
                         .run_query = runQuery,
                         .scan_key_page = scanKeyPage,
                         .probe_incoming_edges = probeIncomingEdges,
                     },
                 };
+            }
+
+            fn authorizeQuery(
+                ptr_inner: *anyopaque,
+                table_name: []const u8,
+                discovers_tree_roots: bool,
+            ) !void {
+                const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
+                const identity = runner.authenticated_identity orelse return;
+                if (!permissionsAllow(identity.permissions, .table, table_name, .read))
+                    return error.Forbidden;
+                // Root discovery probes the physical reverse index, which
+                // cannot yet distinguish parents hidden by a row filter.
+                if (discovers_tree_roots and effectiveRowFilterJson(identity, table_name) != null)
+                    return error.Forbidden;
             }
 
             fn runQuery(
@@ -4668,6 +4684,10 @@ pub const ApiHttpServer = struct {
                 query_json: []const u8,
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
+                if (runner.authenticated_identity) |identity| {
+                    if (!permissionsAllow(identity.permissions, .table, table_name, .read))
+                        return error.Forbidden;
+                }
                 var semantic_resolver = runner.server.semanticStatusResolver(
                     runner.query_embedding_security_scope.domain,
                     runner.query_embedding_security_scope.value,
@@ -4719,6 +4739,10 @@ pub const ApiHttpServer = struct {
                 exclusion_query_json: ?[]const u8,
             ) !retrieval_agent.QueryRunner.KeyPage {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
+                if (runner.authenticated_identity) |identity| {
+                    if (!permissionsAllow(identity.permissions, .table, table_name, .read))
+                        return error.Forbidden;
+                }
                 return try runner.server.scanRetrievalKeyPage(
                     inner_alloc,
                     runner.source,
@@ -4739,6 +4763,12 @@ pub const ApiHttpServer = struct {
                 keys: []const []const u8,
             ) ![]bool {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
+                if (runner.authenticated_identity) |identity| {
+                    if (!permissionsAllow(identity.permissions, .table, table_name, .read))
+                        return error.Forbidden;
+                    if (effectiveRowFilterJson(identity, table_name) != null)
+                        return error.Forbidden;
+                }
                 return try runner.server.probeRetrievalIncomingEdges(
                     inner_alloc,
                     runner.source,
@@ -4840,6 +4870,10 @@ pub const ApiHttpServer = struct {
             },
             error.TableNotFound => {
                 try queue.status(alloc, task_id, context_id, "failed", "not found");
+                return;
+            },
+            error.Forbidden => {
+                try queue.status(alloc, task_id, context_id, "failed", "forbidden");
                 return;
             },
             error.DocIdentityNamespaceMismatch => {
@@ -13494,7 +13528,7 @@ pub fn requiresAdminPermission(path: []const u8) bool {
     if (std.mem.eql(u8, path, routes.Routes.transactions_cleanup)) return true;
     if (std.mem.eql(u8, path, routes.Routes.secrets) or std.mem.startsWith(u8, path, routes.Routes.secrets_prefix)) return true;
     if (std.mem.eql(u8, path, routes.Routes.backup) or std.mem.eql(u8, path, routes.Routes.restore) or std.mem.eql(u8, path, routes.Routes.backups)) return true;
-    if (std.mem.eql(u8, path, routes.Routes.a2a) or std.mem.eql(u8, path, routes.Routes.agents_retrieval)) return true;
+    if (std.mem.eql(u8, path, routes.Routes.a2a)) return true;
     if (std.mem.eql(u8, path, routes.Routes.users_me)) return false;
     if (std.mem.eql(u8, path, routes.Routes.auth_subjects) or std.mem.startsWith(u8, path, routes.Routes.auth_subjects_prefix)) return true;
     return std.mem.eql(u8, path, routes.Routes.users) or std.mem.startsWith(u8, path, routes.Routes.users_prefix);
@@ -20254,6 +20288,11 @@ test "api http server treats only exact extension prefixes as admin routes" {
     try std.testing.expect(!requiresAdminPermission("/extensions/v1/installedXYZ"));
 }
 
+test "retrieval route delegates authorization to referenced tables" {
+    try std.testing.expect(!requiresAdminPermission(routes.Routes.agents_retrieval));
+    try std.testing.expect(requiresAdminPermission(routes.Routes.a2a));
+}
+
 fn encodeBasicAuthorization(alloc: std.mem.Allocator, username: []const u8, password: []const u8) ![]u8 {
     const raw = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ username, password });
     defer alloc.free(raw);
@@ -23260,7 +23299,7 @@ test "api http server serves retrieval agent response envelope" {
     ;
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
-        .uri = "/agents/retrieval",
+        .uri = "/db/v1/agents/retrieval",
         .content_type = "application/json",
         .body = retrieval_body,
     });
@@ -23278,13 +23317,138 @@ test "api http server serves retrieval agent response envelope" {
     ;
     var internal_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
-        .uri = "/agents/retrieval",
+        .uri = "/db/v1/agents/retrieval",
         .content_type = "application/json",
         .body = internal_query_body,
     });
     defer internal_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), internal_resp.status);
     try std.testing.expectEqualStrings("invalid retrieval agent request", internal_resp.body);
+
+    // Retrieval has one canonical, authenticated public route. Keeping a
+    // second root-level binding would bypass authorizeRequest and the
+    // per-query table and row-filter checks below.
+    var root_alias = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/agents/retrieval",
+        .content_type = "application/json",
+        .body = retrieval_body,
+    });
+    defer root_alias.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), root_alias.status);
+
+    const secret = "retrieval-trusted-principal-secret";
+    var auth_server = ApiHttpServer.init(
+        std.testing.allocator,
+        .{
+            .trusted_principal_secret = secret,
+            .trusted_principal_issuer = "trusted-upstream",
+        },
+        source.iface(),
+        table_source.source(),
+        null,
+    );
+    defer auth_server.deinit();
+    const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+
+    const denied_payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"iss":"trusted-upstream","sub":"browser-key","tenant":"tenant-1","tables":["other"],"operations":["read"],"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer std.testing.allocator.free(denied_payload);
+    const denied_token = try encodeTrustedPrincipalToken(std.testing.allocator, secret, denied_payload);
+    defer std.testing.allocator.free(denied_token);
+    var denied_identity = try auth_server.authenticateRequest(.{ .trusted_principal = denied_token });
+    defer denied_identity.deinit(std.testing.allocator);
+    try std.testing.expect(!permissionsAllow(denied_identity.permissions, .table, "docs", .read));
+    const denied_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = denied_token },
+    };
+    var denied = try executeHttpxTestRequest(&auth_server, .{
+        .method = .POST,
+        .uri = "/db/v1/agents/retrieval",
+        .content_type = "application/json",
+        .headers = &denied_headers,
+        .body = retrieval_body,
+    });
+    defer denied.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 403), denied.status);
+    try std.testing.expectEqualStrings("forbidden", denied.body);
+
+    var denied_stream = try executeHttpxTestRequest(&auth_server, .{
+        .method = .POST,
+        .uri = "/db/v1/agents/retrieval",
+        .content_type = "application/json",
+        .headers = &denied_headers,
+        .body =
+        \\{"query":"find hello","stream":true,"queries":[{"table":"docs","full_text_search":{"query":"body:hello"},"limit":5}]}
+        ,
+    });
+    defer denied_stream.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 403), denied_stream.status);
+    try std.testing.expectEqualStrings("forbidden", denied_stream.body);
+
+    const allowed_payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"iss":"trusted-upstream","sub":"browser-key","tenant":"tenant-1","tables":["docs"],"operations":["read"],"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer std.testing.allocator.free(allowed_payload);
+    const allowed_token = try encodeTrustedPrincipalToken(std.testing.allocator, secret, allowed_payload);
+    defer std.testing.allocator.free(allowed_token);
+    const allowed_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = allowed_token },
+    };
+    var allowed = try executeHttpxTestRequest(&auth_server, .{
+        .method = .POST,
+        .uri = "/db/v1/agents/retrieval",
+        .content_type = "application/json",
+        .headers = &allowed_headers,
+        .body = retrieval_body,
+    });
+    defer allowed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), allowed.status);
+
+    const filtered_payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"iss":"trusted-upstream","sub":"browser-key","tenant":"tenant-1","tables":["docs"],"operations":["read"],"row_filter":{{"docs":{{"match_all":{{}}}}}},"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer std.testing.allocator.free(filtered_payload);
+    const filtered_token = try encodeTrustedPrincipalToken(std.testing.allocator, secret, filtered_payload);
+    defer std.testing.allocator.free(filtered_token);
+    const filtered_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = filtered_token },
+    };
+    var filtered = try executeHttpxTestRequest(&auth_server, .{
+        .method = .POST,
+        .uri = "/db/v1/agents/retrieval",
+        .content_type = "application/json",
+        .headers = &filtered_headers,
+        .body = retrieval_body,
+    });
+    defer filtered.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), filtered.status);
+
+    // `$roots` asks the physical reverse index whether each candidate has a
+    // parent. Until that probe can apply row filters to parent documents, it
+    // must fail before an SSE response can reveal hidden graph structure.
+    var filtered_roots = try executeHttpxTestRequest(&auth_server, .{
+        .method = .POST,
+        .uri = "/db/v1/agents/retrieval",
+        .content_type = "application/json",
+        .headers = &filtered_headers,
+        .body =
+        \\{"query":"find roots","stream":true,"queries":[{"table":"docs","tree_search":{"index":"doc_hierarchy","start_nodes":"$roots","max_depth":2},"limit":5}]}
+        ,
+    });
+    defer filtered_roots.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 403), filtered_roots.status);
+    try std.testing.expectEqualStrings("forbidden", filtered_roots.body);
 }
 
 test "api http server maps retrieval agent doc identity mismatch to unavailable" {
@@ -23338,7 +23502,7 @@ test "api http server maps retrieval agent doc identity mismatch to unavailable"
     ;
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
-        .uri = "/agents/retrieval",
+        .uri = "/db/v1/agents/retrieval",
         .content_type = "application/json",
         .body = retrieval_body,
     });
@@ -23390,7 +23554,7 @@ test "api http server serves retrieval agent event stream" {
     ;
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
-        .uri = "/agents/retrieval",
+        .uri = "/db/v1/agents/retrieval",
         .content_type = "application/json",
         .body = retrieval_body,
     });
@@ -23459,6 +23623,40 @@ test "api http server serves retrieval agent event stream" {
     try std.testing.expect(saw_a2a_hit);
     try std.testing.expect(saw_a2a_result);
     try std.testing.expect(saw_a2a_completed);
+
+    const secret = "a2a-retrieval-trusted-principal-secret";
+    server.cfg.trusted_principal_secret = secret;
+    server.cfg.trusted_principal_issuer = "trusted-upstream";
+    const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+    const denied_payload = try std.fmt.allocPrint(
+        alloc,
+        \\{{"iss":"trusted-upstream","sub":"browser-key","tenant":"tenant-1","tables":["other"],"operations":["read"],"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer alloc.free(denied_payload);
+    const denied_token = try encodeTrustedPrincipalToken(alloc, secret, denied_payload);
+    defer alloc.free(denied_token);
+    var denied_identity = try server.authenticateRequest(.{ .trusted_principal = denied_token });
+    defer denied_identity.deinit(alloc);
+    var denied_arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer denied_arena_impl.deinit();
+    const denied_arena = denied_arena_impl.allocator();
+    var denied_queue = a2a.EventQueue.init(denied_arena);
+    defer denied_queue.deinit(denied_arena);
+    try server.executeA2aRetrieval(
+        denied_arena,
+        "{\"query\":\"find hello\",\"stream\":false,\"queries\":[{\"table\":\"docs\",\"full_text_search\":{\"query\":\"body:hello\"},\"limit\":5}]}",
+        "denied-task",
+        "denied-context",
+        &denied_queue,
+        ApiHttpServer.queryEmbeddingSecurityScope(denied_identity),
+        denied_identity,
+    );
+    const denied_events_json = try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .array = denied_queue.events }, .{});
+    defer alloc.free(denied_events_json);
+    try std.testing.expect(std.mem.indexOf(u8, denied_events_json, "\"state\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, denied_events_json, "forbidden") != null);
 }
 
 test "api http server serves eval response envelope" {

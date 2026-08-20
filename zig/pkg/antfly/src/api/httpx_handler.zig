@@ -372,7 +372,6 @@ pub const AntflyApiHandler = struct {
         try server.post(document_artifact_prefix ++ routes.child_range_batch_suffix, httpx.Handler.bind(self, internalDocumentArtifactChildRangeBatch));
         try server.post(document_artifact_prefix ++ routes.reprocess_suffix, httpx.Handler.bind(self, internalDocumentArtifactReprocess));
         try server.post(table_prefix ++ routes.artifacts_marker ++ ":artifact_name" ++ routes.reprocess_suffix, httpx.Handler.bind(self, internalTableArtifactReprocess));
-        try server.post(routes.agents_retrieval, httpx.Handler.bind(self, internalRetrieval));
     }
 
     fn registerProbes(self: *AntflyApiHandler, server: anytype) !void {
@@ -1770,34 +1769,6 @@ pub const AntflyApiHandler = struct {
             internalGroupErrorResponse(ctx, err);
         defer result.deinit(ctx.allocator);
         return internalQueryResponse(ctx, &result);
-    }
-
-    fn internalRetrieval(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
-        const body = (try ctx.body()) orelse "";
-        const response = self.api_server.executeInternalRetrieval(body) catch |err| switch (err) {
-            error.TreeRootSetTooLarge => return textResponse(ctx, 422, "tree root set exceeds the bounded retrieval limit"),
-            error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => return textResponse(ctx, 400, "invalid retrieval agent request"),
-            error.TableNotFound => return textResponse(ctx, 404, "not found"),
-            error.DocIdentityNamespaceMismatch => return textResponse(ctx, 503, "doc identity unavailable"),
-            else => {
-                if (try respondQueryEmbeddingOperationalError(ctx, err)) |operational_response| return operational_response;
-                std.log.err("internal retrieval failed err={}", .{err});
-                return err;
-            },
-        };
-        defer self.api_server.alloc.free(response.body);
-        if (std.mem.eql(u8, response.content_type, "text/event-stream")) {
-            _ = ctx.status(200);
-            try ctx.setHeader("content-type", "text/event-stream");
-            _ = ctx.response.body(response.body);
-            return ctx.response.build();
-        }
-        var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
-        defer arena_impl.deinit();
-        const value = try std.json.parseFromSliceLeaky(metadata_openapi.RetrievalAgentResult, arena_impl.allocator(), response.body, .{
-            .allocate = .alloc_always,
-        });
-        return ctx.json(value);
     }
 
     fn internalGroupScan(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -3491,11 +3462,28 @@ pub const AntflyApiHandler = struct {
                 return .{
                     .ptr = runner,
                     .vtable = &.{
+                        .authorize_query = authorizeQuery,
                         .run_query = runQuery,
                         .scan_key_page = runScanKeyPage,
                         .probe_incoming_edges = probeIncomingEdges,
                     },
                 };
+            }
+
+            fn authorizeQuery(
+                ptr: *anyopaque,
+                table_name: []const u8,
+                discovers_tree_roots: bool,
+            ) !void {
+                const runner: *@This() = @ptrCast(@alignCast(ptr));
+                const identity = runner.authenticated_identity orelse return;
+                if (!http_server_mod.permissionsAllow(identity.permissions, .table, table_name, .read))
+                    return error.Forbidden;
+                // Physical reverse-index probes do not carry row filters. Keep
+                // explicit-key and query-seeded tree traversal available, but
+                // fail closed for structural root discovery.
+                if (discovers_tree_roots and http_server_mod.effectiveRowFilterJson(identity, table_name) != null)
+                    return error.Forbidden;
             }
 
             fn runQuery(
@@ -3505,6 +3493,10 @@ pub const AntflyApiHandler = struct {
                 query_json: []const u8,
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
+                if (runner.authenticated_identity) |identity| {
+                    if (!http_server_mod.permissionsAllow(identity.permissions, .table, table_name, .read))
+                        return error.Forbidden;
+                }
                 var semantic_resolver = runner.server.semanticStatusResolver(runner.query_embedding_security_scope.domain, runner.query_embedding_security_scope.value);
                 var query_req = query_api.parsePublicQueryRequest(a, semantic_resolver.iface(), table_name, query_json) catch |err| {
                     if (query_api.isPublicQueryValidationError(err)) {
@@ -3553,6 +3545,10 @@ pub const AntflyApiHandler = struct {
                 exclusion_query_json: ?[]const u8,
             ) !retrieval_agent.QueryRunner.KeyPage {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
+                if (runner.authenticated_identity) |identity| {
+                    if (!http_server_mod.permissionsAllow(identity.permissions, .table, table_name, .read))
+                        return error.Forbidden;
+                }
                 return try runner.server.scanRetrievalKeyPage(
                     a,
                     runner.source,
@@ -3573,6 +3569,12 @@ pub const AntflyApiHandler = struct {
                 keys: []const []const u8,
             ) ![]bool {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
+                if (runner.authenticated_identity) |identity| {
+                    if (!http_server_mod.permissionsAllow(identity.permissions, .table, table_name, .read))
+                        return error.Forbidden;
+                    if (http_server_mod.effectiveRowFilterJson(identity, table_name) != null)
+                        return error.Forbidden;
+                }
                 return try runner.server.probeRetrievalIncomingEdges(
                     a,
                     runner.source,
@@ -3631,6 +3633,10 @@ pub const AntflyApiHandler = struct {
             error.TableNotFound => {
                 _ = ctx.status(404);
                 return ctx.text("not found");
+            },
+            error.Forbidden => {
+                _ = ctx.status(403);
+                return ctx.text("forbidden");
             },
             error.DocIdentityNamespaceMismatch => {
                 _ = ctx.status(503);
