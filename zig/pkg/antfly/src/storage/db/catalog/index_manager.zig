@@ -6480,7 +6480,7 @@ pub const IndexManager = struct {
         }
         for (entry.observed_field_analyzers) |item| {
             var capability = schema_mod.observedDynamicFieldCapability(entry.runtime_schema, item.field_name, item.mapping());
-            const coverage = observedDynamicFieldTypedDocValueCoverageStatus(entry, item.field_name, item.mapping());
+            const coverage = try observedDynamicFieldTypedDocValueCoverageStatus(entry, item.field_name, item.mapping());
             if (coverage == .covered) {
                 capability.doc_value_coverage = "covered";
                 capability.queryability_state = "queryable";
@@ -6500,7 +6500,7 @@ pub const IndexManager = struct {
                 const field = schema_mod.exactDynamicTemplatePath(template) orelse continue;
                 if (!schema_mod.mappingHasNativeDocValues(template.mapping)) continue;
                 var capability = schema_mod.dynamicTemplateFieldCapability(schema, template);
-                const coverage = observedDynamicFieldTypedDocValueCoverageStatus(entry, field, template.mapping);
+                const coverage = try observedDynamicFieldTypedDocValueCoverageStatus(entry, field, template.mapping);
                 if (coverage == .covered) {
                     capability.doc_value_coverage = "covered";
                     capability.queryability_state = "queryable";
@@ -6532,14 +6532,14 @@ pub const IndexManager = struct {
         entry: *IndexManager.TextIndex,
         field: []const u8,
         mapping: schema_mod.FieldMapping,
-    ) typed_dv_coverage.Status {
+    ) !typed_dv_coverage.Status {
         if (!schema_mod.mappingHasNativeDocValues(mapping)) return .missing_doc_values_section;
         const snapshot = entry.persistent.snapshot();
         if (snapshot.liveDocCount() == 0) return .covered;
 
         for (snapshot.segments) |*segment| {
             if (segment.liveDocCount() == 0) continue;
-            const coverage = segment.typedDocValuesCoverage(field) orelse return .missing_doc_values_section;
+            const coverage = (try segment.typedDocValuesCoverage(field)) orelse return .missing_doc_values_section;
             const value_type = coverage.value_type orelse return coverage.status;
             if (!typedDocValueReaderMatchesMapping(value_type, mapping)) return .doc_values_kind_mismatch;
             if (coverage.status != .covered) return coverage.status;

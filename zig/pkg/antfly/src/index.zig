@@ -151,10 +151,11 @@ pub const SegmentShared = struct {
     /// reading roaring containers or taking the deletion lock.
     deleted_count: std.atomic.Value(u32) = .init(0),
     deletion_lock: std.atomic.Value(u32) = .init(0),
-    /// Immutable physical column summaries plus an atomically maintained
-    /// count of missing values that still belong to live documents. Building
-    /// these once per physical segment keeps admission and planning O(fields ×
-    /// segments), while deletion transitions preserve exact-sort safety.
+    /// Lazily populated physical column summaries plus an atomically
+    /// maintained count of missing values that still belong to live
+    /// documents. Segment admission records only the typed-column names;
+    /// decoding is deferred until exact-sort admission or status asks about a
+    /// concrete field. Deletion transitions preserve exact-sort safety.
     typed_doc_values_coverage: []TypedDocValuesFieldCoverage = &.{},
     /// Set when the segment is replaced/removed from the live index. Runs
     /// once the last reference dies, after resources are deinited.
@@ -204,9 +205,23 @@ pub const TypedDocValuesCoverageStatus = enum {
 pub const TypedDocValuesFieldCoverage = struct {
     field: []const u8,
     value_type: ?typed_dv.ValueType = null,
-    physical_status: TypedDocValuesCoverageStatus,
-    missing_doc_ids: ?roaring.RoaringBitmap = null,
+    physical_status: TypedDocValuesCoverageStatus = .malformed_doc_values_section,
+    /// Sparse columns retain whichever membership set is smaller. When true,
+    /// membership_doc_ids contains missing IDs; otherwise it contains present
+    /// IDs and absence from the bitmap means the document is missing a value.
+    membership_doc_ids: ?roaring.RoaringBitmap = null,
+    membership_is_missing: bool = true,
     missing_live_count: std.atomic.Value(u32) = .init(0),
+    initialized: std.atomic.Value(bool) = .init(false),
+    initialization_lock: std.atomic.Value(u8) = .init(0),
+
+    fn lockInitialization(self: *TypedDocValuesFieldCoverage) void {
+        while (self.initialization_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) spinOrYield();
+    }
+
+    fn unlockInitialization(self: *TypedDocValuesFieldCoverage) void {
+        self.initialization_lock.store(0, .release);
+    }
 
     fn status(self: *const TypedDocValuesFieldCoverage) TypedDocValuesCoverageStatus {
         if (self.physical_status != .sparse_live_doc_values) return self.physical_status;
@@ -214,7 +229,7 @@ pub const TypedDocValuesFieldCoverage = struct {
     }
 
     fn deinit(self: *TypedDocValuesFieldCoverage) void {
-        if (self.missing_doc_ids) |*missing| missing.deinit();
+        if (self.membership_doc_ids) |*membership| membership.deinit();
         self.* = undefined;
     }
 };
@@ -224,7 +239,7 @@ fn freeTypedDocValuesCoverage(alloc: Allocator, coverage: []TypedDocValuesFieldC
     if (coverage.len > 0) alloc.free(coverage);
 }
 
-fn buildTypedDocValuesCoverageAlloc(
+fn buildTypedDocValuesCoverageMetadataAlloc(
     alloc: Allocator,
     reader: *const segment_mod.SegmentReader,
 ) ![]TypedDocValuesFieldCoverage {
@@ -258,57 +273,8 @@ fn buildTypedDocValuesCoverageAlloc(
 
         coverage[initialized] = .{
             .field = field.name,
-            .physical_status = .malformed_doc_values_section,
         };
         initialized += 1;
-        const item = &coverage[initialized - 1];
-        const section_data = (reader.getSection(field.name, .typed_doc_values) catch null) orelse continue;
-        const typed_reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch continue;
-        item.value_type = typed_reader.value_type;
-
-        var present = try std.DynamicBitSetUnmanaged.initEmpty(alloc, reader.doc_count);
-        defer present.deinit(alloc);
-        var structural_status: TypedDocValuesCoverageStatus = .covered;
-        chunks: for (0..typed_reader.num_chunks) |chunk_idx| {
-            const doc_ids = typed_reader.readValidatedChunkDocIds(@intCast(chunk_idx)) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => {
-                    structural_status = .malformed_doc_values_section;
-                    break :chunks;
-                },
-            };
-            defer alloc.free(doc_ids);
-            for (doc_ids) |doc_id| {
-                if (doc_id >= reader.doc_count) {
-                    structural_status = .invalid_doc_value_doc_id;
-                    break :chunks;
-                }
-                if (present.isSet(doc_id)) {
-                    structural_status = .duplicate_doc_value_doc_id;
-                    break :chunks;
-                }
-                present.set(doc_id);
-            }
-        }
-        if (structural_status != .covered) {
-            item.physical_status = structural_status;
-            continue;
-        }
-
-        const missing_count = reader.doc_count - @as(u32, @intCast(present.count()));
-        if (missing_count == 0) {
-            item.physical_status = .covered;
-            continue;
-        }
-
-        var missing = roaring.RoaringBitmap.init(alloc);
-        errdefer missing.deinit();
-        for (0..reader.doc_count) |doc_id| {
-            if (!present.isSet(doc_id)) try missing.add(@intCast(doc_id));
-        }
-        item.physical_status = .sparse_live_doc_values;
-        item.missing_live_count.store(missing_count, .monotonic);
-        item.missing_doc_ids = missing;
     }
     std.debug.assert(initialized == coverage.len);
     std.mem.sort(TypedDocValuesFieldCoverage, coverage, {}, struct {
@@ -319,25 +285,126 @@ fn buildTypedDocValuesCoverageAlloc(
     return coverage;
 }
 
+fn initializeTypedDocValuesFieldCoverage(
+    alloc: Allocator,
+    shared: *SegmentShared,
+    reader: *const segment_mod.SegmentReader,
+    coverage: *TypedDocValuesFieldCoverage,
+) !void {
+    if (coverage.initialized.load(.acquire)) return;
+    coverage.lockInitialization();
+    defer coverage.unlockInitialization();
+    if (coverage.initialized.load(.acquire)) return;
+
+    const section_data = reader.getSection(coverage.field, .typed_doc_values) catch {
+        coverage.physical_status = .malformed_doc_values_section;
+        coverage.initialized.store(true, .release);
+        return;
+    } orelse {
+        coverage.physical_status = .missing_doc_values_section;
+        coverage.initialized.store(true, .release);
+        return;
+    };
+    const typed_reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch {
+        coverage.physical_status = .malformed_doc_values_section;
+        coverage.initialized.store(true, .release);
+        return;
+    };
+    coverage.value_type = typed_reader.value_type;
+
+    var present = try std.DynamicBitSetUnmanaged.initEmpty(alloc, reader.doc_count);
+    defer present.deinit(alloc);
+    var structural_status: TypedDocValuesCoverageStatus = .covered;
+    chunks: for (0..typed_reader.num_chunks) |chunk_idx| {
+        const doc_ids = typed_reader.readValidatedChunkDocIds(@intCast(chunk_idx)) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                structural_status = .malformed_doc_values_section;
+                break :chunks;
+            },
+        };
+        defer alloc.free(doc_ids);
+        for (doc_ids) |doc_id| {
+            if (doc_id >= reader.doc_count) {
+                structural_status = .invalid_doc_value_doc_id;
+                break :chunks;
+            }
+            if (present.isSet(doc_id)) {
+                structural_status = .duplicate_doc_value_doc_id;
+                break :chunks;
+            }
+            present.set(doc_id);
+        }
+    }
+    if (structural_status != .covered) {
+        coverage.physical_status = structural_status;
+        coverage.initialized.store(true, .release);
+        return;
+    }
+
+    const present_count: u32 = @intCast(present.count());
+    const missing_count = reader.doc_count - present_count;
+    if (missing_count == 0) {
+        coverage.physical_status = .covered;
+        coverage.initialized.store(true, .release);
+        return;
+    }
+
+    const retain_missing = missing_count <= present_count;
+    var membership = roaring.RoaringBitmap.init(alloc);
+    errdefer membership.deinit();
+    for (0..reader.doc_count) |doc_id| {
+        if (present.isSet(doc_id) != retain_missing) try membership.add(@intCast(doc_id));
+    }
+    // Decoding immutable segment bytes must not block deletes. Synchronize
+    // only the small publication window: a deletion that completed during the
+    // scan is included in the initial count, while one that starts afterward
+    // observes initialized=true and updates the published membership.
+    shared.lockDeletionShared();
+    coverage.membership_doc_ids = membership;
+    coverage.membership_is_missing = retain_missing;
+    coverage.physical_status = .sparse_live_doc_values;
+    coverage.missing_live_count.store(missingLiveCount(coverage, reader.doc_count, if (shared.deleted) |*deleted| deleted else null), .monotonic);
+    coverage.initialized.store(true, .release);
+    shared.unlockDeletionShared();
+}
+
 fn missingLiveCount(
     coverage: *const TypedDocValuesFieldCoverage,
+    doc_count: u32,
     deleted: ?*const roaring.RoaringBitmap,
 ) u32 {
-    const missing = &(coverage.missing_doc_ids orelse return 0);
-    if (deleted == null) return @intCast(missing.cardinality());
-    var live_missing: u32 = 0;
-    var iterator = missing.iterator();
-    while (iterator.next()) |doc_id| {
-        if (!deleted.?.contains(doc_id)) live_missing += 1;
+    const membership = &(coverage.membership_doc_ids orelse return 0);
+    if (coverage.membership_is_missing) {
+        if (deleted == null) return @intCast(membership.cardinality());
+        var live_missing: u32 = 0;
+        var iterator = membership.iterator();
+        while (iterator.next()) |doc_id| {
+            if (!deleted.?.contains(doc_id)) live_missing += 1;
+        }
+        return live_missing;
     }
-    return live_missing;
+
+    const deleted_count: u32 = if (deleted) |bitmap| @intCast(bitmap.cardinality()) else 0;
+    var live_present: u32 = 0;
+    var iterator = membership.iterator();
+    while (iterator.next()) |doc_id| {
+        if (deleted == null or !deleted.?.contains(doc_id)) live_present += 1;
+    }
+    return (doc_count -| deleted_count) -| live_present;
+}
+
+fn coverageDocIsMissing(coverage: *const TypedDocValuesFieldCoverage, doc_id: u32) bool {
+    if (!coverage.initialized.load(.acquire) or coverage.physical_status != .sparse_live_doc_values) return false;
+    const membership = &(coverage.membership_doc_ids orelse return false);
+    const contains = membership.contains(doc_id);
+    return if (coverage.membership_is_missing) contains else !contains;
 }
 
 fn updateMissingLiveCountsForDeletedDocs(shared: *SegmentShared, doc_ids: []const u32, deleting: bool) void {
     for (shared.typed_doc_values_coverage) |*coverage| {
-        const missing = &(coverage.missing_doc_ids orelse continue);
         for (doc_ids) |doc_id| {
-            if (!missing.contains(doc_id)) continue;
+            if (!coverageDocIsMissing(coverage, doc_id)) continue;
             if (deleting) {
                 const previous = coverage.missing_live_count.fetchSub(1, .acq_rel);
                 std.debug.assert(previous > 0);
@@ -350,26 +417,17 @@ fn updateMissingLiveCountsForDeletedDocs(shared: *SegmentShared, doc_ids: []cons
 
 fn publishReplacementMissingLiveCounts(
     shared: *SegmentShared,
+    doc_count: u32,
     deleted: ?*const roaring.RoaringBitmap,
     publish_increases: bool,
 ) void {
     for (shared.typed_doc_values_coverage) |*coverage| {
-        if (coverage.physical_status != .sparse_live_doc_values) continue;
-        const replacement = missingLiveCount(coverage, deleted);
+        if (!coverage.initialized.load(.acquire) or coverage.physical_status != .sparse_live_doc_values) continue;
+        const replacement = missingLiveCount(coverage, doc_count, deleted);
         const current = coverage.missing_live_count.load(.acquire);
         if ((publish_increases and replacement > current) or (!publish_increases and replacement <= current)) {
             coverage.missing_live_count.store(replacement, .release);
         }
-    }
-}
-
-fn initializeMissingLiveCounts(
-    shared: *SegmentShared,
-    deleted: ?*const roaring.RoaringBitmap,
-) void {
-    for (shared.typed_doc_values_coverage) |*coverage| {
-        if (coverage.physical_status != .sparse_live_doc_values) continue;
-        coverage.missing_live_count.store(missingLiveCount(coverage, deleted), .monotonic);
     }
 }
 
@@ -390,7 +448,7 @@ pub const SegmentEntry = struct {
     }
 
     fn createShared(alloc: Allocator, data: SegmentData, reader: *const segment_mod.SegmentReader) !*SegmentShared {
-        const coverage = try buildTypedDocValuesCoverageAlloc(alloc, reader);
+        const coverage = try buildTypedDocValuesCoverageMetadataAlloc(alloc, reader);
         errdefer freeTypedDocValuesCoverage(alloc, coverage);
         const shared = try alloc.create(SegmentShared);
         initShared(shared, data, coverage);
@@ -449,9 +507,11 @@ pub const SegmentEntry = struct {
         value_type: ?typed_dv.ValueType,
     };
 
-    /// Return cached coverage for a physical typed-doc-values column. Missing
-    /// columns are represented by null; no segment bytes are decoded here.
-    pub fn typedDocValuesCoverage(self: *const SegmentEntry, field: []const u8) ?TypedDocValuesCoverage {
+    /// Return coverage for a physical typed-doc-values column. The first call
+    /// for a concrete field validates and caches its compact membership;
+    /// subsequent calls read only the cached summary. Missing columns are
+    /// represented by null.
+    pub fn typedDocValuesCoverage(self: *const SegmentEntry, field: []const u8) !?TypedDocValuesCoverage {
         var low: usize = 0;
         var high = self.shared.typed_doc_values_coverage.len;
         while (low < high) {
@@ -460,7 +520,17 @@ pub const SegmentEntry = struct {
             switch (std.mem.order(u8, coverage.field, field)) {
                 .lt => low = mid + 1,
                 .gt => high = mid,
-                .eq => return .{ .status = coverage.status(), .value_type = coverage.value_type },
+                .eq => {
+                    if (!coverage.initialized.load(.acquire)) {
+                        // Lazy validation can touch every page in this one
+                        // column. Pin and account the mapping exactly like a
+                        // query reader while the first-use scan runs.
+                        self.beginAccess();
+                        defer self.endAccess();
+                        try initializeTypedDocValuesFieldCoverage(self.reader.alloc, self.shared, &self.reader, coverage);
+                    }
+                    return .{ .status = coverage.status(), .value_type = coverage.value_type };
+                },
             }
         }
         return null;
@@ -1884,9 +1954,8 @@ pub const IndexWriter = struct {
                 if (!deleted.isEmpty()) {
                     shared.deleted = try deleted.clone(self.alloc);
                     shared.deleted_count.store(@intCast(deleted.cardinality()), .release);
-                    // The replacement is not published yet, so initialize its
-                    // coverage exactly once without concurrent-ordering work.
-                    initializeMissingLiveCounts(shared, &shared.deleted.?);
+                    // Coverage remains lazy; its first observation includes
+                    // this replacement bitmap while holding a deletion lease.
                 }
             }
             new_segments[idx] = .{
@@ -1955,7 +2024,7 @@ pub const IndexWriter = struct {
                 // non-queryable before its tombstone disappears. Additional
                 // deletions become queryable only after their tombstones are
                 // visible to executors.
-                publishReplacementMissingLiveCounts(seg.shared, &owned_bitmap, true);
+                publishReplacementMissingLiveCounts(seg.shared, seg.reader.doc_count, &owned_bitmap, true);
                 // When documents are restored, publish the larger count first;
                 // readers may over-fetch while the bitmap is replaced but can
                 // never under-fetch newly visible documents. For additional
@@ -1976,7 +2045,7 @@ pub const IndexWriter = struct {
                 if (replacement_deleted >= current_deleted) {
                     seg.shared.deleted_count.store(replacement_deleted, .release);
                 }
-                publishReplacementMissingLiveCounts(seg.shared, &seg.shared.deleted.?, false);
+                publishReplacementMissingLiveCounts(seg.shared, seg.reader.doc_count, &seg.shared.deleted.?, false);
                 return;
             }
         }
@@ -2167,6 +2236,78 @@ fn buildTestSegment(alloc: Allocator, docs: []const struct { terms: []const inve
     }
 
     return seg_writer.build();
+}
+
+fn buildSparseTypedDocValuesTestSegment(alloc: Allocator, doc_count: u32) ![]u8 {
+    var values = typed_dv.TypedDocValuesWriter.init(alloc, .u64_val, typed_dv.default_chunk_size);
+    defer values.deinit();
+    try values.add(0, .{ .u64_val = 42 });
+    const value_bytes = try values.build();
+    defer alloc.free(value_bytes);
+
+    var segment = segment_mod.SegmentWriter.init(alloc);
+    defer segment.deinit();
+    const field_index = try segment.addField("rank");
+    try segment.addSection(field_index, .typed_doc_values, value_bytes);
+    for (0..doc_count) |doc_id| {
+        var id_buf: [32]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "doc:{d}", .{doc_id});
+        try segment.addStoredDoc(id, "{}");
+    }
+    return segment.build();
+}
+
+test "typed doc values coverage is lazy and retains compact sparse membership" {
+    const alloc = std.testing.allocator;
+    const segment_bytes = try buildSparseTypedDocValuesTestSegment(alloc, 64);
+    defer alloc.free(segment_bytes);
+
+    var writer = try IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(segment_bytes);
+
+    const segment = &writer.snapshot().segments[0];
+    try std.testing.expectEqual(@as(usize, 1), segment.shared.typed_doc_values_coverage.len);
+    const cached = &segment.shared.typed_doc_values_coverage[0];
+    // Segment publication must not decode typed values or allocate a
+    // document-cardinality coverage structure.
+    try std.testing.expect(!cached.initialized.load(.acquire));
+    try std.testing.expect(cached.membership_doc_ids == null);
+
+    const coverage = (try segment.typedDocValuesCoverage("rank")).?;
+    try std.testing.expectEqual(TypedDocValuesCoverageStatus.sparse_live_doc_values, coverage.status);
+    try std.testing.expect(cached.initialized.load(.acquire));
+    try std.testing.expect(!cached.membership_is_missing);
+    try std.testing.expectEqual(@as(usize, 1), cached.membership_doc_ids.?.cardinality());
+    try std.testing.expectEqual(@as(u32, 63), cached.missing_live_count.load(.acquire));
+
+    // With present-ID polarity, deleting an absent value decrements coverage;
+    // deleting the one present value does not.
+    try std.testing.expect(try writer.deleteById("doc:1"));
+    try std.testing.expectEqual(@as(u32, 62), cached.missing_live_count.load(.acquire));
+    try std.testing.expect(try writer.deleteById("doc:0"));
+    try std.testing.expectEqual(@as(u32, 62), cached.missing_live_count.load(.acquire));
+}
+
+test "typed doc values corruption is classified lazily without rejecting segment admission" {
+    const alloc = std.testing.allocator;
+    var segment = segment_mod.SegmentWriter.init(alloc);
+    defer segment.deinit();
+    const field_index = try segment.addField("rank");
+    try segment.addSection(field_index, .typed_doc_values, "malformed");
+    try segment.addStoredDoc("doc:0", "{}");
+    const segment_bytes = try segment.build();
+    defer alloc.free(segment_bytes);
+
+    var writer = try IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(segment_bytes);
+    const indexed = &writer.snapshot().segments[0];
+    try std.testing.expect(!indexed.shared.typed_doc_values_coverage[0].initialized.load(.acquire));
+
+    const coverage = (try indexed.typedDocValuesCoverage("rank")).?;
+    try std.testing.expectEqual(TypedDocValuesCoverageStatus.malformed_doc_values_section, coverage.status);
+    try std.testing.expect(indexed.shared.typed_doc_values_coverage[0].initialized.load(.acquire));
 }
 
 fn mapTestSegment(segment_bytes: []const u8) !SegmentData {

@@ -14976,7 +14976,7 @@ fn snapshotTypedDocValuesCoverageDetailsForMapping(
     var expected_value_type: ?typed_dv.ValueType = null;
     for (snapshot.segments) |*segment| {
         if (segment.liveDocCount() == 0) continue;
-        const cached = segment.typedDocValuesCoverage(field) orelse return .{ .status = .missing_doc_values_section };
+        const cached = (try segment.typedDocValuesCoverage(field)) orelse return .{ .status = .missing_doc_values_section };
         const value_type = cached.value_type orelse return .{ .status = cached.status };
         if (!typedDocValuesTypeMatchesMappedSortField(value_type, mapping)) return .{ .status = .doc_values_kind_mismatch };
         if (expected_value_type) |expected| {
@@ -15003,7 +15003,7 @@ fn snapshotGeoPointDocValuesCoverage(
 ) !TypedDocValuesCoverageStatus {
     for (snapshot.segments) |*segment| {
         if (segment.liveDocCount() == 0) continue;
-        const cached = segment.typedDocValuesCoverage(field) orelse return .missing_doc_values_section;
+        const cached = (try segment.typedDocValuesCoverage(field)) orelse return .missing_doc_values_section;
         const value_type = cached.value_type orelse return cached.status;
         if (value_type != .geo_point) return .doc_values_kind_mismatch;
         if (cached.status != .covered) return cached.status;
