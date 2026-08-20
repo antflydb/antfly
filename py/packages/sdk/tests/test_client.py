@@ -14,7 +14,9 @@ from antfly.client_generated.models.batch_request import BatchRequest  # noqa: E
 from antfly.client_generated.models.graph_index_stats import GraphIndexStats  # noqa: E402
 from antfly.client_generated.models.graph_index_stats_index_type import GraphIndexStatsIndexType  # noqa: E402
 from antfly.client_generated.models.graph_metric_query import GraphMetricQuery  # noqa: E402
-from antfly.client_generated.models.graph_metric_query_metric_freshness import GraphMetricQueryMetricFreshness  # noqa: E402
+from antfly.client_generated.models.graph_metric_query_metric_freshness import (
+    GraphMetricQueryMetricFreshness,  # noqa: E402
+)
 from antfly.client_generated.models.graph_metric_runtime_stats import GraphMetricRuntimeStats  # noqa: E402
 from antfly.client_generated.models.graph_metric_runtime_stats_role import GraphMetricRuntimeStatsRole  # noqa: E402
 from antfly.client_generated.models.inference_chat_message import InferenceChatMessage  # noqa: E402
