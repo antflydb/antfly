@@ -2416,7 +2416,8 @@ pub const BoundTableReadSource = struct {
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         if (req.topology_epoch != 0) return error.TopologyChanged;
         try distributed_graph.validateGraphEdgesTensorAccessPath(alloc, req);
-        const edges = try self.db.getEdges(alloc, req.index_name, req.key, "", req.direction);
+        const graph_entry = self.db.core.graphIndex(req.index_name) orelse return error.IndexNotFound;
+        const edges = try graph_entry.index.getEdgesByTypes(alloc, req.key, req.edge_types, req.direction);
         return .{ .edges = edges };
     }
 };
@@ -7988,7 +7989,7 @@ fn executeProvisionedGraphGetEdgesAttempt(
     _ = try currentIdentityReadGenerationForDb(req.identity_read_generation, db_owner.db());
 
     const graph_entry = db_owner.db().core.graphIndex(req.index_name) orelse return error.IndexNotFound;
-    return .{ .edges = try graph_entry.index.getEdges(alloc, req.key, "", req.direction) };
+    return .{ .edges = try graph_entry.index.getEdgesByTypes(alloc, req.key, req.edge_types, req.direction) };
 }
 
 fn executeHostedGraphGetEdges(
@@ -8034,7 +8035,7 @@ fn graphGetEdgesLocal(
     try reads.reads.prepareLookupWithConsistency(group_id, req.key, .{}, consistency);
 
     const graph_entry = db.core.graphIndex(req.index_name) orelse return error.IndexNotFound;
-    const edges = try graph_entry.index.getEdges(alloc, req.key, "", req.direction);
+    const edges = try graph_entry.index.getEdgesByTypes(alloc, req.key, req.edge_types, req.direction);
     return .{ .edges = edges };
 }
 

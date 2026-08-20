@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Keep manifests/crd limited to directly applicable CRD resources. Downstream
+# consumers may install that directory with kubectl apply -f.
+resources:
+  - crd/antfly.io_antflybackups.yaml
+  - crd/antfly.io_antflyclusters.yaml
+  - crd/antfly.io_antflyrestores.yaml
+  - crd/antfly.io_externalinferencepools.yaml
+  - crd/antfly.io_inferencepools.yaml
+  - crd/antfly.io_inferenceproxies.yaml

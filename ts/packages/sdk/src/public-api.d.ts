@@ -11358,7 +11358,7 @@ export interface components {
             index_name: string;
             /** @description Starting node(s) for the query */
             start_nodes?: components["schemas"]["GraphNodeSelector"];
-            /** @description Target nodes (for pathfinding only) */
+            /** @description Exact target nodes for pathfinding or the final binding of a pattern query. When a pattern endpoint is known, prefer this selector over an exact node_filter.filter_prefix so Antfly can use an exact edge-probe plan. */
             target_nodes?: components["schemas"]["GraphNodeSelector"];
             /** @description Traversal/pathfinding parameters */
             params?: components["schemas"]["GraphQueryParams"];

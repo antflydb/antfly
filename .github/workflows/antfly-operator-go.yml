@@ -59,6 +59,12 @@ jobs:
       - name: Download dependencies
         run: GOWORK=off go mod download
 
+      - name: Install envtest
+        run: GOWORK=off go install sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.0.0-20251126220622-4b46eb04d57f
+
+      - name: Configure envtest
+        run: echo "KUBEBUILDER_ASSETS=$("$(go env GOPATH)/bin/setup-envtest" use -p path 1.35.x!)" >> "$GITHUB_ENV"
+
       - name: Run tests
         run: make test
 

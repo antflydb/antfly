@@ -159,35 +159,50 @@ fn mergeGenericSearchResultsWithRuntimeSchema(
         };
     }
 
-    var merged_hits = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
-    defer {
-        for (merged_hits.items) |*hit| hit.deinit(alloc);
-        merged_hits.deinit(alloc);
-    }
+    // Borrow payloads and retain only the requested top-(offset+limit) window.
+    // An unbounded request still needs every reference, but ordinary pages no
+    // longer allocate either payload copies or an O(total candidates) pointer
+    // array at the coordinator.
+    var merged_hits = std.ArrayListUnmanaged(*const db_mod.types.SearchHit).empty;
+    defer merged_hits.deinit(alloc);
+    var bounded_hits = std.PriorityQueue(
+        *const db_mod.types.SearchHit,
+        ScoreMergeOrder,
+        searchHitRefWorstFirst,
+    ).initContext(.{ .use_score = requestUsesScoreOrderedMerge(req) });
+    defer bounded_hits.deinit(alloc);
 
     const score_ordered_merge = requestUsesScoreOrderedMerge(req);
+    var candidate_count: usize = 0;
+    for (results) |result| candidate_count = std.math.add(usize, candidate_count, result.hits.len) catch std.math.maxInt(usize);
+    const retained_window = std.math.add(usize, @as(usize, offset), @as(usize, limit)) catch std.math.maxInt(usize);
+    const use_bounded_window = limit != 0 and retained_window < candidate_count;
+    if (use_bounded_window) try bounded_hits.ensureTotalCapacity(alloc, retained_window);
     for (results) |result| {
-        for (result.hits) |hit| {
-            if (score_ordered_merge) try validateScoreOrderedMergeHit(hit);
-            try merged_hits.append(alloc, try hit.clone(alloc));
+        for (result.hits) |*hit| {
+            if (score_ordered_merge) try validateScoreOrderedMergeHit(hit.*);
+            if (!use_bounded_window) {
+                try merged_hits.append(alloc, hit);
+                continue;
+            }
+            if (bounded_hits.items.len < retained_window) {
+                try bounded_hits.push(alloc, hit);
+                continue;
+            }
+            const worst = bounded_hits.peek().?;
+            if (!searchHitRefComesBefore(.{ .use_score = score_ordered_merge }, hit, worst)) continue;
+            _ = bounded_hits.pop();
+            try bounded_hits.push(alloc, hit);
         }
     }
 
-    std.sort.pdq(db_mod.types.SearchHit, merged_hits.items, ScoreMergeOrder{
+    const candidate_refs = if (use_bounded_window) bounded_hits.items else merged_hits.items;
+    std.sort.pdq(*const db_mod.types.SearchHit, candidate_refs, ScoreMergeOrder{
         .use_score = score_ordered_merge,
-    }, struct {
-        fn lessThan(order: ScoreMergeOrder, a: db_mod.types.SearchHit, b: db_mod.types.SearchHit) bool {
-            if (order.use_score) {
-                const a_score = a.score.?;
-                const b_score = b.score.?;
-                if (a_score != b_score) return a_score > b_score;
-            }
-            return std.mem.order(u8, a.id, b.id) == .lt;
-        }
-    }.lessThan);
+    }, searchHitRefComesBefore);
 
-    const start: usize = @min(offset, merged_hits.items.len);
-    const max_count: usize = if (limit == 0) merged_hits.items.len - start else @min(limit, merged_hits.items.len - start);
+    const start: usize = @min(offset, candidate_refs.len);
+    const max_count: usize = if (limit == 0) candidate_refs.len - start else @min(limit, candidate_refs.len - start);
     const end = start + max_count;
 
     var final_hits = try alloc.alloc(db_mod.types.SearchHit, max_count);
@@ -197,7 +212,7 @@ fn mergeGenericSearchResultsWithRuntimeSchema(
         alloc.free(final_hits);
     }
 
-    for (merged_hits.items[start..end], 0..) |hit, i| {
+    for (candidate_refs[start..end], 0..) |hit, i| {
         final_hits[i] = try hit.clone(alloc);
         moved += 1;
     }
@@ -224,6 +239,29 @@ fn mergeGenericSearchResultsWithRuntimeSchema(
         .identity_read_generation = mergedSearchResultIdentityReadGeneration(req, results),
         .graph_results = graph_results,
     };
+}
+
+fn searchHitRefComesBefore(
+    order: ScoreMergeOrder,
+    a: *const db_mod.types.SearchHit,
+    b: *const db_mod.types.SearchHit,
+) bool {
+    if (order.use_score) {
+        const a_score = a.score.?;
+        const b_score = b.score.?;
+        if (a_score != b_score) return a_score > b_score;
+    }
+    return std.mem.order(u8, a.id, b.id) == .lt;
+}
+
+fn searchHitRefWorstFirst(
+    order: ScoreMergeOrder,
+    a: *const db_mod.types.SearchHit,
+    b: *const db_mod.types.SearchHit,
+) std.math.Order {
+    if (searchHitRefComesBefore(order, a, b)) return .gt;
+    if (searchHitRefComesBefore(order, b, a)) return .lt;
+    return .eq;
 }
 
 fn requestReturnsHierarchyUnitGroups(req: db_mod.types.SearchRequest) bool {
@@ -1988,6 +2026,33 @@ test "query merge applies global score ordering and offset" {
     try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
     try std.testing.expectEqualStrings("doc:b", merged.hits[0].id);
     try std.testing.expectEqual(@as(?u32, null), merged.hits[0].doc_ordinal);
+}
+
+test "query merge allocation scales with the selected page" {
+    const large_stored = "x" ** 1024;
+    var input_hits: [2048]db_mod.types.SearchHit = undefined;
+    for (&input_hits) |*hit| {
+        hit.* = .{
+            .id = @constCast("doc:a"),
+            .stored_data = @constCast(large_stored),
+        };
+    }
+    const input = db_mod.types.SearchResult{
+        .alloc = std.testing.allocator,
+        .hits = &input_hits,
+        .total_hits = input_hits.len,
+    };
+
+    // Enough for a bounded top-one heap plus one cloned page hit, but not for
+    // an O(candidate count) pointer array or cloned stored candidates.
+    var backing: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    var merged = try mergeSearchResults(fba.allocator(), .{}, &.{input}, 0, 1);
+    defer merged.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
+    try std.testing.expectEqualStrings("doc:a", merged.hits[0].id);
+    try std.testing.expectEqual(@as(usize, large_stored.len), merged.hits[0].stored_data.?.len);
 }
 
 test "query merge rejects score ordered hits without finite scores" {

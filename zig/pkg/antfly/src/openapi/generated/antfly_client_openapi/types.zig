@@ -3882,7 +3882,7 @@ pub const GraphQuery = struct {
     index_name: []const u8,
     /// Starting node(s) for the query
     start_nodes: ?GraphNodeSelector = null,
-    /// Target nodes (for pathfinding only)
+    /// Exact target nodes for pathfinding or the final binding of a pattern query. When a pattern endpoint is known, prefer this selector over an exact node_filter.filter_prefix so Antfly can use an exact edge-probe plan.
     target_nodes: ?GraphNodeSelector = null,
     /// Traversal/pathfinding parameters
     params: ?GraphQueryParams = null,
