@@ -43881,6 +43881,46 @@ const CountingDenseEmbedder = struct {
     }
 };
 
+const ValidatingChunkDenseEmbedder = struct {
+    deterministic: embedder_mod.DeterministicDenseEmbedder = .{},
+
+    fn embedDense(ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32) ![]f32 {
+        const self: *ValidatingChunkDenseEmbedder = @ptrCast(@alignCast(ptr));
+        return try embedder_mod.DeterministicDenseEmbedder.embedDense(&self.deterministic, alloc, embedding_name, text, dims);
+    }
+
+    fn embedDenseBatch(ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+        const self: *ValidatingChunkDenseEmbedder = @ptrCast(@alignCast(ptr));
+        const expected_chunks = [_][]const u8{ "abcdefgh", "ghijklmn", "mno" };
+        for (texts) |text| {
+            for (expected_chunks) |expected| {
+                if (std.mem.eql(u8, text, expected)) break;
+            } else return error.TestUnexpectedResult;
+        }
+
+        const batch = try alloc.alloc([]const f32, texts.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (batch[0..initialized]) |vector| alloc.free(@constCast(vector));
+            alloc.free(batch);
+        }
+        for (texts, 0..) |text, i| {
+            batch[i] = try embedder_mod.DeterministicDenseEmbedder.embedDense(&self.deterministic, alloc, embedding_name, text, dims);
+            initialized += 1;
+        }
+        return batch;
+    }
+
+    fn interface(self: *ValidatingChunkDenseEmbedder) embedder_mod.DenseEmbedder {
+        return .{
+            .ptr = self,
+            .dense_embed_fn = embedDense,
+            .dense_embed_batch_fn = embedDenseBatch,
+            .deinit_fn = null,
+        };
+    }
+};
+
 const ImageDecodingPartsEmbedder = struct {
     calls: usize = 0,
 
@@ -62608,11 +62648,11 @@ test "db addEnrichment supports explicit shared definitions" {
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var validating = ValidatingChunkDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
         .enrichment = .{
             .owner_id = "worker-a",
-            .dense_embedder = deterministic.interface(),
+            .dense_embedder = validating.interface(),
         },
     });
     defer db.close();
@@ -62648,7 +62688,7 @@ test "db addEnrichment supports explicit shared definitions" {
     try db.enrichment_runtime.?.waitForApplied(1);
     try waitForDerivedReplayTarget(&db);
 
-    const query_vec = try deterministic.interface().embedDense(alloc, "chunk_dense_v1", "abcdefgh", 3);
+    const query_vec = try validating.deterministic.interface().embedDense(alloc, "chunk_dense_v1", "abcdefgh", 3);
     defer alloc.free(query_vec);
 
     const req: types.SearchRequest = .{
