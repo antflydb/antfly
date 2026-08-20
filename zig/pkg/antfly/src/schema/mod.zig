@@ -42,6 +42,10 @@ pub fn validateWritesAgainstTableSchema(
     try impl.validateWritesAgainstSchema(alloc, schema, writes);
 }
 
+pub fn documentPropertyAllowsNull(property: impl.DocumentProperty) bool {
+    return impl.documentPropertyAllowsNull(property);
+}
+
 pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSchema) !storage_schema.TableSchema {
     const document_field_templates = try deriveRuntimeDocumentFieldTemplates(alloc, schema);
     var document_field_templates_owned = true;

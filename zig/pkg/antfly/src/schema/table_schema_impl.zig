@@ -3307,77 +3307,66 @@ fn validateDocumentFieldValueWithContext(
     }
 }
 
+pub fn documentPropertyAllowsNull(property: DocumentProperty) bool {
+    const has_all_of = property.all_of.len > 0;
+
+    if (has_all_of) {
+        for (property.all_of) |variant| {
+            if (!documentPropertyAllowsNull(variant)) return false;
+        }
+    }
+
+    if (property.any_of.len > 0) {
+        for (property.any_of) |variant| {
+            if (documentPropertyAllowsNull(variant)) return true;
+        }
+        return false;
+    }
+
+    if (property.one_of.len > 0) {
+        var matches: usize = 0;
+        for (property.one_of) |variant| {
+            if (documentPropertyAllowsNull(variant)) matches += 1;
+        }
+        return matches == 1;
+    }
+
+    if (property.not_schema) |not_schema| {
+        if (documentPropertyAllowsNull(not_schema.*)) return false;
+    }
+
+    if (property.if_schema) |if_schema| {
+        if (documentPropertyAllowsNull(if_schema.*)) {
+            if (property.then_schema) |then_schema| return documentPropertyAllowsNull(then_schema.*);
+            return true;
+        }
+        if (property.else_schema) |else_schema| return documentPropertyAllowsNull(else_schema.*);
+    }
+
+    if (property.const_value) |const_value| return std.mem.eql(u8, const_value, "null");
+
+    if (property.enum_values.len > 0) {
+        for (property.enum_values) |enum_value| {
+            if (std.mem.eql(u8, enum_value, "null")) return true;
+        }
+        return false;
+    }
+
+    if (property.allows_null) return true;
+    if (property.field_type) |field_type| return std.mem.eql(u8, field_type, "null");
+    return has_all_of;
+}
+
 fn validateNullValueWithContext(
     context: *RuntimeValidationContext,
     property: DocumentProperty,
     value: *const std.json.Value,
     enforce_types: bool,
 ) !void {
+    _ = context;
+    _ = value;
     _ = enforce_types;
-    const composed_enforce_types = false;
-    const has_all_of = property.all_of.len > 0;
-
-    if (has_all_of) {
-        for (property.all_of) |variant| try validateNullValueWithContext(context, variant, value, composed_enforce_types);
-    }
-
-    if (property.any_of.len > 0) {
-        for (property.any_of) |variant| {
-            validateNullValueWithContext(context, variant, value, composed_enforce_types) catch continue;
-            return;
-        }
-        return error.InvalidBatchRequest;
-    }
-
-    if (property.one_of.len > 0) {
-        var matches: usize = 0;
-        for (property.one_of) |variant| {
-            validateNullValueWithContext(context, variant, value, composed_enforce_types) catch continue;
-            matches += 1;
-        }
-        if (matches != 1) return error.InvalidBatchRequest;
-        return;
-    }
-
-    if (property.not_schema) |not_schema| {
-        if (validateNullValueWithContext(context, not_schema.*, value, composed_enforce_types)) |_| {
-            return error.InvalidBatchRequest;
-        } else |_| {}
-    }
-
-    if (property.if_schema) |if_schema| {
-        const matched = if (validateNullValueWithContext(context, if_schema.*, value, composed_enforce_types)) |_| true else |_| false;
-        if (matched) {
-            if (property.then_schema) |then_schema| {
-                try validateNullValueWithContext(context, then_schema.*, value, composed_enforce_types);
-                return;
-            }
-            return;
-        }
-        if (property.else_schema) |else_schema| {
-            try validateNullValueWithContext(context, else_schema.*, value, composed_enforce_types);
-            return;
-        }
-    }
-
-    if (property.const_value) |const_value| {
-        if (!std.mem.eql(u8, const_value, "null")) return error.InvalidBatchRequest;
-        return;
-    }
-
-    if (property.enum_values.len > 0) {
-        for (property.enum_values) |enum_value| {
-            if (std.mem.eql(u8, enum_value, "null")) return;
-        }
-        return error.InvalidBatchRequest;
-    }
-
-    if (property.allows_null) return;
-    if (property.field_type) |field_type| {
-        if (std.mem.eql(u8, field_type, "null")) return;
-    }
-    if (has_all_of and property.field_type == null and property.const_value == null and property.enum_values.len == 0) return;
-    return error.InvalidBatchRequest;
+    if (!documentPropertyAllowsNull(property)) return error.InvalidBatchRequest;
 }
 
 fn isIntegralJsonNumber(value: std.json.Value, numeric_value: f64) bool {
