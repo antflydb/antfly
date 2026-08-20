@@ -412,6 +412,7 @@ pub const NamespaceWriteTxn = struct {
         abort: *const fn (Allocator, *anyopaque) void,
         commit: *const fn (Allocator, *anyopaque) anyerror!void,
         get: *const fn (*anyopaque, backend_types.Namespace, []const u8) anyerror![]const u8,
+        get_many_sorted: ?*const fn (*anyopaque, backend_types.Namespace, []const []const u8, []?[]const u8) anyerror!void = null,
         put: *const fn (*anyopaque, backend_types.Namespace, []const u8, []const u8) anyerror!void,
         append_put: ?*const fn (*anyopaque, backend_types.Namespace, []const u8, []const u8) anyerror!void = null,
         delete: *const fn (*anyopaque, backend_types.Namespace, []const u8) anyerror!void,
@@ -430,6 +431,18 @@ pub const NamespaceWriteTxn = struct {
 
     pub fn get(self: *NamespaceWriteTxn, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
         return try self.vtable.get(self.ptr, namespace, key);
+    }
+
+    pub fn getManySorted(self: *NamespaceWriteTxn, namespace: backend_types.Namespace, keys: []const []const u8, values: []?[]const u8) !void {
+        if (keys.len != values.len) return error.InvalidBatch;
+        if (self.vtable.get_many_sorted) |get_many_sorted| return try get_many_sorted(self.ptr, namespace, keys, values);
+        @memset(values, null);
+        for (keys, values) |key, *value| {
+            value.* = self.vtable.get(self.ptr, namespace, key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+        }
     }
 
     pub fn put(self: *NamespaceWriteTxn, namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
@@ -529,6 +542,7 @@ pub const NamespaceBatch = struct {
         abort: *const fn (Allocator, *anyopaque) void,
         commit: *const fn (Allocator, *anyopaque) anyerror!void,
         get: *const fn (*anyopaque, backend_types.Namespace, []const u8) anyerror![]const u8,
+        get_many_sorted: ?*const fn (*anyopaque, backend_types.Namespace, []const []const u8, []?[]const u8) anyerror!void = null,
         put: *const fn (*anyopaque, backend_types.Namespace, []const u8, []const u8) anyerror!void,
         append_put: ?*const fn (*anyopaque, backend_types.Namespace, []const u8, []const u8) anyerror!void = null,
         delete: *const fn (*anyopaque, backend_types.Namespace, []const u8) anyerror!void,
@@ -546,6 +560,18 @@ pub const NamespaceBatch = struct {
 
     pub fn get(self: *NamespaceBatch, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
         return try self.vtable.get(self.ptr, namespace, key);
+    }
+
+    pub fn getManySorted(self: *NamespaceBatch, namespace: backend_types.Namespace, keys: []const []const u8, values: []?[]const u8) !void {
+        if (keys.len != values.len) return error.InvalidBatch;
+        if (self.vtable.get_many_sorted) |get_many_sorted| return try get_many_sorted(self.ptr, namespace, keys, values);
+        @memset(values, null);
+        for (keys, values) |key, *value| {
+            value.* = self.vtable.get(self.ptr, namespace, key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+        }
     }
 
     pub fn put(self: *NamespaceBatch, namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
@@ -795,6 +821,7 @@ pub const NamespaceStore = struct {
         deinit: *const fn (Allocator, *anyopaque) void,
         capabilities: *const fn (*anyopaque) backend_types.Capabilities,
         begin_read: *const fn (Allocator, *anyopaque) anyerror!NamespaceReadTxn,
+        begin_probe: ?*const fn (Allocator, *anyopaque) anyerror!NamespaceReadTxn = null,
         begin_write: *const fn (Allocator, *anyopaque) anyerror!NamespaceWriteTxn,
         begin_batch: *const fn (Allocator, *anyopaque) anyerror!NamespaceBatch,
         begin_batch_with_options: ?*const fn (Allocator, *anyopaque, backend_types.BatchOptions) anyerror!NamespaceBatch = null,
@@ -811,6 +838,13 @@ pub const NamespaceStore = struct {
 
     pub fn beginRead(self: *NamespaceStore) !NamespaceReadTxn {
         return try self.vtable.begin_read(self.allocator, self.ptr);
+    }
+
+    pub fn beginProbe(self: *NamespaceStore) !NamespaceReadTxn {
+        if (self.vtable.begin_probe) |begin_probe| {
+            return try begin_probe(self.allocator, self.ptr);
+        }
+        return try self.beginRead();
     }
 
     pub fn beginWrite(self: *NamespaceStore) !NamespaceWriteTxn {
@@ -1210,6 +1244,10 @@ pub fn namespaceWriteTxnFrom(
             return try unbox(ptr).handle.get(try mapNamespace(namespace), key);
         }
 
+        fn getManySorted(ptr: *anyopaque, namespace: backend_types.Namespace, keys: []const []const u8, values: []?[]const u8) anyerror!void {
+            try unbox(ptr).handle.getManySorted(try mapNamespace(namespace), keys, values);
+        }
+
         fn put(ptr: *anyopaque, namespace: backend_types.Namespace, key: []const u8, value: []const u8) anyerror!void {
             try unbox(ptr).handle.put(try mapNamespace(namespace), key, value);
         }
@@ -1239,6 +1277,7 @@ pub fn namespaceWriteTxnFrom(
             .abort = vt.abort,
             .commit = vt.commit,
             .get = vt.get,
+            .get_many_sorted = if (@hasDecl(Handle, "getManySorted")) vt.getManySorted else null,
             .put = vt.put,
             .append_put = if (@hasDecl(Handle, "appendPut")) vt.appendPut else null,
             .delete = vt.delete,
@@ -1360,6 +1399,10 @@ pub fn namespaceBatchFrom(
             return try unbox(ptr).handle.get(try mapNamespace(namespace), key);
         }
 
+        fn getManySorted(ptr: *anyopaque, namespace: backend_types.Namespace, keys: []const []const u8, values: []?[]const u8) anyerror!void {
+            try unbox(ptr).handle.getManySorted(try mapNamespace(namespace), keys, values);
+        }
+
         fn put(ptr: *anyopaque, namespace: backend_types.Namespace, key: []const u8, value: []const u8) anyerror!void {
             try unbox(ptr).handle.put(try mapNamespace(namespace), key, value);
         }
@@ -1380,6 +1423,7 @@ pub fn namespaceBatchFrom(
             .abort = vt.abort,
             .commit = vt.commit,
             .get = vt.get,
+            .get_many_sorted = if (@hasDecl(Handle, "getManySorted")) vt.getManySorted else null,
             .put = vt.put,
             .append_put = if (@hasDecl(Handle, "appendPut")) vt.appendPut else null,
             .delete = vt.delete,
@@ -1670,6 +1714,10 @@ pub fn namespaceStoreFrom(
     comptime mapNamespace: fn (backend_types.Namespace) anyerror!LocalNamespace,
 ) !NamespaceStore {
     const Handle = @TypeOf(handle);
+    const HandleDecl = switch (@typeInfo(Handle)) {
+        .pointer => |pointer| pointer.child,
+        else => Handle,
+    };
     const wrapper_box_allocator = wrapperBoxAllocator(allocator);
     const box_ptr = try allocBox(wrapper_box_allocator, handle);
 
@@ -1692,6 +1740,13 @@ pub fn namespaceStoreFrom(
             return try namespaceReadTxnFrom(alloc, try unbox(ptr).handle.beginRead(), LocalNamespace, mapNamespace);
         }
 
+        fn beginProbe(alloc: Allocator, ptr: *anyopaque) anyerror!NamespaceReadTxn {
+            if (@hasDecl(HandleDecl, "beginProbe")) {
+                return try namespaceReadTxnFrom(alloc, try unbox(ptr).handle.beginProbe(), LocalNamespace, mapNamespace);
+            }
+            return try beginRead(alloc, ptr);
+        }
+
         fn beginWrite(alloc: Allocator, ptr: *anyopaque) anyerror!NamespaceWriteTxn {
             return try namespaceWriteTxnFrom(alloc, try unbox(ptr).handle.beginWrite(), LocalNamespace, mapNamespace);
         }
@@ -1701,10 +1756,6 @@ pub fn namespaceStoreFrom(
         }
 
         fn beginBatchWithOptions(alloc: Allocator, ptr: *anyopaque, options: backend_types.BatchOptions) anyerror!NamespaceBatch {
-            const HandleDecl = switch (@typeInfo(Handle)) {
-                .pointer => |pointer| pointer.child,
-                else => Handle,
-            };
             if (@hasDecl(HandleDecl, "beginBatchWithOptions")) {
                 return try namespaceBatchFrom(alloc, try unbox(ptr).handle.beginBatchWithOptions(options), LocalNamespace, mapNamespace);
             }
@@ -1719,6 +1770,7 @@ pub fn namespaceStoreFrom(
             .deinit = vt.deinit,
             .capabilities = vt.capabilities,
             .begin_read = vt.beginRead,
+            .begin_probe = if (Handle == NamespaceStore or @hasDecl(HandleDecl, "beginProbe")) vt.beginProbe else null,
             .begin_write = vt.beginWrite,
             .begin_batch = vt.beginBatch,
             .begin_batch_with_options = vt.beginBatchWithOptions,
@@ -1914,9 +1966,17 @@ test "failed commit keeps erased write handle abortable" {
 test "runtime namespace store maps logical namespaces into concrete partitions" {
     const LocalNamespace = enum { meta, docs };
 
+    const Shared = struct {
+        read_calls: usize = 0,
+        probe_calls: usize = 0,
+    };
+
     const MockRead = struct {
+        probe: bool = false,
+
         pub fn abort(_: *@This()) void {}
-        pub fn get(_: *@This(), ns: LocalNamespace, _: []const u8) ![]const u8 {
+        pub fn get(self: *@This(), ns: LocalNamespace, _: []const u8) ![]const u8 {
+            if (self.probe) return "p";
             return switch (ns) {
                 .meta => "m",
                 .docs => "d",
@@ -1957,12 +2017,20 @@ test "runtime namespace store maps logical namespaces into concrete partitions" 
     };
 
     const MockStore = struct {
+        shared: *Shared,
+
         pub fn capabilities(_: *@This()) backend_types.Capabilities {
             return .{ .native_namespaces = true };
         }
 
-        pub fn beginRead(_: *@This()) !MockRead {
+        pub fn beginRead(self: *@This()) !MockRead {
+            self.shared.read_calls += 1;
             return .{};
+        }
+
+        pub fn beginProbe(self: *@This()) !MockRead {
+            self.shared.probe_calls += 1;
+            return .{ .probe = true };
         }
 
         pub fn beginWrite(_: *@This()) !MockWrite {
@@ -1982,7 +2050,8 @@ test "runtime namespace store maps logical namespaces into concrete partitions" 
         }
     }.map;
 
-    const mock = MockStore{};
+    var shared = Shared{};
+    const mock = MockStore{ .shared = &shared };
     var store = try namespaceStoreFrom(std.testing.allocator, mock, LocalNamespace, mapNamespace);
     defer store.deinit();
     try std.testing.expect(store.capabilities().native_namespaces);
@@ -1991,6 +2060,12 @@ test "runtime namespace store maps logical namespaces into concrete partitions" 
     defer read.abort();
     try std.testing.expectEqualStrings("m", try read.get(.{}, "k"));
     try std.testing.expectEqualStrings("d", try read.get(.{ .name = "docs" }, "k"));
+
+    var probe = try store.beginProbe();
+    defer probe.abort();
+    try std.testing.expectEqualStrings("p", try probe.get(.{}, "k"));
+    try std.testing.expectEqual(@as(usize, 1), shared.read_calls);
+    try std.testing.expectEqual(@as(usize, 1), shared.probe_calls);
 
     var write = try store.beginWrite();
     try write.put(.{ .name = "docs" }, "k", "wv");

@@ -3692,6 +3692,7 @@ pub fn build(b: *std.Build) void {
     root_test_step.dependOn(&run_lib_unit_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "api http client round-trips public status and internal capability routes",
         "api http retryable embedding failures provide retry guidance",
         "api http server obtains query embedding policy from resource manager",
         "api http stale hierarchy cursor response is actionable and machine readable",
@@ -4221,7 +4222,16 @@ pub fn build(b: *std.Build) void {
         "data server can register a store without enabling data raft",
         "data server registered data raft uses wal state backend by default",
         "data raft ticker advances consensus independently of control rounds",
+        "raft batch round trips table batch payload",
         "raft batch round trips deterministic transaction begin",
+        "raft protocol barrier is fail closed for legacy batch parsers",
+        "raft protocol barrier rejects unsupported future versions",
+        "raft proposal materializes a default batch timestamp exactly once",
+        "raft batch protocol preflight fingerprint fences every applying replica set",
+        "raft batch protocol plan resolves only current group applying peers",
+        "raft batch protocol cache reuses only short lived negative evidence",
+        "raft batch protocol activation is reusable only in its accepted leader term",
+        "raft batch protocol activation cleanup preserves in flight references",
         "data raft forwarding distinguishes safe retries from ambiguous outcomes",
         "expired data raft deadline snapshots never wait and release before returning",
         "data raft batch forwarding bounds routing campaigns deadlines and deterministic fallback",
@@ -4252,6 +4262,10 @@ pub fn build(b: *std.Build) void {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
+        // The broad macOS ReleaseFast runtime root has measured at 11.37 GiB.
+        // Keep normal aggregate parallelism while giving the scheduler an
+        // honest reservation instead of forcing this root through -j1.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
     });
     const run_lib_data_runtime_tests = addFilteredTestRunArtifact(b, lib_data_runtime_tests);
     const lib_data_runtime_test_step = b.step("lib-data-runtime-test", "Run focused data runtime tests");
@@ -4273,6 +4287,8 @@ pub fn build(b: *std.Build) void {
         "db split sync coordinator can prepare source split again after rollback",
         "db split successor bootstrap atomically replaces stale destination generation",
         "data raft apply store applies delete operations into group state",
+        "data raft protocol barrier persists and transfers in snapshots",
+        "data raft protocol request observation never waits for generation preparation",
         "data raft apply store prepared snapshot retains its MVCC view across later writes",
         "data raft apply store orders independent groups through separate shards",
         "data raft apply store admits one writable owner per root",
@@ -4846,6 +4862,9 @@ pub fn build(b: *std.Build) void {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
+        // This broad macOS ReleaseFast simulation root has measured above
+        // 12 GiB. Reserve its observed class without serializing the suite.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
     });
     const run_lib_metadata_sim_public_tests = addFilteredTestRunArtifact(b, lib_metadata_sim_public_tests);
     const lib_metadata_sim_public_test_step = b.step("lib-metadata-sim-public-test", "Run metadata public lifecycle/split/merge simulation tests");
@@ -5591,6 +5610,7 @@ pub fn build(b: *std.Build) void {
             "replicated split destination seeds inherited doc identity before range publication",
             "internal batch parser rejects mixed split transition commands",
             "internal batch parser requires source acknowledgements to be metadata-only",
+            "internal batch codec preserves timestamps and rejects public injection",
             "internal batch split identity round trips the full u64 id space",
             "internal batch codec round trips replicated transaction phases",
             "txn resolve codec preserves sync level and accepts legacy requests",
@@ -5605,6 +5625,10 @@ pub fn build(b: *std.Build) void {
             "db transaction recovery runtime resolves table-group participants through distributed txn resolver",
             "bound stable single-group transaction retry does not reapply transforms",
             "bound single-group batch reports prepared intent conflicts",
+            "provisioned predicate-only batch validates matching and stale versions",
+            "provisioned single-group commit preserves transaction graph transform contract",
+            "raft single-group fast path excludes graph projection transforms only",
+            "resident writer repair state distinguishes clean and metadata-pending writers",
             "api http client preserves group doc identity conflicts",
             "api http client preserves public batch retry safety classifications",
             "api http client forwards bounded raft batch routing context without allocation",
@@ -5640,6 +5664,7 @@ pub fn build(b: *std.Build) void {
             "resident DB lease adopts seeded write cache across visible generation bump",
             "provisioned write cache close detaches promotion leadership callback before stats",
             "provisioned table write source coalesces same-group waiters",
+            "provisioned table write coalescer hands off after owner completes",
             "provisioned table write source preserves same-key delete then write across coalesced waiters",
             "provisioned table write coalescer isolates invalid waiter on same-key overlap",
             "provisioned table write coalescer isolates failed waiters",
@@ -6285,6 +6310,7 @@ pub fn build(b: *std.Build) void {
         "lsm backend resource manager rejects before wal apply",
         "derived backlog tracker accounts and releases payload bytes",
         "derived backlog tracker fails closed when sequence accounting allocation fails",
+        "derived backlog tracker bounds sequence-only admission drain window",
         "hbc shared cache namespaces entries",
         "hbc shared cache evicts across namespaces under one resource budget",
         "hbc cache reports byte usage to resource manager",
@@ -9461,20 +9487,26 @@ pub fn build(b: *std.Build) void {
                 // Claims conservatively cover clean production ReleaseFast
                 // peaks measured for both aarch64-linux-musl and explicit
                 // aarch64-macos (including Metal and Accelerate). They are
-                // scheduling reservations, not hard process limits. A 24 GiB
+                // scheduling reservations, not hard process limits. A 48 GiB
                 // budget can overlap all four units while a smaller cgroup
                 // automatically schedules only the subset that fits.
-                // aarch64-macOS includes platform framework codegen and peaks
-                // just above 4 GiB; Linux CI retains the tighter reservation.
-                .api_kernel => @as(usize, if (target.result.os.tag == .macos) 5 else 4) * 1024 * 1024 * 1024,
-                // Clean aarch64-macOS ReleaseFast codegen peaks around
-                // 10.9 GB with the platform frameworks enabled. Keep the
+                // aarch64-macOS ReleaseFast codegen reached 9.95 GB with
+                // platform frameworks; Linux CI retains the tighter claim.
+                .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 4) * 1024 * 1024 * 1024,
+                // Clean aarch64-macOS ReleaseFast storage codegen reached
+                // 17.42 GB (16.23 GiB) with the platform frameworks enabled.
+                // Keep the
                 // tighter Linux reservation, where CI remains below 8 GiB.
-                .distributed => @as(usize, if (target.result.os.tag == .macos) 12 else 8) * 1024 * 1024 * 1024,
-                // Debug codegen currently peaks around 6.7 GB on aarch64
-                // macOS; reserve headroom for mode- and target-dependent IR.
-                .inference => 7 * 1024 * 1024 * 1024,
-                .cli => 2 * 1024 * 1024 * 1024,
+                .distributed => @as(usize, if (target.result.os.tag == .macos) 18 else 8) * 1024 * 1024 * 1024,
+                // The broad aarch64-macOS ReleaseFast inference root now
+                // reaches roughly 13.6 GB after storage/runtime integration.
+                // Reserve enough headroom for mode-dependent IR; the build
+                // scheduler can overlap whichever roots fit without forcing
+                // callers to serialize the whole build.
+                .inference => 16 * 1024 * 1024 * 1024,
+                // Clean aarch64-macOS ReleaseFast codegen currently peaks
+                // around 2.23 GB, just above the former 2 GiB reservation.
+                .cli => 3 * 1024 * 1024 * 1024,
             },
         });
         runtime_library_artifacts[@intFromEnum(unit)] = role_artifact;
