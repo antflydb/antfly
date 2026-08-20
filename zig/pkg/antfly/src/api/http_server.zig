@@ -33664,14 +33664,167 @@ test "table backup retry preserves the retained ambiguous generation" {
     try std.testing.expectEqualStrings("retained-generation", retained);
 }
 
-test "table backup writer roles preserve rolling forwarded ownership" {
-    const Role = ApiHttpServer.TableBackupWriterLeaseRole;
-    try std.testing.expect(Role.logical_create.createsLease());
-    try std.testing.expect(Role.logical_create.ownsCommittedRetirement());
-    try std.testing.expect(Role.legacy_forwarded_create.createsLease());
-    try std.testing.expect(!Role.legacy_forwarded_create.ownsCommittedRetirement());
-    try std.testing.expect(!Role.adopt.createsLease());
-    try std.testing.expect(!Role.adopt.ownsCommittedRetirement());
+test "table backup writer roles enforce rolling forwarded lease lifecycle" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    const SuccessfulForwardedWrites = struct {
+        calls: usize = 0,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .backup_table_to_location = backupTableToLocation,
+                },
+            };
+        }
+
+        fn batch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) !?void {
+            return error.UnsupportedOperation;
+        }
+
+        fn backupTableToLocation(
+            ptr: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            _: []const u8,
+            backup_id: []const u8,
+            _: backups_api.BackupFormat,
+            _: backups_api.TableBackupFence,
+            _: []const u8,
+            _: []const u8,
+            _: *anyopaque,
+        ) !?[]backups_api.ShardSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const shards = try inner_alloc.alloc(backups_api.ShardSnapshot, 1);
+            errdefer inner_alloc.free(shards);
+            const start_key = try inner_alloc.dupe(u8, "");
+            errdefer inner_alloc.free(start_key);
+            const snapshot_path = try std.fmt.allocPrint(inner_alloc, "{s}.afb", .{backup_id});
+            errdefer inner_alloc.free(snapshot_path);
+            var integrity = try backups_api.portableBytesIntegrityAlloc(inner_alloc, "payload");
+            errdefer integrity.deinit(inner_alloc);
+            shards[0] = .{
+                .group_id = 1,
+                .start_key = start_key,
+                .snapshot_path = snapshot_path,
+                .artifact_size_bytes = integrity.size_bytes,
+                .artifact_sha256 = integrity.sha256,
+            };
+            return shards;
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/writer-role-lifecycle", .{tmp.sub_path});
+    defer alloc.free(root);
+    var location: backups_api.BackupLocation = .{ .file = root };
+    var source = FakeSource{};
+    var writes = SuccessfulForwardedWrites{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
+    defer server.deinit();
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .indexes_json = tables_api.default_indexes_json,
+        .placement_role = "data",
+    };
+    const fence: backups_api.TableBackupFence = .{
+        .metadata_group_id = 3,
+        .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+        .table_id = table.table_id,
+        .definition_digest = [_]u8{0x11} ** 32,
+        .topology_range_count = 1,
+        .topology_digest = [_]u8{0x22} ** 32,
+    };
+
+    try server.backupOwnedTableWithArtifactId(
+        std.testing.io,
+        &table,
+        fence,
+        table.name,
+        &location,
+        "file:///backups",
+        "logical",
+        "logical-artifact",
+        .portable,
+        "backups",
+        .logical_create,
+    );
+    try std.testing.expect(!try backups_api.renewTableBackupWriterLeaseAtLocation(
+        alloc,
+        std.testing.io,
+        &location,
+        "logical-artifact",
+        std.math.maxInt(u64),
+    ));
+
+    try server.backupOwnedTableWithArtifactId(
+        std.testing.io,
+        &table,
+        fence,
+        table.name,
+        &location,
+        "file:///backups",
+        "legacy",
+        "legacy",
+        .portable,
+        "backups",
+        .legacy_forwarded_create,
+    );
+    try std.testing.expect(try backups_api.renewTableBackupWriterLeaseAtLocation(
+        alloc,
+        std.testing.io,
+        &location,
+        "legacy",
+        std.math.maxInt(u64),
+    ));
+
+    var adopt_fence = fence;
+    adopt_fence.writer_not_after_unix_ns = std.math.maxInt(u64);
+    try backups_api.reserveTableBackupWriterLeaseAtLocation(
+        alloc,
+        std.testing.io,
+        &location,
+        "adopt-artifact",
+        std.math.maxInt(u64),
+    );
+    try server.backupOwnedTableWithArtifactId(
+        std.testing.io,
+        &table,
+        adopt_fence,
+        table.name,
+        &location,
+        "file:///backups",
+        "adopt-artifact",
+        "adopt-artifact",
+        .portable,
+        "backups",
+        .adopt,
+    );
+    try std.testing.expect(try backups_api.renewTableBackupWriterLeaseAtLocation(
+        alloc,
+        std.testing.io,
+        &location,
+        "adopt-artifact",
+        std.math.maxInt(u64),
+    ));
+    try std.testing.expectEqual(@as(usize, 3), writes.calls);
 }
 
 test "api http server rejects restore before persistence without an asynchronous worker" {
