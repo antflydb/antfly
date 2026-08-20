@@ -1691,6 +1691,141 @@ components:
                 result_nodes:
                   type: integer
                   format: uint64
+        graph_metric_runtime:
+          x-go-type-skip-optional-pointer: true
+          $ref: "#/components/schemas/GraphMetricRuntimeStats"
+    GraphMetricRuntimeStats:
+      type: object
+      description: "Summarized graph metric maintenance runtime state. Identity fields are stable hashes, not raw process or owner identifiers."
+      properties:
+        enabled:
+          type: boolean
+        role:
+          type: string
+          enum:
+            - combined
+            - coordinator
+            - worker
+            - worker_pool
+        runtime_id_hash:
+          type: integer
+          format: uint64
+        owner_id_hash:
+          type: integer
+          format: uint64
+        lease_key_hash:
+          type: integer
+          format: uint64
+        worker_id_hash:
+          type: integer
+          format: uint64
+        worker_count:
+          type: integer
+          format: uint64
+        lease_owned:
+          type: boolean
+        has_lease:
+          type: boolean
+        acquisition_count:
+          type: integer
+          format: uint64
+        takeover_count:
+          type: integer
+          format: uint64
+        lease_acquire_failures:
+          type: integer
+          format: uint64
+        lost_leases:
+          type: integer
+          format: uint64
+        last_acquired_ms:
+          type: integer
+          format: uint64
+        started:
+          type: boolean
+        shutdown:
+          type: boolean
+        notified:
+          type: boolean
+        ticks_started:
+          type: integer
+          format: uint64
+        ticks_completed:
+          type: integer
+          format: uint64
+        durable_progress_ticks:
+          type: integer
+          format: uint64
+        idle_ticks:
+          type: integer
+          format: uint64
+        error_ticks:
+          type: integer
+          format: uint64
+        last_error_name:
+          type: string
+        total_metrics_scanned:
+          type: integer
+          format: uint64
+        total_active_builds:
+          type: integer
+          format: uint64
+        total_builds_started:
+          type: integer
+          format: uint64
+        total_worker_steps:
+          type: integer
+          format: uint64
+        total_coordinator_steps:
+          type: integer
+          format: uint64
+        total_pages_claimed:
+          type: integer
+          format: uint64
+        total_pages_completed:
+          type: integer
+          format: uint64
+        total_phases_advanced:
+          type: integer
+          format: uint64
+        total_published:
+          type: integer
+          format: uint64
+        total_failed_builds:
+          type: integer
+          format: uint64
+        last_metrics_scanned:
+          type: integer
+          format: uint64
+        last_active_builds:
+          type: integer
+          format: uint64
+        last_builds_started:
+          type: integer
+          format: uint64
+        last_worker_steps:
+          type: integer
+          format: uint64
+        last_coordinator_steps:
+          type: integer
+          format: uint64
+        last_pages_claimed:
+          type: integer
+          format: uint64
+        last_pages_completed:
+          type: integer
+          format: uint64
+        last_phases_advanced:
+          type: integer
+          format: uint64
+        last_published:
+          type: integer
+          format: uint64
+        last_failed_builds:
+          type: integer
+          format: uint64
+        last_budget_exhausted:
+          type: boolean
     Edge:
       x-go-type-skip-optional-pointer: true
       type: object
@@ -2129,6 +2264,11 @@ components:
           items:
             type: string
           description: "Algebraic provenance labels folded into this result, when requested by an algebraic graph executor"
+        metrics:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Projected graph metric scores keyed by metric name. Values are numbers or null when a requested metric has no score for the node."
         evidence:
           x-go-type-skip-optional-pointer: true
           type: object
@@ -2239,6 +2379,35 @@ components:
           items:
             type: string
           description: "Which fields to return from documents"
+        metrics:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+          description: "Graph metric names to project onto result nodes"
+        order_by:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphMetricOrder'
+          description: "Sort graph result nodes by graph metric scores"
+        where_metric:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphMetricFilter'
+          description: "Filter graph result nodes by graph metric scores"
+        metric_freshness:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum:
+            - published
+            - fresh
+          description: "Freshness mode for projected, ordered, and filtered graph metrics"
+        include_metric_status:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: "Include graph metric status metadata in the graph result"
     PatternMatch:
       x-go-type-skip-optional-pointer: true
       type: object
@@ -2294,12 +2463,22 @@ components:
           format: int64
           x-go-type: time.Duration
           description: "Query execution time"
+        metric_status:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/GraphMetricStatus'
+          description: "Graph metric status metadata keyed by metric name"
     GraphMetricStatus:
       type: object
       required:
         - state
+        - phase
         - published_generation
         - edge_generation
+        - target_edge_generation
+        - build_queued
+        - progress
         - converged
         - iterations_completed
         - delta
@@ -2307,12 +2486,100 @@ components:
       properties:
         state:
           type: string
+        phase:
+          type: string
+          enum:
+            - idle
+            - computing
+            - publishing
+            - complete
+            - prepare_generation
+            - scan_edges_and_out_degree
+            - initialize_ranks
+            - iterate_contributions
+            - reduce_ranks
+            - hits_hub_contributions
+            - hits_hub_reduce_ranks
+            - check_convergence
+            - publish_generation
+            - cleanup_old_generations
+        edge_filter:
+          $ref: '#/components/schemas/GraphMetricEdgeFilterStatus'
+        metadata_version:
+          type: integer
+          format: int64
+          description: "Version of the published graph metric metadata schema."
+        maintenance_paused:
+          type: boolean
+        build_queued:
+          type: boolean
+          description: "Whether a local or distributed build is queued after the currently published or building generation."
         published_generation:
           type: integer
           format: int64
         edge_generation:
           type: integer
           format: int64
+        target_edge_generation:
+          type: integer
+          format: int64
+        queued_generation:
+          type: integer
+          format: int64
+          description: "Pending edge generation waiting to build, or 0 when no build is queued."
+        building_generation:
+          type: integer
+          format: int64
+          description: "Edge generation currently held by an active build lease, or 0 when idle."
+        build_job_id:
+          type: integer
+          format: int64
+          description: "Durable identifier for the active graph metric build job, or 0 when idle."
+        build_started_at_ms:
+          type: integer
+          format: int64
+          description: "Unix epoch milliseconds when the active graph metric build started, or 0 when idle."
+        build_iteration:
+          type: integer
+          format: int64
+          description: "Iteration number reported by the active build lease, or 0 when idle or not iterative."
+        build_lease_expires_at_ms:
+          type: integer
+          format: int64
+          description: "Unix epoch milliseconds when the active build lease expires, or 0 when idle."
+        build_worker_id:
+          type: string
+          description: "Worker id that owns the active build lease. Local builds use `local`."
+        build_cursor:
+          type: string
+          description: "Opaque resumable cursor for the active build phase. Empty or omitted when idle or when the phase has no cursor."
+        build_completed_units:
+          type: integer
+          format: int64
+          description: "Completed work units for the active graph metric build, or 0 when idle or unknown."
+        build_total_units:
+          type: integer
+          format: int64
+          description: "Estimated total work units for the active graph metric build, or 0 when idle or unknown."
+        build_pages:
+          type: array
+          description: "Active leased or failed build pages for the current build phase, capped and ordered by durable page key."
+          items:
+            $ref: '#/components/schemas/GraphMetricBuildPageStatus'
+        build_pages_truncated:
+          type: boolean
+          description: "Whether build_pages was capped before every active page could be included."
+        retry_count:
+          type: integer
+          format: int64
+          description: "Number of consecutive failed build attempts for the current target generation, or 0 when no failure applies."
+        last_error:
+          type: string
+          description: "Last build error for the current failed target generation."
+        progress:
+          type: number
+          format: double
+          description: "Build progress for the target edge generation, from 0.0 to 1.0"
         converged:
           type: boolean
         iterations_completed:
@@ -2324,6 +2591,118 @@ components:
         computed_at_ms:
           type: integer
           format: int64
+        last_event:
+          $ref: '#/components/schemas/GraphMetricEvent'
+        recent_events:
+          type: array
+          description: "Recent graph metric events, newest first."
+          items:
+            $ref: '#/components/schemas/GraphMetricEvent'
+    GraphMetricBuildPageStatus:
+      type: object
+      required:
+        - phase
+        - iteration
+        - page_id
+        - state
+        - range_kind
+      properties:
+        phase:
+          type: string
+        iteration:
+          type: integer
+          format: int64
+        page_id:
+          type: integer
+          format: int64
+        state:
+          type: string
+          enum:
+            - pending
+            - leased
+            - complete
+            - failed
+        range_kind:
+          type: string
+          enum:
+            - full
+            - reverse_edges
+            - nodes
+            - scores
+            - contributions
+            - job_control
+        worker_id:
+          type: string
+          description: "Worker id that owns or last failed this page."
+        lease_expires_at_ms:
+          type: integer
+          format: int64
+          description: "Unix epoch milliseconds when the page lease expires, or 0 when not leased."
+        attempt:
+          type: integer
+          format: int64
+          description: "Current attempt number for this page."
+        cursor:
+          type: string
+          description: "Opaque resumable cursor for this page."
+        completed_units:
+          type: integer
+          format: int64
+          description: "Completed work units for this page."
+        total_units:
+          type: integer
+          format: int64
+          description: "Estimated total work units for this page."
+        last_error:
+          type: string
+          description: "Last page-level error."
+    GraphMetricEvent:
+      type: object
+      required:
+        - sequence
+        - kind
+        - at_ms
+        - target_edge_generation
+        - published_generation
+        - score_count
+      properties:
+        sequence:
+          type: integer
+          format: int64
+        kind:
+          type: string
+          enum:
+            - publish
+            - delete
+            - pause
+            - resume
+            - failed
+        at_ms:
+          type: integer
+          format: int64
+        target_edge_generation:
+          type: integer
+          format: int64
+        published_generation:
+          type: integer
+          format: int64
+        score_count:
+          type: integer
+          format: int64
+    GraphMetricEdgeFilterStatus:
+      type: object
+      required:
+        - mode
+      properties:
+        mode:
+          type: string
+          enum:
+            - all
+            - types
+        types:
+          type: array
+          items:
+            type: string
     GraphMetricScore:
       type: object
       required:
@@ -2335,6 +2714,71 @@ components:
         score:
           type: number
           format: double
+    GraphMetricQuery:
+      type: object
+      required:
+        - index
+        - metric
+      properties:
+        name:
+          type: string
+          minLength: 1
+          description: Optional result key. Defaults to the metric name.
+        index:
+          type: string
+          minLength: 1
+          description: Graph index that owns the published metric.
+        metric:
+          type: string
+          minLength: 1
+          description: Graph metric to read.
+        top_k:
+          type: integer
+          format: int32
+          minimum: 1
+          default: 10
+          description: Maximum globally ranked metric scores to return after shard fan-in.
+        metric_freshness:
+          type: string
+          enum:
+            - published
+            - fresh
+          default: published
+          description: Whether the latest published generation may be stale or must match the graph edge generation.
+    GraphMetricRerank:
+      type: object
+      required:
+        - index
+        - metric
+      properties:
+        index:
+          type: string
+          description: Graph index that owns the published metric.
+        metric:
+          type: string
+          description: Graph metric name to blend into the search hit score.
+        base_weight:
+          type: number
+          format: double
+          default: 1.0
+          description: Multiplier applied to the existing hit score before adding the graph metric feature.
+        weight:
+          type: number
+          format: double
+          default: 1.0
+          description: Multiplier applied to the graph metric score before it is added to the existing hit score.
+        missing_score:
+          type: number
+          format: double
+          default: 0.0
+          description: Metric feature value to use for hits that do not have a score in the published metric generation.
+        metric_freshness:
+          type: string
+          enum:
+            - published
+            - fresh
+          default: published
+          description: Whether stale published generations are acceptable or the metric must be fresh.
     GraphMetricResult:
       type: object
       required:
@@ -2353,3 +2797,44 @@ components:
             $ref: '#/components/schemas/GraphMetricScore'
         status:
           $ref: '#/components/schemas/GraphMetricStatus'
+    GraphMetricOrder:
+      type: object
+      required:
+        - metric
+      properties:
+        metric:
+          type: string
+        direction:
+          type: string
+          enum:
+            - asc
+            - desc
+        nulls:
+          type: string
+          enum:
+            - first
+            - last
+            - nulls_first
+            - nulls_last
+    GraphMetricFilter:
+      type: object
+      required:
+        - metric
+        - op
+        - value
+      properties:
+        metric:
+          type: string
+        op:
+          type: string
+          enum:
+            - ">"
+            - ">="
+            - "<"
+            - "<="
+            - "="
+            - "=="
+            - "!="
+        value:
+          type: number
+          format: double

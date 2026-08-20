@@ -357,6 +357,7 @@ pub const AntflyApiHandler = struct {
         try server.post(table_prefix ++ routes.graph_expand_suffix, httpx.Handler.bind(self, internalGraphExpand));
         try server.post(table_prefix ++ routes.graph_hydrate_suffix, httpx.Handler.bind(self, internalGraphHydrate));
         try server.post(table_prefix ++ routes.graph_edges_suffix, httpx.Handler.bind(self, internalGraphEdges));
+        try server.post(table_prefix ++ routes.graph_metric_maintenance_suffix, httpx.Handler.bind(self, internalGraphMetricMaintenance));
         try server.post(table_prefix ++ routes.text_stats_suffix, httpx.Handler.bind(self, internalTextStats));
         try server.post(table_prefix ++ routes.algebraic_partials_suffix, httpx.Handler.bind(self, internalAlgebraicPartials));
         try server.post(table_prefix ++ routes.routed_batch_suffix, httpx.Handler.bind(self, internalGroupRoutedBatch));
@@ -1039,7 +1040,7 @@ pub const AntflyApiHandler = struct {
         };
     }
 
-    fn internalGroupErrorResponse(ctx: *httpx.Context, err: internal_group_operations.Error) !httpx.Response {
+    fn internalGroupErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         if (sharedInternalHttpErrorSpec(err)) |spec|
             return textResponse(ctx, spec.status, spec.message);
         return switch (err) {
@@ -1830,6 +1831,22 @@ pub const AntflyApiHandler = struct {
             return if (err == error.InvalidArgument) textResponse(ctx, 400, "invalid graph edges request") else internalGroupErrorResponse(ctx, err);
         defer result.deinit(ctx.allocator);
         return ctx.json(result);
+    }
+
+    fn internalGraphMetricMaintenance(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        try operationContext(ctx, null).ensureActive();
+        const writes = self.api_server.table_writes orelse return textResponse(ctx, 404, "not found");
+        const body = (try ctx.body()) orelse "";
+        const json = (writes.graphMetricMaintenanceGroupLocal(ctx.allocator, params.group_id, params.table_name, body) catch |err| switch (err) {
+            error.InvalidGraphMetricRuntimeConfig, error.InvalidGraphMetricBuildWorker => return textResponse(ctx, 400, @errorName(err)),
+            error.UnknownGroup, error.NotFound => return textResponse(ctx, 404, "not found"),
+            error.ReadOnly, error.StorageUnavailable => return textResponse(ctx, 503, @errorName(err)),
+            else => return internalGroupErrorResponse(ctx, err),
+        }) orelse return textResponse(ctx, 404, "not found");
+        defer ctx.allocator.free(json);
+        return jsonResponse(ctx, 200, json);
     }
 
     fn internalTextStats(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -4582,6 +4599,27 @@ pub const AntflyApiHandler = struct {
         const decoded_index_name = (try decodePathParamOrBadRequest(ctx, index_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_index_name);
         var resp = try public_table_http.handleTableDeleteIndex(ctx.allocator, decoded_table_name, decoded_index_name, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
+        return respondOwnedApiResponse(ctx, &resp);
+    }
+
+    pub fn executeGraphMetricAction(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+    ) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
+        defer ctx.allocator.free(decoded_table_name);
+        const decoded_index_name = (try decodePathParamOrBadRequest(ctx, index_name)) orelse return ctx.text("invalid path parameter");
+        defer ctx.allocator.free(decoded_index_name);
+        const decoded_metric_name = (try decodePathParamOrBadRequest(ctx, metric_name)) orelse return ctx.text("invalid path parameter");
+        defer ctx.allocator.free(decoded_metric_name);
+        var resp = try public_table_http.handleTableGraphMetricAction(ctx.allocator, decoded_table_name, decoded_index_name, decoded_metric_name, action, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
         return respondOwnedApiResponse(ctx, &resp);
     }
 

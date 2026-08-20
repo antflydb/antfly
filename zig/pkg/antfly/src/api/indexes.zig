@@ -27,6 +27,13 @@ const internal_keys = @import("../storage/internal_keys.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const enrichment_config_validation = @import("../storage/db/enrichment/config_validation.zig");
 
+pub fn encodeGraphMetricStatusResponse(
+    alloc: std.mem.Allocator,
+    status: db_mod.types.GraphMetricStatus,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{ .status = status }, .{ .emit_null_optional_fields = false });
+}
+
 pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
     if (body.len == 0) return error.InvalidCreateIndexRequest;
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
@@ -1171,7 +1178,7 @@ fn appendIndexRuntimeStatus(
                 defer alloc.free(key);
                 try appendJsonString(alloc, out, key);
                 try out.append(alloc, ':');
-                try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item_runtime.stats.source_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, graph_source_status, item_runtime.stats.async_indexing, if (index_type == .embeddings) item_runtime.stats.enrichment else null, item_runtime.stats.resolution, item_runtime.stats.promotion, item_runtime.stats.resolver_replay, item_runtime.metadata, runtime_status.statusHasRuntimeFacts(item_runtime));
+                try appendSingleIndexRuntimeStatusWithGraphMetricRuntime(alloc, out, index_type, item, item_runtime.stats.source_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, graph_source_status, item_runtime.stats.async_indexing, if (index_type == .embeddings) item_runtime.stats.enrichment else null, item_runtime.stats.graph_metric_runtime, item_runtime.stats.resolution, item_runtime.stats.promotion, item_runtime.stats.resolver_replay, item_runtime.metadata, runtime_status.statusHasRuntimeFacts(item_runtime));
             }
         }
         if (expected_group_ids.len > 0) {
@@ -1205,7 +1212,7 @@ fn appendIndexRuntimeStatus(
         try appendMinimalIndexRuntimeStatus(alloc, out, index_type);
         return;
     };
-    try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item.table_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, graph_source_status, item.async_indexing, if (index_type == .embeddings) item.enrichment else null, item.resolution, item.promotion, item.resolver_replay, null, item.runtime_present);
+    try appendSingleIndexRuntimeStatusWithGraphMetricRuntime(alloc, out, index_type, item, item.table_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, graph_source_status, item.async_indexing, if (index_type == .embeddings) item.enrichment else null, item.graph_metric_runtime, item.resolution, item.promotion, item.resolver_replay, null, item.runtime_present);
 }
 
 fn appendMinimalIndexRuntimeStatus(
@@ -1288,6 +1295,7 @@ const AggregatedIndexStatus = struct {
     async_indexing: db_mod.types.AsyncIndexingStats = .{},
     enrichment: db_mod.types.EnrichmentStats = .{},
     enrichment_observation_count: u64 = 0,
+    graph_metric_runtime: db_mod.types.GraphMetricRuntimeStats = .{},
     resolution: db_mod.types.ReplayStageStats = .{},
     promotion: db_mod.types.ReplayStageStats = .{},
     resolver_replay: db_mod.types.ResolverReplayDiagnostics = .{},
@@ -1508,6 +1516,7 @@ fn aggregateIndexStatusIndexed(
             aggregate.enrichment_observation_count == 0,
         );
         aggregate.enrichment_observation_count +|= 1;
+        aggregateGraphMetricRuntimeStats(&aggregate.graph_metric_runtime, runtime.stats.graph_metric_runtime);
         aggregateReplayStageStats(&aggregate.resolution, runtime.stats.resolution);
         aggregateReplayStageStats(&aggregate.promotion, runtime.stats.promotion);
         aggregateResolverReplayDiagnostics(&aggregate.resolver_replay, runtime.stats.resolver_replay);
@@ -1742,6 +1751,44 @@ fn projectionCheckpointStatusRank(status: []const u8) u8 {
     if (std.mem.eql(u8, status, "rebuilding")) return 20;
     if (std.mem.eql(u8, status, "clean")) return 0;
     return 10;
+}
+
+fn aggregateGraphMetricRuntimeStats(dst: *db_mod.types.GraphMetricRuntimeStats, src: db_mod.types.GraphMetricRuntimeStats) void {
+    const had_facts = dst.hasRuntimeFacts();
+    dst.enabled = dst.enabled or src.enabled;
+    if (src.role) |role| {
+        if (!had_facts) {
+            dst.role = role;
+        } else if (dst.role) |current| {
+            if (current != role) dst.role = null;
+        }
+    }
+    dst.runtime_id_hash ^= src.runtime_id_hash;
+    dst.owner_id_hash ^= src.owner_id_hash;
+    dst.lease_key_hash ^= src.lease_key_hash;
+    dst.worker_id_hash ^= src.worker_id_hash;
+    dst.worker_count +|= src.worker_count;
+    dst.lease_owned = dst.lease_owned or src.lease_owned;
+    dst.has_lease = dst.has_lease or src.has_lease;
+    dst.acquisition_count +|= src.acquisition_count;
+    dst.takeover_count +|= src.takeover_count;
+    dst.lease_acquire_failures +|= src.lease_acquire_failures;
+    dst.lost_leases +|= src.lost_leases;
+    dst.last_acquired_ms = @max(dst.last_acquired_ms, src.last_acquired_ms);
+    dst.started = dst.started or src.started;
+    dst.shutdown = dst.shutdown or src.shutdown;
+    dst.notified = dst.notified or src.notified;
+    inline for (.{
+        "ticks_started",         "ticks_completed",       "durable_progress_ticks", "idle_ticks",         "error_ticks",
+        "total_metrics_scanned", "total_active_builds",   "total_builds_started",   "total_worker_steps", "total_coordinator_steps",
+        "total_pages_claimed",   "total_pages_completed", "total_phases_advanced",  "total_published",    "total_failed_builds",
+        "last_metrics_scanned",  "last_active_builds",    "last_builds_started",    "last_worker_steps",  "last_coordinator_steps",
+        "last_pages_claimed",    "last_pages_completed",  "last_phases_advanced",   "last_published",     "last_failed_builds",
+    }) |field_name| {
+        @field(dst, field_name) +|= @field(src, field_name);
+    }
+    if (dst.last_error_name == null and src.last_error_name != null) dst.last_error_name = src.last_error_name;
+    dst.last_budget_exhausted = dst.last_budget_exhausted or src.last_budget_exhausted;
 }
 
 fn aggregateTextMergeStats(dst: *db_mod.types.TextMergeStats, src: db_mod.types.TextMergeStats) void {
@@ -2717,6 +2764,48 @@ fn appendSingleIndexRuntimeStatus(
     metadata: ?runtime_status.RuntimeStatusMetadata,
     runtime_present: bool,
 ) !void {
+    return appendSingleIndexRuntimeStatusWithGraphMetricRuntime(
+        alloc,
+        out,
+        index_type,
+        item,
+        table_doc_count,
+        embeddings_coverage_policy,
+        embeddings_sparse,
+        coverage_generation,
+        coverage_config_hash,
+        graph_source_status,
+        async_indexing,
+        enrichment,
+        .{},
+        resolution,
+        promotion,
+        resolver_replay,
+        metadata,
+        runtime_present,
+    );
+}
+
+fn appendSingleIndexRuntimeStatusWithGraphMetricRuntime(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    index_type: ApiIndexType,
+    item: anytype,
+    table_doc_count: u64,
+    embeddings_coverage_policy: EmbeddingsCoveragePolicy,
+    embeddings_sparse: bool,
+    coverage_generation: u64,
+    coverage_config_hash: u64,
+    graph_source_status: ?GraphSourceStatus,
+    async_indexing: db_mod.types.AsyncIndexingStats,
+    enrichment: ?db_mod.types.EnrichmentStats,
+    graph_metric_runtime: db_mod.types.GraphMetricRuntimeStats,
+    resolution: ?db_mod.types.ReplayStageStats,
+    promotion: ?db_mod.types.ReplayStageStats,
+    resolver_replay: db_mod.types.ResolverReplayDiagnostics,
+    metadata: ?runtime_status.RuntimeStatusMetadata,
+    runtime_present: bool,
+) !void {
     const coverage_runtime_present = runtime_present and (metadata == null or metadata.?.freshness == .fresh);
     const embeddings_materialization_current = index_type != .embeddings or
         (coverage_runtime_present and coverageIdentityMatches(item, coverage_generation, coverage_config_hash));
@@ -2990,6 +3079,12 @@ fn appendSingleIndexRuntimeStatus(
             try out.appendSlice(alloc, ",\"materialization_pending\":");
             try out.appendSlice(alloc, if (catch_up_active or replay_catch_up_required) "true" else "false");
             try out.append(alloc, '}');
+        }
+        if (graph_metric_runtime.hasRuntimeFacts()) {
+            const encoded_runtime = try std.json.Stringify.valueAlloc(alloc, graph_metric_runtime, .{ .emit_null_optional_fields = false });
+            defer alloc.free(encoded_runtime);
+            try out.appendSlice(alloc, ",\"graph_metric_runtime\":");
+            try out.appendSlice(alloc, encoded_runtime);
         }
     }
     if (index_type == .algebraic) try appendAlgebraicIndexStatsFields(alloc, out, item);
@@ -5793,4 +5888,260 @@ test "single embeddings index encoder keeps partial backfill active while indexe
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":false") != null);
+}
+test "index encoders expose graph metric runtime ownership summary" {
+    const alloc = std.testing.allocator;
+    const shard_a_indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1);
+    defer alloc.free(shard_a_indexes);
+    shard_a_indexes[0] = .{
+        .name = try alloc.dupe(u8, "graph_idx"),
+        .kind = .graph,
+        .edge_count = 12,
+    };
+    defer alloc.free(shard_a_indexes[0].name);
+
+    const shard_b_indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1);
+    defer alloc.free(shard_b_indexes);
+    shard_b_indexes[0] = .{
+        .name = try alloc.dupe(u8, "graph_idx"),
+        .kind = .graph,
+        .edge_count = 8,
+    };
+    defer alloc.free(shard_b_indexes[0].name);
+
+    const local_items = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, 2);
+    defer alloc.free(local_items);
+    local_items[0] = .{
+        .group_id = 7,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+        .stats = .{
+            .doc_count = 4,
+            .index_count = 1,
+            .indexes = shard_a_indexes,
+            .graph_metric_runtime = .{
+                .enabled = true,
+                .role = .worker_pool,
+                .owner_id_hash = 0x11,
+                .worker_id_hash = 0x21,
+                .worker_count = 2,
+                .lease_owned = true,
+                .has_lease = true,
+                .takeover_count = 1,
+                .ticks_started = 4,
+                .ticks_completed = 3,
+                .durable_progress_ticks = 2,
+                .total_pages_claimed = 5,
+                .total_pages_completed = 4,
+                .last_pages_claimed = 2,
+                .last_pages_completed = 1,
+            },
+        },
+    };
+    local_items[1] = .{
+        .group_id = 8,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+        .stats = .{
+            .doc_count = 3,
+            .index_count = 1,
+            .indexes = shard_b_indexes,
+            .graph_metric_runtime = .{
+                .enabled = true,
+                .role = .worker_pool,
+                .owner_id_hash = 0x22,
+                .worker_id_hash = 0x42,
+                .worker_count = 1,
+                .lost_leases = 3,
+                .ticks_started = 6,
+                .ticks_completed = 5,
+                .durable_progress_ticks = 4,
+                .total_pages_claimed = 7,
+                .total_pages_completed = 6,
+                .last_pages_claimed = 4,
+                .last_pages_completed = 3,
+            },
+        },
+    };
+    var local_status = runtime_status.LocalTableRuntimeStatuses{ .items = local_items };
+
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = "{\"graph_idx\":{\"type\":\"graph\"}}",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "graph_idx", &local_status)).?;
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"status\":{\"index_type\":\"graph\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"graph_metric_runtime\":{\"enabled\":true,\"role\":\"worker_pool\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"owner_id_hash\":51") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"worker_count\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"takeover_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lost_leases\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"ticks_started\":10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"total_pages_claimed\":12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"last_pages_completed\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"shard_status\":{\"7\":{\"index_type\":\"graph\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"owner_id_hash\":17") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"8\":{\"index_type\":\"graph\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"owner_id_hash\":34") != null);
+}
+
+test "index encoders expose mixed graph metric runtime roles without aggregate role" {
+    const alloc = std.testing.allocator;
+    const shard_a_indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1);
+    defer alloc.free(shard_a_indexes);
+    shard_a_indexes[0] = .{
+        .name = try alloc.dupe(u8, "graph_idx"),
+        .kind = .graph,
+        .edge_count = 12,
+    };
+    defer alloc.free(shard_a_indexes[0].name);
+
+    const shard_b_indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1);
+    defer alloc.free(shard_b_indexes);
+    shard_b_indexes[0] = .{
+        .name = try alloc.dupe(u8, "graph_idx"),
+        .kind = .graph,
+        .edge_count = 8,
+    };
+    defer alloc.free(shard_b_indexes[0].name);
+
+    const local_items = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, 2);
+    defer alloc.free(local_items);
+    local_items[0] = .{
+        .group_id = 7,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+        .stats = .{
+            .doc_count = 4,
+            .index_count = 1,
+            .indexes = shard_a_indexes,
+            .graph_metric_runtime = .{
+                .enabled = true,
+                .role = .coordinator,
+                .owner_id_hash = 0x11,
+                .worker_count = 0,
+                .has_lease = true,
+                .total_coordinator_steps = 3,
+                .total_published = 1,
+            },
+        },
+    };
+    local_items[1] = .{
+        .group_id = 8,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+        .stats = .{
+            .doc_count = 3,
+            .index_count = 1,
+            .indexes = shard_b_indexes,
+            .graph_metric_runtime = .{
+                .enabled = true,
+                .role = .worker_pool,
+                .owner_id_hash = 0x22,
+                .worker_id_hash = 0x42,
+                .worker_count = 2,
+                .has_lease = true,
+                .total_worker_steps = 5,
+                .total_pages_completed = 4,
+            },
+        },
+    };
+    var local_status = runtime_status.LocalTableRuntimeStatuses{ .items = local_items };
+
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = "{\"graph_idx\":{\"type\":\"graph\"}}",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "graph_idx", &local_status)).?;
+    defer alloc.free(encoded);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+    defer parsed.deinit();
+
+    const aggregate_runtime = parsed.value.object.get("status").?.object.get("graph_metric_runtime").?.object;
+    try std.testing.expect(aggregate_runtime.get("role") == null);
+    try std.testing.expectEqual(@as(i64, 0x33), aggregate_runtime.get("owner_id_hash").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), aggregate_runtime.get("worker_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), aggregate_runtime.get("total_coordinator_steps").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), aggregate_runtime.get("total_worker_steps").?.integer);
+    try std.testing.expectEqual(@as(i64, 4), aggregate_runtime.get("total_pages_completed").?.integer);
+
+    const shard_status = parsed.value.object.get("shard_status").?.object;
+    const shard_a_runtime = shard_status.get("7").?.object.get("graph_metric_runtime").?.object;
+    const shard_b_runtime = shard_status.get("8").?.object.get("graph_metric_runtime").?.object;
+    try std.testing.expectEqualStrings("coordinator", shard_a_runtime.get("role").?.string);
+    try std.testing.expectEqualStrings("worker_pool", shard_b_runtime.get("role").?.string);
+}
+
+test "graph metric status encoder exposes active build pages" {
+    var pages = [_]db_mod.types.GraphMetricBuildPageStatus{
+        .{
+            .phase = .scan_edges_and_out_degree,
+            .iteration = 0,
+            .page_id = 4,
+            .state = .leased,
+            .range_kind = .reverse_edges,
+            .worker_id = "worker-a",
+            .lease_expires_at_ms = 12345,
+            .attempt = 2,
+            .cursor = "edge:42",
+            .completed_units = 7,
+            .total_units = 11,
+        },
+        .{
+            .phase = .scan_edges_and_out_degree,
+            .iteration = 0,
+            .page_id = 5,
+            .state = .failed,
+            .range_kind = .reverse_edges,
+            .worker_id = "worker-b",
+            .attempt = 3,
+            .last_error = "boom",
+        },
+    };
+
+    const encoded = try encodeGraphMetricStatusResponse(std.testing.allocator, .{
+        .name = @constCast("pagerank"),
+        .state = .building,
+        .phase = .scan_edges_and_out_degree,
+        .build_job_id = 9,
+        .build_worker_id = "coordinator",
+        .build_cursor = "phase:scan",
+        .build_completed_units = 17,
+        .build_total_units = 100,
+        .build_pages = pages[0..],
+        .build_pages_truncated = true,
+    });
+    defer std.testing.allocator.free(encoded);
+
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"build_pages\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"phase\":\"scan_edges_and_out_degree\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"state\":\"leased\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"state\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"range_kind\":\"reverse_edges\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"worker_id\":\"worker-a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lease_expires_at_ms\":12345") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"cursor\":\"edge:42\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"completed_units\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"total_units\":11") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"last_error\":\"boom\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"build_pages_truncated\":true") != null);
 }

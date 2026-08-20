@@ -105,9 +105,56 @@ pub const GraphQuery = struct {
     include_documents: bool = false,
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
+    metrics: []const GraphMetricRead = &.{},
+    order_by: []const GraphMetricOrder = &.{},
+    where_metric: []const GraphMetricFilter = &.{},
+    include_metric_status: bool = false,
 };
 
 pub const ExpandStrategy = enum { @"union", intersection };
+
+pub const GraphMetricFreshness = enum {
+    published,
+    fresh,
+};
+
+pub const GraphMetricRead = struct {
+    name: []const u8,
+    freshness: GraphMetricFreshness = .published,
+};
+
+pub const GraphMetricOrderDirection = enum {
+    asc,
+    desc,
+};
+
+pub const GraphMetricNullOrder = enum {
+    first,
+    last,
+};
+
+pub const GraphMetricOrder = struct {
+    name: []const u8,
+    direction: GraphMetricOrderDirection = .desc,
+    nulls: GraphMetricNullOrder = .last,
+    freshness: GraphMetricFreshness = .published,
+};
+
+pub const GraphMetricFilterOp = enum {
+    gt,
+    gte,
+    lt,
+    lte,
+    eq,
+    neq,
+};
+
+pub const GraphMetricFilter = struct {
+    name: []const u8,
+    op: GraphMetricFilterOp,
+    value: f64,
+    freshness: GraphMetricFreshness = .published,
+};
 
 // ============================================================================
 // Result types
@@ -133,10 +180,13 @@ pub const GraphResultNode = struct {
     /// node is same-table (hydrated locally). Lets the api hydrate a cross-table
     /// entity node from its own table instead of failing closed.
     table: ?[]const u8 = null,
+    metrics: []GraphMetricValue = &.{},
 
     pub fn deinit(self: *GraphResultNode, alloc: Allocator) void {
         alloc.free(self.key);
         if (self.table) |t| alloc.free(t);
+        for (self.metrics) |*metric| metric.deinit(alloc);
+        if (self.metrics.len > 0) alloc.free(self.metrics);
         if (self.path) |p| {
             for (p) |s| alloc.free(s);
             alloc.free(p);
@@ -158,14 +208,112 @@ pub const GraphResultNode = struct {
     }
 };
 
+pub const GraphMetricValue = struct {
+    name: []const u8,
+    score: ?f64 = null,
+
+    pub fn deinit(self: *GraphMetricValue, alloc: Allocator) void {
+        alloc.free(self.name);
+        self.* = undefined;
+    }
+};
+
+pub const GraphMetricStatus = struct {
+    name: []const u8,
+    state: graph_mod.GraphIndex.GraphMetricState = .not_ready,
+    phase: graph_mod.GraphIndex.GraphMetricBuildPhase = .idle,
+    edge_filter: graph_mod.GraphMetricEdgeFilter = .{},
+    metadata_version: u32 = 0,
+    maintenance_paused: bool = false,
+    build_queued: bool = false,
+    published_generation: u64 = 0,
+    edge_generation: u64 = 0,
+    target_edge_generation: u64 = 0,
+    queued_generation: u64 = 0,
+    building_generation: u64 = 0,
+    build_job_id: u64 = 0,
+    build_started_at_ms: u64 = 0,
+    build_iteration: u32 = 0,
+    build_lease_expires_at_ms: u64 = 0,
+    build_worker_id: []const u8 = "",
+    retry_count: u64 = 0,
+    last_error: []const u8 = "",
+    progress: f64 = 0.0,
+    converged: bool = false,
+    iterations_completed: u32 = 0,
+    delta: f64 = 0.0,
+    computed_at_ms: u64 = 0,
+    last_event: ?graph_mod.GraphIndex.GraphMetricEvent = null,
+    recent_events: []graph_mod.GraphIndex.GraphMetricEvent = &.{},
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.name);
+        self.edge_filter.deinit(alloc);
+        if (self.build_worker_id.len > 0) alloc.free(self.build_worker_id);
+        if (self.last_error.len > 0) alloc.free(self.last_error);
+        if (self.recent_events.len > 0) alloc.free(self.recent_events);
+        self.* = undefined;
+    }
+};
+
+fn cloneGraphMetricStatus(
+    alloc: Allocator,
+    source: graph_mod.GraphIndex.GraphMetricStatus,
+) !GraphMetricStatus {
+    const name = try alloc.dupe(u8, source.name);
+    errdefer alloc.free(name);
+    var edge_filter = try source.edge_filter.cloneAlloc(alloc);
+    errdefer edge_filter.deinit(alloc);
+    const recent_events = if (source.recent_events.len > 0)
+        try alloc.dupe(graph_mod.GraphIndex.GraphMetricEvent, source.recent_events)
+    else
+        @constCast((&[_]graph_mod.GraphIndex.GraphMetricEvent{})[0..]);
+    errdefer if (recent_events.len > 0) alloc.free(recent_events);
+    const last_error = if (source.last_error.len > 0) try alloc.dupe(u8, source.last_error) else "";
+    errdefer if (last_error.len > 0) alloc.free(last_error);
+    const build_worker_id = if (source.build_worker_id.len > 0) try alloc.dupe(u8, source.build_worker_id) else "";
+    errdefer if (build_worker_id.len > 0) alloc.free(build_worker_id);
+    return .{
+        .name = name,
+        .state = source.state,
+        .phase = source.phase,
+        .edge_filter = edge_filter,
+        .metadata_version = source.metadata_version,
+        .maintenance_paused = source.maintenance_paused,
+        .build_queued = source.build_queued,
+        .published_generation = source.published_generation,
+        .edge_generation = source.edge_generation,
+        .target_edge_generation = source.target_edge_generation,
+        .queued_generation = source.queued_generation,
+        .building_generation = source.building_generation,
+        .build_job_id = source.build_job_id,
+        .build_started_at_ms = source.build_started_at_ms,
+        .build_iteration = source.build_iteration,
+        .build_lease_expires_at_ms = source.build_lease_expires_at_ms,
+        .build_worker_id = build_worker_id,
+        .retry_count = source.retry_count,
+        .last_error = last_error,
+        .progress = source.progress,
+        .converged = source.converged,
+        .iterations_completed = source.iterations_completed,
+        .delta = source.delta,
+        .computed_at_ms = source.computed_at_ms,
+        .last_event = source.last_event,
+        .recent_events = recent_events,
+    };
+}
+
 pub const GraphQueryResult = struct {
     nodes: []GraphResultNode,
     matches: []pattern_mod.PatternMatch = &.{},
+    metric_status: []GraphMetricStatus = &.{},
 
     pub fn deinit(self: *GraphQueryResult, alloc: Allocator) void {
         for (self.nodes) |*node| node.deinit(alloc);
         alloc.free(self.nodes);
         pattern_mod.freeMatches(alloc, self.matches);
+        for (self.metric_status) |*status| status.deinit(alloc);
+        if (self.metric_status.len > 0) alloc.free(self.metric_status);
     }
 };
 
@@ -185,10 +333,14 @@ pub const GraphQueryEngine = struct {
         gq: GraphQuery,
         resolved_keys: []const []const u8,
     ) !GraphQueryResult {
-        return switch (gq.query_type) {
-            .traverse => self.executeTraverse(graph_index, gq.params, resolved_keys, resolveTargetKeys(gq)),
+        const defer_result_limit = graphMetricPostProcessingNeedsFullCandidateSet(gq);
+        var execution_params = gq.params;
+        if (defer_result_limit) execution_params.max_results = 0;
+
+        var result = try switch (gq.query_type) {
+            .traverse => self.executeTraverse(graph_index, execution_params, resolved_keys, resolveTargetKeys(gq)),
             .neighbors => blk: {
-                var params = gq.params;
+                var params = execution_params;
                 params.max_depth = 1;
                 break :blk self.executeTraverse(graph_index, params, resolved_keys, resolveTargetKeys(gq));
             },
@@ -196,6 +348,252 @@ pub const GraphQueryEngine = struct {
             .k_shortest_paths => self.executeKShortestPaths(graph_index, gq, resolved_keys),
             .pattern => self.executePattern(graph_index, gq, resolved_keys),
         };
+        errdefer result.deinit(self.alloc);
+        const metric_dependencies = try self.graphMetricDependenciesAlloc(gq);
+        defer if (metric_dependencies.len > 0) self.alloc.free(metric_dependencies);
+        if (metric_dependencies.len > 0) try self.attachMetricDependencies(graph_index, gq, metric_dependencies, &result);
+        if (gq.where_metric.len > 0) {
+            try self.filterByGraphMetric(graph_index, gq.where_metric, &result);
+        }
+        if (gq.order_by.len > 0) {
+            try self.orderByGraphMetric(graph_index, gq.order_by, &result);
+        }
+        if (defer_result_limit) {
+            try self.limitGraphMetricPostProcessedNodes(gq.params.max_results, &result);
+        }
+        return result;
+    }
+
+    fn graphMetricPostProcessingNeedsFullCandidateSet(gq: GraphQuery) bool {
+        return gq.where_metric.len > 0 or gq.order_by.len > 0;
+    }
+
+    fn limitGraphMetricPostProcessedNodes(
+        self: *GraphQueryEngine,
+        max_results: u32,
+        result: *GraphQueryResult,
+    ) !void {
+        const keep_count: usize = @intCast(max_results);
+        if (max_results == 0 or result.nodes.len <= keep_count) return;
+        for (result.nodes[keep_count..]) |*node| node.deinit(self.alloc);
+        const kept = try self.alloc.dupe(GraphResultNode, result.nodes[0..keep_count]);
+        self.alloc.free(result.nodes);
+        result.nodes = kept;
+    }
+
+    fn filterByGraphMetric(
+        self: *GraphQueryEngine,
+        graph_index: *graph_mod.GraphIndex,
+        filters: []const GraphMetricFilter,
+        result: *GraphQueryResult,
+    ) !void {
+        if (filters.len == 0 or result.nodes.len == 0) return;
+
+        const keep = try self.alloc.alloc(bool, result.nodes.len);
+        defer self.alloc.free(keep);
+        var kept_count: usize = 0;
+        for (result.nodes, 0..) |node, i| {
+            keep[i] = try graphMetricNodePassesFilters(graph_index, filters, node.key);
+            if (keep[i]) kept_count += 1;
+        }
+
+        const filtered = try self.alloc.alloc(GraphResultNode, kept_count);
+        var out_idx: usize = 0;
+        for (result.nodes, 0..) |*node, i| {
+            if (keep[i]) {
+                filtered[out_idx] = node.*;
+                out_idx += 1;
+            } else {
+                node.deinit(self.alloc);
+            }
+        }
+        self.alloc.free(result.nodes);
+        result.nodes = filtered;
+    }
+
+    fn graphMetricNodePassesFilters(
+        graph_index: *graph_mod.GraphIndex,
+        filters: []const GraphMetricFilter,
+        node_key: []const u8,
+    ) !bool {
+        for (filters) |filter| {
+            const score = (try graph_index.graphMetricScore(filter.name, node_key)) orelse return false;
+            if (!metricFilterMatches(score, filter)) return false;
+        }
+        return true;
+    }
+
+    fn metricFilterMatches(score: f64, filter: GraphMetricFilter) bool {
+        return switch (filter.op) {
+            .gt => score > filter.value,
+            .gte => score >= filter.value,
+            .lt => score < filter.value,
+            .lte => score <= filter.value,
+            .eq => score == filter.value,
+            .neq => score != filter.value,
+        };
+    }
+
+    const MetricSortNode = struct {
+        node: GraphResultNode,
+        scores: []?f64,
+        original_index: usize,
+    };
+
+    fn orderByGraphMetric(
+        self: *GraphQueryEngine,
+        graph_index: *graph_mod.GraphIndex,
+        orders: []const GraphMetricOrder,
+        result: *GraphQueryResult,
+    ) !void {
+        if (orders.len == 0 or result.nodes.len == 0) return;
+
+        const score_values = try self.alloc.alloc(?f64, result.nodes.len * orders.len);
+        defer self.alloc.free(score_values);
+        var items = try self.alloc.alloc(MetricSortNode, result.nodes.len);
+        defer self.alloc.free(items);
+
+        for (result.nodes, 0..) |node, node_idx| {
+            const scores = score_values[node_idx * orders.len .. (node_idx + 1) * orders.len];
+            for (orders, 0..) |order, order_idx| {
+                scores[order_idx] = try graph_index.graphMetricScore(order.name, node.key);
+            }
+            items[node_idx] = .{
+                .node = node,
+                .scores = scores,
+                .original_index = node_idx,
+            };
+        }
+
+        std.mem.sort(MetricSortNode, items, orders, metricSortNodeLessThan);
+        for (items, 0..) |item, i| result.nodes[i] = item.node;
+    }
+
+    fn metricSortNodeLessThan(orders: []const GraphMetricOrder, left: MetricSortNode, right: MetricSortNode) bool {
+        for (orders, 0..) |order, i| {
+            const cmp = compareOptionalMetricScore(left.scores[i], right.scores[i], order);
+            if (cmp) |less| return less;
+        }
+        return left.original_index < right.original_index;
+    }
+
+    fn compareOptionalMetricScore(left: ?f64, right: ?f64, order: GraphMetricOrder) ?bool {
+        if (left == null and right == null) return null;
+        if (left == null) return order.nulls == .first;
+        if (right == null) return order.nulls != .first;
+        if (left.? == right.?) return null;
+        return if (order.direction == .desc) left.? > right.? else left.? < right.?;
+    }
+
+    const GraphMetricDependency = struct {
+        read: GraphMetricRead,
+        require_published: bool = false,
+    };
+
+    fn graphMetricDependenciesAlloc(
+        self: *GraphQueryEngine,
+        gq: GraphQuery,
+    ) ![]GraphMetricDependency {
+        var deps = std.ArrayListUnmanaged(GraphMetricDependency).empty;
+        errdefer deps.deinit(self.alloc);
+        for (gq.metrics) |metric| try appendGraphMetricDependency(self.alloc, &deps, metric.name, metric.freshness, false);
+        for (gq.order_by) |order| try appendGraphMetricDependency(self.alloc, &deps, order.name, order.freshness, true);
+        for (gq.where_metric) |filter| try appendGraphMetricDependency(self.alloc, &deps, filter.name, filter.freshness, true);
+        return try deps.toOwnedSlice(self.alloc);
+    }
+
+    fn appendGraphMetricDependency(
+        alloc: Allocator,
+        deps: *std.ArrayListUnmanaged(GraphMetricDependency),
+        name: []const u8,
+        freshness: GraphMetricFreshness,
+        require_published: bool,
+    ) !void {
+        for (deps.items) |*dep| {
+            if (!std.mem.eql(u8, dep.read.name, name)) continue;
+            dep.read.freshness = stricterGraphMetricFreshness(dep.read.freshness, freshness);
+            dep.require_published = dep.require_published or require_published;
+            return;
+        }
+        try deps.append(alloc, .{
+            .read = .{ .name = name, .freshness = freshness },
+            .require_published = require_published,
+        });
+    }
+
+    fn stricterGraphMetricFreshness(left: GraphMetricFreshness, right: GraphMetricFreshness) GraphMetricFreshness {
+        if (left == .fresh or right == .fresh) return .fresh;
+        return .published;
+    }
+
+    fn attachMetricDependencies(
+        self: *GraphQueryEngine,
+        graph_index: *graph_mod.GraphIndex,
+        gq: GraphQuery,
+        metric_dependencies: []const GraphMetricDependency,
+        result: *GraphQueryResult,
+    ) !void {
+        const statuses = try self.alloc.alloc(GraphMetricStatus, metric_dependencies.len);
+        var initialized_statuses: usize = 0;
+        errdefer {
+            for (statuses[0..initialized_statuses]) |*status| status.deinit(self.alloc);
+            if (statuses.len > 0) self.alloc.free(statuses);
+        }
+
+        for (metric_dependencies, 0..) |metric, i| {
+            var raw_status = try graph_index.graphMetricStatus(metric.read.name);
+            defer raw_status.deinit(graph_index.alloc);
+            try validateGraphMetricDependencyStatus(raw_status, metric.read.freshness, metric.require_published);
+            statuses[i] = try cloneGraphMetricStatus(self.alloc, raw_status);
+            initialized_statuses += 1;
+        }
+
+        for (result.nodes) |*node| {
+            try self.attachMetricProjectionToNode(graph_index, gq.metrics, statuses, node);
+        }
+        result.metric_status = statuses;
+    }
+
+    fn validateGraphMetricDependencyStatus(status: graph_mod.GraphIndex.GraphMetricStatus, freshness: GraphMetricFreshness, require_published: bool) !void {
+        if (require_published and status.published_generation == 0) return error.MetricNotReady;
+        if (freshness != .fresh) return;
+        if (status.published_generation == 0) return error.MetricNotReady;
+        if (freshness == .fresh and status.state != .fresh) return error.MetricStale;
+    }
+
+    fn attachMetricProjectionToNode(
+        self: *GraphQueryEngine,
+        graph_index: *graph_mod.GraphIndex,
+        metrics: []const GraphMetricRead,
+        statuses: []const GraphMetricStatus,
+        node: *GraphResultNode,
+    ) !void {
+        if (metrics.len == 0) return;
+        const values = try self.alloc.alloc(GraphMetricValue, metrics.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (values[0..initialized]) |*value| value.deinit(self.alloc);
+            self.alloc.free(values);
+        }
+        for (metrics, 0..) |metric, i| {
+            const status = graphMetricStatusByName(statuses, metric.name) orelse return error.MetricNotReady;
+            values[i] = .{
+                .name = try self.alloc.dupe(u8, metric.name),
+                .score = if (status.published_generation == 0)
+                    null
+                else
+                    try graph_index.graphMetricScore(metric.name, node.key),
+            };
+            initialized += 1;
+        }
+        node.metrics = values;
+    }
+
+    fn graphMetricStatusByName(statuses: []const GraphMetricStatus, name: []const u8) ?GraphMetricStatus {
+        for (statuses) |status| {
+            if (std.mem.eql(u8, status.name, name)) return status;
+        }
+        return null;
     }
 
     fn executeTraverse(
@@ -1390,17 +1788,28 @@ const TestCtx = struct {
     }
 };
 
-fn setupGraph(alloc: Allocator, store_label: []const u8, rev_label: []const u8, sb: *[256]u8, rb: *[256]u8) !*TestCtx {
+fn setupGraphWithOptions(
+    alloc: Allocator,
+    store_label: []const u8,
+    rev_label: []const u8,
+    sb: *[256]u8,
+    rb: *[256]u8,
+    opts: graph_mod.GraphIndexOptions,
+) !*TestCtx {
     const sp = tmpPath(sb, store_label);
     const rp = tmpPath(rb, rev_label);
     const ctx = try alloc.create(TestCtx);
     errdefer alloc.destroy(ctx);
     ctx.store = try docstore.DocStore.open(alloc, sp, .{});
     errdefer ctx.store.close();
-    ctx.graph = try graph_mod.GraphIndex.open(alloc, &ctx.store, rp, "test", .{});
+    ctx.graph = try graph_mod.GraphIndex.open(alloc, &ctx.store, rp, "test", opts);
     ctx.sp = sp;
     ctx.rp = rp;
     return ctx;
+}
+
+fn setupGraph(alloc: Allocator, store_label: []const u8, rev_label: []const u8, sb: *[256]u8, rb: *[256]u8) !*TestCtx {
+    return try setupGraphWithOptions(alloc, store_label, rev_label, sb, rb, .{});
 }
 
 fn expectAlgebraicTraversalReject(proof: AlgebraicTraversalProof, reason: AlgebraicTraversalRejectReason) !void {
@@ -1506,6 +1915,106 @@ test "traverse: multi-start with depth 2" {
 
     // Should find B, C, D (from A) + Y, Z (from X) = 5 nodes
     try std.testing.expectEqual(@as(usize, 5), result.nodes.len);
+}
+
+test "graph metric order and filter dependencies attach status without projection" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const metrics = [_]graph_mod.GraphMetricConfig{.{
+        .name = "degree",
+        .kind = .degree,
+    }};
+    const ctx = try setupGraphWithOptions(alloc, "gq-metric-deps-s", "gq-metric-deps-r", &sb, &rb, .{ .metric_configs = &metrics });
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+
+    try ctx.graph.addEdge("A", "B", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("A", "C", "e", 1.0, 0, 0, "");
+    var degree_status = try ctx.graph.runDegreeMetric("degree");
+    degree_status.deinit(alloc);
+
+    const metric_orders = [_]GraphMetricOrder{.{
+        .name = "degree",
+        .direction = .desc,
+        .freshness = .published,
+    }};
+    const metric_filters = [_]GraphMetricFilter{.{
+        .name = "degree",
+        .op = .gte,
+        .value = 1.0,
+        .freshness = .published,
+    }};
+
+    var engine = GraphQueryEngine{ .alloc = alloc };
+    const start_keys: []const []const u8 = &.{"A"};
+    var result = try engine.execute(&ctx.graph, .{
+        .query_type = .neighbors,
+        .index_name = "test",
+        .start_nodes = .{ .keys = start_keys },
+        .params = .{ .edge_types = &.{"e"}, .direction = .out, .max_results = 8 },
+        .order_by = &metric_orders,
+        .where_metric = &metric_filters,
+    }, start_keys);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), result.nodes.len);
+    try std.testing.expectEqual(@as(usize, 0), result.nodes[0].metrics.len);
+    try std.testing.expectEqual(@as(usize, 1), result.metric_status.len);
+    try std.testing.expectEqualStrings("degree", result.metric_status[0].name);
+    try std.testing.expect(result.metric_status[0].published_generation != 0);
+}
+
+test "graph metric order and filter apply max results after metric processing" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const metrics = [_]graph_mod.GraphMetricConfig{.{
+        .name = "degree",
+        .kind = .degree,
+    }};
+    const ctx = try setupGraphWithOptions(alloc, "gq-metric-limit-s", "gq-metric-limit-r", &sb, &rb, .{ .metric_configs = &metrics });
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+
+    try ctx.graph.addEdge("A", "B", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("A", "C", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("A", "D", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("C", "X", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("C", "Y", "e", 1.0, 0, 0, "");
+    var degree_status = try ctx.graph.runDegreeMetric("degree");
+    degree_status.deinit(alloc);
+
+    const metric_orders = [_]GraphMetricOrder{.{
+        .name = "degree",
+        .direction = .desc,
+        .freshness = .published,
+    }};
+    const metric_filters = [_]GraphMetricFilter{.{
+        .name = "degree",
+        .op = .gte,
+        .value = 3.0,
+        .freshness = .published,
+    }};
+
+    var engine = GraphQueryEngine{ .alloc = alloc };
+    const start_keys: []const []const u8 = &.{"A"};
+    var result = try engine.execute(&ctx.graph, .{
+        .query_type = .neighbors,
+        .index_name = "test",
+        .start_nodes = .{ .keys = start_keys },
+        .params = .{ .edge_types = &.{"e"}, .direction = .out, .max_results = 1 },
+        .order_by = &metric_orders,
+        .where_metric = &metric_filters,
+    }, start_keys);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.nodes.len);
+    try std.testing.expectEqualStrings("C", result.nodes[0].key);
 }
 
 test "traverse can execute through algebraic provenance semiring path" {

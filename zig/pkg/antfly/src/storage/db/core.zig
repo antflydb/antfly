@@ -59,6 +59,7 @@ pub const PendingWorkStats = struct {
     promotion: types.ReplayStageStats = .{},
     text_merge: types.TextMergeStats = .{},
     repair_metadata_rebuild_pending: bool = false,
+    graph_metric: index_manager_mod.IndexManager.GraphMetricPlannedWorkStats = .{},
 };
 
 pub const MaintenanceDriver = struct {

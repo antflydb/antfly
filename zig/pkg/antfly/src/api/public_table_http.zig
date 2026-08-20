@@ -203,6 +203,13 @@ pub const TableApi = struct {
         InternalFailure,
     };
 
+    pub const ExecuteGraphMetricActionError = error{
+        InvalidGraphMetricAction,
+        NotFound,
+        MethodNotAllowed,
+        InternalFailure,
+    };
+
     pub const ExecutePutArtifactEnrichmentError = error{
         Canceled,
         DeadlineExceeded,
@@ -353,6 +360,14 @@ pub const TableApi = struct {
             index_name: []const u8,
             request: operation.RequestContext,
         ) ExecuteDeleteIndexError!void,
+        execute_table_graph_metric_action: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            metric_name: []const u8,
+            action: []const u8,
+        ) ExecuteGraphMetricActionError![]u8 = null,
         execute_put_artifact_enrichment: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -503,6 +518,18 @@ pub const TableApi = struct {
     ) ExecuteDeleteIndexError!void {
         try self.ensureActive();
         return try self.vtable.execute_table_delete_index(self.ptr, alloc, table_name, index_name, self.request);
+    }
+
+    pub fn executeTableGraphMetricAction(
+        self: TableApi,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+    ) ExecuteGraphMetricActionError![]u8 {
+        const fn_ptr = self.vtable.execute_table_graph_metric_action orelse return error.MethodNotAllowed;
+        return try fn_ptr(self.ptr, alloc, table_name, index_name, metric_name, action);
     }
 
     pub fn executePutArtifactEnrichment(
@@ -1236,6 +1263,23 @@ pub fn handleTableDeleteIndex(
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "index delete failed") },
     };
     return .{ .status = 201, .body = try alloc.dupe(u8, "{}"), .json = true };
+}
+
+pub fn handleTableGraphMetricAction(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    index_name: []const u8,
+    metric_name: []const u8,
+    action: []const u8,
+    api: TableApi,
+) !OwnedResponse {
+    const response_body = api.executeTableGraphMetricAction(alloc, table_name, index_name, metric_name, action) catch |err| switch (err) {
+        error.InvalidGraphMetricAction => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid graph metric action") },
+        error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
+        error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
+        error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "graph metric action failed") },
+    };
+    return .{ .status = 200, .body = response_body, .json = true };
 }
 
 pub fn handlePutArtifactEnrichment(
@@ -4142,4 +4186,53 @@ test "public document artifact range reprocess handler returns bounded summary" 
     try std.testing.expectEqual(@as(usize, 1), parsed.value.shard_cursors[0].reprocessed);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.shard_cursors[0].failed);
     try std.testing.expectEqual(@as(u32, 10), parsed.value.shard_cursors[0].limit);
+}
+test "public table graph metric action handler returns status response" {
+    const Backend = struct {
+        called: bool = false,
+
+        fn iface(self: *@This()) TableApi {
+            return .{
+                .ptr = self,
+                .request = .{},
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                    .execute_table_graph_metric_action = executeGraphMetricAction,
+                },
+            };
+        }
+
+        fn executeGraphMetricAction(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            metric_name: []const u8,
+            action: []const u8,
+        ) TableApi.ExecuteGraphMetricActionError![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!std.mem.eql(u8, table_name, "docs")) return error.InternalFailure;
+            if (!std.mem.eql(u8, index_name, "graph_idx")) return error.InternalFailure;
+            if (!std.mem.eql(u8, metric_name, "degree")) return error.InternalFailure;
+            if (!std.mem.eql(u8, action, "pause")) return error.InternalFailure;
+            self.called = true;
+            return alloc.dupe(u8, "{\"status\":{\"state\":\"fresh\",\"maintenance_paused\":true}}") catch return error.InternalFailure;
+        }
+    };
+
+    var backend = Backend{};
+    var resp = try handleTableGraphMetricAction(std.testing.allocator, "docs", "graph_idx", "degree", "pause", backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expect(backend.called);
+    try std.testing.expectEqualStrings("{\"status\":{\"state\":\"fresh\",\"maintenance_paused\":true}}", resp.body);
 }

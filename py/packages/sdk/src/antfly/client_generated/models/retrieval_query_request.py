@@ -22,6 +22,8 @@ if TYPE_CHECKING:
     from ..models.geo_bounding_polygon_query import GeoBoundingPolygonQuery
     from ..models.geo_distance_query import GeoDistanceQuery
     from ..models.geo_shape_query import GeoShapeQuery
+    from ..models.graph_metric_query import GraphMetricQuery
+    from ..models.graph_metric_rerank import GraphMetricRerank
     from ..models.ip_range_query import IPRangeQuery
     from ..models.join_clause import JoinClause
     from ..models.match_all_query import MatchAllQuery
@@ -280,6 +282,8 @@ class RetrievalQueryRequest:
                 Has minor performance overhead — not recommended for production traffic.
             reranker (RerankerConfig | Unset): A unified configuration for a reranking provider. Example: {'provider':
                 'ollama', 'model': 'dengcao/Qwen3-Reranker-0.6B:F16', 'field': 'content'}.
+            graph_metric (GraphMetricQuery | Unset):
+            graph_metric_rerank (GraphMetricRerank | Unset):
             analyses (Analyses | Unset):
             graph_searches (QueryRequestGraphSearches | Unset): Declarative graph queries to execute after full-text/vector
                 searches.
@@ -472,6 +476,8 @@ class RetrievalQueryRequest:
     count: bool | Unset = UNSET
     profile: bool | Unset = UNSET
     reranker: RerankerConfig | Unset = UNSET
+    graph_metric: GraphMetricQuery | Unset = UNSET
+    graph_metric_rerank: GraphMetricRerank | Unset = UNSET
     analyses: Analyses | Unset = UNSET
     graph_searches: QueryRequestGraphSearches | Unset = UNSET
     expand_strategy: QueryRequestExpandStrategy | Unset = UNSET
@@ -748,6 +754,14 @@ class RetrievalQueryRequest:
         if not isinstance(self.reranker, Unset):
             reranker = self.reranker.to_dict()
 
+        graph_metric: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.graph_metric, Unset):
+            graph_metric = self.graph_metric.to_dict()
+
+        graph_metric_rerank: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.graph_metric_rerank, Unset):
+            graph_metric_rerank = self.graph_metric_rerank.to_dict()
+
         analyses: dict[str, Any] | Unset = UNSET
         if not isinstance(self.analyses, Unset):
             analyses = self.analyses.to_dict()
@@ -833,6 +847,10 @@ class RetrievalQueryRequest:
             field_dict["profile"] = profile
         if reranker is not UNSET:
             field_dict["reranker"] = reranker
+        if graph_metric is not UNSET:
+            field_dict["graph_metric"] = graph_metric
+        if graph_metric_rerank is not UNSET:
+            field_dict["graph_metric_rerank"] = graph_metric_rerank
         if analyses is not UNSET:
             field_dict["analyses"] = analyses
         if graph_searches is not UNSET:
@@ -866,6 +884,8 @@ class RetrievalQueryRequest:
         from ..models.geo_bounding_polygon_query import GeoBoundingPolygonQuery
         from ..models.geo_distance_query import GeoDistanceQuery
         from ..models.geo_shape_query import GeoShapeQuery
+        from ..models.graph_metric_query import GraphMetricQuery
+        from ..models.graph_metric_rerank import GraphMetricRerank
         from ..models.ip_range_query import IPRangeQuery
         from ..models.join_clause import JoinClause
         from ..models.match_all_query import MatchAllQuery
@@ -1701,6 +1721,20 @@ class RetrievalQueryRequest:
         else:
             reranker = RerankerConfig.from_dict(_reranker)
 
+        _graph_metric = d.pop("graph_metric", UNSET)
+        graph_metric: GraphMetricQuery | Unset
+        if isinstance(_graph_metric, Unset):
+            graph_metric = UNSET
+        else:
+            graph_metric = GraphMetricQuery.from_dict(_graph_metric)
+
+        _graph_metric_rerank = d.pop("graph_metric_rerank", UNSET)
+        graph_metric_rerank: GraphMetricRerank | Unset
+        if isinstance(_graph_metric_rerank, Unset):
+            graph_metric_rerank = UNSET
+        else:
+            graph_metric_rerank = GraphMetricRerank.from_dict(_graph_metric_rerank)
+
         _analyses = d.pop("analyses", UNSET)
         analyses: Analyses | Unset
         if isinstance(_analyses, Unset):
@@ -1779,6 +1813,8 @@ class RetrievalQueryRequest:
             count=count,
             profile=profile,
             reranker=reranker,
+            graph_metric=graph_metric,
+            graph_metric_rerank=graph_metric_rerank,
             analyses=analyses,
             graph_searches=graph_searches,
             expand_strategy=expand_strategy,

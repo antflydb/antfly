@@ -172,6 +172,24 @@ export type IndexStatus = components["schemas"]["IndexStatus"];
 
 // Graph index types
 export type GraphIndexConfig = components["schemas"]["GraphIndexConfig"];
+export type GraphIndexStats = components["schemas"]["GraphIndexStats"];
+export type GraphMetricActionResponse = components["schemas"]["GraphMetricActionResponse"];
+export type GraphMetricBuildPageStatus = components["schemas"]["GraphMetricBuildPageStatus"];
+export type GraphMetricEdgeFilterStatus = components["schemas"]["GraphMetricEdgeFilterStatus"];
+export type GraphMetricEvent = components["schemas"]["GraphMetricEvent"];
+export type GraphMetricFilter = components["schemas"]["GraphMetricFilter"];
+export type GraphMetricOrder = components["schemas"]["GraphMetricOrder"];
+export type GraphMetricProfile = components["schemas"]["GraphMetricProfile"];
+export type GraphMetricQuery = components["schemas"]["GraphMetricQuery"];
+export type GraphMetricRerank = components["schemas"]["GraphMetricRerank"];
+export type GraphMetricRerankScoreDetails =
+  components["schemas"]["GraphMetricRerankScoreDetails"];
+export type GraphMetricResult = components["schemas"]["GraphMetricResult"];
+export type GraphMetricRuntimeStats = components["schemas"]["GraphMetricRuntimeStats"];
+export type GraphMetricScore = components["schemas"]["GraphMetricScore"];
+export type GraphMetricStatus = components["schemas"]["GraphMetricStatus"];
+export type GraphMetricFreshness = NonNullable<GraphQuery["metric_freshness"]>;
+export type QueryScoreDetails = components["schemas"]["QueryScoreDetails"];
 export type EdgeTypeConfig = components["schemas"]["EdgeTypeConfig"];
 export type EdgeTopology = NonNullable<EdgeTypeConfig["topology"]>;
 

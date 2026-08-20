@@ -151,6 +151,7 @@ const ttl_runtime_mod = @import("maintenance/ttl_runtime.zig");
 const transaction_runtime_mod = @import("maintenance/transaction_runtime.zig");
 const text_merge_runtime_mod = @import("maintenance/text_merge_runtime.zig");
 const sparse_compaction_runtime_mod = @import("maintenance/sparse_compaction_runtime.zig");
+const graph_metric_runtime_mod = @import("maintenance/graph_metric_runtime.zig");
 const transform_mod = @import("transform.zig");
 const sim_fixture = @import("../sim_fixture.zig");
 const storage_sim = @import("../sim_runtime.zig");
@@ -292,6 +293,13 @@ pub const OpenOptions = struct {
         }
     };
 
+    pub const GraphMetricIdleMaintenanceMode = enum {
+        legacy,
+        planned,
+        auto,
+        degree_canary,
+    };
+
     open_mode: OpenOptions.OpenMode = .writer,
     map_size: usize = 256 * 1024 * 1024,
     no_sync: bool = false,
@@ -342,6 +350,11 @@ pub const OpenOptions = struct {
     transaction_recovery: transaction_runtime_mod.Config = .{},
     text_merge: text_merge_runtime_mod.Config = .{},
     sparse_compaction: sparse_compaction_runtime_mod.Config = .{},
+    graph_metric_maintenance: graph_metric_runtime_mod.Config = .{},
+    graph_metric_idle_maintenance: GraphMetricIdleMaintenanceMode = .auto,
+    graph_metric_idle_planned_options: index_manager_mod.IndexManager.GraphMetricPlannedMaintenanceOptions = .{},
+    graph_metric_idle_auto_options: index_manager_mod.IndexManager.GraphMetricPlannedAutoIdleOptions = .{},
+    graph_metric_idle_degree_canary_options: index_manager_mod.IndexManager.GraphMetricDegreeCanaryOptions = .{},
     /// Optional cross-shard candidate source for entity resolution blocking,
     /// injected by the serving layer (see `api/distributed_candidate_source.zig`).
     /// Null means local-only blocking against the worker's own store. Must
@@ -2984,6 +2997,10 @@ pub const DB = struct {
     executor: *derived_executor_mod.Executor,
     start_index_workers: bool,
     optional_runtime_workers_enabled: bool,
+    graph_metric_idle_maintenance: OpenOptions.GraphMetricIdleMaintenanceMode,
+    graph_metric_idle_planned_options: index_manager_mod.IndexManager.GraphMetricPlannedMaintenanceOptions,
+    graph_metric_idle_auto_options: index_manager_mod.IndexManager.GraphMetricPlannedAutoIdleOptions,
+    graph_metric_idle_degree_canary_options: index_manager_mod.IndexManager.GraphMetricDegreeCanaryOptions,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
     enrichment_append_context: ?*EnrichmentAppendContext,
@@ -3006,6 +3023,7 @@ pub const DB = struct {
     transaction_runtime: ?*transaction_runtime_mod.Runtime,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime,
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime,
+    graph_metric_runtime: ?*graph_metric_runtime_mod.GraphMetricRuntime,
     // Background retry of quarantined index loads (see retryQuarantinedIndexLoads).
     // Spawned at open only when the load left failures behind; exits once all
     // quarantined indexes recover or the DB closes.
@@ -3408,6 +3426,10 @@ pub const DB = struct {
                 .executor = executor,
                 .start_index_workers = start_index_workers,
                 .optional_runtime_workers_enabled = false,
+                .graph_metric_idle_maintenance = opts.graph_metric_idle_maintenance,
+                .graph_metric_idle_planned_options = opts.graph_metric_idle_planned_options,
+                .graph_metric_idle_auto_options = opts.graph_metric_idle_auto_options,
+                .graph_metric_idle_degree_canary_options = opts.graph_metric_idle_degree_canary_options,
                 .secret_store = opts.secret_store,
                 .remote_content = opts.remote_content,
                 .enrichment_append_context = null,
@@ -3427,6 +3449,7 @@ pub const DB = struct {
                 .transaction_runtime = null,
                 .text_merge_runtime = null,
                 .sparse_compaction_runtime = null,
+                .graph_metric_runtime = null,
                 .shadow = null,
             };
             backend_owner_transferred = true;
@@ -4133,6 +4156,23 @@ pub const DB = struct {
         self.async_context.sparse_compaction_runtime = runtime;
     }
 
+    fn initOptionalGraphMetricRuntime(self: *DB, cfg: graph_metric_runtime_mod.Config) !void {
+        if (!self.start_index_workers or !cfg.enabled) return;
+        const resources = self.core.asyncResources();
+        const runtime = try self.runtime_alloc.create(graph_metric_runtime_mod.GraphMetricRuntime);
+        errdefer self.runtime_alloc.destroy(runtime);
+        runtime.* = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+            self.runtime_alloc,
+            resources.store,
+            resources.index_manager,
+            resources.apply_mutex,
+            self.backend_runtime,
+            cfg,
+        );
+        errdefer runtime.deinit();
+        self.graph_metric_runtime = runtime;
+    }
+
     fn initOptionalRuntimes(self: *DB, opts: *OpenOptions) !void {
         // Created before enrichment so the enrichment append context can notify
         // it when extraction artifacts land.
@@ -4158,6 +4198,7 @@ pub const DB = struct {
         }
         try self.initOptionalTextMergeRuntime(opts.text_merge);
         try self.initOptionalSparseCompactionRuntime(opts.sparse_compaction);
+        try self.initOptionalGraphMetricRuntime(opts.graph_metric_maintenance);
     }
 
     fn startOptionalRuntimes(self: *DB) !void {
@@ -4174,6 +4215,7 @@ pub const DB = struct {
         }
         if (self.text_merge_runtime) |runtime| try runtime.start();
         if (self.sparse_compaction_runtime) |runtime| try runtime.start();
+        if (self.graph_metric_runtime) |runtime| try runtime.start();
     }
 
     pub fn ensureTransactionRecoveryRuntime(self: *DB, cfg: transaction_runtime_mod.Config) !void {
@@ -4316,6 +4358,10 @@ pub const DB = struct {
         }
         if (self.sparse_compaction_runtime) |runtime| {
             self.async_context.sparse_compaction_runtime = null;
+            runtime.deinit();
+            self.runtime_alloc.destroy(runtime);
+        }
+        if (self.graph_metric_runtime) |runtime| {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
         }
@@ -17163,6 +17209,7 @@ pub const DB = struct {
             .promotion = self.promotionStageStats(),
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStats(),
             .repair_metadata_rebuild_pending = self.artifactRepairMetadataRebuildPending(),
+            .graph_metric = self.core.index_manager.graphMetricPlannedWorkStats() catch .{},
         };
     }
 
@@ -17377,10 +17424,18 @@ pub const DB = struct {
             const next_target = self.core.nextDerivedSequence();
             if (next_target <= stable_target) {
                 try waitForManagedIndexesApplied(self, sequence, index_names);
+                if (self.syncTargetsIncludeGraph(index_names)) _ = try self.runGraphMetricMaintenanceForIdle();
                 return;
             }
             stable_target = next_target;
         }
+    }
+
+    fn syncTargetsIncludeGraph(self: *DB, index_names: []const []const u8) bool {
+        for (index_names) |index_name| {
+            if (self.core.graphIndex(index_name) != null) return true;
+        }
+        return false;
     }
 
     pub fn waitForCurrentSyncLevel(self: *DB, sync_level: types.SyncLevel) !void {
@@ -17710,7 +17765,274 @@ pub const DB = struct {
         try self.drainScheduledTextMerges();
         try self.runArtifactRepairMetadataMaintenanceUntilIdle();
         _ = try self.runDensePostingMaintenanceForIdle();
+        _ = try self.runGraphMetricMaintenanceForIdle();
         _ = try self.runLsmMaintenanceUntilIdle();
+    }
+
+    pub fn runGraphMetricMaintenanceForIdle(self: *DB) !usize {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        return switch (self.graph_metric_idle_maintenance) {
+            .legacy => try self.core.index_manager.runGraphMetricMaintenance(),
+            .planned => try self.runGraphMetricPlannedMaintenanceForIdleLocked(),
+            .auto => if (try self.core.index_manager.shouldRunGraphMetricPlannedAutoIdle(self.graph_metric_idle_auto_options))
+                try self.runGraphMetricPlannedAutoMaintenanceForIdleLocked()
+            else
+                try self.core.index_manager.runGraphMetricMaintenance(),
+            .degree_canary => try self.runGraphMetricDegreeCanaryMaintenanceForIdleLocked(),
+        };
+    }
+
+    fn graphMetricPlannedProgress(result: index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult) usize {
+        return result.builds_started + result.pages_completed + result.phases_advanced + result.published;
+    }
+
+    fn runGraphMetricPlannedMaintenanceForIdleLocked(self: *DB) !usize {
+        const result = try self.core.index_manager.runGraphMetricPlannedMaintenance(self.graph_metric_idle_planned_options);
+        if (result.budget_exhausted) return error.RunUntilIdleDidNotConverge;
+        return graphMetricPlannedProgress(result);
+    }
+
+    fn runGraphMetricPlannedAutoMaintenanceForIdleLocked(self: *DB) !usize {
+        const result = try self.core.index_manager.runGraphMetricPlannedAutoMaintenance(
+            self.graph_metric_idle_planned_options,
+            self.graph_metric_idle_auto_options,
+        );
+        if (result.budget_exhausted) return error.RunUntilIdleDidNotConverge;
+        const progressed = graphMetricPlannedProgress(result);
+        const after = try self.core.index_manager.graphMetricPlannedAutoIdleDecision(self.graph_metric_idle_auto_options);
+        if (!after.shouldRunPlanned() and after.ineligible_queued != 0) {
+            return progressed + try self.core.index_manager.runGraphMetricMaintenance();
+        }
+        return progressed;
+    }
+
+    fn runGraphMetricDegreeCanaryMaintenanceForIdleLocked(self: *DB) !usize {
+        const decision = try self.core.index_manager.graphMetricDegreeCanaryDecision(self.graph_metric_idle_degree_canary_options);
+        if (decision.shouldRunPlanned()) return try self.runGraphMetricPlannedMaintenanceForIdleLocked();
+        if (decision.active_degree_builds != 0 or decision.blocked_active_non_degree != 0) {
+            return error.RunUntilIdleDidNotConverge;
+        }
+        return try self.core.index_manager.runGraphMetricMaintenance();
+    }
+
+    pub fn runGraphMetricPlannedMaintenanceForIdle(
+        self: *DB,
+        options: index_manager_mod.IndexManager.GraphMetricPlannedMaintenanceOptions,
+    ) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.index_manager.runGraphMetricPlannedMaintenance(options);
+    }
+
+    const GraphMetricServiceMaintenanceAction = enum { tick, status, release };
+
+    const GraphMetricServiceMaintenanceRequest = struct {
+        action: GraphMetricServiceMaintenanceAction = .tick,
+        role: graph_metric_runtime_mod.Role,
+        runtime_id: []const u8,
+        owner_id: []const u8,
+        lease_owned: bool = false,
+        lease_ttl_ms: u64 = 30_000,
+        worker_id: ?[]const u8 = null,
+        worker_ids: ?[]const []const u8 = null,
+        start_background_builds: bool = true,
+        max_rounds: usize = 1,
+        max_metrics_per_round: usize = 8,
+        max_pages_per_round: usize = 1,
+        preserve_lease_after_tick: bool = false,
+        now_ms: ?u64 = null,
+    };
+
+    pub fn runGraphMetricServiceMaintenanceJsonAlloc(self: *DB, alloc: Allocator, body: []const u8) ![]u8 {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var parsed = std.json.parseFromSlice(GraphMetricServiceMaintenanceRequest, alloc, if (body.len == 0) "{}" else body, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch return error.InvalidGraphMetricRuntimeConfig;
+        defer parsed.deinit();
+
+        var manual_clock = platform_clock.ManualClock{};
+        if (parsed.value.now_ms) |now_ms| manual_clock.setRealtimeNs(now_ms *| std.time.ns_per_ms);
+        const resources = self.core.asyncResources();
+        var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+            alloc,
+            resources.store,
+            resources.index_manager,
+            resources.apply_mutex,
+            self.backend_runtime,
+            .{
+                .enabled = true,
+                .start_background_loop = false,
+                .role = parsed.value.role,
+                .runtime_id = parsed.value.runtime_id,
+                .lease_owned = parsed.value.lease_owned,
+                .owner_id = parsed.value.owner_id,
+                .lease_ttl_ms = parsed.value.lease_ttl_ms,
+                .coordinator_start_background_builds = parsed.value.start_background_builds,
+                .planned_options = .{
+                    .worker_id = parsed.value.worker_id orelse "",
+                    .worker_ids = parsed.value.worker_ids orelse &.{},
+                    .max_rounds = parsed.value.max_rounds,
+                    .max_metrics_per_round = parsed.value.max_metrics_per_round,
+                    .max_pages_per_round = parsed.value.max_pages_per_round,
+                },
+                .clock = if (parsed.value.now_ms != null) manual_clock.clock() else platform_clock.Clock.real(),
+            },
+        );
+        var preserve_lease = false;
+        defer if (preserve_lease) runtime.deinitPreserveLease() else runtime.deinit();
+
+        if (parsed.value.action == .release) {
+            const released = try runtime.ownership.releaseHeldLease();
+            var current_lease = try runtime.ownership.loadLease(alloc);
+            defer if (current_lease) |*lease| lease_mod.deinitRecord(alloc, lease);
+            var runtime_stats = runtime.stats();
+            runtime_stats.shutdown = true;
+            return try std.json.Stringify.valueAlloc(alloc, .{
+                .released = released,
+                .lease_owner_id_hash = if (current_lease) |lease| graph_metric_runtime_mod.identityHash(lease.owner_id) else 0,
+                .lease_expires_at_ms = if (current_lease) |lease| lease.expires_at_ms else 0,
+                .stats = runtime_stats,
+            }, .{ .emit_null_optional_fields = false });
+        }
+
+        const result: index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult = if (parsed.value.action == .tick) try runtime.runOnceDetailed() else .{};
+        const runtime_stats = runtime.stats();
+        preserve_lease = parsed.value.preserve_lease_after_tick and parsed.value.lease_owned and parsed.value.action == .tick and runtime_stats.has_lease;
+        return try std.json.Stringify.valueAlloc(alloc, .{
+            .result = result,
+            .stats = runtime_stats,
+        }, .{ .emit_null_optional_fields = false });
+    }
+
+    pub fn refreshGraphMetric(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
+        var status = try entry.index.runGraphMetric(metric_name);
+        defer status.deinit(entry.index.alloc);
+        return try cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    pub fn rebuildGraphMetric(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
+        try entry.index.deleteGraphMetricMaterialization(metric_name);
+        var status = try entry.index.runGraphMetric(metric_name);
+        defer status.deinit(entry.index.alloc);
+        return try cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    pub fn deleteGraphMetricMaterialization(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
+        try entry.index.deleteGraphMetricMaterialization(metric_name);
+        var status = try entry.index.graphMetricStatus(metric_name);
+        defer status.deinit(entry.index.alloc);
+        return try cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    pub fn pauseGraphMetricMaintenance(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
+        var status = try entry.index.pauseGraphMetricMaintenance(metric_name);
+        defer status.deinit(entry.index.alloc);
+        return try cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    pub fn resumeGraphMetricMaintenance(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
+        var status = try entry.index.resumeGraphMetricMaintenance(metric_name);
+        defer status.deinit(entry.index.alloc);
+        return try cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    pub fn ensureGraphMetricPlannedBuild(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        metric_name: []const u8,
+        target_generation: u64,
+    ) !types.GraphMetricStatus {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        var status = try self.core.index_manager.ensureGraphMetricPlannedBuild(index_name, metric_name, target_generation);
+        defer status.deinit(self.core.index_manager.alloc);
+        return try cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    pub fn runGraphMetricPlannedWorkerPageStep(self: *DB, index_name: []const u8, metric_name: []const u8, worker_id: []const u8) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.index_manager.runGraphMetricPlannedWorkerPageStep(index_name, metric_name, worker_id);
+    }
+
+    pub fn runGraphMetricPlannedWorkerPageStepAt(self: *DB, index_name: []const u8, metric_name: []const u8, worker_id: []const u8, now_ms: u64) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.index_manager.runGraphMetricPlannedWorkerPageStepAt(index_name, metric_name, worker_id, now_ms);
+    }
+
+    pub fn runGraphMetricPlannedCoordinatorStep(self: *DB, index_name: []const u8, metric_name: []const u8) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.index_manager.runGraphMetricPlannedCoordinatorStep(index_name, metric_name);
+    }
+
+    pub fn runGraphMetricPlannedCoordinatorStepAt(self: *DB, index_name: []const u8, metric_name: []const u8, now_ms: u64) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.index_manager.runGraphMetricPlannedCoordinatorStepAt(index_name, metric_name, now_ms);
+    }
+
+    pub fn failGraphMetricPlannedBuild(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8, err: anyerror) !types.GraphMetricStatus {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        var status = try self.core.index_manager.failGraphMetricPlannedBuild(index_name, metric_name, err);
+        defer status.deinit(self.core.index_manager.alloc);
+        return try cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    pub fn runGraphMetricPlannedDrain(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8, target_generation: u64, options: graph_mod.GraphIndex.GraphMetricPlannedDrainOptions) !types.GraphMetricStatus {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        var status = try self.core.index_manager.runGraphMetricPlannedDrain(index_name, metric_name, target_generation, options);
+        defer status.deinit(self.core.index_manager.alloc);
+        return try cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    pub fn runGraphMetricPlannedCoordinatorSweep(self: *DB, options: index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepOptions) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.index_manager.runGraphMetricPlannedCoordinatorSweep(options);
+    }
+
+    pub fn runGraphMetricPlannedWorkerSweep(self: *DB, options: index_manager_mod.IndexManager.GraphMetricPlannedWorkerSweepOptions) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.index_manager.runGraphMetricPlannedWorkerSweep(options);
     }
 
     pub fn rebuildDenseIndexesForTargetCoverage(self: *DB, alloc: Allocator) !usize {
@@ -19803,6 +20125,7 @@ pub const DB = struct {
         if (item.algebraic_planner_lifecycle_blocking_reason) |value| alloc.free(value);
         if (item.algebraic_last_observed_query_shape) |value| alloc.free(value);
         if (item.algebraic_last_recommended_materialization) |value| alloc.free(value);
+        types.freeGraphMetricStatuses(alloc, @constCast(item.graph_metric_status));
         if (item.algebraic_top_candidate) |candidate| {
             alloc.free(candidate.recommendation);
             alloc.free(candidate.materialization_id);
@@ -20221,6 +20544,104 @@ pub const DB = struct {
         item.algebraic_graph_traversal_result_node_count = algebraic_graph.result_node_count;
     }
 
+    fn cloneGraphMetricBuildPageStatusesFromGraph(
+        alloc: Allocator,
+        source: []const graph_mod.GraphIndex.GraphMetricBuildPageStatus,
+    ) ![]types.GraphMetricBuildPageStatus {
+        if (source.len == 0) return &.{};
+        const out = try alloc.alloc(types.GraphMetricBuildPageStatus, source.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*page| page.deinit(alloc);
+            alloc.free(out);
+        }
+        for (source, 0..) |page, i| {
+            const worker_id = if (page.worker_id.len > 0) try alloc.dupe(u8, page.worker_id) else "";
+            errdefer if (worker_id.len > 0) alloc.free(worker_id);
+            const cursor = if (page.cursor.len > 0) try alloc.dupe(u8, page.cursor) else "";
+            errdefer if (cursor.len > 0) alloc.free(cursor);
+            const last_error = if (page.last_error.len > 0) try alloc.dupe(u8, page.last_error) else "";
+            errdefer if (last_error.len > 0) alloc.free(last_error);
+            out[i] = .{
+                .phase = page.phase,
+                .iteration = page.iteration,
+                .page_id = page.page_id,
+                .state = page.state,
+                .range_kind = page.range_kind,
+                .worker_id = worker_id,
+                .lease_expires_at_ms = page.lease_expires_at_ms,
+                .attempt = page.attempt,
+                .cursor = cursor,
+                .completed_units = page.completed_units,
+                .total_units = page.total_units,
+                .last_error = last_error,
+            };
+            initialized += 1;
+        }
+        return out;
+    }
+
+    fn cloneGraphMetricStatusFromGraph(
+        alloc: Allocator,
+        source: graph_mod.GraphIndex.GraphMetricStatus,
+    ) !types.GraphMetricStatus {
+        var out = types.GraphMetricStatus{
+            .name = try alloc.dupe(u8, source.name),
+            .state = source.state,
+            .phase = source.phase,
+            .metadata_version = source.metadata_version,
+            .maintenance_paused = source.maintenance_paused,
+            .build_queued = source.build_queued,
+            .published_generation = source.published_generation,
+            .edge_generation = source.edge_generation,
+            .target_edge_generation = source.target_edge_generation,
+            .queued_generation = source.queued_generation,
+            .building_generation = source.building_generation,
+            .build_job_id = source.build_job_id,
+            .build_started_at_ms = source.build_started_at_ms,
+            .build_iteration = source.build_iteration,
+            .build_lease_expires_at_ms = source.build_lease_expires_at_ms,
+            .build_completed_units = source.build_completed_units,
+            .build_total_units = source.build_total_units,
+            .build_pages_truncated = source.build_pages_truncated,
+            .retry_count = source.retry_count,
+            .progress = source.progress,
+            .converged = source.converged,
+            .iterations_completed = source.iterations_completed,
+            .delta = source.delta,
+            .computed_at_ms = source.computed_at_ms,
+            .last_event = source.last_event,
+        };
+        errdefer out.deinit(alloc);
+        out.edge_filter = try source.edge_filter.cloneAlloc(alloc);
+        out.build_worker_id = if (source.build_worker_id.len > 0) try alloc.dupe(u8, source.build_worker_id) else "";
+        out.build_cursor = if (source.build_cursor.len > 0) try alloc.dupe(u8, source.build_cursor) else "";
+        out.last_error = if (source.last_error.len > 0) try alloc.dupe(u8, source.last_error) else "";
+        out.recent_events = if (source.recent_events.len > 0)
+            try alloc.dupe(graph_mod.GraphIndex.GraphMetricEvent, source.recent_events)
+        else
+            &.{};
+        out.build_pages = try cloneGraphMetricBuildPageStatusesFromGraph(alloc, source.build_pages);
+        return out;
+    }
+
+    fn populateGraphMetricStatusStats(alloc: Allocator, item: *types.DBIndexStats, graph_index: *graph_mod.GraphIndex) !void {
+        if (graph_index.metric_configs.len == 0) return;
+        const statuses = try alloc.alloc(types.GraphMetricStatus, graph_index.metric_configs.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (statuses[0..initialized]) |*status| status.deinit(alloc);
+            alloc.free(statuses);
+        }
+        for (graph_index.metric_configs, 0..) |cfg, i| {
+            var status = try graph_index.graphMetricStatus(cfg.name);
+            defer status.deinit(graph_index.alloc);
+            statuses[i] = try cloneGraphMetricStatusFromGraph(alloc, status);
+            initialized += 1;
+        }
+        item.graph_metric_status = statuses;
+    }
+
     fn managedIndexAppliedSequence(self: *DB, alloc: Allocator, index_name: []const u8) !u64 {
         var applied_sequence = try self.core.loadAppliedSequence(alloc, index_name);
         if (self.executor.appliedSequence(index_name)) |live_applied| {
@@ -20288,6 +20709,7 @@ pub const DB = struct {
         runtime_stats.promotion = self.promotionStageStats();
         runtime_stats.ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else runtime_stats.ttl_cleanup;
         runtime_stats.transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else runtime_stats.transaction_recovery;
+        runtime_stats.graph_metric_runtime = self.graphMetricRuntimeStats();
 
         // Runtime-only diagnostics are optional status-plane detail and may run
         // under apply. Skip the overlay during lifecycle transitions.
@@ -20509,6 +20931,64 @@ pub const DB = struct {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
         try self.overlayRuntimeStatusIndexesLocked(stats_alloc, runtime_stats);
+    }
+
+    pub fn graphMetricRuntimeStats(self: *DB) types.GraphMetricRuntimeStats {
+        const runtime = self.graph_metric_runtime orelse return .{};
+        const runtime_snapshot = runtime.stats();
+        const total = runtime_snapshot.total_result;
+        const last = runtime_snapshot.last_result;
+        return .{
+            .enabled = runtime_snapshot.enabled,
+            .role = switch (runtime_snapshot.role) {
+                .combined => .combined,
+                .coordinator => .coordinator,
+                .worker => .worker,
+                .worker_pool => .worker_pool,
+            },
+            .runtime_id_hash = runtime_snapshot.runtime_id_hash,
+            .owner_id_hash = runtime_snapshot.owner_id_hash,
+            .lease_key_hash = runtime_snapshot.lease_key_hash,
+            .worker_id_hash = runtime_snapshot.worker_id_hash,
+            .worker_count = @intCast(runtime_snapshot.worker_count),
+            .lease_owned = runtime_snapshot.lease_owned,
+            .has_lease = runtime_snapshot.has_lease,
+            .acquisition_count = runtime_snapshot.acquisition_count,
+            .takeover_count = runtime_snapshot.takeover_count,
+            .lease_acquire_failures = runtime_snapshot.lease_acquire_failures,
+            .lost_leases = runtime_snapshot.lost_leases,
+            .last_acquired_ms = runtime_snapshot.last_acquired_ms,
+            .started = runtime_snapshot.started,
+            .shutdown = runtime_snapshot.shutdown,
+            .notified = runtime_snapshot.notified,
+            .ticks_started = runtime_snapshot.ticks_started,
+            .ticks_completed = runtime_snapshot.ticks_completed,
+            .durable_progress_ticks = runtime_snapshot.durable_progress_ticks,
+            .idle_ticks = runtime_snapshot.idle_ticks,
+            .error_ticks = runtime_snapshot.error_ticks,
+            .last_error_name = runtime_snapshot.last_error_name,
+            .total_metrics_scanned = @intCast(total.metrics_scanned),
+            .total_active_builds = @intCast(total.active_builds),
+            .total_builds_started = @intCast(total.builds_started),
+            .total_worker_steps = @intCast(total.worker_steps),
+            .total_coordinator_steps = @intCast(total.coordinator_steps),
+            .total_pages_claimed = @intCast(total.pages_claimed),
+            .total_pages_completed = @intCast(total.pages_completed),
+            .total_phases_advanced = @intCast(total.phases_advanced),
+            .total_published = @intCast(total.published),
+            .total_failed_builds = @intCast(total.failed_builds),
+            .last_metrics_scanned = @intCast(last.metrics_scanned),
+            .last_active_builds = @intCast(last.active_builds),
+            .last_builds_started = @intCast(last.builds_started),
+            .last_worker_steps = @intCast(last.worker_steps),
+            .last_coordinator_steps = @intCast(last.coordinator_steps),
+            .last_pages_claimed = @intCast(last.pages_claimed),
+            .last_pages_completed = @intCast(last.pages_completed),
+            .last_phases_advanced = @intCast(last.phases_advanced),
+            .last_published = @intCast(last.published),
+            .last_failed_builds = @intCast(last.failed_builds),
+            .last_budget_exhausted = last.budget_exhausted,
+        };
     }
 
     pub fn stats(self: *DB, alloc: Allocator) !types.DBStats {
@@ -20814,6 +21294,7 @@ pub const DB = struct {
                             visible_doc_count = @max(visible_doc_count, item.doc_count);
                         }
                         applyGraphAlgebraicRuntimeStats(&item, &entry.index);
+                        try populateGraphMetricStatusStats(alloc, &item, &entry.index);
                     }
                 },
                 .algebraic => try self.populateAlgebraicIndexStats(alloc, cfg.name, &item, false),
@@ -20843,6 +21324,7 @@ pub const DB = struct {
             .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
             .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStatsSnapshot(),
+            .graph_metric_runtime = self.graphMetricRuntimeStats(),
             .term_doc_freq_cache_hits = term_doc_freq_cache_hits,
             .term_doc_freq_cache_misses = term_doc_freq_cache_misses,
             .async_indexing = async_indexing,
@@ -21045,6 +21527,7 @@ pub const DB = struct {
             .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
             .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStats(),
+            .graph_metric_runtime = self.graphMetricRuntimeStats(),
             .term_doc_freq_cache_hits = blk: {
                 var total: u64 = 0;
                 for (configs) |cfg| {
@@ -21832,13 +22315,14 @@ pub const DB = struct {
             var composed = try self.searchComposed(alloc, selection_req, exec_ctx);
             errdefer composed.deinit();
             try self.populateCanonicalGroupedMatches(alloc, execution_req, exec_ctx, &composed);
+            try self.applyGraphMetricRerank(&composed, execution_req);
             if (externalize_artifact_ids) try externalizeSearchResultArtifactIds(alloc, &composed);
             return composed;
         }
 
-        const has_primary = selection_req.full_text != null or selection_req.dense != null or selection_req.sparse != null or !db_query_search.isDefaultMatchAll(selection_req.query) or selection_req.graph_queries.len == 0;
+        const has_primary = selection_req.full_text != null or selection_req.dense != null or selection_req.sparse != null or !db_query_search.isDefaultMatchAll(selection_req.query) or (selection_req.graph_queries.len == 0 and selection_req.graph_metric_queries.len == 0);
 
-        var base = if (!has_primary and selection_req.graph_queries.len > 0)
+        var base = if (!has_primary and (selection_req.graph_queries.len > 0 or selection_req.graph_metric_queries.len > 0))
             try db_query_search.emptySearchResult(alloc)
         else if (selection_req.full_text) |text|
             try self.searchTextQuery(alloc, selection_req, text)
@@ -21875,6 +22359,11 @@ pub const DB = struct {
         errdefer base.deinit();
         try self.populateCanonicalGroupedMatches(alloc, execution_req, exec_ctx, &base);
 
+        if (execution_req.graph_metric_queries.len > 0) {
+            base.graph_metric_results = try self.executeGraphMetricQueries(alloc, execution_req.graph_metric_queries);
+        }
+        try self.applyGraphMetricRerank(&base, execution_req);
+
         if (execution_req.graph_queries.len == 0) {
             if (externalize_artifact_ids) try externalizeSearchResultArtifactIds(alloc, &base);
             return base;
@@ -21884,6 +22373,121 @@ pub const DB = struct {
         try self.applyGraphExpandStrategy(alloc, &base, execution_req.expand_strategy);
         if (externalize_artifact_ids) try externalizeSearchResultArtifactIds(alloc, &base);
         return base;
+    }
+
+    fn executeGraphMetricQueries(
+        self: *DB,
+        alloc: Allocator,
+        queries: []const types.NamedGraphMetricQuery,
+    ) ![]types.GraphMetricResult {
+        if (queries.len == 0) return &.{};
+        const results = try alloc.alloc(types.GraphMetricResult, queries.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (results[0..initialized]) |*result| result.deinit(alloc);
+            alloc.free(results);
+        }
+        for (queries, 0..) |named, i| {
+            results[i] = try self.executeGraphMetricQuery(alloc, named);
+            initialized += 1;
+        }
+        return results;
+    }
+
+    fn applyGraphMetricRerank(self: *DB, result: *types.SearchResult, req: types.SearchRequest) !void {
+        const rerank = req.graph_metric_rerank orelse return;
+        if (req.count_only) return error.UnsupportedQueryRequest;
+        const entry = self.core.graphIndex(rerank.index_name) orelse return error.IndexNotFound;
+        var status = try entry.index.graphMetricStatus(rerank.metric_name);
+        defer status.deinit(entry.index.alloc);
+        if (status.published_generation == 0) return error.MetricNotReady;
+        if (rerank.freshness == .fresh and status.state != .fresh) return error.MetricStale;
+
+        var result_status = try cloneGraphMetricStatusFromGraph(result.alloc, status);
+        errdefer result_status.deinit(result.alloc);
+        for (result.hits) |*hit| {
+            const metric_score_optional = try entry.index.graphMetricScore(rerank.metric_name, hit.id);
+            const metric_score = metric_score_optional orelse rerank.missing_score;
+            const base_score: f64 = if (hit.score) |score| @floatCast(score) else 0.0;
+            const final_score = clampF64ToF32(rerank.base_weight * base_score + rerank.weight * metric_score);
+            var details = types.GraphMetricRerankScoreDetails{
+                .index_name = try result.alloc.dupe(u8, rerank.index_name),
+                .metric_name = undefined,
+                .base_score = base_score,
+                .base_weight = rerank.base_weight,
+                .metric_score = metric_score_optional,
+                .metric_score_used = metric_score,
+                .metric_weight = rerank.weight,
+                .missing_score_used = metric_score_optional == null,
+                .final_score = final_score,
+                .published_generation = status.published_generation,
+            };
+            errdefer result.alloc.free(details.index_name);
+            details.metric_name = try result.alloc.dupe(u8, rerank.metric_name);
+            if (hit.score_details) |*old| old.deinit(result.alloc);
+            hit.score_details = details;
+            hit.score = final_score;
+        }
+        std.mem.sort(types.SearchHit, result.hits, {}, struct {
+            fn lessThan(_: void, a: types.SearchHit, b: types.SearchHit) bool {
+                const a_score = a.score orelse 0.0;
+                const b_score = b.score orelse 0.0;
+                if (a_score == b_score) return std.mem.lessThan(u8, a.id, b.id);
+                return a_score > b_score;
+            }
+        }.lessThan);
+        if (result.graph_metric_rerank_status) |*old| old.deinit(result.alloc);
+        result.graph_metric_rerank_status = result_status;
+    }
+
+    fn clampF64ToF32(value: f64) f32 {
+        const max = std.math.floatMax(f32);
+        if (value > max) return max;
+        if (value < -max) return -max;
+        return @floatCast(value);
+    }
+
+    fn executeGraphMetricQuery(
+        self: *DB,
+        alloc: Allocator,
+        named: types.NamedGraphMetricQuery,
+    ) !types.GraphMetricResult {
+        const entry = self.core.graphIndex(named.query.index_name) orelse return error.IndexNotFound;
+        var status = try entry.index.graphMetricStatus(named.query.metric_name);
+        defer status.deinit(entry.index.alloc);
+        if (status.published_generation == 0) return error.MetricNotReady;
+        if (named.query.freshness == .fresh and status.state != .fresh) return error.MetricStale;
+
+        const raw_scores = try entry.index.graphMetricTopK(named.query.metric_name, named.query.top_k);
+        defer {
+            for (raw_scores) |*score| score.deinit(entry.index.alloc);
+            if (raw_scores.len > 0) entry.index.alloc.free(raw_scores);
+        }
+        const scores = try alloc.alloc(types.GraphMetricScore, raw_scores.len);
+        var initialized_scores: usize = 0;
+        errdefer {
+            for (scores[0..initialized_scores]) |*score| score.deinit(alloc);
+            alloc.free(scores);
+        }
+        for (raw_scores, 0..) |score, i| {
+            scores[i] = .{ .node = try alloc.dupe(u8, score.node), .score = score.score };
+            initialized_scores += 1;
+        }
+        const name = try alloc.dupe(u8, named.name);
+        errdefer alloc.free(name);
+        const index_name = try alloc.dupe(u8, named.query.index_name);
+        errdefer alloc.free(index_name);
+        const metric_name = try alloc.dupe(u8, named.query.metric_name);
+        errdefer alloc.free(metric_name);
+        var owned_status = try cloneGraphMetricStatusFromGraph(alloc, status);
+        errdefer owned_status.deinit(alloc);
+        return .{
+            .name = name,
+            .index_name = index_name,
+            .metric_name = metric_name,
+            .scores = scores,
+            .status = owned_status,
+        };
     }
 
     fn hierarchyChildrenInaccessibleParentResult(
@@ -22345,7 +22949,7 @@ pub const DB = struct {
             else => return null,
         };
         if (!db_query_search.isDefaultMatchAll(req.query)) return null;
-        if (req.graph_queries.len != 0 or req.expand_strategy != null) return null;
+        if (req.graph_queries.len != 0 or req.graph_metric_queries.len != 0 or req.expand_strategy != null) return null;
         if (req.dense != null or req.sparse != null) return null;
         if (req.dense_queries.len == 1 and req.sparse_queries.len == 0) {
             var next = req;

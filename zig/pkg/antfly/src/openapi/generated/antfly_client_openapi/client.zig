@@ -1296,6 +1296,23 @@ pub const Client = struct {
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
     }
 
+    /// Execute a graph metric operational action
+    /// POST /db/v1/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}
+    pub fn executeGraphMetricAction(self: *@This(), table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !ApiResponse(types.GraphMetricActionResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
+        defer self.allocator.free(encoded_index_name);
+        const encoded_metric_name = try httpx.PercentEncoding.encode(self.allocator, metric_name);
+        defer self.allocator.free(encoded_metric_name);
+        const encoded_action = try httpx.PercentEncoding.encode(self.allocator, action);
+        defer self.allocator.free(encoded_action);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/indexes/{s}/graph-metrics/{s}:{s}", .{ self.base_url, encoded_table_name, encoded_index_name, encoded_metric_name, encoded_action });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.GraphMetricActionResponse).fromResponse(self.allocator, &resp);
+    }
+
     /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
     /// POST /db/v1/tables/{tableName}/merge
     pub fn linearMerge(self: *@This(), table_name: []const u8, body: types.LinearMergeRequest) !ApiResponse(types.LinearMergeResult) {

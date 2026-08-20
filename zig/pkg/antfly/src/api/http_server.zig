@@ -7389,6 +7389,7 @@ pub const ApiHttpServer = struct {
                 .execute_table_get_index = executePublicTableGetIndex,
                 .execute_table_create_index = executePublicTableCreateIndex,
                 .execute_table_delete_index = executePublicTableDeleteIndex,
+                .execute_table_graph_metric_action = executePublicTableGraphMetricAction,
                 .execute_put_artifact_enrichment = executePublicPutArtifactEnrichment,
                 .execute_delete_artifact_enrichment = executePublicDeleteArtifactEnrichment,
                 .execute_list_artifact_enrichments = executePublicListArtifactEnrichments,
@@ -9143,6 +9144,28 @@ pub const ApiHttpServer = struct {
                 return error.InternalFailure;
             },
         }) orelse error.MethodNotAllowed;
+    }
+
+    fn executePublicTableGraphMetricAction(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+    ) public_table_http.TableApi.ExecuteGraphMetricActionError![]u8 {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const source = self.table_writes orelse return error.MethodNotAllowed;
+        var status = (source.graphMetricAction(alloc, table_name, index_name, metric_name, action) catch |err| switch (err) {
+            error.InvalidGraphMetricAction => return error.InvalidGraphMetricAction,
+            error.TableNotFound, error.IndexNotFound, error.MetricNotReady => return error.NotFound,
+            else => {
+                std.log.err("public graph metric action failed table={s} index={s} metric={s} action={s} err={}", .{ table_name, index_name, metric_name, action, err });
+                return error.InternalFailure;
+            },
+        }) orelse return error.NotFound;
+        defer status.deinit(alloc);
+        return indexes_api.encodeGraphMetricStatusResponse(alloc, status) catch return error.InternalFailure;
     }
 
     fn executePublicClusterBackupList(

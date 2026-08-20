@@ -30,6 +30,7 @@ pub const Stats = struct {
     lease_owned: bool = false,
     has_lease: bool = false,
     acquisition_count: u64 = 0,
+    takeover_count: u64 = 0,
     lease_acquire_failures: u64 = 0,
     lost_leases: u64 = 0,
     last_acquired_ms: u64 = 0,
@@ -42,6 +43,7 @@ pub const State = struct {
     lease_ttl_ms: u64,
     has_lease: bool,
     acquisition_count: u64,
+    takeover_count: u64,
     lease_acquire_failures: u64,
     lost_leases: u64,
     last_acquired_ms: u64,
@@ -54,6 +56,7 @@ pub const State = struct {
             .lease_ttl_ms = config.lease_ttl_ms,
             .has_lease = !config.lease_owned,
             .acquisition_count = 0,
+            .takeover_count = 0,
             .lease_acquire_failures = 0,
             .lost_leases = 0,
             .last_acquired_ms = 0,
@@ -67,6 +70,12 @@ pub const State = struct {
         self.* = undefined;
     }
 
+    pub fn deinitPreserveLease(self: *State, alloc: Allocator) void {
+        self.lease.deinit();
+        alloc.free(self.owner_id);
+        self.* = undefined;
+    }
+
     pub fn ensureLease(self: *State, now_ms: u64) !bool {
         if (!self.lease_owned) {
             self.has_lease = true;
@@ -74,13 +83,14 @@ pub const State = struct {
         }
 
         const had_lease = self.has_lease;
-        const acquired = try self.lease.tryAcquire(self.owner_id, now_ms, self.lease_ttl_ms);
-        if (acquired) {
+        const acquired = try self.lease.tryAcquireDetailed(self.owner_id, now_ms, self.lease_ttl_ms);
+        if (acquired.acquiredLease()) {
             self.has_lease = true;
             if (!had_lease) {
                 self.acquisition_count += 1;
                 self.last_acquired_ms = now_ms;
             }
+            if (acquired == .takeover) self.takeover_count += 1;
             return true;
         }
 
@@ -103,11 +113,25 @@ pub const State = struct {
         self.has_lease = !self.lease_owned;
     }
 
+    pub fn releaseHeldLease(self: *State) !bool {
+        const released = if (self.lease_owned)
+            try self.lease.release(self.owner_id)
+        else
+            false;
+        self.has_lease = !self.lease_owned;
+        return released;
+    }
+
+    pub fn loadLease(self: *State, alloc: Allocator) !?lease_mod.LeaseRecord {
+        return try self.lease.load(alloc);
+    }
+
     pub fn stats(self: *const State) Stats {
         return .{
             .lease_owned = self.lease_owned,
             .has_lease = self.has_lease,
             .acquisition_count = self.acquisition_count,
+            .takeover_count = self.takeover_count,
             .lease_acquire_failures = self.lease_acquire_failures,
             .lost_leases = self.lost_leases,
             .last_acquired_ms = self.last_acquired_ms,

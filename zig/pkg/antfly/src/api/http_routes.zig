@@ -99,6 +99,7 @@ pub const Routes = struct {
     pub const graph_expand_suffix = "/graph-expand";
     pub const graph_hydrate_suffix = "/graph-hydrate";
     pub const graph_edges_suffix = "/graph-edges";
+    pub const graph_metric_maintenance_suffix = "/graph-metric-maintenance";
     pub const vector_worker_suffix = "/vector-worker";
     pub const txn_begin_suffix = "/txn-begin";
     pub const txn_prepare_suffix = "/txn-prepare";

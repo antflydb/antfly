@@ -4312,6 +4312,8 @@ pub const BoundTableWriteSource = struct {
                 .put_artifact_enrichment = putArtifactEnrichment,
                 .delete_artifact_enrichment = deleteArtifactEnrichment,
                 .drop_index = dropIndex,
+                .graph_metric_action = graphMetricAction,
+                .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .backup_table = backupTable,
                 .restore_table = restoreTable,
                 .commit_transaction = commitTransaction,
@@ -5009,6 +5011,37 @@ pub const BoundTableWriteSource = struct {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         _ = try (try self.activeDb()).deleteIndex(index_name);
+    }
+
+    fn graphMetricAction(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+    ) !?db_mod.types.GraphMetricStatus {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        const db = try self.activeDb();
+        if (std.mem.eql(u8, action, "refresh")) return try db.refreshGraphMetric(alloc, index_name, metric_name);
+        if (std.mem.eql(u8, action, "rebuild")) return try db.rebuildGraphMetric(alloc, index_name, metric_name);
+        if (std.mem.eql(u8, action, "delete")) return try db.deleteGraphMetricMaterialization(alloc, index_name, metric_name);
+        if (std.mem.eql(u8, action, "pause")) return try db.pauseGraphMetricMaintenance(alloc, index_name, metric_name);
+        if (std.mem.eql(u8, action, "resume")) return try db.resumeGraphMetricMaintenance(alloc, index_name, metric_name);
+        return error.InvalidGraphMetricAction;
+    }
+
+    fn graphMetricMaintenanceGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        _: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?[]u8 {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        return try (try self.activeDb()).runGraphMetricServiceMaintenanceJsonAlloc(alloc, body);
     }
 
     fn batchGroupLocal(
@@ -12808,6 +12841,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .delete_artifact_enrichment = deleteArtifactEnrichment,
                 .drop_index = dropIndex,
                 .drop_table = dropTable,
+                .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .commit_transaction = commitTransaction,
                 .commit_batch = commitBatch,
                 .commit_transaction_with_id = commitTransactionWithId,
@@ -12846,6 +12880,33 @@ pub const ProvisionedTableWriteSource = struct {
                 .request_table_index_structural_reconcile = requestTableIndexStructuralReconcile,
             },
         };
+    }
+
+    fn graphMetricMaintenanceGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?[]u8 {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+
+        if (self.write_cache) |cache| {
+            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
+            defer cached.deinit(alloc);
+            return try cached.db.runGraphMetricServiceMaintenanceJsonAlloc(alloc, body);
+        }
+
+        var db = openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror) catch |err| switch (err) {
+            error.FileNotFound => return error.UnknownGroup,
+            else => return err,
+        };
+        defer db.close();
+        return try db.runGraphMetricServiceMaintenanceJsonAlloc(alloc, body);
     }
 
     fn putArtifactEnrichment(
@@ -16501,6 +16562,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .put_artifact_enrichment = putArtifactEnrichment,
                 .delete_artifact_enrichment = deleteArtifactEnrichment,
                 .drop_index = dropIndex,
+                .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .commit_transaction = commitTransaction,
                 .commit_batch = commitBatch,
                 .commit_transaction_with_id = commitTransactionWithId,
@@ -16533,6 +16595,22 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .local_runtime_statuses = localRuntimeStatuses,
             },
         };
+    }
+
+    fn graphMetricMaintenanceGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?[]u8 {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default_async);
+        defer cached.deinit(hosted_cache.write_cache.alloc);
+        return try cached.db.runGraphMetricServiceMaintenanceJsonAlloc(alloc, body);
     }
 
     fn createIndex(

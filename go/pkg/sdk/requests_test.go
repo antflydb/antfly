@@ -264,3 +264,78 @@ func TestQueryRequestMarshalPreservesJoin(t *testing.T) {
 		t.Fatalf("Marshal encoded unexpected join: %s", body)
 	}
 }
+
+func TestGraphIndexStatsRuntimeSummaryRoundTrip(t *testing.T) {
+	body, err := json.Marshal(GraphIndexStats{
+		IndexType:  GraphIndexStatsIndexType("graph"),
+		TotalEdges: 4,
+		GraphMetricRuntime: GraphMetricRuntimeStats{
+			Enabled:             true,
+			Role:                GraphMetricRuntimeStatsRole("worker_pool"),
+			OwnerIdHash:         17,
+			WorkerCount:         3,
+			TakeoverCount:       2,
+			LostLeases:          1,
+			TotalPagesClaimed:   6,
+			LastPagesCompleted:  3,
+			LastBudgetExhausted: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Marshal graph stats: %v", err)
+	}
+	for _, want := range [][]byte{
+		[]byte(`"graph_metric_runtime"`),
+		[]byte(`"role":"worker_pool"`),
+		[]byte(`"owner_id_hash":17`),
+		[]byte(`"last_budget_exhausted":true`),
+	} {
+		if !bytes.Contains(body, want) {
+			t.Fatalf("Marshal omitted graph metric runtime field %s: %s", want, body)
+		}
+	}
+
+	var stats GraphIndexStats
+	if err := json.Unmarshal(body, &stats); err != nil {
+		t.Fatalf("Unmarshal graph stats: %v", err)
+	}
+	if stats.GraphMetricRuntime.Role != GraphMetricRuntimeStatsRole("worker_pool") {
+		t.Fatalf("unexpected runtime role: %q", stats.GraphMetricRuntime.Role)
+	}
+	if stats.GraphMetricRuntime.OwnerIdHash != 17 ||
+		stats.GraphMetricRuntime.WorkerCount != 3 ||
+		stats.GraphMetricRuntime.TotalPagesClaimed != 6 ||
+		!stats.GraphMetricRuntime.LastBudgetExhausted {
+		t.Fatalf("unexpected runtime summary: %+v", stats.GraphMetricRuntime)
+	}
+}
+
+func TestQueryRequestMarshalPreservesDirectGraphMetricQuery(t *testing.T) {
+	body, err := json.Marshal(QueryRequest{
+		Table: "docs",
+		GraphMetric: &GraphMetricQuery{
+			Name:            "central",
+			Index:           "graph_idx",
+			Metric:          "pagerank",
+			TopK:            25,
+			MetricFreshness: GraphMetricQueryMetricFreshness("fresh"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Marshal graph metric query: %v", err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("Unmarshal graph metric query: %v", err)
+	}
+	metric, ok := decoded["graph_metric"].(map[string]any)
+	if !ok {
+		t.Fatalf("graph_metric missing from request: %s", body)
+	}
+	if metric["name"] != "central" || metric["index"] != "graph_idx" ||
+		metric["metric"] != "pagerank" || metric["top_k"] != float64(25) ||
+		metric["metric_freshness"] != "fresh" {
+		t.Fatalf("unexpected graph_metric payload: %#v", metric)
+	}
+}

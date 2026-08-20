@@ -15,6 +15,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
+const graph_mod = @import("../../../graph/graph.zig");
 const graph_query_mod = @import("../../../graph/query.zig");
 const graph_pattern_mod = @import("../../../graph/pattern.zig");
 const graph_node_identity = @import("../../../graph/node_identity.zig");
@@ -1208,7 +1209,7 @@ pub fn executeSingleNonPatternQueryWithSets(
         start_key_refs,
         target_keys,
     );
-    errdefer graph_result.deinit(alloc);
+    defer graph_result.deinit(alloc);
     if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
         graph_result.nodes = try filterGraphResultNodes(
             alloc,
@@ -1237,6 +1238,11 @@ pub fn executeSingleNonPatternQueryWithSets(
     }
 
     const name = try alloc.dupe(u8, named.name);
+    errdefer alloc.free(name);
+    const metric_status = if (named.query.include_metric_status)
+        try cloneGraphMetricStatusesFromGraph(alloc, graph_result.metric_status)
+    else
+        @constCast((&[_]types.GraphMetricStatus{})[0..]);
     const nodes = graph_result.nodes;
     graph_result.nodes = &.{};
 
@@ -1247,7 +1253,76 @@ pub fn executeSingleNonPatternQueryWithSets(
         .matches = &.{},
         .hits = hits,
         .total_hits = total_hits,
+        .metric_status = metric_status,
     };
+}
+
+fn cloneGraphMetricStatusesFromGraph(
+    alloc: Allocator,
+    statuses: []const graph_query_mod.GraphMetricStatus,
+) ![]types.GraphMetricStatus {
+    if (statuses.len == 0) return &.{};
+    const out = try alloc.alloc(types.GraphMetricStatus, statuses.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*status| status.deinit(alloc);
+        alloc.free(out);
+    }
+    for (statuses, 0..) |status, i| {
+        const name = try alloc.dupe(u8, status.name);
+        var name_moved = false;
+        errdefer if (!name_moved) alloc.free(name);
+        var edge_filter = try status.edge_filter.cloneAlloc(alloc);
+        var edge_filter_moved = false;
+        errdefer if (!edge_filter_moved) edge_filter.deinit(alloc);
+        const recent_events = if (status.recent_events.len > 0)
+            try alloc.dupe(graph_mod.GraphIndex.GraphMetricEvent, status.recent_events)
+        else
+            @constCast((&[_]graph_mod.GraphIndex.GraphMetricEvent{})[0..]);
+        var recent_events_moved = false;
+        errdefer if (!recent_events_moved and recent_events.len > 0) alloc.free(recent_events);
+        const last_error = if (status.last_error.len > 0) try alloc.dupe(u8, status.last_error) else "";
+        var last_error_moved = false;
+        errdefer if (!last_error_moved and last_error.len > 0) alloc.free(last_error);
+        const build_worker_id = if (status.build_worker_id.len > 0) try alloc.dupe(u8, status.build_worker_id) else "";
+        var build_worker_id_moved = false;
+        errdefer if (!build_worker_id_moved and build_worker_id.len > 0) alloc.free(build_worker_id);
+        out[i] = .{
+            .name = name,
+            .state = status.state,
+            .phase = status.phase,
+            .edge_filter = edge_filter,
+            .metadata_version = status.metadata_version,
+            .maintenance_paused = status.maintenance_paused,
+            .build_queued = status.build_queued,
+            .published_generation = status.published_generation,
+            .edge_generation = status.edge_generation,
+            .target_edge_generation = status.target_edge_generation,
+            .queued_generation = status.queued_generation,
+            .building_generation = status.building_generation,
+            .build_job_id = status.build_job_id,
+            .build_started_at_ms = status.build_started_at_ms,
+            .build_iteration = status.build_iteration,
+            .build_lease_expires_at_ms = status.build_lease_expires_at_ms,
+            .build_worker_id = build_worker_id,
+            .retry_count = status.retry_count,
+            .last_error = last_error,
+            .progress = status.progress,
+            .converged = status.converged,
+            .iterations_completed = status.iterations_completed,
+            .delta = status.delta,
+            .computed_at_ms = status.computed_at_ms,
+            .last_event = status.last_event,
+            .recent_events = recent_events,
+        };
+        name_moved = true;
+        edge_filter_moved = true;
+        recent_events_moved = true;
+        last_error_moved = true;
+        build_worker_id_moved = true;
+        initialized += 1;
+    }
+    return out;
 }
 
 pub fn executeSearchGraphWithSets(
@@ -5697,4 +5772,123 @@ test "graph query result doc-set resolution receives identity generation" {
     }
 
     try std.testing.expect(harness.saw_generation);
+}
+test "db query result shape executeSingleNonPatternQueryWithSets hides metric status unless requested" {
+    const alloc = std.testing.allocator;
+
+    const Harness = struct {
+        fn findShortestPath(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: *const types.NamedGraphQuery,
+            _: []const u8,
+            _: []const u8,
+        ) anyerror!?types.GraphPath {
+            return null;
+        }
+
+        fn findKShortestPaths(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            _: *const types.NamedGraphQuery,
+            _: []const u8,
+            _: []const u8,
+        ) anyerror![]types.GraphPath {
+            return try alloc_inner.alloc(types.GraphPath, 0);
+        }
+
+        fn executeGraphQuery(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            _: *const types.NamedGraphQuery,
+            _: []const []const u8,
+            _: [][]u8,
+        ) anyerror!graph_query_mod.GraphQueryResult {
+            const metric_status = try alloc_inner.alloc(graph_query_mod.GraphMetricStatus, 1);
+            metric_status[0] = .{
+                .name = try alloc_inner.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .converged = true,
+            };
+            return .{
+                .nodes = try alloc_inner.alloc(graph_query_mod.GraphResultNode, 0),
+                .matches = &.{},
+                .metric_status = metric_status,
+            };
+        }
+
+        fn loadProjectedDocument(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+        ) anyerror!?[]u8 {
+            return null;
+        }
+    };
+
+    const graph_metric_orders = [_]graph_query_mod.GraphMetricOrder{.{
+        .name = "pagerank",
+        .freshness = .published,
+    }};
+    var named = types.NamedGraphQuery{
+        .name = "tree_search",
+        .query = .{
+            .query_type = .traverse,
+            .index_name = "doc_hierarchy",
+            .start_nodes = .{ .keys = &.{"doc:root"} },
+            .params = .{},
+            .order_by = &graph_metric_orders,
+        },
+    };
+    const executor = NonPatternQueryExecutor{
+        .ctx = null,
+        .find_shortest_path = Harness.findShortestPath,
+        .find_k_shortest_paths = Harness.findKShortestPaths,
+        .execute_graph_query = Harness.executeGraphQuery,
+        .load_projected_document = Harness.loadProjectedDocument,
+    };
+
+    var hidden = try executeSingleNonPatternQueryWithSets(alloc, .{ .limit = 10 }, &named, &.{}, executor);
+    defer hidden.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), hidden.metric_status.len);
+
+    named.query.include_metric_status = true;
+    var included = try executeSingleNonPatternQueryWithSets(alloc, .{ .limit = 10 }, &named, &.{}, executor);
+    defer included.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), included.metric_status.len);
+    try std.testing.expectEqualStrings("pagerank", included.metric_status[0].name);
+    try std.testing.expectEqual(@as(u64, 5), included.metric_status[0].published_generation);
+}
+
+test "graph metric status clone owns active build worker id" {
+    const alloc = std.testing.allocator;
+
+    const worker_id = try alloc.dupe(u8, "worker-a");
+    defer alloc.free(worker_id);
+    const statuses = [_]graph_query_mod.GraphMetricStatus{.{
+        .name = "pagerank",
+        .state = .building,
+        .phase = .computing,
+        .build_queued = true,
+        .building_generation = 7,
+        .build_job_id = 12345,
+        .build_iteration = 3,
+        .build_worker_id = worker_id,
+    }};
+
+    const cloned = try cloneGraphMetricStatusesFromGraph(alloc, &statuses);
+    defer {
+        for (cloned) |*status| status.deinit(alloc);
+        alloc.free(cloned);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), cloned.len);
+    try std.testing.expectEqualStrings("worker-a", cloned[0].build_worker_id);
+    try std.testing.expect(cloned[0].build_worker_id.ptr != worker_id.ptr);
+    try std.testing.expectEqual(@as(u64, 12345), cloned[0].build_job_id);
 }

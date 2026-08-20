@@ -246,13 +246,41 @@ type (
 	ReplicationRoute       = oapi.ReplicationRoute
 
 	// Graph index types
-	GraphIndexConfig       = oapi.GraphIndexConfig
-	GraphIndexStats        = oapi.GraphIndexStats
-	EdgeTypeConfig         = oapi.EdgeTypeConfig
-	EdgeTypeConfigTopology = oapi.EdgeTypeConfigTopology
-	EdgeDirection          = oapi.EdgeDirection
-	Edge                   = oapi.Edge
-	EdgesResponse          = oapi.EdgesResponse
+	GraphIndexConfig                    = oapi.GraphIndexConfig
+	GraphIndexStats                     = oapi.GraphIndexStats
+	GraphIndexStatsIndexType            = oapi.GraphIndexStatsIndexType
+	GraphMetricActionResponse           = oapi.GraphMetricActionResponse
+	GraphMetricBuildPageStatus          = oapi.GraphMetricBuildPageStatus
+	GraphMetricBuildPageStatusRangeKind = oapi.GraphMetricBuildPageStatusRangeKind
+	GraphMetricBuildPageStatusState     = oapi.GraphMetricBuildPageStatusState
+	GraphMetricEdgeFilterStatus         = oapi.GraphMetricEdgeFilterStatus
+	GraphMetricEdgeFilterStatusMode     = oapi.GraphMetricEdgeFilterStatusMode
+	GraphMetricEvent                    = oapi.GraphMetricEvent
+	GraphMetricEventKind                = oapi.GraphMetricEventKind
+	GraphMetricFilter                   = oapi.GraphMetricFilter
+	GraphMetricFilterOp                 = oapi.GraphMetricFilterOp
+	GraphMetricOrder                    = oapi.GraphMetricOrder
+	GraphMetricOrderDirection           = oapi.GraphMetricOrderDirection
+	GraphMetricOrderNulls               = oapi.GraphMetricOrderNulls
+	GraphMetricProfile                  = oapi.GraphMetricProfile
+	GraphMetricQuery                    = oapi.GraphMetricQuery
+	GraphMetricQueryMetricFreshness     = oapi.GraphMetricQueryMetricFreshness
+	GraphMetricRerank                   = oapi.GraphMetricRerank
+	GraphMetricRerankMetricFreshness    = oapi.GraphMetricRerankMetricFreshness
+	GraphMetricRerankScoreDetails       = oapi.GraphMetricRerankScoreDetails
+	GraphMetricResult                   = oapi.GraphMetricResult
+	GraphMetricRuntimeStats             = oapi.GraphMetricRuntimeStats
+	GraphMetricRuntimeStatsRole         = oapi.GraphMetricRuntimeStatsRole
+	GraphMetricScore                    = oapi.GraphMetricScore
+	GraphMetricStatus                   = oapi.GraphMetricStatus
+	GraphMetricStatusPhase              = oapi.GraphMetricStatusPhase
+	GraphQueryMetricFreshness           = oapi.GraphQueryMetricFreshness
+	QueryScoreDetails                   = oapi.QueryScoreDetails
+	EdgeTypeConfig                      = oapi.EdgeTypeConfig
+	EdgeTypeConfigTopology              = oapi.EdgeTypeConfigTopology
+	EdgeDirection                       = oapi.EdgeDirection
+	Edge                                = oapi.Edge
+	EdgesResponse                       = oapi.EdgesResponse
 
 	// Graph query types
 	GraphQuery        = oapi.GraphQuery

@@ -889,6 +889,194 @@ pub const GraphIndexStats = struct {
     promotion: ?std.json.Value = null,
     /// Algebraic graph execution health for bounded semiring traversal.
     algebraic_graph: ?std.json.Value = null,
+    graph_metric_runtime: ?GraphMetricRuntimeStats = null,
+};
+
+pub const GraphMetricBuildPageStatus = struct {
+    phase: []const u8,
+    iteration: i64,
+    page_id: i64,
+    state: []const u8,
+    range_kind: []const u8,
+    /// Worker id that owns or last failed this page.
+    worker_id: ?[]const u8 = null,
+    /// Unix epoch milliseconds when the page lease expires, or 0 when not leased.
+    lease_expires_at_ms: ?i64 = null,
+    /// Current attempt number for this page.
+    attempt: ?i64 = null,
+    /// Opaque resumable cursor for this page.
+    cursor: ?[]const u8 = null,
+    /// Completed work units for this page.
+    completed_units: ?i64 = null,
+    /// Estimated total work units for this page.
+    total_units: ?i64 = null,
+    /// Last page-level error.
+    last_error: ?[]const u8 = null,
+};
+
+pub const GraphMetricEdgeFilterStatus = struct {
+    mode: []const u8,
+    types: ?[]const []const u8 = null,
+};
+
+pub const GraphMetricEvent = struct {
+    sequence: i64,
+    kind: []const u8,
+    at_ms: i64,
+    target_edge_generation: i64,
+    published_generation: i64,
+    score_count: i64,
+};
+
+pub const GraphMetricFilter = struct {
+    metric: []const u8,
+    op: []const u8,
+    value: f64,
+};
+
+pub const GraphMetricOrder = struct {
+    metric: []const u8,
+    direction: ?[]const u8 = null,
+    nulls: ?[]const u8 = null,
+};
+
+pub const GraphMetricQuery = struct {
+    /// Optional result key. Defaults to the metric name.
+    name: ?[]const u8 = null,
+    /// Graph index that owns the published metric.
+    index: []const u8,
+    /// Graph metric to read.
+    metric: []const u8,
+    /// Maximum globally ranked metric scores to return after shard fan-in.
+    top_k: ?i32 = null,
+    /// Whether the latest published generation may be stale or must match the graph edge generation.
+    metric_freshness: ?[]const u8 = null,
+};
+
+pub const GraphMetricRerank = struct {
+    /// Graph index that owns the published metric.
+    index: []const u8,
+    /// Graph metric name to blend into the search hit score.
+    metric: []const u8,
+    /// Multiplier applied to the existing hit score before adding the graph metric feature.
+    base_weight: ?f64 = null,
+    /// Multiplier applied to the graph metric score before it is added to the existing hit score.
+    weight: ?f64 = null,
+    /// Metric feature value to use for hits that do not have a score in the published metric generation.
+    missing_score: ?f64 = null,
+    /// Whether stale published generations are acceptable or the metric must be fresh.
+    metric_freshness: ?[]const u8 = null,
+};
+
+pub const GraphMetricResult = struct {
+    index_name: []const u8,
+    metric: []const u8,
+    scores: []const GraphMetricScore,
+    status: GraphMetricStatus,
+};
+
+/// Summarized graph metric maintenance runtime state. Identity fields are stable hashes, not raw process or owner identifiers.
+pub const GraphMetricRuntimeStats = struct {
+    enabled: ?bool = null,
+    role: ?[]const u8 = null,
+    runtime_id_hash: ?i64 = null,
+    owner_id_hash: ?i64 = null,
+    lease_key_hash: ?i64 = null,
+    worker_id_hash: ?i64 = null,
+    worker_count: ?i64 = null,
+    lease_owned: ?bool = null,
+    has_lease: ?bool = null,
+    acquisition_count: ?i64 = null,
+    takeover_count: ?i64 = null,
+    lease_acquire_failures: ?i64 = null,
+    lost_leases: ?i64 = null,
+    last_acquired_ms: ?i64 = null,
+    started: ?bool = null,
+    shutdown: ?bool = null,
+    notified: ?bool = null,
+    ticks_started: ?i64 = null,
+    ticks_completed: ?i64 = null,
+    durable_progress_ticks: ?i64 = null,
+    idle_ticks: ?i64 = null,
+    error_ticks: ?i64 = null,
+    last_error_name: ?[]const u8 = null,
+    total_metrics_scanned: ?i64 = null,
+    total_active_builds: ?i64 = null,
+    total_builds_started: ?i64 = null,
+    total_worker_steps: ?i64 = null,
+    total_coordinator_steps: ?i64 = null,
+    total_pages_claimed: ?i64 = null,
+    total_pages_completed: ?i64 = null,
+    total_phases_advanced: ?i64 = null,
+    total_published: ?i64 = null,
+    total_failed_builds: ?i64 = null,
+    last_metrics_scanned: ?i64 = null,
+    last_active_builds: ?i64 = null,
+    last_builds_started: ?i64 = null,
+    last_worker_steps: ?i64 = null,
+    last_coordinator_steps: ?i64 = null,
+    last_pages_claimed: ?i64 = null,
+    last_pages_completed: ?i64 = null,
+    last_phases_advanced: ?i64 = null,
+    last_published: ?i64 = null,
+    last_failed_builds: ?i64 = null,
+    last_budget_exhausted: ?bool = null,
+};
+
+pub const GraphMetricScore = struct {
+    node: []const u8,
+    score: f64,
+};
+
+pub const GraphMetricStatus = struct {
+    state: []const u8,
+    phase: []const u8,
+    edge_filter: ?GraphMetricEdgeFilterStatus = null,
+    /// Version of the published graph metric metadata schema.
+    metadata_version: ?i64 = null,
+    maintenance_paused: ?bool = null,
+    /// Whether a local or distributed build is queued after the currently published or building generation.
+    build_queued: bool,
+    published_generation: i64,
+    edge_generation: i64,
+    target_edge_generation: i64,
+    /// Pending edge generation waiting to build, or 0 when no build is queued.
+    queued_generation: ?i64 = null,
+    /// Edge generation currently held by an active build lease, or 0 when idle.
+    building_generation: ?i64 = null,
+    /// Durable identifier for the active graph metric build job, or 0 when idle.
+    build_job_id: ?i64 = null,
+    /// Unix epoch milliseconds when the active graph metric build started, or 0 when idle.
+    build_started_at_ms: ?i64 = null,
+    /// Iteration number reported by the active build lease, or 0 when idle or not iterative.
+    build_iteration: ?i64 = null,
+    /// Unix epoch milliseconds when the active build lease expires, or 0 when idle.
+    build_lease_expires_at_ms: ?i64 = null,
+    /// Worker id that owns the active build lease. Local builds use `local`.
+    build_worker_id: ?[]const u8 = null,
+    /// Opaque resumable cursor for the active build phase. Empty or omitted when idle or when the phase has no cursor.
+    build_cursor: ?[]const u8 = null,
+    /// Completed work units for the active graph metric build, or 0 when idle or unknown.
+    build_completed_units: ?i64 = null,
+    /// Estimated total work units for the active graph metric build, or 0 when idle or unknown.
+    build_total_units: ?i64 = null,
+    /// Active leased or failed build pages for the current build phase, capped and ordered by durable page key.
+    build_pages: ?[]const GraphMetricBuildPageStatus = null,
+    /// Whether build_pages was capped before every active page could be included.
+    build_pages_truncated: ?bool = null,
+    /// Number of consecutive failed build attempts for the current target generation, or 0 when no failure applies.
+    retry_count: ?i64 = null,
+    /// Last build error for the current failed target generation.
+    last_error: ?[]const u8 = null,
+    /// Build progress for the target edge generation, from 0.0 to 1.0
+    progress: f64,
+    converged: bool,
+    iterations_completed: i64,
+    delta: f64,
+    computed_at_ms: i64,
+    last_event: ?GraphMetricEvent = null,
+    /// Recent graph metric events, newest first.
+    recent_events: ?[]const GraphMetricEvent = null,
 };
 
 /// Defines how to select start/target nodes for graph queries
@@ -924,6 +1112,16 @@ pub const GraphQuery = struct {
     include_edges: ?bool = null,
     /// Which fields to return from documents
     fields: ?[]const []const u8 = null,
+    /// Graph metric names to project onto result nodes
+    metrics: ?[]const []const u8 = null,
+    /// Sort graph result nodes by graph metric scores
+    order_by: ?[]const GraphMetricOrder = null,
+    /// Filter graph result nodes by graph metric scores
+    where_metric: ?[]const GraphMetricFilter = null,
+    /// Freshness mode for projected, ordered, and filtered graph metrics
+    metric_freshness: ?[]const u8 = null,
+    /// Include graph metric status metadata in the graph result
+    include_metric_status: ?bool = null,
 };
 
 /// Parameters for graph traversal and pathfinding
@@ -967,6 +1165,8 @@ pub const GraphQueryResult = struct {
     total: i64,
     /// Query execution time
     took: ?i64 = null,
+    /// Graph metric status metadata keyed by metric name
+    metric_status: ?std.json.ArrayHashMap(GraphMetricStatus) = null,
 };
 
 /// Type of graph query to execute
@@ -1022,6 +1222,8 @@ pub const GraphResultNode = struct {
     path_edges: ?[]const PathEdge = null,
     /// Algebraic provenance labels folded into this result, when requested by an algebraic graph executor
     provenance: ?[]const []const u8 = null,
+    /// Projected graph metric scores keyed by metric name. Values are numbers or null when a requested metric has no score for the node.
+    metrics: ?std.json.Value = null,
     /// Parsed evidence envelope for provenance labels and edge metadata
     evidence: ?std.json.Value = null,
     /// Connected edges (when include_edges=true)

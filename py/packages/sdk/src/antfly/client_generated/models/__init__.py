@@ -195,6 +195,7 @@ from .evaluator_score_metadata import EvaluatorScoreMetadata
 from .exa_search_config import ExaSearchConfig
 from .exa_search_config_search_type import ExaSearchConfigSearchType
 from .exact_sort_error import ExactSortError
+from .execute_graph_metric_action_action import ExecuteGraphMetricActionAction
 from .execution_policy import ExecutionPolicy
 from .extension_error import ExtensionError
 from .extension_member import ExtensionMember
@@ -278,15 +279,43 @@ from .graph_index_stats_promotion import GraphIndexStatsPromotion
 from .graph_index_stats_resolution import GraphIndexStatsResolution
 from .graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
 from .graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
+from .graph_metric_action_response import GraphMetricActionResponse
+from .graph_metric_build_page_status import GraphMetricBuildPageStatus
+from .graph_metric_build_page_status_range_kind import GraphMetricBuildPageStatusRangeKind
+from .graph_metric_build_page_status_state import GraphMetricBuildPageStatusState
+from .graph_metric_edge_filter_status import GraphMetricEdgeFilterStatus
+from .graph_metric_edge_filter_status_mode import GraphMetricEdgeFilterStatusMode
+from .graph_metric_event import GraphMetricEvent
+from .graph_metric_event_kind import GraphMetricEventKind
+from .graph_metric_filter import GraphMetricFilter
+from .graph_metric_filter_op import GraphMetricFilterOp
+from .graph_metric_order import GraphMetricOrder
+from .graph_metric_order_direction import GraphMetricOrderDirection
+from .graph_metric_order_nulls import GraphMetricOrderNulls
+from .graph_metric_profile import GraphMetricProfile
+from .graph_metric_query import GraphMetricQuery
+from .graph_metric_query_metric_freshness import GraphMetricQueryMetricFreshness
+from .graph_metric_rerank import GraphMetricRerank
+from .graph_metric_rerank_metric_freshness import GraphMetricRerankMetricFreshness
+from .graph_metric_rerank_score_details import GraphMetricRerankScoreDetails
+from .graph_metric_result import GraphMetricResult
+from .graph_metric_runtime_stats import GraphMetricRuntimeStats
+from .graph_metric_runtime_stats_role import GraphMetricRuntimeStatsRole
+from .graph_metric_score import GraphMetricScore
+from .graph_metric_status import GraphMetricStatus
+from .graph_metric_status_phase import GraphMetricStatusPhase
 from .graph_node_selector import GraphNodeSelector
 from .graph_query import GraphQuery
+from .graph_query_metric_freshness import GraphQueryMetricFreshness
 from .graph_query_params import GraphQueryParams
 from .graph_query_params_algorithm_params import GraphQueryParamsAlgorithmParams
 from .graph_query_result import GraphQueryResult
+from .graph_query_result_metric_status import GraphQueryResultMetricStatus
 from .graph_query_type import GraphQueryType
 from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
+from .graph_result_node_metrics import GraphResultNodeMetrics
 from .ground_truth import GroundTruth
 from .hierarchy_ancestor import HierarchyAncestor
 from .hierarchy_ancestor_document import HierarchyAncestorDocument
@@ -590,7 +619,9 @@ from .query_responses import QueryResponses
 from .query_result import QueryResult
 from .query_result_aggregations import QueryResultAggregations
 from .query_result_analyses import QueryResultAnalyses
+from .query_result_graph_metric_results import QueryResultGraphMetricResults
 from .query_result_graph_results import QueryResultGraphResults
+from .query_score_details import QueryScoreDetails
 from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
 from .query_temporarily_unavailable_error import QueryTemporarilyUnavailableError
@@ -952,6 +983,7 @@ __all__ = (
     "ExactSortError",
     "ExaSearchConfig",
     "ExaSearchConfigSearchType",
+    "ExecuteGraphMetricActionAction",
     "ExecutionPolicy",
     "ExtensionError",
     "ExtensionMember",
@@ -1035,15 +1067,43 @@ __all__ = (
     "GraphIndexStatsResolution",
     "GraphIndexStatsResolverReplay",
     "GraphIndexStatsSourceArtifact",
+    "GraphMetricActionResponse",
+    "GraphMetricBuildPageStatus",
+    "GraphMetricBuildPageStatusRangeKind",
+    "GraphMetricBuildPageStatusState",
+    "GraphMetricEdgeFilterStatus",
+    "GraphMetricEdgeFilterStatusMode",
+    "GraphMetricEvent",
+    "GraphMetricEventKind",
+    "GraphMetricFilter",
+    "GraphMetricFilterOp",
+    "GraphMetricOrder",
+    "GraphMetricOrderDirection",
+    "GraphMetricOrderNulls",
+    "GraphMetricProfile",
+    "GraphMetricQuery",
+    "GraphMetricQueryMetricFreshness",
+    "GraphMetricRerank",
+    "GraphMetricRerankMetricFreshness",
+    "GraphMetricRerankScoreDetails",
+    "GraphMetricResult",
+    "GraphMetricRuntimeStats",
+    "GraphMetricRuntimeStatsRole",
+    "GraphMetricScore",
+    "GraphMetricStatus",
+    "GraphMetricStatusPhase",
     "GraphNodeSelector",
     "GraphQuery",
+    "GraphQueryMetricFreshness",
     "GraphQueryParams",
     "GraphQueryParamsAlgorithmParams",
     "GraphQueryResult",
+    "GraphQueryResultMetricStatus",
     "GraphQueryType",
     "GraphResultNode",
     "GraphResultNodeDocument",
     "GraphResultNodeEvidence",
+    "GraphResultNodeMetrics",
     "GroundTruth",
     "HierarchyAncestor",
     "HierarchyAncestorDocument",
@@ -1345,7 +1405,9 @@ __all__ = (
     "QueryResult",
     "QueryResultAggregations",
     "QueryResultAnalyses",
+    "QueryResultGraphMetricResults",
     "QueryResultGraphResults",
+    "QueryScoreDetails",
     "QueryStrategy",
     "QueryStringQuery",
     "QueryTemporarilyUnavailableError",

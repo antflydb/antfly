@@ -68,7 +68,6 @@ pub const query_string = @import("search/query_string.zig");
 
 // Graph
 pub const graph = @import("graph/graph.zig");
-pub const graph_metrics = @import("graph/metrics.zig");
 pub const traversal = @import("graph/traversal.zig");
 pub const paths = @import("graph/paths.zig");
 pub const graph_query = @import("graph/query.zig");

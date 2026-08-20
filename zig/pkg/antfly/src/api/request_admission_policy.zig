@@ -84,6 +84,7 @@ pub const public_operation_policies = [_]PublicOperationPolicy{
     .{ .operation_id = "getIndex", .class = .none },
     .{ .operation_id = "createIndex", .class = .none },
     .{ .operation_id = "dropIndex", .class = .none },
+    .{ .operation_id = "executeGraphMetricAction", .class = .none },
     .{ .operation_id = "linearMerge", .class = .write },
     .{ .operation_id = "queryTable", .class = .query },
     .{ .operation_id = "listTableRepairIssues", .class = .none },

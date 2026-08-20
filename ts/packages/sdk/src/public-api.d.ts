@@ -175,6 +175,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the graph index */
+                indexName: string;
+                /** @description Name of the configured graph metric */
+                metricName: string;
+                /** @description Operational action to apply to the graph metric materialization */
+                action: "refresh" | "rebuild" | "delete" | "pause" | "resume";
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a graph metric operational action
+         * @description Refresh, rebuild, delete, pause, or resume maintenance for a configured
+         *     graph metric. The metric configuration remains owned by the graph index.
+         *     `delete` clears materialized metric state and maintenance controls; a
+         *     later refresh or rebuild can publish a new generation.
+         */
+        post: operations["executeGraphMetricAction"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/transactions/commit": {
         parameters: {
             query?: never;
@@ -4279,6 +4311,9 @@ export interface components {
             config: components["schemas"]["IndexConfig"];
             status: components["schemas"]["IndexStats"];
         };
+        GraphMetricActionResponse: {
+            status: components["schemas"]["GraphMetricStatus"];
+        };
         /** @description Compact LSM backend operational status. Detailed low-level counters are available through metrics. */
         LsmStorageStatus: {
             /** Format: uint64 */
@@ -6539,6 +6574,19 @@ export interface components {
              *     ```
              */
             reranker?: components["schemas"]["RerankerConfig"];
+            /**
+             * @description Explicit direct top-k read from a published graph metric generation.
+             *     Results are returned in `graph_metric_results`, keyed by `name` when
+             *     supplied or by the metric name otherwise. Shard scores are merged
+             *     deterministically by score descending and node id ascending.
+             */
+            graph_metric?: components["schemas"]["GraphMetricQuery"];
+            /**
+             * @description Optional graph metric score feature to blend into ordinary search hit ranking.
+             *     The metric must have a published generation. With `metric_freshness: fresh`,
+             *     the request fails if graph writes have made the published generation stale.
+             */
+            graph_metric_rerank?: components["schemas"]["GraphMetricRerank"];
             analyses?: components["schemas"]["Analyses"];
             /**
              * @description Declarative graph queries to execute after full-text/vector searches.
@@ -6822,8 +6870,24 @@ export interface components {
             reranker?: components["schemas"]["RerankerProfile"];
             /** @description Result merge statistics (present for hybrid search). */
             merge?: components["schemas"]["MergeProfile"];
+            /** @description Graph metric freshness and generation details for metric-aware query work. */
+            graph_metrics?: components["schemas"]["GraphMetricProfile"][];
             /** @description Sort execution statistics (present when the query used ordered page options and profiling was enabled). */
             sort?: components["schemas"]["SortProfile"];
+        };
+        GraphMetricProfile: {
+            /** @description Name of the graph query or graph metric query that used the metric. */
+            query_name: string;
+            /** @description Profile source, such as `graph_query`, `graph_metric`, or `graph_metric_rerank`. */
+            source: string;
+            /** @description Graph index that owns the metric. */
+            index_name: string;
+            /** @description Graph metric name within the index. */
+            metric_name: string;
+            /** @description Effective freshness mode requested for this metric use. */
+            freshness: string;
+            /** @description Published generation and freshness status observed by the query. */
+            status: components["schemas"]["GraphMetricStatus"];
         };
         /**
          * @description Sort execution profile. These fields are the stable public diagnostic
@@ -7214,6 +7278,54 @@ export interface components {
              */
             chunks?: components["schemas"]["HierarchyMatchHit"][];
         };
+        /** @description Optional score provenance for ranking features that changed the final hit score. */
+        QueryScoreDetails: {
+            /** @description Score contribution from an explicit graph_metric_rerank request. */
+            graph_metric_rerank?: components["schemas"]["GraphMetricRerankScoreDetails"];
+        };
+        GraphMetricRerankScoreDetails: {
+            /** @description Graph index that provided the metric score. */
+            index_name: string;
+            /** @description Graph metric used as a score feature. */
+            metric_name: string;
+            /**
+             * Format: double
+             * @description Hit score before graph metric rerank composition.
+             */
+            base_score: number;
+            /**
+             * Format: double
+             * @description Weight applied to the base score.
+             */
+            base_weight: number;
+            /**
+             * Format: double
+             * @description Published metric score for this hit, or null when the hit was missing from the metric generation.
+             */
+            metric_score?: number | null;
+            /**
+             * Format: double
+             * @description Metric feature value used in the formula after applying missing_score fallback if needed.
+             */
+            metric_score_used: number;
+            /**
+             * Format: double
+             * @description Weight applied to the metric score feature.
+             */
+            metric_weight: number;
+            /** @description True when metric_score was missing and the request's missing_score fallback was used. */
+            missing_score_used: boolean;
+            /**
+             * Format: double
+             * @description Final hit score after graph metric rerank composition.
+             */
+            final_score: number;
+            /**
+             * Format: int64
+             * @description Published graph metric score generation used for this hit.
+             */
+            published_generation: number;
+        };
         /** @description A single query result hit */
         QueryHit: {
             /** @description ID of the record. */
@@ -7235,6 +7347,8 @@ export interface components {
             _index_scores?: {
                 [key: string]: unknown;
             };
+            /** @description Optional explain-style score provenance for score features applied to this hit. */
+            _score_details?: components["schemas"]["QueryScoreDetails"];
             _source?: {
                 [key: string]: unknown;
             };
@@ -7300,6 +7414,10 @@ export interface components {
             /** @description Results from declarative graph queries. */
             graph_results?: {
                 [key: string]: components["schemas"]["GraphQueryResult"];
+            };
+            /** @description Results from direct graph metric reads. */
+            graph_metric_results?: {
+                [key: string]: components["schemas"]["GraphMetricResult"];
             };
             /** @description Detailed execution profile (present when `profile: true` in request). */
             profile?: components["schemas"]["QueryProfile"];
@@ -9722,6 +9840,89 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** @description Summarized graph metric maintenance runtime state. Identity fields are stable hashes, not raw process or owner identifiers. */
+        GraphMetricRuntimeStats: {
+            enabled?: boolean;
+            /** @enum {string} */
+            role?: "combined" | "coordinator" | "worker" | "worker_pool";
+            /** Format: uint64 */
+            runtime_id_hash?: number;
+            /** Format: uint64 */
+            owner_id_hash?: number;
+            /** Format: uint64 */
+            lease_key_hash?: number;
+            /** Format: uint64 */
+            worker_id_hash?: number;
+            /** Format: uint64 */
+            worker_count?: number;
+            lease_owned?: boolean;
+            has_lease?: boolean;
+            /** Format: uint64 */
+            acquisition_count?: number;
+            /** Format: uint64 */
+            takeover_count?: number;
+            /** Format: uint64 */
+            lease_acquire_failures?: number;
+            /** Format: uint64 */
+            lost_leases?: number;
+            /** Format: uint64 */
+            last_acquired_ms?: number;
+            started?: boolean;
+            shutdown?: boolean;
+            notified?: boolean;
+            /** Format: uint64 */
+            ticks_started?: number;
+            /** Format: uint64 */
+            ticks_completed?: number;
+            /** Format: uint64 */
+            durable_progress_ticks?: number;
+            /** Format: uint64 */
+            idle_ticks?: number;
+            /** Format: uint64 */
+            error_ticks?: number;
+            last_error_name?: string;
+            /** Format: uint64 */
+            total_metrics_scanned?: number;
+            /** Format: uint64 */
+            total_active_builds?: number;
+            /** Format: uint64 */
+            total_builds_started?: number;
+            /** Format: uint64 */
+            total_worker_steps?: number;
+            /** Format: uint64 */
+            total_coordinator_steps?: number;
+            /** Format: uint64 */
+            total_pages_claimed?: number;
+            /** Format: uint64 */
+            total_pages_completed?: number;
+            /** Format: uint64 */
+            total_phases_advanced?: number;
+            /** Format: uint64 */
+            total_published?: number;
+            /** Format: uint64 */
+            total_failed_builds?: number;
+            /** Format: uint64 */
+            last_metrics_scanned?: number;
+            /** Format: uint64 */
+            last_active_builds?: number;
+            /** Format: uint64 */
+            last_builds_started?: number;
+            /** Format: uint64 */
+            last_worker_steps?: number;
+            /** Format: uint64 */
+            last_coordinator_steps?: number;
+            /** Format: uint64 */
+            last_pages_claimed?: number;
+            /** Format: uint64 */
+            last_pages_completed?: number;
+            /** Format: uint64 */
+            last_phases_advanced?: number;
+            /** Format: uint64 */
+            last_published?: number;
+            /** Format: uint64 */
+            last_failed_builds?: number;
+            last_budget_exhausted?: boolean;
+        };
         /** @description Statistics for graph index */
         GraphIndexStats: {
             /**
@@ -9864,6 +10065,7 @@ export interface components {
                     result_nodes?: number;
                 };
             };
+            graph_metric_runtime?: components["schemas"]["GraphMetricRuntimeStats"];
         };
         /** @description Compact public statistics for an algebraic sidecar index. Detailed runtime, adaptive, and materialization records remain internal diagnostics. */
         AlgebraicIndexStats: {
@@ -10037,6 +10239,152 @@ export interface components {
         };
         /** @description Statistics for an index */
         IndexStats: components["schemas"]["FullTextIndexStats"] | components["schemas"]["EmbeddingsIndexStats"] | components["schemas"]["GraphIndexStats"] | components["schemas"]["AlgebraicIndexStats"];
+        GraphMetricEdgeFilterStatus: {
+            /** @enum {string} */
+            mode: "all" | "types";
+            types?: string[];
+        };
+        GraphMetricBuildPageStatus: {
+            phase: string;
+            /** Format: int64 */
+            iteration: number;
+            /** Format: int64 */
+            page_id: number;
+            /** @enum {string} */
+            state: "pending" | "leased" | "complete" | "failed";
+            /** @enum {string} */
+            range_kind: "full" | "reverse_edges" | "nodes" | "scores" | "contributions" | "job_control";
+            /** @description Worker id that owns or last failed this page. */
+            worker_id?: string;
+            /**
+             * Format: int64
+             * @description Unix epoch milliseconds when the page lease expires, or 0 when not leased.
+             */
+            lease_expires_at_ms?: number;
+            /**
+             * Format: int64
+             * @description Current attempt number for this page.
+             */
+            attempt?: number;
+            /** @description Opaque resumable cursor for this page. */
+            cursor?: string;
+            /**
+             * Format: int64
+             * @description Completed work units for this page.
+             */
+            completed_units?: number;
+            /**
+             * Format: int64
+             * @description Estimated total work units for this page.
+             */
+            total_units?: number;
+            /** @description Last page-level error. */
+            last_error?: string;
+        };
+        GraphMetricEvent: {
+            /** Format: int64 */
+            sequence: number;
+            /** @enum {string} */
+            kind: "publish" | "delete" | "pause" | "resume" | "failed";
+            /** Format: int64 */
+            at_ms: number;
+            /** Format: int64 */
+            target_edge_generation: number;
+            /** Format: int64 */
+            published_generation: number;
+            /** Format: int64 */
+            score_count: number;
+        };
+        GraphMetricStatus: {
+            state: string;
+            /** @enum {string} */
+            phase: "idle" | "computing" | "publishing" | "complete" | "prepare_generation" | "scan_edges_and_out_degree" | "initialize_ranks" | "iterate_contributions" | "reduce_ranks" | "hits_hub_contributions" | "hits_hub_reduce_ranks" | "check_convergence" | "publish_generation" | "cleanup_old_generations";
+            edge_filter?: components["schemas"]["GraphMetricEdgeFilterStatus"];
+            /**
+             * Format: int64
+             * @description Version of the published graph metric metadata schema.
+             */
+            metadata_version?: number;
+            maintenance_paused?: boolean;
+            /** @description Whether a local or distributed build is queued after the currently published or building generation. */
+            build_queued: boolean;
+            /** Format: int64 */
+            published_generation: number;
+            /** Format: int64 */
+            edge_generation: number;
+            /** Format: int64 */
+            target_edge_generation: number;
+            /**
+             * Format: int64
+             * @description Pending edge generation waiting to build, or 0 when no build is queued.
+             */
+            queued_generation?: number;
+            /**
+             * Format: int64
+             * @description Edge generation currently held by an active build lease, or 0 when idle.
+             */
+            building_generation?: number;
+            /**
+             * Format: int64
+             * @description Durable identifier for the active graph metric build job, or 0 when idle.
+             */
+            build_job_id?: number;
+            /**
+             * Format: int64
+             * @description Unix epoch milliseconds when the active graph metric build started, or 0 when idle.
+             */
+            build_started_at_ms?: number;
+            /**
+             * Format: int64
+             * @description Iteration number reported by the active build lease, or 0 when idle or not iterative.
+             */
+            build_iteration?: number;
+            /**
+             * Format: int64
+             * @description Unix epoch milliseconds when the active build lease expires, or 0 when idle.
+             */
+            build_lease_expires_at_ms?: number;
+            /** @description Worker id that owns the active build lease. Local builds use `local`. */
+            build_worker_id?: string;
+            /** @description Opaque resumable cursor for the active build phase. Empty or omitted when idle or when the phase has no cursor. */
+            build_cursor?: string;
+            /**
+             * Format: int64
+             * @description Completed work units for the active graph metric build, or 0 when idle or unknown.
+             */
+            build_completed_units?: number;
+            /**
+             * Format: int64
+             * @description Estimated total work units for the active graph metric build, or 0 when idle or unknown.
+             */
+            build_total_units?: number;
+            /** @description Active leased or failed build pages for the current build phase, capped and ordered by durable page key. */
+            build_pages?: components["schemas"]["GraphMetricBuildPageStatus"][];
+            /** @description Whether build_pages was capped before every active page could be included. */
+            build_pages_truncated?: boolean;
+            /**
+             * Format: int64
+             * @description Number of consecutive failed build attempts for the current target generation, or 0 when no failure applies.
+             */
+            retry_count?: number;
+            /** @description Last build error for the current failed target generation. */
+            last_error?: string;
+            /**
+             * Format: double
+             * @description Build progress for the target edge generation, from 0.0 to 1.0
+             */
+            progress: number;
+            converged: boolean;
+            /** Format: int64 */
+            iterations_completed: number;
+            /** Format: double */
+            delta: number;
+            /** Format: int64 */
+            computed_at_ms: number;
+            last_event?: components["schemas"]["GraphMetricEvent"];
+            /** @description Recent graph metric events, newest first. */
+            recent_events?: components["schemas"]["GraphMetricEvent"][];
+        };
         /**
          * @description Available tool names for retrieval agents.
          *     - add_filter: Add search filters (field constraints)
@@ -11244,6 +11592,56 @@ export interface components {
             /** @description Handlebars template to render document text for reranking. */
             template?: string;
         } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["OllamaRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
+        GraphMetricQuery: {
+            /** @description Optional result key. Defaults to the metric name. */
+            name?: string;
+            /** @description Graph index that owns the published metric. */
+            index: string;
+            /** @description Graph metric to read. */
+            metric: string;
+            /**
+             * Format: int32
+             * @description Maximum globally ranked metric scores to return after shard fan-in.
+             * @default 10
+             */
+            top_k?: number;
+            /**
+             * @description Whether the latest published generation may be stale or must match the graph edge generation.
+             * @default published
+             * @enum {string}
+             */
+            metric_freshness?: "published" | "fresh";
+        };
+        GraphMetricRerank: {
+            /** @description Graph index that owns the published metric. */
+            index: string;
+            /** @description Graph metric name to blend into the search hit score. */
+            metric: string;
+            /**
+             * Format: double
+             * @description Multiplier applied to the existing hit score before adding the graph metric feature.
+             * @default 1
+             */
+            base_weight?: number;
+            /**
+             * Format: double
+             * @description Multiplier applied to the graph metric score before it is added to the existing hit score.
+             * @default 1
+             */
+            weight?: number;
+            /**
+             * Format: double
+             * @description Metric feature value to use for hits that do not have a score in the published metric generation.
+             * @default 0
+             */
+            missing_score?: number;
+            /**
+             * @description Whether stale published generations are acceptable or the metric must be fresh.
+             * @default published
+             * @enum {string}
+             */
+            metric_freshness?: "published" | "fresh";
+        };
         /**
          * @description Type of graph query to execute
          * @enum {string}
@@ -11351,6 +11749,20 @@ export interface components {
             /** @description Edge to traverse to reach this step (null for first step) */
             edge?: components["schemas"]["PatternEdgeStep"];
         };
+        GraphMetricOrder: {
+            metric: string;
+            /** @enum {string} */
+            direction?: "asc" | "desc";
+            /** @enum {string} */
+            nulls?: "first" | "last" | "nulls_first" | "nulls_last";
+        };
+        GraphMetricFilter: {
+            metric: string;
+            /** @enum {string} */
+            op: ">" | ">=" | "<" | "<=" | "=" | "==" | "!=";
+            /** Format: double */
+            value: number;
+        };
         /** @description Declarative graph query to execute after full-text/vector searches */
         GraphQuery: {
             type: components["schemas"]["GraphQueryType"];
@@ -11372,6 +11784,19 @@ export interface components {
             include_edges?: boolean;
             /** @description Which fields to return from documents */
             fields?: string[];
+            /** @description Graph metric names to project onto result nodes */
+            metrics?: string[];
+            /** @description Sort graph result nodes by graph metric scores */
+            order_by?: components["schemas"]["GraphMetricOrder"][];
+            /** @description Filter graph result nodes by graph metric scores */
+            where_metric?: components["schemas"]["GraphMetricFilter"][];
+            /**
+             * @description Freshness mode for projected, ordered, and filtered graph metrics
+             * @enum {string}
+             */
+            metric_freshness?: "published" | "fresh";
+            /** @description Include graph metric status metadata in the graph result */
+            include_metric_status?: boolean;
         };
         /**
          * @description Configuration for pruning search results based on score quality.
@@ -11442,6 +11867,10 @@ export interface components {
             path_edges?: components["schemas"]["PathEdge"][];
             /** @description Algebraic provenance labels folded into this result, when requested by an algebraic graph executor */
             provenance?: string[];
+            /** @description Projected graph metric scores keyed by metric name. Values are numbers or null when a requested metric has no score for the node. */
+            metrics?: {
+                [key: string]: unknown;
+            };
             /** @description Parsed evidence envelope for provenance labels and edge metadata */
             evidence?: {
                 [key: string]: unknown;
@@ -11474,6 +11903,21 @@ export interface components {
              * @description Query execution time
              */
             took?: number;
+            /** @description Graph metric status metadata keyed by metric name */
+            metric_status?: {
+                [key: string]: components["schemas"]["GraphMetricStatus"];
+            };
+        };
+        GraphMetricScore: {
+            node: string;
+            /** Format: double */
+            score: number;
+        };
+        GraphMetricResult: {
+            index_name: string;
+            metric: string;
+            scores: components["schemas"]["GraphMetricScore"][];
+            status: components["schemas"]["GraphMetricStatus"];
         };
         /**
          * @description Standalone evaluation request for POST /eval endpoint.
@@ -13774,6 +14218,47 @@ export interface operations {
                     "text/plain": string;
                 };
             };
+        };
+    };
+    executeGraphMetricAction: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the graph index */
+                indexName: string;
+                /** @description Name of the configured graph metric */
+                metricName: string;
+                /** @description Operational action to apply to the graph metric materialization */
+                action: "refresh" | "rebuild" | "delete" | "pause" | "resume";
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Updated graph metric status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphMetricActionResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Graph metric actions are unavailable for this runtime */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
         };
     };
     commitTransaction: {

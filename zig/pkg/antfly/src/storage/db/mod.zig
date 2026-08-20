@@ -53,6 +53,7 @@ pub const async_runtime = @import("derived/async_runtime.zig");
 pub const io_threaded_runtime = @import("derived/io_threaded_runtime.zig");
 pub const ttl_runtime = @import("maintenance/ttl_runtime.zig");
 pub const transaction_runtime = @import("maintenance/transaction_runtime.zig");
+pub const graph_metric_runtime = @import("maintenance/graph_metric_runtime.zig");
 pub const document_query = @import("document_query.zig");
 pub const query_projection = @import("query/projection.zig");
 pub const document_mapper = @import("document_mapper.zig");

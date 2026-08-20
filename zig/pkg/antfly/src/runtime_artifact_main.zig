@@ -21,6 +21,7 @@ const structlog = @import("structlog");
 
 extern fn antfly_runtime_cli(context: *const bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_data(context: *const bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_graph_metric_maintenance(context: *const bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_inference(context: *const bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_metadata(context: *const bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_standalone(context: *const bridge.Context) callconv(.c) c_int;
@@ -76,6 +77,7 @@ fn mainImpl(init: std.process.Init) anyerror!void {
     const code = switch (role_options.role) {
         .cli => antfly_runtime_cli(&context),
         .data => antfly_runtime_data(&context),
+        .graph_metric_maintenance => antfly_runtime_graph_metric_maintenance(&context),
         .inference => antfly_runtime_inference(&context),
         .metadata => antfly_runtime_metadata(&context),
         .standalone => antfly_runtime_standalone(&context),

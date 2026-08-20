@@ -72,6 +72,7 @@ fn mainImpl(init: std.process.Init) !void {
     switch (command.route) {
         .cli => return runRuntimeUnit(.cli, subcommand, init, &args),
         .data => return runRuntimeUnit(.data, subcommand, init, &args),
+        .graph_metric_maintenance => return runRuntimeUnit(.graph_metric_maintenance, subcommand, init, &args),
         .ha => return runRuntimeUnit(.ha, subcommand, init, &args),
         .inference => return runRuntimeUnit(.inference, subcommand, init, &args),
         .metadata => return runRuntimeUnit(.metadata, subcommand, init, &args),
@@ -87,10 +88,11 @@ fn mainImpl(init: std.process.Init) !void {
     }
 }
 
-const RuntimeRole = enum { cli, data, ha, inference, metadata, serverless, standalone };
+const RuntimeRole = enum { cli, data, graph_metric_maintenance, ha, inference, metadata, serverless, standalone };
 
 extern fn antfly_runtime_cli(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_data(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_graph_metric_maintenance(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_ha(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_inference(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_metadata(context: *const runtime_bridge.Context) callconv(.c) c_int;
@@ -126,6 +128,7 @@ fn runRuntimeUnit(
     const code = switch (role) {
         .cli => antfly_runtime_cli(&context),
         .data => antfly_runtime_data(&context),
+        .graph_metric_maintenance => antfly_runtime_graph_metric_maintenance(&context),
         .ha => antfly_runtime_ha(&context),
         .inference => antfly_runtime_inference(&context),
         .metadata => antfly_runtime_metadata(&context),

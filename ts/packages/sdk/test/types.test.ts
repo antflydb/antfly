@@ -14,6 +14,9 @@ import type {
   BoolFieldQuery,
   ConjunctionQuery,
   DisjunctionQuery,
+  GraphIndexStats,
+  GraphMetricQuery,
+  GraphMetricRuntimeStats,
   MatchQuery,
   NumericRangeQuery,
   QueryRequest,
@@ -57,6 +60,23 @@ describe("Antfly Query Type Integration", () => {
   });
 
   describe("QueryRequest type safety", () => {
+    it("should expose direct graph metric reads", () => {
+      const graphMetric: GraphMetricQuery = {
+        name: "central",
+        index: "graph_idx",
+        metric: "pagerank",
+        top_k: 25,
+        metric_freshness: "fresh",
+      };
+      const query: QueryRequest = {
+        table: "docs",
+        graph_metric: graphMetric,
+      };
+
+      expect(query.graph_metric?.name).toBe("central");
+      expectTypeOf(query.graph_metric).toMatchTypeOf<GraphMetricQuery | undefined>();
+    });
+
     it("should accept valid MatchQuery in full_text_search", () => {
       const query: QueryRequest = {
         table: "products",
@@ -271,6 +291,33 @@ describe("Antfly Query Type Integration", () => {
       };
 
       expect(query.boost).toBe(2.0);
+    });
+  });
+
+  describe("Graph index stats", () => {
+    it("should expose graph metric runtime telemetry", () => {
+      const runtime: GraphMetricRuntimeStats = {
+        enabled: true,
+        role: "worker_pool",
+        owner_id_hash: 17,
+        worker_count: 3,
+        takeover_count: 2,
+        lost_leases: 1,
+        total_pages_claimed: 6,
+        last_pages_completed: 3,
+        last_budget_exhausted: true,
+      };
+      const stats: GraphIndexStats = {
+        index_type: "graph",
+        total_edges: 4,
+        graph_metric_runtime: runtime,
+      };
+
+      expect(stats.graph_metric_runtime?.role).toBe("worker_pool");
+      expect(stats.graph_metric_runtime?.owner_id_hash).toBe(17);
+      expectTypeOf(stats.graph_metric_runtime).toMatchTypeOf<
+        GraphMetricRuntimeStats | undefined
+      >();
     });
   });
 

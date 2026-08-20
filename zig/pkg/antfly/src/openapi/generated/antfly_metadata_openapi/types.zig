@@ -1439,6 +1439,48 @@ pub const ForeignSource = struct {
     columns: ?[]const ForeignColumn = null,
 };
 
+pub const GraphMetricActionResponse = struct {
+    status: antfly_indexes_openapi.GraphMetricStatus,
+};
+
+pub const GraphMetricProfile = struct {
+    /// Name of the graph query or graph metric query that used the metric.
+    query_name: []const u8,
+    /// Profile source, such as `graph_query`, `graph_metric`, or `graph_metric_rerank`.
+    source: []const u8,
+    /// Graph index that owns the metric.
+    index_name: []const u8,
+    /// Graph metric name within the index.
+    metric_name: []const u8,
+    /// Effective freshness mode requested for this metric use.
+    freshness: []const u8,
+    /// Published generation and freshness status observed by the query.
+    status: antfly_indexes_openapi.GraphMetricStatus,
+};
+
+pub const GraphMetricRerankScoreDetails = struct {
+    /// Graph index that provided the metric score.
+    index_name: []const u8,
+    /// Graph metric used as a score feature.
+    metric_name: []const u8,
+    /// Hit score before graph metric rerank composition.
+    base_score: f64,
+    /// Weight applied to the base score.
+    base_weight: f64,
+    /// Published metric score for this hit, or null when the hit was missing from the metric generation.
+    metric_score: ?f64 = null,
+    /// Metric feature value used in the formula after applying missing_score fallback if needed.
+    metric_score_used: f64,
+    /// Weight applied to the metric score feature.
+    metric_weight: f64,
+    /// True when metric_score was missing and the request's missing_score fallback was used.
+    missing_score_used: bool,
+    /// Final hit score after graph metric rerank composition.
+    final_score: f64,
+    /// Published graph metric score generation used for this hit.
+    published_generation: i64,
+};
+
 pub const HierarchyAncestor = struct {
     id: ?[]const u8 = null,
     document: ?std.json.Value = null,
@@ -2100,6 +2142,8 @@ pub const QueryHit = struct {
     _distance: ?f32 = null,
     /// Scores partitioned by index when using RRF search.
     _index_scores: ?std.json.Value = null,
+    /// Optional explain-style score provenance for score features applied to this hit.
+    _score_details: ?QueryScoreDetails = null,
     _source: ?std.json.Value = null,
     /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level group includes nested matches. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact`, `matches`, and `ancestors` with response-local or requested DB-backed source/unit context when available. Legacy rollup requests continue to use `chunks` instead of `matches`.
     hierarchy: ?QueryHitHierarchy = null,
@@ -2196,6 +2240,8 @@ pub const QueryProfile = struct {
     reranker: ?RerankerProfile = null,
     /// Result merge statistics (present for hybrid search).
     merge: ?MergeProfile = null,
+    /// Graph metric freshness and generation details for metric-aware query work.
+    graph_metrics: ?[]const GraphMetricProfile = null,
     /// Sort execution statistics (present when the query used ordered page options and profiling was enabled).
     sort: ?SortProfile = null,
 };
@@ -2252,6 +2298,10 @@ pub const QueryRequest = struct {
     profile: ?bool = null,
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?antfly_reranking_openapi.RerankerConfig = null,
+    /// Explicit direct top-k read from a published graph metric generation. Results are returned in `graph_metric_results`, keyed by `name` when supplied or by the metric name otherwise. Shard scores are merged deterministically by score descending and node id ascending.
+    graph_metric: ?antfly_indexes_openapi.GraphMetricQuery = null,
+    /// Optional graph metric score feature to blend into ordinary search hit ranking. The metric must have a published generation. With `metric_freshness: fresh`, the request fails if graph writes have made the published generation stale.
+    graph_metric_rerank: ?antfly_indexes_openapi.GraphMetricRerank = null,
     analyses: ?Analyses = null,
     /// Declarative graph queries to execute after full-text/vector searches. Results can reference search results using node selectors like $full_text_results.
     graph_searches: ?std.json.ArrayHashMap(antfly_indexes_openapi.GraphQuery) = null,
@@ -2281,6 +2331,8 @@ pub const QueryResult = struct {
     analyses: ?std.json.ArrayHashMap(AnalysesResult) = null,
     /// Results from declarative graph queries.
     graph_results: ?std.json.ArrayHashMap(antfly_indexes_openapi.GraphQueryResult) = null,
+    /// Results from direct graph metric reads.
+    graph_metric_results: ?std.json.ArrayHashMap(antfly_indexes_openapi.GraphMetricResult) = null,
     /// Detailed execution profile (present when `profile: true` in request).
     profile: ?std.json.Value = null,
     /// Duration of the query in milliseconds.
@@ -2291,6 +2343,12 @@ pub const QueryResult = struct {
     @"error": ?[]const u8 = null,
     /// Which table this result came from
     table: ?[]const u8 = null,
+};
+
+/// Optional score provenance for ranking features that changed the final hit score.
+pub const QueryScoreDetails = struct {
+    /// Score contribution from an explicit graph_metric_rerank request.
+    graph_metric_rerank: ?GraphMetricRerankScoreDetails = null,
 };
 
 /// A transient query dependency or read-availability failure that is safe to retry.
@@ -2677,6 +2735,10 @@ pub const RetrievalQueryRequest = struct {
     profile: ?bool = null,
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?antfly_reranking_openapi.RerankerConfig = null,
+    /// Explicit direct top-k read from a published graph metric generation. Results are returned in `graph_metric_results`, keyed by `name` when supplied or by the metric name otherwise. Shard scores are merged deterministically by score descending and node id ascending.
+    graph_metric: ?antfly_indexes_openapi.GraphMetricQuery = null,
+    /// Optional graph metric score feature to blend into ordinary search hit ranking. The metric must have a published generation. With `metric_freshness: fresh`, the request fails if graph writes have made the published generation stale.
+    graph_metric_rerank: ?antfly_indexes_openapi.GraphMetricRerank = null,
     analyses: ?Analyses = null,
     /// Declarative graph queries to execute after full-text/vector searches. Results can reference search results using node selectors like $full_text_results.
     graph_searches: ?std.json.ArrayHashMap(antfly_indexes_openapi.GraphQuery) = null,

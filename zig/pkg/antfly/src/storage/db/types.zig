@@ -1286,6 +1286,8 @@ pub const SearchRequest = struct {
     dense_queries: []const NamedDenseQuery = &.{},
     sparse_queries: []const NamedSparseQuery = &.{},
     graph_queries: []const NamedGraphQuery = &.{},
+    graph_metric_queries: []const NamedGraphMetricQuery = &.{},
+    graph_metric_rerank: ?GraphMetricRerank = null,
     merge_config: ?MergeConfig = null,
     reranker: ?reranking_mod.Config = null,
     reranker_query_text: []const u8 = "",
@@ -1402,6 +1404,8 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "dense_queries",
     "sparse_queries",
     "graph_queries",
+    "graph_metric_queries",
+    "graph_metric_rerank",
     "merge_config",
     "reranker",
     "reranker_query_text",
@@ -1635,6 +1639,32 @@ pub const NamedGraphQuery = struct {
     query: graph_query_mod.GraphQuery,
 };
 
+pub const GraphMetricFreshness = enum {
+    published,
+    fresh,
+};
+
+pub const GraphMetricQuery = struct {
+    index_name: []const u8,
+    metric_name: []const u8,
+    top_k: u32 = 10,
+    freshness: GraphMetricFreshness = .published,
+};
+
+pub const NamedGraphMetricQuery = struct {
+    name: []const u8,
+    query: GraphMetricQuery,
+};
+
+pub const GraphMetricRerank = struct {
+    index_name: []const u8,
+    metric_name: []const u8,
+    freshness: GraphMetricFreshness = .published,
+    base_weight: f64 = 1.0,
+    weight: f64 = 1.0,
+    missing_score: f64 = 0.0,
+};
+
 pub const NamedFullTextQuery = struct {
     name: []const u8,
     index_name: []const u8,
@@ -1660,6 +1690,44 @@ pub const MergeConfig = struct {
     weights: []const fusion_mod.NamedWeight = &.{},
 };
 
+pub const GraphMetricRerankScoreDetails = struct {
+    index_name: []u8,
+    metric_name: []u8,
+    base_score: f64 = 0.0,
+    base_weight: f64 = 1.0,
+    metric_score: ?f64 = null,
+    metric_score_used: f64 = 0.0,
+    metric_weight: f64 = 1.0,
+    missing_score_used: bool = false,
+    final_score: f64 = 0.0,
+    published_generation: u64 = 0,
+
+    pub fn clone(self: GraphMetricRerankScoreDetails, alloc: Allocator) !GraphMetricRerankScoreDetails {
+        const index_name = try alloc.dupe(u8, self.index_name);
+        errdefer alloc.free(index_name);
+        const metric_name = try alloc.dupe(u8, self.metric_name);
+        errdefer alloc.free(metric_name);
+        return .{
+            .index_name = index_name,
+            .metric_name = metric_name,
+            .base_score = self.base_score,
+            .base_weight = self.base_weight,
+            .metric_score = self.metric_score,
+            .metric_score_used = self.metric_score_used,
+            .metric_weight = self.metric_weight,
+            .missing_score_used = self.missing_score_used,
+            .final_score = self.final_score,
+            .published_generation = self.published_generation,
+        };
+    }
+
+    pub fn deinit(self: *GraphMetricRerankScoreDetails, alloc: Allocator) void {
+        alloc.free(self.index_name);
+        alloc.free(self.metric_name);
+        self.* = undefined;
+    }
+};
+
 pub const SearchHit = struct {
     id: []u8,
     /// Internal graph-hydration namespace. Null means the query's source
@@ -1669,6 +1737,7 @@ pub const SearchHit = struct {
     native_text_doc_id: ?u32 = null,
     /// Higher-is-better relevance score used by every public query path.
     score: ?f32 = null,
+    score_details: ?GraphMetricRerankScoreDetails = null,
     /// Metric-native dense-vector distance. Lower values are better. This is
     /// retained separately so score ordering never depends on the metric.
     distance: ?f32 = null,
@@ -1685,6 +1754,7 @@ pub const SearchHit = struct {
         errdefer {
             alloc.free(cloned.id);
             if (cloned.source_table) |table| alloc.free(table);
+            if (cloned.score_details) |*details| details.deinit(alloc);
             freeIndexScores(alloc, cloned.index_scores);
             freeJsonValues(alloc, cloned.sort_values);
             if (cloned.stored_data) |data| alloc.free(data);
@@ -1696,6 +1766,7 @@ pub const SearchHit = struct {
         cloned.doc_ordinal = self.doc_ordinal;
         cloned.native_text_doc_id = self.native_text_doc_id;
         cloned.score = self.score;
+        cloned.score_details = if (self.score_details) |details| try details.clone(alloc) else null;
         cloned.distance = self.distance;
         cloned.index_scores = try cloneIndexScores(alloc, self.index_scores);
         cloned.sort_values = try cloneJsonValues(alloc, self.sort_values);
@@ -1723,6 +1794,7 @@ pub const SearchHit = struct {
     pub fn deinit(self: *SearchHit, alloc: Allocator) void {
         alloc.free(self.id);
         if (self.source_table) |table| alloc.free(table);
+        if (self.score_details) |*details| details.deinit(alloc);
         freeIndexScores(alloc, self.index_scores);
         freeJsonValues(alloc, self.sort_values);
         if (self.stored_data) |data| alloc.free(data);
@@ -1986,13 +2058,46 @@ pub const SearchResult = struct {
     shard_identity_read_generations: []ShardIdentityReadGeneration = &.{},
     sort_profile: ?SortProfile = null,
     graph_results: []GraphSearchResult = &.{},
+    graph_metric_results: []GraphMetricResult = &.{},
+    graph_metric_rerank_status: ?GraphMetricStatus = null,
 
     pub fn deinit(self: *SearchResult) void {
         for (self.hits) |*hit| hit.deinit(self.alloc);
         if (self.hits.len > 0) self.alloc.free(self.hits);
         for (self.graph_results) |*graph_result| graph_result.deinit(self.alloc);
         if (self.graph_results.len > 0) self.alloc.free(self.graph_results);
+        for (self.graph_metric_results) |*metric_result| metric_result.deinit(self.alloc);
+        if (self.graph_metric_results.len > 0) self.alloc.free(self.graph_metric_results);
+        if (self.graph_metric_rerank_status) |*status| status.deinit(self.alloc);
         if (self.shard_identity_read_generations.len > 0) self.alloc.free(self.shard_identity_read_generations);
+        self.* = undefined;
+    }
+};
+
+pub const GraphMetricScore = struct {
+    node: []u8,
+    score: f64,
+
+    pub fn deinit(self: *GraphMetricScore, alloc: Allocator) void {
+        alloc.free(self.node);
+        self.* = undefined;
+    }
+};
+
+pub const GraphMetricResult = struct {
+    name: []u8,
+    index_name: []u8,
+    metric_name: []u8,
+    scores: []GraphMetricScore,
+    status: GraphMetricStatus,
+
+    pub fn deinit(self: *GraphMetricResult, alloc: Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.index_name);
+        alloc.free(self.metric_name);
+        for (self.scores) |*score| score.deinit(alloc);
+        if (self.scores.len > 0) alloc.free(self.scores);
+        self.status.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -2004,6 +2109,7 @@ pub const GraphSearchResult = struct {
     matches: []GraphPatternMatch = &.{},
     hits: []SearchHit,
     total_hits: u32,
+    metric_status: []GraphMetricStatus = &.{},
 
     pub fn deinit(self: *GraphSearchResult, alloc: Allocator) void {
         alloc.free(self.name);
@@ -2015,9 +2121,83 @@ pub const GraphSearchResult = struct {
         if (self.matches.len > 0) alloc.free(self.matches);
         for (self.hits) |*hit| hit.deinit(alloc);
         if (self.hits.len > 0) alloc.free(self.hits);
+        freeGraphMetricStatuses(alloc, self.metric_status);
         self.* = undefined;
     }
 };
+
+pub const GraphMetricStatus = struct {
+    name: []u8,
+    state: graph_mod.GraphIndex.GraphMetricState = .not_ready,
+    phase: graph_mod.GraphIndex.GraphMetricBuildPhase = .idle,
+    edge_filter: graph_mod.GraphMetricEdgeFilter = .{},
+    metadata_version: u32 = 0,
+    maintenance_paused: bool = false,
+    build_queued: bool = false,
+    published_generation: u64 = 0,
+    edge_generation: u64 = 0,
+    target_edge_generation: u64 = 0,
+    queued_generation: u64 = 0,
+    building_generation: u64 = 0,
+    build_job_id: u64 = 0,
+    build_started_at_ms: u64 = 0,
+    build_iteration: u32 = 0,
+    build_lease_expires_at_ms: u64 = 0,
+    build_worker_id: []const u8 = "",
+    build_cursor: []const u8 = "",
+    build_completed_units: u64 = 0,
+    build_total_units: u64 = 0,
+    build_pages: []GraphMetricBuildPageStatus = &.{},
+    build_pages_truncated: bool = false,
+    retry_count: u64 = 0,
+    last_error: []const u8 = "",
+    progress: f64 = 0.0,
+    converged: bool = false,
+    iterations_completed: u32 = 0,
+    delta: f64 = 0.0,
+    computed_at_ms: u64 = 0,
+    last_event: ?graph_mod.GraphIndex.GraphMetricEvent = null,
+    recent_events: []graph_mod.GraphIndex.GraphMetricEvent = &.{},
+
+    pub fn deinit(self: *GraphMetricStatus, alloc: Allocator) void {
+        alloc.free(self.name);
+        self.edge_filter.deinit(alloc);
+        if (self.build_worker_id.len > 0) alloc.free(self.build_worker_id);
+        if (self.build_cursor.len > 0) alloc.free(self.build_cursor);
+        for (self.build_pages) |*page| page.deinit(alloc);
+        if (self.build_pages.len > 0) alloc.free(self.build_pages);
+        if (self.last_error.len > 0) alloc.free(self.last_error);
+        if (self.recent_events.len > 0) alloc.free(self.recent_events);
+        self.* = undefined;
+    }
+};
+
+pub const GraphMetricBuildPageStatus = struct {
+    phase: graph_mod.GraphIndex.GraphMetricBuildPhase = .idle,
+    iteration: u32 = 0,
+    page_id: u64 = 0,
+    state: graph_mod.GraphIndex.GraphMetricBuildPageState = .pending,
+    range_kind: graph_mod.GraphIndex.GraphMetricBuildPageRangeKind = .full,
+    worker_id: []const u8 = "",
+    lease_expires_at_ms: u64 = 0,
+    attempt: u64 = 0,
+    cursor: []const u8 = "",
+    completed_units: u64 = 0,
+    total_units: u64 = 0,
+    last_error: []const u8 = "",
+
+    pub fn deinit(self: *GraphMetricBuildPageStatus, alloc: Allocator) void {
+        if (self.worker_id.len > 0) alloc.free(self.worker_id);
+        if (self.cursor.len > 0) alloc.free(self.cursor);
+        if (self.last_error.len > 0) alloc.free(self.last_error);
+        self.* = undefined;
+    }
+};
+
+pub fn freeGraphMetricStatuses(alloc: Allocator, statuses: []GraphMetricStatus) void {
+    for (statuses) |*status| status.deinit(alloc);
+    if (statuses.len > 0) alloc.free(statuses);
+}
 
 pub const GraphPatternBinding = struct {
     alias: []u8,
@@ -2200,6 +2380,107 @@ pub const TextMergeStats = struct {
     max_pending_bytes: u64 = 0,
 };
 
+pub const GraphMetricRuntimeRole = enum {
+    combined,
+    coordinator,
+    worker,
+    worker_pool,
+};
+
+pub const GraphMetricRuntimeStats = struct {
+    enabled: bool = false,
+    role: ?GraphMetricRuntimeRole = null,
+    runtime_id_hash: u64 = 0,
+    owner_id_hash: u64 = 0,
+    lease_key_hash: u64 = 0,
+    worker_id_hash: u64 = 0,
+    worker_count: u64 = 0,
+    lease_owned: bool = false,
+    has_lease: bool = false,
+    acquisition_count: u64 = 0,
+    takeover_count: u64 = 0,
+    lease_acquire_failures: u64 = 0,
+    lost_leases: u64 = 0,
+    last_acquired_ms: u64 = 0,
+    started: bool = false,
+    shutdown: bool = false,
+    notified: bool = false,
+    ticks_started: u64 = 0,
+    ticks_completed: u64 = 0,
+    durable_progress_ticks: u64 = 0,
+    idle_ticks: u64 = 0,
+    error_ticks: u64 = 0,
+    last_error_name: ?[]const u8 = null,
+    total_metrics_scanned: u64 = 0,
+    total_active_builds: u64 = 0,
+    total_builds_started: u64 = 0,
+    total_worker_steps: u64 = 0,
+    total_coordinator_steps: u64 = 0,
+    total_pages_claimed: u64 = 0,
+    total_pages_completed: u64 = 0,
+    total_phases_advanced: u64 = 0,
+    total_published: u64 = 0,
+    total_failed_builds: u64 = 0,
+    last_metrics_scanned: u64 = 0,
+    last_active_builds: u64 = 0,
+    last_builds_started: u64 = 0,
+    last_worker_steps: u64 = 0,
+    last_coordinator_steps: u64 = 0,
+    last_pages_claimed: u64 = 0,
+    last_pages_completed: u64 = 0,
+    last_phases_advanced: u64 = 0,
+    last_published: u64 = 0,
+    last_failed_builds: u64 = 0,
+    last_budget_exhausted: bool = false,
+
+    pub fn hasRuntimeFacts(self: @This()) bool {
+        return self.enabled or
+            self.role != null or
+            self.runtime_id_hash != 0 or
+            self.owner_id_hash != 0 or
+            self.lease_key_hash != 0 or
+            self.worker_id_hash != 0 or
+            self.worker_count != 0 or
+            self.lease_owned or
+            self.has_lease or
+            self.acquisition_count != 0 or
+            self.takeover_count != 0 or
+            self.lease_acquire_failures != 0 or
+            self.lost_leases != 0 or
+            self.last_acquired_ms != 0 or
+            self.started or
+            self.shutdown or
+            self.notified or
+            self.ticks_started != 0 or
+            self.ticks_completed != 0 or
+            self.durable_progress_ticks != 0 or
+            self.idle_ticks != 0 or
+            self.error_ticks != 0 or
+            self.last_error_name != null or
+            self.total_metrics_scanned != 0 or
+            self.total_active_builds != 0 or
+            self.total_builds_started != 0 or
+            self.total_worker_steps != 0 or
+            self.total_coordinator_steps != 0 or
+            self.total_pages_claimed != 0 or
+            self.total_pages_completed != 0 or
+            self.total_phases_advanced != 0 or
+            self.total_published != 0 or
+            self.total_failed_builds != 0 or
+            self.last_metrics_scanned != 0 or
+            self.last_active_builds != 0 or
+            self.last_builds_started != 0 or
+            self.last_worker_steps != 0 or
+            self.last_coordinator_steps != 0 or
+            self.last_pages_claimed != 0 or
+            self.last_pages_completed != 0 or
+            self.last_phases_advanced != 0 or
+            self.last_published != 0 or
+            self.last_failed_builds != 0 or
+            self.last_budget_exhausted;
+    }
+};
+
 pub fn accumulateTextMergeStats(dst: *TextMergeStats, src: TextMergeStats) void {
     dst.enabled = dst.enabled or src.enabled;
     dst.active_indexes +|= src.active_indexes;
@@ -2318,6 +2599,7 @@ pub const DBStats = struct {
     ttl_cleanup: TTLCleanupStats = .{},
     transaction_recovery: TransactionRecoveryStats = .{},
     text_merge: TextMergeStats = .{},
+    graph_metric_runtime: GraphMetricRuntimeStats = .{},
     term_doc_freq_cache_hits: u64 = 0,
     term_doc_freq_cache_misses: u64 = 0,
     async_indexing: AsyncIndexingStats = .{},
@@ -2903,6 +3185,7 @@ pub const DBIndexStats = struct {
     algebraic_graph_traversal_rejected_count: u64 = 0,
     algebraic_graph_traversal_fallback_count: u64 = 0,
     algebraic_graph_traversal_result_node_count: u64 = 0,
+    graph_metric_status: []GraphMetricStatus = &.{},
     algebraic_observed_query_shape_count: u64 = 0,
     algebraic_recommendation_count: u64 = 0,
     algebraic_adaptive_candidate_count: u64 = 0,
@@ -3458,6 +3741,7 @@ pub fn freeDBStats(alloc: Allocator, stats: DBStats) void {
         if (item.algebraic_planner_lifecycle_blocking_reason) |value| alloc.free(value);
         if (item.algebraic_last_observed_query_shape) |value| alloc.free(value);
         if (item.algebraic_last_recommended_materialization) |value| alloc.free(value);
+        freeGraphMetricStatuses(alloc, @constCast(item.graph_metric_status));
         if (item.algebraic_top_candidate) |candidate| {
             alloc.free(candidate.recommendation);
             alloc.free(candidate.materialization_id);

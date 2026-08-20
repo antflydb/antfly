@@ -583,8 +583,23 @@ pub const TableRuntimeSnapshotCache = struct {
         }
         var it = state.groups.valueIterator();
         while (it.next()) |status| : (initialized += 1) items[initialized] = try status.clone(alloc);
-        std.mem.sort(LocalTableRuntimeStatus, items, {}, lessThanGroupId);
-        return .{ .items = items };
+
+        // Sort compact indices instead of this ownership-heavy status value.
+        // Besides moving fewer bytes, this avoids instantiating std's SIMD
+        // rotation path for a type whose bit size exceeds u16.
+        const order = try alloc.alloc(usize, items.len);
+        defer alloc.free(order);
+        for (order, 0..) |*index, value| index.* = value;
+        std.mem.sort(usize, order, items, struct {
+            fn lessThan(statuses: []LocalTableRuntimeStatus, lhs: usize, rhs: usize) bool {
+                return statuses[lhs].group_id < statuses[rhs].group_id;
+            }
+        }.lessThan);
+
+        const sorted = try alloc.alloc(LocalTableRuntimeStatus, items.len);
+        for (order, 0..) |source_index, target_index| sorted[target_index] = items[source_index];
+        alloc.free(items);
+        return .{ .items = sorted };
     }
 
     pub fn snapshotGroupStatus(
@@ -761,10 +776,6 @@ pub const TableRuntimeSnapshotCache = struct {
     }
 };
 
-fn lessThanGroupId(_: void, lhs: LocalTableRuntimeStatus, rhs: LocalTableRuntimeStatus) bool {
-    return lhs.group_id < rhs.group_id;
-}
-
 fn preserveArtifactVisibilityOnReplayRegression(previous: LocalTableRuntimeStatus, incoming: *LocalTableRuntimeStatus) void {
     var preserved_visibility = false;
     for (incoming.stats.indexes) |*dst| {
@@ -851,6 +862,7 @@ fn statusStatsHaveRuntimeFacts(stats: db_mod.types.DBStats) bool {
     if (stats.async_indexing.startup.active or stats.async_indexing.dense_catch_up.active) return true;
     if (stats.enrichment.enabled and (stats.enrichment.processed_requests > 0 or stats.enrichment.applied_sequence > 0 or stats.enrichment.target_sequence > 0 or stats.enrichment.retrying or stats.enrichment.worker_failed)) return true;
     if (stats.text_merge.pending_segments > 0 or stats.text_merge.in_flight_merges > 0 or stats.text_merge.completed_merges > 0 or stats.text_merge.failed_merges > 0) return true;
+    if (stats.graph_metric_runtime.hasRuntimeFacts()) return true;
     for (stats.indexes) |index| {
         if (indexHasArtifactVisibilityFacts(index)) return true;
         if (index.repair_degraded or index.repair_issue_count != 0) return true;

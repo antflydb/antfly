@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from ..models.graph_index_stats_resolution import GraphIndexStatsResolution
     from ..models.graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
     from ..models.graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
+    from ..models.graph_metric_runtime_stats import GraphMetricRuntimeStats
     from ..models.index_repair_status import IndexRepairStatus
 
 
@@ -82,6 +83,8 @@ class GraphIndexStats:
         promotion (GraphIndexStatsPromotion | Unset): Artifact promotion replay diagnostics.
         algebraic_graph (GraphIndexStatsAlgebraicGraph | Unset): Algebraic graph execution health for bounded semiring
             traversal.
+        graph_metric_runtime (GraphMetricRuntimeStats | Unset): Summarized graph metric maintenance runtime state.
+            Identity fields are stable hashes, not raw process or owner identifiers.
     """
 
     index_type: GraphIndexStatsIndexType
@@ -131,6 +134,7 @@ class GraphIndexStats:
     resolution: GraphIndexStatsResolution | Unset = UNSET
     promotion: GraphIndexStatsPromotion | Unset = UNSET
     algebraic_graph: GraphIndexStatsAlgebraicGraph | Unset = UNSET
+    graph_metric_runtime: GraphMetricRuntimeStats | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -244,6 +248,10 @@ class GraphIndexStats:
         if not isinstance(self.algebraic_graph, Unset):
             algebraic_graph = self.algebraic_graph.to_dict()
 
+        graph_metric_runtime: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.graph_metric_runtime, Unset):
+            graph_metric_runtime = self.graph_metric_runtime.to_dict()
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -343,6 +351,8 @@ class GraphIndexStats:
             field_dict["promotion"] = promotion
         if algebraic_graph is not UNSET:
             field_dict["algebraic_graph"] = algebraic_graph
+        if graph_metric_runtime is not UNSET:
+            field_dict["graph_metric_runtime"] = graph_metric_runtime
 
         return field_dict
 
@@ -355,6 +365,7 @@ class GraphIndexStats:
         from ..models.graph_index_stats_resolution import GraphIndexStatsResolution
         from ..models.graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
         from ..models.graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
+        from ..models.graph_metric_runtime_stats import GraphMetricRuntimeStats
         from ..models.index_repair_status import IndexRepairStatus
 
         d = dict(src_dict)
@@ -492,6 +503,13 @@ class GraphIndexStats:
         else:
             algebraic_graph = GraphIndexStatsAlgebraicGraph.from_dict(_algebraic_graph)
 
+        _graph_metric_runtime = d.pop("graph_metric_runtime", UNSET)
+        graph_metric_runtime: GraphMetricRuntimeStats | Unset
+        if isinstance(_graph_metric_runtime, Unset):
+            graph_metric_runtime = UNSET
+        else:
+            graph_metric_runtime = GraphMetricRuntimeStats.from_dict(_graph_metric_runtime)
+
         graph_index_stats = cls(
             index_type=index_type,
             error=error,
@@ -540,6 +558,7 @@ class GraphIndexStats:
             resolution=resolution,
             promotion=promotion,
             algebraic_graph=algebraic_graph,
+            graph_metric_runtime=graph_metric_runtime,
         )
 
         graph_index_stats.additional_properties = d

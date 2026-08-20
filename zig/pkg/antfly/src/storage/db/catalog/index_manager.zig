@@ -16,6 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const storage_build_options = @import("build_options");
 const platform = @import("antfly_platform");
+const platform_clock = platform.clock;
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../../common/fs_paths.zig");
 const process_memory = @import("antfly_platform").process_memory;
@@ -4001,9 +4002,10 @@ pub const IndexManager = struct {
                 if (cfg.refresh != .background) continue;
                 var status = try entry.index.graphMetricStatus(cfg.name);
                 defer status.deinit(entry.index.alloc);
+                if (status.maintenance_paused) continue;
                 switch (status.state) {
                     .not_ready, .stale, .failed => {
-                        var published = try entry.index.runPageRankMetric(cfg.name);
+                        var published = try entry.index.runGraphMetric(cfg.name);
                         published.deinit(entry.index.alloc);
                         total_steps += 1;
                     },
@@ -4012,6 +4014,726 @@ pub const IndexManager = struct {
             }
         }
         return total_steps;
+    }
+
+    pub fn refreshGraphMetric(self: *IndexManager, index_name: []const u8, metric_name: []const u8) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.runGraphMetric(metric_name);
+    }
+
+    pub fn rebuildGraphMetric(self: *IndexManager, index_name: []const u8, metric_name: []const u8) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        try entry.index.deleteGraphMetricMaterialization(metric_name);
+        return try entry.index.runGraphMetric(metric_name);
+    }
+
+    pub fn deleteGraphMetricMaterialization(self: *IndexManager, index_name: []const u8, metric_name: []const u8) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        try entry.index.deleteGraphMetricMaterialization(metric_name);
+        return try entry.index.graphMetricStatus(metric_name);
+    }
+
+    pub fn pauseGraphMetricMaintenance(self: *IndexManager, index_name: []const u8, metric_name: []const u8) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.pauseGraphMetricMaintenance(metric_name);
+    }
+
+    pub fn resumeGraphMetricMaintenance(self: *IndexManager, index_name: []const u8, metric_name: []const u8) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.resumeGraphMetricMaintenance(metric_name);
+    }
+
+    pub fn ensureGraphMetricPlannedBuild(
+        self: *IndexManager,
+        index_name: []const u8,
+        metric_name: []const u8,
+        target_generation: u64,
+    ) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.ensureGraphMetricPlannedBuild(metric_name, target_generation);
+    }
+
+    pub fn runGraphMetricPlannedWorkerPageStep(
+        self: *IndexManager,
+        index_name: []const u8,
+        metric_name: []const u8,
+        worker_id: []const u8,
+    ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.runGraphMetricPlannedWorkerPageStepForMetric(metric_name, worker_id);
+    }
+
+    pub fn runGraphMetricPlannedWorkerPageStepAt(
+        self: *IndexManager,
+        index_name: []const u8,
+        metric_name: []const u8,
+        worker_id: []const u8,
+        now_ms: u64,
+    ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.runGraphMetricPlannedWorkerPageStepForMetricAt(metric_name, worker_id, now_ms);
+    }
+
+    pub fn runGraphMetricPlannedCoordinatorStep(
+        self: *IndexManager,
+        index_name: []const u8,
+        metric_name: []const u8,
+    ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.runGraphMetricPlannedCoordinatorStepForMetric(metric_name);
+    }
+
+    pub fn runGraphMetricPlannedCoordinatorStepAt(
+        self: *IndexManager,
+        index_name: []const u8,
+        metric_name: []const u8,
+        now_ms: u64,
+    ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.runGraphMetricPlannedCoordinatorStepForMetricAt(metric_name, now_ms);
+    }
+
+    pub fn failGraphMetricPlannedBuild(
+        self: *IndexManager,
+        index_name: []const u8,
+        metric_name: []const u8,
+        err: anyerror,
+    ) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.failGraphMetricPlannedBuild(metric_name, err);
+    }
+
+    pub fn runGraphMetricPlannedDrain(
+        self: *IndexManager,
+        index_name: []const u8,
+        metric_name: []const u8,
+        target_generation: u64,
+        options: graph_mod.GraphIndex.GraphMetricPlannedDrainOptions,
+    ) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.runGraphMetricPlannedDrain(metric_name, target_generation, options);
+    }
+
+    pub const GraphMetricPlannedSchedulerSweepOptions = struct {
+        max_metrics: usize = 64,
+        start_background_builds: bool = true,
+        now_ms: ?u64 = null,
+        auto_idle_options: ?GraphMetricPlannedAutoIdleOptions = null,
+    };
+
+    pub const GraphMetricPlannedWorkerSweepOptions = struct {
+        worker_id: []const u8,
+        max_pages: usize = 64,
+        now_ms: ?u64 = null,
+    };
+
+    pub const GraphMetricPlannedSchedulerSweepResult = struct {
+        metrics_scanned: usize = 0,
+        active_builds: usize = 0,
+        builds_started: usize = 0,
+        worker_steps: usize = 0,
+        coordinator_steps: usize = 0,
+        pages_claimed: usize = 0,
+        pages_completed: usize = 0,
+        phases_advanced: usize = 0,
+        published: usize = 0,
+        failed_builds: usize = 0,
+        rounds_executed: usize = 0,
+        budget_exhausted: bool = false,
+
+        pub fn progressed(self: @This()) bool {
+            return self.builds_started != 0 or
+                self.worker_steps != 0 or
+                self.coordinator_steps != 0 or
+                self.pages_claimed != 0 or
+                self.pages_completed != 0 or
+                self.phases_advanced != 0 or
+                self.published != 0 or
+                self.failed_builds != 0;
+        }
+
+        pub fn durableProgressed(self: @This()) bool {
+            return self.builds_started != 0 or
+                self.pages_claimed != 0 or
+                self.pages_completed != 0 or
+                self.phases_advanced != 0 or
+                self.published != 0 or
+                self.failed_builds != 0;
+        }
+
+        pub fn add(self: *@This(), other: @This()) void {
+            self.metrics_scanned += other.metrics_scanned;
+            self.active_builds += other.active_builds;
+            self.builds_started += other.builds_started;
+            self.worker_steps += other.worker_steps;
+            self.coordinator_steps += other.coordinator_steps;
+            self.pages_claimed += other.pages_claimed;
+            self.pages_completed += other.pages_completed;
+            self.phases_advanced += other.phases_advanced;
+            self.published += other.published;
+            self.failed_builds += other.failed_builds;
+            self.rounds_executed += other.rounds_executed;
+            self.budget_exhausted = self.budget_exhausted or other.budget_exhausted;
+        }
+    };
+
+    pub const GraphMetricPlannedMaintenanceOptions = struct {
+        worker_id: []const u8 = "graph-metric-idle-worker",
+        worker_ids: []const []const u8 = &.{},
+        max_rounds: usize = 1024,
+        max_metrics_per_round: usize = 64,
+        max_pages_per_round: usize = 64,
+        now_ms: ?u64 = null,
+    };
+
+    pub const GraphMetricPlannedWorkStats = struct {
+        metrics_scanned: usize = 0,
+        queued_builds: usize = 0,
+        active_builds: usize = 0,
+        active_pages: usize = 0,
+        failed_pages: usize = 0,
+        paused_metrics: usize = 0,
+        truncated_pages: bool = false,
+
+        pub fn hasWork(self: @This()) bool {
+            return self.queued_builds != 0 or
+                self.active_builds != 0 or
+                self.active_pages != 0 or
+                self.failed_pages != 0;
+        }
+    };
+
+    pub const GraphMetricPlannedAutoIdleOptions = struct {
+        max_pagerank_iterations: u32 = std.math.maxInt(u32),
+        max_eigenvector_iterations: u32 = std.math.maxInt(u32),
+        max_hits_iterations: u32 = std.math.maxInt(u32),
+        max_active_builds: usize = 4,
+        max_active_builds_per_index: usize = 2,
+    };
+
+    pub const GraphMetricPlannedAutoIdleDecision = struct {
+        active_builds: usize = 0,
+        eligible_queued: usize = 0,
+        deferred_queued: usize = 0,
+        ineligible_queued: usize = 0,
+
+        pub fn shouldRunPlanned(self: @This()) bool {
+            return self.active_builds != 0 or self.eligible_queued != 0;
+        }
+    };
+
+    pub const GraphMetricDegreeCanaryOptions = struct {
+        max_control_records: usize = 64,
+    };
+
+    pub const GraphMetricDegreeCanaryDecision = struct {
+        active_degree_builds: usize = 0,
+        eligible_queued_degree: usize = 0,
+        blocked_active_non_degree: usize = 0,
+        blocked_queued_non_degree: usize = 0,
+        control_records: usize = 0,
+        queued_degree_control_records: usize = 0,
+        failed_pages: usize = 0,
+        truncated_pages: bool = false,
+        max_control_records: usize = 64,
+
+        pub fn shouldRunPlanned(self: @This()) bool {
+            if (self.blocked_active_non_degree != 0) return false;
+            if (self.blocked_queued_non_degree != 0) return false;
+            if (self.failed_pages != 0) return false;
+            if (self.truncated_pages) return false;
+            if (self.control_records > self.max_control_records) return false;
+            if (self.control_records +| self.queued_degree_control_records > self.max_control_records) return false;
+            if (self.active_degree_builds == 1 and self.eligible_queued_degree == 0) return true;
+            if (self.active_degree_builds == 0 and self.eligible_queued_degree == 1) return true;
+            return false;
+        }
+    };
+
+    fn graphMetricBackgroundStartCanonical(configs: []const graph_mod.GraphMetricConfig, cfg: graph_mod.GraphMetricConfig) bool {
+        if (cfg.kind != .hits_hub) return true;
+        for (configs) |candidate| {
+            if (candidate.kind == .hits_authority and candidate.refresh == .background) return false;
+        }
+        return true;
+    }
+
+    pub fn graphMetricPlannedWorkStats(self: *IndexManager) !GraphMetricPlannedWorkStats {
+        var stats = GraphMetricPlannedWorkStats{};
+        for (self.graph_indexes.items) |*entry| {
+            for (entry.metric_configs) |cfg| {
+                stats.metrics_scanned += 1;
+                var status = try entry.index.graphMetricStatus(cfg.name);
+                defer status.deinit(entry.index.alloc);
+                if (status.maintenance_paused) {
+                    stats.paused_metrics += 1;
+                    continue;
+                }
+                if (status.build_pages_truncated) stats.truncated_pages = true;
+                for (status.build_pages) |page| {
+                    switch (page.state) {
+                        .leased => stats.active_pages += 1,
+                        .failed => stats.failed_pages += 1,
+                        .pending, .complete => {},
+                    }
+                }
+                if (status.state == .building or status.phase == .cleanup_old_generations) {
+                    if (!graphMetricBackgroundStartCanonical(entry.metric_configs, cfg)) continue;
+                    stats.active_builds += 1;
+                    continue;
+                }
+                if (cfg.refresh != .background) continue;
+                if (!graphMetricBackgroundStartCanonical(entry.metric_configs, cfg)) continue;
+                switch (status.state) {
+                    .not_ready, .stale => stats.queued_builds += 1,
+                    .disabled, .fresh, .building => {},
+                    .failed => {},
+                }
+            }
+        }
+        return stats;
+    }
+
+    pub fn shouldRunGraphMetricPlannedAutoIdle(
+        self: *IndexManager,
+        options: GraphMetricPlannedAutoIdleOptions,
+    ) !bool {
+        const decision = try self.graphMetricPlannedAutoIdleDecision(options);
+        return decision.shouldRunPlanned();
+    }
+
+    pub fn shouldRunGraphMetricDegreeCanary(
+        self: *IndexManager,
+        options: GraphMetricDegreeCanaryOptions,
+    ) !bool {
+        const decision = try self.graphMetricDegreeCanaryDecision(options);
+        return decision.shouldRunPlanned();
+    }
+
+    pub fn graphMetricDegreeCanaryDecision(
+        self: *IndexManager,
+        options: GraphMetricDegreeCanaryOptions,
+    ) !GraphMetricDegreeCanaryDecision {
+        var decision = GraphMetricDegreeCanaryDecision{
+            .max_control_records = options.max_control_records,
+        };
+
+        for (self.graph_indexes.items) |*entry| {
+            for (entry.metric_configs) |cfg| {
+                var status = try entry.index.graphMetricStatus(cfg.name);
+                defer status.deinit(entry.index.alloc);
+                if (status.maintenance_paused) continue;
+
+                const active = status.state == .building or status.phase == .cleanup_old_generations;
+                if (active) decision.control_records += 1;
+                decision.control_records += status.build_pages.len;
+                if (status.build_pages_truncated) decision.truncated_pages = true;
+                for (status.build_pages) |page| {
+                    if (page.state == .failed) decision.failed_pages += 1;
+                }
+
+                const queued = cfg.refresh == .background and
+                    graphMetricBackgroundStartCanonical(entry.metric_configs, cfg) and
+                    (status.state == .not_ready or status.state == .stale);
+                if (cfg.kind == .degree) {
+                    if (active) decision.active_degree_builds += 1;
+                    if (queued) {
+                        decision.eligible_queued_degree += 1;
+                        decision.queued_degree_control_records +|= entry.index.graphMetricPlannedBuildControlRecordEstimate(cfg);
+                    }
+                } else {
+                    if (active) decision.blocked_active_non_degree += 1;
+                    if (queued) decision.blocked_queued_non_degree += 1;
+                }
+            }
+        }
+
+        return decision;
+    }
+
+    pub fn graphMetricPlannedAutoIdleDecision(
+        self: *IndexManager,
+        options: GraphMetricPlannedAutoIdleOptions,
+    ) !GraphMetricPlannedAutoIdleDecision {
+        var decision = GraphMetricPlannedAutoIdleDecision{};
+        for (self.graph_indexes.items) |*entry| {
+            const index_active_builds = try graphMetricIndexActiveBuilds(entry);
+            var index_scheduled_builds: usize = 0;
+            decision.active_builds += index_active_builds;
+            for (entry.metric_configs) |cfg| {
+                var status = try entry.index.graphMetricStatus(cfg.name);
+                defer status.deinit(entry.index.alloc);
+                if (status.maintenance_paused) continue;
+
+                if (status.state == .building or status.phase == .cleanup_old_generations) {
+                    continue;
+                }
+
+                if (cfg.refresh != .background) continue;
+                if (!graphMetricBackgroundStartCanonical(entry.metric_configs, cfg)) continue;
+                switch (status.state) {
+                    .not_ready, .stale => {
+                        if (!graphMetricQueuedPlannedAutoEligible(entry.metric_configs, cfg, options)) {
+                            decision.ineligible_queued += 1;
+                        } else if (graphMetricPlannedAutoCanStart(
+                            options,
+                            decision.active_builds,
+                            decision.eligible_queued,
+                            index_active_builds,
+                            index_scheduled_builds,
+                        )) {
+                            decision.eligible_queued += 1;
+                            index_scheduled_builds += 1;
+                        } else {
+                            decision.deferred_queued += 1;
+                        }
+                    },
+                    .disabled, .fresh, .building, .failed => {},
+                }
+            }
+        }
+
+        return decision;
+    }
+
+    fn graphMetricIndexActiveBuilds(entry: *GraphIndex) !usize {
+        var active_builds: usize = 0;
+        for (entry.metric_configs) |cfg| {
+            var status = try entry.index.graphMetricStatus(cfg.name);
+            defer status.deinit(entry.index.alloc);
+            if (status.maintenance_paused) continue;
+            if (status.state == .building or status.phase == .cleanup_old_generations) {
+                if (!graphMetricBackgroundStartCanonical(entry.metric_configs, cfg)) continue;
+                active_builds += 1;
+            }
+        }
+        return active_builds;
+    }
+
+    fn graphMetricPlannedAutoCanStart(
+        options: GraphMetricPlannedAutoIdleOptions,
+        active_builds: usize,
+        eligible_queued: usize,
+        index_active_builds: usize,
+        index_scheduled_builds: usize,
+    ) bool {
+        if (options.max_active_builds == 0 or options.max_active_builds_per_index == 0) return false;
+        if (active_builds + eligible_queued >= options.max_active_builds) return false;
+        if (index_active_builds + index_scheduled_builds >= options.max_active_builds_per_index) return false;
+        return true;
+    }
+
+    fn graphMetricQueuedPlannedAutoEligible(
+        configs: []const graph_mod.GraphMetricConfig,
+        cfg: graph_mod.GraphMetricConfig,
+        options: GraphMetricPlannedAutoIdleOptions,
+    ) bool {
+        return switch (cfg.kind) {
+            .degree => true,
+            .pagerank => cfg.max_iterations <= options.max_pagerank_iterations,
+            .eigenvector => cfg.max_iterations <= options.max_eigenvector_iterations,
+            .hits_authority => options.max_hits_iterations != 0 and
+                cfg.max_iterations <= options.max_hits_iterations and
+                graphMetricHasEligibleBackgroundHitsHub(configs, cfg, options),
+            .hits_hub => false,
+        };
+    }
+
+    fn graphMetricHasEligibleBackgroundHitsHub(
+        configs: []const graph_mod.GraphMetricConfig,
+        cfg: graph_mod.GraphMetricConfig,
+        options: GraphMetricPlannedAutoIdleOptions,
+    ) bool {
+        for (configs) |candidate| {
+            if (graphMetricQueuedHitsHubCompatible(candidate, cfg, options)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn graphMetricQueuedHitsHubCompatible(
+        candidate: graph_mod.GraphMetricConfig,
+        cfg: graph_mod.GraphMetricConfig,
+        options: GraphMetricPlannedAutoIdleOptions,
+    ) bool {
+        return candidate.kind == .hits_hub and
+            candidate.refresh == .background and
+            !std.mem.eql(u8, candidate.name, cfg.name) and
+            candidate.max_iterations == cfg.max_iterations and
+            candidate.max_iterations <= options.max_hits_iterations and
+            candidate.tolerance == cfg.tolerance and
+            candidate.edge_filter.equivalent(cfg.edge_filter);
+    }
+
+    fn graphMetricShouldAutoStartQueuedBuild(
+        configs: []const graph_mod.GraphMetricConfig,
+        cfg: graph_mod.GraphMetricConfig,
+        options: GraphMetricPlannedAutoIdleOptions,
+        active_builds: usize,
+        scheduled_builds: usize,
+        index_active_builds: usize,
+        index_scheduled_builds: usize,
+    ) bool {
+        if (!graphMetricBackgroundStartCanonical(configs, cfg)) return false;
+        if (!graphMetricQueuedPlannedAutoEligible(configs, cfg, options)) return false;
+        return graphMetricPlannedAutoCanStart(
+            options,
+            active_builds,
+            scheduled_builds,
+            index_active_builds,
+            index_scheduled_builds,
+        );
+    }
+
+    pub fn runGraphMetricPlannedCoordinatorSweep(
+        self: *IndexManager,
+        options: GraphMetricPlannedSchedulerSweepOptions,
+    ) !GraphMetricPlannedSchedulerSweepResult {
+        var result = GraphMetricPlannedSchedulerSweepResult{};
+        if (options.max_metrics == 0) return result;
+        const active_builds_before_start: usize = if (options.auto_idle_options != null)
+            try self.graphMetricActiveBuildCount()
+        else
+            0;
+        var scheduled_builds: usize = 0;
+
+        for (self.graph_indexes.items) |*entry| {
+            const index_active_builds = if (options.auto_idle_options != null)
+                try graphMetricIndexActiveBuilds(entry)
+            else
+                0;
+            var index_scheduled_builds: usize = 0;
+            for (entry.metric_configs) |cfg| {
+                if (result.metrics_scanned >= options.max_metrics) {
+                    result.budget_exhausted = true;
+                    return result;
+                }
+                result.metrics_scanned += 1;
+
+                var status = try entry.index.graphMetricStatus(cfg.name);
+                defer status.deinit(entry.index.alloc);
+                if (status.maintenance_paused) continue;
+
+                var active = status.state == .building;
+                if (!active and options.start_background_builds and cfg.refresh == .background) {
+                    switch (status.state) {
+                        .not_ready, .stale => {
+                            if (options.auto_idle_options) |auto_options| {
+                                if (!graphMetricShouldAutoStartQueuedBuild(
+                                    entry.metric_configs,
+                                    cfg,
+                                    auto_options,
+                                    active_builds_before_start,
+                                    scheduled_builds,
+                                    index_active_builds,
+                                    index_scheduled_builds,
+                                )) continue;
+                            } else if (!graphMetricBackgroundStartCanonical(entry.metric_configs, cfg)) continue;
+                            var started = try entry.index.ensureGraphMetricPlannedBuild(cfg.name, status.target_edge_generation);
+                            defer started.deinit(entry.index.alloc);
+                            result.builds_started += 1;
+                            scheduled_builds += 1;
+                            index_scheduled_builds += 1;
+                            active = true;
+                        },
+                        .disabled, .fresh, .building, .failed => {},
+                    }
+                }
+                if (!active) continue;
+                result.active_builds += 1;
+
+                const step = (if (options.now_ms) |now_ms|
+                    entry.index.runGraphMetricPlannedCoordinatorStepForMetricAt(cfg.name, now_ms)
+                else
+                    entry.index.runGraphMetricPlannedCoordinatorStepForMetric(cfg.name)) catch |err| switch (err) {
+                    error.GraphMetricBuildJobNotFound, error.GraphMetricBuildNotActive => continue,
+                    else => return err,
+                };
+                result.coordinator_steps += 1;
+                if (step.advanced_phase) result.phases_advanced += 1;
+                if (step.published or (step.advanced_phase and step.phase == .publish_generation)) {
+                    result.published += 1;
+                }
+                if (step.failed_build) result.failed_builds += 1;
+            }
+        }
+        return result;
+    }
+
+    fn graphMetricActiveBuildCount(self: *IndexManager) !usize {
+        var active_builds: usize = 0;
+        for (self.graph_indexes.items) |*entry| {
+            active_builds += try graphMetricIndexActiveBuilds(entry);
+        }
+        return active_builds;
+    }
+
+    pub fn runGraphMetricPlannedWorkerSweep(
+        self: *IndexManager,
+        options: GraphMetricPlannedWorkerSweepOptions,
+    ) !GraphMetricPlannedSchedulerSweepResult {
+        if (options.worker_id.len == 0) return error.InvalidGraphMetricBuildWorker;
+        var result = GraphMetricPlannedSchedulerSweepResult{};
+        if (options.max_pages == 0) return result;
+
+        for (self.graph_indexes.items) |*entry| {
+            for (entry.metric_configs) |cfg| {
+                if (result.worker_steps >= options.max_pages) {
+                    result.budget_exhausted = true;
+                    return result;
+                }
+
+                var status = try entry.index.graphMetricStatus(cfg.name);
+                defer status.deinit(entry.index.alloc);
+                if (status.maintenance_paused) continue;
+                const active = status.state == .building or status.phase == .cleanup_old_generations;
+                if (!active) continue;
+                result.metrics_scanned += 1;
+                result.active_builds += 1;
+
+                const step = (if (options.now_ms) |now_ms|
+                    entry.index.runGraphMetricPlannedWorkerPageStepForMetricAt(cfg.name, options.worker_id, now_ms)
+                else
+                    entry.index.runGraphMetricPlannedWorkerPageStepForMetric(cfg.name, options.worker_id)) catch |err| switch (err) {
+                    error.GraphMetricBuildJobNotFound, error.GraphMetricBuildNotActive => continue,
+                    else => return err,
+                };
+                result.worker_steps += 1;
+                if (step.claimed_page) result.pages_claimed += 1;
+                if (step.completed_page) result.pages_completed += 1;
+                if (step.advanced_phase) result.phases_advanced += 1;
+                if (result.worker_steps >= options.max_pages) {
+                    var after_status = try entry.index.graphMetricStatus(cfg.name);
+                    defer after_status.deinit(entry.index.alloc);
+                    if (graphMetricStatusHasRunnableWorkerPage(after_status, options.worker_id, options.now_ms)) {
+                        result.budget_exhausted = true;
+                    }
+                    return result;
+                }
+            }
+        }
+        return result;
+    }
+
+    pub fn runGraphMetricPlannedMaintenance(
+        self: *IndexManager,
+        options: GraphMetricPlannedMaintenanceOptions,
+    ) !GraphMetricPlannedSchedulerSweepResult {
+        return try self.runGraphMetricPlannedMaintenanceWithAuto(options, null);
+    }
+
+    pub fn runGraphMetricPlannedAutoMaintenance(
+        self: *IndexManager,
+        options: GraphMetricPlannedMaintenanceOptions,
+        auto_options: GraphMetricPlannedAutoIdleOptions,
+    ) !GraphMetricPlannedSchedulerSweepResult {
+        return try self.runGraphMetricPlannedMaintenanceWithAuto(options, auto_options);
+    }
+
+    fn runGraphMetricPlannedMaintenanceWithAuto(
+        self: *IndexManager,
+        options: GraphMetricPlannedMaintenanceOptions,
+        auto_options: ?GraphMetricPlannedAutoIdleOptions,
+    ) !GraphMetricPlannedSchedulerSweepResult {
+        try validateGraphMetricPlannedMaintenanceWorkers(options);
+        var total = GraphMetricPlannedSchedulerSweepResult{};
+        if (options.max_rounds == 0) {
+            total.budget_exhausted = true;
+            return total;
+        }
+
+        var rounds: usize = 0;
+        while (rounds < options.max_rounds) : (rounds += 1) {
+            var round = GraphMetricPlannedSchedulerSweepResult{};
+            const coordinator_before = try self.runGraphMetricPlannedCoordinatorSweep(.{
+                .max_metrics = options.max_metrics_per_round,
+                .start_background_builds = true,
+                .now_ms = options.now_ms,
+                .auto_idle_options = auto_options,
+            });
+            round.add(coordinator_before);
+
+            if (options.worker_ids.len == 0) {
+                const worker = try self.runGraphMetricPlannedWorkerSweep(.{
+                    .worker_id = options.worker_id,
+                    .max_pages = options.max_pages_per_round,
+                    .now_ms = options.now_ms,
+                });
+                round.add(worker);
+            } else {
+                var pages_remaining = options.max_pages_per_round;
+                while (pages_remaining > 0) {
+                    var worker_progressed = false;
+                    for (options.worker_ids) |worker_id| {
+                        if (pages_remaining == 0) break;
+                        const worker = try self.runGraphMetricPlannedWorkerSweep(.{
+                            .worker_id = worker_id,
+                            .max_pages = 1,
+                            .now_ms = options.now_ms,
+                        });
+                        round.add(worker);
+                        pages_remaining -= @min(pages_remaining, worker.worker_steps);
+                        worker_progressed = worker_progressed or worker.durableProgressed();
+                    }
+                    if (!worker_progressed) break;
+                }
+            }
+
+            const coordinator_after = try self.runGraphMetricPlannedCoordinatorSweep(.{
+                .max_metrics = options.max_metrics_per_round,
+                .start_background_builds = true,
+                .now_ms = options.now_ms,
+                .auto_idle_options = auto_options,
+            });
+            round.add(coordinator_after);
+
+            const round_budget_exhausted = round.budget_exhausted;
+            round.budget_exhausted = false;
+            round.rounds_executed = 1;
+            total.add(round);
+            if (!round.durableProgressed()) {
+                total.budget_exhausted = round_budget_exhausted;
+                return total;
+            }
+        }
+        total.budget_exhausted = true;
+        return total;
+    }
+
+    fn validateGraphMetricPlannedMaintenanceWorkers(options: GraphMetricPlannedMaintenanceOptions) !void {
+        if (options.worker_ids.len == 0) {
+            if (options.worker_id.len == 0) return error.InvalidGraphMetricBuildWorker;
+            return;
+        }
+
+        for (options.worker_ids, 0..) |worker_id, i| {
+            if (worker_id.len == 0) return error.InvalidGraphMetricBuildWorker;
+            for (options.worker_ids[0..i]) |prior_worker_id| {
+                if (std.mem.eql(u8, worker_id, prior_worker_id)) return error.InvalidGraphMetricBuildWorker;
+            }
+        }
+    }
+
+    fn graphMetricStatusHasRunnableWorkerPage(
+        status: graph_mod.GraphIndex.GraphMetricStatus,
+        worker_id: []const u8,
+        now_ms: ?u64,
+    ) bool {
+        if (status.state == .building or status.phase == .cleanup_old_generations) return true;
+        if (status.build_pages_truncated) return true;
+        const now: u64 = now_ms orelse platform_clock.Clock.real().nowRealtimeMs();
+        for (status.build_pages) |page| {
+            switch (page.state) {
+                .pending, .failed => return true,
+                .leased => {
+                    if (std.mem.eql(u8, page.worker_id, worker_id)) return true;
+                    if (page.lease_expires_at_ms <= now) return true;
+                },
+                .complete => {},
+            }
+        }
+        return false;
     }
 
     pub const DensePostingMaintenanceOptions = struct {
@@ -18427,9 +19149,21 @@ fn parseGraphMetricConfigs(alloc: Allocator, root: std.json.Value) ![]graph_mod.
         const kind = if (metric_obj.get("kind")) |value| blk: {
             if (value != .string) return error.InvalidIndexConfig;
             if (std.mem.eql(u8, value.string, "pagerank")) break :blk graph_mod.GraphMetricKind.pagerank;
+            if (std.mem.eql(u8, value.string, "degree")) break :blk graph_mod.GraphMetricKind.degree;
+            if (std.mem.eql(u8, value.string, "eigenvector")) break :blk graph_mod.GraphMetricKind.eigenvector;
+            if (std.mem.eql(u8, value.string, "hits_authority")) break :blk graph_mod.GraphMetricKind.hits_authority;
+            if (std.mem.eql(u8, value.string, "hits_hub")) break :blk graph_mod.GraphMetricKind.hits_hub;
             return error.InvalidIndexConfig;
         } else if (std.mem.eql(u8, name, "pagerank"))
             graph_mod.GraphMetricKind.pagerank
+        else if (std.mem.eql(u8, name, "degree"))
+            graph_mod.GraphMetricKind.degree
+        else if (std.mem.eql(u8, name, "eigenvector"))
+            graph_mod.GraphMetricKind.eigenvector
+        else if (std.mem.eql(u8, name, "hits_authority"))
+            graph_mod.GraphMetricKind.hits_authority
+        else if (std.mem.eql(u8, name, "hits_hub"))
+            graph_mod.GraphMetricKind.hits_hub
         else
             return error.InvalidIndexConfig;
 
@@ -18450,8 +19184,12 @@ fn parseGraphMetricConfigs(alloc: Allocator, root: std.json.Value) ![]graph_mod.
             break :blk raw;
         } else 50;
 
+        const owned_name = try alloc.dupe(u8, name);
+        var owned_name_moved = false;
+        errdefer if (!owned_name_moved) alloc.free(owned_name);
+
         var cfg = graph_mod.GraphMetricConfig{
-            .name = try alloc.dupe(u8, name),
+            .name = owned_name,
             .kind = kind,
             .damping = damping,
             .tolerance = tolerance,
@@ -18459,6 +19197,7 @@ fn parseGraphMetricConfigs(alloc: Allocator, root: std.json.Value) ![]graph_mod.
             .refresh = refresh,
             .edge_filter = try parseGraphMetricEdgeFilter(alloc, metric_obj.get("edge_filter")),
         };
+        owned_name_moved = true;
         var cfg_moved = false;
         errdefer if (!cfg_moved) {
             alloc.free(cfg.name);
