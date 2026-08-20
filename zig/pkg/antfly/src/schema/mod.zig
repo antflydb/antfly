@@ -57,6 +57,7 @@ pub fn documentPropertyAllowsNull(property: impl.DocumentProperty) bool {
 
 pub const documentDateTimeToNs = impl.documentDateTimeToNs;
 pub const documentIntegerToI64 = impl.documentIntegerToI64;
+pub const documentNumberToF64 = impl.documentNumberToF64;
 
 pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSchema) !storage_schema.TableSchema {
     const document_field_templates = try deriveRuntimeDocumentFieldTemplates(alloc, schema);

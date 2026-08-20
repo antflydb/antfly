@@ -1995,12 +1995,8 @@ fn coerceColumnValue(alloc: Allocator, column_type: []const u8, json_value: std.
         }
     }
     if (std.mem.eql(u8, column_type, "number")) {
-        switch (json_value) {
-            .float => |number| return Coerced{ .value = .{ .f64_val = number } },
-            .integer => |number| return Coerced{ .value = .{ .f64_val = @floatFromInt(number) } },
-            .number_string => |text| return Coerced{ .value = .{ .f64_val = std.fmt.parseFloat(f64, text) catch return null } },
-            else => return null,
-        }
+        const number = schema_mod.documentNumberToF64(json_value) orelse return null;
+        return Coerced{ .value = .{ .f64_val = number } };
     }
     if (std.mem.eql(u8, column_type, "integer")) {
         const number = schema_mod.documentIntegerToI64(json_value) orelse return null;
@@ -2145,6 +2141,28 @@ test "relational integer validation and projection share exact i64 conversion" {
         defer value.deinit();
         try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, value.value));
     }
+}
+
+test "relational number validation rejects values the row codec cannot encode" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"numeric"}},"required":["amount"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+    var plan = try relationalColumnPlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+
+    const overflowed_number =
+        \\{"amount":1e5000}
+    ;
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = overflowed_number }}),
+    );
+    var value = try std.json.parseFromSlice(std.json.Value, alloc, overflowed_number, .{});
+    defer value.deinit();
+    try std.testing.expect(value.value.object.get("amount").? == .number_string);
+    try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, value.value));
 }
 
 test "relational projection preserves explicit null separately from absence" {

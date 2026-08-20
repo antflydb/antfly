@@ -375,6 +375,7 @@ const SchemaContext = struct {
 const RuntimeValidationContext = struct {
     alloc: std.mem.Allocator,
     root_property: ?*const DocumentProperty = null,
+    require_physical_encoding: bool = false,
     active_root_ref_values: std.ArrayListUnmanaged(usize) = .{ .items = &.{}, .capacity = 0 },
 
     fn deinit(self: *RuntimeValidationContext) void {
@@ -554,7 +555,10 @@ pub fn validateDocumentJson(
     };
 
     const document_schema = try resolveDocumentSchema(schema, root);
-    var validation_context = RuntimeValidationContext{ .alloc = alloc };
+    var validation_context = RuntimeValidationContext{
+        .alloc = alloc,
+        .require_physical_encoding = schema.storage_mode == .relational,
+    };
     defer validation_context.deinit();
     var root_property: ?DocumentProperty = null;
     var root_composition_evaluated_fields = std.StringHashMapUnmanaged(void).empty;
@@ -3290,9 +3294,16 @@ fn validateDocumentFieldValueWithContext(
         std.mem.eql(u8, field_type, "number") or
         std.mem.eql(u8, field_type, "integer"))
     {
-        const numeric_value = parseJsonNumber(value.*) catch return error.InvalidBatchRequest;
-        if ((property.integer_only or std.mem.eql(u8, field_type, "integer")) and documentIntegerToI64(value.*) == null) {
-            return error.InvalidBatchRequest;
+        const numeric_value = if (context.require_physical_encoding)
+            documentNumberToF64(value.*) orelse return error.InvalidBatchRequest
+        else
+            parseJsonNumber(value.*) catch return error.InvalidBatchRequest;
+        if (property.integer_only or std.mem.eql(u8, field_type, "integer")) {
+            const is_integer = if (context.require_physical_encoding)
+                documentIntegerToI64(value.*) != null
+            else
+                isIntegralJsonNumber(value.*, numeric_value);
+            if (!is_integer) return error.InvalidBatchRequest;
         }
         if (property.minimum) |minimum| {
             if (numeric_value < minimum) return error.InvalidBatchRequest;
@@ -3317,17 +3328,25 @@ fn validateDocumentFieldValueWithContext(
     }
     if (std.mem.eql(u8, field_type, "null")) return error.InvalidBatchRequest;
     if (std.mem.eql(u8, field_type, "datetime")) {
-        if (documentDateTimeToNs(value.*) == null) return error.InvalidBatchRequest;
-        return;
+        if (context.require_physical_encoding) {
+            if (documentDateTimeToNs(value.*) == null) return error.InvalidBatchRequest;
+            return;
+        }
+        switch (value.*) {
+            .string, .integer, .number_string => return,
+            else => return error.InvalidBatchRequest,
+        }
     }
     if (std.mem.eql(u8, field_type, "geopoint")) {
+        if (!context.require_physical_encoding) return;
         if (value.* != .object or value.object.count() != 2) return error.InvalidBatchRequest;
-        const lat = parseJsonNumber(value.object.get("lat") orelse return error.InvalidBatchRequest) catch return error.InvalidBatchRequest;
-        const lon = parseJsonNumber(value.object.get("lon") orelse return error.InvalidBatchRequest) catch return error.InvalidBatchRequest;
+        const lat = documentNumberToF64(value.object.get("lat") orelse return error.InvalidBatchRequest) orelse return error.InvalidBatchRequest;
+        const lon = documentNumberToF64(value.object.get("lon") orelse return error.InvalidBatchRequest) orelse return error.InvalidBatchRequest;
         if (!geo_mod.latitudeIsValid(lat) or !geo_mod.longitudeIsValid(lon)) return error.InvalidBatchRequest;
         return;
     }
     if (std.mem.eql(u8, field_type, "geoshape")) {
+        if (!context.require_physical_encoding) return;
         if (value.* != .string) return error.InvalidBatchRequest;
         return;
     }
@@ -3382,6 +3401,19 @@ pub fn documentIntegerToI64(value: std.json.Value) ?i64 {
         },
         else => null,
     };
+}
+
+/// Convert every JSON number accepted by a relational floating-point column
+/// into its finite f64 representation. Validation and projection share this
+/// boundary so a validated write is always encodable by the row codec.
+pub fn documentNumberToF64(value: std.json.Value) ?f64 {
+    const number = switch (value) {
+        .integer => |integer| @as(f64, @floatFromInt(integer)),
+        .float => |float| float,
+        .number_string => |text| std.fmt.parseFloat(f64, text) catch return null,
+        else => return null,
+    };
+    return if (std.math.isFinite(number)) number else null;
 }
 
 pub fn documentPropertyAllowsNull(property: DocumentProperty) bool {
@@ -3872,6 +3904,18 @@ fn parseJsonNumber(value: std.json.Value) !f64 {
     };
 }
 
+fn isIntegralJsonNumber(value: std.json.Value, numeric_value: f64) bool {
+    return switch (value) {
+        .integer => true,
+        .number_string => |text| blk: {
+            _ = std.fmt.parseInt(i64, text, 10) catch break :blk false;
+            break :blk true;
+        },
+        .float => std.math.floor(numeric_value) == numeric_value,
+        else => false,
+    };
+}
+
 fn isMultipleOf(value: f64, divisor: f64) bool {
     const quotient = value / divisor;
     return std.math.approxEqAbs(f64, quotient, @round(quotient), 1e-9);
@@ -4063,6 +4107,18 @@ test "parse schema and validate document writes" {
         error.InvalidBatchRequest,
         validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"title\":\"alpha\",\"body\":\"unexpected\"}" }}),
     );
+}
+
+test "document storage preserves legacy mapped value validation" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseSchema(alloc,
+        \\{"default_type":"doc","enforce_types":true,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"large_integer":{"type":"integer"},"legacy_date":{"type":"datetime"},"legacy_point":{"type":"geopoint"},"legacy_shape":{"type":"geoshape"}},"required":["large_integer","legacy_date","legacy_point","legacy_shape"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+
+    try validateWritesAgainstSchema(alloc, parsed, &.{.{ .value =
+        \\{"large_integer":1e100,"legacy_date":"not-a-date","legacy_point":"legacy","legacy_shape":{"legacy":true}}
+    }});
 }
 
 test "parse dynamic template contract and validate selectors" {
