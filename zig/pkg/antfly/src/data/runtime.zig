@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const httpx = @import("httpx");
 const platform_sync = @import("antfly_platform").sync;
 const antfly = @import("runtime_root.zig");
@@ -15993,7 +15994,31 @@ fn runtimeIndexStatusReportFromLocalIndex(
         .replay_applied_sequence = index.replay_applied_sequence,
         .replay_target_sequence = index.replay_target_sequence,
         .replay_catch_up_required = index.replay_catch_up_required,
+        .repair_status = index.index_repair_status,
+        .repair_active_generation_serviceable = index.index_repair_active_generation_serviceable,
     };
+}
+
+test "data runtime report preserves compact managed repair admission state" {
+    const alloc = std.testing.allocator;
+    const report = try runtimeIndexStatusReportFromLocalIndex(alloc, .{
+        .name = "thumbnail",
+        .kind = .dense_vector,
+        .index_repair_status = .waiting,
+        .index_repair_active_generation_serviceable = false,
+    });
+    defer antfly.metadata.table_manager.freeRuntimeIndexStatusReport(alloc, report);
+
+    try std.testing.expectEqual(antfly.metadata.table_manager.IndexRepairStatus.waiting, report.repair_status.?);
+    try std.testing.expect(!report.repair_active_generation_serviceable);
+
+    const encoded = try std.json.Stringify.valueAlloc(alloc, report, .{});
+    defer alloc.free(encoded);
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false}",
+        encoded,
+    );
 }
 
 fn progressMillis(progress: f64) u16 {

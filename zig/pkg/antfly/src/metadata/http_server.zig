@@ -2288,6 +2288,8 @@ const ParsedRuntimeIndexStatus = struct {
     replay_applied_sequence: ?u64 = null,
     replay_target_sequence: ?u64 = null,
     replay_catch_up_required: ?bool = null,
+    repair_status: ?metadata_table_manager.IndexRepairStatus = null,
+    repair_active_generation_serviceable: ?bool = null,
 };
 
 const ParsedRuntimeGroupStatus = struct {
@@ -2624,7 +2626,28 @@ fn cloneParsedRuntimeIndexStatus(
         .replay_applied_sequence = parsed.replay_applied_sequence orelse 0,
         .replay_target_sequence = parsed.replay_target_sequence orelse 0,
         .replay_catch_up_required = parsed.replay_catch_up_required orelse false,
+        .repair_status = parsed.repair_status,
+        .repair_active_generation_serviceable = parsed.repair_status != null and
+            (parsed.repair_active_generation_serviceable orelse false),
     };
+}
+
+test "metadata status JSON preserves compact managed repair admission state" {
+    const alloc = std.testing.allocator;
+    const report = try parseStoreStatusReport(alloc,
+        \\{"store_id":20,"runtime_statuses":[{"group_id":10,"indexes":[{"name":"thumbnail","kind":"dense_vector","repair_status":"waiting","repair_active_generation_serviceable":true},{"name":"legacy","kind":"full_text","repair_active_generation_serviceable":true}]}]}
+    );
+    defer freeStoreStatusReport(alloc, report);
+
+    try std.testing.expectEqual(@as(usize, 1), report.runtime_statuses.len);
+    const indexes = report.runtime_statuses[0].indexes;
+    try std.testing.expectEqual(@as(usize, 2), indexes.len);
+    try std.testing.expectEqual(metadata_table_manager.IndexRepairStatus.waiting, indexes[0].repair_status.?);
+    try std.testing.expect(indexes[0].repair_active_generation_serviceable);
+    // Proof without a repair lifecycle is not actionable and must not survive
+    // normalization from a malformed or mixed-version producer.
+    try std.testing.expect(indexes[1].repair_status == null);
+    try std.testing.expect(!indexes[1].repair_active_generation_serviceable);
 }
 
 fn parseU64Field(value: std.json.Value) !u64 {

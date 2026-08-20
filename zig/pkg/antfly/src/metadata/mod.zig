@@ -75,6 +75,7 @@ pub const RuntimeEnrichmentStatusReport = table_manager.RuntimeEnrichmentStatusR
 pub const RuntimeDocIdentityStatusReport = table_manager.RuntimeDocIdentityStatusReport;
 pub const RuntimeDocSetPlanningStatusReport = table_manager.RuntimeDocSetPlanningStatusReport;
 pub const RuntimeIndexStatusReport = table_manager.RuntimeIndexStatusReport;
+pub const IndexRepairStatus = table_manager.IndexRepairStatus;
 pub const SchemaProgressRecord = table_manager.SchemaProgressRecord;
 pub const RestoreProgressRecord = table_manager.RestoreProgressRecord;
 pub const ReplicationSourceStatusRecord = table_manager.ReplicationSourceStatusRecord;

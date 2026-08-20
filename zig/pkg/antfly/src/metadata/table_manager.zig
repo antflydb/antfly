@@ -15,7 +15,10 @@
 const std = @import("std");
 const group_ids = @import("../common/group_ids.zig");
 const topology_records = @import("../common/topology_records.zig");
+const index_repair_status = @import("../common/index_repair_status.zig");
 const transition_state = @import("transition_state.zig");
+
+pub const IndexRepairStatus = index_repair_status.IndexRepairStatus;
 
 pub const PlacementClass = enum {
     data,
@@ -808,6 +811,10 @@ pub const RuntimeIndexStatusReport = struct {
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
     replay_catch_up_required: bool = false,
+    repair_status: ?IndexRepairStatus = null,
+    /// This proof is meaningful only while repair_status is non-null. Missing
+    /// proof is deliberately false so mixed-version reports fail closed.
+    repair_active_generation_serviceable: bool = false,
 };
 
 pub const SchemaProgressRecord = struct {
@@ -2123,6 +2130,8 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
         .replay_applied_sequence = record.replay_applied_sequence,
         .replay_target_sequence = record.replay_target_sequence,
         .replay_catch_up_required = record.replay_catch_up_required,
+        .repair_status = record.repair_status,
+        .repair_active_generation_serviceable = record.repair_active_generation_serviceable,
     };
 }
 

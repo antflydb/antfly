@@ -222,7 +222,9 @@ fn runtimeStatusEqual(
             left.backfill_progress_millis != right.backfill_progress_millis or
             left.replay_applied_sequence != right.replay_applied_sequence or
             left.replay_target_sequence != right.replay_target_sequence or
-            left.replay_catch_up_required != right.replay_catch_up_required)
+            left.replay_catch_up_required != right.replay_catch_up_required or
+            left.repair_status != right.repair_status or
+            left.repair_active_generation_serviceable != right.repair_active_generation_serviceable)
         {
             return false;
         }

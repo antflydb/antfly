@@ -55,6 +55,7 @@ const algebraic_mod = @import("algebraic/mod.zig");
 const artifact_ids = @import("artifact_ids.zig");
 const apply_state = @import("derived/apply_state.zig");
 const index_repair_state = @import("derived/index_repair_state.zig");
+const index_repair_status = @import("../../common/index_repair_status.zig");
 const index_generation_manifest = @import("derived/index_generation_manifest.zig");
 const root_identity = @import("root_identity.zig");
 const runtime_error_abi = @import("../../runtime_error_abi.zig");
@@ -20108,6 +20109,7 @@ pub const DB = struct {
             item.index_repair_trigger = "corrupt_local_repair_state";
             item.index_repair_phase = "terminal";
             item.index_repair_wait_reason = "terminal";
+            item.index_repair_status = .failed;
             item.repair_degraded = true;
             return;
         }
@@ -20136,6 +20138,12 @@ pub const DB = struct {
             "convergence"
         else
             "none";
+        item.index_repair_status = index_repair_status.summarize(
+            true,
+            item.index_repair_automation,
+            item.index_repair_phase,
+            item.index_repair_wait_reason,
+        );
         // Keep status available when the optional bounded proof cannot be
         // read; query admission independently retries it and remains closed.
         item.index_repair_active_generation_serviceable =

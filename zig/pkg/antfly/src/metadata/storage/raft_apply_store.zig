@@ -4190,7 +4190,7 @@ fn replicationCutoverRetirementCleared(
 }
 
 const transition_magic = "afmd1";
-const runtime_status_record_version: u16 = 12;
+const runtime_status_record_version: u16 = 13;
 const group_status_record_version: u16 = 4;
 // Store records predate framing and are read by mixed-version metadata
 // replicas. Keep the existing prefix byte-for-byte compatible and put new
@@ -5561,6 +5561,11 @@ fn appendRuntimeIndexStatusRecord(
     try appendInt(alloc, out, u64, record.replay_target_sequence);
     try out.append(alloc, if (record.replay_catch_up_required) 1 else 0);
     try appendOptionalString(alloc, out, record.load_error);
+    try out.append(alloc, if (record.repair_status) |status| @intFromEnum(status) else 0);
+    try out.append(
+        alloc,
+        if (record.repair_status != null and record.repair_active_generation_serviceable) 1 else 0,
+    );
 }
 
 fn readRuntimeIndexStatusRecord(
@@ -5606,6 +5611,26 @@ fn readRuntimeIndexStatusRecord(
     pos.* += 1;
     const load_error = if (version >= 11) try readOptionalString(alloc, encoded, pos) else null;
     errdefer if (load_error) |value| alloc.free(value);
+    const repair_status: ?metadata.IndexRepairStatus = if (version >= 13) blk: {
+        if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+        const tag = encoded[pos.*];
+        pos.* += 1;
+        break :blk switch (tag) {
+            0 => null,
+            @intFromEnum(metadata.IndexRepairStatus.rebuilding) => .rebuilding,
+            @intFromEnum(metadata.IndexRepairStatus.waiting) => .waiting,
+            @intFromEnum(metadata.IndexRepairStatus.paused) => .paused,
+            @intFromEnum(metadata.IndexRepairStatus.failed) => .failed,
+            else => return error.InvalidMetadataTransitionEncoding,
+        };
+    } else null;
+    const repair_active_generation_serviceable = if (version >= 13) blk: {
+        if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+        const value = encoded[pos.*];
+        pos.* += 1;
+        if (value > 1 or (value == 1 and repair_status == null)) return error.InvalidMetadataTransitionEncoding;
+        break :blk value == 1;
+    } else false;
     return .{
         .name = name,
         .kind = kind,
@@ -5627,6 +5652,8 @@ fn readRuntimeIndexStatusRecord(
         .replay_applied_sequence = replay_applied_sequence,
         .replay_target_sequence = replay_target_sequence,
         .replay_catch_up_required = replay_catch_up_required,
+        .repair_status = repair_status,
+        .repair_active_generation_serviceable = repair_active_generation_serviceable,
     };
 }
 
@@ -10863,6 +10890,8 @@ test "metadata raft apply store runtime status codec preserves document identity
             .coverage_config_hash = 0x1234,
             .coverage_identity_ready = true,
             .coverage_summary_ready = true,
+            .repair_status = .rebuilding,
+            .repair_active_generation_serviceable = true,
         }})[0..]),
     }};
 
@@ -10910,6 +10939,8 @@ test "metadata raft apply store runtime status codec preserves document identity
     try std.testing.expectEqual(@as(u64, 0x1234), status.indexes[0].coverage_config_hash);
     try std.testing.expect(status.indexes[0].coverage_identity_ready);
     try std.testing.expect(status.indexes[0].coverage_summary_ready);
+    try std.testing.expectEqual(metadata.IndexRepairStatus.rebuilding, status.indexes[0].repair_status.?);
+    try std.testing.expect(status.indexes[0].repair_active_generation_serviceable);
 }
 
 test "metadata runtime index status decoder accepts version ten records" {
@@ -10926,10 +10957,10 @@ test "metadata runtime index status decoder accepts version ten records" {
         .replay_catch_up_required = true,
     });
 
-    // Version 10 ended immediately after replay_catch_up_required. The final
-    // absent optional-string tag is the only field appended by version 11.
-    try std.testing.expectEqual(@as(u8, 0), encoded.items[encoded.items.len - 1]);
-    encoded.items.len -= 1;
+    // Version 10 ended immediately after replay_catch_up_required. Remove the
+    // version-11 optional load-error tag and the two version-13 repair bytes.
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, encoded.items[encoded.items.len - 3 ..]);
+    encoded.items.len -= 3;
 
     var pos: usize = 0;
     const decoded = try readRuntimeIndexStatusRecord(alloc, encoded.items, &pos, 10);
@@ -10942,6 +10973,8 @@ test "metadata runtime index status decoder accepts version ten records" {
     try std.testing.expectEqual(@as(u64, 11), decoded.replay_target_sequence);
     try std.testing.expect(decoded.replay_catch_up_required);
     try std.testing.expectEqual(@as(?[]const u8, null), decoded.load_error);
+    try std.testing.expect(decoded.repair_status == null);
+    try std.testing.expect(!decoded.repair_active_generation_serviceable);
 }
 
 test "metadata raft apply store group status decoder accepts version one records" {

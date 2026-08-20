@@ -28,6 +28,7 @@ const internal_keys = @import("../storage/internal_keys.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const enrichment_config_validation = @import("../storage/db/enrichment/config_validation.zig");
 const public_index_contract = @import("public_index_contract.zig");
+const index_repair_status = @import("../common/index_repair_status.zig");
 
 pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
     if (body.len == 0) return error.InvalidCreateIndexRequest;
@@ -1436,14 +1437,17 @@ fn appendMinimalIndexRuntimeStatus(
 fn publicIndexRepairState(item: anytype) ?[]const u8 {
     const T = @TypeOf(item);
     if (@hasField(T, "repair_state")) return item.repair_state;
+    if (@hasField(T, "index_repair_status")) {
+        if (item.index_repair_status) |status| return @tagName(status);
+    }
     if (!@hasField(T, "index_repair_id")) return null;
-    // Corrupt durable repair state intentionally has no trustworthy repair ID,
-    // but it is still a terminal, operator-actionable condition.
-    if (std.mem.eql(u8, item.index_repair_automation, "paused")) return "paused";
-    if (std.mem.eql(u8, item.index_repair_phase, "terminal")) return "failed";
-    if (item.index_repair_id == null) return null;
-    if (!std.mem.eql(u8, item.index_repair_wait_reason, "none")) return "waiting";
-    return "rebuilding";
+    const status = index_repair_status.summarize(
+        item.index_repair_id != null,
+        item.index_repair_automation,
+        item.index_repair_phase,
+        item.index_repair_wait_reason,
+    ) orelse return null;
+    return @tagName(status);
 }
 
 fn repairStateRank(state: []const u8) u8 {
@@ -2351,10 +2355,7 @@ test "complete partial embeddings coverage is ready after active generation proo
         .backfill_active = true,
         .backfill_progress = 1.0,
         .repair_degraded = true,
-        .index_repair_id = 1,
-        .index_repair_phase = "detected",
-        .index_repair_automation = "enabled",
-        .index_repair_wait_reason = "none",
+        .index_repair_status = .rebuilding,
         .index_repair_active_generation_serviceable = true,
     };
     var encoded = std.ArrayListUnmanaged(u8).empty;
