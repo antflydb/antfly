@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const platform = @import("antfly_platform");
 const common_config = @import("../common/config.zig");
 const group_ids = @import("../common/group_ids.zig");
@@ -1725,7 +1726,11 @@ test "public api e2e rejects table backup during active schema migration" {
     });
     defer backup_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), backup_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, backup_resp.body, "backup does not support active schema migration") != null);
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"error\":\"backup does not support active schema migration\"}",
+        backup_resp.body,
+    );
 }
 
 test "public api e2e rejects table restore for migration-state backup manifests" {

@@ -58,6 +58,7 @@ pub const max_backup_manifest_bytes: usize = 16 * 1024 * 1024;
 pub const max_backup_attempt_marker_bytes: usize = 2 * 1024 * 1024;
 pub const max_backup_attempt_cursor_bytes: usize = 8 * 1024;
 const max_backup_attempt_lease_bytes: usize = 256;
+const backup_cleanup_lease_owner_prefix = "antfly-cleanup-";
 pub const max_cluster_backup_attempt_tables: usize = 4096;
 pub const backup_attempt_marker_version: u32 = 1;
 pub const backup_attempt_head_version: u32 = 3;
@@ -71,9 +72,10 @@ const backup_attempt_staging_orphan_age_ns: u64 =
     backup_attempt_reclaim_claim_timeout_ns +
     backup_attempt_lease_clock_skew_allowance_ns;
 const backup_attempt_staging_scan_budget: usize = 16;
-/// Maximum remote objects a single opportunistic maintenance job may delete.
-/// Keeping this quantum small prevents cleanup from monopolizing the shared
-/// background I/O lane; an incomplete marker remains durable for the next pass.
+/// Maximum remote storage operations a single opportunistic maintenance job
+/// may spend on attempt fencing and artifact deletion. Keeping this quantum
+/// small prevents cleanup from monopolizing the shared background I/O lane; an
+/// incomplete marker and monotonic cursor remain durable for the next pass.
 pub const backup_attempt_reclaim_object_budget: usize = 256;
 pub const backup_attempt_cleanup_object_budget: usize = 1_000_000;
 pub const backup_attempt_lease_duration_ns: u64 = 5 * std.time.ns_per_min;
@@ -609,6 +611,8 @@ fn s3ConfigForConnection(
     return cfg;
 }
 
+const BackupLeaseFenceClaim = enum { active, claimed };
+
 const RemoteBackupStore = struct {
     const BoundedReadOptions = struct {
         known_size: ?u64 = null,
@@ -915,6 +919,17 @@ const RemoteBackupStore = struct {
         };
     }
 
+    fn deleteSuffixBudgeted(
+        self: *RemoteBackupStore,
+        alloc: std.mem.Allocator,
+        suffix: []const u8,
+        operation_budget: *usize,
+    ) !void {
+        if (operation_budget.* == 0) return error.BackupCleanupBudgetExceeded;
+        operation_budget.* -= 1;
+        try self.deleteSuffix(alloc, suffix);
+    }
+
     /// Delete a small mutable object only when its current contents still name
     /// the expected owner. The ETag condition closes the GET/delete race.
     fn deleteSuffixIfOwned(
@@ -1013,19 +1028,73 @@ const RemoteBackupStore = struct {
         return owned_attempt_id;
     }
 
+    /// Atomically replaces an expired lease, or fills an absent lease slot,
+    /// with a durable cleanup owner. Unlike deletion, the replacement keeps
+    /// delayed writers fenced until exact cleanup has completed.
+    fn claimExpiredLeaseWithFence(
+        self: *RemoteBackupStore,
+        alloc: std.mem.Allocator,
+        suffix: []const u8,
+        expected_owner: []const u8,
+        cleanup_owner: []const u8,
+        now_unix_ns: u64,
+        replacement: []const u8,
+    ) !BackupLeaseFenceClaim {
+        const key = try self.keyAlloc(alloc, suffix);
+        defer alloc.free(key);
+        var current = self.client.getObject(self.bucket, key, .{
+            .range = .{ .offset = 0, .length = max_backup_attempt_lease_bytes },
+            .skip_metadata_probe = true,
+            .max_response_bytes = max_backup_attempt_lease_bytes,
+        }) catch |err| switch (err) {
+            error.FileNotFound => {
+                var created = self.client.putObject(self.bucket, key, replacement, .{
+                    .content_type = "text/plain",
+                    .if_none_match = true,
+                }) catch |put_err| switch (put_err) {
+                    error.PreconditionFailed => return .active,
+                    else => return put_err,
+                };
+                created.deinit(alloc);
+                return .claimed;
+            },
+            else => return err,
+        };
+        defer current.deinit(alloc);
+        const lease = parseClusterBackupReservationLease(current.body) catch return .active;
+        if (std.mem.eql(u8, lease.attempt_id, cleanup_owner)) return .claimed;
+        if (!std.mem.eql(u8, lease.attempt_id, expected_owner) or
+            !clusterBackupLeaseReclaimable(lease.expires_at_unix_ns, now_unix_ns))
+            return .active;
+        const etag = current.metadata.etag orelse
+            return error.BackupReservationIdentityUnavailable;
+        var replaced = self.client.putObject(self.bucket, key, replacement, .{
+            .content_type = "text/plain",
+            .if_match_etag = etag,
+        }) catch |err| switch (err) {
+            error.FileNotFound, error.PreconditionFailed => return .active,
+            else => return err,
+        };
+        replaced.deinit(alloc);
+        return .claimed;
+    }
+
     fn deletePrefix(
         self: *RemoteBackupStore,
         alloc: std.mem.Allocator,
         suffix: []const u8,
-        object_budget: *usize,
+        operation_budget: *usize,
     ) !void {
         const key_prefix = try self.keyPrefixAlloc(alloc, suffix);
         defer alloc.free(key_prefix);
         // Delete in bounded pages. Restarting at the prefix after each batch
         // avoids continuation-token invalidation while the keyset is changing.
         while (true) {
-            if (object_budget.* == 0) return error.BackupCleanupBudgetExceeded;
-            const page_size: u32 = @intCast(@min(object_budget.*, 1000));
+            // Reserve one operation for the listing request and at least one
+            // for forward progress deleting an object returned by that list.
+            if (operation_budget.* < 2) return error.BackupCleanupBudgetExceeded;
+            const page_size: u32 = @intCast(@min(operation_budget.* - 1, 1000));
+            operation_budget.* -= 1;
             var listed = try self.client.listObjects(self.bucket, .{
                 .prefix = key_prefix,
                 .recursive = true,
@@ -1036,11 +1105,12 @@ const RemoteBackupStore = struct {
             for (listed.entries) |entry| {
                 if (!std.mem.startsWith(u8, entry.key, key_prefix))
                     return error.InvalidBackupArtifactPath;
+                if (operation_budget.* == 0) return error.BackupCleanupBudgetExceeded;
+                operation_budget.* -= 1;
                 self.client.deleteObject(self.bucket, entry.key, .{}) catch |err| switch (err) {
                     error.FileNotFound => {},
                     else => return err,
                 };
-                object_budget.* -= 1;
             }
         }
     }
@@ -1628,6 +1698,9 @@ pub const ClusterBackupAttemptMarker = struct {
     cluster_backup_id: []const u8,
     created_at_unix_ns: u64,
     format: BackupFormat,
+    /// True only when every writer participating in this attempt honors the
+    /// durable per-table lease fence used by stale-attempt reclamation.
+    writer_lease_fencing: bool = false,
     tables: []const ClusterBackupAttemptTable,
 };
 
@@ -1651,6 +1724,27 @@ const ClusterBackupReservationLease = struct {
     attempt_id: []const u8,
     expires_at_unix_ns: u64,
 };
+
+fn backupCleanupLeaseOwner(identity: []const u8, buf: *[backup_cleanup_lease_owner_prefix.len + 64]u8) []const u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(identity, &digest, .{});
+    const encoded = std.fmt.bytesToHex(digest, .lower);
+    @memcpy(buf[0..backup_cleanup_lease_owner_prefix.len], backup_cleanup_lease_owner_prefix);
+    @memcpy(buf[backup_cleanup_lease_owner_prefix.len..], &encoded);
+    return buf;
+}
+
+fn clusterCleanupLeaseOwner(
+    attempt_id: []const u8,
+    buf: *[backup_cleanup_lease_owner_prefix.len + 128]u8,
+) ![]const u8 {
+    try validateBackupId(attempt_id);
+    if (backup_cleanup_lease_owner_prefix.len + attempt_id.len > 128)
+        return error.InvalidBackupId;
+    @memcpy(buf[0..backup_cleanup_lease_owner_prefix.len], backup_cleanup_lease_owner_prefix);
+    @memcpy(buf[backup_cleanup_lease_owner_prefix.len .. backup_cleanup_lease_owner_prefix.len + attempt_id.len], attempt_id);
+    return buf[0 .. backup_cleanup_lease_owner_prefix.len + attempt_id.len];
+}
 
 fn reservationOwner(body: []const u8) []const u8 {
     const end = std.mem.indexOfScalar(u8, body, '\n') orelse body.len;
@@ -2899,6 +2993,87 @@ pub fn tableBackupAttemptMatchesAtLocation(
     return std.mem.eql(u8, parsed.value.artifact_backup_id, artifact_backup_id);
 }
 
+fn deleteTableBackupReservationIfArtifactOwnedAtLocation(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    backup_id: []const u8,
+    artifact_backup_id: []const u8,
+) !bool {
+    try validateBackupId(backup_id);
+    try validateBackupId(artifact_backup_id);
+    const suffix = try reservationPath(alloc, "", backup_id, false);
+    defer alloc.free(suffix);
+    return switch (location.*) {
+        .file => |backup_root| blk: {
+            const path = try reservationPath(alloc, backup_root, backup_id, false);
+            defer alloc.free(path);
+            const lock_path = try std.fmt.allocPrint(alloc, "{s}.publish.lock", .{path});
+            defer alloc.free(lock_path);
+            var lock_file = if (std.fs.path.isAbsolute(lock_path))
+                try std.Io.Dir.createFileAbsolute(io, lock_path, .{ .truncate = false })
+            else
+                try std.Io.Dir.cwd().createFile(io, lock_path, .{ .truncate = false });
+            defer lock_file.close(io);
+            try lock_file.lock(io, .exclusive);
+            defer lock_file.unlock(io);
+            const body = readFileAbsoluteAllocWithIo(
+                alloc,
+                io,
+                path,
+                max_table_backup_attempt_reservation_bytes,
+            ) catch |err| switch (err) {
+                error.FileNotFound => break :blk false,
+                else => return err,
+            };
+            defer alloc.free(body);
+            if (std.mem.eql(u8, body, "reserved\n")) break :blk false;
+            var parsed = try std.json.parseFromSlice(
+                TableBackupAttemptReservation,
+                alloc,
+                body,
+                .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
+            );
+            defer parsed.deinit();
+            if (!std.mem.eql(u8, parsed.value.backup_id, backup_id) or
+                !std.mem.eql(u8, parsed.value.artifact_backup_id, artifact_backup_id))
+                break :blk false;
+            try deletePathDurably(io, path);
+            break :blk true;
+        },
+        .remote => |*store| blk: {
+            const key = try store.keyAlloc(alloc, trimLeftSlash(suffix));
+            defer alloc.free(key);
+            var current = store.client.getObject(store.bucket, key, .{
+                .range = .{ .offset = 0, .length = max_table_backup_attempt_reservation_bytes },
+                .skip_metadata_probe = true,
+                .max_response_bytes = max_table_backup_attempt_reservation_bytes,
+            }) catch |err| switch (err) {
+                error.FileNotFound => break :blk false,
+                else => return err,
+            };
+            defer current.deinit(alloc);
+            var parsed = try std.json.parseFromSlice(
+                TableBackupAttemptReservation,
+                alloc,
+                current.body,
+                .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
+            );
+            defer parsed.deinit();
+            if (!std.mem.eql(u8, parsed.value.backup_id, backup_id) or
+                !std.mem.eql(u8, parsed.value.artifact_backup_id, artifact_backup_id))
+                break :blk false;
+            const etag = current.metadata.etag orelse
+                return error.BackupReservationIdentityUnavailable;
+            store.client.deleteObject(store.bucket, key, .{ .if_match_etag = etag }) catch |err| switch (err) {
+                error.FileNotFound, error.PreconditionFailed => break :blk false,
+                else => return err,
+            };
+            break :blk true;
+        },
+    };
+}
+
 /// Creates the storage-writer liveness fence before a request can be delivered
 /// to another node. The artifact generation is globally unique to the attempt,
 /// so it is also the immutable lease owner.
@@ -3004,6 +3179,22 @@ pub fn releaseTableBackupWriterLeaseAtLocation(
     location: *BackupLocation,
     artifact_backup_id: []const u8,
 ) !bool {
+    return releaseTableBackupLeaseIfOwnedAtLocation(
+        alloc,
+        io,
+        location,
+        artifact_backup_id,
+        artifact_backup_id,
+    );
+}
+
+fn releaseTableBackupLeaseIfOwnedAtLocation(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    artifact_backup_id: []const u8,
+    expected_owner: []const u8,
+) !bool {
     const suffix = try tableBackupWriterLeasePath(alloc, "", artifact_backup_id);
     defer alloc.free(suffix);
     return switch (location.*) {
@@ -3029,7 +3220,7 @@ pub fn releaseTableBackupWriterLeaseAtLocation(
                 else => return err,
             };
             defer alloc.free(body);
-            if (!std.mem.eql(u8, reservationOwner(body), artifact_backup_id))
+            if (!std.mem.eql(u8, reservationOwner(body), expected_owner))
                 break :blk false;
             try deletePathDurably(io, path);
             break :blk true;
@@ -3037,23 +3228,30 @@ pub fn releaseTableBackupWriterLeaseAtLocation(
         .remote => |*store| try store.deleteSuffixIfOwned(
             alloc,
             trimLeftSlash(suffix),
-            artifact_backup_id,
+            expected_owner,
         ),
     };
 }
 
 /// Returns true only after proving that no live storage writer owns this
-/// artifact. An expired lease is atomically removed so a delayed forwarded
-/// request cannot recreate or renew it after cleanup begins.
-const TableBackupWriterLeaseClaim = enum { missing, active, claimed };
-
+/// artifact. An expired or absent lease is atomically replaced by a cleanup
+/// tombstone so a delayed forwarded request cannot recreate or renew it after
+/// cleanup begins.
 fn claimExpiredTableBackupWriterLeaseAtLocation(
     alloc: std.mem.Allocator,
     io: std.Io,
     location: *BackupLocation,
     artifact_backup_id: []const u8,
     now_unix_ns: u64,
-) !TableBackupWriterLeaseClaim {
+) !BackupLeaseFenceClaim {
+    var cleanup_owner_buf: [backup_cleanup_lease_owner_prefix.len + 64]u8 = undefined;
+    const cleanup_owner = backupCleanupLeaseOwner(artifact_backup_id, &cleanup_owner_buf);
+    const cleanup_lease = try encodeClusterBackupReservationLease(
+        alloc,
+        cleanup_owner,
+        std.math.maxInt(u64),
+    );
+    defer alloc.free(cleanup_lease);
     const suffix = try tableBackupWriterLeasePath(alloc, "", artifact_backup_id);
     defer alloc.free(suffix);
     return switch (location.*) {
@@ -3075,35 +3273,29 @@ fn claimExpiredTableBackupWriterLeaseAtLocation(
                 path,
                 max_backup_attempt_lease_bytes,
             ) catch |err| switch (err) {
-                error.FileNotFound => break :blk .missing,
+                error.FileNotFound => {
+                    try replaceFileAbsoluteUnderHeldLock(alloc, io, path, cleanup_lease);
+                    break :blk .claimed;
+                },
                 else => return err,
             };
             defer alloc.free(body);
             const lease = parseClusterBackupReservationLease(body) catch break :blk .active;
+            if (std.mem.eql(u8, lease.attempt_id, cleanup_owner)) break :blk .claimed;
             if (!std.mem.eql(u8, lease.attempt_id, artifact_backup_id) or
                 !clusterBackupLeaseReclaimable(lease.expires_at_unix_ns, now_unix_ns))
                 break :blk .active;
-            try deletePathDurably(io, path);
+            try replaceFileAbsoluteUnderHeldLock(alloc, io, path, cleanup_lease);
             break :blk .claimed;
         },
-        .remote => |*store| blk: {
-            const claimed = try store.takeExpiredReservation(
-                alloc,
-                trimLeftSlash(suffix),
-                now_unix_ns,
-                artifact_backup_id,
-            );
-            if (claimed) |owner| {
-                alloc.free(owner);
-                break :blk .claimed;
-            }
-            const owner_matches = try store.suffixOwnerMatches(
-                alloc,
-                trimLeftSlash(suffix),
-                artifact_backup_id,
-            );
-            break :blk if (owner_matches == null) .missing else .active;
-        },
+        .remote => |*store| try store.claimExpiredLeaseWithFence(
+            alloc,
+            trimLeftSlash(suffix),
+            artifact_backup_id,
+            cleanup_owner,
+            now_unix_ns,
+            cleanup_lease,
+        ),
     };
 }
 
@@ -3162,12 +3354,11 @@ pub fn reclaimExpiredTableBackupAttemptAtLocation(
     )) orelse return .active;
     defer parsed.deinit();
     const reservation = parsed.value;
-    if (reservation.created_at_unix_ns) |created_at| {
-        if (created_at > now_unix_ns or
-            now_unix_ns - created_at < backup_attempt_reclaim_age_ns +|
-                backup_attempt_lease_clock_skew_allowance_ns)
-            return .active;
-    }
+    const created_at = reservation.created_at_unix_ns orelse return .active;
+    if (created_at > now_unix_ns or
+        now_unix_ns - created_at < backup_attempt_reclaim_age_ns +|
+            backup_attempt_lease_clock_skew_allowance_ns)
+        return .active;
     const lease_claim = try claimExpiredTableBackupWriterLeaseAtLocation(
         alloc,
         io,
@@ -3175,31 +3366,88 @@ pub fn reclaimExpiredTableBackupAttemptAtLocation(
         reservation.artifact_backup_id,
         now_unix_ns,
     );
-    switch (lease_claim) {
-        .active => return .active,
-        .missing => if (reservation.created_at_unix_ns == null) return .active,
-        .claimed => {},
-    }
+    if (lease_claim == .active) return .active;
     // Publication is the commit point. Recheck after fencing the writer and
     // preserve any canonical manifest that won the final lease race.
-    if (try tableManifestRecordExistsForReconciliation(alloc, io, location, backup_id))
+    if (try tableManifestRecordExistsForReconciliation(alloc, io, location, backup_id)) {
+        var cleanup_owner_buf: [backup_cleanup_lease_owner_prefix.len + 64]u8 = undefined;
+        const cleanup_owner = backupCleanupLeaseOwner(reservation.artifact_backup_id, &cleanup_owner_buf);
+        _ = try releaseTableBackupLeaseIfOwnedAtLocation(
+            alloc,
+            io,
+            location,
+            reservation.artifact_backup_id,
+            cleanup_owner,
+        );
         return .committed;
-    try cleanupUnpublishedTableBackupAttemptAtLocation(
+    }
+    var object_budget: usize = backup_attempt_cleanup_object_budget;
+    try cleanupTableBackupAttemptAtLocationWithBudget(
         alloc,
         io,
         location,
         backup_id,
         reservation.artifact_backup_id,
         reservation.format,
+        &object_budget,
+        false,
+        false,
     );
+    _ = try deleteTableBackupReservationIfArtifactOwnedAtLocation(
+        alloc,
+        io,
+        location,
+        backup_id,
+        reservation.artifact_backup_id,
+    );
+    // Artifact IDs are immutable attempt generations. Retain the tiny cleanup
+    // tombstone permanently: no correct retry needs this generation, while a
+    // forwarded request can be delayed arbitrarily long before its first
+    // storage operation.
     return .reclaimed;
 }
+
+const ClusterAttemptCleanupPhase = enum { writer_leases, artifacts };
 
 const ClusterWriterLeaseScanCursor = struct {
     format_version: u32 = 1,
     attempt_id: []const u8,
+    phase: ClusterAttemptCleanupPhase = .writer_leases,
     next_table_index: usize,
 };
+
+const ClusterAttemptCleanupProgress = struct {
+    phase: ClusterAttemptCleanupPhase = .writer_leases,
+    next_table_index: usize = 0,
+};
+
+fn cleanupProgressLessThan(a: ClusterAttemptCleanupProgress, b: ClusterAttemptCleanupProgress) bool {
+    const a_phase = @intFromEnum(a.phase);
+    const b_phase = @intFromEnum(b.phase);
+    return a_phase < b_phase or (a_phase == b_phase and a.next_table_index < b.next_table_index);
+}
+
+fn parseClusterAttemptCleanupProgress(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    marker: *const ClusterBackupAttemptMarker,
+) ClusterAttemptCleanupProgress {
+    var parsed = std.json.parseFromSlice(
+        ClusterWriterLeaseScanCursor,
+        alloc,
+        body,
+        .{ .allocate = .alloc_always },
+    ) catch return .{};
+    defer parsed.deinit();
+    if (parsed.value.format_version != 1 or
+        !std.mem.eql(u8, parsed.value.attempt_id, marker.attempt_id) or
+        parsed.value.next_table_index > marker.tables.len)
+        return .{};
+    return .{
+        .phase = parsed.value.phase,
+        .next_table_index = parsed.value.next_table_index,
+    };
+}
 
 fn clusterWriterLeaseScanCursorPath(
     alloc: std.mem.Allocator,
@@ -3220,7 +3468,7 @@ fn readClusterWriterLeaseScanCursor(
     io: std.Io,
     location: *BackupLocation,
     marker: *const ClusterBackupAttemptMarker,
-) !usize {
+) !ClusterAttemptCleanupProgress {
     const suffix = try clusterWriterLeaseScanCursorPath(alloc, "", marker.attempt_id);
     defer alloc.free(suffix);
     const body = switch (location.*) {
@@ -3233,8 +3481,8 @@ fn readClusterWriterLeaseScanCursor(
                 path,
                 max_cluster_writer_lease_scan_cursor_bytes,
             ) catch |err| switch (err) {
-                error.FileNotFound => return 0,
-                error.StreamTooLong => return 0,
+                error.FileNotFound => return .{},
+                error.StreamTooLong => return .{},
                 else => return err,
             };
         },
@@ -3243,54 +3491,102 @@ fn readClusterWriterLeaseScanCursor(
             trimLeftSlash(suffix),
             max_cluster_writer_lease_scan_cursor_bytes,
         ) catch |err| switch (err) {
-            error.FileNotFound => return 0,
-            error.BackupManifestTooLarge, error.StreamTooLong => return 0,
+            error.FileNotFound => return .{},
+            error.BackupManifestTooLarge, error.StreamTooLong => return .{},
             else => return err,
         },
     };
     defer alloc.free(body);
-    var parsed = std.json.parseFromSlice(
-        ClusterWriterLeaseScanCursor,
-        alloc,
-        body,
-        .{ .allocate = .alloc_always },
-    ) catch return 0;
-    defer parsed.deinit();
-    if (parsed.value.format_version != 1 or
-        !std.mem.eql(u8, parsed.value.attempt_id, marker.attempt_id) or
-        parsed.value.next_table_index > marker.tables.len)
-        return 0;
-    return parsed.value.next_table_index;
+    return parseClusterAttemptCleanupProgress(alloc, body, marker);
 }
 
-fn writeClusterWriterLeaseScanCursor(
+fn writeClusterWriterLeaseScanCursorMonotonic(
     alloc: std.mem.Allocator,
     io: std.Io,
     location: *BackupLocation,
-    attempt_id: []const u8,
-    next_table_index: usize,
+    marker: *const ClusterBackupAttemptMarker,
+    progress: ClusterAttemptCleanupProgress,
 ) !void {
     const encoded = try stringifyJsonAlloc(alloc, ClusterWriterLeaseScanCursor{
-        .attempt_id = attempt_id,
-        .next_table_index = next_table_index,
+        .attempt_id = marker.attempt_id,
+        .phase = progress.phase,
+        .next_table_index = progress.next_table_index,
     });
     defer alloc.free(encoded);
     if (encoded.len > max_cluster_writer_lease_scan_cursor_bytes)
         return error.BackupManifestTooLarge;
-    const suffix = try clusterWriterLeaseScanCursorPath(alloc, "", attempt_id);
+    const suffix = try clusterWriterLeaseScanCursorPath(alloc, "", marker.attempt_id);
     defer alloc.free(suffix);
     switch (location.*) {
         .file => |backup_root| {
-            const path = try clusterWriterLeaseScanCursorPath(alloc, backup_root, attempt_id);
+            const path = try clusterWriterLeaseScanCursorPath(alloc, backup_root, marker.attempt_id);
             defer alloc.free(path);
-            try writeFileAbsoluteAtomicallyWithIo(alloc, io, path, encoded);
+            const lock_path = try std.fmt.allocPrint(alloc, "{s}.publish.lock", .{path});
+            defer alloc.free(lock_path);
+            if (std.fs.path.dirname(lock_path)) |dir_name| try ensureDirPathWithIo(io, dir_name);
+            var lock_file = if (std.fs.path.isAbsolute(lock_path))
+                try std.Io.Dir.createFileAbsolute(io, lock_path, .{ .truncate = false })
+            else
+                try std.Io.Dir.cwd().createFile(io, lock_path, .{ .truncate = false });
+            defer lock_file.close(io);
+            try lock_file.lock(io, .exclusive);
+            defer lock_file.unlock(io);
+            const current_body = readFileAbsoluteAllocWithIo(
+                alloc,
+                io,
+                path,
+                max_cluster_writer_lease_scan_cursor_bytes,
+            ) catch |err| switch (err) {
+                error.FileNotFound, error.StreamTooLong => null,
+                else => return err,
+            };
+            defer if (current_body) |body| alloc.free(body);
+            if (current_body) |body| {
+                const current = parseClusterAttemptCleanupProgress(alloc, body, marker);
+                if (!cleanupProgressLessThan(current, progress)) return;
+            }
+            try replaceFileAbsoluteUnderHeldLock(alloc, io, path, encoded);
         },
-        .remote => |*store| try store.writeBytes(
-            alloc,
-            trimLeftSlash(suffix),
-            encoded,
-            "application/json",
-        ),
+        .remote => |*store| {
+            const key = try store.keyAlloc(alloc, trimLeftSlash(suffix));
+            defer alloc.free(key);
+            var attempts: usize = 0;
+            while (attempts < 8) : (attempts += 1) {
+                var current = store.client.getObject(store.bucket, key, .{
+                    .range = .{ .offset = 0, .length = max_cluster_writer_lease_scan_cursor_bytes },
+                    .skip_metadata_probe = true,
+                    .max_response_bytes = max_cluster_writer_lease_scan_cursor_bytes,
+                }) catch |err| switch (err) {
+                    error.FileNotFound => {
+                        var created = store.client.putObject(store.bucket, key, encoded, .{
+                            .content_type = "application/json",
+                            .if_none_match = true,
+                        }) catch |put_err| switch (put_err) {
+                            error.PreconditionFailed => continue,
+                            else => return put_err,
+                        };
+                        created.deinit(alloc);
+                        return;
+                    },
+                    else => return err,
+                };
+                defer current.deinit(alloc);
+                const current_progress = parseClusterAttemptCleanupProgress(alloc, current.body, marker);
+                if (!cleanupProgressLessThan(current_progress, progress)) return;
+                const etag = current.metadata.etag orelse
+                    return error.BackupReservationIdentityUnavailable;
+                var replaced = store.client.putObject(store.bucket, key, encoded, .{
+                    .content_type = "application/json",
+                    .if_match_etag = etag,
+                }) catch |put_err| switch (put_err) {
+                    error.FileNotFound, error.PreconditionFailed => continue,
+                    else => return put_err,
+                };
+                replaced.deinit(alloc);
+                return;
+            }
+            return error.BackupRepositoryBusy;
+        },
     }
 }
 
@@ -3320,10 +3616,19 @@ fn claimExpiredClusterTableWriterLeases(
     now_unix_ns: u64,
     object_budget: *usize,
 ) !bool {
-    if (object_budget.* == 0) return false;
-    var index = try readClusterWriterLeaseScanCursor(alloc, io, location, marker);
-    while (index < marker.tables.len and object_budget.* > 0) : (index += 1) {
-        object_budget.* -= 1;
+    if (!marker.writer_lease_fencing or object_budget.* == 0) return false;
+    const progress = try readClusterWriterLeaseScanCursor(alloc, io, location, marker);
+    if (progress.phase == .artifacts) return true;
+    var index = progress.next_table_index;
+    const claim_cost: usize = switch (location.*) {
+        // The worst case is one conditional read plus one create/replace. Use
+        // that cost even when an existing tombstone only needs the read so the
+        // maintenance quantum remains a hard upper bound.
+        .remote => 2,
+        .file => 1,
+    };
+    while (index < marker.tables.len and object_budget.* >= claim_cost) : (index += 1) {
+        object_budget.* -= claim_cost;
         const table = marker.tables[index];
         if ((try claimExpiredTableBackupWriterLeaseAtLocation(
             alloc,
@@ -3332,12 +3637,25 @@ fn claimExpiredClusterTableWriterLeases(
             table.artifact_backup_id,
             now_unix_ns,
         )) == .active) {
-            try writeClusterWriterLeaseScanCursor(alloc, io, location, marker.attempt_id, index);
+            try writeClusterWriterLeaseScanCursorMonotonic(alloc, io, location, marker, .{
+                .phase = .writer_leases,
+                .next_table_index = index,
+            });
             return false;
         }
     }
-    try writeClusterWriterLeaseScanCursor(alloc, io, location, marker.attempt_id, index);
-    return index == marker.tables.len;
+    if (index == marker.tables.len) {
+        try writeClusterWriterLeaseScanCursorMonotonic(alloc, io, location, marker, .{
+            .phase = .artifacts,
+            .next_table_index = 0,
+        });
+        return true;
+    }
+    try writeClusterWriterLeaseScanCursorMonotonic(alloc, io, location, marker, .{
+        .phase = .writer_leases,
+        .next_table_index = index,
+    });
+    return false;
 }
 
 /// Cluster reservations are leases owned by an immutable attempt ID. Cleanup
@@ -3372,6 +3690,70 @@ pub fn reserveClusterBackupAttemptLeaseAtLocation(
             "text/plain",
         ),
     }
+}
+
+fn claimExpiredClusterReservationForCleanup(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    marker: *const ClusterBackupAttemptMarker,
+    now_unix_ns: u64,
+) !bool {
+    if (!marker.writer_lease_fencing) return false;
+    var cleanup_owner_buf: [backup_cleanup_lease_owner_prefix.len + 128]u8 = undefined;
+    const cleanup_owner = clusterCleanupLeaseOwner(marker.attempt_id, &cleanup_owner_buf) catch
+        return false;
+    const cleanup_lease = try encodeClusterBackupReservationLease(
+        alloc,
+        cleanup_owner,
+        std.math.maxInt(u64),
+    );
+    defer alloc.free(cleanup_lease);
+    const suffix = try reservationPath(alloc, "", marker.cluster_backup_id, true);
+    defer alloc.free(suffix);
+    return switch (location.*) {
+        .file => |backup_root| blk: {
+            const path = try reservationPath(alloc, backup_root, marker.cluster_backup_id, true);
+            defer alloc.free(path);
+            const lock_path = try std.fmt.allocPrint(alloc, "{s}.publish.lock", .{path});
+            defer alloc.free(lock_path);
+            var lock_file = if (std.fs.path.isAbsolute(lock_path))
+                try std.Io.Dir.createFileAbsolute(io, lock_path, .{ .truncate = false })
+            else
+                try std.Io.Dir.cwd().createFile(io, lock_path, .{ .truncate = false });
+            defer lock_file.close(io);
+            try lock_file.lock(io, .exclusive);
+            defer lock_file.unlock(io);
+            const body = readFileAbsoluteAllocWithIo(
+                alloc,
+                io,
+                path,
+                max_backup_attempt_lease_bytes,
+            ) catch |err| switch (err) {
+                error.FileNotFound => {
+                    try replaceFileAbsoluteUnderHeldLock(alloc, io, path, cleanup_lease);
+                    break :blk true;
+                },
+                else => return err,
+            };
+            defer alloc.free(body);
+            const lease = parseClusterBackupReservationLease(body) catch break :blk false;
+            if (std.mem.eql(u8, lease.attempt_id, cleanup_owner)) break :blk true;
+            if (!std.mem.eql(u8, lease.attempt_id, marker.attempt_id) or
+                !clusterBackupLeaseReclaimable(lease.expires_at_unix_ns, now_unix_ns))
+                break :blk false;
+            try replaceFileAbsoluteUnderHeldLock(alloc, io, path, cleanup_lease);
+            break :blk true;
+        },
+        .remote => |*store| (try store.claimExpiredLeaseWithFence(
+            alloc,
+            trimLeftSlash(suffix),
+            marker.attempt_id,
+            cleanup_owner,
+            now_unix_ns,
+            cleanup_lease,
+        )) == .claimed,
+    };
 }
 
 /// Renew only the reservation version still owned by this attempt. A false
@@ -4661,6 +5043,7 @@ pub fn cleanupTableBackupAttemptAtLocation(
         format,
         &object_budget,
         true,
+        true,
     );
 }
 
@@ -4682,6 +5065,7 @@ pub fn cleanupUnpublishedTableBackupAttemptAtLocation(
         format,
         &object_budget,
         false,
+        true,
     );
 }
 
@@ -4725,6 +5109,7 @@ fn cleanupTableBackupAttemptAtLocationWithBudget(
     format: BackupFormat,
     object_budget: *usize,
     manifest_owned: bool,
+    delete_logical_reservation: bool,
 ) !void {
     try validateBackupId(backup_id);
     try validateBackupId(artifact_backup_id);
@@ -4753,9 +5138,11 @@ fn cleanupTableBackupAttemptAtLocationWithBudget(
             };
             defer alloc.free(artifact_path);
             try deletePathDurably(io, artifact_path);
-            const reservation_path = try reservationPath(alloc, backup_root, backup_id, false);
-            defer alloc.free(reservation_path);
-            try deletePathDurably(io, reservation_path);
+            if (delete_logical_reservation) {
+                const reservation_path = try reservationPath(alloc, backup_root, backup_id, false);
+                defer alloc.free(reservation_path);
+                try deletePathDurably(io, reservation_path);
+            }
             if (!std.mem.eql(u8, backup_id, artifact_backup_id)) {
                 const forwarded_reservation_path = try reservationPath(alloc, backup_root, artifact_backup_id, false);
                 defer alloc.free(forwarded_reservation_path);
@@ -4766,28 +5153,30 @@ fn cleanupTableBackupAttemptAtLocationWithBudget(
             if (manifest_owned) {
                 const manifest_suffix = try metadataPath(alloc, "", backup_id);
                 defer alloc.free(manifest_suffix);
-                try store.deleteSuffix(alloc, trimLeftSlash(manifest_suffix));
+                try store.deleteSuffixBudgeted(alloc, trimLeftSlash(manifest_suffix), object_budget);
             }
             if (!std.mem.eql(u8, backup_id, artifact_backup_id)) {
                 const forwarded_manifest_suffix = try metadataPath(alloc, "", artifact_backup_id);
                 defer alloc.free(forwarded_manifest_suffix);
-                try store.deleteSuffix(alloc, trimLeftSlash(forwarded_manifest_suffix));
+                try store.deleteSuffixBudgeted(alloc, trimLeftSlash(forwarded_manifest_suffix), object_budget);
             }
             switch (format) {
                 .native => try store.deletePrefix(alloc, artifact_backup_id, object_budget),
                 .portable => {
                     const artifact_suffix = try std.fmt.allocPrint(alloc, "{s}.afb", .{artifact_backup_id});
                     defer alloc.free(artifact_suffix);
-                    try store.deleteSuffix(alloc, artifact_suffix);
+                    try store.deleteSuffixBudgeted(alloc, artifact_suffix, object_budget);
                 },
             }
-            const reservation_suffix = try reservationPath(alloc, "", backup_id, false);
-            defer alloc.free(reservation_suffix);
-            try store.deleteSuffix(alloc, trimLeftSlash(reservation_suffix));
+            if (delete_logical_reservation) {
+                const reservation_suffix = try reservationPath(alloc, "", backup_id, false);
+                defer alloc.free(reservation_suffix);
+                try store.deleteSuffixBudgeted(alloc, trimLeftSlash(reservation_suffix), object_budget);
+            }
             if (!std.mem.eql(u8, backup_id, artifact_backup_id)) {
                 const forwarded_reservation_suffix = try reservationPath(alloc, "", artifact_backup_id, false);
                 defer alloc.free(forwarded_reservation_suffix);
-                try store.deleteSuffix(alloc, trimLeftSlash(forwarded_reservation_suffix));
+                try store.deleteSuffixBudgeted(alloc, trimLeftSlash(forwarded_reservation_suffix), object_budget);
             }
         },
     }
@@ -4991,7 +5380,12 @@ fn clusterReservationAttemptIdAtLocation(
     };
     defer alloc.free(body);
     const lease = try parseClusterBackupReservationLease(body);
-    return try alloc.dupe(u8, lease.attempt_id);
+    const attempt_id = if (std.mem.startsWith(u8, lease.attempt_id, backup_cleanup_lease_owner_prefix))
+        lease.attempt_id[backup_cleanup_lease_owner_prefix.len..]
+    else
+        lease.attempt_id;
+    try validateBackupId(attempt_id);
+    return try alloc.dupe(u8, attempt_id);
 }
 
 /// Atomically claim an expired lease for cleanup. Returns the old owner only
@@ -5138,6 +5532,13 @@ pub fn reclaimExpiredClusterBackupAttemptAtLocation(
         }
         return false;
     }
+    if (!try claimExpiredClusterReservationForCleanup(
+        alloc,
+        io,
+        location,
+        &parsed.value,
+        now_unix_ns,
+    )) return false;
     var writer_lease_budget: usize = backup_attempt_reclaim_scan_budget;
     if (!try claimExpiredClusterTableWriterLeases(
         alloc,
@@ -5151,17 +5552,13 @@ pub fn reclaimExpiredClusterBackupAttemptAtLocation(
     // consumed this invocation's entire quantum, the durable cursor lets the
     // next retry proceed without rescanning those tables.
     if (writer_lease_budget == 0) return false;
-    const attempt_id = (try takeExpiredClusterReservationAtLocation(
+    return try cleanupClusterBackupAttemptIncrementally(
         alloc,
         io,
         location,
-        backup_id,
-        now_unix_ns,
-        observed_attempt_id,
-    )) orelse return false;
-    alloc.free(attempt_id);
-    try cleanupClusterBackupAttemptAtLocation(alloc, io, location, &parsed.value);
-    return true;
+        &parsed.value,
+        &writer_lease_budget,
+    );
 }
 
 pub fn cleanupClusterBackupAttemptAtLocation(
@@ -5182,6 +5579,7 @@ pub fn cleanupClusterBackupAttemptAtLocation(
             table.artifact_backup_id,
             marker.format,
             &object_budget,
+            true,
             true,
         ) catch |err| {
             if (cleanup_error == null) cleanup_error = err;
@@ -5220,6 +5618,81 @@ pub fn cleanupClusterBackupAttemptAtLocation(
     try deleteClusterBackupAttemptMarker(alloc, io, location, marker);
 }
 
+fn cleanupClusterBackupAttemptIncrementally(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    marker: *const ClusterBackupAttemptMarker,
+    operation_budget: *usize,
+) !bool {
+    const remote = switch (location.*) {
+        .remote => true,
+        .file => false,
+    };
+    const progress = try readClusterWriterLeaseScanCursor(alloc, io, location, marker);
+    if (progress.phase != .artifacts) return false;
+    var index = progress.next_table_index;
+    while (index < marker.tables.len and operation_budget.* > 0) {
+        const table = marker.tables[index];
+        cleanupTableBackupAttemptAtLocationWithBudget(
+            alloc,
+            io,
+            location,
+            table.table_backup_id,
+            table.artifact_backup_id,
+            marker.format,
+            operation_budget,
+            true,
+            true,
+        ) catch |err| switch (err) {
+            error.BackupCleanupBudgetExceeded => {
+                try writeClusterWriterLeaseScanCursorMonotonic(alloc, io, location, marker, .{
+                    .phase = .artifacts,
+                    .next_table_index = index,
+                });
+                return false;
+            },
+            else => return err,
+        };
+        // The per-generation cleanup tombstone intentionally outlives the
+        // attempt. Releasing it here would let a delayed forwarded request
+        // recreate an artifact after the durable cursor has advanced.
+        index += 1;
+    }
+
+    try writeClusterWriterLeaseScanCursorMonotonic(alloc, io, location, marker, .{
+        .phase = .artifacts,
+        .next_table_index = index,
+    });
+    if (index != marker.tables.len) return false;
+
+    // Final control-record retirement is a small constant amount of work. Do
+    // not begin it at the tail of an exhausted remote cleanup quantum.
+    if (remote and operation_budget.* < 8) return false;
+    if (remote) operation_budget.* -= 8;
+    var cluster_cleanup_owner_buf: [backup_cleanup_lease_owner_prefix.len + 128]u8 = undefined;
+    const cluster_cleanup_owner = try clusterCleanupLeaseOwner(marker.attempt_id, &cluster_cleanup_owner_buf);
+    const reservation_released = try cleanupClusterReservationIfOwnedAtLocation(
+        alloc,
+        io,
+        location,
+        marker.cluster_backup_id,
+        cluster_cleanup_owner,
+    );
+    if (!reservation_released and
+        (try clusterReservationOwnerMatchesAtLocation(
+            alloc,
+            io,
+            location,
+            marker.cluster_backup_id,
+            cluster_cleanup_owner,
+        )) == true)
+        return error.BackupAttemptLeaseStillOwned;
+    _ = try retireClusterBackupAttemptHeadIfOwned(alloc, io, location, marker.attempt_id);
+    try deleteClusterBackupAttemptMarker(alloc, io, location, marker);
+    return true;
+}
+
 fn reclaimClusterBackupAttemptMarker(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -5238,6 +5711,13 @@ fn reclaimClusterBackupAttemptMarker(
         // renewable reservation is the authority: atomically take it only
         // after expiry, or retain the marker while this owner is still live.
         error.FileNotFound => {
+            if (!try claimExpiredClusterReservationForCleanup(
+                alloc,
+                io,
+                location,
+                marker,
+                now_unix_ns,
+            )) return false;
             if (!try claimExpiredClusterTableWriterLeases(
                 alloc,
                 io,
@@ -5250,53 +5730,13 @@ fn reclaimClusterBackupAttemptMarker(
             // permission to begin an unbudgeted payload cleanup. The durable
             // cursor makes the next pass start directly at cleanup.
             if (object_budget.* == 0) return false;
-            const expired_owner = try takeExpiredClusterReservationAtLocation(
+            return try cleanupClusterBackupAttemptIncrementally(
                 alloc,
                 io,
                 location,
-                marker.cluster_backup_id,
-                now_unix_ns,
-                marker.attempt_id,
+                marker,
+                object_budget,
             );
-            if (expired_owner) |owner| {
-                alloc.free(owner);
-            } else if ((try clusterReservationOwnerMatchesAtLocation(
-                alloc,
-                io,
-                location,
-                marker.cluster_backup_id,
-                marker.attempt_id,
-            )) == true) {
-                return false;
-            }
-            var cleanup_error: ?anyerror = null;
-            for (marker.tables) |table| {
-                cleanupTableBackupAttemptAtLocationWithBudget(
-                    alloc,
-                    io,
-                    location,
-                    table.table_backup_id,
-                    table.artifact_backup_id,
-                    marker.format,
-                    object_budget,
-                    true,
-                ) catch |cleanup_err| {
-                    if (cleanup_error == null) cleanup_error = cleanup_err;
-                };
-            }
-            if (cleanup_error) |cleanup_err| return cleanup_err;
-            if (authoritative_attempt_id) |attempt_id| {
-                if (std.mem.eql(u8, marker.attempt_id, attempt_id)) {
-                    _ = try retireClusterBackupAttemptHeadIfOwned(
-                        alloc,
-                        io,
-                        location,
-                        marker.attempt_id,
-                    );
-                }
-            }
-            try deleteClusterBackupAttemptMarker(alloc, io, location, marker);
-            return true;
         },
         else => return err,
     };
@@ -10854,6 +11294,47 @@ test "table backup reservation durably binds logical and artifact ids" {
         ),
     );
 
+    // Cleanup must bind its delete to the artifact generation it inspected.
+    // A retry that acquires the logical name after the old reservation is
+    // removed cannot be erased by the old cleanup worker.
+    try std.testing.expect(try deleteTableBackupReservationIfArtifactOwnedAtLocation(
+        alloc,
+        io,
+        &location,
+        "logical",
+        "artifact-generation",
+    ));
+    try reserveTableBackupAttemptAtLocation(
+        alloc,
+        io,
+        &location,
+        "logical",
+        "retry-generation",
+        .portable,
+        .{
+            .metadata_group_id = 3,
+            .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+            .table_id = 7,
+            .definition_digest = [_]u8{0x11} ** 32,
+            .topology_range_count = 1,
+            .topology_digest = [_]u8{0x22} ** 32,
+        },
+    );
+    try std.testing.expect(!try deleteTableBackupReservationIfArtifactOwnedAtLocation(
+        alloc,
+        io,
+        &location,
+        "logical",
+        "artifact-generation",
+    ));
+    try std.testing.expect(try tableBackupAttemptMatchesAtLocation(
+        alloc,
+        io,
+        &location,
+        "logical",
+        "retry-generation",
+    ));
+
     const response_body = try encodeBackupOutcomeAmbiguousBody(alloc, "logical", artifact_id);
     defer alloc.free(response_body);
     try ant_json.testing.expectEqualJsonText(
@@ -10876,7 +11357,7 @@ test "table backup writer lease fences cleanup until the storage owner expires" 
     defer location.deinit(alloc);
 
     try reserveTableBackupWriterLeaseAtLocation(alloc, io, &location, "artifact", 100);
-    try std.testing.expectEqual(TableBackupWriterLeaseClaim.active, try claimExpiredTableBackupWriterLeaseAtLocation(
+    try std.testing.expectEqual(BackupLeaseFenceClaim.active, try claimExpiredTableBackupWriterLeaseAtLocation(
         alloc,
         io,
         &location,
@@ -10890,7 +11371,7 @@ test "table backup writer lease fences cleanup until the storage owner expires" 
         "artifact",
         200,
     ));
-    try std.testing.expectEqual(TableBackupWriterLeaseClaim.claimed, try claimExpiredTableBackupWriterLeaseAtLocation(
+    try std.testing.expectEqual(BackupLeaseFenceClaim.claimed, try claimExpiredTableBackupWriterLeaseAtLocation(
         alloc,
         io,
         &location,
@@ -10904,6 +11385,25 @@ test "table backup writer lease fences cleanup until the storage owner expires" 
         "artifact",
         300,
     ));
+    try std.testing.expectError(
+        error.BackupAlreadyExists,
+        reserveTableBackupWriterLeaseAtLocation(alloc, io, &location, "artifact", 300),
+    );
+
+    // Missing is not equivalent to safe: a forwarded request may simply be
+    // delayed before its first lease write. Claiming the empty slot keeps that
+    // writer fenced throughout cleanup.
+    try std.testing.expectEqual(BackupLeaseFenceClaim.claimed, try claimExpiredTableBackupWriterLeaseAtLocation(
+        alloc,
+        io,
+        &location,
+        "delayed-artifact",
+        1,
+    ));
+    try std.testing.expectError(
+        error.BackupAlreadyExists,
+        reserveTableBackupWriterLeaseAtLocation(alloc, io, &location, "delayed-artifact", 300),
+    );
 }
 
 test "standalone table backup stale reclamation fences delayed writers" {
@@ -10941,6 +11441,10 @@ test "standalone table backup stale reclamation fences delayed writers" {
     );
     try std.testing.expect((try tableBackupAttemptArtifactIdAlloc(alloc, io, &location, "logical")) == null);
     try std.testing.expect(!try renewTableBackupWriterLeaseAtLocation(alloc, io, &location, "artifact", std.math.maxInt(u64)));
+    try std.testing.expectError(
+        error.BackupAlreadyExists,
+        reserveTableBackupWriterLeaseAtLocation(alloc, io, &location, "artifact", std.math.maxInt(u64)),
+    );
     try std.testing.expect(!try tableBackupAttemptMatchesAtLocation(alloc, io, &location, "logical", "artifact"));
     try std.testing.expectError(error.FileNotFound, location.remote.readBytesAllocLimited(alloc, "artifact.afb", 64));
 }
@@ -11008,12 +11512,13 @@ test "cluster writer lease reclamation persists bounded scan progress" {
         .cluster_backup_id = "cluster",
         .created_at_unix_ns = 1,
         .format = .portable,
+        .writer_lease_fencing = true,
         .tables = &tables,
     };
     for (tables) |table|
         try reserveTableBackupWriterLeaseAtLocation(alloc, io, &location, table.artifact_backup_id, 1);
 
-    var first_budget: usize = 1;
+    var first_budget: usize = 2;
     try std.testing.expect(!try claimExpiredClusterTableWriterLeases(
         alloc,
         io,
@@ -11022,8 +11527,8 @@ test "cluster writer lease reclamation persists bounded scan progress" {
         std.math.maxInt(u64),
         &first_budget,
     ));
-    try std.testing.expectEqual(@as(usize, 1), try readClusterWriterLeaseScanCursor(alloc, io, &location, &marker));
-    var second_budget: usize = 1;
+    try std.testing.expectEqual(@as(usize, 1), (try readClusterWriterLeaseScanCursor(alloc, io, &location, &marker)).next_table_index);
+    var second_budget: usize = 2;
     try std.testing.expect(!try claimExpiredClusterTableWriterLeases(
         alloc,
         io,
@@ -11032,8 +11537,13 @@ test "cluster writer lease reclamation persists bounded scan progress" {
         std.math.maxInt(u64),
         &second_budget,
     ));
-    try std.testing.expectEqual(@as(usize, 2), try readClusterWriterLeaseScanCursor(alloc, io, &location, &marker));
-    var final_budget: usize = 1;
+    try std.testing.expectEqual(@as(usize, 2), (try readClusterWriterLeaseScanCursor(alloc, io, &location, &marker)).next_table_index);
+    try writeClusterWriterLeaseScanCursorMonotonic(alloc, io, &location, &marker, .{
+        .phase = .writer_leases,
+        .next_table_index = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 2), (try readClusterWriterLeaseScanCursor(alloc, io, &location, &marker)).next_table_index);
+    var final_budget: usize = 2;
     try std.testing.expect(try claimExpiredClusterTableWriterLeases(
         alloc,
         io,
@@ -11042,12 +11552,185 @@ test "cluster writer lease reclamation persists bounded scan progress" {
         std.math.maxInt(u64),
         &final_budget,
     ));
-    try std.testing.expectEqual(@as(usize, 3), try readClusterWriterLeaseScanCursor(alloc, io, &location, &marker));
+    const completed_progress = try readClusterWriterLeaseScanCursor(alloc, io, &location, &marker);
+    try std.testing.expectEqual(ClusterAttemptCleanupPhase.artifacts, completed_progress.phase);
+    try std.testing.expectEqual(@as(usize, 0), completed_progress.next_table_index);
+    try writeClusterWriterLeaseScanCursorMonotonic(alloc, io, &location, &marker, .{
+        .phase = .writer_leases,
+        .next_table_index = tables.len,
+    });
+    try std.testing.expectEqual(
+        ClusterAttemptCleanupPhase.artifacts,
+        (try readClusterWriterLeaseScanCursor(alloc, io, &location, &marker)).phase,
+    );
 
     const cursor_suffix = try clusterWriterLeaseScanCursorPath(alloc, "", marker.attempt_id);
     defer alloc.free(cursor_suffix);
     try location.remote.writeBytes(alloc, trimLeftSlash(cursor_suffix), "not-json", "application/json");
-    try std.testing.expectEqual(@as(usize, 0), try readClusterWriterLeaseScanCursor(alloc, io, &location, &marker));
+    const reset_progress = try readClusterWriterLeaseScanCursor(alloc, io, &location, &marker);
+    try std.testing.expectEqual(ClusterAttemptCleanupProgress{}, reset_progress);
+}
+
+test "legacy cluster attempts without writer fencing are retained" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var location: BackupLocation = .{
+        .remote = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", "backups"),
+    };
+    defer location.deinit(alloc);
+    const tables = [_]ClusterBackupAttemptTable{.{
+        .name = "docs",
+        .table_backup_id = "legacy-table",
+        .artifact_backup_id = "legacy-artifact",
+    }};
+    const marker: ClusterBackupAttemptMarker = .{
+        .attempt_id = "legacy-attempt",
+        .cluster_backup_id = "legacy-cluster",
+        .created_at_unix_ns = 1,
+        .format = .portable,
+        .tables = &tables,
+    };
+    var budget: usize = 8;
+    try std.testing.expect(!try claimExpiredClusterTableWriterLeases(
+        alloc,
+        io,
+        &location,
+        &marker,
+        std.math.maxInt(u64),
+        &budget,
+    ));
+    try reserveTableBackupWriterLeaseAtLocation(
+        alloc,
+        io,
+        &location,
+        tables[0].artifact_backup_id,
+        std.math.maxInt(u64),
+    );
+}
+
+test "remote cluster artifact cleanup advances within a strict operation budget" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var location: BackupLocation = .{
+        .remote = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", "backups"),
+    };
+    defer location.deinit(alloc);
+    const tables = [_]ClusterBackupAttemptTable{
+        .{ .name = "a", .table_backup_id = "table-a", .artifact_backup_id = "artifact-a" },
+        .{ .name = "b", .table_backup_id = "table-b", .artifact_backup_id = "artifact-b" },
+        .{ .name = "c", .table_backup_id = "table-c", .artifact_backup_id = "artifact-c" },
+    };
+    const marker: ClusterBackupAttemptMarker = .{
+        .attempt_id = "budget-attempt",
+        .cluster_backup_id = "budget-cluster",
+        .created_at_unix_ns = 1,
+        .format = .portable,
+        .writer_lease_fencing = true,
+        .tables = &tables,
+    };
+    const fence: TableBackupFence = .{
+        .metadata_group_id = 3,
+        .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+        .table_id = 7,
+        .definition_digest = [_]u8{0x11} ** 32,
+        .topology_range_count = 1,
+        .topology_digest = [_]u8{0x22} ** 32,
+    };
+    try writeClusterBackupAttemptMarker(alloc, io, &location, &marker);
+    try reserveClusterBackupAttemptLeaseAtLocation(
+        alloc,
+        io,
+        &location,
+        marker.cluster_backup_id,
+        marker.attempt_id,
+        1,
+    );
+    try std.testing.expect(try claimExpiredClusterReservationForCleanup(
+        alloc,
+        io,
+        &location,
+        &marker,
+        std.math.maxInt(u64),
+    ));
+    for (tables) |table| {
+        try reserveTableBackupAttemptAtLocation(
+            alloc,
+            io,
+            &location,
+            table.table_backup_id,
+            table.artifact_backup_id,
+            .portable,
+            fence,
+        );
+        const artifact_suffix = try std.fmt.allocPrint(alloc, "{s}.afb", .{table.artifact_backup_id});
+        defer alloc.free(artifact_suffix);
+        try location.remote.writeBytes(
+            alloc,
+            artifact_suffix,
+            table.name,
+            "application/vnd.antfly.backup",
+        );
+    }
+    var fence_budget: usize = tables.len * 2;
+    try std.testing.expect(try claimExpiredClusterTableWriterLeases(
+        alloc,
+        io,
+        &location,
+        &marker,
+        std.math.maxInt(u64),
+        &fence_budget,
+    ));
+    try std.testing.expectError(
+        error.BackupAlreadyExists,
+        reserveTableBackupWriterLeaseAtLocation(alloc, io, &location, tables[0].artifact_backup_id, 100),
+    );
+
+    for (1..tables.len + 1) |expected_index| {
+        // Portable cleanup uses five exact object operations. Every quantum
+        // completes exactly one table, and its immutable-generation tombstone
+        // remains durable after the cursor advances.
+        var operation_budget: usize = 5;
+        try std.testing.expect(!try cleanupClusterBackupAttemptIncrementally(
+            alloc,
+            io,
+            &location,
+            &marker,
+            &operation_budget,
+        ));
+        const progress = try readClusterWriterLeaseScanCursor(alloc, io, &location, &marker);
+        try std.testing.expectEqual(ClusterAttemptCleanupPhase.artifacts, progress.phase);
+        try std.testing.expectEqual(expected_index, progress.next_table_index);
+        try std.testing.expectError(
+            error.BackupAlreadyExists,
+            reserveTableBackupWriterLeaseAtLocation(
+                alloc,
+                io,
+                &location,
+                tables[expected_index - 1].artifact_backup_id,
+                100,
+            ),
+        );
+    }
+    var final_budget: usize = 8;
+    try std.testing.expect(try cleanupClusterBackupAttemptIncrementally(
+        alloc,
+        io,
+        &location,
+        &marker,
+        &final_budget,
+    ));
+    try std.testing.expectError(
+        error.FileNotFound,
+        readClusterBackupAttemptMarker(alloc, io, &location, marker.attempt_id),
+    );
 }
 
 test "table backup cleanup removes the forwarded artifact envelope before payload" {
@@ -11120,7 +11803,7 @@ test "cluster backup attempt markers reject overlapping cleanup identities" {
     );
 }
 
-test "stale owned cluster backup attempt releases fences and retires authoritative head" {
+test "stale owned cluster backup attempt retains generation fences and retires authoritative head" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
@@ -11157,6 +11840,7 @@ test "stale owned cluster backup attempt releases fences and retires authoritati
         .cluster_backup_id = "cluster-snap",
         .created_at_unix_ns = 1,
         .format = .portable,
+        .writer_lease_fencing = true,
         .tables = &tables,
     };
     try writeClusterBackupAttemptMarker(alloc, io, &location, &marker);
@@ -11197,6 +11881,16 @@ test "stale owned cluster backup attempt releases fences and retires authoritati
         std.math.maxInt(u64),
     );
     try reserveBackupAtLocation(alloc, io, &location, "table-snap", false);
+    try std.testing.expectError(
+        error.BackupAlreadyExists,
+        reserveTableBackupWriterLeaseAtLocation(
+            alloc,
+            io,
+            &location,
+            "artifact-snap",
+            std.math.maxInt(u64),
+        ),
+    );
 }
 
 test "expired recovery preserves an oversized remote commit record" {
@@ -11277,6 +11971,7 @@ test "cluster backup reservation heartbeat fences premature and stale recovery" 
         .cluster_backup_id = "cluster-snap",
         .created_at_unix_ns = 1,
         .format = .portable,
+        .writer_lease_fencing = true,
         .tables = &tables,
     };
     try writeClusterBackupAttemptMarker(alloc, io, &location, &marker);
@@ -11436,6 +12131,7 @@ test "filesystem stale attempt reclamation index prevents directory-order starva
         .cluster_backup_id = "z-stale-cluster",
         .created_at_unix_ns = 1,
         .format = .portable,
+        .writer_lease_fencing = true,
         .tables = &stale_tables,
     };
     try writeClusterBackupAttemptMarker(alloc, io, &location, &stale_marker);
@@ -11802,6 +12498,7 @@ test "filesystem stale attempt reclamation recovers an abandoned claim" {
         .cluster_backup_id = "claim-cluster",
         .created_at_unix_ns = 1,
         .format = .portable,
+        .writer_lease_fencing = true,
         .tables = &tables,
     };
     try writeClusterBackupAttemptMarker(alloc, io, &location, &marker);
@@ -11894,6 +12591,7 @@ test "remote stale attempt reclamation cursor prevents prefix starvation" {
         .cluster_backup_id = "z-stale-cluster",
         .created_at_unix_ns = 1,
         .format = .portable,
+        .writer_lease_fencing = true,
         .tables = &stale_tables,
     };
     try writeClusterBackupAttemptMarker(alloc, io, &location, &stale_marker);
@@ -11933,6 +12631,7 @@ test "stale cluster backup attempt preserves aggregate referenced artifacts" {
         .cluster_backup_id = "cluster-two",
         .created_at_unix_ns = 1,
         .format = .native,
+        .writer_lease_fencing = true,
         .tables = &tables,
     };
     try reserveBackupAtLocation(alloc, io, &location, marker.cluster_backup_id, true);

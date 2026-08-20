@@ -19,6 +19,7 @@
 /// Each handler method extracts wire parameters from the httpx Context, calls
 /// a typed operation, and adapts its owned result to an httpx.Response.
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const httpx = @import("httpx");
 const runtime_http_bridge = @import("../runtime_http_bridge.zig");
 const inference_connection_abi = @import("../inference_connection_abi.zig");
@@ -7558,12 +7559,17 @@ test "httpx antfly cluster restore preserves backup location validation" {
     defer alloc.free(base_url);
     const restore_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/restore", .{base_url});
     defer alloc.free(restore_url);
-    const restore_body = "{\"backup_id\":\"snap1\",\"location\":\"ftp://bad\"}";
+    const restore_body =
+        "{\"backup_id\":\"snap1\",\"location\":\"ftp://bad\",\"connection\":\"backups\"}";
     const headers = [_][2][]const u8{.{ "content-type", "application/json" }};
 
     var resp = try requestWithRetry(&client, client_io.io(), .POST, restore_url, restore_body, &headers, 20);
     defer resp.deinit();
     try std.testing.expectEqual(@as(u16, 400), resp.status.code);
-    try std.testing.expectEqualStrings("text/plain; charset=utf-8", resp.contentType().?);
-    try std.testing.expectEqualStrings("unsupported backup location", resp.body.?);
+    try std.testing.expectEqualStrings("application/json", resp.contentType().?);
+    try ant_json.testing.expectEqualJsonText(
+        alloc,
+        "{\"error\":\"unsupported backup location\"}",
+        resp.body.?,
+    );
 }

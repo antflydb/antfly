@@ -9961,6 +9961,7 @@ pub const ApiHttpServer = struct {
             .cluster_backup_id = req.backup_id,
             .created_at_unix_ns = now_unix_ns,
             .format = req.format,
+            .writer_lease_fencing = true,
             .tables = attempt_tables,
         };
         // Publish the immutable journal before acquiring the admission fence.
@@ -33160,6 +33161,7 @@ test "api http server rejects an empty cluster backup without publishing a manif
                 .connection = "backups",
             },
             &location,
+            .{},
         ),
     );
     try std.testing.expect(!(try backups_api.clusterManifestExistsAtLocation(alloc, &location, "empty")));
