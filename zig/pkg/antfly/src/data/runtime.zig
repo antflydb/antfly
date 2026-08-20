@@ -319,7 +319,6 @@ const data_raft_campaign_retry_interval_ns: u64 = 500 * std.time.ns_per_ms;
 const data_raft_local_campaign_max_grace_ns: u64 = 500 * std.time.ns_per_ms;
 const data_raft_forward_response_reserve_ns: u64 = 50 * std.time.ns_per_ms;
 const data_raft_batch_initial_forwards: u8 = antfly.public_api.internal_batch_forwarding.max_forwards;
-const data_raft_protocol_capability_positive_cache_ttl_ns: u64 = 30 * std.time.ns_per_s;
 const data_raft_protocol_capability_negative_cache_ttl_ns: u64 = std.time.ns_per_s;
 const data_raft_protocol_capability_probe_timeout_ms: u32 = 100;
 const data_raft_metadata_sync_interval_ms: u64 = 250;
@@ -1300,6 +1299,10 @@ const RaftTableApplyStateMachine = struct {
             if (!data_raft_batch.looksLikeEnvelope(entry.data)) continue;
             var decoded = try data_raft_batch.decode(self.alloc, entry.data);
             defer decoded.deinit(self.alloc);
+            // The durable apply store consumes protocol barriers. They carry
+            // no document mutation, and their null batch payload is
+            // intentionally poison to binaries that predate the barrier.
+            if (decoded.protocol_barrier_version != null) continue;
             // Split lifecycle commands belong exclusively to the durable Raft
             // apply store. Sending an otherwise empty command through the
             // document DB can fail on unrelated index/runtime state after the
@@ -2552,25 +2555,57 @@ const StoreCapacitySnapshot = struct {
 };
 
 const DataRaftProtocolCapabilityCacheEntry = struct {
-    protocol_version: u16,
-    checked_at_ns: u64,
-    api_url_hash: u64,
+    probe_mutex: std.atomic.Mutex = .unlocked,
+    protocol_version: u16 = 0,
+    checked_at_ns: u64 = 0,
+    endpoint_hash: u64 = 0,
+};
+
+const DataRaftProtocolActivationEntry = struct {
+    /// One reference belongs to the map; every request retains its own so an
+    /// exact-placement cleanup can unlink the entry without racing readers.
+    ref_count: std.atomic.Value(usize) = .init(1),
+    activation_mutex: std.atomic.Mutex = .unlocked,
+    protocol_version: std.atomic.Value(u16) = .init(0),
+    /// A barrier accepted by the current leader is sufficient to order later
+    /// entries in that term, but is not reusable after leadership changes
+    /// until the durable apply-store marker is visible.
+    pending_term: std.atomic.Value(u64) = .init(0),
+
+    fn retain(self: *@This()) void {
+        const previous = self.ref_count.fetchAdd(1, .monotonic);
+        std.debug.assert(previous > 0);
+    }
+
+    fn release(self: *@This(), alloc: std.mem.Allocator) void {
+        const previous = self.ref_count.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+        if (previous == 1) alloc.destroy(self);
+    }
 };
 
 const DataRaftBatchProtocolPreflight = struct {
     conf_state_fingerprint: u64 = 0,
     timestamp_supported: bool = false,
+    barrier_supported: bool = false,
 };
 
-const DataNodeApiRoute = struct {
+const DataRaftProtocolPeer = struct {
     node_id: u64,
-    api_url: []const u8,
+    raft_url: []const u8,
 };
 
-fn freeDataNodeApiRoutes(alloc: std.mem.Allocator, routes: []DataNodeApiRoute) void {
-    for (routes) |route| alloc.free(route.api_url);
-    alloc.free(routes);
-}
+const DataRaftProtocolProbePlan = struct {
+    conf_state_fingerprint: u64 = 0,
+    routes_complete: bool = false,
+    peers: []const DataRaftProtocolPeer = &.{},
+
+    fn deinit(self: *DataRaftProtocolProbePlan, alloc: std.mem.Allocator) void {
+        for (self.peers) |peer| alloc.free(peer.raft_url);
+        if (self.peers.len != 0) alloc.free(self.peers);
+        self.* = undefined;
+    }
+};
 
 fn storeCapacitySnapshot(
     observation: ?resource_manager_mod.CapacityObservation,
@@ -4272,8 +4307,10 @@ pub const DataServer = struct {
     data_raft: ?*antfly.raft.ManagedHttpHostService = null,
     data_raft_mutex: std.atomic.Mutex = .unlocked,
     data_raft_protocol_capability_mutex: std.atomic.Mutex = .unlocked,
-    data_raft_protocol_probe_mutex: std.atomic.Mutex = .unlocked,
-    data_raft_protocol_capabilities: std.AutoHashMapUnmanaged(u64, DataRaftProtocolCapabilityCacheEntry) = .empty,
+    data_raft_protocol_capabilities: std.AutoHashMapUnmanaged(u64, *DataRaftProtocolCapabilityCacheEntry) = .empty,
+    data_raft_protocol_activation_mutex: std.atomic.Mutex = .unlocked,
+    data_raft_protocol_activations: std.AutoHashMapUnmanaged(u64, *DataRaftProtocolActivationEntry) = .empty,
+    data_raft_protocol_activation_cleanup_needed: std.atomic.Value(bool) = .init(false),
     /// Serializes desired-state snapshots while allowing the Raft progress
     /// thread to continue during blocking restore and catalog durability I/O.
     data_raft_reconcile_mutex: std.atomic.Mutex = .unlocked,
@@ -6392,7 +6429,12 @@ pub const DataServer = struct {
             self.alloc.destroy(store);
         }
         if (self.data_raft_base_uri) |uri| self.alloc.free(uri);
+        var protocol_capability_it = self.data_raft_protocol_capabilities.valueIterator();
+        while (protocol_capability_it.next()) |entry| self.alloc.destroy(entry.*);
         self.data_raft_protocol_capabilities.deinit(self.alloc);
+        var protocol_activation_it = self.data_raft_protocol_activations.valueIterator();
+        while (protocol_activation_it.next()) |entry| entry.*.release(self.alloc);
+        self.data_raft_protocol_activations.deinit(self.alloc);
         self.local_split_key_cache.deinit(self.alloc);
         self.local_group_status_cache.clear(self.alloc);
         self.runtime_status_disk_usage_cache.deinit(self.alloc);
@@ -7012,160 +7054,317 @@ pub const DataServer = struct {
         return hasher.final();
     }
 
-    fn cachedDataRaftProtocolCapability(
+    fn dataRaftProtocolCapabilityEntry(
         self: *DataServer,
         node_id: u64,
-        api_url_hash: u64,
-        now_ns: u64,
-    ) ?u16 {
+    ) !*DataRaftProtocolCapabilityCacheEntry {
         lockAtomic(&self.data_raft_protocol_capability_mutex);
         defer self.data_raft_protocol_capability_mutex.unlock();
-        const entry = self.data_raft_protocol_capabilities.get(node_id) orelse return null;
-        if (entry.api_url_hash != api_url_hash) return null;
-        const ttl_ns = if (entry.protocol_version >= data_raft_batch.timestamp_protocol_version)
-            data_raft_protocol_capability_positive_cache_ttl_ns
-        else
-            data_raft_protocol_capability_negative_cache_ttl_ns;
-        if (now_ns -| entry.checked_at_ns > ttl_ns) return null;
-        return entry.protocol_version;
+        if (self.data_raft_protocol_capabilities.get(node_id)) |entry| return entry;
+        const entry = try self.alloc.create(DataRaftProtocolCapabilityCacheEntry);
+        errdefer self.alloc.destroy(entry);
+        entry.* = .{};
+        try self.data_raft_protocol_capabilities.put(self.alloc, node_id, entry);
+        return entry;
     }
 
-    fn cacheDataRaftProtocolCapability(
+    fn dataRaftProtocolActivationEntry(
         self: *DataServer,
-        node_id: u64,
-        api_url_hash: u64,
-        protocol_version: u16,
-        checked_at_ns: u64,
+        group_id: u64,
+    ) !*DataRaftProtocolActivationEntry {
+        lockAtomic(&self.data_raft_protocol_activation_mutex);
+        defer self.data_raft_protocol_activation_mutex.unlock();
+        if (self.data_raft_protocol_activations.get(group_id)) |entry| {
+            entry.retain();
+            return entry;
+        }
+        const entry = try self.alloc.create(DataRaftProtocolActivationEntry);
+        errdefer self.alloc.destroy(entry);
+        entry.* = .{};
+        try self.data_raft_protocol_activations.put(self.alloc, group_id, entry);
+        entry.retain();
+        return entry;
+    }
+
+    /// Unlinks only the caller's observed entry. A placement race can retire
+    /// an entry and install a replacement for the same group before the old
+    /// request notices; pointer identity prevents that stale request from
+    /// removing the replacement. The caller's retained reference remains
+    /// valid until its normal request-scope release.
+    fn unlinkDataRaftProtocolActivationEntry(
+        self: *DataServer,
+        group_id: u64,
+        expected: *DataRaftProtocolActivationEntry,
     ) void {
-        lockAtomic(&self.data_raft_protocol_capability_mutex);
-        defer self.data_raft_protocol_capability_mutex.unlock();
-        self.data_raft_protocol_capabilities.put(self.alloc, node_id, .{
-            .protocol_version = protocol_version,
-            .checked_at_ns = checked_at_ns,
-            .api_url_hash = api_url_hash,
-        }) catch {};
+        var removed: ?*DataRaftProtocolActivationEntry = null;
+        lockAtomic(&self.data_raft_protocol_activation_mutex);
+        if (self.data_raft_protocol_activations.get(group_id)) |current| {
+            if (current == expected) {
+                const entry = self.data_raft_protocol_activations.fetchRemove(group_id) orelse unreachable;
+                removed = entry.value;
+            }
+        }
+        self.data_raft_protocol_activation_mutex.unlock();
+        if (removed) |entry| entry.release(self.alloc);
+    }
+
+    fn sortedGroupIdsContain(group_ids: []const u64, target: u64) bool {
+        var lower: usize = 0;
+        var upper: usize = group_ids.len;
+        while (lower < upper) {
+            const middle = lower + (upper - lower) / 2;
+            if (group_ids[middle] < target) {
+                lower = middle + 1;
+            } else {
+                upper = middle;
+            }
+        }
+        return lower < group_ids.len and group_ids[lower] == target;
+    }
+
+    fn sortedDataRaftGroupIdsAlloc(
+        self: *DataServer,
+        intents: []const antfly.raft.PlacementIntent,
+    ) ![]u64 {
+        const group_ids = try self.alloc.alloc(u64, intents.len);
+        for (intents, group_ids) |intent, *group_id| group_id.* = intent.record.group_id;
+        std.mem.sort(u64, group_ids, {}, comptime std.sort.asc(u64));
+        return group_ids;
+    }
+
+    /// Drops the map's ownership for groups outside exact local placement.
+    /// Request references keep removed entries alive through their final Raft
+    /// status recheck, so topology cleanup never adds a global write-path wait.
+    fn retainDataRaftProtocolActivationGroups(
+        self: *DataServer,
+        active_group_ids_sorted: []const u64,
+    ) void {
+        const Retired = struct {
+            group_id: u64,
+            entry: *DataRaftProtocolActivationEntry,
+        };
+        var retired = std.ArrayListUnmanaged(Retired).empty;
+        defer retired.deinit(self.alloc);
+
+        lockAtomic(&self.data_raft_protocol_activation_mutex);
+        var retire_count: usize = 0;
+        var count_it = self.data_raft_protocol_activations.keyIterator();
+        while (count_it.next()) |group_id| {
+            if (!sortedGroupIdsContain(active_group_ids_sorted, group_id.*)) retire_count += 1;
+        }
+        retired.ensureTotalCapacity(self.alloc, retire_count) catch |err| {
+            self.data_raft_protocol_activation_cleanup_needed.store(true, .release);
+            self.data_raft_protocol_activation_mutex.unlock();
+            std.log.warn("data raft protocol activation cleanup skipped err={s}", .{@errorName(err)});
+            return;
+        };
+        var it = self.data_raft_protocol_activations.iterator();
+        while (it.next()) |item| {
+            if (sortedGroupIdsContain(active_group_ids_sorted, item.key_ptr.*)) continue;
+            retired.appendAssumeCapacity(.{
+                .group_id = item.key_ptr.*,
+                .entry = item.value_ptr.*,
+            });
+        }
+        for (retired.items) |item| {
+            const removed = self.data_raft_protocol_activations.fetchRemove(item.group_id) orelse unreachable;
+            std.debug.assert(removed.value == item.entry);
+        }
+        self.data_raft_protocol_activation_mutex.unlock();
+
+        for (retired.items) |item| item.entry.release(self.alloc);
+        self.data_raft_protocol_activation_cleanup_needed.store(false, .release);
+    }
+
+    fn durableDataRaftBatchProtocolVersion(self: *DataServer, group_id: u64) !u16 {
+        const raft = self.data_raft orelse return error.UnsupportedOperation;
+        const store = raft.host.owned_data_store orelse return error.UnsupportedOperation;
+        return try store.raftBatchProtocolVersionForRequest(group_id);
+    }
+
+    fn dataRaftTimestampProtocolUsable(
+        entry: *const DataRaftProtocolActivationEntry,
+        leader_term: u64,
+    ) bool {
+        return entry.protocol_version.load(.acquire) >= data_raft_batch.timestamp_protocol_version or
+            (leader_term != 0 and entry.pending_term.load(.acquire) == leader_term);
+    }
+
+    fn reusableDataRaftProtocolCapability(
+        entry: *const DataRaftProtocolCapabilityCacheEntry,
+        endpoint_hash: u64,
+        now_ns: u64,
+    ) ?u16 {
+        if (entry.endpoint_hash != endpoint_hash or entry.checked_at_ns == 0) return null;
+        // Only negative evidence is reusable. Positive evidence describes one
+        // process incarnation and is consumed solely by the activation attempt
+        // that observed it; a later activation always revalidates the peer.
+        if (entry.protocol_version < data_raft_batch.activation_barrier_protocol_version and
+            now_ns -| entry.checked_at_ns <= data_raft_protocol_capability_negative_cache_ttl_ns)
+        {
+            return entry.protocol_version;
+        }
+        return null;
+    }
+
+    fn dataRaftProtocolProbeActive(
+        deadline_ns: u64,
+        cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation,
+    ) bool {
+        if (cancellation) |token| {
+            if (token.isCancelled()) return false;
+        }
+        return platform_time.monotonicNs() < deadline_ns;
     }
 
     fn probeDataRaftBatchProtocolVersion(
         self: *DataServer,
         alloc: std.mem.Allocator,
         node_id: u64,
-        api_url: []const u8,
+        raft_url: []const u8,
         deadline_ns: u64,
         cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation,
     ) u16 {
-        const now_ns = platform_time.monotonicNs();
-        const api_url_hash = std.hash.Wyhash.hash(0x552fba325614bacb, api_url);
-        if (self.cachedDataRaftProtocolCapability(node_id, api_url_hash, now_ns)) |version| return version;
-        if (now_ns >= deadline_ns) return 0;
+        const entry = self.dataRaftProtocolCapabilityEntry(node_id) catch return 0;
+        while (!entry.probe_mutex.tryLock()) {
+            if (!dataRaftProtocolProbeActive(deadline_ns, cancellation)) return 0;
+            platform_clock.Clock.real().sleepMs(1);
+        }
+        defer entry.probe_mutex.unlock();
 
-        // Collapse concurrent first-write probes into one network request.
-        // The cache lock stays independent so readers never wait for network
-        // while inspecting a still-valid entry.
-        lockAtomic(&self.data_raft_protocol_probe_mutex);
-        defer self.data_raft_protocol_probe_mutex.unlock();
         const probe_start_ns = platform_time.monotonicNs();
-        if (self.cachedDataRaftProtocolCapability(node_id, api_url_hash, probe_start_ns)) |version| return version;
-        if (probe_start_ns >= deadline_ns) return 0;
+        const endpoint_hash = std.hash.Wyhash.hash(0x552fba325614bacb, raft_url);
+        if (reusableDataRaftProtocolCapability(
+            entry,
+            endpoint_hash,
+            probe_start_ns,
+        )) |version| return version;
+        if (!dataRaftProtocolProbeActive(deadline_ns, cancellation)) return 0;
 
-        var executor = antfly.raft.transport.StdHttpExecutor.init(alloc, .{});
-        defer executor.deinit();
-        var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
+        const raft = self.data_raft orelse return 0;
+        var client = antfly.public_api.ApiHttpClient.init(alloc, raft.host.http_host.request_executor);
         const version = client.fetchDataRaftBatchProtocolVersion(
-            api_url,
+            raft_url,
             @min(dataRaftBatchHttpTimeoutMs(deadline_ns), data_raft_protocol_capability_probe_timeout_ms),
             cancellation,
         ) catch 0;
-        self.cacheDataRaftProtocolCapability(
-            node_id,
-            api_url_hash,
-            version,
-            platform_time.monotonicNs(),
-        );
+        entry.protocol_version = version;
+        entry.checked_at_ns = platform_time.monotonicNs();
+        entry.endpoint_hash = endpoint_hash;
         return version;
+    }
+
+    fn appendDataRaftProtocolPeerLocked(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        raft: *antfly.raft.ManagedHttpHostService,
+        group_id: u64,
+        node_id: u64,
+        peers: *std.ArrayListUnmanaged(DataRaftProtocolPeer),
+    ) !bool {
+        _ = self;
+        const resolver = raft.host.http_host.deps.host.peer_resolver orelse return false;
+        const endpoints = resolver.resolveGroupPeer(alloc, group_id, node_id) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return false,
+        };
+        var retained_address_index: ?usize = null;
+        defer {
+            for (endpoints, 0..) |endpoint, i| {
+                if (retained_address_index == null or retained_address_index.? != i) alloc.free(endpoint.address);
+                alloc.free(endpoint.metadata);
+            }
+            alloc.free(endpoints);
+        }
+        for (endpoints, 0..) |endpoint, i| {
+            switch (endpoint.protocol) {
+                .http, .https, .http2, .http3 => {},
+                .quic => continue,
+            }
+            if (endpoint.address.len == 0) continue;
+            try peers.append(alloc, .{
+                .node_id = node_id,
+                // Transfer the resolver-owned address directly into the
+                // request plan instead of duplicating it on every batch.
+                .raft_url = endpoint.address,
+            });
+            retained_address_index = i;
+            return true;
+        }
+        return false;
+    }
+
+    /// Captures only the current group's remote applying peers while the Raft
+    /// mutex protects the resolver. Network probes happen after this plan has
+    /// been detached, and the final proposal rechecks its membership
+    /// fingerprint under the mutex.
+    fn dataRaftProtocolProbePlanLocked(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        raft: *antfly.raft.ManagedHttpHostService,
+        group_id: u64,
+        conf_state: raft_engine.core.ConfState,
+        local_node_id: u64,
+    ) !DataRaftProtocolProbePlan {
+        var peers = std.ArrayListUnmanaged(DataRaftProtocolPeer).empty;
+        errdefer {
+            for (peers.items) |peer| alloc.free(peer.raft_url);
+            peers.deinit(alloc);
+        }
+        var routes_complete = conf_state.voters.len != 0;
+        const replica_sets = [_][]const u64{
+            conf_state.voters,
+            conf_state.voters_outgoing,
+            conf_state.learners,
+            conf_state.learners_next,
+        };
+        for (replica_sets) |node_ids| {
+            for (node_ids) |node_id| {
+                if (node_id == local_node_id) continue;
+                var already_planned = false;
+                for (peers.items) |peer| {
+                    if (peer.node_id == node_id) {
+                        already_planned = true;
+                        break;
+                    }
+                }
+                if (already_planned) continue;
+                if (!try self.appendDataRaftProtocolPeerLocked(alloc, raft, group_id, node_id, &peers)) {
+                    routes_complete = false;
+                }
+            }
+        }
+        const owned_peers = if (peers.items.len == 0) blk: {
+            peers.deinit(alloc);
+            break :blk &.{};
+        } else try peers.toOwnedSlice(alloc);
+        return .{
+            .conf_state_fingerprint = dataRaftConfStateFingerprint(conf_state),
+            .routes_complete = routes_complete,
+            .peers = owned_peers,
+        };
     }
 
     fn dataRaftBatchProtocolPreflight(
         self: *DataServer,
         alloc: std.mem.Allocator,
-        conf_state: raft_engine.core.ConfState,
-        local_node_id: u64,
-        routes: ?[]const DataNodeApiRoute,
+        plan: DataRaftProtocolProbePlan,
         deadline_ns: u64,
         cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation,
     ) DataRaftBatchProtocolPreflight {
-        const fingerprint = dataRaftConfStateFingerprint(conf_state);
-        if (conf_state.voters.len == 0) return .{ .conf_state_fingerprint = fingerprint };
-        const replica_sets = [_][]const u64{
-            conf_state.voters,
-            conf_state.voters_outgoing,
-            conf_state.learners,
-            conf_state.learners_next,
-        };
-        for (replica_sets) |node_ids| {
-            for (node_ids) |node_id| {
-                if (node_id == local_node_id) continue;
-                const data_routes = routes orelse return .{ .conf_state_fingerprint = fingerprint };
-                var api_url: ?[]const u8 = null;
-                for (data_routes) |route| {
-                    if (route.node_id != node_id) continue;
-                    api_url = route.api_url;
-                    break;
-                }
-                const target_api_url = api_url orelse return .{ .conf_state_fingerprint = fingerprint };
-                if (self.probeDataRaftBatchProtocolVersion(
-                    alloc,
-                    node_id,
-                    target_api_url,
-                    deadline_ns,
-                    cancellation,
-                ) < data_raft_batch.timestamp_protocol_version) return .{ .conf_state_fingerprint = fingerprint };
-            }
+        if (!plan.routes_complete) return .{ .conf_state_fingerprint = plan.conf_state_fingerprint };
+        for (plan.peers) |peer| {
+            if (self.probeDataRaftBatchProtocolVersion(
+                alloc,
+                peer.node_id,
+                peer.raft_url,
+                deadline_ns,
+                cancellation,
+            ) < data_raft_batch.activation_barrier_protocol_version) return .{ .conf_state_fingerprint = plan.conf_state_fingerprint };
         }
         return .{
-            .conf_state_fingerprint = fingerprint,
-            .timestamp_supported = true,
-        };
-    }
-
-    /// Returns null only when a network refresh is required. Known legacy
-    /// versions and incomplete topology are definitive negative results, so
-    /// the common mixed-version path also avoids consensus-state allocation.
-    fn cachedDataRaftBatchProtocolPreflight(
-        self: *DataServer,
-        conf_state: raft_engine.core.ConfState,
-        local_node_id: u64,
-        routes: ?[]const DataNodeApiRoute,
-        now_ns: u64,
-    ) ?DataRaftBatchProtocolPreflight {
-        const fingerprint = dataRaftConfStateFingerprint(conf_state);
-        if (conf_state.voters.len == 0) return .{ .conf_state_fingerprint = fingerprint };
-        const replica_sets = [_][]const u64{
-            conf_state.voters,
-            conf_state.voters_outgoing,
-            conf_state.learners,
-            conf_state.learners_next,
-        };
-        for (replica_sets) |node_ids| {
-            for (node_ids) |node_id| {
-                if (node_id == local_node_id) continue;
-                const data_routes = routes orelse return .{ .conf_state_fingerprint = fingerprint };
-                var api_url: ?[]const u8 = null;
-                for (data_routes) |route| {
-                    if (route.node_id != node_id) continue;
-                    api_url = route.api_url;
-                    break;
-                }
-                const target_api_url = api_url orelse return .{ .conf_state_fingerprint = fingerprint };
-                const api_url_hash = std.hash.Wyhash.hash(0x552fba325614bacb, target_api_url);
-                const version = self.cachedDataRaftProtocolCapability(node_id, api_url_hash, now_ns) orelse return null;
-                if (version < data_raft_batch.timestamp_protocol_version)
-                    return .{ .conf_state_fingerprint = fingerprint };
-            }
-        }
-        return .{
-            .conf_state_fingerprint = fingerprint,
-            .timestamp_supported = true,
+            .conf_state_fingerprint = plan.conf_state_fingerprint,
+            .barrier_supported = true,
         };
     }
 
@@ -7193,11 +7392,6 @@ pub const DataServer = struct {
             // route immediately while the control worker converges this host.
             self.requestDataRaftMetadataSync();
         }
-        const protocol_routes = if (self.remote_metadata) |remote_metadata|
-            try remote_metadata.cachedDataNodeApiRoutes(alloc)
-        else
-            null;
-        defer if (protocol_routes) |routes| freeDataNodeApiRoutes(alloc, routes);
         try ensureDataRaftBatchRouteActive(route);
         const routing_start_ns = platform_time.monotonicNs();
         if (routing_start_ns >= deadline_ns) return error.LeaderUnavailable;
@@ -7212,31 +7406,70 @@ pub const DataServer = struct {
             try ensureDataRaftBatchRouteActive(route);
             const preflighted_local_leader = raft.host.http_host.host.isLocalLeader(group_id);
             var protocol_preflight: DataRaftBatchProtocolPreflight = .{};
+            var protocol_activation_entry: ?*DataRaftProtocolActivationEntry = null;
+            var protocol_activation_lock_owned = false;
+            defer if (protocol_activation_entry) |entry| entry.release(self.alloc);
+            defer if (protocol_activation_lock_owned) protocol_activation_entry.?.activation_mutex.unlock();
             if (preflighted_local_leader) {
-                var preflight_conf_state: ?raft_engine.core.ConfState = null;
-                protocol_preflight = preflight: {
-                    lockAtomic(&self.data_raft_mutex);
-                    defer self.data_raft_mutex.unlock();
-                    const status = raft.host.http_host.host.raftStatus(group_id) orelse break :preflight .{};
-                    if (self.cachedDataRaftBatchProtocolPreflight(
-                        status.conf_state,
-                        raft.host.http_host.host.cfg.local_node_id,
-                        protocol_routes,
-                        platform_time.monotonicNs(),
-                    )) |cached| break :preflight cached;
-                    preflight_conf_state = try status.conf_state.clone(alloc);
-                    break :preflight .{};
-                };
-                defer if (preflight_conf_state) |*conf_state| conf_state.deinit(alloc);
-                if (preflight_conf_state) |conf_state| {
-                    protocol_preflight = self.dataRaftBatchProtocolPreflight(
-                        alloc,
-                        conf_state,
-                        raft.host.http_host.host.cfg.local_node_id,
-                        protocol_routes,
-                        deadline_ns,
-                        route.cancellation,
-                    );
+                const activation_entry = try self.dataRaftProtocolActivationEntry(group_id);
+                protocol_activation_entry = activation_entry;
+                if (activation_entry.protocol_version.load(.acquire) >= data_raft_batch.timestamp_protocol_version) {
+                    protocol_preflight.timestamp_supported = true;
+                } else if (activation_entry.activation_mutex.tryLock()) {
+                    protocol_activation_lock_owned = true;
+                    const durable_version = self.durableDataRaftBatchProtocolVersion(group_id) catch |err| switch (err) {
+                        // These states are retryable, but marker state is
+                        // unknown. Return before proposing instead of silently
+                        // degrading an activated group to legacy encoding.
+                        error.ApplyStoreGroupRetired => {
+                            // Exact reconciliation normally removes this map
+                            // entry. If this request recreated it after that
+                            // cleanup, retire its map reference immediately so
+                            // stable metadata rounds remain allocation-free.
+                            self.unlinkDataRaftProtocolActivationEntry(group_id, activation_entry);
+                            return error.LeaderUnavailable;
+                        },
+                        error.SplitSourceProjectionNotReady,
+                        error.ApplyStoreShuttingDown,
+                        error.ApplyStoreOwnerCachePinned,
+                        error.ResourceBudgetExceeded,
+                        => return error.LeaderUnavailable,
+                        // Corruption, unsupported protocol floors, and storage
+                        // I/O failures are correctness failures and must retain
+                        // their identity for diagnostics.
+                        else => return err,
+                    };
+                    if (durable_version >= data_raft_batch.timestamp_protocol_version) {
+                        activation_entry.protocol_version.store(durable_version, .release);
+                        activation_entry.pending_term.store(0, .release);
+                        protocol_preflight.timestamp_supported = true;
+                    } else {
+                        var protocol_plan: DataRaftProtocolProbePlan = preflight: {
+                            lockAtomic(&self.data_raft_mutex);
+                            defer self.data_raft_mutex.unlock();
+                            const status = raft.host.http_host.host.raftStatus(group_id) orelse break :preflight .{};
+                            // While this leader still owns the term, its
+                            // accepted barrier orders every later proposal.
+                            // Until that barrier applies, concurrent requests
+                            // use legacy encoding without repeating probes.
+                            if (activation_entry.pending_term.load(.acquire) == status.hard.current_term) break :preflight .{};
+                            activation_entry.pending_term.store(0, .release);
+                            break :preflight try self.dataRaftProtocolProbePlanLocked(
+                                alloc,
+                                raft,
+                                group_id,
+                                status.conf_state,
+                                raft.host.http_host.host.cfg.local_node_id,
+                            );
+                        };
+                        defer protocol_plan.deinit(alloc);
+                        protocol_preflight = self.dataRaftBatchProtocolPreflight(
+                            alloc,
+                            protocol_plan,
+                            deadline_ns,
+                            route.cancellation,
+                        );
+                    }
                 }
                 try ensureDataRaftBatchRouteActive(route);
                 if (platform_time.monotonicNs() >= deadline_ns) return error.LeaderUnavailable;
@@ -7266,10 +7499,50 @@ pub const DataServer = struct {
                     } else {
                         const status = raft.host.http_host.host.raftStatus(group_id) orelse
                             return error.RaftBatchWriteOutcomeUnknown;
+                        // Recheck the shared state while proposal ordering is
+                        // locked. A concurrent request may have appended the
+                        // barrier after this request skipped its singleflight
+                        // probe; in that case this entry must use the new
+                        // format because it will follow the barrier.
+                        var timestamp_supported = protocol_preflight.timestamp_supported or
+                            dataRaftTimestampProtocolUsable(protocol_activation_entry.?, status.hard.current_term);
+                        if (!timestamp_supported and
+                            protocol_preflight.barrier_supported and
+                            protocol_preflight.conf_state_fingerprint == dataRaftConfStateFingerprint(status.conf_state))
+                        {
+                            const barrier = try data_raft_batch.encodeProtocolBarrier(
+                                alloc,
+                                table_name,
+                                data_raft_batch.timestamp_protocol_version,
+                            );
+                            defer alloc.free(barrier);
+                            var barrier_index: ?u64 = null;
+                            raft.host.http_host.proposeWithReceipt(group_id, barrier, &barrier_index) catch |err| {
+                                if (barrier_index == null) {
+                                    // Activation is an optimization for this
+                                    // request. Preserve write availability by
+                                    // falling back to the universally readable
+                                    // legacy envelope when it was not accepted.
+                                    std.log.warn("data raft protocol barrier rejected group_id={} err={s}", .{
+                                        group_id,
+                                        @errorName(err),
+                                    });
+                                } else {
+                                    std.log.warn("data raft protocol barrier accepted before dispatch failure group_id={} index={} err={s}", .{
+                                        group_id,
+                                        barrier_index.?,
+                                        @errorName(err),
+                                    });
+                                }
+                            };
+                            if (barrier_index != null) {
+                                timestamp_supported = true;
+                                protocol_activation_entry.?.pending_term.store(status.hard.current_term, .release);
+                            }
+                        }
                         proposal_req = raftBatchRequestForProtocol(
                             req,
-                            protocol_preflight.timestamp_supported and
-                                protocol_preflight.conf_state_fingerprint == dataRaftConfStateFingerprint(status.conf_state),
+                            timestamp_supported,
                         );
                         const proposal_term = status.hard.current_term;
                         const encoded = try data_raft_batch.encode(alloc, table_name, proposal_req);
@@ -10798,6 +11071,14 @@ pub const DataServer = struct {
             // fsync for identical topology.
             const status_fingerprint = self.maintainDataRaftLeadership(snapshot, local_intents.items, registration.node_id);
             self.observeDataRaftStatusFingerprint(status_fingerprint);
+            // The common stable-topology path remains allocation-free. Retry
+            // exact activation cleanup only if its topology-change allocation
+            // previously failed under memory pressure.
+            if (self.data_raft_protocol_activation_cleanup_needed.load(.acquire)) {
+                const active_group_ids = try self.sortedDataRaftGroupIdsAlloc(local_intents.items);
+                defer self.alloc.free(active_group_ids);
+                self.retainDataRaftProtocolActivationGroups(active_group_ids);
+            }
             return;
         }
         // A split destination is placed before cutover publishes its range.
@@ -10847,9 +11128,8 @@ pub const DataServer = struct {
             }
         }
 
-        const active_group_ids = try self.alloc.alloc(u64, local_intents.items.len);
+        const active_group_ids = try self.sortedDataRaftGroupIdsAlloc(local_intents.items);
         defer self.alloc.free(active_group_ids);
-        for (local_intents.items, active_group_ids) |intent, *group_id| group_id.* = intent.record.group_id;
 
         // Admit old-or-new before reconciliation because host reconciliation
         // can have partial side effects before returning an error. Exact new
@@ -10885,6 +11165,7 @@ pub const DataServer = struct {
             if (apply_group_transition) |*transition| transition.commit();
             if (updates.items.len > 0) try raft.host.applyBatch(updates.items);
         }
+        self.retainDataRaftProtocolActivationGroups(active_group_ids);
         const status_fingerprint = self.maintainDataRaftLeadership(snapshot, local_intents.items, registration.node_id);
         self.observeDataRaftStatusFingerprint(status_fingerprint);
         if (metadata_epoch != 0) self.last_data_raft_reconciled_metadata_epoch = metadata_epoch;
@@ -14398,37 +14679,6 @@ const RemoteMetadataSource = struct {
             return try cloneAdminSnapshotOwned(self.alloc, snapshot);
         }
         return null;
-    }
-
-    fn cachedDataNodeApiRoutes(
-        self: *RemoteMetadataSource,
-        alloc: std.mem.Allocator,
-    ) !?[]DataNodeApiRoute {
-        lockAtomic(&self.cache_mutex);
-        defer self.cache_mutex.unlock();
-        const snapshot = self.cached_snapshot orelse return null;
-        var route_count: usize = 0;
-        for (snapshot.stores) |store| {
-            if (!std.mem.eql(u8, store.role, "data")) continue;
-            if (store.api_url.len == 0) continue;
-            route_count += 1;
-        }
-        const routes = try alloc.alloc(DataNodeApiRoute, route_count);
-        var initialized: usize = 0;
-        errdefer {
-            for (routes[0..initialized]) |route| alloc.free(route.api_url);
-            alloc.free(routes);
-        }
-        for (snapshot.stores) |store| {
-            if (!std.mem.eql(u8, store.role, "data")) continue;
-            if (store.api_url.len == 0) continue;
-            routes[initialized] = .{
-                .node_id = store.node_id,
-                .api_url = try alloc.dupe(u8, store.api_url),
-            };
-            initialized += 1;
-        }
-        return routes;
     }
 
     fn fetchSnapshotForHead(self: *RemoteMetadataSource, head: antfly.metadata_api.MetadataHead) !antfly.metadata_api.AdminSnapshot {
@@ -25938,70 +26188,136 @@ test "raft batch protocol preflight fingerprint fences every applying replica se
     try std.testing.expect(fingerprint != DataServer.dataRaftConfStateFingerprint(base));
 }
 
-test "raft batch protocol preflight keeps mixed-version voters and learners on legacy encoding" {
+test "raft batch protocol plan resolves only current group applying peers" {
     const alloc = std.testing.allocator;
-    var server: DataServer = undefined;
-    server.alloc = alloc;
-    server.data_raft_protocol_capability_mutex = .unlocked;
-    server.data_raft_protocol_probe_mutex = .unlocked;
-    server.data_raft_protocol_capabilities = .empty;
-    defer server.data_raft_protocol_capabilities.deinit(alloc);
+    var resolver = antfly.raft.MemoryPeerResolver.init(alloc);
+    defer resolver.deinit();
+    for ([_]u64{ 2, 3, 4, 5 }) |node_id| {
+        var route_buf: [64]u8 = undefined;
+        const route = try std.fmt.bufPrint(&route_buf, "http://raft-node-{d}", .{node_id});
+        try resolver.upsert(77, node_id, &.{.{ .protocol = .http, .address = route }});
+    }
+    try resolver.upsert(88, 99, &.{.{ .protocol = .http, .address = "http://unrelated" }});
 
-    var voters = [_]u64{ 1, 2, 3 };
-    var outgoing = [_]u64{ 1, 2, 4 };
-    var learners = [_]u64{5};
-    var learners_next = [_]u64{6};
+    var raft: antfly.raft.ManagedHttpHostService = undefined;
+    var http_host: antfly.raft.HttpHost = undefined;
+    raft.host.http_host = &http_host;
+    http_host.deps.host.peer_resolver = resolver.resolver();
+    var server: DataServer = undefined;
+
+    var voters = [_]u64{ 1, 2 };
+    var outgoing = [_]u64{ 1, 3 };
+    var learners = [_]u64{4};
+    var learners_next = [_]u64{5};
     const conf_state: raft_engine.core.ConfState = .{
         .voters = &voters,
         .voters_outgoing = &outgoing,
         .learners = &learners,
         .learners_next = &learners_next,
     };
-    const routes = [_]DataNodeApiRoute{
-        .{ .node_id = 2, .api_url = "http://node-2" },
-        .{ .node_id = 3, .api_url = "http://node-3" },
-        .{ .node_id = 4, .api_url = "http://node-4" },
-        .{ .node_id = 5, .api_url = "http://node-5" },
-        .{ .node_id = 6, .api_url = "http://node-6" },
-    };
-    const now_ns = platform_time.monotonicNs();
-    for (routes) |route| {
-        server.cacheDataRaftProtocolCapability(
-            route.node_id,
-            std.hash.Wyhash.hash(0x552fba325614bacb, route.api_url),
-            if (route.node_id == 4) 0 else data_raft_batch.protocol_version,
-            now_ns,
-        );
+    var plan = try server.dataRaftProtocolProbePlanLocked(alloc, &raft, 77, conf_state, 1);
+    defer plan.deinit(alloc);
+    try std.testing.expect(plan.routes_complete);
+    try std.testing.expectEqual(@as(usize, 4), plan.peers.len);
+    for (plan.peers, 0..) |peer, i| {
+        try std.testing.expectEqual(@as(u64, 2) + i, peer.node_id);
+        try std.testing.expect(std.mem.indexOf(u8, peer.raft_url, "unrelated") == null);
     }
-    const mixed = server.dataRaftBatchProtocolPreflight(
-        alloc,
-        conf_state,
-        1,
-        &routes,
-        now_ns + std.time.ns_per_s,
-        null,
-    );
-    try std.testing.expect(!mixed.timestamp_supported);
 
-    server.cacheDataRaftProtocolCapability(
-        4,
-        std.hash.Wyhash.hash(0x552fba325614bacb, routes[2].api_url),
-        data_raft_batch.protocol_version,
-        platform_time.monotonicNs(),
+    learners_next[0] = 6;
+    var incomplete = try server.dataRaftProtocolProbePlanLocked(alloc, &raft, 77, conf_state, 1);
+    defer incomplete.deinit(alloc);
+    try std.testing.expect(!incomplete.routes_complete);
+}
+
+test "raft batch protocol cache reuses only short lived negative evidence" {
+    const alloc = std.testing.allocator;
+    var server: DataServer = undefined;
+    server.alloc = alloc;
+    server.data_raft_protocol_capability_mutex = .unlocked;
+    server.data_raft_protocol_capabilities = .empty;
+    defer {
+        var it = server.data_raft_protocol_capabilities.valueIterator();
+        while (it.next()) |entry| alloc.destroy(entry.*);
+        server.data_raft_protocol_capabilities.deinit(alloc);
+    }
+
+    const first = try server.dataRaftProtocolCapabilityEntry(2);
+    const second = try server.dataRaftProtocolCapabilityEntry(3);
+    try std.testing.expect(first != second);
+
+    const endpoint_hash = std.hash.Wyhash.hash(0x552fba325614bacb, "http://node-2");
+    first.* = .{
+        .protocol_version = data_raft_batch.protocol_version,
+        .checked_at_ns = 200,
+        .endpoint_hash = endpoint_hash,
+    };
+    try std.testing.expect(
+        DataServer.reusableDataRaftProtocolCapability(first, endpoint_hash, 200) == null,
     );
-    const upgraded = server.dataRaftBatchProtocolPreflight(
-        alloc,
-        conf_state,
-        1,
-        &routes,
-        platform_time.monotonicNs() + std.time.ns_per_s,
-        null,
-    );
-    try std.testing.expect(upgraded.timestamp_supported);
+
+    first.protocol_version = 0;
     try std.testing.expectEqual(
-        DataServer.dataRaftConfStateFingerprint(conf_state),
-        upgraded.conf_state_fingerprint,
+        @as(u16, 0),
+        DataServer.reusableDataRaftProtocolCapability(first, endpoint_hash, 201).?,
     );
+    try std.testing.expect(
+        DataServer.reusableDataRaftProtocolCapability(first, endpoint_hash +% 1, 201) == null,
+    );
+
+    lockAtomic(&first.probe_mutex);
+    defer first.probe_mutex.unlock();
+    try std.testing.expect(second.probe_mutex.tryLock());
+    second.probe_mutex.unlock();
+}
+
+test "raft batch protocol activation is reusable only in its accepted leader term" {
+    var entry: DataRaftProtocolActivationEntry = .{};
+    try std.testing.expect(!DataServer.dataRaftTimestampProtocolUsable(&entry, 7));
+
+    entry.pending_term.store(7, .release);
+    try std.testing.expect(DataServer.dataRaftTimestampProtocolUsable(&entry, 7));
+    try std.testing.expect(!DataServer.dataRaftTimestampProtocolUsable(&entry, 8));
+
+    entry.protocol_version.store(data_raft_batch.timestamp_protocol_version, .release);
+    try std.testing.expect(DataServer.dataRaftTimestampProtocolUsable(&entry, 8));
+}
+
+test "raft batch protocol activation cleanup preserves in flight references" {
+    const alloc = std.testing.allocator;
+    var server: DataServer = undefined;
+    server.alloc = alloc;
+    server.data_raft_protocol_activation_mutex = .unlocked;
+    server.data_raft_protocol_activations = .empty;
+    server.data_raft_protocol_activation_cleanup_needed = .init(false);
+    defer {
+        var it = server.data_raft_protocol_activations.valueIterator();
+        while (it.next()) |entry| entry.*.release(alloc);
+        server.data_raft_protocol_activations.deinit(alloc);
+    }
+
+    const retired = try server.dataRaftProtocolActivationEntry(11);
+    const retained = try server.dataRaftProtocolActivationEntry(12);
+    defer retained.release(alloc);
+    retired.protocol_version.store(data_raft_batch.timestamp_protocol_version, .release);
+
+    server.retainDataRaftProtocolActivationGroups(&.{12});
+    try std.testing.expectEqual(@as(usize, 1), server.data_raft_protocol_activations.count());
+    try std.testing.expect(server.data_raft_protocol_activations.get(11) == null);
+    try std.testing.expect(server.data_raft_protocol_activations.get(12) == retained);
+    // Cleanup released only the map reference. The request can safely finish
+    // its lock-free activation read before releasing the final reference.
+    try std.testing.expect(DataServer.dataRaftTimestampProtocolUsable(retired, 99));
+
+    // A stale request must not unlink a replacement installed for the same
+    // group after exact-placement cleanup.
+    const replacement = try server.dataRaftProtocolActivationEntry(11);
+    server.unlinkDataRaftProtocolActivationEntry(11, retired);
+    try std.testing.expect(server.data_raft_protocol_activations.get(11) == replacement);
+    server.unlinkDataRaftProtocolActivationEntry(11, replacement);
+    try std.testing.expect(server.data_raft_protocol_activations.get(11) == null);
+    replacement.release(alloc);
+    retired.release(alloc);
 }
 
 test "data server mirrors managed primary writes into HA replication log" {
