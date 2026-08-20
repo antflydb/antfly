@@ -20098,6 +20098,7 @@ pub const DB = struct {
     }
 
     fn applyDurableIndexRepairStats(
+        self: *DB,
         alloc: Allocator,
         state: ?*const index_repair_state.State,
         repair_state_corrupt: bool,
@@ -20135,6 +20136,10 @@ pub const DB = struct {
             "convergence"
         else
             "none";
+        // Keep status available when the optional bounded proof cannot be
+        // read; query admission independently retries it and remains closed.
+        item.index_repair_active_generation_serviceable =
+            self.managedAdmissionDenseGenerationIsServiceable(alloc, intent) catch false;
         switch (intent.trigger) {
             .incomplete_bulk_publish,
             .root_generation_rebuild,
@@ -21113,7 +21118,7 @@ pub const DB = struct {
             errdefer freeDBIndexStatsItem(alloc, item);
             initializeDerivedCoverageIdentity(cfg, &item);
             applyProjectionCheckpointStats(&item, projection_checkpoint, target_sequence);
-            try applyDurableIndexRepairStats(
+            try self.applyDurableIndexRepairStats(
                 alloc,
                 if (durable_index_repairs) |*state| state else null,
                 self.async_context.index_repair_state_corrupt.load(.acquire),
@@ -21302,7 +21307,7 @@ pub const DB = struct {
                 break;
             }
             applyProjectionCheckpointStats(&item, try self.core.loadProjectionCheckpoint(alloc, cfg.name), item.replay_target_sequence);
-            try applyDurableIndexRepairStats(
+            try self.applyDurableIndexRepairStats(
                 alloc,
                 if (durable_index_repairs) |*state| state else null,
                 self.async_context.index_repair_state_corrupt.load(.acquire),
@@ -21541,7 +21546,7 @@ pub const DB = struct {
             initializeDerivedCoverageIdentity(cfg, &item);
             try self.applyStatusOnlyRebuildStateStats(alloc, cfg, &item);
             applyProjectionCheckpointStats(&item, projection_checkpoint, target_sequence);
-            try applyDurableIndexRepairStats(
+            try self.applyDurableIndexRepairStats(
                 alloc,
                 if (durable_index_repairs) |*state| state else null,
                 self.async_context.index_repair_state_corrupt.load(.acquire),
@@ -72839,6 +72844,14 @@ test "db completed partial managed admission serves and retires redundant repair
     var repair = try db.loadIndexRepairEntryById(alloc, repair_id);
     defer repair.deinit(alloc);
     try std.testing.expect(try db.managedAdmissionDenseGenerationIsServiceable(alloc, repair.intent));
+    const runtime_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, runtime_stats);
+    var saw_serviceable_generation = false;
+    for (runtime_stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
+        saw_serviceable_generation = index_stats.index_repair_active_generation_serviceable;
+    }
+    try std.testing.expect(saw_serviceable_generation);
 
     // Query admission may prove the pinned active generation independently of
     // the background scheduler, while the next scheduler quantum durably

@@ -2846,6 +2846,10 @@ pub const DBIndexStats = struct {
     index_repair_next_retry_at_ms: u64 = 0,
     index_repair_last_error: ?[]const u8 = null,
     index_repair_wait_reason: []const u8 = "none",
+    // Internal proof that the durable intent is obsolete because the active
+    // managed-admission generation has already converged. Public status uses
+    // this to avoid advertising reconstruction that no longer blocks reads.
+    index_repair_active_generation_serviceable: bool = false,
     projection_checkpoint_status: []const u8 = "clean",
     projection_checkpoint_applied_sequence: u64 = 0,
     projection_checkpoint_generation: u64 = 0,

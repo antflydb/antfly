@@ -3533,7 +3533,7 @@ pub fn build(b: *std.Build) void {
         "managed embedder normalizes local admission overload across embedding modes",
         "partial coverage embeddings readiness counts skipped source units",
         "partial coverage embeddings readiness does not mask pending enrichment",
-        "complete partial embeddings coverage is ready while background repair waits",
+        "complete partial embeddings coverage is ready after active generation proof",
         "create table raw parser merges default full text with quickstart embedding index",
         "create table raw parser accepts its canonical full text output",
         "table contract rejects unsupported index kinds before admission",

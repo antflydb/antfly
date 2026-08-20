@@ -1465,7 +1465,7 @@ const AggregatedIndexStatus = struct {
     kind: ?db_mod.types.IndexKind = null,
     load_error: ?[]const u8 = null,
     repair_state: ?[]const u8 = null,
-    repair_wait_is_completed_admission: bool = true,
+    repair_active_generation_serviceable: bool = true,
     backfill_active: bool = false,
     backfill_progress: f64 = 0.0,
     enrichment_failed: bool = false,
@@ -1657,11 +1657,9 @@ fn aggregateIndexStatusIndexed(
         }
         materialization_count += 1;
         if (publicIndexRepairState(item)) |state| {
-            aggregate.repair_wait_is_completed_admission =
-                aggregate.repair_wait_is_completed_admission and
-                std.mem.eql(u8, state, "waiting") and
-                std.mem.eql(u8, item.index_repair_phase, "detected") and
-                std.mem.eql(u8, item.index_repair_wait_reason, "bounded_maintenance");
+            aggregate.repair_active_generation_serviceable =
+                aggregate.repair_active_generation_serviceable and
+                item.index_repair_active_generation_serviceable;
             if (aggregate.repair_state == null or repairStateRank(state) > repairStateRank(aggregate.repair_state.?)) {
                 aggregate.repair_state = state;
             }
@@ -2336,7 +2334,7 @@ test "index status exposes compact repair state without internal diagnostics" {
     try std.testing.expectEqualStrings("waiting", publicIndexRepairState(waiting).?);
 }
 
-test "complete partial embeddings coverage is ready while background repair waits" {
+test "complete partial embeddings coverage is ready after active generation proof" {
     const item = db_mod.types.DBIndexStats{
         .name = "thumbnail",
         .kind = .dense_vector,
@@ -2356,7 +2354,8 @@ test "complete partial embeddings coverage is ready while background repair wait
         .index_repair_id = 1,
         .index_repair_phase = "detected",
         .index_repair_automation = "enabled",
-        .index_repair_wait_reason = "bounded_maintenance",
+        .index_repair_wait_reason = "none",
+        .index_repair_active_generation_serviceable = true,
     };
     var encoded = std.ArrayListUnmanaged(u8).empty;
     defer encoded.deinit(std.testing.allocator);
@@ -2386,9 +2385,12 @@ test "complete partial embeddings coverage is ready while background repair wait
     );
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
-        "{\"rebuilding\":false,\"backfill_active\":false,\"backfill_state\":\"ready\",\"repair\":{\"state\":\"waiting\",\"action_required\":false},\"coverage\":{\"policy\":\"partial\",\"complete\":true,\"healthy\":true,\"pending\":0}}",
+        "{\"rebuilding\":false,\"backfill_active\":false,\"backfill_state\":\"ready\",\"coverage\":{\"policy\":\"partial\",\"complete\":true,\"healthy\":true,\"pending\":0}}",
         encoded.items,
     );
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded.items, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("repair") == null);
 }
 
 test "derived coverage aggregation rejects stale index incarnations" {
@@ -3066,27 +3068,23 @@ fn appendSingleIndexRuntimeStatus(
     }
     if (catch_up_active and catch_up_phase == .idle and replay_catch_up_required) catch_up_phase = .replay;
 
-    const repair_state = if (embeddings_materialization_current) publicIndexRepairState(item) else null;
+    const active_generation_serviceable = if (@hasField(@TypeOf(item), "index_repair_active_generation_serviceable"))
+        item.index_repair_active_generation_serviceable
+    else if (@hasField(@TypeOf(item), "repair_active_generation_serviceable"))
+        item.repair_active_generation_serviceable
+    else
+        false;
+    const repair_state = if (embeddings_materialization_current and !active_generation_serviceable)
+        publicIndexRepairState(item)
+    else
+        null;
     // A load failure with no durable automatic repair remains a terminal
     // operator-visible error. Once a repair intent exists, the compact repair
     // state is authoritative; exposing the quarantined root's raw load error
     // at the same time would incorrectly tell clients to drop/recreate.
     const raw_load_error: ?[]const u8 = if (@hasField(@TypeOf(item), "load_error")) item.load_error else null;
     const load_error: ?[]const u8 = if (repair_state == null) raw_load_error else null;
-    const repair_wait_is_completed_admission = if (@hasField(@TypeOf(item), "index_repair_phase"))
-        std.mem.eql(u8, item.index_repair_phase, "detected") and
-            std.mem.eql(u8, item.index_repair_wait_reason, "bounded_maintenance")
-    else if (@hasField(@TypeOf(item), "repair_wait_is_completed_admission"))
-        item.repair_wait_is_completed_admission
-    else
-        false;
-    const completed_admission_wait = repair_state != null and
-        std.mem.eql(u8, repair_state.?, "waiting") and
-        repair_wait_is_completed_admission and
-        embeddings_view != null and
-        !embeddings_view.?.backfill_active;
-    const repair_blocks_readiness = repair_state != null and
-        (raw_load_error != null or !completed_admission_wait);
+    const repair_blocks_readiness = repair_state != null;
     if (load_error != null) {
         backfill_active = false;
         catch_up_active = false;
