@@ -6285,11 +6285,29 @@ pub const ApiHttpServer = struct {
             artifact_backup_id,
             format,
             connection,
-            .create,
+            .logical_create,
         );
     }
 
-    const TableBackupWriterLeaseRole = enum { create, adopt };
+    const TableBackupWriterLeaseRole = enum {
+        /// Owns the logical reservation and may retire writer state once its
+        /// canonical manifest is durable.
+        logical_create,
+        /// A rolling-upgrade storage owner creates a same-ID lease on behalf
+        /// of an older coordinator. It must leave that fence for coordinator
+        /// resolution because the storage manifest is only an envelope.
+        legacy_forwarded_create,
+        /// A current storage owner adopts the coordinator-created generation.
+        adopt,
+
+        fn createsLease(self: @This()) bool {
+            return self != .adopt;
+        }
+
+        fn ownsCommittedRetirement(self: @This()) bool {
+            return self == .logical_create;
+        }
+    };
 
     fn backupOwnedTableWithArtifactId(
         self: *ApiHttpServer,
@@ -6308,7 +6326,7 @@ pub const ApiHttpServer = struct {
         if (!std.mem.eql(u8, table.name, table_name)) return error.TableNotFound;
         if (table.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
         if (try backups_api.manifestExistsAtLocationWithIo(self.alloc, io, backup_location, backup_id)) {
-            if (writer_lease_role == .create) {
+            if (writer_lease_role.ownsCommittedRetirement()) {
                 _ = backups_api.reconcileCommittedTableBackupWriterStateAtLocation(
                     self.alloc,
                     io,
@@ -6324,7 +6342,7 @@ pub const ApiHttpServer = struct {
         const admission_now: u64 = @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
         var writer_fence = fence;
         const initial_writer_lease_expiration = switch (writer_lease_role) {
-            .create => admission_now +| backups_api.table_backup_writer_lease_duration_ns,
+            .logical_create, .legacy_forwarded_create => admission_now +| backups_api.table_backup_writer_lease_duration_ns,
             .adopt => writer_fence.writer_not_after_unix_ns orelse
                 admission_now +| backups_api.table_backup_writer_lease_duration_ns,
         };
@@ -6332,7 +6350,7 @@ pub const ApiHttpServer = struct {
         // coordinator that omitted the header still gets a finite writer
         // lease, but its reservation remains explicitly legacy so cleanup
         // retains the delayed-delivery tombstone permanently.
-        if (writer_lease_role == .create)
+        if (writer_lease_role == .logical_create)
             writer_fence.writer_not_after_unix_ns = initial_writer_lease_expiration;
         if (writer_lease_role == .adopt and
             writer_fence.writer_not_after_unix_ns != null and
@@ -6391,7 +6409,7 @@ pub const ApiHttpServer = struct {
             .expires_at_unix_ns = .init(initial_writer_lease_expiration),
         };
         switch (writer_lease_role) {
-            .create => backups_api.reserveTableBackupWriterLeaseAtLocation(
+            .logical_create, .legacy_forwarded_create => backups_api.reserveTableBackupWriterLeaseAtLocation(
                 self.alloc,
                 io,
                 backup_location,
@@ -6444,7 +6462,7 @@ pub const ApiHttpServer = struct {
             artifact_backup_id,
         ) catch return error.BackupOutcomeAmbiguous;
         if (!reservation_owned) {
-            if (writer_lease_role == .create) {
+            if (writer_lease_role.createsLease()) {
                 _ = backups_api.releaseTableBackupWriterLeaseAtLocation(
                     self.alloc,
                     io,
@@ -6487,7 +6505,7 @@ pub const ApiHttpServer = struct {
                 std.log.err("table backup cleanup failed phase=rollback class={s}", .{@errorName(cleanup_err)});
                 return error.BackupOutcomeAmbiguous;
             };
-            if (writer_lease_role == .create) {
+            if (writer_lease_role.createsLease()) {
                 _ = backups_api.releaseTableBackupWriterLeaseAtLocation(
                     self.alloc,
                     io,
@@ -6503,7 +6521,7 @@ pub const ApiHttpServer = struct {
         writer_lease_heartbeat.stop_event.set(io);
         writer_lease_future.await(io);
         writer_lease_future_running = false;
-        if (writer_lease_role == .create) {
+        if (writer_lease_role.ownsCommittedRetirement()) {
             backups_api.releaseCommittedTableBackupWriterStateAtLocation(
                 self.alloc,
                 io,
@@ -8920,7 +8938,7 @@ pub const ApiHttpServer = struct {
                 // one rolling-upgrade direction by letting the new owner
                 // create the lease; current coordinators carry metadata
                 // identity and require adoption of their delivery fence.
-                if (forwarded_fence.hasMetadataIdentity()) .adopt else .create,
+                if (forwarded_fence.hasMetadataIdentity()) .adopt else .legacy_forwarded_create,
             );
         } else self.backupOwnedTable(io, &table, admitted_fence, table_name, location, location_uri, backup_id, format, connection);
         backup_result catch |err| switch (err) {
@@ -10159,7 +10177,7 @@ pub const ApiHttpServer = struct {
                 attempt_table.artifact_backup_id,
                 req.format,
                 connection,
-                .create,
+                .logical_create,
             ) catch |err| {
                 if (err == error.BackupOutcomeAmbiguous) {
                     // The forwarded owner may still be completing work after a
@@ -33633,7 +33651,7 @@ test "table backup retry preserves the retained ambiguous generation" {
             "new-generation",
             .portable,
             "backups",
-            .create,
+            .logical_create,
         ),
     );
     const retained = (try backups_api.tableBackupAttemptArtifactIdAlloc(
@@ -33644,6 +33662,16 @@ test "table backup retry preserves the retained ambiguous generation" {
     )).?;
     defer alloc.free(retained);
     try std.testing.expectEqualStrings("retained-generation", retained);
+}
+
+test "table backup writer roles preserve rolling forwarded ownership" {
+    const Role = ApiHttpServer.TableBackupWriterLeaseRole;
+    try std.testing.expect(Role.logical_create.createsLease());
+    try std.testing.expect(Role.logical_create.ownsCommittedRetirement());
+    try std.testing.expect(Role.legacy_forwarded_create.createsLease());
+    try std.testing.expect(!Role.legacy_forwarded_create.ownsCommittedRetirement());
+    try std.testing.expect(!Role.adopt.createsLease());
+    try std.testing.expect(!Role.adopt.ownsCommittedRetirement());
 }
 
 test "api http server rejects restore before persistence without an asynchronous worker" {
