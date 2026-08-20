@@ -410,6 +410,7 @@ pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u
     try validateSchemaValue(parsed.value);
     var schema = try parseTableSchemaValue(alloc, parsed.value);
     defer schema.deinit(alloc);
+    try validateParsedStorageModeSchema(schema);
     try validateParsedTtlSchema(schema);
     try validateParsedRelationalSchema(schema);
     // Relational schemas can be parsed internally so the catalog, projection,
@@ -436,6 +437,7 @@ pub fn parseSchema(alloc: std.mem.Allocator, schema_json: []const u8) !TableSche
         var owned = schema;
         owned.deinit(alloc);
     }
+    try validateParsedStorageModeSchema(schema);
     try validateParsedTtlSchema(schema);
     try validateParsedRelationalSchema(schema);
     return schema;
@@ -472,6 +474,7 @@ pub fn validateJsonSchemaValue(
         root_property.deinit(alloc);
         alloc.destroy(root_property);
     }
+    if (propertyContainsRelationalOnlySchemaType(root_property.*)) return error.InvalidSchemaUpdateRequest;
 
     var validation_context = RuntimeValidationContext{
         .alloc = alloc,
@@ -1734,6 +1737,42 @@ fn validateParsedTtlSchema(schema: TableSchema) !void {
     }
 }
 
+fn validateParsedStorageModeSchema(schema: TableSchema) !void {
+    if (schema.storage_mode == .relational) return;
+    for (schema.document_schemas) |document_schema| {
+        const root_property = makeRootDocumentProperty(document_schema);
+        if (propertyContainsRelationalOnlySchemaType(root_property)) return error.InvalidSchemaUpdateRequest;
+    }
+}
+
+fn propertyContainsRelationalOnlySchemaType(property: DocumentProperty) bool {
+    if (property.field_type) |field_type| {
+        if (std.mem.eql(u8, field_type, "geopoint") or
+            std.mem.eql(u8, field_type, "geoshape") or
+            std.mem.eql(u8, field_type, "json")) return true;
+    }
+
+    for (property.prefix_items) |child| if (propertyContainsRelationalOnlySchemaType(child)) return true;
+    for (property.properties) |child| if (propertyContainsRelationalOnlySchemaType(child)) return true;
+    for (property.pattern_properties) |child| if (propertyContainsRelationalOnlySchemaType(child.property.*)) return true;
+    for (property.dependent_schemas) |child| if (propertyContainsRelationalOnlySchemaType(child.schema.*)) return true;
+    for (property.any_of) |child| if (propertyContainsRelationalOnlySchemaType(child)) return true;
+    for (property.one_of) |child| if (propertyContainsRelationalOnlySchemaType(child)) return true;
+    for (property.all_of) |child| if (propertyContainsRelationalOnlySchemaType(child)) return true;
+
+    if (property.additional_properties_schema) |child| if (propertyContainsRelationalOnlySchemaType(child.*)) return true;
+    if (property.unevaluated_properties_schema) |child| if (propertyContainsRelationalOnlySchemaType(child.*)) return true;
+    if (property.property_names) |child| if (propertyContainsRelationalOnlySchemaType(child.*)) return true;
+    if (property.not_schema) |child| if (propertyContainsRelationalOnlySchemaType(child.*)) return true;
+    if (property.if_schema) |child| if (propertyContainsRelationalOnlySchemaType(child.*)) return true;
+    if (property.then_schema) |child| if (propertyContainsRelationalOnlySchemaType(child.*)) return true;
+    if (property.else_schema) |child| if (propertyContainsRelationalOnlySchemaType(child.*)) return true;
+    if (property.contains_schema) |child| if (propertyContainsRelationalOnlySchemaType(child.*)) return true;
+    if (property.item) |child| if (propertyContainsRelationalOnlySchemaType(child.*)) return true;
+    if (property.unevaluated_items_schema) |child| if (propertyContainsRelationalOnlySchemaType(child.*)) return true;
+    return false;
+}
+
 fn validateParsedRelationalSchema(schema: TableSchema) !void {
     if (schema.storage_mode != .relational) return;
     if (!schema.enforce_types) return error.InvalidSchemaUpdateRequest;
@@ -1745,6 +1784,12 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
         return error.InvalidSchemaUpdateRequest;
     }
     if (document_schema.properties.len == 0) return error.InvalidSchemaUpdateRequest;
+    if (schema.ttl_duration_ns > 0 and
+        !shouldIgnoreSchemaValidationField(schema.ttl_field) and
+        findDocumentProperty(document_schema.properties, schema.ttl_field) == null)
+    {
+        return error.InvalidSchemaUpdateRequest;
+    }
     if (document_schema.additional_properties_allowed orelse false) return error.InvalidSchemaUpdateRequest;
     if (document_schema.additional_properties_schema != null or
         document_schema.pattern_properties.len != 0 or
@@ -3847,6 +3892,16 @@ test "relational schemas imply type enforcement and require a closed typed shape
         \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"type":"integer","enum":[1,2]}},"additionalProperties":false}}}}
     );
     defer typed_enum.deinit(alloc);
+
+    var metadata_ttl = try parseSchema(alloc,
+        \\{"storage_mode":"relational","ttl_duration_ns":1,"default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"additionalProperties":false}}}}
+    );
+    defer metadata_ttl.deinit(alloc);
+
+    var declared_ttl = try parseSchema(alloc,
+        \\{"storage_mode":"relational","ttl_duration_ns":1,"ttl_field":"expires_at","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"expires_at":{"type":"datetime"}},"additionalProperties":false}}}}
+    );
+    defer declared_ttl.deinit(alloc);
 }
 
 test "relational schemas reject contracts the row codec cannot represent" {
@@ -3886,6 +3941,9 @@ test "relational schemas reject contracts the row codec cannot represent" {
     ));
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
         \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"parent":{"$ref":"#","type":["object","null"]}},"additionalProperties":false}}}}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
+        \\{"storage_mode":"relational","ttl_duration_ns":1,"ttl_field":"expires_at","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}}}}}}
     ));
 }
 
@@ -3941,51 +3999,14 @@ fn parseTtlTimestampNs(value: std.json.Value) !u64 {
 }
 
 fn parseTtlStringTimestampNs(text: []const u8) !u64 {
-    return documentDateTimeToNs(.{ .string = text }) orelse error.InvalidBatchRequest;
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidBatchRequest;
+    if (std.fmt.parseInt(u64, trimmed, 10)) |timestamp| return timestamp else |_| {}
+    return storage_schema.parseRfc3339ToNs(trimmed) orelse error.InvalidBatchRequest;
 }
 
 fn parseRfc3339ToNs(text: []const u8) ?u64 {
-    if (text.len < 20) return null;
-    if (text[4] != '-' or text[7] != '-' or text[10] != 'T' or text[13] != ':' or text[16] != ':') return null;
-
-    const year = std.fmt.parseInt(i64, text[0..4], 10) catch return null;
-    const month = std.fmt.parseInt(i64, text[5..7], 10) catch return null;
-    const day = std.fmt.parseInt(i64, text[8..10], 10) catch return null;
-    const hour = std.fmt.parseInt(i64, text[11..13], 10) catch return null;
-    const minute = std.fmt.parseInt(i64, text[14..16], 10) catch return null;
-    const second = std.fmt.parseInt(i64, text[17..19], 10) catch return null;
-
-    var idx: usize = 19;
-    var nanos: u64 = 0;
-    if (idx < text.len and text[idx] == '.') {
-        idx += 1;
-        const frac_start = idx;
-        while (idx < text.len and text[idx] >= '0' and text[idx] <= '9') : (idx += 1) {}
-        const frac = text[frac_start..idx];
-        if (frac.len == 0 or frac.len > 9) return null;
-        var frac_ns = std.fmt.parseInt(u64, frac, 10) catch return null;
-        var scale: usize = frac.len;
-        while (scale < 9) : (scale += 1) frac_ns *= 10;
-        nanos = frac_ns;
-    }
-    if (idx >= text.len or text[idx] != 'Z' or idx + 1 != text.len) return null;
-
-    const days = daysFromCivil(year, month, day);
-    if (days < 0) return null;
-    const secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
-    if (secs < 0) return null;
-    return @as(u64, @intCast(secs)) * std.time.ns_per_s + nanos;
-}
-
-fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
-    var y = year;
-    y -= if (month <= 2) @as(i64, 1) else @as(i64, 0);
-    const era = @divFloor(if (y >= 0) y else y - 399, 400);
-    const yoe = y - era * 400;
-    const mp = month + (if (month > 2) @as(i64, -3) else @as(i64, 9));
-    const doy = @divFloor(153 * mp + 2, 5) + day - 1;
-    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-    return era * 146_097 + doe - 719_468;
+    return storage_schema.parseRfc3339ToNs(text);
 }
 
 fn validateStringFormat(format: []const u8, string_value: []const u8) !void {
@@ -4039,11 +4060,7 @@ fn isValidEmail(value: []const u8) bool {
 }
 
 fn isValidDate(value: []const u8) bool {
-    if (value.len != 10 or value[4] != '-' or value[7] != '-') return false;
-    const year = std.fmt.parseInt(i64, value[0..4], 10) catch return false;
-    const month = std.fmt.parseInt(i64, value[5..7], 10) catch return false;
-    const day = std.fmt.parseInt(i64, value[8..10], 10) catch return false;
-    return civilDateTimeToNs(year, month, day, 0, 0, 0, 0) != null;
+    return storage_schema.parseDateToNs(value) != null;
 }
 
 fn isValidHostname(value: []const u8) bool {
@@ -4067,21 +4084,6 @@ fn isValidUriReference(value: []const u8) bool {
         if (std.ascii.isWhitespace(ch) or std.ascii.isControl(ch)) return false;
     }
     return true;
-}
-
-fn civilDateTimeToNs(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64, nanos: u64) ?u64 {
-    if (month < 1 or month > 12) return null;
-    if (day < 1 or day > 31) return null;
-    if (hour < 0 or hour > 23) return null;
-    if (minute < 0 or minute > 59) return null;
-    if (second < 0 or second > 60) return null;
-    if (nanos >= std.time.ns_per_s) return null;
-
-    const days = daysFromCivil(year, month, day);
-    if (days < 0) return null;
-    const secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
-    if (secs < 0) return null;
-    return @as(u64, @intCast(secs)) * std.time.ns_per_s + nanos;
 }
 
 fn isValidUuid(value: []const u8) bool {
@@ -4112,13 +4114,33 @@ test "parse schema and validate document writes" {
 test "document storage preserves legacy mapped value validation" {
     const alloc = std.testing.allocator;
     var parsed = try parseSchema(alloc,
-        \\{"default_type":"doc","enforce_types":true,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"large_integer":{"type":"integer"},"legacy_date":{"type":"datetime"},"legacy_point":{"type":"geopoint"},"legacy_shape":{"type":"geoshape"}},"required":["large_integer","legacy_date","legacy_point","legacy_shape"],"additionalProperties":false}}}}
+        \\{"default_type":"doc","enforce_types":true,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"large_integer":{"type":"integer"},"legacy_date":{"type":"datetime"},"legacy_payload":{"type":"string","x-antfly-field":{"type":"json"}}},"required":["large_integer","legacy_date","legacy_payload"],"additionalProperties":false}}}}
     );
     defer parsed.deinit(alloc);
 
     try validateWritesAgainstSchema(alloc, parsed, &.{.{ .value =
-        \\{"large_integer":1e100,"legacy_date":"not-a-date","legacy_point":"legacy","legacy_shape":{"legacy":true}}
+        \\{"large_integer":1e100,"legacy_date":"not-a-date","legacy_payload":"still-a-document-string"}
     }});
+}
+
+test "document storage rejects relational-only raw schema types" {
+    const alloc = std.testing.allocator;
+    const invalid_schemas = [_][]const u8{
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"geopoint\"}}}}}}",
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"geoshape\"}}}}}}",
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"$defs\":{\"payload\":{\"type\":\"json\"}},\"properties\":{\"value\":{\"$ref\":\"#/$defs/payload\"}}}}}}",
+    };
+    for (invalid_schemas) |schema_json| {
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc, schema_json));
+    }
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        validateJsonSchemaJson(alloc, "{\"type\":\"geopoint\"}", "\"legacy\""),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchemaUpdateRequest(alloc, "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"geopoint\"}}}}}}"),
+    );
 }
 
 test "parse dynamic template contract and validate selectors" {
@@ -4907,11 +4929,14 @@ test "validate ttl field values and schema bindings" {
 
     try validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"expires_at\":1700000000000000000}" }});
     try validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"expires_at\":\"2024-01-02T03:04:05Z\"}" }});
-    try validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"expires_at\":\"1970-01-01\"}" }});
     try validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"expires_at\":\" 15 \"}" }});
     try std.testing.expectEqual(
         @as(?u64, 1_700_000_000_000_000_000),
         try documentTtlTimestampNs(std.testing.allocator, parsed, "{\"expires_at\":1700000000000000000}"),
+    );
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"expires_at\":\"1970-01-01\"}" }}),
     );
     try std.testing.expectError(
         error.InvalidBatchRequest,

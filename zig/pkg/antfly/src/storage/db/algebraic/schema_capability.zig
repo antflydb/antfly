@@ -2392,6 +2392,54 @@ test "relational integer and datetime columns preserve their logical values" {
     try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, invalid_negative.value));
 }
 
+test "relational datetime validation and projection reject invalid or unencodable values" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"ts":{"type":"datetime"}},"required":["ts"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+    var plan = try relationalColumnPlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+
+    const invalid_documents = [_][]const u8{
+        "{\"ts\":\"2023-02-29\"}",
+        "{\"ts\":\"2024-13-01\"}",
+        "{\"ts\":\"2024-01-01T24:00:00Z\"}",
+        "{\"ts\":\"9999-12-31\"}",
+    };
+    for (invalid_documents) |document| {
+        try std.testing.expectError(
+            error.InvalidBatchRequest,
+            schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = document }}),
+        );
+        var value = try std.json.parseFromSlice(std.json.Value, alloc, document, .{});
+        defer value.deinit();
+        try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, value.value));
+    }
+}
+
+test "relational custom ttl column validates and projects" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"storage_mode":"relational","ttl_duration_ns":1,"ttl_field":"expires_at","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"expires_at":{"type":"datetime"}},"required":["id","expires_at"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+    var plan = try relationalColumnPlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+
+    const document =
+        \\{"id":"a","expires_at":"1970-01-01T00:00:00Z"}
+    ;
+    try schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = document }});
+    var value = try std.json.parseFromSlice(std.json.Value, alloc, document, .{});
+    defer value.deinit();
+    var row = try projectRelationalRowAlloc(alloc, plan, value.value);
+    defer row.deinit(alloc);
+
+    const ttl_index = relationalColumnIndex(plan, "expires_at") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 0), row.cell(ttl_index).?.value.u64_val);
+}
+
 test "relational cells round-trip through typed_doc_values storage" {
     const alloc = std.testing.allocator;
     var plan = try relationalTestPlanAlloc(alloc);
