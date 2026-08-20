@@ -3464,12 +3464,6 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid retrieval agent request");
         };
-        if (authenticated_identity) |identity| {
-            if (!try ApiHttpServer.retrievalRequestTablesAllowed(alloc, body_data, identity)) {
-                _ = ctx.status(403);
-                return ctx.text("forbidden");
-            }
-        }
         if (try self.acquirePublicOperation(ctx, "retrievalAgent")) |response| return response;
         defer self.releasePublicOperation("retrievalAgent");
 
@@ -3483,11 +3477,28 @@ pub const AntflyApiHandler = struct {
                 return .{
                     .ptr = runner,
                     .vtable = &.{
+                        .authorize_query = authorizeQuery,
                         .run_query = runQuery,
                         .scan_key_page = runScanKeyPage,
                         .probe_incoming_edges = probeIncomingEdges,
                     },
                 };
+            }
+
+            fn authorizeQuery(
+                ptr: *anyopaque,
+                table_name: []const u8,
+                discovers_tree_roots: bool,
+            ) !void {
+                const runner: *@This() = @ptrCast(@alignCast(ptr));
+                const identity = runner.authenticated_identity orelse return;
+                if (!http_server_mod.permissionsAllow(identity.permissions, .table, table_name, .read))
+                    return error.Forbidden;
+                // Physical reverse-index probes do not carry row filters. Keep
+                // explicit-key and query-seeded tree traversal available, but
+                // fail closed for structural root discovery.
+                if (discovers_tree_roots and http_server_mod.effectiveRowFilterJson(identity, table_name) != null)
+                    return error.Forbidden;
             }
 
             fn runQuery(
@@ -3575,6 +3586,8 @@ pub const AntflyApiHandler = struct {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
                 if (runner.authenticated_identity) |identity| {
                     if (!http_server_mod.permissionsAllow(identity.permissions, .table, table_name, .read))
+                        return error.Forbidden;
+                    if (http_server_mod.effectiveRowFilterJson(identity, table_name) != null)
                         return error.Forbidden;
                 }
                 return try runner.server.probeRetrievalIncomingEdges(

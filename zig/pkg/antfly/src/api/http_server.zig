@@ -4637,12 +4637,6 @@ pub const ApiHttpServer = struct {
             try queue.status(alloc, task_id, context_id, "failed", "not found");
             return;
         };
-        if (authenticated_identity) |identity| {
-            if (!try retrievalRequestTablesAllowed(alloc, body, identity)) {
-                try queue.status(alloc, task_id, context_id, "failed", "forbidden");
-                return;
-            }
-        }
         comptime std.debug.assert(request_admission_policy.publicOperationClass("retrievalAgent").? == .query);
         if (!self.tryAcquireQuery()) {
             try queue.status(alloc, task_id, context_id, "failed", "query capacity exhausted");
@@ -4660,11 +4654,27 @@ pub const ApiHttpServer = struct {
                 return .{
                     .ptr = runner,
                     .vtable = &.{
+                        .authorize_query = authorizeQuery,
                         .run_query = runQuery,
                         .scan_key_page = scanKeyPage,
                         .probe_incoming_edges = probeIncomingEdges,
                     },
                 };
+            }
+
+            fn authorizeQuery(
+                ptr_inner: *anyopaque,
+                table_name: []const u8,
+                discovers_tree_roots: bool,
+            ) !void {
+                const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
+                const identity = runner.authenticated_identity orelse return;
+                if (!permissionsAllow(identity.permissions, .table, table_name, .read))
+                    return error.Forbidden;
+                // Root discovery probes the physical reverse index, which
+                // cannot yet distinguish parents hidden by a row filter.
+                if (discovers_tree_roots and effectiveRowFilterJson(identity, table_name) != null)
+                    return error.Forbidden;
             }
 
             fn runQuery(
@@ -4755,6 +4765,8 @@ pub const ApiHttpServer = struct {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
                 if (runner.authenticated_identity) |identity| {
                     if (!permissionsAllow(identity.permissions, .table, table_name, .read))
+                        return error.Forbidden;
+                    if (effectiveRowFilterJson(identity, table_name) != null)
                         return error.Forbidden;
                 }
                 return try runner.server.probeRetrievalIncomingEdges(
@@ -8275,28 +8287,6 @@ pub const ApiHttpServer = struct {
             .ctx = identity,
             .authorize_table = authorizeGraphTargetTableRead,
         };
-    }
-
-    /// Authorize every statically declared retrieval table before any query
-    /// work or streaming output begins. Full request validation remains owned
-    /// by retrieval_agent; malformed shapes are deliberately left to it.
-    pub fn retrievalRequestTablesAllowed(
-        alloc: std.mem.Allocator,
-        body: []const u8,
-        identity: AuthenticatedIdentity,
-    ) !bool {
-        var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return true;
-        defer parsed.deinit();
-        if (parsed.value != .object) return true;
-        const queries = parsed.value.object.get("queries") orelse return true;
-        if (queries != .array) return true;
-        for (queries.array.items) |query| {
-            if (query != .object) continue;
-            const table = query.object.get("table") orelse continue;
-            if (table != .string) continue;
-            if (!permissionsAllow(identity.permissions, .table, table.string, .read)) return false;
-        }
-        return true;
     }
 
     fn authorizeGraphTargetTableRead(
@@ -23409,6 +23399,44 @@ test "api http server serves retrieval agent response envelope" {
     });
     defer allowed.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), allowed.status);
+
+    const filtered_payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"iss":"trusted-upstream","sub":"browser-key","tenant":"tenant-1","tables":["docs"],"operations":["read"],"row_filter":{{"docs":{{"match_all":{{}}}}}},"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer std.testing.allocator.free(filtered_payload);
+    const filtered_token = try encodeTrustedPrincipalToken(std.testing.allocator, secret, filtered_payload);
+    defer std.testing.allocator.free(filtered_token);
+    const filtered_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = filtered_token },
+    };
+    var filtered = try executeHttpxTestRequest(&auth_server, .{
+        .method = .POST,
+        .uri = "/db/v1/agents/retrieval",
+        .content_type = "application/json",
+        .headers = &filtered_headers,
+        .body = retrieval_body,
+    });
+    defer filtered.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), filtered.status);
+
+    // `$roots` asks the physical reverse index whether each candidate has a
+    // parent. Until that probe can apply row filters to parent documents, it
+    // must fail before an SSE response can reveal hidden graph structure.
+    var filtered_roots = try executeHttpxTestRequest(&auth_server, .{
+        .method = .POST,
+        .uri = "/db/v1/agents/retrieval",
+        .content_type = "application/json",
+        .headers = &filtered_headers,
+        .body =
+        \\{"query":"find roots","stream":true,"queries":[{"table":"docs","tree_search":{"index":"doc_hierarchy","start_nodes":"$roots","max_depth":2},"limit":5}]}
+        ,
+    });
+    defer filtered_roots.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 403), filtered_roots.status);
+    try std.testing.expectEqualStrings("forbidden", filtered_roots.body);
 }
 
 test "api http server maps retrieval agent doc identity mismatch to unavailable" {
