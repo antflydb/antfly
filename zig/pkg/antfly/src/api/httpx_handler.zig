@@ -4023,13 +4023,14 @@ pub const AntflyApiHandler = struct {
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_table_name);
         const body_data = (try ctx.body()) orelse "";
-        const expected_fence = backups_api.parseTableBackupFenceHeaderValues(
+        const expected_fence = backups_api.parseTableBackupFenceHeaderValuesWithDeadline(
             ctx.header(backups_api.backup_fence_metadata_group_id_header),
             ctx.header(backups_api.backup_fence_metadata_incarnation_header),
             ctx.header(backups_api.backup_fence_table_id_header),
             ctx.header(backups_api.backup_fence_definition_header),
             ctx.header(backups_api.backup_fence_topology_count_header),
             ctx.header(backups_api.backup_fence_topology_header),
+            ctx.header(backups_api.backup_writer_not_after_header),
         ) catch {
             _ = ctx.status(400);
             return ctx.text("invalid backup fence");

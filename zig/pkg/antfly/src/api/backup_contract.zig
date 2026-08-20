@@ -16,6 +16,7 @@ pub const backup_fence_table_id_header = "X-Antfly-Backup-Table-Id";
 pub const backup_fence_definition_header = "X-Antfly-Backup-Definition-SHA256";
 pub const backup_fence_topology_count_header = "X-Antfly-Backup-Topology-Count";
 pub const backup_fence_topology_header = "X-Antfly-Backup-Topology-SHA256";
+pub const backup_writer_not_after_header = "X-Antfly-Backup-Writer-Not-After-Unix-Ns";
 pub const catalog_changed_message = "table changed during backup admission";
 pub const backup_outcome_ambiguous_message = "backup outcome is ambiguous; inspect the backup id before retrying";
 
@@ -42,6 +43,10 @@ pub const TableBackupFence = struct {
     definition_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
     topology_range_count: u64,
     topology_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    /// Current coordinators bound how long a forwarded request may wait before
+    /// its storage owner adopts the pre-created writer lease. Null identifies
+    /// a legacy delivery that requires a permanent cleanup tombstone.
+    writer_not_after_unix_ns: ?u64 = null,
 
     pub fn hasMetadataIdentity(self: @This()) bool {
         return self.metadata_group_id != 0 and

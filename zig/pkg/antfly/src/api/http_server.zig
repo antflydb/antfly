@@ -6309,6 +6309,23 @@ pub const ApiHttpServer = struct {
         if (table.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
         if (try backups_api.manifestExistsAtLocationWithIo(self.alloc, io, backup_location, backup_id))
             return error.BackupAlreadyExists;
+        const admission_now: u64 = @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
+        var writer_fence = fence;
+        const initial_writer_lease_expiration = switch (writer_lease_role) {
+            .create => admission_now +| backups_api.table_backup_writer_lease_duration_ns,
+            .adopt => writer_fence.writer_not_after_unix_ns orelse
+                admission_now +| backups_api.table_backup_writer_lease_duration_ns,
+        };
+        // Only creators can mint a delivery deadline. A rolling-upgrade
+        // coordinator that omitted the header still gets a finite writer
+        // lease, but its reservation remains explicitly legacy so cleanup
+        // retains the delayed-delivery tombstone permanently.
+        if (writer_lease_role == .create)
+            writer_fence.writer_not_after_unix_ns = initial_writer_lease_expiration;
+        if (writer_lease_role == .adopt and
+            writer_fence.writer_not_after_unix_ns != null and
+            admission_now >= initial_writer_lease_expiration)
+            return error.BackupAttemptLeaseLost;
         var reclaimed_stale_attempt = false;
         while (true) {
             backups_api.reserveTableBackupAttemptAtLocation(
@@ -6318,7 +6335,7 @@ pub const ApiHttpServer = struct {
                 backup_id,
                 artifact_backup_id,
                 format,
-                fence,
+                writer_fence,
             ) catch |err| switch (err) {
                 error.BackupAlreadyExists => {
                     const retained_artifact_id = backups_api.tableBackupAttemptArtifactIdAlloc(
@@ -6354,9 +6371,6 @@ pub const ApiHttpServer = struct {
             };
             break;
         }
-        const initial_writer_lease_expiration =
-            @as(u64, @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds())) +|
-            backups_api.table_backup_writer_lease_duration_ns;
         var writer_lease_heartbeat: TableBackupWriterLeaseHeartbeat = .{
             .alloc = self.alloc,
             .io = io,
@@ -6382,16 +6396,32 @@ pub const ApiHttpServer = struct {
                 ) catch {};
                 return err;
             },
-            .adopt => writer_lease_heartbeat.ensureOwned() catch |err| {
-                backups_api.cleanupUnpublishedTableBackupAttemptAtLocation(
-                    self.alloc,
-                    io,
-                    backup_location,
-                    backup_id,
-                    artifact_backup_id,
-                    format,
-                ) catch {};
-                return err;
+            .adopt => {
+                const adopt_now: u64 = @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
+                if (writer_fence.writer_not_after_unix_ns != null and
+                    adopt_now >= initial_writer_lease_expiration)
+                {
+                    backups_api.cleanupUnpublishedTableBackupAttemptAtLocation(
+                        self.alloc,
+                        io,
+                        backup_location,
+                        backup_id,
+                        artifact_backup_id,
+                        format,
+                    ) catch {};
+                    return error.BackupAttemptLeaseLost;
+                }
+                writer_lease_heartbeat.ensureOwned() catch |err| {
+                    backups_api.cleanupUnpublishedTableBackupAttemptAtLocation(
+                        self.alloc,
+                        io,
+                        backup_location,
+                        backup_id,
+                        artifact_backup_id,
+                        format,
+                    ) catch {};
+                    return err;
+                };
             },
         }
         const reservation_owned = backups_api.tableBackupAttemptMatchesAtLocation(
@@ -6423,7 +6453,7 @@ pub const ApiHttpServer = struct {
             writer_lease_future.await(io);
         };
         var cleanup_safe = true;
-        self.executeReservedTableBackup(io, table, fence, table_name, backup_location, location_uri, backup_id, artifact_backup_id, format, connection, &writer_lease_heartbeat, &cleanup_safe) catch |err| {
+        self.executeReservedTableBackup(io, table, writer_fence, table_name, backup_location, location_uri, backup_id, artifact_backup_id, format, connection, &writer_lease_heartbeat, &cleanup_safe) catch |err| {
             writer_lease_heartbeat.stop_event.set(io);
             writer_lease_future.await(io);
             writer_lease_future_running = false;
@@ -8855,11 +8885,13 @@ pub const ApiHttpServer = struct {
         // A forwarded storage-owner hop must preserve the coordinator's
         // generation ID. Generating another ID here would leave cleanup unable
         // to address the actual payload after a failed or ambiguous transport.
-        const backup_result = if (expected_fence) |forwarded_fence|
-            self.backupOwnedTableWithArtifactId(
+        const backup_result = if (expected_fence) |forwarded_fence| blk: {
+            var storage_fence = admitted_fence;
+            storage_fence.writer_not_after_unix_ns = forwarded_fence.writer_not_after_unix_ns;
+            break :blk self.backupOwnedTableWithArtifactId(
                 io,
                 &table,
-                admitted_fence,
+                storage_fence,
                 table_name,
                 location,
                 location_uri,
@@ -8873,9 +8905,8 @@ pub const ApiHttpServer = struct {
                 // create the lease; current coordinators carry metadata
                 // identity and require adoption of their delivery fence.
                 if (forwarded_fence.hasMetadataIdentity()) .adopt else .create,
-            )
-        else
-            self.backupOwnedTable(io, &table, admitted_fence, table_name, location, location_uri, backup_id, format, connection);
+            );
+        } else self.backupOwnedTable(io, &table, admitted_fence, table_name, location, location_uri, backup_id, format, connection);
         backup_result catch |err| switch (err) {
             error.NotLeader,
             error.ProposalDropped,
@@ -8887,6 +8918,7 @@ pub const ApiHttpServer = struct {
             error.CatalogChanged => return error.CatalogChanged,
             error.BackupAlreadyExists => return error.BackupAlreadyExists,
             error.BackupOutcomeAmbiguous => return error.BackupOutcomeAmbiguous,
+            error.BackupAttemptLeaseLost => return error.BackupOutcomeAmbiguous,
             error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
             error.TableNotFound => return error.NotFound,
             error.UnsupportedOperation => return error.MethodNotAllowed,
@@ -9962,6 +9994,7 @@ pub const ApiHttpServer = struct {
             .created_at_unix_ns = now_unix_ns,
             .format = req.format,
             .writer_lease_fencing = true,
+            .writer_delivery_deadline_fencing = true,
             .tables = attempt_tables,
         };
         // Publish the immutable journal before acquiring the admission fence.

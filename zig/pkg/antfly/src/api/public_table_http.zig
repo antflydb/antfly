@@ -1097,7 +1097,11 @@ pub fn handleTableBackupExpectedFence(
         },
         error.BackupManifestTooLarge => return .{ .status = 400, .body = try alloc.dupe(u8, backups_api.manifest_too_large_message) },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
-        error.UnsupportedBackupMigrationState => return .{ .status = 400, .body = try alloc.dupe(u8, "backup does not support active schema migration") },
+        error.UnsupportedBackupMigrationState => return .{
+            .status = 400,
+            .body = try backups_api.encodeErrorBody(alloc, "backup does not support active schema migration"),
+            .json = true,
+        },
         error.UnsupportedMultiRangeTable => return .{ .status = 400, .body = try alloc.dupe(u8, "backup does not support multi-range tables") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "backup failed") },
     };
@@ -3546,11 +3550,16 @@ test "public table backup handler exposes non-retryable fenced outcomes" {
         }
     };
 
-    const cases = [_]struct { failure: TableApi.ExecuteBackupError, expected: []const u8 }{
+    const cases = [_]struct { failure: TableApi.ExecuteBackupError, status: u16 = 409, expected: []const u8 }{
         .{ .failure = error.CatalogChanged, .expected = backups_api.catalog_changed_body },
         .{
             .failure = error.BackupOutcomeAmbiguous,
             .expected = "{\"code\":\"backup_outcome_ambiguous\",\"error\":\"backup outcome is ambiguous; inspect the backup id before retrying\",\"message\":\"backup outcome is ambiguous; inspect the backup id and artifact id before retrying\",\"retryable\":false,\"backup_id\":\"snap\"}",
+        },
+        .{
+            .failure = error.UnsupportedBackupMigrationState,
+            .status = 400,
+            .expected = "{\"error\":\"backup does not support active schema migration\"}",
         },
     };
     var node_config = try testBackupNodeConfig(std.testing.allocator);
@@ -3567,7 +3576,7 @@ test "public table backup handler exposes non-retryable fenced outcomes" {
             null,
         );
         defer resp.deinit(std.testing.allocator);
-        try std.testing.expectEqual(@as(u16, 409), resp.status);
+        try std.testing.expectEqual(case.status, resp.status);
         try std.testing.expect(resp.json);
         try ant_json.testing.expectEqualJsonText(std.testing.allocator, case.expected, resp.body);
     }
