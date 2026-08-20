@@ -64,6 +64,8 @@ const snowball_languages = [_][]const u8{
 };
 
 const snowball_generated_root = "pkg/antfly/src/search/snowball/generated";
+const sql_grammar_source = "lib/sql/grammar/antfly_sql.y";
+const sql_grammar_generated_root = "lib/sql/grammar/generated/root.zig";
 
 const snowball_compiler_sources = [_][]const u8{
     "compiler/analyser.c",
@@ -512,6 +514,119 @@ fn addLocalOpenApiCodegen(
     exe.root_module.addImport("openapi", openapi_mod);
     exe.root_module.addImport("httpx", httpx_mod);
     return exe;
+}
+
+fn addLocalYaccCodegen(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Step.Compile {
+    const yacc_mod = b.createModule(.{
+        .root_source_file = b.path("lib/yacc/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const exe = b.addExecutable(.{
+        .name = "yacc-zig",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/yacc/src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    exe.root_module.addImport("yacc", yacc_mod);
+    return exe;
+}
+
+const YaccSteps = struct {
+    run_yacc_tests: *std.Build.Step.Run,
+    run_parser_tests: *std.Build.Step.Run,
+};
+
+fn addYaccSteps(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) YaccSteps {
+    const yacc_codegen = addLocalYaccCodegen(b, target, optimize);
+    const install_yacc_codegen = b.addInstallArtifact(yacc_codegen, .{});
+    const yacc_codegen_step = b.step("yacc-zig", "Build and install the standalone Zig yacc generator");
+    yacc_codegen_step.dependOn(&install_yacc_codegen.step);
+
+    const yacc_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/yacc/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_yacc_tests = b.addRunArtifact(yacc_tests);
+    const yacc_test_step = b.step("yacc-test", "Run standalone lib/yacc parser generator tests");
+    yacc_test_step.dependOn(&run_yacc_tests.step);
+
+    const regen_run = b.addRunArtifact(yacc_codegen);
+    regen_run.addFileArg(b.path(sql_grammar_source));
+    const regen_output = regen_run.addOutputFileArg("regen_sql_grammar_root.zig");
+    regen_run.addArg(sql_grammar_source);
+    const update = b.addUpdateSourceFiles();
+    update.addCopyFileToSource(regen_output, sql_grammar_generated_root);
+    const regen_fmt = b.addSystemCommand(&.{ b.graph.zig_exe, "fmt", sql_grammar_generated_root });
+    regen_fmt.step.dependOn(&update.step);
+    const regen_step = b.step("regen-sql-grammar", "Regenerate checked-in Antfly SQL grammar metadata");
+    regen_step.dependOn(&regen_fmt.step);
+
+    const check_run = b.addRunArtifact(yacc_codegen);
+    check_run.addFileArg(b.path(sql_grammar_source));
+    const check_output = check_run.addOutputFileArg("check_sql_grammar_root.zig");
+    check_run.addArg(sql_grammar_source);
+    const check_fmt = b.addSystemCommand(&.{ b.graph.zig_exe, "fmt" });
+    check_fmt.addFileArg(check_output);
+    const compare = b.addRunArtifact(addFileCompareTool(b));
+    compare.step.dependOn(&check_fmt.step);
+    compare.addFileArg(check_output);
+    compare.addFileArg(b.path(sql_grammar_generated_root));
+
+    const generated_compile = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(sql_grammar_generated_root),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_generated_compile = b.addRunArtifact(generated_compile);
+    const check_step = b.step("sql-grammar-generated-check", "Check and compile the generated Antfly SQL grammar metadata");
+    check_step.dependOn(&compare.step);
+    check_step.dependOn(&run_generated_compile.step);
+
+    const parser_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/sql/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_parser_tests = b.addRunArtifact(parser_tests);
+    const parser_test_step = b.step("sql-parser-test", "Run the storage-independent SQL lexer and parser tests");
+    parser_test_step.dependOn(&run_parser_tests.step);
+
+    const parser_bench = b.addExecutable(.{
+        .name = "sql-parser-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/sql/parser_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    const run_parser_bench = b.addRunArtifact(parser_bench);
+    if (b.args) |args| run_parser_bench.addArgs(args);
+    const parser_bench_step = b.step("sql-parser-bench", "Benchmark generated SQL parser latency, throughput, and allocations");
+    parser_bench_step.dependOn(&run_parser_bench.step);
+
+    return .{
+        .run_yacc_tests = run_yacc_tests,
+        .run_parser_tests = run_parser_tests,
+    };
 }
 
 fn addLocalHttpxModule(
@@ -1339,6 +1454,7 @@ pub fn build(b: *std.Build) void {
     addSnowballCheckStep(b);
     const openapi_codegen = addLocalOpenApiCodegen(b, target, optimize, httpx_mod);
     addOpenApiRegenStep(b, openapi_codegen);
+    const yacc_steps = addYaccSteps(b, target, optimize);
     const openapi_root_check = addOpenApiRootCheckStep(b);
     const antfly_generated_root = "pkg/antfly/src/openapi/generated";
     const public_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_public_openapi", antfly_generated_root ++ "/antfly_public_openapi");
@@ -3967,6 +4083,8 @@ pub fn build(b: *std.Build) void {
 
     const unit_test_step = b.step("unit-test", "Run hermetic unit and focused integration test buckets without metadata chaos simulations");
     const unit_test_progress_step = b.step("unit-test-progress", "Run labeled major unit test suites to expose slow or stuck phases");
+    unit_test_step.dependOn(&yacc_steps.run_yacc_tests.step);
+    unit_test_step.dependOn(&yacc_steps.run_parser_tests.step);
 
     const lib_db_tests = b.addTest(.{
         .root_module = lib_test_mod,
