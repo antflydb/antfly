@@ -704,6 +704,8 @@ pub const RelationalColumn = struct {
     path: []u8,
     column_type: []u8,
     physical: []u8,
+    required: bool = false,
+    allows_null: bool = false,
     nullable: bool = true,
     indexed: bool = true,
     is_json: bool = false,
@@ -807,6 +809,10 @@ pub fn relationalColumnsJsonAlloc(alloc: Allocator, table_name: []const u8, plan
         try out.append(alloc, ',');
         try appendJsonString(alloc, &out, "nullable");
         try out.appendSlice(alloc, if (column.nullable) ":true," else ":false,");
+        try appendJsonString(alloc, &out, "required");
+        try out.appendSlice(alloc, if (column.required) ":true," else ":false,");
+        try appendJsonString(alloc, &out, "allows_null");
+        try out.appendSlice(alloc, if (column.allows_null) ":true," else ":false,");
         try appendJsonString(alloc, &out, "indexed");
         try out.appendSlice(alloc, if (column.indexed) ":true," else ":false,");
         try appendJsonString(alloc, &out, "is_json");
@@ -848,7 +854,9 @@ fn collectRelationalColumn(
         .path = owned_path,
         .column_type = owned_column_type,
         .physical = owned_physical,
-        .nullable = !required,
+        .required = required,
+        .allows_null = property.allows_null,
+        .nullable = !required or property.allows_null,
         .indexed = indexed,
         .is_json = is_json,
     });
@@ -1005,7 +1013,8 @@ fn expectRelationalColumn(
 //
 // projectRelationalRowAlloc turns a document into one typed cell per declared
 // column, ready to hand to section/typed_doc_values.zig at segment-build time:
-//   - missing/null value on a non-nullable column -> error.MissingRequiredColumn
+//   - a missing required value -> error.MissingRequiredColumn
+//   - an explicit null not admitted by the JSON Schema -> error.InvalidColumnValue
 //   - value that does not match the declared column type -> error.InvalidColumnValue
 //   - json columns are stringified to bytes (and flagged is_json so the caller
 //     can additionally index the subtree like a document)
@@ -1036,6 +1045,7 @@ pub const ColumnValue = union(PhysicalType) {
 pub const RelationalCell = struct {
     column: usize,
     present: bool = false,
+    is_null: bool = false,
     is_json: bool = false,
     value: ColumnValue = .{ .bool_val = false },
 };
@@ -1084,8 +1094,13 @@ pub fn projectRelationalRowAlloc(alloc: Allocator, plan: RelationalPlan, root: s
     for (plan.columns, 0..) |column, i| {
         cells[i] = .{ .column = i, .present = false, .is_json = column.is_json };
         const found = valueAtJsonPath(root, column.path);
-        if (found == null or found.? == .null) {
-            if (!column.nullable) return error.MissingRequiredColumn;
+        if (found == null) {
+            if (column.required) return error.MissingRequiredColumn;
+            continue;
+        }
+        if (found.? == .null) {
+            if (!column.allows_null) return error.InvalidColumnValue;
+            cells[i] = .{ .column = i, .present = true, .is_null = true, .is_json = column.is_json };
             continue;
         }
         const coerced = (try coerceColumnValue(alloc, column.column_type, found.?)) orelse return error.InvalidColumnValue;
@@ -1255,6 +1270,49 @@ test "relational projection enforces required columns and types" {
     , .{});
     defer lossy_extra_member.deinit();
     try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, lossy_extra_member.value));
+}
+
+test "relational projection preserves explicit null separately from absence" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"required_nullable":{"type":["keyword","null"]},"optional_nullable":{"type":["keyword","null"]},"optional_nonnull":{"type":"keyword"}},"required":["required_nullable"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+    var plan = try relationalColumnPlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+
+    const required_index = relationalColumnIndex(plan, "required_nullable").?;
+    const optional_index = relationalColumnIndex(plan, "optional_nullable").?;
+    try std.testing.expect(plan.columns[required_index].required);
+    try std.testing.expect(plan.columns[required_index].allows_null);
+    try std.testing.expect(plan.columns[required_index].nullable);
+
+    var explicit_nulls = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"required_nullable":null,"optional_nullable":null}
+    , .{});
+    defer explicit_nulls.deinit();
+    var row = try projectRelationalRowAlloc(alloc, plan, explicit_nulls.value);
+    defer row.deinit(alloc);
+    try std.testing.expect(row.cell(required_index).?.is_null);
+    try std.testing.expect(row.cell(optional_index).?.is_null);
+
+    var absent_optional = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"required_nullable":"present"}
+    , .{});
+    defer absent_optional.deinit();
+    var sparse_row = try projectRelationalRowAlloc(alloc, plan, absent_optional.value);
+    defer sparse_row.deinit(alloc);
+    try std.testing.expect(sparse_row.cell(optional_index) == null);
+
+    var missing_required = try std.json.parseFromSlice(std.json.Value, alloc, "{}", .{});
+    defer missing_required.deinit();
+    try std.testing.expectError(error.MissingRequiredColumn, projectRelationalRowAlloc(alloc, plan, missing_required.value));
+
+    var forbidden_null = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"required_nullable":"present","optional_nonnull":null}
+    , .{});
+    defer forbidden_null.deinit();
+    try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, forbidden_null.value));
 }
 
 test "relational projection yields typed cells" {

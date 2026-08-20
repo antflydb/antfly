@@ -24,8 +24,10 @@ indexed exactly the way documents are indexed today (path-fact projection plus
 dynamic templates over that subtree). That gives relational tables typed
 columns *and* the schemaless document behaviour where it is wanted.
 
-Relational mode is **not** a separate store. It is a `storage_mode` on
-`TableSchema`. A document-mode table behaves exactly as before.
+Relational mode is **not** a separate store. Internally it is represented by a
+`storage_mode` on the parsed `TableSchema`. It is not exposed by the public
+OpenAPI schema until the runtime write/read lifecycle honors that mode
+end-to-end. A document-mode table behaves exactly as before.
 
 ## Why this fits
 
@@ -70,14 +72,12 @@ a strict subset of the second:
 Ship Phase A first. Phase B is an internal storage swap behind the same
 contract and query surface.
 
-## Public contract
+## Contract rollout
 
-`storage_mode` is added to `TableSchema` (`specs/openapi/antfly/schema.yaml`):
-
-- `document` (default) — current behaviour, unchanged.
-- `relational` — required closed schema and a typed-column storage contract;
-  columnar persistence and predicate pushdown arrive through the runtime phases
-  below.
+The parsed schema has an internal `storage_mode`, but public create and update
+requests reject `relational` until column persistence and reads are wired
+atomically. This prevents a caller from selecting a storage contract that the
+runtime would silently execute as ordinary document storage.
 
 In `relational` mode the following are implied/enforced:
 
@@ -91,9 +91,11 @@ In `relational` mode the following are implied/enforced:
   dynamic rules inside `json` columns require the later JSON-subdocument
   lifecycle integration.
 
-`json` is added to `AntflyType`. A `json` column is stored as a `bytes` column
-and indexed like a document subtree (path facts + dynamic templates). It is the
-escape hatch for semi-structured data inside an otherwise typed row.
+The raw JSON Schema type `json` is accepted for a relational property. It is
+not a dynamic-template `AntflyType`: a `json` column is stored as a `bytes`
+column and later indexed like a document subtree (path facts + dynamic
+templates). It is the escape hatch for semi-structured data inside an
+otherwise typed row.
 
 Constraints in scope for v1: primary key is the existing document key;
 `NOT NULL` via `required_fields`. **Out of scope for v1:** cross-document unique
@@ -194,10 +196,11 @@ physical representation and backfill plan are compatible.
 
 ## Phased plan
 
-- **Phase 1 — contract + catalog (this change).**
-  `storage_mode` on `TableSchema` (spec + Go + Zig), `json` `AntflyType`, and
+- **Phase 1 — internal contract + catalog (this change).**
+  Internal `storage_mode` parsing, raw-schema `json` columns, and
   `relationalColumnPlanAlloc` producing the typed-column catalog with tests.
-  No behaviour change for document-mode tables.
+  Public schema mutations remain gated, and there is no behaviour change for
+  document-mode tables.
 - **Phase 2 — write path (projection done).** `projectRelationalRowAlloc`
   produces order-preserving typed cells per column, enforces `NOT NULL`, and
   captures `json` subtrees, verified end-to-end against the real

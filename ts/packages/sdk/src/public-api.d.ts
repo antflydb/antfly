@@ -9226,18 +9226,6 @@ export interface components {
              * @description Backend-managed schema generation used for migrations. Omit it from create and update requests.
              */
             readonly version?: number;
-            /**
-             * @description Storage profile for the table.
-             *     - "document" (default): schemaless JSON documents with optional,
-             *       soft schema validation. All indexes are derived from the document.
-             *     - "relational": required closed schema with a typed-column storage
-             *       contract. Documents must match a declared type. A field typed
-             *       "json" represents a subtree that can retain document-style
-             *       indexing. Implies enforce_types and closed document types.
-             * @default document
-             * @enum {string}
-             */
-            storage_mode?: "document" | "relational";
             /** @description Default type to use from the document_types. */
             default_type?: string;
             /**

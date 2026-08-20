@@ -12,12 +12,13 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! On-disk codec for a relational document's typed columns — the row payload
-//! stored under the synchronous relational base-row key for a relational table.
+//! Candidate on-disk codec for a relational document's typed columns. Public
+//! relational schema mutations remain gated until this payload is wired
+//! through the synchronous base-row write/read lifecycle.
 //!
-//! In relational mode the base row is *not* a JSON blob: it is the document's
-//! projected typed columns, serialized by this codec. `db.get` decodes the row
-//! and reconstructs canonical JSON on read.
+//! Once that lifecycle is enabled, the base row is the document's projected
+//! typed columns rather than a JSON blob; `db.get` will decode the row and
+//! reconstruct JSON on read.
 //!
 //! A document is one relational base-row pair (one packed row), not a key-range
 //! of per-column pairs: every synchronous reader (point lookup,
@@ -44,9 +45,9 @@
 //!   count   u32              -- number of cells (present columns only)
 //!   per cell:
 //!     path_len   u32, path bytes
-//!     flags      u8          -- bit0: is_json
+//!     flags      u8          -- bit0: is_json, bit1: is_null
 //!     value_type u8          -- typed_doc_values.ValueType tag
-//!     payload:
+//!     payload (omitted when is_null):
 //!       u64_val   : 8 bytes
 //!       i64_val   : 8 bytes (two's-complement bit pattern)
 //!       f64_val   : 8 bytes (bitcast)
@@ -71,8 +72,9 @@ pub const magic: [4]u8 = "AROW".*;
 pub const version: u32 = 1;
 
 const flag_is_json: u8 = 1;
-const known_flags: u8 = flag_is_json;
-const min_encoded_cell_len: usize = @sizeOf(u32) + 2 + 1;
+const flag_is_null: u8 = 2;
+const known_flags: u8 = flag_is_json | flag_is_null;
+const min_encoded_cell_len: usize = @sizeOf(u32) + 2;
 
 /// One reconstructable column value. Owns nothing: `path` and (for `bytes_val`)
 /// the value bytes borrow either the caller's buffers (when serializing) or the
@@ -84,6 +86,9 @@ pub const Cell = struct {
     /// When true a `bytes_val` payload is already valid JSON (embedded
     /// verbatim); otherwise it is a plain string (JSON-escaped on read).
     is_json: bool = false,
+    /// Distinguishes an explicitly stored JSON null from an absent column.
+    /// `value_type` retains the declared physical type; `value` is ignored.
+    is_null: bool = false,
     value: typed_dv.TypedValue,
 };
 
@@ -117,6 +122,7 @@ fn serializedLenWithAllocator(alloc: Allocator, cells: []const Cell) !usize {
     for (cells) |cell| {
         _ = std.math.cast(u32, cell.path.len) orelse return error.InvalidRelationalRow;
         encoded_len = try serializedLenAdd(encoded_len, @sizeOf(u32) + cell.path.len + 2);
+        if (cell.is_null) continue;
         encoded_len = try serializedLenAdd(encoded_len, switch (cell.value) {
             .u64_val, .i64_val, .f64_val => @sizeOf(u64),
             .bool_val => 1,
@@ -149,9 +155,11 @@ fn serializeIntoUnchecked(buf: []u8, cells: []const Cell) []u8 {
         writeU32(out, &pos, @intCast(cell.path.len));
         @memcpy(out[pos..][0..cell.path.len], cell.path);
         pos += cell.path.len;
-        out[pos] = if (cell.is_json) flag_is_json else 0;
+        out[pos] = (if (cell.is_json) flag_is_json else 0) |
+            (if (cell.is_null) flag_is_null else 0);
         out[pos + 1] = @intFromEnum(cell.value_type);
         pos += 2;
+        if (cell.is_null) continue;
         switch (cell.value) {
             .u64_val => |value| writeU64(out, &pos, value),
             .i64_val => |value| writeU64(out, &pos, @bitCast(value)),
@@ -180,6 +188,8 @@ fn serializedLenAdd(current: usize, additional: usize) !usize {
 }
 
 fn cellValueMatchesType(cell: Cell) bool {
+    if (cell.is_json and cell.value_type != .bytes_val) return false;
+    if (cell.is_null) return true;
     const matches = switch (cell.value_type) {
         .u64_val => cell.value == .u64_val,
         .i64_val => cell.value == .i64_val,
@@ -188,10 +198,11 @@ fn cellValueMatchesType(cell: Cell) bool {
         .geo_point => cell.value == .geo_point,
         .bool_val => cell.value == .bool_val,
     };
-    return matches and (!cell.is_json or cell.value_type == .bytes_val);
+    return matches;
 }
 
 fn cellValueIsSerializable(cell: Cell) bool {
+    if (cell.is_null) return true;
     return switch (cell.value) {
         .f64_val => |value| std.math.isFinite(value),
         .geo_point => |value| geo_mod.latitudeIsValid(value.lat) and geo_mod.longitudeIsValid(value.lon),
@@ -203,7 +214,7 @@ fn validateCell(alloc: Allocator, cell: Cell) !void {
     if (!std.unicode.utf8ValidateSlice(cell.path) or
         !cellValueMatchesType(cell) or
         !cellValueIsSerializable(cell)) return error.InvalidRelationalRow;
-    if (cell.value == .bytes_val) {
+    if (!cell.is_null and cell.value == .bytes_val) {
         if (cell.is_json) {
             if (!(try std.json.validate(alloc, cell.value.bytes_val))) return error.InvalidRelationalRow;
         } else if (!std.unicode.utf8ValidateSlice(cell.value.bytes_val)) {
@@ -351,7 +362,8 @@ fn readCellAt(data: []const u8, pos: *usize) !Cell {
     if (flags & ~known_flags != 0) return error.InvalidRelationalRow;
     if (flags & flag_is_json != 0 and value_type != .bytes_val) return error.InvalidRelationalRow;
 
-    const value: typed_dv.TypedValue = switch (value_type) {
+    const is_null = flags & flag_is_null != 0;
+    const value: typed_dv.TypedValue = if (is_null) zeroValue(value_type) else switch (value_type) {
         .u64_val => .{ .u64_val = try readU64Checked(data, pos) },
         .i64_val => .{ .i64_val = @bitCast(try readU64Checked(data, pos)) },
         .f64_val => .{ .f64_val = @bitCast(try readU64Checked(data, pos)) },
@@ -381,12 +393,24 @@ fn readCellAt(data: []const u8, pos: *usize) !Cell {
         .path = path,
         .value_type = value_type,
         .is_json = (flags & flag_is_json) != 0,
+        .is_null = is_null,
         .value = value,
     };
     if (!std.unicode.utf8ValidateSlice(cell.path) or !cellValueIsSerializable(cell)) {
         return error.InvalidRelationalRow;
     }
     return cell;
+}
+
+fn zeroValue(value_type: typed_dv.ValueType) typed_dv.TypedValue {
+    return switch (value_type) {
+        .u64_val => .{ .u64_val = 0 },
+        .i64_val => .{ .i64_val = 0 },
+        .f64_val => .{ .f64_val = 0 },
+        .bytes_val => .{ .bytes_val = "" },
+        .geo_point => .{ .geo_point = .{ .lat = 0, .lon = 0 } },
+        .bool_val => .{ .bool_val = false },
+    };
 }
 
 /// Look up a single column by its JSON path directly from a serialized row,
@@ -411,9 +435,20 @@ pub fn findCellByPath(value: []const u8, path: []const u8) !?Cell {
 /// Reconstruct a document's canonical JSON directly from a serialized typed-row
 /// value. Schema-free. Caller owns the returned bytes.
 pub fn reconstructValueAlloc(alloc: Allocator, value: []const u8) ![]u8 {
-    var row = try deserialize(alloc, value);
-    defer row.deinit(alloc);
-    return try reconstructDocumentAlloc(alloc, row.cells);
+    var cursor = try RowCursor.init(alloc, value);
+    defer cursor.deinit();
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    try out.append(alloc, '{');
+    var needs_comma = false;
+    while (try cursor.next()) |cell| {
+        try appendValidatedCellValue(alloc, &out, cell, needs_comma);
+        needs_comma = true;
+    }
+    try cursor.finish();
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
 }
 
 /// Materialize a document-mode stored value as JSON by returning an owned copy.
@@ -439,7 +474,8 @@ pub fn reconstructDocumentAlloc(alloc: Allocator, cells: []const Cell) ![]u8 {
 
     try out.append(alloc, '{');
     for (cells, 0..) |c, i| {
-        try appendCellValue(alloc, &out, c.path, c.value_type, c.is_json, c.value, i > 0);
+        try validateCell(alloc, c);
+        try appendValidatedCellValue(alloc, &out, c, i > 0);
     }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
@@ -464,22 +500,36 @@ pub fn appendCellValue(
         .is_json = is_json,
         .value = value,
     };
-    if (!cellValueMatchesType(cell) or !cellValueIsSerializable(cell)) return error.InvalidRelationalRow;
+    try validateCell(alloc, cell);
+    return try appendValidatedCellValue(alloc, out, cell, needs_comma);
+}
+
+fn appendValidatedCellValue(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    cell: Cell,
+    needs_comma: bool,
+) !void {
     if (needs_comma) try out.append(alloc, ',');
-    try appendJsonString(alloc, out, path);
+    try appendJsonString(alloc, out, cell.path);
     try out.append(alloc, ':');
-    switch (value_type) {
-        .f64_val => try appendFmt(alloc, out, "{d}", .{value.f64_val}),
-        .u64_val => try appendFmt(alloc, out, "{d}", .{value.u64_val}),
-        .i64_val => try appendFmt(alloc, out, "{d}", .{value.i64_val}),
-        .bool_val => try out.appendSlice(alloc, if (value.bool_val) "true" else "false"),
-        .geo_point => try appendFmt(alloc, out, "{{\"lat\":{d},\"lon\":{d}}}", .{ value.geo_point.lat, value.geo_point.lon }),
+    if (cell.is_null) {
+        try out.appendSlice(alloc, "null");
+        return;
+    }
+    switch (cell.value_type) {
+        .f64_val => try appendFmt(alloc, out, "{d}", .{cell.value.f64_val}),
+        .u64_val => try appendFmt(alloc, out, "{d}", .{cell.value.u64_val}),
+        .i64_val => try appendFmt(alloc, out, "{d}", .{cell.value.i64_val}),
+        .bool_val => try out.appendSlice(alloc, if (cell.value.bool_val) "true" else "false"),
+        .geo_point => try appendFmt(alloc, out, "{{\"lat\":{d},\"lon\":{d}}}", .{ cell.value.geo_point.lat, cell.value.geo_point.lon }),
         .bytes_val => {
-            if (is_json) {
-                if (!(try std.json.validate(alloc, value.bytes_val))) return error.InvalidRelationalRow;
-                try out.appendSlice(alloc, value.bytes_val); // already canonical JSON
+            if (cell.is_json) {
+                // RowCursor/appendCellValue validates this exactly once before
+                // reaching the hot formatting path.
+                try out.appendSlice(alloc, cell.value.bytes_val);
             } else {
-                try appendJsonString(alloc, out, value.bytes_val);
+                try appendJsonString(alloc, out, cell.value.bytes_val);
             }
         },
     }
@@ -596,6 +646,25 @@ test "relational row codec reconstructs an empty row" {
     const json = try reconstructDocumentAlloc(alloc, row.cells);
     defer alloc.free(json);
     try std.testing.expectEqualStrings("{}", json);
+}
+
+test "relational row codec preserves explicit null cells" {
+    const alloc = std.testing.allocator;
+    const encoded = try serialize(alloc, &.{
+        .{ .path = "name", .value_type = .bytes_val, .is_null = true, .value = .{ .bytes_val = "ignored" } },
+        .{ .path = "payload", .value_type = .bytes_val, .is_json = true, .is_null = true, .value = .{ .bytes_val = "ignored" } },
+        .{ .path = "active", .value_type = .bool_val, .is_null = true, .value = .{ .bool_val = true } },
+    });
+    defer alloc.free(encoded);
+
+    var row = try deserialize(alloc, encoded);
+    defer row.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), row.cells.len);
+    for (row.cells) |cell| try std.testing.expect(cell.is_null);
+
+    const reconstructed = try reconstructValueAlloc(alloc, encoded);
+    defer alloc.free(reconstructed);
+    try std.testing.expectEqualStrings("{\"name\":null,\"payload\":null,\"active\":null}", reconstructed);
 }
 
 test "relational row codec escapes string paths and values" {

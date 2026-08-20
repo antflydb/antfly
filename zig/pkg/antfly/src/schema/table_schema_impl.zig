@@ -411,6 +411,11 @@ pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u
     defer schema.deinit(alloc);
     try validateParsedTtlSchema(schema);
     try validateParsedRelationalSchema(schema);
+    // Relational schemas can be parsed internally so the catalog, projection,
+    // and on-disk codec can be developed and validated independently. Do not
+    // admit them through the public schema mutation path until storage mode is
+    // carried through runtime schema derivation and the write/read lifecycle.
+    if (schema.storage_mode == .relational) return error.InvalidSchemaUpdateRequest;
     return try stringifyJsonValue(alloc, parsed.value);
 }
 
@@ -1785,9 +1790,7 @@ fn isRelationalStorageProperty(property: DocumentProperty) bool {
     }
     return property.integer_only or
         property.properties.len != 0 or
-        property.item != null or
-        property.const_value != null or
-        property.enum_values.len != 0;
+        property.item != null;
 }
 
 fn parseDocumentSchemas(alloc: std.mem.Allocator, value: std.json.Value) ![]DocumentSchema {
@@ -3753,6 +3756,11 @@ test "relational schemas imply type enforcement and require a closed typed shape
     try std.testing.expect(schema.storage_mode == .relational);
     try std.testing.expect(schema.enforce_types);
     try std.testing.expectEqual(@as(usize, 1), schema.document_schemas.len);
+
+    var typed_enum = try parseSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"type":"integer","enum":[1,2]}},"additionalProperties":false}}}}
+    );
+    defer typed_enum.deinit(alloc);
 }
 
 test "relational schemas reject contracts the row codec cannot represent" {
@@ -3773,6 +3781,12 @@ test "relational schemas reject contracts the row codec cannot represent" {
         \\{"storage_mode":"relational","document_schemas":{"first":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}}}},"second":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}}}}}}
     ));
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"const":1}},"additionalProperties":false}}}}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"enum":[1,2]}},"additionalProperties":false}}}}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
         \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"allOf":[{"type":"object","properties":{"tenant":{"type":"keyword"}}}],"additionalProperties":false}}}}
     ));
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
@@ -3783,6 +3797,12 @@ test "relational schemas reject contracts the row codec cannot represent" {
     ));
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchemaUpdateRequest(alloc,
         \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"if":{"required":["id"]},"then":{"required":["tenant"]},"additionalProperties":false}}}}
+    ));
+}
+
+test "public schema mutations gate relational storage until runtime wiring lands" {
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchemaUpdateRequest(std.testing.allocator,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
     ));
 }
 

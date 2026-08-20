@@ -88,8 +88,6 @@ pub const DynamicTemplate = struct {
 pub const TableSchema = struct {
     /// Backend-managed schema generation used for migrations. Omit it from create and update requests.
     version: ?i64 = null,
-    /// Storage profile for the table. - "document" (default): schemaless JSON documents with optional, soft schema validation. All indexes are derived from the document. - "relational": required closed schema with a typed-column storage contract. Documents must match a declared type. A field typed "json" represents a subtree that can retain document-style indexing. Implies enforce_types and closed document types.
-    storage_mode: ?[]const u8 = null,
     /// Default type to use from the document_types.
     default_type: ?[]const u8 = null,
     /// Whether to enforce that documents must match one of the provided document types. If false, documents not matching any type will be accepted but not indexed.

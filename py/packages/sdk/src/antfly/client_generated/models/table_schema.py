@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.table_schema_storage_mode import TableSchemaStorageMode
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -24,14 +23,6 @@ class TableSchema:
     Attributes:
         version (int | Unset): Backend-managed schema generation used for migrations. Omit it from create and update
             requests.
-        storage_mode (TableSchemaStorageMode | Unset): Storage profile for the table.
-            - "document" (default): schemaless JSON documents with optional,
-              soft schema validation. All indexes are derived from the document.
-            - "relational": required closed schema with a typed-column storage
-              contract. Documents must match a declared type. A field typed
-              "json" represents a subtree that can retain document-style
-              indexing. Implies enforce_types and closed document types.
-             Default: TableSchemaStorageMode.DOCUMENT.
         default_type (str | Unset): Default type to use from the document_types.
         enforce_types (bool | Unset): Whether to enforce that documents must match one of the provided document types.
             If false, documents not matching any type will be accepted but not indexed.
@@ -48,7 +39,6 @@ class TableSchema:
     """
 
     version: int | Unset = UNSET
-    storage_mode: TableSchemaStorageMode | Unset = TableSchemaStorageMode.DOCUMENT
     default_type: str | Unset = UNSET
     enforce_types: bool | Unset = UNSET
     document_schemas: TableSchemaDocumentSchemas | Unset = UNSET
@@ -59,10 +49,6 @@ class TableSchema:
 
     def to_dict(self) -> dict[str, Any]:
         version = self.version
-
-        storage_mode: str | Unset = UNSET
-        if not isinstance(self.storage_mode, Unset):
-            storage_mode = self.storage_mode.value
 
         default_type = self.default_type
 
@@ -88,8 +74,6 @@ class TableSchema:
         field_dict.update({})
         if version is not UNSET:
             field_dict["version"] = version
-        if storage_mode is not UNSET:
-            field_dict["storage_mode"] = storage_mode
         if default_type is not UNSET:
             field_dict["default_type"] = default_type
         if enforce_types is not UNSET:
@@ -112,13 +96,6 @@ class TableSchema:
 
         d = dict(src_dict)
         version = d.pop("version", UNSET)
-
-        _storage_mode = d.pop("storage_mode", UNSET)
-        storage_mode: TableSchemaStorageMode | Unset
-        if isinstance(_storage_mode, Unset):
-            storage_mode = UNSET
-        else:
-            storage_mode = TableSchemaStorageMode(_storage_mode)
 
         default_type = d.pop("default_type", UNSET)
 
@@ -146,7 +123,6 @@ class TableSchema:
 
         table_schema = cls(
             version=version,
-            storage_mode=storage_mode,
             default_type=default_type,
             enforce_types=enforce_types,
             document_schemas=document_schemas,
