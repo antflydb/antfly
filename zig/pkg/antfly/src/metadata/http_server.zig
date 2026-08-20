@@ -76,6 +76,7 @@ pub const AdminSource = struct {
         head: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataHead = null,
         linearizable_head: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.MetadataHead = null,
         linearizable_snapshot: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.AdminSnapshot = null,
+        runtime_topology: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataRuntimeTopology = null,
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
         validate_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) anyerror!bool = null,
@@ -141,6 +142,11 @@ pub const AdminSource = struct {
 
     pub fn status(self: AdminSource) !metadata_api.MetadataStatus {
         return try self.vtable.status(self.ptr);
+    }
+
+    pub fn runtimeTopology(self: AdminSource) !metadata_api.MetadataRuntimeTopology {
+        const topology_fn = self.vtable.runtime_topology orelse return error.UnsupportedOperation;
+        return try topology_fn(self.ptr);
     }
 
     pub fn adminSnapshot(self: AdminSource) !metadata_api.AdminSnapshot {
@@ -322,6 +328,7 @@ pub const AdminSource = struct {
                 .head = metadataServiceHead,
                 .linearizable_head = metadataServiceLinearizableHead,
                 .linearizable_snapshot = metadataServiceLinearizableSnapshot,
+                .runtime_topology = metadataServiceRuntimeTopology,
                 .status = metadataServiceStatus,
                 .admin_snapshot = metadataServiceAdminSnapshot,
                 .validate_publication = metadataServiceValidatePublication,
@@ -366,6 +373,7 @@ pub const AdminSource = struct {
                 .head = metadataHttpServiceHead,
                 .linearizable_head = metadataHttpServiceLinearizableHead,
                 .linearizable_snapshot = metadataHttpServiceLinearizableSnapshot,
+                .runtime_topology = metadataHttpServiceRuntimeTopology,
                 .status = metadataHttpServiceStatus,
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
                 .validate_publication = metadataHttpServiceValidatePublication,
@@ -439,6 +447,11 @@ pub const AdminSource = struct {
     fn metadataServiceStatus(ptr: *anyopaque) !metadata_api.MetadataStatus {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         return try svc.status();
+    }
+
+    fn metadataServiceRuntimeTopology(ptr: *anyopaque) !metadata_api.MetadataRuntimeTopology {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        return try svc.runtimeTopology();
     }
 
     fn metadataServiceAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
@@ -798,6 +811,11 @@ pub const AdminSource = struct {
         return try coherentLinearizableSnapshot(service.MetadataHttpService, svc, request);
     }
 
+    fn metadataHttpServiceRuntimeTopology(ptr: *anyopaque) !metadata_api.MetadataRuntimeTopology {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return try svc.runtimeTopology();
+    }
+
     fn metadataHttpServiceAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         return try svc.adminSnapshot();
@@ -1140,6 +1158,7 @@ pub const MetadataHttpServer = struct {
         // barrier that gives this endpoint its meaning.
         try server.post(routes.Routes.internal_linearizable_head, httpx.Handler.bind(self, metadataLinearizableHead));
         try server.post(routes.Routes.internal_linearizable_snapshot, httpx.Handler.bind(self, metadataLinearizableSnapshot));
+        try server.get(routes.Routes.runtime_topology, httpx.Handler.bind(self, metadataRuntimeTopology));
         try server.get(routes.Routes.status, httpx.Handler.bind(self, metadataStatus));
         try server.get(routes.Routes.admin_snapshot, httpx.Handler.bind(self, metadataSnapshot));
         try server.get(routes.Routes.active_transitions, httpx.Handler.bind(self, metadataActiveTransitions));
@@ -1324,6 +1343,11 @@ pub const MetadataHttpServer = struct {
         var result = operations.linearizableSnapshot(request) catch |err| return metadataReadError(ctx, err);
         defer operations.freeSnapshot(&result);
         request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        return self.trackedJson(ctx, result);
+    }
+
+    fn metadataRuntimeTopology(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const result = self.source.runtimeTopology() catch |err| return metadataReadError(ctx, err);
         return self.trackedJson(ctx, result);
     }
 
@@ -3071,12 +3095,14 @@ test "metadata http server reports reallocation protocol upgrade gating" {
 test "metadata http server serves status and filtered admin routes" {
     const FakeSource = struct {
         const incarnation: metadata_api.MetadataClusterIncarnation = "77777777777777777777777777777777".*;
+        const voter_set_fingerprint: metadata_api.MetadataRaftVoterSetFingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".*;
 
         fn iface(_: *@This()) AdminSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
                     .head = head,
+                    .runtime_topology = runtimeTopology,
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .validate_publication = validatePublication,
@@ -3090,11 +3116,29 @@ test "metadata http server serves status and filtered admin routes" {
             return .{ .metadata_group_id = 77, .metadata_incarnation = incarnation, .metadata_epoch = 5 };
         }
 
+        fn runtimeTopology(_: *anyopaque) !metadata_api.MetadataRuntimeTopology {
+            return .{
+                .metadata_group_id = 77,
+                .metadata_incarnation = incarnation,
+                .metadata_raft_local_node_id = 2,
+                .metadata_raft_role = "follower",
+                .metadata_raft_leader_id = 1,
+                .metadata_raft_term = 9,
+                .metadata_raft_local_voter = true,
+                .metadata_raft_voter_count = 3,
+                .metadata_raft_voter_set_fingerprint = voter_set_fingerprint,
+                .metadata_raft_learner_count = 2,
+            };
+        }
+
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{
                 .metadata_group_id = 77,
                 .metadata_incarnation = incarnation,
                 .metadata_epoch = 5,
+                .metadata_raft_voter_set_fingerprint = voter_set_fingerprint,
+                .metadata_raft_joint_consensus = true,
+                .metadata_raft_learner_count = 2,
                 .metrics = .{},
                 .projected_tables = 1,
                 .projected_tables_with_replication_sources = 1,
@@ -3199,10 +3243,23 @@ test "metadata http server serves status and filtered admin routes" {
     var source = FakeSource{};
     var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
 
+    var topology_resp = try server.executeTypedHandlerForTest(.GET, routes.Routes.runtime_topology, &.{}, MetadataHttpServer.metadataRuntimeTopology);
+    defer topology_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 200), topology_resp.status.code);
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"metadata_group_id\":77,\"metadata_raft_local_node_id\":2,\"metadata_raft_role\":\"follower\",\"metadata_raft_leader_id\":1,\"metadata_raft_term\":9,\"metadata_raft_local_voter\":true,\"metadata_raft_voter_count\":3,\"metadata_raft_learner_count\":2}",
+        topology_resp.body.?,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, topology_resp.body.?, "\"projected_tables\"") == null);
+
     var status_resp = try server.executeTypedHandlerForTest(.GET, routes.Routes.status, &.{}, MetadataHttpServer.metadataStatus);
     defer status_resp.deinit();
     try std.testing.expectEqual(@as(u16, 200), status_resp.status.code);
     try std.testing.expect(std.mem.indexOf(u8, status_resp.body.?, "\"metadata_group_id\":77") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_resp.body.?, "\"metadata_raft_voter_set_fingerprint\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_resp.body.?, "\"metadata_raft_joint_consensus\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_resp.body.?, "\"metadata_raft_learner_count\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_resp.body.?, "\"projected_tables_with_replication_sources\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_resp.body.?, "\"projected_replication_sources\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_resp.body.?, "\"projected_replication_source_lag_millis_max\":34") != null);
@@ -4315,7 +4372,7 @@ test "coherent linearizable snapshot retries a torn capture and preserves reques
 
         const incarnation: metadata_api.MetadataClusterIncarnation = "22222222222222222222222222222222".*;
 
-        fn ensureLinearizableReadWithContext(self: *@This(), request: operation.RequestContext) !void {
+        pub fn ensureLinearizableReadWithContext(self: *@This(), request: operation.RequestContext) !void {
             try request.ensureActive();
             self.barrier_calls += 1;
             self.saw_request_id = std.mem.eql(u8, request.request_id, "snapshot-test");
@@ -4336,7 +4393,7 @@ test "coherent linearizable snapshot retries a torn capture and preserves reques
             };
         }
 
-        fn adminSnapshotFence(self: *@This()) !service.AdminSnapshotFence {
+        pub fn adminSnapshotFence(self: *@This()) !service.AdminSnapshotFence {
             defer self.fence_calls += 1;
             return fence(switch (self.fence_calls) {
                 0 => 1,
@@ -4344,7 +4401,7 @@ test "coherent linearizable snapshot retries a torn capture and preserves reques
             });
         }
 
-        fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+        pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
             self.snapshot_calls += 1;
             return .{
                 .status = .{
@@ -4362,7 +4419,7 @@ test "coherent linearizable snapshot retries a torn capture and preserves reques
             };
         }
 
-        fn freeAdminSnapshot(self: *@This(), snapshot: *metadata_api.AdminSnapshot) void {
+        pub fn freeAdminSnapshot(self: *@This(), snapshot: *metadata_api.AdminSnapshot) void {
             self.frees += 1;
             snapshot.* = undefined;
         }

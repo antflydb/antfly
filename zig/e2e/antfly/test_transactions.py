@@ -87,6 +87,7 @@ def assert_committed_response(status: int, result: dict) -> None:
         assert result["status"] in {
             "committed_visibility_pending",
             "committed_recovery_pending",
+            "committed_repair_required",
         }
 
 

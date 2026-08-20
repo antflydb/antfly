@@ -644,6 +644,19 @@ pub const RaftApplyStore = struct {
         return batch.*;
     }
 
+    /// Request-path protocol observation must never wait behind a generation
+    /// import. The caller cannot safely treat a busy or failed lookup as an
+    /// absent marker, because the marker is an irreversible log-format floor.
+    pub fn raftBatchProtocolVersionForRequest(self: *RaftApplyStore, group_id: u64) !u16 {
+        const io = self.io_impl.io();
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        try self.requireTransitionReadyLocked(shard, group_id);
+        const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse return 0;
+        return try shard_state_store.currentRaftBatchProtocolVersion(&group_store.store, self.alloc, group_id);
+    }
+
     pub fn appliedNormalEntries(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]AppliedNormalEntry {
         const io = self.io_impl.io();
         const shard = self.batchShard(group_id);
@@ -1484,7 +1497,7 @@ pub const RaftApplyStore = struct {
                     self.alloc.free(range.end);
                 },
                 .prepare_split, .start_split, .finalize_split, .rollback_split => |transition| self.alloc.free(transition.split_key),
-                .acknowledge_split, .flush_split_delta => {},
+                .acknowledge_split, .set_raft_batch_protocol, .flush_split_delta => {},
             };
             self.alloc.free(metadata.operations);
         }
@@ -1631,7 +1644,7 @@ pub const RaftApplyStore = struct {
                     alloc.free(range.end);
                 },
                 .prepare_split, .start_split, .finalize_split, .rollback_split => |transition| alloc.free(transition.split_key),
-                .acknowledge_split, .flush_split_delta => {},
+                .acknowledge_split, .set_raft_batch_protocol, .flush_split_delta => {},
             };
             operations.deinit(alloc);
         }
@@ -1797,6 +1810,10 @@ pub const RaftApplyStore = struct {
 
         var decoded = try data_raft_batch.decode(alloc, data);
         defer decoded.deinit(alloc);
+        if (decoded.protocol_barrier_version) |version| {
+            try operations.append(alloc, .{ .set_raft_batch_protocol = version });
+            return;
+        }
         for (decoded.batch.req.writes) |write| {
             const key = try alloc.dupe(u8, write.key);
             errdefer alloc.free(key);
@@ -1919,6 +1936,80 @@ test "data raft apply store persists batches across reopen" {
         try std.testing.expectEqualStrings("b", group_state[1].key);
         try std.testing.expectEqualStrings("", group_state[1].value);
     }
+}
+
+test "data raft protocol barrier persists and transfers in snapshots" {
+    var source_tmp = std.testing.tmpDir(.{});
+    defer source_tmp.cleanup();
+    const source_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/protocol-source", .{source_tmp.sub_path});
+    defer std.testing.allocator.free(source_root);
+
+    var source = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = source_root });
+    defer source.deinit();
+    const barrier = try data_raft_batch.encodeProtocolBarrier(
+        std.testing.allocator,
+        "docs",
+        data_raft_batch.timestamp_protocol_version,
+    );
+    defer std.testing.allocator.free(barrier);
+    const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{.{
+        .term = 1,
+        .index = 1,
+        .entry_type = .normal,
+        .data = barrier,
+    }});
+    defer std.testing.allocator.free(entries);
+    try source.snapshotBuilder().applyBatch(.{
+        .group_id = 45,
+        .commit_index = 1,
+        .entries_bytes = entries,
+    });
+    try std.testing.expectEqual(
+        data_raft_batch.timestamp_protocol_version,
+        try source.raftBatchProtocolVersionForRequest(45),
+    );
+
+    const snapshot = try source.snapshotBuilder().buildSnapshot(std.testing.allocator, 45);
+    defer std.testing.allocator.free(snapshot);
+    var target_tmp = std.testing.tmpDir(.{});
+    defer target_tmp.cleanup();
+    const target_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/protocol-target", .{target_tmp.sub_path});
+    defer std.testing.allocator.free(target_root);
+    var target = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = target_root });
+    defer target.deinit();
+    try std.testing.expect(try target.snapshotBuilder().installSnapshot(
+        std.testing.allocator,
+        45,
+        1,
+        snapshot,
+    ));
+    try std.testing.expectEqual(
+        data_raft_batch.timestamp_protocol_version,
+        try target.raftBatchProtocolVersionForRequest(45),
+    );
+}
+
+test "data raft protocol request observation never waits for generation preparation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/protocol-busy", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+
+    const group_id: u64 = 46;
+    const shard = store.batchShard(group_id);
+    {
+        shard.mutex.lockUncancelable(store.io_impl.io());
+        defer shard.mutex.unlock(store.io_impl.io());
+        try shard.generation_preparations.put(std.testing.allocator, group_id, {});
+    }
+    defer store.cancelGenerationPreparation(group_id);
+
+    try std.testing.expectError(
+        error.SplitSourceProjectionNotReady,
+        store.raftBatchProtocolVersionForRequest(group_id),
+    );
 }
 
 test "data raft apply store admits one writable owner per root" {

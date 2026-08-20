@@ -37,6 +37,7 @@ pub const BatchRequest = types.BatchRequest;
 pub const BatchResponse = types.BatchResponse;
 pub const ByteRange = types.ByteRange;
 pub const CalendarInterval = types.CalendarInterval;
+pub const CardinalityMode = types.CardinalityMode;
 pub const CdcConnection = types.CdcConnection;
 pub const ClusterBackupRequest = types.ClusterBackupRequest;
 pub const ClusterBackupResponse = types.ClusterBackupResponse;

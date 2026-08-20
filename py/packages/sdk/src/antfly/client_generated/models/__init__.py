@@ -70,6 +70,7 @@ from .brave_search_config import BraveSearchConfig
 from .brave_search_config_freshness import BraveSearchConfigFreshness
 from .calendar_interval import CalendarInterval
 from .capability import Capability
+from .cardinality_mode import CardinalityMode
 from .cdc_connection import CdcConnection
 from .chain_condition import ChainCondition
 from .chain_link import ChainLink
@@ -869,6 +870,7 @@ __all__ = (
     "BraveSearchConfigFreshness",
     "CalendarInterval",
     "Capability",
+    "CardinalityMode",
     "CdcConnection",
     "ChainCondition",
     "ChainLink",

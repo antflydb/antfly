@@ -25,6 +25,7 @@ const metadata_incarnation = @import("incarnation.zig");
 const reallocation_request = @import("reallocation_request.zig");
 
 pub const MetadataClusterIncarnation = metadata_incarnation.MetadataClusterIncarnation;
+pub const MetadataRaftVoterSetFingerprint = [table_manager.voter_set_fingerprint_len * 2]u8;
 
 pub const MetadataStatus = struct {
     metadata_group_id: u64,
@@ -39,6 +40,10 @@ pub const MetadataStatus = struct {
     metadata_raft_commit_index: u64 = 0,
     metadata_raft_local_voter: bool = false,
     metadata_raft_voter_count: usize = 0,
+    metadata_raft_voter_set_fingerprint: ?MetadataRaftVoterSetFingerprint = null,
+    metadata_raft_joint_consensus: bool = false,
+    /// Includes both stable and staged learners (`learners_next`).
+    metadata_raft_learner_count: usize = 0,
     metadata_raft_election_elapsed: u32 = 0,
     metadata_raft_randomized_election_timeout: u32 = 0,
     metadata_raft_votes_granted: usize = 0,
@@ -132,6 +137,24 @@ pub const MetadataHead = struct {
     metadata_group_id: u64,
     metadata_incarnation: ?MetadataClusterIncarnation = null,
     metadata_epoch: u64 = 0,
+};
+
+/// Compact, constant-size runtime topology consumed by safety monitors.
+/// Keep this separate from MetadataStatus so frequent topology probes never
+/// walk or clone the projected catalog.
+pub const MetadataRuntimeTopology = struct {
+    metadata_group_id: u64,
+    metadata_incarnation: ?MetadataClusterIncarnation = null,
+    metadata_raft_local_node_id: u64 = 0,
+    metadata_raft_role: []const u8 = "absent",
+    metadata_raft_leader_id: ?u64 = null,
+    metadata_raft_term: u64 = 0,
+    metadata_raft_local_voter: bool = false,
+    metadata_raft_voter_count: usize = 0,
+    metadata_raft_voter_set_fingerprint: ?MetadataRaftVoterSetFingerprint = null,
+    metadata_raft_joint_consensus: bool = false,
+    /// Includes both stable and staged learners (`learners_next`).
+    metadata_raft_learner_count: usize = 0,
 };
 
 pub const ReplicationSourceActionHint = struct {

@@ -152,6 +152,7 @@ pub const NamespaceWriteTxn = struct {
         abort: *const fn (Allocator, *anyopaque) void,
         commit: *const fn (Allocator, *anyopaque) anyerror!void,
         get: *const fn (*anyopaque, Namespace, []const u8) anyerror![]const u8,
+        get_many_sorted: ?*const fn (*anyopaque, Namespace, []const []const u8, []?[]const u8) anyerror!void = null,
         put: *const fn (*anyopaque, Namespace, []const u8, []const u8) anyerror!void,
         append_put: ?*const fn (*anyopaque, Namespace, []const u8, []const u8) anyerror!void = null,
         delete: *const fn (*anyopaque, Namespace, []const u8) anyerror!void,
@@ -170,6 +171,18 @@ pub const NamespaceWriteTxn = struct {
 
     pub fn get(self: *NamespaceWriteTxn, namespace: Namespace, key: []const u8) ![]const u8 {
         return try self.vtable.get(self.ptr, namespace, key);
+    }
+
+    pub fn getManySorted(self: *NamespaceWriteTxn, namespace: Namespace, keys: []const []const u8, values: []?[]const u8) !void {
+        if (keys.len != values.len) return error.InvalidBatch;
+        if (self.vtable.get_many_sorted) |get_many_sorted| return try get_many_sorted(self.ptr, namespace, keys, values);
+        @memset(values, null);
+        for (keys, values) |key, *value| {
+            value.* = self.vtable.get(self.ptr, namespace, key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+        }
     }
 
     pub fn put(self: *NamespaceWriteTxn, namespace: Namespace, key: []const u8, value: []const u8) !void {
@@ -200,6 +213,7 @@ pub const NamespaceBatch = struct {
         abort: *const fn (Allocator, *anyopaque) void,
         commit: *const fn (Allocator, *anyopaque) anyerror!void,
         get: *const fn (*anyopaque, Namespace, []const u8) anyerror![]const u8,
+        get_many_sorted: ?*const fn (*anyopaque, Namespace, []const []const u8, []?[]const u8) anyerror!void = null,
         put: *const fn (*anyopaque, Namespace, []const u8, []const u8) anyerror!void,
         append_put: ?*const fn (*anyopaque, Namespace, []const u8, []const u8) anyerror!void = null,
         delete: *const fn (*anyopaque, Namespace, []const u8) anyerror!void,
@@ -217,6 +231,18 @@ pub const NamespaceBatch = struct {
 
     pub fn get(self: *NamespaceBatch, namespace: Namespace, key: []const u8) ![]const u8 {
         return try self.vtable.get(self.ptr, namespace, key);
+    }
+
+    pub fn getManySorted(self: *NamespaceBatch, namespace: Namespace, keys: []const []const u8, values: []?[]const u8) !void {
+        if (keys.len != values.len) return error.InvalidBatch;
+        if (self.vtable.get_many_sorted) |get_many_sorted| return try get_many_sorted(self.ptr, namespace, keys, values);
+        @memset(values, null);
+        for (keys, values) |key, *value| {
+            value.* = self.vtable.get(self.ptr, namespace, key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+        }
     }
 
     pub fn put(self: *NamespaceBatch, namespace: Namespace, key: []const u8, value: []const u8) !void {
@@ -437,6 +463,10 @@ pub fn namespaceWriteTxnFrom(
             return try unbox(ptr).handle.get(try mapNamespace(namespace), key);
         }
 
+        fn getManySorted(ptr: *anyopaque, namespace: Namespace, keys: []const []const u8, values: []?[]const u8) anyerror!void {
+            try unbox(ptr).handle.getManySorted(try mapNamespace(namespace), keys, values);
+        }
+
         fn put(ptr: *anyopaque, namespace: Namespace, key: []const u8, value: []const u8) anyerror!void {
             try unbox(ptr).handle.put(try mapNamespace(namespace), key, value);
         }
@@ -461,6 +491,7 @@ pub fn namespaceWriteTxnFrom(
             .abort = vt.abort,
             .commit = vt.commit,
             .get = vt.get,
+            .get_many_sorted = if (@hasDecl(Handle, "getManySorted")) vt.getManySorted else null,
             .put = vt.put,
             .append_put = if (@hasDecl(Handle, "appendPut")) vt.appendPut else null,
             .delete = vt.delete,
@@ -499,6 +530,10 @@ pub fn namespaceBatchFrom(
             return try unbox(ptr).handle.get(try mapNamespace(namespace), key);
         }
 
+        fn getManySorted(ptr: *anyopaque, namespace: Namespace, keys: []const []const u8, values: []?[]const u8) anyerror!void {
+            try unbox(ptr).handle.getManySorted(try mapNamespace(namespace), keys, values);
+        }
+
         fn put(ptr: *anyopaque, namespace: Namespace, key: []const u8, value: []const u8) anyerror!void {
             try unbox(ptr).handle.put(try mapNamespace(namespace), key, value);
         }
@@ -519,6 +554,7 @@ pub fn namespaceBatchFrom(
             .abort = vt.abort,
             .commit = vt.commit,
             .get = vt.get,
+            .get_many_sorted = if (@hasDecl(Handle, "getManySorted")) vt.getManySorted else null,
             .put = vt.put,
             .append_put = if (@hasDecl(Handle, "appendPut")) vt.appendPut else null,
             .delete = vt.delete,

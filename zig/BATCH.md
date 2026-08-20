@@ -112,8 +112,9 @@ The long-term rule for dense replay sizing is:
 - allow larger batches when budgets are available
 - shrink/split windows before apply when the estimated bytes would exceed the budget
 
-The default estimate is 384 f32 dimensions, because that is the current public
-benchmark shape. It can be overridden with `ANTFLY_DENSE_REPLAY_ESTIMATED_VECTOR_BYTES`.
+Live managed indexes derive the estimate from their configured dimensions. The
+384-f32 default remains only for callers that do not carry dense index metadata.
+It can be overridden with `ANTFLY_DENSE_REPLAY_ESTIMATED_VECTOR_BYTES`.
 The byte window can be overridden with `ANTFLY_DENSE_REPLAY_MAX_WINDOW_BYTES`. These
 are escape hatches; production sizing should come from resource-manager budgets.
 
@@ -217,6 +218,22 @@ Unbounded outer-finish deferral remains an explicit offline/full-index optimizat
 That shape is allowed to trade a long finish phase for cheaper intermediate batches.
 It is not the default for the live public replay path; live replay must keep the finish
 scope tied to the current bounded window.
+
+Live bulk coalescing also must not disable storage safety bounds. A public upload can
+continuously replenish both the primary write window and dense replay, so it is not a
+finite offline builder even though those layers use bulk transactions internally. The
+normal primary and dense LSM profiles therefore keep hard L0 write pressure enabled
+during active bulk windows. Soft compaction may still be deferred to protect replay and
+foreground latency; hard pressure must remain observable and make bounded progress.
+
+Persisted compaction builds output without the backend lock. Concurrent flushes prepend
+new L0 runs, so publication must relocate its exact immutable input IDs before checking
+the current target overlap closure. Pure positional movement is safe; a removed input or
+new overlapping target is genuinely stale and must still discard the output. Without
+that distinction, a continuous public load can discard every completed pressure
+compaction until ingestion stops. The 1M batch-100 validation changed from 16 published
+compactions across 26 pressure events and 582 final runs of hard debt to 24/24 published
+compactions, zero overloads, and zero final debt.
 
 ## Stable contract
 

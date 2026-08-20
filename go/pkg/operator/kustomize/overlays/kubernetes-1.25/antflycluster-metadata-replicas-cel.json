@@ -1,0 +1,12 @@
+[
+  {
+    "op": "add",
+    "path": "/spec/versions/0/schema/openAPIV3Schema/properties/spec/x-kubernetes-validations",
+    "value": [
+      {
+        "message": "metadata replica count is immutable; create a differently named cluster with fresh metadata PVCs at the target topology and restore from backup",
+        "rule": "(has(self.metadataNodes) ? (has(self.metadataNodes.replicas) ? self.metadataNodes.replicas : 3) : 3) == (has(oldSelf.metadataNodes) ? (has(oldSelf.metadataNodes.replicas) ? oldSelf.metadataNodes.replicas : 3) : 3)"
+      }
+    ]
+  }
+]

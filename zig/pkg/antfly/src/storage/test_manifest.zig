@@ -22,6 +22,7 @@ comptime {
     _ = @import("db/algebraic/cylinder.zig");
     _ = @import("db/algebraic/distributed.zig");
     _ = @import("db/algebraic/fact.zig");
+    _ = @import("db/algebraic/hll.zig");
     _ = @import("db/algebraic/index.zig");
     _ = @import("db/algebraic/ir.zig");
     _ = @import("db/algebraic/join.zig");
@@ -185,6 +186,7 @@ comptime {
     _ = @import("lsm_backend_sim_test.zig");
     _ = @import("maintenance.zig");
     _ = @import("mem_backend.zig");
+    _ = @import("mem_ordered.zig");
     _ = @import("object_storage.zig");
     _ = @import("persistent.zig");
     _ = @import("portable_backup.zig");

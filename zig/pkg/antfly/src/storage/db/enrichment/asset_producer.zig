@@ -90,7 +90,26 @@ pub const Producer = struct {
         produce_batch: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request) anyerror![][]u8 = null,
         can_produce_batch: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request) anyerror!bool = null,
         deinit: ?*const fn (ptr: *anyopaque, alloc: Allocator) void = null,
+        /// See embedder.DenseEmbedder.foreground_bounded. This is deliberately
+        /// opt-in so a custom callback cannot silently defeat the write
+        /// visibility deadline.
+        foreground_bounded: bool = false,
+        /// Optional request-aware refinement of foreground_bounded. Producers
+        /// that can dispatch to both bounded transports and unbounded local
+        /// callbacks use this hook to preserve the bounded fast path without
+        /// overstating the contract for a particular request.
+        foreground_bounded_for_requests: ?*const fn (
+            ptr: *anyopaque,
+            alloc: Allocator,
+            requests: []const Request,
+        ) anyerror!bool = null,
     };
+
+    pub fn foregroundBoundedForRequests(self: Producer, alloc: Allocator, requests: []const Request) !bool {
+        if (self.vtable.foreground_bounded_for_requests) |foreground_bounded|
+            return try foreground_bounded(self.ptr, alloc, requests);
+        return self.vtable.foreground_bounded;
+    }
 
     pub fn produce(self: Producer, alloc: Allocator, request: Request) ![]u8 {
         return try self.vtable.produce(self.ptr, alloc, request);

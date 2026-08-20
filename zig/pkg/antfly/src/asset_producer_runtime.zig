@@ -24,6 +24,7 @@ const asset_producer = @import("storage/db/enrichment/asset_producer.zig");
 
 const Allocator = std.mem.Allocator;
 const local_reader_batch_max_images: usize = 64;
+const max_asset_provider_timeout_ms: u64 = 300_000;
 
 pub const Runtime = struct {
     alloc: Allocator,
@@ -56,7 +57,10 @@ pub const Runtime = struct {
 
         const client = try alloc.create(httpx.Client);
         errdefer alloc.destroy(client);
-        client.* = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+        var client_config = httpx.ClientConfig{ .keep_alive = false };
+        client_config.timeouts = httpx.Timeouts.uniform(max_asset_provider_timeout_ms);
+        client_config.timeouts.request_ms = max_asset_provider_timeout_ms;
+        client.* = httpx.Client.initWithConfig(alloc, io, client_config);
         errdefer client.deinit();
 
         runtime.* = Runtime.initWithOptions(alloc, client, options);
@@ -76,6 +80,9 @@ pub const Runtime = struct {
     pub fn producer(self: *Runtime) asset_producer.Producer {
         return .{
             .ptr = self,
+            // A caller-owned HTTP client may not have a finite request timeout,
+            // so this borrowed interface cannot advertise the foreground
+            // liveness contract.
             .vtable = &.{ .produce = produce, .produce_batch = produceBatch, .can_produce_batch = canProduceBatch },
         };
     }
@@ -83,7 +90,73 @@ pub const Runtime = struct {
     pub fn ownedProducer(self: *Runtime) asset_producer.Producer {
         return .{
             .ptr = self,
-            .vtable = &.{ .produce = produce, .produce_batch = produceBatch, .can_produce_batch = canProduceBatch, .deinit = deinitProducer },
+            .vtable = &.{
+                .produce = produce,
+                .produce_batch = produceBatch,
+                .can_produce_batch = canProduceBatch,
+                .deinit = deinitProducer,
+                .foreground_bounded = true,
+                .foreground_bounded_for_requests = foregroundBoundedForRequests,
+            },
+        };
+    }
+
+    fn foregroundBoundedForRequests(
+        ptr: *anyopaque,
+        alloc: Allocator,
+        requests: []const asset_producer.Request,
+    ) !bool {
+        const self: *Runtime = @ptrCast(@alignCast(ptr));
+        for (requests, 0..) |request, i| {
+            // Routing depends only on the producer type and configuration.
+            // Avoid reparsing the overwhelmingly common homogeneous batch.
+            if (i > 0 and request.producer_type == requests[i - 1].producer_type and
+                std.mem.eql(u8, request.config_json, requests[i - 1].config_json)) continue;
+            if (!try self.requestForegroundBounded(alloc, request)) return false;
+        }
+        return true;
+    }
+
+    fn requestForegroundBounded(self: *Runtime, alloc: Allocator, request: asset_producer.Request) !bool {
+        return switch (request.producer_type) {
+            // These routes never enter an external callback. Unsupported
+            // document extraction also fails synchronously in produceOne.
+            .copy, .document_extraction => true,
+            .generator => blk: {
+                var parsed = try parseGeneratorProducerConfig(alloc, request.config_json);
+                defer parsed.deinit(alloc);
+                const local = self.antfly_provider orelse break :blk true;
+                break :blk !(parsed.generator.provider == .antfly and
+                    parsed.generator.url.len == 0 and
+                    (local.generate_messages != null or local.generate_text != null));
+            },
+            .reader => blk: {
+                var parsed = try std.json.parseFromSlice(readers.Config, alloc, request.config_json, .{
+                    .allocate = .alloc_always,
+                    .ignore_unknown_fields = true,
+                });
+                defer parsed.deinit();
+                const local = self.antfly_provider orelse break :blk true;
+                break :blk !(isLocalReaderProvider(parsed.value.provider, parsed.value.resolvedUrl()) and
+                    local.read_images != null);
+            },
+            .transcriber => blk: {
+                var parsed = try std.json.parseFromSlice(transcribing.Config, alloc, request.config_json, .{
+                    .allocate = .alloc_always,
+                    .ignore_unknown_fields = true,
+                });
+                defer parsed.deinit();
+                const local = self.antfly_provider orelse break :blk true;
+                break :blk !(isLocalTranscriberProvider(parsed.value.provider, parsed.value.resolvedUrl()) and
+                    local.transcribe_audio != null);
+            },
+            .extractor => blk: {
+                var parsed = try extracting.parseConfigFromSlice(alloc, request.config_json);
+                defer parsed.deinit(alloc);
+                const local = self.antfly_provider orelse break :blk true;
+                break :blk !(isLocalExtractionProvider(parsed.provider, parsed.resolvedUrl()) and
+                    local.extract != null);
+            },
         };
     }
 
@@ -1338,6 +1411,56 @@ fn expectJsonF32Field(value: std.json.Value, field: []const u8, expected: f32) !
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expectApproxEqAbs(expected, actual, 0.0001);
+}
+
+test "owned asset producer foreground contract follows the selected route" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+
+    const Local = struct {
+        fn provider(self: *@This()) managed_embedder.AntflyProvider {
+            return .{
+                .ptr = self,
+                .embed_dense_texts = embedDense,
+                .embed_sparse_texts = embedSparse,
+                .read_images = readImages,
+            };
+        }
+
+        fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn embedSparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]@import("storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+
+        fn readImages(_: *anyopaque, _: Allocator, _: []const u8, _: readers.Request) ![]readers.Result {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var local = Local{};
+    const runtime = try Runtime.createOwned(alloc, io_impl.io(), .{ .antfly_provider = local.provider() });
+    const producer = runtime.ownedProducer();
+    defer producer.deinit(alloc);
+
+    try std.testing.expect(!try producer.foregroundBoundedForRequests(alloc, &.{.{
+        .producer_type = .reader,
+        .config_json = "{\"provider\":\"antfly\",\"model\":\"local-reader\"}",
+        .source_text = "image",
+    }}));
+    try std.testing.expect(try producer.foregroundBoundedForRequests(alloc, &.{.{
+        .producer_type = .reader,
+        .config_json = "{\"provider\":\"antfly\",\"model\":\"remote-reader\",\"url\":\"http://127.0.0.1:8082\"}",
+        .source_text = "image",
+    }}));
+    try std.testing.expect(try producer.foregroundBoundedForRequests(alloc, &.{.{
+        .producer_type = .copy,
+        .config_json = "",
+        .source_text = "copy",
+    }}));
 }
 
 test "asset producer runtime batches compatible antfly generator requests" {

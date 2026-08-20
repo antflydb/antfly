@@ -168,6 +168,10 @@ pub const MemoryClient = struct {
                 .bucket = try alloc.dupe(u8, bucket),
                 .key = try alloc.dupe(u8, key),
                 .etag = try alloc.dupe(u8, object.etag),
+                .checksum = .{
+                    .algorithm = .sha256_hex,
+                    .value = try alloc.dupe(u8, object.etag),
+                },
                 .content_length = @intCast(object.body.len),
                 .content_type = if (object.content_type) |value| try alloc.dupe(u8, value) else null,
             },
@@ -201,6 +205,10 @@ pub const MemoryClient = struct {
             .bucket = try alloc.dupe(u8, bucket),
             .key = try alloc.dupe(u8, key),
             .etag = try alloc.dupe(u8, object.etag),
+            .checksum = .{
+                .algorithm = .sha256_hex,
+                .value = try alloc.dupe(u8, object.etag),
+            },
             .content_length = @intCast(object.body.len),
             .content_type = if (object.content_type) |value| try alloc.dupe(u8, value) else null,
         };
@@ -397,6 +405,8 @@ test "memory client supports put get stat list and delete" {
     var got = try client.getObject("bucket", "a/one", .{});
     defer got.deinit(alloc);
     try std.testing.expectEqualStrings("alpha", got.body);
+    try std.testing.expectEqual(types.ObjectChecksumAlgorithm.sha256_hex, got.metadata.checksum.?.algorithm);
+    try std.testing.expectEqualStrings(put.etag.?, got.metadata.checksum.?.value);
     try std.testing.expectError(
         error.ResponseTooLarge,
         client.getObject("bucket", "a/one", .{ .max_response_bytes = 4 }),
@@ -411,6 +421,8 @@ test "memory client supports put get stat list and delete" {
     var meta = try client.statObject("bucket", "a/one");
     defer meta.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 5), meta.content_length);
+    try std.testing.expectEqual(types.ObjectChecksumAlgorithm.sha256_hex, meta.checksum.?.algorithm);
+    try std.testing.expectEqualStrings(put.etag.?, meta.checksum.?.value);
 
     var listed = try client.listObjects("bucket", .{ .prefix = "a/" });
     defer listed.deinit(alloc);

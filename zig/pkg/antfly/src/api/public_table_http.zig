@@ -81,6 +81,7 @@ pub const TableApi = struct {
         HAWriteDurabilityPending,
         OutcomeUnknown,
         CommittedPending,
+        CommittedRepairRequired,
         WriteOutcomeUnknown,
         DocIdentityUnavailable,
         HAReadOnlyStandby,
@@ -786,6 +787,11 @@ pub fn handleTableBatch(
         error.CommittedPending => return .{
             .status = 202,
             .body = try batch_api.encodeBatchResponse(alloc, batch_req.resultWithStatus("committed_pending")),
+            .json = true,
+        },
+        error.CommittedRepairRequired => return .{
+            .status = 202,
+            .body = try batch_api.encodeBatchResponse(alloc, batch_req.resultWithStatus("committed_repair_required")),
             .json = true,
         },
         // Do not use a retryable 5xx: clients must reconcile an ambiguous
@@ -2309,6 +2315,37 @@ test "public table batch handler returns accepted for durable pending commits" {
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 202), resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"inserted\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"committed_pending\"") != null);
+}
+
+test "public table batch handler identifies committed repair-required writes" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{ .ptr = undefined, .request = .{}, .vtable = &.{
+                .execute_table_batch = executeTableBatch,
+                .execute_table_query_request = unsupportedQueryRequest,
+                .execute_table_query_view = unsupportedQueryView,
+                .execute_table_backup = unsupportedBackup,
+                .execute_table_restore = unsupportedRestore,
+                .execute_table_list_indexes = unsupportedListIndexes,
+                .execute_table_get_index = unsupportedGetIndex,
+                .execute_table_create_index = unsupportedCreateIndex,
+                .execute_table_delete_index = unsupportedDeleteIndex,
+            } };
+        }
+
+        fn executeTableBatch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest, _: operation.RequestContext) TableApi.ExecuteBatchError!void {
+            return error.CommittedRepairRequired;
+        }
+    };
+
+    var resp = try handleTableBatch(std.testing.allocator, "docs",
+        \\{"inserts":{"doc-a":{"title":"alpha"}}}
+    , Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"inserted\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"committed_repair_required\"") != null);
 }
 
 test "public table batch handler preserves ambiguous write outcomes" {
