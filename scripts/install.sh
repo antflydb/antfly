@@ -220,9 +220,11 @@ Environment:
   This script will automatically detect your OS and architecture,
   download the appropriate binaries, and install them.
 
-  ANTFLY_DOWNLOAD_CLASS may be external, employee, or ci. Employee and CI
-  archive requests carry a metric label; missing or invalid values are treated
-  as external. The label is not an authentication credential.
+  ANTFLY_DOWNLOAD_CLASS supplies a best-effort analytics label for archive
+  requests. Set it to employee for staff downloads or ci for automated jobs;
+  unset, external, and invalid values are measured as external traffic. Values
+  are caller-asserted and can be omitted or forged. They are not authentication
+  credentials and must not be treated as proof of employee or CI identity.
 
   By default, it installs to:
     - /usr/local/bin (if running as root)
