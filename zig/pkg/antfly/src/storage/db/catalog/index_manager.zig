@@ -17312,6 +17312,25 @@ pub fn denseConfigRequiresArtifactCoverage(alloc: Allocator, cfg: types.IndexCon
     return dense_cfg.external or dense_cfg.embedding_name != null or generator != null;
 }
 
+/// Returns whether callers, rather than source-document projection, own this
+/// vector index's population. Admission must separately prove that no matching
+/// artifacts predate the catalog entry before it can skip a rebuild.
+pub fn configUsesExternalCoverage(alloc: Allocator, cfg: types.IndexConfig) !bool {
+    return switch (cfg.kind) {
+        .dense_vector => blk: {
+            const dense_cfg = try parseDenseConfig(alloc, cfg.config_json);
+            defer dense_cfg.deinit(alloc);
+            break :blk dense_cfg.external;
+        },
+        .sparse_vector => blk: {
+            const sparse_cfg = try parseSparseConfig(alloc, cfg.config_json);
+            defer sparse_cfg.deinit(alloc);
+            break :blk sparse_cfg.external;
+        },
+        else => false,
+    };
+}
+
 pub fn denseConfigDimensions(alloc: Allocator, cfg: types.IndexConfig) !u32 {
     if (cfg.kind != .dense_vector) return error.InvalidIndexConfiguration;
     const dense_cfg = try parseDenseConfig(alloc, cfg.config_json);
@@ -20834,6 +20853,30 @@ test "parseSparseConfig accepts external embedding indexes" {
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("sparse", cfg.field_name);
     try std.testing.expect(cfg.external);
+}
+
+test "configUsesExternalCoverage distinguishes caller-populated vector indexes" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try configUsesExternalCoverage(alloc, .{
+        .name = "dense_external",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}",
+    }));
+    try std.testing.expect(!(try configUsesExternalCoverage(alloc, .{
+        .name = "dense_managed",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3}",
+    })));
+    try std.testing.expect(try configUsesExternalCoverage(alloc, .{
+        .name = "sparse_external",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse\",\"external\":true}",
+    }));
+    try std.testing.expect(!(try configUsesExternalCoverage(alloc, .{
+        .name = "text",
+        .kind = .full_text,
+        .config_json = "{}",
+    })));
 }
 
 test "parseDenseGeneratorConfig parses source_template" {

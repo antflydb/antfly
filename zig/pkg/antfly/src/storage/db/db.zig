@@ -15678,6 +15678,36 @@ pub const DB = struct {
         return empty.visibility_summary;
     }
 
+    fn externalCoverageHasStoredArtifacts(self: *DB, cfg: types.IndexConfig) !bool {
+        const artifact_name = switch (cfg.kind) {
+            .dense_vector => try index_manager_mod.denseConfigArtifactNameAlloc(self.alloc, cfg),
+            .sparse_vector => try self.alloc.dupe(u8, cfg.name),
+            else => return false,
+        };
+        defer self.alloc.free(artifact_name);
+        const lower = try self.core.documentRangeLowerAlloc("");
+        defer self.core.alloc.free(lower);
+
+        const ScanState = struct {
+            artifact_name: []const u8,
+            found: bool = false,
+
+            fn scanEntry(ctx: ?*anyopaque, key: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                const matches = (internal_keys.isEmbeddingArtifactKey(key) and
+                    internal_keys.matchesEmbeddingArtifactName(key, state.artifact_name)) or
+                    (internal_keys.isDerivedEmbeddingArtifactKey(key) and
+                        internal_keys.matchesDerivedEmbeddingArtifactName(key, state.artifact_name));
+                if (!matches) return .@"continue";
+                state.found = true;
+                return .stop;
+            }
+        };
+        var state = ScanState{ .artifact_name = artifact_name };
+        try self.core.store.scanWithContext(lower, "", .{}, &state, ScanState.scanEntry);
+        return state.found;
+    }
+
     fn installIndexWhileEnrichmentQuiesced(
         self: *DB,
         cfg: types.IndexConfig,
@@ -15689,7 +15719,12 @@ pub const DB = struct {
             return error.UnsupportedOperation;
         try self.removeOrphanedIndexRepairIntentForFreshAdmission(self.alloc, cfg.name);
         const summary = try self.managedAdmissionVisibilitySummary();
-        const disposition: IndexAdmissionDisposition = if (admission_mode == .managed and summary.live_ordinals != 0)
+        const externally_populated = try index_manager_mod.configUsesExternalCoverage(self.alloc, cfg);
+        const external_artifacts_exist = externally_populated and
+            try self.externalCoverageHasStoredArtifacts(cfg);
+        const disposition: IndexAdmissionDisposition = if (admission_mode == .managed and
+            summary.live_ordinals != 0 and
+            (!externally_populated or external_artifacts_exist))
             .managed_rebuild
         else
             .activation_fence;
@@ -15715,9 +15750,10 @@ pub const DB = struct {
             self.core.index_manager.clearRepairUnavailable(cfg.name);
         };
 
-        // Managed empty-source admission still bypasses ordinary synchronous
-        // backfill. Its O(1) identity proof establishes an already-complete
-        // generation at the current replay head without scanning tombstones.
+        // Managed empty-source and proven-empty external admissions bypass
+        // ordinary synchronous backfill. Source identity proves the former;
+        // a streaming artifact-key probe proves the latter. Both start clean
+        // at the current replay head.
         var applied = switch (admission_mode) {
             .ordinary => try self.core.addIndex(cfg, admission_write),
             .managed => try self.core.addManagedIndex(cfg, admission_write),
@@ -72590,7 +72626,7 @@ test "db managed vector admission captures writes while durable repair is pendin
     const cfg = types.IndexConfig{
         .name = "semantic_idx",
         .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
     };
     var db = try DB.open(alloc, std.mem.span(path), .{
         .open_mode = .writer_no_replay,
@@ -72616,7 +72652,7 @@ test "db managed vector admission captures writes while durable repair is pendin
     try db.batch(.{
         .writes = &.{.{
             .key = "doc:new",
-            .value = "{\"body\":\"after admission\",\"_embeddings\":{\"semantic_idx\":[1,0,0]}}",
+            .value = "{\"body\":\"after admission\",\"embedding\":[1,0,0]}",
         }},
         .sync_level = .write,
     });
@@ -72627,6 +72663,95 @@ test "db managed vector admission captures writes while durable repair is pendin
     } else return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u64, 0), target.doc_count);
     try std.testing.expect(target.replay_target_sequence > target.replay_applied_sequence);
+}
+
+test "db managed external dense admission ignores unrelated source rows" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const cfg = types.IndexConfig{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "readiness", .value = "{\"ready\":true}" }},
+        .sync_level = .write,
+    });
+
+    try std.testing.expect((try db.admitManagedIndex(cfg)) == null);
+    try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
+    try std.testing.expect(!db.core.index_manager.repairUnavailable(cfg.name));
+    try std.testing.expectEqual(
+        @as(?u64, 0),
+        try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, cfg.name),
+    );
+    const admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, cfg.name);
+    defer alloc.free(admission_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, admission_key));
+
+    // Subsequent caller-owned artifacts still enter through ordinary replay.
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:new",
+            .value = "{\"body\":\"after admission\",\"_embeddings\":{\"semantic_idx\":[1,0,0]}}",
+        }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectEqual(
+        @as(?u64, 1),
+        try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, cfg.name),
+    );
+    var result = try db.search(alloc, .{
+        .index_name = cfg.name,
+        .query = .{ .dense_knn = .{ .vector = &.{ 1, 0, 0 }, .k = 1 } },
+        .limit = 1,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:new", result.hits[0].id);
+}
+
+test "db managed external dense admission rebuilds preexisting target artifacts" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const cfg = types.IndexConfig{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:old",
+            .value = "{\"body\":\"before admission\",\"_embeddings\":{\"semantic_idx\":[1,0,0]}}",
+        }},
+        .sync_level = .write,
+    });
+
+    _ = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(try db.hasPendingIndexRepairIntents(alloc));
+    try std.testing.expect(db.core.index_manager.repairUnavailable(cfg.name));
+    try std.testing.expectError(error.IndexRebuilding, db.search(alloc, .{
+        .index_name = cfg.name,
+        .query = .{ .dense_knn = .{ .vector = &.{ 1, 0, 0 }, .k = 1 } },
+    }));
 }
 
 test "db managed vector admission durably seeds missing enrichment artifacts" {

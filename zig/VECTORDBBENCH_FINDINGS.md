@@ -299,6 +299,51 @@ not yet a product-change justification, but it shows that dense structural work
 can consume most of the public client's 120-second timeout budget even while
 the replay/backpressure invariants behave as designed.
 
+### External indexes need an external-coverage admission fence
+
+The public table API writes a readiness document before it creates the
+caller-populated dense index. Managed admission previously treated any live
+source document as proof that the new index required a full source rebuild.
+That is correct for projected and generated indexes, but false for an
+`external: true` dense or sparse index: unrelated source documents cannot
+produce caller-owned vector artifacts. The single readiness row therefore
+caused three unnecessary durable-repair attempts and added about 36 seconds to
+the otherwise vector-only 50K lifecycle.
+
+Managed admission now recognizes the external-coverage contract. It installs
+the index at an activation fence only after a streaming key scan proves that no
+matching caller-owned artifact predates the catalog entry, initializes its
+artifact counter, and lets ordinary post-admission replay populate new
+artifacts. If matching artifacts already exist, admission retains the durable
+rebuild path. The public API still provides end-to-end durability and
+query-visibility checks; this does not bypass replay or weaken `full_index`
+synchronization.
+
+The 50K public-API A/B completed in 42.08 seconds (34.99 seconds inserting and
+7.08 seconds catching up), versus 77.90 seconds before the fix. It published
+all 50,000 vectors with zero repair runs or attempts. Peak RSS was 1.42 GB,
+attributable demand was 974.7 MB, and cumulative snapshot copying was 177.95 MB
+across 42 calls at final status. This restores the established 30--40-second
+band within normal single-run host variation while removing work that was
+incorrect for every externally populated index, not just this benchmark.
+
+### Smaller HBC replay batches trade away too much throughput
+
+Two follow-ups tested whether bounding dense HBC apply size would reduce the
+late-load leaf-normalization pause. Lowering the existing replay-window policy
+to 4,096 items completed the 50K lifecycle in 92.41 seconds. It fragmented the
+same source stream into 27 replay finalizations and was rejected.
+
+A narrower prototype retained the large replay transaction but split only
+known-new, insert-only HBC applies into 4,096-item calls. It lowered peak RSS
+from 1.42 GB to 1.11 GB and the largest measured HBC apply from 2.35 seconds to
+1.62 seconds, but increased the lifecycle to 46.45 seconds and increased HBC
+finalization work. The prototype is also rejected: partial rollback across
+chunks is more complex, and a roughly 10% throughput regression is not a good
+general default for this memory reduction. A future HBC change should make
+leaf normalization incrementally publishable or schedulable while preserving
+one replay transaction, rather than fragmenting replay or its apply operation.
+
 ## Measurements
 
 Unless a row explicitly reports a mean and range, the times below are
@@ -327,6 +372,9 @@ one-machine diagnostics rather than publication-grade means.
 | 50K, replay-lane snapshot, full-text + dense, current main | 32.90 s | 41.78 s | 46.3 MB clones; 702.4 MB physical footprint, 1.66 GB RSS; both indexes ready |
 | 50K, replay-lane snapshot, 1 MiB checkpoint floor (rejected) | 28.40 s | 41.75 s | 80.5 MB clones; 147 final L0 runs / 86 flushes; no physical-footprint benefit |
 | 50K, 128 MiB preferred primary runs (rejected) | 37.41 s | 43.97 s | Finer output layout; 1.61 GB RSS; slightly slower than the current-main range |
+| 50K, external-coverage admission fence | 34.99 s | 42.08 s | Zero repair attempts; 177.95 MB clones, 974.7 MB demand, 1.42 GB RSS |
+| 50K, 4,096-item replay windows (rejected) | 55.46 s | 92.41 s | 27 replay finalizations; 769 MB demand, 1.48 GB RSS |
+| 50K, internal 4,096-item HBC applies (rejected) | 39.13 s | 46.45 s | 1.11 GB RSS but slower and more complex; prototype reverted |
 | 1M Cohere, batch 100, four workers, original public path | incomplete | projected about 45–50 min | Throughput fell from about 30.8K docs/min in minute one to about 21.1K docs/min in minute four |
 | 1M, bounded clones + fair coalescer control | incomplete at 783,201 rows / 1,867 s | -- | Two exact 120 s timeouts from primary L0 pressure; 3.83 GB clones, 1.40 GB demand, 3.76 GB peak RSS; 200 ms `vmmap` and overlapping compilers contaminate speed |
 | 1M, rate-limited sampler + maintenance fair turn | incomplete at 592,001 rows / about 725 s | -- | No timeout, but live dense bulk mode still reached 537 aggregate L0 runs; 1.59 GB clones, 888 MB demand, 3.02 GB peak RSS |
@@ -438,13 +486,14 @@ published.
    Merely splitting leveled output files does not split the fixed-point overlap
    closure. Preserve the oversized progress escape for a minimum indivisible
    closure and verify that the extra L0 runs do not amplify write pressure.
-2. Add duration/size telemetry around HBC leaf normalization and determine
-   whether large splits can be sliced or scheduled without holding the entire
-   derived-backlog drain window. Preserve source-write ordering and bounded
-   replay memory rather than bypassing admission.
-3. Attribute the remaining bound-read snapshot clones separately from replay
-   lanes; do not replace those multi-operation snapshots with unsafe live
-   probes merely to improve a cumulative counter.
+2. Design bounded or incrementally publishable HBC leaf normalization inside a
+   single replay transaction. Smaller replay windows and naïve internal apply
+   chunks both regressed 50K throughput, so preserve source-write ordering,
+   rollback semantics, and replay amortization.
+3. Focus remaining snapshot-copy work on current scans, which accounted for
+   127.6 MB of the 150.7 MB live aggregate in the external-admission run;
+   bound-read copies were 23.1 MB. Do not replace multi-operation snapshots
+   with unsafe live probes merely to improve a cumulative counter.
 4. Repeat the 1M lifecycle three times through Circus on a controlled host and
    publish its mean plus range. Three current-main 50K lifecycles now average
    41.65 seconds with a 38.72--43.14 second range, but the single follow-up 1M
