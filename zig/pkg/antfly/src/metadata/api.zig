@@ -31,6 +31,9 @@ pub const MetadataStatus = struct {
     metadata_group_id: u64,
     /// Zero means the peer predates the causal reallocation barrier.
     reallocation_barrier_protocol_version: u16 = 0,
+    /// Maximum embedded runtime-status record version this replica can apply;
+    /// zero means the peer predates rolling-safe format negotiation.
+    runtime_status_record_version: u16 = 0,
     metadata_incarnation: ?MetadataClusterIncarnation = null,
     metadata_epoch: u64 = 0,
     metadata_raft_local_node_id: u64 = 0,

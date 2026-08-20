@@ -69,10 +69,19 @@ pub fn applyObservationsOwned(
     records: []table_manager.StoreRecord,
     observations: []const StoreObservation,
 ) !usize {
+    return try applyObservationsOwnedWithRepairStatus(alloc, records, observations, true);
+}
+
+pub fn applyObservationsOwnedWithRepairStatus(
+    alloc: std.mem.Allocator,
+    records: []table_manager.StoreRecord,
+    observations: []const StoreObservation,
+    include_repair_status: bool,
+) !usize {
     var applied: usize = 0;
     for (observations) |observation| {
         const index = findStoreIndex(records, observation.store_id) orelse return error.UnknownStore;
-        if (!observationChangesRecord(records[index], observation)) {
+        if (!observationChangesRecordWithRepairStatus(records[index], observation, include_repair_status)) {
             applied += 1;
             continue;
         }
@@ -109,6 +118,14 @@ pub fn observationChangesRecord(
     existing: table_manager.StoreRecord,
     observation: StoreObservation,
 ) bool {
+    return observationChangesRecordWithRepairStatus(existing, observation, true);
+}
+
+pub fn observationChangesRecordWithRepairStatus(
+    existing: table_manager.StoreRecord,
+    observation: StoreObservation,
+    include_repair_status: bool,
+) bool {
     return existing.live != observation.live or
         !std.mem.eql(u8, existing.health_class, observation.health_class) or
         existing.capacity_bytes != observation.capacity_bytes or
@@ -119,7 +136,7 @@ pub fn observationChangesRecord(
         existing.active_backfills != observation.active_backfills or
         existing.backfill_progress_millis != observation.backfill_progress_millis or
         !groupStatusesEqual(existing.group_statuses, observation.group_statuses) or
-        !runtimeStatusesEqual(existing.runtime_statuses, observation.runtime_statuses);
+        !runtimeStatusesEqual(existing.runtime_statuses, observation.runtime_statuses, include_repair_status);
 }
 
 fn groupStatusesEqual(
@@ -165,10 +182,11 @@ fn groupStatusEqual(
 fn runtimeStatusesEqual(
     lhs: []const table_manager.RuntimeGroupStatusReport,
     rhs: []const table_manager.RuntimeGroupStatusReport,
+    include_repair_status: bool,
 ) bool {
     if (lhs.len != rhs.len) return false;
     for (lhs, rhs) |left, right| {
-        if (!runtimeStatusEqual(left, right)) return false;
+        if (!runtimeStatusEqual(left, right, include_repair_status)) return false;
     }
     return true;
 }
@@ -176,6 +194,7 @@ fn runtimeStatusesEqual(
 fn runtimeStatusEqual(
     lhs: table_manager.RuntimeGroupStatusReport,
     rhs: table_manager.RuntimeGroupStatusReport,
+    include_repair_status: bool,
 ) bool {
     if (lhs.table_id != rhs.table_id or
         !std.mem.eql(u8, lhs.table_name, rhs.table_name) or
@@ -223,8 +242,8 @@ fn runtimeStatusEqual(
             left.replay_applied_sequence != right.replay_applied_sequence or
             left.replay_target_sequence != right.replay_target_sequence or
             left.replay_catch_up_required != right.replay_catch_up_required or
-            left.repair_status != right.repair_status or
-            left.repair_active_generation_serviceable != right.repair_active_generation_serviceable)
+            (include_repair_status and (left.repair_status != right.repair_status or
+                left.repair_active_generation_serviceable != right.repair_active_generation_serviceable)))
         {
             return false;
         }
@@ -486,6 +505,43 @@ test "store observer coalesces status heartbeat timestamps" {
 
     observation.group_statuses = stale_groups[0..];
     try std.testing.expect(observationChangesRecord(existing, observation));
+}
+
+test "store observer can ignore unactivated repair fields without hiding other changes" {
+    var existing_indexes = [_]table_manager.RuntimeIndexStatusReport{.{
+        .name = "visual_idx",
+        .kind = "dense_vector",
+        .doc_count = 10,
+    }};
+    var observed_indexes = existing_indexes;
+    observed_indexes[0].repair_status = .rebuilding;
+    observed_indexes[0].repair_active_generation_serviceable = true;
+    var existing_runtime = [_]table_manager.RuntimeGroupStatusReport{.{
+        .table_id = 1,
+        .table_name = "products",
+        .group_id = 2,
+        .store_id = 3,
+        .node_id = 4,
+        .source = "runtime",
+        .freshness = "fresh",
+        .indexes = existing_indexes[0..],
+    }};
+    var observed_runtime = existing_runtime;
+    observed_runtime[0].indexes = observed_indexes[0..];
+    const existing = table_manager.StoreRecord{
+        .store_id = 3,
+        .node_id = 4,
+        .runtime_statuses = existing_runtime[0..],
+    };
+    const observation = StoreObservation{
+        .store_id = 3,
+        .runtime_statuses = observed_runtime[0..],
+    };
+
+    try std.testing.expect(observationChangesRecord(existing, observation));
+    try std.testing.expect(!observationChangesRecordWithRepairStatus(existing, observation, false));
+    observed_indexes[0].doc_count += 1;
+    try std.testing.expect(observationChangesRecordWithRepairStatus(existing, observation, false));
 }
 
 test "metadata store observer detects exact voter set changes at a stable count" {

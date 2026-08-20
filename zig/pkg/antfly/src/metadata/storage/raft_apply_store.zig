@@ -22,6 +22,7 @@ const lsm_backend = @import("../../storage/lsm_backend.zig");
 const metadata = @import("../domain.zig");
 const metadata_reconciler = @import("../reconciler.zig");
 const metadata_incarnation = @import("../incarnation.zig");
+const runtime_status_protocol = @import("../runtime_status_protocol.zig");
 const transition_state = @import("../transition_state.zig");
 const extension_domain = @import("../../extensions/mod.zig");
 const metadata_table_manager = @import("../table_manager.zig");
@@ -4190,11 +4191,11 @@ fn replicationCutoverRetirementCleared(
 }
 
 const transition_magic = "afmd1";
-const runtime_status_record_version: u16 = 13;
 const group_status_record_version: u16 = 4;
 // Store records predate framing and are read by mixed-version metadata
-// replicas. Keep the existing prefix byte-for-byte compatible and put new
-// optional state in a self-identifying trailer that older readers ignore.
+// replicas. Keep the existing prefix byte-for-byte compatible. Extensions are
+// self-identifying for current readers, but legacy readers do not ignore them;
+// embedded record-version upgrades therefore require capability negotiation.
 const store_record_extension_magic = "afsx1";
 const store_record_extension_version: u16 = 1;
 const reallocation_request_extension_magic = "afrr1";
@@ -5129,7 +5130,8 @@ fn appendRuntimeGroupStatusRecord(
     out: *std.ArrayListUnmanaged(u8),
     record: metadata.RuntimeGroupStatusReport,
 ) !void {
-    try appendInt(alloc, out, u16, runtime_status_record_version);
+    const version = runtimeGroupStatusRecordVersion(record);
+    try appendInt(alloc, out, u16, version);
     try appendInt(alloc, out, u64, record.table_id);
     try appendRequiredString(alloc, out, record.table_name);
     try appendInt(alloc, out, u64, record.group_id);
@@ -5154,7 +5156,14 @@ fn appendRuntimeGroupStatusRecord(
     try appendRuntimeDocIdentityStatusRecord(alloc, out, record.doc_identity);
     try appendRuntimeDocSetPlanningStatusRecord(alloc, out, record.doc_set_planning);
     try appendInt(alloc, out, u32, @intCast(record.indexes.len));
-    for (record.indexes) |index| try appendRuntimeIndexStatusRecord(alloc, out, index);
+    for (record.indexes) |index| try appendRuntimeIndexStatusRecord(alloc, out, index, version);
+}
+
+fn runtimeGroupStatusRecordVersion(record: metadata.RuntimeGroupStatusReport) u16 {
+    for (record.indexes) |index| {
+        if (index.repair_status != null) return runtime_status_protocol.repair_status_record_version;
+    }
+    return runtime_status_protocol.legacy_record_version;
 }
 
 fn appendRuntimeEnrichmentStatusRecord(
@@ -5303,8 +5312,22 @@ fn readRuntimeGroupStatusRecord(
     encoded: []const u8,
     pos: *usize,
 ) !metadata.RuntimeGroupStatusReport {
+    return try readRuntimeGroupStatusRecordWithMaxVersion(
+        alloc,
+        encoded,
+        pos,
+        runtime_status_protocol.current_record_version,
+    );
+}
+
+fn readRuntimeGroupStatusRecordWithMaxVersion(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+    max_supported_version: u16,
+) !metadata.RuntimeGroupStatusReport {
     const version = try readInt(encoded, pos, u16);
-    if (version == 0 or version > runtime_status_record_version) return error.InvalidMetadataTransitionEncoding;
+    if (version == 0 or version > max_supported_version) return error.InvalidMetadataTransitionEncoding;
     const table_id = try readInt(encoded, pos, u64);
     const table_name = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(table_name);
@@ -5540,6 +5563,7 @@ fn appendRuntimeIndexStatusRecord(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
     record: metadata.RuntimeIndexStatusReport,
+    version: u16,
 ) !void {
     try appendRequiredString(alloc, out, record.name);
     try appendRequiredString(alloc, out, record.kind);
@@ -5561,11 +5585,13 @@ fn appendRuntimeIndexStatusRecord(
     try appendInt(alloc, out, u64, record.replay_target_sequence);
     try out.append(alloc, if (record.replay_catch_up_required) 1 else 0);
     try appendOptionalString(alloc, out, record.load_error);
-    try out.append(alloc, if (record.repair_status) |status| @intFromEnum(status) else 0);
-    try out.append(
-        alloc,
-        if (record.repair_status != null and record.repair_active_generation_serviceable) 1 else 0,
-    );
+    if (version >= runtime_status_protocol.repair_status_record_version) {
+        try out.append(alloc, if (record.repair_status) |status| @intFromEnum(status) else 0);
+        try out.append(
+            alloc,
+            if (record.repair_status != null and record.repair_active_generation_serviceable) 1 else 0,
+        );
+    }
 }
 
 fn readRuntimeIndexStatusRecord(
@@ -10955,7 +10981,7 @@ test "metadata runtime index status decoder accepts version ten records" {
         .replay_applied_sequence = 9,
         .replay_target_sequence = 11,
         .replay_catch_up_required = true,
-    });
+    }, runtime_status_protocol.current_record_version);
 
     // Version 10 ended immediately after replay_catch_up_required. Remove the
     // version-11 optional load-error tag and the two version-13 repair bytes.
@@ -10975,6 +11001,63 @@ test "metadata runtime index status decoder accepts version ten records" {
     try std.testing.expectEqual(@as(?[]const u8, null), decoded.load_error);
     try std.testing.expect(decoded.repair_status == null);
     try std.testing.expect(!decoded.repair_active_generation_serviceable);
+}
+
+test "metadata runtime status writer preserves the version twelve rolling-upgrade contract" {
+    const alloc = std.testing.allocator;
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+
+    var indexes = [_]metadata.RuntimeIndexStatusReport{.{
+        .name = "visual_idx",
+        .kind = "dense_vector",
+    }};
+    const status = metadata.RuntimeGroupStatusReport{
+        .table_id = 1,
+        .table_name = "products",
+        .group_id = 2,
+        .store_id = 3,
+        .node_id = 4,
+        .source = "runtime",
+        .freshness = "fresh",
+        .indexes = indexes[0..],
+    };
+
+    try appendRuntimeGroupStatusRecord(alloc, &encoded, status);
+    var version_pos: usize = 0;
+    try std.testing.expectEqual(
+        runtime_status_protocol.legacy_record_version,
+        try readInt(encoded.items, &version_pos, u16),
+    );
+    var legacy_pos: usize = 0;
+    const legacy_decoded = try readRuntimeGroupStatusRecordWithMaxVersion(
+        alloc,
+        encoded.items,
+        &legacy_pos,
+        runtime_status_protocol.legacy_record_version,
+    );
+    defer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, legacy_decoded);
+    try std.testing.expectEqual(encoded.items.len, legacy_pos);
+
+    encoded.clearRetainingCapacity();
+    indexes[0].repair_status = .rebuilding;
+    indexes[0].repair_active_generation_serviceable = true;
+    try appendRuntimeGroupStatusRecord(alloc, &encoded, status);
+    version_pos = 0;
+    try std.testing.expectEqual(
+        runtime_status_protocol.repair_status_record_version,
+        try readInt(encoded.items, &version_pos, u16),
+    );
+    legacy_pos = 0;
+    try std.testing.expectError(
+        error.InvalidMetadataTransitionEncoding,
+        readRuntimeGroupStatusRecordWithMaxVersion(
+            alloc,
+            encoded.items,
+            &legacy_pos,
+            runtime_status_protocol.legacy_record_version,
+        ),
+    );
 }
 
 test "metadata raft apply store group status decoder accepts version one records" {

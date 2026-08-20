@@ -1241,6 +1241,7 @@ test "metadata http client retries bounded timeout on fetch status" {
     const status = try client.fetchStatus("http://127.0.0.1:9000");
     try std.testing.expectEqual(@as(u64, 88), status.metadata_group_id);
     try std.testing.expectEqual(@as(u16, 0), status.reallocation_barrier_protocol_version);
+    try std.testing.expectEqual(@as(u16, 0), status.runtime_status_record_version);
     try std.testing.expectEqual(@as(usize, 2), timeout_executor.attempts);
 }
 
