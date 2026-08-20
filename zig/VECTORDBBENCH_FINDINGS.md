@@ -262,6 +262,43 @@ overlap-closed plan would reintroduce compaction starvation. The next design
 experiment must make those closures partition-aware while retaining the
 oversized escape hatch for guaranteed progress.
 
+### Smaller leveled files do not split an overlap-closed job
+
+A follow-up set the primary LSM's preferred run-file size to its 128 MiB
+base-level target while retaining the separate 512 MiB physical admission
+limit. This was deliberately a layout preference rather than a smaller maximum
+record size. It produced the intended finer leveled geometry: after shutdown,
+the primary L2 contained 27 runs with a 136.7 MB largest physical file instead
+of a handful of roughly 512 MB files.
+
+That geometry did not bound compaction. The 1M public-API lifecycle still
+admitted 14 oversized selections, and its largest overlap-closed job consumed
+2.562 GB of input, produced 2.454 GB of output, and lasted 55.15 seconds. The
+run completed with all 1,000,000 vectors query-visible and zero final hard debt,
+but took 1,753.77 seconds, rewrote 27.70 GB across 36 jobs, and peaked at
+3.72 GB RSS / 1.50 GB process physical footprint. Those are regressions from
+the 1,617.08-second, 3.19 GB RSS / 1.30 GB control, while the maximum job is
+effectively unchanged from 2.57 GB. The 50K gate was also slightly slower at
+43.97 seconds versus the current-main 38.72--43.14-second range.
+
+The preference is therefore rejected. Splitting a completed compaction into
+smaller output files does not split its input closure: a broad L0 range still
+expands through overlapping target runs and older L0 runs before planning can
+apply its byte budget. The next safe experiment must narrow persisted L0 source
+ranges themselves (without workload-specific key assumptions), then combine
+that with a lower soft input budget. The oversized-single-job escape remains
+necessary for a minimum correct closure that cannot be divided.
+
+The same run isolated a separate late-load pause. Status publication stopped
+for about 84 seconds near 785K rows and then recovered without a client timeout.
+A live stack sample showed the elected primary writer waiting in bounded
+derived-backlog admission, the other public writers waiting for that group
+operation, and the dense worker normalizing and splitting an oversized HBC
+leaf. This was not the primary compaction above. It is one diagnostic sample,
+not yet a product-change justification, but it shows that dense structural work
+can consume most of the public client's 120-second timeout budget even while
+the replay/backpressure invariants behave as designed.
+
 ## Measurements
 
 Unless a row explicitly reports a mean and range, the times below are
@@ -289,12 +326,14 @@ one-machine diagnostics rather than publication-grade means.
 | 50K, clean merged control, full-text + dense | 41.79 s | 46.32 s | 3.51 GB clones; both indexes ready |
 | 50K, replay-lane snapshot, full-text + dense, current main | 32.90 s | 41.78 s | 46.3 MB clones; 702.4 MB physical footprint, 1.66 GB RSS; both indexes ready |
 | 50K, replay-lane snapshot, 1 MiB checkpoint floor (rejected) | 28.40 s | 41.75 s | 80.5 MB clones; 147 final L0 runs / 86 flushes; no physical-footprint benefit |
+| 50K, 128 MiB preferred primary runs (rejected) | 37.41 s | 43.97 s | Finer output layout; 1.61 GB RSS; slightly slower than the current-main range |
 | 1M Cohere, batch 100, four workers, original public path | incomplete | projected about 45–50 min | Throughput fell from about 30.8K docs/min in minute one to about 21.1K docs/min in minute four |
 | 1M, bounded clones + fair coalescer control | incomplete at 783,201 rows / 1,867 s | -- | Two exact 120 s timeouts from primary L0 pressure; 3.83 GB clones, 1.40 GB demand, 3.76 GB peak RSS; 200 ms `vmmap` and overlapping compilers contaminate speed |
 | 1M, rate-limited sampler + maintenance fair turn | incomplete at 592,001 rows / about 725 s | -- | No timeout, but live dense bulk mode still reached 537 aggregate L0 runs; 1.59 GB clones, 888 MB demand, 3.02 GB peak RSS |
 | 1M, primary + dense hard pressure before relocation | 1,536.04 s | 1,644.37 s | 825 final L0 runs / 582 debt; 16 compactions from 26 pressure events, 1.60 GB demand, 3.89 GB RSS |
 | 1M, relocated compaction publication | 1,099.85 s | 1,110.66 s | Full E2E completion; 10.81 s catch-up, 111 final L0 runs / zero debt, 1.20 GB demand, 4.21 GB RSS |
 | 1M, instrumented replay-lane snapshot | 1,605.87 s | 1,617.08 s | Full E2E completion; 1.65 GB clones, 1.30 GB physical footprint, 3.19 GB RSS; zero debt; 2.57 GB / 52.6 s largest compaction |
+| 1M, 128 MiB preferred primary runs (rejected) | 1,751.71 s | 1,753.77 s | 2.07 GB clones, 1.50 GB physical footprint, 3.72 GB RSS; zero debt; 2.562 GB / 55.15 s largest compaction |
 
 The original partial 1M run reached about 105K documents with 542 flushes, 212 L0 runs,
 and roughly 23.6 GB of cumulative mutable-snapshot clone bytes. Dense HBC work
@@ -394,13 +433,19 @@ published.
 
 ## Next checks
 
-1. Partition broad L0-to-level overlap closures so ordinary compaction jobs can
-   stay near a soft byte target without disabling the oversized progress escape
-   hatch or reintroducing discarded work and hard L0 debt.
-2. Attribute the remaining bound-read snapshot clones separately from replay
+1. Narrow broad persisted L0 source ranges with adaptive, workload-independent
+   range slices, then pair them with a lower soft compaction-input budget.
+   Merely splitting leveled output files does not split the fixed-point overlap
+   closure. Preserve the oversized progress escape for a minimum indivisible
+   closure and verify that the extra L0 runs do not amplify write pressure.
+2. Add duration/size telemetry around HBC leaf normalization and determine
+   whether large splits can be sliced or scheduled without holding the entire
+   derived-backlog drain window. Preserve source-write ordering and bounded
+   replay memory rather than bypassing admission.
+3. Attribute the remaining bound-read snapshot clones separately from replay
    lanes; do not replace those multi-operation snapshots with unsafe live
    probes merely to improve a cumulative counter.
-3. Repeat the 1M lifecycle three times through Circus on a controlled host and
+4. Repeat the 1M lifecycle three times through Circus on a controlled host and
    publish its mean plus range. Three current-main 50K lifecycles now average
    41.65 seconds with a 38.72--43.14 second range, but the single follow-up 1M
    lifecycle remains diagnostic because compaction scheduling produced
