@@ -2285,7 +2285,7 @@ test "relational number validation rejects values the row codec cannot preserve"
 test "relational json columns preserve nested numeric domains" {
     const alloc = std.testing.allocator;
     var parsed = try schema_mod.parseValidatedTableSchema(alloc,
-        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"attrs":{"type":"object","properties":{"counter":{"type":"integer"},"amount":{"type":"numeric"}},"required":["counter","amount"],"additionalProperties":false},"samples":{"type":"array","items":{"type":"integer"}},"qty":{"type":"integer"}},"required":["attrs","samples"],"additionalProperties":false}}}}
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"attrs":{"type":"object","properties":{"counter":{"type":"integer","minimum":9223372036854775808},"amount":{"type":"numeric"}},"required":["counter","amount"],"additionalProperties":false},"samples":{"type":"array","items":{"type":"integer","minimum":9223372036854775808}},"qty":{"type":"integer"}},"required":["attrs","samples"],"additionalProperties":false}}}}
     );
     defer parsed.deinit(alloc);
     var plan = try relationalColumnPlanAlloc(alloc, parsed);
@@ -2307,12 +2307,24 @@ test "relational json columns preserve nested numeric domains" {
     try std.testing.expect(samples.is_json);
     try std.testing.expectEqualStrings("[9223372036854775808]", samples.value.bytes_val);
 
+    // Nested JSON constraints still apply even though their integer domain is
+    // not limited by the physical relational i64 encoding.
     try std.testing.expectError(
         error.InvalidBatchRequest,
         schema_mod.validateWritesAgainstTableSchema(
             alloc,
             parsed,
-            &.{.{ .value = "{\"attrs\":{\"counter\":1,\"amount\":1},\"samples\":[1],\"qty\":9223372036854775808}" }},
+            &.{.{ .value = "{\"attrs\":{\"counter\":1,\"amount\":1},\"samples\":[9223372036854775808]}" }},
+        ),
+    );
+
+    // A true physical integer column remains bounded by i64.
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        schema_mod.validateWritesAgainstTableSchema(
+            alloc,
+            parsed,
+            &.{.{ .value = "{\"attrs\":{\"counter\":9223372036854775808,\"amount\":1},\"samples\":[9223372036854775808],\"qty\":9223372036854775808}" }},
         ),
     );
 }

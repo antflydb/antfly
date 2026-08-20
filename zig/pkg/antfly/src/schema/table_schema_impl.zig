@@ -1838,6 +1838,11 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
 }
 
 fn relationalIntegerConstraintsAreExact(property: DocumentProperty) bool {
+    // A JSON-backed property is one lossless bytes column. Its descendants are
+    // validated as JSON but never lowered into physical i64 cells, so their
+    // integer constraints do not need to fit the relational scalar encoding.
+    if (documentPropertyUsesJsonEncoding(property)) return true;
+
     const integer_property = property.integer_only or
         (property.field_type != null and std.mem.eql(u8, property.field_type.?, "integer"));
     if (integer_property) {
