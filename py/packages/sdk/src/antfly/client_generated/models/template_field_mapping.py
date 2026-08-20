@@ -14,7 +14,7 @@ T = TypeVar("T", bound="TemplateFieldMapping")
 
 @_attrs_define
 class TemplateFieldMapping:
-    """Field mapping to apply when a dynamic template matches
+    """Field mapping used by a dynamic template or a document property's `x-antfly-field` annotation.
 
     Attributes:
         type_ (AntflyType2 | Unset): Field type annotations for schema fields

@@ -1016,7 +1016,7 @@ pub fn fieldCapabilitiesAlloc(alloc: Allocator, schema: TableSchema) ![]FieldCap
     for (schema.full_text_documents) |doc| {
         for (doc.fields) |field| {
             if (std.mem.eql(u8, field.path, "_id")) continue;
-            if (resolveFieldType(schema, field.path) != null) continue;
+            if (resolveFieldType(schema, field.emitted_name) != null) continue;
             count += 1;
         }
     }
@@ -1036,7 +1036,7 @@ pub fn fieldCapabilitiesAlloc(alloc: Allocator, schema: TableSchema) ![]FieldCap
     for (schema.full_text_documents) |doc| {
         for (doc.fields) |field| {
             if (std.mem.eql(u8, field.path, "_id")) continue;
-            if (resolveFieldType(schema, field.path) != null) continue;
+            if (resolveFieldType(schema, field.emitted_name) != null) continue;
             capabilities[index] = fullTextFieldCapability(schema, doc.name, field);
             index += 1;
         }

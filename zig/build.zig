@@ -3560,6 +3560,7 @@ pub fn build(b: *std.Build) void {
         "schema rejects sortable non-scalar dynamic mappings",
         "runtime schema derives and validates index sort metadata",
         "runtime schema lowers document field mappings to exact declared fields",
+        "runtime schema retains shorthand exact scalar declarations as non-sortable capabilities",
         "schema rejects sortable non-scalar document field mappings",
         "runtime schema field capability helpers classify mapped sortability",
         "document mapper accepts match-mapping-type dynamic template index_sort field",

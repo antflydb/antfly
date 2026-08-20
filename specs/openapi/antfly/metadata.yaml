@@ -185,6 +185,45 @@ tags:
       - Primary types (`text`, `html`) can be combined with variants (`keyword`, `search_as_you_type`)
       - `search_as_you_type` + `keyword` allowed without primary type (auto-adds `text`)
 
+      `x-antfly-types` remains supported as the compact multi-mapping/search
+      shorthand. Exact scalar names in that array describe how a field is
+      searched, but do not opt the field into the typed doc-value storage
+      required by production `order_by`.
+
+      ### `x-antfly-field`
+      Use an explicit field mapping for fields that participate in exact sort.
+      Set `sortable: true` on a keyword, numeric/number/integer,
+      boolean/bool, datetime/date/timestamp, or link mapping. Antfly derives
+      the internal typed doc values; `doc_values` is intentionally not a public
+      setting.
+
+      ```json
+      {
+        "created_at": {
+          "type": "string",
+          "format": "date-time",
+          "x-antfly-field": {"type": "date", "sortable": true}
+        },
+        "title": {
+          "type": "string",
+          "x-antfly-field": {
+            "type": "text",
+            "fields": {
+              "keyword": {"type": "keyword", "sortable": true}
+            }
+          }
+        }
+      }
+      ```
+
+      Sort the examples above with `created_at` and `title.keyword`,
+      respectively. An analyzed `text` field is never directly sortable.
+      Adding `sortable: true` to an existing table is a physical mapping
+      change: exact sort becomes available only after the active index
+      generation reports complete native coverage through
+      `field_capabilities.sort_lifecycle_state` (`queryable` or
+      `accelerated`).
+
       ### `x-antfly-index`
       Boolean to disable indexing for a field:
       ```json
@@ -6814,7 +6853,9 @@ components:
             when each non-`_id` field is a mapped exact scalar field with sortable
             native doc-value coverage. Sortable mapping types are keyword,
             numeric/number/integer, boolean/bool, datetime/date/timestamp, and
-            link. Analyzed `text` fields and `search_as_you_type`, geo, embedding,
+            link. Declare the field with `x-antfly-field` and `sortable: true`;
+            `x-antfly-types` shorthand declarations alone are not sortable.
+            Analyzed `text` fields and `search_as_you_type`, geo, embedding,
             blob, html, object, and array fields are not directly sortable; sort
             on an exact scalar mapping such as `title.keyword` instead. Requests
             that cannot be executed through an exact native sort path return 422

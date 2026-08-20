@@ -102,7 +102,7 @@ pub const TableSchema = struct {
     dynamic_templates: ?[]const DynamicTemplate = null,
 };
 
-/// Field mapping to apply when a dynamic template matches
+/// Field mapping used by a dynamic template or a document property's `x-antfly-field` annotation.
 pub const TemplateFieldMapping = struct {
     type: ?AntflyType = null,
     /// Analyzer name (e.g., "standard", "keyword", "en", "html_analyzer"). Used for text fields to control tokenization and normalization.

@@ -183,8 +183,55 @@ fn appendRuntimeDocumentFieldTemplates(
         return;
     }
 
-    const mapping = property.antfly_field orelse return;
-    try appendRuntimeDocumentFieldMappingTemplates(alloc, out, path, mapping);
+    if (property.antfly_field) |mapping| {
+        try appendRuntimeDocumentFieldMappingTemplates(alloc, out, path, mapping);
+        return;
+    }
+
+    // x-antfly-types is the compact multi-mapping/search shorthand, while
+    // x-antfly-field carries explicit physical capabilities such as sortable.
+    // Preserve shorthand exact-scalar declarations in the runtime capability
+    // model, but do not silently opt every scalar into typed doc values. That
+    // keeps existing indexing/storage costs stable while allowing sort
+    // validation and table introspection to report non_sortable_field instead
+    // of incorrectly claiming that a declared field is unmapped.
+    try appendShorthandRuntimeDocumentFieldTemplates(alloc, out, path, property.antfly_types);
+}
+
+fn appendShorthandRuntimeDocumentFieldTemplates(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(storage_schema.DynamicTemplate),
+    path: []const u8,
+    antfly_types: []const []const u8,
+) !void {
+    const has_primary = containsString(antfly_types, "text") or containsString(antfly_types, "html");
+    const has_search_as_you_type = containsString(antfly_types, "search_as_you_type");
+
+    for (antfly_types) |type_name| {
+        const field_type = parseRuntimeFieldType(type_name);
+        if (!storage_schema.fieldTypeIsSortableScalar(field_type)) continue;
+
+        const emitted_path = if ((field_type == .keyword or field_type == .link) and (has_primary or has_search_as_you_type))
+            try std.fmt.allocPrint(alloc, "{s}.keyword", .{path})
+        else
+            try alloc.dupe(u8, path);
+        defer alloc.free(emitted_path);
+
+        try out.append(alloc, .{
+            .name = try alloc.dupe(u8, emitted_path),
+            .path_match = try alloc.dupe(u8, emitted_path),
+            .mapping = .{
+                .field_type = field_type,
+                .do_index = true,
+                .store = false,
+                .doc_values = false,
+                .sortable = false,
+                .missing_null_policy = .missing_rejected,
+                .include_in_all = false,
+                .analyzer = try alloc.dupe(u8, defaultDynamicTemplateAnalyzer(field_type)),
+            },
+        });
+    }
 }
 
 fn appendRuntimeDocumentFieldMappingTemplates(
@@ -1129,6 +1176,57 @@ test "runtime schema lowers document field mappings to exact declared fields" {
     try std.testing.expect(!location_capability.sortable);
     try std.testing.expectEqualStrings("schema_declared", location_capability.doc_value_coverage);
     try std.testing.expectEqualStrings("declared", location_capability.queryability_state);
+}
+
+test "runtime schema retains shorthand exact scalar declarations as non-sortable capabilities" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{
+        \\  "document_schemas": {
+        \\    "doc": {
+        \\      "schema": {
+        \\        "type": "object",
+        \\        "properties": {
+        \\          "title": {"type":"string","x-antfly-types":["text"]},
+        \\          "title_and_keyword": {"type":"string","x-antfly-types":["text","keyword"]},
+        \\          "label": {"type":"string","x-antfly-types":["keyword"]},
+        \\          "size": {"type":"number","x-antfly-types":["numeric"]},
+        \\          "modified_at": {"type":"string","format":"date-time","x-antfly-types":["datetime"]}
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    );
+    defer parsed.deinit(alloc);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+
+    try std.testing.expectEqual(@as(usize, 4), runtime.dynamic_templates.len);
+    const keyword_mapping = storage_schema.resolveDeclaredFieldType(runtime, "title_and_keyword.keyword") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.AntflyType.keyword, keyword_mapping.field_type);
+    try std.testing.expect(!keyword_mapping.doc_values);
+    try std.testing.expect(!keyword_mapping.sortable);
+
+    const label_mapping = storage_schema.resolveDeclaredFieldType(runtime, "label") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.AntflyType.keyword, label_mapping.field_type);
+    const size_mapping = storage_schema.resolveDeclaredFieldType(runtime, "size") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.AntflyType.numeric, size_mapping.field_type);
+    const modified_mapping = storage_schema.resolveDeclaredFieldType(runtime, "modified_at") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.AntflyType.datetime, modified_mapping.field_type);
+
+    const capabilities = try storage_schema.fieldCapabilitiesAlloc(alloc, runtime);
+    defer storage_schema.freeFieldCapabilities(alloc, capabilities);
+    try std.testing.expectEqual(@as(usize, 7), capabilities.len);
+    for ([_][]const u8{ "title_and_keyword.keyword", "label", "size", "modified_at" }) |field| {
+        const capability = findFieldCapability(capabilities, field) orelse return error.TestExpectedEqual;
+        try std.testing.expect(!capability.doc_values);
+        try std.testing.expect(!capability.sortable);
+        try std.testing.expectEqualStrings("not_declared", capability.doc_value_coverage);
+        try std.testing.expectEqualStrings("missing_doc_values", capability.queryability_state);
+        try std.testing.expectEqualStrings("unsupported", capability.sort_lifecycle_state);
+    }
 }
 
 test "schema rejects sortable non-scalar document field mappings" {

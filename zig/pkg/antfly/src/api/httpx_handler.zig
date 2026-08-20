@@ -3830,18 +3830,15 @@ pub const AntflyApiHandler = struct {
             defer alloc.free(debug_body);
             return jsonResponse(ctx, 200, debug_body);
         }
-        var snapshot = (try self.api_server.source.adminSnapshot()) orelse {
+        // Use the shared status encoder so the public table response includes
+        // the same runtime doc-value evidence used by exact-sort admission.
+        // A schema declaration alone must remain "declared" until every local
+        // shard reports compatible physical coverage.
+        const body = (try self.api_server.maybeEncodeTableStatus(decoded_table_name)) orelse {
             _ = ctx.status(404);
             return ctx.text("not found");
         };
-        defer self.api_server.source.freeAdminSnapshot(&snapshot);
-        var storage_status_buf: [1]tables_api.TableStorageStatus = undefined;
-        const storage_statuses = try self.api_server.bestEffortSingleTableStorageStatuses(decoded_table_name, &snapshot, &storage_status_buf);
-        const body = (try tables_api.encodeSingleTableStatusWithStorageStatuses(alloc, &snapshot, decoded_table_name, storage_statuses)) orelse {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        };
-        defer alloc.free(body);
+        defer self.api_server.alloc.free(body);
         return respondApiResponseBody(ctx, 200, body);
     }
 

@@ -5101,9 +5101,41 @@ pub const ApiHttpServer = struct {
         const runtime_schema = try schema_mod.deriveRuntimeTableSchema(self.alloc, parsed_schema);
         defer storage_schema.freeSchema(self.alloc, runtime_schema);
 
-        const observed_dynamic_capability_sets = try self.bestEffortObservedDynamicFieldCapabilitySets(table_name);
+        const observed_dynamic_capability_sets = try self.queryObservedDynamicFieldCapabilitySets(
+            table_name,
+            query_req,
+        );
         defer self.freeObservedDynamicFieldCapabilitySets(observed_dynamic_capability_sets);
         try validatePublicQuerySortCapabilitiesAgainstRuntime(query_req, runtime_schema, observed_dynamic_capability_sets);
+    }
+
+    fn queryObservedDynamicFieldCapabilitySets(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        query_req: db_mod.types.SearchRequest,
+    ) ![]table_reads.ObservedDynamicFieldCapabilitySet {
+        const source = self.table_reads orelse return &.{};
+        return self.bestEffortObservedDynamicFieldCapabilitySets(table_name) catch |err| switch (err) {
+            error.StorageReadTemporarilyUnavailable => {
+                // A cold provisioned table has not installed a resident query
+                // handle yet. Let the normal preflight retry protocol prepare
+                // it without making GET /tables perform cold index loading,
+                // then re-read the physical coverage used by sort admission.
+                var summary = (try source.preflightQuery(
+                    self.alloc,
+                    table_name,
+                    query_req,
+                    .read_index,
+                    0,
+                )) orelse return error.StorageReadTemporarilyUnavailable;
+                defer summary.deinit(self.alloc);
+                return self.bestEffortObservedDynamicFieldCapabilitySets(table_name) catch |retry_err| switch (retry_err) {
+                    error.StorageReadTemporarilyUnavailable => error.StorageReadTemporarilyUnavailable,
+                    else => retry_err,
+                };
+            },
+            else => return err,
+        };
     }
 
     pub fn validateTableWritesAgainstSchema(self: *ApiHttpServer, table_name: []const u8, writes: anytype) !void {
@@ -5144,8 +5176,21 @@ pub const ApiHttpServer = struct {
     pub fn maybeEncodeTableStatus(self: *ApiHttpServer, table_name: []const u8) !?[]u8 {
         var snapshot = (try self.source.adminSnapshot()) orelse return null;
         defer self.source.freeAdminSnapshot(&snapshot);
+        if (tables_api.findTableByName(&snapshot, table_name) == null) return null;
         var storage_status_buf: [1]tables_api.TableStorageStatus = undefined;
         const storage_statuses = try self.bestEffortSingleTableStorageStatuses(table_name, &snapshot, &storage_status_buf);
+        if (storage_statuses) |_| {
+            const observed = self.bestEffortObservedDynamicFieldCapabilitySets(table_name) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    std.log.debug("runtime field capability observation unavailable table={s} err={s}", .{ table_name, @errorName(err) });
+                    return try tables_api.encodeSingleTableStatusWithStorageStatuses(self.alloc, &snapshot, table_name, storage_statuses);
+                },
+            };
+            defer self.freeObservedDynamicFieldCapabilitySets(observed);
+            storage_status_buf[0].observed_dynamic_field_capability_sets = observed;
+            return try tables_api.encodeSingleTableStatusWithStorageStatuses(self.alloc, &snapshot, table_name, storage_statuses);
+        }
         return try tables_api.encodeSingleTableStatusWithStorageStatuses(self.alloc, &snapshot, table_name, storage_statuses);
     }
 

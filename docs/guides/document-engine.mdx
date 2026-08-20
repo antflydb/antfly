@@ -108,6 +108,14 @@ subfield:
 field-value structures needed for exact sort and filters. Do not configure
 `doc_values` directly.
 
+The compact `x-antfly-types` shorthand remains supported for simple and
+multi-field search mappings, but does not implicitly enable exact sort. Use
+`x-antfly-field` as the detailed form when a field needs physical options such
+as `sortable: true`. This intentionally avoids adding doc-value storage and
+build cost to every scalar field. The mapping change rebuilds physical
+coverage; issue `order_by` only after the field's reported lifecycle becomes
+`queryable` or `accelerated`.
+
 Field capabilities report what the planner can safely do with a concrete field:
 
 - `query_modes` describes modes such as `full_text`, `exact`, `range`, `geo`,
@@ -264,4 +272,3 @@ the selected plan, source, candidate source, selection reason, exactness,
 candidate counts, source-load behavior, and rejection reasons. Lower-level
 executor counters belong in logs, traces, benchmarks, or explicit debug
 surfaces rather than normal SDK responses.
-

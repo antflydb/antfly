@@ -30,7 +30,8 @@ class DynamicTemplate:
                 Example: "metadata.**" matches "metadata.author", "metadata.tags.primary"
             path_unmatch (str | Unset): Path exclusion pattern. If it matches the full path, the template is skipped.
             match_mapping_type (DynamicTemplateMatchMappingType | Unset): Filter by detected JSON type
-            mapping (TemplateFieldMapping | Unset): Field mapping to apply when a dynamic template matches
+            mapping (TemplateFieldMapping | Unset): Field mapping used by a dynamic template or a document property's
+                `x-antfly-field` annotation.
     """
 
     name: str | Unset = UNSET

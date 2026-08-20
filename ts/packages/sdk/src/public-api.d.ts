@@ -6436,7 +6436,9 @@ export interface components {
              *     when each non-`_id` field is a mapped exact scalar field with sortable
              *     native doc-value coverage. Sortable mapping types are keyword,
              *     numeric/number/integer, boolean/bool, datetime/date/timestamp, and
-             *     link. Analyzed `text` fields and `search_as_you_type`, geo, embedding,
+             *     link. Declare the field with `x-antfly-field` and `sortable: true`;
+             *     `x-antfly-types` shorthand declarations alone are not sortable.
+             *     Analyzed `text` fields and `search_as_you_type`, geo, embedding,
              *     blob, html, object, and array fields are not directly sortable; sort
              *     on an exact scalar mapping such as `title.keyword` instead. Requests
              *     that cannot be executed through an exact native sort path return 422
@@ -9170,7 +9172,7 @@ export interface components {
          * @enum {string}
          */
         "AntflyType-2": "text" | "html" | "keyword" | "numeric" | "boolean" | "datetime" | "geopoint" | "geoshape" | "embedding" | "blob" | "link" | "search_as_you_type";
-        /** @description Field mapping to apply when a dynamic template matches */
+        /** @description Field mapping used by a dynamic template or a document property's `x-antfly-field` annotation. */
         TemplateFieldMapping: {
             type?: components["schemas"]["AntflyType-2"];
             /**

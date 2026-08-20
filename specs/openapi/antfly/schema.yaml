@@ -118,7 +118,7 @@ components:
     TemplateFieldMapping:
       type: object
       additionalProperties: false
-      description: Field mapping to apply when a dynamic template matches
+      description: Field mapping used by a dynamic template or a document property's `x-antfly-field` annotation.
       properties:
         type:
           $ref: "#/components/schemas/AntflyType"
