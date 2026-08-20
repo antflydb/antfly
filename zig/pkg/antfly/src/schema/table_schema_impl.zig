@@ -4169,13 +4169,12 @@ test "parse accepts sortable without public doc values and rejects unsupported s
     const rank = sortable_document_field.document_schemas[0].properties[0].antfly_field orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(true, rank.sortable.?);
 
-    try std.testing.expectError(
-        error.InvalidSchemaUpdateRequest,
-        parseSchema(
-            std.testing.allocator,
-            "{\"dynamic_templates\":[{\"name\":\"payload\",\"path_match\":\"payload\",\"mapping\":{\"type\":\"json\"}}]}",
-        ),
+    var legacy_json_mapping = try parseSchema(
+        std.testing.allocator,
+        "{\"dynamic_templates\":[{\"name\":\"payload\",\"path_match\":\"payload\",\"mapping\":{\"type\":\"json\"}}]}",
     );
+    defer legacy_json_mapping.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("json", legacy_json_mapping.dynamic_templates[0].field_type.?);
     var legacy_unknown_mapping = try parseSchema(
         std.testing.allocator,
         "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"payload\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"unknown\"}}}}}}}",

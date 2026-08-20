@@ -994,7 +994,7 @@ test "runtime schema preserves legacy unknown mapping types as text" {
     var parsed = try parseValidatedTableSchema(alloc,
         \\{
         \\  "dynamic_templates": [
-        \\    {"name":"legacy_dynamic","path_match":"dynamic","mapping":{"type":"legacy_custom"}}
+        \\    {"name":"legacy_dynamic","path_match":"dynamic","mapping":{"type":"json"}}
         \\  ],
         \\  "document_schemas": {
         \\    "doc": {
