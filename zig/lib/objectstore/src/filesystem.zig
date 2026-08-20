@@ -279,6 +279,10 @@ pub const FilesystemClient = struct {
             .bucket = try alloc.dupe(u8, bucket),
             .key = try alloc.dupe(u8, key),
             .etag = try alloc.dupe(u8, &header.etag),
+            .checksum = .{
+                .algorithm = .sha256_hex,
+                .value = try alloc.dupe(u8, &header.etag),
+            },
             .content_length = header.content_length,
             .content_type = if (header.content_type.len == 0) null else try alloc.dupe(u8, header.content_type),
             .last_modified_unix_ms = file_stat.mtime.toMilliseconds(),
@@ -1034,6 +1038,8 @@ test "filesystem client supports bucket/object lifecycle and file helpers" {
     defer got.deinit(alloc);
     try std.testing.expectEqualStrings("alpha", got.body);
     try std.testing.expectEqualStrings("text/plain", got.metadata.content_type.?);
+    try std.testing.expectEqual(types.ObjectChecksumAlgorithm.sha256_hex, got.metadata.checksum.?.algorithm);
+    try std.testing.expectEqualStrings(put.etag.?, got.metadata.checksum.?.value);
 
     var ranged = try client.getObject("docs", "nested/a.txt", .{ .range = .{ .offset = 1, .length = 3 } });
     defer ranged.deinit(alloc);

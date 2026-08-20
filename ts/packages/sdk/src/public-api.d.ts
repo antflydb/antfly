@@ -4053,6 +4053,15 @@ export interface components {
          * @enum {string}
          */
         AggregationType: "sum" | "avg" | "min" | "max" | "count" | "sumsquares" | "stats" | "cardinality" | "terms" | "range" | "date_range" | "histogram" | "date_histogram" | "geohash_grid" | "geo_distance" | "significant_terms";
+        /**
+         * @description Exact-vs-approximate selection for a cardinality aggregation:
+         *     - auto: use a materialized HyperLogLog sketch when one applies and is
+         *       current, else an exact distinct scan (default).
+         *     - exact: always compute an exact distinct count.
+         *     - approximate: require a matching sketch; error if none applies.
+         * @enum {string}
+         */
+        CardinalityMode: "auto" | "exact" | "approximate";
         AggregationRange: {
             /** @description Name of the range bucket */
             name: string;
@@ -4130,6 +4139,8 @@ export interface components {
             type: components["schemas"]["AggregationType"];
             /** @description Field to aggregate on. Required unless `fields` is supplied for a multi-field terms aggregation. */
             field?: string;
+            /** @description Selection mode for a cardinality aggregation. `auto` (default) uses a materialized HyperLogLog sketch when one applies and is current, else falls back to an exact distinct scan. `exact` always scans. `approximate` requires a sketch and errors if none applies. Ignored for other types. */
+            mode?: components["schemas"]["CardinalityMode"];
             /** @description Ordered field list for multi-field terms aggregations. Bucket keys are returned as JSON arrays in the same order. */
             fields?: string[];
             /**
@@ -4214,6 +4225,13 @@ export interface components {
              * @description Single value for metric aggregations (sum, avg, min, max, count, cardinality)
              */
             value?: number;
+            /** @description For cardinality aggregations, whether the value is an approximate estimate from a HyperLogLog sketch (true) or an exact distinct count (false). Absent for non-cardinality aggregations. */
+            approximate?: boolean;
+            /**
+             * Format: float
+             * @description For an approximate cardinality value, the relative standard error of the estimate. Present only when approximate is true.
+             */
+            relative_error?: number;
             /** @description Document count for stats aggregations */
             count?: number;
             /**
@@ -11340,7 +11358,7 @@ export interface components {
             index_name: string;
             /** @description Starting node(s) for the query */
             start_nodes?: components["schemas"]["GraphNodeSelector"];
-            /** @description Target nodes (for pathfinding only) */
+            /** @description Exact target nodes for pathfinding or the final binding of a pattern query. When a pattern endpoint is known, prefer this selector over an exact node_filter.filter_prefix so Antfly can use an exact edge-probe plan. */
             target_nodes?: components["schemas"]["GraphNodeSelector"];
             /** @description Traversal/pathfinding parameters */
             params?: components["schemas"]["GraphQueryParams"];

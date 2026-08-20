@@ -43,6 +43,7 @@ const shard_mod = @import("../shard.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const resolver_catalog_mod = @import("catalog/resolver_catalog.zig");
 const resolution_runtime_mod = @import("resolution_runtime.zig");
+const resolution_handoff = @import("resolution_handoff.zig");
 const promotion_runtime_mod = @import("promotion_runtime.zig");
 const resolver_lib = @import("antfly_resolver");
 const backfill_state_mod = @import("backfill_state.zig");
@@ -132,6 +133,7 @@ const traversal_mod = @import("../../graph/traversal.zig");
 const paths_mod = @import("../../graph/paths.zig");
 const graph_query_mod = @import("../../graph/query.zig");
 const graph_pattern_mod = @import("../../graph/pattern.zig");
+const graph_node_identity = @import("../../graph/node_identity.zig");
 const mapper = @import("document_mapper.zig");
 const planning_adapter_mod = @import("planning_adapter.zig");
 const planning_bindings_mod = @import("planning_bindings.zig");
@@ -678,6 +680,7 @@ fn managedIndexReplayHint(kind: types.IndexKind) change_journal_mod.TargetHint {
 const AsyncContext = struct {
     alloc: Allocator,
     io: ?std.Io = null,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
     store: *docstore_mod.DocStore,
     snapshot_read_txn: ?*docstore_mod.DocStore.Txn = null,
     applied_sequence_checkpoint_path: ?[]const u8 = null,
@@ -1520,6 +1523,7 @@ const TransactionResolution = struct {
     status: transactions_mod.TxnStatus,
     commit_version: u64,
     expected_intent_revision: u64,
+    intent_keys: []const []const u8,
 };
 
 const ha_applied_lsn_value_len: usize = @sizeOf(u64);
@@ -2973,6 +2977,7 @@ pub const DB = struct {
     backend_runtime: *background_runtime_mod.BackendRuntime,
     backend_owner_id: u64,
     repair_cleanup_owner_id: u64,
+    algebraic_hll_owner_id: u64 = 0,
     owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager,
     capacity_source: ?types.RepairCapacitySource,
@@ -3208,6 +3213,12 @@ pub const DB = struct {
     fn mirrorHASchemaMetadataCommit(self: *DB, table_schema: schema_mod.TableSchema) !void {
         var ctx = self.batchContext();
         try mirrorHASchemaMetadataCommitContext(&ctx, table_schema);
+    }
+
+    fn attachAlgebraicHllMaintenanceLane(self: *DB) !void {
+        const owner_id = try self.backend_runtime.allocOwnerId();
+        self.algebraic_hll_owner_id = owner_id;
+        self.core.index_manager.attachHllMaintenance(self.backend_runtime.durable_jobs, owner_id);
     }
 
     fn hydrateAlgebraicObservationStatusBestEffort(self: *DB) void {
@@ -3461,6 +3472,8 @@ pub const DB = struct {
                 opts.enrichment = null;
             }
 
+            try db.attachAlgebraicHllMaintenanceLane();
+
             const admission_prefix = try internal_keys.managedIndexAdmissionRootPrefixAlloc(alloc);
             defer alloc.free(admission_prefix);
             const managed_admissions = try db.core.store.scanPrefix(alloc, admission_prefix);
@@ -3637,6 +3650,7 @@ pub const DB = struct {
         const async_resources = self.core.asyncResources();
         self.async_context.* = .{
             .alloc = self.runtime_alloc,
+            .resource_manager = resource_manager,
             .store = async_resources.store,
             .applied_sequence_checkpoint_path = async_resources.applied_sequence_checkpoint_path,
             .index_repair_checkpoint = async_resources.index_repair_checkpoint,
@@ -3972,7 +3986,7 @@ pub const DB = struct {
             self.core.replaySource(),
             self.core.batchExecutionResources().index_manager,
             append_ctx,
-            appendDerivedBatchFromEnrichment,
+            appendResolutionRecord,
             self.backend_runtime,
             // Cross-shard blocking source when the serving layer injected one
             // (via OpenOptions); null means local-only blocking against this
@@ -4248,6 +4262,10 @@ pub const DB = struct {
         self.setQueryVisibilityHook(null);
         self.async_context.background_closing.store(true, .release);
         self.async_context.enrichment_desired_running.store(false, .release);
+        if (self.algebraic_hll_owner_id != 0) {
+            self.backend_runtime.durable_jobs.closeOwner(self.algebraic_hll_owner_id);
+            self.algebraic_hll_owner_id = 0;
+        }
         self.backend_runtime.durable_jobs.closeOwner(self.repair_cleanup_owner_id);
         self.backend_runtime.durable_jobs.closeOwner(self.backend_owner_id);
         self.clearLiveDocSetCache();
@@ -5112,6 +5130,22 @@ pub const DB = struct {
         }
     }
 
+    /// Applies a one-participant transaction through the ordinary atomic DB
+    /// batch while preserving the distributed transaction's representability
+    /// contract for transforms. This avoids durable 2PC bookkeeping without
+    /// making graph-transform behavior depend on the current shard count.
+    pub fn batchTransactionCompatible(self: *DB, req: types.BatchRequest) anyerror!void {
+        var compatible_req = req;
+        compatible_req.reject_graph_transform_projections = true;
+        if (benchMetricsEnabled()) {
+            var profile = BatchProfile{};
+            try self.batchInternal(compatible_req, &profile, .{});
+            logBatchProfile(compatible_req, profile);
+        } else {
+            try self.batchInternal(compatible_req, null, .{});
+        }
+    }
+
     pub fn batchProfiled(self: *DB, req: types.BatchRequest, profile: *BatchProfile) anyerror!void {
         try self.batchInternal(req, profile, .{});
     }
@@ -5591,7 +5625,10 @@ pub const DB = struct {
                     resolution.txn_id,
                     resolution.status,
                     resolution.commit_version,
-                    .{ .expected_intent_revision = resolution.expected_intent_revision },
+                    .{
+                        .expected_intent_revision = resolution.expected_intent_revision,
+                        .known_intent_keys = resolution.intent_keys,
+                    },
                 );
                 self.core.unlockApply();
                 apply_mutex_held = false;
@@ -5620,6 +5657,14 @@ pub const DB = struct {
         var effective_ops = try coalesceKeyValueRequest(self, types.BatchWrite, req.writes, req.deletes, req.transforms);
         defer effective_ops.deinit(self.alloc);
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.resolve_transforms_ns, resolve_transforms_start_ns);
+
+        // Transaction intents carry primary key/value rows but not projected
+        // graph deltas. Evaluate this after transform expansion so absent
+        // non-upsert documents retain their established no-op semantics, and
+        // before any request mutation is persisted.
+        if (req.reject_graph_transform_projections and effective_ops.graph_writes.items.len != 0) {
+            return error.UnsupportedTransformOperation;
+        }
 
         const merge_effective_req_start_ns = monotonicTimeNs();
 
@@ -6276,6 +6321,7 @@ pub const DB = struct {
                     .deletes = delete_keys.items,
                     .replay = if (replay_append) |entry| .{ .sequence = entry.sequence, .payload = entry.payload } else null,
                     .expected_intent_revision = resolution.expected_intent_revision,
+                    .known_intent_keys = resolution.intent_keys,
                 },
             );
             if (outcome.applied) {
@@ -13023,6 +13069,15 @@ pub const DB = struct {
         if (manifest_sequence != reached_target) return error.IndexGenerationManifestMismatch;
         try ensureRepairActivationDeadline(activation_deadline_ns);
 
+        if (cfg.kind == .algebraic) {
+            // Certify this physical projection only after the final replay has
+            // converged under the apply fence. The marker lives in the shadow
+            // namespace, so a crash before pointer publication cannot release
+            // the active generation's lifecycle gate.
+            try shadow_manager.persistAlgebraicProjectionConfigReady(self.core.store, cfg.name);
+            try ensureRepairActivationDeadline(activation_deadline_ns);
+        }
+
         // Transfer the already-open runtime for every index family. Pointer
         // publication and in-memory handoff are allocation-free, and the
         // predecessor is retired only after service fences are released.
@@ -13063,7 +13118,6 @@ pub const DB = struct {
             .generation = final_update.generation,
             .config_hash = final_update.config_hash,
         });
-
         // The pointer and clean checkpoint are now ordered before any later
         // foreground apply. Release the write fence before operator hooks,
         // intent cleanup, and generation garbage collection. Capture the
@@ -14699,6 +14753,13 @@ pub const DB = struct {
         return try self.core.getStoreValue(alloc, public_schema_json_key);
     }
 
+    /// Refresh schema-derived algebraic index configs (notably dynamic-template
+    /// rules) in place from the given table schema JSON, so a dynamic-template
+    /// change applies to a running DB without a reopen.
+    pub fn reloadAlgebraicSchemaConfigs(self: *DB, schema_json: []const u8) !void {
+        try self.core.index_manager.reloadAlgebraicSchemaConfigs(schema_json);
+    }
+
     pub fn beginTransaction(self: *DB, timestamp_ns: u64) !transactions_mod.TxnId {
         const txn_id = makeTxnId(self);
         return try self.beginTransactionWithIdAndParticipants(txn_id, timestamp_ns, &.{});
@@ -14884,13 +14945,20 @@ pub const DB = struct {
         while (attempts < 8) : (attempts += 1) {
             var intents = try self.core.collectTransactionIntentBatch(self.alloc, txn_id);
             defer intents.deinit(self.alloc);
+            const intent_keys = try self.alloc.alloc([]const u8, intents.writes.len + intents.deletes.len);
+            defer self.alloc.free(intent_keys);
+            for (intents.writes, 0..) |write, i| intent_keys[i] = write.key;
+            for (intents.deletes, 0..) |key, i| intent_keys[intents.writes.len + i] = key;
             if (intents.writes.len == 0 and intents.deletes.len == 0) {
                 lockApply(self);
                 const outcome = self.core.resolveTransactionIntentsWithExtraBatch(
                     txn_id,
                     status,
                     commit_version,
-                    .{ .expected_intent_revision = intents.revision },
+                    .{
+                        .expected_intent_revision = intents.revision,
+                        .known_intent_keys = intent_keys,
+                    },
                 ) catch |err| {
                     self.core.unlockApply();
                     if (err == error.IntentSnapshotChanged) continue;
@@ -14916,6 +14984,7 @@ pub const DB = struct {
                     .status = status,
                     .commit_version = commit_version,
                     .expected_intent_revision = intents.revision,
+                    .intent_keys = intent_keys,
                 },
             }) catch |err| {
                 if (err == error.IntentSnapshotChanged) continue;
@@ -15225,6 +15294,9 @@ pub const DB = struct {
             pattern,
             max_results,
             return_aliases,
+            &.{},
+            false,
+            true,
             null,
         );
     }
@@ -15237,6 +15309,9 @@ pub const DB = struct {
         pattern: []const graph_pattern_mod.PatternStep,
         max_results: u32,
         return_aliases: []const []const u8,
+        target_nodes: []const graph_node_identity.Ref,
+        target_required: bool,
+        include_paths: bool,
         node_admission: ?NodeAdmission,
     ) ![]graph_pattern_mod.PatternMatch {
         if (start_keys.len == 0) return try alloc.alloc(graph_pattern_mod.PatternMatch, 0);
@@ -15245,6 +15320,9 @@ pub const DB = struct {
         return try self.core.graphMatchPattern(alloc, index_name, start_keys, pattern, .{
             .max_results = max_results,
             .return_aliases = return_aliases,
+            .target_nodes = target_nodes,
+            .target_required = target_required,
+            .include_paths = include_paths,
             .evaluator = .{
                 .ctx = &filter_ctx,
                 .func = patternNodeFilterEvaluator,
@@ -15905,6 +15983,7 @@ pub const DB = struct {
                 try deletes.append(self.alloc, resolution_key);
                 resolution_key_owned = false;
                 try appendUniqueOwnedKey(self.alloc, &changed, resolution_key);
+                try appendResolutionHandoffDeleteKey(self.alloc, &deletes, resolution_key);
             } else {
                 self.alloc.free(resolution_key);
                 resolution_key_owned = false;
@@ -15927,6 +16006,7 @@ pub const DB = struct {
             if (!containsDeleteKey(deletes.items, row.key)) {
                 try deletes.append(self.alloc, try self.alloc.dupe(u8, row.key));
                 try appendUniqueOwnedKey(self.alloc, &changed, row.key);
+                try appendResolutionHandoffDeleteKey(self.alloc, &deletes, row.key);
             }
             try self.collectResolverMentionArtifactsForDocLocked(cfg, parsed.doc_key, &deletes, &changed);
         }
@@ -16250,6 +16330,7 @@ pub const DB = struct {
         var changed: u64 = 0;
         for (self.core.index_manager.algebraic_indexes.items) |*entry| {
             changed += try entry.index.evaluateAdaptiveCandidates(self.core.store, target_sequence);
+            changed += try entry.index.evaluateHllCardinalityCandidates(self.core.store);
         }
         return changed;
     }
@@ -17418,19 +17499,27 @@ pub const DB = struct {
             const drain_resolver_replay = self.resolverReplayNeedsDrain();
             if (drain_resolver_replay) {
                 if (self.resolution_runtime) |runtime| {
-                    if (drained_sequence > 0) runtime.notifySequence(drained_sequence - 1);
+                    // nextDerivedSequence() is the highest committed sequence,
+                    // not the next append sequence. Include that record when
+                    // recovering a missed runtime notification.
+                    if (drained_sequence > 0) runtime.notifySequence(drained_sequence);
                     try runtime.catchUp();
                 }
 
                 if (self.promotion_runtime) |runtime| {
                     const latest = self.core.nextDerivedSequence();
-                    if (latest > 0) runtime.notifySequence(latest - 1);
+                    if (latest > 0) runtime.notifySequence(latest);
                     try runtime.catchUp();
                 }
 
-                if (self.resolverReplayBlockedAfterRunnableDrain()) return;
-
-                try self.runMaintenanceUntilWithOptions(self.currentMaintenanceTargetSequence(), .{}, options);
+                // Resolution can append graph/promotion replay before
+                // promotion discovers that its external sink is unavailable.
+                // Drain those independent derived consumers before reporting
+                // the blocked stage; otherwise runUntilIdle can return with a
+                // durable resolution artifact that is absent from the graph.
+                if (self.core.nextDerivedSequence() > drained_sequence) {
+                    try self.runMaintenanceUntilWithOptions(self.currentMaintenanceTargetSequence(), .{}, options);
+                }
                 if (self.resolverReplayBlockedAfterRunnableDrain()) return;
             }
 
@@ -17473,7 +17562,7 @@ pub const DB = struct {
         return more;
     }
 
-    fn runArtifactRepairMetadataMaintenanceUntilIdle(self: *DB) !void {
+    pub fn runArtifactRepairMetadataMaintenanceUntilIdle(self: *DB) !void {
         while (try self.runArtifactRepairMetadataMaintenancePass()) {}
     }
 
@@ -23275,7 +23364,7 @@ pub const DB = struct {
             if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
             return .{ .req = req };
         }
-        if (try self.searchRequestWithDirectAlgebraicDocFilterAlloc(req, &entry.index)) |direct| return direct;
+        if (try self.searchRequestWithDirectAlgebraicDocFilterAlloc(req, entry.index)) |direct| return direct;
         var filter_doc_ids: [][]u8 = &.{};
         errdefer entry.index.freeDocIds(filter_doc_ids);
         var exclude_doc_ids: [][]u8 = &.{};
@@ -23286,7 +23375,7 @@ pub const DB = struct {
         var filter_supported = req.filter_doc_ids_positive or req.filter_doc_ids.len > 0;
         var filter_bindings = std.ArrayListUnmanaged(@import("algebraic/index.zig").Index.FilterBinding).empty;
         defer {
-            for (filter_bindings.items) |*binding| binding.set.deinit(&entry.index);
+            for (filter_bindings.items) |*binding| binding.set.deinit(entry.index);
             filter_bindings.deinit(entry.index.alloc);
         }
 
@@ -23308,7 +23397,7 @@ pub const DB = struct {
                 if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
                 return .{ .req = req };
             };
-            errdefer set.deinit(&entry.index);
+            errdefer set.deinit(entry.index);
             try filter_bindings.append(entry.index.alloc, .{
                 .name = binding.name,
                 .set = set,
@@ -23319,7 +23408,7 @@ pub const DB = struct {
         if (req.filter_query_json.len > 0) {
             if (try entry.index.docIdSetForFilterJsonWithBindingsAlloc(self.core.store, req.filter_query_json, filter_bindings.items)) |set| {
                 var owned_set = set;
-                defer owned_set.deinit(&entry.index);
+                defer owned_set.deinit(entry.index);
                 if (owned_set.include) |ids| {
                     if (filter_supported) {
                         const intersected = try intersectAlgebraicDocIds(entry.index.alloc, filter_doc_ids, ids);
@@ -23343,7 +23432,7 @@ pub const DB = struct {
         if (req.exclusion_query_json.len > 0) {
             if (try entry.index.docIdSetForFilterJsonWithBindingsAlloc(self.core.store, req.exclusion_query_json, filter_bindings.items)) |set| {
                 var owned_set = set;
-                defer owned_set.deinit(&entry.index);
+                defer owned_set.deinit(entry.index);
                 if (owned_set.include) |ids| {
                     const merged = try unionAlgebraicDocIds(entry.index.alloc, exclude_doc_ids, ids);
                     entry.index.freeDocIds(exclude_doc_ids);
@@ -23388,7 +23477,7 @@ pub const DB = struct {
         entry.index.recordVectorFilterResolved(filter_doc_ids.len, exclude_doc_ids.len);
         return .{
             .req = next,
-            .index = &entry.index,
+            .index = entry.index,
             .filter_doc_ids = filter_doc_ids,
             .exclude_doc_ids = exclude_doc_ids,
             .resolved_doc_filter = resolved_filter,
@@ -24740,15 +24829,20 @@ pub const DB = struct {
         alloc: Allocator,
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
+        target_nodes: []const graph_node_identity.Ref,
     ) anyerror![]graph_pattern_mod.PatternMatch {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.matchPattern(
+        return try self.matchPatternWithNodeAdmission(
             alloc,
             named.query.index_name,
             start_key_refs,
             named.query.pattern,
             named.query.params.max_results,
             named.query.return_aliases,
+            target_nodes,
+            named.query.target_nodes != null,
+            named.query.params.include_paths,
+            null,
         );
     }
 
@@ -24757,6 +24851,7 @@ pub const DB = struct {
         alloc: Allocator,
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
+        target_nodes: []const graph_node_identity.Ref,
     ) anyerror![]graph_pattern_mod.PatternMatch {
         const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try execution.db.matchPatternWithNodeAdmission(
@@ -24766,6 +24861,9 @@ pub const DB = struct {
             named.query.pattern,
             named.query.params.max_results,
             named.query.return_aliases,
+            target_nodes,
+            named.query.target_nodes != null,
+            named.query.params.include_paths,
             execution.admission.iface(),
         );
     }
@@ -25985,6 +26083,20 @@ fn containsDeleteKey(list: []const []const u8, key: []const u8) bool {
         if (std.mem.eql(u8, existing, key)) return true;
     }
     return false;
+}
+
+fn appendResolutionHandoffDeleteKey(
+    alloc: Allocator,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    resolution_key: []const u8,
+) !void {
+    const handoff_key = try resolution_handoff.keyAlloc(alloc, resolution_key);
+    errdefer alloc.free(handoff_key);
+    if (containsDeleteKey(deletes.items, handoff_key)) {
+        alloc.free(handoff_key);
+        return;
+    }
+    try deletes.append(alloc, handoff_key);
 }
 
 fn overwriteProbeLessThan(_: void, lhs: OverwriteProbeEntry, rhs: OverwriteProbeEntry) bool {
@@ -33370,7 +33482,19 @@ fn appendReplicatedHADerivedEffectContext(ctx: *const BatchExecutionContext, rec
 }
 
 fn encodeChangeRecordPayload(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch, sequence: u64) ![]u8 {
-    var record = try change_journal_mod.recordFromDerivedBatch(ctx.alloc, batch, sequence);
+    return try encodeChangeRecordPayloadWithTargetHints(ctx, batch, sequence, null);
+}
+
+fn encodeChangeRecordPayloadWithTargetHints(
+    ctx: *const BatchExecutionContext,
+    batch: derived_types.DerivedBatch,
+    sequence: u64,
+    target_hints: ?[]const change_journal_mod.TargetHint,
+) ![]u8 {
+    var record = if (target_hints) |hints|
+        try change_journal_mod.recordFromDerivedBatchWithTargetHints(ctx.alloc, batch, sequence, hints)
+    else
+        try change_journal_mod.recordFromDerivedBatch(ctx.alloc, batch, sequence);
     defer change_journal_mod.deinitRecord(ctx.alloc, &record);
     return try change_journal_mod.encodeRecord(ctx.alloc, record);
 }
@@ -33404,6 +33528,27 @@ fn haMutationBarrierFromContext(ctx: *const BatchExecutionContext) ?*HAMutationB
 fn acquireHAMutationSharedContext(ctx: *const BatchExecutionContext) ?HAMutationBarrier.SharedLease {
     const barrier = haMutationBarrierFromContext(ctx) orelse return null;
     return barrier.acquireShared();
+}
+
+fn haTransitionMutexFromContext(ctx: *const BatchExecutionContext) ?*std.atomic.Mutex {
+    var transition_mutex: ?*std.atomic.Mutex = null;
+    const mirrors = .{
+        ctx.ha_async_effect_mirror,
+        ctx.ha_async_batch_mirror,
+        ctx.ha_async_metadata_mirror,
+    };
+    inline for (mirrors) |maybe_mirror| {
+        if (maybe_mirror) |mirror| {
+            if (mirror.transition_mutex) |candidate| {
+                if (transition_mutex) |configured| {
+                    std.debug.assert(configured == candidate);
+                } else {
+                    transition_mutex = candidate;
+                }
+            }
+        }
+    }
+    return transition_mutex;
 }
 
 fn mirrorHAReplayPayloadBestEffortContext(ctx: *const BatchExecutionContext, payload: []const u8) void {
@@ -33999,6 +34144,7 @@ fn beginDenseCatchUpSessionTracked(ctx: *AsyncContext, index_name: []const u8) !
     ctx.stats.dense_catch_up.active.store(1, .monotonic);
     ctx.stats.dense_catch_up.phase.store(@intFromEnum(types.DenseCatchUpStats.Phase.replay), .monotonic);
     _ = ctx.active_dense_catch_up_sessions.fetchAdd(1, .release);
+    if (ctx.resource_manager) |manager| manager.beginLatencySensitiveDerivedReplay();
 }
 
 fn finishDenseCatchUpSessionLocked(ctx: *AsyncContext, index_name: []const u8) bool {
@@ -34008,6 +34154,7 @@ fn finishDenseCatchUpSessionLocked(ctx: *AsyncContext, index_name: []const u8) b
         return false;
     }
     ctx.active_dense_catch_up_sessions.store(active - 1, .release);
+    if (ctx.resource_manager) |manager| manager.finishLatencySensitiveDerivedReplay();
     if (active == 1) {
         ctx.stats.dense_catch_up.active.store(0, .monotonic);
         ctx.stats.dense_catch_up.phase.store(@intFromEnum(types.DenseCatchUpStats.Phase.idle), .monotonic);
@@ -34303,8 +34450,11 @@ fn noteTargetAdvanceRepairRun(ctx: *AsyncContext, index_name: []const u8, now_ns
 
 test "async context dense catch-up session tracking suppresses local bulk sessions" {
     var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{});
+    defer resource_manager.deinit(std.testing.allocator);
     var ctx = AsyncContext{
         .alloc = std.testing.allocator,
+        .resource_manager = &resource_manager,
         .store = undefined,
         .index_manager = undefined,
         .apply_mutex = &apply_mutex,
@@ -34318,6 +34468,7 @@ test "async context dense catch-up session tracking suppresses local bulk sessio
     try std.testing.expectEqual(@as(u32, 1), ctx.active_dense_catch_up_sessions.load(.monotonic));
     try std.testing.expect(ctx.stats.dense_catch_up.active.load(.monotonic) != 0);
     try std.testing.expect(asyncContextHasActiveDenseBulkWork(&ctx));
+    try std.testing.expect(resource_manager.shouldDeferSoftCompactionForDerivedReplay());
     try std.testing.expect(ctx.text_merge_deferred.load(.acquire));
     try std.testing.expect(shouldDeferAppliedSequenceFlush(&ctx, false));
     try std.testing.expect(!shouldDeferAppliedSequenceFlush(&ctx, true));
@@ -34327,6 +34478,9 @@ test "async context dense catch-up session tracking suppresses local bulk sessio
     try std.testing.expectEqual(@as(u32, 0), ctx.active_dense_catch_up_sessions.load(.monotonic));
     try std.testing.expect(ctx.stats.dense_catch_up.active.load(.monotonic) == 0);
     try std.testing.expect(!ctx.text_merge_deferred.load(.acquire));
+    // Session-owned deferral has ended, but the short quiet period still
+    // protects the just-completed publication from an immediate soft rewrite.
+    try std.testing.expect(resource_manager.shouldDeferSoftCompactionForDerivedReplay());
     try std.testing.expect(!shouldDeferAppliedSequenceFlush(&ctx, false));
     try std.testing.expect(denseApplyUsesLocalStreamingSession(&ctx, "vec"));
 
@@ -34582,6 +34736,324 @@ fn appendDerivedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.De
     }
 
     var applied_batch = batch;
+    applied_batch.sequence = sequence;
+    try applyDerivedBatchContext(&batch_ctx, applied_batch);
+    return sequence;
+}
+
+const ResolutionHandoffDocStoreSink = struct {
+    store: *docstore_mod.DocStore,
+
+    fn write(self: *@This(), writes: []const docstore_mod.KVPair, deletes: []const []const u8) !void {
+        try self.store.putBatch(writes, deletes);
+    }
+};
+
+fn publishResolutionHandoffContext(
+    ctx: *const BatchExecutionContext,
+    write: resolution_runtime_mod.RecordWrite,
+) !void {
+    var sink = ResolutionHandoffDocStoreSink{ .store = ctx.store };
+    try publishResolutionHandoffContextWithSink(ctx, write, &sink);
+}
+
+fn publishResolutionHandoffContextWithSink(
+    ctx: *const BatchExecutionContext,
+    write: resolution_runtime_mod.RecordWrite,
+    sink: anytype,
+) !void {
+    if (!write.publish_resolution_handoff) return;
+    const marker_count = write.artifact_writes.len + write.artifact_deletes.len;
+    if (marker_count == 0) return;
+
+    const marker_keys = try ctx.alloc.alloc([]u8, marker_count);
+    var marker_keys_initialized: usize = 0;
+    defer {
+        for (marker_keys[0..marker_keys_initialized]) |key| ctx.alloc.free(key);
+        ctx.alloc.free(marker_keys);
+    }
+    const marker_values = try ctx.alloc.alloc(resolution_handoff.Value, write.artifact_writes.len);
+    defer ctx.alloc.free(marker_values);
+    const marker_writes = try ctx.alloc.alloc(docstore_mod.KVPair, write.artifact_writes.len);
+    defer ctx.alloc.free(marker_writes);
+    const marker_deletes = try ctx.alloc.alloc([]const u8, write.artifact_deletes.len);
+    defer ctx.alloc.free(marker_deletes);
+
+    for (write.artifact_writes, 0..) |artifact, i| {
+        marker_keys[i] = try resolution_handoff.keyAlloc(ctx.alloc, artifact.key);
+        marker_keys_initialized += 1;
+        marker_values[i] = resolution_handoff.value(artifact.value);
+        marker_writes[i] = .{ .key = marker_keys[i], .value = &marker_values[i] };
+    }
+    for (write.artifact_deletes, 0..) |artifact_key, i| {
+        const marker_index = write.artifact_writes.len + i;
+        marker_keys[marker_index] = try resolution_handoff.keyAlloc(ctx.alloc, artifact_key);
+        marker_keys_initialized += 1;
+        marker_deletes[i] = marker_keys[marker_index];
+    }
+
+    // Match the established apply -> transition lock order. The encompassing
+    // resolution writer still owns the HA mutation lease; the final gate check
+    // makes marker publication linearizable with a primary-role fence, while a
+    // single metadata batch preserves backfill throughput.
+    ctx.apply_mutex.lockExclusive();
+    defer ctx.apply_mutex.unlockExclusive();
+    const transition_mutex = haTransitionMutexFromContext(ctx);
+    if (transition_mutex) |mutex| lockAtomic(mutex);
+    defer if (transition_mutex) |mutex| mutex.unlock();
+    try enforceHAWriteGateOptional(ctx.ha_write_gate);
+    try sink.write(marker_writes, marker_deletes);
+}
+
+test "db resolution handoff completion publishes fanout in one metadata batch" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+    });
+    defer db.close();
+    var batch_ctx = db.batchContext();
+
+    const CountingSink = struct {
+        store: *docstore_mod.DocStore,
+        calls: usize = 0,
+        writes: usize = 0,
+        deletes: usize = 0,
+
+        fn write(self: *@This(), writes: []const docstore_mod.KVPair, deletes: []const []const u8) !void {
+            self.calls += 1;
+            self.writes += writes.len;
+            self.deletes += deletes.len;
+            try self.store.putBatch(writes, deletes);
+        }
+    };
+    var counting_sink = CountingSink{ .store = batch_ctx.store };
+
+    const first_resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(first_resolution_key);
+    const second_resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:b", "resolution_v1");
+    defer alloc.free(second_resolution_key);
+    const writes = [_]resolution_runtime_mod.ArtifactWrite{
+        .{ .key = first_resolution_key, .value = "{\"entities\":[\"a\"]}" },
+        .{ .key = second_resolution_key, .value = "{\"entities\":[\"b\"]}" },
+    };
+    try publishResolutionHandoffContextWithSink(&batch_ctx, .{
+        .batch = .{},
+        .artifact_writes = &writes,
+        .publish_resolution_handoff = true,
+    }, &counting_sink);
+    try std.testing.expectEqual(@as(usize, 1), counting_sink.calls);
+    try std.testing.expectEqual(@as(usize, 2), counting_sink.writes);
+    try std.testing.expectEqual(@as(usize, 0), counting_sink.deletes);
+
+    const first_marker_key = try resolution_handoff.keyAlloc(alloc, first_resolution_key);
+    defer alloc.free(first_marker_key);
+    const second_marker_key = try resolution_handoff.keyAlloc(alloc, second_resolution_key);
+    defer alloc.free(second_marker_key);
+    for (writes, [_][]const u8{ first_marker_key, second_marker_key }) |artifact, marker_key| {
+        const raw = try db.core.store.get(alloc, marker_key);
+        defer alloc.free(raw);
+        const expected = resolution_handoff.value(artifact.value);
+        try std.testing.expectEqualSlices(u8, &expected, raw);
+    }
+}
+
+test "storage.ha resolution handoff fence rejects completion after durable HA replay" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.heap.c_allocator;
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 271,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+
+    var public_gate = ha_public_gate_state_mod.State{};
+    public_gate.configurePrimary(&primary, false);
+    var transition_mutex: std.atomic.Mutex = .unlocked;
+    var barrier: HAMutationBarrier = .{};
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
+        .ha_async_effect_mirror = .{
+            .primary = &primary,
+            .mutation_barrier = &barrier,
+            .transition_mutex = &transition_mutex,
+        },
+        .ha_write_gate = .{ .shared = .{ .state = &public_gate } },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    const PauseBeforePublish = struct {
+        io: std.Io,
+        entered: std.atomic.Value(bool) = .init(false),
+        reached: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered.store(true, .release);
+            self.reached.set(self.io);
+            self.release.waitUncancelable(self.io);
+        }
+    };
+    const WriteProbe = struct {
+        ctx: *EnrichmentAppendContext,
+        resolution_key: []const u8,
+        pause: *PauseBeforePublish,
+        result: std.atomic.Value(u8) = .init(0),
+
+        fn run(self: *@This()) void {
+            // Also wake the test if the writer fails before entering the hook,
+            // so a real regression reports its assertion instead of hanging.
+            defer self.pause.reached.set(self.pause.io);
+            const writes = [_]resolution_runtime_mod.ArtifactWrite{.{
+                .key = self.resolution_key,
+                .value = "{\"entities\":[\"durable\"]}",
+            }};
+            _ = appendResolutionRecordWithHook(self.ctx, .{
+                .batch = .{ .changed_artifact_keys = &.{self.resolution_key} },
+                .artifact_writes = &writes,
+                .publish_resolution_handoff = true,
+            }, ResolutionHandoffPublishHook{
+                .ptr = self.pause,
+                .run_fn = PauseBeforePublish.run,
+            }) catch |err| {
+                self.result.store(if (err == error.HAFencedPrimary) 1 else 2, .release);
+                return;
+            };
+            self.result.store(3, .release);
+        }
+    };
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:fenced", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const marker_key = try resolution_handoff.keyAlloc(alloc, resolution_key);
+    defer alloc.free(marker_key);
+    var pause = PauseBeforePublish{ .io = std.testing.io };
+    var probe = WriteProbe{
+        .ctx = db.resolution_append_context.?,
+        .resolution_key = resolution_key,
+        .pause = &pause,
+    };
+    const thread = try std.Thread.spawn(.{}, WriteProbe.run, .{&probe});
+    var thread_joined = false;
+    errdefer {
+        pause.release.set(pause.io);
+        if (!thread_joined) thread.join();
+    }
+
+    pause.reached.waitUncancelable(pause.io);
+    try std.testing.expect(pause.entered.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+    try std.testing.expectEqual(@as(u64, 1), db.core.nextDerivedSequence());
+    const artifact = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(artifact);
+    try std.testing.expectEqualStrings("{\"entities\":[\"durable\"]}", artifact);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, marker_key));
+    // The hook runs inside appendResolutionRecord's shared mutation lease.
+    try std.testing.expect(barrier.tryAcquireExclusive() == null);
+
+    lockAtomic(&transition_mutex);
+    public_gate.publishPrimaryFence(true);
+    pause.release.set(pause.io);
+    transition_mutex.unlock();
+    thread.join();
+    thread_joined = true;
+
+    try std.testing.expectEqual(@as(u8, 1), probe.result.load(.acquire));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, marker_key));
+    var capture = barrier.tryAcquireExclusive() orelse return error.TestExpectedEqual;
+    capture.release();
+}
+
+const ResolutionHandoffPublishHook = struct {
+    ptr: *anyopaque,
+    run_fn: *const fn (ptr: *anyopaque) void,
+
+    fn run(self: @This()) void {
+        self.run_fn(self.ptr);
+    }
+};
+
+const NoopResolutionHandoffPublishHook = struct {
+    fn run(_: @This()) void {}
+};
+
+fn appendResolutionRecord(ctx_ptr: *anyopaque, write: resolution_runtime_mod.RecordWrite) !u64 {
+    return try appendResolutionRecordWithHook(ctx_ptr, write, NoopResolutionHandoffPublishHook{});
+}
+
+fn appendResolutionRecordWithHook(
+    ctx_ptr: *anyopaque,
+    write: resolution_runtime_mod.RecordWrite,
+    before_handoff_publish: anytype,
+) !u64 {
+    const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
+    if (write.artifact_writes.len == 0 and write.artifact_deletes.len == 0 and write.target_hints == null) {
+        return appendDerivedBatchFromEnrichment(ctx_ptr, write.batch);
+    }
+
+    var batch_ctx = ctx.batchContext();
+    var ha_mutation = acquireHAMutationSharedContext(&batch_ctx);
+    defer if (ha_mutation) |*lease| lease.release();
+    try enforceHAWriteGateOptional(batch_ctx.ha_write_gate);
+
+    const store_writes = try batch_ctx.alloc.alloc(docstore_mod.KVPair, write.artifact_writes.len);
+    defer batch_ctx.alloc.free(store_writes);
+    for (write.artifact_writes, 0..) |artifact, i| {
+        store_writes[i] = .{ .key = artifact.key, .value = artifact.value };
+    }
+
+    batch_ctx.apply_mutex.lockExclusive();
+    var apply_mutex_held = true;
+    errdefer if (apply_mutex_held) batch_ctx.apply_mutex.unlockExclusive();
+    const sequence = batch_ctx.store.reserveNextReplaySequence(1);
+    const payload = try encodeChangeRecordPayloadWithTargetHints(
+        &batch_ctx,
+        write.batch,
+        sequence,
+        write.target_hints,
+    );
+    defer batch_ctx.alloc.free(payload);
+    try batch_ctx.store.putBatchWithReplay(batch_ctx.io, store_writes, write.artifact_deletes, .{
+        .sequence = sequence,
+        .payload = payload,
+    });
+    if (shouldAppendSplitDeltaForContext(&batch_ctx)) {
+        try batch_ctx.shard_manager.appendSplitDelta(currentTimeNs(), store_writes, write.artifact_deletes);
+    }
+    batch_ctx.apply_mutex.unlockExclusive();
+    apply_mutex_held = false;
+
+    try mirrorHAReplayPayloadCommitContext(&batch_ctx, payload);
+    before_handoff_publish.run();
+    try publishResolutionHandoffContext(&batch_ctx, write);
+    batch_ctx.executor.trackBacklogBytes(sequence, @intCast(payload.len)) catch {};
+    notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
+    if (ctx.executor.hasWorkers()) {
+        ctx.executor.forceSequence(sequence);
+        return sequence;
+    }
+
+    var applied_batch = write.batch;
     applied_batch.sequence = sequence;
     try applyDerivedBatchContext(&batch_ctx, applied_batch);
     return sequence;
@@ -44003,10 +44475,11 @@ test "db open borrows shared backend runtime" {
     try std.testing.expect(first.backend_owner_id != 0);
     try std.testing.expect(second.backend_owner_id != 0);
     try std.testing.expect(first.backend_owner_id != second.backend_owner_id);
-    // Each DB owns one backend lane and one repair/cleanup lane. Generation
-    // retirement uses the runtime-wide cleanup owner instead.
+    // Each DB owns a backend lane, a repair/cleanup lane, and an algebraic HLL
+    // maintenance lane. Generation retirement uses the runtime-wide cleanup
+    // owner instead.
     try std.testing.expectEqual(
-        second.repair_cleanup_owner_id + 1,
+        second.algebraic_hll_owner_id + 1,
         try runtime.ptr().allocOwnerId(),
     );
 }
@@ -49039,14 +49512,17 @@ test "db backfills a mention name embedding so ann/cosine resolution links end-t
     try std.testing.expectEqualStrings("person/ada_lovelace", edges[0].target);
 }
 
-test "db resolves extracted entities into a resolution artifact end-to-end" {
+test "db runUntilIdle catches resolution up to the committed tail after a missed notification" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+    });
     defer db.close();
 
     // A graph index drives production of the relations_v1 asset (extraction)
@@ -49081,6 +49557,15 @@ test "db resolves extracted entities into a resolution artifact end-to-end" {
         },
         .sync_level = .enrichments,
     });
+
+    // Runtime notifications are wake-up optimizations, not correctness
+    // state. Simulate losing the notification after the source artifact was
+    // committed; runUntilIdle must recover from the durable replay tail.
+    const resolution_runtime = db.resolution_runtime.?;
+    resolution_runtime.target_sequence.store(
+        resolution_runtime.applied_sequence.load(.acquire),
+        .release,
+    );
     try db.runUntilIdle();
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
@@ -49382,6 +49867,12 @@ const FakePromotionSink = struct {
             if (std.mem.eql(u8, u.key, key)) return u.doc;
         }
         return null;
+    }
+
+    fn count(self: *FakePromotionSink) usize {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        return self.upserts.items.len;
     }
 };
 
@@ -49734,12 +50225,19 @@ test "db materializes doc->entity mention edges as provenance and clears them on
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
     defer alloc.free(resolution_key);
+    const resolution_handoff_key = try resolution_handoff.keyAlloc(alloc, resolution_key);
+    defer alloc.free(resolution_handoff_key);
     {
         const raw = try db.core.store.get(alloc, resolution_key);
         defer alloc.free(raw);
         try std.testing.expect(std.mem.indexOf(u8, raw, "\"decision\":\"new\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, raw, "person/ada_lovelace") != null);
         try std.testing.expect(std.mem.indexOf(u8, raw, "org/antfly") != null);
+    }
+    {
+        const raw = try db.core.store.get(alloc, resolution_handoff_key);
+        defer alloc.free(raw);
+        try std.testing.expectEqual(@sizeOf(resolution_handoff.Value), raw.len);
     }
 
     const ada_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "prov_graph", "mentions", "person/ada_lovelace");
@@ -49797,6 +50295,7 @@ test "db materializes doc->entity mention edges as provenance and clears them on
         try std.testing.expectEqual(@as(usize, 0), inbound.len);
     }
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, ada_mention_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_handoff_key));
 }
 
 test "db resolver removal retires resolution artifacts and mention graph state" {
@@ -49857,10 +50356,17 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
     defer alloc.free(resolution_key);
+    const resolution_handoff_key = try resolution_handoff.keyAlloc(alloc, resolution_key);
+    defer alloc.free(resolution_handoff_key);
     {
         const raw = try db.core.store.get(alloc, resolution_key);
         defer alloc.free(raw);
         try std.testing.expect(std.mem.indexOf(u8, raw, "person/ada_lovelace") != null);
+    }
+    {
+        const raw = try db.core.store.get(alloc, resolution_handoff_key);
+        defer alloc.free(raw);
+        try std.testing.expectEqual(@sizeOf(resolution_handoff.Value), raw.len);
     }
 
     const graph_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "prov_graph", "mentions", "person/ada_lovelace");
@@ -49913,6 +50419,7 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
     try std.testing.expectEqual(@as(usize, 0), resolvers.len);
 
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_handoff_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, graph_edge_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, mention_artifact_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, second_mention_artifact_key));
@@ -49938,6 +50445,8 @@ test "db does not materialize review-band resolution as canonical mention edges"
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
+    // Keep production workers enabled: this is the regression for the original
+    // race between background resolver catch-up and the runUntilIdle fence.
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
@@ -50014,7 +50523,9 @@ test "db does not materialize review-band resolution as canonical mention edges"
     try std.testing.expectEqualStrings("match", curated_ent.get("decision").?.string);
     try std.testing.expectEqualStrings("person/ada_lovelace", curated_ent.get("doc_ref").?.object.get("key").?.string);
 
-    const curated_edges = try waitForGraphEdges(alloc, &db, "prov_graph", "doc:a", "mentions", .out, 1);
+    // runUntilIdle is the lifecycle fence: a blocked promotion sink must not
+    // prevent the independent graph consumer from publishing this edge.
+    const curated_edges = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
     defer graph_mod.GraphIndex.freeEdges(alloc, curated_edges);
     try std.testing.expectEqual(@as(usize, 1), curated_edges.len);
     try std.testing.expectEqualStrings("person/ada_lovelace", curated_edges[0].target);
@@ -50027,8 +50538,14 @@ test "db mention edge weight is fused from extractor trust and mention confidenc
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+    });
     defer db.close();
+    var promotion_sink = FakePromotionSink{ .alloc = alloc };
+    defer promotion_sink.deinit();
+    db.setEntitySink(promotion_sink.sink());
 
     try db.addIndex(.{
         .name = "prov_graph",
@@ -50066,12 +50583,43 @@ test "db mention edge weight is fused from extractor trust and mention confidenc
     });
     try db.runUntilIdle();
 
-    const out = try waitForGraphEdges(alloc, &db, "prov_graph", "doc:a", "mentions", .out, 1);
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const initial_resolution = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(initial_resolution);
+
+    const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
     defer graph_mod.GraphIndex.freeEdges(alloc, out);
     try std.testing.expectEqual(@as(usize, 1), out.len);
     try std.testing.expectEqualStrings("person/ada_lovelace", out[0].target);
     // Calibrated weight, not the legacy 1.0.
     try std.testing.expectApproxEqAbs(@as(f64, 0.72), out[0].weight, 1e-9);
+    try std.testing.expectEqual(@as(usize, 1), promotion_sink.count());
+
+    // Mention confidence belongs to the source extraction, not the resolution
+    // decision. The resolution bytes therefore stay unchanged, but replay must
+    // still reconcile the source-dependent graph weight.
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace","confidence":0.4}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const updated_resolution = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(updated_resolution);
+    try std.testing.expectEqualStrings(initial_resolution, updated_resolution);
+
+    const updated = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, updated);
+    try std.testing.expectEqual(@as(usize, 1), updated.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.36), updated[0].weight, 1e-9);
+    try std.testing.expectEqual(@as(usize, 1), promotion_sink.count());
+    try std.testing.expect(!db.pendingWorkStats().promotion.blocked);
 }
 
 test "db rewriteEntityEdges repoints provenance edges to a merge survivor" {
@@ -61105,30 +61653,12 @@ test "db preflightSearchRequest validates live lane bindings" {
     try std.testing.expectError(error.InvalidArgument, db.preflightSearchRequest(alloc, .{
         .graph_queries = &.{
             .{
-                .name = "pattern_with_target",
-                .query = .{
-                    .query_type = .pattern,
-                    .index_name = "graph_v1",
-                    .start_nodes = .{ .keys = &.{"doc:a"} },
-                    .target_nodes = .{ .keys = &.{"doc:b"} },
-                    .pattern = &.{
-                        .{
-                            .alias = "src",
-                            .edge = .{},
-                        },
-                    },
-                },
-            },
-        },
-    }, 0));
-    try std.testing.expectError(error.InvalidArgument, db.preflightSearchRequest(alloc, .{
-        .graph_queries = &.{
-            .{
                 .name = "pattern_missing_type",
                 .query = .{
                     .query_type = .pattern,
                     .index_name = "graph_v1",
                     .start_nodes = .{ .keys = &.{"doc:a"} },
+                    .target_nodes = .{ .keys = &.{"doc:b"} },
                     .pattern = &.{
                         .{
                             .alias = "src",
@@ -61160,6 +61690,7 @@ test "db preflightSearchRequest validates live lane bindings" {
                     .query_type = .pattern,
                     .index_name = "graph_v1",
                     .start_nodes = .{ .keys = &.{"doc:a"} },
+                    .target_nodes = .{ .keys = &.{"doc:b"} },
                     .pattern = &.{
                         .{
                             .alias = "src",
@@ -70718,6 +71249,54 @@ test "db managed vector admission durably seeds missing enrichment artifacts" {
     try std.testing.expect(db.core.index_manager.repairUnavailable("semantic_idx"));
 }
 
+test "db managed algebraic admission builds and reopens requires generation marker" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const cfg = types.IndexConfig{
+        .name = "analytics_idx",
+        .kind = .algebraic,
+        .config_json =
+        \\{"version":1,"table":"docs","capability_lifecycle_status":"rebuild_required","dynamic_rules_backfill_pending":true,"group_fields":[{"name":"category","path":"category","type":"string"}],"dynamic_field_rules":[{"name":"ids","match":"*_id","type":"string"}],"materializations":[]}
+        ,
+    };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.addIndex(cfg);
+        try db.core.saveProjectionCheckpoint(cfg.name, .{
+            .status = .clean,
+            .generation = 9,
+            .config_hash = types.indexConfigHash(cfg),
+        });
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+    const active = reopened.core.index_manager.algebraicIndex(cfg.name) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!active.index.projectionConfigReady());
+    try std.testing.expect(!active.index.plannerLifecycleReady());
+    try std.testing.expect(active.index.resolveField("user_id", .group) == null);
+}
+
+// Functional repair tests verify durable construction, activation, and reopen,
+// not the production reader-pause SLA. A contended CI worker can exhaust the
+// 250 ms production window, which correctly persists retry backoff that these
+// synchronous completion loops do not wait out.
+const repair_completion_test_options = types.ArtifactRepairRunOptions{
+    .max_activation_pause_ms = 5_000,
+};
+
 test "db managed algebraic admission builds and reopens an isolated generation" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -70728,7 +71307,7 @@ test "db managed algebraic admission builds and reopens an isolated generation" 
         .name = "analytics_idx",
         .kind = .algebraic,
         .config_json =
-        \\{"version":1,"table":"docs","group_fields":[{"name":"category","path":"category","type":"string"}],"materializations":[]}
+        \\{"version":1,"table":"docs","capability_lifecycle_status":"rebuild_required","dynamic_rules_backfill_pending":true,"group_fields":[{"name":"category","path":"category","type":"string"}],"dynamic_field_rules":[{"name":"ids","match":"*_id","type":"string"}],"materializations":[]}
         ,
     };
     var active_namespace: []u8 = undefined;
@@ -70749,15 +71328,18 @@ test "db managed algebraic admission builds and reopens an isolated generation" 
         try std.testing.expect(try db.hasPendingIndexRepairIntents(alloc));
         const canonical = db.core.index_manager.algebraicIndex(cfg.name) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqualStrings("canonical/analytics_idx", canonical.index.storageNamespace());
+        try std.testing.expect(!canonical.index.plannerLifecycleReady());
+        try std.testing.expect(canonical.index.resolveField("user_id", .group) == null);
 
         var repaired = false;
         for (0..16) |_| {
-            const step = try db.advanceIndexRepairIntent(alloc, repair_id, .{});
+            const step = try db.advanceIndexRepairIntent(alloc, repair_id, repair_completion_test_options);
             if (step.repaired) {
                 repaired = true;
                 break;
             }
             try std.testing.expect(!step.terminal);
+            try std.testing.expectEqual(@as(u64, 0), step.next_retry_at_ms);
         }
         try std.testing.expect(repaired);
         try std.testing.expect(!db.core.index_manager.repairUnavailable(cfg.name));
@@ -70765,6 +71347,8 @@ test "db managed algebraic admission builds and reopens an isolated generation" 
 
         const active = db.core.index_manager.algebraicIndex(cfg.name) orelse return error.TestUnexpectedResult;
         try std.testing.expect(std.mem.startsWith(u8, active.index.storageNamespace(), ".repair-shadow-"));
+        try std.testing.expect(active.index.plannerLifecycleReady());
+        try std.testing.expect(active.index.resolveField("user_id", .group) != null);
         active_namespace = try alloc.dupe(u8, active.index.storageNamespace());
         var resolved = (try active.index.resolvedDocFilterForFilterJsonAlloc(
             db.core.store,
@@ -70786,6 +71370,8 @@ test "db managed algebraic admission builds and reopens an isolated generation" 
     defer reopened.close();
     const active = reopened.core.index_manager.algebraicIndex(cfg.name) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(active_namespace, active.index.storageNamespace());
+    try std.testing.expect(active.index.plannerLifecycleReady());
+    try std.testing.expect(active.index.resolveField("user_id", .group) != null);
     var resolved = (try active.index.resolvedDocFilterForFilterJsonAlloc(
         reopened.core.store,
         "{\"term\":{\"category\":\"tools\"}}",
@@ -70818,13 +71404,6 @@ test "db algebraic generation build yields and resumes from its durable source c
         }
     };
     var yield_token: u8 = 0;
-    const resume_options = types.ArtifactRepairRunOptions{
-        // This test covers durable cursor yield/resume, not the production
-        // activation pause SLA. Give contended CI hosts enough headroom so an
-        // activation timeout cannot arm retry backoff between immediate test
-        // attempts and masquerade as a failure to resume the saved cursor.
-        .max_activation_pause_ms = 5_000,
-    };
     var repair_id: u128 = 0;
     {
         var db = try DB.open(alloc, std.mem.span(path), .{
@@ -70841,7 +71420,7 @@ test "db algebraic generation build yields and resumes from its durable source c
             .sync_level = .write,
         });
         repair_id = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
-        var yield_options = resume_options;
+        var yield_options = repair_completion_test_options;
         yield_options.yield_check = .{ .ptr = &yield_token, .is_requested = Yield.requested };
         const first = try db.advanceIndexRepairIntent(alloc, repair_id, yield_options);
         try std.testing.expect(first.attempted);
@@ -70875,12 +71454,13 @@ test "db algebraic generation build yields and resumes from its durable source c
     try std.testing.expectEqual(repair_id, (try reopened.indexRepairIdForIndex(alloc, cfg.name)).?);
     var repaired = false;
     for (0..16) |_| {
-        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, resume_options);
+        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, repair_completion_test_options);
         if (step.repaired) {
             repaired = true;
             break;
         }
         try std.testing.expect(!step.terminal);
+        try std.testing.expectEqual(@as(u64, 0), step.next_retry_at_ms);
     }
     try std.testing.expect(repaired);
     const active = reopened.core.index_manager.algebraicIndex(cfg.name) orelse return error.TestUnexpectedResult;
@@ -70957,12 +71537,13 @@ test "db forced algebraic repair persists an operator generation intent before e
     try std.testing.expectEqual(repair_id, (try reopened.indexRepairIdForIndex(alloc, cfg.name)).?);
     var repaired = false;
     for (0..16) |_| {
-        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
+        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, repair_completion_test_options);
         if (step.repaired) {
             repaired = true;
             break;
         }
         try std.testing.expect(!step.terminal);
+        try std.testing.expectEqual(@as(u64, 0), step.next_retry_at_ms);
     }
     try std.testing.expect(repaired);
     try std.testing.expect((try reopened.indexRepairIdForIndex(alloc, cfg.name)) == null);
@@ -71025,12 +71606,13 @@ test "db algebraic post-commit activation crash recovers through generation repa
         return error.TestUnexpectedResult;
     var repaired = false;
     for (0..16) |_| {
-        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
+        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, repair_completion_test_options);
         if (step.repaired) {
             repaired = true;
             break;
         }
         try std.testing.expect(!step.terminal);
+        try std.testing.expectEqual(@as(u64, 0), step.next_retry_at_ms);
     }
     try std.testing.expect(repaired);
     try std.testing.expect(!reopened.core.index_manager.repairUnavailable(cfg.name));
@@ -71120,12 +71702,13 @@ test "db managed full text admission survives restart without in-place backfill"
 
     var repaired = false;
     for (0..16) |_| {
-        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
+        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, repair_completion_test_options);
         if (step.repaired) {
             repaired = true;
             break;
         }
         try std.testing.expect(!step.terminal);
+        try std.testing.expectEqual(@as(u64, 0), step.next_retry_at_ms);
     }
     try std.testing.expect(repaired);
     try std.testing.expect(!try reopened.hasPendingIndexRepairIntents(alloc));

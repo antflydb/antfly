@@ -216,6 +216,11 @@ pub const BatchRequest = struct {
     predicates: []const TransactionVersionPredicate = &.{},
     timestamp_ns: u64 = 0,
     sync_level: SyncLevel = .write,
+    /// Internal single-participant transaction contract. Transform expansion
+    /// still runs under the DB apply lock, but the batch is rejected before
+    /// mutation if it would emit graph projection deltas that the distributed
+    /// transaction intent format cannot represent.
+    reject_graph_transform_projections: bool = false,
     /// Internal data-Raft transition state. Public batch parsing never sets it.
     split_checkpoint: ?SplitReplicationCheckpoint = null,
     /// Internal identity context for writes to an unpublished split destination.

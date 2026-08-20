@@ -19,6 +19,7 @@ pub const Routes = struct {
     pub const snapshot_upload = "/raft/v1/snapshot/upload";
     pub const snapshot_fetch = "/raft/v1/snapshot/fetch";
     pub const health = "/raft/v1/health";
+    pub const capabilities = "/internal/v1/capabilities";
 
     pub fn join(alloc: std.mem.Allocator, base: []const u8, path: []const u8) ![]u8 {
         const total_len, const trimmed_base, const needs_separator = joinParts(base, path);

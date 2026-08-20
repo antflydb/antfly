@@ -21,6 +21,7 @@ const db_mod = @import("../storage/db/mod.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
+const algebraic_partials_wire = @import("algebraic_partials_wire.zig");
 const distributed_stats_mod = @import("../search/distributed_stats.zig");
 const routes = @import("http_routes.zig");
 const raft_routes = @import("../raft/transport/routes.zig");
@@ -278,6 +279,30 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
         return try std.json.parseFromSlice(cluster.ClusterStatus, self.alloc, resp.body, .{ .allocate = .alloc_always });
+    }
+
+    pub fn fetchDataRaftBatchProtocolVersion(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !u16 {
+        const uri = try self.joinRoute(base_uri, routes.Routes.internal_capabilities);
+        defer self.alloc.free(uri);
+        var resp = try self.executor.execute(self.alloc, .{
+            .method = .GET,
+            .uri = uri,
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
+        });
+        defer resp.deinit(self.alloc);
+        if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
+        const Parsed = struct { data_raft_batch_protocol_version: u16 = 0 };
+        const parsed = try std.json.parseFromSlice(Parsed, self.alloc, resp.body, .{
+            .ignore_unknown_fields = true,
+        });
+        defer parsed.deinit();
+        return parsed.value.data_raft_batch_protocol_version;
     }
 
     pub fn fetchLookup(
@@ -1074,9 +1099,14 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
+        const response_headers = [_]http_common.RequestHeader{.{
+            .name = algebraic_partials_wire.response_encoding_header,
+            .value = algebraic_partials_wire.base64_v1,
+        }};
         var resp = try self.executor.execute(self.alloc, .{
             .method = .POST,
             .uri = uri,
+            .headers = &response_headers,
             .content_type = "application/json",
             .body = body,
             .timeout_ms = timeout_ms,
@@ -3528,7 +3558,7 @@ test "api http client encodes merge doc identity reassignment action flag" {
     );
 }
 
-test "api http client round-trips public status route" {
+test "api http client round-trips public status and internal capability routes" {
     const std_http_executor = @import("../raft/transport/std_http_executor.zig");
     const http_test_runtime = @import("http_test_runtime.zig");
     const http_server = @import("http_server.zig");
@@ -3569,6 +3599,10 @@ test "api http client round-trips public status route" {
     var status = try client.fetchClusterStatus(base_uri);
     defer status.deinit();
     try std.testing.expectEqual(cluster.ClusterHealth.degraded, status.value.health);
+    try std.testing.expectEqual(
+        internal_batch_forwarding.raft_batch_protocol_version,
+        try client.fetchDataRaftBatchProtocolVersion(base_uri, null, null),
+    );
 }
 
 test "api http client round-trips shard median key route" {

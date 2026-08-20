@@ -16,6 +16,7 @@ pub const token = @import("token.zig");
 pub const value = @import("value.zig");
 pub const algebra = @import("algebra.zig");
 pub const law = @import("law.zig");
+pub const hll = @import("hll.zig");
 pub const fact = @import("fact.zig");
 pub const pathfact = @import("pathfact.zig");
 pub const lexical = @import("lexical.zig");
@@ -38,6 +39,7 @@ test {
     _ = value;
     _ = algebra;
     _ = law;
+    _ = hll;
     _ = fact;
     _ = pathfact;
     _ = lexical;

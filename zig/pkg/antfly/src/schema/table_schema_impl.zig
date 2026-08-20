@@ -636,6 +636,12 @@ pub fn globMatch(pattern: []const u8, text: []const u8) bool {
     return pi == pattern.len;
 }
 
+/// Match a field name against a JSON Schema `patternProperties` expression
+/// using the same regex engine and error mapping as runtime validation.
+pub fn patternPropertyMatches(pattern: []const u8, field_name: []const u8) !bool {
+    return try regexMatch(pattern, field_name);
+}
+
 fn stringifyJsonValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
 }
@@ -2924,8 +2930,16 @@ fn findDocumentProperty(properties: []const DocumentProperty, field_name: []cons
     return null;
 }
 
-fn shouldIgnoreSchemaValidationField(field_name: []const u8) bool {
+pub fn shouldIgnoreSchemaValidationField(field_name: []const u8) bool {
     return field_name.len > 0 and field_name[0] == '_';
+}
+
+pub fn pathContainsSchemaIgnoredField(path: []const u8) bool {
+    var segments = std.mem.splitScalar(u8, path, '.');
+    while (segments.next()) |segment| {
+        if (shouldIgnoreSchemaValidationField(segment)) return true;
+    }
+    return false;
 }
 
 fn fieldMatchesDynamicTemplates(dynamic_templates: []const DynamicTemplate, path: []const u8, value: std.json.Value) bool {
@@ -3170,7 +3184,9 @@ fn validateDocumentFieldValueWithContext(
         property.unevaluated_properties_schema != null or
         property.property_names != null or
         property.dependent_required.len > 0 or
-        property.dependent_schemas.len > 0)
+        property.dependent_schemas.len > 0 or
+        property.min_properties != null or
+        property.max_properties != null)
     {
         const object = switch (value.*) {
             .object => |object| object,
@@ -4870,6 +4886,35 @@ test "validate string length and object cardinality" {
     try std.testing.expectError(
         error.InvalidBatchRequest,
         validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"title\":\"alpha\",\"meta\":{\"a\":\"x\",\"b\":\"y\",\"c\":\"z\"}}" }}),
+    );
+}
+
+test "validate min and max properties without other nested object rules" {
+    var open = try parseSchema(
+        std.testing.allocator,
+        "{\"default_type\":\"doc\",\"enforce_types\":false,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"meta\":{\"type\":\"object\",\"minProperties\":1,\"maxProperties\":1}}}}}}",
+    );
+    defer open.deinit(std.testing.allocator);
+
+    try validateWritesAgainstSchema(std.testing.allocator, open, &.{.{ .value = "{\"meta\":{\"a\":1}}" }});
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateWritesAgainstSchema(std.testing.allocator, open, &.{.{ .value = "{\"meta\":{}}" }}),
+    );
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateWritesAgainstSchema(std.testing.allocator, open, &.{.{ .value = "{\"meta\":{\"a\":1,\"b\":2}}" }}),
+    );
+
+    var closed = try parseSchema(
+        std.testing.allocator,
+        "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"meta\":{\"type\":\"object\",\"minProperties\":0}}}}}}",
+    );
+    defer closed.deinit(std.testing.allocator);
+    try validateWritesAgainstSchema(std.testing.allocator, closed, &.{.{ .value = "{\"meta\":{}}" }});
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateWritesAgainstSchema(std.testing.allocator, closed, &.{.{ .value = "{\"meta\":{\"unknown\":1}}" }}),
     );
 }
 
