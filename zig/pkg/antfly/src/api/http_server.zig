@@ -6307,8 +6307,20 @@ pub const ApiHttpServer = struct {
     ) !void {
         if (!std.mem.eql(u8, table.name, table_name)) return error.TableNotFound;
         if (table.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
-        if (try backups_api.manifestExistsAtLocationWithIo(self.alloc, io, backup_location, backup_id))
+        if (try backups_api.manifestExistsAtLocationWithIo(self.alloc, io, backup_location, backup_id)) {
+            if (writer_lease_role == .create) {
+                _ = backups_api.reconcileCommittedTableBackupWriterStateAtLocation(
+                    self.alloc,
+                    io,
+                    backup_location,
+                    backup_id,
+                ) catch |err| {
+                    std.log.warn("committed table backup writer-state reconciliation deferred class={s}", .{@errorName(err)});
+                    return error.BackupOutcomeAmbiguous;
+                };
+            }
             return error.BackupAlreadyExists;
+        }
         const admission_now: u64 = @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
         var writer_fence = fence;
         const initial_writer_lease_expiration = switch (writer_lease_role) {
@@ -6492,14 +6504,18 @@ pub const ApiHttpServer = struct {
         writer_lease_future.await(io);
         writer_lease_future_running = false;
         if (writer_lease_role == .create) {
-            _ = backups_api.releaseTableBackupWriterLeaseAtLocation(
+            backups_api.releaseCommittedTableBackupWriterStateAtLocation(
                 self.alloc,
                 io,
                 backup_location,
                 artifact_backup_id,
-            ) catch |release_err| blk: {
+            ) catch |release_err| {
                 std.log.warn("table backup writer lease release deferred phase=commit class={s}", .{@errorName(release_err)});
-                break :blk false;
+                // The manifest is already durable. Preserve the reservation as
+                // a reconciliation journal and surface the committed outcome
+                // as ambiguous so a same-ID inspection/retry retires the
+                // sidecar instead of leaking it permanently.
+                return error.BackupOutcomeAmbiguous;
             };
         }
     }

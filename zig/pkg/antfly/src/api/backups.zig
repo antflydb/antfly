@@ -84,6 +84,10 @@ pub const backup_attempt_reclaim_object_budget: usize = 256;
 /// A foreground conflict may advance stale-attempt cleanup, but it must not
 /// turn one API request into an unbounded object-store or filesystem sweep.
 pub const backup_attempt_request_reclaim_object_budget: usize = 32;
+/// Bounds read/open work that cannot make durable progress until a leaf is
+/// reached. Antfly-produced trees are shallow; exceeding this limit indicates
+/// a corrupt or adversarial repository and fails closed without recursion.
+const backup_cleanup_local_traversal_budget: usize = 512;
 pub const backup_attempt_cleanup_object_budget: usize = 1_000_000;
 pub const backup_attempt_lease_duration_ns: u64 = 5 * std.time.ns_per_min;
 pub const backup_attempt_lease_renew_interval_ns: u64 = std.time.ns_per_min;
@@ -3390,6 +3394,86 @@ fn releaseTableBackupCleanupFenceWithBudget(
     );
 }
 
+fn releaseTableBackupWriterStateWithBudget(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    artifact_backup_id: []const u8,
+    operation_budget: *usize,
+) !void {
+    const writer_cost: usize = switch (location.*) {
+        // One owner read and, in the matching case, one conditional delete.
+        .remote => 2,
+        .file => 1,
+    };
+    if (operation_budget.* < writer_cost)
+        return error.BackupCleanupBudgetExceeded;
+    operation_budget.* -= writer_cost;
+    _ = try releaseTableBackupWriterLeaseAtLocation(
+        alloc,
+        io,
+        location,
+        artifact_backup_id,
+    );
+    try releaseTableBackupCleanupFenceWithBudget(
+        alloc,
+        io,
+        location,
+        artifact_backup_id,
+        operation_budget,
+    );
+}
+
+/// Retires every owner spelling for an artifact generation after its canonical
+/// manifest is durable. This treats an absent writer owner and a cleanup
+/// tombstone installed by a publication race as equally successful terminal
+/// states, while surfacing storage failures for durable retry.
+pub fn releaseCommittedTableBackupWriterStateAtLocation(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    artifact_backup_id: []const u8,
+) !void {
+    var operation_budget: usize = 6;
+    try releaseTableBackupWriterStateWithBudget(
+        alloc,
+        io,
+        location,
+        artifact_backup_id,
+        &operation_budget,
+    );
+}
+
+/// Retries sidecar retirement after the canonical table manifest is already
+/// durable. Logical reservations use an opaque, distinct artifact generation;
+/// a same-ID reservation is a forwarded envelope whose coordinator may still
+/// need the shared writer lease to publish its canonical manifest.
+pub fn reconcileCommittedTableBackupWriterStateAtLocation(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    backup_id: []const u8,
+) !bool {
+    if (!try tableManifestRecordExistsForReconciliation(alloc, io, location, backup_id))
+        return false;
+    var parsed = (try readTableBackupAttemptReservation(
+        alloc,
+        io,
+        location,
+        backup_id,
+    )) orelse return false;
+    defer parsed.deinit();
+    if (std.mem.eql(u8, backup_id, parsed.value.artifact_backup_id))
+        return false;
+    try releaseCommittedTableBackupWriterStateAtLocation(
+        alloc,
+        io,
+        location,
+        parsed.value.artifact_backup_id,
+    );
+    return true;
+}
+
 /// Returns true only after proving that no live storage writer owns this
 /// artifact. An expired or absent lease is atomically replaced by a cleanup
 /// tombstone so a delayed forwarded request cannot recreate or renew it after
@@ -3581,7 +3665,11 @@ pub fn reclaimExpiredTableBackupAttemptAtLocation(
     return .reclaimed;
 }
 
-const ClusterAttemptCleanupPhase = enum { writer_leases, artifacts };
+const ClusterAttemptCleanupPhase = enum {
+    writer_leases,
+    artifacts,
+    committed_writer_state,
+};
 
 const ClusterWriterLeaseScanCursor = struct {
     format_version: u32 = 1,
@@ -3792,6 +3880,14 @@ fn claimExpiredClusterTableWriterLeases(
 ) !bool {
     if (!marker.writer_lease_fencing or object_budget.* == 0) return false;
     const progress = try readClusterWriterLeaseScanCursor(alloc, io, location, marker);
+    // A committed reconciliation cursor is only reachable if an operator
+    // removed the canonical manifest after publication. Reset the advisory
+    // cursor and restart fencing before any artifact cleanup; never reuse its
+    // table index as payload-cleanup progress.
+    if (progress.phase == .committed_writer_state) {
+        try deleteClusterWriterLeaseScanCursor(alloc, io, location, marker.attempt_id);
+        return false;
+    }
     if (progress.phase == .artifacts) return true;
     var index = progress.next_table_index;
     const claim_cost: usize = switch (location.*) {
@@ -3827,6 +3923,54 @@ fn claimExpiredClusterTableWriterLeases(
     }
     try writeClusterWriterLeaseScanCursorMonotonic(alloc, io, location, marker, .{
         .phase = .writer_leases,
+        .next_table_index = index,
+    });
+    return false;
+}
+
+/// A committed aggregate proves every table writer finished before
+/// publication. Retire any writer or cleanup owner left behind by a transient
+/// conditional-delete failure before discarding the marker that makes those
+/// exact artifact generations discoverable.
+fn releaseCommittedClusterTableWriterStates(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    marker: *const ClusterBackupAttemptMarker,
+    operation_budget: *usize,
+) !bool {
+    if (!marker.writer_lease_fencing) return true;
+    const progress = try readClusterWriterLeaseScanCursor(alloc, io, location, marker);
+    // The artifacts phase can contain cleanup tombstones installed by stale
+    // reconciliation immediately before publication became visible. A
+    // distinct terminal phase prevents mistaking those tombstones for already
+    // retired committed state.
+    var index: usize = if (progress.phase == .committed_writer_state)
+        progress.next_table_index
+    else
+        0;
+    const release_cost: usize = switch (location.*) {
+        .remote => 6,
+        .file => 3,
+    };
+    while (index < marker.tables.len and operation_budget.* >= release_cost) : (index += 1) {
+        try releaseTableBackupWriterStateWithBudget(
+            alloc,
+            io,
+            location,
+            marker.tables[index].artifact_backup_id,
+            operation_budget,
+        );
+    }
+    if (index == marker.tables.len) {
+        try writeClusterWriterLeaseScanCursorMonotonic(alloc, io, location, marker, .{
+            .phase = .committed_writer_state,
+            .next_table_index = index,
+        });
+        return true;
+    }
+    try writeClusterWriterLeaseScanCursorMonotonic(alloc, io, location, marker, .{
+        .phase = .committed_writer_state,
         .next_table_index = index,
     });
     return false;
@@ -5212,78 +5356,181 @@ fn deletePathDurably(io: std.Io, path: []const u8) !void {
     );
 }
 
-/// Deletes at most `operation_budget` filesystem entries. Directories are
-/// traversed depth-first and removed only after their children, so every pass
-/// makes durable, idempotent progress without `deleteTree` monopolizing a
-/// request or the shared maintenance lane.
-fn deleteFileOrTreeFromDirWithBudget(
+const LocalCleanupFrame = struct {
+    dir: std.Io.Dir,
+    iterator: std.Io.Dir.Iterator,
+    parent: std.Io.Dir,
+    name: []u8,
+};
+
+fn deleteLocalCleanupLeaf(
     io: std.Io,
     dir: std.Io.Dir,
     sub_path: []const u8,
     operation_budget: *usize,
 ) !bool {
-    var child = dir.openDir(io, sub_path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return true,
-        error.NotDir => {
-            if (operation_budget.* == 0) return false;
-            operation_budget.* -= 1;
-            dir.deleteFile(io, sub_path) catch |delete_err| switch (delete_err) {
-                error.FileNotFound => {},
-                else => return delete_err,
-            };
-            return true;
-        },
-        else => return err,
-    };
-    var child_open = true;
-    defer if (child_open) child.close(io);
-
-    var iterator = child.iterateAssumeFirstIteration();
-    while (try iterator.next(io)) |entry| {
-        if (operation_budget.* == 0) return false;
-        if (entry.kind == .directory) {
-            if (!try deleteFileOrTreeFromDirWithBudget(
-                io,
-                child,
-                entry.name,
-                operation_budget,
-            )) return false;
-        } else {
-            operation_budget.* -= 1;
-            child.deleteFile(io, entry.name) catch |err| switch (err) {
-                error.FileNotFound => {},
-                // A concurrently replaced or inaccurately typed directory is
-                // handled by the same bounded recursive path.
-                error.IsDir => {
-                    if (!try deleteFileOrTreeFromDirWithBudget(
-                        io,
-                        child,
-                        entry.name,
-                        operation_budget,
-                    )) return false;
-                },
-                else => return err,
-            };
-        }
-    }
-    child.close(io);
-    child_open = false;
     if (operation_budget.* == 0) return false;
     operation_budget.* -= 1;
-    dir.deleteDir(io, sub_path) catch |err| switch (err) {
+    dir.deleteFile(io, sub_path) catch |err| switch (err) {
         error.FileNotFound => {},
-        error.DirNotEmpty => return false,
+        // The entry changed from a leaf to a directory. Restart from the root
+        // on the next bounded pass and reopen it without following symlinks.
+        error.IsDir => return false,
         else => return err,
     };
     return true;
 }
 
+/// Deletes at most `operation_budget` filesystem entries with a separate hard
+/// bound on traversal work. The explicit stack avoids attacker-controlled call
+/// depth, and every directory open refuses symlink traversal so neither a
+/// static link nor a concurrent directory-to-link replacement can escape the
+/// backup root.
+fn deleteFileOrTreeFromDirWithBudget(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    sub_path: []const u8,
+    operation_budget: *usize,
+) !bool {
+    if (operation_budget.* == 0) return false;
+    var traversal_budget: usize = backup_cleanup_local_traversal_budget;
+    traversal_budget -= 1;
+    const root = dir.openDir(io, sub_path, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return true,
+        error.NotDir, error.SymLinkLoop => return deleteLocalCleanupLeaf(
+            io,
+            dir,
+            sub_path,
+            operation_budget,
+        ),
+        else => return err,
+    };
+    var frames = std.ArrayListUnmanaged(LocalCleanupFrame).empty;
+    defer {
+        for (frames.items) |*frame| {
+            frame.dir.close(io);
+            alloc.free(frame.name);
+        }
+        frames.deinit(alloc);
+    }
+    const root_name = alloc.dupe(u8, sub_path) catch |err| {
+        root.close(io);
+        return err;
+    };
+    frames.append(alloc, .{
+        .dir = root,
+        .iterator = root.iterateAssumeFirstIteration(),
+        .parent = dir,
+        .name = root_name,
+    }) catch |err| {
+        alloc.free(root_name);
+        root.close(io);
+        return err;
+    };
+
+    while (frames.items.len > 0) {
+        if (operation_budget.* == 0) return false;
+        if (traversal_budget == 0)
+            return error.BackupCleanupTraversalLimitExceeded;
+        traversal_budget -= 1;
+        const top = &frames.items[frames.items.len - 1];
+        const entry = try top.iterator.next(io);
+        if (entry) |child_entry| {
+            if (child_entry.kind != .directory) {
+                if (!try deleteLocalCleanupLeaf(
+                    io,
+                    top.dir,
+                    child_entry.name,
+                    operation_budget,
+                )) return false;
+                continue;
+            }
+            if (traversal_budget == 0)
+                return error.BackupCleanupTraversalLimitExceeded;
+            traversal_budget -= 1;
+            const child = top.dir.openDir(io, child_entry.name, .{
+                .iterate = true,
+                .follow_symlinks = false,
+            }) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                error.NotDir, error.SymLinkLoop => {
+                    if (!try deleteLocalCleanupLeaf(
+                        io,
+                        top.dir,
+                        child_entry.name,
+                        operation_budget,
+                    )) return false;
+                    continue;
+                },
+                else => return err,
+            };
+            const child_name = alloc.dupe(u8, child_entry.name) catch |err| {
+                child.close(io);
+                return err;
+            };
+            const parent = top.dir;
+            frames.append(alloc, .{
+                .dir = child,
+                .iterator = child.iterateAssumeFirstIteration(),
+                .parent = parent,
+                .name = child_name,
+            }) catch |err| {
+                alloc.free(child_name);
+                child.close(io);
+                return err;
+            };
+            continue;
+        }
+
+        if (operation_budget.* == 0) return false;
+        var finished = frames.pop().?;
+        finished.dir.close(io);
+        operation_budget.* -= 1;
+        finished.parent.deleteDir(io, finished.name) catch |err| switch (err) {
+            error.FileNotFound => {},
+            error.DirNotEmpty => {
+                alloc.free(finished.name);
+                return false;
+            },
+            // A concurrent replacement is now a leaf. Never reopen it through
+            // the stale directory type observed by the iterator.
+            error.NotDir => {
+                const deleted = deleteLocalCleanupLeaf(
+                    io,
+                    finished.parent,
+                    finished.name,
+                    operation_budget,
+                ) catch |delete_err| {
+                    alloc.free(finished.name);
+                    return delete_err;
+                };
+                if (!deleted) {
+                    alloc.free(finished.name);
+                    return false;
+                }
+            },
+            else => {
+                alloc.free(finished.name);
+                return err;
+            },
+        };
+        alloc.free(finished.name);
+    }
+    return true;
+}
+
 fn deletePathDurablyWithBudget(
+    alloc: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
     operation_budget: *usize,
 ) !void {
     if (!try deleteFileOrTreeFromDirWithBudget(
+        alloc,
         io,
         std.Io.Dir.cwd(),
         path,
@@ -5391,7 +5638,7 @@ fn cleanupTableBackupAttemptAtLocationWithBudget(
                 // Remove and durably fence the table commit record before its
                 // payload. A crash must never resurrect a manifest whose
                 // artifact cleanup had already started.
-                try deletePathDurablyWithBudget(io, manifest_path, object_budget);
+                try deletePathDurablyWithBudget(alloc, io, manifest_path, object_budget);
             }
             if (!std.mem.eql(u8, backup_id, artifact_backup_id)) {
                 const forwarded_manifest_path = try metadataPath(alloc, backup_root, artifact_backup_id);
@@ -5400,23 +5647,23 @@ fn cleanupTableBackupAttemptAtLocationWithBudget(
                 // envelope before the coordinator installs the logical
                 // manifest. Remove it before its payload during rollback or
                 // stale-attempt reconciliation.
-                try deletePathDurablyWithBudget(io, forwarded_manifest_path, object_budget);
+                try deletePathDurablyWithBudget(alloc, io, forwarded_manifest_path, object_budget);
             }
             const artifact_path = switch (format) {
                 .native => try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, artifact_backup_id }),
                 .portable => try std.fmt.allocPrint(alloc, "{s}/{s}.afb", .{ backup_root, artifact_backup_id }),
             };
             defer alloc.free(artifact_path);
-            try deletePathDurablyWithBudget(io, artifact_path, object_budget);
+            try deletePathDurablyWithBudget(alloc, io, artifact_path, object_budget);
             if (delete_logical_reservation) {
                 const reservation_path = try reservationPath(alloc, backup_root, backup_id, false);
                 defer alloc.free(reservation_path);
-                try deletePathDurablyWithBudget(io, reservation_path, object_budget);
+                try deletePathDurablyWithBudget(alloc, io, reservation_path, object_budget);
             }
             if (!std.mem.eql(u8, backup_id, artifact_backup_id)) {
                 const forwarded_reservation_path = try reservationPath(alloc, backup_root, artifact_backup_id, false);
                 defer alloc.free(forwarded_reservation_path);
-                try deletePathDurablyWithBudget(io, forwarded_reservation_path, object_budget);
+                try deletePathDurablyWithBudget(alloc, io, forwarded_reservation_path, object_budget);
             }
         },
         .remote => |*store| {
@@ -6136,14 +6383,21 @@ fn reclaimClusterBackupAttemptMarker(
     defer committed.deinit(alloc);
 
     _ = authoritative_attempt_id;
+    if (!try releaseCommittedClusterTableWriterStates(
+        alloc,
+        io,
+        location,
+        marker,
+        object_budget,
+    )) return false;
     const remote = switch (location.*) {
         .remote => true,
         .file => false,
     };
     // Reservation-owner variants plus cursor/marker retirement are
     // a fixed amount of work, but still participate in the remote I/O budget.
-    if (remote and object_budget.* < 9) return false;
-    if (remote) object_budget.* -= 9;
+    if (remote and object_budget.* < 10) return false;
+    if (remote) object_budget.* -= 10;
     _ = try cleanupClusterReservationIfOwnedAtLocation(
         alloc,
         io,
@@ -12051,6 +12305,65 @@ test "standalone table backup stale reclamation preserves committed manifests an
     );
 }
 
+test "committed table reconciliation retires writer state but preserves forwarded envelopes" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var location: BackupLocation = .{
+        .remote = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", "backups"),
+    };
+    defer location.deinit(alloc);
+    const fence: TableBackupFence = .{
+        .metadata_group_id = 3,
+        .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+        .table_id = 7,
+        .definition_digest = [_]u8{0x11} ** 32,
+        .topology_range_count = 1,
+        .topology_digest = [_]u8{0x22} ** 32,
+        .writer_not_after_unix_ns = 2,
+    };
+    try reserveTableBackupAttemptAtLocation(alloc, io, &location, "logical", "artifact", .portable, fence);
+    try reserveTableBackupWriterLeaseAtLocation(alloc, io, &location, "artifact", std.math.maxInt(u64));
+    try location.remote.writeBytes(alloc, "logical-metadata.json", "{}", "application/json");
+    try std.testing.expect(try reconcileCommittedTableBackupWriterStateAtLocation(
+        alloc,
+        io,
+        &location,
+        "logical",
+    ));
+    const logical_lease = try tableBackupWriterLeasePath(alloc, "", "artifact");
+    defer alloc.free(logical_lease);
+    try std.testing.expectError(
+        error.FileNotFound,
+        location.remote.readBytesAllocLimited(
+            alloc,
+            trimLeftSlash(logical_lease),
+            max_backup_attempt_lease_bytes,
+        ),
+    );
+
+    try reserveTableBackupAttemptAtLocation(alloc, io, &location, "forwarded", "forwarded", .portable, fence);
+    try reserveTableBackupWriterLeaseAtLocation(alloc, io, &location, "forwarded", std.math.maxInt(u64));
+    try location.remote.writeBytes(alloc, "forwarded-metadata.json", "{}", "application/json");
+    try std.testing.expect(!try reconcileCommittedTableBackupWriterStateAtLocation(
+        alloc,
+        io,
+        &location,
+        "forwarded",
+    ));
+    const forwarded_lease = try tableBackupWriterLeasePath(alloc, "", "forwarded");
+    defer alloc.free(forwarded_lease);
+    const retained = try location.remote.readBytesAllocLimited(
+        alloc,
+        trimLeftSlash(forwarded_lease),
+        max_backup_attempt_lease_bytes,
+    );
+    alloc.free(retained);
+}
+
 test "cluster writer lease reclamation persists bounded scan progress" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -12842,6 +13155,79 @@ test "filesystem artifact cleanup stops at its operation budget and resumes" {
     try std.testing.expect(!try pathExistsWithIo(io, artifact_path));
 }
 
+test "filesystem artifact cleanup unlinks symlinks without traversing their targets" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/symlink-cleanup", .{tmp.sub_path});
+    defer alloc.free(root);
+    const outside = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/outside", .{tmp.sub_path});
+    defer alloc.free(outside);
+    try ensureDirPathWithIo(io, root);
+    try ensureDirPathWithIo(io, outside);
+    const sentinel = try std.fmt.allocPrint(alloc, "{s}/sentinel", .{outside});
+    defer alloc.free(sentinel);
+    try writeFileAbsolute(sentinel, "preserve");
+    const artifact_path = try std.fmt.allocPrint(alloc, "{s}/artifact", .{root});
+    defer alloc.free(artifact_path);
+    try std.Io.Dir.cwd().symLink(io, "../outside", artifact_path, .{ .is_directory = true });
+
+    var location: BackupLocation = .{ .file = root };
+    var budget: usize = 8;
+    try cleanupTableBackupAttemptAtLocationWithBudget(
+        alloc,
+        io,
+        &location,
+        "logical",
+        "artifact",
+        .native,
+        &budget,
+        false,
+        false,
+    );
+    try std.testing.expect(!try pathExistsWithIo(io, artifact_path));
+    const preserved = try readFileAbsoluteAllocWithIo(alloc, io, sentinel, 16);
+    defer alloc.free(preserved);
+    try std.testing.expectEqualStrings("preserve", preserved);
+}
+
+test "filesystem artifact cleanup rejects adversarial depth within a fixed traversal bound" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/deep-cleanup", .{tmp.sub_path});
+    defer alloc.free(root);
+    var deep_path = std.ArrayListUnmanaged(u8).empty;
+    defer deep_path.deinit(alloc);
+    try deep_path.appendSlice(alloc, root);
+    try deep_path.appendSlice(alloc, "/artifact");
+    for (0..300) |_| try deep_path.appendSlice(alloc, "/d");
+    try ensureDirPathWithIo(io, deep_path.items);
+
+    var location: BackupLocation = .{ .file = root };
+    var budget: usize = backup_attempt_request_reclaim_object_budget;
+    try std.testing.expectError(
+        error.BackupCleanupTraversalLimitExceeded,
+        cleanupTableBackupAttemptAtLocationWithBudget(
+            alloc,
+            io,
+            &location,
+            "logical",
+            "artifact",
+            .native,
+            &budget,
+            false,
+            false,
+        ),
+    );
+}
+
 test "stale committed marker retires when the authoritative head is unchanged" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -12877,6 +13263,30 @@ test "stale committed marker retires when the authoritative head is unchanged" {
         marker.attempt_id,
         1,
     );
+    // Simulate stale reclamation claiming the writer just before publication
+    // became visible. The artifacts cursor must not make committed-marker
+    // reconciliation skip the retained cleanup tombstone.
+    try reserveTableBackupWriterLeaseAtLocation(
+        alloc,
+        io,
+        &location,
+        attempt_tables[0].artifact_backup_id,
+        1,
+    );
+    try std.testing.expectEqual(
+        BackupLeaseFenceClaim.claimed,
+        try claimExpiredTableBackupWriterLeaseAtLocation(
+            alloc,
+            io,
+            &location,
+            attempt_tables[0].artifact_backup_id,
+            std.math.maxInt(u64),
+        ),
+    );
+    try writeClusterWriterLeaseScanCursorMonotonic(alloc, io, &location, &marker, .{
+        .phase = .artifacts,
+        .next_table_index = 0,
+    });
     const committed_tables = [_]ClusterTableBackupEntry{.{
         .name = "docs",
         .table_backup_id = "table-snap",
@@ -12910,6 +13320,20 @@ test "stale committed marker retires when the authoritative head is unchanged" {
         &location,
         marker.cluster_backup_id,
     )) == null);
+    const writer_lease = try tableBackupWriterLeasePath(
+        alloc,
+        "",
+        attempt_tables[0].artifact_backup_id,
+    );
+    defer alloc.free(writer_lease);
+    try std.testing.expectError(
+        error.FileNotFound,
+        location.remote.readBytesAllocLimited(
+            alloc,
+            trimLeftSlash(writer_lease),
+            max_backup_attempt_lease_bytes,
+        ),
+    );
 }
 
 test "filesystem stale attempt reclamation index prevents directory-order starvation" {
