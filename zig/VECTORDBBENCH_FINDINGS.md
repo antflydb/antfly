@@ -227,11 +227,12 @@ bounded all-lane iterator and compares the returned sequence; it does not infer
 that sequence gaps are visible. A legacy store without replay lanes retains the
 old current-scan fallback.
 
-With both default full-text and dense indexing enabled, the final 50K check
-copied 16.8 MB rather than 3.51 GB (about 208x less), completed in 40.64 seconds
-rather than 46.32 seconds, and published all 50,001 full-text documents and all
-50,000 vectors. This removes unrelated copying from the general default-index
-product path; it is not a VectorDBBench-only full-text disable.
+With both default full-text and dense indexing enabled, the final current-main
+50K check copied 46.3 MB rather than 3.51 GB (about 76x less), completed in
+41.78 seconds rather than 46.32 seconds, and published all 50,001 full-text
+documents and all 50,000 vectors. This removes unrelated copying from the
+general default-index product path; it is not a VectorDBBench-only full-text
+disable.
 
 ### A lower checkpoint floor remains counterproductive
 
@@ -263,7 +264,8 @@ oversized escape hatch for guaranteed progress.
 
 ## Measurements
 
-All times below are one-machine diagnostics, not publication-grade means.
+Unless a row explicitly reports a mean and range, the times below are
+one-machine diagnostics rather than publication-grade means.
 
 | Run | Insert | Ready/load | Notes |
 | --- | ---: | ---: | --- |
@@ -283,9 +285,9 @@ All times below are one-machine diagnostics, not publication-grade means.
 | 50K, fair maintenance + rate-limited sampler | 27.78 s | 29.88 s | 249.0 MB clones; 673 MB demand, 1.89 GB RSS; zero final replay lag |
 | 50K, relocated compaction publication | 25.05 s | 27.53 s | 103.7 MB clones; 708.5 MB demand, 1.96 GB RSS; 59 final L0 runs / zero debt |
 | 50K, clean merged control, vector-only | 27.14 s | 40.35 s | 168.5 MB clones; 601.9 MB physical footprint, 1.85 GB RSS |
-| 50K, replay-lane snapshot, vector-only | 27.42 s | 36.07 s | 53.7 MB clones; 571.7 MB physical footprint, 1.64 GB RSS; zero debt |
+| 50K, replay-lane snapshot, vector-only, current-main three-run mean | 30.73 s | 41.65 s (38.72--43.14 s range) | 92.1 MB mean clones; 531.0 MB mean physical footprint, 1.67 GB mean RSS; complete visibility, no overload |
 | 50K, clean merged control, full-text + dense | 41.79 s | 46.32 s | 3.51 GB clones; both indexes ready |
-| 50K, replay-lane snapshot, full-text + dense | 33.73 s | 40.64 s | 16.8 MB clones; 692 MB physical footprint, 1.70 GB RSS; both indexes ready |
+| 50K, replay-lane snapshot, full-text + dense, current main | 32.90 s | 41.78 s | 46.3 MB clones; 702.4 MB physical footprint, 1.66 GB RSS; both indexes ready |
 | 50K, replay-lane snapshot, 1 MiB checkpoint floor (rejected) | 28.40 s | 41.75 s | 80.5 MB clones; 147 final L0 runs / 86 flushes; no physical-footprint benefit |
 | 1M Cohere, batch 100, four workers, original public path | incomplete | projected about 45–50 min | Throughput fell from about 30.8K docs/min in minute one to about 21.1K docs/min in minute four |
 | 1M, bounded clones + fair coalescer control | incomplete at 783,201 rows / 1,867 s | -- | Two exact 120 s timeouts from primary L0 pressure; 3.83 GB clones, 1.40 GB demand, 3.76 GB peak RSS; 200 ms `vmmap` and overlapping compilers contaminate speed |
@@ -398,7 +400,8 @@ published.
 2. Attribute the remaining bound-read snapshot clones separately from replay
    lanes; do not replace those multi-operation snapshots with unsafe live
    probes merely to improve a cumulative counter.
-3. Publish three fresh 50K and 1M lifecycle measurements through Circus on a
-   controlled host, reporting mean plus range. The single follow-up 1M
-   lifecycle is diagnostic because compaction scheduling produced materially
-   different curves on the same host.
+3. Repeat the 1M lifecycle three times through Circus on a controlled host and
+   publish its mean plus range. Three current-main 50K lifecycles now average
+   41.65 seconds with a 38.72--43.14 second range, but the single follow-up 1M
+   lifecycle remains diagnostic because compaction scheduling produced
+   materially different curves on the same host.
