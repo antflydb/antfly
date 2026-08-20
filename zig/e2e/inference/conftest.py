@@ -524,7 +524,15 @@ def api(base_url):
             _check(r)
             return r.json()
 
-        def classify(self, text: list[str], labels: list[str], model: str = "", **kwargs):
+        def classify(
+            self,
+            text: list[str],
+            labels: list[str],
+            model: str = "",
+            *,
+            request_timeout: float | None = None,
+            **kwargs,
+        ):
             multi_label = bool(kwargs.pop("multi_label", False))
             hypothesis_template = kwargs.pop("hypothesis_template", None)
             top_k = kwargs.pop("top_k", None)
@@ -552,7 +560,10 @@ def api(base_url):
             }
             if threshold is not None:
                 body["options"]["threshold"] = threshold
-            r = self.post("/extract", json=body)
+            request_kwargs = (
+                {"timeout": request_timeout} if request_timeout is not None else {}
+            )
+            r = self.post("/extract", json=body, **request_kwargs)
             _check(r)
             return r.json()
 

@@ -11,6 +11,15 @@ on:
     - cron: "0 8 * * *"
     - cron: "0 3 * * 0"
   workflow_dispatch:
+    inputs:
+      validation_scope:
+        description: "Full validation scope"
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - inference-e2e
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -42,6 +51,16 @@ jobs:
           set -euo pipefail
 
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ "${{ inputs.validation_scope }}" == "inference-e2e" ]]; then
+              {
+                echo "zig_tests=false"
+                echo "e2e=true"
+                echo "model_check=false"
+                echo "trace_validate=false"
+                echo "backup_s3=false"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             {
               echo "zig_tests=true"
               echo "e2e=true"
@@ -195,7 +214,7 @@ jobs:
       ) ||
       github.event_name == 'merge_group' ||
       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' && inputs.validation_scope == 'all') ||
       github.event.schedule == '0 8 * * *'
     runs-on: arc-antfly-publish-arm64
     timeout-minutes: 20
@@ -515,7 +534,7 @@ jobs:
   zig-full-tests:
     name: zig-full / x86_64
     needs: changes
-    if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *'
+    if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.validation_scope == 'all') || github.event.schedule == '0 8 * * *'
     runs-on: arc-antfly-heavy
     timeout-minutes: 120
     env:
@@ -712,7 +731,7 @@ jobs:
       (
         github.event_name == 'merge_group' ||
         (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'workflow_dispatch' && inputs.validation_scope == 'all') ||
         github.event.schedule == '0 8 * * *'
       )
     runs-on: arc-antfly-standard
@@ -902,7 +921,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [inference, antfly]
+        suite: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.validation_scope == 'inference-e2e' && '["inference"]' || '["inference","antfly"]') }}
     env:
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}-${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
