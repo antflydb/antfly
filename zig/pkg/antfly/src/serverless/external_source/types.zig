@@ -151,7 +151,7 @@ pub const FileEntry = struct {
         for (self.row_groups, 0..) |row_group, idx| {
             try row_group.validate(self.byte_len);
             if (row_group.ordinal != idx) return error.InvalidExternalSourceInventory;
-            total_rows += row_group.row_count;
+            total_rows = std.math.add(u64, total_rows, row_group.row_count) catch return error.InvalidExternalSourceInventory;
         }
         if (self.row_groups.len != 0 and total_rows != self.row_count) return error.InvalidExternalSourceInventory;
     }
@@ -191,15 +191,23 @@ pub const Inventory = struct {
     }
 
     pub fn validate(self: Inventory) !void {
+        try self.validateAlloc(std.heap.page_allocator);
+    }
+
+    pub fn validateAlloc(self: Inventory, alloc: Allocator) !void {
         if (self.source_id.len == 0) return error.InvalidExternalSourceInventory;
         if (self.source_uri.len == 0) return error.InvalidExternalSourceInventory;
         if (self.snapshot_id.len == 0) return error.InvalidExternalSourceInventory;
         if (self.schema_fingerprint.len == 0) return error.InvalidExternalSourceInventory;
-        for (self.files, 0..) |file, idx| {
+
+        var file_ids = std.StringHashMapUnmanaged(void).empty;
+        defer file_ids.deinit(alloc);
+        const file_capacity = std.math.cast(u32, self.files.len) orelse return error.InvalidExternalSourceInventory;
+        try file_ids.ensureTotalCapacity(alloc, file_capacity);
+        for (self.files) |file| {
             try file.validate();
-            for (self.files[0..idx]) |previous| {
-                if (std.mem.eql(u8, previous.file_id, file.file_id)) return error.InvalidExternalSourceInventory;
-            }
+            const entry = try file_ids.getOrPut(alloc, file.file_id);
+            if (entry.found_existing) return error.InvalidExternalSourceInventory;
         }
     }
 
@@ -254,4 +262,29 @@ test "external source inventory validates files and row groups" {
     try inventory.validate();
     try std.testing.expect(inventory.fileById("file-a.parquet") != null);
     try std.testing.expect(inventory.fileById("missing.parquet") == null);
+}
+
+test "external source inventory rejects duplicate file ids with allocator-backed validation" {
+    const alloc = std.testing.allocator;
+    var inventory = Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "snapshot-1"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(FileEntry, 2),
+    };
+    defer inventory.deinit(alloc);
+    for (inventory.files, 0..) |*file, idx| {
+        file.* = .{
+            .file_id = try alloc.dupe(u8, "part.parquet"),
+            .object_uri = try std.fmt.allocPrint(alloc, "s3://bucket/events/part-{d}.parquet", .{idx}),
+            .etag = try std.fmt.allocPrint(alloc, "etag-{d}", .{idx}),
+            .byte_len = 1,
+            .row_count = 0,
+            .row_groups = &.{},
+        };
+    }
+
+    try std.testing.expectError(error.InvalidExternalSourceInventory, inventory.validateAlloc(alloc));
 }

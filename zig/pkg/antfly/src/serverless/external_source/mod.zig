@@ -53,6 +53,7 @@ pub const externalTableBindingFromRuntimeExternalBaseSource = catalog_binding.bi
 pub const isParquetDataObject = object_snapshot.isParquetDataObject;
 pub const planParquetPrefixInventoryAlloc = object_snapshot.planParquetPrefixInventoryAlloc;
 pub const planParquetPrefixInventoryFromObjectStorageAlloc = object_snapshot.planParquetPrefixInventoryFromObjectStorageAlloc;
+pub const advanceObjectListingContinuationTokenAlloc = object_snapshot.advanceContinuationTokenAlloc;
 pub const parseIcebergMetadataPlanAlloc = iceberg_metadata.parseMetadataPlanAlloc;
 pub const parseIcebergManifestListAlloc = iceberg_avro.parseManifestListAlloc;
 pub const parseIcebergDataManifestAlloc = iceberg_avro.parseDataManifestAlloc;
@@ -88,6 +89,7 @@ test "serverless external source module compiles" {
     _ = isParquetDataObject;
     _ = planParquetPrefixInventoryAlloc;
     _ = planParquetPrefixInventoryFromObjectStorageAlloc;
+    _ = advanceObjectListingContinuationTokenAlloc;
     _ = parseIcebergMetadataPlanAlloc;
     _ = parseIcebergManifestListAlloc;
     _ = parseIcebergDataManifestAlloc;

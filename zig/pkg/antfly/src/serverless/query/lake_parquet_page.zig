@@ -21,6 +21,11 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const snappy = @import("../../encoding/snappy.zig");
 
+/// Parquet pages are normally around 1 MiB. Keep enough headroom for existing
+/// writers while preventing an external page header or compressed payload from
+/// requesting process-scale allocations.
+pub const max_uncompressed_page_bytes: usize = 64 * 1024 * 1024;
+
 const CompactType = enum(u4) {
     stop = 0,
     boolean_true = 1,
@@ -72,6 +77,7 @@ pub const Header = struct {
     definition_level_bytes: usize = 0,
     repetition_level_bytes: usize = 0,
     data_payload_offset: usize = 0,
+    data_is_compressed: bool = true,
 
     pub fn validatePlainDictionary(self: Header) !void {
         if (self.page_type != .dictionary_page) return error.UnsupportedParquetPage;
@@ -2401,41 +2407,64 @@ fn decodePagePayloadAlloc(
 ) !PagePayload {
     if (compressed_payload.len != header.compressed_page_size) return error.InvalidParquetPage;
     const expected_len: usize = @intCast(header.uncompressed_page_size);
-    const bytes = switch (compression) {
-        .uncompressed => blk: {
-            if (header.compressed_page_size != header.uncompressed_page_size) return error.UnsupportedParquetPage;
-            if (compressed_payload.len != expected_len) return error.InvalidParquetPage;
-            break :blk try alloc.dupe(u8, compressed_payload);
-        },
+    if (expected_len > max_uncompressed_page_bytes) return error.ParquetPageTooLarge;
+
+    const level_prefix_len = if (header.page_type == .data_page_v2) header.data_payload_offset else 0;
+    if (level_prefix_len > expected_len or level_prefix_len > compressed_payload.len) return error.InvalidParquetPage;
+    if (compression == .uncompressed and header.compressed_page_size != header.uncompressed_page_size) {
+        return error.UnsupportedParquetPage;
+    }
+    const values_are_compressed = compression != .uncompressed and
+        (header.page_type != .data_page_v2 or header.data_is_compressed);
+    if (!values_are_compressed) {
+        if (compressed_payload.len != expected_len) return error.InvalidParquetPage;
+        return .{ .bytes = try alloc.dupe(u8, compressed_payload) };
+    }
+
+    const decoded_values = try decodeCompressedExactAlloc(
+        alloc,
+        compression,
+        compressed_payload[level_prefix_len..],
+        expected_len - level_prefix_len,
+    );
+    if (level_prefix_len == 0) return .{ .bytes = decoded_values };
+    defer alloc.free(decoded_values);
+
+    const bytes = try alloc.alloc(u8, expected_len);
+    @memcpy(bytes[0..level_prefix_len], compressed_payload[0..level_prefix_len]);
+    @memcpy(bytes[level_prefix_len..], decoded_values);
+    return .{ .bytes = bytes };
+}
+
+fn decodeCompressedExactAlloc(
+    alloc: Allocator,
+    compression: CompressionCodec,
+    compressed: []const u8,
+    expected_len: usize,
+) ![]u8 {
+    const read_limit = std.math.add(usize, expected_len, 1) catch return error.ParquetPageTooLarge;
+    const decoded = switch (compression) {
+        .uncompressed => return error.InvalidParquetPage,
         .snappy => blk: {
-            const decoded = try snappy.decode(alloc, compressed_payload);
-            errdefer alloc.free(decoded);
-            if (decoded.len != expected_len) return error.InvalidParquetPage;
-            break :blk decoded;
+            if (try snappy.decodedLen(compressed) != expected_len) return error.InvalidParquetPage;
+            break :blk try snappy.decode(alloc, compressed);
         },
         .gzip => blk: {
-            var in: std.Io.Reader = .fixed(compressed_payload);
-            var out: std.Io.Writer.Allocating = .init(alloc);
-            defer out.deinit();
+            var in: std.Io.Reader = .fixed(compressed);
             var window: [std.compress.flate.max_window_len]u8 = undefined;
             var decompress: std.compress.flate.Decompress = .init(&in, .gzip, &window);
-            _ = try decompress.reader.streamRemaining(&out.writer);
-            const decoded = try out.toOwnedSlice();
-            errdefer alloc.free(decoded);
-            if (decoded.len != expected_len) return error.InvalidParquetPage;
-            break :blk decoded;
+            break :blk try decompress.reader.allocRemaining(alloc, .limited(read_limit));
         },
         .zstd => blk: {
-            var in: std.Io.Reader = .fixed(compressed_payload);
+            var in: std.Io.Reader = .fixed(compressed);
             var window: [std.compress.zstd.default_window_len + std.compress.zstd.block_size_max]u8 = undefined;
             var decompress: std.compress.zstd.Decompress = .init(&in, &window, .{});
-            const decoded = try decompress.reader.allocRemaining(alloc, .unlimited);
-            errdefer alloc.free(decoded);
-            if (decoded.len != expected_len) return error.InvalidParquetPage;
-            break :blk decoded;
+            break :blk try decompress.reader.allocRemaining(alloc, .limited(read_limit));
         },
     };
-    return .{ .bytes = bytes };
+    errdefer alloc.free(decoded);
+    if (decoded.len != expected_len) return error.InvalidParquetPage;
+    return decoded;
 }
 
 fn parseHeaderStruct(reader: *Reader) !Header {
@@ -2484,6 +2513,7 @@ fn parseHeaderStruct(reader: *Reader) !Header {
         .definition_level_bytes = page_header.definition_level_bytes,
         .repetition_level_bytes = page_header.repetition_level_bytes,
         .data_payload_offset = page_header.data_payload_offset,
+        .data_is_compressed = page_header.data_is_compressed,
     };
 }
 
@@ -2493,6 +2523,7 @@ const DataPageHeader = struct {
     definition_level_bytes: usize = 0,
     repetition_level_bytes: usize = 0,
     data_payload_offset: usize = 0,
+    data_is_compressed: bool = true,
 };
 
 fn parseDataPageHeader(reader: *Reader) !DataPageHeader {
@@ -2535,12 +2566,14 @@ fn parseDataPageHeaderV2(reader: *Reader) !DataPageHeader {
     var encoding: ?Encoding = null;
     var definition_level_bytes: usize = 0;
     var repetition_level_bytes: usize = 0;
+    var data_is_compressed = true;
     while (try reader.readFieldHeader(&previous_field_id)) |field| {
         switch (field.id) {
             1 => value_count = try reader.readRequiredU32(field.type),
             4 => encoding = try encodingFromInt(try reader.readRequiredI32(field.type)),
             5 => definition_level_bytes = @intCast(try reader.readRequiredU32(field.type)),
             6 => repetition_level_bytes = @intCast(try reader.readRequiredU32(field.type)),
+            7 => data_is_compressed = try reader.readRequiredBool(field.type),
             else => try reader.skip(field.type),
         }
     }
@@ -2550,6 +2583,7 @@ fn parseDataPageHeaderV2(reader: *Reader) !DataPageHeader {
         .definition_level_bytes = definition_level_bytes,
         .repetition_level_bytes = repetition_level_bytes,
         .data_payload_offset = definition_level_bytes + repetition_level_bytes,
+        .data_is_compressed = data_is_compressed,
     };
 }
 
@@ -2606,6 +2640,14 @@ const Reader = struct {
         const value = try self.readRequiredI32(field_type);
         if (value < 0) return error.InvalidParquetPage;
         return @intCast(value);
+    }
+
+    fn readRequiredBool(_: *Reader, field_type: CompactType) !bool {
+        return switch (field_type) {
+            .boolean_true => true,
+            .boolean_false => false,
+            else => error.InvalidParquetPage,
+        };
     }
 
     fn readI16(self: *Reader) !i16 {
@@ -2945,6 +2987,28 @@ fn buildDataPageV2HeaderFixtureWithLevelsAndEncoding(
     repetition_level_bytes: i32,
     encoding: i32,
 ) !std.ArrayListUnmanaged(u8) {
+    return try buildDataPageV2HeaderFixtureWithCompression(
+        alloc,
+        value_count,
+        compressed_size,
+        compressed_size,
+        definition_level_bytes,
+        repetition_level_bytes,
+        encoding,
+        null,
+    );
+}
+
+fn buildDataPageV2HeaderFixtureWithCompression(
+    alloc: Allocator,
+    value_count: i32,
+    uncompressed_size: i32,
+    compressed_size: i32,
+    definition_level_bytes: i32,
+    repetition_level_bytes: i32,
+    encoding: i32,
+    is_compressed: ?bool,
+) !std.ArrayListUnmanaged(u8) {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
 
@@ -2952,7 +3016,7 @@ fn buildDataPageV2HeaderFixtureWithLevelsAndEncoding(
     try appendField(&out, alloc, &page_prev, 1, .i32);
     try appendI32(&out, alloc, 3);
     try appendField(&out, alloc, &page_prev, 2, .i32);
-    try appendI32(&out, alloc, compressed_size);
+    try appendI32(&out, alloc, uncompressed_size);
     try appendField(&out, alloc, &page_prev, 3, .i32);
     try appendI32(&out, alloc, compressed_size);
     try appendField(&out, alloc, &page_prev, 8, .struct_);
@@ -2970,6 +3034,9 @@ fn buildDataPageV2HeaderFixtureWithLevelsAndEncoding(
     try appendI32(&out, alloc, definition_level_bytes);
     try appendField(&out, alloc, &data_prev, 6, .i32);
     try appendI32(&out, alloc, repetition_level_bytes);
+    if (is_compressed) |value| {
+        try appendField(&out, alloc, &data_prev, 7, if (value) .boolean_true else .boolean_false);
+    }
     try appendStop(&out, alloc);
 
     try appendStop(&out, alloc);
@@ -3336,6 +3403,76 @@ test "parquet page scanner decodes snappy plain i64 pages" {
     defer alloc.free(values);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 20 }, values);
     try std.testing.expectError(error.UnsupportedParquetPage, scanUncompressedPlainI64ColumnChunkAlloc(alloc, chunk.items));
+}
+
+test "parquet page scanner keeps v2 levels uncompressed and honors is_compressed" {
+    const alloc = std.testing.allocator;
+    const definition_levels = [_]u8{ 3, 0b00000101 };
+    const values = [_]u8{
+        10, 0, 0, 0, 0, 0, 0, 0,
+        20, 0, 0, 0, 0, 0, 0, 0,
+    };
+    const compressed_values = try snappy.encode(alloc, &values);
+    defer alloc.free(compressed_values);
+
+    var compressed_header = try buildDataPageV2HeaderFixtureWithCompression(
+        alloc,
+        3,
+        @intCast(definition_levels.len + values.len),
+        @intCast(definition_levels.len + compressed_values.len),
+        definition_levels.len,
+        0,
+        0,
+        true,
+    );
+    defer compressed_header.deinit(alloc);
+    var compressed_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer compressed_chunk.deinit(alloc);
+    try compressed_chunk.appendSlice(alloc, compressed_header.items);
+    try compressed_chunk.appendSlice(alloc, &definition_levels);
+    try compressed_chunk.appendSlice(alloc, compressed_values);
+
+    var compressed_result = try scanOptionalPlainI64ColumnChunkAlloc(alloc, compressed_chunk.items, .snappy);
+    defer compressed_result.deinit(alloc);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 0, 20 }, compressed_result.values);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 0 }, compressed_result.nulls);
+
+    var raw_header = try buildDataPageV2HeaderFixtureWithCompression(
+        alloc,
+        3,
+        @intCast(definition_levels.len + values.len),
+        @intCast(definition_levels.len + values.len),
+        definition_levels.len,
+        0,
+        0,
+        false,
+    );
+    defer raw_header.deinit(alloc);
+    var raw_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer raw_chunk.deinit(alloc);
+    try raw_chunk.appendSlice(alloc, raw_header.items);
+    try raw_chunk.appendSlice(alloc, &definition_levels);
+    try raw_chunk.appendSlice(alloc, &values);
+
+    var raw_result = try scanOptionalPlainI64ColumnChunkAlloc(alloc, raw_chunk.items, .snappy);
+    defer raw_result.deinit(alloc);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 0, 20 }, raw_result.values);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 0 }, raw_result.nulls);
+}
+
+test "parquet page decoder rejects oversized declared output before decompression" {
+    try std.testing.expectError(error.ParquetPageTooLarge, decodePagePayloadAlloc(
+        std.testing.allocator,
+        .{
+            .page_type = .data_page,
+            .uncompressed_page_size = max_uncompressed_page_bytes + 1,
+            .compressed_page_size = 1,
+            .value_count = 1,
+            .encoding = .plain,
+        },
+        .snappy,
+        &[_]u8{0},
+    ));
 }
 
 test "parquet page scanner decodes gzip plain i64 pages" {

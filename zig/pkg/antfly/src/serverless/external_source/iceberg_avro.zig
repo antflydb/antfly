@@ -24,6 +24,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const snappy = @import("../../encoding/snappy.zig");
 
+/// Iceberg writers normally keep Avro OCF blocks modest. This ceiling bounds
+/// both ordinary parsing work and decompression of user-owned manifest files.
+pub const max_decoded_block_bytes: usize = 64 * 1024 * 1024;
+
 pub const ManifestContent = enum(u8) {
     data = 0,
     deletes = 1,
@@ -402,21 +406,24 @@ fn decodeBlockAlloc(
     encoded_block: []const u8,
 ) !DecodedBlock {
     return switch (codec) {
-        .null => .{ .bytes = encoded_block },
+        .null => if (encoded_block.len <= max_decoded_block_bytes)
+            .{ .bytes = encoded_block }
+        else
+            error.AvroBlockTooLarge,
         .deflate => blk: {
             var in: std.Io.Reader = .fixed(encoded_block);
-            var out: std.Io.Writer.Allocating = .init(alloc);
-            defer out.deinit();
             var window: [std.compress.flate.max_window_len]u8 = undefined;
             var decompress: std.compress.flate.Decompress = .init(&in, .raw, &window);
-            _ = try decompress.reader.streamRemaining(&out.writer);
-            const decoded = try out.toOwnedSlice();
+            const decoded = try decompress.reader.allocRemaining(alloc, .limited(max_decoded_block_bytes + 1));
+            errdefer alloc.free(decoded);
+            if (decoded.len > max_decoded_block_bytes) return error.AvroBlockTooLarge;
             break :blk .{ .bytes = decoded, .owned = decoded };
         },
         .snappy => blk: {
             if (encoded_block.len < 4) return error.InvalidAvroContainer;
             const checksum_start = encoded_block.len - 4;
             const compressed = encoded_block[0..checksum_start];
+            if (try snappy.decodedLen(compressed) > max_decoded_block_bytes) return error.AvroBlockTooLarge;
             const expected_crc = std.mem.readInt(u32, encoded_block[checksum_start..][0..4], .big);
             const decoded = try snappy.decode(alloc, compressed);
             errdefer alloc.free(decoded);
@@ -427,7 +434,9 @@ fn decodeBlockAlloc(
             var in: std.Io.Reader = .fixed(encoded_block);
             var window: [std.compress.zstd.default_window_len + std.compress.zstd.block_size_max]u8 = undefined;
             var decompress: std.compress.zstd.Decompress = .init(&in, &window, .{});
-            const decoded = try decompress.reader.allocRemaining(alloc, .unlimited);
+            const decoded = try decompress.reader.allocRemaining(alloc, .limited(max_decoded_block_bytes + 1));
+            errdefer alloc.free(decoded);
+            if (decoded.len > max_decoded_block_bytes) return error.AvroBlockTooLarge;
             break :blk .{ .bytes = decoded, .owned = decoded };
         },
     };
@@ -1139,6 +1148,16 @@ test "iceberg avro manifest-list decoder reads zstandard blocks" {
     try std.testing.expectEqual(@as(usize, 2), list.entries.len);
     try std.testing.expectEqualStrings("s3://bucket/t/metadata/m0.avro", list.entries[0].manifest_path);
     try std.testing.expectEqual(ManifestContent.deletes, list.entries[1].content);
+}
+
+test "iceberg avro block decoder rejects oversized snappy output before allocation" {
+    // Raw Snappy starts with the decoded length as an unsigned varint. The CRC
+    // bytes are irrelevant because the size guard runs first.
+    const encoded = [_]u8{ 0x81, 0x80, 0x80, 0x20, 0, 0, 0, 0 };
+    try std.testing.expectError(
+        error.AvroBlockTooLarge,
+        decodeBlockAlloc(std.testing.allocator, .snappy, &encoded),
+    );
 }
 
 test "iceberg avro manifest-list decoder rejects unsupported codec" {

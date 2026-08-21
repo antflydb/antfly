@@ -312,11 +312,11 @@ fn icebergMetadataUriForOpenedStoreAlloc(
             }
         }
 
-        if (page.next_continuation_token) |token| {
-            const owned_next = try alloc.dupe(u8, token);
-            if (next_token) |old| alloc.free(old);
-            next_token = owned_next;
-        } else break;
+        if (!try external_source.advanceObjectListingContinuationTokenAlloc(
+            alloc,
+            &next_token,
+            page.next_continuation_token,
+        )) break;
     }
 
     const key = best_key orelse return error.ExternalLakeSnapshotMismatch;

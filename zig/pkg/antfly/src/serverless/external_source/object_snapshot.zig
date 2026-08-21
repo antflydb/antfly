@@ -113,11 +113,7 @@ pub fn planParquetPrefixInventoryFromObjectStorageAlloc(
             });
         }
 
-        if (page.next_continuation_token) |token| {
-            const owned_next = try alloc.dupe(u8, token);
-            if (next_token) |old| alloc.free(old);
-            next_token = owned_next;
-        } else break;
+        if (!try advanceContinuationTokenAlloc(alloc, &next_token, page.next_continuation_token)) break;
     }
 
     return try planParquetPrefixInventoryWithObjectUriBaseAlloc(
@@ -128,6 +124,31 @@ pub fn planParquetPrefixInventoryFromObjectStorageAlloc(
         request.schema_fingerprint,
         listed_objects.items,
     );
+}
+
+/// Own the provider's next listing token and reject responses that cannot make
+/// forward progress. Object-store implementations occasionally surface empty
+/// or repeated tokens on malformed pagination responses; accepting either
+/// would turn snapshot resolution into an unbounded loop.
+pub fn advanceContinuationTokenAlloc(
+    alloc: Allocator,
+    current: *?[]u8,
+    received: ?[]const u8,
+) !bool {
+    const token = received orelse {
+        if (current.*) |old| alloc.free(old);
+        current.* = null;
+        return false;
+    };
+    if (token.len == 0) return error.InvalidContinuationToken;
+    if (current.*) |old| {
+        if (std.mem.eql(u8, old, token)) return error.InvalidContinuationToken;
+    }
+
+    const owned = try alloc.dupe(u8, token);
+    if (current.*) |old| alloc.free(old);
+    current.* = owned;
+    return true;
 }
 
 pub fn planParquetPrefixInventoryAlloc(
@@ -395,6 +416,19 @@ test "raw parquet prefix snapshot changes with object version identity" {
 
     try std.testing.expect(!std.mem.eql(u8, inv_a.snapshot_id, inv_b.snapshot_id));
     try std.testing.expectEqualStrings("s3://bucket/logs/part-a.parquet", inv_a.files[0].object_uri);
+}
+
+test "raw parquet prefix pagination requires advancing continuation tokens" {
+    const alloc = std.testing.allocator;
+    var token: ?[]u8 = null;
+    defer if (token) |value| alloc.free(value);
+
+    try std.testing.expect(try advanceContinuationTokenAlloc(alloc, &token, "page-2"));
+    try std.testing.expectEqualStrings("page-2", token.?);
+    try std.testing.expectError(error.InvalidContinuationToken, advanceContinuationTokenAlloc(alloc, &token, "page-2"));
+    try std.testing.expectError(error.InvalidContinuationToken, advanceContinuationTokenAlloc(alloc, &token, ""));
+    try std.testing.expect(!try advanceContinuationTokenAlloc(alloc, &token, null));
+    try std.testing.expect(token == null);
 }
 
 test "raw parquet prefix snapshot rejects empty and unversioned listings" {

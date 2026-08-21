@@ -32,6 +32,18 @@ pub const CredentialRef = struct {
 
     pub fn validate(self: CredentialRef) !void {
         if (self.ref_id.len == 0) return error.InvalidExternalTableBinding;
+        if (self.scope.len == 0) return;
+        if (self.scope.len > 4096 or self.scope[0] == '/' or self.scope[self.scope.len - 1] == '/' or
+            std.mem.indexOfAny(u8, self.scope, "\\\x00") != null)
+        {
+            return error.InvalidExternalTableBinding;
+        }
+        var components = std.mem.splitScalar(u8, self.scope, '/');
+        while (components.next()) |component| {
+            if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) {
+                return error.InvalidExternalTableBinding;
+            }
+        }
     }
 };
 

@@ -39,6 +39,7 @@ pub fn openBindingObjectStoreAlloc(
     binding: catalog_binding.Binding,
     options: BindingObjectStoreOpenOptions,
 ) !object_store_support.OpenedObjectStore {
+    try binding.validate();
     if (binding.format != .parquet and binding.format != .iceberg) return error.UnsupportedRowsQuery;
     if (binding.credential_ref == null) return try object_store_support.OpenedObjectStore.initRemoteUriWithOptions(
         alloc,
@@ -69,25 +70,32 @@ fn openCredentialedBindingObjectStoreAlloc(
     };
 
     return switch (parsed) {
-        .s3 => |value| try openCredentialedS3PrefixAlloc(
-            alloc,
-            options.secret_store,
-            external_io,
-            value.bucket,
-            value.prefix,
-            options.read_only,
-        ),
-        .gcs => |value| try openCredentialedGcsPrefixAlloc(
-            alloc,
-            options.secret_store,
-            external_io,
-            value.bucket,
-            value.prefix,
-            options.read_only,
-        ),
+        .s3 => |value| blk: {
+            try ensurePrefixAllowed(value.prefix, credential.scope);
+            break :blk try openCredentialedS3PrefixAlloc(
+                alloc,
+                options.secret_store,
+                external_io,
+                value.bucket,
+                value.prefix,
+                options.read_only,
+            );
+        },
+        .gcs => |value| blk: {
+            try ensurePrefixAllowed(value.prefix, credential.scope);
+            break :blk try openCredentialedGcsPrefixAlloc(
+                alloc,
+                options.secret_store,
+                external_io,
+                value.bucket,
+                value.prefix,
+                options.read_only,
+            );
+        },
         .file => |path| blk: {
             if (external_io.protocol != .filesystem) return error.UnsupportedExternalLakeCredentialRef;
             const root = external_io.root orelse return error.UnsupportedExternalLakeCredentialRef;
+            try ensurePrefixAllowed(std.mem.trimStart(u8, path, "/"), credential.scope);
             const resolved_path = try resolveFilesystemSourcePathAlloc(alloc, root, path);
             defer alloc.free(resolved_path);
             const file_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{resolved_path});
@@ -389,6 +397,19 @@ test "serverless external source credentialed binding opens scoped gcs source wi
         .bearer_token => |token| try std.testing.expectEqualStrings("test-token", token),
         else => return error.TestExpectedEqual,
     }
+
+    // The binding scope is a second, catalog-owned restriction and must not be
+    // silently widened by a broader matching connection prefix.
+    try std.testing.expectError(error.ExternalLakeCredentialScopeMismatch, openBindingObjectStoreAlloc(alloc, .{
+        .table_id = "events",
+        .format = .parquet,
+        .source_uri = "gs://lake-bucket/events/2026",
+        .credential_ref = .{ .ref_id = "prod-gcs-lake-read", .scope = "events/private" },
+        .schema_fingerprint = "schema-v1",
+    }, .{
+        .file_bucket = "external-lake",
+        .node_config = &cfg,
+    }));
 
     try std.testing.expectError(error.ExternalLakeCredentialScopeMismatch, openBindingObjectStoreAlloc(alloc, .{
         .table_id = "events",
