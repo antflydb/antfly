@@ -1381,9 +1381,8 @@ pub fn normalizeEmbeddingsIndexDimensionJsonWithOptions(
         if (!sparse) _ = try resolveDeclaredEmbeddingDimensionsRequired(cfg);
         return null;
     }
-    const embedder = embedder_value orelse return error.InvalidCreateTableRequest;
-
     if (sparse) {
+        const embedder = embedder_value orelse return error.InvalidCreateTableRequest;
         if (validation_value != null) return error.InvalidCreateTableRequest;
         try validateSparseEmbeddingForManagedConfig(alloc, index_name, cfg, embedder, options);
         return null;
@@ -1391,6 +1390,15 @@ pub fn normalizeEmbeddingsIndexDimensionJsonWithOptions(
 
     const declared_dims = try resolveDeclaredEmbeddingDimensions(cfg);
     if (validation == .defer_probe and declared_dims == null) return error.InvalidCreateTableRequest;
+    // Chunker-only dense indexes consume caller-supplied chunk embeddings and
+    // have no embedding provider to probe. Their declared dimension remains
+    // authoritative; the subsequent config translation validates that a
+    // chunker is actually present.
+    const embedder = embedder_value orelse {
+        if (validation_value != null) return error.InvalidCreateTableRequest;
+        _ = try resolveDeclaredEmbeddingDimensionsRequired(cfg);
+        return null;
+    };
     const dims = try resolveEmbeddingDimensionsForManagedConfigWithValidation(alloc, index_name, cfg, embedder, options, validation);
     if (cfg.dimension != null and validation_value == null) return null;
 
@@ -3589,6 +3597,32 @@ test "managed embedder defers operational dimension probe failure with explicit 
     try testManagedEmbedderDefersOperationalDimensionProbeFailure();
 }
 
+fn testChunkerOnlyDenseIndexPreservesDeclaredDimensions() !void {
+    const alloc = std.testing.allocator;
+    const index_json =
+        \\{"type":"embeddings","field":"body","dimension":3,"chunker":{"provider":"antfly","store_chunks":false,"text":{"target_tokens":4,"separator":" "}}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect((try normalizeEmbeddingsIndexDimensionJsonWithOptions(
+        alloc,
+        "semantic_chunked_idx",
+        parsed.value,
+        .{},
+    )) == null);
+
+    const translated = try translateEmbeddingsIndexConfigJsonWithOptions(
+        alloc,
+        "semantic_chunked_idx",
+        parsed.value,
+        .{},
+    );
+    defer alloc.free(translated);
+    try std.testing.expect(std.mem.indexOf(u8, translated, "\"dims\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, translated, "\"chunker\":") != null);
+}
+
 test "managed embedder strict dimension probe failure is retryable" {
     try testManagedEmbedderStrictDimensionProbeFailureIsRetryable();
 }
@@ -3598,6 +3632,7 @@ pub fn testDimensionProbeValidationModes() !void {
     try testManagedEmbedderDefersOperationalDimensionProbeFailure();
     try testManagedEmbedderDeferProbeRequiresDeclaredDimension();
     try testManagedEmbedderStrictDimensionProbeFailureIsRetryable();
+    try testChunkerOnlyDenseIndexPreservesDeclaredDimensions();
 }
 
 fn testManagedEmbedderDefersOperationalDimensionProbeFailure() !void {

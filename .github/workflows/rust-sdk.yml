@@ -1,0 +1,53 @@
+name: Rust SDK CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rs/crates/sdk/**"
+      - "rs/Cargo.toml"
+      - "rs/Cargo.lock"
+      - "openapi.yaml"
+      - "specs/openapi/**"
+      - ".github/workflows/rust-sdk.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "rs/crates/sdk/**"
+      - "rs/Cargo.toml"
+      - "rs/Cargo.lock"
+      - "openapi.yaml"
+      - "specs/openapi/**"
+      - ".github/workflows/rust-sdk.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  sdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: rs
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Build and test SDK
+        run: cargo test --locked --package antfly-sdk

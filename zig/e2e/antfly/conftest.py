@@ -987,6 +987,8 @@ class StandaloneAntflyServer:
             )
             if matches:
                 return matches[-1].rstrip("/")
+            if "standalone local metadata enabled (raft disabled)" in logs:
+                return ""
             time.sleep(0.1)
         return ""
 

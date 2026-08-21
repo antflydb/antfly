@@ -59,10 +59,11 @@ const SemanticReadinessAdvisory = struct {
         self.active = false;
     }
 
-    fn awaitOnQueryFailure(self: *@This(), io: std.Io) void {
-        if (!self.active) return;
+    fn awaitOnQueryFailure(self: *@This(), io: std.Io) bool {
+        if (!self.active) return false;
         self.group.await(io) catch {};
         self.active = false;
+        return true;
     }
 };
 
@@ -263,7 +264,13 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
             advisory.start(io, client, tbl, indexes.?) catch {};
         }
         var resp = client.queryTable(tbl, body) catch |err| {
-            advisory.awaitOnQueryFailure(io);
+            // Explicit selection overlaps the bounded readiness lookup with
+            // the query. With implicit selection, defer the lookup until the
+            // query actually fails: successful requests keep the fast path,
+            // while failures still explain an empty table index catalog.
+            if (!advisory.awaitOnQueryFailure(io) and semantic_search != null) {
+                index_readiness.warnIfSemanticIndexesAreNotReady(client, tbl, indexes);
+            }
             return err;
         };
         advisory.cancel(io);

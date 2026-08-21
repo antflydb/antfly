@@ -87,10 +87,13 @@ impl Default for types::CreateEmbeddingsIndexRequest {
 impl Default for types::CreateGraphIndexRequest {
     fn default() -> Self {
         Self {
+            artifact: None,
             description: None,
             edge_types: Vec::new(),
             enrichments: Vec::new(),
             max_edges_per_document: None,
+            resolvers: Vec::new(),
+            source: None,
             summarizer: None,
             template: None,
             type_: types::CreateGraphIndexRequestType::Graph,

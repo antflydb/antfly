@@ -258,6 +258,7 @@ pub const TextStatsResponse = table_read_source.TextStatsResponse;
 pub const BackgroundTextStatsResponse = table_read_source.BackgroundTextStatsResponse;
 pub const LsmStorageStats = table_read_source.LsmStorageStats;
 pub const ObservedDynamicFieldCapabilitySet = table_read_source.ObservedDynamicFieldCapabilitySet;
+pub const DynamicFieldObservationQuery = table_read_source.DynamicFieldObservationQuery;
 pub const ParsedTextStatsHttpResponse = table_read_source.ParsedTextStatsHttpResponse;
 
 pub const testing = if (builtin.is_test) struct {
@@ -1366,6 +1367,39 @@ fn provisionedLocalQueryDbOwner(
     return .{ .owned = db };
 }
 
+fn provisionedLocalQueryDbOwnerIfPresent(
+    resident_db: ?ResidentDbSource,
+    cache: ?*ProvisionedTableReadCache,
+    catalog: table_catalog.CatalogSource,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lsm_root_generation: u64,
+    table_name: []const u8,
+    read_activity_held: bool,
+) !?LocalQueryDbOwner {
+    if (resident_db) |source| {
+        if (try source.leaseGroup(alloc, table_name, group_id, lsm_root_generation, .{
+            .read_activity_held = read_activity_held,
+        })) |lease_value| {
+            validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease_value.db) catch |err| {
+                var lease = lease_value;
+                lease.release(alloc);
+                return err;
+            };
+            return .{ .resident = .{ .lease = lease_value, .alloc = alloc } };
+        }
+    }
+
+    const query_cache = cache orelse return null;
+    const identity_namespace = try requireTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id);
+    var lease = query_cache.getIfPresent(group_id, lsm_root_generation, identity_namespace, table_name) orelse return null;
+    validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease.db) catch |err| {
+        lease.release();
+        return err;
+    };
+    return .{ .cached = lease };
+}
+
 const LocalQueryExecution = struct {
     request: db_mod.types.SearchRequest,
     result: db_mod.types.SearchResult,
@@ -2093,10 +2127,11 @@ pub const BoundTableReadSource = struct {
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
+        observation: DynamicFieldObservationQuery,
     ) !?[]ObservedDynamicFieldCapabilitySet {
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table_name)) return null;
-        return try self.db.observedDynamicFieldCapabilitySetsAlloc(alloc);
+        return try self.db.observedDynamicFieldCapabilitySetsAlloc(alloc, observation);
     }
 
     fn localRuntimeStatuses(
@@ -3567,6 +3602,7 @@ pub const ProvisionedTableReadSource = struct {
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
+        observation: DynamicFieldObservationQuery,
     ) !?[]ObservedDynamicFieldCapabilitySet {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var read_activity = self.beginPreparedRead(table_name, .general);
@@ -3579,19 +3615,33 @@ pub const ProvisionedTableReadSource = struct {
         errdefer freeObservedDynamicFieldCapabilitySetsFromList(alloc, &merged);
 
         for (group_ids) |group_id| {
-            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-            defer alloc.free(path);
-            const identity_namespace = try requireTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
-            var db = try openProvisionedWarmStatusDbForTable(
+            // Sort/queryability evidence lives in the loaded text-index
+            // catalog, which status-only DB handles intentionally omit. Lease
+            // only an already-present, generation-matched resident or cached
+            // query DB: table status must not map a potentially large index.
+            // Query admission handles the temporary miss by running its normal
+            // preflight warm-and-retry protocol.
+            var owner = (provisionedLocalQueryDbOwnerIfPresent(
+                self.resident_db,
+                self.cache,
+                self.catalog,
                 alloc,
-                path,
+                group_id,
                 self.visibleRootGeneration(group_id),
-                self.backend_runtime,
-                identity_namespace,
-            );
-            defer db.close();
+                table_name,
+                true,
+            ) catch |err| switch (err) {
+                // ResidentDbRetryRequired is a private in-process retry
+                // protocol and is intentionally absent from the runtime error
+                // ABI. Translate it before this callback crosses a runtime
+                // partition so query admission can perform the normal warm
+                // retry while status reads remain best effort.
+                error.ResidentDbRetryRequired => return error.StorageReadTemporarilyUnavailable,
+                else => return err,
+            }) orelse return error.StorageReadTemporarilyUnavailable;
+            defer owner.deinit();
 
-            const group_sets = try db.observedDynamicFieldCapabilitySetsAlloc(alloc);
+            const group_sets = try owner.db().observedDynamicFieldCapabilitySetsAlloc(alloc, observation);
             defer freeObservedDynamicFieldCapabilitySets(alloc, group_sets);
             for (group_sets) |set| try mergeObservedDynamicFieldCapabilitySet(alloc, &merged, set);
         }
@@ -26722,7 +26772,7 @@ test "provisioned storage inspection uses table read admission" {
     source.prepare_for_read = tracker.iface();
 
     try std.testing.expect((try source.source().lsmStorageStats(std.testing.allocator, "docs")) == null);
-    try std.testing.expect((try source.source().observedDynamicFieldCapabilitySets(std.testing.allocator, "docs")) == null);
+    try std.testing.expect((try source.source().observedDynamicFieldCapabilitySets(std.testing.allocator, "docs", .{})) == null);
     try std.testing.expectEqual(@as(usize, 2), tracker.begins);
     try std.testing.expectEqual(@as(usize, 2), tracker.ends);
 }

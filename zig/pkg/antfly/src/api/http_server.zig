@@ -3889,12 +3889,26 @@ pub const ApiHttpServer = struct {
         return tables_api.lsmStorageStatusFromStats(aggregate);
     }
 
+    fn observedDynamicFieldCapabilitySets(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        observation: table_reads.DynamicFieldObservationQuery,
+    ) ![]table_reads.ObservedDynamicFieldCapabilitySet {
+        const source = self.table_reads orelse return &.{};
+        return (try source.observedDynamicFieldCapabilitySets(self.alloc, table_name, observation)) orelse &.{};
+    }
+
     fn bestEffortObservedDynamicFieldCapabilitySets(
         self: *ApiHttpServer,
         table_name: []const u8,
     ) ![]table_reads.ObservedDynamicFieldCapabilitySet {
-        const source = self.table_reads orelse return &.{};
-        return (try source.observedDynamicFieldCapabilitySets(self.alloc, table_name)) orelse &.{};
+        return self.observedDynamicFieldCapabilitySets(table_name, .{ .coverage_read_mode = .cached_only }) catch |err| switch (err) {
+            // Observability and query-builder callers can still provide the
+            // declared schema when a cold query DB has no physical evidence
+            // yet. They must not warm storage merely to enrich metadata.
+            error.StorageReadTemporarilyUnavailable => &.{},
+            else => return err,
+        };
     }
 
     fn freeObservedDynamicFieldCapabilitySets(
@@ -5119,6 +5133,9 @@ pub const ApiHttpServer = struct {
         query_req: db_mod.types.SearchRequest,
     ) !void {
         if (!publicSearchRequestHasSortPageControls(query_req)) return;
+        // Reject shape/source errors and finish synthetic-only sorts before
+        // opening table state or validating any physical column.
+        if (try validatePublicQuerySortRequestContract(query_req)) return;
 
         var snapshot = (try self.source.adminSnapshot()) orelse return;
         defer self.source.freeAdminSnapshot(&snapshot);
@@ -5133,9 +5150,59 @@ pub const ApiHttpServer = struct {
         const runtime_schema = try schema_mod.deriveRuntimeTableSchema(self.alloc, parsed_schema);
         defer storage_schema.freeSchema(self.alloc, runtime_schema);
 
-        const observed_dynamic_capability_sets = try self.bestEffortObservedDynamicFieldCapabilitySets(table_name);
+        const physical_sort_fields = try publicPhysicalSortFieldsAlloc(self.alloc, query_req.order_by);
+        defer if (physical_sort_fields.len > 0) self.alloc.free(physical_sort_fields);
+        const can_observe_physical_coverage = if (self.table_reads) |source|
+            source.supportsObservedDynamicFieldCapabilitySets()
+        else
+            false;
+        const observed_dynamic_capability_sets: []table_reads.ObservedDynamicFieldCapabilitySet = if (physical_sort_fields.len == 0 or !can_observe_physical_coverage)
+            &.{}
+        else
+            try self.queryObservedDynamicFieldCapabilitySets(table_name, query_req, .{
+                .index_name = query_req.primary_text_index_name orelse query_req.index_name,
+                .fields = physical_sort_fields,
+                .coverage_read_mode = .validate,
+                .execution_deadline_ns = query_req.execution_deadline_ns,
+                .cancellation = query_req.cancellation,
+            });
         defer self.freeObservedDynamicFieldCapabilitySets(observed_dynamic_capability_sets);
-        try validatePublicQuerySortCapabilitiesAgainstRuntime(query_req, runtime_schema, observed_dynamic_capability_sets);
+        try validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(
+            query_req,
+            runtime_schema,
+            observed_dynamic_capability_sets,
+            can_observe_physical_coverage,
+        );
+    }
+
+    fn queryObservedDynamicFieldCapabilitySets(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        query_req: db_mod.types.SearchRequest,
+        observation: table_reads.DynamicFieldObservationQuery,
+    ) ![]table_reads.ObservedDynamicFieldCapabilitySet {
+        const source = self.table_reads orelse return &.{};
+        return self.observedDynamicFieldCapabilitySets(table_name, observation) catch |err| switch (err) {
+            error.StorageReadTemporarilyUnavailable => {
+                // A cold provisioned table has not installed a resident query
+                // handle yet. Let the normal preflight retry protocol prepare
+                // it without making GET /tables perform cold index loading,
+                // then re-read the physical coverage used by sort admission.
+                var summary = (try source.preflightQuery(
+                    self.alloc,
+                    table_name,
+                    query_req,
+                    .read_index,
+                    0,
+                )) orelse return error.StorageReadTemporarilyUnavailable;
+                defer summary.deinit(self.alloc);
+                return self.observedDynamicFieldCapabilitySets(table_name, observation) catch |retry_err| switch (retry_err) {
+                    error.StorageReadTemporarilyUnavailable => error.StorageReadTemporarilyUnavailable,
+                    else => retry_err,
+                };
+            },
+            else => return err,
+        };
     }
 
     pub fn validateTableWritesAgainstSchema(self: *ApiHttpServer, table_name: []const u8, writes: anytype) !void {
@@ -5176,8 +5243,21 @@ pub const ApiHttpServer = struct {
     pub fn maybeEncodeTableStatus(self: *ApiHttpServer, table_name: []const u8) !?[]u8 {
         var snapshot = (try self.source.adminSnapshot()) orelse return null;
         defer self.source.freeAdminSnapshot(&snapshot);
+        if (tables_api.findTableByName(&snapshot, table_name) == null) return null;
         var storage_status_buf: [1]tables_api.TableStorageStatus = undefined;
         const storage_statuses = try self.bestEffortSingleTableStorageStatuses(table_name, &snapshot, &storage_status_buf);
+        if (storage_statuses) |_| {
+            const observed = self.bestEffortObservedDynamicFieldCapabilitySets(table_name) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    std.log.debug("runtime field capability observation unavailable table={s} err={s}", .{ table_name, @errorName(err) });
+                    return try tables_api.encodeSingleTableStatusWithStorageStatuses(self.alloc, &snapshot, table_name, storage_statuses);
+                },
+            };
+            defer self.freeObservedDynamicFieldCapabilitySets(observed);
+            storage_status_buf[0].observed_dynamic_field_capability_sets = observed;
+            return try tables_api.encodeSingleTableStatusWithStorageStatuses(self.alloc, &snapshot, table_name, storage_statuses);
+        }
         return try tables_api.encodeSingleTableStatusWithStorageStatuses(self.alloc, &snapshot, table_name, storage_statuses);
     }
 
@@ -7994,6 +8074,45 @@ pub const ApiHttpServer = struct {
                 },
                 error.InvalidQueryRequest => {
                     return err;
+                },
+                else => return err,
+            };
+        }
+    }
+
+    /// Point reads use the same bounded cold-runtime readiness policy as
+    /// public queries. A successful table creation or write should not expose
+    /// an internal read-cache installation race to the next lookup, while
+    /// remote/read-only deployments still fail fast and callers can cancel.
+    pub fn lookupWithReadinessRetry(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        source: table_reads.TableReadSource,
+        table_name: []const u8,
+        key: []const u8,
+        opts: db_mod.types.LookupOptions,
+        consistency: raft_mod.ReadConsistency,
+        request: api_operation.RequestContext,
+    ) !?table_reads.LookupResponse {
+        const retry_timeout_ns: u64 = if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
+        const retry_poll_ns = 50 * std.time.ns_per_ms;
+        const start_ns = platform_time.monotonicNs();
+        while (true) {
+            try ensureTableOperationActive(request);
+            return source.lookup(alloc, table_name, key, opts, consistency) catch |err| switch (err) {
+                error.StorageReadTemporarilyUnavailable => {
+                    const now_ns = platform_time.monotonicNs();
+                    if (retry_timeout_ns == 0) return err;
+                    const sleep_ns = boundedRetrySleepNs(
+                        request.deadline_ns,
+                        now_ns,
+                        start_ns,
+                        retry_timeout_ns,
+                        retry_poll_ns,
+                    ) orelse return err;
+                    if (sleep_ns == 0) return error.DeadlineExceeded;
+                    try sleepNsCancellable(sleep_ns, request.cancellation);
+                    continue;
                 },
                 else => return err,
             };
@@ -13082,8 +13201,66 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntime(
     runtime_schema: storage_schema.TableSchema,
     observed_dynamic_capability_sets: []const table_reads.ObservedDynamicFieldCapabilitySet,
 ) !void {
+    return validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(
+        query_req,
+        runtime_schema,
+        observed_dynamic_capability_sets,
+        true,
+    );
+}
+
+fn validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(
+    query_req: db_mod.types.SearchRequest,
+    runtime_schema: storage_schema.TableSchema,
+    observed_dynamic_capability_sets: []const table_reads.ObservedDynamicFieldCapabilitySet,
+    physical_evidence_available: bool,
+) !void {
+    if (try validatePublicQuerySortRequestContract(query_req)) return;
     const cursor = if (query_req.search_after.len > 0) query_req.search_after else query_req.search_before;
-    if (query_req.order_by.len == 0 and cursor.len == 0) return;
+    for (query_req.order_by, 0..) |field, i| {
+        if (std.mem.eql(u8, field.field, "_id")) continue;
+        if (std.mem.eql(u8, field.field, "_score")) continue;
+
+        if (storage_schema.resolveDeclaredFieldType(runtime_schema, field.field)) |mapping| {
+            try validatePublicMappedSortField(field.field, mapping);
+            if (try validatePublicSortCapabilityEvidence(
+                observed_dynamic_capability_sets,
+                query_req.primary_text_index_name orelse query_req.index_name,
+                field.field,
+                mapping.field_type,
+            ) == null) {
+                if (physical_evidence_available) try validatePublicMappedSortCoverage(field.field, mapping);
+            }
+            if (cursor.len > 0) try validatePublicMappedSortCursor(field.field, mapping.field_type, cursor[i]);
+            continue;
+        }
+
+        if (try validatePublicSortCapabilityEvidence(
+            observed_dynamic_capability_sets,
+            query_req.primary_text_index_name orelse query_req.index_name,
+            field.field,
+            null,
+        )) |field_type| {
+            if (cursor.len > 0) try validatePublicMappedSortCursor(field.field, field_type, cursor[i]);
+            continue;
+        }
+
+        // A routed gateway cannot see shard-local wildcard/dynamic mappings.
+        // Defer only the physical question; every owning shard still performs
+        // the same fail-closed native-sort planning before reading results.
+        if (physical_evidence_available) {
+            recordPublicSortCapabilityRejection(field.field, "unmapped_sort_field", "unmapped_field");
+            return error.UnsupportedExactSort;
+        }
+    }
+}
+
+/// Validate everything that does not require physical typed-doc-values
+/// evidence. Returning true means the request is fully handled by synthetic
+/// sort keys and query admission can avoid table/index access entirely.
+fn validatePublicQuerySortRequestContract(query_req: db_mod.types.SearchRequest) !bool {
+    const cursor = if (query_req.search_after.len > 0) query_req.search_after else query_req.search_before;
+    if (query_req.order_by.len == 0 and cursor.len == 0) return true;
     try validatePublicCountOnlySortPageContract(query_req);
     try validatePublicSortCursorContract(query_req);
     if (query_req.hierarchy_children != null) {
@@ -13106,48 +13283,42 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntime(
             recordPublicSortCapabilityRejection("_hierarchy.position", "invalid_cursor_arity", "invalid_hierarchy_navigation_order");
             return error.InvalidQueryRequest;
         }
-        return;
+        return true;
     }
     try validatePublicScoreSortSource(query_req);
     try validatePublicApproximateSortSource(query_req);
-    if (query_req.order_by.len == 0) return;
-    for (query_req.order_by, 0..) |field, i| {
-        if (std.mem.eql(u8, field.field, "_id")) continue;
-        if (std.mem.eql(u8, field.field, "_score")) continue;
-
-        if (storage_schema.resolveDeclaredFieldType(runtime_schema, field.field)) |mapping| {
-            try validatePublicMappedSortField(field.field, mapping);
-            if (try validatePublicSortCapabilityEvidence(
-                observed_dynamic_capability_sets,
-                query_req.primary_text_index_name orelse query_req.index_name,
-                field.field,
-                mapping.field_type,
-            ) == null) {
-                try validatePublicMappedSortCoverage(field.field, mapping);
-            }
-            if (cursor.len > 0) try validatePublicMappedSortCursor(field.field, mapping.field_type, cursor[i]);
-            continue;
-        }
-
-        if (try validatePublicSortCapabilityEvidence(
-            observed_dynamic_capability_sets,
-            query_req.primary_text_index_name orelse query_req.index_name,
-            field.field,
-            null,
-        )) |field_type| {
-            if (cursor.len > 0) try validatePublicMappedSortCursor(field.field, field_type, cursor[i]);
-            continue;
-        }
-
-        recordPublicSortCapabilityRejection(field.field, "unmapped_sort_field", "unmapped_field");
-        return error.UnsupportedExactSort;
+    for (query_req.order_by) |field| {
+        if (!std.mem.eql(u8, field.field, "_id") and !std.mem.eql(u8, field.field, "_score")) return false;
     }
+    return true;
 }
 
 fn publicSearchRequestHasSortPageControls(query_req: db_mod.types.SearchRequest) bool {
     return query_req.order_by.len > 0 or
         query_req.search_after.len > 0 or
         query_req.search_before.len > 0;
+}
+
+fn publicPhysicalSortFieldsAlloc(
+    alloc: std.mem.Allocator,
+    order_by: []const db_mod.types.SortField,
+) ![]const []const u8 {
+    var fields = std.ArrayListUnmanaged([]const u8).empty;
+    defer fields.deinit(alloc);
+    for (order_by) |sort_field| {
+        if (std.mem.eql(u8, sort_field.field, "_id") or
+            std.mem.eql(u8, sort_field.field, "_score") or
+            std.mem.eql(u8, sort_field.field, "_hierarchy.position")) continue;
+        var duplicate = false;
+        for (fields.items) |field| {
+            if (std.mem.eql(u8, field, sort_field.field)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) try fields.append(alloc, sort_field.field);
+    }
+    return try fields.toOwnedSlice(alloc);
 }
 
 fn validatePublicCountOnlySortPageContract(query_req: db_mod.types.SearchRequest) !void {
@@ -17426,6 +17597,88 @@ test "api http retry sleep is bounded by request deadline" {
     );
 }
 
+test "api http point lookup retries bounded local readiness races" {
+    const FakeStatus = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn source() StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+    };
+    const FakeReads = struct {
+        attempts: u32 = 0,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &.{
+                .lookup = lookup,
+                .scan = scan,
+                .query = query,
+            } };
+        }
+
+        fn lookup(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("doc:1", key);
+            self.attempts += 1;
+            if (self.attempts == 1) return error.StorageReadTemporarilyUnavailable;
+            return .{
+                .json = try alloc.dupe(u8, "{\"title\":\"alpha\"}"),
+                .version = 7,
+            };
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) anyerror!?query_api.QueryResponse {
+            return error.UnsupportedOperation;
+        }
+    };
+    const DummyWrites = struct {
+        fn source() table_writes.TableWriteSource {
+            return .{ .ptr = undefined, .vtable = &.{ .batch = batch } };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return;
+        }
+    };
+
+    var reads = FakeReads{};
+    var server = ApiHttpServer.init(
+        std.testing.allocator,
+        .{},
+        FakeStatus.source(),
+        reads.source(),
+        DummyWrites.source(),
+    );
+    var response = (try server.lookupWithReadinessRetry(
+        std.testing.allocator,
+        reads.source(),
+        "docs",
+        "doc:1",
+        .{},
+        .read_index,
+        .{},
+    )).?;
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), reads.attempts);
+    try std.testing.expectEqual(@as(u64, 7), response.version);
+    try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", response.json);
+}
+
 test "api http transient read retry honors expired request deadline before source query" {
     const FakeReads = struct {
         attempts: u32 = 0,
@@ -18238,6 +18491,22 @@ test "api http public table dispatch preserves unsupported sorted query as exact
     ));
 }
 
+test "api http exact sort observation selects only unique physical fields" {
+    const order = [_]db_mod.types.SortField{
+        .{ .field = "price" },
+        .{ .field = "_score" },
+        .{ .field = "price", .desc = true },
+        .{ .field = "quantity" },
+        .{ .field = "_id" },
+        .{ .field = "_hierarchy.position" },
+    };
+    const fields = try publicPhysicalSortFieldsAlloc(std.testing.allocator, &order);
+    defer if (fields.len > 0) std.testing.allocator.free(fields);
+    try std.testing.expectEqual(@as(usize, 2), fields.len);
+    try std.testing.expectEqualStrings("price", fields[0]);
+    try std.testing.expectEqualStrings("quantity", fields[1]);
+}
+
 test "api http public sort gate accepts synthetic hierarchy child positions" {
     const runtime_schema = storage_schema.TableSchema{};
     const order = [_]db_mod.types.SortField{
@@ -18318,6 +18587,23 @@ test "api http public sort capability gate validates mapped sortable fields" {
     };
 
     const created_order = [_]db_mod.types.SortField{.{ .field = "created_at", .desc = true }};
+    // Routed gateways validate the declaration and cursor shape, then defer
+    // physical coverage to the fail-closed shard executor because they do not
+    // own a local text-index catalog.
+    try validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(.{
+        .order_by = &created_order,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{}, false);
+    const routed_bad_cursor = [_]std.json.Value{ .{ .string = "not-a-date" }, .{ .string = "doc:1" } };
+    const routed_effective_order = [_]db_mod.types.SortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id" },
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(.{
+        .order_by = &routed_effective_order,
+        .search_after = &routed_bad_cursor,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{}, false));
     try validatePublicQuerySortCapabilitiesAgainstRuntime(.{
         .order_by = &created_order,
         .primary_text_index_name = "full_text_index_v0",
@@ -24872,8 +25158,64 @@ test "api http server query builder loads structured table index metadata" {
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
+    const ColdReads = struct {
+        fn source() table_reads.TableReadSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .observed_dynamic_field_capability_sets = observedDynamicFieldCapabilitySets,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?query_api.QueryResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn observedDynamicFieldCapabilitySets(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: table_reads.DynamicFieldObservationQuery,
+        ) anyerror!?[]table_reads.ObservedDynamicFieldCapabilitySet {
+            return error.StorageReadTemporarilyUnavailable;
+        }
+    };
+
     var source = FakeSource{};
-    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), ColdReads.source(), null);
     const context = try server.loadQueryBuilderTableContext("docs");
     defer freeQueryBuilderTableContext(alloc, context);
 

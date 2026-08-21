@@ -662,62 +662,6 @@ pub const AntflyType = enum {
     }
 };
 
-/// Field type annotations for schema fields
-pub const AntflyType2 = enum {
-    text,
-    html,
-    keyword,
-    numeric,
-    boolean,
-    datetime,
-    geopoint,
-    geoshape,
-    embedding,
-    blob,
-    link,
-    search_as_you_type,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .text => "text",
-            .html => "html",
-            .keyword => "keyword",
-            .numeric => "numeric",
-            .boolean => "boolean",
-            .datetime => "datetime",
-            .geopoint => "geopoint",
-            .geoshape => "geoshape",
-            .embedding => "embedding",
-            .blob => "blob",
-            .link => "link",
-            .search_as_you_type => "search_as_you_type",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "text", .text },
-            .{ "html", .html },
-            .{ "keyword", .keyword },
-            .{ "numeric", .numeric },
-            .{ "boolean", .boolean },
-            .{ "datetime", .datetime },
-            .{ "geopoint", .geopoint },
-            .{ "geoshape", .geoshape },
-            .{ "embedding", .embedding },
-            .{ "blob", .blob },
-            .{ "link", .link },
-            .{ "search_as_you_type", .search_as_you_type },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
 /// Configuration for the Anthropic generative AI provider.
 pub const AnthropicGeneratorConfig = struct {
     /// The full model ID of the Anthropic model to use.
@@ -2796,12 +2740,48 @@ pub const DocumentArtifactTableReprocessResponse = struct {
     shard_cursors: []const DocumentArtifactReprocessShardCursor,
 };
 
+/// Executable physical mapping used by a document property's `x-antfly-field` annotation. The mapping must accept the JSON Schema value type. Declarations for the same dotted path across document types must normalize to an identical physical mapping, and present values that cannot be encoded are rejected at write admission. Mappings contributed by `anyOf` or `oneOf` must normalize to the same mapping in every alternative; conditional and dynamically named mappings are rejected.
+pub const DocumentFieldMapping = struct {
+    type: ?FieldMappingType = null,
+    /// Analyzer name for text-oriented mappings.
+    analyzer: ?[]const u8 = null,
+    /// Whether to index the field. Omit to use the server default of true.
+    index: ?bool = null,
+    /// Whether to store the field value (default false)
+    store: ?bool = null,
+    /// Whether to include in the _all field for cross-field search
+    include_in_all: ?bool = null,
+    /// Whether this exact scalar field can be used in order_by. Supported sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Analyzed text, search_as_you_type, geo, embedding, blob, html, object, and array fields are not directly sortable; use an exact scalar subfield such as title.keyword for sorted string pagination. Antfly derives the required typed doc values when enabled.
+    sortable: ?bool = null,
+    /// Missing/null sort policy. The current production policy rejects missing or null native sort values.
+    missing_null_policy: ?[]const u8 = null,
+    /// Named one-level multifields emitted from this property's value. For example, a text title can expose a sortable keyword subfield.
+    fields: ?std.json.ArrayHashMap(DocumentSubfieldMapping) = null,
+};
+
 /// Defines the structure of a document type
 pub const DocumentSchema = struct {
     /// A description of the document type.
     description: ?[]const u8 = null,
     /// A valid JSON Schema defining the document's structure. This is used to infer indexing rules and field types.
     schema: ?std.json.Value = null,
+};
+
+/// Mapping for one named multifield emitted from its parent document property. Multifields are intentionally one level deep and read the parent property's JSON value rather than a nested JSON property.
+pub const DocumentSubfieldMapping = struct {
+    type: ?FieldMappingType = null,
+    /// Analyzer name for text-oriented mappings.
+    analyzer: ?[]const u8 = null,
+    /// Whether to index the field. Omit to use the server default of true.
+    index: ?bool = null,
+    /// Whether to store the field value (default false)
+    store: ?bool = null,
+    /// Whether to include in the _all field for cross-field search
+    include_in_all: ?bool = null,
+    /// Whether this exact scalar subfield can be used in order_by. Antfly derives the required typed doc values when enabled.
+    sortable: ?bool = null,
+    /// Missing/null sort policy. The current production policy rejects missing or null native sort values.
+    missing_null_policy: ?[]const u8 = null,
 };
 
 pub const DropExtensionRequest = struct {
@@ -3815,13 +3795,13 @@ pub const FieldCapability = struct {
     type: AntflyType,
     /// Query modes supported by this concrete field variant. These modes are derived from Antfly field types such as `text`, `keyword`, `datetime`, `geopoint`, and `search_as_you_type`; they are not separate schema toggles.
     query_modes: []const []const u8,
-    /// Whether this concrete field is declared sortable in the effective capability model. Public exact order_by accepts it only when sort_lifecycle_state is queryable or accelerated.
+    /// Whether this concrete field is declared sortable in the effective capability model. A cold declared field is validated on first exact order_by use; clients do not need to poll lifecycle status.
     sortable: bool,
     /// Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
     provenance: []const u8,
     /// Current missing/null handling policy for this field.
     missing_null_policy: []const u8,
-    /// Operational lifecycle state for exact sort use. Queryable fields are accepted by public exact sort; accelerated fields are queryable and participate in the configured index_sort tuple.
+    /// Cached operational lifecycle state for exact sort use. Declared or indexed fields are validated on first public exact-sort use; queryable fields have validated native coverage; accelerated fields are queryable and participate in the configured index_sort tuple.
     sort_lifecycle_state: []const u8,
     /// Analyzer name for text/searchable fields, when applicable.
     analyzer: ?[]const u8 = null,
@@ -3829,6 +3809,83 @@ pub const FieldCapability = struct {
     index_sort_position: ?i64 = null,
     /// Sort direction in the table index_sort tuple when this field participates.
     index_sort_order: ?[]const u8 = null,
+};
+
+/// Field types accepted by detailed `x-antfly-field` and dynamic-template mappings. JSON-schema-oriented aliases are normalized to Antfly's corresponding runtime type: number/integer to numeric, bool to boolean, date/timestamp to datetime, geo_point to geopoint, and geo_shape to geoshape.
+pub const FieldMappingType = enum {
+    text,
+    html,
+    keyword,
+    numeric,
+    number,
+    integer,
+    boolean,
+    bool,
+    datetime,
+    date,
+    timestamp,
+    geopoint,
+    geo_point,
+    geoshape,
+    geo_shape,
+    embedding,
+    blob,
+    link,
+    search_as_you_type,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .text => "text",
+            .html => "html",
+            .keyword => "keyword",
+            .numeric => "numeric",
+            .number => "number",
+            .integer => "integer",
+            .boolean => "boolean",
+            .bool => "bool",
+            .datetime => "datetime",
+            .date => "date",
+            .timestamp => "timestamp",
+            .geopoint => "geopoint",
+            .geo_point => "geo_point",
+            .geoshape => "geoshape",
+            .geo_shape => "geo_shape",
+            .embedding => "embedding",
+            .blob => "blob",
+            .link => "link",
+            .search_as_you_type => "search_as_you_type",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "text", .text },
+            .{ "html", .html },
+            .{ "keyword", .keyword },
+            .{ "numeric", .numeric },
+            .{ "number", .number },
+            .{ "integer", .integer },
+            .{ "boolean", .boolean },
+            .{ "bool", .bool },
+            .{ "datetime", .datetime },
+            .{ "date", .date },
+            .{ "timestamp", .timestamp },
+            .{ "geopoint", .geopoint },
+            .{ "geo_point", .geo_point },
+            .{ "geoshape", .geoshape },
+            .{ "geo_shape", .geo_shape },
+            .{ "embedding", .embedding },
+            .{ "blob", .blob },
+            .{ "link", .link },
+            .{ "search_as_you_type", .search_as_you_type },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Statistics about a specific field.
@@ -7575,7 +7632,7 @@ pub const QueryRequest = struct {
     offset: ?i64 = null,
     /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline.
     timeout_ms: ?i64 = null,
-    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque, sortable value is bound to the complete source hierarchy revision. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
+    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque, sortable value is bound to the complete source hierarchy revision. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Declare the field with `x-antfly-field` and `sortable: true`; `x-antfly-types` shorthand declarations alone are not sortable. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
     order_by: ?[]const SortField = null,
     /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. When `order_by` is omitted, Antfly uses `_id` ascending as the effective order and the cursor tuple must contain exactly one `_id` string. Supported for exact text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests. For hierarchy child traversal, a cursor whose source-artifact revision changed returns `409 hierarchy_cursor_stale`; restart the same traversal without `search_after` rather than retrying the stale tuple.
     search_after: ?[]const std.json.Value = null,
@@ -8130,7 +8187,7 @@ pub const RetrievalQueryRequest = struct {
     offset: ?i64 = null,
     /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline.
     timeout_ms: ?i64 = null,
-    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque, sortable value is bound to the complete source hierarchy revision. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
+    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque, sortable value is bound to the complete source hierarchy revision. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Declare the field with `x-antfly-field` and `sortable: true`; `x-antfly-types` shorthand declarations alone are not sortable. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
     order_by: ?[]const SortField = null,
     /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. When `order_by` is omitted, Antfly uses `_id` ascending as the effective order and the cursor tuple must contain exactly one `_id` string. Supported for exact text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests. For hierarchy child traversal, a cursor whose source-artifact revision changed returns `409 hierarchy_cursor_stale`; restart the same traversal without `search_after` rather than retrying the stale tuple.
     search_after: ?[]const std.json.Value = null,
@@ -9052,12 +9109,12 @@ pub const TavilySearchConfig = struct {
     exclude_domains: ?[]const []const u8 = null,
 };
 
-/// Field mapping to apply when a dynamic template matches
+/// Field mapping used by a dynamic template. Dynamic templates match one physical field at a time and therefore do not accept multifields; use a DocumentFieldMapping in a document property's `x-antfly-field` annotation when named subfields are required.
 pub const TemplateFieldMapping = struct {
-    type: ?AntflyType2 = null,
+    type: ?FieldMappingType = null,
     /// Analyzer name (e.g., "standard", "keyword", "en", "html_analyzer"). Used for text fields to control tokenization and normalization.
     analyzer: ?[]const u8 = null,
-    /// Whether to index the field (default true)
+    /// Whether to index the field. Omit to use the server default of true.
     index: ?bool = null,
     /// Whether to store the field value (default false)
     store: ?bool = null,
