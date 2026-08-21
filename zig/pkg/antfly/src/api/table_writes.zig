@@ -75,6 +75,76 @@ fn applyGraphMetricActionToDb(
     return error.InvalidGraphMetricAction;
 }
 
+const GraphMetricGroupActionRequest = struct {
+    operation: ?[]const u8 = null,
+    index_name: []const u8 = "",
+    metric_name: []const u8 = "",
+    action: []const u8 = "",
+};
+
+const graph_metric_group_action_operation = "metric_action_v1";
+
+fn graphMetricGroupActionBodyAlloc(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    metric_name: []const u8,
+    action: []const u8,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, GraphMetricGroupActionRequest{
+        .operation = graph_metric_group_action_operation,
+        .index_name = index_name,
+        .metric_name = metric_name,
+        .action = action,
+    }, .{ .emit_null_optional_fields = false });
+}
+
+fn runGraphMetricMaintenanceOrActionJsonAlloc(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    body: []const u8,
+) ![]u8 {
+    var parsed = std.json.parseFromSlice(GraphMetricGroupActionRequest, alloc, body, .{ .ignore_unknown_fields = true }) catch
+        return try db.runGraphMetricServiceMaintenanceJsonAlloc(alloc, body);
+    defer parsed.deinit();
+    const operation = parsed.value.operation orelse return try db.runGraphMetricServiceMaintenanceJsonAlloc(alloc, body);
+    if (!std.mem.eql(u8, operation, graph_metric_group_action_operation)) {
+        return try db.runGraphMetricServiceMaintenanceJsonAlloc(alloc, body);
+    }
+    if (parsed.value.index_name.len == 0 or parsed.value.metric_name.len == 0 or parsed.value.action.len == 0) {
+        return error.InvalidGraphMetricAction;
+    }
+    var status = try applyGraphMetricActionToDb(
+        alloc,
+        db,
+        parsed.value.index_name,
+        parsed.value.metric_name,
+        parsed.value.action,
+    );
+    defer status.deinit(alloc);
+    return try std.json.Stringify.valueAlloc(alloc, status, .{ .emit_null_optional_fields = false });
+}
+
+fn parseGraphMetricGroupActionStatusAlloc(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+) !db_mod.types.GraphMetricStatus {
+    var parsed = try std.json.parseFromSlice(db_mod.types.GraphMetricStatus, alloc, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    return try query_api.cloneGraphMetricStatus(alloc, parsed.value);
+}
+
+test "graph metric group action envelope is typed and versioned" {
+    const alloc = std.testing.allocator;
+    const body = try graphMetricGroupActionBodyAlloc(alloc, "graph_idx", "pagerank", "refresh");
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(GraphMetricGroupActionRequest, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(graph_metric_group_action_operation, parsed.value.operation.?);
+    try std.testing.expectEqualStrings("graph_idx", parsed.value.index_name);
+    try std.testing.expectEqualStrings("pagerank", parsed.value.metric_name);
+    try std.testing.expectEqualStrings("refresh", parsed.value.action);
+}
+
 fn publishRuntimeStatusGroupForTest(
     cache: *runtime_status.TableRuntimeSnapshotCache,
     table_name: []const u8,
@@ -130,6 +200,7 @@ const startup_catch_up_no_progress_threshold: u8 = 3;
 const startup_catch_up_quarantine_base_ms: u64 = 30 * std.time.ms_per_s;
 const startup_catch_up_quarantine_max_ms: u64 = 10 * std.time.s_per_min * std.time.ms_per_s;
 const artifact_repair_max_groups_per_request: usize = 64;
+const graph_metric_action_fanout_max: usize = 16;
 const restore_trash_dir_name = ".antfly-restore-trash";
 // Explicit cache bulk sessions are reserved for rebuild/import paths. Normal
 // API uploads no longer start these windows automatically; DB/storage owns
@@ -5152,7 +5223,7 @@ pub const BoundTableWriteSource = struct {
     ) !?[]u8 {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-        return try (try self.activeDb()).runGraphMetricServiceMaintenanceJsonAlloc(alloc, body);
+        return try runGraphMetricMaintenanceOrActionJsonAlloc(alloc, try self.activeDb(), body);
     }
 
     fn batchGroupLocal(
@@ -13030,7 +13101,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.write_cache) |cache| {
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
             defer cached.deinit(alloc);
-            return try cached.db.runGraphMetricServiceMaintenanceJsonAlloc(alloc, body);
+            return try runGraphMetricMaintenanceOrActionJsonAlloc(alloc, cached.db, body);
         }
 
         var db = openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror) catch |err| switch (err) {
@@ -13038,7 +13109,7 @@ pub const ProvisionedTableWriteSource = struct {
             else => return err,
         };
         defer db.close();
-        return try db.runGraphMetricServiceMaintenanceJsonAlloc(alloc, body);
+        return try runGraphMetricMaintenanceOrActionJsonAlloc(alloc, &db, body);
     }
 
     fn graphMetricAction(
@@ -13086,7 +13157,7 @@ pub const ProvisionedTableWriteSource = struct {
                 break :blk try applyGraphMetricActionToDb(alloc, &db, index_name, metric_name, action);
             };
             if (aggregate) |*status| {
-                query_api.mergeGraphMetricStatusInto(alloc, status, shard_status) catch |err| {
+                query_api.mergeCompatibleGraphMetricStatusInto(alloc, status, shard_status) catch |err| {
                     shard_status.deinit(alloc);
                     return err;
                 };
@@ -16877,7 +16948,40 @@ pub const HostedProvisionedTableWriteSource = struct {
         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
         var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default_async);
         defer cached.deinit(hosted_cache.write_cache.alloc);
-        return try cached.db.runGraphMetricServiceMaintenanceJsonAlloc(alloc, body);
+        return try runGraphMetricMaintenanceOrActionJsonAlloc(alloc, cached.db, body);
+    }
+
+    fn graphMetricActionForRoute(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        route: table_router.GroupRoute,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        cancellation: db_mod.types.CancellationToken,
+    ) !db_mod.types.GraphMetricStatus {
+        if (cancellation.isCancelled()) return error.Canceled;
+        return switch (route) {
+            .local => blk: {
+                const response_body = (try graphMetricMaintenanceGroupLocal(self, alloc, group_id, table_name, body)) orelse
+                    return error.UnknownGroup;
+                defer alloc.free(response_body);
+                break :blk try parseGraphMetricGroupActionStatusAlloc(alloc, response_body);
+            },
+            .remote => |remote| blk: {
+                var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                var request_cancellation = http_common.RequestCancellation.fromToken(cancellation);
+                var response = try client.fetchGroupGraphMetricMaintenanceWithCancellation(
+                    remote.base_uri,
+                    group_id,
+                    table_name,
+                    body,
+                    if (cancellation.ptr != null) &request_cancellation else null,
+                );
+                defer response.deinit(alloc);
+                break :blk try parseGraphMetricGroupActionStatusAlloc(alloc, response.body);
+            },
+        };
     }
 
     fn graphMetricAction(
@@ -16903,28 +17007,108 @@ pub const HostedProvisionedTableWriteSource = struct {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const group_ids = try table_catalog.resolveGroupsForSpanEventually(alloc, self.catalog, table_name, "", "", 5 * std.time.ns_per_s, 10);
         defer alloc.free(group_ids);
+        if (group_ids.len == 0) return null;
+        const body = try graphMetricGroupActionBodyAlloc(alloc, index_name, metric_name, action);
+        defer alloc.free(body);
+
+        // Resolve the complete route set before mutating any shard. This avoids
+        // an avoidable partial action when topology is already incomplete.
+        const routes = try alloc.alloc(table_router.GroupRoute, group_ids.len);
+        var routes_initialized: usize = 0;
+        defer {
+            for (routes[0..routes_initialized]) |*route| route.deinit(alloc);
+            alloc.free(routes);
+        }
+        for (group_ids, 0..) |group_id, i| {
+            routes[i] = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse
+                return error.LeaderUnavailable;
+            routes_initialized += 1;
+        }
+
         var aggregate: ?db_mod.types.GraphMetricStatus = null;
         errdefer if (aggregate) |*status| status.deinit(alloc);
-        var handled: usize = 0;
-        for (group_ids) |group_id| {
-            if (cancellation.isCancelled()) return error.Canceled;
-            if (self.router.localStatus(group_id) != .active) continue;
-            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-            defer alloc.free(path);
-            const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
-            var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default_async);
-            defer cached.deinit(hosted_cache.write_cache.alloc);
-            var shard_status = try applyGraphMetricActionToDb(alloc, cached.db, index_name, metric_name, action);
-            handled += 1;
-            if (aggregate) |*status| {
-                query_api.mergeGraphMetricStatusInto(alloc, status, shard_status) catch |err| {
+
+        var api_lane: ?db_mod.background_runtime.BackendRuntime.ApiLaneLease = if (self.backend_runtime) |runtime|
+            runtime.acquireApiLane() catch |err| switch (err) {
+                error.BackendRuntimeUnavailable => null,
+                else => return err,
+            }
+        else
+            null;
+        defer if (api_lane) |*lane| lane.release();
+        if (api_lane == null or group_ids.len == 1) {
+            for (group_ids, routes) |group_id, route| {
+                var shard_status = try self.graphMetricActionForRoute(alloc, route, group_id, table_name, body, cancellation);
+                if (aggregate) |*status| {
+                    query_api.mergeCompatibleGraphMetricStatusInto(alloc, status, shard_status) catch |err| {
+                        shard_status.deinit(alloc);
+                        return err;
+                    };
                     shard_status.deinit(alloc);
-                    return err;
-                };
-                shard_status.deinit(alloc);
-            } else aggregate = shard_status;
+                } else aggregate = shard_status;
+            }
+            return aggregate;
         }
-        if (handled == 0) return null;
+
+        const Slot = struct {
+            arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            status: ?db_mod.types.GraphMetricStatus = null,
+            err: ?anyerror = null,
+        };
+        const slots = try alloc.alloc(Slot, group_ids.len);
+        defer {
+            for (slots) |*slot| slot.arena.deinit();
+            alloc.free(slots);
+        }
+        for (slots) |*slot| slot.* = .{};
+
+        const Fiber = struct {
+            fn run(
+                hosted_source: *HostedProvisionedTableWriteSource,
+                slot: *Slot,
+                route: table_router.GroupRoute,
+                group_id: u64,
+                table_name_inner: []const u8,
+                body_inner: []const u8,
+                cancellation_inner: db_mod.types.CancellationToken,
+            ) void {
+                slot.status = hosted_source.graphMetricActionForRoute(
+                    slot.arena.allocator(),
+                    route,
+                    group_id,
+                    table_name_inner,
+                    body_inner,
+                    cancellation_inner,
+                ) catch |err| {
+                    slot.err = err;
+                    return;
+                };
+            }
+        };
+        const io = api_lane.?.io();
+        const width = @max(@as(usize, 1), @min(
+            group_ids.len,
+            @min(graph_metric_action_fanout_max, @as(usize, @intCast(api_lane.?.concurrentCapacity()))),
+        ));
+        var start: usize = 0;
+        while (start < group_ids.len) : (start += width) {
+            const end = @min(start + width, group_ids.len);
+            var group: Io.Group = .init;
+            for (group_ids[start..end], routes[start..end], start..end) |group_id, route, i| {
+                group.async(io, Fiber.run, .{ self, &slots[i], route, group_id, table_name, body, cancellation });
+            }
+            group.await(io) catch {};
+            if (cancellation.isCancelled()) return error.Canceled;
+        }
+        for (slots) |slot| if (slot.err) |err| return err;
+        for (slots) |slot| {
+            const shard_status = slot.status orelse return error.UnknownGroup;
+            if (aggregate) |*status| {
+                try query_api.mergeCompatibleGraphMetricStatusInto(alloc, status, shard_status);
+            } else {
+                aggregate = try query_api.cloneGraphMetricStatus(alloc, shard_status);
+            }
+        }
         return aggregate;
     }
 

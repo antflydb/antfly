@@ -34,7 +34,7 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Error | GraphMetricActionResponse | None:
+) -> Error | GraphMetricActionResponse | str | None:
     if response.status_code == 200:
         response_200 = GraphMetricActionResponse.from_dict(response.json())
 
@@ -55,6 +55,15 @@ def _parse_response(
 
         return response_405
 
+    if response.status_code == 409:
+        response_409 = response.text
+        return response_409
+
+    if response.status_code == 429:
+        response_429 = Error.from_dict(response.json())
+
+        return response_429
+
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
 
@@ -68,7 +77,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Error | GraphMetricActionResponse]:
+) -> Response[Error | GraphMetricActionResponse | str]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -84,13 +93,16 @@ def sync_detailed(
     action: ExecuteGraphMetricActionAction,
     *,
     client: AuthenticatedClient,
-) -> Response[Error | GraphMetricActionResponse]:
+) -> Response[Error | GraphMetricActionResponse | str]:
     """Execute a graph metric operational action
 
      Refresh, rebuild, delete, pause, or resume maintenance for a configured
     graph metric. The metric configuration remains owned by the graph index.
-    `delete` clears materialized metric state and maintenance controls; a
-    later refresh or rebuild can publish a new generation.
+    Refresh and rebuild durably enqueue bounded, resumable maintenance and
+    return the aggregate shard status without waiting for graph-sized work.
+    `delete` clears materialized metric state and durably disables automatic
+    maintenance. A later refresh, rebuild, or resume action re-enables the
+    metric and can publish a new generation.
 
     Args:
         table_name (str):
@@ -103,7 +115,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | GraphMetricActionResponse]
+        Response[Error | GraphMetricActionResponse | str]
     """
 
     kwargs = _get_kwargs(
@@ -127,13 +139,16 @@ def sync(
     action: ExecuteGraphMetricActionAction,
     *,
     client: AuthenticatedClient,
-) -> Error | GraphMetricActionResponse | None:
+) -> Error | GraphMetricActionResponse | str | None:
     """Execute a graph metric operational action
 
      Refresh, rebuild, delete, pause, or resume maintenance for a configured
     graph metric. The metric configuration remains owned by the graph index.
-    `delete` clears materialized metric state and maintenance controls; a
-    later refresh or rebuild can publish a new generation.
+    Refresh and rebuild durably enqueue bounded, resumable maintenance and
+    return the aggregate shard status without waiting for graph-sized work.
+    `delete` clears materialized metric state and durably disables automatic
+    maintenance. A later refresh, rebuild, or resume action re-enables the
+    metric and can publish a new generation.
 
     Args:
         table_name (str):
@@ -146,7 +161,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | GraphMetricActionResponse
+        Error | GraphMetricActionResponse | str
     """
 
     return sync_detailed(
@@ -165,13 +180,16 @@ async def asyncio_detailed(
     action: ExecuteGraphMetricActionAction,
     *,
     client: AuthenticatedClient,
-) -> Response[Error | GraphMetricActionResponse]:
+) -> Response[Error | GraphMetricActionResponse | str]:
     """Execute a graph metric operational action
 
      Refresh, rebuild, delete, pause, or resume maintenance for a configured
     graph metric. The metric configuration remains owned by the graph index.
-    `delete` clears materialized metric state and maintenance controls; a
-    later refresh or rebuild can publish a new generation.
+    Refresh and rebuild durably enqueue bounded, resumable maintenance and
+    return the aggregate shard status without waiting for graph-sized work.
+    `delete` clears materialized metric state and durably disables automatic
+    maintenance. A later refresh, rebuild, or resume action re-enables the
+    metric and can publish a new generation.
 
     Args:
         table_name (str):
@@ -184,7 +202,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | GraphMetricActionResponse]
+        Response[Error | GraphMetricActionResponse | str]
     """
 
     kwargs = _get_kwargs(
@@ -206,13 +224,16 @@ async def asyncio(
     action: ExecuteGraphMetricActionAction,
     *,
     client: AuthenticatedClient,
-) -> Error | GraphMetricActionResponse | None:
+) -> Error | GraphMetricActionResponse | str | None:
     """Execute a graph metric operational action
 
      Refresh, rebuild, delete, pause, or resume maintenance for a configured
     graph metric. The metric configuration remains owned by the graph index.
-    `delete` clears materialized metric state and maintenance controls; a
-    later refresh or rebuild can publish a new generation.
+    Refresh and rebuild durably enqueue bounded, resumable maintenance and
+    return the aggregate shard status without waiting for graph-sized work.
+    `delete` clears materialized metric state and durably disables automatic
+    maintenance. A later refresh, rebuild, or resume action re-enables the
+    metric and can publish a new generation.
 
     Args:
         table_name (str):
@@ -225,7 +246,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | GraphMetricActionResponse
+        Error | GraphMetricActionResponse | str
     """
 
     return (

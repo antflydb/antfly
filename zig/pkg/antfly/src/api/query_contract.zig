@@ -2285,7 +2285,7 @@ fn queryBodyContractFields(alloc: std.mem.Allocator, body: []const u8) !QueryBod
         .has_public_doc_filter_bindings = parsed.value.object.get("with") != null,
         .has_public_hierarchy_controls = objectHasNonNullField(parsed.value.object, "hierarchy"),
         .has_query_timeout = parsed.value.object.get("timeout_ms") != null,
-        .has_graph_metric = parsed.value.object.get("graph_metric") != null,
+        .has_graph_metric = objectHasNonNullField(parsed.value.object, "graph_metric"),
     };
 }
 
@@ -8605,6 +8605,7 @@ fn parseGraphMetricQueriesAlloc(
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     const metric_value = parsed.value.object.get("graph_metric") orelse return &.{};
+    if (metric_value == .null) return &.{};
     if (metric_value != .object) return error.InvalidQueryRequest;
     const index_name = try parseRequiredStringField(metric_value.object, "index");
     const metric_name = try parseRequiredStringField(metric_value.object, "metric");
@@ -14292,6 +14293,18 @@ test "api query contract bounds graph metric top k" {
     try std.testing.expectError(error.InvalidQueryRequest, parseGraphMetricQueriesAlloc(alloc,
         \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","top_k":10001}}
     ));
+}
+
+test "api query contract treats nullable graph metric extensions as absent" {
+    const alloc = std.testing.allocator;
+    var parsed = try parsePublicQueryRequest(alloc, null, "docs",
+        \\{"full_text_search":{"match":"needle","field":"body"},"graph_metric":null,"graph_metric_rerank":null}
+    );
+    defer parsed.deinit(alloc);
+
+    try std.testing.expect(parsed.req.full_text != null);
+    try std.testing.expectEqual(@as(usize, 0), parsed.req.graph_metric_queries.len);
+    try std.testing.expect(parsed.req.graph_metric_rerank == null);
 }
 
 test "api query contract rejects legacy native doc id constraint fields" {

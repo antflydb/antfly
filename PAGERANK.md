@@ -1323,8 +1323,9 @@ Current implementation progress:
 
 - Local graph indexes expose a metric materialization deletion primitive that
   removes dirty, published, metadata, and score keys for a configured metric.
-  The metric remains configured and returns `MetricNotReady` until maintenance
-  or a manual run rebuilds it from durable graph edges.
+  A durable disabled marker prevents background maintenance from immediately
+  recreating operator-deleted data; refresh, rebuild, or resume explicitly
+  re-enables the configured metric and rebuilds it from durable graph edges.
 - DB and index-manager layers expose local manual refresh and rebuild
   primitives for a named graph metric. Manual refresh runs the configured metric
   regardless of background refresh mode; rebuild clears materialized state first
@@ -1334,12 +1335,13 @@ Current implementation progress:
   last published generation, status reports `maintenance_paused`, and manual
   refresh can still publish a fresh generation while background maintenance is
   paused.
-- The public table HTTP layer exposes local graph metric operational actions at
-  `/tables/{table}/indexes/{index}/graph-metrics/{metric}/actions/{action}` for
+- The public table HTTP layer exposes graph metric operational actions at
+  `POST /tables/{table}/indexes/{index}/graph-metrics/{metric}:{action}` for
   `refresh`, `rebuild`, `delete`, `pause`, and `resume`. Each action is
   idempotent at the API contract level and returns the updated graph metric
-  status. `delete` clears materialized metric state and maintenance controls
-  while leaving the configured metric available for a later refresh or rebuild.
+  status. `delete` clears materialized metric state, reports `disabled`, and
+  suppresses automatic maintenance while leaving the configured metric
+  available for a later refresh, rebuild, or resume.
 - The modular OpenAPI source specs and regenerated Zig public/client contract
   modules now describe graph query metric projection, ordering, filtering,
   freshness, result status metadata, and the graph metric operational action

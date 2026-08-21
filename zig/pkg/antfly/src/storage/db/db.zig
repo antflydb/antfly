@@ -18155,6 +18155,7 @@ pub const DB = struct {
         lockApply(self);
         defer self.core.unlockApply();
         const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
+        try entry.index.enableGraphMetric(metric_name);
         var status = try entry.index.runGraphMetric(metric_name);
         defer status.deinit(entry.index.alloc);
         return try cloneGraphMetricStatusFromGraph(alloc, status);
@@ -18166,6 +18167,7 @@ pub const DB = struct {
         defer self.core.unlockApply();
         const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
         try entry.index.deleteGraphMetricMaterialization(metric_name);
+        try entry.index.enableGraphMetric(metric_name);
         var status = try entry.index.runGraphMetric(metric_name);
         defer status.deinit(entry.index.alloc);
         return try cloneGraphMetricStatusFromGraph(alloc, status);
@@ -18188,6 +18190,11 @@ pub const DB = struct {
             const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
             var current = try entry.index.graphMetricStatus(metric_name);
             defer current.deinit(entry.index.alloc);
+            if (!force and current.state == .disabled) {
+                try entry.index.enableGraphMetric(metric_name);
+                current.deinit(entry.index.alloc);
+                current = try entry.index.graphMetricStatus(metric_name);
+            }
             if (!force and current.state == .fresh) {
                 break :blk try cloneGraphMetricStatusFromGraph(alloc, current);
             }
@@ -18196,7 +18203,10 @@ pub const DB = struct {
             // forced rebuild therefore must unpublish the old materialization
             // before workers rewrite that generation; readers can never
             // observe a partially replaced score set.
-            if (force) try entry.index.deleteGraphMetricMaterialization(metric_name);
+            if (force) {
+                try entry.index.deleteGraphMetricMaterialization(metric_name);
+                try entry.index.enableGraphMetric(metric_name);
+            }
             var scheduled = try self.core.index_manager.ensureGraphMetricPlannedBuild(index_name, metric_name, target_generation);
             defer scheduled.deinit(self.core.index_manager.alloc);
             break :blk try cloneGraphMetricStatusFromGraph(alloc, scheduled);

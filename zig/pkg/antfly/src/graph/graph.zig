@@ -781,6 +781,31 @@ pub const GraphIndex = struct {
         return try self.graphMetricKeyAlloc(&.{ metric_name, "score", generation_text });
     }
 
+    fn graphMetricRankPrefixAlloc(self: *GraphIndex, metric_name: []const u8, generation: u64) ![]u8 {
+        const generation_text = try std.fmt.allocPrint(self.alloc, "{d}", .{generation});
+        defer self.alloc.free(generation_text);
+        return try self.graphMetricKeyAlloc(&.{ metric_name, "rank", generation_text });
+    }
+
+    fn graphMetricRankKeyAlloc(self: *GraphIndex, metric_name: []const u8, generation: u64, score: f64, node: []const u8) ![]u8 {
+        if (!std.math.isFinite(score)) return error.InvalidGraphMetricScore;
+        const prefix = try self.graphMetricRankPrefixAlloc(metric_name, generation);
+        defer self.alloc.free(prefix);
+        var descending_score: [8]u8 = undefined;
+        // Canonicalize signed zero so equal numeric scores remain grouped and
+        // the following node component provides the stable tie-break.
+        const canonical_score: f64 = if (score == 0.0) 0.0 else score;
+        const bits: u64 = @bitCast(canonical_score);
+        const ascending_bits = if (bits & (@as(u64, 1) << 63) != 0) ~bits else bits ^ (@as(u64, 1) << 63);
+        std.mem.writeInt(u64, &descending_score, ~ascending_bits, .big);
+        var key = std.ArrayListUnmanaged(u8).empty;
+        defer key.deinit(self.alloc);
+        try key.appendSlice(self.alloc, prefix);
+        try internal_keys.appendEncodedComponent(&key, self.alloc, &descending_score);
+        try internal_keys.appendEncodedComponent(&key, self.alloc, node);
+        return try key.toOwnedSlice(self.alloc);
+    }
+
     fn graphMetricPublishedGenerationKeyAlloc(self: *GraphIndex, metric_name: []const u8) ![]u8 {
         return try self.graphMetricKeyAlloc(&.{ metric_name, "published_generation" });
     }
@@ -791,6 +816,10 @@ pub const GraphIndex = struct {
 
     fn graphMetricMaintenancePausedKeyAlloc(self: *GraphIndex, metric_name: []const u8) ![]u8 {
         return try self.graphMetricControlKeyAlloc(&.{ metric_name, "maintenance_paused" });
+    }
+
+    fn graphMetricDisabledKeyAlloc(self: *GraphIndex, metric_name: []const u8) ![]u8 {
+        return try self.graphMetricControlKeyAlloc(&.{ metric_name, "disabled" });
     }
 
     fn graphMetricBuildLeaseKeyAlloc(self: *GraphIndex, metric_name: []const u8) ![]u8 {
@@ -1339,6 +1368,12 @@ pub const GraphIndex = struct {
         return (try readU64OrZero(txn, key)) != 0;
     }
 
+    fn metricDisabled(self: *GraphIndex, txn: anytype, metric_name: []const u8) !bool {
+        const key = try self.graphMetricDisabledKeyAlloc(metric_name);
+        defer self.alloc.free(key);
+        return (try readU64OrZero(txn, key)) != 0;
+    }
+
     fn metricBuildLease(self: *GraphIndex, txn: anytype, metric_name: []const u8) !?GraphMetricBuildLease {
         const key = try self.graphMetricBuildLeaseKeyAlloc(metric_name);
         defer self.alloc.free(key);
@@ -1475,6 +1510,11 @@ pub const GraphIndex = struct {
         const now_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
         var batch = try self.beginWriteReverseBatch();
         errdefer batch.abort();
+
+        // The disabled marker is checked in the same transaction that creates
+        // the lease. A scheduler decision made before an operator delete can
+        // therefore never resurrect the metric after that delete commits.
+        if (try self.metricDisabled(&batch, metric_name)) return error.GraphMetricDisabled;
 
         const key = try self.graphMetricBuildLeaseKeyAlloc(metric_name);
         defer self.alloc.free(key);
@@ -8618,6 +8658,9 @@ pub const GraphIndex = struct {
         const prefix = try self.graphMetricScorePrefixAlloc(metric_name, generation);
         defer self.alloc.free(prefix);
         _ = try self.deleteKeysWithPrefixInBatch(batch, prefix);
+        const rank_prefix = try self.graphMetricRankPrefixAlloc(metric_name, generation);
+        defer self.alloc.free(rank_prefix);
+        _ = try self.deleteKeysWithPrefixInBatch(batch, rank_prefix);
         const meta_key = try self.graphMetricMetaKeyAlloc(metric_name, generation);
         defer self.alloc.free(meta_key);
         batch.delete(meta_key) catch |err| switch (err) {
@@ -8967,6 +9010,12 @@ pub const GraphIndex = struct {
                 else => return err,
             };
         }
+        // A durable tombstone distinguishes an operator-requested delete from
+        // an uninitialized background metric. Explicit refresh/rebuild/resume
+        // clears it; autonomous maintenance must leave the metric deleted.
+        const disabled_key = try self.graphMetricDisabledKeyAlloc(metric_name);
+        defer self.alloc.free(disabled_key);
+        try putU64(&batch, disabled_key, 1);
         try self.appendGraphMetricEvent(&batch, metric_name, .{
             .kind = .delete,
             .at_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms),
@@ -9005,6 +9054,12 @@ pub const GraphIndex = struct {
             error.NotFound => {},
             else => return err,
         };
+        const disabled_key = try self.graphMetricDisabledKeyAlloc(metric_name);
+        defer self.alloc.free(disabled_key);
+        batch.delete(disabled_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
         try self.appendGraphMetricEvent(&batch, metric_name, .{
             .kind = .@"resume",
             .at_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms),
@@ -9014,6 +9069,27 @@ pub const GraphIndex = struct {
         });
         try batch.commit();
         return try self.graphMetricStatus(metric_name);
+    }
+
+    /// Re-enable an operator-deleted metric without changing pause state or
+    /// emitting a synthetic resume event. Explicit refresh/rebuild actions use
+    /// this immediately before acquiring their build lease.
+    pub fn enableGraphMetric(self: *GraphIndex, metric_name: []const u8) !void {
+        _ = self.metricConfig(metric_name) orelse return error.MetricNotReady;
+        {
+            var txn = try self.beginReadReverseTxn();
+            defer txn.abort();
+            if (!try self.metricDisabled(&txn, metric_name)) return;
+        }
+        var batch = try self.beginWriteReverseBatch();
+        errdefer batch.abort();
+        const disabled_key = try self.graphMetricDisabledKeyAlloc(metric_name);
+        defer self.alloc.free(disabled_key);
+        batch.delete(disabled_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        try batch.commit();
     }
 
     fn publishGraphMetricScores(
@@ -9026,12 +9102,7 @@ pub const GraphIndex = struct {
         var batch = try self.beginWriteReverseBatch();
         errdefer batch.abort();
         const prior_published = try self.metricPublishedGeneration(&batch, metric_name);
-        for (scores) |score| {
-            if (!std.math.isFinite(score.score)) return error.InvalidGraphMetricScore;
-            const score_key = try self.graphMetricScoreKeyAlloc(metric_name, target_generation, score.node);
-            defer self.alloc.free(score_key);
-            try putF64(&batch, score_key, score.score);
-        }
+        try self.putGraphMetricScoresInBatch(&batch, metric_name, target_generation, scores);
         const published_key = try self.graphMetricPublishedGenerationKeyAlloc(metric_name);
         defer self.alloc.free(published_key);
         try putU64(&batch, published_key, target_generation);
@@ -9174,11 +9245,18 @@ pub const GraphIndex = struct {
         target_generation: u64,
         scores: []const GraphMetricScore,
     ) !void {
+        // The check shares the writer transaction with the score writes. A
+        // build that started before an operator delete can therefore neither
+        // recreate deleted scores nor race the tombstone at commit time.
+        if (try self.metricDisabled(batch, metric_name)) return error.GraphMetricDisabled;
         for (scores) |score| {
             if (!std.math.isFinite(score.score)) return error.InvalidGraphMetricScore;
             const score_key = try self.graphMetricScoreKeyAlloc(metric_name, target_generation, score.node);
             defer self.alloc.free(score_key);
             try putF64(batch, score_key, score.score);
+            const rank_key = try self.graphMetricRankKeyAlloc(metric_name, target_generation, score.score, score.node);
+            defer self.alloc.free(rank_key);
+            try putF64(batch, rank_key, score.score);
         }
     }
 
@@ -9189,6 +9267,9 @@ pub const GraphIndex = struct {
         target_generation: u64,
         meta: GraphMetricMeta,
     ) !void {
+        // Publication is the visibility linearization point. Never let an
+        // already-running worker clear a newer operator delete.
+        if (try self.metricDisabled(batch, metric_name)) return error.GraphMetricDisabled;
         const published_key = try self.graphMetricPublishedGenerationKeyAlloc(metric_name);
         defer self.alloc.free(published_key);
         try putU64(batch, published_key, target_generation);
@@ -10171,6 +10252,7 @@ pub const GraphIndex = struct {
         const published_generation = try self.metricPublishedGeneration(&txn, metric_name);
         const dirty_generation = try self.metricDirtyGeneration(&txn, metric_name);
         const maintenance_paused = try self.metricMaintenancePaused(&txn, metric_name);
+        const disabled = try self.metricDisabled(&txn, metric_name);
         const maybe_build_lease = try self.metricBuildLease(&txn, metric_name);
         const maybe_build_job = try self.metricBuildJob(&txn, metric_name);
         const maybe_failure_detail = try self.metricFailureDetail(&txn, metric_name);
@@ -10262,7 +10344,9 @@ pub const GraphIndex = struct {
         errdefer active_build_page_statuses.deinit(self.alloc);
         const edge_filter_stale = has_stored_edge_filter and !graphMetricEdgeFiltersEqual(edge_filter, cfg.edge_filter);
         const config_fingerprint_stale = has_stored_config_fingerprint and stored_config_fingerprint != graphMetricConfigFingerprint(cfg);
-        const base_state: GraphMetricState = if (last_event != null and last_event.?.kind == .failed and last_event.?.target_edge_generation == target_edge_generation)
+        const base_state: GraphMetricState = if (disabled)
+            .disabled
+        else if (last_event != null and last_event.?.kind == .failed and last_event.?.target_edge_generation == target_edge_generation)
             .failed
         else if (published_generation == 0)
             .not_ready
@@ -10329,6 +10413,16 @@ pub const GraphIndex = struct {
         return try internal_keys.decodeBodyAlloc(self.alloc, key[pos..term]);
     }
 
+    fn graphMetricNodeFromRankKeyAlloc(self: *GraphIndex, key: []const u8, prefix: []const u8) !?[]u8 {
+        if (!std.mem.startsWith(u8, key, prefix)) return null;
+        const score_pos = prefix.len;
+        const score_term = internal_keys.findComponentTerminator(key, score_pos) orelse return null;
+        const node_pos = score_term + 2;
+        const node_term = internal_keys.findComponentTerminator(key, node_pos) orelse return null;
+        if (node_term + 2 != key.len) return null;
+        return try internal_keys.decodeBodyAlloc(self.alloc, key[node_pos..node_term]);
+    }
+
     pub fn graphMetricTopK(self: *GraphIndex, metric_name: []const u8, limit: usize) ![]GraphMetricScore {
         if (limit == 0) return try self.alloc.alloc(GraphMetricScore, 0);
         if (limit > 10_000) return error.InvalidGraphMetricTopK;
@@ -10337,6 +10431,36 @@ pub const GraphIndex = struct {
         defer txn.abort();
         const generation = try self.metricPublishedGeneration(&txn, metric_name);
         if (generation == 0) return error.MetricNotReady;
+
+        // Current materializations maintain a score-ordered secondary keyspace,
+        // so ordinary top-K reads touch only K entries. Keep the node-keyed scan
+        // below as an upgrade fallback for materializations written by older
+        // releases; the next refresh replaces them with ranked keys.
+        const rank_prefix = try self.graphMetricRankPrefixAlloc(metric_name, generation);
+        defer self.alloc.free(rank_prefix);
+        var ranked = std.ArrayListUnmanaged(GraphMetricScore).empty;
+        defer ranked.deinit(self.alloc);
+        errdefer for (ranked.items) |*score| score.deinit(self.alloc);
+        try ranked.ensureTotalCapacity(self.alloc, limit);
+        {
+            var rank_cur = try txn.openCursor();
+            defer rank_cur.close();
+            var rank_entry_opt = try rank_cur.seekAtOrAfter(rank_prefix);
+            while (rank_entry_opt) |entry| : (rank_entry_opt = try rank_cur.next()) {
+                if (!std.mem.startsWith(u8, entry.key, rank_prefix)) break;
+                const score_value = decodeF64(entry.value) orelse return error.InvalidGraphMetricScore;
+                if (!std.math.isFinite(score_value)) return error.InvalidGraphMetricScore;
+                const node = (try self.graphMetricNodeFromRankKeyAlloc(entry.key, rank_prefix)) orelse return error.InvalidGraphMetricRankEntry;
+                try ranked.append(self.alloc, .{ .node = node, .score = score_value });
+                if (ranked.items.len == limit) break;
+            }
+        }
+        if (ranked.items.len > 0) {
+            const out = try self.alloc.dupe(GraphMetricScore, ranked.items);
+            ranked.items.len = 0;
+            return out;
+        }
+
         const prefix = try self.graphMetricScorePrefixAlloc(metric_name, generation);
         defer self.alloc.free(prefix);
         var scores = std.PriorityQueue(GraphMetricScore, void, graphMetricScoreWorstFirst).initContext({});
@@ -18776,12 +18900,57 @@ test "graph metric materialization deletion clears scores and allows rebuild" {
         alloc.free(top);
     }
     try std.testing.expectEqual(@as(usize, 3), top.len);
+    try std.testing.expectEqualStrings("doc-b", top[0].node);
+    try std.testing.expectEqualStrings("doc-a", top[1].node);
+    try std.testing.expectEqualStrings("doc-c", top[2].node);
+    {
+        const rank_prefix = try graph.graphMetricRankPrefixAlloc("degree", published_generation);
+        defer alloc.free(rank_prefix);
+        var rank_txn = try graph.beginReadReverseTxn();
+        defer rank_txn.abort();
+        try std.testing.expectEqual(top.len, try GraphIndex.countKeysWithPrefix(&rank_txn, rank_prefix));
+    }
+
+    // Published generations created before the ranked keyspace was introduced
+    // remain readable during rolling upgrades. New publications always restore
+    // the efficient ordered representation.
+    {
+        const rank_prefix = try graph.graphMetricRankPrefixAlloc("degree", published_generation);
+        defer alloc.free(rank_prefix);
+        var rank_batch = try graph.beginWriteReverseBatch();
+        errdefer rank_batch.abort();
+        try std.testing.expectEqual(top.len, try graph.deleteKeysWithPrefixInBatch(&rank_batch, rank_prefix));
+        try rank_batch.commit();
+    }
+    const legacy_top = try graph.graphMetricTopK("degree", 1);
+    defer {
+        for (legacy_top) |*score| score.deinit(alloc);
+        alloc.free(legacy_top);
+    }
+    try std.testing.expectEqual(@as(usize, 1), legacy_top.len);
+    try std.testing.expectEqualStrings("doc-b", legacy_top[0].node);
 
     try graph.deleteGraphMetricMaterialization("degree");
     var deleted_status = try graph.graphMetricStatus("degree");
     defer deleted_status.deinit(alloc);
-    try std.testing.expectEqual(GraphIndex.GraphMetricState.not_ready, deleted_status.state);
+    try std.testing.expectEqual(GraphIndex.GraphMetricState.disabled, deleted_status.state);
+    try std.testing.expect(!deleted_status.build_queued);
     try std.testing.expectEqual(@as(u64, 0), deleted_status.published_generation);
+    try std.testing.expectError(error.MetricNotReady, graph.graphMetricTopK("degree", 1));
+    try std.testing.expectError(error.GraphMetricDisabled, graph.runGraphMetric("degree"));
+    const stale_scores = [_]GraphIndex.GraphMetricScore{.{ .node = "doc-a", .score = 99.0 }};
+    try std.testing.expectError(error.GraphMetricDisabled, graph.publishGraphMetricScores(
+        "degree",
+        published_generation,
+        &stale_scores,
+        .{
+            .converged = true,
+            .iterations_completed = 1,
+            .computed_at_ms = 1,
+            .config_fingerprint = GraphIndex.graphMetricConfigFingerprint(metrics[0]),
+            .edge_filter = metrics[0].edge_filter,
+        },
+    ));
     try std.testing.expectError(error.MetricNotReady, graph.graphMetricTopK("degree", 1));
     {
         var job_txn = try graph.beginReadReverseTxn();
@@ -18795,8 +18964,13 @@ test "graph metric materialization deletion clears scores and allows rebuild" {
     try graph.deleteGraphMetricMaterialization("degree");
     var deleted_paused_status = try graph.graphMetricStatus("degree");
     defer deleted_paused_status.deinit(alloc);
-    try std.testing.expectEqual(GraphIndex.GraphMetricState.not_ready, deleted_paused_status.state);
+    try std.testing.expectEqual(GraphIndex.GraphMetricState.disabled, deleted_paused_status.state);
+    try std.testing.expect(!deleted_paused_status.build_queued);
     try std.testing.expect(!deleted_paused_status.maintenance_paused);
+
+    var resumed_after_delete = try graph.resumeGraphMetricMaintenance("degree");
+    defer resumed_after_delete.deinit(alloc);
+    try std.testing.expectEqual(GraphIndex.GraphMetricState.not_ready, resumed_after_delete.state);
 
     var rebuilt = try graph.runGraphMetric("degree");
     defer rebuilt.deinit(alloc);

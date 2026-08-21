@@ -1385,6 +1385,77 @@ pub fn mergeGraphMetricStatusInto(alloc: std.mem.Allocator, target: *db_mod.type
     target.computed_at_ms = @max(target.computed_at_ms, source.computed_at_ms);
 }
 
+/// Operational fan-out may aggregate generations and progress that naturally
+/// differ by shard, but it must never conceal divergent metric definitions.
+/// Query fan-in performs the same validation before calling the lower-level
+/// merge helper; control-plane callers use this checked entry point directly.
+pub fn mergeCompatibleGraphMetricStatusInto(
+    alloc: std.mem.Allocator,
+    target: *db_mod.types.GraphMetricStatus,
+    source: db_mod.types.GraphMetricStatus,
+) !void {
+    if (!std.mem.eql(u8, target.name, source.name)) return error.GraphMetricStatusConflict;
+    if (target.metadata_version != 0 and
+        source.metadata_version != 0 and
+        target.metadata_version != source.metadata_version)
+    {
+        return error.GraphMetricStatusConflict;
+    }
+    if (!target.edge_filter.equivalent(source.edge_filter)) return error.GraphMetricStatusConflict;
+    try mergeGraphMetricStatusInto(alloc, target, source);
+}
+
+test "graph metric operational status aggregation rejects divergent shard definitions" {
+    const alloc = std.testing.allocator;
+    const cites_filter = graph_mod.GraphMetricEdgeFilter{ .mode = .types, .types = &.{"cites"} };
+    const related_filter = graph_mod.GraphMetricEdgeFilter{ .mode = .types, .types = &.{"related"} };
+
+    var target = db_mod.types.GraphMetricStatus{
+        .name = try alloc.dupe(u8, "pagerank"),
+        .state = .fresh,
+        .edge_filter = try cites_filter.cloneAlloc(alloc),
+        .metadata_version = 2,
+        .published_generation = 7,
+        .progress = 1.0,
+    };
+    defer target.deinit(alloc);
+
+    var metadata_mismatch = db_mod.types.GraphMetricStatus{
+        .name = try alloc.dupe(u8, "pagerank"),
+        .edge_filter = try cites_filter.cloneAlloc(alloc),
+        .metadata_version = 3,
+    };
+    defer metadata_mismatch.deinit(alloc);
+    try std.testing.expectError(
+        error.GraphMetricStatusConflict,
+        mergeCompatibleGraphMetricStatusInto(alloc, &target, metadata_mismatch),
+    );
+
+    var filter_mismatch = db_mod.types.GraphMetricStatus{
+        .name = try alloc.dupe(u8, "pagerank"),
+        .edge_filter = try related_filter.cloneAlloc(alloc),
+        .metadata_version = 2,
+    };
+    defer filter_mismatch.deinit(alloc);
+    try std.testing.expectError(
+        error.GraphMetricStatusConflict,
+        mergeCompatibleGraphMetricStatusInto(alloc, &target, filter_mismatch),
+    );
+
+    var compatible = db_mod.types.GraphMetricStatus{
+        .name = try alloc.dupe(u8, "pagerank"),
+        .state = .stale,
+        .edge_filter = try cites_filter.cloneAlloc(alloc),
+        .metadata_version = 2,
+        .published_generation = 7,
+        .progress = 0.5,
+    };
+    defer compatible.deinit(alloc);
+    try mergeCompatibleGraphMetricStatusInto(alloc, &target, compatible);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.stale, target.state);
+    try std.testing.expectEqual(@as(f64, 0.5), target.progress);
+}
+
 fn mergeGraphMetricMetadataVersion(left: u32, right: u32) u32 {
     if (left == 0) return right;
     if (right == 0) return left;

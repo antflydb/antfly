@@ -197,8 +197,11 @@ export interface paths {
          * Execute a graph metric operational action
          * @description Refresh, rebuild, delete, pause, or resume maintenance for a configured
          *     graph metric. The metric configuration remains owned by the graph index.
-         *     `delete` clears materialized metric state and maintenance controls; a
-         *     later refresh or rebuild can publish a new generation.
+         *     Refresh and rebuild durably enqueue bounded, resumable maintenance and
+         *     return the aggregate shard status without waiting for graph-sized work.
+         *     `delete` clears materialized metric state and durably disables automatic
+         *     maintenance. A later refresh, rebuild, or resume action re-enables the
+         *     metric and can publish a new generation.
          */
         post: operations["executeGraphMetricAction"];
         delete?: never;
@@ -14246,7 +14249,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Updated graph metric status */
+            /** @description Aggregate graph metric status after the action is durably accepted */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -14259,6 +14262,24 @@ export interface operations {
             404: components["responses"]["NotFound"];
             /** @description Graph metric actions are unavailable for this runtime */
             405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The table topology or write-owner generation changed; retry the action */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            /** @description Local storage resources are temporarily exhausted */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -4005,7 +4005,10 @@ pub const IndexManager = struct {
                 if (status.maintenance_paused) continue;
                 switch (status.state) {
                     .not_ready, .stale, .failed => {
-                        var published = try entry.index.runGraphMetric(cfg.name);
+                        var published = entry.index.runGraphMetric(cfg.name) catch |err| switch (err) {
+                            error.GraphMetricDisabled => continue,
+                            else => return err,
+                        };
                         published.deinit(entry.index.alloc);
                         total_steps += 1;
                     },
@@ -4018,12 +4021,14 @@ pub const IndexManager = struct {
 
     pub fn refreshGraphMetric(self: *IndexManager, index_name: []const u8, metric_name: []const u8) !graph_mod.GraphIndex.GraphMetricStatus {
         const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        try entry.index.enableGraphMetric(metric_name);
         return try entry.index.runGraphMetric(metric_name);
     }
 
     pub fn rebuildGraphMetric(self: *IndexManager, index_name: []const u8, metric_name: []const u8) !graph_mod.GraphIndex.GraphMetricStatus {
         const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
         try entry.index.deleteGraphMetricMaterialization(metric_name);
+        try entry.index.enableGraphMetric(metric_name);
         return try entry.index.runGraphMetric(metric_name);
     }
 
@@ -4530,7 +4535,10 @@ pub const IndexManager = struct {
                                     index_scheduled_builds,
                                 )) continue;
                             } else if (!graphMetricBackgroundStartCanonical(entry.metric_configs, cfg)) continue;
-                            var started = try entry.index.ensureGraphMetricPlannedBuild(cfg.name, status.target_edge_generation);
+                            var started = entry.index.ensureGraphMetricPlannedBuild(cfg.name, status.target_edge_generation) catch |err| switch (err) {
+                                error.GraphMetricDisabled => continue,
+                                else => return err,
+                            };
                             defer started.deinit(entry.index.alloc);
                             result.builds_started += 1;
                             scheduled_builds += 1;
@@ -4547,7 +4555,7 @@ pub const IndexManager = struct {
                     entry.index.runGraphMetricPlannedCoordinatorStepForMetricAt(cfg.name, now_ms)
                 else
                     entry.index.runGraphMetricPlannedCoordinatorStepForMetric(cfg.name)) catch |err| switch (err) {
-                    error.GraphMetricBuildJobNotFound, error.GraphMetricBuildNotActive => continue,
+                    error.GraphMetricBuildJobNotFound, error.GraphMetricBuildNotActive, error.GraphMetricDisabled => continue,
                     else => return err,
                 };
                 result.coordinator_steps += 1;
@@ -4596,7 +4604,7 @@ pub const IndexManager = struct {
                     entry.index.runGraphMetricPlannedWorkerPageStepForMetricAt(cfg.name, options.worker_id, now_ms)
                 else
                     entry.index.runGraphMetricPlannedWorkerPageStepForMetric(cfg.name, options.worker_id)) catch |err| switch (err) {
-                    error.GraphMetricBuildJobNotFound, error.GraphMetricBuildNotActive => continue,
+                    error.GraphMetricBuildJobNotFound, error.GraphMetricBuildNotActive, error.GraphMetricDisabled => continue,
                     else => return err,
                 };
                 result.worker_steps += 1;

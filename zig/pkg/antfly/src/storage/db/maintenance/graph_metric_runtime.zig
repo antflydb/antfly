@@ -10899,9 +10899,10 @@ test "db graph metric runtime operations manual refresh rebuild and delete opera
 
     var deleted = try db.deleteGraphMetricMaterialization(alloc, "graph_idx", "manual_degree");
     defer deleted.deinit(alloc);
-    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.not_ready, deleted.state);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.disabled, deleted.state);
     try std.testing.expectEqual(@as(u64, 0), deleted.published_generation);
     try std.testing.expect(!deleted.maintenance_paused);
+    try std.testing.expect(!deleted.build_queued);
 
     try std.testing.expectError(error.MetricNotReady, graph_entry.index.graphMetricTopK("manual_degree", 1));
 
@@ -11051,6 +11052,33 @@ test "db graph metric runtime operations pause and resume controls background ma
         try std.testing.expectEqual(@as(usize, 1), top.len);
         try std.testing.expectEqualStrings("doc:b", top[0].node);
         try std.testing.expectApproxEqAbs(@as(f64, 3.0), top[0].score, 0.001);
+    }
+
+    var deleted = try db.deleteGraphMetricMaterialization(alloc, "graph_idx", "degree");
+    defer deleted.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.disabled, deleted.state);
+    try std.testing.expect(!deleted.build_queued);
+    try db.runUntilIdle();
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("degree");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.disabled, status.state);
+        try std.testing.expectEqual(@as(u64, 0), status.published_generation);
+    }
+
+    var reenabled = try db.resumeGraphMetricMaintenance(alloc, "graph_idx", "degree");
+    defer reenabled.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.not_ready, reenabled.state);
+    try std.testing.expect(reenabled.build_queued);
+    try db.runUntilIdle();
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("degree");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, status.state);
     }
 }
 

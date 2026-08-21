@@ -2495,9 +2495,11 @@ paths:
 
         return the aggregate shard status without waiting for graph-sized work.
 
-        `delete` clears materialized metric state and maintenance controls; a
+        `delete` clears materialized metric state and durably disables automatic
 
-        later refresh or rebuild can publish a new generation.
+        maintenance. A later refresh, rebuild, or resume action re-enables the
+
+        metric and can publish a new generation.
       tags:
         - index_management
       operationId: executeGraphMetricAction

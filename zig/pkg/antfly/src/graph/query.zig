@@ -342,16 +342,19 @@ pub const GraphQueryEngine = struct {
         var execution_params = gq.params;
         if (defer_result_limit) execution_params.max_results = graph_metric_candidate_limit + 1;
 
-        var result = try switch (gq.query_type) {
+        var execution_query = gq;
+        execution_query.params = execution_params;
+
+        var result = try switch (execution_query.query_type) {
             .traverse => self.executeTraverse(graph_index, execution_params, resolved_keys, resolveTargetKeys(gq)),
             .neighbors => blk: {
                 var params = execution_params;
                 params.max_depth = 1;
                 break :blk self.executeTraverse(graph_index, params, resolved_keys, resolveTargetKeys(gq));
             },
-            .shortest_path => self.executeShortestPath(graph_index, gq, resolved_keys),
-            .k_shortest_paths => self.executeKShortestPaths(graph_index, gq, resolved_keys),
-            .pattern => self.executePattern(graph_index, gq, resolved_keys),
+            .shortest_path => self.executeShortestPath(graph_index, execution_query, resolved_keys),
+            .k_shortest_paths => self.executeKShortestPaths(graph_index, execution_query, resolved_keys),
+            .pattern => self.executePattern(graph_index, execution_query, resolved_keys),
         };
         errdefer result.deinit(self.alloc);
         if (defer_result_limit and result.nodes.len > graph_metric_candidate_limit) {
@@ -836,13 +839,14 @@ pub const GraphQueryEngine = struct {
             all_results.deinit(self.alloc);
         }
 
-        for (start_keys, 0..) |sk, start_index| {
+        outer: for (start_keys, 0..) |sk, start_index| {
             if (admitted_starts) |mask| if (!mask[start_index]) continue;
             for (target_keys) |tk| {
                 const path = try paths_mod.findShortestPath(self.alloc, graph_index, sk, tk, opts);
                 if (path) |p| {
                     defer paths_mod.freePath(self.alloc, p);
                     try all_results.append(self.alloc, try pathToResultNode(self.alloc, &p));
+                    if (gq.params.max_results > 0 and all_results.items.len >= gq.params.max_results) break :outer;
                 }
             }
         }
@@ -875,11 +879,12 @@ pub const GraphQueryEngine = struct {
         defer if (admitted_starts) |mask| self.alloc.free(mask);
         if (self.node_admission != null and admitted_starts == null) return null;
 
-        for (start_keys, 0..) |start_key, start_index| {
+        outer: for (start_keys, 0..) |start_key, start_index| {
             if (admitted_starts) |mask| if (!mask[start_index]) continue;
             for (target_keys) |target_key| {
                 if (std.mem.eql(u8, start_key, target_key)) {
                     try all_results.append(self.alloc, try trivialPathResultNode(self.alloc, start_key));
+                    if (params.max_results > 0 and all_results.items.len >= params.max_results) break :outer;
                     continue;
                 }
 
@@ -906,6 +911,7 @@ pub const GraphQueryEngine = struct {
                 if (reached.len != 1) return null;
                 const node = (try algebraicShortestPathResultNodeAlloc(self.alloc, graph_index, params, start_key, target_key, reached[0])) orelse return null;
                 try all_results.append(self.alloc, node);
+                if (params.max_results > 0 and all_results.items.len >= params.max_results) break :outer;
             }
         }
 
@@ -943,7 +949,7 @@ pub const GraphQueryEngine = struct {
             all_results.deinit(self.alloc);
         }
 
-        for (start_keys, 0..) |sk, start_index| {
+        outer: for (start_keys, 0..) |sk, start_index| {
             if (admitted_starts) |mask| if (!mask[start_index]) continue;
             for (target_keys) |tk| {
                 const found = try paths_mod.findKShortestPaths(self.alloc, graph_index, sk, tk, gq.k, opts);
@@ -951,6 +957,7 @@ pub const GraphQueryEngine = struct {
 
                 for (found) |p| {
                     try all_results.append(self.alloc, try pathToResultNode(self.alloc, &p));
+                    if (gq.params.max_results > 0 and all_results.items.len >= gq.params.max_results) break :outer;
                 }
             }
         }
@@ -2063,6 +2070,90 @@ test "graph metric order and filter apply max results after metric processing" {
     try std.testing.expectEqualStrings("C", result.nodes[0].key);
 }
 
+test "shortest path metric filtering evaluates the complete bounded candidate set" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const metrics = [_]graph_mod.GraphMetricConfig{.{ .name = "degree", .kind = .degree }};
+    const ctx = try setupGraphWithOptions(alloc, "gq-metric-shortest-s", "gq-metric-shortest-r", &sb, &rb, .{ .metric_configs = &metrics });
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+
+    try ctx.graph.addEdge("A", "B", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("A", "C", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("C", "X", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("C", "Y", "e", 1.0, 0, 0, "");
+    var degree_status = try ctx.graph.runDegreeMetric("degree");
+    degree_status.deinit(alloc);
+
+    const filters = [_]GraphMetricFilter{.{
+        .name = "degree",
+        .op = .gte,
+        .value = 3.0,
+        .freshness = .published,
+    }};
+    var engine = GraphQueryEngine{ .alloc = alloc };
+    const starts: []const []const u8 = &.{"A"};
+    var result = try engine.execute(&ctx.graph, .{
+        .query_type = .shortest_path,
+        .index_name = "test",
+        .start_nodes = .{ .keys = starts },
+        .target_nodes = .{ .keys = &.{ "B", "C" } },
+        .params = .{ .max_depth = 2, .max_results = 1 },
+        .where_metric = &filters,
+    }, starts);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.nodes.len);
+    try std.testing.expectEqualStrings("C", result.nodes[0].key);
+}
+
+test "pattern metric filtering evaluates matches beyond the response limit" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const metrics = [_]graph_mod.GraphMetricConfig{.{ .name = "degree", .kind = .degree }};
+    const ctx = try setupGraphWithOptions(alloc, "gq-metric-pattern-s", "gq-metric-pattern-r", &sb, &rb, .{ .metric_configs = &metrics });
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+
+    try ctx.graph.addEdge("A", "B", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("A", "C", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("C", "X", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("C", "Y", "e", 1.0, 0, 0, "");
+    var degree_status = try ctx.graph.runDegreeMetric("degree");
+    degree_status.deinit(alloc);
+
+    const filters = [_]GraphMetricFilter{.{
+        .name = "degree",
+        .op = .gte,
+        .value = 3.0,
+        .freshness = .published,
+    }};
+    const steps: []const pattern_mod.PatternStep = &.{
+        .{ .alias = "start", .edge = .{ .direction = .out } },
+        .{ .alias = "neighbor", .edge = .{ .direction = .out } },
+    };
+    var engine = GraphQueryEngine{ .alloc = alloc };
+    const starts: []const []const u8 = &.{"A"};
+    var result = try engine.execute(&ctx.graph, .{
+        .query_type = .pattern,
+        .index_name = "test",
+        .start_nodes = .{ .keys = starts },
+        .pattern = steps,
+        .params = .{ .max_results = 1 },
+        .where_metric = &filters,
+    }, starts);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.nodes.len);
+    try std.testing.expectEqualStrings("C", result.nodes[0].key);
+}
+
 test "traverse can execute through algebraic provenance semiring path" {
     const alloc = std.testing.allocator;
     var sb: [256]u8 = undefined;
@@ -2791,6 +2882,17 @@ test "k_shortest_paths via engine" {
     try std.testing.expectEqual(@as(usize, 2), result.nodes.len);
     // First path should be shorter/lighter
     try std.testing.expect(result.nodes[0].distance <= result.nodes[1].distance);
+
+    var limited = try engine.execute(&ctx.graph, .{
+        .query_type = .k_shortest_paths,
+        .index_name = "test",
+        .start_nodes = .{ .keys = start_keys },
+        .target_nodes = .{ .keys = &.{"C"} },
+        .k = 2,
+        .params = .{ .weight_mode = .min_weight, .max_results = 1 },
+    }, start_keys);
+    defer limited.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), limited.nodes.len);
 }
 
 test "k_shortest_paths k one can execute through algebraic shortest path proof" {

@@ -1357,6 +1357,17 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !QueryResponse {
+        return self.fetchGroupGraphMetricMaintenanceWithCancellation(base_uri, group_id, table_name, body, null);
+    }
+
+    pub fn fetchGroupGraphMetricMaintenanceWithCancellation(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !QueryResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -1373,11 +1384,15 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .cancellation = cancellation,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
-            400 => return error.InvalidGraphMetricRuntimeConfig,
+            400 => if (std.mem.eql(u8, resp.body, @errorName(error.InvalidGraphMetricAction)))
+                return error.InvalidGraphMetricAction
+            else
+                return error.InvalidGraphMetricRuntimeConfig,
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupConflictError(resp.body),
