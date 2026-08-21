@@ -273,6 +273,23 @@ describe("AntflyClient", () => {
       });
     });
 
+    it("formats table query Problem Details errors", async () => {
+      mockPost.mockResolvedValueOnce({
+        data: undefined,
+        error: {
+          type: "about:blank",
+          title: "Bad Gateway",
+          status: 502,
+          detail: "upstream query response ended unexpectedly",
+        },
+        response: new Response(undefined, { status: 502 }),
+      });
+
+      await expect(client.tables.query("products", { limit: 3 })).rejects.toThrow(
+        "Table query failed: upstream query response ended unexpectedly"
+      );
+    });
+
     it("should return the durable table restore job", async () => {
       const restoreJob = {
         job_id: "9223372036854775807",

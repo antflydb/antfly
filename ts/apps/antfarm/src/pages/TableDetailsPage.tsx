@@ -82,7 +82,13 @@ import {
   generateSearchableFields,
   type SearchableField,
 } from "../utils/fieldUtils";
-import { buildTableQueryRequest, parseTableQueryRequest } from "./table-query";
+import {
+  artifactRetrievalDefaults,
+  buildTableQueryRequest,
+  parseTableQueryRequest,
+  tableQueryErrorMessage,
+  tableQueryInput,
+} from "./table-query";
 
 const formatBytes = (bytes: number, decimals = 2) => {
   if (bytes === 0) return "0 Bytes";
@@ -247,10 +253,11 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   const [filterQuery, setFilterQuery] = useState(JSON.stringify({}, null, 2));
   const [semanticQuery, setSemanticQuery] = useState(JSON.stringify({}, null, 2));
   const [selectedFields, setSelectedFields] = useState<string[]>([]);
-  const [includeProfile, setIncludeProfile] = useState(true);
+  const [includeProfile, setIncludeProfile] = useState(false);
 
   // Derive search modes from input content instead of toggles
   const hasSemanticQuery = query.trim().length > 0 && queryIndexes.length > 0;
+  const hasFullTextQuery = query.trim().length > 0 && !hasSemanticQuery;
   const hasFilterQuery = useMemo(() => {
     try {
       const parsed = JSON.parse(filterQuery);
@@ -264,15 +271,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
 
   const [queryMode, setQueryMode] = useState<"builder" | "json">("builder");
 
-  // Auto-select first vector index when indexes load
-  useEffect(() => {
-    if (queryIndexes.length === 0) {
-      const vectorIndexes = indexes.filter((idx) => idx.config.type === "embeddings");
-      if (vectorIndexes.length > 0) {
-        setQueryIndexes([vectorIndexes[0].config.name]);
-      }
-    }
-  }, [indexes, queryIndexes.length]);
+  const artifactRetrieval = useMemo(
+    () => artifactRetrievalDefaults(indexes, queryIndexes),
+    [indexes, queryIndexes]
+  );
 
   const semanticQueryRequest = useMemo(() => {
     return buildTableQueryRequest({
@@ -282,18 +284,25 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       semanticQuery,
       filterQuery,
       includeProfile,
+      artifactSearchField: artifactRetrieval?.field,
+      returnArtifactMatches: artifactRetrieval?.returnMatches,
     });
-  }, [query, queryIndexes, filterQuery, semanticQuery, selectedFields, includeProfile]);
+  }, [
+    query,
+    queryIndexes,
+    filterQuery,
+    semanticQuery,
+    selectedFields,
+    includeProfile,
+    artifactRetrieval,
+  ]);
   const semanticQueryRequestString = useMemo(
     () => JSON.stringify(semanticQueryRequest, null, 2),
     [semanticQueryRequest]
   );
 
   const [queryJsonString, setQueryJsonString] = useState(semanticQueryRequestString);
-  const parsedJsonQuery = useMemo(
-    () => parseTableQueryRequest(queryJsonString),
-    [queryJsonString]
-  );
+  const parsedJsonQuery = useMemo(() => parseTableQueryRequest(queryJsonString), [queryJsonString]);
   const isJsonQueryValid = parsedJsonQuery !== null;
 
   const handleQueryModeChange = (v: string) => {
@@ -305,10 +314,15 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       if (queryRequest) {
         setQueryIndexes(queryRequest.indexes || []);
         setSelectedFields(queryRequest.fields || []);
+        setIncludeProfile(queryRequest.profile === true);
         setFieldInput(""); // Clear field input when switching from JSON mode
 
         // Set query content (search mode is auto-detected from content)
-        setQuery(queryRequest.semantic_search || "");
+        const nextArtifactRetrieval = artifactRetrievalDefaults(
+          indexes,
+          queryRequest.indexes || []
+        );
+        setQuery(tableQueryInput(queryRequest, nextArtifactRetrieval?.field));
 
         // Set filter query content
         if (queryRequest.filter_query) {
@@ -392,10 +406,20 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     fetchDocumentCount();
   }, [fetchDocumentCount]);
 
-  // Reset editing state when switching tables
+  // Reset table-specific editor state when switching tables.
   useEffect(() => {
+    if (!tableName) return;
     setIsEditingSchema(false);
-  }, []);
+    setQuery("");
+    setQueryResult(null);
+    setQueryIndexes([]);
+    setFilterQuery(JSON.stringify({}, null, 2));
+    setSemanticQuery(JSON.stringify({}, null, 2));
+    setSelectedFields([]);
+    setIncludeProfile(false);
+    setQueryMode("builder");
+    setError(null);
+  }, [tableName]);
 
   const handleOpenCreateDialog = () => {
     setOpenCreateDialog(true);
@@ -440,6 +464,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
 
   const handleRunQuery = useCallback(async () => {
     if (!tableName) return;
+    setError(null);
     try {
       const queryRequest = queryMode === "json" ? parsedJsonQuery : semanticQueryRequest;
       if (!queryRequest) {
@@ -449,7 +474,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       const response = await api.tables.query(tableName, queryRequest);
       setQueryResult(response?.responses?.[0] || null);
     } catch (e) {
-      setError(`Failed to run query on table ${tableName}.`);
+      setError(tableQueryErrorMessage(e, `Failed to run query on table ${tableName}.`));
       console.error(e);
     }
   }, [tableName, queryMode, parsedJsonQuery, semanticQueryRequest]);
@@ -957,6 +982,13 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                         </div>
                       </AccordionTrigger>
                       <AccordionContent className="pb-3 pt-1 space-y-2.5">
+                        {artifactRetrieval && selectedFields.length === 0 && (
+                          <p className="text-xs text-muted-foreground">
+                            Artifact retrieval defaults to the {artifactRetrieval.field} field so
+                            source files and inline URLs are not returned. Select fields here to
+                            override that projection.
+                          </p>
+                        )}
                         <Input
                           id="fields-input"
                           placeholder="Type field name and press Enter"
@@ -991,19 +1023,19 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                       </AccordionContent>
                     </AccordionItem>
 
-                    {/* Semantic Search */}
+                    {/* Search query and optional semantic index */}
                     <AccordionItem value="semantic" className="border rounded-none bg-card/50 px-3">
                       <AccordionTrigger className="py-2.5 hover:no-underline">
-                        <span className="font-medium text-sm">Semantic Search</span>
+                        <span className="font-medium text-sm">Search Query</span>
                       </AccordionTrigger>
                       <AccordionContent className="pb-3 pt-1">
                         <div className="space-y-2.5">
                           <div>
-                            <Label className="text-xs mb-1 block">Vector Index</Label>
+                            <Label className="text-xs mb-1 block">Vector Index (optional)</Label>
                             {indexes.filter((idx) => idx.config.type === "embeddings").length ===
                             0 ? (
                               <p className="text-xs text-muted-foreground">
-                                No vector indexes available. Create one to enable semantic search.
+                                No vector indexes available. Entered text will use full-text search.
                               </p>
                             ) : (
                               <MultiSelect
@@ -1024,6 +1056,12 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                                     ))}
                                 </MultiSelectContent>
                               </MultiSelect>
+                            )}
+                            {indexes.some((idx) => idx.config.type === "embeddings") && (
+                              <p className="mt-1 text-xs text-muted-foreground">
+                                Select a vector index for semantic search, or clear the selection to
+                                use full-text search.
+                              </p>
                             )}
                           </div>
                           {queryIndexes.length > 1 && (
@@ -1059,10 +1097,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                       </AccordionContent>
                     </AccordionItem>
 
-                    {/* Full-Text Search */}
+                    {/* Structured filters */}
                     <AccordionItem value="filter" className="border rounded-none bg-card/50 px-3">
                       <AccordionTrigger className="py-2.5 hover:no-underline">
-                        <span className="font-medium text-sm">Full-Text Search</span>
+                        <span className="font-medium text-sm">Filters</span>
                       </AccordionTrigger>
                       <AccordionContent className="pb-3 pt-1">
                         <QueryBuilder
@@ -1161,12 +1199,16 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
               </Button>
               <span className="text-xs text-muted-foreground">
                 {hasSemanticQuery && hasFilterQuery
-                  ? "Running semantic + full-text search"
+                  ? "Running semantic search with filters"
                   : hasSemanticQuery
                     ? "Running semantic search"
-                    : hasFilterQuery
-                      ? "Running full-text search"
-                      : "Browsing all documents"}
+                    : hasFullTextQuery && hasFilterQuery
+                      ? "Running full-text search with filters"
+                      : hasFullTextQuery
+                        ? "Running full-text search"
+                        : hasFilterQuery
+                          ? "Filtering documents"
+                          : "Browsing all documents"}
               </span>
             </DashboardToolbar>
 
