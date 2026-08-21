@@ -17,7 +17,12 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
-workers="${ANTFLY_E2E_WORKERS:-2}"
+default_workers=4
+detected_workers="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+if [[ "$detected_workers" =~ ^[1-9][0-9]*$ ]] && (( detected_workers < default_workers )); then
+  default_workers="$detected_workers"
+fi
+workers="${ANTFLY_E2E_WORKERS:-$default_workers}"
 
 if [[ ! "$workers" =~ ^(0|[1-9][0-9]*)$ ]]; then
   echo "ANTFLY_E2E_WORKERS must be a non-negative integer; got: $workers" >&2
