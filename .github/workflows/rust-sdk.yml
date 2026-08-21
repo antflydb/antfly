@@ -33,7 +33,7 @@ env:
 
 jobs:
   sdk:
-    runs-on: ubuntu-latest
+    runs-on: arc-antfly-standard
     timeout-minutes: 20
     defaults:
       run:

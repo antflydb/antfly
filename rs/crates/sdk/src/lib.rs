@@ -210,13 +210,22 @@ mod tests {
             "name": "thumbnail",
             "type": "embeddings",
             "dimension": 512,
-            "distance_metric": "cosine"
+            "distance_metric": "cosine",
+            "chunker": {
+                "provider": "antfly",
+                "model": "fixed",
+                "store_chunks": false
+            }
         }))
         .expect("deserialize created embeddings index");
         match created {
             types::CreatedIndex::EmbeddingsIndex(index) => {
                 assert_eq!(index.name, "thumbnail");
                 assert_eq!(index.dimension.map(std::num::NonZeroU64::get), Some(512));
+                assert_eq!(
+                    index.chunker.map(|chunker| chunker.model),
+                    Some("fixed".to_string()),
+                );
             }
             other => panic!("unexpected created index variant: {other:?}"),
         }

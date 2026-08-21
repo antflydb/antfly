@@ -1354,7 +1354,64 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     return try out.toOwnedSlice(alloc);
 }
 
-pub fn normalizeEmbeddingsIndexDimensionJsonWithOptions(
+fn normalizeAntflyChunkerDefaultModelJson(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !?[]u8 {
+    const root = switch (value) {
+        .object => |object| object,
+        else => return null,
+    };
+    const type_value = root.get("type") orelse return null;
+    if (type_value != .string or !std.mem.eql(u8, type_value.string, "embeddings")) return null;
+
+    const chunker = switch (root.get("chunker") orelse return null) {
+        .object => |object| object,
+        else => return null,
+    };
+    const provider = chunker.get("provider") orelse return null;
+    if (provider != .string or !std.mem.eql(u8, provider.string, "antfly")) return null;
+    // Preserve explicit values, including null, so validation can reject them
+    // instead of silently changing caller intent.
+    if (chunker.get("model") != null) return null;
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.append(alloc, '{');
+    var first_root_field = true;
+    var root_it = root.iterator();
+    while (root_it.next()) |entry| {
+        if (!first_root_field) try out.append(alloc, ',');
+        first_root_field = false;
+        try appendJsonString(alloc, &out, entry.key_ptr.*);
+        try out.append(alloc, ':');
+        if (!std.mem.eql(u8, entry.key_ptr.*, "chunker")) {
+            const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(entry.value_ptr.*, .{})});
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+            continue;
+        }
+
+        try out.append(alloc, '{');
+        var first_chunker_field = true;
+        var chunker_it = chunker.iterator();
+        while (chunker_it.next()) |chunker_entry| {
+            if (!first_chunker_field) try out.append(alloc, ',');
+            first_chunker_field = false;
+            try appendJsonString(alloc, &out, chunker_entry.key_ptr.*);
+            try out.append(alloc, ':');
+            const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(chunker_entry.value_ptr.*, .{})});
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+        }
+        if (!first_chunker_field) try out.append(alloc, ',');
+        try out.appendSlice(alloc, "\"model\":\"fixed\"}");
+    }
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn normalizeEmbeddingsIndexDimensionOnlyJsonWithOptions(
     alloc: std.mem.Allocator,
     index_name: []const u8,
     value: std.json.Value,
@@ -1425,6 +1482,25 @@ pub fn normalizeEmbeddingsIndexDimensionJsonWithOptions(
     try out.appendSlice(alloc, dims_json);
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+pub fn normalizeEmbeddingsIndexDimensionJsonWithOptions(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    value: std.json.Value,
+    options: InitOptions,
+) !?[]u8 {
+    if (try normalizeEmbeddingsIndexDimensionOnlyJsonWithOptions(alloc, index_name, value, options)) |normalized_dimension| {
+        errdefer alloc.free(normalized_dimension);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, normalized_dimension, .{});
+        defer parsed.deinit();
+        if (try normalizeAntflyChunkerDefaultModelJson(alloc, parsed.value)) |normalized_defaults| {
+            alloc.free(normalized_dimension);
+            return normalized_defaults;
+        }
+        return normalized_dimension;
+    }
+    return try normalizeAntflyChunkerDefaultModelJson(alloc, value);
 }
 
 fn parseManagedEmbeddingEntry(
@@ -3605,17 +3681,27 @@ fn testChunkerOnlyDenseIndexPreservesDeclaredDimensions() !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
     defer parsed.deinit();
 
-    try std.testing.expect((try normalizeEmbeddingsIndexDimensionJsonWithOptions(
+    const normalized = (try normalizeEmbeddingsIndexDimensionJsonWithOptions(
         alloc,
         "semantic_chunked_idx",
         parsed.value,
         .{},
-    )) == null);
+    )) orelse return error.TestUnexpectedResult;
+    defer alloc.free(normalized);
+    try ant_json.testing.expectEqualJsonText(
+        alloc,
+        \\{"type":"embeddings","field":"body","dimension":3,"chunker":{"provider":"antfly","model":"fixed","store_chunks":false,"text":{"target_tokens":4,"separator":" "}}}
+    ,
+        normalized,
+    );
+
+    var normalized_parsed = try std.json.parseFromSlice(std.json.Value, alloc, normalized, .{});
+    defer normalized_parsed.deinit();
 
     const translated = try translateEmbeddingsIndexConfigJsonWithOptions(
         alloc,
         "semantic_chunked_idx",
-        parsed.value,
+        normalized_parsed.value,
         .{},
     );
     defer alloc.free(translated);

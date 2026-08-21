@@ -9112,11 +9112,11 @@ export interface components {
              */
             api_url?: string;
             /**
-             * @description The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
+             * @description The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other values select a model from models/chunkers/{name}/. Successful create responses include the effective model.
              * @default fixed
              * @example fixed
              */
-            model: string;
+            model?: string;
         };
         /**
          * @description The chunking provider to use.

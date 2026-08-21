@@ -2255,28 +2255,26 @@ def test_serverless_chunked_dense_index_reports_chunk_embeddings_blocker(
         )
         == {}
     )
-    assert_created_index(
-        serverless_api.create_index(
-            table_name,
-            index_name,
-            {
-                "name": index_name,
-                "type": "embeddings",
-                "field": "body",
-                "dimension": 3,
-                "chunker": {
-                    "provider": "antfly",
-                    "store_chunks": False,
-                    "text": {
-                        "target_tokens": 4,
-                        "separator": " ",
-                    },
+    created_index = serverless_api.create_index(
+        table_name,
+        index_name,
+        {
+            "name": index_name,
+            "type": "embeddings",
+            "field": "body",
+            "dimension": 3,
+            "chunker": {
+                "provider": "antfly",
+                "store_chunks": False,
+                "text": {
+                    "target_tokens": 4,
+                    "separator": " ",
                 },
             },
-        ),
-        index_name,
-        "embeddings",
+        },
     )
+    assert_created_index(created_index, index_name, "embeddings")
+    assert created_index["chunker"]["model"] == "fixed"
 
     serverless_api.ingest_table(
         table_name,

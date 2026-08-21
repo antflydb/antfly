@@ -569,8 +569,8 @@ pub const AntflyChunkerConfig = struct {
     audio: ?AudioChunkOptions = null,
     /// The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
-    /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
-    model: []const u8,
+    /// The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other values select a model from models/chunkers/{name}/. Successful create responses include the effective model.
+    model: ?[]const u8 = null,
 };
 
 /// Configuration for the Antfly inference embedding provider. Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models. It provides embedding generation with multi-tier caching (memory + persistent). **Features:** - Local ONNX-based embedding generation - L1 memory cache with configurable TTL - L2 persistent Pebble database cache - Singleflight deduplication for concurrent identical requests **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims) Models are loaded from the `models/embedders/{name}/` directory.
@@ -1282,7 +1282,7 @@ pub const ChunkerConfig = struct {
     audio: ?AudioChunkOptions = null,
     /// The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
-    /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
+    /// The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other values select a model from models/chunkers/{name}/. Successful create responses include the effective model.
     model: ?[]const u8 = null,
     provider: ChunkerProvider,
     /// Controls whether chunk data is persisted to storage. When false (default), chunks are generated in memory and only embeddings are stored. When true, both chunks and embeddings are stored.
