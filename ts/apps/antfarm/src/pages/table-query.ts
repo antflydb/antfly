@@ -84,20 +84,21 @@ export function artifactRetrievalDefaults(
     // candidates, but must never turn an unrelated vector index into an
     // artifact-backed index.
     const allEnrichments = [...enrichments, ...tableEnrichments];
-    const artifactEnrichment =
-      allEnrichments.find(
-        (enrichment) =>
-          (enrichment.kind === "chunk" || enrichment.kind === "asset") &&
-          enrichment.name === config.artifact_name
-      ) ??
-      allEnrichments.find(
-        (enrichment) =>
-          (enrichment.kind === "chunk" || enrichment.kind === "asset") &&
-          enrichment.full_text_index === true
-      );
+    const artifactEnrichments = allEnrichments.filter(
+      (enrichment) =>
+        (enrichment.kind === "chunk" || enrichment.kind === "asset") &&
+        (config.artifact_name
+          ? enrichment.name === config.artifact_name
+          : enrichment.full_text_index === true)
+    );
 
-    if (artifactEnrichment || config.artifact_name) {
-      artifactFields.add(artifactEnrichment?.field?.trim() || config.field?.trim() || "text");
+    if (artifactEnrichments.length > 0) {
+      for (const enrichment of artifactEnrichments) {
+        artifactFields.add(enrichment.field?.trim() || config.field?.trim() || "text");
+      }
+      artifactIndexCount++;
+    } else if (config.artifact_name) {
+      artifactFields.add(config.field?.trim() || "text");
       artifactIndexCount++;
     } else {
       ordinaryIndexCount++;
@@ -159,13 +160,29 @@ export function parseTableQueryRequest(source: string): QueryRequest | null {
   return parseJsonObject(source) as QueryRequest | null;
 }
 
-export function tableQueryInput(request: QueryRequest, artifactSearchField?: string): string {
+export function tableQueryInput(
+  request: QueryRequest,
+  artifactSearchFields?: string | string[]
+): string {
   if (typeof request.semantic_search === "string") {
     return request.semantic_search;
   }
+  const artifactFields = [
+    ...new Set(
+      (Array.isArray(artifactSearchFields) ? artifactSearchFields : [artifactSearchFields])
+        .filter((field): field is string => typeof field === "string")
+        .map((field) => field.trim())
+        .filter(Boolean)
+    ),
+  ];
+  const artifactSearchField = artifactFields[0];
   const raw = request.full_text_search as
-    | { field?: unknown; match?: unknown; query?: unknown }
+    | { disjuncts?: unknown; field?: unknown; match?: unknown; query?: unknown }
     | undefined;
+  const disjunctionMatch = simpleArtifactDisjunctionMatch(raw, artifactFields);
+  if (disjunctionMatch !== null) {
+    return disjunctionMatch;
+  }
   if (
     typeof raw?.match === "string" &&
     (artifactSearchField === undefined ||
@@ -194,6 +211,42 @@ export function tableQueryInput(request: QueryRequest, artifactSearchField?: str
     }
   }
   return value;
+}
+
+function simpleArtifactDisjunctionMatch(
+  raw: { disjuncts?: unknown; field?: unknown; match?: unknown; query?: unknown } | undefined,
+  artifactFields: string[]
+): string | null {
+  if (!raw || artifactFields.length < 2 || !Array.isArray(raw.disjuncts)) return null;
+  if (Object.keys(raw).some((key) => key !== "disjuncts")) return null;
+
+  const fields = new Set<string>();
+  let match: string | undefined;
+  for (const disjunct of raw.disjuncts) {
+    if (!disjunct || typeof disjunct !== "object" || Array.isArray(disjunct)) return null;
+    const clause = disjunct as Record<string, unknown>;
+    if (
+      Object.keys(clause).length !== 2 ||
+      typeof clause.field !== "string" ||
+      typeof clause.match !== "string"
+    ) {
+      return null;
+    }
+    if (match !== undefined && match !== clause.match) return null;
+    match = clause.match;
+    fields.add(clause.field);
+  }
+
+  const expectedFields = new Set(artifactFields);
+  if (
+    match === undefined ||
+    fields.size !== raw.disjuncts.length ||
+    fields.size !== expectedFields.size ||
+    [...fields].some((field) => !expectedFields.has(field))
+  ) {
+    return null;
+  }
+  return match;
 }
 
 export function tableQueryErrorMessage(error: unknown, fallback: string): string {

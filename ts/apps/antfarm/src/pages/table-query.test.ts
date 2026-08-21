@@ -309,6 +309,90 @@ describe("table query builder UX", () => {
     });
   });
 
+  it("collects every separately registered artifact field routed to full-text search", () => {
+    const indexes = [
+      {
+        config: { name: "full_text_index_v0", type: "full_text" },
+        shard_status: {},
+        status: { index_type: "full_text" },
+      },
+    ] as IndexStatus[];
+    const tableStatus = {
+      name: "docs",
+      indexes: {
+        full_text_index_v0: { name: "full_text_index_v0", type: "full_text" },
+      },
+      shards: {},
+      storage_status: {},
+      artifact_enrichments: [
+        {
+          name: "document_chunks_v1",
+          kind: "chunk",
+          field: "text",
+          full_text_index: true,
+        },
+        {
+          name: "image_captions_v1",
+          kind: "asset",
+          field: "caption",
+          full_text_index: true,
+        },
+      ],
+    } as TableStatus;
+
+    expect(artifactRetrievalDefaults(indexes, [], tableStatus)).toEqual({
+      field: "text",
+      fields: ["text", "caption"],
+      returnMatches: true,
+    });
+  });
+
+  it("keeps explicitly named full-text artifact indexes isolated", () => {
+    const indexes = [
+      {
+        config: {
+          name: "document_text",
+          type: "full_text",
+          artifact_name: "document_chunks_v1",
+        },
+        shard_status: {},
+        status: { index_type: "full_text" },
+      },
+    ] as unknown as IndexStatus[];
+    const tableStatus = {
+      name: "docs",
+      indexes: {
+        document_text: {
+          name: "document_text",
+          type: "full_text",
+          artifact_name: "document_chunks_v1",
+        },
+      },
+      shards: {},
+      storage_status: {},
+      artifact_enrichments: [
+        {
+          name: "document_chunks_v1",
+          kind: "chunk",
+          field: "text",
+          full_text_index: true,
+        },
+        {
+          name: "image_captions_v1",
+          kind: "asset",
+          field: "caption",
+          full_text_index: true,
+        },
+      ],
+    } as unknown as TableStatus;
+
+    expect(artifactRetrievalDefaults(indexes, [], tableStatus)).toEqual({
+      field: "text",
+      fields: ["text"],
+      returnMatches: true,
+    });
+  });
+
   it("does not treat an ordinary vector index as artifact-backed because of table enrichments", () => {
     const indexes = [
       {
@@ -469,6 +553,51 @@ describe("table query builder UX", () => {
     expect(
       tableQueryInput({ full_text_search: { match: "event horizon", field: "text" } }, "text")
     ).toBe("event horizon");
+  });
+
+  it("round-trips generated multi-field artifact disjunctions into the builder", () => {
+    const request = buildTableQueryRequest({
+      query: "event horizon",
+      queryIndexes: [],
+      selectedFields: [],
+      semanticQuery: "{}",
+      filterQuery: "{}",
+      includeProfile: false,
+      artifactSearchField: "text",
+      artifactProjectionFields: ["text", "caption"],
+      returnArtifactMatches: true,
+    });
+
+    expect(tableQueryInput(request, ["text", "caption"])).toBe("event horizon");
+  });
+
+  it("does not flatten heterogeneous or custom full-text disjunctions", () => {
+    expect(
+      tableQueryInput(
+        {
+          full_text_search: {
+            disjuncts: [
+              { field: "text", match: "event horizon" },
+              { field: "caption", match: "singularity" },
+            ],
+          },
+        },
+        ["text", "caption"]
+      )
+    ).toBe("");
+    expect(
+      tableQueryInput(
+        {
+          full_text_search: {
+            disjuncts: [
+              { field: "text", match: "event horizon" },
+              { field: "summary", match: "event horizon" },
+            ],
+          },
+        },
+        ["text", "caption"]
+      )
+    ).toBe("");
   });
 
   it("shows Problem Details and Error messages instead of undefined", () => {

@@ -336,7 +336,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
           queryRequest.indexes || [],
           tableStatus
         );
-        setQuery(tableQueryInput(queryRequest, nextArtifactRetrieval?.field));
+        setQuery(tableQueryInput(queryRequest, nextArtifactRetrieval?.fields));
 
         // Set filter query content
         if (queryRequest.filter_query) {
