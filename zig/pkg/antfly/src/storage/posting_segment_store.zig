@@ -273,29 +273,150 @@ pub const Store = struct {
         covered_source_sequence: u64,
         segment_bytes: []const u8,
     ) !void {
+        return try self.publishCheckpointInternal(
+            segment_generation,
+            covered_source_sequence,
+            segment_bytes,
+            null,
+            false,
+        );
+    }
+
+    /// Durably writes an unreferenced immutable segment. Until a later CURRENT
+    /// publication names it, a crash leaves only a harmless orphan. This lets
+    /// checkpoint construction and its large file write run off the foreground
+    /// replay path.
+    pub fn stageCheckpointSegment(
+        self: *Store,
+        segment_generation: u64,
+        segment_bytes: []const u8,
+    ) !void {
         if (self.poisoned) return error.PostingStoreRequiresReopen;
         if (self.checkpoint) |current| {
             if (segment_generation <= current.segment_generation) return error.OutOfOrderPostingSegmentGeneration;
         }
-        if (covered_source_sequence < self.covered_source_sequence) return error.OutOfOrderPostingCheckpointSequence;
         _ = try posting_segment.Reader.init(segment_bytes);
+        const segment_path = try self.segmentPathAlloc(segment_generation);
+        defer self.alloc.free(segment_path);
+        try atomicReplace(self.alloc, self.storage, segment_path, segment_bytes);
+    }
+
+    /// Publishes a segment materialized from the committed WAL prefix ending
+    /// at `flattened_wal_bytes`, and carries every subsequently committed
+    /// batch into the next WAL generation. The byte boundary is intentional:
+    /// maintenance may commit more than one ordered batch at the same source
+    /// sequence, so filtering the tail by sequence could silently lose work.
+    pub fn publishCheckpointPreservingWalTail(
+        self: *Store,
+        segment_generation: u64,
+        covered_source_sequence: u64,
+        segment_bytes: []const u8,
+        flattened_wal_bytes: u64,
+    ) !void {
+        return try self.publishCheckpointInternal(
+            segment_generation,
+            covered_source_sequence,
+            segment_bytes,
+            flattened_wal_bytes,
+            false,
+        );
+    }
+
+    /// Publishes a segment already made durable by `stageCheckpointSegment`
+    /// while carrying forward the committed WAL suffix.
+    pub fn publishStagedCheckpointPreservingWalTail(
+        self: *Store,
+        segment_generation: u64,
+        covered_source_sequence: u64,
+        segment_bytes: []const u8,
+        flattened_wal_bytes: u64,
+    ) !void {
+        return try self.publishCheckpointInternal(
+            segment_generation,
+            covered_source_sequence,
+            segment_bytes,
+            flattened_wal_bytes,
+            true,
+        );
+    }
+
+    fn publishCheckpointInternal(
+        self: *Store,
+        segment_generation: u64,
+        covered_source_sequence: u64,
+        segment_bytes: []const u8,
+        flattened_wal_bytes: ?u64,
+        segment_already_staged: bool,
+    ) !void {
+        if (self.poisoned) return error.PostingStoreRequiresReopen;
+        if (self.checkpoint) |current| {
+            if (segment_generation <= current.segment_generation) return error.OutOfOrderPostingSegmentGeneration;
+        }
+        _ = try posting_segment.Reader.init(segment_bytes);
+
+        var retained_wal: ?RecoveredWal = null;
+        defer if (retained_wal) |*wal| wal.deinit();
+        var tail: []const u8 = &.{};
+        var tail_last_committed_batch: ?u64 = null;
+        var tail_covered_source_sequence = covered_source_sequence;
+        if (flattened_wal_bytes) |prefix_bytes_u64| {
+            const prefix_bytes = std.math.cast(usize, prefix_bytes_u64) orelse return error.InvalidPostingWalBoundary;
+            retained_wal = try self.recoverWal();
+            const wal = &retained_wal.?;
+            if (@as(u64, @intCast(wal.replay.committed_bytes)) != self.wal_committed_bytes or
+                prefix_bytes > wal.replay.committed_bytes)
+            {
+                return error.InvalidPostingWalBoundary;
+            }
+            var prefix_replay = try posting_wal.Replay.parse(self.alloc, wal.bytes[0..prefix_bytes]);
+            defer prefix_replay.deinit();
+            if (prefix_replay.committed_bytes != prefix_bytes or
+                prefix_replay.covered_source_sequence != covered_source_sequence)
+            {
+                return error.InvalidPostingWalBoundary;
+            }
+            tail = wal.bytes[prefix_bytes..wal.replay.committed_bytes];
+            if (tail.len > 0) {
+                var tail_replay = try posting_wal.Replay.parse(self.alloc, tail);
+                defer tail_replay.deinit();
+                if (tail_replay.committed_bytes != tail.len) return error.InvalidPostingWalBoundary;
+                for (tail_replay.records.items) |record| {
+                    if (record.source_sequence < covered_source_sequence) return error.PostingWalOverlapsCheckpoint;
+                }
+                tail_last_committed_batch = tail_replay.last_committed_batch;
+                tail_covered_source_sequence = @max(covered_source_sequence, tail_replay.covered_source_sequence);
+            }
+            if (tail.len == 0) {
+                if (covered_source_sequence != self.covered_source_sequence) return error.InvalidPostingWalBoundary;
+            } else if (tail_covered_source_sequence != self.covered_source_sequence or
+                tail_last_committed_batch != self.last_committed_batch)
+            {
+                return error.InvalidPostingWalBoundary;
+            }
+        } else if (covered_source_sequence < self.covered_source_sequence) {
+            return error.OutOfOrderPostingCheckpointSequence;
+        }
 
         const next_wal_generation = std.math.add(u64, self.wal_generation, 1) catch
             return error.PostingWalGenerationOverflow;
         const segment_path = try self.segmentPathAlloc(segment_generation);
         defer self.alloc.free(segment_path);
-        try atomicReplace(self.alloc, self.storage, segment_path, segment_bytes);
+        if (segment_already_staged) {
+            if (try self.storage.fileSize(segment_path) != segment_bytes.len) return error.MissingPostingSegment;
+        } else {
+            try atomicReplace(self.alloc, self.storage, segment_path, segment_bytes);
+        }
 
         const next_wal_path = try self.walPathAlloc(next_wal_generation);
         defer self.alloc.free(next_wal_path);
-        try atomicReplace(self.alloc, self.storage, next_wal_path, &.{});
+        try atomicReplace(self.alloc, self.storage, next_wal_path, tail);
 
         const next_checkpoint: posting_wal.Checkpoint = .{
             .segment_generation = segment_generation,
             .segment_checksum = std.hash.Crc32.hash(segment_bytes),
             .segment_admission_checksum = try posting_segment.admissionChecksum(segment_bytes),
             .wal_generation = next_wal_generation,
-            .wal_committed_bytes = 0,
+            .wal_committed_bytes = @intCast(tail.len),
             .covered_source_sequence = covered_source_sequence,
         };
         const encoded = next_checkpoint.encode();
@@ -307,9 +428,9 @@ pub const Store = struct {
         const previous_wal_generation = self.wal_generation;
         self.checkpoint = next_checkpoint;
         self.wal_generation = next_wal_generation;
-        self.wal_committed_bytes = 0;
-        self.last_committed_batch = null;
-        self.covered_source_sequence = covered_source_sequence;
+        self.wal_committed_bytes = @intCast(tail.len);
+        self.last_committed_batch = tail_last_committed_batch;
+        self.covered_source_sequence = tail_covered_source_sequence;
         self.segment_bytes = @intCast(segment_bytes.len);
 
         if (previous) |old| {
@@ -584,6 +705,77 @@ test "storage.posting segment store orders maintenance batches independently fro
     try store.appendCoverage(try store.nextBatchId(), 11, .{ .sync = false });
     try std.testing.expectEqual(@as(u64, 11), store.covered_source_sequence);
     try std.testing.expectEqual(@as(?u64, 3), store.last_committed_batch);
+}
+
+test "storage.posting segment publication preserves the exact committed WAL tail" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+
+    var store = try Store.open(alloc, memory.storage(), "/posting-preserved-tail");
+    defer store.deinit();
+    var initial_writer = posting_segment.Writer.init(alloc);
+    defer initial_writer.deinit();
+    try initial_writer.appendBaseAt(3, 10, "initial");
+    const initial_segment = try initial_writer.build();
+    defer alloc.free(initial_segment);
+    try store.publishCheckpoint(1, 10, initial_segment);
+
+    try store.appendBatch(try store.nextBatchId(), &.{.{
+        .kind = .base,
+        .posting_id = 3,
+        .source_sequence = 11,
+        .payload = "flattened",
+    }}, 11);
+    const flattened_wal_bytes = store.wal_committed_bytes;
+
+    // This maintenance batch deliberately has the same source sequence as
+    // the segment boundary. Sequence-based filtering would lose it.
+    try store.appendBatch(try store.nextBatchId(), &.{.{
+        .kind = .base,
+        .posting_id = 3,
+        .source_sequence = 11,
+        .payload = "same-sequence-tail",
+    }}, 11);
+    try store.appendCoverage(try store.nextBatchId(), 12, .{ .sync = false });
+
+    var next_writer = posting_segment.Writer.init(alloc);
+    defer next_writer.deinit();
+    try next_writer.appendBaseAt(3, 11, "flattened");
+    const next_segment = try next_writer.build();
+    defer alloc.free(next_segment);
+    try store.publishCheckpointPreservingWalTail(2, 11, next_segment, flattened_wal_bytes);
+    try std.testing.expect(store.wal_committed_bytes > 0);
+    try std.testing.expectEqual(@as(u64, 12), store.covered_source_sequence);
+    try std.testing.expectEqual(@as(?u64, 3), store.last_committed_batch);
+
+    store.deinit();
+    store = try Store.open(alloc, memory.storage(), "/posting-preserved-tail");
+    try std.testing.expectEqual(@as(u64, 11), store.checkpoint.?.covered_source_sequence);
+    try std.testing.expectEqual(@as(u64, 12), store.covered_source_sequence);
+    var replay = try store.recoverWal();
+    defer replay.deinit();
+    try std.testing.expectEqualStrings("same-sequence-tail", replay.replay.latest(3, .base).?.payload);
+}
+
+test "storage.posting segment publication rejects a non-commit WAL boundary" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+
+    var store = try Store.open(alloc, memory.storage(), "/posting-bad-boundary");
+    defer store.deinit();
+    var writer = posting_segment.Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendBaseAt(1, 1, "one");
+    const segment = try writer.build();
+    defer alloc.free(segment);
+    try store.publishCheckpoint(1, 1, segment);
+    try store.appendCoverage(1, 2, .{ .sync = false });
+    try std.testing.expectError(
+        error.InvalidPostingWalBoundary,
+        store.publishCheckpointPreservingWalTail(2, 2, segment, store.wal_committed_bytes - 1),
+    );
 }
 
 test "storage.posting segment store bounds WAL tails relative to the segment" {

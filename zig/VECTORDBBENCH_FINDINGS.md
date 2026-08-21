@@ -656,8 +656,9 @@ sequence when a committed transaction touches no posting payload, and
 kind-specific tombstones prevent fallback to stale values. The sidecar is
 admitted only at the exact durable source sequence. A short, corrupt, or
 ahead-of-source tail is rejected and rebuilt from the authoritative source
-journal. The production policy checkpoints at a 1 MiB tail, at 64 MiB
-unconditionally, or when the tail reaches half the checkpoint size.
+journal. The first policy checkpointed at a 1 MiB tail, at 64 MiB
+unconditionally, or when the tail reached half the checkpoint size; the
+large-corpus results below supersede that deliberately aggressive prototype.
 
 The direct-reinsert workload is supported internally but is not the public
 table replacement contract. The public path atomically deletes the old
@@ -825,10 +826,78 @@ seconds: a fresh authoritative LSM scan during checkpointing temporarily put
 replay about 120 source batches behind and pushed the sampler above its memory
 target. Subsequent checkpoints now merge the complete leased immutable
 directory and WAL overlays, so only generation 1 scans the authoritative LSM.
-The production policy waits for at least 4 MiB and a tail equal to the current
-segment size, with the existing unconditional 64 MiB cap. On 50K this reduced
-checkpoint publications from ten to six and recovered 3.67 seconds versus the
-half-segment flatten run while ending with an empty WAL.
+The first widened policy waited for at least 4 MiB and a tail equal to the
+current segment size, with the existing unconditional 64 MiB cap. On 50K this
+reduced checkpoint publications from ten to six and recovered 3.67 seconds
+versus the half-segment flatten run while ending with an empty WAL. At 1M it
+still published 18 full checkpoints before 575K and remained throughput-bound
+on synchronous rewrites despite keeping L0 pressure and RSS bounded. A fixed
+32 MiB policy reduced publication frequency but still made each full segment
+construction and durable write part of replay's foreground critical path.
+
+The current design separates three different bounds instead of treating them
+as one compaction threshold:
+
+- Every 32 MiB of WAL growth, live per-batch generations collapse to one
+  overlay above the mmap root. If no query or builder leases the chain, owned
+  payloads move into the newest map without copying; otherwise a replacement
+  immutable overlay is copied and atomically installed, preserving the old
+  transaction's view.
+- At 128 MiB, one retained immutable generation is flattened and durably
+  staged by a background worker. Source replay keeps appending to the current
+  WAL while that work runs.
+- Publication carries forward the exact committed byte suffix after the
+  builder's boundary into a new WAL generation. This is byte-based rather
+  than sequence-based because more than one ordered maintenance batch may
+  legitimately commit at the same source sequence. Only a 256 MiB emergency
+  ceiling can force replay to join a slow builder.
+
+The crash order remains segment, next-generation WAL, then `CURRENT`; a crash
+before `CURRENT` can leave only an unreferenced staged segment. The foreground
+verifies the committed prefix and suffix before publication, and restart
+checks the segment and WAL normally. A persistent background build or storage
+failure propagates to the existing fail-closed invalidation path instead of
+starting a new full build on every replay callback.
+
+Moving construction to a worker without moving the durable segment write was
+not enough: the first public 50K attempt regressed to 53.78 seconds ready. With
+the segment staged by the worker, the same gate improved to 46.98 seconds
+(33.64 insert plus 13.34 catch-up), 2.01 GB RSS, and 580.5 MB physical
+footprint. Separating cheap overlay collapse from durable compaction improved a
+load-only sample to 44.58 seconds (36.19 plus 8.39) with 1.98 GB RSS and
+556.7 MB physical footprint.
+
+The complete 50K lifecycle took 51.01 seconds (41.90 insert plus 9.11
+catch-up) on the contended host. It published generation 1 and then retained a
+52 MiB WAL without another full rewrite. Live recall@100 was 0.9837 and serial
+p50/p95/p99 was 2.5/3.3/6.6 ms; after restart recall was 0.9839 and latency was
+2.4/2.9/6.4 ms. Live QPS at concurrency 1/5/10/20/30/40/60/80 was
+104/662/559/631/639/717/879/864; reopened QPS was
+138/685/610/689/694/767/1,042/1,006. Restart became write-ready about 1.3
+seconds after the public API was reachable. The load-only memory sample is the
+cleaner comparison; the full lifecycle's query cache raised the combined
+physical-footprint ledger to 1.40 GB while peak RSS was 1.92 GB.
+
+The corresponding 1M lifecycle proves the handoff invariant but rejects this
+dual-write implementation as the final ingest design. It took 2,160.94 seconds
+to insert and 11.84 seconds to catch up, or 2,172.78 seconds ready. Thirteen
+generations published without a forced builder join or a primary write-pressure
+event, and every generation after the first was constructed from a retained
+immutable generation rather than an LSM scan. The final sidecar was a 237 MiB
+segment plus a 37 MiB WAL. Nevertheless, post-commit capture still opened a
+primary snapshot to read final values back from the general LSM, producing
+2.32 GB of cumulative mutable copying, and the same derived values were still
+written to both storage engines. Load-only peak RSS was 4.12 GB and the native
+physical-footprint ledger peak was 1.70 GB. These are bounded, but the duplicate
+path is slower than the earlier 1,603-second LSM control and therefore rejected.
+
+Live recall@100 was 0.9861. Serial p50/p95/p99 was
+30.3/628.4/656.1 ms and QPS at concurrency 1/5/10/20/30/40/60/80 was
+5.6/53.8/91.2/99.5/95.6/93.6/80.0/47.8. After restart, recall was 0.9862,
+serial p50/p95/p99 was 27.6/519.3/538.2 ms, and the same concurrency curve was
+7.1/74.8/119.7/104.8/108.0/128.5/119.6/92.8 QPS. Recall parity holds, but 1M
+tail latency remains a separate query-path optimization target; the WAL-backed
+mutation work must not trade recall for an attractive load number.
 
 The full-derived query run preserved the existing boundary-rerank policy and
 measured recall 0.9842 with serial p50/p95/p99 of 2.5/3.0/6.8 ms. Throughput
