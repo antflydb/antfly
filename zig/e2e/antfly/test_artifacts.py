@@ -55,7 +55,31 @@ def _first_query_hit_id(result: dict) -> str | None:
     return ids[0] if ids else None
 
 
+def _document_units_asset_enrichment() -> dict:
+    """Return the table artifact-enrichment request shape."""
+
+    return {
+        "kind": "asset",
+        "field": "url",
+        "content_type": "application/json",
+        "producer_json": {
+            "type": "document_extraction",
+            "config": {
+                "source": {
+                    "filename_field": "filename",
+                    "content_type_field": "mime_type",
+                    "version_field": "version",
+                }
+            },
+        },
+    }
+
+
 def _document_units_index_config() -> dict:
+    artifact = _document_units_asset_enrichment()
+    source_field = artifact.pop("field")
+    artifact["name"] = DOCUMENT_UNITS_ARTIFACT
+    artifact["source"] = {"type": "field", "value": source_field}
     return {
         "type": "graph",
         "source": {
@@ -64,22 +88,7 @@ def _document_units_index_config() -> dict:
             "path": "$.edges[*]",
             "format": "extraction_relation",
         },
-        "artifact": {
-            "name": DOCUMENT_UNITS_ARTIFACT,
-            "kind": "asset",
-            "source": {"type": "field", "value": "url"},
-            "content_type": "application/json",
-            "producer_json": {
-                "type": "document_extraction",
-                "config": {
-                    "source": {
-                        "filename_field": "filename",
-                        "content_type_field": "mime_type",
-                        "version_field": "version",
-                    }
-                },
-            },
-        },
+        "artifact": artifact,
         "edge_types": [{"name": "mentions"}],
     }
 
@@ -253,8 +262,8 @@ def test_pdf_ocr_inline_url_paged_chunks_and_inline_jpeg_e2e(
     """Raw inline/URL PDFs render every page, OCR, chunk, and index server-side."""
 
     table_name = f"document_pdf_ocr_{time.time_ns()}"
-    index_config = _document_units_index_config()
-    extraction_config = index_config["artifact"]["producer_json"]["config"]
+    asset_enrichment = _document_units_asset_enrichment()
+    extraction_config = asset_enrichment["producer_json"]["config"]
     extraction_config["ocr"] = {
         "enabled": True,
         "mode": "always",
@@ -267,7 +276,6 @@ def test_pdf_ocr_inline_url_paged_chunks_and_inline_jpeg_e2e(
             "api_url": pdf_ocr_e2e_server.reader_api_url,
         },
     }
-    asset_enrichment = dict(index_config["artifact"])
     asset_enrichment["producer_json"] = json.dumps(asset_enrichment["producer_json"])
     created = stateful_api.create_table(table_name, num_shards=1)
     assert created.get("name") == table_name or created.get("table_name") == table_name
@@ -375,9 +383,7 @@ def test_pdf_ocr_inline_url_paged_chunks_and_inline_jpeg_e2e(
                     >= (
                         4
                         if doc_key in {"pdf-inline", "pdf-url"}
-                        else 2
-                        if doc_key == "pdf-scanned-table"
-                        else 1
+                        else 2 if doc_key == "pdf-scanned-table" else 1
                     )
                 )
                 else None
@@ -510,8 +516,8 @@ def test_pdf_auto_ocr_only_renders_pages_without_usable_embedded_text_e2e(
     """Auto OCR keeps Form-XObject text and renders only the scanned page."""
 
     table_name = f"document_pdf_auto_ocr_{time.time_ns()}"
-    index_config = _document_units_index_config()
-    extraction_config = index_config["artifact"]["producer_json"]["config"]
+    asset_enrichment = _document_units_asset_enrichment()
+    extraction_config = asset_enrichment["producer_json"]["config"]
     extraction_config["ocr"] = {
         "enabled": True,
         "mode": "auto",
@@ -524,7 +530,6 @@ def test_pdf_auto_ocr_only_renders_pages_without_usable_embedded_text_e2e(
             "api_url": pdf_ocr_e2e_server.reader_api_url,
         },
     }
-    asset_enrichment = dict(index_config["artifact"])
     asset_enrichment["producer_json"] = json.dumps(asset_enrichment["producer_json"])
     created = stateful_api.create_table(table_name, num_shards=1)
     assert created.get("name") == table_name or created.get("table_name") == table_name
