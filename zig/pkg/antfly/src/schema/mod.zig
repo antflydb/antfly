@@ -48,34 +48,147 @@ pub fn validateWritesAgainstTableSchema(
     schema: ParsedTableSchema,
     writes: anytype,
 ) !void {
-    try impl.validateWritesAgainstSchema(alloc, schema, writes);
+    const physical_fields = try derivePhysicalFieldValidations(alloc, schema);
+    defer freePhysicalFieldValidations(alloc, physical_fields);
+    try impl.validateWritesAgainstSchemaWithPhysicalFields(alloc, schema, writes, physical_fields);
+}
+
+fn derivePhysicalFieldValidations(
+    alloc: std.mem.Allocator,
+    schema: ParsedTableSchema,
+) ![]impl.PhysicalFieldValidation {
+    var out = std.ArrayListUnmanaged(impl.PhysicalFieldValidation).empty;
+    errdefer freePhysicalFieldValidationItems(alloc, out.items);
+    defer out.deinit(alloc);
+    var seen_types = std.StringHashMapUnmanaged(u16).empty;
+    defer seen_types.deinit(alloc);
+    for (schema.document_schemas) |document_schema| {
+        for (document_schema.properties) |property| {
+            try appendPhysicalDocumentFieldValidations(alloc, &out, &seen_types, property.name, property);
+        }
+        for (document_schema.all_of) |variant| {
+            try appendPhysicalDocumentFieldValidations(alloc, &out, &seen_types, "", variant);
+        }
+        for (document_schema.any_of) |variant| {
+            try appendPhysicalDocumentFieldValidations(alloc, &out, &seen_types, "", variant);
+        }
+        for (document_schema.one_of) |variant| {
+            try appendPhysicalDocumentFieldValidations(alloc, &out, &seen_types, "", variant);
+        }
+    }
+    std.mem.sort(impl.PhysicalFieldValidation, out.items, {}, physicalFieldValidationLessThan);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendPhysicalDocumentFieldValidations(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(impl.PhysicalFieldValidation),
+    seen_types: *std.StringHashMapUnmanaged(u16),
+    path: []const u8,
+    property: impl.DocumentProperty,
+) anyerror!void {
+    if (property.antfly_index != null and !property.antfly_index.?) return;
+    if (property.antfly_field) |mapping| {
+        try appendPhysicalFieldMappingValidation(alloc, out, seen_types, path, mapping);
+    }
+    if (property.root_ref) return;
+    if (property.item) |item| {
+        try appendPhysicalDocumentFieldValidations(alloc, out, seen_types, path, item.*);
+    }
+    for (property.properties) |child| {
+        const child_path = try appendPath(alloc, path, child.name);
+        defer alloc.free(child_path);
+        try appendPhysicalDocumentFieldValidations(alloc, out, seen_types, child_path, child);
+    }
+    for (property.all_of) |variant| {
+        try appendPhysicalDocumentFieldValidations(alloc, out, seen_types, path, variant);
+    }
+    for (property.any_of) |variant| {
+        try appendPhysicalDocumentFieldValidations(alloc, out, seen_types, path, variant);
+    }
+    for (property.one_of) |variant| {
+        try appendPhysicalDocumentFieldValidations(alloc, out, seen_types, path, variant);
+    }
+}
+
+fn appendPhysicalFieldMappingValidation(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(impl.PhysicalFieldValidation),
+    seen_types: *std.StringHashMapUnmanaged(u16),
+    source_field: []const u8,
+    mapping: impl.DynamicTemplate,
+) !void {
+    if (source_field.len == 0) return error.InvalidSchemaUpdateRequest;
+    try appendUniquePhysicalFieldValidation(alloc, out, seen_types, source_field, parseRuntimeFieldType(mapping.field_type orelse "text"));
+    for (mapping.fields) |subfield| {
+        try appendUniquePhysicalFieldValidation(alloc, out, seen_types, source_field, parseRuntimeFieldType(subfield.field_type orelse "text"));
+    }
+}
+
+fn appendUniquePhysicalFieldValidation(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(impl.PhysicalFieldValidation),
+    seen_types: *std.StringHashMapUnmanaged(u16),
+    source_field: []const u8,
+    field_type: storage_schema.AntflyType,
+) !void {
+    const type_mask = @as(u16, 1) << @intCast(@intFromEnum(field_type));
+    if (seen_types.getPtr(source_field)) |mask| {
+        if (mask.* & type_mask != 0) return;
+        const owned_source = try alloc.dupe(u8, source_field);
+        out.append(alloc, .{
+            .source_field = owned_source,
+            .field_type = field_type,
+        }) catch |err| {
+            alloc.free(owned_source);
+            return err;
+        };
+        mask.* |= type_mask;
+        return;
+    }
+    const owned_source = try alloc.dupe(u8, source_field);
+    out.append(alloc, .{
+        .source_field = owned_source,
+        .field_type = field_type,
+    }) catch |err| {
+        alloc.free(owned_source);
+        return err;
+    };
+    seen_types.put(alloc, owned_source, type_mask) catch |err| {
+        out.items.len -= 1;
+        alloc.free(owned_source);
+        return err;
+    };
+}
+
+fn physicalFieldValidationLessThan(_: void, a: impl.PhysicalFieldValidation, b: impl.PhysicalFieldValidation) bool {
+    const order = std.mem.order(u8, a.source_field, b.source_field);
+    if (order != .eq) return order == .lt;
+    return @intFromEnum(a.field_type) < @intFromEnum(b.field_type);
+}
+
+fn freePhysicalFieldValidations(alloc: std.mem.Allocator, fields: []impl.PhysicalFieldValidation) void {
+    freePhysicalFieldValidationItems(alloc, fields);
+    if (fields.len > 0) alloc.free(fields);
+}
+
+fn freePhysicalFieldValidationItems(alloc: std.mem.Allocator, fields: []impl.PhysicalFieldValidation) void {
+    for (fields) |field| alloc.free(field.source_field);
 }
 
 pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSchema) !storage_schema.TableSchema {
-    const document_field_templates = try deriveRuntimeDocumentFieldTemplates(alloc, schema);
-    var document_field_templates_owned = true;
-    errdefer if (document_field_templates_owned) freeRuntimeDynamicTemplates(alloc, document_field_templates);
+    const exact_fields = try deriveRuntimeExactDocumentFields(alloc, schema);
+    errdefer freeRuntimeExactFields(alloc, exact_fields);
 
-    const dynamic_template_len = schema.dynamic_templates.len + document_field_templates.len;
-    var dynamic_templates: []storage_schema.DynamicTemplate = if (dynamic_template_len == 0)
+    var dynamic_templates: []storage_schema.DynamicTemplate = if (schema.dynamic_templates.len == 0)
         &[_]storage_schema.DynamicTemplate{}
     else
-        try alloc.alloc(storage_schema.DynamicTemplate, dynamic_template_len);
+        try alloc.alloc(storage_schema.DynamicTemplate, schema.dynamic_templates.len);
     var initialized: usize = 0;
     errdefer {
         freeRuntimeDynamicTemplateItems(alloc, dynamic_templates[0..initialized]);
         if (dynamic_templates.len > 0) alloc.free(dynamic_templates);
     }
-    // Exact document-property mappings are authoritative. Keep them ahead of
-    // wildcard dynamic templates so a catch-all rule cannot shadow an explicit
-    // x-antfly-field declaration.
-    for (document_field_templates) |template| {
-        dynamic_templates[initialized] = template;
-        initialized += 1;
-    }
-    document_field_templates_owned = false;
-    if (document_field_templates.len > 0) alloc.free(document_field_templates);
-
     for (schema.dynamic_templates) |template| {
         dynamic_templates[initialized] = try runtimeDynamicTemplateFromParsed(alloc, template);
         initialized += 1;
@@ -87,7 +200,7 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
     const full_text_documents = try deriveRuntimeFullTextDocuments(alloc, schema);
     errdefer freeRuntimeFullTextDocuments(alloc, full_text_documents);
 
-    const index_sort = try deriveRuntimeIndexSort(alloc, schema.index_sort, dynamic_templates);
+    const index_sort = try deriveRuntimeIndexSort(alloc, schema.index_sort, exact_fields, dynamic_templates);
     errdefer freeRuntimeIndexSort(alloc, index_sort);
 
     return .{
@@ -96,11 +209,20 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .ttl_duration_ns = schema.ttl_duration_ns,
         .ttl_field = try alloc.dupe(u8, schema.ttl_field),
         .enforce_types = schema.enforce_types,
+        .exact_fields = exact_fields,
         .dynamic_templates = dynamic_templates,
         .declared_fields = declared_fields,
         .full_text_documents = full_text_documents,
         .index_sort = index_sort,
     };
+}
+
+fn freeRuntimeExactFields(alloc: std.mem.Allocator, fields: []storage_schema.ExactField) void {
+    for (fields) |field| {
+        alloc.free(field.field);
+        alloc.free(field.mapping.analyzer);
+    }
+    if (fields.len > 0) alloc.free(fields);
 }
 
 fn freeRuntimeDeclaredFields(alloc: std.mem.Allocator, fields: []storage_schema.DeclaredField) void {
@@ -148,56 +270,204 @@ fn runtimeDynamicTemplateFromParsed(alloc: std.mem.Allocator, template: impl.Dyn
     };
 }
 
-fn deriveRuntimeDocumentFieldTemplates(alloc: std.mem.Allocator, schema: ParsedTableSchema) ![]storage_schema.DynamicTemplate {
-    var out = std.ArrayListUnmanaged(storage_schema.DynamicTemplate).empty;
+fn deriveRuntimeExactDocumentFields(alloc: std.mem.Allocator, schema: ParsedTableSchema) ![]storage_schema.ExactField {
+    var out = std.ArrayListUnmanaged(storage_schema.ExactField).empty;
     errdefer {
-        freeRuntimeDynamicTemplateItems(alloc, out.items);
+        freeRuntimeExactFieldItems(alloc, out.items);
         out.deinit(alloc);
     }
     var exact_paths = std.StringHashMapUnmanaged(usize).empty;
     defer exact_paths.deinit(alloc);
     for (schema.document_schemas) |document_schema| {
-        for (document_schema.properties) |property| {
-            try appendRuntimeDocumentFieldTemplates(alloc, &out, &exact_paths, property.name, property);
-        }
+        try appendRuntimeDocumentSchemaExactFields(alloc, &out, &exact_paths, document_schema);
     }
+    std.mem.sort(storage_schema.ExactField, out.items, {}, exactFieldLessThan);
     return try out.toOwnedSlice(alloc);
 }
 
-fn appendRuntimeDocumentFieldTemplates(
+fn exactFieldLessThan(_: void, a: storage_schema.ExactField, b: storage_schema.ExactField) bool {
+    return std.mem.order(u8, a.field, b.field) == .lt;
+}
+
+fn appendRuntimeDocumentSchemaExactFields(
     alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(storage_schema.DynamicTemplate),
+    out: *std.ArrayListUnmanaged(storage_schema.ExactField),
+    exact_paths: *std.StringHashMapUnmanaged(usize),
+    document_schema: impl.DocumentSchema,
+) !void {
+    for (document_schema.properties) |property| {
+        try appendRuntimeDocumentExactFields(alloc, out, exact_paths, property.name, property);
+    }
+    for (document_schema.all_of) |variant| {
+        try appendRuntimeDocumentExactFields(alloc, out, exact_paths, "", variant);
+    }
+    try appendEquivalentVariantExactFields(alloc, out, exact_paths, "", document_schema.any_of);
+    try appendEquivalentVariantExactFields(alloc, out, exact_paths, "", document_schema.one_of);
+    try rejectConditionalOrDynamicExactMappings(document_schema);
+}
+
+fn appendRuntimeDocumentExactFields(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(storage_schema.ExactField),
     exact_paths: *std.StringHashMapUnmanaged(usize),
     path: []const u8,
     property: impl.DocumentProperty,
-) !void {
+) anyerror!void {
     if (property.antfly_index != null and !property.antfly_index.?) return;
+
+    if (property.antfly_field) |mapping| {
+        if (path.len == 0) return error.InvalidSchemaUpdateRequest;
+        try appendRuntimeDocumentFieldMappingTemplates(alloc, out, exact_paths, path, mapping);
+    }
+
+    if (property.root_ref) return;
 
     if (property.item) |item| {
         if (item.antfly_index != null and !item.antfly_index.?) return;
-        if (item.properties.len > 0) {
-            for (item.properties) |child| {
-                const child_path = try appendPath(alloc, path, child.name);
-                defer alloc.free(child_path);
-                try appendRuntimeDocumentFieldTemplates(alloc, out, exact_paths, child_path, child);
-            }
-        }
-        return;
+        try appendRuntimeDocumentExactFields(alloc, out, exact_paths, path, item.*);
     }
 
-    if (property.properties.len > 0) {
-        for (property.properties) |child| {
-            const child_path = try appendPath(alloc, path, child.name);
-            defer alloc.free(child_path);
-            try appendRuntimeDocumentFieldTemplates(alloc, out, exact_paths, child_path, child);
-        }
-        return;
+    for (property.properties) |child| {
+        const child_path = try appendPath(alloc, path, child.name);
+        defer alloc.free(child_path);
+        try appendRuntimeDocumentExactFields(alloc, out, exact_paths, child_path, child);
     }
 
-    if (property.antfly_field) |mapping| {
-        try appendRuntimeDocumentFieldMappingTemplates(alloc, out, exact_paths, path, mapping);
-        return;
+    for (property.all_of) |variant| {
+        try appendRuntimeDocumentExactFields(alloc, out, exact_paths, path, variant);
     }
+    try appendEquivalentVariantExactFields(alloc, out, exact_paths, path, property.any_of);
+    try appendEquivalentVariantExactFields(alloc, out, exact_paths, path, property.one_of);
+    try rejectConditionalOrDynamicExactMappings(property);
+    if (documentPropertiesContainExactMapping(property.prefix_items) or
+        propertyContainsExactMappingOptional(property.contains_schema) or
+        propertyContainsExactMappingOptional(property.unevaluated_items_schema))
+    {
+        return error.InvalidSchemaUpdateRequest;
+    }
+}
+
+fn appendEquivalentVariantExactFields(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(storage_schema.ExactField),
+    exact_paths: *std.StringHashMapUnmanaged(usize),
+    path: []const u8,
+    variants: []const impl.DocumentProperty,
+) anyerror!void {
+    if (variants.len == 0) return;
+
+    var canonical: ?[]storage_schema.ExactField = null;
+    defer if (canonical) |fields| freeRuntimeExactFields(alloc, fields);
+    for (variants) |variant| {
+        var branch = std.ArrayListUnmanaged(storage_schema.ExactField).empty;
+        errdefer {
+            freeRuntimeExactFieldItems(alloc, branch.items);
+            branch.deinit(alloc);
+        }
+        var branch_paths = std.StringHashMapUnmanaged(usize).empty;
+        defer branch_paths.deinit(alloc);
+        try appendRuntimeDocumentExactFields(alloc, &branch, &branch_paths, path, variant);
+        std.mem.sort(storage_schema.ExactField, branch.items, {}, exactFieldLessThan);
+        const owned_branch = try branch.toOwnedSlice(alloc);
+
+        if (canonical) |fields| {
+            defer freeRuntimeExactFields(alloc, owned_branch);
+            if (!runtimeExactFieldSlicesEqual(fields, owned_branch)) return error.InvalidSchemaUpdateRequest;
+        } else {
+            canonical = owned_branch;
+        }
+    }
+
+    if (canonical) |fields| {
+        for (fields) |field| {
+            try appendUniqueRuntimeExactField(alloc, out, exact_paths, try cloneRuntimeExactField(alloc, field));
+        }
+    }
+}
+
+fn runtimeExactFieldSlicesEqual(a: []const storage_schema.ExactField, b: []const storage_schema.ExactField) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!std.mem.eql(u8, left.field, right.field) or !runtimeFieldMappingsEqual(left.mapping, right.mapping)) return false;
+    }
+    return true;
+}
+
+fn cloneRuntimeExactField(alloc: std.mem.Allocator, field: storage_schema.ExactField) !storage_schema.ExactField {
+    const owned_path = try alloc.dupe(u8, field.field);
+    errdefer alloc.free(owned_path);
+    return .{
+        .field = owned_path,
+        .mapping = .{
+            .field_type = field.mapping.field_type,
+            .do_index = field.mapping.do_index,
+            .store = field.mapping.store,
+            .doc_values = field.mapping.doc_values,
+            .sortable = field.mapping.sortable,
+            .missing_null_policy = field.mapping.missing_null_policy,
+            .include_in_all = field.mapping.include_in_all,
+            .analyzer = try alloc.dupe(u8, field.mapping.analyzer),
+        },
+    };
+}
+
+fn rejectConditionalOrDynamicExactMappings(schema_node: anytype) !void {
+    for (schema_node.pattern_properties) |pattern_property| {
+        if (propertyContainsExactMapping(pattern_property.property.*)) return error.InvalidSchemaUpdateRequest;
+    }
+    if (propertyContainsExactMappingOptional(schema_node.additional_properties_schema) or
+        propertyContainsExactMappingOptional(schema_node.unevaluated_properties_schema) or
+        propertyContainsExactMappingOptional(schema_node.property_names) or
+        propertyContainsExactMappingOptional(schema_node.not_schema) or
+        propertyContainsExactMappingOptional(schema_node.if_schema) or
+        propertyContainsExactMappingOptional(schema_node.then_schema) or
+        propertyContainsExactMappingOptional(schema_node.else_schema))
+    {
+        return error.InvalidSchemaUpdateRequest;
+    }
+    for (schema_node.dependent_schemas) |dependent_schema| {
+        if (propertyContainsExactMapping(dependent_schema.schema.*)) return error.InvalidSchemaUpdateRequest;
+    }
+}
+
+fn propertyContainsExactMappingOptional(property: ?*impl.DocumentProperty) bool {
+    return if (property) |value| propertyContainsExactMapping(value.*) else false;
+}
+
+fn documentPropertiesContainExactMapping(properties: []const impl.DocumentProperty) bool {
+    for (properties) |property| {
+        if (propertyContainsExactMapping(property)) return true;
+    }
+    return false;
+}
+
+fn propertyContainsExactMapping(property: impl.DocumentProperty) bool {
+    if (property.antfly_field != null) return true;
+    if (property.root_ref) return false;
+    if (documentPropertiesContainExactMapping(property.prefix_items) or
+        documentPropertiesContainExactMapping(property.properties) or
+        documentPropertiesContainExactMapping(property.any_of) or
+        documentPropertiesContainExactMapping(property.one_of) or
+        documentPropertiesContainExactMapping(property.all_of))
+    {
+        return true;
+    }
+    for (property.pattern_properties) |pattern_property| {
+        if (propertyContainsExactMapping(pattern_property.property.*)) return true;
+    }
+    for (property.dependent_schemas) |dependent_schema| {
+        if (propertyContainsExactMapping(dependent_schema.schema.*)) return true;
+    }
+    return propertyContainsExactMappingOptional(property.additional_properties_schema) or
+        propertyContainsExactMappingOptional(property.unevaluated_properties_schema) or
+        propertyContainsExactMappingOptional(property.property_names) or
+        propertyContainsExactMappingOptional(property.not_schema) or
+        propertyContainsExactMappingOptional(property.if_schema) or
+        propertyContainsExactMappingOptional(property.then_schema) or
+        propertyContainsExactMappingOptional(property.else_schema) or
+        propertyContainsExactMappingOptional(property.contains_schema) or
+        propertyContainsExactMappingOptional(property.item) or
+        propertyContainsExactMappingOptional(property.unevaluated_items_schema);
 }
 
 fn deriveRuntimeDeclaredDocumentFields(
@@ -296,49 +566,49 @@ fn appendShorthandRuntimeDeclaredFields(
 
 fn appendRuntimeDocumentFieldMappingTemplates(
     alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(storage_schema.DynamicTemplate),
+    out: *std.ArrayListUnmanaged(storage_schema.ExactField),
     exact_paths: *std.StringHashMapUnmanaged(usize),
     path: []const u8,
     mapping: impl.DynamicTemplate,
 ) !void {
-    try appendUniqueRuntimeDocumentFieldTemplate(
+    try appendUniqueRuntimeExactField(
         alloc,
         out,
         exact_paths,
-        try runtimeDocumentFieldTemplateFromParsed(alloc, path, mapping),
+        try runtimeExactFieldFromParsed(alloc, path, mapping),
     );
     for (mapping.fields) |subfield| {
         const subfield_path = try appendPath(alloc, path, subfield.name);
         defer alloc.free(subfield_path);
-        try appendUniqueRuntimeDocumentFieldTemplate(
+        try appendUniqueRuntimeExactField(
             alloc,
             out,
             exact_paths,
-            try runtimeDocumentFieldTemplateFromParsed(alloc, subfield_path, subfield),
+            try runtimeExactFieldFromParsed(alloc, subfield_path, subfield),
         );
     }
 }
 
-fn appendUniqueRuntimeDocumentFieldTemplate(
+fn appendUniqueRuntimeExactField(
     alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(storage_schema.DynamicTemplate),
+    out: *std.ArrayListUnmanaged(storage_schema.ExactField),
     exact_paths: *std.StringHashMapUnmanaged(usize),
-    template: storage_schema.DynamicTemplate,
+    field: storage_schema.ExactField,
 ) !void {
-    var template_owned = true;
-    errdefer if (template_owned) freeRuntimeDynamicTemplateItem(alloc, template);
-    if (exact_paths.get(template.name)) |existing_index| {
-        if (!runtimeFieldMappingsEqual(out.items[existing_index].mapping, template.mapping)) {
+    var field_owned = true;
+    errdefer if (field_owned) freeRuntimeExactFieldItem(alloc, field);
+    if (exact_paths.get(field.field)) |existing_index| {
+        if (!runtimeFieldMappingsEqual(out.items[existing_index].mapping, field.mapping)) {
             return error.InvalidSchemaUpdateRequest;
         }
-        freeRuntimeDynamicTemplateItem(alloc, template);
-        template_owned = false;
+        freeRuntimeExactFieldItem(alloc, field);
+        field_owned = false;
         return;
     }
 
-    try out.append(alloc, template);
-    template_owned = false;
-    try exact_paths.put(alloc, out.items[out.items.len - 1].name, out.items.len - 1);
+    try out.append(alloc, field);
+    field_owned = false;
+    try exact_paths.put(alloc, out.items[out.items.len - 1].field, out.items.len - 1);
 }
 
 fn runtimeFieldMappingsEqual(a: storage_schema.FieldMapping, b: storage_schema.FieldMapping) bool {
@@ -352,18 +622,21 @@ fn runtimeFieldMappingsEqual(a: storage_schema.FieldMapping, b: storage_schema.F
         std.mem.eql(u8, a.analyzer, b.analyzer);
 }
 
-fn runtimeDocumentFieldTemplateFromParsed(
+fn runtimeExactFieldFromParsed(
     alloc: std.mem.Allocator,
     path: []const u8,
     mapping: impl.DynamicTemplate,
-) !storage_schema.DynamicTemplate {
+) !storage_schema.ExactField {
     const field_type = parseRuntimeFieldType(mapping.field_type orelse "text");
     const sortable = mapping.sortable orelse false;
     const do_index = mapping.do_index orelse true;
     try validateRuntimeSortableMapping(field_type, sortable);
+    const field = try alloc.dupe(u8, path);
+    errdefer alloc.free(field);
+    const analyzer = try alloc.dupe(u8, mapping.analyzer orelse defaultDynamicTemplateAnalyzer(field_type));
+    errdefer alloc.free(analyzer);
     return .{
-        .name = try alloc.dupe(u8, path),
-        .path_match = try alloc.dupe(u8, path),
+        .field = field,
         .mapping = .{
             .field_type = field_type,
             .do_index = do_index,
@@ -375,9 +648,18 @@ fn runtimeDocumentFieldTemplateFromParsed(
             else
                 .missing_rejected,
             .include_in_all = mapping.include_in_all orelse false,
-            .analyzer = try alloc.dupe(u8, mapping.analyzer orelse defaultDynamicTemplateAnalyzer(field_type)),
+            .analyzer = analyzer,
         },
     };
+}
+
+fn freeRuntimeExactFieldItems(alloc: std.mem.Allocator, fields: []storage_schema.ExactField) void {
+    for (fields) |field| freeRuntimeExactFieldItem(alloc, field);
+}
+
+fn freeRuntimeExactFieldItem(alloc: std.mem.Allocator, field: storage_schema.ExactField) void {
+    alloc.free(field.field);
+    alloc.free(field.mapping.analyzer);
 }
 
 fn freeRuntimeDynamicTemplateItem(alloc: std.mem.Allocator, template: storage_schema.DynamicTemplate) void {
@@ -391,25 +673,7 @@ fn freeRuntimeDynamicTemplateItem(alloc: std.mem.Allocator, template: storage_sc
 }
 
 fn parseRuntimeFieldType(field_type: []const u8) storage_schema.AntflyType {
-    if (std.mem.eql(u8, field_type, "text")) return .text;
-    if (std.mem.eql(u8, field_type, "keyword")) return .keyword;
-    if (std.mem.eql(u8, field_type, "numeric") or
-        std.mem.eql(u8, field_type, "number") or
-        std.mem.eql(u8, field_type, "integer"))
-        return .numeric;
-    if (std.mem.eql(u8, field_type, "embedding")) return .embedding;
-    if (std.mem.eql(u8, field_type, "link")) return .link;
-    if (std.mem.eql(u8, field_type, "boolean") or std.mem.eql(u8, field_type, "bool")) return .boolean;
-    if (std.mem.eql(u8, field_type, "datetime") or
-        std.mem.eql(u8, field_type, "date") or
-        std.mem.eql(u8, field_type, "timestamp"))
-        return .datetime;
-    if (std.mem.eql(u8, field_type, "geopoint") or std.mem.eql(u8, field_type, "geo_point")) return .geopoint;
-    if (std.mem.eql(u8, field_type, "geoshape") or std.mem.eql(u8, field_type, "geo_shape")) return .geoshape;
-    if (std.mem.eql(u8, field_type, "blob")) return .blob;
-    if (std.mem.eql(u8, field_type, "html")) return .html;
-    if (std.mem.eql(u8, field_type, "search_as_you_type")) return .search_as_you_type;
-    return .text;
+    return storage_schema.parseAntflyType(field_type) orelse .text;
 }
 
 fn validateRuntimeSortableMapping(field_type: storage_schema.AntflyType, sortable: bool) !void {
@@ -475,6 +739,7 @@ fn freeRuntimeIndexSort(alloc: std.mem.Allocator, fields: []const storage_schema
 fn deriveRuntimeIndexSort(
     alloc: std.mem.Allocator,
     parsed_fields: []const impl.IndexSortField,
+    exact_fields: []const storage_schema.ExactField,
     dynamic_templates: []const storage_schema.DynamicTemplate,
 ) ![]const storage_schema.IndexSortField {
     if (parsed_fields.len == 0) return &.{};
@@ -499,6 +764,7 @@ fn deriveRuntimeIndexSort(
     }
 
     const validation_schema = storage_schema.TableSchema{
+        .exact_fields = exact_fields,
         .dynamic_templates = dynamic_templates,
     };
     for (parsed_fields) |field| {
@@ -1225,12 +1491,12 @@ test "runtime schema lowers document field mappings to exact declared fields" {
     const runtime = try deriveRuntimeTableSchema(alloc, parsed);
     defer storage_schema.freeSchema(alloc, runtime);
 
-    try std.testing.expectEqual(@as(usize, 6), runtime.dynamic_templates.len);
-    try std.testing.expectEqualStrings("created_at", runtime.dynamic_templates[0].name);
-    try std.testing.expectEqualStrings("created_at", runtime.dynamic_templates[0].path_match.?);
-    try std.testing.expectEqual(storage_schema.AntflyType.datetime, runtime.dynamic_templates[0].mapping.field_type);
-    try std.testing.expect(runtime.dynamic_templates[0].mapping.doc_values);
-    try std.testing.expect(runtime.dynamic_templates[0].mapping.sortable);
+    try std.testing.expectEqual(@as(usize, 6), runtime.exact_fields.len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.dynamic_templates.len);
+    const created_exact = storage_schema.findExactField(runtime.exact_fields, "created_at") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.AntflyType.datetime, created_exact.mapping.field_type);
+    try std.testing.expect(created_exact.mapping.doc_values);
+    try std.testing.expect(created_exact.mapping.sortable);
 
     const created_mapping = storage_schema.resolveDeclaredFieldType(runtime, "created_at") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(storage_schema.AntflyType.datetime, created_mapping.field_type);
@@ -1273,7 +1539,7 @@ test "runtime schema lowers document field mappings to exact declared fields" {
     try std.testing.expect(created_capability.doc_values);
     try std.testing.expect(created_capability.sortable);
     try std.testing.expectEqualStrings("schema_declared", created_capability.doc_value_coverage);
-    try std.testing.expectEqualStrings("dynamic_template", created_capability.provenance);
+    try std.testing.expectEqualStrings("document_schema", created_capability.provenance);
     try std.testing.expectEqualStrings("declared", created_capability.queryability_state);
     const keyword_capability = findFieldCapability(capabilities, "title.keyword") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(storage_schema.AntflyType.keyword, keyword_capability.field_type);
@@ -1311,9 +1577,10 @@ test "explicit document field mappings take precedence over dynamic templates" {
     const runtime = try deriveRuntimeTableSchema(alloc, parsed);
     defer storage_schema.freeSchema(alloc, runtime);
 
-    try std.testing.expectEqual(@as(usize, 2), runtime.dynamic_templates.len);
-    try std.testing.expectEqualStrings("price", runtime.dynamic_templates[0].name);
-    try std.testing.expectEqualStrings("fallback", runtime.dynamic_templates[1].name);
+    try std.testing.expectEqual(@as(usize, 1), runtime.exact_fields.len);
+    try std.testing.expectEqualStrings("price", runtime.exact_fields[0].field);
+    try std.testing.expectEqual(@as(usize, 1), runtime.dynamic_templates.len);
+    try std.testing.expectEqualStrings("fallback", runtime.dynamic_templates[0].name);
 
     const declared = storage_schema.resolveDeclaredFieldType(runtime, "price") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(storage_schema.AntflyType.numeric, declared.field_type);
@@ -1342,8 +1609,9 @@ test "document field mappings deduplicate compatible paths and reject conflicts"
 
     const runtime = try deriveRuntimeTableSchema(alloc, compatible);
     defer storage_schema.freeSchema(alloc, runtime);
-    try std.testing.expectEqual(@as(usize, 1), runtime.dynamic_templates.len);
-    try std.testing.expectEqualStrings("price", runtime.dynamic_templates[0].name);
+    try std.testing.expectEqual(@as(usize, 1), runtime.exact_fields.len);
+    try std.testing.expectEqualStrings("price", runtime.exact_fields[0].field);
+    try std.testing.expectEqual(@as(usize, 0), runtime.dynamic_templates.len);
 
     var conflicting = try parseValidatedTableSchema(alloc,
         \\{
@@ -1359,6 +1627,85 @@ test "document field mappings deduplicate compatible paths and reject conflicts"
     );
     defer conflicting.deinit(alloc);
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, deriveRuntimeTableSchema(alloc, conflicting));
+}
+
+test "write validation enforces table-wide exact mappings across document types" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{
+        \\  "default_type":"event",
+        \\  "document_schemas": {
+        \\    "event": {"schema": {"type":"object", "properties": {
+        \\      "created_at": {"type":"string","x-antfly-field":{"type":"datetime","sortable":true}}
+        \\    }}},
+        \\    "note": {"schema": {"type":"object", "properties": {
+        \\      "created_at": {"type":"string"}
+        \\    }}}
+        \\  }
+        \\}
+    );
+    defer parsed.deinit(alloc);
+
+    // Exact mappings define one physical table column even when a different
+    // logical document schema admits the same JSON path.
+    try validateWritesAgainstTableSchema(alloc, parsed, &.{.{
+        .value = "{\"_type\":\"note\",\"created_at\":\"2026-08-20T12:00:00Z\"}",
+    }});
+    try std.testing.expectError(error.InvalidBatchRequest, validateWritesAgainstTableSchema(alloc, parsed, &.{.{
+        .value = "{\"_type\":\"note\",\"created_at\":\"not-a-date\"}",
+    }}));
+}
+
+test "composed schemas lower only unconditional equivalent exact mappings" {
+    const alloc = std.testing.allocator;
+    var all_of = try parseValidatedTableSchema(alloc,
+        \\{
+        \\  "document_schemas": {
+        \\    "doc": {"schema": {"type":"object", "allOf": [
+        \\      {"properties":{"rank":{"type":"number","x-antfly-field":{"type":"number","sortable":true}}}},
+        \\      {"properties":{"rank":{"minimum":0}}}
+        \\    ]}}
+        \\  }
+        \\}
+    );
+    defer all_of.deinit(alloc);
+    const all_of_runtime = try deriveRuntimeTableSchema(alloc, all_of);
+    defer storage_schema.freeSchema(alloc, all_of_runtime);
+    try std.testing.expectEqual(@as(usize, 1), all_of_runtime.exact_fields.len);
+    try std.testing.expectEqualStrings("rank", all_of_runtime.exact_fields[0].field);
+
+    var equivalent_any_of = try parseValidatedTableSchema(alloc,
+        \\{
+        \\  "document_schemas": {
+        \\    "doc": {"schema": {"type":"object", "properties": {
+        \\      "rank": {"anyOf":[
+        \\        {"type":"number","x-antfly-field":{"type":"number","sortable":true}},
+        \\        {"type":"integer","x-antfly-field":{"type":"numeric","sortable":true}}
+        \\      ]}
+        \\    }}}
+        \\  }
+        \\}
+    );
+    defer equivalent_any_of.deinit(alloc);
+    const equivalent_runtime = try deriveRuntimeTableSchema(alloc, equivalent_any_of);
+    defer storage_schema.freeSchema(alloc, equivalent_runtime);
+    try std.testing.expectEqual(@as(usize, 1), equivalent_runtime.exact_fields.len);
+    try std.testing.expectEqualStrings("rank", equivalent_runtime.exact_fields[0].field);
+
+    var conditional = try parseValidatedTableSchema(alloc,
+        \\{
+        \\  "document_schemas": {
+        \\    "doc": {"schema": {"type":"object", "properties": {
+        \\      "rank": {"anyOf":[
+        \\        {"type":"number","x-antfly-field":{"type":"number","sortable":true}},
+        \\        {"type":"string"}
+        \\      ]}
+        \\    }}}
+        \\  }
+        \\}
+    );
+    defer conditional.deinit(alloc);
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, deriveRuntimeTableSchema(alloc, conditional));
 }
 
 test "runtime schema retains shorthand exact scalar declarations as non-sortable capabilities" {

@@ -7740,6 +7740,45 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    /// Point reads use the same bounded cold-runtime readiness policy as
+    /// public queries. A successful table creation or write should not expose
+    /// an internal read-cache installation race to the next lookup, while
+    /// remote/read-only deployments still fail fast and callers can cancel.
+    pub fn lookupWithReadinessRetry(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        source: table_reads.TableReadSource,
+        table_name: []const u8,
+        key: []const u8,
+        opts: db_mod.types.LookupOptions,
+        consistency: raft_mod.ReadConsistency,
+        request: api_operation.RequestContext,
+    ) !?table_reads.LookupResponse {
+        const retry_timeout_ns: u64 = if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
+        const retry_poll_ns = 50 * std.time.ns_per_ms;
+        const start_ns = platform_time.monotonicNs();
+        while (true) {
+            try ensureTableOperationActive(request);
+            return source.lookup(alloc, table_name, key, opts, consistency) catch |err| switch (err) {
+                error.StorageReadTemporarilyUnavailable => {
+                    const now_ns = platform_time.monotonicNs();
+                    if (retry_timeout_ns == 0) return err;
+                    const sleep_ns = boundedRetrySleepNs(
+                        request.deadline_ns,
+                        now_ns,
+                        start_ns,
+                        retry_timeout_ns,
+                        retry_poll_ns,
+                    ) orelse return err;
+                    if (sleep_ns == 0) return error.DeadlineExceeded;
+                    try sleepNsCancellable(sleep_ns, request.cancellation);
+                    continue;
+                },
+                else => return err,
+            };
+        }
+    }
+
     fn executePublicTableQueryDispatchWithIdentity(
         self: *ApiHttpServer,
         alloc: std.mem.Allocator,
@@ -16724,6 +16763,88 @@ test "api http retry sleep is bounded by request deadline" {
         @as(?u64, null),
         boundedRetrySleepNs(null, now_ns, now_ns - 100, 50, 25 * std.time.ns_per_ms),
     );
+}
+
+test "api http point lookup retries bounded local readiness races" {
+    const FakeStatus = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn source() StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+    };
+    const FakeReads = struct {
+        attempts: u32 = 0,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &.{
+                .lookup = lookup,
+                .scan = scan,
+                .query = query,
+            } };
+        }
+
+        fn lookup(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("doc:1", key);
+            self.attempts += 1;
+            if (self.attempts == 1) return error.StorageReadTemporarilyUnavailable;
+            return .{
+                .json = try alloc.dupe(u8, "{\"title\":\"alpha\"}"),
+                .version = 7,
+            };
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) anyerror!?query_api.QueryResponse {
+            return error.UnsupportedOperation;
+        }
+    };
+    const DummyWrites = struct {
+        fn source() table_writes.TableWriteSource {
+            return .{ .ptr = undefined, .vtable = &.{ .batch = batch } };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return;
+        }
+    };
+
+    var reads = FakeReads{};
+    var server = ApiHttpServer.init(
+        std.testing.allocator,
+        .{},
+        FakeStatus.source(),
+        reads.source(),
+        DummyWrites.source(),
+    );
+    var response = (try server.lookupWithReadinessRetry(
+        std.testing.allocator,
+        reads.source(),
+        "docs",
+        "doc:1",
+        .{},
+        .read_index,
+        .{},
+    )).?;
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), reads.attempts);
+    try std.testing.expectEqual(@as(u64, 7), response.version);
+    try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", response.json);
 }
 
 test "api http transient read retry honors expired request deadline before source query" {

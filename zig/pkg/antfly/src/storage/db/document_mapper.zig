@@ -1616,6 +1616,7 @@ fn extractTextFieldsFromValue(
 }
 
 fn runtimeHasSchemaDrivenText(schema: runtime_schema.TableSchema) bool {
+    if (schema.exact_fields.len > 0) return true;
     if (schema.dynamic_templates.len > 0) return true;
     for (schema.full_text_documents) |doc| {
         if (doc.fields.len > 0) return true;
@@ -1747,9 +1748,13 @@ fn appendMappedSubfieldTypedDocValueFields(
     path: []const u8,
     value: std.json.Value,
 ) !void {
-    for (schema.dynamic_templates) |template| {
-        const subfield_path = directMappedSubfieldPath(template, path) orelse continue;
-        const mapping = template.mapping;
+    const start = runtime_schema.exactSubfieldLowerBound(schema.exact_fields, path);
+    for (schema.exact_fields[start..]) |field| {
+        const subfield_path = directMappedSubfieldPath(field, path) orelse {
+            if (!exactFieldMaySharePathPrefix(field.field, path)) break;
+            continue;
+        };
+        const mapping = field.mapping;
         if (!mapping.doc_values) continue;
         const typed_value = (try typedDocValueForMappedFieldAlloc(alloc, mapping, value)) orelse continue;
         try typed_fields.append(alloc, .{
@@ -1766,21 +1771,30 @@ fn appendMappedSubfieldTypedDocValueConflicts(
     schema: runtime_schema.TableSchema,
     path: []const u8,
 ) !void {
-    for (schema.dynamic_templates) |template| {
-        const subfield_path = directMappedSubfieldPath(template, path) orelse continue;
-        if (!template.mapping.doc_values) continue;
+    const start = runtime_schema.exactSubfieldLowerBound(schema.exact_fields, path);
+    for (schema.exact_fields[start..]) |field| {
+        const subfield_path = directMappedSubfieldPath(field, path) orelse {
+            if (!exactFieldMaySharePathPrefix(field.field, path)) break;
+            continue;
+        };
+        if (!field.mapping.doc_values) continue;
         try appendSchemaTypedDocValueConflict(alloc, typed_fields, subfield_path);
     }
 }
 
-fn directMappedSubfieldPath(template: runtime_schema.DynamicTemplate, path: []const u8) ?[]const u8 {
-    const exact_path = runtime_schema.exactDynamicTemplatePath(template) orelse return null;
+fn directMappedSubfieldPath(field: runtime_schema.ExactField, path: []const u8) ?[]const u8 {
+    const exact_path = field.field;
     if (exact_path.len <= path.len + 1) return null;
     if (!std.mem.startsWith(u8, exact_path, path)) return null;
     if (exact_path[path.len] != '.') return null;
     const suffix = exact_path[path.len + 1 ..];
     if (std.mem.indexOfScalar(u8, suffix, '.') != null) return null;
     return exact_path;
+}
+
+fn exactFieldMaySharePathPrefix(field: []const u8, path: []const u8) bool {
+    if (!std.mem.startsWith(u8, field, path)) return false;
+    return field.len == path.len or (field.len > path.len and field[path.len] == '.');
 }
 
 fn resolveArrayTypedDocValueMapping(
@@ -1830,6 +1844,7 @@ fn typedDocValueForMappedFieldAlloc(
     mapping: runtime_schema.FieldMapping,
     value: std.json.Value,
 ) !?typed_dv.TypedValue {
+    if (!runtime_schema.fieldTypeAcceptsRuntimeValue(mapping.field_type, value)) return null;
     return switch (mapping.field_type) {
         .keyword, .link => switch (value) {
             .string => |text| .{ .bytes_val = try alloc.dupe(u8, text) },
@@ -2023,9 +2038,13 @@ fn appendMappedSubfieldTextFields(
     text_analysis: introducer_mod.TextAnalysisConfig,
     observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
 ) !void {
-    for (schema.dynamic_templates) |template| {
-        const subfield_path = directMappedSubfieldPath(template, path) orelse continue;
-        const mapping = template.mapping;
+    const start = runtime_schema.exactSubfieldLowerBound(schema.exact_fields, path);
+    for (schema.exact_fields[start..]) |field| {
+        const subfield_path = directMappedSubfieldPath(field, path) orelse {
+            if (!exactFieldMaySharePathPrefix(field.field, path)) break;
+            continue;
+        };
+        const mapping = field.mapping;
         if (!isTextFieldType(mapping.field_type)) continue;
         try appendMappedTextField(alloc, fields, subfield_path, text, mapping, text_analysis);
         if (observed_field_analyzers) |collector| {
@@ -2081,7 +2100,7 @@ fn resolveDynamicTextMapping(schema: runtime_schema.TableSchema, path: []const u
     }
 
     const field_name = fieldNameFromPath(path);
-    if (runtime_schema.resolveFieldTypeForValue(schema, field_name, value)) |mapping| {
+    if (runtime_schema.resolveDynamicTemplateForValue(schema, field_name, value)) |mapping| {
         if (isTextFieldType(mapping.field_type)) return mapping;
     }
     return null;
@@ -2093,7 +2112,7 @@ fn resolveDynamicGeoPointMapping(schema: runtime_schema.TableSchema, path: []con
     }
 
     const field_name = fieldNameFromPath(path);
-    if (runtime_schema.resolveFieldTypeForValue(schema, field_name, value)) |mapping| {
+    if (runtime_schema.resolveDynamicTemplateForValue(schema, field_name, value)) |mapping| {
         if (mapping.field_type == .geopoint) return mapping;
     }
     return null;
@@ -3368,10 +3387,9 @@ test "document mapper emits schema keyword typed doc values" {
 test "document mapper emits mapped keyword subfield postings and typed doc values" {
     const alloc = std.testing.allocator;
     const text_analysis = introducer_mod.TextAnalysisConfig{};
-    const templates = [_]runtime_schema.DynamicTemplate{
+    const exact_fields = [_]runtime_schema.ExactField{
         .{
-            .name = "title",
-            .path_match = "title",
+            .field = "title",
             .mapping = .{
                 .field_type = .text,
                 .doc_values = false,
@@ -3380,8 +3398,7 @@ test "document mapper emits mapped keyword subfield postings and typed doc value
             },
         },
         .{
-            .name = "title.keyword",
-            .path_match = "title.keyword",
+            .field = "title.keyword",
             .mapping = .{
                 .field_type = .keyword,
                 .doc_values = true,
@@ -3391,7 +3408,7 @@ test "document mapper emits mapped keyword subfield postings and typed doc value
         },
     };
     const schema: runtime_schema.TableSchema = .{
-        .dynamic_templates = &templates,
+        .exact_fields = &exact_fields,
     };
 
     const segment = (try buildTextSegmentFromDocuments(alloc, &.{
@@ -3416,6 +3433,17 @@ test "document mapper emits mapped keyword subfield postings and typed doc value
     defer alloc.free(second);
     try std.testing.expectEqualStrings("Alpha Phone", first);
     try std.testing.expectEqualStrings("Beta Phone", second);
+}
+
+test "exact document mappings do not leak through dynamic leaf-name fallback" {
+    const exact_fields = [_]runtime_schema.ExactField{.{
+        .field = "title",
+        .mapping = .{ .field_type = .keyword, .analyzer = "keyword" },
+    }};
+    const schema: runtime_schema.TableSchema = .{ .exact_fields = &exact_fields };
+
+    try std.testing.expect(resolveDynamicTextMapping(schema, "title", "top-level") != null);
+    try std.testing.expect(resolveDynamicTextMapping(schema, "meta.title", "nested") == null);
 }
 
 test "document mapper emits schema-derived mapped keyword subfield coverage" {

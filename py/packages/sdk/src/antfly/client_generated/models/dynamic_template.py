@@ -33,7 +33,9 @@ class DynamicTemplate:
             mapping (TemplateFieldMapping | Unset): Field mapping used by a dynamic template or a document property's
                 `x-antfly-field` annotation. A property mapping must accept the JSON Schema value type. Explicit property
                 mappings take precedence over dynamic templates, and declarations for the same dotted path across document types
-                must normalize to an identical physical mapping.
+                must normalize to an identical physical mapping. Present values that cannot be encoded by that mapping are
+                rejected at write admission. Mappings contributed by `anyOf` or `oneOf` must normalize to the same mapping in
+                every alternative; conditional and dynamically named property mappings are rejected.
     """
 
     name: str | Unset = UNSET

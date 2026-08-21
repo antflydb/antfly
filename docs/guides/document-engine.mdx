@@ -118,6 +118,14 @@ issue `order_by` directly: Antfly validates a cold field on first use and fails
 closed if physical coverage is incomplete. Status reads never warm columns, so
 a safe but not-yet-validated field can remain `declared` until that first sort.
 
+Explicit mappings are exact, table-wide physical declarations. Present values
+must be encodable by the mapping—for example, a `date` mapping accepts an RFC
+3339/date string or a non-negative nanosecond timestamp—and invalid writes are
+rejected before indexing. An `allOf` may contribute an exact mapping. Every
+alternative of an `anyOf` or `oneOf` must contribute the same normalized
+mapping; conditional or dynamically named mappings are rejected because they
+cannot guarantee one stable physical type for the dotted path.
+
 Field capabilities report what the planner can safely do with a concrete field:
 
 - `query_modes` describes modes such as `full_text`, `exact`, `range`, `geo`,

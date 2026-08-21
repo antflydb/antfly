@@ -4966,7 +4966,7 @@ test "distributed merge uses runtime schema for typed date cursors" {
     }, &.{ left_after, right_after }, schema));
 }
 
-test "distributed merge rejects cursor outside concrete shard sort tuple domain" {
+test "distributed merge accepts cursors across the logical numeric domain" {
     const alloc = std.testing.allocator;
 
     const rank_mapping = runtime_schema_mod.DynamicTemplate{
@@ -5007,19 +5007,17 @@ test "distributed merge rejects cursor outside concrete shard sort tuple domain"
         .{ .number_string = "1.5" },
         .{ .string = "doc:a" },
     };
-    resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.InvalidQueryRequest, mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+    const fractional_page = try mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
         .order_by = &order_by,
         .search_after = &fractional_cursor,
         .limit = 1,
-    }, &.{after_result}, schema));
-    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("rank", diagnostic.field);
-    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
-    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+    }, &.{after_result}, schema);
+    defer testFreeOwnedHits(alloc, fractional_page.hits);
+    try std.testing.expectEqual(@as(usize, 1), fractional_page.hits.len);
+    try std.testing.expectEqualStrings("doc:b", fractional_page.hits[0].id);
 }
 
-test "sorted segment bounds reject cursor outside concrete bound domain" {
+test "sorted segment bounds compare across the logical numeric domain" {
     const templates = [_]runtime_schema_mod.DynamicTemplate{.{
         .name = "rank",
         .path_match = "rank",
@@ -5060,14 +5058,9 @@ test "sorted segment bounds reject cursor outside concrete bound domain" {
         .{ .number_string = "10.5" },
         .{ .string = "doc:a" },
     };
-    resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.InvalidQueryRequest, compareSortedSegmentBoundToCursor(.{
+    try std.testing.expectEqual(std.math.Order.lt, try compareSortedSegmentBoundToCursor(.{
         .order_by = &order_by,
     }, plan, bounds[0..], fractional_cursor[0..]));
-    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("rank", diagnostic.field);
-    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
-    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
 }
 
 test "distributed merge validates mapped sort fields when runtime schema is present" {
@@ -17424,7 +17417,7 @@ fn resolveDynamicTemplateFieldAnalyzer(schema: runtime_schema_mod.TableSchema, f
     }
     const field_name = fieldNameFromPath(field);
     if (!std.mem.eql(u8, field_name, field)) {
-        if (runtime_schema_mod.resolveFieldType(schema, field_name)) |mapping| {
+        if (runtime_schema_mod.resolveDynamicTemplateForValue(schema, field_name, null)) |mapping| {
             if (isTextFieldType(mapping.field_type)) return mapping.analyzer;
         }
     }
@@ -22266,7 +22259,7 @@ test "native datetime sort rejects values that cannot serialize as timestamps" {
     }));
 }
 
-test "native sort execution rejects cursors outside concrete doc value key type" {
+test "native sort execution accepts cursors across the logical numeric domain" {
     const alloc = std.testing.allocator;
 
     const templates = [_]runtime_schema_mod.DynamicTemplate{.{
@@ -22303,8 +22296,7 @@ test "native sort execution rejects cursors outside concrete doc value key type"
         .{ .number_string = "10.5" },
         .{ .string = "doc:a" },
     };
-    resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.InvalidQueryRequest, sortAndPageSearchResultInPlace(&result, .{
+    try sortAndPageSearchResultInPlace(&result, .{
         .order_by = &order_by,
         .search_after = &cursor,
         .include_stored = false,
@@ -22316,11 +22308,8 @@ test "native sort execution rejects cursors outside concrete doc value key type"
     }, .{
         .require_native = true,
         .load = Loader.load,
-    }));
-    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("rank", diagnostic.field);
-    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
-    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+    });
+    try std.testing.expectEqual(@as(usize, 0), result.hits.len);
 }
 
 test "native numeric sort rejects non-finite doc values" {

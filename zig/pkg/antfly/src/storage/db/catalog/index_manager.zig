@@ -6504,6 +6504,23 @@ pub const IndexManager = struct {
             initialized += 1;
         }
         if (entry.runtime_schema) |schema| {
+            for (schema.exact_fields) |field| {
+                if (!schema_mod.mappingHasNativeDocValues(field.mapping)) continue;
+                if (!observation.includesField(field.field)) continue;
+                var capability = schema_mod.exactFieldCapability(schema, field);
+                if (try observedDynamicFieldTypedDocValueCoverageStatus(entry, field.field, field.mapping, observation)) |coverage| {
+                    if (coverage == .covered) {
+                        capability.doc_value_coverage = "covered";
+                        capability.queryability_state = "queryable";
+                    } else {
+                        capability.doc_value_coverage = typed_dv_coverage.statusName(coverage);
+                        capability.queryability_state = "missing_doc_values";
+                    }
+                }
+                schema_mod.refreshSortLifecycleState(&capability);
+                capabilities[initialized] = try schema_mod.cloneFieldCapabilityAlloc(alloc, capability);
+                initialized += 1;
+            }
             for (schema.dynamic_templates) |template| {
                 const field = schema_mod.exactDynamicTemplatePath(template) orelse continue;
                 if (!schema_mod.mappingHasNativeDocValues(template.mapping)) continue;
@@ -6536,6 +6553,11 @@ pub const IndexManager = struct {
             if (observation.includesField(item.field_name)) capability_count += 1;
         }
         const schema = entry.runtime_schema orelse return capability_count;
+        for (schema.exact_fields) |field| {
+            if (!schema_mod.mappingHasNativeDocValues(field.mapping)) continue;
+            if (!observation.includesField(field.field)) continue;
+            capability_count += 1;
+        }
         for (schema.dynamic_templates) |template| {
             const field = schema_mod.exactDynamicTemplatePath(template) orelse continue;
             if (!schema_mod.mappingHasNativeDocValues(template.mapping)) continue;

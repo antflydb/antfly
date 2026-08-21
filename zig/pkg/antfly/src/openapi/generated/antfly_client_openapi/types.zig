@@ -8483,7 +8483,7 @@ pub const TavilySearchConfig = struct {
     exclude_domains: ?[]const []const u8 = null,
 };
 
-/// Field mapping used by a dynamic template or a document property's `x-antfly-field` annotation. A property mapping must accept the JSON Schema value type. Explicit property mappings take precedence over dynamic templates, and declarations for the same dotted path across document types must normalize to an identical physical mapping.
+/// Field mapping used by a dynamic template or a document property's `x-antfly-field` annotation. A property mapping must accept the JSON Schema value type. Explicit property mappings take precedence over dynamic templates, and declarations for the same dotted path across document types must normalize to an identical physical mapping. Present values that cannot be encoded by that mapping are rejected at write admission. Mappings contributed by `anyOf` or `oneOf` must normalize to the same mapping in every alternative; conditional and dynamically named property mappings are rejected.
 pub const TemplateFieldMapping = struct {
     type: ?FieldMappingType = null,
     /// Analyzer name (e.g., "standard", "keyword", "en", "html_analyzer"). Used for text fields to control tokenization and normalization.

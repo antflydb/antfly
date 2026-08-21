@@ -482,32 +482,46 @@ pub fn validateWritesAgainstSchema(
     schema: TableSchema,
     writes: anytype,
 ) !void {
+    try validateWritesAgainstSchemaWithPhysicalFields(alloc, schema, writes, &.{});
+}
+
+pub const PhysicalFieldValidation = struct {
+    source_field: []const u8,
+    field_type: storage_schema.AntflyType,
+};
+
+pub fn validateWritesAgainstSchemaWithPhysicalFields(
+    alloc: std.mem.Allocator,
+    schema: TableSchema,
+    writes: anytype,
+    physical_fields: []const PhysicalFieldValidation,
+) !void {
     const Writes = @TypeOf(writes);
     switch (@typeInfo(Writes)) {
         .pointer => |pointer| {
             if (pointer.size == .slice) {
-                for (writes) |write| try validateDocumentJson(alloc, schema, write.value);
+                for (writes) |write| try validateDocumentJsonWithPhysicalFields(alloc, schema, write.value, physical_fields);
                 return;
             }
             if (pointer.size == .one) {
                 const child = @typeInfo(pointer.child);
                 if (child == .array) {
-                    for (writes.*) |write| try validateDocumentJson(alloc, schema, write.value);
+                    for (writes.*) |write| try validateDocumentJsonWithPhysicalFields(alloc, schema, write.value, physical_fields);
                     return;
                 }
                 if (child == .@"struct" and child.@"struct".is_tuple) {
-                    inline for (writes.*) |write| try validateDocumentJson(alloc, schema, write.value);
+                    inline for (writes.*) |write| try validateDocumentJsonWithPhysicalFields(alloc, schema, write.value, physical_fields);
                     return;
                 }
             }
         },
         .array => {
-            for (writes) |write| try validateDocumentJson(alloc, schema, write.value);
+            for (writes) |write| try validateDocumentJsonWithPhysicalFields(alloc, schema, write.value, physical_fields);
             return;
         },
         .@"struct" => |struct_info| {
             if (struct_info.is_tuple) {
-                inline for (writes) |write| try validateDocumentJson(alloc, schema, write.value);
+                inline for (writes) |write| try validateDocumentJsonWithPhysicalFields(alloc, schema, write.value, physical_fields);
                 return;
             }
         },
@@ -521,7 +535,16 @@ pub fn validateDocumentJson(
     schema: TableSchema,
     value_json: []const u8,
 ) !void {
-    if (schema.document_schemas.len == 0 and !schema.enforce_types and schema.ttl_duration_ns == 0 and schema.dynamic_templates.len == 0) return;
+    try validateDocumentJsonWithPhysicalFields(alloc, schema, value_json, &.{});
+}
+
+fn validateDocumentJsonWithPhysicalFields(
+    alloc: std.mem.Allocator,
+    schema: TableSchema,
+    value_json: []const u8,
+    physical_fields: []const PhysicalFieldValidation,
+) !void {
+    if (schema.document_schemas.len == 0 and !schema.enforce_types and schema.ttl_duration_ns == 0 and schema.dynamic_templates.len == 0 and physical_fields.len == 0) return;
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
     defer parsed.deinit();
@@ -583,6 +606,75 @@ pub fn validateDocumentJson(
             }
         }
         if (schema.enforce_types) return error.InvalidBatchRequest;
+    }
+
+    if (physical_fields.len > 0) {
+        var path = std.ArrayListUnmanaged(u8).empty;
+        defer path.deinit(alloc);
+        try validatePhysicalDocumentValue(alloc, physical_fields, &path, parsed.value, false);
+    }
+}
+
+fn validatePhysicalDocumentValue(
+    alloc: std.mem.Allocator,
+    physical_fields: []const PhysicalFieldValidation,
+    path: *std.ArrayListUnmanaged(u8),
+    value: std.json.Value,
+    validate_current_path: bool,
+) !void {
+    if (validate_current_path and value != .null) {
+        const start = physicalFieldLowerBound(physical_fields, path.items);
+        for (physical_fields[start..]) |field| {
+            if (!std.mem.eql(u8, field.source_field, path.items)) break;
+            try validatePhysicalFieldValue(field.field_type, value);
+        }
+    }
+
+    switch (value) {
+        .object => |object| {
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (entry.key_ptr.*.len > 0 and entry.key_ptr.*[0] == '_') continue;
+                const previous_len = path.items.len;
+                defer path.shrinkRetainingCapacity(previous_len);
+                if (previous_len > 0) try path.append(alloc, '.');
+                try path.appendSlice(alloc, entry.key_ptr.*);
+                try validatePhysicalDocumentValue(alloc, physical_fields, path, entry.value_ptr.*, true);
+            }
+        },
+        // A mapped scalar field may be multi-valued. Validate the mapping once
+        // against the complete array, then preserve the same path while walking
+        // object items for mappings declared below an array-of-objects field.
+        .array => |array| {
+            for (array.items) |item| {
+                try validatePhysicalDocumentValue(alloc, physical_fields, path, item, false);
+            }
+        },
+        else => {},
+    }
+}
+
+fn physicalFieldLowerBound(fields: []const PhysicalFieldValidation, path: []const u8) usize {
+    var low: usize = 0;
+    var high: usize = fields.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        if (std.mem.order(u8, fields[mid].source_field, path) == .lt) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return low;
+}
+
+fn validatePhysicalFieldValue(field_type: storage_schema.AntflyType, value: std.json.Value) !void {
+    if (value == .array and field_type != .embedding) {
+        for (value.array.items) |item| {
+            if (!storage_schema.fieldTypeAcceptsRuntimeValue(field_type, item)) return error.InvalidBatchRequest;
+        }
+    } else if (!storage_schema.fieldTypeAcceptsRuntimeValue(field_type, value)) {
+        return error.InvalidBatchRequest;
     }
 }
 
@@ -2967,6 +3059,10 @@ fn validateDocumentFieldValueWithContext(
 
     if (value.* == .null) return validateNullValueWithContext(context, property, value, enforce_types);
 
+    if ((property.antfly_index orelse true)) {
+        if (property.antfly_field) |mapping| try validateMappedFieldValue(mapping, value.*);
+    }
+
     if (property.all_of.len > 0) {
         for (property.all_of) |variant| try validateDocumentFieldValueWithContext(context, variant, value, composed_enforce_types);
     }
@@ -3269,6 +3365,18 @@ fn validateDocumentFieldValueWithContext(
         }
         return;
     }
+}
+
+fn validateMappedFieldValue(mapping: DynamicTemplate, value: std.json.Value) !void {
+    const field_type = storage_schema.parseAntflyType(mapping.field_type orelse "text") orelse return error.InvalidBatchRequest;
+    if (value == .array and field_type != .embedding) {
+        for (value.array.items) |item| {
+            if (!storage_schema.fieldTypeAcceptsRuntimeValue(field_type, item)) return error.InvalidBatchRequest;
+        }
+    } else if (!storage_schema.fieldTypeAcceptsRuntimeValue(field_type, value)) {
+        return error.InvalidBatchRequest;
+    }
+    for (mapping.fields) |subfield| try validateMappedFieldValue(subfield, value);
 }
 
 fn validateNullValueWithContext(
@@ -4217,6 +4325,28 @@ test "parse rejects document field mappings incompatible with their schema value
         var parsed = try parseSchema(std.testing.allocator, schema_json);
         parsed.deinit(std.testing.allocator);
     }
+}
+
+test "write validation rejects values that cannot populate explicit physical mappings" {
+    var parsed = try parseSchema(
+        std.testing.allocator,
+        "{\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"created_at\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"date\",\"sortable\":true}},\"created_ns\":{\"type\":\"integer\",\"x-antfly-field\":{\"type\":\"date\",\"sortable\":true}},\"location\":{\"type\":\"object\",\"x-antfly-field\":{\"type\":\"geo_point\"}}}}}}}",
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"created_at\":\"2026-08-20T12:00:00Z\",\"created_ns\":0,\"location\":{\"lat\":37.7,\"lon\":-122.4}}" }});
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"created_at\":\"not-a-date\",\"created_ns\":0,\"location\":{\"lat\":0,\"lon\":0}}" }}),
+    );
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"created_at\":\"2026-08-20\",\"created_ns\":-1,\"location\":{\"lat\":0,\"lon\":0}}" }}),
+    );
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"created_at\":\"2026-08-20\",\"created_ns\":0,\"location\":{\"lat\":91,\"lon\":0}}" }}),
+    );
 }
 
 test "parse explicit field analyzer override" {
