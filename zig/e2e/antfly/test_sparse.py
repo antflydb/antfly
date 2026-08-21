@@ -26,6 +26,9 @@ import requests
 from helpers import assert_created_index, create_index_payload, wait_until
 
 
+pytestmark = pytest.mark.reuse_antfly_process
+
+
 def _create_index(api, table_name: str, index_name: str, payload: dict) -> dict:
     return api.post(
         f"/tables/{table_name}/indexes/{index_name}",

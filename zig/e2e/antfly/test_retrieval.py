@@ -25,6 +25,9 @@ import requests
 from helpers import assert_created_index, wait_until
 
 
+pytestmark = pytest.mark.reuse_antfly_process
+
+
 def _parse_sse_events(body: str) -> list[tuple[str, object]]:
     events: list[tuple[str, object]] = []
     for chunk in body.strip().split("\n\n"):

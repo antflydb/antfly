@@ -27,6 +27,10 @@ from helpers import (
     wait_until,
 )
 
+
+pytestmark = pytest.mark.reuse_antfly_process
+
+
 CLIPCLAP_MODEL = "antflydb/clipclap"
 
 
