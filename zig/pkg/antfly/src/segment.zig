@@ -1238,6 +1238,7 @@ const SegmentSortValue = union(enum) {
     bool_val: bool,
     bytes_val: []u8,
     id: []const u8,
+    numeric_val: typed_dv.NumericValue,
 
     fn deinit(self: *SegmentSortValue, alloc: Allocator) void {
         switch (self.*) {
@@ -1255,6 +1256,7 @@ const SegmentSortValueTag = enum {
     bool_val,
     bytes_val,
     id,
+    numeric_val,
 };
 
 fn segmentSortValueTag(value: SegmentSortValue) SegmentSortValueTag {
@@ -1265,6 +1267,7 @@ fn segmentSortValueTag(value: SegmentSortValue) SegmentSortValueTag {
         .bool_val => .bool_val,
         .bytes_val => .bytes_val,
         .id => .id,
+        .numeric_val => .numeric_val,
     };
 }
 
@@ -2156,16 +2159,20 @@ fn loadSegmentSortKeyAlloc(
     const section = (try reader.getSection(field, .typed_doc_values)) orelse return error.UnsupportedTypedDocValues;
     var dv_reader = try typed_dv.TypedDocValuesReader.init(alloc, section);
     return switch (dv_reader.value_type) {
-        .u64_val => .{ .u64_val = (try segmentSortDocValue(dv_reader.getU64(doc_id))) orelse return error.InvalidSegment },
-        .i64_val => .{ .i64_val = (try segmentSortDocValue(dv_reader.getI64(doc_id))) orelse return error.InvalidSegment },
+        // Normalize legacy scalar numeric columns into the exact tagged
+        // domain before comparing sort keys. This keeps sorted compaction
+        // valid across an on-disk format rollout without rounding integers.
+        .u64_val => .{ .numeric_val = .{ .u64_val = (try segmentSortDocValue(dv_reader.getU64(doc_id))) orelse return error.InvalidSegment } },
+        .i64_val => .{ .numeric_val = .{ .i64_val = (try segmentSortDocValue(dv_reader.getI64(doc_id))) orelse return error.InvalidSegment } },
         .f64_val => blk: {
             const value = (try segmentSortDocValue(dv_reader.getF64(doc_id))) orelse return error.InvalidSegment;
             if (!std.math.isFinite(value)) return error.InvalidSegment;
-            break :blk .{ .f64_val = value };
+            break :blk .{ .numeric_val = .{ .f64_val = value } };
         },
         .bool_val => .{ .bool_val = (try segmentSortDocValue(dv_reader.getBool(doc_id))) orelse return error.InvalidSegment },
         .bytes_val => .{ .bytes_val = (try segmentSortDocValue(dv_reader.getBytesAlloc(doc_id))) orelse return error.InvalidSegment },
         .geo_point => return error.UnsupportedTypedDocValues,
+        .numeric_val => .{ .numeric_val = (try segmentSortDocValue(dv_reader.getNumeric(doc_id))) orelse return error.InvalidSegment },
     };
 }
 
@@ -2210,6 +2217,10 @@ fn compareSegmentSortValues(a: SegmentSortValue, b: SegmentSortValue) std.math.O
         },
         .id => |av| switch (b) {
             .id => |bv| std.mem.order(u8, av, bv),
+            else => .lt,
+        },
+        .numeric_val => |av| switch (b) {
+            .numeric_val => |bv| typed_dv.compareNumericValues(av, bv),
             else => .lt,
         },
     };
@@ -2262,6 +2273,11 @@ fn segmentBoundValueFromSortValueAlloc(alloc: Allocator, value: SegmentSortValue
         .bool_val => |v| .{ .bool_val = v },
         .bytes_val => |v| .{ .bytes_val = try alloc.dupe(u8, v) },
         .id => |v| .{ .id = try alloc.dupe(u8, v) },
+        .numeric_val => |v| switch (v) {
+            .u64_val => |number| .{ .u64_val = number },
+            .i64_val => |number| .{ .i64_val = number },
+            .f64_val => |number| .{ .f64_val = number },
+        },
     };
 }
 
@@ -2271,8 +2287,15 @@ fn mergeTypedDocValuesSections(
     field_name: []const u8,
 ) !?[]u8 {
     var value_type: ?typed_dv.ValueType = null;
-    var writer: ?typed_dv.TypedDocValuesWriter = null;
-    defer if (writer) |*w| w.deinit();
+
+    for (inputs) |input| {
+        const section_data = (try input.reader.getSection(field_name, .typed_doc_values)) orelse continue;
+        const reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
+        value_type = mergeTypedDocValuesValueType(value_type, reader.value_type) orelse return null;
+    }
+    const target_value_type = value_type orelse return null;
+    var writer = typed_dv.TypedDocValuesWriter.init(alloc, target_value_type, typed_dv.default_chunk_size);
+    defer writer.deinit();
 
     var merged_doc_base: u32 = 0;
     for (inputs) |input| {
@@ -2280,16 +2303,6 @@ fn mergeTypedDocValuesSections(
         var dv_reader: ?typed_dv.TypedDocValuesReader = null;
         if (try reader.getSection(field_name, .typed_doc_values)) |section_data| {
             dv_reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
-            if (value_type == null) {
-                value_type = dv_reader.?.value_type;
-                writer = typed_dv.TypedDocValuesWriter.init(alloc, dv_reader.?.value_type, typed_dv.default_chunk_size);
-            } else if (value_type.? != dv_reader.?.value_type) {
-                if (writer) |*w| {
-                    w.deinit();
-                    writer = null;
-                }
-                return null;
-            }
         }
 
         if (dv_reader) |*dv| {
@@ -2304,7 +2317,7 @@ fn mergeTypedDocValuesSections(
                         @intCast(deleted.rank(entry.doc_id))
                     else
                         0;
-                    try writer.?.add(merged_doc_base + entry.doc_id - deleted_before, entry.value);
+                    try addMergedTypedDocValue(&writer, merged_doc_base + entry.doc_id - deleted_before, entry.value);
                 }
             }
         }
@@ -2316,11 +2329,34 @@ fn mergeTypedDocValuesSections(
         merged_doc_base += reader.doc_count - deleted_live_range;
     }
 
-    if (writer) |*w| {
-        if (w.entries.items.len == 0) return null;
-        return try w.build();
-    }
+    if (writer.entries.items.len == 0) return null;
+    return try writer.build();
+}
+
+fn typedDocValuesValueTypeIsNumeric(value_type: typed_dv.ValueType) bool {
+    return switch (value_type) {
+        .u64_val, .i64_val, .f64_val, .numeric_val => true,
+        else => false,
+    };
+}
+
+fn mergeTypedDocValuesValueType(current: ?typed_dv.ValueType, next: typed_dv.ValueType) ?typed_dv.ValueType {
+    const existing = current orelse return next;
+    if (existing == next) return existing;
+    if (typedDocValuesValueTypeIsNumeric(existing) and typedDocValuesValueTypeIsNumeric(next)) return .numeric_val;
     return null;
+}
+
+fn addMergedTypedDocValue(writer: *typed_dv.TypedDocValuesWriter, doc_id: u32, value: typed_dv.TypedValue) !void {
+    if (writer.value_type != .numeric_val) return writer.add(doc_id, value);
+    const numeric: typed_dv.NumericValue = switch (value) {
+        .u64_val => |number| .{ .u64_val = number },
+        .i64_val => |number| .{ .i64_val = number },
+        .f64_val => |number| .{ .f64_val = number },
+        .numeric_val => |number| number,
+        else => return error.InvalidSegment,
+    };
+    return writer.add(doc_id, .{ .numeric_val = numeric });
 }
 
 fn mergeTypedDocValuesSectionsInOrder(
@@ -2337,11 +2373,7 @@ fn mergeTypedDocValuesSectionsInOrder(
     for (inputs, 0..) |input, i| {
         const section = (try input.reader.getSection(field_name, .typed_doc_values)) orelse continue;
         readers[i] = try typed_dv.TypedDocValuesReader.init(alloc, section);
-        if (value_type == null) {
-            value_type = readers[i].?.value_type;
-        } else if (value_type.? != readers[i].?.value_type) {
-            return null;
-        }
+        value_type = mergeTypedDocValuesValueType(value_type, readers[i].?.value_type) orelse return null;
     }
     const vt = value_type orelse return null;
 
@@ -2364,13 +2396,13 @@ fn addTypedDocValueIfPresent(
 ) !void {
     switch (reader.value_type) {
         .u64_val => if (try reader.getU64(src_doc_id)) |value| {
-            try writer.add(out_doc_id, .{ .u64_val = value });
+            try addMergedTypedDocValue(writer, out_doc_id, .{ .u64_val = value });
         },
         .i64_val => if (try reader.getI64(src_doc_id)) |value| {
-            try writer.add(out_doc_id, .{ .i64_val = value });
+            try addMergedTypedDocValue(writer, out_doc_id, .{ .i64_val = value });
         },
         .f64_val => if (try reader.getF64(src_doc_id)) |value| {
-            try writer.add(out_doc_id, .{ .f64_val = value });
+            try addMergedTypedDocValue(writer, out_doc_id, .{ .f64_val = value });
         },
         .geo_point => if (try reader.getGeoPoint(src_doc_id)) |value| {
             try writer.add(out_doc_id, .{ .geo_point = value });
@@ -2381,6 +2413,9 @@ fn addTypedDocValueIfPresent(
         .bytes_val => if (try reader.getBytesAlloc(src_doc_id)) |value| {
             defer alloc.free(value);
             try writer.add(out_doc_id, .{ .bytes_val = value });
+        },
+        .numeric_val => if (try reader.getNumeric(src_doc_id)) |value| {
+            try addMergedTypedDocValue(writer, out_doc_id, .{ .numeric_val = value });
         },
     }
 }
@@ -3086,6 +3121,45 @@ test "segment append merge preserves bytes typed doc values" {
     try std.testing.expectEqualStrings("beta", tenant1_value);
 }
 
+test "segment append merge normalizes legacy mixed numeric doc values" {
+    const alloc = std.testing.allocator;
+
+    var integer_writer = typed_dv.TypedDocValuesWriter.init(alloc, .i64_val, 1024);
+    defer integer_writer.deinit();
+    try integer_writer.add(0, .{ .i64_val = -9007199254740993 });
+    const integer_data = try integer_writer.build();
+    defer alloc.free(integer_data);
+    var first_writer = SegmentWriter.init(alloc);
+    defer first_writer.deinit();
+    const first_field = try first_writer.addField("price");
+    try first_writer.addSection(first_field, .typed_doc_values, integer_data);
+    try first_writer.addStoredDoc("doc:integer", "{}");
+    const first_segment = try first_writer.build();
+    defer alloc.free(first_segment);
+
+    var decimal_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
+    defer decimal_writer.deinit();
+    try decimal_writer.add(0, .{ .f64_val = 10.5 });
+    const decimal_data = try decimal_writer.build();
+    defer alloc.free(decimal_data);
+    var second_writer = SegmentWriter.init(alloc);
+    defer second_writer.deinit();
+    const second_field = try second_writer.addField("price");
+    try second_writer.addSection(second_field, .typed_doc_values, decimal_data);
+    try second_writer.addStoredDoc("doc:decimal", "{}");
+    const second_segment = try second_writer.build();
+    defer alloc.free(second_segment);
+
+    const merged = try mergeSegments(alloc, &.{ first_segment, second_segment });
+    defer alloc.free(merged);
+    var merged_reader = try SegmentReader.init(alloc, merged);
+    defer merged_reader.deinit();
+    var values = try typed_dv.TypedDocValuesReader.init(alloc, (try merged_reader.getSection("price", .typed_doc_values)) orelse return error.TestExpectedEqual);
+    try std.testing.expectEqual(typed_dv.ValueType.numeric_val, values.value_type);
+    try std.testing.expectEqual(typed_dv.NumericValue{ .i64_val = -9007199254740993 }, (try values.getNumeric(0)).?);
+    try std.testing.expectEqual(typed_dv.NumericValue{ .f64_val = 10.5 }, (try values.getNumeric(1)).?);
+}
+
 test "segment append merge remaps sparse multi-chunk typed doc values around deletions" {
     const alloc = std.testing.allocator;
 
@@ -3568,12 +3642,12 @@ test "segment sorted merge rejects non-finite f64 index sort values" {
     }, .{ .index_sort = &sort_fields }));
 }
 
-test "segment sorted merge rejects mixed index sort doc value domains" {
+test "segment sorted merge normalizes legacy mixed numeric index sort domains" {
     const alloc = std.testing.allocator;
 
     var u64_writer = typed_dv.TypedDocValuesWriter.init(alloc, .u64_val, 1024);
     defer u64_writer.deinit();
-    try u64_writer.add(0, .{ .u64_val = 2 });
+    try u64_writer.add(0, .{ .u64_val = 9_007_199_254_740_993 });
     const u64_data = try u64_writer.build();
     defer alloc.free(u64_data);
 
@@ -3591,7 +3665,7 @@ test "segment sorted merge rejects mixed index sort doc value domains" {
 
     var i64_writer = typed_dv.TypedDocValuesWriter.init(alloc, .i64_val, 1024);
     defer i64_writer.deinit();
-    try i64_writer.add(0, .{ .i64_val = 1 });
+    try i64_writer.add(0, .{ .i64_val = -9_007_199_254_740_993 });
     const i64_data = try i64_writer.build();
     defer alloc.free(i64_data);
 
@@ -3616,10 +3690,20 @@ test "segment sorted merge rejects mixed index sort doc value domains" {
         .{ .field = "price", .desc = false },
         .{ .field = "_id", .desc = false },
     };
-    try std.testing.expectError(error.InvalidSegment, mergeSegmentInputsWithOptions(alloc, &.{
+    const merged = try mergeSegmentInputsWithOptions(alloc, &.{
         .{ .reader = &reader1 },
         .{ .reader = &reader2 },
-    }, .{ .index_sort = &sort_fields }));
+    }, .{ .index_sort = &sort_fields });
+    defer alloc.free(merged);
+
+    var merged_reader = try SegmentReader.init(alloc, merged);
+    defer merged_reader.deinit();
+    try std.testing.expectEqualStrings("doc:a", (try merged_reader.storedDoc(0)).?.id);
+    try std.testing.expectEqualStrings("doc:b", (try merged_reader.storedDoc(1)).?.id);
+    var values = try typed_dv.TypedDocValuesReader.init(alloc, (try merged_reader.getSection("price", .typed_doc_values)) orelse return error.TestExpectedEqual);
+    try std.testing.expectEqual(typed_dv.ValueType.numeric_val, values.value_type);
+    try std.testing.expectEqual(typed_dv.NumericValue{ .i64_val = -9_007_199_254_740_993 }, (try values.getNumeric(0)).?);
+    try std.testing.expectEqual(typed_dv.NumericValue{ .u64_val = 9_007_199_254_740_993 }, (try values.getNumeric(1)).?);
 }
 
 test "multi-field segment" {

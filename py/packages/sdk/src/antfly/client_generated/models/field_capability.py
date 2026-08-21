@@ -26,13 +26,13 @@ class FieldCapability:
             Antfly field types such as `text`, `keyword`, `datetime`, `geopoint`, and
             `search_as_you_type`; they are not separate schema toggles.
         sortable (bool): Whether this concrete field is declared sortable in the effective
-            capability model. Public exact order_by accepts it only when
-            sort_lifecycle_state is queryable or accelerated.
+            capability model. A cold declared field is validated on first
+            exact order_by use; clients do not need to poll lifecycle status.
         provenance (str): Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
         missing_null_policy (str): Current missing/null handling policy for this field.
-        sort_lifecycle_state (FieldCapabilitySortLifecycleState): Operational lifecycle state for exact sort use.
-            Queryable fields are accepted by public exact sort; accelerated fields are queryable and participate in the
-            configured index_sort tuple.
+        sort_lifecycle_state (FieldCapabilitySortLifecycleState): Cached operational lifecycle state for exact sort use.
+            Declared or indexed fields are validated on first public exact-sort use; queryable fields have validated native
+            coverage; accelerated fields are queryable and participate in the configured index_sort tuple.
         name (str | Unset): Mapping or dynamic-template name, when applicable.
         field (str | Unset): Concrete query field path when known. Pattern-only dynamic templates may omit this.
         path_pattern (str | Unset): Dynamic-template path_match pattern, when applicable.
