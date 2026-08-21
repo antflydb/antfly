@@ -185,6 +185,49 @@ tags:
       - Primary types (`text`, `html`) can be combined with variants (`keyword`, `search_as_you_type`)
       - `search_as_you_type` + `keyword` allowed without primary type (auto-adds `text`)
 
+      `x-antfly-types` remains supported as the compact multi-mapping/search
+      shorthand. Exact scalar names in that array describe how a field is
+      searched, but do not opt the field into the typed doc-value storage
+      required by production `order_by`.
+
+      ### `x-antfly-field`
+      Use an explicit field mapping for fields that participate in exact sort.
+      Set `sortable: true` on a keyword, numeric/number/integer,
+      boolean/bool, datetime/date/timestamp, or link mapping. Antfly derives
+      the internal typed doc values; `doc_values` is intentionally not a public
+      setting. The mapping type must accept the property's JSON Schema value
+      type. Explicit property mappings take precedence over dynamic templates.
+      When multiple document types declare the same dotted field path, their
+      normalized physical mappings must be identical.
+
+      ```json
+      {
+        "created_at": {
+          "type": "string",
+          "format": "date-time",
+          "x-antfly-field": {"type": "date", "sortable": true}
+        },
+        "title": {
+          "type": "string",
+          "x-antfly-field": {
+            "type": "text",
+            "fields": {
+              "keyword": {"type": "keyword", "sortable": true}
+            }
+          }
+        }
+      }
+      ```
+
+      Sort the examples above with `created_at` and `title.keyword`,
+      respectively. An analyzed `text` field is never directly sortable.
+      Adding `sortable: true` to an existing table is a physical mapping
+      change. Once the write or rebuild visibility barrier completes, clients
+      may issue `order_by` directly. Antfly validates cold physical coverage on
+      first use and fails closed when it is incomplete; status reads do not
+      warm columns, so `sort_lifecycle_state` may remain `declared` until that
+      validation succeeds.
+
       ### `x-antfly-index`
       Boolean to disable indexing for a field:
       ```json
@@ -3354,8 +3397,8 @@ components:
           type: boolean
           description: |
             Whether this concrete field is declared sortable in the effective
-            capability model. Public exact order_by accepts it only when
-            sort_lifecycle_state is queryable or accelerated.
+            capability model. A cold declared field is validated on first
+            exact order_by use; clients do not need to poll lifecycle status.
         provenance:
           type: string
           description: Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
@@ -3365,7 +3408,7 @@ components:
         sort_lifecycle_state:
           type: string
           enum: [unsupported, declared, indexed, covered, queryable, accelerated]
-          description: Operational lifecycle state for exact sort use. Queryable fields are accepted by public exact sort; accelerated fields are queryable and participate in the configured index_sort tuple.
+          description: Cached operational lifecycle state for exact sort use. Declared or indexed fields are validated on first public exact-sort use; queryable fields have validated native coverage; accelerated fields are queryable and participate in the configured index_sort tuple.
         analyzer:
           type: string
           description: Analyzer name for text/searchable fields, when applicable.
@@ -6823,7 +6866,9 @@ components:
             when each non-`_id` field is a mapped exact scalar field with sortable
             native doc-value coverage. Sortable mapping types are keyword,
             numeric/number/integer, boolean/bool, datetime/date/timestamp, and
-            link. Analyzed `text` fields and `search_as_you_type`, geo, embedding,
+            link. Declare the field with `x-antfly-field` and `sortable: true`;
+            `x-antfly-types` shorthand declarations alone are not sortable.
+            Analyzed `text` fields and `search_as_you_type`, geo, embedding,
             blob, html, object, and array fields are not directly sortable; sort
             on an exact scalar mapping such as `title.keyword` instead. Requests
             that cannot be executed through an exact native sort path return 422

@@ -37,7 +37,6 @@ from .antfly_embedder_config import AntflyEmbedderConfig
 from .antfly_generator_config import AntflyGeneratorConfig
 from .antfly_reranker_config import AntflyRerankerConfig
 from .antfly_type import AntflyType
-from .antfly_type_2 import AntflyType2
 from .anthropic_generator_config import AnthropicGeneratorConfig
 from .api_key import ApiKey
 from .api_key_row_filter_type_0 import ApiKeyRowFilterType0
@@ -151,8 +150,13 @@ from .document_artifact_table_reprocess_response_reprocess import DocumentArtifa
 from .document_artifact_table_reprocess_response_reprocess_status import (
     DocumentArtifactTableReprocessResponseReprocessStatus,
 )
+from .document_field_mapping import DocumentFieldMapping
+from .document_field_mapping_fields import DocumentFieldMappingFields
+from .document_field_mapping_missing_null_policy import DocumentFieldMappingMissingNullPolicy
 from .document_schema import DocumentSchema
 from .document_schema_schema import DocumentSchemaSchema
+from .document_subfield_mapping import DocumentSubfieldMapping
+from .document_subfield_mapping_missing_null_policy import DocumentSubfieldMappingMissingNullPolicy
 from .drop_extension_request import DropExtensionRequest
 from .drop_extension_request_mode import DropExtensionRequestMode
 from .drop_extension_response import DropExtensionResponse
@@ -236,6 +240,7 @@ from .field_capability import FieldCapability
 from .field_capability_index_sort_order import FieldCapabilityIndexSortOrder
 from .field_capability_query_modes_item import FieldCapabilityQueryModesItem
 from .field_capability_sort_lifecycle_state import FieldCapabilitySortLifecycleState
+from .field_mapping_type import FieldMappingType
 from .field_statistics import FieldStatistics
 from .filter_spec import FilterSpec
 from .filter_spec_operator import FilterSpecOperator
@@ -827,7 +832,6 @@ __all__ = (
     "AntflyGeneratorConfig",
     "AntflyRerankerConfig",
     "AntflyType",
-    "AntflyType2",
     "AnthropicGeneratorConfig",
     "ApiKey",
     "ApiKeyRowFilterType0",
@@ -939,8 +943,13 @@ __all__ = (
     "DocumentArtifactTableReprocessResponse",
     "DocumentArtifactTableReprocessResponseReprocess",
     "DocumentArtifactTableReprocessResponseReprocessStatus",
+    "DocumentFieldMapping",
+    "DocumentFieldMappingFields",
+    "DocumentFieldMappingMissingNullPolicy",
     "DocumentSchema",
     "DocumentSchemaSchema",
+    "DocumentSubfieldMapping",
+    "DocumentSubfieldMappingMissingNullPolicy",
     "DropExtensionRequest",
     "DropExtensionRequestMode",
     "DropExtensionResponse",
@@ -1024,6 +1033,7 @@ __all__ = (
     "FieldCapabilityIndexSortOrder",
     "FieldCapabilityQueryModesItem",
     "FieldCapabilitySortLifecycleState",
+    "FieldMappingType",
     "FieldStatistics",
     "FilterSpec",
     "FilterSpecOperator",

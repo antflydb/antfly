@@ -51,6 +51,31 @@ const RuntimeLibraryUnit = enum {
     cli,
 };
 
+// Static archives must be presented from consumers to providers. The
+// distributed/application unit calls into both the API kernel and inference
+// unit, while the remote CLI is an executable-facing leaf. Keep this separate
+// from RuntimeLibraryUnit declaration order: declaration order controls build
+// graph construction, not the final link's dependency topology.
+const runtime_library_link_order = [_]RuntimeLibraryUnit{
+    .cli,
+    .distributed,
+    .api_kernel,
+    .inference,
+};
+
+comptime {
+    const unit_count = std.meta.fields(RuntimeLibraryUnit).len;
+    if (runtime_library_link_order.len != unit_count)
+        @compileError("runtime_library_link_order must contain every runtime library unit exactly once");
+    var seen = [_]bool{false} ** unit_count;
+    for (runtime_library_link_order) |unit| {
+        const index = @intFromEnum(unit);
+        if (seen[index])
+            @compileError("runtime_library_link_order contains a duplicate runtime library unit");
+        seen[index] = true;
+    }
+}
+
 const snowball_languages = [_][]const u8{
     "danish",
     "dutch",
@@ -3583,7 +3608,7 @@ pub fn build(b: *std.Build) void {
         "distributed merge uses runtime schema for typed date cursors",
         "segment index sort metadata roundtrip",
         "segment merge drops index sort metadata until physical sort is preserved",
-        "segment sorted merge rejects mixed index sort doc value domains",
+        "segment sorted merge normalizes legacy mixed numeric index sort domains",
         "segment sorted merge preserves index sort and remaps doc addressed sections",
         "dynamic template selector and mapping-option resolution",
         "parse document field mapping contract",
@@ -3591,16 +3616,33 @@ pub fn build(b: *std.Build) void {
         "schema rejects sortable non-scalar dynamic mappings",
         "runtime schema derives and validates index sort metadata",
         "runtime schema lowers document field mappings to exact declared fields",
+        "explicit document field mappings take precedence over dynamic templates",
+        "document field mappings deduplicate compatible paths and reject conflicts",
+        "write validation enforces table-wide exact mappings across document types",
+        "composed schemas lower only unconditional equivalent exact mappings",
+        "runtime schema retains shorthand exact scalar declarations as non-sortable capabilities",
+        "metadata.schema update ignores shorthand capability declaration order",
         "schema rejects sortable non-scalar document field mappings",
+        "parse rejects document field mappings incompatible with their schema value domain",
+        "write validation rejects values that cannot populate explicit physical mappings",
         "runtime schema field capability helpers classify mapped sortability",
+        "schema serialization rejects unsorted or duplicate exact fields",
+        "sorted exact fields resolve before wildcard templates and find subfields without allocation",
         "document mapper accepts match-mapping-type dynamic template index_sort field",
         "document mapper emits mapped keyword subfield postings and typed doc values",
+        "exact document mappings do not leak through dynamic leaf-name fallback",
+        "nested exact mappings do not consume their parent value as a multi-field",
+        "distributed merge accepts cursors across the logical numeric domain",
+        "sorted segment bounds compare across the logical numeric domain",
+        "native sort execution accepts cursors across the logical numeric domain",
         "document mapper emits schema-derived mapped keyword subfield coverage",
         "document mapper omits multi-valued mapped keyword subfield typed doc values",
         "document mapper flushes schema index_sort segments in physical sort order",
         "document mapper validates schema index_sort field capabilities",
         "document mapper emits schema geo point typed doc values",
         "typed doc values bytes round-trip",
+        "typed doc values exact numeric domain round-trip and comparison",
+        "typed doc values coverage admission honors cancellation deadline and contention",
         "cover bounding box enforces budget with hashed deduplication",
         "cover bounding box rejects invalid bounds",
         "geo distance filter",
@@ -3640,6 +3682,9 @@ pub fn build(b: *std.Build) void {
         "text field sort uses sorted segment membership path when index sort matches",
         "text projected source load rejects expired deadline before stored load",
         "native numeric sort rejects non-finite doc values",
+        "mixed numeric concrete sort keys share one cursor domain",
+        "native sort coverage diagnostics classify physical doc value failures",
+        "native sort cold coverage validation observes request deadline and cancellation",
         "sort uses native text doc values without stored json fallback",
         "required native sort does not fall back to stored json on doc value miss",
         "native doc values plan enforces native values even with non-requiring loader",
@@ -3727,10 +3772,12 @@ pub fn build(b: *std.Build) void {
         "api http retryable embedding failures provide retry guidance",
         "api http server obtains query embedding policy from resource manager",
         "api http stale hierarchy cursor response is actionable and machine readable",
+        "api http point lookup retries bounded local readiness races",
         "api http hierarchy traversal preserves policy and cursor across remote hydration seam",
         "api http public sort gate accepts synthetic hierarchy child positions",
         "api http public sort capability gate validates mapped sortable fields",
         "api http public sort capability gate fails closed for uncovered observed dynamic fields",
+        "table read source distinguishes unavailable physical capability observation",
         "generated route policy inventory is unique and describes wire modes",
         "linked API dispatch preserves kernel-owned ingress policy",
         "linked transport projects the universal request cancellation callback",
@@ -4585,6 +4632,8 @@ pub fn build(b: *std.Build) void {
         "text score query exposes score top k sort profile",
         "native text sort planner requires live segment index sort coverage for sorted executor",
         "native text sort planner ignores fully deleted legacy segments for index sort coverage",
+        "native sort coverage diagnostics classify physical doc value failures",
+        "native sort cold coverage validation observes request deadline and cancellation",
         "match_all sorted segment seek merges sorted segments and applies cursors",
         "match_all sorted segment seek uses cursor seek within each segment",
         "match_all sorted segment seek enforces scan budget",
@@ -4614,17 +4663,21 @@ pub fn build(b: *std.Build) void {
         "document mapper omits multi-valued schema numeric typed doc values",
         "document mapper preserves integer numeric doc values as i64",
         "document mapper preserves unsigned numeric doc values beyond i64 as u64",
-        "document mapper omits mixed numeric typed doc value domains",
+        "document mapper preserves mixed numeric typed doc value domains",
         "document mapper omits non-finite numeric doc values",
         "document mapper flushes schema index_sort segments in physical sort order",
-        "document mapper rejects mixed native value types for index_sort field",
+        "document mapper orders mixed numeric domains for index_sort field",
         "document mapper validates schema index_sort field capabilities",
+        "segment append merge normalizes legacy mixed numeric doc values",
+        "range filter on typed doc values",
+        "search with stats aggregation",
         "merge preserves common sorted segment index_sort metadata",
         "sort planner rejects non-finite numeric index sort bounds",
         "schema keyword doc values back native sort planner",
         "schema link doc values back native sort planner",
         "schema numeric u64 doc values back native sort planner without rounding",
         "schema numeric i64 doc values back native sort planner",
+        "mixed numeric concrete sort keys share one cursor domain",
         "schema boolean doc values back native sort planner",
         "db exact sort resolves mapped geo metadata filters from typed doc values",
     };
@@ -7092,6 +7145,7 @@ pub fn build(b: *std.Build) void {
     index_manager_test_mod.addImport("antfly_resolver", resolver_mod);
     index_manager_test_mod.addImport("antfly_chunking", chunking_mod);
     index_manager_test_mod.addImport("antfly_regex", regex_mod);
+    index_manager_test_mod.addImport("antfly_reader_config", reader_config_mod);
     index_manager_test_mod.addImport("structlog", structlog_mod);
     const index_manager_unit_tests = b.addTest(.{
         .root_module = index_manager_test_mod,
@@ -7681,24 +7735,7 @@ pub fn build(b: *std.Build) void {
             "storage.wal.",
         },
     };
-    const unit_storage_shard_names = [_][]const u8{
-        "storage-algebraic-tests",
-        "storage-derived-enrichment-tests",
-        "storage-query-catalog-tests",
-        "storage-db-core-tests",
-        "storage-ha-tests",
-        "storage-lsm-lite-tests",
-        "storage-utility-tests",
-    };
-    const unit_storage_shard_max_rss = [_]usize{
-        4 * 1024 * 1024 * 1024,
-        5 * 1024 * 1024 * 1024,
-        5 * 1024 * 1024 * 1024,
-        8 * 1024 * 1024 * 1024,
-        5 * 1024 * 1024 * 1024,
-        5 * 1024 * 1024 * 1024,
-        5 * 1024 * 1024 * 1024,
-    };
+    const unit_storage_db_core_shard_index = 3;
     // Recent CI timings put these DB categories at 279 seconds and the
     // complement at 297 seconds. Run the two halves from one compiled DB-core
     // artifact so the dominant shard gets parallel runtime without duplicating
@@ -7740,25 +7777,142 @@ pub fn build(b: *std.Build) void {
     const storage_runtime_filter_is_default =
         lib_storage_runtime_filters.len == 1 and
         std.mem.eql(u8, lib_storage_runtime_filters[0], "storage.");
-    // Keep the largest DB artifact on one lane and serialize the remaining
-    // storage shards on the other. The patched build runner still enforces
-    // every artifact's max_rss claim, while the second lane prevents the DB
-    // runtime from leaving the other CPU cores idle for several minutes.
-    const unit_storage_shard_lanes = [_]usize{ 1, 1, 1, 0, 1, 1, 1 };
-    var unit_storage_tails = [_]?*std.Build.Step{ null, null };
-    var recall_test_artifact: ?*std.Build.Step.Compile = null;
+    // Preserve three independent compiler processes while removing four
+    // repeated semantic-analysis/code-generation passes through the broad
+    // Antfly test root. DB core remains isolated, the engine artifact owns HA
+    // and LSM/Lite, and the support artifact owns the other four logical
+    // ownership groups plus the reusable recall tests.
+    var unit_storage_support_compile_filters: []const []const u8 = &.{};
+    for ([_]usize{ 0, 1, 2, 6 }) |shard_index| {
+        unit_storage_support_compile_filters = compileFiltersWithAnchors(
+            b,
+            unit_storage_support_compile_filters,
+            unit_storage_shard_filters[shard_index],
+        );
+    }
+    unit_storage_support_compile_filters = compileFiltersWithAnchors(
+        b,
+        unit_storage_support_compile_filters,
+        &unit_storage_recall_filters,
+    );
+    var unit_storage_engine_compile_filters: []const []const u8 = &.{};
+    for ([_]usize{ 4, 5 }) |shard_index| {
+        unit_storage_engine_compile_filters = compileFiltersWithAnchors(
+            b,
+            unit_storage_engine_compile_filters,
+            unit_storage_shard_filters[shard_index],
+        );
+    }
+
+    const unit_storage_support_tests = b.addTest(.{
+        .name = "storage-support-tests",
+        .root_module = lib_test_mod,
+        .filters = unit_storage_support_compile_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+        .max_rss = 8 * 1024 * 1024 * 1024,
+    });
+    unit_storage_support_tests.step.dependOn(&unit_storage_shard_audit.step);
+    const run_unit_storage_support_tests = b.addRunArtifact(unit_storage_support_tests);
+    configureUnitStorageTestRun(
+        b,
+        run_unit_storage_support_tests,
+        lib_storage_runtime_filters,
+        !storage_runtime_filter_is_default,
+        lib_unit_filters,
+        &root_test_skip_filters,
+        &.{},
+        false,
+    );
+    unit_test_step.dependOn(&run_unit_storage_support_tests.step);
+    unit_storage_sharded_test_step.dependOn(&run_unit_storage_support_tests.step);
+
+    const unit_storage_engine_tests = b.addTest(.{
+        .name = "storage-engine-tests",
+        .root_module = lib_test_mod,
+        .filters = unit_storage_engine_compile_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+        .max_rss = 8 * 1024 * 1024 * 1024,
+    });
+    unit_storage_engine_tests.step.dependOn(&unit_storage_shard_audit.step);
+    const run_unit_storage_engine_tests = b.addRunArtifact(unit_storage_engine_tests);
+    configureUnitStorageTestRun(
+        b,
+        run_unit_storage_engine_tests,
+        lib_storage_runtime_filters,
+        !storage_runtime_filter_is_default,
+        lib_unit_filters,
+        &root_test_skip_filters,
+        &.{},
+        // This artifact owns HA, so do not apply the broad-root HA skip.
+        true,
+    );
+    // Keep runtime memory bounded to the existing two lanes. This dependency
+    // orders only the Run steps; all three artifacts remain free to compile in
+    // parallel.
+    run_unit_storage_engine_tests.step.dependOn(&run_unit_storage_support_tests.step);
+    unit_test_step.dependOn(&run_unit_storage_engine_tests.step);
+    unit_storage_sharded_test_step.dependOn(&run_unit_storage_engine_tests.step);
+
+    const unit_storage_db_core_tests = b.addTest(.{
+        .name = "storage-db-core-tests",
+        .root_module = lib_test_mod,
+        .filters = unit_storage_shard_filters[unit_storage_db_core_shard_index],
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+        .max_rss = 8 * 1024 * 1024 * 1024,
+    });
+    unit_storage_db_core_tests.step.dependOn(&unit_storage_shard_audit.step);
+    const unit_storage_compile_step = b.step(
+        "unit-storage-compile",
+        "Compile the three storage unit-test artifacts without running them",
+    );
+    unit_storage_compile_step.dependOn(&unit_storage_support_tests.step);
+    unit_storage_compile_step.dependOn(&unit_storage_engine_tests.step);
+    unit_storage_compile_step.dependOn(&unit_storage_db_core_tests.step);
+
+    // Keep an explicit, opt-in equivalence check for future changes to these
+    // groupings. It compiles the former seven-artifact layout and compares the
+    // union of declared named tests with the default three-artifact layout.
+    // Neither the baseline artifacts nor this comparison are dependencies of
+    // unit-test, unit-storage-test, or recall-test.
+    const unit_storage_baseline_names = [_][]const u8{
+        "storage-algebraic-baseline-tests",
+        "storage-derived-enrichment-baseline-tests",
+        "storage-query-catalog-baseline-tests",
+        "storage-db-core-baseline-tests",
+        "storage-ha-baseline-tests",
+        "storage-lsm-lite-baseline-tests",
+        "storage-utility-baseline-tests",
+    };
+    const unit_storage_baseline_max_rss = [_]usize{
+        4 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024,
+        8 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024,
+    };
+    var unit_storage_baseline_tests: [unit_storage_shard_filters.len]*std.Build.Step.Compile = undefined;
     for (
         unit_storage_shard_filters,
-        unit_storage_shard_names,
-        unit_storage_shard_max_rss,
-        unit_storage_shard_lanes,
-    ) |shard_filters, shard_name, shard_max_rss, lane| {
-        const is_utility_shard = std.mem.eql(u8, shard_name, "storage-utility-tests");
-        const compile_filters = if (is_utility_shard)
+        unit_storage_baseline_names,
+        unit_storage_baseline_max_rss,
+        0..,
+    ) |shard_filters, shard_name, shard_max_rss, shard_index| {
+        const compile_filters = if (shard_index == 6)
             compileFiltersWithAnchors(b, shard_filters, &unit_storage_recall_filters)
         else
             shard_filters;
-        const unit_storage_tests = b.addTest(.{
+        unit_storage_baseline_tests[shard_index] = b.addTest(.{
             .name = shard_name,
             .root_module = lib_test_mod,
             .filters = compile_filters,
@@ -7768,76 +7922,78 @@ pub fn build(b: *std.Build) void {
             },
             .max_rss = shard_max_rss,
         });
-        unit_storage_tests.step.dependOn(&unit_storage_shard_audit.step);
-        const lane_previous = unit_storage_tails[lane];
-        // Keep the reusable recall artifact free of unit-run dependencies so
-        // `zig build recall-test` does not execute the rest of storage first.
-        // Its ordinary unit Run step is still ordered on the lane below.
-        if (!is_utility_shard) {
-            if (lane_previous) |previous| unit_storage_tests.step.dependOn(previous);
-        }
-        if (is_utility_shard) recall_test_artifact = unit_storage_tests;
-        const is_ha_shard = std.mem.eql(u8, shard_name, "storage-ha-tests");
-        const is_db_core_shard = std.mem.eql(u8, shard_name, "storage-db-core-tests");
-        if (is_db_core_shard and storage_runtime_filter_is_default) {
-            // Zig serializes independent checked Run steps for one artifact.
-            // Use one scheduler-visible step that launches both filtered
-            // processes, preserving one compile while realizing the overlap.
-            const run_db_core_partitioned_tests = b.addSystemCommand(&.{"python3"});
-            run_db_core_partitioned_tests.setName("run test storage-db-core-tests partitioned");
-            run_db_core_partitioned_tests.addFileArg(b.path("tools/run_test_partitions.py"));
-            run_db_core_partitioned_tests.addArg("--executable");
-            run_db_core_partitioned_tests.addArtifactArg(unit_storage_tests);
-            for (unit_storage_db_core_lane_filters) |lane_filter| {
-                run_db_core_partitioned_tests.addArgs(&.{ "--partition-filter", lane_filter });
-            }
-            for (lib_unit_filters) |filter| {
-                run_db_core_partitioned_tests.addArgs(&.{ "--common-skip-filter", filter });
-            }
-            for (root_test_skip_filters) |filter| {
-                run_db_core_partitioned_tests.addArgs(&.{ "--common-skip-filter", filter });
-            }
-            for (release_scale_test_filters) |filter| {
-                run_db_core_partitioned_tests.addArgs(&.{ "--common-skip-filter", filter });
-            }
-            if (b.args) |runtime_args| {
-                if (runtime_args.len != 0) {
-                    run_db_core_partitioned_tests.addArg("--");
-                    run_db_core_partitioned_tests.addArgs(runtime_args);
-                }
-            }
-            run_db_core_partitioned_tests.stdio = .inherit;
-            run_db_core_partitioned_tests.step.max_rss = 12 * 1024 * 1024 * 1024;
-            unit_test_step.dependOn(&run_db_core_partitioned_tests.step);
-            unit_storage_sharded_test_step.dependOn(&run_db_core_partitioned_tests.step);
-            unit_storage_tails[lane] = &run_db_core_partitioned_tests.step;
-            continue;
-        }
+        unit_storage_baseline_tests[shard_index].step.dependOn(&unit_storage_shard_audit.step);
+    }
+    const compare_unit_storage_inventory = b.addSystemCommand(&.{"python3"});
+    compare_unit_storage_inventory.setName("compare consolidated storage test inventory");
+    compare_unit_storage_inventory.addFileArg(b.path("tools/compare_test_inventories.py"));
+    compare_unit_storage_inventory.addArg("--baseline");
+    for (unit_storage_baseline_tests) |baseline_tests| {
+        compare_unit_storage_inventory.addArtifactArg(baseline_tests);
+    }
+    compare_unit_storage_inventory.addArg("--candidate");
+    compare_unit_storage_inventory.addArtifactArg(unit_storage_support_tests);
+    compare_unit_storage_inventory.addArtifactArg(unit_storage_engine_tests);
+    compare_unit_storage_inventory.addArtifactArg(unit_storage_db_core_tests);
+    compare_unit_storage_inventory.addArgs(&.{ "--label", "storage consolidation" });
+    const unit_storage_inventory_step = b.step(
+        "unit-storage-test-inventory",
+        "Verify the consolidated artifacts preserve the seven-shard named test inventory",
+    );
+    unit_storage_inventory_step.dependOn(&compare_unit_storage_inventory.step);
 
-        const run_unit_storage_tests = b.addRunArtifact(unit_storage_tests);
+    if (storage_runtime_filter_is_default) {
+        // Zig serializes independent checked Run steps for one artifact. Use
+        // one scheduler-visible step that launches both filtered DB processes,
+        // preserving one compile while realizing the overlap.
+        const run_db_core_partitioned_tests = b.addSystemCommand(&.{"python3"});
+        run_db_core_partitioned_tests.setName("run test storage-db-core-tests partitioned");
+        run_db_core_partitioned_tests.addFileArg(b.path("tools/run_test_partitions.py"));
+        run_db_core_partitioned_tests.addArg("--executable");
+        run_db_core_partitioned_tests.addArtifactArg(unit_storage_db_core_tests);
+        for (unit_storage_db_core_lane_filters) |lane_filter| {
+            run_db_core_partitioned_tests.addArgs(&.{ "--partition-filter", lane_filter });
+        }
+        for (lib_unit_filters) |filter| {
+            run_db_core_partitioned_tests.addArgs(&.{ "--common-skip-filter", filter });
+        }
+        for (root_test_skip_filters) |filter| {
+            run_db_core_partitioned_tests.addArgs(&.{ "--common-skip-filter", filter });
+        }
+        for (release_scale_test_filters) |filter| {
+            run_db_core_partitioned_tests.addArgs(&.{ "--common-skip-filter", filter });
+        }
+        if (b.args) |runtime_args| {
+            if (runtime_args.len != 0) {
+                run_db_core_partitioned_tests.addArg("--");
+                run_db_core_partitioned_tests.addArgs(runtime_args);
+            }
+        }
+        run_db_core_partitioned_tests.stdio = .inherit;
+        run_db_core_partitioned_tests.step.max_rss = 12 * 1024 * 1024 * 1024;
+        unit_test_step.dependOn(&run_db_core_partitioned_tests.step);
+        unit_storage_sharded_test_step.dependOn(&run_db_core_partitioned_tests.step);
+    } else {
+        const run_unit_storage_db_core_tests = b.addRunArtifact(unit_storage_db_core_tests);
         configureUnitStorageTestRun(
             b,
-            run_unit_storage_tests,
+            run_unit_storage_db_core_tests,
             lib_storage_runtime_filters,
-            !storage_runtime_filter_is_default,
+            true,
             lib_unit_filters,
             &root_test_skip_filters,
             &.{},
-            is_ha_shard,
+            false,
         );
-        if (is_utility_shard) {
-            if (lane_previous) |previous| run_unit_storage_tests.step.dependOn(previous);
-        }
-        unit_test_step.dependOn(&run_unit_storage_tests.step);
-        unit_storage_sharded_test_step.dependOn(&run_unit_storage_tests.step);
-        unit_storage_tails[lane] = &run_unit_storage_tests.step;
+        unit_test_step.dependOn(&run_unit_storage_db_core_tests.step);
+        unit_storage_sharded_test_step.dependOn(&run_unit_storage_db_core_tests.step);
     }
 
     // Reuse the storage utility executable instead of compiling another copy
     // of the broad Antfly root solely for the two corpus recall tests. Its
     // ordinary unit run selects `storage.` and therefore never executes these
     // additional compile-time tests.
-    const compiled_recall_tests = recall_test_artifact orelse @panic("storage utility test artifact missing");
+    const compiled_recall_tests = unit_storage_support_tests;
     const run_compiled_recall_tests = addFilteredTestRunArtifactWithRuntimeFilters(
         b,
         compiled_recall_tests,
@@ -9908,12 +10064,15 @@ pub fn build(b: *std.Build) void {
         if (unit == .distributed) {
             libantfly_link_mod.linkLibrary(role_artifact);
         }
-        antfly_main.root_module.linkLibrary(role_artifact);
         if (strip) {
             var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
             defer visited.deinit();
             setStripRecursively(role_mod, &visited);
         }
+    }
+
+    for (runtime_library_link_order) |unit| {
+        antfly_main.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(unit)].?);
     }
 
     if (runtime_artifact_role) |role| {
@@ -9943,15 +10102,15 @@ pub fn build(b: *std.Build) void {
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
             },
             .data, .graph_metric_maintenance, .metadata => {
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?);
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?);
             },
             .inference => {
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?);
             },
             .standalone => {
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?);
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?);
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?);
             },
         }

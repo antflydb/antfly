@@ -879,6 +879,7 @@ pub const RangeFilter = struct {
                 .f64_val => reader.getF64(@intCast(doc_id)) catch continue,
                 .i64_val => if (reader.getI64(@intCast(doc_id)) catch continue) |value| @floatFromInt(value) else null,
                 .u64_val => if (reader.getU64(@intCast(doc_id)) catch continue) |value| @floatFromInt(value) else null,
+                .numeric_val => if (reader.getNumeric(@intCast(doc_id)) catch continue) |value| typed_dv.numericValueAsF64(value) else null,
                 else => null,
             };
             const value = numeric_value orelse continue;
@@ -2285,11 +2286,11 @@ test "range filter on typed doc values" {
     defer seg_writer.deinit();
 
     // Create typed doc values for "price" field
-    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 128);
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .numeric_val, 128);
     defer dv_writer.deinit();
-    try dv_writer.add(0, .{ .f64_val = 10.0 });
-    try dv_writer.add(1, .{ .f64_val = 25.0 });
-    try dv_writer.add(2, .{ .f64_val = 50.0 });
+    try dv_writer.add(0, .{ .numeric_val = .{ .i64_val = 10 } });
+    try dv_writer.add(1, .{ .numeric_val = .{ .f64_val = 25.0 } });
+    try dv_writer.add(2, .{ .numeric_val = .{ .u64_val = 50 } });
 
     const dv_data = try dv_writer.build();
     defer alloc.free(dv_data);

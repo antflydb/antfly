@@ -184,6 +184,73 @@ tags:
       - `search_as_you_type` + `keyword` allowed without primary type (auto-adds `text`)
 
 
+      `x-antfly-types` remains supported as the compact multi-mapping/search
+
+      shorthand. Exact scalar names in that array describe how a field is
+
+      searched, but do not opt the field into the typed doc-value storage
+
+      required by production `order_by`.
+
+
+      ### `x-antfly-field`
+
+      Use an explicit field mapping for fields that participate in exact sort.
+
+      Set `sortable: true` on a keyword, numeric/number/integer,
+
+      boolean/bool, datetime/date/timestamp, or link mapping. Antfly derives
+
+      the internal typed doc values; `doc_values` is intentionally not a public
+
+      setting. The mapping type must accept the property's JSON Schema value
+
+      type. Explicit property mappings take precedence over dynamic templates.
+
+      When multiple document types declare the same dotted field path, their
+
+      normalized physical mappings must be identical.
+
+
+      ```json
+
+      {
+        "created_at": {
+          "type": "string",
+          "format": "date-time",
+          "x-antfly-field": {"type": "date", "sortable": true}
+        },
+        "title": {
+          "type": "string",
+          "x-antfly-field": {
+            "type": "text",
+            "fields": {
+              "keyword": {"type": "keyword", "sortable": true}
+            }
+          }
+        }
+      }
+
+      ```
+
+
+      Sort the examples above with `created_at` and `title.keyword`,
+
+      respectively. An analyzed `text` field is never directly sortable.
+
+      Adding `sortable: true` to an existing table is a physical mapping
+
+      change. Once the write or rebuild visibility barrier completes, clients
+
+      may issue `order_by` directly. Antfly validates cold physical coverage on
+
+      first use and fails closed when it is incomplete; status reads do not
+
+      warm columns, so `sort_lifecycle_state` may remain `declared` until that
+
+      validation succeeds.
+
+
       ### `x-antfly-index`
 
       Boolean to disable indexing for a field:
@@ -9931,9 +9998,9 @@ components:
           description: >
             Whether this concrete field is declared sortable in the effective
 
-            capability model. Public exact order_by accepts it only when
+            capability model. A cold declared field is validated on first
 
-            sort_lifecycle_state is queryable or accelerated.
+            exact order_by use; clients do not need to poll lifecycle status.
         provenance:
           type: string
           description: Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
@@ -9949,9 +10016,9 @@ components:
             - covered
             - queryable
             - accelerated
-          description: Operational lifecycle state for exact sort use. Queryable fields are accepted by
-            public exact sort; accelerated fields are queryable and participate in the configured index_sort
-            tuple.
+          description: Cached operational lifecycle state for exact sort use. Declared or indexed fields
+            are validated on first public exact-sort use; queryable fields have validated native coverage;
+            accelerated fields are queryable and participate in the configured index_sort tuple.
         analyzer:
           type: string
           description: Analyzer name for text/searchable fields, when applicable.
@@ -13958,7 +14025,11 @@ components:
 
             numeric/number/integer, boolean/bool, datetime/date/timestamp, and
 
-            link. Analyzed `text` fields and `search_as_you_type`, geo, embedding,
+            link. Declare the field with `x-antfly-field` and `sortable: true`;
+
+            `x-antfly-types` shorthand declarations alone are not sortable.
+
+            Analyzed `text` fields and `search_as_you_type`, geo, embedding,
 
             blob, html, object, and array fields are not directly sortable; sort
 
@@ -17972,6 +18043,130 @@ components:
               field: text
               source_artifact_name: document_chunks_v1
               expected_dims: 768
+    FieldMappingType:
+      type: string
+      description: >
+        Field types accepted by detailed `x-antfly-field` and dynamic-template
+
+        mappings. JSON-schema-oriented aliases are normalized to Antfly's
+
+        corresponding runtime type: number/integer to numeric, bool to boolean,
+
+        date/timestamp to datetime, geo_point to geopoint, and geo_shape to
+
+        geoshape.
+      enum:
+        - text
+        - html
+        - keyword
+        - numeric
+        - number
+        - integer
+        - boolean
+        - bool
+        - datetime
+        - date
+        - timestamp
+        - geopoint
+        - geo_point
+        - geoshape
+        - geo_shape
+        - embedding
+        - blob
+        - link
+        - search_as_you_type
+    DocumentSubfieldMapping:
+      type: object
+      additionalProperties: false
+      description: Mapping for one named multifield emitted from its parent document property. Multifields
+        are intentionally one level deep and read the parent property's JSON value rather than a nested
+        JSON property.
+      properties:
+        type:
+          $ref: '#/components/schemas/FieldMappingType'
+        analyzer:
+          type: string
+          description: Analyzer name for text-oriented mappings.
+        index:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: Whether to index the field. Omit to use the server default of true.
+        store:
+          type: boolean
+          default: false
+          description: Whether to store the field value (default false)
+        include_in_all:
+          type: boolean
+          default: false
+          description: Whether to include in the _all field for cross-field search
+        sortable:
+          type: boolean
+          default: false
+          description: Whether this exact scalar subfield can be used in order_by. Antfly derives the
+            required typed doc values when enabled.
+        missing_null_policy:
+          type: string
+          enum:
+            - missing_rejected
+          default: missing_rejected
+          description: Missing/null sort policy. The current production policy rejects missing or null
+            native sort values.
+    DocumentFieldMapping:
+      type: object
+      additionalProperties: false
+      description: Executable physical mapping used by a document property's `x-antfly-field` annotation.
+        The mapping must accept the JSON Schema value type. Declarations for the same dotted path across
+        document types must normalize to an identical physical mapping, and present values that cannot
+        be encoded are rejected at write admission. Mappings contributed by `anyOf` or `oneOf` must normalize
+        to the same mapping in every alternative; conditional and dynamically named mappings are rejected.
+      properties:
+        type:
+          $ref: '#/components/schemas/FieldMappingType'
+        analyzer:
+          type: string
+          description: Analyzer name for text-oriented mappings.
+        index:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: Whether to index the field. Omit to use the server default of true.
+        store:
+          type: boolean
+          default: false
+          description: Whether to store the field value (default false)
+        include_in_all:
+          type: boolean
+          default: false
+          description: Whether to include in the _all field for cross-field search
+        sortable:
+          type: boolean
+          default: false
+          description: >
+            Whether this exact scalar field can be used in order_by. Supported
+
+            sortable mapping types are keyword, numeric/number/integer,
+
+            boolean/bool, datetime/date/timestamp, and link. Analyzed text,
+
+            search_as_you_type, geo, embedding, blob, html, object, and array
+
+            fields are not directly sortable; use an exact scalar subfield such
+
+            as title.keyword for sorted string pagination. Antfly derives the
+
+            required typed doc values when enabled.
+        missing_null_policy:
+          type: string
+          enum:
+            - missing_rejected
+          default: missing_rejected
+          description: Missing/null sort policy. The current production policy rejects missing or null
+            native sort values.
+        fields:
+          type: object
+          description: Named one-level multifields emitted from this property's value. For example, a
+            text title can expose a sortable keyword subfield.
+          additionalProperties:
+            $ref: '#/components/schemas/DocumentSubfieldMapping'
     DocumentSchema:
       type: object
       description: Defines the structure of a document type
@@ -17986,29 +18181,17 @@ components:
             A valid JSON Schema defining the document's structure.
 
             This is used to infer indexing rules and field types.
-    AntflyType-2:
-      type: string
-      description: Field type annotations for schema fields
-      enum:
-        - text
-        - html
-        - keyword
-        - numeric
-        - boolean
-        - datetime
-        - geopoint
-        - geoshape
-        - embedding
-        - blob
-        - link
-        - search_as_you_type
+          x-antfly-field-mapping-schema:
+            $ref: '#/components/schemas/DocumentFieldMapping'
     TemplateFieldMapping:
       type: object
       additionalProperties: false
-      description: Field mapping to apply when a dynamic template matches
+      description: Field mapping used by a dynamic template. Dynamic templates match one physical field
+        at a time and therefore do not accept multifields; use a DocumentFieldMapping in a document property's
+        `x-antfly-field` annotation when named subfields are required.
       properties:
         type:
-          $ref: '#/components/schemas/AntflyType-2'
+          $ref: '#/components/schemas/FieldMappingType'
         analyzer:
           type: string
           description: >
@@ -18017,8 +18200,8 @@ components:
             Used for text fields to control tokenization and normalization.
         index:
           type: boolean
-          default: true
-          description: Whether to index the field (default true)
+          x-go-type-skip-optional-pointer: false
+          description: Whether to index the field. Omit to use the server default of true.
         store:
           type: boolean
           default: false
