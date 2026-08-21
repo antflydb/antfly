@@ -10593,6 +10593,9 @@ pub const IndexManager = struct {
                             };
                         },
                     };
+                    if (index.experimentalPostingReadsEnabled()) {
+                        std.log.info("dense posting sidecar activated index={s} sequence={}", .{ cfg.name, applied_sequence });
+                    }
                 }
                 const apply_mutex = try self.allocIndexApplyMutex();
                 var apply_mutex_owned = true;

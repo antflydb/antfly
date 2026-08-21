@@ -1480,6 +1480,79 @@ const ExperimentalPostingReadState = struct {
     }
 };
 
+/// Immutable query generation. A root owns a decoded segment/WAL snapshot;
+/// later generations own only the values changed by one committed derived
+/// batch and retain their parent. Read transactions pin one generation, so a
+/// query sees either the complete old or complete new posting state.
+const ExperimentalPostingReadGeneration = struct {
+    alloc: Allocator,
+    refs: std.atomic.Value(u32) = .init(1),
+    root: ?*ExperimentalPostingReadState = null,
+    parent: ?*ExperimentalPostingReadGeneration = null,
+    values: std.AutoHashMapUnmanaged(u128, ?[]u8) = .empty,
+
+    fn createRoot(alloc: Allocator, state: *ExperimentalPostingReadState) !*ExperimentalPostingReadGeneration {
+        const generation = try alloc.create(ExperimentalPostingReadGeneration);
+        generation.* = .{ .alloc = alloc, .root = state };
+        return generation;
+    }
+
+    fn createOverlay(alloc: Allocator, parent: *ExperimentalPostingReadGeneration) !*ExperimentalPostingReadGeneration {
+        const generation = try alloc.create(ExperimentalPostingReadGeneration);
+        generation.* = .{ .alloc = alloc, .parent = parent };
+        parent.retain();
+        return generation;
+    }
+
+    fn retain(self: *ExperimentalPostingReadGeneration) void {
+        const previous = self.refs.fetchAdd(1, .monotonic);
+        std.debug.assert(previous > 0 and previous < std.math.maxInt(u32));
+    }
+
+    fn releaseOpaque(ptr: *anyopaque) void {
+        const self: *ExperimentalPostingReadGeneration = @ptrCast(@alignCast(ptr));
+        self.release();
+    }
+
+    fn release(self: *ExperimentalPostingReadGeneration) void {
+        var current: ?*ExperimentalPostingReadGeneration = self;
+        while (current) |generation| {
+            const previous = generation.refs.fetchSub(1, .acq_rel);
+            std.debug.assert(previous > 0);
+            if (previous != 1) return;
+            const parent = generation.parent;
+            var values = generation.values.valueIterator();
+            while (values.next()) |slot| if (slot.*) |owned| generation.alloc.free(owned);
+            generation.values.deinit(generation.alloc);
+            if (generation.root) |state| {
+                state.deinit();
+                generation.alloc.destroy(state);
+            }
+            const alloc = generation.alloc;
+            alloc.destroy(generation);
+            current = parent;
+        }
+    }
+
+    fn set(self: *ExperimentalPostingReadGeneration, posting_id: u64, kind: vectorindex_posting_wal.RecordKind, value_bytes: ?[]const u8) !void {
+        const owned = if (value_bytes) |bytes| try self.alloc.dupe(u8, bytes) else null;
+        errdefer if (owned) |bytes| self.alloc.free(bytes);
+        const result = try self.values.getOrPut(self.alloc, experimentalPostingValueKey(posting_id, kind));
+        std.debug.assert(!result.found_existing);
+        result.value_ptr.* = owned;
+    }
+
+    fn value(self: *ExperimentalPostingReadGeneration, posting_id: u64, kind: vectorindex_posting_wal.RecordKind) !?[]const u8 {
+        var generation: ?*ExperimentalPostingReadGeneration = self;
+        const key = experimentalPostingValueKey(posting_id, kind);
+        while (generation) |current| : (generation = current.parent) {
+            if (current.values.get(key)) |maybe_value| return maybe_value orelse error.NotFound;
+            if (current.root) |state| return try state.value(posting_id, kind);
+        }
+        return error.Corrupted;
+    }
+};
+
 fn experimentalPostingValueKey(posting_id: u64, kind: vectorindex_posting_wal.RecordKind) u128 {
     return (@as(u128, posting_id) << 8) | @intFromEnum(kind);
 }
@@ -1515,6 +1588,10 @@ pub const ExperimentalPostingWalAppendOptions = struct {
     sync: bool = true,
 };
 
+const ExperimentalPostingMaintenanceCapture = struct {
+    covered_source_sequence: u64,
+};
+
 pub const HBCIndex = struct {
     alloc: Allocator,
     env_owner: EnvOwner,
@@ -1527,7 +1604,8 @@ pub const HBCIndex = struct {
     published_generation: AtomicU64,
     experimental_posting_reads_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     experimental_posting_sidecar_managed: bool = false,
-    experimental_posting_read_state: ?*ExperimentalPostingReadState = null,
+    experimental_posting_read_generation: ?*ExperimentalPostingReadGeneration = null,
+    experimental_posting_read_generation_mu: std.atomic.Mutex = .unlocked,
     experimental_posting_delta_base_state: ?*ExperimentalPostingReadState = null,
     experimental_posting_write_store: ?posting_segment_store_mod.Store = null,
     experimental_posting_capture_enabled: bool = false,
@@ -1894,7 +1972,6 @@ pub const HBCIndex = struct {
         if (self.write_session_depth != 0 and self.write_session_kind != kind) {
             return error.MixedWriteSessionKinds;
         }
-        try self.prepareExperimentalPostingWrite();
         switch (self.env_owner) {
             .lsm => |handle| handle.backend.beginBulkIngestSession() catch |err| {
                 return err;
@@ -2795,11 +2872,7 @@ pub const HBCIndex = struct {
 
     fn deinitWithBackendDisposition(self: *HBCIndex, abandon_after_crash: bool) void {
         self.experimental_posting_reads_enabled.store(false, .release);
-        if (self.experimental_posting_read_state) |state| {
-            state.deinit();
-            self.alloc.destroy(state);
-            self.experimental_posting_read_state = null;
-        }
+        self.clearExperimentalPostingReadGeneration();
         if (self.experimental_posting_delta_base_state) |state| {
             state.deinit();
             self.alloc.destroy(state);
@@ -2877,11 +2950,104 @@ pub const HBCIndex = struct {
         self.experimental_posting_reads_enabled.store(false, .release);
     }
 
-    fn prepareExperimentalPostingWrite(self: *HBCIndex) !void {
-        self.disableExperimentalPostingReads();
-        if (self.experimental_posting_sidecar_managed and !self.experimental_posting_capture_enabled) {
-            try self.invalidateExperimentalPostingSidecar();
+    fn clearExperimentalPostingReadGeneration(self: *HBCIndex) void {
+        lockAtomic(&self.experimental_posting_read_generation_mu);
+        const old = self.experimental_posting_read_generation;
+        self.experimental_posting_read_generation = null;
+        self.experimental_posting_read_generation_mu.unlock();
+        if (old) |generation| generation.release();
+    }
+
+    fn installExperimentalPostingReadGeneration(
+        self: *HBCIndex,
+        generation: *ExperimentalPostingReadGeneration,
+    ) void {
+        lockAtomic(&self.experimental_posting_read_generation_mu);
+        const old = self.experimental_posting_read_generation;
+        self.experimental_posting_read_generation = generation;
+        self.experimental_posting_reads_enabled.store(true, .release);
+        self.experimental_posting_read_generation_mu.unlock();
+        if (old) |previous| previous.release();
+    }
+
+    fn acquireExperimentalPostingReadGeneration(self: *HBCIndex) ?*ExperimentalPostingReadGeneration {
+        if (!self.experimental_posting_reads_enabled.load(.acquire)) return null;
+        lockAtomic(&self.experimental_posting_read_generation_mu);
+        defer self.experimental_posting_read_generation_mu.unlock();
+        if (!self.experimental_posting_reads_enabled.load(.acquire)) return null;
+        const generation = self.experimental_posting_read_generation orelse return null;
+        generation.retain();
+        return generation;
+    }
+
+    fn experimentalPostingReadGenerationIsCurrent(
+        self: *HBCIndex,
+        generation: *ExperimentalPostingReadGeneration,
+    ) bool {
+        lockAtomic(&self.experimental_posting_read_generation_mu);
+        defer self.experimental_posting_read_generation_mu.unlock();
+        return self.experimental_posting_reads_enabled.load(.acquire) and
+            self.experimental_posting_read_generation == generation;
+    }
+
+    fn experimentalPostingReadGenerationLoaded(self: *HBCIndex) bool {
+        lockAtomic(&self.experimental_posting_read_generation_mu);
+        defer self.experimental_posting_read_generation_mu.unlock();
+        return self.experimental_posting_read_generation != null;
+    }
+
+    fn retainCurrentExperimentalPostingReadGeneration(self: *HBCIndex) ?*ExperimentalPostingReadGeneration {
+        lockAtomic(&self.experimental_posting_read_generation_mu);
+        defer self.experimental_posting_read_generation_mu.unlock();
+        const generation = self.experimental_posting_read_generation orelse return null;
+        generation.retain();
+        return generation;
+    }
+
+    fn publishExperimentalPostingReadOverlay(
+        self: *HBCIndex,
+        txn: *vectorindex_store.NamespaceReadTxn,
+        touched_keys: []const u128,
+    ) !void {
+        const parent = self.retainCurrentExperimentalPostingReadGeneration() orelse return;
+        defer parent.release();
+        const generation = try ExperimentalPostingReadGeneration.createOverlay(self.alloc, parent);
+        errdefer generation.release();
+        try generation.values.ensureTotalCapacity(self.alloc, @intCast(touched_keys.len));
+        for (touched_keys) |key| {
+            const posting_id = experimentalPostingValueKeyId(key);
+            const kind = try experimentalPostingValueKeyKind(key);
+            const current = self.readCommittedExperimentalPostingValue(txn, posting_id, kind) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            try generation.set(posting_id, kind, current);
         }
+        self.installExperimentalPostingReadGeneration(generation);
+    }
+
+    fn refreshExperimentalPostingReadGenerationBestEffort(
+        self: *HBCIndex,
+        covered_source_sequence: u64,
+    ) void {
+        const state = self.loadExperimentalPostingState(covered_source_sequence) catch |err| {
+            std.log.warn("dense posting sidecar live generation refresh failed sequence={} err={s}", .{
+                covered_source_sequence,
+                @errorName(err),
+            });
+            return;
+        };
+        const generation = ExperimentalPostingReadGeneration.createRoot(self.alloc, state) catch |err| {
+            state.deinit();
+            self.alloc.destroy(state);
+            std.log.warn("dense posting sidecar live generation allocation failed sequence={} err={s}", .{
+                covered_source_sequence,
+                @errorName(err),
+            });
+            return;
+        };
+        self.experimental_posting_sidecar_managed = true;
+        self.installExperimentalPostingReadGeneration(generation);
     }
 
     fn discardExperimentalPostingDeltaBaseState(self: *HBCIndex) void {
@@ -2924,8 +3090,10 @@ pub const HBCIndex = struct {
     }
 
     pub fn invalidateExperimentalPostingSidecar(self: *HBCIndex) !void {
-        self.cancelExperimentalPostingMutationCapture();
+        self.experimental_posting_capture_enabled = false;
+        self.experimental_touched_posting_values.clearRetainingCapacity();
         self.disableExperimentalPostingReads();
+        self.clearExperimentalPostingReadGeneration();
         self.discardExperimentalPostingDeltaBaseState();
         self.closeExperimentalPostingWalWriter();
         var posting_store = try self.openExperimentalPostingStore();
@@ -2946,15 +3114,29 @@ pub const HBCIndex = struct {
         }
         var posting_store = &self.experimental_posting_write_store.?;
         if (posting_store.checkpoint == null) {
-            self.cancelExperimentalPostingMutationCapture();
+            self.experimental_posting_capture_enabled = false;
+            self.experimental_touched_posting_values.clearRetainingCapacity();
             _ = try self.publishExperimentalPostingCheckpoint(applied_sequence);
             return;
         }
-        if (posting_store.covered_source_sequence > applied_sequence) return error.OutOfOrderPostingCheckpointSequence;
+        // Applied-sequence persistence is coalesced independently from dense
+        // replay. A delayed callback may therefore carry a watermark below a
+        // sidecar generation already published by a later callback. Never
+        // regress source coverage or discard captured posting changes: record
+        // those changes as another derived batch at the current source epoch.
+        const publication_sequence = @max(posting_store.covered_source_sequence, applied_sequence);
         if (self.experimental_posting_capture_enabled) {
-            _ = try self.finishExperimentalPostingMutationCapture(applied_sequence, applied_sequence, options);
+            _ = try self.finishExperimentalPostingMutationCapture(
+                try posting_store.nextBatchId(),
+                publication_sequence,
+                options,
+            );
         } else if (posting_store.covered_source_sequence < applied_sequence) {
-            try posting_store.appendCoverage(applied_sequence, applied_sequence, .{ .sync = options.sync });
+            try posting_store.appendCoverage(
+                try posting_store.nextBatchId(),
+                applied_sequence,
+                .{ .sync = options.sync },
+            );
         }
 
         // finishExperimentalPostingMutationCapture may have lazily replaced
@@ -2962,7 +3144,7 @@ pub const HBCIndex = struct {
         // policy.
         posting_store = &self.experimental_posting_write_store.?;
         if (posting_store.shouldCheckpoint(.{})) {
-            _ = try self.publishExperimentalPostingCheckpoint(applied_sequence);
+            _ = try self.publishExperimentalPostingCheckpoint(posting_store.covered_source_sequence);
         }
     }
 
@@ -2981,6 +3163,73 @@ pub const HBCIndex = struct {
     pub fn cancelExperimentalPostingMutationCapture(self: *HBCIndex) void {
         self.experimental_posting_capture_enabled = false;
         self.experimental_touched_posting_values.clearRetainingCapacity();
+        if (self.experimental_posting_sidecar_managed and self.experimentalPostingReadGenerationLoaded()) {
+            self.experimental_posting_reads_enabled.store(true, .release);
+        }
+    }
+
+    fn beginExperimentalPostingMaintenanceCapture(self: *HBCIndex) !?ExperimentalPostingMaintenanceCapture {
+        // A source-replay capture already owns the ordering boundary. Any
+        // maintenance it invokes belongs to that source batch and must not be
+        // committed independently.
+        if (!self.experimental_posting_sidecar_managed or self.experimental_posting_capture_enabled) return null;
+        if (self.write_session_depth != 0) return null;
+        if (self.experimental_posting_write_store == null) {
+            self.experimental_posting_write_store = try self.openExperimentalPostingStore();
+        }
+        const posting_store = &self.experimental_posting_write_store.?;
+        if (posting_store.checkpoint == null) return null;
+        const capture: ExperimentalPostingMaintenanceCapture = .{
+            .covered_source_sequence = posting_store.covered_source_sequence,
+        };
+        try self.beginExperimentalPostingMutationCapture();
+        return capture;
+    }
+
+    fn cancelExperimentalPostingMaintenanceCapture(self: *HBCIndex) void {
+        self.cancelExperimentalPostingMutationCapture();
+    }
+
+    /// Completes an independently committed maintenance transaction without
+    /// advancing authoritative source coverage. Failure cannot roll back that
+    /// transaction, so remove CURRENT and retain the LSM as the safe fallback.
+    fn finishExperimentalPostingMaintenanceCaptureBestEffort(
+        self: *HBCIndex,
+        capture: ExperimentalPostingMaintenanceCapture,
+    ) void {
+        if (self.experimental_touched_posting_values.count() == 0) {
+            self.cancelExperimentalPostingMaintenanceCapture();
+            return;
+        }
+        self.finishExperimentalPostingMaintenanceCapture(capture) catch |err| {
+            std.log.warn("dense posting sidecar disabled after maintenance publication failure sequence={} err={s}", .{
+                capture.covered_source_sequence,
+                @errorName(err),
+            });
+            self.invalidateExperimentalPostingSidecar() catch |invalidate_err| {
+                std.log.warn("dense posting sidecar maintenance invalidation failed err={s}", .{@errorName(invalidate_err)});
+            };
+        };
+    }
+
+    fn finishExperimentalPostingMaintenanceCapture(
+        self: *HBCIndex,
+        capture: ExperimentalPostingMaintenanceCapture,
+    ) !void {
+        if (self.experimental_posting_write_store == null) return error.MissingPostingCheckpoint;
+        var posting_store = &self.experimental_posting_write_store.?;
+        if (posting_store.covered_source_sequence != capture.covered_source_sequence) {
+            return error.PostingCheckpointSequenceMismatch;
+        }
+        _ = try self.finishExperimentalPostingMutationCapture(
+            try posting_store.nextBatchId(),
+            capture.covered_source_sequence,
+            .{},
+        );
+        posting_store = &self.experimental_posting_write_store.?;
+        if (posting_store.shouldCheckpoint(.{})) {
+            _ = try self.publishExperimentalPostingCheckpoint(capture.covered_source_sequence);
+        }
     }
 
     /// Must be called only after the authoritative HBC/source transaction has
@@ -2995,11 +3244,22 @@ pub const HBCIndex = struct {
         if (!self.experimental_posting_capture_enabled) return error.ExperimentalPostingCaptureNotActive;
         self.experimental_posting_capture_enabled = false;
         defer self.experimental_touched_posting_values.clearRetainingCapacity();
+        // The authoritative transaction has already committed. Any failure
+        // from here must fail closed so neither live reads nor restart can
+        // admit a stale posting generation.
+        errdefer self.invalidateExperimentalPostingSidecar() catch |invalidate_err| {
+            std.log.warn("dense posting sidecar capture invalidation failed err={s}", .{@errorName(invalidate_err)});
+        };
         if (self.experimental_posting_write_store == null) {
             self.experimental_posting_write_store = try self.openExperimentalPostingStore();
         }
         const posting_store = &self.experimental_posting_write_store.?;
-        const delta_base_state = try self.ensureExperimentalPostingDeltaBaseState();
+        const delta_base_generation = self.retainCurrentExperimentalPostingReadGeneration();
+        defer if (delta_base_generation) |generation| generation.release();
+        const delta_base_state = if (delta_base_generation == null)
+            try self.ensureExperimentalPostingDeltaBaseState()
+        else
+            null;
 
         const touched_keys = try self.alloc.alloc(u128, self.experimental_touched_posting_values.count());
         defer self.alloc.free(touched_keys);
@@ -3029,7 +3289,10 @@ pub const HBCIndex = struct {
             };
             if (current) |value| {
                 var emitted_patch = false;
-                const previous = delta_base_state.value(posting_id, kind) catch |err| switch (err) {
+                const previous = (if (delta_base_generation) |generation|
+                    generation.value(posting_id, kind)
+                else
+                    delta_base_state.?.value(posting_id, kind)) catch |err| switch (err) {
                     error.NotFound => null,
                     else => return err,
                 };
@@ -3082,18 +3345,31 @@ pub const HBCIndex = struct {
         }
         try posting_store.appendBatchWithOptions(batch_id, records.items, covered_source_sequence, .{ .sync = options.sync });
 
-        // Keep the in-process delta base current after reads have been disabled
-        // by the authoritative write. Restart reconstructs the same state from
-        // the immutable segment and committed WAL.
-        for (touched_keys) |key| {
-            const posting_id = experimentalPostingValueKeyId(key);
-            const kind = try experimentalPostingValueKeyKind(key);
-            const current = self.readCommittedExperimentalPostingValue(&txn, posting_id, kind) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
-            try delta_base_state.set(posting_id, kind, current);
+        // The live immutable generation is itself the next delta encoder base.
+        // Only the restart/fallback path maintains a separate materialized
+        // state when no live generation was available.
+        if (delta_base_state) |state| {
+            for (touched_keys) |key| {
+                const posting_id = experimentalPostingValueKeyId(key);
+                const kind = try experimentalPostingValueKeyKind(key);
+                const current = self.readCommittedExperimentalPostingValue(&txn, posting_id, kind) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                try state.set(posting_id, kind, current);
+            }
         }
+        if (touched_keys.len > 0) self.publishExperimentalPostingReadOverlay(&txn, touched_keys) catch |err| {
+            // The durable segment + WAL remains valid. Drop only the live
+            // generation so queries safely use LSM until restart instead of
+            // invalidating a successfully committed derived batch.
+            std.log.warn("dense posting sidecar live overlay publication failed sequence={} err={s}", .{
+                covered_source_sequence,
+                @errorName(err),
+            });
+            self.disableExperimentalPostingReads();
+            self.clearExperimentalPostingReadGeneration();
+        };
         return .{
             .batch_id = batch_id,
             .covered_source_sequence = covered_source_sequence,
@@ -3129,8 +3405,9 @@ pub const HBCIndex = struct {
     /// Materializes the currently committed packed HBC node and RaBitQ values
     /// into a durable immutable generation. The caller supplies the upstream
     /// source sequence whose complete effects are represented by this state.
-    /// This method does not switch reads; activation is a separate explicit
-    /// step so publication cannot expose a checkpoint prematurely.
+    /// Once CURRENT is durable, installs the same immutable generation for new
+    /// in-process readers. Publication therefore cannot expose a checkpoint
+    /// before its segment and empty next-generation WAL are recoverable.
     pub fn publishExperimentalPostingCheckpoint(
         self: *HBCIndex,
         covered_source_sequence: u64,
@@ -3180,6 +3457,9 @@ pub const HBCIndex = struct {
         const segment_bytes = try writer.build();
         defer self.alloc.free(segment_bytes);
         try posting_store.publishCheckpoint(generation, covered_source_sequence, segment_bytes);
+        // Collapse the live overlay chain at the same point the durable WAL is
+        // checkpointed. Failure leaves the equivalent old generation active.
+        self.refreshExperimentalPostingReadGenerationBestEffort(covered_source_sequence);
         return .{
             .generation = generation,
             .covered_source_sequence = covered_source_sequence,
@@ -3364,14 +3644,19 @@ pub const HBCIndex = struct {
 
     /// Activates a previously published segment plus its committed WAL tail
     /// only when it exactly covers the caller's authoritative source sequence.
-    /// Any later write disables the sidecar before opening its transaction and
-    /// falls back to the LSM, so stale posting bytes are never served.
+    /// Captured posting mutations leave the last committed immutable generation
+    /// readable, then atomically publish a delta overlay after commit. Leased
+    /// old generations remain valid for transactions already in flight.
     pub fn activateExperimentalPostingReads(self: *HBCIndex, expected_source_sequence: u64) !void {
-        if (self.experimental_posting_read_state != null) return error.ExperimentalPostingReadsAlreadyLoaded;
+        if (self.experimentalPostingReadGenerationLoaded()) return error.ExperimentalPostingReadsAlreadyLoaded;
         const state = try self.loadExperimentalPostingState(expected_source_sequence);
-        self.experimental_posting_read_state = state;
+        errdefer {
+            state.deinit();
+            self.alloc.destroy(state);
+        }
+        const generation = try ExperimentalPostingReadGeneration.createRoot(self.alloc, state);
         self.experimental_posting_sidecar_managed = true;
-        self.experimental_posting_reads_enabled.store(true, .release);
+        self.installExperimentalPostingReadGeneration(generation);
     }
 
     pub fn experimentalPostingReadsEnabled(self: *const HBCIndex) bool {
@@ -3481,7 +3766,6 @@ pub const HBCIndex = struct {
         result.value_ptr.* = .{ .value = owned };
         self.deferred_node_key_value_bytes +|= owned.len;
         self.maybeObserveApplyWorkspaceBytes();
-        try self.noteExperimentalPostingMutation(.nodes, key);
         return true;
     }
 
@@ -3495,7 +3779,6 @@ pub const HBCIndex = struct {
         }
         result.value_ptr.* = .{ .value = null };
         self.maybeObserveApplyWorkspaceBytes();
-        try self.noteExperimentalPostingMutation(.nodes, key);
         return true;
     }
 
@@ -3504,42 +3787,61 @@ pub const HBCIndex = struct {
         return std.mem.readInt(u64, key[2..10], .big);
     }
 
-    fn noteExperimentalPostingMutation(self: *HBCIndex, namespace: Namespace, key: []const u8) !void {
-        if (!self.experimental_posting_capture_enabled) return;
-        const posting_value = switch (namespace) {
+    fn experimentalPostingMutationIdentity(namespace: Namespace, key: []const u8) ?struct {
+        posting_id: u64,
+        kind: vectorindex_posting_wal.RecordKind,
+    } {
+        return switch (namespace) {
             .nodes => blk: {
-                const decoded = decodeNodeKey(key) orelse return;
+                const decoded = decodeNodeKey(key) orelse return null;
                 break :blk switch (decoded.suffix) {
-                    .packed_node => .{ decoded.id, vectorindex_posting_wal.RecordKind.base },
-                    .posting => .{ decoded.id, vectorindex_posting_wal.RecordKind.posting_state },
-                    else => return,
+                    .packed_node => .{ .posting_id = decoded.id, .kind = .base },
+                    .posting => .{ .posting_id = decoded.id, .kind = .posting_state },
+                    else => return null,
                 };
             },
-            .quant => .{ decodeQuantizedNodeId(key) orelse return, vectorindex_posting_wal.RecordKind.quantized_checkpoint },
-            .meta, .vecs => return,
+            .quant => .{
+                .posting_id = decodeQuantizedNodeId(key) orelse return null,
+                .kind = .quantized_checkpoint,
+            },
+            .meta, .vecs => null,
         };
+    }
+
+    /// Called before the authoritative mutation is staged. Non-posting keys
+    /// cannot stale the sidecar. A covered posting mutation is captured;
+    /// otherwise CURRENT is removed before that mutation can commit.
+    fn noteExperimentalPostingMutation(self: *HBCIndex, namespace: Namespace, key: []const u8) !void {
+        const posting_value = experimentalPostingMutationIdentity(namespace, key) orelse return;
+        if (!self.experimental_posting_capture_enabled) {
+            if (self.experimental_posting_sidecar_managed) try self.invalidateExperimentalPostingSidecar();
+            return;
+        }
         try self.experimental_touched_posting_values.put(
             self.alloc,
-            experimentalPostingValueKey(posting_value[0], posting_value[1]),
+            experimentalPostingValueKey(posting_value.posting_id, posting_value.kind),
             {},
         );
     }
 
-    fn experimentalPostingValue(self: *HBCIndex, namespace: Namespace, key: []const u8) !?[]const u8 {
-        if (!self.experimental_posting_reads_enabled.load(.acquire)) return null;
-        const state = self.experimental_posting_read_state orelse return error.Corrupted;
+    fn experimentalPostingValue(self: *HBCIndex, txn: anytype, namespace: Namespace, key: []const u8) !?[]const u8 {
+        _ = self;
+        const Child = comptime txnLikeChild(@TypeOf(txn));
+        if (comptime Child != vectorindex_store.NamespaceReadTxn) return null;
+        const lease = txn.read_lease orelse return null;
+        const generation: *ExperimentalPostingReadGeneration = @ptrCast(@alignCast(lease.ptr));
         return switch (namespace) {
             .nodes => blk: {
                 const decoded = decodeNodeKey(key) orelse break :blk null;
                 break :blk switch (decoded.suffix) {
-                    .packed_node => try state.value(decoded.id, .base),
-                    .posting => try state.value(decoded.id, .posting_state),
+                    .packed_node => try generation.value(decoded.id, .base),
+                    .posting => try generation.value(decoded.id, .posting_state),
                     else => null,
                 };
             },
             .quant => blk: {
                 const node_id = decodeQuantizedNodeId(key) orelse break :blk null;
-                break :blk try state.value(node_id, .quantized_checkpoint);
+                break :blk try generation.value(node_id, .quantized_checkpoint);
             },
             .meta, .vecs => null,
         };
@@ -3551,7 +3853,7 @@ pub const HBCIndex = struct {
                 return staged.value orelse error.NotFound;
             }
         }
-        if (try self.experimentalPostingValue(namespace, key)) |value| return value;
+        if (try self.experimentalPostingValue(txn, namespace, key)) |value| return value;
         const Child = comptime txnLikeChild(@TypeOf(txn));
         switch (Child) {
             vectorindex_store.NamespaceReadTxn,
@@ -3563,7 +3865,7 @@ pub const HBCIndex = struct {
     }
 
     fn getNamespacedCommitted(self: *HBCIndex, txn: anytype, comptime namespace: Namespace, key: []const u8) ![]const u8 {
-        if (try self.experimentalPostingValue(namespace, key)) |value| return value;
+        if (try self.experimentalPostingValue(txn, namespace, key)) |value| return value;
         const Child = comptime txnLikeChild(@TypeOf(txn));
         switch (Child) {
             vectorindex_store.NamespaceReadTxn,
@@ -3580,9 +3882,9 @@ pub const HBCIndex = struct {
             vectorindex_store.NamespaceWriteTxn,
             vectorindex_store.NamespaceBatch,
             => {
+                try self.noteExperimentalPostingMutation(namespace, key);
                 if (namespace == .nodes and try self.stageNodeKeyPut(key, value)) return;
                 try txn.put(namespace, key, value);
-                try self.noteExperimentalPostingMutation(namespace, key);
                 self.noteNamespacePut(namespace, key.len, value.len, false);
             },
             vectorindex_store.NamespaceReadTxn => return error.ReadOnly,
@@ -3594,29 +3896,27 @@ pub const HBCIndex = struct {
         const Child = comptime txnLikeChild(@TypeOf(txn));
         switch (Child) {
             vectorindex_store.NamespaceWriteTxn => {
+                try self.noteExperimentalPostingMutation(namespace, key);
                 txn.appendPut(namespace, key, value) catch |err| switch (err) {
                     error.Unsupported => {
                         try txn.put(namespace, key, value);
-                        try self.noteExperimentalPostingMutation(namespace, key);
                         self.noteNamespacePut(namespace, key.len, value.len, false);
                         return;
                     },
                     else => return err,
                 };
-                try self.noteExperimentalPostingMutation(namespace, key);
                 self.noteNamespacePut(namespace, key.len, value.len, true);
             },
             vectorindex_store.NamespaceBatch => {
+                try self.noteExperimentalPostingMutation(namespace, key);
                 txn.appendPut(namespace, key, value) catch |err| switch (err) {
                     error.Unsupported => {
                         try txn.put(namespace, key, value);
-                        try self.noteExperimentalPostingMutation(namespace, key);
                         self.noteNamespacePut(namespace, key.len, value.len, false);
                         return;
                     },
                     else => return err,
                 };
-                try self.noteExperimentalPostingMutation(namespace, key);
                 self.noteNamespacePut(namespace, key.len, value.len, true);
             },
             vectorindex_store.NamespaceReadTxn => return error.ReadOnly,
@@ -3630,9 +3930,9 @@ pub const HBCIndex = struct {
             vectorindex_store.NamespaceWriteTxn,
             vectorindex_store.NamespaceBatch,
             => {
+                try self.noteExperimentalPostingMutation(namespace, key);
                 if (namespace == .nodes and try self.stageNodeKeyDelete(key)) return;
                 try txn.delete(namespace, key);
-                try self.noteExperimentalPostingMutation(namespace, key);
                 self.noteNamespaceDelete(namespace, key.len);
             },
             vectorindex_store.NamespaceReadTxn => return error.ReadOnly,
@@ -3718,15 +4018,50 @@ pub const HBCIndex = struct {
     }
 
     pub fn beginRuntimeReadTxn(self: *HBCIndex) !vectorindex_store.NamespaceReadTxn {
-        return try self.store.beginRead();
+        while (true) {
+            const generation = self.acquireExperimentalPostingReadGeneration();
+            var txn = self.store.beginRead() catch |err| {
+                if (generation) |acquired| acquired.release();
+                return err;
+            };
+            if (generation) |acquired| {
+                if (!self.experimentalPostingReadGenerationIsCurrent(acquired)) {
+                    acquired.release();
+                    txn.abort();
+                    continue;
+                }
+                txn.read_lease = .{
+                    .ptr = acquired,
+                    .release = ExperimentalPostingReadGeneration.releaseOpaque,
+                };
+            }
+            return txn;
+        }
     }
 
     pub fn beginRuntimeSearchTxn(self: *HBCIndex) !vectorindex_store.NamespaceReadTxn {
-        return try self.store.beginProbeOrRead();
+        while (true) {
+            const generation = self.acquireExperimentalPostingReadGeneration();
+            var txn = self.store.beginProbeOrRead() catch |err| {
+                if (generation) |acquired| acquired.release();
+                return err;
+            };
+            if (generation) |acquired| {
+                if (!self.experimentalPostingReadGenerationIsCurrent(acquired)) {
+                    acquired.release();
+                    txn.abort();
+                    continue;
+                }
+                txn.read_lease = .{
+                    .ptr = acquired,
+                    .release = ExperimentalPostingReadGeneration.releaseOpaque,
+                };
+            }
+            return txn;
+        }
     }
 
     pub fn beginRuntimeWriteTxn(self: *HBCIndex) !vectorindex_store.NamespaceWriteTxn {
-        try self.prepareExperimentalPostingWrite();
         if (self.crossBatchPublicationActive()) self.bulk_publication_may_have_mutated = true;
         if (!self.crossBatchPublicationActive()) {
             self.deferred_quantized_nodes.clearRetainingCapacity();
@@ -3738,7 +4073,6 @@ pub const HBCIndex = struct {
     }
 
     pub fn beginRuntimeBatchTxn(self: *HBCIndex) !vectorindex_store.NamespaceBatch {
-        try self.prepareExperimentalPostingWrite();
         if (self.crossBatchPublicationActive()) self.bulk_publication_may_have_mutated = true;
         if (!self.crossBatchPublicationActive()) {
             self.deferred_quantized_nodes.clearRetainingCapacity();
@@ -3750,7 +4084,6 @@ pub const HBCIndex = struct {
     }
 
     pub fn beginRuntimeBatchTxnOptions(self: *HBCIndex, options: BatchInsertOptions) !vectorindex_store.NamespaceBatch {
-        try self.prepareExperimentalPostingWrite();
         if (self.crossBatchPublicationActive()) self.bulk_publication_may_have_mutated = true;
         if (!self.shouldDeferQuantizedRebuildToBulkFinish(options)) {
             self.deferred_quantized_nodes.clearRetainingCapacity();
@@ -6819,7 +7152,10 @@ pub const HBCIndex = struct {
     /// Bounded repair sweep (see hbc_index.repairTreeLinks). Clears the
     /// pending flag once a sweep completes within budget.
     pub fn repairTreeLinks(self: *HBCIndex, max_nodes: usize) !vectorindex_hbc_index.TreeLinkRepairReport {
+        const posting_capture = try self.beginExperimentalPostingMaintenanceCapture();
+        errdefer if (posting_capture != null) self.cancelExperimentalPostingMaintenanceCapture();
         const report = try vectorindex_hbc_index.repairLinks(self, max_nodes);
+        if (posting_capture) |capture| self.finishExperimentalPostingMaintenanceCaptureBestEffort(capture);
         if (report.completed) self.link_repair_pending.store(false, .release);
         return report;
     }
@@ -6902,6 +7238,8 @@ pub const HBCIndex = struct {
     }
 
     pub fn repairDirtyPostingsWithOptions(self: *HBCIndex, options: PostingMaintenanceOptions) !PostingMaintenanceResult {
+        const posting_capture = try self.beginExperimentalPostingMaintenanceCapture();
+        errdefer if (posting_capture != null) self.cancelExperimentalPostingMaintenanceCapture();
         var txn = try self.beginWriteTxn();
         errdefer txn.abort();
         const result = try vectorindex_hbc_index.repairDirtyPostingsTxnWithOptions(self, &txn, options);
@@ -6911,6 +7249,7 @@ pub const HBCIndex = struct {
         try commitTxn(&txn);
         self.write_profile.insert_commit_ns += elapsedSince(commit_start);
         self.finishPublishedSearchStateRefresh();
+        if (posting_capture) |capture| self.finishExperimentalPostingMaintenanceCaptureBestEffort(capture);
         return result;
     }
 
@@ -7802,7 +8141,7 @@ test "insert and search" {
     try std.testing.expectEqual(@as(u64, 1), hits[0].vector_id);
 }
 
-test "experimental posting checkpoint reopens safely and a write disables it" {
+test "experimental posting checkpoint reopens safely and publishes immutable generations" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
     const path = tp.init();
@@ -7846,12 +8185,36 @@ test "experimental posting checkpoint reopens safely and a write disables it" {
         defer results.deinit();
         try std.testing.expectEqual(@as(u64, 1), results.items.items[0].vector_id);
 
+        var old_txn = try reopened.beginReadTxn();
+        defer old_txn.abort();
+        try std.testing.expect(old_txn.read_lease != null);
+        var root_key_buf: [12]u8 = undefined;
+        const root_key = encodeNodeKey(&root_key_buf, reopened.metadata.root_node, .packed_node);
+        const old_root = try alloc.dupe(u8, try reopened.getNamespaced(&old_txn, .nodes, root_key));
+        defer alloc.free(old_root);
+
         try reopened.beginExperimentalPostingMutationCapture();
         errdefer reopened.cancelExperimentalPostingMutationCapture();
         try reopened.insertWithMetadata(3, &[_]f32{ 0.5, 0.5 }, "doc:3");
-        try std.testing.expect(!reopened.experimentalPostingReadsEnabled());
+        // Until commit, newly opened reads keep using the previous complete
+        // segment generation rather than falling through to the LSM.
+        try std.testing.expect(reopened.experimentalPostingReadsEnabled());
+        var during_txn = try reopened.beginReadTxn();
+        defer during_txn.abort();
+        try std.testing.expect(during_txn.read_lease != null);
+        try std.testing.expectEqualSlices(u8, old_root, try reopened.getNamespaced(&during_txn, .nodes, root_key));
         const captured = try reopened.finishExperimentalPostingMutationCapture(2, 4, .{});
         try std.testing.expect(captured.record_count > 0);
+        try std.testing.expect(reopened.experimentalPostingReadsEnabled());
+
+        // A transaction opened before publication remains pinned to the old
+        // immutable generation; a new transaction sees the complete overlay.
+        try std.testing.expectEqualSlices(u8, old_root, try reopened.getNamespaced(&old_txn, .nodes, root_key));
+        var new_txn = try reopened.beginReadTxn();
+        defer new_txn.abort();
+        try std.testing.expect(new_txn.read_lease != null);
+        try std.testing.expect(!std.mem.eql(u8, old_root, try reopened.getNamespaced(&new_txn, .nodes, root_key)));
+
         var after_write = try reopened.search(&[_]f32{ 0.5, 0.5 }, 3);
         defer after_write.deinit();
         try std.testing.expectEqual(@as(usize, 3), after_write.items.items.len);
@@ -7899,19 +8262,37 @@ test "managed posting sidecar follows applied sequence and uncovered writes inva
         // A source-only journal advance must still make the exact startup
         // sequence fence usable without fabricating a posting mutation.
         try idx.persistExperimentalPostingSidecarAtAppliedSequence(3, .{});
+        // A delayed persistence callback must not regress source coverage or
+        // invalidate a newer sidecar. Its captured changes become a derived
+        // batch at the already-published source epoch.
+        try idx.beginExperimentalPostingMutationCapture();
+        try idx.insertWithMetadata(3, &[_]f32{ 0.5, 0.5 }, "doc:3");
+        try idx.persistExperimentalPostingSidecarAtAppliedSequence(2, .{});
 
         var posting_store = try idx.openExperimentalPostingStore();
         defer posting_store.deinit();
+        try std.testing.expectEqual(@as(u64, 3), posting_store.covered_source_sequence);
+        try std.testing.expectEqual(@as(?u64, 3), posting_store.last_committed_batch);
         var recovered = try posting_store.recoverWal();
         defer recovered.deinit();
-        var patch_count: usize = 0;
+        var derived_at_current_epoch: usize = 0;
         var coverage_count: usize = 0;
         for (recovered.replay.records.items) |record| switch (record.kind) {
-            .mutation => patch_count += 1,
+            .base,
+            .quantized_checkpoint,
+            .posting_state,
+            .base_tombstone,
+            .quantized_checkpoint_tombstone,
+            .posting_state_tombstone,
+            .tombstone,
+            .mutation,
+            => if (record.source_sequence == 3) {
+                derived_at_current_epoch += 1;
+            },
             .coverage => coverage_count += 1,
-            else => {},
+            .centroid_directory, .commit => {},
         };
-        try std.testing.expect(patch_count > 0);
+        try std.testing.expect(derived_at_current_epoch > 0);
         try std.testing.expectEqual(@as(usize, 1), coverage_count);
     }
 
@@ -7926,14 +8307,26 @@ test "managed posting sidecar follows applied sequence and uncovered writes inva
         });
         defer reopened.close();
         try reopened.activateExperimentalPostingReads(3);
-        var results = try reopened.search(&[_]f32{ 0.0, 1.0 }, 2);
+        var results = try reopened.search(&[_]f32{ 0.0, 1.0 }, 3);
         defer results.deinit();
-        try std.testing.expectEqual(@as(usize, 2), results.items.items.len);
+        try std.testing.expectEqual(@as(usize, 3), results.items.items.len);
+
+        // Projection progress is metadata, not a posting mutation. It must
+        // neither disable reads nor remove CURRENT.
+        var projection = reopened.projectionCheckpointMetadata();
+        projection.applied_sequence = 3;
+        projection.generation += 1;
+        try reopened.saveProjectionCheckpointMetadata(projection);
+        try std.testing.expect(reopened.experimentalPostingReadsEnabled());
+        var still_published = try reopened.openExperimentalPostingStore();
+        defer still_published.deinit();
+        try std.testing.expect(still_published.checkpoint != null);
+        try std.testing.expectEqual(@as(u64, 3), still_published.covered_source_sequence);
 
         // This mutation deliberately has no source-sequence capture. CURRENT
-        // is removed before the authoritative transaction opens, so a crash or
-        // restart cannot accidentally serve the old sequence-3 sidecar.
-        try reopened.insertWithMetadata(3, &[_]f32{ 0.5, 0.5 }, "doc:3");
+        // is removed before its first posting write can be staged, so a crash
+        // or restart cannot accidentally serve the old sequence-3 sidecar.
+        try reopened.insertWithMetadata(4, &[_]f32{ 0.25, 0.75 }, "doc:4");
     }
 
     var final = try HBCIndex.open(alloc, path, .{
@@ -7946,6 +8339,82 @@ test "managed posting sidecar follows applied sequence and uncovered writes inva
     });
     defer final.close();
     try std.testing.expectError(error.MissingPostingCheckpoint, final.activateExperimentalPostingReads(3));
+}
+
+test "managed posting sidecar records maintenance without advancing source coverage" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    {
+        var idx = try HBCIndex.open(alloc, path, .{
+            .dims = 2,
+            .leaf_size = 8,
+            .branching_factor = 2,
+            .search_width = 8,
+            .use_quantization = false,
+            .lazy_posting_maintenance = true,
+            .storage_backend = .lsm,
+        });
+        defer idx.close();
+
+        try idx.beginExperimentalPostingMutationCapture();
+        try idx.insert(1, &[_]f32{ 1.0, 0.0 });
+        try idx.persistExperimentalPostingSidecarAtAppliedSequence(1, .{});
+        try std.testing.expect(idx.experimentalPostingReadsEnabled());
+
+        try idx.beginExperimentalPostingMutationCapture();
+        try idx.insert(2, &[_]f32{ 3.0, 0.0 });
+        try idx.persistExperimentalPostingSidecarAtAppliedSequence(2, .{});
+        try std.testing.expect(idx.experimentalPostingReadsEnabled());
+
+        const before = try idx.postingBacklogStats();
+        try std.testing.expect(before.needsRepair());
+    }
+
+    {
+        var reopened = try HBCIndex.open(alloc, path, .{
+            .dims = 2,
+            .leaf_size = 8,
+            .branching_factor = 2,
+            .search_width = 8,
+            .use_quantization = false,
+            .lazy_posting_maintenance = true,
+            .storage_backend = .lsm,
+        });
+        defer reopened.close();
+        try reopened.activateExperimentalPostingReads(2);
+
+        const repaired = try reopened.repairDirtyPostings();
+        try std.testing.expectEqual(@as(u64, 1), repaired.centroid_refreshed);
+        try std.testing.expect(reopened.experimentalPostingReadsEnabled());
+
+        var posting_store = try reopened.openExperimentalPostingStore();
+        defer posting_store.deinit();
+        try std.testing.expectEqual(@as(u64, 2), posting_store.covered_source_sequence);
+        try std.testing.expectEqual(@as(?u64, 2), posting_store.last_committed_batch);
+        var recovered = try posting_store.recoverWal();
+        defer recovered.deinit();
+        try std.testing.expectEqual(@as(u64, 2), recovered.replay.covered_source_sequence);
+    }
+
+    var final = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 8,
+        .branching_factor = 2,
+        .search_width = 8,
+        .use_quantization = false,
+        .lazy_posting_maintenance = true,
+        .storage_backend = .lsm,
+    });
+    defer final.close();
+    try final.activateExperimentalPostingReads(2);
+    const backlog = try final.postingBacklogStats();
+    try std.testing.expect(!backlog.needsRepair());
+    var results = try final.search(&[_]f32{ 3.0, 0.0 }, 2);
+    defer results.deinit();
+    try std.testing.expectEqual(@as(usize, 2), results.items.items.len);
 }
 
 test "flat rabitq centroid directory searches leaf postings" {

@@ -703,9 +703,13 @@ durability authority. Only postings touched by a successfully committed source
 transaction are captured, and the applied watermark is not published until
 derived capture completes. Derived failures never fail a committed source
 write: they durably invalidate `CURRENT`, after which ordinary replay repairs
-the acceleration. Queries use immutable admitted state; a concurrent write can
-disable future sidecar selection without freeing memory held by an in-flight
-query.
+the acceleration. Each query transaction leases one immutable posting
+generation. Covered writes leave the last committed generation available,
+then atomically publish a delta overlay before their applied watermark becomes
+visible; in-flight queries finish on their old generation and new queries use
+the new one. The LSM remains authoritative for source rows, vectors, metadata,
+and recovery, but normal posting queries after the first checkpoint do not
+fall through to the LSM.
 
 ### Public API qualification
 
@@ -720,6 +724,7 @@ runs, not the three-run publication sample required by the memory methodology.
 | Case | Insert | Catch-up | Total ready | Live recall | Live serial p50 / p95 / p99 | Live QPS at 1 / 4 / 16 | Reopened cold p50 / p95 / p99 | Reopened warm p50 / p95 / p99 | Demand / RSS peak |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | OpenAI 1,536D 50K | 35.63 s | 9.04 s | 44.67 s | 0.9849 | 2.9 / 5.6 / 13.8 ms | 44.58 / 399.82 / 670.94 | 5.3 / 10.3 / 423.7 ms | 4.6 / 6.1 / 422.9 ms | 734 MB / 1.80 GB |
+| OpenAI 1,536D 50K, live immutable generations | 34.11 s | 11.19 s | 45.31 s | 0.9846 | 2.6 / 4.5 / 13.2 ms | 44.66 / 482.70 / 683.75 | 4.8 / 9.9 / 412.2 ms | 4.0 / 4.7 / 411.7 ms | 719 MB / 1.87 GB |
 | Cohere 768D 1M | 1,579.41 s | 32.21 s | 1,611.63 s | 0.9863 | 50.6 / 617.3 / 664.6 ms | 5.08 / 17.67 / 37.89 | 43.0 / 467.1 / 495.1 ms | 9.0 / 15.6 / 436.3 ms | 1.40 GB / 4.99 GB |
 
 The 50K result recovers the established 30--40 second insert range while
@@ -739,13 +744,34 @@ the long steady-state portion. Cumulative mutable snapshot copies reached
 1.89 GB, far below the earlier multi-gigabyte cloning observed before 28K rows,
 but still identify the remaining general optimization surface.
 
-The 1M artifact also exposes one lifecycle limitation. Incremental sidecar
-maintenance safely invalidated after an HBC write outside a captured source
-window; queries fell back to the authoritative LSM, and restart rebuilt a
-175 MB generation before the warm pass. This demonstrates safe fallback and
-strong warm-read potential, but not uninterrupted 1M derived-WAL maintenance.
-Maintenance-only HBC mutations need an ordered derived epoch (or a quiescent
-recheckpoint) that does not fabricate a new authoritative source sequence.
+The original 1M artifact also exposed a lifecycle limitation. Incremental
+sidecar maintenance safely invalidated after an HBC write outside a captured
+source window; queries fell back to the authoritative LSM, and restart rebuilt
+a 175 MB generation before the warm pass. The follow-up implementation gives
+every derived batch an order independent from its source watermark, so
+maintenance may append multiple batches at the same covered source sequence.
+It also classifies posting mutations exactly: projection metadata and raw
+vector writes do not invalidate `CURRENT`, while an uncovered packed-posting
+write still fails closed before it can commit.
+
+The live-generation 50K follow-up exercised that lifecycle through the public
+API without a posting publication or invalidation warning. A delayed sequence
+278 persistence callback arrived after a newer sidecar generation in the first
+diagnostic attempt; treating that callback as out-of-order had needlessly
+invalidated the sidecar. The corrected path records its captured mutations as
+another derived batch at the already-covered source epoch and never regresses
+source coverage. The clean run kept `CURRENT` through sequence 501, and restart
+admitted the same 16 MB segment at exact sequence 501. Focused tests pin an old
+generation across publication and prove that a new transaction sees the new
+posting bytes while the old transaction remains unchanged.
+
+The follow-up sampler had one incomplete `vmmap` sample while the original
+server process was exiting; its RSS fallback made the synthesized
+`demand_peak_bytes` invalid. The table therefore reports the complete
+physical-footprint ledger high-water (718.7 MB) as demand, plus the independent
+cache-inclusive RSS peak (1.87 GB). Reopened recall was 0.9759 in both cold and
+warm passes; as with the earlier control, the live-to-reopened change is not
+specific to the segment reader.
 
 ## Memory methodology
 
@@ -789,12 +815,11 @@ published.
    41.65 seconds with a 38.72--43.14 second range, but the single follow-up 1M
    lifecycle remains diagnostic because compaction scheduling produced
    materially different curves on the same host.
-5. Give maintenance-only HBC transactions an ordered derived epoch, then
-   repeat public 50K and 1M qualification with uninterrupted WAL coverage.
-   Preserve exact source-sequence admission, safe fallback, normal rerank-policy
-   boundaries, and identical LSM/sidecar ranked results. Separately trace the
-   50K live-to-reopened HBC recall change; a sidecar-disabled control reproduces
-   it, so widening rerank would only hide the persistence issue.
+5. Repeat the public 1M qualification with the ordered derived epoch and
+   transaction-leased immutable generations, checking that `CURRENT` remains
+   uninterrupted through maintenance and delayed applied-sequence callbacks.
+   Preserve exact source-sequence admission, safe failure fallback, normal
+   rerank-policy boundaries, and identical LSM/sidecar ranked results.
 6. Compare eager single-read segment admission with mmap and footer/index-first
    range admission at 50K and 1M. Include page-cache/RSS accounting; do not
    trade a lower startup timer for unbounded mapped or decoded residency.

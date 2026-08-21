@@ -136,7 +136,7 @@ pub const Store = struct {
             return error.PostingWalShorterThanCheckpoint;
         }
         for (recovered.replay.records.items) |record| {
-            if (record.source_sequence <= checkpoint.covered_source_sequence) {
+            if (record.source_sequence < checkpoint.covered_source_sequence) {
                 return error.PostingWalOverlapsCheckpoint;
             }
         }
@@ -168,6 +168,15 @@ pub const Store = struct {
         return try self.appendBatchWithOptions(batch_id, records, covered_source_sequence, .{});
     }
 
+    /// Returns the next monotonically ordered derived batch id in the current
+    /// WAL generation. Batch order is deliberately independent from source
+    /// sequence order: maintenance may commit multiple posting mutations at
+    /// the same authoritative source sequence.
+    pub fn nextBatchId(self: *const Store) !u64 {
+        return std.math.add(u64, self.last_committed_batch orelse 0, 1) catch
+            error.PostingWalBatchOverflow;
+    }
+
     pub fn appendBatchWithOptions(
         self: *Store,
         batch_id: u64,
@@ -179,7 +188,7 @@ pub const Store = struct {
         if (self.checkpoint == null) return error.MissingPostingCheckpoint;
         if (records.len == 0) return error.EmptyPostingWalBatch;
         for (records) |record| {
-            if (record.source_sequence <= self.covered_source_sequence) return error.PostingWalOverlapsCheckpoint;
+            if (record.source_sequence < self.covered_source_sequence) return error.PostingWalOverlapsCheckpoint;
             if (record.source_sequence > covered_source_sequence) return error.InvalidPostingWalCommit;
         }
         var writer = posting_wal.Writer.initAfterCommitted(
@@ -469,6 +478,48 @@ test "storage.posting segment store truncates incomplete WAL tail before append"
     var replay = try store.recoverWal();
     defer replay.deinit();
     try std.testing.expectEqualStrings("two", replay.replay.latest(3, .base).?.payload);
+}
+
+test "storage.posting segment store orders maintenance batches independently from source coverage" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+
+    var store = try Store.open(alloc, memory.storage(), "/posting-maintenance");
+    defer store.deinit();
+    var segment_writer = posting_segment.Writer.init(alloc);
+    defer segment_writer.deinit();
+    try segment_writer.appendBaseAt(3, 10, "initial");
+    const segment = try segment_writer.build();
+    defer alloc.free(segment);
+    try store.publishCheckpoint(1, 10, segment);
+
+    try store.appendBatch(try store.nextBatchId(), &.{.{
+        .kind = .base,
+        .posting_id = 3,
+        .source_sequence = 10,
+        .payload = "maintenance-one",
+    }}, 10);
+    try store.appendBatch(try store.nextBatchId(), &.{.{
+        .kind = .base,
+        .posting_id = 3,
+        .source_sequence = 10,
+        .payload = "maintenance-two",
+    }}, 10);
+    try std.testing.expectEqual(@as(u64, 10), store.covered_source_sequence);
+    try std.testing.expectEqual(@as(?u64, 2), store.last_committed_batch);
+    store.deinit();
+
+    store = try Store.open(alloc, memory.storage(), "/posting-maintenance");
+    try std.testing.expectEqual(@as(u64, 10), store.covered_source_sequence);
+    try std.testing.expectEqual(@as(?u64, 2), store.last_committed_batch);
+    var replay = try store.recoverWal();
+    defer replay.deinit();
+    try std.testing.expectEqualStrings("maintenance-two", replay.replay.latest(3, .base).?.payload);
+
+    try store.appendCoverage(try store.nextBatchId(), 11, .{ .sync = false });
+    try std.testing.expectEqual(@as(u64, 11), store.covered_source_sequence);
+    try std.testing.expectEqual(@as(?u64, 3), store.last_committed_batch);
 }
 
 test "storage.posting segment store bounds WAL tails relative to the segment" {
