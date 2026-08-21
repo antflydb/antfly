@@ -2937,14 +2937,14 @@ pub const GraphIndex = struct {
         return summary;
     }
 
-    fn graphMetricBuildPhaseHasExhaustedPage(
+    fn graphMetricBuildPhaseExhaustedPageAlloc(
         self: *GraphIndex,
         metric_name: []const u8,
         job_id: u64,
         phase: GraphMetricBuildPhase,
         iteration: u32,
         now_ms: u64,
-    ) !bool {
+    ) !?GraphMetricBuildPageExhaustion {
         var txn = try self.beginReadReverseTxn();
         defer txn.abort();
         const page_prefix = try self.graphMetricBuildPagePrefixAlloc(metric_name, job_id, phase, iteration);
@@ -2956,13 +2956,21 @@ pub const GraphIndex = struct {
             if (!std.mem.startsWith(u8, entry.key, page_prefix)) break;
             const page = decodeGraphMetricBuildPage(entry.value) orelse return error.InvalidGraphMetricBuildPage;
             if (page.job_id != job_id or page.phase != phase or page.iteration != iteration) return error.InvalidGraphMetricBuildPage;
-            switch (page.state) {
-                .failed => if (page.attempt >= graph_metric_build_max_page_attempts) return true,
-                .leased => if (page.attempt >= graph_metric_build_max_page_attempts and page.lease_expires_at_ms <= now_ms) return true,
-                .pending, .complete => {},
-            }
+            const exhausted = switch (page.state) {
+                .failed => page.attempt >= graph_metric_build_max_page_attempts,
+                .leased => page.attempt >= graph_metric_build_max_page_attempts and page.lease_expires_at_ms <= now_ms,
+                .pending, .complete => false,
+            };
+            if (!exhausted) continue;
+            return .{
+                .phase = page.phase,
+                .iteration = page.iteration,
+                .page_id = page.page_id,
+                .attempt = page.attempt,
+                .last_error = if (page.last_error.len > 0) try self.alloc.dupe(u8, page.last_error) else "",
+            };
         }
-        return false;
+        return null;
     }
 
     fn advanceGraphMetricBuildPhaseIfReady(
@@ -3620,17 +3628,20 @@ pub const GraphIndex = struct {
     }
 
     fn recordGraphMetricFailure(self: *GraphIndex, metric_name: []const u8, err: anyerror) !void {
+        return try self.recordGraphMetricFailureReason(metric_name, @errorName(err));
+    }
+
+    fn recordGraphMetricFailureReason(self: *GraphIndex, metric_name: []const u8, failure_reason: []const u8) !void {
         const pair_cfg = if (self.metricConfig(metric_name)) |cfg| self.pairedHitsMetricConfig(cfg) else null;
         var batch = try self.beginWriteReverseBatch();
         errdefer batch.abort();
-        const err_name = @errorName(err);
         const retry_count = try self.nextGraphMetricFailureRetryCountInBatch(&batch, metric_name);
-        try self.putGraphMetricFailureDetailInBatch(&batch, metric_name, retry_count, err_name);
+        try self.putGraphMetricFailureDetailInBatch(&batch, metric_name, retry_count, failure_reason);
         const now_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
         var failure_record = GraphMetricFailureRecord{
             .at_ms = now_ms,
             .retry_count = retry_count,
-            .last_error = err_name,
+            .last_error = failure_reason,
         };
         if (try self.metricBuildJob(&batch, metric_name)) |job| {
             failure_record.job_id = job.job_id;
@@ -3681,7 +3692,7 @@ pub const GraphIndex = struct {
                 .iteration = job.iteration,
                 .retry_count = retry_count,
                 .worker_id = job.worker_id,
-                .last_error = err_name,
+                .last_error = failure_reason,
                 .cursor = job.cursor,
                 .completed_units = job.completed_units,
                 .total_units = job.total_units,
@@ -3697,7 +3708,7 @@ pub const GraphIndex = struct {
         });
         if (pair_cfg) |pair| {
             const pair_retry_count = try self.nextGraphMetricFailureRetryCountInBatch(&batch, pair.name);
-            try self.putGraphMetricFailureDetailInBatch(&batch, pair.name, pair_retry_count, err_name);
+            try self.putGraphMetricFailureDetailInBatch(&batch, pair.name, pair_retry_count, failure_reason);
             var pair_failure_record = failure_record;
             pair_failure_record.retry_count = pair_retry_count;
             if (pair_failure_record.score_generation != 0) {
@@ -5078,6 +5089,19 @@ pub const GraphIndex = struct {
         completed_units: u64 = 0,
         total_units: u64 = 0,
         output_fingerprint: u64 = 0,
+    };
+
+    const GraphMetricBuildPageExhaustion = struct {
+        phase: GraphMetricBuildPhase,
+        iteration: u32,
+        page_id: u64,
+        attempt: u64,
+        last_error: []u8,
+
+        fn deinit(self: *@This(), alloc: Allocator) void {
+            if (self.last_error.len > 0) alloc.free(self.last_error);
+            self.* = undefined;
+        }
     };
 
     const PrefixDeletePageResult = struct {
@@ -10898,6 +10922,14 @@ pub const GraphIndex = struct {
         metric_name: []const u8,
         err: anyerror,
     ) !GraphMetricStatus {
+        return try self.failGraphMetricPlannedBuildWithReason(metric_name, @errorName(err));
+    }
+
+    fn failGraphMetricPlannedBuildWithReason(
+        self: *GraphIndex,
+        metric_name: []const u8,
+        failure_reason: []const u8,
+    ) !GraphMetricStatus {
         const owner_name = try self.graphMetricLifecycleOwnerName(metric_name);
         {
             var txn = try self.beginReadReverseTxn();
@@ -10907,8 +10939,26 @@ pub const GraphIndex = struct {
             const lease = try self.metricBuildLease(&txn, owner_name) orelse return error.GraphMetricBuildNotActive;
             if (lease.job_id != job.job_id) return error.GraphMetricBuildNotActive;
         }
-        try self.recordGraphMetricFailure(owner_name, err);
+        try self.recordGraphMetricFailureReason(owner_name, failure_reason);
         return try self.graphMetricStatus(metric_name);
+    }
+
+    fn failGraphMetricPlannedBuildForExhaustedPage(
+        self: *GraphIndex,
+        metric_name: []const u8,
+        exhaustion: GraphMetricBuildPageExhaustion,
+    ) !GraphMetricStatus {
+        const cause = if (exhaustion.last_error.len > 0)
+            exhaustion.last_error
+        else
+            "GraphMetricBuildPageLeaseExpired";
+        const failure_reason = try std.fmt.allocPrint(
+            self.alloc,
+            "GraphMetricBuildPageAttemptsExhausted: phase={s}, iteration={d}, page_id={d}, attempt={d}, cause={s}",
+            .{ @tagName(exhaustion.phase), exhaustion.iteration, exhaustion.page_id, exhaustion.attempt, cause },
+        );
+        defer self.alloc.free(failure_reason);
+        return try self.failGraphMetricPlannedBuildWithReason(metric_name, failure_reason);
     }
 
     pub fn runPageRankMetric(self: *GraphIndex, metric_name: []const u8) !GraphMetricStatus {
@@ -11273,8 +11323,10 @@ pub const GraphIndex = struct {
         if (job.phase == .complete) return .{ .phase = .complete, .published = true, .completed_build = true };
         if (job.phase == .publish_generation) {
             if (graphMetricKindUsesPlannedIterativeRunner(cfg.kind)) {
-                if (try self.graphMetricBuildPhaseHasExhaustedPage(metric_name, job.job_id, job.phase, job.iteration, now_ms)) {
-                    var failed = try self.failGraphMetricPlannedBuild(metric_name, error.GraphMetricBuildPageAttemptsExhausted);
+                if (try self.graphMetricBuildPhaseExhaustedPageAlloc(metric_name, job.job_id, job.phase, job.iteration, now_ms)) |exhaustion_value| {
+                    var exhaustion = exhaustion_value;
+                    defer exhaustion.deinit(self.alloc);
+                    var failed = try self.failGraphMetricPlannedBuildForExhaustedPage(metric_name, exhaustion);
                     defer failed.deinit(self.alloc);
                     return .{ .phase = .publish_generation, .failed_build = true };
                 }
@@ -11290,8 +11342,10 @@ pub const GraphIndex = struct {
         }
         if (job.phase == .cleanup_old_generations) return .{ .phase = .cleanup_old_generations };
         if (!graphMetricBuildPhaseHasPageExecutor(cfg.kind, job.phase)) return error.UnsupportedGraphMetricBuildPhase;
-        if (try self.graphMetricBuildPhaseHasExhaustedPage(metric_name, job.job_id, job.phase, job.iteration, now_ms)) {
-            var failed = try self.failGraphMetricPlannedBuild(metric_name, error.GraphMetricBuildPageAttemptsExhausted);
+        if (try self.graphMetricBuildPhaseExhaustedPageAlloc(metric_name, job.job_id, job.phase, job.iteration, now_ms)) |exhaustion_value| {
+            var exhaustion = exhaustion_value;
+            defer exhaustion.deinit(self.alloc);
+            var failed = try self.failGraphMetricPlannedBuildForExhaustedPage(metric_name, exhaustion);
             defer failed.deinit(self.alloc);
             return .{ .phase = job.phase, .failed_build = true };
         }
@@ -14199,11 +14253,13 @@ test "graph pagerank later iteration exhausted page fails build and preserves pr
     try std.testing.expectEqual(GraphIndex.GraphMetricState.failed, failed_status.state);
     try std.testing.expectEqual(published_generation, failed_status.published_generation);
     try std.testing.expectEqual(@as(u64, 0), failed_status.build_job_id);
-    try std.testing.expectEqualStrings("GraphMetricBuildPageAttemptsExhausted", failed_status.last_error);
+    const exhaustion_reason = "GraphMetricBuildPageAttemptsExhausted: phase=iterate_contributions, iteration=1, page_id=3, attempt=3, cause=retryable later contribution failure";
+    try std.testing.expectEqualStrings(exhaustion_reason, failed_status.last_error);
     try std.testing.expectEqual(@as(usize, 1), failed_status.recent_failures.len);
     try std.testing.expectEqual(active_job.job_id, failed_status.recent_failures[0].job_id);
     try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, failed_status.recent_failures[0].phase);
     try std.testing.expectEqual(@as(u32, 1), failed_status.recent_failures[0].iteration);
+    try std.testing.expectEqualStrings(exhaustion_reason, failed_status.recent_failures[0].last_error);
 
     const after_failure_top = try graph.graphMetricTopK("pagerank", 10);
     defer {
@@ -14224,7 +14280,7 @@ test "graph pagerank later iteration exhausted page fails build and preserves pr
         try std.testing.expectEqual(active_job.job_id, failed_job.job_id);
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, failed_job.phase);
         try std.testing.expectEqual(@as(u32, 1), failed_job.iteration);
-        try std.testing.expectEqualStrings("GraphMetricBuildPageAttemptsExhausted", failed_job.last_error);
+        try std.testing.expectEqualStrings(exhaustion_reason, failed_job.last_error);
         try std.testing.expect((try graph.metricBuildManifest(&txn, "pagerank", active_job.job_id)) == null);
         try std.testing.expectEqual(@as(usize, 0), try graph.countGraphMetricScoreGeneration("pagerank", rebuilding_generation));
     }
@@ -15203,6 +15259,139 @@ test "graph pagerank coordinator publish failure preserves prior published gener
         try std.testing.expectEqual(active_job.job_id, failed_job.job_id);
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.publish_generation, failed_job.phase);
         try std.testing.expectEqualStrings("InvalidGraphMetricBuildManifest", failed_job.last_error);
+        try std.testing.expect((try graph.metricBuildManifest(&txn, "pagerank", active_job.job_id)) == null);
+        try std.testing.expectEqual(@as(usize, 0), try graph.countGraphMetricScoreGeneration("pagerank", active_job.score_generation));
+    }
+}
+
+test "graph pagerank exhausted publish page preserves root cause and prior generation" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-pagerank-publish-exhausted-root-cause");
+    defer cleanupTmp(store_path);
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-pagerank-publish-exhausted-root-cause");
+    defer cleanupTmp(rev_path);
+
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    const metrics = [_]GraphMetricConfig{.{
+        .name = "pagerank",
+        .kind = .pagerank,
+        .refresh = .manual,
+        .max_iterations = 1,
+        .tolerance = 0.000001,
+    }};
+    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    defer graph.close();
+
+    try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
+    var published = try graph.runPageRankMetricPlanned("pagerank");
+    defer published.deinit(alloc);
+    try std.testing.expectEqual(GraphIndex.GraphMetricState.fresh, published.state);
+    const published_generation = published.published_generation;
+
+    const before_failure_top = try graph.graphMetricTopK("pagerank", 10);
+    defer {
+        for (before_failure_top) |*score| score.deinit(alloc);
+        alloc.free(before_failure_top);
+    }
+
+    try graph.addEdge("doc-c", "doc-b", "cites", 1.0, 0, 0, "");
+    var building = try graph.ensureGraphMetricPlannedBuild("pagerank", graph.edge_generation);
+    defer building.deinit(alloc);
+    const active_job = blk: {
+        var txn = try graph.beginReadReverseTxn();
+        defer txn.abort();
+        break :blk try graph.metricBuildJob(&txn, "pagerank") orelse return error.TestExpectedGraphMetricBuildJob;
+    };
+
+    inline for (.{ .prepare_generation, .scan_edges_and_out_degree, .initialize_ranks, .iterate_contributions, .reduce_ranks, .check_convergence }) |expected_phase| {
+        const step = try graph.runGraphMetricPlannedWorkerStep("pagerank", metrics[0], "worker-prepare");
+        try std.testing.expectEqual(expected_phase, step.phase);
+        try std.testing.expect(step.claimed_page);
+        try std.testing.expect(step.completed_page);
+        try std.testing.expect(step.advanced_phase);
+    }
+
+    const missing_rank_key = try graph.graphMetricBuildPageRankKeyAlloc("pagerank", active_job.job_id, active_job.iteration + 1, "doc-a");
+    defer alloc.free(missing_rank_key);
+    {
+        var batch = try graph.beginWriteReverseBatch();
+        errdefer batch.abort();
+        try batch.delete(missing_rank_key);
+        try batch.commit();
+    }
+
+    var exhausted_page_id: u64 = 0;
+    var attempt: u64 = 0;
+    while (attempt < graph_metric_build_max_page_attempts) : (attempt += 1) {
+        const worker_id = switch (attempt) {
+            0 => "worker-a",
+            1 => "worker-b",
+            else => "worker-c",
+        };
+        const rejected = try graph.runGraphMetricPlannedWorkerPageStepForMetric("pagerank", worker_id);
+        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.publish_generation, rejected.phase);
+        try std.testing.expect(rejected.claimed_page);
+        try std.testing.expect(!rejected.completed_page);
+        if (attempt == 0) {
+            exhausted_page_id = rejected.page_id;
+        } else {
+            try std.testing.expectEqual(exhausted_page_id, rejected.page_id);
+        }
+    }
+    {
+        var txn = try graph.beginReadReverseTxn();
+        defer txn.abort();
+        const page = try graph.metricBuildPage(&txn, "pagerank", active_job.job_id, .publish_generation, active_job.iteration, exhausted_page_id) orelse return error.TestExpectedGraphMetricBuildPage;
+        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.failed, page.state);
+        try std.testing.expectEqual(@as(u64, graph_metric_build_max_page_attempts), page.attempt);
+        try std.testing.expectEqualStrings("InvalidGraphMetricScore", page.last_error);
+    }
+
+    graph.close();
+    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+
+    const failed_step = try graph.runGraphMetricPlannedCoordinatorStepForMetric("pagerank");
+    try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.publish_generation, failed_step.phase);
+    try std.testing.expect(failed_step.failed_build);
+    try std.testing.expect(!failed_step.advanced_phase);
+    try std.testing.expect(!failed_step.published);
+
+    const exhaustion_reason = try std.fmt.allocPrint(
+        alloc,
+        "GraphMetricBuildPageAttemptsExhausted: phase=publish_generation, iteration={d}, page_id={d}, attempt={d}, cause=InvalidGraphMetricScore",
+        .{ active_job.iteration, exhausted_page_id, graph_metric_build_max_page_attempts },
+    );
+    defer alloc.free(exhaustion_reason);
+    var failed_status = try graph.graphMetricStatus("pagerank");
+    defer failed_status.deinit(alloc);
+    try std.testing.expectEqual(GraphIndex.GraphMetricState.failed, failed_status.state);
+    try std.testing.expectEqual(published_generation, failed_status.published_generation);
+    try std.testing.expectEqual(@as(u64, 0), failed_status.build_job_id);
+    try std.testing.expectEqualStrings(exhaustion_reason, failed_status.last_error);
+    try std.testing.expectEqual(@as(usize, 1), failed_status.recent_failures.len);
+    try std.testing.expectEqualStrings(exhaustion_reason, failed_status.recent_failures[0].last_error);
+    try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.publish_generation, failed_status.recent_failures[0].phase);
+
+    const after_failure_top = try graph.graphMetricTopK("pagerank", 10);
+    defer {
+        for (after_failure_top) |*score| score.deinit(alloc);
+        alloc.free(after_failure_top);
+    }
+    try std.testing.expectEqual(before_failure_top.len, after_failure_top.len);
+    for (before_failure_top, after_failure_top) |before, after| {
+        try std.testing.expectEqualStrings(before.node, after.node);
+        try std.testing.expectApproxEqAbs(before.score, after.score, 0.0000001);
+        try std.testing.expect(!std.mem.eql(u8, after.node, "doc-c"));
+    }
+    {
+        var txn = try graph.beginReadReverseTxn();
+        defer txn.abort();
+        const failed_job = try graph.metricBuildJob(&txn, "pagerank") orelse return error.TestExpectedGraphMetricBuildJob;
+        try std.testing.expectEqual(active_job.job_id, failed_job.job_id);
+        try std.testing.expectEqualStrings(exhaustion_reason, failed_job.last_error);
         try std.testing.expect((try graph.metricBuildManifest(&txn, "pagerank", active_job.job_id)) == null);
         try std.testing.expectEqual(@as(usize, 0), try graph.countGraphMetricScoreGeneration("pagerank", active_job.score_generation));
     }
@@ -16580,8 +16769,67 @@ test "graph metric coordinator fails build after page attempts exhaust" {
     defer status.deinit(alloc);
     try std.testing.expectEqual(GraphIndex.GraphMetricState.failed, status.state);
     try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.idle, status.phase);
-    try std.testing.expectEqualStrings("GraphMetricBuildPageAttemptsExhausted", status.last_error);
+    try std.testing.expectEqualStrings(
+        "GraphMetricBuildPageAttemptsExhausted: phase=scan_edges_and_out_degree, iteration=0, page_id=1, attempt=3, cause=retryable",
+        status.last_error,
+    );
     try std.testing.expectEqual(@as(u64, 0), status.published_generation);
+}
+
+test "graph metric coordinator reports expired exhausted page lease" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-metric-page-expired-exhausted-fail");
+    defer cleanupTmp(store_path);
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-metric-page-expired-exhausted-fail");
+    defer cleanupTmp(rev_path);
+
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    const metrics = [_]GraphMetricConfig{.{
+        .name = "degree",
+        .kind = .degree,
+        .refresh = .manual,
+    }};
+    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    defer graph.close();
+
+    try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
+    try graph.acquireGraphMetricBuildLease("degree", graph.edge_generation);
+    const prepare_worker = try graph.runGraphMetricPlannedWorkerPageStepForMetric("degree", "worker-prepare");
+    try std.testing.expect(prepare_worker.completed_page);
+    const prepare_coordinator = try graph.runGraphMetricPlannedCoordinatorStepForMetric("degree");
+    try std.testing.expect(prepare_coordinator.advanced_phase);
+
+    const active_job = blk: {
+        var txn = try graph.beginReadReverseTxn();
+        defer txn.abort();
+        break :blk try graph.metricBuildJob(&txn, "degree") orelse return error.TestExpectedGraphMetricBuildJob;
+    };
+    const first = try graph.claimGraphMetricBuildPageAt("degree", active_job.job_id, .scan_edges_and_out_degree, 0, 1, "worker-a", 1000) orelse return error.TestExpectedGraphMetricBuildPage;
+    const second = try graph.claimGraphMetricBuildPageAt("degree", active_job.job_id, .scan_edges_and_out_degree, 0, 1, "worker-b", first.lease_expires_at_ms + 1) orelse return error.TestExpectedGraphMetricBuildPage;
+    const exhausted = try graph.claimGraphMetricBuildPageAt("degree", active_job.job_id, .scan_edges_and_out_degree, 0, 1, "worker-c", second.lease_expires_at_ms + 1) orelse return error.TestExpectedGraphMetricBuildPage;
+    try std.testing.expectEqual(@as(u64, graph_metric_build_max_page_attempts), exhausted.attempt);
+    try std.testing.expectEqualStrings("", exhausted.last_error);
+
+    const failed_step = try graph.runGraphMetricPlannedCoordinatorStepForMetricAt("degree", exhausted.lease_expires_at_ms + 1);
+    try std.testing.expect(failed_step.failed_build);
+    try std.testing.expect(!failed_step.advanced_phase);
+
+    const exhaustion_reason = "GraphMetricBuildPageAttemptsExhausted: phase=scan_edges_and_out_degree, iteration=0, page_id=1, attempt=3, cause=GraphMetricBuildPageLeaseExpired";
+    var status = try graph.graphMetricStatus("degree");
+    defer status.deinit(alloc);
+    try std.testing.expectEqual(GraphIndex.GraphMetricState.failed, status.state);
+    try std.testing.expectEqualStrings(exhaustion_reason, status.last_error);
+    try std.testing.expectEqual(@as(usize, 1), status.recent_failures.len);
+    try std.testing.expectEqualStrings(exhaustion_reason, status.recent_failures[0].last_error);
+    {
+        var txn = try graph.beginReadReverseTxn();
+        defer txn.abort();
+        const failed_job = try graph.metricBuildJob(&txn, "degree") orelse return error.TestExpectedGraphMetricBuildJob;
+        try std.testing.expectEqualStrings(exhaustion_reason, failed_job.last_error);
+    }
 }
 
 test "graph metric build scheduler claims next eligible page" {
@@ -22013,11 +22261,13 @@ test "graph eigenvector later iteration exhausted page fails build and preserves
     try std.testing.expectEqual(GraphIndex.GraphMetricState.failed, failed_status.state);
     try std.testing.expectEqual(published_generation, failed_status.published_generation);
     try std.testing.expectEqual(@as(u64, 0), failed_status.build_job_id);
-    try std.testing.expectEqualStrings("GraphMetricBuildPageAttemptsExhausted", failed_status.last_error);
+    const exhaustion_reason = "GraphMetricBuildPageAttemptsExhausted: phase=iterate_contributions, iteration=1, page_id=3, attempt=3, cause=retryable later eigenvector contribution failure";
+    try std.testing.expectEqualStrings(exhaustion_reason, failed_status.last_error);
     try std.testing.expectEqual(@as(usize, 1), failed_status.recent_failures.len);
     try std.testing.expectEqual(active_job.job_id, failed_status.recent_failures[0].job_id);
     try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, failed_status.recent_failures[0].phase);
     try std.testing.expectEqual(@as(u32, 1), failed_status.recent_failures[0].iteration);
+    try std.testing.expectEqualStrings(exhaustion_reason, failed_status.recent_failures[0].last_error);
 
     const after_failure_top = try graph.graphMetricTopK("eigenvector", 10);
     defer {
@@ -22037,7 +22287,7 @@ test "graph eigenvector later iteration exhausted page fails build and preserves
         try std.testing.expectEqual(active_job.job_id, failed_job.job_id);
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, failed_job.phase);
         try std.testing.expectEqual(@as(u32, 1), failed_job.iteration);
-        try std.testing.expectEqualStrings("GraphMetricBuildPageAttemptsExhausted", failed_job.last_error);
+        try std.testing.expectEqualStrings(exhaustion_reason, failed_job.last_error);
         try std.testing.expect((try graph.metricBuildManifest(&txn, "eigenvector", active_job.job_id)) == null);
         try std.testing.expectEqual(@as(usize, 0), try graph.countGraphMetricScoreGeneration("eigenvector", active_job.score_generation));
     }
@@ -24358,8 +24608,14 @@ test "graph hits later iteration exhausted page fails pair and preserves prior p
     try std.testing.expectEqual(published_generation, failed_hub.published_generation);
     try std.testing.expectEqual(@as(u64, 0), failed_authority.build_job_id);
     try std.testing.expectEqual(@as(u64, 0), failed_hub.build_job_id);
-    try std.testing.expectEqualStrings("GraphMetricBuildPageAttemptsExhausted", failed_authority.last_error);
-    try std.testing.expectEqualStrings("GraphMetricBuildPageAttemptsExhausted", failed_hub.last_error);
+    const exhaustion_reason = try std.fmt.allocPrint(
+        alloc,
+        "GraphMetricBuildPageAttemptsExhausted: phase=hits_hub_reduce_ranks, iteration=1, page_id={d}, attempt=3, cause=retryable later hits hub reduce failure",
+        .{exhausted_hub_reduce_page_id},
+    );
+    defer alloc.free(exhaustion_reason);
+    try std.testing.expectEqualStrings(exhaustion_reason, failed_authority.last_error);
+    try std.testing.expectEqualStrings(exhaustion_reason, failed_hub.last_error);
     try std.testing.expectEqual(@as(usize, 1), failed_authority.recent_failures.len);
     try std.testing.expectEqual(@as(usize, 1), failed_hub.recent_failures.len);
     try std.testing.expectEqual(active_job.job_id, failed_authority.recent_failures[0].job_id);
@@ -24368,6 +24624,8 @@ test "graph hits later iteration exhausted page fails pair and preserves prior p
     try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.hits_hub_reduce_ranks, failed_hub.recent_failures[0].phase);
     try std.testing.expectEqual(@as(u32, 1), failed_authority.recent_failures[0].iteration);
     try std.testing.expectEqual(@as(u32, 1), failed_hub.recent_failures[0].iteration);
+    try std.testing.expectEqualStrings(exhaustion_reason, failed_authority.recent_failures[0].last_error);
+    try std.testing.expectEqualStrings(exhaustion_reason, failed_hub.recent_failures[0].last_error);
 
     const after_authorities = try graph.graphMetricTopK("hits_authority", 10);
     defer {
@@ -24398,7 +24656,7 @@ test "graph hits later iteration exhausted page fails pair and preserves prior p
         try std.testing.expectEqual(active_job.job_id, failed_job.job_id);
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.hits_hub_reduce_ranks, failed_job.phase);
         try std.testing.expectEqual(@as(u32, 1), failed_job.iteration);
-        try std.testing.expectEqualStrings("GraphMetricBuildPageAttemptsExhausted", failed_job.last_error);
+        try std.testing.expectEqualStrings(exhaustion_reason, failed_job.last_error);
         try std.testing.expect((try graph.metricBuildManifest(&txn, "hits_authority", active_job.job_id)) == null);
         try std.testing.expectEqual(@as(usize, 0), try graph.countGraphMetricScoreGeneration("hits_authority", active_job.score_generation));
         try std.testing.expectEqual(@as(usize, 0), try graph.countGraphMetricScoreGeneration("hits_hub", active_job.score_generation));
