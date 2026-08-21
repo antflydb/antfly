@@ -53,6 +53,7 @@ pub fn parseFooterPreflight(
     const len_offset = tail_bytes.len - trailer_len;
     const footer_metadata_len = std.mem.readInt(u32, tail_bytes[len_offset .. len_offset + 4][0..4], .little);
     if (footer_metadata_len == 0) return error.InvalidParquetFooter;
+    if (footer_metadata_len > range_io.max_parquet_footer_metadata_bytes) return error.ParquetMetadataTooLarge;
     if (footer_metadata_len > object_len - trailer_len) return error.InvalidParquetFooter;
 
     const metadata_offset = object_len - trailer_len - footer_metadata_len;
@@ -150,4 +151,15 @@ test "parquet footer preflight rejects invalid trailers" {
         @intCast((overflow_len >> 24) & 0xff),
     } ++ [_]u8{ 'P', 'A', 'R', '1' };
     try std.testing.expectError(error.InvalidParquetFooter, parseFooterPreflight(overflow.len, 0, &overflow));
+}
+
+test "parquet footer preflight rejects oversized metadata before its range is fetched" {
+    const footer_metadata_len: u32 = @intCast(range_io.max_parquet_footer_metadata_bytes + 1);
+    var tail = [_]u8{0} ** trailer_len;
+    std.mem.writeInt(u32, tail[0..4], footer_metadata_len, .little);
+    @memcpy(tail[4..8], parquet_magic);
+    try std.testing.expectError(
+        error.ParquetMetadataTooLarge,
+        parseFooterPreflight(@as(u64, footer_metadata_len) + trailer_len, footer_metadata_len, &tail),
+    );
 }

@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const bounded_decode = @import("../bounded_decode.zig");
 const catalog_types = @import("../catalog/types.zig");
 const manifest_base_source = @import("base_source.zig");
 const manifest_types = @import("types.zig");
@@ -815,20 +816,27 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
     };
 }
 
-fn decodeStringAlloc(alloc: Allocator, data: []const u8, pos_ptr: *usize) ![]const u8 {
+fn decodeStringAlloc(
+    alloc: Allocator,
+    data: []const u8,
+    pos_ptr: *usize,
+    budget: *bounded_decode.Budget,
+) ![]const u8 {
     var pos = pos_ptr.*;
-    if (pos + 4 > data.len) return error.InvalidManifest;
-    const len = std.mem.readInt(u32, data[pos..][0..4], .little);
+    if (pos > data.len or data.len - pos < 4) return error.InvalidManifest;
+    const raw_len = std.mem.readInt(u32, data[pos..][0..4], .little);
+    const len: usize = @intCast(raw_len);
     pos += 4;
-    if (pos + len > data.len) return error.InvalidManifest;
+    if (len > data.len - pos) return error.InvalidManifest;
+    try budget.admitBytes(len);
     const value = try alloc.dupe(u8, data[pos .. pos + len]);
     pos += len;
     pos_ptr.* = pos;
     return value;
 }
 
-fn decodeOptionalStringAlloc(alloc: Allocator, data: []const u8, pos_ptr: *usize) !?[]const u8 {
-    const value = try decodeStringAlloc(alloc, data, pos_ptr);
+fn decodeOptionalStringAlloc(alloc: Allocator, data: []const u8, pos_ptr: *usize, budget: *bounded_decode.Budget) !?[]const u8 {
+    const value = try decodeStringAlloc(alloc, data, pos_ptr, budget);
     if (value.len == 0) {
         alloc.free(value);
         return null;
@@ -836,12 +844,13 @@ fn decodeOptionalStringAlloc(alloc: Allocator, data: []const u8, pos_ptr: *usize
     return value;
 }
 
-fn decodeStringListAlloc(alloc: Allocator, data: []const u8, pos_ptr: *usize) ![]const []const u8 {
+fn decodeStringListAlloc(alloc: Allocator, data: []const u8, pos_ptr: *usize, budget: *bounded_decode.Budget) ![]const []const u8 {
     var pos = pos_ptr.*;
-    if (pos + 4 > data.len) return error.InvalidManifest;
-    const count = std.mem.readInt(u32, data[pos..][0..4], .little);
+    if (pos > data.len or data.len - pos < 4) return error.InvalidManifest;
+    const raw_count = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += 4;
     pos_ptr.* = pos;
+    const count = try budget.admitCount([]const u8, raw_count, data.len - pos, 4);
     if (count == 0) return &.{};
 
     const out = try alloc.alloc([]const u8, count);
@@ -851,7 +860,7 @@ fn decodeStringListAlloc(alloc: Allocator, data: []const u8, pos_ptr: *usize) ![
         for (out[0..initialized]) |item| alloc.free(item);
     }
     for (0..count) |idx| {
-        out[idx] = try decodeStringAlloc(alloc, data, pos_ptr);
+        out[idx] = try decodeStringAlloc(alloc, data, pos_ptr, budget);
         initialized += 1;
     }
     return out;
@@ -864,6 +873,7 @@ fn freeStringList(alloc: Allocator, values: []const []const u8) void {
 
 fn decodeBaseSourceAlloc(alloc: Allocator, data: []const u8) !manifest_types.BaseSourceDescriptor {
     if (data.len == 0) return error.InvalidManifest;
+    var budget = try bounded_decode.Budget.init(data.len, .{});
     var pos: usize = 0;
     const kind_value = data[pos];
     pos += 1;
@@ -872,13 +882,13 @@ fn decodeBaseSourceAlloc(alloc: Allocator, data: []const u8) !manifest_types.Bas
         @intFromEnum(manifest_types.BaseSourceKind.antfly_document_segments) => .{ .antfly_document_segments = {} },
         @intFromEnum(manifest_types.BaseSourceKind.antfly_lsm_overlay) => .{ .antfly_lsm_overlay = {} },
         @intFromEnum(manifest_types.BaseSourceKind.antfly_row_fragments) => blk: {
-            const snapshot_id = try decodeStringAlloc(alloc, data, &pos);
+            const snapshot_id = try decodeStringAlloc(alloc, data, &pos, &budget);
             errdefer alloc.free(snapshot_id);
-            const schema_fingerprint = try decodeStringAlloc(alloc, data, &pos);
+            const schema_fingerprint = try decodeStringAlloc(alloc, data, &pos, &budget);
             errdefer alloc.free(schema_fingerprint);
-            const row_fragment_artifacts = try decodeStringListAlloc(alloc, data, &pos);
+            const row_fragment_artifacts = try decodeStringListAlloc(alloc, data, &pos, &budget);
             errdefer freeStringList(alloc, row_fragment_artifacts);
-            const row_fragment_stats_artifacts = try decodeStringListAlloc(alloc, data, &pos);
+            const row_fragment_stats_artifacts = try decodeStringListAlloc(alloc, data, &pos, &budget);
             errdefer freeStringList(alloc, row_fragment_stats_artifacts);
             break :blk .{ .antfly_row_fragments = .{
                 .snapshot_id = snapshot_id,
@@ -899,17 +909,17 @@ fn decodeBaseSourceAlloc(alloc: Allocator, data: []const u8) !manifest_types.Bas
                 else => return error.InvalidManifest,
             };
             pos += 1;
-            const source_uri = try decodeStringAlloc(alloc, data, &pos);
+            const source_uri = try decodeStringAlloc(alloc, data, &pos, &budget);
             errdefer alloc.free(source_uri);
-            const snapshot_id = try decodeStringAlloc(alloc, data, &pos);
+            const snapshot_id = try decodeStringAlloc(alloc, data, &pos, &budget);
             errdefer alloc.free(snapshot_id);
-            const schema_fingerprint = try decodeStringAlloc(alloc, data, &pos);
+            const schema_fingerprint = try decodeStringAlloc(alloc, data, &pos, &budget);
             errdefer alloc.free(schema_fingerprint);
-            const file_inventory_artifact = try decodeOptionalStringAlloc(alloc, data, &pos);
+            const file_inventory_artifact = try decodeOptionalStringAlloc(alloc, data, &pos, &budget);
             errdefer if (file_inventory_artifact) |artifact_id| alloc.free(artifact_id);
-            const row_group_metadata_artifact = try decodeOptionalStringAlloc(alloc, data, &pos);
+            const row_group_metadata_artifact = try decodeOptionalStringAlloc(alloc, data, &pos, &budget);
             errdefer if (row_group_metadata_artifact) |artifact_id| alloc.free(artifact_id);
-            const delete_metadata_artifact = try decodeOptionalStringAlloc(alloc, data, &pos);
+            const delete_metadata_artifact = try decodeOptionalStringAlloc(alloc, data, &pos, &budget);
             errdefer if (delete_metadata_artifact) |artifact_id| alloc.free(artifact_id);
             const source = manifest_types.ExternalBaseSource{
                 .format = format,
@@ -1068,4 +1078,14 @@ test "manifest codec rejects bad magic" {
     const alloc = std.testing.allocator;
     const bad = [_]u8{ 'B', 'A', 'D', '!', 1, 0 };
     try std.testing.expectError(error.InvalidManifest, decodeAlloc(alloc, &bad));
+}
+
+test "lake manifest base source decoder rejects forged string-list counts before allocation" {
+    const alloc = std.testing.allocator;
+    var encoded = [_]u8{0} ** 13;
+    encoded[0] = @intFromEnum(manifest_types.BaseSourceKind.antfly_row_fragments);
+    std.mem.writeInt(u32, encoded[1..5], 0, .little);
+    std.mem.writeInt(u32, encoded[5..9], 0, .little);
+    std.mem.writeInt(u32, encoded[9..13], std.math.maxInt(u32), .little);
+    try std.testing.expectError(error.DecodedArtifactTooLarge, decodeBaseSourceAlloc(alloc, &encoded));
 }

@@ -14,11 +14,14 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const bounded_decode = @import("../bounded_decode.zig");
 const algebraic_segment = @import("types.zig");
 
 const magic = "AFAS";
 const expression_magic = "AFEX";
 const version: u32 = 1;
+
+pub const DecodeLimits = bounded_decode.Limits;
 
 pub fn encodeAlloc(alloc: Allocator, segment: algebraic_segment.Segment) ![]u8 {
     try segment.validate();
@@ -47,6 +50,11 @@ pub fn encodeAlloc(alloc: Allocator, segment: algebraic_segment.Segment) ![]u8 {
 }
 
 pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !algebraic_segment.Segment {
+    return try decodeAllocWithLimits(alloc, bytes, .{});
+}
+
+pub fn decodeAllocWithLimits(alloc: Allocator, bytes: []const u8, limits: DecodeLimits) !algebraic_segment.Segment {
+    var budget = try bounded_decode.Budget.init(bytes.len, limits);
     var cursor: usize = 0;
     if (bytes.len < magic.len + 4) return error.InvalidAlgebraicSegment;
     if (!std.mem.eql(u8, bytes[0..magic.len], magic)) return error.InvalidAlgebraicSegmentMagic;
@@ -57,21 +65,22 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !algebraic_segment.Segme
     if (cursor >= bytes.len) return error.InvalidAlgebraicSegment;
     const source_kind = try decodeSourceKind(bytes[cursor]);
     cursor += 1;
-    const snapshot_id = try readBytesAlloc(alloc, bytes, &cursor);
+    const snapshot_id = try readBytesAlloc(alloc, bytes, &cursor, &budget);
     errdefer alloc.free(snapshot_id);
-    const schema_fingerprint = try readBytesAlloc(alloc, bytes, &cursor);
+    const schema_fingerprint = try readBytesAlloc(alloc, bytes, &cursor, &budget);
     errdefer alloc.free(schema_fingerprint);
-    const source_id = try readBytesAlloc(alloc, bytes, &cursor);
+    const source_id = try readBytesAlloc(alloc, bytes, &cursor, &budget);
     errdefer alloc.free(source_id);
 
     if (cursor >= bytes.len) return error.InvalidAlgebraicSegment;
     const op = try decodeAggregateOp(bytes[cursor]);
     cursor += 1;
-    const group_column = try readBytesAlloc(alloc, bytes, &cursor);
+    const group_column = try readBytesAlloc(alloc, bytes, &cursor, &budget);
     errdefer alloc.free(group_column);
-    const value_column = try readBytesAlloc(alloc, bytes, &cursor);
+    const value_column = try readBytesAlloc(alloc, bytes, &cursor, &budget);
     errdefer alloc.free(value_column);
-    const group_count = try readU32(bytes, &cursor);
+    const raw_group_count = try readU32(bytes, &cursor);
+    const group_count = try budget.admitCount(algebraic_segment.GroupFold, raw_group_count, bytes.len - cursor, 12);
 
     const groups = try alloc.alloc(algebraic_segment.GroupFold, group_count);
     errdefer alloc.free(groups);
@@ -82,7 +91,7 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !algebraic_segment.Segme
 
     for (groups) |*group| {
         var keep_group = false;
-        const key = try readBytesAlloc(alloc, bytes, &cursor);
+        const key = try readBytesAlloc(alloc, bytes, &cursor, &budget);
         errdefer if (!keep_group) alloc.free(key);
         group.* = .{
             .key = key,
@@ -137,6 +146,11 @@ pub fn encodeExpressionAlloc(alloc: Allocator, materialization: algebraic_segmen
 }
 
 pub fn decodeExpressionAlloc(alloc: Allocator, bytes: []const u8) !algebraic_segment.ExpressionMaterialization {
+    return try decodeExpressionAllocWithLimits(alloc, bytes, .{});
+}
+
+pub fn decodeExpressionAllocWithLimits(alloc: Allocator, bytes: []const u8, limits: DecodeLimits) !algebraic_segment.ExpressionMaterialization {
+    var budget = try bounded_decode.Budget.init(bytes.len, limits);
     var cursor: usize = 0;
     if (bytes.len < expression_magic.len + 4) return error.InvalidAlgebraicSegment;
     if (!std.mem.eql(u8, bytes[0..expression_magic.len], expression_magic)) return error.InvalidAlgebraicSegmentMagic;
@@ -147,13 +161,14 @@ pub fn decodeExpressionAlloc(alloc: Allocator, bytes: []const u8) !algebraic_seg
     if (cursor >= bytes.len) return error.InvalidAlgebraicSegment;
     const source_kind = try decodeSourceKind(bytes[cursor]);
     cursor += 1;
-    const snapshot_id = try readBytesAlloc(alloc, bytes, &cursor);
+    const snapshot_id = try readBytesAlloc(alloc, bytes, &cursor, &budget);
     errdefer alloc.free(snapshot_id);
-    const schema_fingerprint = try readBytesAlloc(alloc, bytes, &cursor);
+    const schema_fingerprint = try readBytesAlloc(alloc, bytes, &cursor, &budget);
     errdefer alloc.free(schema_fingerprint);
-    const source_id = try readBytesAlloc(alloc, bytes, &cursor);
+    const source_id = try readBytesAlloc(alloc, bytes, &cursor, &budget);
     errdefer alloc.free(source_id);
-    const expression_count = try readU32(bytes, &cursor);
+    const raw_expression_count = try readU32(bytes, &cursor);
+    const expression_count = try budget.admitCount(algebraic_segment.ExpressionFold, raw_expression_count, bytes.len - cursor, 17);
 
     const expressions = try alloc.alloc(algebraic_segment.ExpressionFold, expression_count);
     errdefer alloc.free(expressions);
@@ -163,12 +178,12 @@ pub fn decodeExpressionAlloc(alloc: Allocator, bytes: []const u8) !algebraic_seg
     }
 
     for (expressions) |*expression| {
-        const name = try readBytesAlloc(alloc, bytes, &cursor);
+        const name = try readBytesAlloc(alloc, bytes, &cursor, &budget);
         errdefer alloc.free(name);
         if (cursor >= bytes.len) return error.InvalidAlgebraicSegment;
         const op = try decodeAggregateOp(bytes[cursor]);
         cursor += 1;
-        const value_column = try readBytesAlloc(alloc, bytes, &cursor);
+        const value_column = try readBytesAlloc(alloc, bytes, &cursor, &budget);
         errdefer alloc.free(value_column);
         expression.* = .{
             .name = name,
@@ -256,9 +271,11 @@ fn appendBytes(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), bytes: []cons
     try out.appendSlice(alloc, bytes);
 }
 
-fn readBytesAlloc(alloc: Allocator, bytes: []const u8, cursor: *usize) ![]u8 {
-    const len = try readU32(bytes, cursor);
-    if (cursor.* + len > bytes.len) return error.InvalidAlgebraicSegment;
+fn readBytesAlloc(alloc: Allocator, bytes: []const u8, cursor: *usize, budget: *bounded_decode.Budget) ![]u8 {
+    const raw_len = try readU32(bytes, cursor);
+    const len: usize = @intCast(raw_len);
+    if (cursor.* > bytes.len or len > bytes.len - cursor.*) return error.InvalidAlgebraicSegment;
+    try budget.admitBytes(len);
     const out = try alloc.dupe(u8, bytes[cursor.* .. cursor.* + len]);
     cursor.* += len;
     return out;
@@ -328,6 +345,37 @@ test "algebraic segment codec round-trips group-by folds" {
     try std.testing.expectEqualStrings("tenant", decoded.aggregate.group_column);
     try std.testing.expectEqual(@as(usize, 2), decoded.aggregate.groups.len);
     try std.testing.expectEqual(@as(i64, 20), decoded.aggregate.groups[1].value.sum_i64);
+}
+
+test "lake algebraic segment codec rejects forged fold counts before allocation" {
+    const alloc = std.testing.allocator;
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+    try encoded.appendSlice(alloc, magic);
+    try appendU32(alloc, &encoded, version);
+    try encoded.append(alloc, @intFromEnum(algebraic_segment.SourceKind.serverless_fragment));
+    try appendBytes(alloc, &encoded, "snapshot");
+    try appendBytes(alloc, &encoded, "schema");
+    try appendBytes(alloc, &encoded, "source");
+    try encoded.append(alloc, @intFromEnum(algebraic_segment.AggregateOp.count));
+    try appendBytes(alloc, &encoded, "group");
+    try appendBytes(alloc, &encoded, "value");
+    try appendU32(alloc, &encoded, std.math.maxInt(u32));
+    try std.testing.expectError(error.DecodedArtifactTooLarge, decodeAlloc(alloc, encoded.items));
+}
+
+test "lake algebraic expression codec rejects forged counts before allocation" {
+    const alloc = std.testing.allocator;
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+    try encoded.appendSlice(alloc, expression_magic);
+    try appendU32(alloc, &encoded, version);
+    try encoded.append(alloc, @intFromEnum(algebraic_segment.SourceKind.external_iceberg));
+    try appendBytes(alloc, &encoded, "snapshot");
+    try appendBytes(alloc, &encoded, "schema");
+    try appendBytes(alloc, &encoded, "source");
+    try appendU32(alloc, &encoded, std.math.maxInt(u32));
+    try std.testing.expectError(error.DecodedArtifactTooLarge, decodeExpressionAlloc(alloc, encoded.items));
 }
 
 test "algebraic segment codec round-trips expression folds" {

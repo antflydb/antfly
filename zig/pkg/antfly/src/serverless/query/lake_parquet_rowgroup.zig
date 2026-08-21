@@ -34,6 +34,18 @@ const fs_paths = @import("../../common/fs_paths.zig");
 const snappy = @import("../../encoding/snappy.zig");
 pub const ObjectRangeCacheDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
+pub const MaterializationLimits = struct {
+    max_rows: usize = 1_000_000,
+    max_projected_cells: usize = 8_000_000,
+    max_struct_allocation_bytes: usize = 256 * 1024 * 1024,
+
+    pub fn validate(self: MaterializationLimits) !void {
+        if (self.max_rows == 0 or self.max_projected_cells == 0 or self.max_struct_allocation_bytes == 0) {
+            return error.InvalidParquetMaterializationLimits;
+        }
+    }
+};
+
 pub const ColumnChunkInput = struct {
     column_id: []const u8,
     /// Raw column chunk bytes for one supported i64 column path.
@@ -82,6 +94,7 @@ pub const ObjectRangeReader = struct {
         len: usize,
     ) ![]u8 {
         if (bucket.len == 0 or key.len == 0 or len == 0) return error.InvalidLakeRangeRead;
+        if (len > range_io.max_physical_range_read_bytes) return error.LakeRangeReadTooLarge;
         const bytes = try self.read_range_alloc(self.ctx, alloc, bucket, key, offset, len);
         errdefer alloc.free(bytes);
         if (bytes.len != len) return error.InvalidLakeRangeRead;
@@ -132,10 +145,12 @@ pub const ObjectRangeCachePolicy = struct {
     max_total_bytes: ?usize = null,
     max_bytes_by_lane: [object_range_cache_lane_count]?usize = [_]?usize{null} ** object_range_cache_lane_count,
     protected_lanes: [object_range_cache_lane_count]bool = [_]bool{false} ** object_range_cache_lane_count,
+    max_fetch_bytes: usize = range_io.max_physical_range_read_bytes,
 
     pub fn lakeServingDefaults(max_total_bytes: usize) ObjectRangeCachePolicy {
         var policy = ObjectRangeCachePolicy{};
         policy.setTotalLimit(max_total_bytes);
+        policy.setFetchLimit(@min(max_total_bytes, range_io.max_physical_range_read_bytes));
         policy.protectLane(.metadata);
         policy.protectLane(.serving_sidecar);
         policy.setLaneLimit(.broad_scan_scratch, max_total_bytes / 8);
@@ -154,6 +169,10 @@ pub const ObjectRangeCachePolicy = struct {
 
     pub fn setTotalLimit(self: *ObjectRangeCachePolicy, max_bytes: usize) void {
         self.max_total_bytes = max_bytes;
+    }
+
+    pub fn setFetchLimit(self: *ObjectRangeCachePolicy, max_bytes: usize) void {
+        self.max_fetch_bytes = @min(max_bytes, range_io.max_physical_range_read_bytes);
     }
 
     pub fn protectLane(self: *ObjectRangeCachePolicy, cache_lane: range_io.CacheLane) void {
@@ -333,11 +352,11 @@ pub const ObjectRangeCache = struct {
         read: range_io.RangeRead,
     ) ![]u8 {
         const cache_lane = read.cacheLane();
-        const cache_key = try read.cacheKeyAlloc(alloc);
         const read_len: usize = std.math.cast(usize, read.range.len) orelse {
-            alloc.free(cache_key);
             return error.InvalidLakeRangeRead;
         };
+        if (read_len > self.policy.max_fetch_bytes) return error.LakeRangeReadTooLarge;
+        const cache_key = try read.cacheKeyAlloc(alloc);
         if (self.entries.get(cache_key)) |cached| {
             if (cached.bytes.len != read_len) {
                 alloc.free(cache_key);
@@ -630,6 +649,7 @@ const DecodedColumn = union(enum) {
 pub const RowGroupSource = struct {
     inventory: external_source.Inventory,
     row_groups: []const RowGroupInput,
+    materialization_limits: MaterializationLimits = .{},
     next_index: usize = 0,
     current: ?OwnedBatch = null,
 
@@ -665,12 +685,13 @@ pub const RowGroupSource = struct {
 
         const input = self.row_groups[self.next_index];
         self.next_index += 1;
-        self.current = try buildSupportedI64RowGroupBatchAlloc(
+        self.current = try buildSupportedI64RowGroupBatchAllocWithLimits(
             alloc,
             self.inventory,
             input.file_id,
             input.row_group_ordinal,
             input.chunks,
+            self.materialization_limits,
         );
         return self.current.?.batch;
     }
@@ -694,6 +715,7 @@ pub const ObjectRangeRowGroupSource = struct {
     inventory: external_source.Inventory,
     row_groups: []const ObjectRangeRowGroupInput,
     coalesce_options: range_io.CoalesceOptions = .{},
+    materialization_limits: MaterializationLimits = .{},
     next_index: usize = 0,
     current: ?OwnedBatch = null,
 
@@ -766,6 +788,7 @@ pub const ObjectRangeRowGroupSource = struct {
             input.row_group_ordinal,
             input.projected_columns,
             self.coalesce_options,
+            self.materialization_limits,
         );
         return self.current.?.batch;
     }
@@ -790,7 +813,7 @@ pub fn buildRequiredPlainI64RowGroupBatchAlloc(
     row_group_ordinal: u32,
     projected_chunks: []const ColumnChunkInput,
 ) !OwnedBatch {
-    return try buildPlainI64RowGroupBatchAlloc(alloc, inventory, file_id, row_group_ordinal, projected_chunks, .{ .fixed = .required });
+    return try buildPlainI64RowGroupBatchAlloc(alloc, inventory, file_id, row_group_ordinal, projected_chunks, .{ .fixed = .required }, .{});
 }
 
 pub fn buildOptionalPlainI64RowGroupBatchAlloc(
@@ -800,7 +823,7 @@ pub fn buildOptionalPlainI64RowGroupBatchAlloc(
     row_group_ordinal: u32,
     projected_chunks: []const ColumnChunkInput,
 ) !OwnedBatch {
-    return try buildPlainI64RowGroupBatchAlloc(alloc, inventory, file_id, row_group_ordinal, projected_chunks, .{ .fixed = .optional });
+    return try buildPlainI64RowGroupBatchAlloc(alloc, inventory, file_id, row_group_ordinal, projected_chunks, .{ .fixed = .optional }, .{});
 }
 
 pub fn buildDictionaryPlainI64RowGroupBatchAlloc(
@@ -810,7 +833,7 @@ pub fn buildDictionaryPlainI64RowGroupBatchAlloc(
     row_group_ordinal: u32,
     projected_chunks: []const ColumnChunkInput,
 ) !OwnedBatch {
-    return try buildPlainI64RowGroupBatchAlloc(alloc, inventory, file_id, row_group_ordinal, projected_chunks, .{ .fixed = .dictionary_required });
+    return try buildPlainI64RowGroupBatchAlloc(alloc, inventory, file_id, row_group_ordinal, projected_chunks, .{ .fixed = .dictionary_required }, .{});
 }
 
 pub fn buildSupportedI64RowGroupBatchAlloc(
@@ -820,7 +843,18 @@ pub fn buildSupportedI64RowGroupBatchAlloc(
     row_group_ordinal: u32,
     projected_chunks: []const ColumnChunkInput,
 ) !OwnedBatch {
-    return try buildPlainI64RowGroupBatchAlloc(alloc, inventory, file_id, row_group_ordinal, projected_chunks, .from_inventory);
+    return try buildSupportedI64RowGroupBatchAllocWithLimits(alloc, inventory, file_id, row_group_ordinal, projected_chunks, .{});
+}
+
+pub fn buildSupportedI64RowGroupBatchAllocWithLimits(
+    alloc: Allocator,
+    inventory: external_source.Inventory,
+    file_id: []const u8,
+    row_group_ordinal: u32,
+    projected_chunks: []const ColumnChunkInput,
+    limits: MaterializationLimits,
+) !OwnedBatch {
+    return try buildPlainI64RowGroupBatchAlloc(alloc, inventory, file_id, row_group_ordinal, projected_chunks, .from_inventory, limits);
 }
 
 const PlainI64Mode = enum {
@@ -903,6 +937,39 @@ const PlainI64ModeRequest = union(enum) {
     from_inventory,
 };
 
+fn admitMaterialization(
+    raw_row_count: u64,
+    projected_column_count: usize,
+    limits: MaterializationLimits,
+) !usize {
+    try limits.validate();
+    if (projected_column_count == 0) return error.InvalidParquetRowGroupBatch;
+    const row_count = std.math.cast(usize, raw_row_count) orelse return error.ParquetRowGroupTooLarge;
+    if (row_count > limits.max_rows) return error.ParquetRowGroupTooLarge;
+    const projected_cells = std.math.mul(usize, row_count, projected_column_count) catch
+        return error.ParquetRowGroupTooLarge;
+    if (projected_cells > limits.max_projected_cells) return error.ParquetRowGroupTooLarge;
+
+    var estimated_bytes = std.math.mul(usize, row_count, @sizeOf(rowsource.RowRef)) catch
+        return error.ParquetRowGroupTooLarge;
+    const column_metadata_bytes = std.math.mul(
+        usize,
+        projected_column_count,
+        @sizeOf(rowsource.ColumnVector) + @sizeOf([]u8) + @sizeOf(DecodedColumn) + @sizeOf([]u8),
+    ) catch return error.ParquetRowGroupTooLarge;
+    estimated_bytes = std.math.add(usize, estimated_bytes, column_metadata_bytes) catch
+        return error.ParquetRowGroupTooLarge;
+    const projected_value_bytes = std.math.mul(
+        usize,
+        projected_cells,
+        @max(@sizeOf(i64), @sizeOf([]u8)) + @sizeOf(u8),
+    ) catch return error.ParquetRowGroupTooLarge;
+    estimated_bytes = std.math.add(usize, estimated_bytes, projected_value_bytes) catch
+        return error.ParquetRowGroupTooLarge;
+    if (estimated_bytes > limits.max_struct_allocation_bytes) return error.ParquetRowGroupTooLarge;
+    return row_count;
+}
+
 fn buildPlainI64RowGroupBatchAlloc(
     alloc: Allocator,
     inventory: external_source.Inventory,
@@ -910,13 +977,14 @@ fn buildPlainI64RowGroupBatchAlloc(
     row_group_ordinal: u32,
     projected_chunks: []const ColumnChunkInput,
     mode_request: PlainI64ModeRequest,
+    limits: MaterializationLimits,
 ) !OwnedBatch {
     try inventory.validate();
     if (projected_chunks.len == 0) return error.InvalidParquetRowGroupBatch;
     const file = inventory.fileById(file_id) orelse return error.ExternalSourceFileNotFound;
     if (row_group_ordinal >= file.row_groups.len) return error.ExternalSourceRowOutOfBounds;
     const row_group = file.row_groups[row_group_ordinal];
-    const row_count: usize = std.math.cast(usize, row_group.row_count) orelse return error.InvalidParquetRowGroupBatch;
+    const row_count = try admitMaterialization(row_group.row_count, projected_chunks.len, limits);
     const binding = rowsource_bridge.bindingFromValidatedInventory(inventory);
 
     const row_refs = try alloc.alloc(rowsource.RowRef, row_count);
@@ -1200,6 +1268,7 @@ pub fn buildRequiredPlainI64RowGroupBatchFromObjectRangeReaderAlloc(
         projected_columns,
         .{ .fixed = .required },
         .{},
+        .{},
     );
 }
 
@@ -1211,7 +1280,7 @@ pub fn buildSupportedI64RowGroupBatchFromObjectRangeReaderAlloc(
     row_group_ordinal: u32,
     projected_columns: []const []const u8,
 ) !OwnedBatch {
-    return try buildSupportedI64RowGroupBatchFromCoalescedObjectRangeReaderAlloc(
+    return try buildSupportedI64RowGroupBatchFromObjectRangeReaderAllocWithLimits(
         alloc,
         reader,
         inventory,
@@ -1219,6 +1288,29 @@ pub fn buildSupportedI64RowGroupBatchFromObjectRangeReaderAlloc(
         row_group_ordinal,
         projected_columns,
         .{},
+    );
+}
+
+pub fn buildSupportedI64RowGroupBatchFromObjectRangeReaderAllocWithLimits(
+    alloc: Allocator,
+    reader: ObjectRangeReader,
+    inventory: external_source.Inventory,
+    file_id: []const u8,
+    row_group_ordinal: u32,
+    projected_columns: []const []const u8,
+    limits: MaterializationLimits,
+) !OwnedBatch {
+    return try buildPlainI64RowGroupBatchFromObjectRangeReaderAlloc(
+        alloc,
+        reader,
+        null,
+        inventory,
+        file_id,
+        row_group_ordinal,
+        projected_columns,
+        .from_inventory,
+        .{},
+        limits,
     );
 }
 
@@ -1261,6 +1353,7 @@ pub fn buildSupportedI64RowGroupBatchFromCoalescedObjectRangeReaderAlloc(
         row_group_ordinal,
         projected_columns,
         coalesce_options,
+        .{},
     );
 }
 
@@ -1283,6 +1376,7 @@ pub fn buildSupportedI64RowGroupBatchFromCachedCoalescedObjectRangeReaderAlloc(
         row_group_ordinal,
         projected_columns,
         coalesce_options,
+        .{},
     );
 }
 
@@ -1295,6 +1389,7 @@ fn buildSupportedI64RowGroupBatchFromMaybeCachedCoalescedObjectRangeReaderAlloc(
     row_group_ordinal: u32,
     projected_columns: []const []const u8,
     coalesce_options: range_io.CoalesceOptions,
+    limits: MaterializationLimits,
 ) !OwnedBatch {
     return try buildPlainI64RowGroupBatchFromObjectRangeReaderAlloc(
         alloc,
@@ -1306,6 +1401,7 @@ fn buildSupportedI64RowGroupBatchFromMaybeCachedCoalescedObjectRangeReaderAlloc(
         projected_columns,
         .from_inventory,
         coalesce_options,
+        limits,
     );
 }
 
@@ -1319,12 +1415,14 @@ fn buildPlainI64RowGroupBatchFromObjectRangeReaderAlloc(
     projected_columns: []const []const u8,
     mode_request: PlainI64ModeRequest,
     coalesce_options: range_io.CoalesceOptions,
+    limits: MaterializationLimits,
 ) !OwnedBatch {
     try inventory.validate();
     if (projected_columns.len == 0) return error.InvalidParquetRowGroupBatch;
     const file = inventory.fileById(file_id) orelse return error.ExternalSourceFileNotFound;
     if (row_group_ordinal >= file.row_groups.len) return error.ExternalSourceRowOutOfBounds;
     const row_group = file.row_groups[row_group_ordinal];
+    _ = try admitMaterialization(row_group.row_count, projected_columns.len, limits);
     const object = try range_io.objectRefForExternalFileUri(file);
 
     const chunk_inputs = try alloc.alloc(ColumnChunkInput, projected_columns.len);
@@ -1365,6 +1463,7 @@ fn buildPlainI64RowGroupBatchFromObjectRangeReaderAlloc(
         row_group_ordinal,
         chunk_inputs,
         mode_request,
+        limits,
     );
     errdefer owned.deinit(alloc);
 
@@ -5560,6 +5659,50 @@ test "parquet object range cache rejects corrupted cached range lengths" {
     try std.testing.expectEqual(@as(usize, 0), stats.misses);
 }
 
+test "parquet object range cache enforces fetch admission before reader invocation" {
+    const alloc = std.testing.allocator;
+    const CountingReader = struct {
+        calls: usize = 0,
+
+        fn readRangeAlloc(
+            ctx: *anyopaque,
+            a: Allocator,
+            bucket: []const u8,
+            key: []const u8,
+            offset: u64,
+            len: usize,
+        ) ![]u8 {
+            _ = bucket;
+            _ = key;
+            _ = offset;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return try a.alloc(u8, len);
+        }
+    };
+    var reader_impl = CountingReader{};
+    const reader = ObjectRangeReader{
+        .ctx = &reader_impl,
+        .read_range_alloc = CountingReader.readRangeAlloc,
+    };
+    var policy = ObjectRangeCachePolicy{};
+    policy.setFetchLimit(1);
+    var cache = ObjectRangeCache{ .policy = policy };
+    defer cache.deinit(alloc);
+    const read = range_io.RangeRead{
+        .object = .{
+            .bucket = "bucket",
+            .key = "object",
+            .byte_len = 2,
+            .version = .{ .etag = "etag" },
+        },
+        .range = .{ .offset = 0, .len = 2 },
+        .purpose = .parquet_column_chunk,
+    };
+    try std.testing.expectError(error.LakeRangeReadTooLarge, cache.readAlloc(alloc, reader, read));
+    try std.testing.expectEqual(@as(usize, 0), reader_impl.calls);
+}
+
 test "parquet object range cache rejects corrupted cached range checksums" {
     const alloc = std.testing.allocator;
     var cache = ObjectRangeCache{};
@@ -7752,5 +7895,47 @@ test "parquet row group batch rejects mismatched decoded row counts" {
         "part-a.parquet",
         0,
         &[_]ColumnChunkInput{.{ .column_id = "amount", .bytes = chunk.items }},
+    ));
+}
+
+test "parquet row group materialization rejects oversized batches before decoding" {
+    const alloc = std.testing.allocator;
+    var inventory = external_source.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "sha256:objects"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source.FileEntry, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-a"),
+        .byte_len = 1,
+        .row_count = 11,
+        .row_groups = try alloc.alloc(external_source.RowGroup, 1),
+    };
+    inventory.files[0].row_groups[0] = .{
+        .ordinal = 0,
+        .row_count = 11,
+        .file_offset = 0,
+        .total_byte_len = 1,
+        .column_chunks = try alloc.alloc(external_source.ColumnChunk, 1),
+    };
+    inventory.files[0].row_groups[0].column_chunks[0] = .{
+        .column_id = try alloc.dupe(u8, "amount"),
+        .file_offset = 0,
+        .compressed_len = 1,
+    };
+
+    try std.testing.expectError(error.ParquetRowGroupTooLarge, buildSupportedI64RowGroupBatchAllocWithLimits(
+        alloc,
+        inventory,
+        "part-a.parquet",
+        0,
+        &.{.{ .column_id = "amount", .bytes = "x" }},
+        .{ .max_rows = 10 },
     ));
 }

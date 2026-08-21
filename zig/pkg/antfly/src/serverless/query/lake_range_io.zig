@@ -24,6 +24,12 @@ const external_source = @import("../external_source/types.zig");
 const iceberg_avro = @import("../external_source/iceberg_avro.zig");
 const Allocator = std.mem.Allocator;
 
+/// Hard ceiling for one physical object-store response. Cache capacity is a
+/// retention policy, not a safe fetch limit, so this is enforced by every
+/// planned read before network I/O begins.
+pub const max_physical_range_read_bytes: u64 = 256 * 1024 * 1024;
+pub const max_parquet_footer_metadata_bytes: u64 = 64 * 1024 * 1024;
+
 pub const CacheLane = enum {
     metadata,
     compressed_range,
@@ -104,6 +110,7 @@ pub const RangeRead = struct {
     pub fn validate(self: RangeRead) !void {
         try self.object.validate();
         try self.range.validate(self.object.byte_len);
+        if (self.range.len > max_physical_range_read_bytes) return error.LakeRangeReadTooLarge;
         switch (self.purpose) {
             .decoded_column_page, .projected_row_batch => {
                 if (self.decoded_column_id.len == 0) return error.InvalidLakeRangeRead;
@@ -144,11 +151,13 @@ pub fn planParquetFooterRead(object: ObjectRef, max_probe_bytes: u64) !RangeRead
     try object.validate();
     if (max_probe_bytes == 0) return error.InvalidLakeRangeRead;
     const read_len = @min(object.byte_len, max_probe_bytes);
-    return .{
+    const read = RangeRead{
         .object = object,
         .range = .{ .offset = object.byte_len - read_len, .len = read_len },
         .purpose = .parquet_footer,
     };
+    try read.validate();
+    return read;
 }
 
 pub fn objectRefForExternalFile(
@@ -284,8 +293,9 @@ fn canCoalesce(a: RangeRead, b: RangeRead, max_gap_bytes: u64) bool {
     if (!std.mem.eql(u8, a.compression_codec, b.compression_codec)) return false;
     if (b.range.offset < a.range.offset) return false;
     const a_end = a.range.end();
-    if (b.range.offset <= a_end) return true;
-    return b.range.offset - a_end <= max_gap_bytes;
+    if (b.range.offset > a_end and b.range.offset - a_end > max_gap_bytes) return false;
+    const new_end = @max(a_end, b.range.end());
+    return new_end - a.range.offset <= max_physical_range_read_bytes;
 }
 
 fn sameObjectVersion(a: ObjectRef, b: ObjectRef) bool {
@@ -352,6 +362,35 @@ test "lake range planner creates tail footer reads with versioned cache keys" {
     try std.testing.expect(std.mem.indexOf(u8, key, "etag=etag-1") != null);
     try std.testing.expect(std.mem.indexOf(u8, key, "offset=983040") != null);
     try std.testing.expect(std.mem.indexOf(u8, key, "purpose=parquet_footer") != null);
+}
+
+test "lake range planner rejects oversized reads and bounded coalescing" {
+    const alloc = std.testing.allocator;
+    const oversized_object = ObjectRef{
+        .bucket = "warehouse",
+        .key = "events/oversized.parquet",
+        .byte_len = max_physical_range_read_bytes + 1,
+        .version = .{ .etag = "etag-oversized" },
+    };
+    try std.testing.expectError(error.LakeRangeReadTooLarge, planColumnChunkRead(oversized_object, .{
+        .column_id = @constCast("amount"),
+        .file_offset = 0,
+        .compressed_len = max_physical_range_read_bytes + 1,
+    }));
+
+    const object = ObjectRef{
+        .bucket = "warehouse",
+        .key = "events/coalesced.parquet",
+        .byte_len = max_physical_range_read_bytes * 2,
+        .version = .{ .etag = "etag-coalesced" },
+    };
+    const reads = [_]RangeRead{
+        .{ .object = object, .range = .{ .offset = 0, .len = max_physical_range_read_bytes / 2 + 1 }, .purpose = .parquet_column_chunk },
+        .{ .object = object, .range = .{ .offset = max_physical_range_read_bytes / 2 + 1, .len = max_physical_range_read_bytes / 2 + 1 }, .purpose = .parquet_column_chunk },
+    };
+    const coalesced = try coalescePhysicalReadsAlloc(alloc, &reads, .{});
+    defer alloc.free(coalesced);
+    try std.testing.expectEqual(@as(usize, 2), coalesced.len);
 }
 
 test "lake range planner derives object refs from external file uris" {

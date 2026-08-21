@@ -19,9 +19,30 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const bounded_decode = @import("../bounded_decode.zig");
 const external_source = @import("../external_source/types.zig");
 const external_binding = @import("../external_source/catalog_binding.zig");
 const lake_scan_plan = @import("lake_scan_plan.zig");
+const range_io = @import("lake_range_io.zig");
+
+pub const DecodeLimits = struct {
+    max_footer_bytes: usize = range_io.max_parquet_footer_metadata_bytes,
+    max_struct_allocation_bytes: usize = 256 * 1024 * 1024,
+    max_elements: usize = 1_000_000,
+    max_skip_operations: usize = 4_000_000,
+    max_nesting_depth: usize = 64,
+
+    pub fn validate(self: DecodeLimits) !void {
+        if (self.max_footer_bytes == 0 or
+            self.max_struct_allocation_bytes == 0 or
+            self.max_elements == 0 or
+            self.max_skip_operations == 0 or
+            self.max_nesting_depth == 0)
+        {
+            return error.InvalidParquetMetadataLimits;
+        }
+    }
+};
 
 const CompactType = enum(u4) {
     stop = 0,
@@ -38,6 +59,11 @@ const CompactType = enum(u4) {
     map = 11,
     struct_ = 12,
 };
+
+fn decodeCompactType(raw: u8) !CompactType {
+    if (raw > @intFromEnum(CompactType.struct_)) return error.InvalidParquetMetadata;
+    return @enumFromInt(raw);
+}
 
 pub const ParsedFooter = struct {
     version: i32,
@@ -61,12 +87,39 @@ pub fn parseFooterMetadataAlloc(
     footer_metadata: []const u8,
     file_len: u64,
 ) !ParsedFooter {
+    return try parseFooterMetadataAllocWithLimits(alloc, footer_metadata, file_len, .{});
+}
+
+pub fn parseFooterMetadataAllocWithLimits(
+    alloc: Allocator,
+    footer_metadata: []const u8,
+    file_len: u64,
+    limits: DecodeLimits,
+) !ParsedFooter {
+    try limits.validate();
     if (footer_metadata.len == 0) return error.InvalidParquetMetadata;
-    var reader = Reader{ .bytes = footer_metadata };
+    var reader = Reader{
+        .bytes = footer_metadata,
+        .budget = bounded_decode.Budget.init(footer_metadata.len, .{
+            .max_artifact_bytes = limits.max_footer_bytes,
+            .max_allocation_bytes = limits.max_struct_allocation_bytes,
+            .max_elements = limits.max_elements,
+        }) catch |err| return mapDecodeLimitError(err),
+        .remaining_skip_operations = limits.max_skip_operations,
+        .max_nesting_depth = limits.max_nesting_depth,
+    };
     var footer = try parseFileMetadata(alloc, &reader, file_len);
     errdefer footer.deinit(alloc);
     if (reader.cursor != reader.bytes.len) return error.InvalidParquetMetadata;
     return footer;
+}
+
+fn mapDecodeLimitError(err: anyerror) anyerror {
+    return switch (err) {
+        error.DecodedArtifactTooLarge => error.ParquetMetadataTooLarge,
+        error.InvalidEncodedCount => error.InvalidParquetMetadata,
+        else => err,
+    };
 }
 
 pub fn enrichInventoryFilesWithFootersAlloc(
@@ -358,7 +411,9 @@ fn parseFileMetadata(alloc: Allocator, reader: *Reader, file_len: u64) !ParsedFo
     }
 
     var total_rows: u64 = 0;
-    for (got_row_groups) |group| total_rows += group.row_count;
+    for (got_row_groups) |group| {
+        total_rows = std.math.add(u64, total_rows, group.row_count) catch return error.InvalidParquetMetadata;
+    }
     if (got_row_groups.len != 0 and total_rows != got_row_count) return error.InvalidParquetMetadata;
     row_groups = null;
 
@@ -408,6 +463,10 @@ fn parseSchemaColumnsAlloc(alloc: Allocator, reader: *Reader, field_type: Compac
     if (list.elem_type != .struct_) return error.InvalidParquetMetadata;
     if (list.len == 0) return error.InvalidParquetMetadata;
 
+    try reader.admitAllocation(SchemaElement, list.len);
+    // A flattened schema cannot contain more leaf columns than elements.
+    try reader.admitAllocation(SchemaColumn, list.len);
+    try reader.admitAllocation([]const u8, list.len);
     const elements = try alloc.alloc(SchemaElement, list.len);
     errdefer alloc.free(elements);
     var initialized: usize = 0;
@@ -428,7 +487,7 @@ fn parseSchemaColumnsAlloc(alloc: Allocator, reader: *Reader, field_type: Compac
     var path = std.ArrayListUnmanaged([]const u8).empty;
     defer path.deinit(alloc);
     var cursor: usize = 1;
-    try collectSchemaColumnsAlloc(alloc, elements, &cursor, elements[0].child_count, false, &path, &columns);
+    try collectSchemaColumnsAlloc(alloc, reader, elements, &cursor, elements[0].child_count, false, &path, &columns, 0);
     if (cursor != elements.len) return error.InvalidParquetMetadata;
 
     for (elements) |*element| element.deinit(alloc);
@@ -499,13 +558,16 @@ fn parseSchemaElement(alloc: Allocator, reader: *Reader) !SchemaElement {
 
 fn collectSchemaColumnsAlloc(
     alloc: Allocator,
+    reader: *Reader,
     elements: []const SchemaElement,
     cursor: *usize,
     child_count: u32,
     inherited_nullable: bool,
     path: *std.ArrayListUnmanaged([]const u8),
     columns: *std.ArrayListUnmanaged(SchemaColumn),
+    depth: usize,
 ) !void {
+    if (depth >= reader.max_nesting_depth) return error.ParquetMetadataTooLarge;
     for (0..child_count) |_| {
         if (cursor.* >= elements.len) return error.InvalidParquetMetadata;
         const element = elements[cursor.*];
@@ -516,9 +578,12 @@ fn collectSchemaColumnsAlloc(
         defer _ = path.pop();
 
         if (element.child_count == 0) {
-            const column_id = try joinSchemaPathAlloc(alloc, path.items);
+            const column_id = try joinSchemaPathAlloc(alloc, reader, path.items);
             errdefer alloc.free(column_id);
-            const logical_type: []u8 = if (element.logical_type.len == 0) &.{} else try alloc.dupe(u8, element.logical_type);
+            const logical_type: []u8 = if (element.logical_type.len == 0) &.{} else blk: {
+                try reader.admitAllocation(u8, element.logical_type.len);
+                break :blk try alloc.dupe(u8, element.logical_type);
+            };
             errdefer if (logical_type.len > 0) alloc.free(logical_type);
             try columns.append(alloc, .{
                 .column_id = column_id,
@@ -530,7 +595,7 @@ fn collectSchemaColumnsAlloc(
                 .field_id = element.field_id,
             });
         } else {
-            try collectSchemaColumnsAlloc(alloc, elements, cursor, element.child_count, element_nullable, path, columns);
+            try collectSchemaColumnsAlloc(alloc, reader, elements, cursor, element.child_count, element_nullable, path, columns, depth + 1);
         }
     }
 }
@@ -542,13 +607,14 @@ fn isNullableRepetition(repetition_type: ?i32) bool {
     };
 }
 
-fn joinSchemaPathAlloc(alloc: Allocator, parts: []const []const u8) ![]u8 {
+fn joinSchemaPathAlloc(alloc: Allocator, reader: *Reader, parts: []const []const u8) ![]u8 {
     if (parts.len == 0) return error.InvalidParquetMetadata;
     var total_len: usize = parts.len - 1;
     for (parts) |part| {
         if (part.len == 0) return error.InvalidParquetMetadata;
-        total_len += part.len;
+        total_len = std.math.add(usize, total_len, part.len) catch return error.ParquetMetadataTooLarge;
     }
+    try reader.admitAllocation(u8, total_len);
     const out = try alloc.alloc(u8, total_len);
     var cursor: usize = 0;
     for (parts, 0..) |part, idx| {
@@ -596,6 +662,7 @@ fn parseRowGroupList(alloc: Allocator, reader: *Reader, file_len: u64) ![]extern
     const list = try reader.readListHeader();
     if (list.elem_type != .struct_) return error.InvalidParquetMetadata;
 
+    try reader.admitAllocation(external_source.RowGroup, list.len);
     const row_groups = try alloc.alloc(external_source.RowGroup, list.len);
     errdefer alloc.free(row_groups);
     var initialized: usize = 0;
@@ -658,6 +725,7 @@ fn parseColumnChunkList(alloc: Allocator, reader: *Reader, file_len: u64) ![]ext
     const list = try reader.readListHeader();
     if (list.elem_type != .struct_) return error.InvalidParquetMetadata;
 
+    try reader.admitAllocation(external_source.ColumnChunk, list.len);
     const chunks = try alloc.alloc(external_source.ColumnChunk, list.len);
     errdefer alloc.free(chunks);
     var initialized: usize = 0;
@@ -923,6 +991,7 @@ fn parsePathInSchemaAlloc(alloc: Allocator, reader: *Reader, field_type: Compact
     if (list.elem_type != .binary) return error.InvalidParquetMetadata;
     if (list.len == 0) return error.InvalidParquetMetadata;
 
+    try reader.admitAllocation([]u8, list.len);
     var parts = try alloc.alloc([]u8, list.len);
     defer alloc.free(parts);
     var initialized: usize = 0;
@@ -933,10 +1002,12 @@ fn parsePathInSchemaAlloc(alloc: Allocator, reader: *Reader, field_type: Compact
     for (parts) |*part| {
         part.* = try reader.readBinaryAlloc(alloc);
         if (part.len == 0) return error.InvalidParquetMetadata;
-        total_len += part.len;
+        total_len = std.math.add(usize, total_len, part.len) catch return error.ParquetMetadataTooLarge;
         initialized += 1;
     }
-    const out = try alloc.alloc(u8, total_len + parts.len - 1);
+    const output_len = std.math.add(usize, total_len, parts.len - 1) catch return error.ParquetMetadataTooLarge;
+    try reader.admitAllocation(u8, output_len);
+    const out = try alloc.alloc(u8, output_len);
     var cursor: usize = 0;
     for (parts, 0..) |part, idx| {
         if (idx != 0) {
@@ -1123,22 +1194,41 @@ const ListHeader = struct {
 const Reader = struct {
     bytes: []const u8,
     cursor: usize = 0,
+    budget: bounded_decode.Budget,
+    remaining_skip_operations: usize,
+    max_nesting_depth: usize,
+
+    fn admitAllocation(self: *Reader, comptime T: type, count: usize) !void {
+        self.budget.admitAllocation(T, count) catch |err| return mapDecodeLimitError(err);
+    }
+
+    fn admitElements(self: *Reader, raw_count: anytype, min_encoded_bytes: usize) !usize {
+        return self.budget.admitElements(
+            raw_count,
+            self.bytes.len - self.cursor,
+            min_encoded_bytes,
+        ) catch |err| return mapDecodeLimitError(err);
+    }
 
     fn readFieldHeader(self: *Reader, previous_field_id: *i16) !?Field {
         const raw = try self.readByte();
-        const field_type: CompactType = @enumFromInt(raw & 0x0f);
+        const field_type = try decodeCompactType(raw & 0x0f);
         if (field_type == .stop) return null;
         const delta: i16 = @intCast(raw >> 4);
-        const field_id = if (delta == 0) try self.readI16() else previous_field_id.* + delta;
+        const field_id = if (delta == 0)
+            try self.readI16()
+        else
+            std.math.add(i16, previous_field_id.*, delta) catch return error.InvalidParquetMetadata;
         previous_field_id.* = field_id;
         return .{ .id = field_id, .type = field_type };
     }
 
     fn readListHeader(self: *Reader) !ListHeader {
         const raw = try self.readByte();
-        const elem_type: CompactType = @enumFromInt(raw & 0x0f);
+        const elem_type = try decodeCompactType(raw & 0x0f);
         const inline_len = raw >> 4;
-        const len = if (inline_len == 15) try self.readVarintUsize() else inline_len;
+        const raw_len = if (inline_len == 15) try self.readVarintUsize() else inline_len;
+        const len = try self.admitElements(raw_len, 0);
         return .{ .elem_type = elem_type, .len = len };
     }
 
@@ -1175,6 +1265,7 @@ const Reader = struct {
     fn readBinaryAlloc(self: *Reader, alloc: Allocator) ![]u8 {
         const len = try self.readVarintUsize();
         if (len > self.bytes.len - self.cursor) return error.InvalidParquetMetadata;
+        try self.admitAllocation(u8, len);
         const out = try alloc.dupe(u8, self.bytes[self.cursor .. self.cursor + len]);
         self.cursor += len;
         return out;
@@ -1204,6 +1295,13 @@ const Reader = struct {
     }
 
     fn skip(self: *Reader, field_type: CompactType) !void {
+        return try self.skipAtDepth(field_type, 0);
+    }
+
+    fn skipAtDepth(self: *Reader, field_type: CompactType, depth: usize) !void {
+        if (depth >= self.max_nesting_depth) return error.ParquetMetadataTooLarge;
+        if (self.remaining_skip_operations == 0) return error.ParquetMetadataTooLarge;
+        self.remaining_skip_operations -= 1;
         switch (field_type) {
             .stop => {},
             .boolean_true, .boolean_false => {},
@@ -1222,22 +1320,24 @@ const Reader = struct {
             },
             .list, .set => {
                 const list = try self.readListHeader();
-                for (0..list.len) |_| try self.skip(list.elem_type);
+                for (0..list.len) |_| try self.skipAtDepth(list.elem_type, depth + 1);
             },
             .map => {
                 const count = try self.readVarintUsize();
                 if (count == 0) return;
+                const element_count = std.math.mul(usize, count, 2) catch return error.ParquetMetadataTooLarge;
+                _ = try self.admitElements(element_count, 0);
                 const types = try self.readByte();
-                const key_type: CompactType = @enumFromInt(types >> 4);
-                const value_type: CompactType = @enumFromInt(types & 0x0f);
+                const key_type = try decodeCompactType(types >> 4);
+                const value_type = try decodeCompactType(types & 0x0f);
                 for (0..count) |_| {
-                    try self.skip(key_type);
-                    try self.skip(value_type);
+                    try self.skipAtDepth(key_type, depth + 1);
+                    try self.skipAtDepth(value_type, depth + 1);
                 }
             },
             .struct_ => {
                 var previous_field_id: i16 = 0;
-                while (try self.readFieldHeader(&previous_field_id)) |field| try self.skip(field.type);
+                while (try self.readFieldHeader(&previous_field_id)) |field| try self.skipAtDepth(field.type, depth + 1);
             },
         }
     }
@@ -1333,6 +1433,18 @@ test "parquet metadata parser extracts row groups and column chunks" {
     try std.testing.expectEqual(@as(u64, 40), footer.row_groups[0].column_chunks[0].compressed_len);
     try std.testing.expectEqual(@as(?i64, 10), footer.row_groups[0].column_chunks[0].stats_min_i64);
     try std.testing.expectEqual(@as(?i64, 20), footer.row_groups[0].column_chunks[0].stats_max_i64);
+}
+
+test "parquet metadata parser rejects forged list counts before allocation" {
+    const alloc = std.testing.allocator;
+    // FileMetaData.version followed by a schema list claiming five structs.
+    const forged = [_]u8{ 0x15, 0x02, 0x19, 0xfc, 0x05 };
+    try std.testing.expectError(error.ParquetMetadataTooLarge, parseFooterMetadataAllocWithLimits(
+        alloc,
+        &forged,
+        1024,
+        .{ .max_elements = 4 },
+    ));
 }
 
 test "parquet metadata parser derives nullable columns from schema repetition" {

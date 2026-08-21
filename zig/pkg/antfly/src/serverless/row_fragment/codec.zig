@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const bounded_decode = @import("../bounded_decode.zig");
 const row_fragment = @import("types.zig");
 
 const magic = "AFRF";
@@ -21,6 +22,8 @@ const version: u32 = 1;
 
 const cell_null: u8 = 0;
 const cell_present: u8 = 1;
+
+pub const DecodeLimits = bounded_decode.Limits;
 
 pub fn encodeAlloc(alloc: Allocator, fragment: row_fragment.Fragment) ![]u8 {
     try fragment.validate();
@@ -52,6 +55,11 @@ pub fn encodeAlloc(alloc: Allocator, fragment: row_fragment.Fragment) ![]u8 {
 }
 
 pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !row_fragment.Fragment {
+    return try decodeAllocWithLimits(alloc, bytes, .{});
+}
+
+pub fn decodeAllocWithLimits(alloc: Allocator, bytes: []const u8, limits: DecodeLimits) !row_fragment.Fragment {
+    var budget = try bounded_decode.Budget.init(bytes.len, limits);
     var cursor: usize = 0;
     if (bytes.len < magic.len + 4) return error.InvalidRowFragment;
     if (!std.mem.eql(u8, bytes[0..magic.len], magic)) return error.InvalidRowFragmentMagic;
@@ -59,10 +67,12 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !row_fragment.Fragment {
     const got_version = try readU32(bytes, &cursor);
     if (got_version != version) return error.UnsupportedRowFragmentVersion;
 
-    const schema_fingerprint = try readBytesAlloc(alloc, bytes, &cursor);
+    const schema_fingerprint = try readBytesAlloc(alloc, bytes, &cursor, &budget);
     errdefer alloc.free(schema_fingerprint);
-    const row_count = try readU32(bytes, &cursor);
-    const column_count = try readU32(bytes, &cursor);
+    const raw_row_count = try readU32(bytes, &cursor);
+    const raw_column_count = try readU32(bytes, &cursor);
+    const row_count = try budget.admitCount(row_fragment.RowRef, raw_row_count, bytes.len - cursor, 12);
+    const column_count = try budget.admitCount(row_fragment.Column, raw_column_count, bytes.len - cursor, 9);
 
     const row_refs = try alloc.alloc(row_fragment.RowRef, row_count);
     errdefer alloc.free(row_refs);
@@ -74,7 +84,7 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !row_fragment.Fragment {
     for (row_refs) |*row_ref| {
         row_ref.* = .{
             .ordinal = try readU64(bytes, &cursor),
-            .key = try readBytesAlloc(alloc, bytes, &cursor),
+            .key = try readBytesAlloc(alloc, bytes, &cursor, &budget),
         };
         initialized_row_refs += 1;
     }
@@ -87,13 +97,14 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !row_fragment.Fragment {
     }
 
     for (columns) |*column| {
-        const name = try readBytesAlloc(alloc, bytes, &cursor);
+        const name = try readBytesAlloc(alloc, bytes, &cursor, &budget);
         errdefer alloc.free(name);
         if (cursor >= bytes.len) return error.InvalidRowFragment;
         const kind = try decodeColumnKind(bytes[cursor]);
         cursor += 1;
-        const value_count = try readU32(bytes, &cursor);
-        if (value_count != row_count) return error.InvalidRowFragment;
+        const raw_value_count = try readU32(bytes, &cursor);
+        if (raw_value_count != raw_row_count) return error.InvalidRowFragment;
+        const value_count = try budget.admitCount(row_fragment.CellValue, raw_value_count, bytes.len - cursor, 1);
         const values = try alloc.alloc(row_fragment.CellValue, value_count);
         errdefer alloc.free(values);
         var initialized_values: usize = 0;
@@ -101,7 +112,7 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !row_fragment.Fragment {
             for (values[0..initialized_values]) |*value| value.deinit(alloc);
         }
         for (values) |*value| {
-            value.* = try decodeCellAlloc(alloc, bytes, &cursor, kind);
+            value.* = try decodeCellAlloc(alloc, bytes, &cursor, &budget, kind);
             initialized_values += 1;
         }
         column.* = .{
@@ -170,6 +181,7 @@ fn decodeCellAlloc(
     alloc: Allocator,
     bytes: []const u8,
     cursor: *usize,
+    budget: *bounded_decode.Budget,
     kind: row_fragment.ColumnKind,
 ) !row_fragment.CellValue {
     if (cursor.* >= bytes.len) return error.InvalidRowFragment;
@@ -178,8 +190,8 @@ fn decodeCellAlloc(
     if (tag == cell_null) return .null;
     if (tag != cell_present) return error.InvalidRowFragment;
     return switch (kind) {
-        .bytes => .{ .bytes = try readBytesAlloc(alloc, bytes, cursor) },
-        .json => .{ .json = try readBytesAlloc(alloc, bytes, cursor) },
+        .bytes => .{ .bytes = try readBytesAlloc(alloc, bytes, cursor, budget) },
+        .json => .{ .json = try readBytesAlloc(alloc, bytes, cursor, budget) },
         .i64 => .{ .i64 = try readI64(bytes, cursor) },
         .f64 => .{ .f64 = @bitCast(try readU64(bytes, cursor)) },
         .bool => blk: {
@@ -193,7 +205,8 @@ fn decodeCellAlloc(
             };
         },
         .vector_f32 => blk: {
-            const len = try readU32(bytes, cursor);
+            const raw_len = try readU32(bytes, cursor);
+            const len = try budget.admitCount(f32, raw_len, bytes.len - cursor.*, @sizeOf(f32));
             const vector = try alloc.alloc(f32, len);
             errdefer alloc.free(vector);
             for (vector) |*value| value.* = @bitCast(try readU32(bytes, cursor));
@@ -219,9 +232,11 @@ fn appendBytes(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), bytes: []cons
     try out.appendSlice(alloc, bytes);
 }
 
-fn readBytesAlloc(alloc: Allocator, bytes: []const u8, cursor: *usize) ![]u8 {
-    const len = try readU32(bytes, cursor);
-    if (cursor.* + len > bytes.len) return error.InvalidRowFragment;
+fn readBytesAlloc(alloc: Allocator, bytes: []const u8, cursor: *usize, budget: *bounded_decode.Budget) ![]u8 {
+    const raw_len = try readU32(bytes, cursor);
+    const len: usize = @intCast(raw_len);
+    if (cursor.* > bytes.len or len > bytes.len - cursor.*) return error.InvalidRowFragment;
+    try budget.admitBytes(len);
     const out = try alloc.dupe(u8, bytes[cursor.* .. cursor.* + len]);
     cursor.* += len;
     return out;
@@ -319,4 +334,35 @@ test "row fragment codec round-trips typed columns" {
     try std.testing.expect(decoded.columns[2].values[1] == .null);
     try std.testing.expectEqual(@as(f32, 0.5), decoded.columns[3].values[1].vector_f32[0]);
     try std.testing.expectEqual(@as(f32, 0.5), decoded.columns[3].values[1].vector_f32[1]);
+}
+
+test "row fragment codec rejects forged counts before allocation" {
+    const alloc = std.testing.allocator;
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+    try encoded.appendSlice(alloc, magic);
+    try appendU32(alloc, &encoded, version);
+    try appendBytes(alloc, &encoded, "schema-v1");
+    try appendU32(alloc, &encoded, std.math.maxInt(u32));
+    try appendU32(alloc, &encoded, 0);
+    try std.testing.expectError(error.DecodedArtifactTooLarge, decodeAlloc(alloc, encoded.items));
+}
+
+test "row fragment codec bounds vector allocation amplification" {
+    const alloc = std.testing.allocator;
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+    try encoded.appendSlice(alloc, magic);
+    try appendU32(alloc, &encoded, version);
+    try appendBytes(alloc, &encoded, "schema-v1");
+    try appendU32(alloc, &encoded, 1);
+    try appendU32(alloc, &encoded, 1);
+    try appendU64(alloc, &encoded, 0);
+    try appendBytes(alloc, &encoded, "row-a");
+    try appendBytes(alloc, &encoded, "embedding");
+    try encoded.append(alloc, @intFromEnum(row_fragment.ColumnKind.vector_f32));
+    try appendU32(alloc, &encoded, 1);
+    try encoded.append(alloc, cell_present);
+    try appendU32(alloc, &encoded, std.math.maxInt(u32));
+    try std.testing.expectError(error.DecodedArtifactTooLarge, decodeAlloc(alloc, encoded.items));
 }

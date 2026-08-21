@@ -31,8 +31,10 @@ pub const Builder = writer.Builder;
 pub const Reader = reader.Reader;
 pub const FragmentSource = source.FragmentSource;
 pub const MaterializedBatch = source.MaterializedBatch;
+pub const DecodeLimits = codec.DecodeLimits;
 pub const encodeAlloc = codec.encodeAlloc;
 pub const decodeAlloc = codec.decodeAlloc;
+pub const decodeAllocWithLimits = codec.decodeAllocWithLimits;
 pub const buildStatsAlloc = stats.buildAlloc;
 pub const encodeStatsAlloc = stats.encodeAlloc;
 
@@ -49,8 +51,11 @@ test "serverless row fragment module compiles" {
     _ = Builder;
     _ = Reader;
     _ = FragmentSource;
+    _ = MaterializedBatch;
+    _ = DecodeLimits;
     _ = encodeAlloc;
     _ = decodeAlloc;
+    _ = decodeAllocWithLimits;
     _ = buildStatsAlloc;
     _ = encodeStatsAlloc;
 }
