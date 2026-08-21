@@ -82,7 +82,9 @@ Current status:
   query.
 - The HBC read benchmark now treats query behavior as an ingest acceptance
   gate. It reports QPS, p50/p95/p99/max latency, sampled exact recall@k, and
-  storage reads both immediately after ingest and after close/reopen.
+  storage reads both immediately after ingest and after close/reopen. Its
+  `public_ingest` build arm uses the same external-vector/coalesced/bulk-session
+  options as derived replay so storage experiments share one matched workload.
 
 ## Current HBC Shape
 

@@ -425,6 +425,16 @@ fast query/recall regression gate for storage-format experiments. The cold
 first query after reopen was 14.7 ms, which is tracked separately from the
 warm distribution rather than hidden in an average.
 
+A closer `public_ingest` arm now uses the derived replay path's external-vector
+loader, known-new/coalesced batches, deferred RaBitQ rebuild policy, and one
+bulk publication session. Three current-main 5K-by-1536 samples averaged
+233.3 ms to build (21.4K vectors/s; 229.5--238.5 ms range) and 33.74 MB written.
+Recall@10 was 0.670 in every before/after-reopen sample. After reopen, warm
+query p50 averaged 0.340 ms, p95 1.405 ms, p99 1.756 ms, and throughput about
+1,920 QPS. Immediately after ingest, p50 averaged 0.339 ms and p95 1.597 ms.
+This is the matched internal gate for future storage arms; public HTTP E2E
+latency and the real VectorDBBench corpus remain required before promotion.
+
 | Run | Insert | Ready/load | Notes |
 | --- | ---: | ---: | --- |
 | 50K OpenAI, batch 100, four workers, original public path | 46.39 s | 48.42 s | Default full-text index present |

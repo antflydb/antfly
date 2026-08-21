@@ -57,7 +57,18 @@ const StorageSelection = enum {
 const BuildSelection = enum {
     bulk_build,
     online_coalesced,
+    public_ingest,
     both,
+};
+
+const ExternalVectorLoaderContext = struct {
+    items: []const hbc.BatchInsertItem,
+
+    fn load(ctx_ptr: *anyopaque, allocator: Allocator, vector_id: u64, _: []const u8) ![]f32 {
+        const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
+        if (vector_id == 0 or vector_id > ctx.items.len) return error.NotFound;
+        return try allocator.dupe(f32, ctx.items[@intCast(vector_id - 1)].vector);
+    }
 };
 
 const StorageCounters = struct {
@@ -432,6 +443,7 @@ pub fn main(init: std.process.Init) !void {
     const build_modes: []const BuildSelection = switch (cfg.build_mode) {
         .bulk_build => &[_]BuildSelection{.bulk_build},
         .online_coalesced => &[_]BuildSelection{.online_coalesced},
+        .public_ingest => &[_]BuildSelection{.public_ingest},
         .both => &[_]BuildSelection{ .bulk_build, .online_coalesced },
     };
 
@@ -440,6 +452,8 @@ pub fn main(init: std.process.Init) !void {
             for (0..cfg.samples) |sample_index| {
                 var scenario = try Scenario.init(allocator, cfg, sample_index, storage_mode, build_mode);
                 defer scenario.deinit();
+                var external_loader_ctx: ExternalVectorLoaderContext = .{ .items = items };
+                if (build_mode == .public_ingest) scenario.index.setExternalVectorLoader(&external_loader_ctx, ExternalVectorLoaderContext.load);
                 const before_build_storage = scenario.storage_harness.snapshotCounters();
                 scenario.index.resetWriteProfile();
                 const build_start = nanotime();
@@ -453,7 +467,10 @@ pub fn main(init: std.process.Init) !void {
                     .k = cfg.k,
                     .load_metadata = false,
                 }, dataset, true);
-                if (cfg.reopen_before_query) try scenario.reopen();
+                if (cfg.reopen_before_query) {
+                    try scenario.reopen();
+                    if (build_mode == .public_ingest) scenario.index.setExternalVectorLoader(&external_loader_ctx, ExternalVectorLoaderContext.load);
+                }
 
                 try benchQueries(out, &stdout_writer, &scenario, "cold_first_query_no_metadata", queries, 1, .{
                     .query = queries[0..cfg.dims],
@@ -531,6 +548,23 @@ fn buildIndex(scenario: *Scenario, items: []const hbc.BatchInsertItem) !void {
                 });
                 offset = end;
             }
+        },
+        .public_ingest => {
+            try scenario.index.beginBulkIngestSession();
+            errdefer scenario.index.abortBulkIngestSession();
+            var offset: usize = 0;
+            while (offset < items.len) {
+                const end = @min(offset + scenario.cfg.batch_size, items.len);
+                try scenario.index.batchInsertWithMetadataOptions(items[offset..end], .{
+                    .assume_absent_ids = true,
+                    .coalesce_leaf_writes = true,
+                    .defer_quantized_rebuild = true,
+                    .skip_vector_store = true,
+                    .bulk_ingest = true,
+                });
+                offset = end;
+            }
+            try scenario.index.finishBulkIngestSessionWithOptions(.{ .compact = false });
         },
         .both => unreachable,
     }
