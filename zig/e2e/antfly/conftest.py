@@ -48,7 +48,7 @@ import time
 from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 from typing import Any, Callable
 
 import pytest
@@ -216,7 +216,12 @@ def _uses_reusable_antfly_process(request: pytest.FixtureRequest) -> bool:
         "yes",
         "on",
     }
-    return not disabled and request.node.get_closest_marker("reuse_antfly_process") is not None
+    force_fresh = request.node.get_closest_marker("fresh_antfly_process") is not None
+    return (
+        not disabled
+        and not force_fresh
+        and request.node.get_closest_marker("reuse_antfly_process") is not None
+    )
 
 
 class ReusableAntflyRuntime:
@@ -245,6 +250,13 @@ def _cleanup_created_tables(api: Any, table_names: set[str]) -> list[str]:
         except requests.RequestException as err:
             cleanup_errors.append(f"{table_name}: {err}")
     return cleanup_errors
+
+
+def _created_table_from_path(path: str) -> str | None:
+    parts = path.partition("?")[0].strip("/").split("/")
+    if len(parts) != 2 or parts[0] != "tables" or not parts[1]:
+        return None
+    return unquote(parts[1])
 
 
 def ready_index_status(index_info: dict[str, Any], *, require_query_fresh: bool = False) -> dict[str, Any] | None:
@@ -2230,7 +2242,10 @@ def stateful_api(request: pytest.FixtureRequest):
         def post(self, path: str, payload: dict) -> Any:
             try:
                 with self._request_lock:
-                    return self._check(self.s.post(f"{self.url}{path}", json=payload, timeout=30))
+                    result = self._check(self.s.post(f"{self.url}{path}", json=payload, timeout=30))
+                if table_name := _created_table_from_path(path):
+                    self._created_tables.add(table_name)
+                return result
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
@@ -2723,7 +2738,10 @@ def backup_api(request: pytest.FixtureRequest):
         def post(self, path: str, payload: dict) -> Any:
             try:
                 with self._request_lock:
-                    return self._check(self.s.post(f"{self.url}{path}", json=payload, timeout=30))
+                    result = self._check(self.s.post(f"{self.url}{path}", json=payload, timeout=30))
+                if table_name := _created_table_from_path(path):
+                    self._created_tables.add(table_name)
+                return result
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
