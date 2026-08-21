@@ -3723,6 +3723,75 @@ fn metalStatsCompactJson(
         allocator,
         &out,
         \\,
+        \\"projected_expert_arena":{{
+        \\"enabled":{d},
+        \\"capacities":[{d},{d},{d},{d}],
+        \\"layer_attempts":[{d},{d},{d},{d}],
+        \\"route_hits":[{d},{d},{d},{d}],
+        \\"route_misses":[{d},{d},{d},{d}],
+        \\"all_hit_layers":[{d},{d},{d},{d}],
+        \\"token_attempts":[{d},{d},{d},{d}],
+        \\"all_hit_tokens":[{d},{d},{d},{d}]
+        \\}}
+    ,
+        .{
+            provider.a4b_moe_projected_enabled,
+            ops.a4b_projected_slot_capacities[0],
+            ops.a4b_projected_slot_capacities[1],
+            ops.a4b_projected_slot_capacities[2],
+            ops.a4b_projected_slot_capacities[3],
+            provider.a4b_moe_projected_layer_attempts[0],
+            provider.a4b_moe_projected_layer_attempts[1],
+            provider.a4b_moe_projected_layer_attempts[2],
+            provider.a4b_moe_projected_layer_attempts[3],
+            provider.a4b_moe_projected_route_hits[0],
+            provider.a4b_moe_projected_route_hits[1],
+            provider.a4b_moe_projected_route_hits[2],
+            provider.a4b_moe_projected_route_hits[3],
+            provider.a4b_moe_projected_route_misses[0],
+            provider.a4b_moe_projected_route_misses[1],
+            provider.a4b_moe_projected_route_misses[2],
+            provider.a4b_moe_projected_route_misses[3],
+            provider.a4b_moe_projected_all_hit_layers[0],
+            provider.a4b_moe_projected_all_hit_layers[1],
+            provider.a4b_moe_projected_all_hit_layers[2],
+            provider.a4b_moe_projected_all_hit_layers[3],
+            provider.a4b_moe_projected_token_attempts[0],
+            provider.a4b_moe_projected_token_attempts[1],
+            provider.a4b_moe_projected_token_attempts[2],
+            provider.a4b_moe_projected_token_attempts[3],
+            provider.a4b_moe_projected_all_hit_tokens[0],
+            provider.a4b_moe_projected_all_hit_tokens[1],
+            provider.a4b_moe_projected_all_hit_tokens[2],
+            provider.a4b_moe_projected_all_hit_tokens[3],
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
+        \\"mapped_layer0_prewarm":{{
+        \\"attempts":{d},
+        \\"successes":{d},
+        \\"failures":{d},
+        \\"logical_bytes":{d},
+        \\"page_touches":{d},
+        \\"nanos":{d}
+        \\}}
+    ,
+        .{
+            provider.a4b_moe_mapped_layer0_prewarm_attempts,
+            provider.a4b_moe_mapped_layer0_prewarm_successes,
+            provider.a4b_moe_mapped_layer0_prewarm_failures,
+            provider.a4b_moe_mapped_layer0_prewarm_logical_bytes,
+            provider.a4b_moe_mapped_layer0_prewarm_page_touches,
+            provider.a4b_moe_mapped_layer0_prewarm_nanos,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
         \\"residency":{{
         \\"quantized_slots":{d},
         \\"quantized_prepared_bytes":{d},
@@ -5537,7 +5606,7 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
     const top_fallback = graph_mod.executor_stats.quantKernelTopFallbackReason(plan_stats);
     const fast_path_misses = graph_mod.executor_stats.quantKernelFastPathMisses(plan_stats);
     print(
-        "metal_a4b_moe: linear_attempts={d} linear_successes={d} linear_fallbacks={d} pair_attempts={d} pair_successes={d} pair_fallbacks={d} scatter_attempts={d} scatter_successes={d} scatter_fallbacks={d} slot_arena_attempts={d} slot_arena_successes={d} slot_arena_failures={d} checkpoint_attempts={d} checkpoint_all_hit_tokens={d} checkpoint_miss_tokens={d} checkpoint_replays={d} slot_uploads={d} slot_upload_bytes={d}\n",
+        "metal_a4b_moe: linear_attempts={d} linear_successes={d} linear_fallbacks={d} pair_attempts={d} pair_successes={d} pair_fallbacks={d} scatter_attempts={d} scatter_successes={d} scatter_fallbacks={d} slot_arena_attempts={d} slot_arena_successes={d} slot_arena_failures={d} mapped_layer0_attempts={d} mapped_layer0_successes={d} mapped_layer0_failures={d} prewarm_attempts={d} prewarm_successes={d} prewarm_failures={d} prewarm_logical_bytes={d} prewarm_page_touches={d} prewarm_ms={d} checkpoint_attempts={d} checkpoint_all_hit_tokens={d} checkpoint_miss_tokens={d} checkpoint_replays={d} slot_uploads={d} slot_upload_bytes={d}\n",
         .{
             metal_snapshot.provider.a4b_packed_q4_0_linear_attempts,
             metal_snapshot.provider.a4b_packed_q4_0_linear_successes,
@@ -5551,6 +5620,15 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
             metal_snapshot.provider.a4b_moe_slot_arena_attempts,
             metal_snapshot.provider.a4b_moe_slot_arena_successes,
             metal_snapshot.provider.a4b_moe_slot_arena_failures,
+            metal_snapshot.provider.a4b_moe_mapped_layer0_attempts,
+            metal_snapshot.provider.a4b_moe_mapped_layer0_successes,
+            metal_snapshot.provider.a4b_moe_mapped_layer0_failures,
+            metal_snapshot.provider.a4b_moe_mapped_layer0_prewarm_attempts,
+            metal_snapshot.provider.a4b_moe_mapped_layer0_prewarm_successes,
+            metal_snapshot.provider.a4b_moe_mapped_layer0_prewarm_failures,
+            metal_snapshot.provider.a4b_moe_mapped_layer0_prewarm_logical_bytes,
+            metal_snapshot.provider.a4b_moe_mapped_layer0_prewarm_page_touches,
+            @divTrunc(metal_snapshot.provider.a4b_moe_mapped_layer0_prewarm_nanos, std.time.ns_per_ms),
             metal_snapshot.provider.a4b_moe_checkpoint_attempts,
             metal_snapshot.provider.a4b_moe_checkpoint_all_hit_tokens,
             metal_snapshot.provider.a4b_moe_checkpoint_miss_tokens,
@@ -5559,6 +5637,21 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
             metal_snapshot.provider.a4b_moe_slot_upload_bytes,
         },
     );
+    for (ops.a4b_projected_slot_capacities, 0..) |capacity, projection| {
+        print(
+            "metal_a4b_moe_projected_arena: enabled={d} slots={d} layer_attempts={d} route_hits={d} route_misses={d} all_hit_layers={d} token_attempts={d} all_hit_tokens={d}\n",
+            .{
+                metal_snapshot.provider.a4b_moe_projected_enabled,
+                capacity,
+                metal_snapshot.provider.a4b_moe_projected_layer_attempts[projection],
+                metal_snapshot.provider.a4b_moe_projected_route_hits[projection],
+                metal_snapshot.provider.a4b_moe_projected_route_misses[projection],
+                metal_snapshot.provider.a4b_moe_projected_all_hit_layers[projection],
+                metal_snapshot.provider.a4b_moe_projected_token_attempts[projection],
+                metal_snapshot.provider.a4b_moe_projected_all_hit_tokens[projection],
+            },
+        );
+    }
     print(
         "metal_quant_kernel_plan: planned={d} handwritten_production={d} generated_production={d} unsupported_routes={d} fast_path_misses={d} generated_candidates={d} generated_artifact_missing={d} generated_runtime_not_wired={d} unsupported={d} unsupported_format={d} unsupported_shape={d} unsupported_epilogue={d} unsupported_backend={d} tensor_core_repack_required={d} top_fallback_reason={s} top_fallback_count={d}\n",
         .{
@@ -7980,6 +8073,13 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     snapshot.provider.a4b_moe_checkpoint_all_hit_tokens = 2;
     snapshot.provider.a4b_moe_checkpoint_miss_tokens = 1;
     snapshot.provider.a4b_moe_checkpoint_replays = 1;
+    snapshot.provider.a4b_moe_projected_enabled = 1;
+    snapshot.provider.a4b_moe_projected_layer_attempts = .{ 30, 30, 30, 30 };
+    snapshot.provider.a4b_moe_projected_route_hits = .{ 100, 120, 140, 160 };
+    snapshot.provider.a4b_moe_projected_route_misses = .{ 140, 120, 100, 80 };
+    snapshot.provider.a4b_moe_projected_all_hit_layers = .{ 1, 2, 3, 4 };
+    snapshot.provider.a4b_moe_projected_token_attempts = .{ 5, 5, 5, 5 };
+    snapshot.provider.a4b_moe_projected_all_hit_tokens = .{ 0, 1, 2, 3 };
 
     const graph_stats = graph_mod.executor_stats.ExecutionStats{
         .quant_kernel_planned_ops = 12,
@@ -8083,6 +8183,12 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     try std.testing.expectEqual(@as(i64, 7), root.get("frame_fallbacks").?.object.get("decode_fallback").?.integer);
     try std.testing.expectEqual(@as(i64, 8), root.get("frame_fallbacks").?.object.get("prefill_execute").?.integer);
     try std.testing.expectEqual(@as(i64, 9), root.get("frame_fallbacks").?.object.get("prefill_execute_attempts").?.integer);
+    const projected_arena = root.get("projected_expert_arena").?.object;
+    try std.testing.expectEqual(@as(i64, 1), projected_arena.get("enabled").?.integer);
+    try std.testing.expectEqual(@as(i64, 12), projected_arena.get("capacities").?.array.items[1].integer);
+    try std.testing.expectEqual(@as(i64, 140), projected_arena.get("route_hits").?.array.items[2].integer);
+    try std.testing.expectEqual(@as(i64, 80), projected_arena.get("route_misses").?.array.items[3].integer);
+    try std.testing.expectEqual(@as(i64, 2), projected_arena.get("all_hit_tokens").?.array.items[2].integer);
     try std.testing.expectEqual(@as(i64, 10), root.get("residency").?.object.get("runtime_mapped_fallbacks").?.integer);
     try std.testing.expectEqual(@as(i64, 11), root.get("residency").?.object.get("active_frame_bootstrap_misses").?.integer);
     try std.testing.expectEqual(@as(i64, 12), root.get("residency").?.object.get("runtime_mapped_failures").?.integer);

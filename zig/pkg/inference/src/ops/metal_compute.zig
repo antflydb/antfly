@@ -46,6 +46,161 @@ const CT = ops.CT;
 const MetalTensor = metal_tensor_mod.MetalTensor;
 const QuantizedStorage = weight_source_mod.QuantizedStorage;
 
+/// Read-only simulation of several bounded expert arenas. It consumes route
+/// IDs already returned by the authoritative selector and never publishes a
+/// slot map or touches weight storage.
+const A4bProjectedArenaTelemetry = struct {
+    const capacity_count = ops.a4b_projected_slot_capacities.len;
+    const max_layers = runtime_root.moe.expert_slot_arena.max_layers;
+    const max_experts = runtime_root.moe.expert_slot_arena.max_experts;
+    const ExpertSlotArena = runtime_root.moe.expert_slot_arena.ExpertSlotArena;
+
+    fn initialArenas() [capacity_count]ExpertSlotArena {
+        var arenas: [capacity_count]ExpertSlotArena = undefined;
+        for (ops.a4b_projected_slot_capacities, 0..) |capacity, projection| {
+            arenas[projection] = ExpertSlotArena.init(capacity) catch unreachable;
+        }
+        return arenas;
+    }
+
+    arenas: [capacity_count]ExpertSlotArena = initialArenas(),
+    token_all_hit: [capacity_count]bool = [_]bool{false} ** capacity_count,
+    token_active: bool = false,
+    next_layer: usize = 0,
+
+    fn reset(self: *A4bProjectedArenaTelemetry) void {
+        self.* = .{};
+    }
+
+    fn observe(
+        self: *A4bProjectedArenaTelemetry,
+        stats: *ops.NativeQuantTimingStats,
+        layer: usize,
+        layer_count: usize,
+        expert_count: usize,
+        experts: []const u32,
+    ) void {
+        if (layer_count == 0 or layer_count > max_layers or layer >= layer_count or
+            expert_count == 0 or expert_count > max_experts or experts.len == 0)
+        {
+            self.token_active = false;
+            return;
+        }
+
+        if (layer == 0) {
+            self.token_active = true;
+            self.next_layer = 0;
+            self.token_all_hit = [_]bool{true} ** capacity_count;
+        } else if (!self.token_active or layer != self.next_layer) {
+            self.token_active = false;
+            return;
+        }
+
+        for (0..capacity_count) |projection| {
+            const observation = self.arenas[projection].observeRoute(
+                layer,
+                expert_count,
+                experts,
+            ) catch {
+                self.token_active = false;
+                return;
+            };
+            stats.a4b_moe_projected_layer_attempts[projection] +|= 1;
+            stats.a4b_moe_projected_route_hits[projection] +|= observation.hit_count;
+            stats.a4b_moe_projected_route_misses[projection] +|= observation.miss_count;
+            if (observation.all_hit_before_update) {
+                stats.a4b_moe_projected_all_hit_layers[projection] +|= 1;
+            } else {
+                self.token_all_hit[projection] = false;
+            }
+        }
+
+        self.next_layer = layer + 1;
+        if (self.next_layer != layer_count) return;
+        for (0..capacity_count) |projection| {
+            stats.a4b_moe_projected_token_attempts[projection] +|= 1;
+            if (self.token_all_hit[projection]) {
+                stats.a4b_moe_projected_all_hit_tokens[projection] +|= 1;
+            }
+        }
+        self.token_active = false;
+    }
+};
+
+test "metal_compute: projected A4B arenas distinguish cold and warm tokens" {
+    var telemetry = A4bProjectedArenaTelemetry{};
+    var stats = ops.NativeQuantTimingStats{};
+    const route = [_]u32{ 0, 1, 2, 3, 4, 5, 6, 7 };
+
+    telemetry.observe(&stats, 0, 2, 128, &route);
+    telemetry.observe(&stats, 1, 2, 128, &route);
+    telemetry.observe(&stats, 0, 2, 128, &route);
+    telemetry.observe(&stats, 1, 2, 128, &route);
+
+    for (0..ops.a4b_projected_slot_capacities.len) |projection| {
+        try std.testing.expectEqual(@as(u64, 4), stats.a4b_moe_projected_layer_attempts[projection]);
+        try std.testing.expectEqual(@as(u64, 16), stats.a4b_moe_projected_route_hits[projection]);
+        try std.testing.expectEqual(@as(u64, 16), stats.a4b_moe_projected_route_misses[projection]);
+        try std.testing.expectEqual(@as(u64, 2), stats.a4b_moe_projected_all_hit_layers[projection]);
+        try std.testing.expectEqual(@as(u64, 2), stats.a4b_moe_projected_token_attempts[projection]);
+        try std.testing.expectEqual(@as(u64, 1), stats.a4b_moe_projected_all_hit_tokens[projection]);
+    }
+}
+
+test "metal_compute: projected A4B arenas expose capacity working set" {
+    var telemetry = A4bProjectedArenaTelemetry{};
+    var stats = ops.NativeQuantTimingStats{};
+    const route_a = [_]u32{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    const route_b = [_]u32{ 4, 5, 6, 7, 8, 9, 10, 11 };
+
+    telemetry.observe(&stats, 0, 1, 128, &route_a);
+    telemetry.observe(&stats, 0, 1, 128, &route_b);
+    telemetry.observe(&stats, 0, 1, 128, &route_a);
+
+    for (0..ops.a4b_projected_slot_capacities.len) |projection| {
+        try std.testing.expectEqual(@as(u64, 3), stats.a4b_moe_projected_token_attempts[projection]);
+    }
+    try std.testing.expectEqual(@as(u64, 0), stats.a4b_moe_projected_all_hit_tokens[0]);
+    try std.testing.expectEqual(@as(u64, 1), stats.a4b_moe_projected_all_hit_tokens[1]);
+    try std.testing.expectEqual(@as(u64, 1), stats.a4b_moe_projected_all_hit_tokens[2]);
+    try std.testing.expectEqual(@as(u64, 1), stats.a4b_moe_projected_all_hit_tokens[3]);
+}
+
+test "metal_compute: projected A4B arena policy matches authoritative directory" {
+    const routes = [_][8]u32{
+        .{ 0, 1, 2, 3, 4, 5, 6, 7 },
+        .{ 4, 5, 6, 7, 8, 9, 10, 11 },
+        .{ 0, 1, 2, 3, 4, 5, 6, 7 },
+        .{ 8, 9, 10, 11, 12, 13, 14, 15 },
+        .{ 4, 5, 6, 7, 8, 9, 10, 11 },
+    };
+
+    for (ops.a4b_projected_slot_capacities, 0..) |capacity, projection| {
+        var telemetry = A4bProjectedArenaTelemetry{};
+        var stats = ops.NativeQuantTimingStats{};
+        var authoritative = try runtime_root.moe.expert_slot_arena.ExpertSlotArena.init(capacity);
+        for (routes) |route| {
+            const expected = try authoritative.observeRoute(0, 128, &route);
+            const prior_hits = stats.a4b_moe_projected_route_hits[projection];
+            const prior_misses = stats.a4b_moe_projected_route_misses[projection];
+            const prior_all_hit = stats.a4b_moe_projected_all_hit_tokens[projection];
+            telemetry.observe(&stats, 0, 1, 128, &route);
+            try std.testing.expectEqual(
+                @as(u64, @intCast(expected.hit_count)),
+                stats.a4b_moe_projected_route_hits[projection] - prior_hits,
+            );
+            try std.testing.expectEqual(
+                @as(u64, @intCast(expected.miss_count)),
+                stats.a4b_moe_projected_route_misses[projection] - prior_misses,
+            );
+            try std.testing.expectEqual(
+                @as(u64, @intFromBool(expected.all_hit_before_update)),
+                stats.a4b_moe_projected_all_hit_tokens[projection] - prior_all_hit,
+            );
+        }
+    }
+}
+
 fn concreteShapeElementCount(shape: []const i32) ?usize {
     var count: usize = 1;
     for (shape) |dim| {
@@ -714,10 +869,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     active_deberta_encoder_frame_plan_key: ?ActiveDebertaEncoderFramePlanKey = null,
     pending_prefill_kv_device_seeds: std.ArrayListUnmanaged(PendingKvDeviceSeed) = .empty,
     timing_stats: ops.NativeQuantTimingStats = .{},
+    a4b_mapped_layer0_prewarm_result: ?ops.A4bMappedLayer0PrewarmResult = null,
+    a4b_mapped_layer0_prewarm_nanos: u64 = 0,
     // Candidate identity directory for the bounded A4B expert arena. The
     // current host dispatch remains authoritative until weight bytes are
     // copied into these slots and route-slot kernels can replay misses.
     a4b_expert_slot_arena: ?runtime_root.moe.expert_slot_arena.ExpertSlotArena = null,
+    a4b_projected_arena_telemetry_requested: ?bool = null,
+    a4b_projected_arena_telemetry: ?*A4bProjectedArenaTelemetry = null,
     a4b_moe_checkpoint_active: bool = false,
     a4b_moe_checkpoint_layer_count: usize = 0,
     a4b_moe_checkpoint_top_k: usize = 0,
@@ -3722,6 +3881,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             metal_runtime.clearRawRmsNormSlot(self.provider_impl, slot.*);
         }
         self.dynamic_rms_norm_slots.deinit(self.allocator);
+        if (self.a4b_projected_arena_telemetry) |telemetry| {
+            self.allocator.destroy(telemetry);
+            self.a4b_projected_arena_telemetry = null;
+        }
         if (comptime false) {
             if (self.provider) |provider| provider.deinit();
         }
@@ -4741,6 +4904,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             self.timing_stats.a4b_moe_route_select_fallbacks += 1;
             return null;
         }
+        self.observeProjectedA4bArena(
+            layer_index,
+            rows,
+            num_experts,
+            top_k,
+            expert_ids,
+        );
         self.timing_stats.a4b_moe_route_select_successes += 1;
         return .{
             .expert_ids = expert_ids,
@@ -4748,6 +4918,42 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .rows = rows,
             .top_k = top_k,
         };
+    }
+
+    fn observeProjectedA4bArena(
+        self: *MetalCompute,
+        layer_index: usize,
+        rows: usize,
+        num_experts: usize,
+        top_k: usize,
+        expert_ids: []const u32,
+    ) void {
+        const requested = self.a4b_projected_arena_telemetry_requested orelse blk: {
+            const enabled = getenvBool("TERMITE_METAL_ENABLE_A4B_PROJECTED_ARENA_TELEMETRY");
+            self.a4b_projected_arena_telemetry_requested = enabled;
+            break :blk enabled;
+        };
+        if (!requested) return;
+        const config = self.data.a4b_inference orelse return;
+        if (rows != 1 or num_experts != config.geometry.expert_count or
+            top_k != config.geometry.top_k or expert_ids.len != top_k)
+        {
+            return;
+        }
+        const telemetry = self.a4b_projected_arena_telemetry orelse blk: {
+            const created = self.allocator.create(A4bProjectedArenaTelemetry) catch return;
+            created.* = .{};
+            self.a4b_projected_arena_telemetry = created;
+            break :blk created;
+        };
+        self.timing_stats.a4b_moe_projected_enabled = 1;
+        telemetry.observe(
+            &self.timing_stats,
+            layer_index,
+            config.geometry.moe_layer_count,
+            num_experts,
+            expert_ids,
+        );
     }
 
     const MoeSlotLayout = struct {
@@ -4835,10 +5041,80 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         );
     }
 
+    fn prewarmA4bMappedLayer0Op(
+        ctx: *anyopaque,
+        request: *const ops.A4bMappedLayer0PrewarmRequest,
+    ) anyerror!?ops.A4bMappedLayer0PrewarmResult {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!getenvBool("TERMITE_METAL_ENABLE_A4B_LAYER0_DEVICE_MAPPED_MOE") or
+            !getenvBool("TERMITE_METAL_ENABLE_A4B_LAYER0_DEVICE_MAPPED_PREWARM")) return null;
+        if (self.a4b_mapped_layer0_prewarm_result) |result| return result;
+        const config = self.data.a4b_inference orelse return null;
+        if (request.layer_index != 0) return null;
+        const hidden_size: usize = @intCast(config.geometry.hidden_size);
+        const inter_size: usize = @intCast(config.geometry.expert_intermediate_size);
+        const expert_count: usize = @intCast(config.geometry.expert_count);
+
+        self.timing_stats.a4b_moe_mapped_layer0_prewarm_attempts +|= 1;
+        const started_at = monotonicNowNs();
+        defer {
+            const elapsed = monotonicNowNs() - started_at;
+            const elapsed_nanos = std.math.cast(u64, elapsed) orelse std.math.maxInt(u64);
+            self.timing_stats.a4b_moe_mapped_layer0_prewarm_nanos +|= elapsed_nanos;
+            if (self.a4b_mapped_layer0_prewarm_result != null) {
+                self.a4b_mapped_layer0_prewarm_nanos = elapsed_nanos;
+            }
+        }
+        const gate = (try self.ensurePackedMoeLinearDescriptor(
+            request.w1,
+            hidden_size,
+            inter_size,
+        )) orelse {
+            self.timing_stats.a4b_moe_mapped_layer0_prewarm_failures +|= 1;
+            return error.A4bMetalRouteUnavailable;
+        };
+        const up = (try self.ensurePackedMoeLinearDescriptor(
+            request.w3,
+            hidden_size,
+            inter_size,
+        )) orelse {
+            self.timing_stats.a4b_moe_mapped_layer0_prewarm_failures +|= 1;
+            return error.A4bMetalRouteUnavailable;
+        };
+        const down = (try self.ensurePackedMoeLinearDescriptor(
+            request.w2,
+            inter_size,
+            hidden_size,
+        )) orelse {
+            self.timing_stats.a4b_moe_mapped_layer0_prewarm_failures +|= 1;
+            return error.A4bMetalRouteUnavailable;
+        };
+        const result = metal_runtime.decoderRuntimePrewarmMappedMoeLayer0(
+            self.provider_impl,
+            request.layer_index,
+            gate,
+            up,
+            down,
+            hidden_size,
+            inter_size,
+            expert_count,
+        ) orelse {
+            self.timing_stats.a4b_moe_mapped_layer0_prewarm_failures +|= 1;
+            return error.A4bMetalRouteDispatchFailed;
+        };
+        self.a4b_mapped_layer0_prewarm_result = result;
+        self.timing_stats.a4b_moe_mapped_layer0_prewarm_successes +|= 1;
+        self.timing_stats.a4b_moe_mapped_layer0_prewarm_logical_bytes +|= result.logical_bytes;
+        self.timing_stats.a4b_moe_mapped_layer0_prewarm_page_touches +|= result.page_touches;
+        return result;
+    }
+
     fn runMoeBlockOp(ctx: *anyopaque, request: *const ops.RunMoeBlockRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const config = self.data.a4b_inference orelse return null;
-        if (!getenvBool("TERMITE_METAL_ENABLE_A4B_EXPERT_SLOT_ARENA")) return null;
+        const mapped_layer0 = getenvBool("TERMITE_METAL_ENABLE_A4B_LAYER0_DEVICE_MAPPED_MOE");
+        const slot_arena = getenvBool("TERMITE_METAL_ENABLE_A4B_EXPERT_SLOT_ARENA");
+        if (!mapped_layer0 and !slot_arena) return null;
         if (request.total != 1 or request.activation != .gelu_new or request.layer_index >= config.geometry.moe_layer_count or
             request.hidden_size != config.geometry.hidden_size or request.inter_size != config.geometry.expert_intermediate_size or
             request.num_experts != config.geometry.expert_count or request.top_k != config.geometry.top_k) return null;
@@ -4850,6 +5126,77 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const logits_buf = toBuf(request.router_logits);
         const logits = logits_buf.metal_tensor orelse return null;
         if (!logits.isDevice()) return null;
+
+        if (mapped_layer0 and request.layer_index == 0) {
+            self.timing_stats.a4b_moe_mapped_layer0_attempts += 1;
+            const gate_descriptor = (try self.ensurePackedMoeLinearDescriptor(
+                request.w1,
+                request.hidden_size,
+                request.inter_size,
+            )) orelse {
+                self.timing_stats.a4b_moe_mapped_layer0_failures += 1;
+                return error.A4bMetalRouteUnavailable;
+            };
+            const up_descriptor = (try self.ensurePackedMoeLinearDescriptor(
+                request.w3,
+                request.hidden_size,
+                request.inter_size,
+            )) orelse {
+                self.timing_stats.a4b_moe_mapped_layer0_failures += 1;
+                return error.A4bMetalRouteUnavailable;
+            };
+            const down_descriptor = (try self.ensurePackedMoeLinearDescriptor(
+                request.w2,
+                request.inter_size,
+                request.hidden_size,
+            )) orelse {
+                self.timing_stats.a4b_moe_mapped_layer0_failures += 1;
+                return error.A4bMetalRouteUnavailable;
+            };
+
+            self.timing_stats.a4b_moe_route_select_attempts += 1;
+            if (!metal_runtime.decoderRuntimeSelectMoeRoutesBufferedDevice(
+                self.provider_impl,
+                request.layer_index,
+                logits,
+                request.total,
+                request.num_experts,
+                request.top_k,
+                request.router_logit_scale,
+            )) {
+                self.timing_stats.a4b_moe_route_select_fallbacks += 1;
+                self.timing_stats.a4b_moe_mapped_layer0_failures += 1;
+                return error.A4bMetalRouteUnavailable;
+            }
+            self.timing_stats.a4b_moe_route_select_successes += 1;
+
+            var input = try self.ownedDeviceMetalTensorFromCt(request.input);
+            defer input.deinit();
+            var scale: ?MetalTensor = null;
+            defer if (scale) |*value| value.deinit();
+            if (request.expert_scale) |scale_ct| scale = try self.ownedDeviceMetalTensorFromCt(scale_ct);
+            const output = (try metal_runtime.decoderRuntimeMoeForwardQ4_0MappedLayer0Device(
+                self.provider_impl,
+                request.layer_index,
+                gate_descriptor,
+                up_descriptor,
+                down_descriptor,
+                input,
+                request.total,
+                request.hidden_size,
+                request.inter_size,
+                request.num_experts,
+                request.top_k,
+                request.activation,
+                scale,
+            )) orelse {
+                self.timing_stats.a4b_moe_mapped_layer0_failures += 1;
+                return error.A4bMetalRouteDispatchFailed;
+            };
+            self.timing_stats.a4b_moe_mapped_layer0_successes += 1;
+            return self.ctFromOwnedMetalTensor(output);
+        }
+        if (!slot_arena) return null;
 
         self.timing_stats.a4b_moe_slot_arena_attempts += 1;
         if (self.a4b_moe_checkpoint_active and !self.a4b_moe_synchronized_replay) {
@@ -23537,6 +23884,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn debugTimingSnapshotOp(ctx: *anyopaque) ops.BackendDebugTimingSnapshot {
         const self: *const MetalCompute = @ptrCast(@alignCast(ctx));
         var provider_stats = self.timing_stats;
+        // Prewarm is model/runtime lifecycle state, while the surrounding
+        // timing counters are request-scoped and may be reset immediately
+        // after prepare(). Preserve its one-shot accounting in snapshots.
+        if (self.a4b_mapped_layer0_prewarm_result) |prewarm| {
+            provider_stats.a4b_moe_mapped_layer0_prewarm_attempts = 1;
+            provider_stats.a4b_moe_mapped_layer0_prewarm_successes = 1;
+            provider_stats.a4b_moe_mapped_layer0_prewarm_failures = 0;
+            provider_stats.a4b_moe_mapped_layer0_prewarm_logical_bytes = prewarm.logical_bytes;
+            provider_stats.a4b_moe_mapped_layer0_prewarm_page_touches = prewarm.page_touches;
+            provider_stats.a4b_moe_mapped_layer0_prewarm_nanos = self.a4b_mapped_layer0_prewarm_nanos;
+        }
         self.populateMemoryDebugStats(&provider_stats);
         return .{
             .native_quant_null = false,
@@ -23566,6 +23924,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         metal_runtime.resetStageTiming(self.provider_impl.raw_decode_runtime) catch {};
         self.timing_stats = .{};
+        if (self.a4b_projected_arena_telemetry) |telemetry| telemetry.reset();
         const runtime_stats = metal_runtime.runtimeMemorySnapshot(self.provider_impl.raw_decode_runtime);
         self.runtime_frame_begin_baseline = runtime_stats.frame_begin_count;
         self.runtime_frame_submit_baseline = runtime_stats.frame_submit_count;
@@ -25513,6 +25872,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.moeScatterAdd = moeScatterAddOp;
         vt.moeSelectRoutes = moeSelectRoutesOp;
         vt.runMoeBlock = runMoeBlockOp;
+        vt.prewarmA4bMappedLayer0 = prewarmA4bMappedLayer0Op;
         vt.splitLastDim3 = splitLastDim3Op;
         vt.linearPair = linearPairOp;
         vt.linearTriple = linearTripleOp;

@@ -2078,6 +2078,44 @@ fn prewarmEmbeddingWeight(cb: *const ops.ComputeBackend, gpt_config: gpt_mod.Con
     defer cb.free(embedded);
 }
 
+fn a4bMappedLayer0PrewarmEnabled(gpt_config: gpt_mod.Config) bool {
+    return gemma4_runtime.isQualifiedA4bArchitecture(gpt_config) and
+        gemma4_runtime.getenvBool("TERMITE_METAL_ENABLE_A4B_LAYER0_DEVICE_MAPPED_MOE") and
+        gemma4_runtime.getenvBool("TERMITE_METAL_ENABLE_A4B_LAYER0_DEVICE_MAPPED_PREWARM");
+}
+
+fn prewarmA4bMappedLayer0(cb: *const ops.ComputeBackend, gpt_config: gpt_mod.Config) !void {
+    if (!a4bMappedLayer0PrewarmEnabled(gpt_config)) return;
+    const w1 = try gpt_arch.getModelWeight(
+        cb,
+        gpt_config,
+        "model.layers.0.block_sparse_moe.packed.w1.weight",
+    );
+    defer cb.free(w1);
+    const w3 = try gpt_arch.getModelWeight(
+        cb,
+        gpt_config,
+        "model.layers.0.block_sparse_moe.packed.w3.weight",
+    );
+    defer cb.free(w3);
+    const w2 = try gpt_arch.getModelWeight(
+        cb,
+        gpt_config,
+        "model.layers.0.block_sparse_moe.packed.w2.weight",
+    );
+    defer cb.free(w2);
+    const result = (try cb.prewarmA4bMappedLayer0(&.{
+        .layer_index = 0,
+        .w1 = w1,
+        .w3 = w3,
+        .w2 = w2,
+    })) orelse return error.A4bMetalMappedLayer0PrewarmUnavailable;
+    std.log.info(
+        "A4B Metal layer-0 mapped prewarm complete: logical_bytes={d} page_touches={d}",
+        .{ result.logical_bytes, result.page_touches },
+    );
+}
+
 pub fn prewarmSharedDecoderRuntime(
     allocator: std.mem.Allocator,
     session: backends.Session,
@@ -2089,6 +2127,14 @@ pub fn prewarmSharedDecoderRuntime(
     var cb = try session_factory.getComputeBackend(session, allocator);
     defer cb.deinit();
 
+    // A4B uses the graph fallback rather than the prepared dense-family
+    // decoder, so its bounded mapped-page warmup is the complete shared
+    // pre-publication prepare operation when explicitly enabled.
+    if (a4bMappedLayer0PrewarmEnabled(gpt_config)) {
+        try prewarmA4bMappedLayer0(&cb, gpt_config);
+        return true;
+    }
+
     const configured_layer_count = gpt_config.num_hidden_layers;
     const prepare = try cb.decoderRuntimePrepareOrReuseFamily(
         allocator,
@@ -2098,6 +2144,7 @@ pub fn prewarmSharedDecoderRuntime(
     );
     if (prepare.prepared) {
         try prewarmEmbeddingWeight(&cb, gpt_config);
+        try prewarmA4bMappedLayer0(&cb, gpt_config);
     }
     return prepare.prepared;
 }
@@ -2159,11 +2206,18 @@ fn runtimePrepare(
     request: model_runtime.PrepareRequest,
 ) !bool {
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
-    if (!runtime_ctx.decoderRuntimeExecutorEnabled()) return false;
-
     timing_stats.runtime_prepare_calls += 1;
     const started_at = monotonicNowNs();
     defer timing_stats.runtime_prepare_nanos += @intCast(monotonicNowNs() - started_at);
+
+    // Qualified A4B currently executes through the graph fallback, not the
+    // prepared dense-family decoder. Treat its explicitly requested bounded
+    // page warmup as a complete prepare operation before probing that family.
+    if (a4bMappedLayer0PrewarmEnabled(runtime_ctx.gpt_config)) {
+        try prewarmA4bMappedLayer0(&runtime_ctx.cb, runtime_ctx.gpt_config);
+        return true;
+    }
+    if (!runtime_ctx.decoderRuntimeExecutorEnabled()) return false;
 
     const configured_layer_count = runtime_ctx.decoderRuntimeConfiguredLayerCount();
     const prepare_started_at = monotonicNowNs();
@@ -2182,6 +2236,7 @@ fn runtimePrepare(
     }
     if (prepare.prepared) {
         prewarmEmbeddingWeight(&runtime_ctx.cb, runtime_ctx.gpt_config) catch {};
+        try prewarmA4bMappedLayer0(&runtime_ctx.cb, runtime_ctx.gpt_config);
         _ = decoder_gated_runtime.preplanPrefillFrame(
             &runtime_ctx.cb,
             allocator,

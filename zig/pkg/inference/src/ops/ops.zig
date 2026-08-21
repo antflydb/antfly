@@ -473,6 +473,21 @@ pub const MoeForwardFusedRequest = struct {
 
 pub const RunMoeBlockRequest = MoeForwardFusedRequest;
 
+/// Prepare the page-backed packed projections consumed by the qualified A4B
+/// layer-0 device-mapped MoE path. The backend must keep this bounded to the
+/// three supplied projection spans and complete the touch before returning.
+pub const A4bMappedLayer0PrewarmRequest = struct {
+    layer_index: usize,
+    w1: CT,
+    w3: CT,
+    w2: CT,
+};
+
+pub const A4bMappedLayer0PrewarmResult = struct {
+    logical_bytes: u64,
+    page_touches: u64,
+};
+
 pub const A4bResidencyMode = backend_contracts.A4bResidencyMode;
 pub const A4bInferenceRequest = backend_contracts.A4bInferenceRequest;
 pub const A4bExpertGeometry = backend_contracts.A4bExpertGeometry;
@@ -570,6 +585,11 @@ pub const DecoderRuntimeFrameRegime = enum(u8) {
     decode = 2,
 };
 
+/// Candidate bounded expert-arena capacities evaluated by the Metal route
+/// shadow. These counters are diagnostic only: the authoritative route and
+/// weight path are unchanged.
+pub const a4b_projected_slot_capacities = [_]u8{ 8, 12, 16, 24 };
+
 pub const NativeQuantTimingStats = struct {
     calls: u64 = 0,
     pair_calls: u64 = 0,
@@ -586,12 +606,34 @@ pub const NativeQuantTimingStats = struct {
     a4b_moe_slot_arena_attempts: u64 = 0,
     a4b_moe_slot_arena_successes: u64 = 0,
     a4b_moe_slot_arena_failures: u64 = 0,
+    a4b_moe_mapped_layer0_attempts: u64 = 0,
+    a4b_moe_mapped_layer0_successes: u64 = 0,
+    a4b_moe_mapped_layer0_failures: u64 = 0,
+    a4b_moe_mapped_layer0_prewarm_attempts: u64 = 0,
+    a4b_moe_mapped_layer0_prewarm_successes: u64 = 0,
+    a4b_moe_mapped_layer0_prewarm_failures: u64 = 0,
+    a4b_moe_mapped_layer0_prewarm_logical_bytes: u64 = 0,
+    a4b_moe_mapped_layer0_prewarm_page_touches: u64 = 0,
+    a4b_moe_mapped_layer0_prewarm_nanos: u64 = 0,
     a4b_moe_checkpoint_attempts: u64 = 0,
     a4b_moe_checkpoint_all_hit_tokens: u64 = 0,
     a4b_moe_checkpoint_miss_tokens: u64 = 0,
     a4b_moe_checkpoint_replays: u64 = 0,
     a4b_moe_slot_uploads: u64 = 0,
     a4b_moe_slot_upload_bytes: u64 = 0,
+    a4b_moe_projected_enabled: u64 = 0,
+    a4b_moe_projected_layer_attempts: [a4b_projected_slot_capacities.len]u64 =
+        [_]u64{0} ** a4b_projected_slot_capacities.len,
+    a4b_moe_projected_route_hits: [a4b_projected_slot_capacities.len]u64 =
+        [_]u64{0} ** a4b_projected_slot_capacities.len,
+    a4b_moe_projected_route_misses: [a4b_projected_slot_capacities.len]u64 =
+        [_]u64{0} ** a4b_projected_slot_capacities.len,
+    a4b_moe_projected_all_hit_layers: [a4b_projected_slot_capacities.len]u64 =
+        [_]u64{0} ** a4b_projected_slot_capacities.len,
+    a4b_moe_projected_token_attempts: [a4b_projected_slot_capacities.len]u64 =
+        [_]u64{0} ** a4b_projected_slot_capacities.len,
+    a4b_moe_projected_all_hit_tokens: [a4b_projected_slot_capacities.len]u64 =
+        [_]u64{0} ** a4b_projected_slot_capacities.len,
     a4b_packed_q4_0_linear_attempts: u64 = 0,
     a4b_packed_q4_0_linear_successes: u64 = 0,
     a4b_packed_q4_0_linear_fallbacks: u64 = 0,
@@ -1651,6 +1693,14 @@ pub const ComputeBackend = struct {
         /// the dense/gated decoder-block contracts and should only exist where
         /// routed-expert execution is structurally distinct.
         runMoeBlock: ?*const fn (ctx: *anyopaque, request: *const RunMoeBlockRequest) anyerror!?CT = null,
+
+        /// Synchronously make the qualified layer-0 mapped expert projections
+        /// GPU-visible during model preparation. Backends return null when the
+        /// path is disabled or unsupported.
+        prewarmA4bMappedLayer0: ?*const fn (
+            ctx: *anyopaque,
+            request: *const A4bMappedLayer0PrewarmRequest,
+        ) anyerror!?A4bMappedLayer0PrewarmResult = null,
 
         /// Store a per-expert output scale tensor for the current MoE layer.
         /// The graph backend threads this into fused_moe_scatter_add so the
@@ -4367,6 +4417,16 @@ pub const ComputeBackend = struct {
 
     pub fn runMoeBlock(self: *const ComputeBackend, request: *const RunMoeBlockRequest) !?CT {
         if (self.vtable.runMoeBlock) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn prewarmA4bMappedLayer0(
+        self: *const ComputeBackend,
+        request: *const A4bMappedLayer0PrewarmRequest,
+    ) !?A4bMappedLayer0PrewarmResult {
+        if (self.vtable.prewarmA4bMappedLayer0) |op| {
             return op(self.ptr, request);
         }
         return null;
