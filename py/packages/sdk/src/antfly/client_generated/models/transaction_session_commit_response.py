@@ -23,7 +23,9 @@ class TransactionSessionCommitResponse:
     Attributes:
         status (TransactionCommitResponseStatus): Durable transaction outcome. Pending committed states mean the
             commit decision is durable while its requested visibility barrier
-            or participant recovery is still completing.
+            or participant recovery is still completing. `committed_repair_required`
+            means the commit decision is durable and coordination may be released, but
+            a terminal enrichment failure requires operator repair.
         transaction_id (str):
         conflict (TransactionConflict | Unset): Structured details for an aborted transaction attempt.
         tables (TransactionCommitResponseTables | Unset): Per-table batch results (present for every committed status)

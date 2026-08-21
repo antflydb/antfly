@@ -27,6 +27,7 @@ const dense_replay_window_shrink_denominator: u64 = 4;
 const dense_replay_finish_target_ns: u64 = 3 * std.time.ns_per_s;
 const dense_replay_finish_hard_ns: u64 = 8 * std.time.ns_per_s;
 const dense_replay_write_pressure_hard_ns: u64 = std.time.ns_per_s;
+const dense_replay_soft_compaction_quiet_ns: u64 = 500 * std.time.ns_per_ms;
 const soft_throttle_delay_ns: u64 = 10 * std.time.ns_per_ms;
 const supports_pressure_wait = builtin.os.tag != .freestanding and
     builtin.link_libc and
@@ -255,6 +256,11 @@ pub const Options = struct {
     /// These are runtime policy values, not index or API configuration.
     derived_backlog_high_sequences: usize = 200,
     derived_backlog_resume_sequences: usize = 100,
+    /// Bound how much sequence-only replay debt one foreground admission must
+    /// inherit. Byte and aggregate LSM pressure can still request a larger
+    /// drain; this window only prevents a healthy async index backlog from
+    /// concentrating minutes of work into one public write acknowledgement.
+    derived_backlog_throttle_window_sequences: usize = 16,
     /// Node-owned filesystem growth policy. This is deliberately not table or
     /// index configuration. The larger of the fixed floor and this fraction
     /// of observed capacity is kept available for WAL, checkpoints, and
@@ -463,6 +469,7 @@ pub const DenseReplayWindowResult = struct {
 pub const DerivedBacklogLimits = struct {
     high_sequences: usize,
     resume_sequences: usize,
+    throttle_window_sequences: usize,
 };
 
 pub const QueryEmbeddingPolicy = struct {
@@ -567,6 +574,8 @@ pub const ResourceManager = struct {
     mutex: std.atomic.Mutex = .unlocked,
     pressure_change: PressureChange = .{},
     memory: MutableMemory,
+    latency_sensitive_derived_replay_sessions: std.atomic.Value(u64) = .init(0),
+    latency_sensitive_derived_replay_quiet_until_ns: std.atomic.Value(u64) = .init(0),
     slices: [slice_count]MutableSlice,
     dense_replay_window_budget_bytes: u64 = 0,
     dense_replay_last_finish_ns: u64 = 0,
@@ -574,6 +583,7 @@ pub const ResourceManager = struct {
     dense_replay_last_write_pressure_compactions: u64 = 0,
     derived_backlog_high_sequences: usize,
     derived_backlog_resume_sequences: usize,
+    derived_backlog_throttle_window_sequences: usize,
     disk_safety_floor_bytes: u64,
     disk_safety_floor_divisor: u64,
     capacity_domains: std.AutoHashMapUnmanaged(CapacityDomainId, MutableCapacityDomain) = .empty,
@@ -606,6 +616,7 @@ pub const ResourceManager = struct {
                 0
             else
                 @min(options.derived_backlog_resume_sequences, high_sequences - 1),
+            .derived_backlog_throttle_window_sequences = options.derived_backlog_throttle_window_sequences,
             .disk_safety_floor_bytes = options.disk_safety_floor_bytes,
             .disk_safety_floor_divisor = options.disk_safety_floor_divisor,
             .query_embedding_cache_budget = cache_budget.CacheBudget.init(options.query_embedding_cache_bytes),
@@ -617,6 +628,32 @@ pub const ResourceManager = struct {
 
     pub fn queryEmbeddingCacheBudget(self: *ResourceManager) *cache_budget.CacheBudget {
         return &self.query_embedding_cache_budget;
+    }
+
+    /// Marks a replay session whose query-visible projection work should take
+    /// precedence over optional background compaction. This does not relax LSM
+    /// durability or hard write-pressure limits; it only lets backends defer
+    /// their soft compaction lane while replay is actively consuming the same
+    /// CPU and storage bandwidth.
+    pub fn beginLatencySensitiveDerivedReplay(self: *ResourceManager) void {
+        _ = self.latency_sensitive_derived_replay_sessions.fetchAdd(1, .release);
+    }
+
+    pub fn finishLatencySensitiveDerivedReplay(self: *ResourceManager) void {
+        const previous = self.latency_sensitive_derived_replay_sessions.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+        if (previous == 1) {
+            const now_ns = platform_time.monotonicNs();
+            self.latency_sensitive_derived_replay_quiet_until_ns.store(
+                now_ns +| dense_replay_soft_compaction_quiet_ns,
+                .release,
+            );
+        }
+    }
+
+    pub fn shouldDeferSoftCompactionForDerivedReplay(self: *const ResourceManager) bool {
+        if (self.latency_sensitive_derived_replay_sessions.load(.acquire) != 0) return true;
+        return platform_time.monotonicNs() < self.latency_sensitive_derived_replay_quiet_until_ns.load(.acquire);
     }
 
     pub fn queryEmbeddingPolicy(self: *const ResourceManager) QueryEmbeddingPolicy {
@@ -905,6 +942,7 @@ pub const ResourceManager = struct {
         return .{
             .high_sequences = self.derived_backlog_high_sequences,
             .resume_sequences = self.derived_backlog_resume_sequences,
+            .throttle_window_sequences = self.derived_backlog_throttle_window_sequences,
         };
     }
 
@@ -2591,6 +2629,22 @@ test "resource manager records soft and hard budget pressure" {
     try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserve(.derived_backlog, 9));
     stats = manager.snapshot();
     try std.testing.expectEqual(@as(u64, 1), stats.slices[sliceIndex(.derived_backlog)].hard_limit_rejections);
+}
+
+test "latency-sensitive derived replay defers only optional background work" {
+    var manager = ResourceManager.init(.{});
+    defer manager.deinit(std.testing.allocator);
+
+    try std.testing.expect(!manager.shouldDeferSoftCompactionForDerivedReplay());
+    manager.beginLatencySensitiveDerivedReplay();
+    manager.beginLatencySensitiveDerivedReplay();
+    try std.testing.expect(manager.shouldDeferSoftCompactionForDerivedReplay());
+    manager.finishLatencySensitiveDerivedReplay();
+    try std.testing.expect(manager.shouldDeferSoftCompactionForDerivedReplay());
+    manager.finishLatencySensitiveDerivedReplay();
+    try std.testing.expect(manager.shouldDeferSoftCompactionForDerivedReplay());
+    manager.latency_sensitive_derived_replay_quiet_until_ns.store(0, .release);
+    try std.testing.expect(!manager.shouldDeferSoftCompactionForDerivedReplay());
 }
 
 test "resource manager background deferral follows slice policy" {

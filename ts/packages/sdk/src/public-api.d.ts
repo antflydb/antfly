@@ -4053,6 +4053,15 @@ export interface components {
          * @enum {string}
          */
         AggregationType: "sum" | "avg" | "min" | "max" | "count" | "sumsquares" | "stats" | "cardinality" | "terms" | "range" | "date_range" | "histogram" | "date_histogram" | "geohash_grid" | "geo_distance" | "significant_terms";
+        /**
+         * @description Exact-vs-approximate selection for a cardinality aggregation:
+         *     - auto: use a materialized HyperLogLog sketch when one applies and is
+         *       current, else an exact distinct scan (default).
+         *     - exact: always compute an exact distinct count.
+         *     - approximate: require a matching sketch; error if none applies.
+         * @enum {string}
+         */
+        CardinalityMode: "auto" | "exact" | "approximate";
         AggregationRange: {
             /** @description Name of the range bucket */
             name: string;
@@ -4130,6 +4139,8 @@ export interface components {
             type: components["schemas"]["AggregationType"];
             /** @description Field to aggregate on. Required unless `fields` is supplied for a multi-field terms aggregation. */
             field?: string;
+            /** @description Selection mode for a cardinality aggregation. `auto` (default) uses a materialized HyperLogLog sketch when one applies and is current, else falls back to an exact distinct scan. `exact` always scans. `approximate` requires a sketch and errors if none applies. Ignored for other types. */
+            mode?: components["schemas"]["CardinalityMode"];
             /** @description Ordered field list for multi-field terms aggregations. Bucket keys are returned as JSON arrays in the same order. */
             fields?: string[];
             /**
@@ -4214,6 +4225,13 @@ export interface components {
              * @description Single value for metric aggregations (sum, avg, min, max, count, cardinality)
              */
             value?: number;
+            /** @description For cardinality aggregations, whether the value is an approximate estimate from a HyperLogLog sketch (true) or an exact distinct count (false). Absent for non-cardinality aggregations. */
+            approximate?: boolean;
+            /**
+             * Format: float
+             * @description For an approximate cardinality value, the relative standard error of the estimate. Present only when approximate is true.
+             */
+            relative_error?: number;
             /** @description Document count for stats aggregations */
             count?: number;
             /**
@@ -4741,10 +4759,13 @@ export interface components {
         };
         BatchResponse: {
             /**
-             * @description Durable commit and visibility/participant recovery state.
+             * @description Durable commit outcome. `committed_pending` means requested visibility or
+             *     participant propagation is still completing. `committed_repair_required`
+             *     means the primary write committed, but a terminal enrichment failure needs
+             *     operator repair and will not be retried indefinitely.
              * @enum {string}
              */
-            status?: "committed" | "committed_pending";
+            status?: "committed" | "committed_pending" | "committed_repair_required";
             /** @description Number of documents successfully inserted */
             inserted?: number;
             /** @description Number of documents successfully deleted */
@@ -4806,10 +4827,13 @@ export interface components {
         /** @description Response for a cross-table batch operation. Contains per-table results. */
         MultiBatchResponse: {
             /**
-             * @description Durable commit and visibility/propagation state.
+             * @description Durable commit outcome. Pending states mean requested visibility or
+             *     participant propagation is still completing. `committed_repair_required`
+             *     means the primary writes committed, but a terminal enrichment failure needs
+             *     operator repair and will not be retried indefinitely.
              * @enum {string}
              */
-            status?: "committed" | "committed_visibility_pending" | "committed_recovery_pending";
+            status?: "committed" | "committed_visibility_pending" | "committed_recovery_pending" | "committed_repair_required";
             /** @description Per-table batch results */
             tables?: {
                 [key: string]: components["schemas"]["BatchResponse"];
@@ -4908,10 +4932,12 @@ export interface components {
             /**
              * @description Durable transaction outcome. Pending committed states mean the
              *     commit decision is durable while its requested visibility barrier
-             *     or participant recovery is still completing.
+             *     or participant recovery is still completing. `committed_repair_required`
+             *     means the commit decision is durable and coordination may be released, but
+             *     a terminal enrichment failure requires operator repair.
              * @enum {string}
              */
-            status: "committed" | "committed_visibility_pending" | "committed_recovery_pending" | "aborted";
+            status: "committed" | "committed_visibility_pending" | "committed_recovery_pending" | "committed_repair_required" | "aborted";
             /** @description Details about the conflict that caused an abort (only present when status is "aborted") */
             conflict?: components["schemas"]["TransactionConflict"];
             /** @description Per-table batch results (present for every committed status) */

@@ -2704,8 +2704,30 @@ pub const ApiHttpServer = struct {
                         // a new leader may discard it before apply. Upgrade
                         // only the weakest level, preserving stronger caller
                         // visibility contracts without extra hot-path work.
-                        if (commit.sync_level == .propose) .write else commit.sync_level,
+                        if (commit.repair_handoff_needs_coordinator or commit.sync_level == .propose)
+                            .write
+                        else
+                            commit.sync_level,
                     ) catch |err| switch (err) {
+                        error.EnrichmentWorkerFailed => {
+                            // Older records and third-party sources may expose a
+                            // committed terminal repair only as an error. Persist
+                            // that fact now; the next claim uses write durability
+                            // to recover coordinator metadata without calling the
+                            // failed provider again.
+                            _ = (self.txn_sessions.recordTerminalCommitWithRepair(
+                                self.alloc,
+                                txn_id,
+                                .committed,
+                                true,
+                                null,
+                                null,
+                            ) catch |persist_err| {
+                                std.log.warn("stable transaction repair handoff persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(persist_err) });
+                                continue;
+                            }) orelse continue;
+                            continue;
+                        },
                         error.InvalidBatchRequest,
                         error.InvalidArgument,
                         error.InvalidGraphEdges,
@@ -2732,16 +2754,18 @@ pub const ApiHttpServer = struct {
                             _ = self.txn_sessions.remove(self.alloc, txn_id);
                         },
                         .committed => |committed| {
-                            const status: transactions_api.TerminalCommitStatus = if (committed.propagation_pending)
-                                .committed_recovery_pending
-                            else if (committed.visibility_pending)
-                                .committed_visibility_pending
-                            else
-                                .committed;
-                            _ = (self.txn_sessions.recordTerminalCommit(
+                            const repair_required = commit.repair_required or committed.visibility_repair_required;
+                            const status = transactions_api.terminalCommitStatusForOutcome(
+                                committed.propagation_pending,
+                                committed.visibility_pending,
+                                committed.visibility_retry_pending,
+                                committed.visibility_repair_required,
+                            );
+                            _ = (self.txn_sessions.recordTerminalCommitWithRepair(
                                 self.alloc,
                                 txn_id,
                                 status,
+                                repair_required,
                                 committed.coordinator_group_id,
                                 committed.coordinator_table_name,
                             ) catch |err| {
@@ -4654,11 +4678,27 @@ pub const ApiHttpServer = struct {
                 return .{
                     .ptr = runner,
                     .vtable = &.{
+                        .authorize_query = authorizeQuery,
                         .run_query = runQuery,
                         .scan_key_page = scanKeyPage,
                         .probe_incoming_edges = probeIncomingEdges,
                     },
                 };
+            }
+
+            fn authorizeQuery(
+                ptr_inner: *anyopaque,
+                table_name: []const u8,
+                discovers_tree_roots: bool,
+            ) !void {
+                const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
+                const identity = runner.authenticated_identity orelse return;
+                if (!permissionsAllow(identity.permissions, .table, table_name, .read))
+                    return error.Forbidden;
+                // Root discovery probes the physical reverse index, which
+                // cannot yet distinguish parents hidden by a row filter.
+                if (discovers_tree_roots and effectiveRowFilterJson(identity, table_name) != null)
+                    return error.Forbidden;
             }
 
             fn runQuery(
@@ -4668,6 +4708,10 @@ pub const ApiHttpServer = struct {
                 query_json: []const u8,
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
+                if (runner.authenticated_identity) |identity| {
+                    if (!permissionsAllow(identity.permissions, .table, table_name, .read))
+                        return error.Forbidden;
+                }
                 var semantic_resolver = runner.server.semanticStatusResolver(
                     runner.query_embedding_security_scope.domain,
                     runner.query_embedding_security_scope.value,
@@ -4719,6 +4763,10 @@ pub const ApiHttpServer = struct {
                 exclusion_query_json: ?[]const u8,
             ) !retrieval_agent.QueryRunner.KeyPage {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
+                if (runner.authenticated_identity) |identity| {
+                    if (!permissionsAllow(identity.permissions, .table, table_name, .read))
+                        return error.Forbidden;
+                }
                 return try runner.server.scanRetrievalKeyPage(
                     inner_alloc,
                     runner.source,
@@ -4739,6 +4787,12 @@ pub const ApiHttpServer = struct {
                 keys: []const []const u8,
             ) ![]bool {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
+                if (runner.authenticated_identity) |identity| {
+                    if (!permissionsAllow(identity.permissions, .table, table_name, .read))
+                        return error.Forbidden;
+                    if (effectiveRowFilterJson(identity, table_name) != null)
+                        return error.Forbidden;
+                }
                 return try runner.server.probeRetrievalIncomingEdges(
                     inner_alloc,
                     runner.source,
@@ -4840,6 +4894,10 @@ pub const ApiHttpServer = struct {
             },
             error.TableNotFound => {
                 try queue.status(alloc, task_id, context_id, "failed", "not found");
+                return;
+            },
+            error.Forbidden => {
+                try queue.status(alloc, task_id, context_id, "failed", "forbidden");
                 return;
             },
             error.DocIdentityNamespaceMismatch => {
@@ -7411,7 +7469,7 @@ pub const ApiHttpServer = struct {
         // the transaction protocol, preserve its typed outcome instead of
         // reporting cancellation for a write that may already be durable.
         try ensureTableOperationActive(request);
-        const outcome = (source.commitBatch(alloc, &tables, req.sync_level) catch |err| switch (err) {
+        const outcome = (source.commitBatchWithCancellation(alloc, &tables, req.sync_level, request.cancellation) catch |err| switch (err) {
             error.InvalidBatchRequest,
             error.InvalidArgument,
             error.InvalidGraphEdges,
@@ -7425,14 +7483,17 @@ pub const ApiHttpServer = struct {
             => return error.Conflict,
             error.CommitVisibilityNotSatisfied,
             error.CommitPropagationIncomplete,
+            error.EnrichmentWaitCanceled,
+            error.EnrichmentWaitTimeout,
+            error.EnrichmentRetryInProgress,
             => return error.CommittedPending,
+            error.EnrichmentWorkerFailed => return error.CommittedRepairRequired,
             error.AbortDecisionNotDurable,
             error.TransactionBeginFailed,
             => return error.WriteUnavailable,
             error.CommitDecisionUnknown => return error.OutcomeUnknown,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
-            error.EnrichmentRetryInProgress,
             error.ResourceBudgetExceeded,
             error.PersistentDescriptorAdmissionExhausted,
             error.TextMergeBackpressureTimeout,
@@ -7461,7 +7522,17 @@ pub const ApiHttpServer = struct {
             },
         }) orelse return error.NotFound;
         switch (outcome) {
-            .committed => |committed| if (committed.propagation_pending or committed.visibility_pending) return error.CommittedPending,
+            .committed => |committed| {
+                const status = transactions_api.terminalCommitStatusForOutcome(
+                    committed.propagation_pending,
+                    committed.visibility_pending,
+                    committed.visibility_retry_pending,
+                    committed.visibility_repair_required,
+                );
+                if (status != .committed) return error.CommittedPending;
+                if (committed.visibility_repair_required)
+                    return error.CommittedRepairRequired;
+            },
             .conflict => return error.Conflict,
         }
     }
@@ -8774,7 +8845,10 @@ pub const ApiHttpServer = struct {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
             error.ModelNotFound => return error.ModelNotFound,
-            else => return error.InternalFailure,
+            else => {
+                std.log.err("public create index normalization failed table={s} index={s} err={}", .{ table_name, index_name, err });
+                return error.InternalFailure;
+            },
         };
         defer alloc.free(normalized_index_json);
 
@@ -8789,7 +8863,10 @@ pub const ApiHttpServer = struct {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
             error.ModelNotFound => return error.ModelNotFound,
-            else => return error.InternalFailure,
+            else => {
+                std.log.err("public create index validation failed table={s} index={s} err={}", .{ table_name, index_name, err });
+                return error.InternalFailure;
+            },
         };
 
         // Materialize catalog-owned fields once. The same exact config is sent
@@ -13494,7 +13571,7 @@ pub fn requiresAdminPermission(path: []const u8) bool {
     if (std.mem.eql(u8, path, routes.Routes.transactions_cleanup)) return true;
     if (std.mem.eql(u8, path, routes.Routes.secrets) or std.mem.startsWith(u8, path, routes.Routes.secrets_prefix)) return true;
     if (std.mem.eql(u8, path, routes.Routes.backup) or std.mem.eql(u8, path, routes.Routes.restore) or std.mem.eql(u8, path, routes.Routes.backups)) return true;
-    if (std.mem.eql(u8, path, routes.Routes.a2a) or std.mem.eql(u8, path, routes.Routes.agents_retrieval)) return true;
+    if (std.mem.eql(u8, path, routes.Routes.a2a)) return true;
     if (std.mem.eql(u8, path, routes.Routes.users_me)) return false;
     if (std.mem.eql(u8, path, routes.Routes.auth_subjects) or std.mem.startsWith(u8, path, routes.Routes.auth_subjects_prefix)) return true;
     return std.mem.eql(u8, path, routes.Routes.users) or std.mem.startsWith(u8, path, routes.Routes.users_prefix);
@@ -20254,6 +20331,11 @@ test "api http server treats only exact extension prefixes as admin routes" {
     try std.testing.expect(!requiresAdminPermission("/extensions/v1/installedXYZ"));
 }
 
+test "retrieval route delegates authorization to referenced tables" {
+    try std.testing.expect(!requiresAdminPermission(routes.Routes.agents_retrieval));
+    try std.testing.expect(requiresAdminPermission(routes.Routes.a2a));
+}
+
 fn encodeBasicAuthorization(alloc: std.mem.Allocator, username: []const u8, password: []const u8) ![]u8 {
     const raw = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ username, password });
     defer alloc.free(raw);
@@ -23260,7 +23342,7 @@ test "api http server serves retrieval agent response envelope" {
     ;
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
-        .uri = "/agents/retrieval",
+        .uri = "/db/v1/agents/retrieval",
         .content_type = "application/json",
         .body = retrieval_body,
     });
@@ -23278,13 +23360,138 @@ test "api http server serves retrieval agent response envelope" {
     ;
     var internal_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
-        .uri = "/agents/retrieval",
+        .uri = "/db/v1/agents/retrieval",
         .content_type = "application/json",
         .body = internal_query_body,
     });
     defer internal_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), internal_resp.status);
     try std.testing.expectEqualStrings("invalid retrieval agent request", internal_resp.body);
+
+    // Retrieval has one canonical, authenticated public route. Keeping a
+    // second root-level binding would bypass authorizeRequest and the
+    // per-query table and row-filter checks below.
+    var root_alias = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/agents/retrieval",
+        .content_type = "application/json",
+        .body = retrieval_body,
+    });
+    defer root_alias.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), root_alias.status);
+
+    const secret = "retrieval-trusted-principal-secret";
+    var auth_server = ApiHttpServer.init(
+        std.testing.allocator,
+        .{
+            .trusted_principal_secret = secret,
+            .trusted_principal_issuer = "trusted-upstream",
+        },
+        source.iface(),
+        table_source.source(),
+        null,
+    );
+    defer auth_server.deinit();
+    const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+
+    const denied_payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"iss":"trusted-upstream","sub":"browser-key","tenant":"tenant-1","tables":["other"],"operations":["read"],"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer std.testing.allocator.free(denied_payload);
+    const denied_token = try encodeTrustedPrincipalToken(std.testing.allocator, secret, denied_payload);
+    defer std.testing.allocator.free(denied_token);
+    var denied_identity = try auth_server.authenticateRequest(.{ .trusted_principal = denied_token });
+    defer denied_identity.deinit(std.testing.allocator);
+    try std.testing.expect(!permissionsAllow(denied_identity.permissions, .table, "docs", .read));
+    const denied_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = denied_token },
+    };
+    var denied = try executeHttpxTestRequest(&auth_server, .{
+        .method = .POST,
+        .uri = "/db/v1/agents/retrieval",
+        .content_type = "application/json",
+        .headers = &denied_headers,
+        .body = retrieval_body,
+    });
+    defer denied.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 403), denied.status);
+    try std.testing.expectEqualStrings("forbidden", denied.body);
+
+    var denied_stream = try executeHttpxTestRequest(&auth_server, .{
+        .method = .POST,
+        .uri = "/db/v1/agents/retrieval",
+        .content_type = "application/json",
+        .headers = &denied_headers,
+        .body =
+        \\{"query":"find hello","stream":true,"queries":[{"table":"docs","full_text_search":{"query":"body:hello"},"limit":5}]}
+        ,
+    });
+    defer denied_stream.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 403), denied_stream.status);
+    try std.testing.expectEqualStrings("forbidden", denied_stream.body);
+
+    const allowed_payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"iss":"trusted-upstream","sub":"browser-key","tenant":"tenant-1","tables":["docs"],"operations":["read"],"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer std.testing.allocator.free(allowed_payload);
+    const allowed_token = try encodeTrustedPrincipalToken(std.testing.allocator, secret, allowed_payload);
+    defer std.testing.allocator.free(allowed_token);
+    const allowed_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = allowed_token },
+    };
+    var allowed = try executeHttpxTestRequest(&auth_server, .{
+        .method = .POST,
+        .uri = "/db/v1/agents/retrieval",
+        .content_type = "application/json",
+        .headers = &allowed_headers,
+        .body = retrieval_body,
+    });
+    defer allowed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), allowed.status);
+
+    const filtered_payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"iss":"trusted-upstream","sub":"browser-key","tenant":"tenant-1","tables":["docs"],"operations":["read"],"row_filter":{{"docs":{{"match_all":{{}}}}}},"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer std.testing.allocator.free(filtered_payload);
+    const filtered_token = try encodeTrustedPrincipalToken(std.testing.allocator, secret, filtered_payload);
+    defer std.testing.allocator.free(filtered_token);
+    const filtered_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = filtered_token },
+    };
+    var filtered = try executeHttpxTestRequest(&auth_server, .{
+        .method = .POST,
+        .uri = "/db/v1/agents/retrieval",
+        .content_type = "application/json",
+        .headers = &filtered_headers,
+        .body = retrieval_body,
+    });
+    defer filtered.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), filtered.status);
+
+    // `$roots` asks the physical reverse index whether each candidate has a
+    // parent. Until that probe can apply row filters to parent documents, it
+    // must fail before an SSE response can reveal hidden graph structure.
+    var filtered_roots = try executeHttpxTestRequest(&auth_server, .{
+        .method = .POST,
+        .uri = "/db/v1/agents/retrieval",
+        .content_type = "application/json",
+        .headers = &filtered_headers,
+        .body =
+        \\{"query":"find roots","stream":true,"queries":[{"table":"docs","tree_search":{"index":"doc_hierarchy","start_nodes":"$roots","max_depth":2},"limit":5}]}
+        ,
+    });
+    defer filtered_roots.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 403), filtered_roots.status);
+    try std.testing.expectEqualStrings("forbidden", filtered_roots.body);
 }
 
 test "api http server maps retrieval agent doc identity mismatch to unavailable" {
@@ -23338,7 +23545,7 @@ test "api http server maps retrieval agent doc identity mismatch to unavailable"
     ;
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
-        .uri = "/agents/retrieval",
+        .uri = "/db/v1/agents/retrieval",
         .content_type = "application/json",
         .body = retrieval_body,
     });
@@ -23390,7 +23597,7 @@ test "api http server serves retrieval agent event stream" {
     ;
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
-        .uri = "/agents/retrieval",
+        .uri = "/db/v1/agents/retrieval",
         .content_type = "application/json",
         .body = retrieval_body,
     });
@@ -23459,6 +23666,40 @@ test "api http server serves retrieval agent event stream" {
     try std.testing.expect(saw_a2a_hit);
     try std.testing.expect(saw_a2a_result);
     try std.testing.expect(saw_a2a_completed);
+
+    const secret = "a2a-retrieval-trusted-principal-secret";
+    server.cfg.trusted_principal_secret = secret;
+    server.cfg.trusted_principal_issuer = "trusted-upstream";
+    const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+    const denied_payload = try std.fmt.allocPrint(
+        alloc,
+        \\{{"iss":"trusted-upstream","sub":"browser-key","tenant":"tenant-1","tables":["other"],"operations":["read"],"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer alloc.free(denied_payload);
+    const denied_token = try encodeTrustedPrincipalToken(alloc, secret, denied_payload);
+    defer alloc.free(denied_token);
+    var denied_identity = try server.authenticateRequest(.{ .trusted_principal = denied_token });
+    defer denied_identity.deinit(alloc);
+    var denied_arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer denied_arena_impl.deinit();
+    const denied_arena = denied_arena_impl.allocator();
+    var denied_queue = a2a.EventQueue.init(denied_arena);
+    defer denied_queue.deinit(denied_arena);
+    try server.executeA2aRetrieval(
+        denied_arena,
+        "{\"query\":\"find hello\",\"stream\":false,\"queries\":[{\"table\":\"docs\",\"full_text_search\":{\"query\":\"body:hello\"},\"limit\":5}]}",
+        "denied-task",
+        "denied-context",
+        &denied_queue,
+        ApiHttpServer.queryEmbeddingSecurityScope(denied_identity),
+        denied_identity,
+    );
+    const denied_events_json = try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .array = denied_queue.events }, .{});
+    defer alloc.free(denied_events_json);
+    try std.testing.expect(std.mem.indexOf(u8, denied_events_json, "\"state\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, denied_events_json, "forbidden") != null);
 }
 
 test "api http server serves eval response envelope" {
@@ -24412,6 +24653,9 @@ test "api http server routes table batches through the batch commit hook" {
         batch_calls: usize = 0,
         transaction_calls: usize = 0,
         batch_commit_calls: usize = 0,
+        commit_error: ?anyerror = null,
+        repair_outcome: bool = false,
+        legacy_visibility_pending_outcome: bool = false,
 
         fn source(self: *@This()) table_writes.TableWriteSource {
             return .{
@@ -24462,6 +24706,15 @@ test "api http server routes table batches through the batch commit hook" {
             try std.testing.expectEqual(@as(usize, 1), tables[0].deletes.len);
             try std.testing.expectEqualStrings("doc:gone", tables[0].deletes[0]);
             try std.testing.expectEqual(db_mod.types.SyncLevel.write, sync_level);
+            if (self.commit_error) |err| return err;
+            if (self.repair_outcome) return .{ .committed = .{
+                .participant_count = 2,
+                .visibility_repair_required = true,
+            } };
+            if (self.legacy_visibility_pending_outcome) return .{ .committed = .{
+                .participant_count = 2,
+                .visibility_pending = true,
+            } };
             return .{ .committed = .{ .participant_count = 2 } };
         }
     };
@@ -24491,6 +24744,52 @@ test "api http server routes table batches through the batch commit hook" {
     try std.testing.expectEqual(@as(usize, 1), writes.batch_commit_calls);
     try std.testing.expectEqual(@as(usize, 0), writes.transaction_calls);
     try std.testing.expectEqual(@as(usize, 0), writes.batch_calls);
+
+    for ([_]anyerror{ error.EnrichmentWaitCanceled, error.EnrichmentWaitTimeout, error.EnrichmentRetryInProgress }) |wait_err| {
+        writes.commit_error = wait_err;
+        var pending_resp = try executeHttpxTestRequest(&server, .{
+            .method = .POST,
+            .uri = "/tables/docs/batch",
+            .content_type = "application/json",
+            .body = batch_body,
+        });
+        defer pending_resp.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u16, 202), pending_resp.status);
+        try std.testing.expect(std.mem.indexOf(u8, pending_resp.body, "\"status\":\"committed_pending\"") != null);
+    }
+    writes.commit_error = error.EnrichmentWorkerFailed;
+    var repair_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs/batch",
+        .content_type = "application/json",
+        .body = batch_body,
+    });
+    defer repair_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), repair_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, repair_resp.body, "\"status\":\"committed_repair_required\"") != null);
+    writes.commit_error = null;
+    writes.repair_outcome = true;
+    var repair_outcome_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs/batch",
+        .content_type = "application/json",
+        .body = batch_body,
+    });
+    defer repair_outcome_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), repair_outcome_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, repair_outcome_resp.body, "\"status\":\"committed_repair_required\"") != null);
+    writes.repair_outcome = false;
+    writes.legacy_visibility_pending_outcome = true;
+    var legacy_pending_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs/batch",
+        .content_type = "application/json",
+        .body = batch_body,
+    });
+    defer legacy_pending_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), legacy_pending_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, legacy_pending_resp.body, "\"status\":\"committed_pending\"") != null);
+    try std.testing.expectEqual(@as(usize, 7), writes.batch_commit_calls);
 }
 
 test "api http server serves table batch transforms" {

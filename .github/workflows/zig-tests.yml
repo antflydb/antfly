@@ -308,6 +308,8 @@ jobs:
           tools/test_run_bounded_zig_build.py
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
+          tools/test_run_test_partitions.py
+          tools/test_run_recall_checks.py
 
       - name: Check inference kernel generator
         working-directory: zig/pkg/inference
@@ -579,6 +581,8 @@ jobs:
           tools/test_run_bounded_zig_build.py
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
+          tools/test_run_test_partitions.py
+          tools/test_run_recall_checks.py
 
       # Keep normal build-step parallelism while bounding aggregate compiler
       # memory to the pod's cgroup budget.
@@ -619,6 +623,7 @@ jobs:
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
           release-scale-test
+          recall-harness-build
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
@@ -652,42 +657,14 @@ jobs:
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
-      - name: Run Zig recall tests
+      - name: Run Zig recall checks
         working-directory: zig
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
-          recall-test
+          recall-ci-test
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
-
-      - name: Run Zig recall harness sweep
-        working-directory: zig
-        run: |
-          set -euo pipefail
-          datasets=(
-            images-512d-10k.gob
-            random-20d-1k.gob
-            fashionminst-784d-1k.gob
-            fashionminst-784d-10k.gob
-            laionclip-768d-1k.gob
-            laiongemini-1408d-1k.gob
-            laiongemini-512d-10k.gob
-            dbpedia-1536d-1k.gob
-            random-2048d-1k.gob
-            random-4096d-1k.gob
-            wikiarticles-768d-10k.gob
-          )
-          for dataset in "${datasets[@]}"; do
-            echo "::group::recall-harness ${dataset}"
-            taskset -c ${{ steps.cpus.outputs.list }} \
-              python3 tools/run_bounded_zig_build.py --zig zig -- build \
-              recall-harness \
-              --build-runner ${{ steps.cpus.outputs.build_runner }} \
-              --maxrss ${{ steps.cpus.outputs.max_rss }} \
-              -- --dataset-dir testdata/vectorsets --dataset "${dataset}"
-            echo "::endgroup::"
-          done
 
       - name: Run Zig chaos tests
         working-directory: zig

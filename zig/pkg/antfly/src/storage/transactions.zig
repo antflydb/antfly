@@ -45,6 +45,11 @@ const intents_prefix = "\x00\x00__txn_intents__:";
 // same backend batch as the corresponding intent, so the DB apply mutex makes
 // lock acquisition and ordinary batch admission linearizable.
 const intent_locks_prefix = "\x00\x00__txn_intent_locks__:";
+// Pending transactions retain their exact user keys so collection and
+// resolution use point probes instead of cloning the whole mutable memtable.
+// Resolution deletes this sidecar atomically with the intents; terminal
+// history uses TxnRecord.intents_resolved instead.
+const intent_keys_prefix = "\x00\x00__txn_intent_keys__:";
 const records_prefix = "\x00\x00__txn_records__:";
 const participants_prefix = "\x00\x00__txn_participants__:";
 const resolved_participants_prefix = "\x00\x00__txn_resolved_participants__:";
@@ -112,6 +117,8 @@ pub const TxnSummary = struct {
     coordinator: bool,
     coordinator_known: bool,
     retain_terminal: bool = false,
+    intents_resolved: bool = false,
+    intents_resolved_known: bool = false,
 };
 
 pub const TxnSummaryPage = struct {
@@ -124,6 +131,10 @@ pub const ResolutionExtraBatch = struct {
     deletes: []const []const u8 = &.{},
     replay: ?ReplayAppend = null,
     expected_intent_revision: ?u64 = null,
+    /// Exact user keys captured from a validated intent snapshot. Ordinary
+    /// commits can point-read these keys instead of prefix-scanning (and
+    /// cloning) the whole mutable memtable. Recovery leaves this null.
+    known_intent_keys: ?[]const []const u8 = null,
 };
 
 pub const ResolutionOutcome = struct {
@@ -201,6 +212,11 @@ const TxnRecord = struct {
     /// Old records predate explicit retry retention and may learn it from an
     /// idempotent begin during a rolling upgrade.
     retain_terminal_known: bool = true,
+    /// Set atomically with the terminal record and intent deletion. Recovery
+    /// can then distinguish a completed local resolution from an older or
+    /// externally decided terminal record whose intents still need replay.
+    intents_resolved: bool = false,
+    intents_resolved_known: bool = false,
 
     fn visibleVersion(self: TxnRecord) u64 {
         if (self.commit_version > 0) return self.commit_version;
@@ -214,6 +230,7 @@ const txn_record_v2_size = 49;
 const txn_record_v3_size = 50;
 const txn_record_v4_size = 51;
 const txn_record_v5_size = 52;
+const txn_record_v6_size = 53;
 
 // ============================================================================
 // TxnManager
@@ -390,6 +407,28 @@ pub const TxnManager = struct {
             return err;
         };
 
+        var intent_keys = try self.loadIntentKeysForWrite(self.alloc, txn_id, record.intent_revision);
+        defer freeParticipantList(self.alloc, intent_keys);
+        for (intents) |intent| {
+            var found = false;
+            for (intent_keys) |existing| {
+                if (std.mem.eql(u8, existing, intent.key)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (found) continue;
+            const owned_key = try self.alloc.dupe(u8, intent.key);
+            errdefer self.alloc.free(owned_key);
+            intent_keys = try self.alloc.realloc(intent_keys, intent_keys.len + 1);
+            intent_keys[intent_keys.len - 1] = owned_key;
+        }
+        std.mem.sort([]u8, intent_keys, {}, struct {
+            fn lessThan(_: void, left: []u8, right: []u8) bool {
+                return std.mem.order(u8, left, right) == .lt;
+            }
+        }.lessThan);
+
         // Write all intents — collect keys and values, free after putBatch
         var write_keys = std.ArrayListUnmanaged([]u8).empty;
         defer {
@@ -439,6 +478,11 @@ pub const TxnManager = struct {
         try write_vals.append(self.alloc, record_value);
         try writes.append(self.alloc, .{ .key = &record_key, .value = record_value });
 
+        const intent_keys_key = makeSidecarKey(intent_keys_prefix, txn_id);
+        const intent_keys_value = try encodeParticipantList(self.alloc, intent_keys);
+        try write_vals.append(self.alloc, intent_keys_value);
+        try writes.append(self.alloc, .{ .key = &intent_keys_key, .value = intent_keys_value });
+
         try self.applyBatch(writes.items, &.{}, null);
 
         self.traceWriteIntentSuccess(txn_id, intents, predicates);
@@ -479,6 +523,10 @@ pub const TxnManager = struct {
             }
             return err;
         };
+        if (was_terminal and record.intents_resolved_known and record.intents_resolved) return .{
+            .applied = false,
+            .replay_sequence = record.replay_sequence,
+        };
 
         // Scan all intents for this txn
         var intent_prefix_buf: [intents_prefix.len + 17]u8 = undefined;
@@ -487,17 +535,28 @@ pub const TxnManager = struct {
         intent_prefix_buf[intents_prefix.len + 16] = ':';
         const scan_prefix = intent_prefix_buf[0 .. intents_prefix.len + 17];
 
-        const intent_entries = try self.scanPrefix(self.alloc, scan_prefix);
+        const intent_entries = if (extra_batch.known_intent_keys) |keys|
+            try self.loadIntentEntriesByKeys(self.alloc, scan_prefix, keys)
+        else
+            try self.loadIntentEntries(self.alloc, txn_id, scan_prefix);
         defer backend_scan.freeResults(self.alloc, intent_entries);
 
         // A resolve retry after the terminal record and all intents are already
         // durable must not apply the caller's derived batch again. In
         // particular, doing so could overwrite a newer user write with the
         // transaction's old value.
-        if (was_terminal and intent_entries.len == 0) return .{
-            .applied = false,
-            .replay_sequence = record.replay_sequence,
-        };
+        if (was_terminal and intent_entries.len == 0) {
+            record.intents_resolved = true;
+            record.intents_resolved_known = true;
+            const marker_value = try self.encodeRecord(record);
+            defer self.alloc.free(marker_value);
+            const stale_manifest_key = makeSidecarKey(intent_keys_prefix, txn_id);
+            try self.applyBatch(&.{.{ .key = &rec_key, .value = marker_value }}, &.{&stale_manifest_key}, null);
+            return .{
+                .applied = false,
+                .replay_sequence = record.replay_sequence,
+            };
+        }
 
         var writes = std.ArrayListUnmanaged(docstore.KVPair).empty;
         defer writes.deinit(self.alloc);
@@ -517,7 +576,8 @@ pub const TxnManager = struct {
             try owned_apply_keys.append(self.alloc, lock_key);
             try deletes.append(self.alloc, lock_key);
         }
-
+        const intent_keys_key = makeSidecarKey(intent_keys_prefix, txn_id);
+        try deletes.append(self.alloc, &intent_keys_key);
         if (status == .committed) {
             // Apply intents to real keys
             for (intent_entries) |entry| {
@@ -554,6 +614,8 @@ pub const TxnManager = struct {
         if (status == .committed) {
             if (extra_batch.replay) |replay| record.replay_sequence = replay.sequence;
         }
+        record.intents_resolved = true;
+        record.intents_resolved_known = true;
         const rec_val = try self.encodeRecord(record);
         defer self.alloc.free(rec_val);
         try writes.append(self.alloc, .{ .key = &rec_key, .value = rec_val });
@@ -593,7 +655,7 @@ pub const TxnManager = struct {
         intent_prefix_buf[intents_prefix.len + 16] = ':';
         const scan_prefix = intent_prefix_buf[0 .. intents_prefix.len + 17];
 
-        const intent_entries = try self.scanPrefix(alloc, scan_prefix);
+        const intent_entries = try self.loadIntentEntries(alloc, txn_id, scan_prefix);
         defer backend_scan.freeResults(alloc, intent_entries);
 
         var write_count: usize = 0;
@@ -633,18 +695,22 @@ pub const TxnManager = struct {
     }
 
     pub fn hasIntents(self: *TxnManager, txn_id: TxnId) !bool {
+        const record = try self.loadTransactionRecord(txn_id);
+        if (record.intents_resolved_known and record.intents_resolved) return false;
         var intent_prefix_buf: [intents_prefix.len + 17]u8 = undefined;
         @memcpy(intent_prefix_buf[0..intents_prefix.len], intents_prefix);
         @memcpy(intent_prefix_buf[intents_prefix.len..][0..16], &txn_id);
         intent_prefix_buf[intents_prefix.len + 16] = ':';
         const prefix = intent_prefix_buf[0 .. intents_prefix.len + 17];
 
-        var read = try self.store.beginRead();
-        defer read.abort();
-        var cursor = try read.openCursor();
-        defer cursor.close();
-        const entry = (try cursor.seekAtOrAfter(prefix)) orelse return false;
-        return std.mem.startsWith(u8, entry.key, prefix);
+        if (try self.loadIntentKeysOptional(self.alloc, txn_id)) |intent_keys| {
+            defer freeParticipantList(self.alloc, intent_keys);
+            return intent_keys.len > 0;
+        }
+        // Compatibility for a pending transaction written before manifests.
+        const entries = try backend_scan.scanPrefix(self.alloc, &self.store, prefix);
+        defer backend_scan.freeResults(self.alloc, entries);
+        return entries.len > 0;
     }
 
     pub fn validateIntentSnapshot(self: *TxnManager, txn_id: TxnId, expected_revision: u64) !IntentSnapshotValidation {
@@ -705,7 +771,7 @@ pub const TxnManager = struct {
         intent_prefix_buf[intents_prefix.len + 16] = ':';
         const scan_prefix = intent_prefix_buf[0 .. intents_prefix.len + 17];
 
-        const intent_entries = try self.scanPrefix(alloc, scan_prefix);
+        const intent_entries = try self.loadIntentEntries(alloc, txn_id, scan_prefix);
         defer backend_scan.freeResults(alloc, intent_entries);
 
         for (intent_entries) |entry| {
@@ -822,6 +888,8 @@ pub const TxnManager = struct {
                 .coordinator = record.coordinator,
                 .coordinator_known = record.coordinator_known,
                 .retain_terminal = record.retain_terminal,
+                .intents_resolved = record.intents_resolved,
+                .intents_resolved_known = record.intents_resolved_known,
             });
             last = txn_id;
             entry = try cursor.next();
@@ -991,7 +1059,7 @@ pub const TxnManager = struct {
                 continue;
             }
 
-            if (try self.hasAnyIntents(txn_id)) {
+            if (!(summary.intents_resolved_known and summary.intents_resolved) and try self.hasAnyIntents(txn_id)) {
                 const resolve_ts = switch (summary.status) {
                     .committed => if (summary.commit_version > 0) summary.commit_version else summary.begin_timestamp,
                     .aborted => if (summary.finalized_at > 0) summary.finalized_at else resolution_timestamp,
@@ -1008,6 +1076,18 @@ pub const TxnManager = struct {
                 }
                 _ = try self.resolveIntentsWithExtraBatch(txn_id, summary.status, resolve_ts, extra_batch);
                 stats.resolved_finalized += 1;
+            } else if (!(summary.intents_resolved_known and summary.intents_resolved)) {
+                // A pre-v6 terminal record without intents is already locally
+                // resolved. Persist the marker once so retained transaction
+                // history does not repeat a broad compatibility scan.
+                var upgraded = try self.loadTransactionRecord(txn_id);
+                upgraded.intents_resolved = true;
+                upgraded.intents_resolved_known = true;
+                const upgraded_key = makeRecordKey(txn_id);
+                const upgraded_value = try self.encodeRecord(upgraded);
+                defer self.alloc.free(upgraded_value);
+                const stale_manifest_key = makeSidecarKey(intent_keys_prefix, txn_id);
+                try self.applyBatch(&.{.{ .key = &upgraded_key, .value = upgraded_value }}, &.{&stale_manifest_key}, null);
             }
 
             const unresolved = try self.getUnresolvedParticipants(self.alloc, txn_id);
@@ -1022,8 +1102,12 @@ pub const TxnManager = struct {
                 options.retained_cutoff_timestamp orelse cutoff_timestamp
             else
                 cutoff_timestamp;
+            const no_intents = if (refreshed.intents_resolved_known and refreshed.intents_resolved)
+                true
+            else
+                !try self.hasAnyIntents(txn_id);
             if (refreshed.status != .pending and refreshed.finalized_at < cleanup_cutoff and
-                !try self.hasAnyIntents(txn_id) and !try self.hasHAOutbox(txn_id))
+                no_intents and !try self.hasHAOutbox(txn_id))
             {
                 try self.deleteTransactionMetadata(txn_id);
                 stats.cleaned_records += 1;
@@ -1090,6 +1174,47 @@ pub const TxnManager = struct {
         if (try self.hasPendingIntentForKey(key, null)) return TxnError.IntentConflict;
     }
 
+    /// Check a complete ordinary write batch with one sorted point probe.
+    /// Intent locks are independent keys, so opening a read transaction per
+    /// user key only multiplies snapshot/layout work without strengthening the
+    /// conflict guarantee. The DB apply mutex keeps this batch check
+    /// linearizable with concurrent intent admission.
+    pub fn checkOrdinaryWriteConflicts(self: *TxnManager, user_keys: []const []const u8) !void {
+        if (user_keys.len == 0) return;
+
+        const lock_keys = try self.alloc.alloc([]u8, user_keys.len);
+        var initialized: usize = 0;
+        defer {
+            for (lock_keys[0..initialized]) |key| self.alloc.free(key);
+            self.alloc.free(lock_keys);
+        }
+        for (user_keys, 0..) |user_key, i| {
+            lock_keys[i] = try self.makeIntentLockKey(user_key);
+            initialized += 1;
+        }
+        std.mem.sort([]u8, lock_keys, {}, struct {
+            fn lessThan(_: void, left: []u8, right: []u8) bool {
+                return std.mem.order(u8, left, right) == .lt;
+            }
+        }.lessThan);
+
+        const key_refs = try self.alloc.alloc([]const u8, lock_keys.len);
+        defer self.alloc.free(key_refs);
+        for (lock_keys, 0..) |key, i| key_refs[i] = key;
+        const owners = try self.alloc.alloc(?[]const u8, key_refs.len);
+        defer self.alloc.free(owners);
+        @memset(owners, null);
+
+        var probe = try self.store.beginProbe();
+        defer probe.abort();
+        try probe.getManySorted(key_refs, owners);
+        for (owners) |maybe_owner| {
+            const owner = maybe_owner orelse continue;
+            if (owner.len != @sizeOf(TxnId)) return TxnError.InvalidTxnRecord;
+            return TxnError.IntentConflict;
+        }
+    }
+
     /// Build an intent key: intents_prefix + txn_id + ':' + user_key
     fn makeIntentKey(self: *TxnManager, txn_id: TxnId, user_key: []const u8) ![]u8 {
         const total = intents_prefix.len + 16 + 1 + user_key.len;
@@ -1125,7 +1250,7 @@ pub const TxnManager = struct {
     }
 
     fn encodeRecord(self: *TxnManager, record: TxnRecord) ![]u8 {
-        const buf = try self.alloc.alloc(u8, txn_record_v5_size);
+        const buf = try self.alloc.alloc(u8, txn_record_v6_size);
         buf[0] = @intFromEnum(record.status);
         std.mem.writeInt(u64, buf[1..9], record.begin_timestamp, .little);
         std.mem.writeInt(u64, buf[9..17], record.commit_version, .little);
@@ -1136,6 +1261,7 @@ pub const TxnManager = struct {
         buf[49] = @intFromBool(record.prepared);
         buf[50] = @intFromBool(record.coordinator);
         buf[51] = @intFromBool(record.retain_terminal);
+        buf[52] = @intFromBool(record.intents_resolved);
         return buf;
     }
 
@@ -1151,7 +1277,11 @@ pub const TxnManager = struct {
             TxnError.TxnNotFound => return false,
             else => return err,
         };
-        if (record.status == .pending or try self.hasAnyIntents(txn_id) or try self.hasHAOutbox(txn_id)) return false;
+        const has_intents = if (record.intents_resolved_known and record.intents_resolved)
+            false
+        else
+            try self.hasAnyIntents(txn_id);
+        if (record.status == .pending or has_intents or try self.hasHAOutbox(txn_id)) return false;
         const cutoff = if (record.retain_terminal) retained_cutoff_timestamp else cutoff_timestamp;
         if (record.finalized_at >= cutoff) return false;
         const unresolved = try self.getUnresolvedParticipants(self.alloc, txn_id);
@@ -1162,13 +1292,113 @@ pub const TxnManager = struct {
     }
 
     fn hasAnyIntents(self: *TxnManager, txn_id: TxnId) !bool {
+        return try self.hasIntents(txn_id);
+    }
+
+    fn loadIntentKeysOptional(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !?[][]u8 {
+        const key = makeSidecarKey(intent_keys_prefix, txn_id);
+        const raw = self.getAlloc(alloc, &key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer alloc.free(raw);
+        return try decodeParticipantList(alloc, raw);
+    }
+
+    fn loadIntentKeysForWrite(self: *TxnManager, alloc: Allocator, txn_id: TxnId, revision: u64) ![][]u8 {
+        if (try self.loadIntentKeysOptional(alloc, txn_id)) |keys| return keys;
+        if (revision == 0) return try alloc.alloc([]u8, 0);
+
+        // A rolling-upgrade transaction may already contain intents without a
+        // sidecar. Pay for one stable scan and publish the manifest with the
+        // next intent revision.
         var prefix_buf: [intents_prefix.len + 17]u8 = undefined;
         @memcpy(prefix_buf[0..intents_prefix.len], intents_prefix);
         @memcpy(prefix_buf[intents_prefix.len..][0..16], &txn_id);
         prefix_buf[intents_prefix.len + 16] = ':';
-        const intents = try self.scanPrefix(self.alloc, prefix_buf[0 .. intents_prefix.len + 17]);
-        defer backend_scan.freeResults(self.alloc, intents);
-        return intents.len > 0;
+        const prefix = prefix_buf[0 .. intents_prefix.len + 17];
+        const entries = try backend_scan.scanPrefix(alloc, &self.store, prefix);
+        defer backend_scan.freeResults(alloc, entries);
+        const keys = try alloc.alloc([]u8, entries.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (keys[0..initialized]) |key| alloc.free(key);
+            alloc.free(keys);
+        }
+        for (entries, 0..) |entry, i| {
+            keys[i] = try alloc.dupe(u8, entry.key[prefix.len..]);
+            initialized += 1;
+        }
+        return keys;
+    }
+
+    fn loadIntentEntries(
+        self: *TxnManager,
+        alloc: Allocator,
+        txn_id: TxnId,
+        scan_prefix: []const u8,
+    ) ![]backend_scan.OwnedKVPair {
+        const intent_keys = (try self.loadIntentKeysOptional(alloc, txn_id)) orelse
+            return try self.scanPrefix(alloc, scan_prefix);
+        defer freeParticipantList(alloc, intent_keys);
+        return try self.loadIntentEntriesByKeys(alloc, scan_prefix, intent_keys);
+    }
+
+    fn loadIntentEntriesByKeys(
+        self: *TxnManager,
+        alloc: Allocator,
+        scan_prefix: []const u8,
+        user_keys: []const []const u8,
+    ) ![]backend_scan.OwnedKVPair {
+        if (user_keys.len == 0) return try alloc.alloc(backend_scan.OwnedKVPair, 0);
+
+        const full_keys = try alloc.alloc([]u8, user_keys.len);
+        var full_keys_initialized: usize = 0;
+        defer {
+            for (full_keys[0..full_keys_initialized]) |key| alloc.free(key);
+            alloc.free(full_keys);
+        }
+        for (user_keys, 0..) |user_key, i| {
+            full_keys[i] = try std.mem.concat(alloc, u8, &.{ scan_prefix, user_key });
+            full_keys_initialized += 1;
+        }
+        std.mem.sort([]u8, full_keys, {}, struct {
+            fn lessThan(_: void, left: []u8, right: []u8) bool {
+                return std.mem.order(u8, left, right) == .lt;
+            }
+        }.lessThan);
+
+        const key_refs = try alloc.alloc([]const u8, full_keys.len);
+        defer alloc.free(key_refs);
+        for (full_keys, 0..) |key, i| key_refs[i] = key;
+        const values = try alloc.alloc(?[]const u8, full_keys.len);
+        defer alloc.free(values);
+        @memset(values, null);
+        var probe = try self.store.beginProbe();
+        defer probe.abort();
+        try probe.getManySorted(key_refs, values);
+
+        const entries = try alloc.alloc(backend_scan.OwnedKVPair, full_keys.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (entries[0..initialized]) |entry| {
+                alloc.free(entry.key);
+                alloc.free(entry.value);
+            }
+            alloc.free(entries);
+        }
+        for (values, 0..) |maybe_value, i| {
+            const value = maybe_value orelse return error.IntentSnapshotChanged;
+            const owned_key = try alloc.dupe(u8, key_refs[i]);
+            errdefer alloc.free(owned_key);
+            const owned_value = try alloc.dupe(u8, value);
+            entries[i] = .{
+                .key = owned_key,
+                .value = owned_value,
+            };
+            initialized += 1;
+        }
+        return entries;
     }
 
     fn scanPrefix(self: *TxnManager, alloc: Allocator, prefix: []const u8) ![]backend_scan.OwnedKVPair {
@@ -1181,7 +1411,8 @@ pub const TxnManager = struct {
         const resolved_key = makeSidecarKey(resolved_participants_prefix, txn_id);
         const ha_batch_key = makeTransactionHABatchOutboxKey(txn_id);
         const ha_replay_key = makeTransactionHAReplayOutboxKey(txn_id);
-        try self.applyBatch(&.{}, &.{ &record_key, &participant_key, &resolved_key, &ha_batch_key, &ha_replay_key }, null);
+        const intent_keys_key = makeSidecarKey(intent_keys_prefix, txn_id);
+        try self.applyBatch(&.{}, &.{ &record_key, &participant_key, &resolved_key, &ha_batch_key, &ha_replay_key, &intent_keys_key }, null);
     }
 
     fn saveParticipantSet(self: *TxnManager, comptime prefix: []const u8, txn_id: TxnId, participants: []const []const u8) !void {
@@ -1218,14 +1449,19 @@ pub const TxnManager = struct {
     }
 
     fn getAlloc(self: *TxnManager, alloc: Allocator, key: []const u8) ![]u8 {
-        var txn = try self.store.beginRead();
+        // These helpers copy one value and release it immediately; none of
+        // their callers retain a multi-operation snapshot. On the runtime LSM
+        // a bound read clones the mutable memtable, while a probe reads the
+        // current tip under the backend lock. In particular, ordinary batch
+        // admission calls this for every transaction-intent lock key.
+        var txn = try self.store.beginProbe();
         defer txn.abort();
         const value = try txn.get(key);
         return try alloc.dupe(u8, value);
     }
 
     fn keyExists(self: *TxnManager, key: []const u8) !bool {
-        var txn = try self.store.beginRead();
+        var txn = try self.store.beginProbe();
         defer txn.abort();
         _ = txn.get(key) catch |err| switch (err) {
             error.NotFound => return false,
@@ -1495,6 +1731,23 @@ fn resolveDecisionConflictReason(current: TxnStatus, requested: TxnStatus) []con
 }
 
 fn decodeRecord(raw: []const u8) !TxnRecord {
+    if (raw.len == txn_record_v6_size) {
+        if (raw[49] > 1 or raw[50] > 1 or raw[51] > 1 or raw[52] > 1) return TxnError.InvalidTxnRecord;
+        return .{
+            .status = @enumFromInt(raw[0]),
+            .begin_timestamp = std.mem.readInt(u64, raw[1..9], .little),
+            .commit_version = std.mem.readInt(u64, raw[9..17], .little),
+            .created_at = std.mem.readInt(u64, raw[17..25], .little),
+            .finalized_at = std.mem.readInt(u64, raw[25..33], .little),
+            .intent_revision = std.mem.readInt(u64, raw[33..41], .little),
+            .replay_sequence = std.mem.readInt(u64, raw[41..49], .little),
+            .prepared = raw[49] == 1,
+            .coordinator = raw[50] == 1,
+            .retain_terminal = raw[51] == 1,
+            .intents_resolved = raw[52] == 1,
+            .intents_resolved_known = true,
+        };
+    }
     if (raw.len == txn_record_v5_size) {
         if (raw[49] > 1 or raw[50] > 1 or raw[51] > 1) return TxnError.InvalidTxnRecord;
         return .{
@@ -2024,6 +2277,87 @@ test "concurrent intent conflict" {
         .{ .key = "shared_key", .value = "from_txn2" },
     }, &.{});
     try std.testing.expectError(TxnError.IntentConflict, result);
+}
+
+test "transaction point reads do not clone runtime lsm mutable state" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var backend = try lsm_backend.Backend.open(alloc, path, .{
+        .flush_threshold_bytes = 64 * 1024 * 1024,
+    });
+    defer backend.close();
+
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+    var mgr = try TxnManager.init(alloc, &store);
+    defer mgr.deinit();
+
+    const txn_id: TxnId = .{3} ** 16;
+    try mgr.initTransaction(txn_id, 1000);
+    try mgr.writeIntents(txn_id, &.{.{ .key = "shared", .value = "pending" }}, &.{});
+    const before = backend.snapshotMaintenanceStats();
+    try std.testing.expectError(TxnError.IntentConflict, mgr.checkOrdinaryWriteConflict("shared"));
+    try mgr.checkOrdinaryWriteConflict("unlocked");
+    const before_batch_reads = backend.snapshotReadStats();
+    try std.testing.expectError(
+        TxnError.IntentConflict,
+        mgr.checkOrdinaryWriteConflicts(&.{ "free:a", "shared", "free:b" }),
+    );
+    try mgr.checkOrdinaryWriteConflicts(&.{ "free:a", "free:b" });
+    const after_batch_reads = backend.snapshotReadStats();
+    try std.testing.expectEqual(
+        before_batch_reads.get_many_sorted_calls + 2,
+        after_batch_reads.get_many_sorted_calls,
+    );
+    try std.testing.expectEqual(TxnStatus.pending, try mgr.getTransactionStatus(txn_id));
+    const after_point_reads = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(
+        before.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
+        after_point_reads.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
+    );
+
+    try std.testing.expect(try mgr.hasIntents(txn_id));
+    var intent_batch = try mgr.collectIntentBatch(alloc, txn_id);
+    defer intent_batch.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), intent_batch.writes.len);
+    try mgr.resolveIntents(txn_id, .aborted, 2000);
+    try std.testing.expect(!try mgr.hasIntents(txn_id));
+    const after_lifecycle = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(
+        before.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
+        after_lifecycle.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
+    );
+}
+
+test "transaction intent manifest rolls forward legacy in-flight intents" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+    var mgr = try TxnManager.init(alloc, &runtime);
+    defer mgr.deinit();
+
+    const txn_id: TxnId = .{5} ** 16;
+    try mgr.initTransaction(txn_id, 1000);
+    try mgr.writeIntents(txn_id, &.{.{ .key = "doc:a", .value = "a" }}, &.{});
+
+    // Simulate an in-flight transaction prepared by a pre-manifest binary.
+    const manifest_key = makeSidecarKey(intent_keys_prefix, txn_id);
+    try mgr.applyBatch(&.{}, &.{&manifest_key}, null);
+    try mgr.writeIntents(txn_id, &.{.{ .key = "doc:b", .value = "b" }}, &.{});
+
+    var snapshot = try mgr.collectIntentBatch(alloc, txn_id);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.writes.len);
+    try std.testing.expectEqualStrings("doc:a", snapshot.writes[0].key);
+    try std.testing.expectEqualStrings("doc:b", snapshot.writes[1].key);
 }
 
 test "transaction delete intent" {

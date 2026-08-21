@@ -1415,6 +1415,28 @@ test "reader selection singleflights same keys while independent stripes discove
         calls: std.atomic.Value(usize) = .init(0),
         active: std.atomic.Value(usize) = .init(0),
         max_active: std.atomic.Value(usize) = .init(0),
+        rendezvous: bool = false,
+        first_active: std.Io.Event = .unset,
+        second_active: std.Io.Event = .unset,
+
+        fn waitForPeer(event: *std.Io.Event, io: std.Io) !void {
+            // Event waits may wake spuriously. Retry for a bounded period so a
+            // regression that serializes different stripes fails instead of
+            // deadlocking the test.
+            for (0..50) |_| {
+                if (event.isSet()) return;
+                event.waitTimeout(io, .{
+                    .duration = .{
+                        .raw = std.Io.Duration.fromMilliseconds(100),
+                        .clock = .awake,
+                    },
+                }) catch |err| switch (err) {
+                    error.Timeout => continue,
+                    else => return err,
+                };
+            }
+            return error.ReaderDiscoveryRendezvousTimeout;
+        }
 
         fn discover(
             raw: *anyopaque,
@@ -1424,7 +1446,7 @@ test "reader selection singleflights same keys while independent stripes discove
             _: *const FailedReaderPathSet,
         ) ![]const u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            _ = self.calls.fetchAdd(1, .monotonic);
+            const call_index = self.calls.fetchAdd(1, .monotonic);
             const active = self.active.fetchAdd(1, .monotonic) + 1;
             defer _ = self.active.fetchSub(1, .monotonic);
             var observed_max = self.max_active.load(.monotonic);
@@ -1436,7 +1458,19 @@ test "reader selection singleflights same keys while independent stripes discove
                     .monotonic,
                 ) orelse break;
             }
-            try io.sleep(std.Io.Duration.fromMilliseconds(25), .awake);
+            if (self.rendezvous) switch (call_index) {
+                0 => {
+                    self.first_active.set(io);
+                    try waitForPeer(&self.second_active, io);
+                },
+                1 => {
+                    self.second_active.set(io);
+                    try waitForPeer(&self.first_active, io);
+                },
+                else => return error.UnexpectedReaderDiscoveryCall,
+            } else {
+                try io.sleep(std.Io.Duration.fromMilliseconds(25), .awake);
+            }
             return allocator.dupe(u8, "/models/readers/shared");
         }
 
@@ -1444,6 +1478,8 @@ test "reader selection singleflights same keys while independent stripes discove
             self.calls.store(0, .monotonic);
             self.active.store(0, .monotonic);
             self.max_active.store(0, .monotonic);
+            self.first_active.reset();
+            self.second_active.reset();
         }
     };
     const ResolveTask = struct {
@@ -1489,6 +1525,7 @@ test "reader selection singleflights same keys while independent stripes discove
     try std.testing.expectEqual(@as(usize, 1), discovery.calls.load(.monotonic));
 
     discovery.reset();
+    discovery.rendezvous = true;
     var independent_resolver = ReaderResolver.init(allocator);
     defer independent_resolver.deinit();
     const first_name = "acme/independent-a";

@@ -6,7 +6,7 @@ This guide covers installing the Antfly Operator in your Kubernetes cluster.
 
 Before installing the operator, ensure you have:
 
-- **Kubernetes 1.20+** cluster running
+- **Kubernetes 1.23+** cluster running
 - **kubectl** installed and configured to access your cluster
 - **Storage class** with dynamic provisioning (most cloud providers include this by default)
 - **Cluster admin permissions** to create CRDs and cluster-scoped resources

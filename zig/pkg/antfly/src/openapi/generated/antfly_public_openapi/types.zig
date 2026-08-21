@@ -235,6 +235,8 @@ pub const AggregationRequest = struct {
     type: AggregationType,
     /// Field to aggregate on. Required unless `fields` is supplied for a multi-field terms aggregation.
     field: ?[]const u8 = null,
+    /// Selection mode for a cardinality aggregation. `auto` (default) uses a materialized HyperLogLog sketch when one applies and is current, else falls back to an exact distinct scan. `exact` always scans. `approximate` requires a sketch and errors if none applies. Ignored for other types.
+    mode: ?std.json.Value = null,
     /// Ordered field list for multi-field terms aggregations. Bucket keys are returned as JSON arrays in the same order.
     fields: ?[]const []const u8 = null,
     /// Maximum number of buckets to return (for bucketing aggregations)
@@ -270,6 +272,10 @@ pub const AggregationRequest = struct {
 pub const AggregationResult = struct {
     /// Single value for metric aggregations (sum, avg, min, max, count, cardinality)
     value: ?f32 = null,
+    /// For cardinality aggregations, whether the value is an approximate estimate from a HyperLogLog sketch (true) or an exact distinct count (false). Absent for non-cardinality aggregations.
+    approximate: ?bool = null,
+    /// For an approximate cardinality value, the relative standard error of the estimate. Present only when approximate is true.
+    relative_error: ?f32 = null,
     /// Document count for stats aggregations
     count: ?i64 = null,
     /// Minimum value for stats aggregations
@@ -599,7 +605,7 @@ pub const BatchRequest = struct {
 };
 
 pub const BatchResponse = struct {
-    /// Durable commit and visibility/participant recovery state.
+    /// Durable commit outcome. `committed_pending` means requested visibility or participant propagation is still completing. `committed_repair_required` means the primary write committed, but a terminal enrichment failure needs operator repair and will not be retried indefinitely.
     status: ?[]const u8 = null,
     /// Number of documents successfully inserted
     inserted: ?i64 = null,
@@ -647,6 +653,35 @@ pub const CalendarInterval = enum {
             .{ "month", .month },
             .{ "quarter", .quarter },
             .{ "year", .year },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Exact-vs-approximate selection for a cardinality aggregation: - auto: use a materialized HyperLogLog sketch when one applies and is current, else an exact distinct scan (default). - exact: always compute an exact distinct count. - approximate: require a matching sketch; error if none applies.
+pub const CardinalityMode = enum {
+    auto,
+    exact,
+    approximate,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .exact => "exact",
+            .approximate => "approximate",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "exact", .exact },
+            .{ "approximate", .approximate },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -2025,7 +2060,7 @@ pub const MultiBatchRequest = struct {
 
 /// Response for a cross-table batch operation. Contains per-table results.
 pub const MultiBatchResponse = struct {
-    /// Durable commit and visibility/propagation state.
+    /// Durable commit outcome. Pending states mean requested visibility or participant propagation is still completing. `committed_repair_required` means the primary writes committed, but a terminal enrichment failure needs operator repair and will not be retried indefinitely.
     status: ?[]const u8 = null,
     /// Per-table batch results
     tables: ?std.json.ArrayHashMap(BatchResponse) = null,
@@ -3465,7 +3500,7 @@ pub const TransactionCommitRequest = struct {
 
 /// Result of an OCC transaction commit attempt.
 pub const TransactionCommitResponse = struct {
-    /// Durable transaction outcome. Pending committed states mean the commit decision is durable while its requested visibility barrier or participant recovery is still completing.
+    /// Durable transaction outcome. Pending committed states mean the commit decision is durable while its requested visibility barrier or participant recovery is still completing. `committed_repair_required` means the commit decision is durable and coordination may be released, but a terminal enrichment failure requires operator repair.
     status: []const u8,
     /// Details about the conflict that caused an abort (only present when status is "aborted")
     conflict: ?TransactionConflict = null,
@@ -3526,7 +3561,7 @@ pub const TransactionSessionCleanupResponse = struct {
 };
 
 pub const TransactionSessionCommitResponse = struct {
-    /// Durable transaction outcome. Pending committed states mean the commit decision is durable while its requested visibility barrier or participant recovery is still completing.
+    /// Durable transaction outcome. Pending committed states mean the commit decision is durable while its requested visibility barrier or participant recovery is still completing. `committed_repair_required` means the commit decision is durable and coordination may be released, but a terminal enrichment failure requires operator repair.
     status: []const u8,
     /// Details about the conflict that caused an abort (only present when status is "aborted")
     conflict: ?TransactionConflict = null,

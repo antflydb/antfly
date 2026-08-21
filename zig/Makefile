@@ -57,11 +57,11 @@ inference-e2e-models: ## Prefetch the curated inference E2E model set with `antf
 # TLA+ Verification Commands
 # ====================================================================================
 
-.PHONY: generate generated-check tls-compat-check openapi-generate openapi-check mcp-schema-fragments-generate mcp-schema-fragments-check snowball-generate snowball-check cabi-header-generate cabi-header-check license-headers license-check tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-check-lsm tla-trace-raft tla-trace-txn
+.PHONY: generate generated-check tls-compat-check openapi-generate openapi-check mcp-schema-fragments-generate mcp-schema-fragments-check snowball-generate snowball-check sql-grammar-generate sql-grammar-check cabi-header-generate cabi-header-check license-headers license-check tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-check-lsm tla-trace-raft tla-trace-txn
 
-generate: openapi-generate snowball-generate cabi-header-generate ## Regenerate checked-in generated sources.
+generate: openapi-generate snowball-generate sql-grammar-generate cabi-header-generate ## Regenerate checked-in generated sources.
 
-generated-check: tls-compat-check openapi-check snowball-check cabi-header-check ## Check all checked-in generated sources are current.
+generated-check: tls-compat-check openapi-check snowball-check sql-grammar-check cabi-header-check ## Check all checked-in generated sources are current.
 
 tls-compat-check: ## Verify the checked-in Zig 0.16 TLS compatibility patch has not drifted.
 	@sh lib/httpx/src/tls/check_client_compat.sh
@@ -87,6 +87,12 @@ snowball-generate:
 
 snowball-check:
 	$(ZIG) build check-snowball
+
+sql-grammar-generate:
+	$(ZIG) build regen-sql-grammar
+
+sql-grammar-check:
+	$(ZIG) build sql-grammar-generated-check
 
 cabi-header-generate:
 	$(SCRIPTS_PY) ../scripts/packaging/sync_cabi_header.py

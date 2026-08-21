@@ -53,6 +53,13 @@ const LocalSchemaProgressProvider = struct {
 const default_public_port: u16 = 8080;
 const cors_default_methods = [_][]const u8{ "GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH" };
 const cors_default_headers = [_][]const u8{ "Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin" };
+const cors_default_exposed_headers = [_][]const u8{
+    "X-Request-ID",
+    "Retry-After",
+    "X-RateLimit-Limit",
+    "X-RateLimit-Remaining",
+    "X-RateLimit-Reset",
+};
 const cors_default_max_age: u32 = 3600;
 const antfarm_max_file_bytes: usize = 64 * 1024 * 1024;
 const standalone_session_ttl_ns: u64 = std.time.ns_per_hour;
@@ -2884,7 +2891,7 @@ fn appendCorsPreflightVary(headers: *httpx.Headers, include_origin: bool) !void 
 }
 
 fn applyCorsExposedHeaders(ctx: *httpx.Context, config: *const antfly.common.config.Config.CorsConfig) !void {
-    const exposed = config.exposed_headers orelse return;
+    const exposed = config.exposed_headers orelse &cors_default_exposed_headers;
     if (exposed.len == 0) return;
     const joined = try joinCorsValues(ctx.allocator, exposed);
     defer ctx.allocator.free(joined);
@@ -4447,13 +4454,14 @@ fn invokeInferenceProvider(
     defer alloc.free(request_json);
     var response_handle: ?*anyopaque = null;
     var response_json: inference_bridge.String = undefined;
+    const effective_deadline_ns = deadline_ns orelse platform_time.monotonicNs() +| 5 * std.time.ns_per_min;
     const context = inference_bridge.ProviderInvokeContext{
         .abi_version = inference_bridge.abi_version,
         .handle = handle,
         .operation = @intFromEnum(operation),
         .request_json = inference_bridge.String.init(request_json),
-        .deadline_ns = deadline_ns orelse 0,
-        .has_deadline = @intFromBool(deadline_ns != null),
+        .deadline_ns = effective_deadline_ns,
+        .has_deadline = 1,
         .out_response_handle = &response_handle,
         .out_response_json = &response_json,
     };
@@ -5766,6 +5774,10 @@ test "standalone CORS middleware enforces dynamic configuration" {
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 209), response.status.code);
         try std.testing.expectEqualStrings("*", response.headers.get("Access-Control-Allow-Origin").?);
+        try std.testing.expectEqualStrings(
+            "X-Request-ID, Retry-After, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset",
+            response.headers.get("Access-Control-Expose-Headers").?,
+        );
     }
     {
         var response = try Harness.execute(

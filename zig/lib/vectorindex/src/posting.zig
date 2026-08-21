@@ -277,15 +277,29 @@ pub const PostingStore = struct {
         }
         @memset(node.centroid, 0);
 
-        const vector_scratch = try index.alloc.alloc(f32, index.config.dims);
-        defer index.alloc.free(vector_scratch);
-        const transformed = try index.alloc.alloc(f32, index.config.dims);
-        defer index.alloc.free(transformed);
+        const Index = switch (@typeInfo(@TypeOf(index))) {
+            .pointer => |ptr| ptr.child,
+            else => @TypeOf(index),
+        };
+        if (comptime @hasDecl(Index, "loadPostingVectorsTransformed")) {
+            const matrix_len = try std.math.mul(usize, node.members.len, index.config.dims);
+            const vectors = try index.alloc.alloc(f32, matrix_len);
+            defer index.alloc.free(vectors);
+            try index.loadPostingVectorsTransformed(txn, node.members, vectors);
+            for (0..node.members.len) |i| {
+                vec.add(node.centroid, vectors[i * index.config.dims ..][0..index.config.dims]);
+            }
+        } else {
+            const vector_scratch = try index.alloc.alloc(f32, index.config.dims);
+            defer index.alloc.free(vector_scratch);
+            const transformed = try index.alloc.alloc(f32, index.config.dims);
+            defer index.alloc.free(transformed);
 
-        for (node.members) |member_id| {
-            const v = try index.getVectorScratch(txn, member_id, vector_scratch);
-            _ = index.transformVector(v, transformed);
-            vec.add(node.centroid, transformed);
+            for (node.members) |member_id| {
+                const v = try index.getVectorScratch(txn, member_id, vector_scratch);
+                _ = index.transformVector(v, transformed);
+                vec.add(node.centroid, transformed);
+            }
         }
         vec.scale(1.0 / @as(f32, @floatFromInt(node.members.len)), node.centroid);
         normalizeCentroidForMetric(index, node.centroid);
@@ -302,6 +316,15 @@ pub const PostingStore = struct {
         if (!node.is_leaf) return error.ExpectedLeaf;
         const dims: usize = @intCast(index.metadata.dims);
         if (vectors.len < node.members.len * dims) return error.BufferTooSmall;
+
+        const Index = switch (@typeInfo(@TypeOf(index))) {
+            .pointer => |ptr| ptr.child,
+            else => @TypeOf(index),
+        };
+        if (comptime @hasDecl(Index, "loadPostingVectorsTransformedWithOptions")) {
+            try index.loadPostingVectorsTransformedWithOptions(txn, node.members, vectors, options);
+            return;
+        }
 
         const raw_scratch = try index.alloc.alloc(f32, dims);
         defer index.alloc.free(raw_scratch);
@@ -585,6 +608,122 @@ test "posting store appends and removes members" {
     const removed = try PostingStore.removeMembers(alloc, &node, &[_]u64{ 1, 9 });
     try std.testing.expectEqual(@as(usize, 1), removed);
     try std.testing.expectEqualSlices(u64, &[_]u64{3}, node.members);
+}
+
+test "posting centroid recompute uses batch transformed vector loader" {
+    const Profile = struct {
+        centroid_recompute_calls: u64 = 0,
+        centroid_recompute_members_total: u64 = 0,
+        centroid_recompute_members_max: u64 = 0,
+    };
+    const Config = struct {
+        dims: usize = 2,
+        metric: vec.DistanceMetric = .l2_squared,
+        max_cached_vectors: usize = 1,
+    };
+    const Metadata = struct {
+        active_count: u64 = 2,
+        node_count: u64 = 1,
+    };
+    const TestIndex = struct {
+        alloc: std.mem.Allocator,
+        config: Config = .{},
+        metadata: Metadata = .{},
+        write_profile: Profile = .{},
+        batch_calls: usize = 0,
+
+        fn hasExternalVectorLoader(_: *@This()) bool {
+            return true;
+        }
+
+        fn loadPostingVectorsTransformed(self: *@This(), _: void, ids: []const u64, matrix: []f32) !void {
+            self.batch_calls += 1;
+            for (ids, 0..) |id, i| {
+                matrix[i * 2] = @floatFromInt(id);
+                matrix[i * 2 + 1] = @floatFromInt(id * 2);
+            }
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    const members = try alloc.dupe(u64, &.{ 1, 3 });
+    const centroid = try alloc.alloc(f32, 2);
+    var node = types.Node{
+        .id = 1,
+        .is_leaf = true,
+        .level = 0,
+        .parent = 0,
+        .centroid = centroid,
+        .children = &.{},
+        .members = members,
+    };
+    defer node.deinit(alloc);
+    var index = TestIndex{ .alloc = alloc };
+
+    try PostingStore.recomputeCentroid(&index, {}, &node);
+    try std.testing.expectEqual(@as(usize, 1), index.batch_calls);
+    try std.testing.expectApproxEqAbs(@as(f32, 2), node.centroid[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 4), node.centroid[1], 0.0001);
+}
+
+test "quantized refresh uses batch transformed vector loader with options" {
+    const Config = struct { dims: usize = 2 };
+    const Metadata = struct { dims: usize = 2 };
+    const TestIndex = struct {
+        alloc: std.mem.Allocator,
+        config: Config = .{},
+        metadata: Metadata = .{},
+        batch_calls: usize = 0,
+        scalar_calls: usize = 0,
+
+        fn loadPostingVectorsTransformedWithOptions(
+            self: *@This(),
+            _: void,
+            ids: []const u64,
+            matrix: []f32,
+            options: anytype,
+        ) !void {
+            if (!options.marker) return error.InvalidArgument;
+            self.batch_calls += 1;
+            for (ids, 0..) |id, i| {
+                matrix[i * 2] = @floatFromInt(id);
+                matrix[i * 2 + 1] = @floatFromInt(id * 2);
+            }
+        }
+
+        fn getVectorScratch(self: *@This(), _: void, _: u64, _: []f32) ![]const f32 {
+            self.scalar_calls += 1;
+            return error.UnexpectedScalarLoad;
+        }
+
+        fn transformVector(_: *@This(), input: []const f32, _: []f32) []const f32 {
+            return input;
+        }
+    };
+
+    const members = [_]u64{ 2, 5 };
+    const node = types.Node{
+        .id = 1,
+        .is_leaf = true,
+        .level = 0,
+        .parent = 0,
+        .centroid = &.{},
+        .children = &.{},
+        .members = @constCast(members[0..]),
+    };
+    var index = TestIndex{ .alloc = std.testing.allocator };
+    var matrix: [4]f32 = undefined;
+
+    try PostingStore.loadTransformedVectorsForQuantizedRefresh(
+        &index,
+        {},
+        &node,
+        matrix[0..],
+        .{ .marker = true },
+    );
+    try std.testing.expectEqual(@as(usize, 1), index.batch_calls);
+    try std.testing.expectEqual(@as(usize, 0), index.scalar_calls);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 4, 5, 10 }, matrix[0..]);
 }
 
 test "posting state tracks dirty versions" {
