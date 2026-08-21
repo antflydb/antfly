@@ -2635,6 +2635,7 @@ components:
             - scores
             - contributions
             - job_control
+            - summary
         worker_id:
           type: string
           description: "Worker id that owns or last failed this page."

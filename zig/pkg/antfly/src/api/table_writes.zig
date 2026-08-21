@@ -17037,12 +17037,25 @@ pub const HostedProvisionedTableWriteSource = struct {
             null;
         defer if (api_lane) |*lane| lane.release();
         if (api_lane == null or group_ids.len == 1) {
+            var accepted_groups: usize = 0;
             for (group_ids, routes) |group_id, route| {
-                var shard_status = try self.graphMetricActionForRoute(alloc, route, group_id, table_name, body, cancellation);
+                var shard_status = self.graphMetricActionForRoute(alloc, route, group_id, table_name, body, cancellation) catch |err| {
+                    if (accepted_groups == 0) return err;
+                    std.log.warn(
+                        "graph metric action partially accepted table={s} index={s} metric={s} action={s} accepted_groups={} failed_group_id={} err={s}; retry is safe",
+                        .{ table_name, index_name, metric_name, action, accepted_groups, group_id, @errorName(err) },
+                    );
+                    return error.GraphMetricActionPartialOutcome;
+                };
+                accepted_groups += 1;
                 if (aggregate) |*status| {
                     query_api.mergeCompatibleGraphMetricStatusInto(alloc, status, shard_status) catch |err| {
                         shard_status.deinit(alloc);
-                        return err;
+                        std.log.warn(
+                            "graph metric action accepted but shard status aggregation failed table={s} index={s} metric={s} action={s} accepted_groups={} err={s}; retry is safe",
+                            .{ table_name, index_name, metric_name, action, accepted_groups, @errorName(err) },
+                        );
+                        return error.GraphMetricActionPartialOutcome;
                     };
                     shard_status.deinit(alloc);
                 } else aggregate = shard_status;
@@ -17098,13 +17111,41 @@ pub const HostedProvisionedTableWriteSource = struct {
                 group.async(io, Fiber.run, .{ self, &slots[i], route, group_id, table_name, body, cancellation });
             }
             group.await(io) catch {};
-            if (cancellation.isCancelled()) return error.Canceled;
         }
-        for (slots) |slot| if (slot.err) |err| return err;
+        var accepted_groups: usize = 0;
+        var first_failed_group: ?u64 = null;
+        var first_error: ?anyerror = null;
+        for (slots, group_ids) |slot, group_id| {
+            if (slot.err) |err| {
+                if (first_error == null) {
+                    first_error = err;
+                    first_failed_group = group_id;
+                }
+            } else if (slot.status != null) {
+                accepted_groups += 1;
+            } else if (first_error == null) {
+                first_error = error.UnknownGroup;
+                first_failed_group = group_id;
+            }
+        }
+        if (first_error) |err| {
+            if (accepted_groups == 0) return err;
+            std.log.warn(
+                "graph metric action partially accepted table={s} index={s} metric={s} action={s} accepted_groups={} total_groups={} first_failed_group_id={} err={s}; retry is safe",
+                .{ table_name, index_name, metric_name, action, accepted_groups, group_ids.len, first_failed_group.?, @errorName(err) },
+            );
+            return error.GraphMetricActionPartialOutcome;
+        }
         for (slots) |slot| {
             const shard_status = slot.status orelse return error.UnknownGroup;
             if (aggregate) |*status| {
-                try query_api.mergeCompatibleGraphMetricStatusInto(alloc, status, shard_status);
+                query_api.mergeCompatibleGraphMetricStatusInto(alloc, status, shard_status) catch |err| {
+                    std.log.warn(
+                        "graph metric action accepted by all shards but status aggregation failed table={s} index={s} metric={s} action={s} total_groups={} err={s}; retry is safe",
+                        .{ table_name, index_name, metric_name, action, group_ids.len, @errorName(err) },
+                    );
+                    return error.GraphMetricActionPartialOutcome;
+                };
             } else {
                 aggregate = try query_api.cloneGraphMetricStatus(alloc, shard_status);
             }

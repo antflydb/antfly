@@ -454,13 +454,20 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
     pub fn runOnceDetailed(self: *GraphMetricRuntime) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
         if (!self.config.enabled) return .{};
         self.recordTickStarted();
-        const now_ms = self.config.clock.nowRealtimeMs();
-        if (!self.ensureRuntimeLease(now_ms)) {
+        // Reject non-owners before contending on the database-wide apply
+        // fence. The post-lock renewal below remains authoritative because a
+        // lease can be lost while this runtime waits for the fence.
+        if (!self.ensureRuntimeLease(self.config.clock.nowRealtimeMs())) {
             self.recordTickSuccess(.{});
             return .{};
         }
         if (!lockApplyExclusiveBackoff(self)) return .{};
         defer self.apply_mutex.unlockExclusive();
+        const now_ms = self.config.clock.nowRealtimeMs();
+        if (!self.ensureRuntimeLease(now_ms)) {
+            self.recordTickSuccess(.{});
+            return .{};
+        }
 
         const result = runBoundaryTick(self.maintenance_boundary, self.config, now_ms) catch |err| {
             self.recordTickError(err);
@@ -481,13 +488,17 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
             self.recordTickError(err);
             return err;
         }
-        const now_ms = self.config.clock.nowRealtimeMs();
-        if (!self.ensureRuntimeLease(now_ms)) {
+        if (!self.ensureRuntimeLease(self.config.clock.nowRealtimeMs())) {
             self.recordTickSuccess(.{});
             return .{};
         }
         if (!lockApplyExclusiveBackoff(self)) return .{};
         defer self.apply_mutex.unlockExclusive();
+        const now_ms = self.config.clock.nowRealtimeMs();
+        if (!self.ensureRuntimeLease(now_ms)) {
+            self.recordTickSuccess(.{});
+            return .{};
+        }
 
         const result = self.maintenance_boundary.runCoordinator(.{
             .max_metrics = self.config.planned_options.max_metrics_per_round,
@@ -512,13 +523,17 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
             self.recordTickError(err);
             return err;
         }
-        const now_ms = self.config.clock.nowRealtimeMs();
-        if (!self.ensureRuntimeLease(now_ms)) {
+        if (!self.ensureRuntimeLease(self.config.clock.nowRealtimeMs())) {
             self.recordTickSuccess(.{});
             return .{};
         }
         if (!lockApplyExclusiveBackoff(self)) return .{};
         defer self.apply_mutex.unlockExclusive();
+        const now_ms = self.config.clock.nowRealtimeMs();
+        if (!self.ensureRuntimeLease(now_ms)) {
+            self.recordTickSuccess(.{});
+            return .{};
+        }
 
         const result = self.maintenance_boundary.runWorker(.{
             .worker_id = worker_id,
@@ -545,13 +560,17 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
         }
         if (!self.config.enabled) return .{};
         self.recordTickStarted();
-        const now_ms = self.config.clock.nowRealtimeMs();
-        if (!self.ensureRuntimeLease(now_ms)) {
+        if (!self.ensureRuntimeLease(self.config.clock.nowRealtimeMs())) {
             self.recordTickSuccess(.{});
             return .{};
         }
         if (!lockApplyExclusiveBackoff(self)) return .{};
         defer self.apply_mutex.unlockExclusive();
+        const now_ms = self.config.clock.nowRealtimeMs();
+        if (!self.ensureRuntimeLease(now_ms)) {
+            self.recordTickSuccess(.{});
+            return .{};
+        }
 
         const total = self.runWorkerPoolSweepLockedAt(now_ms) catch |err| {
             self.recordTickError(err);

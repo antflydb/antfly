@@ -17604,6 +17604,11 @@ fn parseRemoteGraphMetricRerankStatus(
     const profile = maybe_profile orelse return null;
     if (profile != .object) return error.InvalidQueryResponse;
     const graph_metrics_value = profile.object.get("graph_metrics") orelse return null;
+    // `graph_metrics` is optional in the public profile contract. The typed
+    // encoder currently preserves absent optional fields as JSON null, so a
+    // profiled non-metric shard response must be treated exactly like an
+    // omitted field rather than poisoning the whole fan-in response.
+    if (graph_metrics_value == .null) return null;
     if (graph_metrics_value != .array) return error.InvalidQueryResponse;
 
     var result: ?db_mod.types.GraphMetricStatus = null;
@@ -27509,6 +27514,17 @@ test "remote query parser rejects invalid graph metric status and duplicate rera
     ));
 }
 
+test "remote query parser accepts nullable graph metrics in ordinary profiles" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseRemoteSearchResult(alloc,
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"profile":{"shards":{"total":1,"successful":1,"failed":0},"graph_metrics":null},"took":0,"status":200}]}
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), parsed.hits.len);
+    try std.testing.expect(parsed.graph_metric_rerank_status == null);
+}
+
 // Ported hosted fan-in coverage from the combined graph-metrics branch.
 const GraphMetricJsonTestSurface = union(enum) {
     direct: []const u8,
@@ -28820,7 +28836,10 @@ test "hosted cross-range graph metric fan-in merges compatible hits pair" {
     defer response.deinit(alloc);
 
     try expectGraphMetricJsonStatus(alloc, response.json, .{ .direct = "authority" }, "hits_authority", "building", published_generation, active_target_generation);
-    try expectGraphMetricJsonStatus(alloc, response.json, .{ .direct = "hub" }, "hits_hub", "stale", published_generation, null);
+    // HITS authority and hub are one atomic lifecycle pair. Both surfaces must
+    // report the shared in-flight generation even when only the authority
+    // metric was used to start the build.
+    try expectGraphMetricJsonStatus(alloc, response.json, .{ .direct = "hub" }, "hits_hub", "building", published_generation, active_target_generation);
     for (prefixes) |prefix| {
         const authority_needle = try std.fmt.allocPrint(alloc, "doc:{s}:authority", .{prefix});
         defer alloc.free(authority_needle);
@@ -28910,7 +28929,7 @@ test "hosted cross-range graph metric fan-in merges compatible hits pair" {
     }, .read_index)).?;
     defer traversal_response.deinit(alloc);
     try expectGraphMetricJsonStatus(alloc, traversal_response.json, .{ .traversal = "hits_neighbors" }, "hits_authority", "building", published_generation, active_target_generation);
-    try expectGraphMetricJsonStatus(alloc, traversal_response.json, .{ .traversal = "hits_neighbors" }, "hits_hub", "stale", published_generation, null);
+    try expectGraphMetricJsonStatus(alloc, traversal_response.json, .{ .traversal = "hits_neighbors" }, "hits_hub", "building", published_generation, active_target_generation);
     for (prefixes) |prefix| {
         const authority_needle = try std.fmt.allocPrint(alloc, "doc:{s}:authority", .{prefix});
         defer alloc.free(authority_needle);
@@ -28935,7 +28954,7 @@ test "hosted cross-range graph metric fan-in merges compatible hits pair" {
     }, .read_index)).?;
     defer ordered_traversal_response.deinit(alloc);
     try expectGraphMetricJsonStatus(alloc, ordered_traversal_response.json, .{ .traversal = "ordered_hits_neighbors" }, "hits_authority", "building", published_generation, active_target_generation);
-    try expectGraphMetricJsonStatus(alloc, ordered_traversal_response.json, .{ .traversal = "ordered_hits_neighbors" }, "hits_hub", "stale", published_generation, null);
+    try expectGraphMetricJsonStatus(alloc, ordered_traversal_response.json, .{ .traversal = "ordered_hits_neighbors" }, "hits_hub", "building", published_generation, active_target_generation);
 
     const hits_metric_filters = [_]graph_query_mod.GraphMetricFilter{.{
         .name = "hits_authority",
@@ -28952,7 +28971,7 @@ test "hosted cross-range graph metric fan-in merges compatible hits pair" {
     }, .read_index)).?;
     defer filtered_traversal_response.deinit(alloc);
     try expectGraphMetricJsonStatus(alloc, filtered_traversal_response.json, .{ .traversal = "filtered_hits_neighbors" }, "hits_authority", "building", published_generation, active_target_generation);
-    try expectGraphMetricJsonStatus(alloc, filtered_traversal_response.json, .{ .traversal = "filtered_hits_neighbors" }, "hits_hub", "stale", published_generation, null);
+    try expectGraphMetricJsonStatus(alloc, filtered_traversal_response.json, .{ .traversal = "filtered_hits_neighbors" }, "hits_hub", "building", published_generation, active_target_generation);
 
     const fresh_hits_metric_reads = [_]graph_query_mod.GraphMetricRead{
         .{ .name = "hits_authority", .freshness = .fresh },

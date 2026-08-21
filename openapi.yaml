@@ -2513,7 +2513,8 @@ paths:
         '400':
           $ref: '#/components/responses/BadRequest'
         '409':
-          description: The table topology or write-owner generation changed; retry the action
+          description: The table topology or write-owner generation changed, or only some shards accepted
+            the action; retrying is consistency-safe and reuses any still-active build
           content:
             text/plain:
               schema:
@@ -19586,6 +19587,7 @@ components:
             - scores
             - contributions
             - job_control
+            - summary
         worker_id:
           type: string
           description: Worker id that owns or last failed this page.

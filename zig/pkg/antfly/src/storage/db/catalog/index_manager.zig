@@ -4254,10 +4254,10 @@ pub const IndexManager = struct {
         }
     };
 
-    fn graphMetricBackgroundStartCanonical(configs: []const graph_mod.GraphMetricConfig, cfg: graph_mod.GraphMetricConfig) bool {
+    fn graphMetricLifecycleCanonical(configs: []const graph_mod.GraphMetricConfig, cfg: graph_mod.GraphMetricConfig) bool {
         if (cfg.kind != .hits_hub) return true;
         for (configs) |candidate| {
-            if (candidate.refresh == .background and graph_mod.graphMetricHitsPairCompatible(cfg, candidate)) return false;
+            if (candidate.kind == .hits_authority and graph_mod.graphMetricHitsPairCompatible(cfg, candidate)) return false;
         }
         return true;
     }
@@ -4273,6 +4273,7 @@ pub const IndexManager = struct {
                     stats.paused_metrics += 1;
                     continue;
                 }
+                if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
                 if (status.build_pages_truncated) stats.truncated_pages = true;
                 for (status.build_pages) |page| {
                     switch (page.state) {
@@ -4282,12 +4283,11 @@ pub const IndexManager = struct {
                     }
                 }
                 if (status.state == .building or status.phase == .cleanup_old_generations) {
-                    if (!graphMetricBackgroundStartCanonical(entry.metric_configs, cfg)) continue;
                     stats.active_builds += 1;
                     continue;
                 }
                 if (cfg.refresh != .background) continue;
-                if (!graphMetricBackgroundStartCanonical(entry.metric_configs, cfg)) continue;
+                if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
                 switch (status.state) {
                     .not_ready, .stale => stats.queued_builds += 1,
                     .disabled, .fresh, .building => {},
@@ -4327,6 +4327,7 @@ pub const IndexManager = struct {
                 var status = try entry.index.graphMetricStatus(cfg.name);
                 defer status.deinit(entry.index.alloc);
                 if (status.maintenance_paused) continue;
+                if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
 
                 const active = status.state == .building or status.phase == .cleanup_old_generations;
                 if (active) decision.control_records += 1;
@@ -4337,7 +4338,7 @@ pub const IndexManager = struct {
                 }
 
                 const queued = cfg.refresh == .background and
-                    graphMetricBackgroundStartCanonical(entry.metric_configs, cfg) and
+                    graphMetricLifecycleCanonical(entry.metric_configs, cfg) and
                     (status.state == .not_ready or status.state == .stale);
                 if (cfg.kind == .degree) {
                     if (active) decision.active_degree_builds += 1;
@@ -4374,7 +4375,7 @@ pub const IndexManager = struct {
                 }
 
                 if (cfg.refresh != .background) continue;
-                if (!graphMetricBackgroundStartCanonical(entry.metric_configs, cfg)) continue;
+                if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
                 switch (status.state) {
                     .not_ready, .stale => {
                         if (!graphMetricQueuedPlannedAutoEligible(entry.metric_configs, cfg, options)) {
@@ -4407,7 +4408,7 @@ pub const IndexManager = struct {
             defer status.deinit(entry.index.alloc);
             if (status.maintenance_paused) continue;
             if (status.state == .building or status.phase == .cleanup_old_generations) {
-                if (!graphMetricBackgroundStartCanonical(entry.metric_configs, cfg)) continue;
+                if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
                 active_builds += 1;
             }
         }
@@ -4479,7 +4480,7 @@ pub const IndexManager = struct {
         index_active_builds: usize,
         index_scheduled_builds: usize,
     ) bool {
-        if (!graphMetricBackgroundStartCanonical(configs, cfg)) return false;
+        if (!graphMetricLifecycleCanonical(configs, cfg)) return false;
         if (!graphMetricQueuedPlannedAutoEligible(configs, cfg, options)) return false;
         return graphMetricPlannedAutoCanStart(
             options,
@@ -4518,6 +4519,7 @@ pub const IndexManager = struct {
                 var status = try entry.index.graphMetricStatus(cfg.name);
                 defer status.deinit(entry.index.alloc);
                 if (status.maintenance_paused) continue;
+                if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
 
                 var active = status.state == .building;
                 if (!active and options.start_background_builds and cfg.refresh == .background) {
@@ -4533,7 +4535,7 @@ pub const IndexManager = struct {
                                     index_active_builds,
                                     index_scheduled_builds,
                                 )) continue;
-                            } else if (!graphMetricBackgroundStartCanonical(entry.metric_configs, cfg)) continue;
+                            } else if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
                             var started = entry.index.ensureGraphMetricPlannedBuild(cfg.name, status.target_edge_generation) catch |err| switch (err) {
                                 error.GraphMetricDisabled => continue,
                                 else => return err,
@@ -4606,6 +4608,7 @@ pub const IndexManager = struct {
                     result.pages_completed += 1;
                     continue;
                 }
+                if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
                 const active = status.state == .building or status.phase == .cleanup_old_generations;
                 if (!active) continue;
                 result.metrics_scanned += 1;
@@ -19525,20 +19528,20 @@ test "graph config bounds iterative metric work" {
     ));
 }
 
-test "background HITS scheduling suppresses only the compatible hub" {
+test "HITS lifecycle scheduling suppresses only the compatible hub" {
     const cites = [_][]const u8{"cites"};
     const mentions = [_][]const u8{"mentions"};
     const compatible = [_]graph_mod.GraphMetricConfig{
         .{ .name = "authority", .kind = .hits_authority, .edge_filter = .{ .mode = .types, .types = &cites } },
         .{ .name = "hub", .kind = .hits_hub, .edge_filter = .{ .mode = .types, .types = &cites } },
     };
-    try std.testing.expect(!IndexManager.graphMetricBackgroundStartCanonical(&compatible, compatible[1]));
+    try std.testing.expect(!IndexManager.graphMetricLifecycleCanonical(&compatible, compatible[1]));
 
     const unrelated = [_]graph_mod.GraphMetricConfig{
         .{ .name = "authority", .kind = .hits_authority, .edge_filter = .{ .mode = .types, .types = &mentions } },
         .{ .name = "hub", .kind = .hits_hub, .edge_filter = .{ .mode = .types, .types = &cites } },
     };
-    try std.testing.expect(IndexManager.graphMetricBackgroundStartCanonical(&unrelated, unrelated[1]));
+    try std.testing.expect(IndexManager.graphMetricLifecycleCanonical(&unrelated, unrelated[1]));
 }
 
 test "graph config parses artifact source and shorthand asset enrichment" {

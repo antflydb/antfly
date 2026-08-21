@@ -297,6 +297,7 @@ pub const Detail = enum(c_int) {
     enrichment_wait_canceled,
     enrichment_wait_timeout,
     enrichment_worker_failed,
+    graph_metric_action_partial_outcome,
 };
 
 pub const Status = extern struct {
@@ -369,6 +370,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.WriteOutcomeUnknown => status(.retryable, .write_outcome_unknown),
         error.RaftBatchWriteOutcomeUnknown => status(.retryable, .raft_batch_write_outcome_unknown),
         error.RaftBatchWritePartialOutcome => status(.retryable, .raft_batch_write_partial_outcome),
+        error.GraphMetricActionPartialOutcome => status(.retryable, .graph_metric_action_partial_outcome),
         error.DocIdentityUnavailable => status(.retryable, .doc_identity_unavailable),
         error.HAReadOnlyStandby => status(.unavailable, .ha_read_only_standby),
         error.HAPromotedStandbyRequiresPrimaryOpen => status(.unavailable, .ha_promoted_standby_requires_primary_open),
@@ -882,6 +884,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .enrichment_wait_canceled => "EnrichmentWaitCanceled",
         .enrichment_wait_timeout => "EnrichmentWaitTimeout",
         .enrichment_worker_failed => "EnrichmentWorkerFailed",
+        .graph_metric_action_partial_outcome => "GraphMetricActionPartialOutcome",
     };
 }
 

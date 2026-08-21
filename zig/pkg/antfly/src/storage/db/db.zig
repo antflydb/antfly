@@ -18206,7 +18206,14 @@ pub const DB = struct {
             // "unpublish first". Repeated requests remain idempotent while a
             // build is active, and readers keep the verified prior epoch until
             // the new pointer is atomically published.
-            var scheduled = try self.core.index_manager.ensureGraphMetricPlannedBuild(index_name, metric_name, target_generation);
+            var scheduled = self.core.index_manager.ensureGraphMetricPlannedBuild(index_name, metric_name, target_generation) catch |err| switch (err) {
+                // A newer edge snapshot may be queued while the prior bounded
+                // build is still active. Treat repeated control-plane actions
+                // as accepted and expose the active/queued generations in the
+                // returned status instead of turning a safe retry into a 500.
+                error.GraphMetricBuildAlreadyRunning => break :blk try cloneGraphMetricStatusFromGraph(alloc, current),
+                else => return err,
+            };
             defer scheduled.deinit(self.core.index_manager.alloc);
             break :blk try cloneGraphMetricStatusFromGraph(alloc, scheduled);
         };

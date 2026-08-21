@@ -9215,6 +9215,7 @@ pub const ApiHttpServer = struct {
             error.TableGenerationChanged,
             error.GraphMetricDisabled,
             error.GraphMetricStatusConflict,
+            error.GraphMetricActionPartialOutcome,
             => return error.Conflict,
             error.LeaderUnavailable, error.UnknownGroup => return error.NotLeader,
             error.PersistentDescriptorAdmissionExhausted, error.ResourceBudgetExceeded, error.BackendRuntimeShuttingDown => return error.Backpressured,
