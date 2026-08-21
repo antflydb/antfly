@@ -1077,6 +1077,9 @@ jobs:
           ANTFLY_INFERENCE_STANDALONE_TESTS: "1"
           ANTFLY_INFERENCE_STANDALONE_MODELS_DIR: ~/.antfly/inference/models
           ANTFLY_INFERENCE_STANDALONE_MODEL_NAME: ggml-org/gemma-4-e2b-it-gguf
+          # Match the cold-start contract used by the full inference suite.
+          # Standalone exercises the same CPU-only model initialization path.
+          ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT: "1800"
           ANTFLY_INFERENCE_STANDALONE_PROCESS_MEMORY_BUDGET_MB: "14000"
           ANTFLY_INFERENCE_STANDALONE_HOST_BUDGET_MB: "12000"
           ANTFLY_INFERENCE_STANDALONE_COMBINED_BUDGET_MB: "12000"

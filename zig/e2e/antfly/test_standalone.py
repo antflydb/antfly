@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import signal
 import subprocess
@@ -48,6 +49,7 @@ DEFAULT_INFERENCE_STANDALONE_COMBINED_BUDGET_MB = 16384
 DEFAULT_INFERENCE_STANDALONE_KV_BUDGET_MB = 0
 DEFAULT_INFERENCE_STANDALONE_SCRATCH_BUDGET_MB = 0
 DEFAULT_INFERENCE_STANDALONE_PROCESS_MEMORY_BUDGET_MB = 0
+DEFAULT_INFERENCE_STANDALONE_FIRST_USE_REQUEST_TIMEOUT = 300.0
 
 
 def _integration_enabled(env_name: str) -> bool:
@@ -64,6 +66,19 @@ def _env_int(name: str, default: int) -> int:
     if value is None or value == "":
         return default
     return int(value)
+
+
+def _positive_timeout(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    try:
+        value = default if raw is None else float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must be a positive finite number, got {raw!r}"
+        ) from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a positive finite number, got {value!r}")
+    return value
 
 
 def _wait_for_server(url: str, timeout_s: float = 30.0, path: str = "/status") -> bool:
@@ -295,7 +310,12 @@ class EmbeddedInferenceStandaloneServer:
         self.tempdir.cleanup()
 
 
-def _warm_inference_generator(api_url: str, model_name: str) -> None:
+def _warm_inference_generator(
+    api_url: str,
+    model_name: str,
+    *,
+    request_timeout: float,
+) -> None:
     response = requests.post(
         f"{api_url}/generate",
         json={
@@ -304,12 +324,132 @@ def _warm_inference_generator(api_url: str, model_name: str) -> None:
             "max_tokens": 8,
             "temperature": 0,
         },
-        timeout=300,
+        timeout=request_timeout,
     )
     if response.status_code >= 400:
         raise AssertionError(
             f"generator warmup failed: {response.status_code} {response.text}"
         )
+
+
+def _finish_standalone_server(
+    server: EmbeddedInferenceStandaloneServer,
+    primary_failure: BaseException | None,
+) -> None:
+    cleanup_failure: str | None = None
+    try:
+        server.stop()
+    except Exception as exc:
+        cleanup_failure = f"standalone inference cleanup raised {type(exc).__name__}: {exc}"
+    else:
+        if server.forced_kill or server.returncode != 0:
+            cleanup_failure = (
+                "standalone inference did not shut down cleanly "
+                f"(forced_kill={server.forced_kill}, returncode={server.returncode})\n"
+                f"last logs:\n{server.final_logs[-8000:]}"
+            )
+
+    if cleanup_failure is None:
+        return
+    if primary_failure is not None:
+        primary_failure.add_note(cleanup_failure)
+        return
+    raise AssertionError(cleanup_failure)
+
+
+def test_standalone_warmup_uses_configured_first_use_deadline(monkeypatch):
+    observed: dict[str, object] = {}
+
+    class Response:
+        status_code = 200
+        text = ""
+
+    def post(url: str, **kwargs):
+        observed["url"] = url
+        observed["timeout"] = kwargs["timeout"]
+        return Response()
+
+    monkeypatch.setattr(requests, "post", post)
+
+    _warm_inference_generator(
+        "http://127.0.0.1:8080/ai/v1",
+        "test/model",
+        request_timeout=1800.0,
+    )
+
+    assert observed == {
+        "url": "http://127.0.0.1:8080/ai/v1/generate",
+        "timeout": 1800.0,
+    }
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "invalid"])
+def test_standalone_first_use_deadline_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT", value)
+
+    with pytest.raises(
+        ValueError,
+        match="ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT must be a positive finite number",
+    ):
+        _positive_timeout(
+            "ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT",
+            DEFAULT_INFERENCE_STANDALONE_FIRST_USE_REQUEST_TIMEOUT,
+        )
+
+
+class _FakeStandaloneServer:
+    def __init__(
+        self,
+        *,
+        forced_kill: bool = False,
+        returncode: int = 0,
+        stop_failure: Exception | None = None,
+    ):
+        self.forced_kill = forced_kill
+        self.returncode = returncode
+        self.stop_failure = stop_failure
+        self.final_logs = "standalone diagnostic logs"
+        self.stop_calls = 0
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+        if self.stop_failure is not None:
+            raise self.stop_failure
+
+
+def test_standalone_cleanup_preserves_primary_failure():
+    server = _FakeStandaloneServer(returncode=1)
+    primary_failure = RuntimeError("warmup timed out")
+
+    _finish_standalone_server(server, primary_failure)
+
+    assert server.stop_calls == 1
+    assert primary_failure.__notes__ == [
+        "standalone inference did not shut down cleanly "
+        "(forced_kill=False, returncode=1)\n"
+        "last logs:\nstandalone diagnostic logs"
+    ]
+
+
+def test_standalone_cleanup_exception_is_attached_to_primary_failure():
+    server = _FakeStandaloneServer(stop_failure=OSError("cleanup failed"))
+    primary_failure = RuntimeError("warmup timed out")
+
+    _finish_standalone_server(server, primary_failure)
+
+    assert server.stop_calls == 1
+    assert primary_failure.__notes__ == [
+        "standalone inference cleanup raised OSError: cleanup failed"
+    ]
+
+
+def test_standalone_cleanup_failure_is_primary_after_successful_test():
+    server = _FakeStandaloneServer(forced_kill=True, returncode=-9)
+
+    with pytest.raises(AssertionError, match="did not shut down cleanly"):
+        _finish_standalone_server(server, None)
+
+    assert server.stop_calls == 1
 
 
 @pytest.fixture(scope="session")
@@ -356,6 +496,10 @@ def embedded_standalone_runtime():
         "ANTFLY_INFERENCE_STANDALONE_PROCESS_MEMORY_BUDGET_MB",
         DEFAULT_INFERENCE_STANDALONE_PROCESS_MEMORY_BUDGET_MB,
     )
+    first_use_request_timeout = _positive_timeout(
+        "ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT",
+        DEFAULT_INFERENCE_STANDALONE_FIRST_USE_REQUEST_TIMEOUT,
+    )
 
     server = EmbeddedInferenceStandaloneServer(
         binary,
@@ -365,10 +509,15 @@ def embedded_standalone_runtime():
         process_memory_budget_mb=process_memory_budget_mb,
     )
     warmup_performed = False
+    primary_failure: BaseException | None = None
     try:
         if not _integration_enabled("ANTFLY_INFERENCE_STANDALONE_SKIP_GENERATOR_WARMUP"):
             try:
-                _warm_inference_generator(server.inference_api_url, model_name)
+                _warm_inference_generator(
+                    server.inference_api_url,
+                    model_name,
+                    request_timeout=first_use_request_timeout,
+                )
             except Exception as exc:
                 raise AssertionError(
                     f"standalone inference generator warmup failed for {model_name}: {exc}\n"
@@ -387,14 +536,14 @@ def embedded_standalone_runtime():
             "warmup_performed": warmup_performed,
             "logs": server.debug_logs,
         }
+    except BaseException as exc:
+        # A skipped test has no primary failure to preserve; a teardown defect
+        # must still surface instead of being hidden behind the skip outcome.
+        if not isinstance(exc, pytest.skip.Exception):
+            primary_failure = exc
+        raise
     finally:
-        server.stop()
-        if server.forced_kill or server.returncode != 0:
-            pytest.fail(
-                "standalone inference did not shut down cleanly "
-                f"(forced_kill={server.forced_kill}, returncode={server.returncode})\n"
-                f"last logs:\n{server.final_logs[-8000:]}"
-            )
+        _finish_standalone_server(server, primary_failure)
 
 
 @pytest.fixture(scope="function")
