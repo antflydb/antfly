@@ -45,6 +45,8 @@ pub const DeltaValue = struct {
     value: []const u8,
 };
 
+pub const SequencedValue = DeltaValue;
+
 const PendingEntry = struct {
     posting_id: PostingId,
     kind: EntryKind,
@@ -91,44 +93,66 @@ pub const Writer = struct {
     }
 
     pub fn appendBase(self: *Writer, posting_id: PostingId, value: []const u8) !void {
+        try self.appendBaseAt(posting_id, 0, value);
+    }
+
+    pub fn appendBaseAt(self: *Writer, posting_id: PostingId, sequence: u64, value: []const u8) !void {
         try self.appendEntry(.{
             .posting_id = posting_id,
             .kind = .base,
-            .sequence = 0,
+            .sequence = sequence,
         }, value);
     }
 
     /// Transfers ownership of `value`, including on error.
     pub fn appendBaseOwned(self: *Writer, posting_id: PostingId, value: []u8) !void {
+        try self.appendBaseOwnedAt(posting_id, 0, value);
+    }
+
+    /// Transfers ownership of `value`, including on error.
+    pub fn appendBaseOwnedAt(self: *Writer, posting_id: PostingId, sequence: u64, value: []u8) !void {
         try self.appendEntryOwned(.{
             .posting_id = posting_id,
             .kind = .base,
-            .sequence = 0,
+            .sequence = sequence,
         }, value);
     }
 
     pub fn appendCentroidDirectory(self: *Writer, posting_id: PostingId, value: []const u8) !void {
+        try self.appendCentroidDirectoryAt(posting_id, 0, value);
+    }
+
+    pub fn appendCentroidDirectoryAt(self: *Writer, posting_id: PostingId, sequence: u64, value: []const u8) !void {
         try self.appendEntry(.{
             .posting_id = posting_id,
             .kind = .centroid_directory,
-            .sequence = 0,
+            .sequence = sequence,
         }, value);
     }
 
     pub fn appendQuantizedCheckpoint(self: *Writer, posting_id: PostingId, value: []const u8) !void {
+        try self.appendQuantizedCheckpointAt(posting_id, 0, value);
+    }
+
+    pub fn appendQuantizedCheckpointAt(self: *Writer, posting_id: PostingId, sequence: u64, value: []const u8) !void {
         try self.appendEntry(.{
             .posting_id = posting_id,
             .kind = .quantized_checkpoint,
-            .sequence = 0,
+            .sequence = sequence,
         }, value);
     }
 
     /// Transfers ownership of `value`, including on error.
     pub fn appendQuantizedCheckpointOwned(self: *Writer, posting_id: PostingId, value: []u8) !void {
+        try self.appendQuantizedCheckpointOwnedAt(posting_id, 0, value);
+    }
+
+    /// Transfers ownership of `value`, including on error.
+    pub fn appendQuantizedCheckpointOwnedAt(self: *Writer, posting_id: PostingId, sequence: u64, value: []u8) !void {
         try self.appendEntryOwned(.{
             .posting_id = posting_id,
             .kind = .quantized_checkpoint,
-            .sequence = 0,
+            .sequence = sequence,
         }, value);
     }
 
@@ -250,15 +274,30 @@ pub const Reader = struct {
     }
 
     pub fn getBase(self: Reader, posting_id: PostingId) !?[]const u8 {
-        return try self.getExact(posting_id, .base, 0);
+        const result = try self.getLatest(posting_id, .base);
+        return if (result) |found| found.value else null;
+    }
+
+    pub fn getBaseValue(self: Reader, posting_id: PostingId) !?SequencedValue {
+        return try self.getLatest(posting_id, .base);
     }
 
     pub fn getCentroidDirectory(self: Reader, posting_id: PostingId) !?[]const u8 {
-        return try self.getExact(posting_id, .centroid_directory, 0);
+        const result = try self.getLatest(posting_id, .centroid_directory);
+        return if (result) |found| found.value else null;
+    }
+
+    pub fn getCentroidDirectoryValue(self: Reader, posting_id: PostingId) !?SequencedValue {
+        return try self.getLatest(posting_id, .centroid_directory);
     }
 
     pub fn getQuantizedCheckpoint(self: Reader, posting_id: PostingId) !?[]const u8 {
-        return try self.getExact(posting_id, .quantized_checkpoint, 0);
+        const result = try self.getLatest(posting_id, .quantized_checkpoint);
+        return if (result) |found| found.value else null;
+    }
+
+    pub fn getQuantizedCheckpointValue(self: Reader, posting_id: PostingId) !?SequencedValue {
+        return try self.getLatest(posting_id, .quantized_checkpoint);
     }
 
     pub fn deltas(self: Reader, posting_id: PostingId) DeltaIterator {
@@ -269,12 +308,16 @@ pub const Reader = struct {
         };
     }
 
-    fn getExact(self: Reader, posting_id: PostingId, kind: EntryKind, sequence: u64) !?[]const u8 {
-        const index = self.lowerBound(posting_id, kind, sequence);
-        if (index >= self.entry_count) return null;
-        const entry = try self.indexEntry(index);
-        if (entry.posting_id != posting_id or entry.kind != kind or entry.sequence != sequence) return null;
-        return try entry.value(self.data);
+    fn getLatest(self: Reader, posting_id: PostingId, kind: EntryKind) !?SequencedValue {
+        var index = self.lowerBound(posting_id, kind, 0);
+        var latest: ?IndexEntry = null;
+        while (index < self.entry_count) : (index += 1) {
+            const entry = try self.indexEntry(index);
+            if (entry.posting_id != posting_id or entry.kind != kind) break;
+            latest = entry;
+        }
+        const found = latest orelse return null;
+        return .{ .sequence = found.sequence, .value = try found.value(self.data) };
     }
 
     fn lowerBound(self: Reader, posting_id: PostingId, kind: EntryKind, sequence: u64) usize {
@@ -421,6 +464,7 @@ fn readU64(bytes: *const [8]u8) u64 {
 pub fn testStoresPointAndOrderedDeltaValues() !void {
     const alloc = std.testing.allocator;
     const base = "packed-posting-v1";
+    const base_v2 = "packed-posting-v2";
     const delta_4 = "insert:40";
     const delta_5 = "delete:20";
     const centroid = "centroid-directory-v1";
@@ -430,7 +474,8 @@ pub fn testStoresPointAndOrderedDeltaValues() !void {
     defer writer.deinit();
     try writer.appendDelta(7, 5, delta_5);
     try writer.appendCentroidDirectory(7, centroid);
-    try writer.appendBase(7, base);
+    try writer.appendBaseAt(7, 10, base);
+    try writer.appendBaseAt(7, 12, base_v2);
     try writer.appendQuantizedCheckpoint(7, quantized);
     try writer.appendDelta(7, 4, delta_4);
 
@@ -438,7 +483,9 @@ pub fn testStoresPointAndOrderedDeltaValues() !void {
     defer alloc.free(bytes);
 
     const reader = try Reader.init(bytes);
-    try std.testing.expectEqualSlices(u8, base, (try reader.getBase(7)).?);
+    try std.testing.expectEqualSlices(u8, base_v2, (try reader.getBase(7)).?);
+    const latest_base = (try reader.getBaseValue(7)).?;
+    try std.testing.expectEqual(@as(u64, 12), latest_base.sequence);
     try std.testing.expectEqualSlices(u8, centroid, (try reader.getCentroidDirectory(7)).?);
     try std.testing.expectEqualSlices(u8, quantized, (try reader.getQuantizedCheckpoint(7)).?);
     try std.testing.expect(try reader.getBase(8) == null);
