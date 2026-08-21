@@ -183,6 +183,18 @@ pub fn observationChangesRecordWithRepairStatus(
     observation: StoreObservation,
     include_repair_status: bool,
 ) bool {
+    // Until the v13 codec is activated, absence is not authoritative for an
+    // already-committed repair identity. A legacy or transient heartbeat can
+    // omit an index (or its whole runtime group), and replacing the owned
+    // snapshot in that case would erase the only admission-safety fact. Treat
+    // the heartbeat as unchanged so callers neither replace the projection nor
+    // propose the deletion. A same-name index with a different materialization
+    // identity remains authoritative and is handled as an explicit replacement.
+    if (!include_repair_status and observationOmitsCommittedRuntimeRepairIdentity(
+        existing.runtime_statuses,
+        observation.runtime_statuses,
+    )) return false;
+
     return existing.live != observation.live or
         !std.mem.eql(u8, existing.health_class, observation.health_class) or
         existing.capacity_bytes != observation.capacity_bytes or
@@ -194,6 +206,38 @@ pub fn observationChangesRecordWithRepairStatus(
         existing.backfill_progress_millis != observation.backfill_progress_millis or
         !groupStatusesEqual(existing.group_statuses, observation.group_statuses) or
         !runtimeStatusesEqual(existing.runtime_statuses, observation.runtime_statuses, include_repair_status);
+}
+
+fn observationOmitsCommittedRuntimeRepairIdentity(
+    existing: []const table_manager.RuntimeGroupStatusReport,
+    next: []const table_manager.RuntimeGroupStatusReport,
+) bool {
+    for (existing) |prior_runtime| {
+        var has_committed_repair = false;
+        for (prior_runtime.indexes) |prior_index| {
+            if (prior_index.repair_status != null) {
+                has_committed_repair = true;
+                break;
+            }
+        }
+        // Activation may be unknown because another store has a repair fact;
+        // keep the common repair-free store path linear in its own index count.
+        if (!has_committed_repair) continue;
+
+        const next_runtime = findRuntimeRepairIdentity(next, prior_runtime) orelse return true;
+        for (prior_runtime.indexes) |prior_index| {
+            if (prior_index.repair_status == null) continue;
+            var logical_index_present = false;
+            for (next_runtime.indexes) |next_index| {
+                if (std.mem.eql(u8, prior_index.name, next_index.name)) {
+                    logical_index_present = true;
+                    break;
+                }
+            }
+            if (!logical_index_present) return true;
+        }
+    }
+    return false;
 }
 
 fn groupStatusesEqual(

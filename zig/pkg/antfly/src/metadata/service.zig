@@ -6556,7 +6556,7 @@ test "metadata service status reporting never proposes deletion of committed rep
     observed_indexes[0].doc_count = 11;
     var observed_runtime = existing_runtime;
     observed_runtime[0].indexes = observed_indexes[0..];
-    const reports = [_]metadata_table_manager.StoreStatusReport{.{
+    var reports = [_]metadata_table_manager.StoreStatusReport{.{
         .store_id = 3,
         .runtime_statuses = observed_runtime[0..],
     }};
@@ -6584,8 +6584,33 @@ test "metadata service status reporting never proposes deletion of committed rep
         projected[0].runtime_statuses[0].indexes[0].repair_status.?,
     );
 
+    // Omitting the index is not an authoritative deletion while activation is
+    // unknown. Preserve the whole committed snapshot rather than allowing the
+    // repair admission fact to disappear with an incomplete heartbeat.
+    observed_runtime[0].indexes = &.{};
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try reportStoreStatusesWithProjected(&service, &projected, &reports),
+    );
+    try std.testing.expectEqual(@as(usize, 0), service.upserts);
+    try std.testing.expect(storeHasRuntimeRepairStatus(projected[0]));
+    try std.testing.expectEqual(@as(usize, 1), projected[0].runtime_statuses[0].indexes.len);
+
+    // A transient heartbeat can also omit the whole runtime group. That absence
+    // carries no more deletion authority than an omitted member index.
+    reports[0].runtime_statuses = &.{};
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try reportStoreStatusesWithProjected(&service, &projected, &reports),
+    );
+    try std.testing.expectEqual(@as(usize, 0), service.upserts);
+    try std.testing.expect(storeHasRuntimeRepairStatus(projected[0]));
+    try std.testing.expectEqual(@as(usize, 1), projected[0].runtime_statuses.len);
+
     // A replacement materialization does not inherit stale repair identity and
     // may continue publishing its legacy-compatible heartbeat.
+    reports[0].runtime_statuses = observed_runtime[0..];
+    observed_runtime[0].indexes = observed_indexes[0..];
     observed_indexes[0].doc_count = 13;
     observed_indexes[0].coverage_generation = 9;
     try std.testing.expectEqual(
