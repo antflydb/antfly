@@ -420,11 +420,6 @@ pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u
     try validateParsedStorageModeSchema(schema);
     try validateParsedTtlSchema(schema);
     try validateParsedRelationalSchema(schema);
-    // Relational schemas can be parsed internally so the catalog, projection,
-    // and on-disk codec can be developed and validated independently. Do not
-    // admit them through the public schema mutation path until storage mode is
-    // carried through runtime schema derivation and the write/read lifecycle.
-    if (schema.storage_mode == .relational) return error.InvalidSchemaUpdateRequest;
     return try stringifyJsonValue(alloc, parsed.value);
 }
 
@@ -4688,10 +4683,12 @@ test "schema rejects invalid patterns before instance evaluation" {
     );
 }
 
-test "public schema mutations gate relational storage until runtime wiring lands" {
-    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchemaUpdateRequest(std.testing.allocator,
+test "public schema mutations admit wired relational storage" {
+    const normalized = try parseSchemaUpdateRequest(std.testing.allocator,
         \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
-    ));
+    );
+    defer std.testing.allocator.free(normalized);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "\"storage_mode\":\"relational\"") != null);
 }
 
 fn parseJsonNumber(value: std.json.Value) !f64 {

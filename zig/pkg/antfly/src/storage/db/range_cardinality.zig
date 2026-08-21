@@ -42,7 +42,7 @@ pub fn countPrimaryDocuments(
 
         fn scanEntry(ctx: ?*anyopaque, key: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            if (internal_keys.isPrimaryDocumentKey(key)) state.count = std.math.add(u64, state.count, 1) catch
+            if (internal_keys.isStoredDocumentRowKey(key)) state.count = std.math.add(u64, state.count, 1) catch
                 return error.RangeDocumentCountOverflow;
             return .@"continue";
         }

@@ -16790,8 +16790,8 @@ const MatchAllPrimaryKeyScanBatch = struct {
         self.scanned += 1;
         if (self.scanned % 1024 == 0) try checkSearchRequestDeadline(self.req);
 
-        if (!internal_keys.isPrimaryDocumentKey(key)) return .@"continue";
-        var raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.alloc, key)) orelse return .@"continue";
+        if (!internal_keys.isStoredDocumentRowKey(key)) return .@"continue";
+        var raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, key)) orelse return .@"continue";
         errdefer self.alloc.free(raw_key);
 
         try self.raw_keys.append(self.alloc, raw_key);
@@ -16850,8 +16850,8 @@ const MatchAllCandidateCollectState = struct {
         self.processed += 1;
         if (self.processed % 1024 == 0) try checkSearchRequestDeadline(self.req);
 
-        if (!internal_keys.isPrimaryDocumentKey(store_key)) return;
-        var raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.alloc, store_key)) orelse return;
+        if (!internal_keys.isStoredDocumentRowKey(store_key)) return;
+        var raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, store_key)) orelse return;
         errdefer self.alloc.free(raw_key);
 
         const owned = raw_key;

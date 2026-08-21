@@ -132,6 +132,45 @@ pub const FullTextDocument = struct {
     infer_type_dynamic_paths: []const []const u8 = &.{},
 };
 
+/// Storage profile for a table. Relational mode stores a self-describing packed
+/// row as the authoritative document value instead of retaining a JSON blob.
+pub const StorageMode = enum(u8) {
+    document = 0,
+    relational = 1,
+};
+
+/// Logical column type retained by the runtime schema. This remains separate
+/// from AntflyType so signed integers do not collapse into the f64-backed
+/// numeric representation used by legacy document indexes.
+pub const RelationalColumnType = enum(u8) {
+    string = 0,
+    blob = 1,
+    boolean = 2,
+    datetime = 3,
+    integer = 4,
+    number = 5,
+    geopoint = 6,
+    geoshape = 7,
+    json = 8,
+};
+
+pub const RelationalJsonKind = enum(u8) {
+    none = 0,
+    any = 1,
+    object = 2,
+    array = 3,
+};
+
+pub const RelationalColumn = struct {
+    name: []const u8,
+    path: []const u8,
+    column_type: RelationalColumnType,
+    required: bool = false,
+    allows_null: bool = false,
+    is_json: bool = false,
+    json_kind: RelationalJsonKind = .none,
+};
+
 pub const IndexSortField = struct {
     field: []const u8,
     desc: bool = false,
@@ -143,8 +182,10 @@ pub const TableSchema = struct {
     ttl_duration_ns: u64 = 0,
     ttl_field: []const u8 = "_timestamp",
     enforce_types: bool = false,
+    storage_mode: StorageMode = .document,
     dynamic_templates: []const DynamicTemplate = &.{},
     full_text_documents: []const FullTextDocument = &.{},
+    relational_columns: []const RelationalColumn = &.{},
     index_sort: []const IndexSortField = &.{},
 };
 
@@ -166,7 +207,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 11); // format version
+    try appendU32(&buf, alloc, 12); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -226,6 +267,18 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         try buf.append(alloc, if (field.desc) 1 else 0);
     }
 
+    try buf.append(alloc, @intFromEnum(schema.storage_mode));
+    try appendU32(&buf, alloc, @intCast(schema.relational_columns.len));
+    for (schema.relational_columns) |column| {
+        try appendStr(&buf, alloc, column.name);
+        try appendStr(&buf, alloc, column.path);
+        try buf.append(alloc, @intFromEnum(column.column_type));
+        try buf.append(alloc, if (column.required) 1 else 0);
+        try buf.append(alloc, if (column.allows_null) 1 else 0);
+        try buf.append(alloc, if (column.is_json) 1 else 0);
+        try buf.append(alloc, @intFromEnum(column.json_kind));
+    }
+
     const result = try alloc.dupe(u8, buf.items);
     buf.deinit(alloc);
     return result;
@@ -239,7 +292,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 11) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 12) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -521,14 +574,84 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         break :blk fields;
     } else &.{};
 
+    if (fmt_version >= 12 and pos >= data.len) return error.InvalidFormat;
+    const storage_mode: StorageMode = if (fmt_version >= 12) switch (data[pos]) {
+        0 => .document,
+        1 => .relational,
+        else => return error.InvalidSchema,
+    } else .document;
+    if (fmt_version >= 12) pos += 1;
+
+    const relational_columns: []RelationalColumn = if (fmt_version >= 12) blk: {
+        const column_count = readU32(data, &pos);
+        const columns = try alloc.alloc(RelationalColumn, column_count);
+        var columns_initialized: usize = 0;
+        errdefer {
+            for (columns[0..columns_initialized]) |column| {
+                alloc.free(column.name);
+                alloc.free(column.path);
+            }
+            alloc.free(columns);
+        }
+        for (columns) |*column| {
+            var name: ?[]u8 = try alloc.dupe(u8, readStr(data, &pos));
+            errdefer if (name) |owned_name| alloc.free(owned_name);
+            var path: ?[]u8 = try alloc.dupe(u8, readStr(data, &pos));
+            errdefer if (path) |owned_path| alloc.free(owned_path);
+            if (pos + 5 > data.len) return error.InvalidFormat;
+            const column_type: RelationalColumnType = switch (data[pos]) {
+                0 => .string,
+                1 => .blob,
+                2 => .boolean,
+                3 => .datetime,
+                4 => .integer,
+                5 => .number,
+                6 => .geopoint,
+                7 => .geoshape,
+                8 => .json,
+                else => return error.InvalidSchema,
+            };
+            pos += 1;
+            const required = data[pos] == 1;
+            pos += 1;
+            const allows_null = data[pos] == 1;
+            pos += 1;
+            const is_json = data[pos] == 1;
+            pos += 1;
+            const json_kind: RelationalJsonKind = switch (data[pos]) {
+                0 => .none,
+                1 => .any,
+                2 => .object,
+                3 => .array,
+                else => return error.InvalidSchema,
+            };
+            pos += 1;
+            column.* = .{
+                .name = name.?,
+                .path = path.?,
+                .column_type = column_type,
+                .required = required,
+                .allows_null = allows_null,
+                .is_json = is_json,
+                .json_kind = json_kind,
+            };
+            columns_initialized += 1;
+            name = null;
+            path = null;
+        }
+        break :blk columns;
+    } else &.{};
+
     return .{
         .version = version,
         .default_type = default_type,
         .ttl_duration_ns = ttl_duration_ns,
         .ttl_field = ttl_field,
         .enforce_types = enforce_types,
+        .storage_mode = storage_mode,
         .dynamic_templates = templates,
         .full_text_documents = full_text_documents,
+        .relational_columns = relational_columns,
         .index_sort = index_sort,
     };
 }
@@ -572,6 +695,11 @@ pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
         if (doc.infer_type_dynamic_paths.len > 0) alloc.free(doc.infer_type_dynamic_paths);
     }
     if (s.full_text_documents.len > 0) alloc.free(s.full_text_documents);
+    for (s.relational_columns) |column| {
+        alloc.free(column.name);
+        alloc.free(column.path);
+    }
+    if (s.relational_columns.len > 0) alloc.free(s.relational_columns);
     for (s.index_sort) |field| alloc.free(field.field);
     if (s.index_sort.len > 0) alloc.free(s.index_sort);
 }
@@ -1577,6 +1705,50 @@ test "schema serialize/deserialize round-trip" {
     try std.testing.expect(loaded.index_sort[0].desc);
     try std.testing.expectEqualStrings("_id", loaded.index_sort[1].field);
     try std.testing.expect(!loaded.index_sort[1].desc);
+}
+
+test "schema round trips relational storage catalog and reads version 11 defaults" {
+    const alloc = std.testing.allocator;
+    const columns = [_]RelationalColumn{
+        .{
+            .name = "count",
+            .path = "count",
+            .column_type = .integer,
+            .required = true,
+            .allows_null = true,
+        },
+        .{
+            .name = "payload",
+            .path = "payload",
+            .column_type = .json,
+            .is_json = true,
+            .json_kind = .object,
+        },
+    };
+    const encoded = try serializeSchema(alloc, .{
+        .storage_mode = .relational,
+        .relational_columns = &columns,
+    });
+    defer alloc.free(encoded);
+    const loaded = try deserializeSchema(alloc, encoded);
+    defer freeSchema(alloc, loaded);
+    try std.testing.expectEqual(StorageMode.relational, loaded.storage_mode);
+    try std.testing.expectEqual(@as(usize, 2), loaded.relational_columns.len);
+    try std.testing.expectEqual(RelationalColumnType.integer, loaded.relational_columns[0].column_type);
+    try std.testing.expect(loaded.relational_columns[0].required);
+    try std.testing.expect(loaded.relational_columns[0].allows_null);
+    try std.testing.expectEqual(RelationalJsonKind.object, loaded.relational_columns[1].json_kind);
+
+    const current_document = try serializeSchema(alloc, .{});
+    defer alloc.free(current_document);
+    try std.testing.expect(current_document.len >= 5);
+    const legacy = try alloc.dupe(u8, current_document[0 .. current_document.len - 5]);
+    defer alloc.free(legacy);
+    std.mem.writeInt(u32, legacy[4..8], 11, .little);
+    const loaded_legacy = try deserializeSchema(alloc, legacy);
+    defer freeSchema(alloc, loaded_legacy);
+    try std.testing.expectEqual(StorageMode.document, loaded_legacy.storage_mode);
+    try std.testing.expectEqual(@as(usize, 0), loaded_legacy.relational_columns.len);
 }
 
 test "schema deserialization cleans only initialized dynamic templates on allocation failure" {

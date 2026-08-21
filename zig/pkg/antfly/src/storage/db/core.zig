@@ -25,6 +25,7 @@ const internal_keys = @import("../internal_keys.zig");
 const docstore_mod = @import("../docstore.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
 const mapper = @import("document_mapper.zig");
+const relational_store = @import("relational_store.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const replay_source_mod = @import("derived/replay_source.zig");
 const transaction_runtime_mod = @import("maintenance/transaction_runtime.zig");
@@ -929,6 +930,8 @@ pub const DBCore = struct {
             .store = self.store,
             .identity_namespace = self.identity_namespace,
             .alloc = alloc,
+            .relational_base_rows = if (self.schema) |schema| schema.storage_mode == .relational else false,
+            .relational_columns = if (self.schema) |schema| schema.relational_columns else &.{},
         };
         var effective_config = config;
         effective_config.resolution_extra_hooks = transactionRecoveryIdentityHooks(&identity_ctx);
@@ -1456,6 +1459,8 @@ pub const DBCore = struct {
             .store = self.store,
             .identity_namespace = self.identity_namespace,
             .alloc = self.alloc,
+            .relational_base_rows = if (self.schema) |schema| schema.storage_mode == .relational else false,
+            .relational_columns = if (self.schema) |schema| schema.relational_columns else &.{},
         };
         return try manager.recoverTransactionsWithExtraBatchHooks(
             cutoff_timestamp,
@@ -1469,6 +1474,8 @@ pub const TransactionRecoveryIdentityContext = struct {
     store: *docstore_mod.DocStore,
     identity_namespace: doc_identity.Namespace,
     alloc: Allocator,
+    relational_base_rows: bool = false,
+    relational_columns: []const schema_mod.RelationalColumn = &.{},
 };
 
 pub fn transactionRecoveryIdentityHooks(ctx: *TransactionRecoveryIdentityContext) transactions_mod.TxnManager.RecoveryExtraBatchHooks {
@@ -1493,7 +1500,6 @@ fn buildTransactionRecoveryIdentityExtraBatch(
     status: transactions_mod.TxnStatus,
     timestamp: u64,
 ) anyerror!transactions_mod.ResolutionExtraBatch {
-    _ = timestamp;
     if (status != .committed) return .{};
     const identity_ctx: *TransactionRecoveryIdentityContext = @ptrCast(@alignCast(ctx.?));
     const alloc = identity_ctx.alloc;
@@ -1560,7 +1566,64 @@ fn buildTransactionRecoveryIdentityExtraBatch(
             &identity_writes,
         );
     }
-    if (identity_writes.items.len == 0 and identity_visibility_deletes.items.len == 0) return .{};
+    var skip_intent_keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (skip_intent_keys.items) |key| alloc.free(@constCast(key));
+        skip_intent_keys.deinit(alloc);
+    }
+    if (identity_ctx.relational_base_rows) {
+        const mutations = try manager.collectIntentMutations(alloc, txn_id);
+        defer {
+            for (mutations) |*mutation| mutation.deinit(alloc);
+            if (mutations.len > 0) alloc.free(mutations);
+        }
+        for (mutations) |mutation| {
+            if (transactionIdentityMetadataKey(mutation.key)) continue;
+            const skip_key = try alloc.dupe(u8, mutation.key);
+            var skip_key_owned = true;
+            errdefer if (skip_key_owned) alloc.free(skip_key);
+            try skip_intent_keys.append(alloc, skip_key);
+            skip_key_owned = false;
+
+            const primary_key = try internal_keys.documentKeyAlloc(alloc, mutation.key);
+            var primary_key_owned = true;
+            errdefer if (primary_key_owned) alloc.free(primary_key);
+            try identity_visibility_deletes.append(alloc, primary_key);
+            primary_key_owned = false;
+
+            const row_key = try relational_store.keyAlloc(alloc, mutation.key);
+            var row_key_owned = true;
+            errdefer if (row_key_owned) alloc.free(row_key);
+            if (mutation.value) |value| {
+                const row_value = try relational_store.encodeValueAlloc(alloc, value, identity_ctx.relational_columns);
+                var row_value_owned = true;
+                errdefer if (row_value_owned) alloc.free(row_value);
+                try identity_writes.append(alloc, .{ .key = row_key, .value = row_value });
+                row_key_owned = false;
+                row_value_owned = false;
+
+                const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, mutation.key);
+                var timestamp_key_owned = true;
+                errdefer if (timestamp_key_owned) alloc.free(timestamp_key);
+                const timestamp_value = try alloc.alloc(u8, 8);
+                var timestamp_value_owned = true;
+                errdefer if (timestamp_value_owned) alloc.free(timestamp_value);
+                std.mem.writeInt(u64, timestamp_value[0..8], timestamp, .little);
+                try identity_writes.append(alloc, .{ .key = timestamp_key, .value = timestamp_value });
+                timestamp_key_owned = false;
+                timestamp_value_owned = false;
+            } else {
+                try identity_visibility_deletes.append(alloc, row_key);
+                row_key_owned = false;
+                const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, mutation.key);
+                var timestamp_key_owned = true;
+                errdefer if (timestamp_key_owned) alloc.free(timestamp_key);
+                try identity_visibility_deletes.append(alloc, timestamp_key);
+                timestamp_key_owned = false;
+            }
+        }
+    }
+    if (identity_writes.items.len == 0 and identity_visibility_deletes.items.len == 0 and skip_intent_keys.items.len == 0) return .{};
     const owned_writes = try identity_writes.toOwnedSlice(alloc);
     errdefer {
         for (owned_writes) |item| {
@@ -1576,9 +1639,11 @@ fn buildTransactionRecoveryIdentityExtraBatch(
         }
         if (owned_deletes.len > 0) alloc.free(owned_deletes);
     }
+    const owned_skip_intent_keys = try skip_intent_keys.toOwnedSlice(alloc);
     return .{
         .writes = owned_writes,
         .deletes = owned_deletes,
+        .skip_intent_keys = owned_skip_intent_keys,
     };
 }
 
@@ -1592,8 +1657,10 @@ fn cleanupTransactionRecoveryIdentityExtraBatch(ctx: ?*anyopaque, batch: transac
     for (batch.deletes) |key| {
         alloc.free(@constCast(key));
     }
+    for (batch.skip_intent_keys) |key| alloc.free(@constCast(key));
     if (batch.writes.len > 0) alloc.free(@constCast(batch.writes));
     if (batch.deletes.len > 0) alloc.free(@constCast(batch.deletes));
+    if (batch.skip_intent_keys.len > 0) alloc.free(@constCast(batch.skip_intent_keys));
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {

@@ -136,6 +136,7 @@ const graph_query_mod = @import("../../graph/query.zig");
 const graph_pattern_mod = @import("../../graph/pattern.zig");
 const graph_node_identity = @import("../../graph/node_identity.zig");
 const mapper = @import("document_mapper.zig");
+const relational_store = @import("relational_store.zig");
 const planning_adapter_mod = @import("planning_adapter.zig");
 const planning_bindings_mod = @import("planning_bindings.zig");
 const planning_stats_mod = @import("planning_stats.zig");
@@ -684,6 +685,7 @@ const AsyncContext = struct {
     io: ?std.Io = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     store: *docstore_mod.DocStore,
+    relational_base_rows: bool = false,
     snapshot_read_txn: ?*docstore_mod.DocStore.Txn = null,
     applied_sequence_checkpoint_path: ?[]const u8 = null,
     index_repair_checkpoint: ?index_repair_state.Location = null,
@@ -1272,6 +1274,7 @@ const EnrichmentAppendContext = struct {
             .executor = self.executor,
             .io = if (self.async_context) |ctx| ctx.io else null,
             .async_context = self.async_context,
+            .relational_base_rows = if (self.async_context) |ctx| ctx.relational_base_rows else false,
             .ha_async_effect_mirror = self.ha_async_effect_mirror,
             .ha_async_batch_mirror = self.ha_async_batch_mirror,
             .ha_async_metadata_mirror = self.ha_async_metadata_mirror,
@@ -1315,6 +1318,7 @@ const BatchExecutionContext = struct {
     resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
     promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
     async_context: ?*AsyncContext = null,
+    relational_base_rows: bool = false,
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
     ha_async_effect_mirror: ?HAAsyncEffectMirror = null,
     ha_async_batch_mirror: ?HAAsyncBatchMirror = null,
@@ -3102,6 +3106,7 @@ pub const DB = struct {
             .resolution_runtime = self.resolution_runtime,
             .promotion_runtime = self.promotion_runtime,
             .async_context = self.async_context,
+            .relational_base_rows = relationalColumns(self) != null,
             .ha_async_effect_mirror = self.ha_async_effect_mirror,
             .ha_async_batch_mirror = self.ha_async_batch_mirror,
             .ha_async_metadata_mirror = self.ha_async_metadata_mirror,
@@ -3461,6 +3466,7 @@ pub const DB = struct {
                 // open; no index runtime exists yet and the metadata record is
                 // already the durable authority for this replica projection.
                 try db.core.setSchema(table_schema);
+                db.refreshRelationalRuntimeMode();
             }
             const optional_runtimes_initialized = opts.open_mode.allowsOptionalRuntimes() and opts.start_optional_runtimes and !ha_standby_role;
             const optional_runtime_workers_enabled = optional_runtimes_initialized and opts.start_optional_runtime_workers;
@@ -3657,6 +3663,7 @@ pub const DB = struct {
             .alloc = self.runtime_alloc,
             .resource_manager = resource_manager,
             .store = async_resources.store,
+            .relational_base_rows = relationalColumns(self) != null,
             .applied_sequence_checkpoint_path = async_resources.applied_sequence_checkpoint_path,
             .index_repair_checkpoint = async_resources.index_repair_checkpoint,
             .index_manager = async_resources.index_manager,
@@ -3667,6 +3674,7 @@ pub const DB = struct {
             .query_visibility_hook = null,
             .text_merge_runtime = null,
         };
+        self.core.index_manager.setRelationalBaseRows(self.async_context.relational_base_rows);
         self.executor.* = try derived_executor_mod.init(
             self.runtime_alloc,
             executor_config,
@@ -3818,6 +3826,8 @@ pub const DB = struct {
 
     fn createDetachedEnrichmentRuntime(self: *DB, enrichment_cfg: enrichment_runtime_mod.Config) !?DetachedEnrichmentRuntime {
         if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null and !enrichment_cfg.enable_without_producers) return null;
+        var effective_enrichment_cfg = enrichment_cfg;
+        effective_enrichment_cfg.relational_base_rows = relationalColumns(self) != null;
 
         const append_ctx = try self.runtime_alloc.create(EnrichmentAppendContext);
         errdefer self.runtime_alloc.destroy(append_ctx);
@@ -3867,7 +3877,7 @@ pub const DB = struct {
             self.executor,
             notifyDerivedExecutorSequence,
             self.backend_runtime,
-            enrichment_cfg,
+            effective_enrichment_cfg,
         );
         errdefer runtime.deinit();
         // The repair ledger and its sequence marker are committed before the
@@ -4115,6 +4125,8 @@ pub const DB = struct {
             .store = self.core.store,
             .identity_namespace = self.core.identity_namespace,
             .alloc = self.runtime_alloc,
+            .relational_base_rows = relationalColumns(self) != null,
+            .relational_columns = relationalColumns(self) orelse &.{},
         };
         var effective_cfg = cfg;
         effective_cfg.resolution_extra_hooks = db_core.transactionRecoveryIdentityHooks(identity_ctx);
@@ -5413,7 +5425,13 @@ pub const DB = struct {
     }
 
     fn setSchemaReplicatedApplyWithMarker(self: *DB, table_schema: schema_mod.TableSchema, applied_lsn_marker: ?u64) anyerror!void {
-        try self.core.setSchema(table_schema);
+        {
+            lockApply(self);
+            defer self.core.unlockApply();
+            try self.validateStorageModeCompatibilityLocked(table_schema);
+            try self.core.setSchema(table_schema);
+            self.refreshRelationalRuntimeMode();
+        }
         if (applied_lsn_marker) |lsn| try self.markHAReplicationRecordApplied(lsn);
     }
 
@@ -5929,14 +5947,19 @@ pub const DB = struct {
             if (extracted[i].cleaned_value) |cleaned| {
                 try validateDocumentExtractionInlineSources(self, cleaned);
                 const strip_store_value_start_ns = monotonicTimeNs();
-                const store_value = try strippedStoredDocumentValueAlloc(
+                const store_value = if (relationalColumns(self)) |columns| blk: {
+                    const packed_row = try relational_store.encodeValueAlloc(self.alloc, cleaned, columns);
+                    errdefer self.alloc.free(packed_row);
+                    try owned_store_values.append(self.alloc, packed_row);
+                    break :blk packed_row;
+                } else try strippedStoredDocumentValueAlloc(
                     self.alloc,
                     cleaned,
                     vector_store_field_names,
                     &owned_store_values,
                 );
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_strip_store_value_ns, strip_store_value_start_ns);
-                const store_key = try internal_keys.documentKeyAlloc(self.alloc, write.key);
+                const store_key = try encodeStoreLookupKeyAlloc(self, self.alloc, write.key);
                 try owned_store_keys.append(self.alloc, store_key);
                 try overwrite_probe_entries.append(self.alloc, .{
                     .key = store_key,
@@ -5946,6 +5969,14 @@ pub const DB = struct {
                     .key = store_key,
                     .value = store_value,
                 });
+                if (relationalColumns(self) != null) {
+                    const legacy_document_key = try internal_keys.documentKeyAlloc(self.alloc, write.key);
+                    var legacy_document_key_owned = false;
+                    defer if (!legacy_document_key_owned) self.alloc.free(legacy_document_key);
+                    try owned_delete_keys.append(self.alloc, legacy_document_key);
+                    legacy_document_key_owned = true;
+                    try delete_keys.append(self.alloc, legacy_document_key);
+                }
                 try identity_upsert_keys.append(self.alloc, write.key);
                 try identity_upsert_write_indexes.append(self.alloc, i);
                 if (shouldWriteTimestamp(write.key)) {
@@ -6043,9 +6074,17 @@ pub const DB = struct {
             try appendUniqueOwnedKey(self.alloc, &changed_graph_artifact_keys, artifact_key);
         }
         for (effective_req.deletes) |key| {
-            const store_key = try internal_keys.documentKeyAlloc(self.alloc, key);
+            const store_key = try encodeStoreLookupKeyAlloc(self, self.alloc, key);
             try owned_delete_keys.append(self.alloc, store_key);
             try delete_keys.append(self.alloc, store_key);
+            if (relationalColumns(self) != null) {
+                const legacy_document_key = try internal_keys.documentKeyAlloc(self.alloc, key);
+                var legacy_document_key_owned = false;
+                defer if (!legacy_document_key_owned) self.alloc.free(legacy_document_key);
+                try owned_delete_keys.append(self.alloc, legacy_document_key);
+                legacy_document_key_owned = true;
+                try delete_keys.append(self.alloc, legacy_document_key);
+            }
             if (shouldWriteTimestamp(key)) {
                 const timestamp_key = try makeTimestampKey(self.alloc, key);
                 try timestamp_delete_keys.append(self.alloc, timestamp_key);
@@ -6371,6 +6410,7 @@ pub const DB = struct {
                     .replay = if (replay_append) |entry| .{ .sequence = entry.sequence, .payload = entry.payload } else null,
                     .expected_intent_revision = resolution.expected_intent_revision,
                     .known_intent_keys = resolution.intent_keys,
+                    .skip_intent_keys = if (relationalColumns(self) != null) resolution.intent_keys else &.{},
                 },
             );
             if (outcome.applied) {
@@ -7920,9 +7960,10 @@ pub const DB = struct {
     }
 
     pub fn get(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
-        const store_key = try encodeStoreLookupKeyAlloc(alloc, key);
+        const store_key = try encodeStoreLookupKeyAlloc(self, alloc, key);
         defer alloc.free(store_key);
-        return try self.core.getStoreValue(alloc, store_key);
+        const raw = try self.core.getStoreValue(alloc, store_key) orelse return null;
+        return try materializeOwnedStoredDocumentValueAlloc(self, alloc, raw);
     }
 
     pub fn getGroupCreatedAtMillis(self: *DB, alloc: Allocator, group_id: u64) !?u64 {
@@ -13814,7 +13855,7 @@ pub const DB = struct {
         };
         defer alloc.free(internal_key);
 
-        return (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, internal_key)) orelse error.NotFound;
+        return (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, internal_key)) orelse error.NotFound;
     }
 
     pub fn getSplitState(self: *DB, alloc: Allocator) !?types.SplitState {
@@ -13934,7 +13975,7 @@ pub const DB = struct {
             deletes.deinit(alloc);
         }
         for (existing_documents) |entry| {
-            const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, entry.key)) orelse continue;
+            const logical_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, entry.key)) orelse continue;
             if (seen.contains(logical_key)) {
                 alloc.free(logical_key);
                 continue;
@@ -14084,7 +14125,7 @@ pub const DB = struct {
             deletes.deinit(alloc);
         }
         for (existing_documents) |entry| {
-            const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, entry.key)) orelse continue;
+            const logical_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, entry.key)) orelse continue;
             if (seen.contains(logical_key)) {
                 alloc.free(logical_key);
                 continue;
@@ -14863,7 +14904,13 @@ pub const DB = struct {
     fn setSchemaGuarded(self: *DB, table_schema: schema_mod.TableSchema) !void {
         try self.enforceHAWriteGate();
         try self.preflightHAMetadataSyncCommit();
-        try self.core.setSchema(table_schema);
+        {
+            lockApply(self);
+            defer self.core.unlockApply();
+            try self.validateStorageModeCompatibilityLocked(table_schema);
+            try self.core.setSchema(table_schema);
+            self.refreshRelationalRuntimeMode();
+        }
         try self.mirrorHASchemaMetadataCommit(table_schema);
     }
 
@@ -14871,6 +14918,43 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.setSchemaGuarded(table_schema);
+    }
+
+    fn refreshRelationalRuntimeMode(self: *DB) void {
+        const enabled = relationalColumns(self) != null;
+        self.async_context.relational_base_rows = enabled;
+        self.core.index_manager.setRelationalBaseRows(enabled);
+        if (self.ttl_cleanup_context) |ctx| ctx.batch.relational_base_rows = enabled;
+        if (self.enrichment_runtime) |runtime| runtime.setRelationalBaseRows(enabled);
+        if (self.transaction_recovery_identity_context) |ctx| {
+            ctx.relational_base_rows = enabled;
+            ctx.relational_columns = relationalColumns(self) orelse &.{};
+        }
+    }
+
+    fn validateStorageModeCompatibilityLocked(self: *DB, next_schema: schema_mod.TableSchema) !void {
+        if (self.core.schema) |current_schema| {
+            if (current_schema.storage_mode != next_schema.storage_mode) return error.InvalidSchemaUpdateRequest;
+            return;
+        }
+
+        const lower = [_]u8{internal_keys.user_namespace};
+        const upper = [_]u8{internal_keys.user_namespace + 1};
+        const rows = try self.core.store.scanRange(self.alloc, &lower, &upper);
+        defer docstore_mod.DocStore.freeResults(self.alloc, rows);
+
+        var saw_document = false;
+        var saw_relational = false;
+        for (rows) |row| {
+            if (internal_keys.isPrimaryDocumentKey(row.key)) {
+                saw_document = true;
+            } else if (internal_keys.isRelationalRowKey(row.key)) {
+                saw_relational = true;
+            }
+            if (saw_document and saw_relational) return error.InvalidSchemaUpdateRequest;
+        }
+        if (saw_document and next_schema.storage_mode != .document) return error.InvalidSchemaUpdateRequest;
+        if (saw_relational and next_schema.storage_mode != .relational) return error.InvalidSchemaUpdateRequest;
     }
 
     fn setSchemaJsonGuarded(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
@@ -19758,9 +19842,9 @@ pub const DB = struct {
             fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
                 const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
                 if (!isPrimaryDocumentStoreKey(key)) return .@"continue";
-                const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(state.alloc, key)) orelse return .@"continue";
+                const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(state.alloc, key)) orelse return .@"continue";
                 errdefer state.alloc.free(raw_key);
-                const raw_value = try state.alloc.dupe(u8, value);
+                const raw_value = try relational_store.materializeStoredValueAlloc(state.alloc, key, value);
                 errdefer state.alloc.free(raw_value);
                 try state.writes.append(state.alloc, .{
                     .key = raw_key,
@@ -21886,7 +21970,7 @@ pub const DB = struct {
                 _ = value;
                 const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
                 if (!isPrimaryDocumentStoreKey(key)) return .@"continue";
-                const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(state.alloc, key)) orelse return .@"continue";
+                const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(state.alloc, key)) orelse return .@"continue";
                 errdefer state.alloc.free(raw_key);
                 try state.doc_ids.append(state.alloc, raw_key);
                 state.coverage.scanned_primary_docs += 1;
@@ -21963,7 +22047,7 @@ pub const DB = struct {
         var count: u32 = 0;
         for (docs) |doc| {
             if (!isPrimaryDocumentStoreKey(doc.key)) continue;
-            const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, doc.key)) orelse continue;
+            const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, doc.key)) orelse continue;
             defer alloc.free(raw_key);
 
             if (!byte_range.contains(raw_key)) continue;
@@ -21978,11 +22062,14 @@ pub const DB = struct {
             }
             if (try isExpiredDocumentKey(self, alloc, raw_key)) continue;
 
+            const logical_value = try relational_store.materializeStoredValueAlloc(alloc, doc.key, doc.value);
+            defer alloc.free(logical_value);
+
             if (prepared_filter) |*filter| {
-                if (!(try filter.matchesStored(alloc, raw_key, doc.value))) continue;
+                if (!(try filter.matchesStored(alloc, raw_key, logical_value))) continue;
             }
 
-            const hash = std.hash.Wyhash.hash(0, doc.value);
+            const hash = std.hash.Wyhash.hash(0, logical_value);
             try hashes.append(alloc, .{
                 .id = try alloc.dupe(u8, raw_key),
                 .hash = hash,
@@ -21991,7 +22078,7 @@ pub const DB = struct {
             if (opts.include_documents) {
                 try documents.append(alloc, .{
                     .id = try alloc.dupe(u8, raw_key),
-                    .json = try projectLookupStoredBytes(self, alloc, raw_key, doc.value, .{
+                    .json = try projectLookupStoredBytes(self, alloc, raw_key, logical_value, .{
                         .fields = opts.fields,
                         .include_all_fields = opts.include_all_fields,
                     }),
@@ -22178,9 +22265,13 @@ pub const DB = struct {
         const navigation = req.hierarchy_children orelse return error.InvalidQueryRequest;
         if (navigation.parent_level != .source or navigation.level != .unit) return error.UnsupportedQueryRequest;
 
-        const source_key = try internal_keys.documentKeyAlloc(alloc, navigation.parent_id);
+        const source_key = try encodeStoreLookupKeyAlloc(self, alloc, navigation.parent_id);
         defer alloc.free(source_key);
-        const maybe_stored_source = try self.core.getStoreValue(alloc, source_key);
+        const maybe_raw_source = try self.core.getStoreValue(alloc, source_key);
+        const maybe_stored_source = if (maybe_raw_source) |raw_source|
+            try materializeOwnedStoredDocumentValueAlloc(self, alloc, raw_source)
+        else
+            null;
         if (maybe_stored_source == null) {
             // Distributed traversal is fanned out across table groups. Parent
             // absence on one shard only means that shard does not own the plan;
@@ -25292,7 +25383,7 @@ pub const DB = struct {
     }
 
     fn loadStoredSearchDocumentProbe(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
-        const store_key = try encodeStoreLookupKeyAlloc(alloc, key);
+        const store_key = try encodeStoreLookupKeyAlloc(self, alloc, key);
         defer alloc.free(store_key);
         var txn = try self.core.store.beginProbeTxn();
         defer txn.abort();
@@ -25300,7 +25391,8 @@ pub const DB = struct {
             error.NotFound => return null,
             else => return err,
         };
-        return try alloc.dupe(u8, raw);
+        const owned = try alloc.dupe(u8, raw);
+        return try materializeOwnedStoredDocumentValueAlloc(self, alloc, owned);
     }
 
     fn loadProjectedSearchDocumentMany(
@@ -25897,7 +25989,7 @@ fn loadStoredSearchDocumentsMany(self: *DB, alloc: Allocator, keys: []const []co
     for (keys, 0..) |key, i| {
         try pending.append(alloc, .{
             .original_index = i,
-            .store_key = try encodeStoreLookupKeyAlloc(alloc, key),
+            .store_key = try encodeStoreLookupKeyAlloc(self, alloc, key),
         });
     }
     if (bench_profile) key_ns = platform_time.monotonicNs() - key_start_ns;
@@ -25929,7 +26021,8 @@ fn loadStoredSearchDocumentsMany(self: *DB, alloc: Allocator, keys: []const []co
     const dupe_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     for (pending.items, 0..) |item, i| {
         const value = read_values[i] orelse continue;
-        loaded[item.original_index] = try alloc.dupe(u8, value);
+        const owned = try alloc.dupe(u8, value);
+        loaded[item.original_index] = try materializeOwnedStoredDocumentValueAlloc(self, alloc, owned);
     }
     if (bench_profile) dupe_ns = platform_time.monotonicNs() - dupe_start_ns;
     if (bench_profile) {
@@ -26066,18 +26159,31 @@ fn isMetadataKey(key: []const u8) bool {
 }
 
 fn isPrimaryDocumentStoreKey(key: []const u8) bool {
-    return internal_keys.isPrimaryDocumentKey(key);
+    return internal_keys.isStoredDocumentRowKey(key);
 }
 
 fn skipNonPrimaryMedianKey(key: []const u8) bool {
     return !isPrimaryDocumentStoreKey(key);
 }
 
-fn encodeStoreLookupKeyAlloc(alloc: Allocator, key: []const u8) ![]u8 {
+fn relationalColumns(self: *const DB) ?[]const schema_mod.RelationalColumn {
+    const schema = self.core.schema orelse return null;
+    if (schema.storage_mode != .relational) return null;
+    return schema.relational_columns;
+}
+
+fn encodeStoreLookupKeyAlloc(self: *const DB, alloc: Allocator, key: []const u8) ![]u8 {
     if (internal_keys.isInternalUserKey(key) or std.mem.startsWith(u8, key, "\x00\x00__metadata__:") or isSplitMetadataKey(key)) {
         return try alloc.dupe(u8, key);
     }
+    if (relationalColumns(self) != null) return try relational_store.keyAlloc(alloc, key);
     return try internal_keys.documentKeyAlloc(alloc, key);
+}
+
+fn materializeOwnedStoredDocumentValueAlloc(self: *const DB, alloc: Allocator, raw: []u8) ![]u8 {
+    if (relationalColumns(self) == null) return raw;
+    defer alloc.free(raw);
+    return try relational_store.decodeValueAlloc(alloc, raw);
 }
 
 fn documentRangeLowerAlloc(alloc: Allocator, raw_key: []const u8) ![]u8 {
@@ -31947,7 +32053,13 @@ fn appendPrecomputedGraphSourceArtifactKey(
         defer graph_store_writes.deinit(self.alloc);
 
         if (artifact_value) |value| {
-            const raw_doc = try batchDocumentValueForGraphSource(self.alloc, self.core.store, store_writes.items, artifact_ref.document_id);
+            const raw_doc = try batchDocumentValueForGraphSource(
+                self.alloc,
+                self.core.store,
+                store_writes.items,
+                artifact_ref.document_id,
+                relationalColumns(self) != null,
+            );
             defer if (raw_doc) |doc_value| self.alloc.free(doc_value);
             const graph_writes = try graphWritesFromArtifactValueAlloc(self.alloc, graph_entry.config.name, artifact_ref.document_id, value, source, graphArtifactContentType(self.core.index_manager, source.artifact_name), raw_doc);
             defer freeGraphWrites(self.alloc, graph_writes);
@@ -32015,26 +32127,39 @@ fn batchDocumentValueForGraphSource(
     store: *docstore_mod.DocStore,
     store_writes: []const docstore_mod.KVPair,
     doc_key: []const u8,
+    relational_base_rows: bool,
 ) !?[]u8 {
-    const internal_doc_key = try internal_keys.documentKeyAlloc(alloc, doc_key);
+    const internal_doc_key = if (relational_base_rows)
+        try relational_store.keyAlloc(alloc, doc_key)
+    else
+        try internal_keys.documentKeyAlloc(alloc, doc_key);
     defer alloc.free(internal_doc_key);
     for (store_writes) |write| {
-        if (std.mem.eql(u8, write.key, internal_doc_key)) return try alloc.dupe(u8, write.value);
+        if (std.mem.eql(u8, write.key, internal_doc_key)) {
+            return try relational_store.materializeStoredValueAlloc(alloc, write.key, write.value);
+        }
     }
-    return try storeDocumentValueForGraphSource(alloc, store, doc_key);
+    return try storeDocumentValueForGraphSource(alloc, store, doc_key, relational_base_rows);
 }
 
 fn storeDocumentValueForGraphSource(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     doc_key: []const u8,
+    relational_base_rows: bool,
 ) !?[]u8 {
-    const internal_doc_key = try internal_keys.documentKeyAlloc(alloc, doc_key);
+    const internal_doc_key = if (relational_base_rows)
+        try relational_store.keyAlloc(alloc, doc_key)
+    else
+        try internal_keys.documentKeyAlloc(alloc, doc_key);
     defer alloc.free(internal_doc_key);
-    return store.get(alloc, internal_doc_key) catch |err| switch (err) {
+    const raw = store.get(alloc, internal_doc_key) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
     };
+    if (raw == null) return null;
+    defer alloc.free(raw.?);
+    return try relational_store.materializeStoredValueAlloc(alloc, internal_doc_key, raw.?);
 }
 
 fn graphArtifactContentType(index_manager: *const index_manager_mod.IndexManager, artifact_name: []const u8) []const u8 {
@@ -33560,9 +33685,20 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     }
 
     for (keys) |key| {
-        const store_key = try internal_keys.documentKeyAlloc(ctx.alloc, key);
+        const store_key = if (ctx.relational_base_rows)
+            try relational_store.keyAlloc(ctx.alloc, key)
+        else
+            try internal_keys.documentKeyAlloc(ctx.alloc, key);
         try owned_delete_keys.append(ctx.alloc, store_key);
         try delete_keys.append(ctx.alloc, store_key);
+        if (ctx.relational_base_rows) {
+            const legacy_document_key = try internal_keys.documentKeyAlloc(ctx.alloc, key);
+            var legacy_document_key_owned = false;
+            defer if (!legacy_document_key_owned) ctx.alloc.free(legacy_document_key);
+            try owned_delete_keys.append(ctx.alloc, legacy_document_key);
+            legacy_document_key_owned = true;
+            try delete_keys.append(ctx.alloc, legacy_document_key);
+        }
         if (!shouldWriteTimestamp(key)) continue;
         const timestamp_key = try makeTimestampKey(ctx.alloc, key);
         try timestamp_delete_keys.append(ctx.alloc, timestamp_key);
@@ -37732,7 +37868,7 @@ fn replaySourceDocumentExists(
     ctx: *const AsyncContext,
     source_doc_key: []const u8,
 ) !bool {
-    const store_key = try replayDocumentStoreKeyAlloc(ctx.alloc, source_doc_key);
+    const store_key = try replayDocumentStoreKeyAlloc(ctx.alloc, source_doc_key, ctx.relational_base_rows);
     defer ctx.alloc.free(store_key);
     const raw = ctx.store.get(ctx.alloc, store_key) catch |err| switch (err) {
         error.NotFound => return false,
@@ -37856,7 +37992,10 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             index_ref.name,
             publication_context.chunk_backed,
             ctx.index_manager.byte_range,
-            .{ .prefer_inline_when_store_tip_matches_sequence = batch.sequence },
+            .{
+                .prefer_inline_when_store_tip_matches_sequence = batch.sequence,
+                .relational_base_rows = ctx.relational_base_rows,
+            },
         );
         defer collected.deinit();
         if (collected.missing_required != 0) return error.ReplayDocumentNotVisible;
@@ -37979,7 +38118,10 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 ctx.store,
                 batch.documents,
                 ctx.index_manager.byte_range,
-                .{ .skip_doc_keys = &dense_embedding_doc_keys },
+                .{
+                    .skip_doc_keys = &dense_embedding_doc_keys,
+                    .relational_base_rows = ctx.relational_base_rows,
+                },
                 null,
             );
             defer index_writes.deinit();
@@ -38052,6 +38194,7 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                     .prefer_inline_when_store_tip_matches_sequence = batch.sequence,
                     .prefer_available_inline_values = true,
                     .skip_doc_keys = &sparse_embedding_doc_keys,
+                    .relational_base_rows = ctx.relational_base_rows,
                 },
                 if (emit_sparse_write_profile) &collect_doc_profile else null,
             );
@@ -38511,17 +38654,21 @@ const OwnedSparseEmbeddingWrites = struct {
 
 const CollectTextDocumentWritesOptions = struct {
     prefer_inline_when_store_tip_matches_sequence: ?u64 = null,
+    relational_base_rows: bool = false,
 };
 
 const CollectDocumentWritesOptions = struct {
     prefer_inline_when_store_tip_matches_sequence: ?u64 = null,
     prefer_available_inline_values: bool = false,
     skip_doc_keys: ?*const std.StringHashMapUnmanaged(void) = null,
+    relational_base_rows: bool = false,
 };
 
-fn replayDocumentStoreKeyAlloc(alloc: Allocator, key: []const u8) ![]u8 {
+fn replayDocumentStoreKeyAlloc(alloc: Allocator, key: []const u8, relational_base_rows: bool) ![]u8 {
     return if (internal_keys.isInternalUserKey(key))
         try alloc.dupe(u8, key)
+    else if (relational_base_rows)
+        try relational_store.keyAlloc(alloc, key)
     else
         try internal_keys.documentKeyAlloc(alloc, key);
 }
@@ -38624,7 +38771,7 @@ fn collectSparseFieldWritesProfiled(
         }
         try pending.append(alloc, .{
             .doc_key = doc.key,
-            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key),
+            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key, opts.relational_base_rows),
             .inline_value = doc.cleaned_value,
         });
     }
@@ -38664,9 +38811,13 @@ fn collectSparseFieldWritesProfiled(
     if (profile) |p| p.read_ns = monotonicTimeNs() - read_start_ns;
 
     for (pending.items, 0..) |item, i| {
+        var owned_logical_value: ?[]u8 = null;
+        defer if (owned_logical_value) |owned| alloc.free(owned);
         const value = if (read_values[i]) |store_value| blk: {
             if (profile) |p| p.store_hits += 1;
-            break :blk store_value;
+            const logical = try relational_store.materializeStoredValueAlloc(alloc, item.store_key, store_value);
+            owned_logical_value = logical;
+            break :blk logical;
         } else if (item.inline_value) |inline_value| blk: {
             if (profile) |p| p.inline_hits += 1;
             break :blk inline_value;
@@ -38769,7 +38920,7 @@ fn collectDocumentWritesProfiled(
         }
         try pending.append(alloc, .{
             .doc_key = doc.key,
-            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key),
+            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key, opts.relational_base_rows),
             .inline_value = doc.cleaned_value,
         });
     }
@@ -38821,7 +38972,10 @@ fn collectDocumentWritesProfiled(
             missing_required += 1;
             continue;
         };
-        const owned_value = try alloc.dupe(u8, value);
+        const owned_value = if (read_values[i] != null)
+            try relational_store.materializeStoredValueAlloc(alloc, item.store_key, value)
+        else
+            try alloc.dupe(u8, value);
         try writes.append(alloc, .{
             .key = item.doc_key,
             .value = owned_value,
@@ -38968,7 +39122,7 @@ fn collectTextDocumentWritesForIndex(
         }
         try pending.append(alloc, .{
             .doc_key = doc.key,
-            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key),
+            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key, opts.relational_base_rows),
             .inline_value = doc.cleaned_value,
         });
     }
@@ -39002,7 +39156,7 @@ fn collectTextDocumentWritesForIndex(
             continue;
         };
         const stable_value = if (read_values[i] != null) blk: {
-            const owned = try alloc.dupe(u8, value);
+            const owned = try relational_store.materializeStoredValueAlloc(alloc, item.store_key, value);
             result.owned_values.append(alloc, owned) catch |err| {
                 alloc.free(owned);
                 return err;
@@ -39406,7 +39560,12 @@ fn materializeGraphSourceArtifactsForIndex(
         }
 
         if (raw) |value| {
-            const raw_doc = try storeDocumentValueForGraphSource(alloc, store, artifact_ref.document_id);
+            const raw_doc = try storeDocumentValueForGraphSource(
+                alloc,
+                store,
+                artifact_ref.document_id,
+                if (options.repair_ctx) |ctx| ctx.relational_base_rows else false,
+            );
             defer if (raw_doc) |doc_value| alloc.free(doc_value);
             const graph_writes = graphWritesFromArtifactValueAlloc(alloc, index_name, artifact_ref.document_id, value, source, graphArtifactContentType(index_manager, source.artifact_name), raw_doc) catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -41263,7 +41422,7 @@ fn collectSplitFrontierDocKeys(alloc: Allocator, store: *docstore_mod.DocStore, 
 
     for (scanned) |entry| {
         if (!isPrimaryDocumentStoreKey(entry.key)) continue;
-        const raw = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, entry.key)) orelse continue;
+        const raw = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, entry.key)) orelse continue;
         try keys.append(alloc, raw);
     }
 
@@ -41391,8 +41550,8 @@ fn putIndexedSplitBatchDirect(
     }
 
     for (writes, 0..) |write, i| {
-        if (internal_keys.isPrimaryDocumentKey(write.key)) {
-            const raw = (try internal_keys.decodePrimaryDocumentKeyAlloc(dest_indexes.alloc, write.key)) orelse return error.InvalidInternalUserKey;
+        if (internal_keys.isStoredDocumentRowKey(write.key)) {
+            const raw = (try internal_keys.decodeStoredDocumentRowKeyAlloc(dest_indexes.alloc, write.key)) orelse return error.InvalidInternalUserKey;
             try owned_keys.append(dest_indexes.alloc, raw);
             logical_writes[i] = .{
                 .key = raw,
@@ -42631,10 +42790,10 @@ fn rebuildAlgebraicIndexFromSnapshotSliceContext(
 
             fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
                 const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
-                const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(state.alloc, key)) orelse
+                const logical_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(state.alloc, key)) orelse
                     return .@"continue";
                 errdefer state.alloc.free(logical_key);
-                const cleaned_value = try state.alloc.dupe(u8, value);
+                const cleaned_value = try relational_store.materializeStoredValueAlloc(state.alloc, key, value);
                 errdefer state.alloc.free(cleaned_value);
                 try state.documents.append(state.alloc, .{
                     .key = logical_key,
@@ -42808,7 +42967,9 @@ fn rebuildDenseIndexFromPrimaryVectorsSliceContext(
                 return .@"continue";
             }
             try checkAsyncRepairCancelled(state.ctx);
-            if (try mapper.extractDenseVectorField(state.ctx.alloc, value, state.field_name, state.dims)) |vector| {
+            const logical_value = try relational_store.materializeStoredValueAlloc(state.ctx.alloc, key, value);
+            defer state.ctx.alloc.free(logical_value);
+            if (try mapper.extractDenseVectorField(state.ctx.alloc, logical_value, state.field_name, state.dims)) |vector| {
                 state.ctx.alloc.free(vector);
             } else {
                 if (state.scanned_since_yield_check >= 1024) {
@@ -42817,9 +42978,9 @@ fn rebuildDenseIndexFromPrimaryVectorsSliceContext(
                 }
                 return .@"continue";
             }
-            const doc_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(state.ctx.alloc, key)) orelse return .@"continue";
+            const doc_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(state.ctx.alloc, key)) orelse return .@"continue";
             errdefer state.ctx.alloc.free(doc_key);
-            const doc_value = try state.ctx.alloc.dupe(u8, value);
+            const doc_value = try state.ctx.alloc.dupe(u8, logical_value);
             errdefer state.ctx.alloc.free(doc_value);
             try state.writes.append(state.ctx.alloc, .{
                 .key = doc_key,
@@ -45747,6 +45908,195 @@ test "db default primary backend survives reopen" {
         const stats = try reopened.diagnosticStats(alloc);
         defer types.freeDBStats(alloc, stats);
         try std.testing.expectEqual(@as(u64, 2), stats.doc_count);
+    }
+}
+
+test "db relational mode stores authoritative packed rows across reopen scan and delete" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"count":{"type":"integer"},"status":{"type":"keyword"},"title":{"type":"text"},"payload":{"type":"json"}},"required":["id","count","status","title"],"additionalProperties":false}}}}
+    ;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try db.setSchema(runtime_schema);
+        try db.addIndex(.{ .name = "ft_rows", .kind = .full_text, .config_json = "{}" });
+
+        try db.batch(.{ .writes = &.{.{
+            .key = "row:a",
+            .value = "{\"id\":\"a\",\"count\":9007199254740993,\"status\":\"active\",\"title\":\"replayed relational row\",\"payload\":{\"n\":0.10000000000000001}}",
+        }}, .sync_level = .write });
+
+        const row_key = try internal_keys.relationalRowKeyAlloc(alloc, "row:a");
+        defer alloc.free(row_key);
+        const packed_row = try db.core.store.get(alloc, row_key);
+        defer alloc.free(packed_row);
+        try std.testing.expect(mapper.isRelationalRowValue(packed_row));
+        const document_key = try internal_keys.documentKeyAlloc(alloc, "row:a");
+        defer alloc.free(document_key);
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, document_key));
+    }
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+        const raw = (try db.get(alloc, "row:a")) orelse return error.TestExpectedEqual;
+        defer alloc.free(raw);
+        try std.testing.expectEqualStrings(
+            "{\"id\":\"a\",\"count\":9007199254740993,\"status\":\"active\",\"title\":\"replayed relational row\",\"payload\":{\"n\":0.10000000000000001}}",
+            raw,
+        );
+
+        try db.runUntilIdle();
+        var search_result = try db.search(alloc, .{
+            .index_name = "ft_rows",
+            .query = .{ .match = .{ .field = "title", .text = "replayed" } },
+        });
+        defer search_result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), search_result.hits.len);
+        try std.testing.expectEqualStrings("row:a", search_result.hits[0].id);
+
+        var scanned = try db.scan(alloc, "", "", .{
+            .include_documents = true,
+            .filter_query_json = "{\"term\":{\"status\":\"active\"}}",
+        });
+        defer scanned.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), scanned.documents.len);
+        try std.testing.expectEqualStrings("row:a", scanned.documents[0].id);
+        try std.testing.expectEqualStrings(raw, scanned.documents[0].json);
+
+        const txn_id = try db.beginTransaction(2_000);
+        try db.writeIntents(txn_id, &.{.{
+            .key = "row:b",
+            .value = "{\"id\":\"b\",\"count\":2,\"status\":\"active\",\"title\":\"committed row\"}",
+        }}, &.{});
+        try db.commitTransaction(txn_id, 2_001);
+        const committed = (try db.get(alloc, "row:b")) orelse return error.TestExpectedEqual;
+        defer alloc.free(committed);
+        try std.testing.expectEqualStrings(
+            "{\"id\":\"b\",\"count\":2,\"status\":\"active\",\"title\":\"committed row\"}",
+            committed,
+        );
+        const committed_legacy_key = try internal_keys.documentKeyAlloc(alloc, "row:b");
+        defer alloc.free(committed_legacy_key);
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, committed_legacy_key));
+
+        try db.batch(.{ .deletes = &.{"row:a"} });
+        try std.testing.expect((try db.get(alloc, "row:a")) == null);
+        const row_key = try internal_keys.relationalRowKeyAlloc(alloc, "row:a");
+        defer alloc.free(row_key);
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, row_key));
+    }
+}
+
+test "db relational one-shot recovery resolves orphaned intents into packed rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const commit_ts: u64 = 2_000;
+    const txn_id = try db.beginTransaction(1_000);
+    try db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "row:one_shot_recovered", .value = "{\"title\":\"one shot\",\"amount\":21.5}" }},
+    });
+
+    const record_key = blk: {
+        const prefix = "\x00\x00__txn_records__:";
+        var key: [prefix.len + @sizeOf(transactions_mod.TxnId)]u8 = undefined;
+        @memcpy(key[0..prefix.len], prefix);
+        @memcpy(key[prefix.len..], &txn_id);
+        break :blk key;
+    };
+    var record_value: [33]u8 = undefined;
+    record_value[0] = @intFromEnum(transactions_mod.TxnStatus.committed);
+    std.mem.writeInt(u64, record_value[1..9], 1_000, .little);
+    std.mem.writeInt(u64, record_value[9..17], commit_ts, .little);
+    std.mem.writeInt(u64, record_value[17..25], 1_000, .little);
+    std.mem.writeInt(u64, record_value[25..33], commit_ts, .little);
+    try db.core.store.put(&record_key, &record_value);
+
+    var recorder = TxnResolverRecorder{};
+    const recovery = try db.runTransactionRecoveryOnce(.{
+        .enabled = true,
+        .cutoff_ns = 1,
+        .resolver_ctx = &recorder,
+        .resolve_participant_fn = TxnResolverRecorder.resolve,
+    });
+    try std.testing.expect(recovery.resolved_finalized >= 1);
+
+    const raw = (try db.get(alloc, "row:one_shot_recovered")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expectEqualStrings("{\"title\":\"one shot\",\"amount\":21.5}", raw);
+    try std.testing.expectEqual(commit_ts, try db.getTimestamp(alloc, "row:one_shot_recovered"));
+
+    const relational_key = try relational_store.keyAlloc(alloc, "row:one_shot_recovered");
+    defer alloc.free(relational_key);
+    const raw_row = try db.core.store.get(alloc, relational_key);
+    defer alloc.free(raw_row);
+    try std.testing.expect(mapper.isRelationalRowValue(raw_row));
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:one_shot_recovered");
+    defer alloc.free(primary_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
+}
+
+test "db rejects relational storage mode transitions and physical row reinterpretation" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const relational_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, relational_schema);
+
+    var relational_path_buf: [256]u8 = undefined;
+    const relational_path = tempPath(&relational_path_buf);
+    defer cleanupTempDir(relational_path);
+    {
+        var db = try DB.open(alloc, std.mem.span(relational_path), .{});
+        defer db.close();
+        try db.setSchema(relational_schema);
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, db.setSchema(.{
+            .version = 2,
+            .storage_mode = .document,
+        }));
+    }
+
+    var document_path_buf: [256]u8 = undefined;
+    const document_path = tempPath(&document_path_buf);
+    defer cleanupTempDir(document_path);
+    {
+        var db = try DB.open(alloc, std.mem.span(document_path), .{});
+        defer db.close();
+        try db.batch(.{ .writes = &.{.{ .key = "doc:existing", .value = "{\"title\":\"existing\"}" }} });
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, db.setSchema(relational_schema));
     }
 }
 
@@ -68277,9 +68627,9 @@ test "collectDocumentWrites batches sorted document reads and falls back to inli
     var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
     defer store.close();
 
-    const stored_a = try replayDocumentStoreKeyAlloc(alloc, "a");
+    const stored_a = try replayDocumentStoreKeyAlloc(alloc, "a", false);
     defer alloc.free(stored_a);
-    const stored_c = try replayDocumentStoreKeyAlloc(alloc, "c");
+    const stored_c = try replayDocumentStoreKeyAlloc(alloc, "c", false);
     defer alloc.free(stored_c);
     try store.putBatch(&.{
         .{ .key = stored_a, .value = "{\"title\":\"alpha\"}" },
@@ -68313,7 +68663,7 @@ test "collectDocumentWrites skips missing out-of-range replay docs" {
     var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
     defer store.close();
 
-    const stored_z = try replayDocumentStoreKeyAlloc(alloc, "doc:z");
+    const stored_z = try replayDocumentStoreKeyAlloc(alloc, "doc:z", false);
     defer alloc.free(stored_z);
     try store.putBatch(&.{
         .{ .key = stored_z, .value = "{\"title\":\"zeta\"}" },

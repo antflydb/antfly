@@ -92,6 +92,9 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
     const full_text_documents = try deriveRuntimeFullTextDocuments(alloc, schema);
     errdefer freeRuntimeFullTextDocuments(alloc, full_text_documents);
 
+    const relational_columns = try deriveRuntimeRelationalColumns(alloc, schema);
+    errdefer freeRuntimeRelationalColumns(alloc, relational_columns);
+
     const index_sort = try deriveRuntimeIndexSort(alloc, schema.index_sort, dynamic_templates);
     errdefer freeRuntimeIndexSort(alloc, index_sort);
 
@@ -101,10 +104,104 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .ttl_duration_ns = schema.ttl_duration_ns,
         .ttl_field = try alloc.dupe(u8, schema.ttl_field),
         .enforce_types = schema.enforce_types,
+        .storage_mode = switch (schema.storage_mode) {
+            .document => .document,
+            .relational => .relational,
+        },
         .dynamic_templates = dynamic_templates,
         .full_text_documents = full_text_documents,
+        .relational_columns = relational_columns,
         .index_sort = index_sort,
     };
+}
+
+fn deriveRuntimeRelationalColumns(
+    alloc: std.mem.Allocator,
+    schema: ParsedTableSchema,
+) ![]storage_schema.RelationalColumn {
+    var columns = std.ArrayListUnmanaged(storage_schema.RelationalColumn).empty;
+    errdefer {
+        for (columns.items) |column| {
+            alloc.free(column.name);
+            alloc.free(column.path);
+        }
+        columns.deinit(alloc);
+    }
+
+    for (schema.document_schemas) |document_schema| {
+        for (document_schema.properties) |property| {
+            const column_type = runtimeRelationalColumnType(property) orelse continue;
+            var name: ?[]u8 = try alloc.dupe(u8, property.name);
+            errdefer if (name) |owned_name| alloc.free(owned_name);
+            var path: ?[]u8 = try alloc.dupe(u8, property.name);
+            errdefer if (path) |owned_path| alloc.free(owned_path);
+            const uses_json = documentPropertyUsesJsonEncoding(property);
+            try columns.append(alloc, .{
+                .name = name.?,
+                .path = path.?,
+                .column_type = column_type,
+                .required = requiredFieldsContain(document_schema.required_fields, property.name),
+                .allows_null = documentPropertyAllowsNull(property),
+                .is_json = uses_json,
+                .json_kind = runtimeRelationalJsonKind(property),
+            });
+            name = null;
+            path = null;
+        }
+    }
+    return try columns.toOwnedSlice(alloc);
+}
+
+fn freeRuntimeRelationalColumns(
+    alloc: std.mem.Allocator,
+    columns: []storage_schema.RelationalColumn,
+) void {
+    for (columns) |column| {
+        alloc.free(column.name);
+        alloc.free(column.path);
+    }
+    if (columns.len > 0) alloc.free(columns);
+}
+
+fn requiredFieldsContain(required_fields: []const []const u8, name: []const u8) bool {
+    for (required_fields) |field| {
+        if (std.mem.eql(u8, field, name)) return true;
+    }
+    return false;
+}
+
+fn runtimeRelationalColumnType(property: impl.DocumentProperty) ?storage_schema.RelationalColumnType {
+    if (documentPropertyUsesJsonEncoding(property)) return .json;
+    if (property.field_type) |field_type| {
+        if (std.mem.eql(u8, field_type, "keyword") or
+            std.mem.eql(u8, field_type, "link") or
+            std.mem.eql(u8, field_type, "string") or
+            std.mem.eql(u8, field_type, "text") or
+            std.mem.eql(u8, field_type, "html") or
+            std.mem.eql(u8, field_type, "search_as_you_type")) return .string;
+        if (std.mem.eql(u8, field_type, "blob")) return .blob;
+        if (std.mem.eql(u8, field_type, "boolean")) return .boolean;
+        if (std.mem.eql(u8, field_type, "datetime")) return .datetime;
+        if (std.mem.eql(u8, field_type, "integer")) return .integer;
+        if (std.mem.eql(u8, field_type, "numeric") or std.mem.eql(u8, field_type, "number")) return .number;
+        if (std.mem.eql(u8, field_type, "geopoint")) return .geopoint;
+        if (std.mem.eql(u8, field_type, "geoshape")) return .geoshape;
+    }
+    if (property.integer_only) return .integer;
+    if (property.const_value != null or property.enum_values.len > 0) return .string;
+    return null;
+}
+
+fn runtimeRelationalJsonKind(property: impl.DocumentProperty) storage_schema.RelationalJsonKind {
+    if (!documentPropertyUsesJsonEncoding(property)) return .none;
+    if (property.field_type) |field_type| {
+        if (std.mem.eql(u8, field_type, "object")) return .object;
+        if (std.mem.eql(u8, field_type, "array")) return .array;
+        if (std.mem.eql(u8, field_type, "json")) return .any;
+    }
+    if (property.properties.len > 0) return .object;
+    if (property.item != null or property.prefix_items.len > 0) return .array;
+    return .any;
 }
 
 fn freeRuntimeDynamicTemplates(alloc: std.mem.Allocator, templates: []storage_schema.DynamicTemplate) void {
@@ -958,6 +1055,26 @@ test "runtime schema materializes default-analyzed search-as-you-type root prefi
     }
     try std.testing.expect(html_index_prefix);
     try std.testing.expect(!html_root_prefix);
+}
+
+test "runtime schema derives authoritative relational columns" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"count":{"type":"integer"},"score":{"type":["number","null"]},"payload":{"type":"json"}},"required":["id","count"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+
+    try std.testing.expectEqual(storage_schema.StorageMode.relational, runtime.storage_mode);
+    try std.testing.expectEqual(@as(usize, 4), runtime.relational_columns.len);
+    try std.testing.expectEqual(storage_schema.RelationalColumnType.string, runtime.relational_columns[0].column_type);
+    try std.testing.expect(runtime.relational_columns[0].required);
+    try std.testing.expectEqual(storage_schema.RelationalColumnType.integer, runtime.relational_columns[1].column_type);
+    try std.testing.expect(runtime.relational_columns[2].allows_null);
+    try std.testing.expectEqual(storage_schema.RelationalColumnType.json, runtime.relational_columns[3].column_type);
+    try std.testing.expect(runtime.relational_columns[3].is_json);
+    try std.testing.expectEqual(storage_schema.RelationalJsonKind.any, runtime.relational_columns[3].json_kind);
 }
 
 test "runtime schema derives internal doc values from sortable scalar mappings" {

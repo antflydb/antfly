@@ -30,6 +30,7 @@ const matcher = @import("antfly_matcher");
 const resolver_catalog = @import("catalog/resolver_catalog.zig");
 const resolution_handoff = @import("resolution_handoff.zig");
 const internal_keys = @import("../internal_keys.zig");
+const relational_store = @import("relational_store.zig");
 const artifact_ids = @import("artifact_ids.zig");
 const derived_types = @import("derived/derived_types.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
@@ -909,13 +910,15 @@ const PrefixCandidateProvider = struct {
         fn consume(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
             const self: *ScanCtx = @ptrCast(@alignCast(ptr));
             if (self.limit > 0 and self.seen >= self.limit) return error.CandidateLimitReached;
-            const entity_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.allocator, key)) orelse return;
+            const entity_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.allocator, key)) orelse return;
             defer self.allocator.free(entity_key);
-            const resolved_key = try jsonStringFieldAlloc(self.allocator, value, "merged_into");
+            const logical_value = try relational_store.materializeStoredValueAlloc(self.allocator, key, value);
+            defer self.allocator.free(logical_value);
+            const resolved_key = try jsonStringFieldAlloc(self.allocator, logical_value, "merged_into");
             defer if (resolved_key) |rk| self.allocator.free(rk);
             const resolved_raw = if (resolved_key) |rk| try entityRawFromStore(self.allocator, self.store, rk) else null;
             defer if (resolved_raw) |rv| self.allocator.free(rv);
-            try appendEntityCandidateWithResolved(self.allocator, self.table, entity_key, value, resolved_key, resolved_raw, self.out);
+            try appendEntityCandidateWithResolved(self.allocator, self.table, entity_key, logical_value, resolved_key, resolved_raw, self.out);
             self.seen += 1;
         }
     };
@@ -947,6 +950,12 @@ const PrefixCandidateProvider = struct {
 };
 
 fn entityRawFromStore(allocator: std.mem.Allocator, store: resolver_lib.ArtifactStore, entity_key: []const u8) !?[]u8 {
+    const row_store_key = try relational_store.keyAlloc(allocator, entity_key);
+    defer allocator.free(row_store_key);
+    if (try store.get(allocator, row_store_key)) |packed_row| {
+        defer allocator.free(packed_row);
+        return try relational_store.decodeValueAlloc(allocator, packed_row);
+    }
     const doc_store_key = try internal_keys.documentKeyAlloc(allocator, entity_key);
     defer allocator.free(doc_store_key);
     return try store.get(allocator, doc_store_key);

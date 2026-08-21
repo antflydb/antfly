@@ -65,6 +65,7 @@ const scraping = if (builtin.os.tag == .freestanding or build_options.bench_mini
 else
     @import("antfly_scraping");
 const mapper = @import("../document_mapper.zig");
+const relational_store = @import("../relational_store.zig");
 
 fn getenv(name: [*:0]const u8) ?[]const u8 {
     return platform.env.getenv(name);
@@ -77,6 +78,7 @@ pub const Config = struct {
     sparse_embedder: ?embedder_mod.SparseEmbedder = null,
     asset_producer: ?asset_producer_mod.Producer = null,
     enable_without_producers: bool = false,
+    relational_base_rows: bool = false,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
@@ -2094,9 +2096,9 @@ fn getOrCreateRequestChunks(
         }
     }
 
-    const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
+    const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
+    const raw = storeGetDocumentAlloc(runtime, doc_store_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
         else => null,
     };
@@ -2167,6 +2169,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     retry_error_has_request_identity: bool = false,
     retrying: bool = false,
     worker_failed: bool = false,
+    relational_base_rows: bool = false,
     skip_by_hash_count: u64 = 0,
     skipped_source_count: u64 = 0,
     codec_decode_failures: u64 = 0,
@@ -2227,12 +2230,14 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .failure_pending_fence = failure_pending_fence,
             .notify_ctx = notify_ctx,
             .notify_fn = notify_fn,
+            .relational_base_rows = config.relational_base_rows,
             .config = .{
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
                 .sparse_embedder = config.sparse_embedder,
                 .asset_producer = config.asset_producer,
                 .enable_without_producers = config.enable_without_producers,
+                .relational_base_rows = config.relational_base_rows,
                 .secret_store = config.secret_store,
                 .remote_content = config.remote_content,
                 .resource_manager = config.resource_manager,
@@ -2283,6 +2288,10 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     pub fn setStatusHook(self: *@This(), hook: ?StatusHook) void {
         _ = self;
         _ = hook;
+    }
+
+    pub fn setRelationalBaseRows(self: *@This(), enabled: bool) void {
+        self.relational_base_rows = enabled;
     }
 
     pub fn notifySequence(self: *@This(), sequence: u64) void {
@@ -2562,6 +2571,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     retry_error_has_request_identity: bool = false,
     retrying: bool = false,
     worker_failed: bool = false,
+    relational_base_rows: std.atomic.Value(bool) = .init(false),
     skip_by_hash_count: u64 = 0,
     skipped_source_count: u64 = 0,
     codec_decode_failures: u64 = 0,
@@ -2629,12 +2639,14 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .failure_pending_fence = failure_pending_fence,
             .notify_ctx = notify_ctx,
             .notify_fn = notify_fn,
+            .relational_base_rows = .init(config.relational_base_rows),
             .config = .{
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
                 .sparse_embedder = config.sparse_embedder,
                 .asset_producer = config.asset_producer,
                 .enable_without_producers = config.enable_without_producers,
+                .relational_base_rows = config.relational_base_rows,
                 .secret_store = config.secret_store,
                 .remote_content = config.remote_content,
                 .resource_manager = config.resource_manager,
@@ -2713,6 +2725,10 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.mutex.lockUncancelable(io);
         self.status_hook = hook;
         self.mutex.unlock(io);
+    }
+
+    pub fn setRelationalBaseRows(self: *EnrichmentRuntime, enabled: bool) void {
+        self.relational_base_rows.store(enabled, .monotonic);
     }
 
     fn notifyStatusHook(self: *EnrichmentRuntime) void {
@@ -4385,9 +4401,9 @@ fn processAsset(
     deferred_assets: *std.ArrayListUnmanaged(AssetProducerBatchItem),
     window: *GeneratedReplayWindow,
 ) !void {
-    const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
+    const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
+    const raw = storeGetDocumentAlloc(runtime, doc_store_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
         else => return,
     };
@@ -8488,9 +8504,9 @@ fn collectPlainDenseBatchItem(
     window: *GeneratedReplayWindow,
 ) !?PlainDenseBatchItem {
     const embedding_artifact_name = requestEmbeddingName(request);
-    const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
+    const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
+    const raw = storeGetDocumentAlloc(runtime, doc_store_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
         else => return null,
     };
@@ -8776,9 +8792,9 @@ fn getOrCreatePlannedRequests(
     const owned_doc_key = try runtime.alloc.dupe(u8, doc_key);
     errdefer runtime.alloc.free(owned_doc_key);
 
-    const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, doc_key);
+    const doc_store_key = try documentSourceStoreKeyAlloc(runtime, doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
+    const raw = storeGetDocumentAlloc(runtime, doc_store_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
         else => {
             const empty = try runtime.alloc.alloc(enrichment_types.GeneratedEnrichmentRequest, 0);
@@ -9197,9 +9213,9 @@ fn processDenseEmbedding(
         return;
     }
 
-    const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
+    const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
+    const raw = storeGetDocumentAlloc(runtime, doc_store_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
         else => return,
     };
@@ -9337,9 +9353,9 @@ fn processSparseEmbedding(
         return;
     }
 
-    const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
+    const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
+    const raw = storeGetDocumentAlloc(runtime, doc_store_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
         else => return,
     };
@@ -12718,6 +12734,27 @@ fn storeGetAlloc(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
     defer txn.abort();
     const raw = try txn.get(key);
     return try runtime.alloc.dupe(u8, raw);
+}
+
+fn runtimeUsesRelationalBaseRows(runtime: *EnrichmentRuntime) bool {
+    return if (comptime builtin.os.tag == .freestanding)
+        runtime.relational_base_rows
+    else
+        runtime.relational_base_rows.load(.monotonic);
+}
+
+fn storeGetDocumentAlloc(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
+    const raw = try storeGetAlloc(runtime, key);
+    if (!runtimeUsesRelationalBaseRows(runtime)) return raw;
+    defer runtime.alloc.free(raw);
+    return try relational_store.decodeValueAlloc(runtime.alloc, raw);
+}
+
+fn documentSourceStoreKeyAlloc(runtime: *EnrichmentRuntime, doc_key: []const u8) ![]u8 {
+    return if (runtimeUsesRelationalBaseRows(runtime))
+        try relational_store.keyAlloc(runtime.alloc, doc_key)
+    else
+        try internal_keys.documentKeyAlloc(runtime.alloc, doc_key);
 }
 
 fn storeGetAllocWithRetry(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {

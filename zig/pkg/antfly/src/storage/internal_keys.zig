@@ -23,6 +23,7 @@ pub const replay_all_kind: u8 = 0xfe;
 
 pub const primary_kind: u8 = 0x10;
 pub const ttl_kind: u8 = 0x11;
+pub const relational_row_kind: u8 = 0x12;
 pub const artifact_kind: u8 = 0x20;
 pub const chunk_record_kind: u8 = 0x30;
 pub const derived_embedding_kind: u8 = 0x31;
@@ -231,6 +232,14 @@ pub fn documentKeyAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
     key[0] = user_namespace;
     const pos = 1 + encodeComponent(key[1..], doc_key);
     key[pos] = primary_kind;
+    return key;
+}
+
+pub fn relationalRowKeyAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    var key = try alloc.alloc(u8, 1 + encodedComponentLen(doc_key) + 1);
+    key[0] = user_namespace;
+    const pos = 1 + encodeComponent(key[1..], doc_key);
+    key[pos] = relational_row_kind;
     return key;
 }
 
@@ -993,6 +1002,16 @@ pub fn isPrimaryDocumentKey(key: []const u8) bool {
     return term + 3 == key.len and key[term + 2] == primary_kind;
 }
 
+pub fn isRelationalRowKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const term = findComponentTerminator(key, 1) orelse return false;
+    return term + 3 == key.len and key[term + 2] == relational_row_kind;
+}
+
+pub fn isStoredDocumentRowKey(key: []const u8) bool {
+    return isPrimaryDocumentKey(key) or isRelationalRowKey(key);
+}
+
 pub fn isTtlKey(key: []const u8) bool {
     if (!isInternalUserKey(key)) return false;
     const term = findComponentTerminator(key, 1) orelse return false;
@@ -1001,6 +1020,12 @@ pub fn isTtlKey(key: []const u8) bool {
 
 pub fn decodePrimaryDocumentKeyAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
     if (!isPrimaryDocumentKey(key)) return null;
+    const term = findComponentTerminator(key, 1).?;
+    return try decodeBodyAlloc(alloc, key[1..term]);
+}
+
+pub fn decodeStoredDocumentRowKeyAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
+    if (!isStoredDocumentRowKey(key)) return null;
     const term = findComponentTerminator(key, 1).?;
     return try decodeBodyAlloc(alloc, key[1..term]);
 }
@@ -2079,4 +2104,24 @@ test "decodePrimaryDocumentKeyAlloc round-trips and rejects non-primary keys" {
     defer alloc.free(asset);
     try std.testing.expect(!isPrimaryDocumentKey(asset));
     try std.testing.expect((try decodePrimaryDocumentKeyAlloc(alloc, asset)) == null);
+}
+
+test "stored document row keys round trip document and relational keyspaces" {
+    const alloc = std.testing.allocator;
+    const document_id = "person/ada\x00lovelace";
+    const primary = try documentKeyAlloc(alloc, document_id);
+    defer alloc.free(primary);
+    const relational = try relationalRowKeyAlloc(alloc, document_id);
+    defer alloc.free(relational);
+
+    try std.testing.expect(isStoredDocumentRowKey(primary));
+    try std.testing.expect(isStoredDocumentRowKey(relational));
+    try std.testing.expect(!std.mem.eql(u8, primary, relational));
+
+    const decoded_primary = (try decodeStoredDocumentRowKeyAlloc(alloc, primary)).?;
+    defer alloc.free(decoded_primary);
+    const decoded_relational = (try decodeStoredDocumentRowKeyAlloc(alloc, relational)).?;
+    defer alloc.free(decoded_relational);
+    try std.testing.expectEqualStrings(document_id, decoded_primary);
+    try std.testing.expectEqualStrings(document_id, decoded_relational);
 }

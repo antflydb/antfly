@@ -24,6 +24,7 @@ const geo_mod = @import("../../search/geo.zig");
 const schema_api = @import("../../schema/mod.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const runtime_schema = @import("../schema.zig");
+const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const types = @import("types.zig");
 
 pub const schema_less_exact_field_suffix = ".keyword";
@@ -3081,6 +3082,163 @@ fn appendUniqueString(alloc: Allocator, list: *std.ArrayListUnmanaged([]u8), val
         if (std.mem.eql(u8, existing, value)) return;
     }
     try list.append(alloc, try alloc.dupe(u8, value));
+}
+
+/// Project a validated relational document into the authoritative packed-row
+/// representation. Numeric parsing keeps the original JSON token so signed
+/// integers and JSON subdocuments retain their exact domains.
+pub fn buildRelationalRowValueAlloc(
+    alloc: Allocator,
+    doc_json: []const u8,
+    columns: []const runtime_schema.RelationalColumn,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, doc_json, .{ .parse_numbers = false });
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidBatchRequest;
+
+    var cells = std.ArrayListUnmanaged(relational_row_codec.Cell).empty;
+    defer cells.deinit(alloc);
+    var owned = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned.items) |buffer| alloc.free(buffer);
+        owned.deinit(alloc);
+    }
+
+    for (columns) |column| {
+        const found = parsed.value.object.get(column.name) orelse {
+            if (column.required) return error.InvalidBatchRequest;
+            continue;
+        };
+        const value_type = relationalValueType(column.column_type);
+        if (found == .null) {
+            if (!column.allows_null) return error.InvalidBatchRequest;
+            try cells.append(alloc, .{
+                .path = column.path,
+                .value_type = value_type,
+                .is_json = column.is_json,
+                .is_null = true,
+                .value = relationalZeroValue(value_type),
+            });
+            continue;
+        }
+
+        if (column.is_json) switch (column.json_kind) {
+            .object => if (found != .object) return error.InvalidBatchRequest,
+            .array => if (found != .array) return error.InvalidBatchRequest,
+            .any => {},
+            .none => return error.InvalidBatchRequest,
+        };
+
+        const value = if (column.is_json) blk: {
+            const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(found, .{})});
+            errdefer alloc.free(encoded);
+            try owned.append(alloc, encoded);
+            break :blk typed_dv.TypedValue{ .bytes_val = encoded };
+        } else try relationalTypedValueAlloc(alloc, column.column_type, found, &owned) orelse
+            return error.InvalidBatchRequest;
+
+        try cells.append(alloc, .{
+            .path = column.path,
+            .value_type = value_type,
+            .is_json = column.is_json,
+            .value = value,
+        });
+    }
+    return try relational_row_codec.serialize(alloc, cells.items);
+}
+
+pub fn materializeRelationalRowValueAlloc(alloc: Allocator, value: []const u8) ![]u8 {
+    return try relational_row_codec.reconstructValueAlloc(alloc, value);
+}
+
+pub fn isRelationalRowValue(value: []const u8) bool {
+    return relational_row_codec.looksLikeRow(value);
+}
+
+fn relationalValueType(column_type: runtime_schema.RelationalColumnType) typed_dv.ValueType {
+    return switch (column_type) {
+        .datetime => .u64_val,
+        .integer => .i64_val,
+        .number => .f64_val,
+        .boolean => .bool_val,
+        .geopoint => .geo_point,
+        .string, .blob, .geoshape, .json => .bytes_val,
+    };
+}
+
+fn relationalZeroValue(value_type: typed_dv.ValueType) typed_dv.TypedValue {
+    return switch (value_type) {
+        .u64_val => .{ .u64_val = 0 },
+        .i64_val => .{ .i64_val = 0 },
+        .f64_val => .{ .f64_val = 0 },
+        .bytes_val => .{ .bytes_val = "" },
+        .bool_val => .{ .bool_val = false },
+        .geo_point => .{ .geo_point = .{ .lat = 0, .lon = 0 } },
+    };
+}
+
+fn relationalTypedValueAlloc(
+    alloc: Allocator,
+    column_type: runtime_schema.RelationalColumnType,
+    value: std.json.Value,
+    owned: *std.ArrayListUnmanaged([]u8),
+) !?typed_dv.TypedValue {
+    return switch (column_type) {
+        .string, .blob, .geoshape => switch (value) {
+            .string => |text| .{ .bytes_val = text },
+            else => null,
+        },
+        .boolean => switch (value) {
+            .bool => |flag| .{ .bool_val = flag },
+            else => null,
+        },
+        .integer => if (schema_api.documentIntegerToI64(value)) |number|
+            .{ .i64_val = number }
+        else
+            null,
+        .number => if (schema_api.documentNumberToF64(value)) |number|
+            .{ .f64_val = number }
+        else
+            null,
+        .datetime => if (schema_api.documentDateTimeToNs(value)) |timestamp|
+            .{ .u64_val = timestamp }
+        else
+            null,
+        .geopoint => blk: {
+            if (value != .object or value.object.count() != 2) break :blk null;
+            const lat = schema_api.documentNumberToF64(value.object.get("lat") orelse break :blk null) orelse break :blk null;
+            const lon = schema_api.documentNumberToF64(value.object.get("lon") orelse break :blk null) orelse break :blk null;
+            if (!geo_mod.latitudeIsValid(lat) or !geo_mod.longitudeIsValid(lon)) break :blk null;
+            break :blk .{ .geo_point = .{ .lat = lat, .lon = lon } };
+        },
+        .json => blk: {
+            const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+            errdefer alloc.free(encoded);
+            try owned.append(alloc, encoded);
+            break :blk .{ .bytes_val = encoded };
+        },
+    };
+}
+
+test "document mapper builds relational packed rows without numeric loss" {
+    const alloc = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .column_type = .string, .required = true },
+        .{ .name = "count", .path = "count", .column_type = .integer, .required = true },
+        .{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true, .json_kind = .any },
+    };
+    const encoded = try buildRelationalRowValueAlloc(
+        alloc,
+        "{\"id\":\"a\",\"count\":9007199254740993,\"payload\":{\"n\":0.10000000000000001}}",
+        &columns,
+    );
+    defer alloc.free(encoded);
+    const rebuilt = try materializeRelationalRowValueAlloc(alloc, encoded);
+    defer alloc.free(rebuilt);
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"a\",\"count\":9007199254740993,\"payload\":{\"n\":0.10000000000000001}}",
+        rebuilt,
+    );
 }
 
 test "document mapper builds text segment from top-level string fields" {

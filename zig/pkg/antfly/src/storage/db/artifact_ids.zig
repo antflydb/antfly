@@ -54,7 +54,7 @@ const DecodedInternalComponent = struct {
 };
 
 pub fn resolvePublicHitIdentityAlloc(alloc: Allocator, key: []const u8) !PublicIdentity {
-    if (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, key)) |doc_id| {
+    if (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, key)) |doc_id| {
         return .{ .id = doc_id };
     }
     if (try decodeArtifactRefAlloc(alloc, key)) |artifact_ref| {

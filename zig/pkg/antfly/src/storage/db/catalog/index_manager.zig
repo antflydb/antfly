@@ -57,6 +57,7 @@ const lmdb = if (storage_build_options.lmdb_enabled or builtin.is_test) @import(
     };
 };
 const mapper = @import("../document_mapper.zig");
+const relational_store = @import("../relational_store.zig");
 const typed_dv = @import("../../../section/typed_doc_values.zig");
 const typed_dv_coverage = @import("../typed_doc_values_coverage.zig");
 const dense_exact = @import("../dense_exact.zig");
@@ -1128,6 +1129,7 @@ pub const IndexManager = struct {
     hll_maintenance_lane: ?background_runtime_mod.DurableJobLane = null,
     hll_maintenance_owner_id: u64 = 0,
     primary_store: ?*docstore_mod.DocStore,
+    relational_base_rows: bool = false,
     applied_sequence_checkpoint_path: ?[]const u8,
     catalog_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
     /// 0 = idle, 1 = queued/running, 2 = rerun requested while active.
@@ -2149,6 +2151,7 @@ pub const IndexManager = struct {
             .owned_resource_manager = owned_resource_manager,
             .bind_cache_resource_manager = bind_cache_resource_manager,
             .primary_store = null,
+            .relational_base_rows = false,
             .applied_sequence_checkpoint_path = null,
             .load_parallelism = null,
             .full_text_pending_bytes_accounted = 0,
@@ -2324,6 +2327,10 @@ pub const IndexManager = struct {
         if (comptime Store == *docstore_mod.DocStore) {
             self.primary_store = store;
         }
+    }
+
+    pub fn setRelationalBaseRows(self: *IndexManager, enabled: bool) void {
+        self.relational_base_rows = enabled;
     }
 
     fn freeTextIndexEntry(self: *IndexManager, entry: *TextIndex) void {
@@ -9474,13 +9481,13 @@ pub const IndexManager = struct {
                     }
 
                     state.saw_visible_doc.* = true;
-                    const doc_id = if (internal_keys.isPrimaryDocumentKey(key))
-                        (try internal_keys.decodePrimaryDocumentKeyAlloc(state.manager.alloc, key)) orelse return .@"continue"
+                    const doc_id = if (internal_keys.isStoredDocumentRowKey(key))
+                        (try internal_keys.decodeStoredDocumentRowKeyAlloc(state.manager.alloc, key)) orelse return .@"continue"
                     else
                         try state.manager.alloc.dupe(u8, key);
                     var doc_id_owned = true;
                     errdefer if (doc_id_owned) state.manager.alloc.free(doc_id);
-                    const doc_value = try state.manager.alloc.dupe(u8, value);
+                    const doc_value = try relational_store.materializeStoredValueAlloc(state.manager.alloc, key, value);
                     var doc_value_owned = true;
                     errdefer if (doc_value_owned) state.manager.alloc.free(doc_value);
 
@@ -9683,13 +9690,13 @@ pub const IndexManager = struct {
                     }
 
                     state.saw_visible_doc.* = true;
-                    const doc_id = if (internal_keys.isPrimaryDocumentKey(key))
-                        (try internal_keys.decodePrimaryDocumentKeyAlloc(state.manager.alloc, key)) orelse return .@"continue"
+                    const doc_id = if (internal_keys.isStoredDocumentRowKey(key))
+                        (try internal_keys.decodeStoredDocumentRowKeyAlloc(state.manager.alloc, key)) orelse return .@"continue"
                     else
                         try state.manager.alloc.dupe(u8, key);
                     var doc_id_owned = true;
                     errdefer if (doc_id_owned) state.manager.alloc.free(doc_id);
-                    const doc_value = try state.manager.alloc.dupe(u8, value);
+                    const doc_value = try relational_store.materializeStoredValueAlloc(state.manager.alloc, key, value);
                     var doc_value_owned = true;
                     errdefer if (doc_value_owned) state.manager.alloc.free(doc_value);
 
@@ -12143,11 +12150,13 @@ pub const IndexManager = struct {
         errdefer mapping_batch.abort();
 
         for (docs) |doc| {
-            if (!internal_keys.isPrimaryDocumentKey(doc.key)) continue;
-            const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.alloc, doc.key)) orelse continue;
+            if (!visibleBaseDocumentRowKey(self, doc.key)) continue;
+            const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, doc.key)) orelse continue;
             defer self.alloc.free(raw_key);
             if (!self.keyInRange(raw_key)) continue;
-            const vector_values = (try mapper.extractDenseVectorField(self.alloc, doc.value, entry.field_name, entry.dims)) orelse continue;
+            const logical_value = try relational_store.materializeStoredValueAlloc(self.alloc, doc.key, doc.value);
+            defer self.alloc.free(logical_value);
+            const vector_values = (try mapper.extractDenseVectorField(self.alloc, logical_value, entry.field_name, entry.dims)) orelse continue;
             errdefer self.alloc.free(vector_values);
 
             const assignment = try self.ensureDenseVectorIdTxn(&mapping_batch, entry.config.name, raw_key, null);
@@ -12231,14 +12240,16 @@ pub const IndexManager = struct {
 
         const backfill_batch_size = if (builtin.is_test) test_sparse_backfill_batch_size orelse sparse_backfill_batch_size else sparse_backfill_batch_size;
         for (docs) |doc| {
-            if (!internal_keys.isPrimaryDocumentKey(doc.key)) continue;
+            if (!visibleBaseDocumentRowKey(self, doc.key)) continue;
             if (resume_from) |resume_key| {
                 if (resume_key.len > 0 and std.mem.order(u8, doc.key, resume_key) != .gt) continue;
             }
-            const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.alloc, doc.key)) orelse continue;
+            const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, doc.key)) orelse continue;
             defer self.alloc.free(raw_key);
             if (!self.keyInRange(raw_key)) continue;
-            var sparse_vec = (try mapper.extractSparseVectorField(self.alloc, doc.value, entry.field_name)) orelse continue;
+            const logical_value = try relational_store.materializeStoredValueAlloc(self.alloc, doc.key, doc.value);
+            defer self.alloc.free(logical_value);
+            var sparse_vec = (try mapper.extractSparseVectorField(self.alloc, logical_value, entry.field_name)) orelse continue;
             var sparse_vec_owned = true;
             errdefer if (sparse_vec_owned) sparse_vec.deinit(self.alloc);
             saw_visible_doc = true;
@@ -15462,14 +15473,19 @@ pub const IndexManager = struct {
                 break :blk try manager.loadDenseVectorArtifactForHbc(alloc, store, metadata, entry.config.name, load_session);
             }
 
-            const doc_store_key = try internal_keys.documentKeyAlloc(alloc, metadata);
+            const doc_store_key = if (manager.relational_base_rows)
+                try relational_store.keyAlloc(alloc, metadata)
+            else
+                try internal_keys.documentKeyAlloc(alloc, metadata);
             defer alloc.free(doc_store_key);
             const raw = manager.loadPrimaryDocumentRawForHbc(store, doc_store_key, load_session, alloc) catch |err| switch (err) {
                 error.NotFound => break :blk try manager.loadDenseVectorArtifactForHbc(alloc, store, metadata, entry.config.name, load_session),
                 else => return err,
             };
             defer if (load_session == null) alloc.free(raw);
-            break :blk (try mapper.extractDenseVectorField(alloc, raw, entry.field_name, entry.dims)) orelse
+            const logical = try relational_store.materializeStoredValueAlloc(alloc, doc_store_key, raw);
+            defer alloc.free(logical);
+            break :blk (try mapper.extractDenseVectorField(alloc, logical, entry.field_name, entry.dims)) orelse
                 try manager.loadDenseVectorArtifactForHbc(alloc, store, metadata, entry.config.name, load_session);
         };
         errdefer alloc.free(vector);
@@ -16923,13 +16939,21 @@ fn textIndexShouldConsumeDoc(self: *const IndexManager, entry: *const IndexManag
         return internal_keys.matchesChunkArtifactName(key, artifact_name) or
             internal_keys.matchesAssetArtifactName(key, artifact_name);
     }
-    if (isPrimaryDocumentCandidate(key)) return true;
+    if (visibleBaseDocumentRowKey(self, key)) return true;
+    if (!internal_keys.isInternalUserKey(key) and docstore_mod.KeyEncoder.parseEdgeKey(key) == null) return true;
     if (!internal_keys.isChunkArtifactRecordKey(key)) return false;
     return try self.textIndexIsChunkBacked(self.alloc, entry.config.name);
 }
 
+fn visibleBaseDocumentRowKey(self: *const IndexManager, key: []const u8) bool {
+    return if (self.relational_base_rows)
+        internal_keys.isRelationalRowKey(key)
+    else
+        internal_keys.isPrimaryDocumentKey(key);
+}
+
 fn isPrimaryDocumentCandidate(key: []const u8) bool {
-    if (internal_keys.isPrimaryDocumentKey(key)) return true;
+    if (internal_keys.isStoredDocumentRowKey(key)) return true;
     if (internal_keys.isInternalUserKey(key)) return false;
     if (docstore_mod.KeyEncoder.parseEdgeKey(key) != null) return false;
     return true;
