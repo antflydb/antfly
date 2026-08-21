@@ -243,6 +243,10 @@ pub const Builder = struct {
         const records = try self.wal.readFromAlloc(namespace, start_lsn);
         defer wal_mod.freeRecords(self.alloc, records);
 
+        if (records.len != 0 and publicationPlanHasExternalBaseSource(plan)) {
+            return error.ExternalTableReadOnly;
+        }
+
         if (records.len == 0) {
             if (plan.external_source_plan) |external_plan| {
                 if (current_manifest == null or !externalSourcePlanMatchesManifest(external_plan, current_manifest.?)) {
@@ -1204,6 +1208,15 @@ fn cloneTableDefinitionBaseSourceAlloc(
         try manifest_base_source.cloneDescriptorAlloc(alloc, descriptor)
     else
         null;
+}
+
+fn publicationPlanHasExternalBaseSource(plan: publication_plan.TablePublicationPlan) bool {
+    if (plan.external_source_plan != null) return true;
+    const base_source = plan.table_definition.base_source orelse return false;
+    return switch (base_source) {
+        .external_parquet, .external_iceberg, .external_lance => true,
+        else => false,
+    };
 }
 
 fn attachResolvedExternalSourcePlanIfPresent(
@@ -5525,6 +5538,24 @@ test "serverless builder publishes initial external manifest without wal records
     try std.testing.expectEqual(@as(usize, 1), updated_manifest.artifacts.len);
     try std.testing.expectEqualStrings("external-inventory-2", updated_manifest.artifacts[0].artifact_id);
     try std.testing.expectEqualStrings("snapshot-2", updated_manifest.base_source.?.external_parquet.snapshot_id);
+
+    const encoded_mutation = try api_codec.encodeMutationAlloc(alloc, .{
+        .kind = .upsert,
+        .doc_id = "event-1",
+        .body = "should-not-publish",
+    });
+    defer alloc.free(encoded_mutation);
+    _ = try wal_store.append("events", 100, encoded_mutation);
+    try std.testing.expectError(error.ExternalTableReadOnly, builder.publishNamespaceWithMetricAndPlan("events", .cosine, .{
+        .targets = .{ .published_search_sources = search_sources.defaultPublishedSearchSources() },
+        .external_source_plan = updated_plan,
+        .table_definition = .{
+            .schema_json = @constCast("{\"storage_mode\":\"relational\"}"),
+            .read_schema_json = @constCast("{}"),
+            .indexes_json = @constCast("{}"),
+        },
+    }));
+    try std.testing.expectEqual(@as(u64, 2), try progress_store.getHead("events"));
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

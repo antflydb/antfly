@@ -38,6 +38,17 @@ const tables_api = @import("../../api/tables.zig");
 const full_text_indexes = @import("../../api/full_text_indexes.zig");
 const shared_vector = @import("antfly_vector").vector;
 
+const PublicationPlanPurpose = enum {
+    status,
+    publication,
+};
+
+fn ensureSchemaWritesAllowedAlloc(alloc: Allocator, schema_json: []const u8) !void {
+    var binding = (try publication_plan.externalBindingFromSchemaJsonAlloc(alloc, schema_json)) orelse return;
+    defer binding.deinit(alloc);
+    if (binding.binding.write_policy == .read_only) return error.ExternalTableReadOnly;
+}
+
 pub const CatalogService = struct {
     alloc: Allocator,
     artifacts: *artifacts_mod.ArtifactStore,
@@ -169,6 +180,18 @@ pub const CatalogService = struct {
         return null;
     }
 
+    pub fn ensureTableWritesAllowed(self: *CatalogService, table_name: []const u8) !void {
+        var table = (try self.getTableAlloc(self.alloc, table_name)) orelse return error.NamespaceNotFound;
+        defer table.deinit(self.alloc);
+        try ensureSchemaWritesAllowedAlloc(self.alloc, table.schema_json);
+    }
+
+    pub fn ensureNamespaceWritesAllowed(self: *CatalogService, namespace: []const u8) !void {
+        var table = (try self.getTableForNamespaceAlloc(self.alloc, namespace)) orelse return;
+        defer table.deinit(self.alloc);
+        try ensureSchemaWritesAllowedAlloc(self.alloc, table.schema_json);
+    }
+
     pub fn setTableDefinition(
         self: *CatalogService,
         table_name: []const u8,
@@ -240,7 +263,7 @@ pub const CatalogService = struct {
 
     pub fn buildStatus(self: *CatalogService, namespace: []const u8) !catalog_types.BuildStatus {
         const policy = self.getPolicy(namespace) catch catalog_types.NamespacePolicy{};
-        var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy);
+        var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy, .status);
         defer plan.deinit(self.alloc);
         const effective_policy = plan.policy;
         var published_head = try self.loadPublishedHeadAlloc(namespace);
@@ -642,7 +665,7 @@ pub const CatalogService = struct {
 
     pub fn buildNamespace(self: *CatalogService, namespace: []const u8) !builder_mod.BuildResult {
         const policy = self.getPolicy(namespace) catch catalog_types.NamespacePolicy{};
-        var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy);
+        var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy, .publication);
         defer plan.deinit(self.alloc);
         return try self.builder.publishNamespaceWithMetricAndPlan(
             namespace,
@@ -709,13 +732,14 @@ pub const CatalogService = struct {
         self: *CatalogService,
         namespace: []const u8,
         policy: catalog_types.NamespacePolicy,
+        purpose: PublicationPlanPurpose,
     ) !publication_plan.TablePublicationPlan {
         const tables = try self.listTablesAlloc(self.alloc);
         defer self.freeTables(self.alloc, tables);
         for (tables) |table| {
             if (!std.mem.eql(u8, table.namespace, namespace)) continue;
             const effective_policy = effectivePolicyForTable(policy, table.indexes_json) catch return error.InvalidTableIndexMetadata;
-            const targets: builder_mod.Builder.PublicationTargets = if (table.indexes_json.len == 0 or std.mem.eql(u8, table.indexes_json, "{}"))
+            var targets: builder_mod.Builder.PublicationTargets = if (table.indexes_json.len == 0 or std.mem.eql(u8, table.indexes_json, "{}"))
                 .{
                     .published_search_sources = try search_sources.clonePublishedSearchSourcesAlloc(self.alloc, search_sources.defaultPublishedSearchSources()),
                     .include_graph = true,
@@ -730,6 +754,7 @@ pub const CatalogService = struct {
                     ),
                     .include_graph = true,
                 };
+            errdefer search_sources.deinitPublishedSearchSources(self.alloc, &targets.published_search_sources);
 
             var metadata_republish: publication_plan.MetadataRepublishReasons = .{};
             var published_head = try self.loadPublishedHeadAlloc(namespace);
@@ -863,7 +888,10 @@ pub const CatalogService = struct {
                     table.indexes_json,
                 );
                 errdefer table_definition.deinit(self.alloc);
-                var external_source_plan = try self.externalSourcePlanForTableAlloc(namespace, table);
+                var external_source_plan = if (purpose == .publication)
+                    try self.externalSourcePlanForTableAlloc(namespace, table)
+                else
+                    null;
                 errdefer if (external_source_plan) |*plan| plan.deinit(self.alloc);
 
                 return .{
@@ -920,7 +948,10 @@ pub const CatalogService = struct {
                 table.indexes_json,
             );
             errdefer table_definition.deinit(self.alloc);
-            var external_source_plan = try self.externalSourcePlanForTableAlloc(namespace, table);
+            var external_source_plan = if (purpose == .publication)
+                try self.externalSourcePlanForTableAlloc(namespace, table)
+            else
+                null;
             errdefer if (external_source_plan) |*plan| plan.deinit(self.alloc);
 
             return .{
@@ -4763,6 +4794,54 @@ test "serverless catalog service fails closed for current external binding witho
         error.ExternalSourcePlanResolverUnavailable,
         catalog.externalSourcePlanForTableAlloc("events", table),
     );
+}
+
+test "serverless catalog status stays local and write admission rejects read-only external tables" {
+    const alloc = std.testing.allocator;
+    const current_schema =
+        \\{"version":5,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://bucket/events","snapshot":"current","schema_fingerprint":"schema-v5","write_policy":"read_only"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+
+    var artifact_root_buf: [256]u8 = undefined;
+    var manifest_root_buf: [256]u8 = undefined;
+    var wal_root_buf: [256]u8 = undefined;
+    var catalog_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-external-status");
+    const manifest_root = tmpPath(&manifest_root_buf, "manifests-external-status");
+    const wal_root = tmpPath(&wal_root_buf, "wal-external-status");
+    const catalog_root = tmpPath(&catalog_root_buf, "catalog-external-status");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(manifest_root);
+    defer cleanupTmp(wal_root);
+    defer cleanupTmp(catalog_root);
+
+    var fs_artifacts = try @import("../artifacts/mod.zig").FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+    var fs_manifests = try manifest_mod.FsStore.init(alloc, std.mem.span(manifest_root));
+    var manifest_store = fs_manifests.manifestStore();
+    defer manifest_store.deinit();
+    var fs_progress = try @import("fs_progress_store.zig").FsProgressStore.init(alloc, std.mem.span(manifest_root));
+    var progress_store = fs_progress.progressStore();
+    defer progress_store.deinit();
+    var fs_wal = try wal_mod.FsStore.init(alloc, std.mem.span(wal_root));
+    var wal_store = fs_wal.walStore();
+    defer wal_store.deinit();
+    var fs_catalog = try @import("fs_store.zig").FsStore.init(alloc, std.mem.span(catalog_root));
+    var test_catalog_store = fs_catalog.catalogStore();
+    defer test_catalog_store.deinit();
+
+    var builder = builder_mod.Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    var catalog = CatalogService.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store, &builder, &test_catalog_store);
+    defer catalog.deinit();
+    try std.testing.expect(try catalog.ensureTableWithDefinition("events", 1, .{}, current_schema, "", "{}"));
+
+    var status = try catalog.tableBuildStatus("events");
+    defer status.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 0), status.latest_wal_lsn);
+    try std.testing.expectError(error.ExternalTableReadOnly, catalog.ensureTableWritesAllowed("events"));
+    try std.testing.expectError(error.ExternalTableReadOnly, catalog.ensureNamespaceWritesAllowed("events"));
+    try std.testing.expectError(error.ExternalSourcePlanResolverUnavailable, catalog.buildTable("events"));
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

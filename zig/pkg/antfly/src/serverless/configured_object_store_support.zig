@@ -208,8 +208,13 @@ fn ensureBucketAllowed(bucket: []const u8, allowed_buckets: []const []const u8) 
 }
 
 fn ensurePrefixAllowed(prefix: []const u8, allowed_prefix: []const u8) !void {
-    if (allowed_prefix.len == 0) return;
-    if (std.mem.startsWith(u8, prefix, allowed_prefix)) return;
+    const allowed = std.mem.trimEnd(u8, allowed_prefix, "/");
+    const requested = std.mem.trimEnd(u8, prefix, "/");
+    if (allowed.len == 0) return;
+    if (std.mem.eql(u8, requested, allowed)) return;
+    if (requested.len > allowed.len and
+        std.mem.startsWith(u8, requested, allowed) and
+        requested[allowed.len] == '/') return;
     return error.ExternalLakeCredentialScopeMismatch;
 }
 
@@ -341,7 +346,7 @@ test "credentialed binding object store opens scoped filesystem source" {
     }));
 }
 
-test "credentialed binding object store opens scoped gcs source with bearer token" {
+test "serverless external source credentialed binding opens scoped gcs source with bearer token" {
     const alloc = std.testing.allocator;
     const cfg_json =
         \\{
@@ -353,8 +358,9 @@ test "credentialed binding object store opens scoped gcs source with bearer toke
         \\        "protocol": "gcs",
         \\        "buckets": ["lake-bucket"],
         \\        "prefix": "events",
-        \\        "headers": {
-        \\          "Authorization": "Bearer test-token"
+        \\        "credentials": {
+        \\          "source": "bearer_token",
+        \\          "bearer_token": "test-token"
         \\        }
         \\      }
         \\    }
@@ -394,9 +400,19 @@ test "credentialed binding object store opens scoped gcs source with bearer toke
         .file_bucket = "external-lake",
         .node_config = &cfg,
     }));
+    try std.testing.expectError(error.ExternalLakeCredentialScopeMismatch, openBindingObjectStoreAlloc(alloc, .{
+        .table_id = "events-private",
+        .format = .parquet,
+        .source_uri = "gs://lake-bucket/events-private/2026",
+        .credential_ref = .{ .ref_id = "prod-gcs-lake-read", .scope = "events" },
+        .schema_fingerprint = "schema-v1",
+    }, .{
+        .file_bucket = "external-lake",
+        .node_config = &cfg,
+    }));
 }
 
-test "credentialed binding object store opens scoped s3 source with configured credentials" {
+test "serverless external source credentialed binding opens scoped s3 source with configured credentials" {
     const alloc = std.testing.allocator;
     const cfg_json =
         \\{
@@ -410,9 +426,12 @@ test "credentialed binding object store opens scoped s3 source with configured c
         \\        "use_ssl": true,
         \\        "buckets": ["lake-bucket"],
         \\        "prefix": "events",
-        \\        "access_key_id": "test-key",
-        \\        "secret_access_key": "test-secret",
-        \\        "session_token": "test-session"
+        \\        "credentials": {
+        \\          "source": "static",
+        \\          "access_key_id": "test-key",
+        \\          "secret_access_key": "test-secret",
+        \\          "session_token": "test-session"
+        \\        }
         \\      }
         \\    }
         \\  }
@@ -452,9 +471,19 @@ test "credentialed binding object store opens scoped s3 source with configured c
         .file_bucket = "external-lake",
         .node_config = &cfg,
     }));
+    try std.testing.expectError(error.ExternalLakeCredentialScopeMismatch, openBindingObjectStoreAlloc(alloc, .{
+        .table_id = "events-private",
+        .format = .parquet,
+        .source_uri = "s3://lake-bucket/events-private/2026",
+        .credential_ref = .{ .ref_id = "prod-s3-lake-read", .scope = "events" },
+        .schema_fingerprint = "schema-v1",
+    }, .{
+        .file_bucket = "external-lake",
+        .node_config = &cfg,
+    }));
 }
 
-test "credentialed binding object store resolves s3 credential secrets" {
+test "serverless external source resolves s3 credential secrets" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -481,9 +510,12 @@ test "credentialed binding object store resolves s3 credential secrets" {
         \\        "protocol": "s3",
         \\        "endpoint": "${secret:s3.lake.endpoint}",
         \\        "buckets": ["lake-bucket"],
-        \\        "access_key_id": "${secret:s3.lake.access_key_id}",
-        \\        "secret_access_key": "${secret:s3.lake.secret_access_key}",
-        \\        "session_token": "${secret:s3.lake.session_token}"
+        \\        "credentials": {
+        \\          "source": "static",
+        \\          "access_key_id": "${secret:s3.lake.access_key_id}",
+        \\          "secret_access_key": "${secret:s3.lake.secret_access_key}",
+        \\          "session_token": "${secret:s3.lake.session_token}"
+        \\        }
         \\      }
         \\    }
         \\  }
@@ -513,7 +545,7 @@ test "credentialed binding object store resolves s3 credential secrets" {
     try std.testing.expectEqualStrings("secret-session", s3_client.cfg.credentials.session_token.?);
 }
 
-test "credentialed binding object store resolves gcs authorization secret" {
+test "serverless external source resolves gcs bearer token secret" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -521,7 +553,7 @@ test "credentialed binding object store resolves gcs authorization secret" {
     defer alloc.free(secret_path);
     var secret_store = try common_secrets.FileStore.init(alloc, secret_path);
     defer secret_store.deinit();
-    var stored = try secret_store.put(alloc, "gcs.lake.authorization", "Bearer secret-token");
+    var stored = try secret_store.put(alloc, "gcs.lake.token", "secret-token");
     defer stored.deinit(alloc);
 
     const cfg_json =
@@ -533,8 +565,9 @@ test "credentialed binding object store resolves gcs authorization secret" {
         \\      "external_io": {
         \\        "protocol": "gcs",
         \\        "buckets": ["lake-bucket"],
-        \\        "headers": {
-        \\          "authorization": "${secret:gcs.lake.authorization}"
+        \\        "credentials": {
+        \\          "source": "bearer_token",
+        \\          "bearer_token": "${secret:gcs.lake.token}"
         \\        }
         \\      }
         \\    }

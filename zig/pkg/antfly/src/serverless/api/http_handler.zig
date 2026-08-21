@@ -830,6 +830,10 @@ pub const HttpHandler = struct {
 
     fn handleIngestBatch(self: *HttpHandler, namespace: []const u8, body: []const u8) !HttpResponse {
         if (try self.requireMutableRoute()) |resp| return resp;
+        self.catalog.ensureNamespaceWritesAllowed(namespace) catch |err| switch (err) {
+            error.ExternalTableReadOnly => return try textResponse(self.alloc, 405, "external table is read-only"),
+            else => return try textResponse(self.alloc, 500, "write admission failed"),
+        };
         var status = self.catalog.buildStatus(namespace) catch return try textResponse(self.alloc, 500, "status failed");
         defer status.deinit(self.alloc);
         if (!status.publish_admitted) {
@@ -846,6 +850,11 @@ pub const HttpHandler = struct {
 
     fn handleIngestTableBatch(self: *HttpHandler, table_name: []const u8, body: []const u8) !HttpResponse {
         if (try self.requireMutableRoute()) |resp| return resp;
+        self.catalog.ensureTableWritesAllowed(table_name) catch |err| switch (err) {
+            error.NamespaceNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.ExternalTableReadOnly => return try textResponse(self.alloc, 405, "external table is read-only"),
+            else => return try textResponse(self.alloc, 500, "write admission failed"),
+        };
         var status = self.catalog.tableBuildStatus(table_name) catch return try textResponse(self.alloc, 500, "status failed");
         defer status.deinit(self.alloc);
         if (!status.publish_admitted) {
@@ -4350,6 +4359,15 @@ pub const HttpHandler = struct {
         _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         if (self.runtime_status.role == .query_only) return error.Unavailable;
+
+        self.catalog.ensureTableWritesAllowed(table_name) catch |err| switch (err) {
+            error.NamespaceNotFound => return error.NotFound,
+            error.ExternalTableReadOnly => return error.MethodNotAllowed,
+            else => {
+                std.log.err("serverless public table batch write admission failed table={s} err={}", .{ table_name, err });
+                return error.InternalFailure;
+            },
+        };
 
         var status = self.catalog.tableBuildStatus(table_name) catch |err| switch (err) {
             error.NamespaceNotFound => return error.NotFound,
