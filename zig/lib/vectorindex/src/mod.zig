@@ -23,6 +23,7 @@ pub const store = @import("store.zig");
 pub const posting = @import("posting.zig");
 pub const posting_segment = @import("posting_segment.zig");
 pub const posting_wal = @import("posting_wal.zig");
+pub const hbc_vector_directory = @import("hbc_vector_directory.zig");
 pub const hbc_runtime = @import("hbc_runtime.zig");
 pub const hbc = @import("hbc.zig");
 pub const hbc_index = @import("hbc_index.zig");

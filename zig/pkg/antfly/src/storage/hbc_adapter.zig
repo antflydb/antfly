@@ -63,6 +63,7 @@ const vectorindex_hbc_index = @import("antfly_vectorindex").hbc_index;
 const vectorindex_posting = @import("antfly_vectorindex").posting;
 const vectorindex_posting_segment = @import("antfly_vectorindex").posting_segment;
 const vectorindex_posting_wal = @import("antfly_vectorindex").posting_wal;
+const vectorindex_hbc_vector_directory = @import("antfly_vectorindex").hbc_vector_directory;
 const vectorindex_spfresh_index = @import("antfly_vectorindex").spfresh_index;
 const vectorindex_hbc_transfer = @import("antfly_vectorindex").hbc_transfer;
 const vectorindex_hbc_debug = @import("antfly_vectorindex").hbc_debug;
@@ -1410,8 +1411,9 @@ fn claimLocalClockSlot(clock_keys: []u64, start_slot: usize, key: u64) ?usize {
 
 const ExperimentalPostingReadState = struct {
     alloc: Allocator,
-    segment_bytes: []u8,
+    retained_segment: posting_segment_store_mod.RetainedSegment,
     segment: vectorindex_posting_segment.VerifiedReader,
+    vector_directory: ?vectorindex_hbc_vector_directory.Reader = null,
     wal: posting_segment_store_mod.RecoveredWal,
     materialized: std.AutoHashMapUnmanaged(u128, ?[]u8) = .empty,
 
@@ -1420,7 +1422,7 @@ const ExperimentalPostingReadState = struct {
         while (values.next()) |slot| if (slot.*) |owned| self.alloc.free(owned);
         self.materialized.deinit(self.alloc);
         self.segment.deinit();
-        self.alloc.free(self.segment_bytes);
+        self.retained_segment.deinit(self.alloc);
         self.wal.deinit();
         self.* = undefined;
     }
@@ -1429,12 +1431,13 @@ const ExperimentalPostingReadState = struct {
         if (self.materialized.get(experimentalPostingValueKey(posting_id, kind))) |maybe_value| {
             return maybe_value orelse error.NotFound;
         }
-        return switch (kind) {
-            .base => try self.segment.getBase(posting_id),
-            .quantized_checkpoint => try self.segment.getQuantizedCheckpoint(posting_id),
-            .posting_state => try self.segment.getPostingState(posting_id),
-            else => null,
+        if (self.vector_directory) |directory| switch (kind) {
+            .vector_leaf => return try directory.get(.leaf, posting_id),
+            .vector_metadata => return try directory.get(.metadata, posting_id),
+            else => {},
         };
+        const entry_kind = experimentalPostingSegmentKind(kind) orelse return null;
+        return try self.segment.getValue(posting_id, entry_kind);
     }
 
     fn set(self: *ExperimentalPostingReadState, posting_id: u64, kind: vectorindex_posting_wal.RecordKind, value_bytes: ?[]const u8) !void {
@@ -1448,13 +1451,17 @@ const ExperimentalPostingReadState = struct {
 
     fn materializeWal(self: *ExperimentalPostingReadState) !void {
         for (self.wal.replay.records.items) |record| switch (record.kind) {
-            .base, .quantized_checkpoint, .posting_state => try self.set(record.posting_id, record.kind, record.payload),
+            .base, .quantized_checkpoint, .posting_state, .node_range, .vector_leaf, .vector_metadata, .index_metadata => try self.set(record.posting_id, record.kind, record.payload),
             .mutation => {
                 if (record.payload.len < 6) return error.CorruptedPostingPatch;
                 const target: vectorindex_posting_wal.RecordKind = switch (record.payload[5]) {
                     @intFromEnum(vectorindex_posting_wal.RecordKind.base) => .base,
                     @intFromEnum(vectorindex_posting_wal.RecordKind.quantized_checkpoint) => .quantized_checkpoint,
                     @intFromEnum(vectorindex_posting_wal.RecordKind.posting_state) => .posting_state,
+                    @intFromEnum(vectorindex_posting_wal.RecordKind.node_range) => .node_range,
+                    @intFromEnum(vectorindex_posting_wal.RecordKind.vector_leaf) => .vector_leaf,
+                    @intFromEnum(vectorindex_posting_wal.RecordKind.vector_metadata) => .vector_metadata,
+                    @intFromEnum(vectorindex_posting_wal.RecordKind.index_metadata) => .index_metadata,
                     else => return error.InvalidPostingPatchTarget,
                 };
                 const base = self.value(record.posting_id, target) catch |err| switch (err) {
@@ -1470,15 +1477,36 @@ const ExperimentalPostingReadState = struct {
                 vectorindex_posting_wal.RecordKind.base,
                 vectorindex_posting_wal.RecordKind.quantized_checkpoint,
                 vectorindex_posting_wal.RecordKind.posting_state,
+                vectorindex_posting_wal.RecordKind.node_range,
+                vectorindex_posting_wal.RecordKind.vector_leaf,
+                vectorindex_posting_wal.RecordKind.vector_metadata,
+                vectorindex_posting_wal.RecordKind.index_metadata,
             }) |kind| try self.set(record.posting_id, kind, null),
             .base_tombstone => try self.set(record.posting_id, .base, null),
             .quantized_checkpoint_tombstone => try self.set(record.posting_id, .quantized_checkpoint, null),
             .posting_state_tombstone => try self.set(record.posting_id, .posting_state, null),
+            .node_range_tombstone => try self.set(record.posting_id, .node_range, null),
+            .vector_leaf_tombstone => try self.set(record.posting_id, .vector_leaf, null),
+            .vector_metadata_tombstone => try self.set(record.posting_id, .vector_metadata, null),
+            .index_metadata_tombstone => try self.set(record.posting_id, .index_metadata, null),
             .coverage => {},
             .centroid_directory, .commit => return error.UnsupportedExperimentalPostingWalRecord,
         };
     }
 };
+
+fn experimentalPostingSegmentKind(kind: vectorindex_posting_wal.RecordKind) ?vectorindex_posting_segment.EntryKind {
+    return switch (kind) {
+        .base => .base,
+        .quantized_checkpoint => .quantized_checkpoint,
+        .posting_state => .posting_state,
+        .node_range => .node_range,
+        .vector_leaf => .vector_leaf,
+        .vector_metadata => .vector_metadata,
+        .index_metadata => .index_metadata,
+        else => null,
+    };
+}
 
 /// Immutable query generation. A root owns a decoded segment/WAL snapshot;
 /// later generations own only the values changed by one committed derived
@@ -1566,6 +1594,10 @@ fn experimentalPostingValueKeyKind(key: u128) !vectorindex_posting_wal.RecordKin
         @intFromEnum(vectorindex_posting_wal.RecordKind.base) => .base,
         @intFromEnum(vectorindex_posting_wal.RecordKind.quantized_checkpoint) => .quantized_checkpoint,
         @intFromEnum(vectorindex_posting_wal.RecordKind.posting_state) => .posting_state,
+        @intFromEnum(vectorindex_posting_wal.RecordKind.node_range) => .node_range,
+        @intFromEnum(vectorindex_posting_wal.RecordKind.vector_leaf) => .vector_leaf,
+        @intFromEnum(vectorindex_posting_wal.RecordKind.vector_metadata) => .vector_metadata,
+        @intFromEnum(vectorindex_posting_wal.RecordKind.index_metadata) => .index_metadata,
         else => error.InvalidPostingPatchTarget,
     };
 }
@@ -3232,6 +3264,18 @@ pub const HBCIndex = struct {
         }
     }
 
+    fn experimentalPostingKindBenefitsFromPatch(kind: vectorindex_posting_wal.RecordKind) bool {
+        return switch (kind) {
+            // Packed nodes and quantized payloads contain long stable runs.
+            // The remaining values are small fixed-width or short metadata;
+            // walking an immutable generation chain and building an AFPD patch
+            // costs more than writing their complete value.
+            .base, .quantized_checkpoint, .posting_state => true,
+            .node_range, .vector_leaf, .vector_metadata, .index_metadata => false,
+            else => false,
+        };
+    }
+
     /// Must be called only after the authoritative HBC/source transaction has
     /// committed. It snapshots exactly the postings touched while capture was
     /// active into one committed derived-WAL batch.
@@ -3280,35 +3324,89 @@ pub const HBCIndex = struct {
 
         var txn = try self.store.beginRead();
         defer txn.abort();
+
+        const VectorLookup = struct {
+            logical_key: u128,
+            storage_key: [10]u8,
+
+            fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+                return std.mem.order(u8, &lhs.storage_key, &rhs.storage_key) == .lt;
+            }
+        };
+        var vector_lookup_count: usize = 0;
+        for (touched_keys) |key| switch (try experimentalPostingValueKeyKind(key)) {
+            .vector_leaf, .vector_metadata => vector_lookup_count += 1,
+            else => {},
+        };
+        const vector_lookups = try self.alloc.alloc(VectorLookup, vector_lookup_count);
+        defer self.alloc.free(vector_lookups);
+        var next_vector_lookup: usize = 0;
+        for (touched_keys) |key| {
+            const id = experimentalPostingValueKeyId(key);
+            const kind = try experimentalPostingValueKeyKind(key);
+            const storage_key = switch (kind) {
+                .vector_leaf => blk: {
+                    var buf: [10]u8 = undefined;
+                    _ = encodeVecLeafKey(&buf, id);
+                    break :blk buf;
+                },
+                .vector_metadata => blk: {
+                    var buf: [10]u8 = undefined;
+                    _ = encodeVecMetaKey(&buf, id);
+                    break :blk buf;
+                },
+                else => continue,
+            };
+            vector_lookups[next_vector_lookup] = .{ .logical_key = key, .storage_key = storage_key };
+            next_vector_lookup += 1;
+        }
+        std.mem.sort(VectorLookup, vector_lookups, {}, VectorLookup.lessThan);
+        const vector_key_views = try self.alloc.alloc([]const u8, vector_lookup_count);
+        defer self.alloc.free(vector_key_views);
+        const vector_values = try self.alloc.alloc(?[]const u8, vector_lookup_count);
+        defer self.alloc.free(vector_values);
+        for (vector_lookups, vector_key_views) |*lookup, *key| key.* = &lookup.storage_key;
+        if (vector_lookup_count > 0) try txn.getManySorted(.vecs, vector_key_views, vector_values);
+        var committed_vector_values = std.AutoHashMapUnmanaged(u128, ?[]const u8).empty;
+        defer committed_vector_values.deinit(self.alloc);
+        try committed_vector_values.ensureTotalCapacity(self.alloc, @intCast(vector_lookup_count));
+        for (vector_lookups, vector_values) |lookup, value| {
+            committed_vector_values.putAssumeCapacity(lookup.logical_key, value);
+        }
         for (touched_keys) |key| {
             const posting_id = experimentalPostingValueKeyId(key);
             const kind = try experimentalPostingValueKeyKind(key);
-            const current = self.readCommittedExperimentalPostingValue(&txn, posting_id, kind) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
-            if (current) |value| {
-                var emitted_patch = false;
-                const previous = (if (delta_base_generation) |generation|
-                    generation.value(posting_id, kind)
-                else
-                    delta_base_state.?.value(posting_id, kind)) catch |err| switch (err) {
+            const current = if (committed_vector_values.get(key)) |value|
+                value
+            else
+                self.readCommittedExperimentalPostingValue(&txn, posting_id, kind) catch |err| switch (err) {
                     error.NotFound => null,
                     else => return err,
                 };
-                if (previous) |base| {
-                    const patch = try vectorindex_posting_wal.encodeReplacementPatchAlloc(self.alloc, kind, base, value);
-                    if (patch.len < value.len) {
-                        owned_payloads.appendAssumeCapacity(patch);
-                        records.appendAssumeCapacity(.{
-                            .kind = .mutation,
-                            .posting_id = posting_id,
-                            .source_sequence = covered_source_sequence,
-                            .payload = patch,
-                        });
-                        emitted_patch = true;
-                    } else {
-                        self.alloc.free(patch);
+            if (current) |value| {
+                var emitted_patch = false;
+                if (experimentalPostingKindBenefitsFromPatch(kind)) {
+                    const previous = (if (delta_base_generation) |generation|
+                        generation.value(posting_id, kind)
+                    else
+                        delta_base_state.?.value(posting_id, kind)) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    if (previous) |base| {
+                        const patch = try vectorindex_posting_wal.encodeReplacementPatchAlloc(self.alloc, kind, base, value);
+                        if (patch.len < value.len) {
+                            owned_payloads.appendAssumeCapacity(patch);
+                            records.appendAssumeCapacity(.{
+                                .kind = .mutation,
+                                .posting_id = posting_id,
+                                .source_sequence = covered_source_sequence,
+                                .payload = patch,
+                            });
+                            emitted_patch = true;
+                        } else {
+                            self.alloc.free(patch);
+                        }
                     }
                 }
                 if (!emitted_patch) {
@@ -3327,6 +3425,10 @@ pub const HBCIndex = struct {
                         .base => .base_tombstone,
                         .quantized_checkpoint => .quantized_checkpoint_tombstone,
                         .posting_state => .posting_state_tombstone,
+                        .node_range => .node_range_tombstone,
+                        .vector_leaf => .vector_leaf_tombstone,
+                        .vector_metadata => .vector_metadata_tombstone,
+                        .index_metadata => .index_metadata_tombstone,
                         else => unreachable,
                     },
                     .posting_id = posting_id,
@@ -3352,10 +3454,13 @@ pub const HBCIndex = struct {
             for (touched_keys) |key| {
                 const posting_id = experimentalPostingValueKeyId(key);
                 const kind = try experimentalPostingValueKeyKind(key);
-                const current = self.readCommittedExperimentalPostingValue(&txn, posting_id, kind) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+                const current = if (committed_vector_values.get(key)) |value|
+                    value
+                else
+                    self.readCommittedExperimentalPostingValue(&txn, posting_id, kind) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
                 try state.set(posting_id, kind, current);
             }
         }
@@ -3398,6 +3503,19 @@ pub const HBCIndex = struct {
                 var key_buf: [10]u8 = undefined;
                 break :blk try txn.get(.quant, encodeQuantKey(&key_buf, posting_id));
             },
+            .node_range => blk: {
+                var key_buf: [12]u8 = undefined;
+                break :blk try txn.get(.nodes, encodeNodeKey(&key_buf, posting_id, .range));
+            },
+            .vector_leaf => blk: {
+                var key_buf: [10]u8 = undefined;
+                break :blk try txn.get(.vecs, encodeVecLeafKey(&key_buf, posting_id));
+            },
+            .vector_metadata => blk: {
+                var key_buf: [10]u8 = undefined;
+                break :blk try txn.get(.vecs, encodeVecMetaKey(&key_buf, posting_id));
+            },
+            .index_metadata => try txn.get(.meta, meta_key),
             else => error.InvalidPostingPatchTarget,
         };
     }
@@ -3428,6 +3546,13 @@ pub const HBCIndex = struct {
 
         var txn = try self.store.beginRead();
         defer txn.abort();
+
+        if (txn.get(.meta, meta_key)) |metadata| {
+            try writer.appendValueAt(0, .index_metadata, covered_source_sequence, metadata);
+        } else |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        }
         var node_id: u64 = 1;
         while (node_id <= self.metadata.node_count) : (node_id = std.math.add(u64, node_id, 1) catch break) {
             var node_key_buf: [12]u8 = undefined;
@@ -3437,6 +3562,14 @@ pub const HBCIndex = struct {
             };
             try writer.appendBaseAt(node_id, covered_source_sequence, packed_node);
             posting_count += 1;
+
+            var range_key_buf: [12]u8 = undefined;
+            if (txn.get(.nodes, encodeNodeKey(&range_key_buf, node_id, .range))) |range| {
+                try writer.appendValueAt(node_id, .node_range, covered_source_sequence, range);
+            } else |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            }
 
             var posting_key_buf: [12]u8 = undefined;
             if (txn.get(.nodes, encodeNodeKey(&posting_key_buf, node_id, .posting))) |posting_state| {
@@ -3454,6 +3587,26 @@ pub const HBCIndex = struct {
                 else => return err,
             }
         }
+
+        // Vector-to-leaf assignments and external-vector metadata share one
+        // compact ordered block instead of creating millions of generic
+        // segment entries and allocator objects at 1M scale. Raw `v:` vectors
+        // deliberately remain in the source store.
+        var vector_directory_writer = try vectorindex_hbc_vector_directory.Writer.init(self.alloc);
+        defer vector_directory_writer.deinit();
+        var vec_cursor = try txn.openCursor(.vecs);
+        defer vec_cursor.close();
+        var vec_entry = try vec_cursor.first();
+        while (vec_entry) |entry| : (vec_entry = try vec_cursor.next()) {
+            const decoded = decodeVectorDerivedKey(entry.key) orelse continue;
+            try vector_directory_writer.append(switch (decoded.kind) {
+                .vector_leaf => .leaf,
+                .vector_metadata => .metadata,
+                else => unreachable,
+            }, decoded.vector_id, entry.value);
+        }
+        const vector_directory = try vector_directory_writer.build();
+        try writer.appendValueOwnedAt(0, .vector_directory, covered_source_sequence, vector_directory);
         const segment_bytes = try writer.build();
         defer self.alloc.free(segment_bytes);
         try posting_store.publishCheckpoint(generation, covered_source_sequence, segment_bytes);
@@ -3590,16 +3743,29 @@ pub const HBCIndex = struct {
         var opened = try self.openExperimentalPostingStoreWithSegment();
         defer opened.store.deinit();
         var segment_bytes_owned = true;
-        errdefer if (segment_bytes_owned) self.alloc.free(opened.segment_bytes);
+        errdefer if (segment_bytes_owned) opened.segment.deinit(self.alloc);
         if (opened.store.checkpoint == null) return error.MissingPostingCheckpoint;
         if (expected_source_sequence) |expected| if (opened.store.covered_source_sequence != expected) {
             return error.PostingCheckpointSequenceMismatch;
         };
 
-        const segment_bytes = opened.segment_bytes;
+        const segment_bytes = opened.segment.bytes();
         var segment = try vectorindex_posting_segment.VerifiedReader.init(self.alloc, segment_bytes);
         var segment_owned = true;
         errdefer if (segment_owned) segment.deinit();
+        if (try segment.getValue(0, .index_metadata)) |encoded_metadata| {
+            const checkpoint_metadata = IndexMetadata.decode(encoded_metadata);
+            if (checkpoint_metadata.version != self.metadata.version or
+                checkpoint_metadata.dims != self.metadata.dims or
+                checkpoint_metadata.branching_factor != self.metadata.branching_factor or
+                checkpoint_metadata.leaf_size != self.metadata.leaf_size or
+                checkpoint_metadata.use_quantization != self.metadata.use_quantization or
+                checkpoint_metadata.quantizer_seed != self.metadata.quantizer_seed or
+                checkpoint_metadata.metric != self.metadata.metric)
+            {
+                return error.PostingCheckpointMetadataMismatch;
+            }
+        }
         var wal = try opened.store.recoverWal();
         var wal_owned = true;
         errdefer if (wal_owned) wal.deinit();
@@ -3607,22 +3773,38 @@ pub const HBCIndex = struct {
             .base,
             .quantized_checkpoint,
             .posting_state,
+            .node_range,
+            .vector_leaf,
+            .vector_metadata,
+            .index_metadata,
             .tombstone,
             .base_tombstone,
             .quantized_checkpoint_tombstone,
             .posting_state_tombstone,
+            .node_range_tombstone,
+            .vector_leaf_tombstone,
+            .vector_metadata_tombstone,
+            .index_metadata_tombstone,
             .mutation,
             .coverage,
             => {},
             .centroid_directory, .commit => return error.UnsupportedExperimentalPostingWalRecord,
         };
 
+        // The directory validates its compact index eagerly and values lazily.
+        // Avoid the generic segment payload CRC here: hashing the entire nested
+        // container would fault every metadata page on an otherwise cold mmap.
+        const vector_directory = if (try segment.getNestedContainer(0, .vector_directory)) |bytes|
+            try vectorindex_hbc_vector_directory.Reader.init(bytes)
+        else
+            null;
         const state = try self.alloc.create(ExperimentalPostingReadState);
         errdefer self.alloc.destroy(state);
         state.* = .{
             .alloc = self.alloc,
-            .segment_bytes = segment_bytes,
+            .retained_segment = opened.segment,
             .segment = segment,
+            .vector_directory = vector_directory,
             .wal = wal,
         };
         segment_bytes_owned = false;
@@ -3668,6 +3850,15 @@ pub const HBCIndex = struct {
             .pointer => |ptr| ptr.child,
             else => @compileError("expected pointer to transaction-like type"),
         };
+    }
+
+    pub fn txnUsesImmutableGeneration(self: *HBCIndex, txn: anytype) bool {
+        _ = self;
+        const Child = comptime txnLikeChild(@TypeOf(txn));
+        return if (comptime Child == vectorindex_store.NamespaceReadTxn)
+            txn.read_lease != null
+        else
+            false;
     }
 
     pub fn bindTxnLike(self: *HBCIndex, txn: anytype) !void {
@@ -3787,6 +3978,25 @@ pub const HBCIndex = struct {
         return std.mem.readInt(u64, key[2..10], .big);
     }
 
+    fn decodeVectorDerivedKey(key: []const u8) ?struct {
+        vector_id: u64,
+        kind: vectorindex_posting_wal.RecordKind,
+    } {
+        if (key.len != 10 or key[1] != ':') return null;
+        const kind: vectorindex_posting_wal.RecordKind = switch (key[0]) {
+            'l' => .vector_leaf,
+            'm' => .vector_metadata,
+            // Raw vectors are source-owned when an external loader is
+            // configured. Index-local vectors need a separately sharded block
+            // container rather than inflating the compact posting segment.
+            else => return null,
+        };
+        return .{
+            .vector_id = std.mem.readInt(u64, key[2..10], .big),
+            .kind = kind,
+        };
+    }
+
     fn experimentalPostingMutationIdentity(namespace: Namespace, key: []const u8) ?struct {
         posting_id: u64,
         kind: vectorindex_posting_wal.RecordKind,
@@ -3797,6 +4007,7 @@ pub const HBCIndex = struct {
                 break :blk switch (decoded.suffix) {
                     .packed_node => .{ .posting_id = decoded.id, .kind = .base },
                     .posting => .{ .posting_id = decoded.id, .kind = .posting_state },
+                    .range => .{ .posting_id = decoded.id, .kind = .node_range },
                     else => return null,
                 };
             },
@@ -3804,7 +4015,15 @@ pub const HBCIndex = struct {
                 .posting_id = decodeQuantizedNodeId(key) orelse return null,
                 .kind = .quantized_checkpoint,
             },
-            .meta, .vecs => null,
+            // Projection/applied-sequence changes share the global metadata
+            // row but are not query-derived index mutations. The immutable
+            // checkpoint retains a recovery/config copy; runtime metadata
+            // remains sourced from the authoritative catalog.
+            .meta => null,
+            .vecs => if (decodeVectorDerivedKey(key)) |decoded|
+                .{ .posting_id = decoded.vector_id, .kind = decoded.kind }
+            else
+                null,
         };
     }
 
@@ -3836,6 +4055,7 @@ pub const HBCIndex = struct {
                 break :blk switch (decoded.suffix) {
                     .packed_node => try generation.value(decoded.id, .base),
                     .posting => try generation.value(decoded.id, .posting_state),
+                    .range => try generation.value(decoded.id, .node_range),
                     else => null,
                 };
             },
@@ -3843,8 +4063,42 @@ pub const HBCIndex = struct {
                 const node_id = decodeQuantizedNodeId(key) orelse break :blk null;
                 break :blk try generation.value(node_id, .quantized_checkpoint);
             },
-            .meta, .vecs => null,
+            // Global metadata also carries mutable projection watermarks. It
+            // is retained in the checkpoint for recovery/config migration but
+            // continues to read from the authoritative catalog until those
+            // concerns have separate records.
+            .meta => null,
+            .vecs => blk: {
+                const decoded = decodeVectorDerivedKey(key) orelse break :blk null;
+                break :blk try generation.value(decoded.vector_id, decoded.kind);
+            },
         };
+    }
+
+    /// Batch lookups must honor the same immutable transaction lease as point
+    /// reads; otherwise rerank metadata and split planning silently fall back
+    /// to a newer LSM snapshot than the posting generation.
+    pub fn getNamespacedManySorted(
+        self: *HBCIndex,
+        txn: anytype,
+        comptime namespace: Namespace,
+        keys: []const []const u8,
+        values: []?[]const u8,
+    ) !void {
+        if (keys.len != values.len) return error.InvalidArgument;
+        const Child = comptime txnLikeChild(@TypeOf(txn));
+        if (comptime Child == vectorindex_store.NamespaceReadTxn) {
+            if (txn.read_lease != null) {
+                for (keys, values) |key, *value| {
+                    value.* = self.getNamespaced(txn, namespace, key) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                }
+                return;
+            }
+        }
+        try txn.getManySorted(namespace, keys, values);
     }
 
     pub fn getNamespaced(self: *HBCIndex, txn: anytype, comptime namespace: Namespace, key: []const u8) ![]const u8 {
@@ -8180,6 +8434,7 @@ test "experimental posting checkpoint reopens safely and publishes immutable gen
         try std.testing.expectError(error.PostingCheckpointSequenceMismatch, reopened.activateExperimentalPostingReads(4));
         try reopened.activateExperimentalPostingReads(3);
         try std.testing.expect(reopened.experimentalPostingReadsEnabled());
+        try std.testing.expect(reopened.experimental_posting_read_generation.?.root.?.retained_segment.isMapped());
 
         var results = try reopened.search(&[_]f32{ 1.0, 0.0 }, 1);
         defer results.deinit();
@@ -8188,6 +8443,8 @@ test "experimental posting checkpoint reopens safely and publishes immutable gen
         var old_txn = try reopened.beginReadTxn();
         defer old_txn.abort();
         try std.testing.expect(old_txn.read_lease != null);
+        try std.testing.expectEqualStrings("doc:1", (try reopened.getMetadataInTxn(&old_txn, 1)).?);
+        _ = try reopened.getVecLeaf(&old_txn, 1);
         var root_key_buf: [12]u8 = undefined;
         const root_key = encodeNodeKey(&root_key_buf, reopened.metadata.root_node, .packed_node);
         const old_root = try alloc.dupe(u8, try reopened.getNamespaced(&old_txn, .nodes, root_key));
@@ -8210,10 +8467,13 @@ test "experimental posting checkpoint reopens safely and publishes immutable gen
         // A transaction opened before publication remains pinned to the old
         // immutable generation; a new transaction sees the complete overlay.
         try std.testing.expectEqualSlices(u8, old_root, try reopened.getNamespaced(&old_txn, .nodes, root_key));
+        try std.testing.expectEqual(@as(?[]const u8, null), try reopened.getMetadataInTxn(&old_txn, 3));
         var new_txn = try reopened.beginReadTxn();
         defer new_txn.abort();
         try std.testing.expect(new_txn.read_lease != null);
         try std.testing.expect(!std.mem.eql(u8, old_root, try reopened.getNamespaced(&new_txn, .nodes, root_key)));
+        try std.testing.expectEqualStrings("doc:3", (try reopened.getMetadataInTxn(&new_txn, 3)).?);
+        _ = try reopened.getVecLeaf(&new_txn, 3);
 
         var after_write = try reopened.search(&[_]f32{ 0.5, 0.5 }, 3);
         defer after_write.deinit();
@@ -8281,9 +8541,17 @@ test "managed posting sidecar follows applied sequence and uncovered writes inva
             .base,
             .quantized_checkpoint,
             .posting_state,
+            .node_range,
+            .vector_leaf,
+            .vector_metadata,
+            .index_metadata,
             .base_tombstone,
             .quantized_checkpoint_tombstone,
             .posting_state_tombstone,
+            .node_range_tombstone,
+            .vector_leaf_tombstone,
+            .vector_metadata_tombstone,
+            .index_metadata_tombstone,
             .tombstone,
             .mutation,
             => if (record.source_sequence == 3) {
@@ -10377,7 +10645,7 @@ test "coalesced batch insert keeps routed child nodes stable across cache evicti
     try std.testing.expect(results.getHits().len > 0);
 }
 
-test "mixed delete write batch routes covered replacements as absent" {
+test "mixed delete write batch keeps covered replacements on sequential routing" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
     const path = tp.init();
@@ -10414,9 +10682,11 @@ test "mixed delete write batch routes covered replacements as absent" {
 
     const profile = idx.getWriteProfile();
     try std.testing.expectEqual(@as(u64, 5), idx.stats().active_count);
-    try std.testing.expectEqual(@as(u64, 1), profile.batch_route_calls);
-    try std.testing.expect(profile.batch_route_internal_nodes > 0);
-    try std.testing.expectEqual(@as(u64, writes.len), profile.batch_route_items);
+    // Transaction-local deletes allow the existence lookup to be skipped, but
+    // are not proof that grouped routing against one pre-insert topology is
+    // quality-safe. This pins the replacement invariant documented above.
+    try std.testing.expectEqual(@as(u64, 0), profile.batch_route_calls);
+    try std.testing.expectEqual(@as(u64, 0), profile.batch_route_items);
 
     var results = try idx.search(&[_]f32{ 20.2, 20.0 }, 1);
     defer results.deinit();

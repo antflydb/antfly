@@ -26,7 +26,7 @@ const posting_segment = @import("posting_segment.zig");
 pub const PostingId = posting_segment.PostingId;
 
 const magic: u32 = 0x41465057; // AFPW
-const version: u16 = 4;
+const version: u16 = 5;
 const min_supported_version: u16 = 1;
 const frame_header_len: usize = 48;
 const checksum_offset: usize = 12;
@@ -45,6 +45,14 @@ pub const RecordKind = enum(u8) {
     posting_state_tombstone = 9,
     /// Advances source coverage when a journal batch has no posting changes.
     coverage = 10,
+    node_range = 11,
+    vector_leaf = 12,
+    vector_metadata = 13,
+    index_metadata = 14,
+    node_range_tombstone = 15,
+    vector_leaf_tombstone = 16,
+    vector_metadata_tombstone = 17,
+    index_metadata_tombstone = 18,
     commit = 255,
 };
 
@@ -175,6 +183,10 @@ pub fn applyReplacementPatchAlloc(
         @intFromEnum(RecordKind.base) => .base,
         @intFromEnum(RecordKind.quantized_checkpoint) => .quantized_checkpoint,
         @intFromEnum(RecordKind.posting_state) => .posting_state,
+        @intFromEnum(RecordKind.node_range) => .node_range,
+        @intFromEnum(RecordKind.vector_leaf) => .vector_leaf,
+        @intFromEnum(RecordKind.vector_metadata) => .vector_metadata,
+        @intFromEnum(RecordKind.index_metadata) => .index_metadata,
         else => return error.InvalidPostingPatchTarget,
     };
     const base_len: usize = @intCast(std.mem.readInt(u32, payload[8..12], .big));
@@ -478,10 +490,17 @@ const lookup_record_kinds = [_]RecordKind{
     .centroid_directory,
     .quantized_checkpoint,
     .posting_state,
+    .node_range,
+    .vector_leaf,
+    .vector_metadata,
+    .index_metadata,
 };
 
 fn isLookupValueKind(kind: RecordKind) bool {
-    return kind == .base or kind == .quantized_checkpoint or kind == .posting_state;
+    return switch (kind) {
+        .base, .quantized_checkpoint, .posting_state, .node_range, .vector_leaf, .vector_metadata, .index_metadata => true,
+        else => false,
+    };
 }
 
 fn postingKindKey(posting_id: PostingId, kind: RecordKind) u128 {
@@ -493,6 +512,10 @@ fn tombstoneTarget(kind: RecordKind) ?RecordKind {
         .base_tombstone => .base,
         .quantized_checkpoint_tombstone => .quantized_checkpoint,
         .posting_state_tombstone => .posting_state,
+        .node_range_tombstone => .node_range,
+        .vector_leaf_tombstone => .vector_leaf,
+        .vector_metadata_tombstone => .vector_metadata,
+        .index_metadata_tombstone => .index_metadata,
         else => null,
     };
 }
@@ -573,6 +596,14 @@ fn decodeFrame(bytes: []const u8) !?DecodedFrame {
         @intFromEnum(RecordKind.quantized_checkpoint_tombstone) => .quantized_checkpoint_tombstone,
         @intFromEnum(RecordKind.posting_state_tombstone) => .posting_state_tombstone,
         @intFromEnum(RecordKind.coverage) => .coverage,
+        @intFromEnum(RecordKind.node_range) => .node_range,
+        @intFromEnum(RecordKind.vector_leaf) => .vector_leaf,
+        @intFromEnum(RecordKind.vector_metadata) => .vector_metadata,
+        @intFromEnum(RecordKind.index_metadata) => .index_metadata,
+        @intFromEnum(RecordKind.node_range_tombstone) => .node_range_tombstone,
+        @intFromEnum(RecordKind.vector_leaf_tombstone) => .vector_leaf_tombstone,
+        @intFromEnum(RecordKind.vector_metadata_tombstone) => .vector_metadata_tombstone,
+        @intFromEnum(RecordKind.index_metadata_tombstone) => .index_metadata_tombstone,
         @intFromEnum(RecordKind.commit) => .commit,
         else => return error.InvalidPostingWalRecord,
     };
@@ -591,10 +622,12 @@ fn decodeFrame(bytes: []const u8) !?DecodedFrame {
 pub const Checkpoint = struct {
     pub const encoded_len: usize = 52;
     const checkpoint_magic: [4]u8 = "AFPC".*;
-    const checkpoint_version: u16 = 1;
+    const checkpoint_version: u16 = 2;
+    const min_checkpoint_version: u16 = 1;
 
     segment_generation: u64,
     segment_checksum: u32,
+    segment_admission_checksum: u32 = 0,
     wal_generation: u64,
     wal_committed_bytes: u64,
     covered_source_sequence: u64,
@@ -606,7 +639,7 @@ pub const Checkpoint = struct {
         std.mem.writeInt(u16, out[6..8], 0, .big);
         std.mem.writeInt(u64, out[8..16], self.segment_generation, .big);
         std.mem.writeInt(u32, out[16..20], self.segment_checksum, .big);
-        std.mem.writeInt(u32, out[20..24], 0, .big);
+        std.mem.writeInt(u32, out[20..24], self.segment_admission_checksum, .big);
         std.mem.writeInt(u64, out[24..32], self.wal_generation, .big);
         std.mem.writeInt(u64, out[32..40], self.wal_committed_bytes, .big);
         std.mem.writeInt(u64, out[40..48], self.covered_source_sequence, .big);
@@ -617,8 +650,11 @@ pub const Checkpoint = struct {
     pub fn decode(bytes: []const u8) !Checkpoint {
         if (bytes.len != encoded_len) return error.InvalidPostingCheckpoint;
         if (!std.mem.eql(u8, bytes[0..4], &checkpoint_magic)) return error.BadPostingCheckpointMagic;
-        if (std.mem.readInt(u16, bytes[4..6], .big) != checkpoint_version) return error.UnsupportedPostingCheckpointVersion;
-        if (std.mem.readInt(u16, bytes[6..8], .big) != 0 or std.mem.readInt(u32, bytes[20..24], .big) != 0) {
+        const encoded_version = std.mem.readInt(u16, bytes[4..6], .big);
+        if (encoded_version < min_checkpoint_version or encoded_version > checkpoint_version) return error.UnsupportedPostingCheckpointVersion;
+        if (std.mem.readInt(u16, bytes[6..8], .big) != 0 or
+            (encoded_version == 1 and std.mem.readInt(u32, bytes[20..24], .big) != 0))
+        {
             return error.UnsupportedPostingCheckpointFlags;
         }
         if (std.mem.readInt(u32, bytes[48..52], .big) != std.hash.Crc32.hash(bytes[0..48])) {
@@ -627,6 +663,7 @@ pub const Checkpoint = struct {
         return .{
             .segment_generation = std.mem.readInt(u64, bytes[8..16], .big),
             .segment_checksum = std.mem.readInt(u32, bytes[16..20], .big),
+            .segment_admission_checksum = if (encoded_version >= 2) std.mem.readInt(u32, bytes[20..24], .big) else 0,
             .wal_generation = std.mem.readInt(u64, bytes[24..32], .big),
             .wal_committed_bytes = std.mem.readInt(u64, bytes[32..40], .big),
             .covered_source_sequence = std.mem.readInt(u64, bytes[40..48], .big),
@@ -719,6 +756,7 @@ pub fn testCheckpointRoundTripAndChecksum() !void {
     const expected: Checkpoint = .{
         .segment_generation = 8,
         .segment_checksum = 0x12345678,
+        .segment_admission_checksum = 0x87654321,
         .wal_generation = 9,
         .wal_committed_bytes = 4096,
         .covered_source_sequence = 1234,
@@ -726,6 +764,14 @@ pub fn testCheckpointRoundTripAndChecksum() !void {
     var encoded = expected.encode();
     const decoded = try Checkpoint.decode(&encoded);
     try std.testing.expectEqualDeep(expected, decoded);
+
+    // V1 used the same fixed layout but reserved bytes 20..24. It remains
+    // readable and deliberately requests the legacy whole-file checksum.
+    var legacy = encoded;
+    std.mem.writeInt(u16, legacy[4..6], 1, .big);
+    @memset(legacy[20..24], 0);
+    std.mem.writeInt(u32, legacy[48..52], std.hash.Crc32.hash(legacy[0..48]), .big);
+    try std.testing.expectEqual(@as(u32, 0), (try Checkpoint.decode(&legacy)).segment_admission_checksum);
     encoded[10] ^= 1;
     try std.testing.expectError(error.PostingCheckpointChecksumMismatch, Checkpoint.decode(&encoded));
 }
@@ -802,6 +848,22 @@ test "posting WAL kind tombstones mask only their target" {
     try std.testing.expectEqualStrings("base-v2", replay.resolve(7, .base).value.payload);
     try std.testing.expect(replay.resolve(7, .quantized_checkpoint) == .tombstone);
     try std.testing.expect(replay.resolve(7, .posting_state) == .missing);
+}
+
+test "posting WAL resolves compact HBC derived values and tombstones" {
+    const alloc = std.testing.allocator;
+    var writer = Writer.init(alloc);
+    defer writer.deinit();
+    try writer.append(.vector_metadata, 1, 42, 100, "doc:42");
+    try writer.append(.vector_leaf, 1, 42, 100, "leaf:7");
+    try writer.commit(1, 100);
+    try writer.append(.vector_metadata_tombstone, 2, 42, 101, &.{});
+    try writer.commit(2, 101);
+
+    var replay = try Replay.parse(alloc, writer.bytes());
+    defer replay.deinit();
+    try std.testing.expect(replay.resolve(42, .vector_metadata) == .tombstone);
+    try std.testing.expectEqualStrings("leaf:7", replay.resolve(42, .vector_leaf).value.payload);
 }
 
 test "posting WAL replacement patches round trip and reject the wrong base" {

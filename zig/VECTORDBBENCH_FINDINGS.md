@@ -765,6 +765,76 @@ admitted the same 16 MB segment at exact sequence 501. Focused tests pin an old
 generation across publication and prove that a new transaction sees the new
 posting bytes while the old transaction remains unchanged.
 
+### Full derived-state segment follow-up
+
+The posting sidecar now contains the complete query-facing derived HBC state,
+not only packed postings and quantized payloads. Packed nodes already contain
+centroids and child/member topology. The segment adds node split ranges and a
+compact vector directory for vector-to-leaf assignments and result metadata.
+The checkpoint also retains the stable index configuration needed to reject an
+incompatible generation during recovery. Projection watermarks remain in the
+authoritative catalog because they have a different mutation lifetime.
+
+The vector directory is an ordered immutable block rather than one generic
+segment object per vector. It uses a contiguous value area, a fixed-width
+binary-search index, an index checksum, and per-value checksums. This avoids
+millions of allocator objects at 1M scale. Raw embeddings deliberately remain
+source-owned when HBC has an external vector loader; copying the 1M corpus into
+one posting checkpoint would be duplicate storage and a poor mmap/RSS boundary.
+
+Native segment admission now retains a read-only mmap. Checkpoint v2 verifies
+the segment header, footer, and complete index without faulting all payload
+pages; posting payloads and vector-directory values are verified on first
+access. Legacy v1 checkpoints retain whole-file checksum admission. The nested
+vector directory does not pay a redundant outer payload scan: its own index is
+checked eagerly and the requested leaf/metadata value is checked lazily.
+Memory and object-storage implementations safely fall back to owned bytes.
+
+Every read transaction leases one immutable generation. Batch reads for split
+ranges, leaf assignments, vectors, and result metadata use that same lease.
+Leased queries bypass the process-global metadata cache, which prevents an old
+query from observing metadata admitted by a newer generation and lets mmap
+pages replace duplicate heap residency. A test pins an old transaction across
+publication and verifies that only a new transaction observes the replacement
+topology and metadata.
+
+The first public 50K run exposed avoidable capture overhead: tiny leaf and
+metadata values performed scalar LSM reads and walked the immutable generation
+chain to attempt replacement patches. It inserted in 44.79 seconds and became
+ready in 51.60 seconds. Batch-reading all touched vector values once and only
+patching large packed/quantized posting families recovered the expected load
+rate:
+
+| Public 50K full-derived checkpoint | Insert | Catch-up | Total ready | Snapshot copies | Sidecar | Peak RSS | Peak attributable demand |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Before capture fast path | 44.79 s | 6.81 s | 51.60 s | 133 MB | 19 MB | 1.60 GB | 1.16 GB during load |
+| Batched tiny-value capture | 36.19 s | 13.41 s | 49.61 s | 116 MB | 17 MB + 5.9 MB WAL | 1.80 GB | 1.23 GB |
+
+The optimized insert is back in the 30--40 second target range. Total-ready
+time varies with asynchronous catch-up/checkpoint scheduling, so insert and
+catch-up are reported separately. Both runs reached sequence 501 with all
+50,000 vectors query-visible. The second row is a single diagnostic sample;
+the RSS high-water occurred after the peak attributable-demand sample and is
+cache-inclusive.
+
+The full-derived query run preserved the existing boundary-rerank policy and
+measured recall 0.9842 with serial p50/p95/p99 of 2.5/3.0/6.8 ms. Throughput
+was 100 QPS at concurrency 1, 625 at 5, 698 at 20, and 774 at 40. Higher
+concurrency crossed public-server admission and produced HTTP 429 responses,
+so its nominal 905/985 QPS at 60/80 is not an accepted saturation result.
+Restart admitted the mmap generation at exact sequence 501 and served 110 QPS
+at concurrency 1 and 695 at concurrency 5 before the external harness was
+interrupted. Recall remained within the prior public runs' normal spread.
+
+This does **not** yet remove derived HBC keys from the general LSM. The segment
+and WAL are a rebuildable acceleration while the LSM/source journal remains
+the recovery authority and supplies transaction-local read-your-writes. Safely
+removing duplicate derived persistence requires a transactional delta writer
+that participates in HBC mutations, supports rollback/read-your-writes, and
+has an explicit rebuild/failover contract. Deleting LSM keys after commit or
+making the current post-commit capture authoritative would create a crash
+window and is not an acceptable benchmark optimization.
+
 The follow-up sampler had one incomplete `vmmap` sample while the original
 server process was exiting; its RSS fallback made the synthesized
 `demand_peak_bytes` invalid. The table therefore reports the complete
@@ -820,6 +890,11 @@ published.
    uninterrupted through maintenance and delayed applied-sequence callbacks.
    Preserve exact source-sequence admission, safe failure fallback, normal
    rerank-policy boundaries, and identical LSM/sidecar ranked results.
-6. Compare eager single-read segment admission with mmap and footer/index-first
-   range admission at 50K and 1M. Include page-cache/RSS accounting; do not
-   trade a lower startup timer for unbounded mapped or decoded residency.
+6. Repeat the public 1M qualification with the full derived-state directory,
+   mmap/index-first admission, and batched tiny-value capture. Track insert,
+   catch-up, recall, serial and saturated query latency, segment/WAL size,
+   snapshot copies, attributable demand, and cache-inclusive RSS separately.
+7. Before removing derived HBC keys from the LSM, prototype a transactional
+   segment-WAL mutation backend with rollback and read-your-writes. Prove crash
+   recovery at every source/derived publication boundary and preserve the
+   existing authoritative-journal rebuild path.

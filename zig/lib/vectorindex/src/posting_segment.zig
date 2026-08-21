@@ -40,6 +40,11 @@ pub const EntryKind = enum(u8) {
     quantized_checkpoint = 4,
     tombstone = 5,
     posting_state = 6,
+    node_range = 7,
+    vector_leaf = 8,
+    vector_metadata = 9,
+    index_metadata = 10,
+    vector_directory = 11,
 };
 
 pub const DeltaValue = struct {
@@ -168,6 +173,19 @@ pub const Writer = struct {
             .kind = .posting_state,
             .sequence = sequence,
         }, value);
+    }
+
+    /// Appends any current HBC-derived value. The physical container is keyed
+    /// by a generic u64 identity even though the historical API calls it a
+    /// posting id; vector ids and the singleton metadata id therefore share
+    /// the same compact index without key encoding overhead.
+    pub fn appendValueAt(self: *Writer, id: PostingId, kind: EntryKind, sequence: u64, value: []const u8) !void {
+        try self.appendEntry(.{ .posting_id = id, .kind = kind, .sequence = sequence }, value);
+    }
+
+    /// Transfers ownership of `value`, including on error.
+    pub fn appendValueOwnedAt(self: *Writer, id: PostingId, kind: EntryKind, sequence: u64, value: []u8) !void {
+        try self.appendEntryOwned(.{ .posting_id = id, .kind = kind, .sequence = sequence }, value);
     }
 
     pub fn appendTombstone(self: *Writer, posting_id: PostingId, sequence: u64) !void {
@@ -319,6 +337,11 @@ pub const Reader = struct {
         return if (result) |found| found.value else null;
     }
 
+    pub fn getValue(self: Reader, id: PostingId, kind: EntryKind) !?[]const u8 {
+        const result = try self.getLatest(id, kind);
+        return if (result) |found| found.value else null;
+    }
+
     pub fn deltas(self: Reader, posting_id: PostingId) DeltaIterator {
         return .{
             .reader = self,
@@ -373,6 +396,11 @@ pub const Reader = struct {
             @intFromEnum(EntryKind.quantized_checkpoint) => .quantized_checkpoint,
             @intFromEnum(EntryKind.tombstone) => .tombstone,
             @intFromEnum(EntryKind.posting_state) => .posting_state,
+            @intFromEnum(EntryKind.node_range) => .node_range,
+            @intFromEnum(EntryKind.vector_leaf) => .vector_leaf,
+            @intFromEnum(EntryKind.vector_metadata) => .vector_metadata,
+            @intFromEnum(EntryKind.index_metadata) => .index_metadata,
+            @intFromEnum(EntryKind.vector_directory) => .vector_directory,
             else => return error.CorruptedPostingSegment,
         };
         const offset = std.math.cast(usize, readU64(raw[17..25])) orelse return error.CorruptedPostingSegment;
@@ -403,6 +431,15 @@ pub const Reader = struct {
         }
     }
 };
+
+/// Checksums the eagerly validated footer and index, excluding opaque payload
+/// bytes that already carry lazy per-entry checksums. A durable publication
+/// pointer can use this fingerprint to admit an mmap without faulting every
+/// payload page at startup.
+pub fn admissionChecksum(data: []const u8) !u32 {
+    const reader = try Reader.init(data);
+    return std.hash.Crc32.hash(data[reader.index_offset..]);
+}
 
 pub const VerifiedReader = struct {
     const Verification = std.atomic.Value(u8);
@@ -439,6 +476,21 @@ pub const VerifiedReader = struct {
     pub fn getPostingState(self: *VerifiedReader, posting_id: PostingId) !?[]const u8 {
         const result = try self.getLatest(posting_id, .posting_state);
         return if (result) |found| found.value else null;
+    }
+
+    pub fn getValue(self: *VerifiedReader, id: PostingId, kind: EntryKind) !?[]const u8 {
+        const result = try self.getLatest(id, kind);
+        return if (result) |found| found.value else null;
+    }
+
+    /// Returns a nested container without checksumming its complete payload.
+    /// The posting segment index still authenticates the container bounds;
+    /// the nested format must validate its own header/index and lazily verify
+    /// each value. Restrict this API so ordinary posting values cannot bypass
+    /// their payload checksum by accident.
+    pub fn getNestedContainer(self: *VerifiedReader, id: PostingId, kind: EntryKind) !?[]const u8 {
+        if (kind != .vector_directory) return error.NotNestedPostingContainer;
+        return try self.reader.getValue(id, kind);
     }
 
     fn getLatest(self: *VerifiedReader, posting_id: PostingId, kind: EntryKind) !?SequencedValue {
@@ -680,4 +732,36 @@ test "posting segment validates index and payload checksums" {
 
 test "posting segment verified reader memoizes payload status" {
     try testVerifiedReaderMemoizesPayloadStatus();
+}
+
+test "posting segment stores compact HBC derived families" {
+    const alloc = std.testing.allocator;
+    var writer = Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendValueAt(7, .node_range, 10, "range");
+    try writer.appendValueAt(42, .vector_leaf, 10, "leaf");
+    try writer.appendValueAt(42, .vector_metadata, 10, "metadata");
+    try writer.appendValueAt(0, .index_metadata, 10, "index");
+    const bytes = try writer.build();
+    defer alloc.free(bytes);
+    try std.testing.expect((try admissionChecksum(bytes)) != 0);
+    var reader = try VerifiedReader.init(alloc, bytes);
+    defer reader.deinit();
+    try std.testing.expectEqualStrings("range", (try reader.getValue(7, .node_range)).?);
+    try std.testing.expectEqualStrings("leaf", (try reader.getValue(42, .vector_leaf)).?);
+    try std.testing.expectEqualStrings("metadata", (try reader.getValue(42, .vector_metadata)).?);
+    try std.testing.expectEqualStrings("index", (try reader.getValue(0, .index_metadata)).?);
+}
+
+test "posting segment nested container avoids eager payload verification" {
+    const alloc = std.testing.allocator;
+    var writer = Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendValueAt(0, .vector_directory, 1, "nested payload");
+    const bytes = try writer.build();
+    defer alloc.free(bytes);
+    var reader = try VerifiedReader.init(alloc, bytes);
+    defer reader.deinit();
+    try std.testing.expectEqualStrings("nested payload", (try reader.getNestedContainer(0, .vector_directory)).?);
+    try std.testing.expectError(error.NotNestedPostingContainer, reader.getNestedContainer(0, .base));
 }

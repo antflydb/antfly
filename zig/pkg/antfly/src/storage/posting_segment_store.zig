@@ -12,6 +12,7 @@
 //! after CURRENT is durably replaced.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const lsm_backend = @import("lsm_backend/mod.zig");
 const vectorindex = @import("antfly_vectorindex");
@@ -22,6 +23,33 @@ const current_name = "CURRENT";
 const max_control_bytes = posting_wal.Checkpoint.encoded_len;
 const max_wal_bytes: usize = 512 * 1024 * 1024;
 const max_segment_bytes: usize = if (@sizeOf(usize) >= 8) 4 * 1024 * 1024 * 1024 else std.math.maxInt(usize);
+
+pub const RetainedSegment = union(enum) {
+    heap: []u8,
+    mapped: []align(std.heap.page_size_min) u8,
+
+    pub fn bytes(self: RetainedSegment) []const u8 {
+        return switch (self) {
+            .heap => |data| data,
+            .mapped => |data| data,
+        };
+    }
+
+    pub fn isMapped(self: RetainedSegment) bool {
+        return self == .mapped;
+    }
+
+    pub fn deinit(self: *RetainedSegment, alloc: Allocator) void {
+        switch (self.*) {
+            .heap => |data| alloc.free(data),
+            .mapped => |data| if (builtin.os.tag != .freestanding and builtin.os.tag != .windows and builtin.os.tag != .wasi)
+                std.posix.munmap(data)
+            else
+                unreachable,
+        }
+        self.* = undefined;
+    }
+};
 
 pub const BatchRecord = struct {
     kind: posting_wal.RecordKind,
@@ -73,12 +101,12 @@ pub const Store = struct {
     /// This avoids reading and checksumming a large immutable segment twice on
     /// process startup.
     pub fn openWithSegmentAlloc(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8) !OpenedWithSegment {
-        var retained_segment: ?[]u8 = null;
+        var retained_segment: ?RetainedSegment = null;
         var store = try openInternal(alloc, storage, root_dir, &retained_segment);
         errdefer store.deinit();
         return .{
             .store = store,
-            .segment_bytes = retained_segment orelse return error.MissingPostingCheckpoint,
+            .segment = retained_segment orelse return error.MissingPostingCheckpoint,
         };
     }
 
@@ -86,7 +114,7 @@ pub const Store = struct {
         alloc: Allocator,
         storage: lsm_backend.Storage,
         root_dir: []const u8,
-        retained_segment: ?*?[]u8,
+        retained_segment: ?*?RetainedSegment,
     ) !Store {
         const owned_root = try alloc.dupe(u8, root_dir);
         storage.createDirPath(owned_root) catch |err| {
@@ -126,9 +154,10 @@ pub const Store = struct {
         store.wal_generation = checkpoint.wal_generation;
         store.covered_source_sequence = checkpoint.covered_source_sequence;
 
-        const segment_bytes = try store.readSegmentAllocFor(checkpoint);
+        var retained = try store.readSegmentRetainedFor(checkpoint);
         var segment_owned = true;
-        defer if (segment_owned) alloc.free(segment_bytes);
+        defer if (segment_owned) retained.deinit(alloc);
+        const segment_bytes = retained.bytes();
         store.segment_bytes = @intCast(segment_bytes.len);
         var recovered = try store.recoverWal();
         defer recovered.deinit();
@@ -153,7 +182,7 @@ pub const Store = struct {
             recovered.replay.covered_source_sequence,
         );
         if (retained_segment) |out| {
-            out.* = segment_bytes;
+            out.* = retained;
             segment_owned = false;
         }
         return store;
@@ -264,6 +293,7 @@ pub const Store = struct {
         const next_checkpoint: posting_wal.Checkpoint = .{
             .segment_generation = segment_generation,
             .segment_checksum = std.hash.Crc32.hash(segment_bytes),
+            .segment_admission_checksum = try posting_segment.admissionChecksum(segment_bytes),
             .wal_generation = next_wal_generation,
             .wal_committed_bytes = 0,
             .covered_source_sequence = covered_source_sequence,
@@ -334,6 +364,25 @@ pub const Store = struct {
         return bytes;
     }
 
+    fn readSegmentRetainedFor(self: *Store, checkpoint: posting_wal.Checkpoint) !RetainedSegment {
+        const path = try self.segmentPathAlloc(checkpoint.segment_generation);
+        defer self.alloc.free(path);
+        if (mapSegmentFile(path)) |mapped| {
+            const published_checksum_matches = mapped.len <= max_segment_bytes and (if (checkpoint.segment_admission_checksum != 0)
+                (posting_segment.admissionChecksum(mapped) catch 0) == checkpoint.segment_admission_checksum
+            else
+                std.hash.Crc32.hash(mapped) == checkpoint.segment_checksum);
+            if (published_checksum_matches) {
+                if (posting_segment.Reader.init(mapped)) |_| {
+                    std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.RANDOM) catch {};
+                    return .{ .mapped = mapped };
+                } else |_| {}
+            }
+            std.posix.munmap(mapped);
+        } else |_| {}
+        return .{ .heap = try self.readSegmentAllocFor(checkpoint) };
+    }
+
     fn replaceWal(self: *Store, contents: []const u8) !void {
         const path = try self.walPathAlloc(self.wal_generation);
         defer self.alloc.free(path);
@@ -376,15 +425,30 @@ pub const Store = struct {
 
 pub const OpenedWithSegment = struct {
     store: Store,
-    segment_bytes: []u8,
+    segment: RetainedSegment,
 
     pub fn deinit(self: *OpenedWithSegment) void {
         const alloc = self.store.alloc;
         self.store.deinit();
-        alloc.free(self.segment_bytes);
+        self.segment.deinit(alloc);
         self.* = undefined;
     }
 };
+
+fn mapSegmentFile(path: []const u8) ![]align(std.heap.page_size_min) u8 {
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.UnsupportedPlatform;
+    }
+    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{
+        .ACCMODE = .RDONLY,
+        .CLOEXEC = true,
+    }, 0);
+    defer _ = std.posix.system.close(fd);
+    const size_raw = std.posix.system.lseek(fd, 0, std.posix.SEEK.END);
+    if (size_raw <= 0) return error.EmptyPostingSegment;
+    const size = std.math.cast(usize, size_raw) orelse return error.PostingSegmentTooLarge;
+    return try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
+}
 
 fn boundedReadLimit(max_bytes: usize) usize {
     return std.math.add(usize, max_bytes, 1) catch std.math.maxInt(usize);

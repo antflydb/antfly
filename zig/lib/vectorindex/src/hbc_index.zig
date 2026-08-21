@@ -25,6 +25,7 @@ const search_runtime = @import("search_runtime.zig");
 const search_results = @import("search_results.zig");
 const hbc_runtime = @import("hbc_runtime.zig");
 const posting = @import("posting.zig");
+const store = @import("store.zig");
 const spfresh_index = @import("spfresh_index.zig");
 const proto = @import("antfly_vector").proto;
 const quantizer_mod = @import("antfly_vector").quantizer;
@@ -106,6 +107,20 @@ fn txnSupportsGetManySorted(comptime Txn: type) bool {
         .pointer => |ptr| @hasDecl(ptr.child, "getManySorted"),
         else => @hasDecl(Txn, "getManySorted"),
     };
+}
+
+fn getNamespacedManySorted(
+    self: anytype,
+    txn: anytype,
+    comptime namespace: store.Namespace,
+    keys: []const []const u8,
+    values: []?[]const u8,
+) !void {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "getNamespacedManySorted")) {
+        return try self.getNamespacedManySorted(txn, namespace, keys, values);
+    }
+    return try txn.getManySorted(namespace, keys, values);
 }
 
 fn indexHasExternalVectorLoader(self: anytype) bool {
@@ -310,6 +325,14 @@ fn borrowCachedMetadataHandle(self: anytype, vector_id: u64) ?CachedMetadataRead
         if (self.borrowCachedMetadata(vector_id)) |borrowed| return .{ .borrowed = borrowed };
     }
     return null;
+}
+
+fn txnUsesImmutableGeneration(self: anytype, txn: anytype) bool {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "txnUsesImmutableGeneration")) {
+        return self.txnUsesImmutableGeneration(txn);
+    }
+    return false;
 }
 
 fn loadNodeReadHandleProfiled(
@@ -781,13 +804,16 @@ pub fn getVecLeaf(self: anytype, txn: anytype, vector_id: u64) !u64 {
 }
 
 pub fn loadMetadataRaw(self: anytype, txn: anytype, vector_id: u64, is_not_found: fn (anyerror) bool) !?[]const u8 {
-    if (self.getCachedMetadata(vector_id)) |cached| return cached;
+    const immutable_generation = txnUsesImmutableGeneration(self, txn);
+    if (!immutable_generation) {
+        if (self.getCachedMetadata(vector_id)) |cached| return cached;
+    }
     var key_buf: [10]u8 = undefined;
     const data = self.getNamespaced(txn, .vecs, hbc.encodeVecMetaKey(&key_buf, vector_id)) catch |err| {
         if (is_not_found(err)) return null;
         return err;
     };
-    return try self.cacheMetadata(vector_id, data);
+    return if (immutable_generation) data else try self.cacheMetadata(vector_id, data);
 }
 
 pub fn putMetadata(self: anytype, txn: anytype, vector_id: u64, metadata: []const u8) !void {
@@ -1438,7 +1464,7 @@ pub fn computeNodeSplitRange(self: anytype, txn: anytype, node: *const types.Nod
     const values = try self.alloc.alloc(?[]const u8, lookups.len);
     defer self.alloc.free(values);
     if (comptime txnSupportsGetManySorted(@TypeOf(txn))) {
-        try txn.getManySorted(.nodes, keys, values);
+        try getNamespacedManySorted(self, txn, .nodes, keys, values);
     } else {
         @memset(values, null);
         for (keys, values) |key, *value| {
@@ -1672,9 +1698,11 @@ pub fn getMetadataManySortedInTxnWithScratch(
 
     var lookup_count: usize = 0;
     for (vector_ids, 0..) |vector_id, index| {
-        if (self.getCachedMetadata(vector_id)) |cached| {
-            out_metadata[index] = cached;
-            continue;
+        if (!txnUsesImmutableGeneration(self, txn)) {
+            if (self.getCachedMetadata(vector_id)) |cached| {
+                out_metadata[index] = cached;
+                continue;
+            }
         }
         var key: [10]u8 = undefined;
         _ = hbc.encodeVecMetaKey(&key, vector_id);
@@ -1695,7 +1723,7 @@ pub fn getMetadataManySortedInTxnWithScratch(
     for (lookups, 0..) |*lookup, i| key_views[i] = lookup.key[0..];
 
     if (comptime txnSupportsGetManySorted(@TypeOf(txn))) {
-        try txn.getManySorted(.vecs, key_views, values);
+        try getNamespacedManySorted(self, txn, .vecs, key_views, values);
     } else {
         for (key_views, 0..) |key, i| {
             values[i] = txn.get(.vecs, key) catch |err| switch (err) {
@@ -1706,7 +1734,10 @@ pub fn getMetadataManySortedInTxnWithScratch(
     }
     for (values, 0..) |maybe_value, i| {
         const value = maybe_value orelse continue;
-        out_metadata[lookups[i].item_index] = try self.cacheMetadata(lookups[i].vector_id, value);
+        out_metadata[lookups[i].item_index] = if (txnUsesImmutableGeneration(self, txn))
+            value
+        else
+            try self.cacheMetadata(lookups[i].vector_id, value);
     }
 }
 
@@ -2881,7 +2912,7 @@ fn loadVectorIdsSortedWithScratch(
     std.mem.sort(FixedKeyLookup, lookups, {}, lessFixedKeyLookup);
     for (lookups, 0..) |*lookup, i| key_views[i] = lookup.key[0..];
 
-    try txn.getManySorted(.vecs, key_views, values);
+    try getNamespacedManySorted(self, txn, .vecs, key_views, values);
     for (values, 0..) |maybe_value, i| {
         const value = maybe_value orelse continue;
         if (borrowCachedVectorHandle(self, lookups[i].vector_id)) |cached_handle| {
@@ -3598,15 +3629,17 @@ fn populateMetadataBatchedWithScratch(
     var lookup_count: usize = 0;
     for (results.items.items, 0..) |item, index| {
         if (item.metadata != null) continue;
-        if (borrowCachedMetadataHandle(self, item.vector_id)) |cached_handle| {
-            var handle = cached_handle;
-            defer handle.deinit();
-            results.items.items[index].metadata = try self.alloc.dupe(u8, handle.view());
-            continue;
-        }
-        if (self.getCachedMetadata(item.vector_id)) |cached| {
-            results.items.items[index].metadata = try self.alloc.dupe(u8, cached);
-            continue;
+        if (!txnUsesImmutableGeneration(self, txn)) {
+            if (borrowCachedMetadataHandle(self, item.vector_id)) |cached_handle| {
+                var handle = cached_handle;
+                defer handle.deinit();
+                results.items.items[index].metadata = try self.alloc.dupe(u8, handle.view());
+                continue;
+            }
+            if (self.getCachedMetadata(item.vector_id)) |cached| {
+                results.items.items[index].metadata = try self.alloc.dupe(u8, cached);
+                continue;
+            }
         }
         var key: [10]u8 = undefined;
         _ = hbc.encodeVecMetaKey(&key, item.vector_id);
@@ -3625,10 +3658,10 @@ fn populateMetadataBatchedWithScratch(
     std.mem.sort(FixedKeyLookup, lookups, {}, lessFixedKeyLookup);
     for (lookups, 0..) |*lookup, i| key_views[i] = lookup.key[0..];
 
-    try txn.getManySorted(.vecs, key_views, values);
+    try getNamespacedManySorted(self, txn, .vecs, key_views, values);
     for (values, 0..) |maybe_value, i| {
         const value = maybe_value orelse continue;
-        _ = try self.cacheMetadata(lookups[i].vector_id, value);
+        if (!txnUsesImmutableGeneration(self, txn)) _ = try self.cacheMetadata(lookups[i].vector_id, value);
         results.items.items[lookups[i].item_index].metadata = try self.alloc.dupe(u8, value);
     }
 }
