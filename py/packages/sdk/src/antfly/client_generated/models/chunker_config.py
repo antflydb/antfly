@@ -33,6 +33,11 @@ class ChunkerConfig:
         full_text_index (ChunkerConfigFullTextIndex | Unset): Configuration for full-text indexing of chunks in Bleve.
             When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's _chunks field.
             When absent, chunks use :c: suffix and are only used for vector embeddings.
+        api_url (str | Unset): The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL. Example:
+            http://localhost:8080.
+        model (str | Unset): The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other
+            values select a model from models/chunkers/{name}/. Successful create responses include the effective model.
+            Default: 'fixed'. Example: fixed.
         max_chunks (int | Unset):
         threshold (float | Unset):
         text (TextChunkOptions | Unset): Options specific to text chunking.
@@ -42,6 +47,8 @@ class ChunkerConfig:
     provider: ChunkerProvider
     store_chunks: bool | Unset = False
     full_text_index: ChunkerConfigFullTextIndex | Unset = UNSET
+    api_url: str | Unset = UNSET
+    model: str | Unset = "fixed"
     max_chunks: int | Unset = UNSET
     threshold: float | Unset = UNSET
     text: TextChunkOptions | Unset = UNSET
@@ -56,6 +63,10 @@ class ChunkerConfig:
         full_text_index: dict[str, Any] | Unset = UNSET
         if not isinstance(self.full_text_index, Unset):
             full_text_index = self.full_text_index.to_dict()
+
+        api_url = self.api_url
+
+        model = self.model
 
         max_chunks = self.max_chunks
 
@@ -80,6 +91,10 @@ class ChunkerConfig:
             field_dict["store_chunks"] = store_chunks
         if full_text_index is not UNSET:
             field_dict["full_text_index"] = full_text_index
+        if api_url is not UNSET:
+            field_dict["api_url"] = api_url
+        if model is not UNSET:
+            field_dict["model"] = model
         if max_chunks is not UNSET:
             field_dict["max_chunks"] = max_chunks
         if threshold is not UNSET:
@@ -109,6 +124,10 @@ class ChunkerConfig:
         else:
             full_text_index = ChunkerConfigFullTextIndex.from_dict(_full_text_index)
 
+        api_url = d.pop("api_url", UNSET)
+
+        model = d.pop("model", UNSET)
+
         max_chunks = d.pop("max_chunks", UNSET)
 
         threshold = d.pop("threshold", UNSET)
@@ -131,6 +150,8 @@ class ChunkerConfig:
             provider=provider,
             store_chunks=store_chunks,
             full_text_index=full_text_index,
+            api_url=api_url,
+            model=model,
             max_chunks=max_chunks,
             threshold=threshold,
             text=text,

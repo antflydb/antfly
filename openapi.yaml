@@ -17878,6 +17878,18 @@ components:
 
                 When absent, chunks use :c: suffix and are only used for vector embeddings.
               additionalProperties: true
+            api_url:
+              type: string
+              format: uri
+              description: The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL.
+              example: http://localhost:8080
+            model:
+              type: string
+              description: The chunking model to use. Defaults to 'fixed' for simple token-based chunking;
+                other values select a model from models/chunkers/{name}/. Successful create responses
+                include the effective model.
+              default: fixed
+              example: fixed
             max_chunks:
               type: integer
               minimum: 1

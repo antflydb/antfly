@@ -41,6 +41,19 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Install native build dependencies
+        shell: bash
+        run: |
+          if command -v cc >/dev/null 2>&1 && command -v cmake >/dev/null 2>&1 && command -v pkg-config >/dev/null 2>&1; then
+            exit 0
+          fi
+          sudo_cmd=""
+          if command -v sudo >/dev/null 2>&1; then
+            sudo_cmd="sudo"
+          fi
+          $sudo_cmd apt-get update
+          $sudo_cmd apt-get install --yes --no-install-recommends build-essential cmake pkg-config
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:

@@ -9149,6 +9149,18 @@ export interface components {
             full_text_index?: {
                 [key: string]: unknown;
             };
+            /**
+             * Format: uri
+             * @description The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL.
+             * @example http://localhost:8080
+             */
+            api_url?: string;
+            /**
+             * @description The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other values select a model from models/chunkers/{name}/. Successful create responses include the effective model.
+             * @default fixed
+             * @example fixed
+             */
+            model?: string;
             max_chunks?: number;
             /** Format: float */
             threshold?: number;

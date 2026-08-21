@@ -223,7 +223,7 @@ mod tests {
                 assert_eq!(index.name, "thumbnail");
                 assert_eq!(index.dimension.map(std::num::NonZeroU64::get), Some(512));
                 assert_eq!(
-                    index.chunker.map(|chunker| chunker.model),
+                    index.chunker.and_then(|chunker| chunker.model),
                     Some("fixed".to_string()),
                 );
             }

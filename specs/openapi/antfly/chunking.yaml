@@ -36,9 +36,20 @@ components:
                 When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's _chunks field.
                 When absent, chunks use :c: suffix and are only used for vector embeddings.
               additionalProperties: true
-            # Repeat ChunkOptions here instead of relying only on the nested
-            # AntflyChunkerConfig allOf. Several generators flatten a single
-            # allOf level and otherwise drop these supported fields.
+            # Repeat provider-specific fields and ChunkOptions here instead of
+            # relying only on the nested AntflyChunkerConfig allOf. Several
+            # generators flatten a single allOf level and otherwise drop these
+            # supported fields from the unified request/response type.
+            api_url:
+              type: string
+              format: uri
+              description: "The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL."
+              example: "http://localhost:8080"
+            model:
+              type: string
+              description: "The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other values select a model from models/chunkers/{name}/. Successful create responses include the effective model."
+              default: "fixed"
+              example: "fixed"
             max_chunks:
               type: integer
               minimum: 1
