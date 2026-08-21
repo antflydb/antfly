@@ -189,6 +189,7 @@ comptime {
     _ = @import("mem_ordered.zig");
     _ = @import("object_storage.zig");
     _ = @import("persistent.zig");
+    _ = @import("posting_segment_store.zig");
     _ = @import("portable_backup.zig");
     _ = @import("resource_manager.zig");
     _ = @import("schema.zig");

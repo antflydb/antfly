@@ -454,6 +454,26 @@ are memoized as well as successes. The runtime design should either preverify
 hot/pinned postings or let their first cache admission pay this cost once; it
 must never checksum an unchanged payload on every query.
 
+The public qualification harness now keeps query behavior in the same evidence
+bundle as load and memory. A current-main 50K vector-only control inserted in
+28.88 seconds and became ready in 37.55 seconds. Its live public-API serial
+search measured 98.49% recall@100 with 2.5 ms p50, 4.2 ms p95, and 9.7 ms p99.
+The short concurrency curve peaked at 481 QPS with four clients; sixteen
+clients were already saturated at 356 QPS and 452.9 ms p95. After a clean
+restart, recall was 98.06%, while cold-cache latency rose to 3.9 ms p50,
+9.8 ms p95, and 412.6 ms p99. The process was fully caught up by the final
+status sample. Segment/WAL candidates must therefore preserve recall and beat
+both live and post-reopen latency distributions, not only the load timer.
+
+The first durable posting-store layer now publishes in the order immutable
+segment, empty next-generation WAL, then checksummed `CURRENT`; old artifacts
+are deleted only after `CURRENT` is durable. WAL appends require an initial
+checkpoint, expose only complete committed batches, poison an ambiguous writer
+after an append/sync error, and atomically discard incomplete or uncommitted
+tails before accepting another append after reopen. This is storage-level
+plumbing only: HBC still uses the LSM until transaction-aware runtime wiring can
+prove that a checkpoint and WAL tail cover the same source sequence.
+
 | Run | Insert | Ready/load | Notes |
 | --- | ---: | ---: | --- |
 | 50K OpenAI, batch 100, four workers, original public path | 46.39 s | 48.42 s | Default full-text index present |

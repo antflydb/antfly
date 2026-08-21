@@ -62,6 +62,17 @@ pub const Writer = struct {
         return .{ .alloc = alloc };
     }
 
+    /// Starts a frame encoder after an already durable committed prefix. The
+    /// returned writer emits only new frames while preserving global batch and
+    /// source-sequence ordering checks.
+    pub fn initAfterCommitted(alloc: Allocator, last_committed_batch: ?u64, covered_source_sequence: u64) Writer {
+        return .{
+            .alloc = alloc,
+            .last_committed_batch = last_committed_batch,
+            .covered_source_sequence = covered_source_sequence,
+        };
+    }
+
     pub fn deinit(self: *Writer) void {
         self.out.deinit(self.alloc);
         self.* = undefined;
@@ -386,6 +397,21 @@ pub fn testCommittedBatchesReplayInOrder() !void {
     try std.testing.expectEqualSlices(u8, "quant-v1", posting_records.next().?.payload);
     try std.testing.expectEqualSlices(u8, "delete:2", posting_records.next().?.payload);
     try std.testing.expect(posting_records.next() == null);
+}
+
+test "posting WAL writer can continue after a durable prefix" {
+    const alloc = std.testing.allocator;
+    var writer = Writer.initAfterCommitted(alloc, 9, 99);
+    defer writer.deinit();
+
+    try writer.append(.base, 10, 7, 100, "base-v2");
+    try writer.commit(10, 100);
+    try std.testing.expectError(error.OutOfOrderPostingWalBatch, writer.append(.base, 10, 7, 101, "bad"));
+
+    var replay = try Replay.parse(alloc, writer.bytes());
+    defer replay.deinit();
+    try std.testing.expectEqual(@as(?u64, 10), replay.last_committed_batch);
+    try std.testing.expectEqual(@as(u64, 100), replay.covered_source_sequence);
 }
 
 pub fn testIgnoresUncommittedAndPartialTails() !void {
