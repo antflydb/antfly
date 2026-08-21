@@ -5170,6 +5170,7 @@ fn toOpenApiGraphMetricStatus(
         .phase = graphMetricPhaseName(status.phase),
         .edge_filter = .{ .mode = @tagName(status.edge_filter.mode), .types = if (status.edge_filter.types.len > 0) status.edge_filter.types else null },
         .metadata_version = @intCast(status.metadata_version),
+        .config_fingerprint = saturatingI64(status.config_fingerprint),
         .maintenance_paused = status.maintenance_paused,
         .build_queued = status.build_queued,
         .published_generation = saturatingI64(status.published_generation),

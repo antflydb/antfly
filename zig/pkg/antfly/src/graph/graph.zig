@@ -810,6 +810,26 @@ pub const GraphIndex = struct {
         return try self.graphMetricKeyAlloc(&.{ metric_name, "published_generation" });
     }
 
+    fn graphMetricScoreGenerationSequenceKeyAlloc(self: *GraphIndex, metric_name: []const u8) ![]u8 {
+        return try self.graphMetricControlKeyAlloc(&.{ metric_name, "score_generation_sequence" });
+    }
+
+    fn graphMetricRetiredScoreGenerationKeyAlloc(self: *GraphIndex, metric_name: []const u8) ![]u8 {
+        return try self.graphMetricControlKeyAlloc(&.{ metric_name, "retired_score_generation" });
+    }
+
+    fn graphMetricNextRetiredScoreGenerationKeyAlloc(self: *GraphIndex, metric_name: []const u8) ![]u8 {
+        return try self.graphMetricControlKeyAlloc(&.{ metric_name, "next_retired_score_generation" });
+    }
+
+    fn graphMetricRetiredScoreCleanupPhaseKeyAlloc(self: *GraphIndex, metric_name: []const u8) ![]u8 {
+        return try self.graphMetricControlKeyAlloc(&.{ metric_name, "retired_score_cleanup_phase" });
+    }
+
+    fn graphMetricRetiredScoreCleanupCursorKeyAlloc(self: *GraphIndex, metric_name: []const u8) ![]u8 {
+        return try self.graphMetricControlKeyAlloc(&.{ metric_name, "retired_score_cleanup_cursor" });
+    }
+
     fn graphMetricDirtyGenerationKeyAlloc(self: *GraphIndex, metric_name: []const u8) ![]u8 {
         return try self.graphMetricKeyAlloc(&.{ metric_name, "dirty_generation" });
     }
@@ -820,6 +840,18 @@ pub const GraphIndex = struct {
 
     fn graphMetricDisabledKeyAlloc(self: *GraphIndex, metric_name: []const u8) ![]u8 {
         return try self.graphMetricControlKeyAlloc(&.{ metric_name, "disabled" });
+    }
+
+    fn graphMetricDeleteCleanupPhaseKeyAlloc(self: *GraphIndex, metric_name: []const u8) ![]u8 {
+        return try self.graphMetricControlKeyAlloc(&.{ metric_name, "delete_cleanup_phase" });
+    }
+
+    fn graphMetricDeleteCleanupCursorKeyAlloc(self: *GraphIndex, metric_name: []const u8) ![]u8 {
+        return try self.graphMetricControlKeyAlloc(&.{ metric_name, "delete_cleanup_cursor" });
+    }
+
+    fn graphMetricDeleteCleanupJobIdKeyAlloc(self: *GraphIndex, metric_name: []const u8) ![]u8 {
+        return try self.graphMetricControlKeyAlloc(&.{ metric_name, "delete_cleanup_job_id" });
     }
 
     fn graphMetricBuildLeaseKeyAlloc(self: *GraphIndex, metric_name: []const u8) ![]u8 {
@@ -1356,6 +1388,63 @@ pub const GraphIndex = struct {
         return try readU64OrZero(txn, key);
     }
 
+    /// Translate the internal score-namespace pointer into the public edge
+    /// snapshot generation. Pre-v4 materializations used the same value for
+    /// both and remain readable without migration.
+    fn metricPublishedEdgeGeneration(self: *GraphIndex, txn: anytype, metric_name: []const u8) !u64 {
+        const score_generation = try self.metricPublishedGeneration(txn, metric_name);
+        if (score_generation == 0) return 0;
+
+        const meta_key = try self.graphMetricMetaKeyAlloc(metric_name, score_generation);
+        defer self.alloc.free(meta_key);
+        const raw = txn.get(meta_key) catch |err| switch (err) {
+            error.NotFound => return score_generation,
+            else => return err,
+        };
+        const meta = decodeGraphMetricMeta(raw) orelse return score_generation;
+        return if (meta.target_edge_generation != 0)
+            meta.target_edge_generation
+        else
+            score_generation;
+    }
+
+    /// Allocate a private, durable score namespace. Edge generations identify
+    /// the input snapshot; they are deliberately not reused as storage epochs
+    /// because a config-only rebuild can target the same edge snapshot.
+    fn allocateGraphMetricScoreGenerationInBatch(
+        self: *GraphIndex,
+        batch: anytype,
+        metric_name: []const u8,
+        cfg: GraphMetricConfig,
+        target_edge_generation: u64,
+    ) !u64 {
+        const sequence_key = try self.graphMetricScoreGenerationSequenceKeyAlloc(metric_name);
+        defer self.alloc.free(sequence_key);
+        var greatest = @max(
+            try readU64OrZero(batch, sequence_key),
+            try self.metricPublishedGeneration(batch, metric_name),
+        );
+
+        const pair_cfg = self.pairedHitsMetricConfig(cfg);
+        var pair_sequence_key: ?[]u8 = null;
+        defer if (pair_sequence_key) |key| self.alloc.free(key);
+        if (pair_cfg) |pair| {
+            const key = try self.graphMetricScoreGenerationSequenceKeyAlloc(pair.name);
+            pair_sequence_key = key;
+            greatest = @max(greatest, try readU64OrZero(batch, key));
+            greatest = @max(greatest, try self.metricPublishedGeneration(batch, pair.name));
+        }
+        const next = if (greatest < target_edge_generation)
+            target_edge_generation
+        else blk: {
+            if (greatest == std.math.maxInt(u64)) return error.GraphMetricGenerationExhausted;
+            break :blk greatest + 1;
+        };
+        try putU64(batch, sequence_key, next);
+        if (pair_sequence_key) |key| try putU64(batch, key, next);
+        return next;
+    }
+
     fn metricDirtyGeneration(self: *GraphIndex, txn: anytype, metric_name: []const u8) !u64 {
         const key = try self.graphMetricDirtyGenerationKeyAlloc(metric_name);
         defer self.alloc.free(key);
@@ -1527,8 +1616,13 @@ pub const GraphIndex = struct {
             else => return err,
         }
 
+        const cfg = self.metricConfig(metric_name) orelse return error.MetricNotReady;
+        const score_generation = try self.allocateGraphMetricScoreGenerationInBatch(&batch, metric_name, cfg, target_generation);
         const lease = GraphMetricBuildLease{
-            .job_id = graphMetricBuildJobId(metric_name, target_generation, now_ms),
+            // The durable score epoch is already monotonic and unique for this
+            // metric. Reuse it as the job identity so two rebuilds started in
+            // the same millisecond can never alias a completed job namespace.
+            .job_id = score_generation,
             .target_generation = target_generation,
             .started_at_ms = now_ms,
             .lease_expires_at_ms = now_ms + graph_metric_local_build_lease_ms,
@@ -1543,7 +1637,7 @@ pub const GraphIndex = struct {
         try self.putGraphMetricBuildJobInBatch(&batch, metric_name, .{
             .job_id = lease.job_id,
             .target_generation = target_generation,
-            .score_generation = target_generation,
+            .score_generation = score_generation,
             .started_at_ms = lease.started_at_ms,
             .updated_at_ms = now_ms,
             .lease_expires_at_ms = lease.lease_expires_at_ms,
@@ -1551,11 +1645,10 @@ pub const GraphIndex = struct {
             .iteration = lease.iteration,
             .worker_id = lease.worker_id,
         });
-        const cfg = self.metricConfig(metric_name) orelse return error.MetricNotReady;
         try self.planGraphMetricBuildManifestInBatch(&batch, metric_name, cfg, .{
             .job_id = lease.job_id,
             .target_generation = target_generation,
-            .score_generation = target_generation,
+            .score_generation = score_generation,
             .started_at_ms = lease.started_at_ms,
             .updated_at_ms = now_ms,
             .lease_expires_at_ms = lease.lease_expires_at_ms,
@@ -2926,6 +3019,10 @@ pub const GraphIndex = struct {
         lease.phase = phase;
         lease.iteration = iteration;
         const now_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+        const score_generation = if (try self.metricBuildJob(&batch, metric_name)) |job|
+            if (job.job_id == lease.job_id) job.score_generation else lease.target_generation
+        else
+            lease.target_generation;
         const encoded = try self.alloc.alloc(u8, graphMetricBuildLeaseEncodedLen(lease));
         defer self.alloc.free(encoded);
         encodeGraphMetricBuildLease(lease, encoded);
@@ -2933,7 +3030,7 @@ pub const GraphIndex = struct {
         try self.putGraphMetricBuildJobInBatch(&batch, metric_name, .{
             .job_id = lease.job_id,
             .target_generation = lease.target_generation,
-            .score_generation = lease.target_generation,
+            .score_generation = score_generation,
             .started_at_ms = lease.started_at_ms,
             .updated_at_ms = now_ms,
             .lease_expires_at_ms = lease.lease_expires_at_ms,
@@ -3307,8 +3404,11 @@ pub const GraphIndex = struct {
             failure_record.phase = job.phase;
             failure_record.iteration = job.iteration;
             const published_generation = try self.metricPublishedGeneration(&batch, metric_name);
-            if (job.score_generation != 0 and job.score_generation != published_generation) {
-                try self.deleteScoreGeneration(&batch, metric_name, job.score_generation);
+            if (job.score_generation != 0 and
+                job.score_generation != published_generation and
+                try self.scoreGenerationHasKeysInBatch(&batch, metric_name, job.score_generation))
+            {
+                try self.enqueueRetiredScoreGenerationInBatch(&batch, metric_name, job.score_generation);
             }
             _ = try self.deleteGraphMetricBuildJobNamespaceInBatch(&batch, metric_name, job.job_id);
             const lease_key = try self.graphMetricBuildLeaseKeyAlloc(metric_name);
@@ -3339,7 +3439,7 @@ pub const GraphIndex = struct {
             .kind = .failed,
             .at_ms = now_ms,
             .target_edge_generation = self.edge_generation,
-            .published_generation = try self.metricPublishedGeneration(&batch, metric_name),
+            .published_generation = try self.metricPublishedEdgeGeneration(&batch, metric_name),
             .score_count = 0,
         });
         if (pair_cfg) |pair| {
@@ -3349,8 +3449,10 @@ pub const GraphIndex = struct {
             pair_failure_record.retry_count = pair_retry_count;
             if (pair_failure_record.score_generation != 0) {
                 const pair_published_generation = try self.metricPublishedGeneration(&batch, pair.name);
-                if (pair_failure_record.score_generation != pair_published_generation) {
-                    try self.deleteScoreGeneration(&batch, pair.name, pair_failure_record.score_generation);
+                if (pair_failure_record.score_generation != pair_published_generation and
+                    try self.scoreGenerationHasKeysInBatch(&batch, pair.name, pair_failure_record.score_generation))
+                {
+                    try self.enqueueRetiredScoreGenerationInBatch(&batch, pair.name, pair_failure_record.score_generation);
                 }
             }
             try self.appendGraphMetricFailureRecord(&batch, pair.name, pair_failure_record);
@@ -3358,7 +3460,7 @@ pub const GraphIndex = struct {
                 .kind = .failed,
                 .at_ms = now_ms,
                 .target_edge_generation = self.edge_generation,
-                .published_generation = try self.metricPublishedGeneration(&batch, pair.name),
+                .published_generation = try self.metricPublishedEdgeGeneration(&batch, pair.name),
                 .score_count = 0,
             });
         }
@@ -4473,9 +4575,13 @@ pub const GraphIndex = struct {
         phase: GraphMetricBuildPhase = .idle,
         edge_filter: GraphMetricEdgeFilter = .{},
         metadata_version: u32 = 0,
+        config_fingerprint: u64 = 0,
         maintenance_paused: bool = false,
         build_queued: bool = false,
         published_generation: u64 = 0,
+        /// Edge snapshot identity represented by the internal published score
+        /// namespace. API adapters expose this as `published_generation`.
+        published_edge_generation: u64 = 0,
         edge_generation: u64 = 0,
         target_edge_generation: u64 = 0,
         queued_generation: u64 = 0,
@@ -4533,6 +4639,7 @@ pub const GraphIndex = struct {
 
     const GraphMetricMeta = struct {
         schema_version: u32 = graph_metric_meta_schema_version,
+        target_edge_generation: u64 = 0,
         converged: bool = false,
         iterations_completed: u32 = 0,
         delta: f64 = 0.0,
@@ -4736,10 +4843,11 @@ pub const GraphIndex = struct {
         }
     };
 
-    pub const graph_metric_meta_schema_version: u32 = 3;
+    pub const graph_metric_meta_schema_version: u32 = 4;
     const graph_metric_meta_legacy_encoded_len = 8 + 8 + 8 + 8;
     const graph_metric_meta_v1_encoded_len = 8 + graph_metric_meta_legacy_encoded_len;
-    const graph_metric_meta_encoded_len = graph_metric_meta_v1_encoded_len + 8;
+    const graph_metric_meta_v3_encoded_len = graph_metric_meta_v1_encoded_len + 8;
+    const graph_metric_meta_encoded_len = graph_metric_meta_v3_encoded_len + 8;
     const graph_metric_edge_filter_header_len = 8 + 8;
     const graph_metric_build_lease_legacy_encoded_len = 8 + 8 + 8;
     const graph_metric_build_lease_v1_header_len = 8 + graph_metric_build_lease_legacy_encoded_len + 8 + 8;
@@ -4791,6 +4899,7 @@ pub const GraphIndex = struct {
         var offset: usize = 0;
         inline for (.{
             @as(u64, meta.schema_version),
+            meta.target_edge_generation,
             if (meta.converged) @as(u64, 1) else @as(u64, 0),
             @as(u64, meta.iterations_completed),
             @as(u64, @bitCast(meta.delta)),
@@ -4803,14 +4912,19 @@ pub const GraphIndex = struct {
     }
 
     fn decodeGraphMetricMeta(raw: []const u8) ?GraphMetricMeta {
-        if (raw.len != graph_metric_meta_encoded_len and raw.len != graph_metric_meta_v1_encoded_len and raw.len != graph_metric_meta_legacy_encoded_len) return null;
+        if (raw.len != graph_metric_meta_encoded_len and raw.len != graph_metric_meta_v3_encoded_len and raw.len != graph_metric_meta_v1_encoded_len and raw.len != graph_metric_meta_legacy_encoded_len) return null;
         var offset: usize = 0;
-        const has_schema_version = raw.len == graph_metric_meta_encoded_len or raw.len == graph_metric_meta_v1_encoded_len;
+        const has_schema_version = raw.len == graph_metric_meta_encoded_len or raw.len == graph_metric_meta_v3_encoded_len or raw.len == graph_metric_meta_v1_encoded_len;
         const schema_version: u32 = if (has_schema_version) blk: {
             const value = std.mem.readInt(u64, raw[offset..][0..8], .little);
             offset += 8;
             if (value > graph_metric_meta_schema_version) return null;
             break :blk @intCast(value);
+        } else 0;
+        const target_edge_generation = if (raw.len == graph_metric_meta_encoded_len) blk: {
+            const value = std.mem.readInt(u64, raw[offset..][0..8], .little);
+            offset += 8;
+            break :blk value;
         } else 0;
         const converged = std.mem.readInt(u64, raw[offset..][0..8], .little) != 0;
         offset += 8;
@@ -4820,12 +4934,13 @@ pub const GraphIndex = struct {
         offset += 8;
         const computed_at_ms = std.mem.readInt(u64, raw[offset..][0..8], .little);
         offset += 8;
-        const config_fingerprint = if (raw.len == graph_metric_meta_encoded_len)
+        const config_fingerprint = if (raw.len == graph_metric_meta_encoded_len or raw.len == graph_metric_meta_v3_encoded_len)
             std.mem.readInt(u64, raw[offset..][0..8], .little)
         else
             0;
         return .{
             .schema_version = schema_version,
+            .target_edge_generation = target_edge_generation,
             .converged = converged,
             .iterations_completed = iterations_completed,
             .delta = @bitCast(delta_bits),
@@ -5646,7 +5761,11 @@ pub const GraphIndex = struct {
             last = edge_type;
             emitted += 1;
         }
-        return hasher.final();
+        // Public OpenAPI and remote-wire status uses signed 64-bit integers.
+        // Keep the durable identity in the positive i64 domain so adapters do
+        // not truncate, saturate, or reinterpret an otherwise valid hash.
+        const fingerprint = hasher.final() & std.math.maxInt(i64);
+        return if (fingerprint == 0) 1 else fingerprint;
     }
 
     fn nextGraphMetricEdgeFilterType(types: []const []const u8, last: ?[]const u8) ?[]const u8 {
@@ -8681,6 +8800,123 @@ pub const GraphIndex = struct {
         };
     }
 
+    fn enqueueRetiredScoreGenerationInBatch(
+        self: *GraphIndex,
+        batch: anytype,
+        metric_name: []const u8,
+        generation: u64,
+    ) !void {
+        if (generation == 0) return;
+        const generation_key = try self.graphMetricRetiredScoreGenerationKeyAlloc(metric_name);
+        defer self.alloc.free(generation_key);
+        const existing = try readU64OrZero(batch, generation_key);
+        if (existing == generation) return;
+        if (existing != 0) {
+            const next_key = try self.graphMetricNextRetiredScoreGenerationKeyAlloc(metric_name);
+            defer self.alloc.free(next_key);
+            const next = try readU64OrZero(batch, next_key);
+            if (next == generation) return;
+            if (next != 0) return error.GraphMetricRetiredGenerationBacklog;
+            try putU64(batch, next_key, generation);
+            return;
+        }
+        try putU64(batch, generation_key, generation);
+        const phase_key = try self.graphMetricRetiredScoreCleanupPhaseKeyAlloc(metric_name);
+        defer self.alloc.free(phase_key);
+        try putU64(batch, phase_key, 1);
+        const cursor_key = try self.graphMetricRetiredScoreCleanupCursorKeyAlloc(metric_name);
+        defer self.alloc.free(cursor_key);
+        try batch.put(cursor_key, "");
+    }
+
+    fn scoreGenerationHasKeysInBatch(self: *GraphIndex, batch: anytype, metric_name: []const u8, generation: u64) !bool {
+        const score_prefix = try self.graphMetricScorePrefixAlloc(metric_name, generation);
+        defer self.alloc.free(score_prefix);
+        if (try self.hasKeysWithPrefixInBatch(batch, score_prefix)) return true;
+        const rank_prefix = try self.graphMetricRankPrefixAlloc(metric_name, generation);
+        defer self.alloc.free(rank_prefix);
+        return try self.hasKeysWithPrefixInBatch(batch, rank_prefix);
+    }
+
+    /// Reclaim at most one bounded page from the generations retired by atomic
+    /// pointer swaps. The two-slot queue absorbs a publish followed by an
+    /// operator action while cleanup catches up, then applies backpressure.
+    pub fn cleanupRetiredGraphMetricScoreGenerationPage(self: *GraphIndex, metric_name: []const u8) !bool {
+        var batch = try self.beginWriteReverseBatch();
+        errdefer batch.abort();
+        const generation_key = try self.graphMetricRetiredScoreGenerationKeyAlloc(metric_name);
+        defer self.alloc.free(generation_key);
+        const next_generation_key = try self.graphMetricNextRetiredScoreGenerationKeyAlloc(metric_name);
+        defer self.alloc.free(next_generation_key);
+        const generation = try readU64OrZero(&batch, generation_key);
+        if (generation == 0) {
+            try batch.commit();
+            return false;
+        }
+        const published = try self.metricPublishedGeneration(&batch, metric_name);
+        if (generation == published) return error.GraphMetricRetiredGenerationPublished;
+        const phase_key = try self.graphMetricRetiredScoreCleanupPhaseKeyAlloc(metric_name);
+        defer self.alloc.free(phase_key);
+        const phase = try readU64OrZero(&batch, phase_key);
+        const cursor_key = try self.graphMetricRetiredScoreCleanupCursorKeyAlloc(metric_name);
+        defer self.alloc.free(cursor_key);
+        const cursor = batch.get(cursor_key) catch |err| switch (err) {
+            error.NotFound => "",
+            else => return err,
+        };
+
+        if (phase == 1 or phase == 2) {
+            const prefix = if (phase == 1)
+                try self.graphMetricScorePrefixAlloc(metric_name, generation)
+            else
+                try self.graphMetricRankPrefixAlloc(metric_name, generation);
+            defer self.alloc.free(prefix);
+            var deleted = try self.deleteKeysWithPrefixPageInBatch(&batch, prefix, cursor, graph_metric_build_cleanup_delete_page_units);
+            defer deleted.deinit(self.alloc);
+            if (!deleted.reached_end) {
+                try batch.put(cursor_key, deleted.cursor);
+                try batch.commit();
+                return true;
+            }
+            try putU64(&batch, phase_key, phase + 1);
+            try batch.put(cursor_key, "");
+            try batch.commit();
+            return true;
+        }
+
+        inline for (.{
+            try self.graphMetricMetaKeyAlloc(metric_name, generation),
+            try self.graphMetricMetaEdgeFilterKeyAlloc(metric_name, generation),
+            try self.graphMetricMetaConfigFingerprintKeyAlloc(metric_name, generation),
+        }) |key| {
+            defer self.alloc.free(key);
+            batch.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
+        const next_generation = try readU64OrZero(&batch, next_generation_key);
+        if (next_generation != 0) {
+            try putU64(&batch, generation_key, next_generation);
+            try putU64(&batch, phase_key, 1);
+            try batch.put(cursor_key, "");
+            batch.delete(next_generation_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            try batch.commit();
+            return true;
+        }
+        inline for (.{ generation_key, phase_key, cursor_key, next_generation_key }) |key| {
+            batch.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
+        try batch.commit();
+        return true;
+    }
+
     fn countGraphMetricScoreGeneration(self: *GraphIndex, metric_name: []const u8, generation: u64) !usize {
         if (generation == 0) return 0;
         var txn = try self.beginReadReverseTxn();
@@ -8718,6 +8954,13 @@ pub const GraphIndex = struct {
             };
         }
         return keys.items.len;
+    }
+
+    fn hasKeysWithPrefixInBatch(_: *GraphIndex, batch: anytype, prefix: []const u8) !bool {
+        var cur = try batch.openCursor();
+        defer cur.close();
+        const entry = try cur.seekAtOrAfter(prefix) orelse return false;
+        return std.mem.startsWith(u8, entry.key, prefix);
     }
 
     fn deleteKeysWithPrefixPageInBatch(
@@ -8978,44 +9221,43 @@ pub const GraphIndex = struct {
 
     pub fn deleteGraphMetricMaterialization(self: *GraphIndex, metric_name: []const u8) !void {
         _ = self.metricConfig(metric_name) orelse return error.MetricNotReady;
-        const prefix = try self.graphMetricKeyAlloc(&.{metric_name});
-        defer self.alloc.free(prefix);
-        const control_prefix = try self.graphMetricControlKeyAlloc(&.{metric_name});
-        defer self.alloc.free(control_prefix);
-
         var batch = try self.beginWriteReverseBatch();
         errdefer batch.abort();
-        var keys = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (keys.items) |key| self.alloc.free(key);
-            keys.deinit(self.alloc);
-        }
-        {
-            var cur = try batch.openCursor();
-            defer cur.close();
-            var entry_opt = try cur.seekAtOrAfter(prefix);
-            while (entry_opt) |entry| : (entry_opt = try cur.next()) {
-                if (!std.mem.startsWith(u8, entry.key, prefix)) break;
-                try keys.append(self.alloc, try self.alloc.dupe(u8, entry.key));
-            }
-            entry_opt = try cur.seekAtOrAfter(control_prefix);
-            while (entry_opt) |entry| : (entry_opt = try cur.next()) {
-                if (!std.mem.startsWith(u8, entry.key, control_prefix)) break;
-                try keys.append(self.alloc, try self.alloc.dupe(u8, entry.key));
-            }
-        }
-        for (keys.items) |key| {
-            batch.delete(key) catch |err| switch (err) {
-                error.NotFound => {},
-                else => return err,
-            };
-        }
+        const active_job_id = if (try self.metricBuildJob(&batch, metric_name)) |job| job.job_id else 0;
+        const prior_published = try self.metricPublishedGeneration(&batch, metric_name);
+        if (prior_published != 0) try self.enqueueRetiredScoreGenerationInBatch(&batch, metric_name, prior_published);
         // A durable tombstone distinguishes an operator-requested delete from
         // an uninitialized background metric. Explicit refresh/rebuild/resume
         // clears it; autonomous maintenance must leave the metric deleted.
         const disabled_key = try self.graphMetricDisabledKeyAlloc(metric_name);
         defer self.alloc.free(disabled_key);
         try putU64(&batch, disabled_key, 1);
+
+        // Visibility changes are O(1). Physical reclamation is checkpointed in
+        // bounded pages by the maintenance runtime, so delete latency and the
+        // writer transaction do not grow with graph size.
+        inline for (.{
+            try self.graphMetricPublishedGenerationKeyAlloc(metric_name),
+            try self.graphMetricDirtyGenerationKeyAlloc(metric_name),
+            try self.graphMetricMaintenancePausedKeyAlloc(metric_name),
+            try self.graphMetricBuildLeaseKeyAlloc(metric_name),
+            try self.graphMetricBuildJobKeyAlloc(metric_name),
+        }) |key| {
+            defer self.alloc.free(key);
+            batch.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
+        const cleanup_phase_key = try self.graphMetricDeleteCleanupPhaseKeyAlloc(metric_name);
+        defer self.alloc.free(cleanup_phase_key);
+        try putU64(&batch, cleanup_phase_key, 1);
+        const cleanup_cursor_key = try self.graphMetricDeleteCleanupCursorKeyAlloc(metric_name);
+        defer self.alloc.free(cleanup_cursor_key);
+        try batch.put(cleanup_cursor_key, "");
+        const cleanup_job_id_key = try self.graphMetricDeleteCleanupJobIdKeyAlloc(metric_name);
+        defer self.alloc.free(cleanup_job_id_key);
+        try putU64(&batch, cleanup_job_id_key, active_job_id);
         try self.appendGraphMetricEvent(&batch, metric_name, .{
             .kind = .delete,
             .at_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms),
@@ -9024,6 +9266,67 @@ pub const GraphIndex = struct {
             .score_count = 0,
         });
         try batch.commit();
+    }
+
+    /// Reclaim one bounded page for an operator-deleted metric. Returns true
+    /// when work was performed; callers may fairly interleave metrics.
+    pub fn cleanupDeletedGraphMetricMaterializationPage(self: *GraphIndex, metric_name: []const u8) !bool {
+        const data_prefix = try self.graphMetricKeyAlloc(&.{metric_name});
+        defer self.alloc.free(data_prefix);
+        const phase_key = try self.graphMetricDeleteCleanupPhaseKeyAlloc(metric_name);
+        defer self.alloc.free(phase_key);
+        const cursor_key = try self.graphMetricDeleteCleanupCursorKeyAlloc(metric_name);
+        defer self.alloc.free(cursor_key);
+        const job_id_key = try self.graphMetricDeleteCleanupJobIdKeyAlloc(metric_name);
+        defer self.alloc.free(job_id_key);
+
+        var batch = try self.beginWriteReverseBatch();
+        errdefer batch.abort();
+        if (!try self.metricDisabled(&batch, metric_name)) {
+            try batch.commit();
+            return false;
+        }
+        const phase = try readU64OrZero(&batch, phase_key);
+        if (phase == 0) {
+            try batch.commit();
+            return false;
+        }
+        const cursor = batch.get(cursor_key) catch |err| switch (err) {
+            error.NotFound => "",
+            else => return err,
+        };
+        const job_id = try readU64OrZero(&batch, job_id_key);
+        const prefix = if (phase == 1)
+            data_prefix
+        else if (job_id != 0)
+            try self.graphMetricBuildJobNamespacePrefixAlloc(metric_name, job_id)
+        else
+            "";
+        defer if (phase != 1 and prefix.len > 0) self.alloc.free(prefix);
+
+        if (prefix.len > 0) {
+            var deleted = try self.deleteKeysWithPrefixPageInBatch(&batch, prefix, cursor, graph_metric_build_cleanup_delete_page_units);
+            defer deleted.deinit(self.alloc);
+            if (!deleted.reached_end) {
+                try batch.put(cursor_key, deleted.cursor);
+                try batch.commit();
+                return true;
+            }
+        }
+
+        if (phase == 1 and job_id != 0) {
+            try putU64(&batch, phase_key, 2);
+            try batch.put(cursor_key, "");
+        } else {
+            inline for (.{ phase_key, cursor_key, job_id_key }) |key| {
+                batch.delete(key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+            }
+        }
+        try batch.commit();
+        return true;
     }
 
     pub fn pauseGraphMetricMaintenance(self: *GraphIndex, metric_name: []const u8) !GraphMetricStatus {
@@ -9037,7 +9340,7 @@ pub const GraphIndex = struct {
             .kind = .pause,
             .at_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms),
             .target_edge_generation = self.edge_generation,
-            .published_generation = try self.metricPublishedGeneration(&batch, metric_name),
+            .published_generation = try self.metricPublishedEdgeGeneration(&batch, metric_name),
             .score_count = 0,
         });
         try batch.commit();
@@ -9060,11 +9363,22 @@ pub const GraphIndex = struct {
             error.NotFound => {},
             else => return err,
         };
+        inline for (.{
+            try self.graphMetricDeleteCleanupPhaseKeyAlloc(metric_name),
+            try self.graphMetricDeleteCleanupCursorKeyAlloc(metric_name),
+            try self.graphMetricDeleteCleanupJobIdKeyAlloc(metric_name),
+        }) |cleanup_key| {
+            defer self.alloc.free(cleanup_key);
+            batch.delete(cleanup_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
         try self.appendGraphMetricEvent(&batch, metric_name, .{
             .kind = .@"resume",
             .at_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms),
             .target_edge_generation = self.edge_generation,
-            .published_generation = try self.metricPublishedGeneration(&batch, metric_name),
+            .published_generation = try self.metricPublishedEdgeGeneration(&batch, metric_name),
             .score_count = 0,
         });
         try batch.commit();
@@ -9089,6 +9403,17 @@ pub const GraphIndex = struct {
             error.NotFound => {},
             else => return err,
         };
+        inline for (.{
+            try self.graphMetricDeleteCleanupPhaseKeyAlloc(metric_name),
+            try self.graphMetricDeleteCleanupCursorKeyAlloc(metric_name),
+            try self.graphMetricDeleteCleanupJobIdKeyAlloc(metric_name),
+        }) |key| {
+            defer self.alloc.free(key);
+            batch.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
         try batch.commit();
     }
 
@@ -9101,30 +9426,18 @@ pub const GraphIndex = struct {
     ) !GraphMetricStatus {
         var batch = try self.beginWriteReverseBatch();
         errdefer batch.abort();
+        const cfg = self.metricConfig(metric_name) orelse return error.MetricNotReady;
+        const score_generation = if (try self.metricBuildJob(&batch, metric_name)) |job| blk: {
+            if (job.target_generation != target_generation) return error.GraphMetricBuildJobMismatch;
+            break :blk job.score_generation;
+        } else try self.allocateGraphMetricScoreGenerationInBatch(&batch, metric_name, cfg, target_generation);
         const prior_published = try self.metricPublishedGeneration(&batch, metric_name);
-        try self.putGraphMetricScoresInBatch(&batch, metric_name, target_generation, scores);
-        const published_key = try self.graphMetricPublishedGenerationKeyAlloc(metric_name);
-        defer self.alloc.free(published_key);
-        try putU64(&batch, published_key, target_generation);
-        const dirty_key = try self.graphMetricDirtyGenerationKeyAlloc(metric_name);
-        defer self.alloc.free(dirty_key);
-        try putU64(&batch, dirty_key, target_generation);
-        const meta_key = try self.graphMetricMetaKeyAlloc(metric_name, target_generation);
-        defer self.alloc.free(meta_key);
-        var meta_buf: [graph_metric_meta_encoded_len]u8 = undefined;
-        encodeGraphMetricMeta(meta, &meta_buf);
-        try batch.put(meta_key, &meta_buf);
-        const edge_filter_key = try self.graphMetricMetaEdgeFilterKeyAlloc(metric_name, target_generation);
-        defer self.alloc.free(edge_filter_key);
-        const edge_filter_encoded = try self.alloc.alloc(u8, graphMetricEdgeFilterEncodedLen(meta.edge_filter));
-        defer self.alloc.free(edge_filter_encoded);
-        encodeGraphMetricEdgeFilter(meta.edge_filter, edge_filter_encoded);
-        try batch.put(edge_filter_key, edge_filter_encoded);
-        const config_fingerprint_key = try self.graphMetricMetaConfigFingerprintKeyAlloc(metric_name, target_generation);
-        defer self.alloc.free(config_fingerprint_key);
-        try putU64(&batch, config_fingerprint_key, meta.config_fingerprint);
-        if (prior_published != 0 and prior_published != target_generation) {
-            try self.deleteScoreGeneration(&batch, metric_name, prior_published);
+        try self.putGraphMetricScoresInBatch(&batch, metric_name, score_generation, scores);
+        var published_meta = meta;
+        published_meta.target_edge_generation = target_generation;
+        try self.publishGraphMetricPointerInBatch(&batch, metric_name, score_generation, published_meta);
+        if (prior_published != 0 and prior_published != score_generation) {
+            try self.enqueueRetiredScoreGenerationInBatch(&batch, metric_name, prior_published);
         }
         try self.clearGraphMetricFailureInBatch(&batch, metric_name);
         try self.appendGraphMetricEvent(&batch, metric_name, .{
@@ -9153,16 +9466,18 @@ pub const GraphIndex = struct {
         const job = try self.metricBuildJob(&batch, metric_name) orelse return error.GraphMetricBuildJobNotFound;
         if (job.job_id != job_id) return error.GraphMetricBuildJobMismatch;
         const prior_published = try self.metricPublishedGeneration(&batch, metric_name);
-        try self.publishGraphMetricPointerInBatch(&batch, metric_name, verification.score_generation, meta);
+        var published_meta = meta;
+        published_meta.target_edge_generation = verification.target_generation;
+        try self.publishGraphMetricPointerInBatch(&batch, metric_name, verification.score_generation, published_meta);
         try self.appendGraphMetricEvent(&batch, metric_name, .{
             .kind = .publish,
             .at_ms = meta.computed_at_ms,
             .target_edge_generation = verification.target_generation,
-            .published_generation = verification.score_generation,
+            .published_generation = verification.target_generation,
             .score_count = score_count,
         });
         if (prior_published != 0 and prior_published != verification.score_generation) {
-            try self.deleteScoreGeneration(&batch, metric_name, prior_published);
+            try self.enqueueRetiredScoreGenerationInBatch(&batch, metric_name, prior_published);
         }
         try self.clearGraphMetricFailureInBatch(&batch, metric_name);
         try self.putGraphMetricBuildJobInBatch(&batch, metric_name, .{
@@ -9207,12 +9522,21 @@ pub const GraphIndex = struct {
     ) !void {
         var batch = try self.beginWriteReverseBatch();
         errdefer batch.abort();
+        const cfg = self.metricConfig(first_metric_name) orelse return error.MetricNotReady;
+        const score_generation = if (try self.metricBuildJob(&batch, first_metric_name)) |job| blk: {
+            if (job.target_generation != target_generation) return error.GraphMetricBuildJobMismatch;
+            break :blk job.score_generation;
+        } else try self.allocateGraphMetricScoreGenerationInBatch(&batch, first_metric_name, cfg, target_generation);
         const first_prior_published = try self.metricPublishedGeneration(&batch, first_metric_name);
         const second_prior_published = try self.metricPublishedGeneration(&batch, second_metric_name);
-        try self.putGraphMetricScoresInBatch(&batch, first_metric_name, target_generation, first_scores);
-        try self.putGraphMetricScoresInBatch(&batch, second_metric_name, target_generation, second_scores);
-        try self.publishGraphMetricPointerInBatch(&batch, first_metric_name, target_generation, first_meta);
-        try self.publishGraphMetricPointerInBatch(&batch, second_metric_name, target_generation, second_meta);
+        var published_first_meta = first_meta;
+        published_first_meta.target_edge_generation = target_generation;
+        var published_second_meta = second_meta;
+        published_second_meta.target_edge_generation = target_generation;
+        try self.putGraphMetricScoresInBatch(&batch, first_metric_name, score_generation, first_scores);
+        try self.putGraphMetricScoresInBatch(&batch, second_metric_name, score_generation, second_scores);
+        try self.publishGraphMetricPointerInBatch(&batch, first_metric_name, score_generation, published_first_meta);
+        try self.publishGraphMetricPointerInBatch(&batch, second_metric_name, score_generation, published_second_meta);
         try self.appendGraphMetricEvent(&batch, first_metric_name, .{
             .kind = .publish,
             .at_ms = first_meta.computed_at_ms,
@@ -9227,11 +9551,11 @@ pub const GraphIndex = struct {
             .published_generation = target_generation,
             .score_count = second_scores.len,
         });
-        if (first_prior_published != 0 and first_prior_published != target_generation) {
-            try self.deleteScoreGeneration(&batch, first_metric_name, first_prior_published);
+        if (first_prior_published != 0 and first_prior_published != score_generation) {
+            try self.enqueueRetiredScoreGenerationInBatch(&batch, first_metric_name, first_prior_published);
         }
-        if (second_prior_published != 0 and second_prior_published != target_generation) {
-            try self.deleteScoreGeneration(&batch, second_metric_name, second_prior_published);
+        if (second_prior_published != 0 and second_prior_published != score_generation) {
+            try self.enqueueRetiredScoreGenerationInBatch(&batch, second_metric_name, second_prior_published);
         }
         try self.clearGraphMetricFailureInBatch(&batch, first_metric_name);
         try self.clearGraphMetricFailureInBatch(&batch, second_metric_name);
@@ -9275,7 +9599,7 @@ pub const GraphIndex = struct {
         try putU64(batch, published_key, target_generation);
         const dirty_key = try self.graphMetricDirtyGenerationKeyAlloc(metric_name);
         defer self.alloc.free(dirty_key);
-        try putU64(batch, dirty_key, target_generation);
+        try putU64(batch, dirty_key, meta.target_edge_generation);
         const meta_key = try self.graphMetricMetaKeyAlloc(metric_name, target_generation);
         defer self.alloc.free(meta_key);
         var meta_buf: [graph_metric_meta_encoded_len]u8 = undefined;
@@ -9869,6 +10193,7 @@ pub const GraphIndex = struct {
         defer self.freeGraphMetricScoreArray(scores);
 
         const meta = GraphMetricMeta{
+            .target_edge_generation = verification.target_generation,
             .converged = verification.converged,
             .iterations_completed = rank_iteration,
             .delta = verification.total_delta,
@@ -9906,21 +10231,21 @@ pub const GraphIndex = struct {
             .kind = .publish,
             .at_ms = meta.computed_at_ms,
             .target_edge_generation = verification.target_generation,
-            .published_generation = verification.score_generation,
+            .published_generation = verification.target_generation,
             .score_count = scores.len,
         });
         try self.appendGraphMetricEvent(&batch, pair.name, .{
             .kind = .publish,
             .at_ms = pair_meta.computed_at_ms,
             .target_edge_generation = verification.target_generation,
-            .published_generation = verification.score_generation,
+            .published_generation = verification.target_generation,
             .score_count = pair_scores.len,
         });
         if (prior_published != 0 and prior_published != verification.score_generation) {
-            try self.deleteScoreGeneration(&batch, metric_name, prior_published);
+            try self.enqueueRetiredScoreGenerationInBatch(&batch, metric_name, prior_published);
         }
         if (pair_prior_published != 0 and pair_prior_published != verification.score_generation) {
-            try self.deleteScoreGeneration(&batch, pair.name, pair_prior_published);
+            try self.enqueueRetiredScoreGenerationInBatch(&batch, pair.name, pair_prior_published);
         }
         try self.clearGraphMetricFailureInBatch(&batch, metric_name);
         try self.clearGraphMetricFailureInBatch(&batch, pair.name);
@@ -10276,6 +10601,15 @@ pub const GraphIndex = struct {
                 else => return err,
             }
         }
+        // The pointer addresses an internal score namespace. Preserve the
+        // public generation contract as the edge snapshot that produced it;
+        // pre-v4 materializations used the same value for both.
+        const published_edge_generation = if (published_generation == 0)
+            0
+        else if (meta.target_edge_generation != 0)
+            meta.target_edge_generation
+        else
+            published_generation;
         const name = try self.alloc.dupe(u8, metric_name);
         errdefer self.alloc.free(name);
         var edge_filter = try cfg.edge_filter.cloneAlloc(self.alloc);
@@ -10350,7 +10684,7 @@ pub const GraphIndex = struct {
             .failed
         else if (published_generation == 0)
             .not_ready
-        else if (dirty_generation > published_generation or self.edge_generation > published_generation or edge_filter_stale or config_fingerprint_stale)
+        else if (dirty_generation > published_edge_generation or self.edge_generation > published_edge_generation or edge_filter_stale or config_fingerprint_stale)
             .stale
         else
             .fresh;
@@ -10375,9 +10709,11 @@ pub const GraphIndex = struct {
             .phase = active_phase,
             .edge_filter = edge_filter,
             .metadata_version = meta.schema_version,
+            .config_fingerprint = stored_config_fingerprint,
             .maintenance_paused = maintenance_paused,
             .build_queued = queued_generation != 0,
             .published_generation = published_generation,
+            .published_edge_generation = published_edge_generation,
             .edge_generation = self.edge_generation,
             .target_edge_generation = target_edge_generation,
             .queued_generation = queued_generation,
@@ -10824,6 +11160,47 @@ test "graph metric status marks algorithm config drift stale" {
     try std.testing.expectEqual(stale.edge_generation, stale.queued_generation);
 }
 
+test "graph metric metadata preserves score epoch input and decodes v3" {
+    const current = GraphIndex.GraphMetricMeta{
+        .target_edge_generation = 41,
+        .converged = true,
+        .iterations_completed = 7,
+        .delta = 0.125,
+        .computed_at_ms = 1234,
+        .config_fingerprint = 0x1122334455667788,
+    };
+    var encoded: [GraphIndex.graph_metric_meta_encoded_len]u8 = undefined;
+    GraphIndex.encodeGraphMetricMeta(current, &encoded);
+    const decoded = GraphIndex.decodeGraphMetricMeta(&encoded) orelse return error.TestExpectedGraphMetricMeta;
+    try std.testing.expectEqual(GraphIndex.graph_metric_meta_schema_version, decoded.schema_version);
+    try std.testing.expectEqual(current.target_edge_generation, decoded.target_edge_generation);
+    try std.testing.expectEqual(current.converged, decoded.converged);
+    try std.testing.expectEqual(current.iterations_completed, decoded.iterations_completed);
+    try std.testing.expectEqual(current.delta, decoded.delta);
+    try std.testing.expectEqual(current.computed_at_ms, decoded.computed_at_ms);
+    try std.testing.expectEqual(current.config_fingerprint, decoded.config_fingerprint);
+
+    // V3 encoded the same convergence fields and fingerprint but used its key
+    // generation as the edge snapshot identity.
+    var v3: [GraphIndex.graph_metric_meta_v3_encoded_len]u8 = undefined;
+    var offset: usize = 0;
+    inline for (.{
+        @as(u64, 3),
+        @as(u64, 1),
+        @as(u64, 5),
+        @as(u64, @bitCast(@as(f64, 0.25))),
+        @as(u64, 5678),
+        @as(u64, 0x8877665544332211),
+    }) |value| {
+        std.mem.writeInt(u64, v3[offset..][0..8], value, .little);
+        offset += 8;
+    }
+    const legacy = GraphIndex.decodeGraphMetricMeta(&v3) orelse return error.TestExpectedGraphMetricMeta;
+    try std.testing.expectEqual(@as(u32, 3), legacy.schema_version);
+    try std.testing.expectEqual(@as(u64, 0), legacy.target_edge_generation);
+    try std.testing.expectEqual(@as(u64, 0x8877665544332211), legacy.config_fingerprint);
+}
+
 test "graph metric failed rebuild preserves published generation and records event" {
     const alloc = std.testing.allocator;
     var store_buf: [256]u8 = undefined;
@@ -10872,7 +11249,8 @@ test "graph metric failed rebuild preserves published generation and records eve
         try std.testing.expectEqual(@as(u64, 1), failed_job.retry_count);
         try std.testing.expectEqualStrings("InvalidGraphMetricScore", failed_job.last_error);
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.check_convergence, failed_job.phase);
-        try std.testing.expectEqual(failed_job.target_generation, failed_job.score_generation);
+        try std.testing.expect(failed_job.score_generation != failed_job.target_generation);
+        try std.testing.expect(failed_job.score_generation != failed.published_generation);
     }
 
     const top = try graph.graphMetricTopK("pagerank", 1);
@@ -10896,6 +11274,52 @@ test "graph metric failed rebuild preserves published generation and records eve
         try std.testing.expectEqual(@as(u64, 0), recovered_job.retry_count);
         try std.testing.expectEqualStrings("", recovered_job.last_error);
     }
+}
+
+test "graph metric rebuild at unchanged edge generation publishes an isolated score epoch" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-degree-same-edge-rebuild");
+    defer cleanupTmp(store_path);
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-degree-same-edge-rebuild");
+    defer cleanupTmp(rev_path);
+
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    const metrics = [_]GraphMetricConfig{.{ .name = "degree", .kind = .degree, .refresh = .manual }};
+    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    defer graph.close();
+    try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
+    try graph.addEdge("doc-a", "doc-c", "cites", 1.0, 0, 0, "");
+
+    var first = try graph.runGraphMetric("degree");
+    defer first.deinit(alloc);
+    const edge_generation = first.published_edge_generation;
+    const first_score_generation = first.published_generation;
+
+    var rebuilt = try graph.runGraphMetric("degree");
+    defer rebuilt.deinit(alloc);
+    try std.testing.expectEqual(edge_generation, rebuilt.published_edge_generation);
+    try std.testing.expect(rebuilt.published_generation > first_score_generation);
+    try std.testing.expectEqual(@as(usize, 3), try graph.countGraphMetricScoreGeneration("degree", rebuilt.published_generation));
+
+    const top = try graph.graphMetricTopK("degree", 3);
+    defer {
+        for (top) |*score| score.deinit(alloc);
+        alloc.free(top);
+    }
+    try std.testing.expectEqual(@as(usize, 3), top.len);
+    try std.testing.expectEqualStrings("doc-a", top[0].node);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), top[0].score, 0.001);
+
+    var cleanup_steps: usize = 0;
+    while (try graph.cleanupRetiredGraphMetricScoreGenerationPage("degree")) {
+        cleanup_steps += 1;
+        if (cleanup_steps > 8) return error.TestGraphMetricCleanupDidNotConverge;
+    }
+    try std.testing.expect(cleanup_steps > 0);
+    try std.testing.expectEqual(@as(usize, 0), try graph.countGraphMetricScoreGeneration("degree", first_score_generation));
 }
 
 test "graph metric failed rebuild preserves published generation across reopen" {
@@ -11258,7 +11682,10 @@ test "graph metric edge filter equality and fingerprint treat types as set" {
         .kind = .pagerank,
         .edge_filter = right_filter,
     };
-    try std.testing.expectEqual(GraphIndex.graphMetricConfigFingerprint(left), GraphIndex.graphMetricConfigFingerprint(right));
+    const fingerprint = GraphIndex.graphMetricConfigFingerprint(left);
+    try std.testing.expectEqual(fingerprint, GraphIndex.graphMetricConfigFingerprint(right));
+    try std.testing.expect(fingerprint > 0);
+    try std.testing.expect(fingerprint <= std.math.maxInt(i64));
 }
 
 test "graph metric build manifest is durable and idempotent across reopen" {
@@ -18178,6 +18605,14 @@ test "graph metric verified publish cleans completed job namespace only" {
     try std.testing.expectEqual(status.published_generation, fresh.published_generation);
 }
 
+fn drainRetiredGraphMetricScoresForTest(graph: *GraphIndex, metric_name: []const u8) !void {
+    var steps: usize = 0;
+    while (try graph.cleanupRetiredGraphMetricScoreGenerationPage(metric_name)) {
+        steps += 1;
+        if (steps > 16) return error.TestGraphMetricCleanupDidNotConverge;
+    }
+}
+
 test "graph metric failed planned build cleans abandoned scores and job namespace" {
     const alloc = std.testing.allocator;
     var store_buf: [256]u8 = undefined;
@@ -18225,6 +18660,7 @@ test "graph metric failed planned build cleans abandoned scores and job namespac
     }
 
     try graph.recordGraphMetricFailure("degree", error.InvalidGraphMetricScore);
+    try drainRetiredGraphMetricScoresForTest(&graph, "degree");
 
     {
         var txn = try graph.beginReadReverseTxn();
@@ -18385,6 +18821,7 @@ test "graph metric repeated failed planned builds bound diagnostics and cleanup 
         try std.testing.expectEqual(GraphIndex.GraphMetricState.failed, failed.state);
         try std.testing.expectEqual(@as(u64, i + 1), failed.retry_count);
         try std.testing.expectEqual(@as(usize, @min(i + 1, graph_metric_recent_event_limit)), failed.recent_failures.len);
+        try drainRetiredGraphMetricScoresForTest(&graph, "degree");
 
         {
             var txn = try graph.beginReadReverseTxn();
@@ -18547,6 +18984,7 @@ fn verifyRepeatedFailedIterativeMetricBuildCleanup(
         try std.testing.expectEqual(GraphIndex.GraphMetricState.failed, failed.state);
         try std.testing.expectEqual(@as(u64, i + 1), failed.retry_count);
         try std.testing.expectEqual(@as(usize, @min(i + 1, graph_metric_recent_event_limit)), failed.recent_failures.len);
+        try drainRetiredGraphMetricScoresForTest(&graph, metric_name);
 
         {
             var txn = try graph.beginReadReverseTxn();
@@ -18671,6 +19109,8 @@ test "graph metric repeated failed hits builds bound diagnostics and cleanup aba
         try std.testing.expectEqual(@as(u64, i + 1), failed_hub.retry_count);
         try std.testing.expectEqual(@as(usize, @min(i + 1, graph_metric_recent_event_limit)), failed_authority.recent_failures.len);
         try std.testing.expectEqual(failed_authority.recent_failures.len, failed_hub.recent_failures.len);
+        try drainRetiredGraphMetricScoresForTest(&graph, "hits_authority");
+        try drainRetiredGraphMetricScoresForTest(&graph, "hits_hub");
 
         {
             var txn = try graph.beginReadReverseTxn();

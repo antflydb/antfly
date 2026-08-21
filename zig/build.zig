@@ -7202,6 +7202,9 @@ pub fn build(b: *std.Build) void {
         "graph metric runtime boundary tick",
         "ownership state tracks lease takeover and loss",
         "graph metric order and filter dependencies attach status without projection",
+        "graph metric metadata preserves score epoch input and decodes v3",
+        "graph metric edge filter equality and fingerprint treat types as set",
+        "graph metric rebuild at unchanged edge generation publishes an isolated score epoch",
     };
     const graph_metric_unit_tests = b.addTest(.{
         .root_module = db_test_mod,
@@ -7287,6 +7290,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_graph_metric_fan_in_tests.step);
 
     const graph_metric_remote_wire_filters = [_][]const u8{
+        "multi-shard reads fail closed for shard-local graph metric scores",
         "graph metric shard request carries internal status without mutating public request",
         "encode query request includes graph metric read rerank and traversal status",
         "remote query parser preserves graph metric fan-in provenance and durable status",

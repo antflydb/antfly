@@ -1034,6 +1034,8 @@ pub const GraphMetricStatus = struct {
     edge_filter: ?GraphMetricEdgeFilterStatus = null,
     /// Version of the published graph metric metadata schema.
     metadata_version: ?i64 = null,
+    /// Deterministic fingerprint of the configuration that produced the published metric snapshot.
+    config_fingerprint: ?i64 = null,
     maintenance_paused: ?bool = null,
     /// Whether a local or distributed build is queued after the currently published or building generation.
     build_queued: bool,

@@ -288,29 +288,31 @@ Queries only resolve scores through `graph_metric_published`. Build jobs write
 to a private `building_generation` and flip the published pointer only after the
 generation converges or reaches the configured iteration cap.
 
-For the first version, clean up old generations immediately after publishing a
-new generation, while preserving snapshot safety. The implementation must not
-delete a generation that an active query snapshot can still read.
+Score generations are private storage epochs, not edge generations. A manual
+refresh or config-only rebuild may target the same edge snapshot more than once,
+so every attempt gets a new durable score namespace. Status and API responses
+continue to expose the edge snapshot as `published_generation`; the private
+score epoch is only used to locate immutable materialized rows.
 
-If graph metric reads run inside a stable read transaction or storage snapshot,
-delete old generation rows immediately after the publish pointer flips. Existing
-readers keep their snapshot; new readers resolve the new published generation.
+Publication enqueues the superseded score epoch for bounded background cleanup.
+Cleanup uses durable phase/cursor state and small transactions, which avoids
+unbounded write batches and remains safe for readers holding an older storage
+snapshot. Failed builds enqueue only their unpublished output and never remove
+the last good published generation. Operator deletion similarly tombstones the
+metric immediately, then removes scores, ranks, metadata, and job state in
+bounded maintenance pages.
 
-If graph metric reads are not snapshot-safe, use a small deferred cleanup queue
-instead of adding a full reader-epoch system in v1:
-
-```text
-graph_metric_cleanup:<index>:<metric>:<generation> -> eligible_after_ms
-```
-
-Maintenance deletes queued generations after `eligible_after_ms`. Use an
-internal v1 constant:
+The durable cleanup state is internal:
 
 ```text
-default_deferred_cleanup_ms = 60_000
+graph_metric_retired:<index>:<metric> -> score_generation
+graph_metric_cleanup_phase:<index>:<metric> -> scores | ranks | metadata
+graph_metric_cleanup_cursor:<index>:<metric> -> last_key
 ```
 
-Do not expose the deferred cleanup delay as user-facing config in v1.
+The queue is deliberately bounded. If maintenance cannot retire generations as
+fast as new materializations are requested, control requests apply backpressure
+instead of accumulating unbounded disk usage.
 
 Future versions can add retention controls for debugging or rollback:
 
@@ -1433,20 +1435,13 @@ Current implementation progress:
   metric status. Each profile entry records the query name, source, graph index,
   metric name, effective freshness mode, and the observed graph metric status,
   including published generation, target edge generation, state, and progress.
-- Distributed public query fan-in now preserves direct `graph_metric_results`
-  from remote shard responses. The API merge path groups results by requested
-  query name, merges shard statuses conservatively, sorts scores by score
-  descending with node-key tie-breaking, and applies the requested metric
-  `top_k` after global merge. It also verifies that all score-bearing shard
-  results for a named metric refer to the same index, metric, and nonzero
-  published score generation before ranking scores together. Requested metric
-  fan-in also requires every shard response to include exactly one matching
-  metric result, so missing shard data, unpublished zero-generation metrics,
-  and incompatible generations fail closed instead of producing a blended
-  top-k. `metric_freshness: "fresh"` is enforced again at fan-in, so a shard
-  response that reports stale/building/failed status for a fresh direct metric
-  request is rejected instead of being merged. This establishes the
-  deterministic direct-metric merge contract. Focused merge coverage now also
+- The distributed merge layer contains a deterministic, fail-closed contract
+  for a future globally coordinated metric materialization. It groups direct
+  results by requested query name, validates index, metric, configuration
+  fingerprint, edge scope, and publication metadata, sorts scores by score
+  descending with node-key tie-breaking, and applies `top_k` only after merge.
+  `metric_freshness: "fresh"` is enforced again at fan-in. Focused merge coverage
+  also
   verifies paired HITS authority/hub results preserve the last compatible
   published generation when a shard reports a failed rebuild, while `fresh`
   fails closed. Hosted cross-range coverage now proves compatible published
@@ -1465,24 +1460,16 @@ Current implementation progress:
   projection/order/filter, and authority rerank merge behavior with prior-pair
   preservation, `fresh` rejection, remote HITS generation/metadata/edge-filter
   mismatch rejection, and missing-status rejection.
-  This narrows the gap between focused CI fan-in and promotion-scale shard evidence.
-  Distributed metric jobs and promotion-scale globally comparable published
-  generations remain future work.
-- Distributed graph-query fan-in now applies the same fail-closed generation
-  rule to score-bearing graph metric reads. When a graph query requests metric
-  projection, metric ordering, or metric filtering, every shard must return the
-  named graph result and a matching nonzero published status for each requested
-  metric. The merge path combines compatible metric status by name and refuses
-  missing graph results, missing metric status, unpublished zero-generation
-  status, incompatible published generations, or stale status for a metric use
-  that requested `fresh` before appending nodes from different shards. Query
-  profile coverage now also verifies the merged graph-query metric status is
-  reported once with the effective freshness mode, stale/building state, and
-  published/building generations. Fast root coverage now explicitly exercises
-  the order/filter shard fan-in path, including compatible stale published
-  reads, `fresh` rejection, incompatible generations, and zero-generation
-  rejection. This closes the traversal/projection/order/filter fan-in and
-  profile-output hole without changing local graph query freshness semantics.
+  This narrows the gap between focused merge tests and promotion-scale shard
+  evidence, but it does not make independently normalized shard-local scores
+  globally comparable.
+- Until a coordinator builds and publishes one table-wide metric snapshot,
+  production table reads fail closed before fan-out when a request uses direct
+  metric top-k, metric-assisted reranking, or graph metric projection, ordering,
+  or filtering across more than one shard. Traversal without metric scores
+  remains supported. This gate prevents numerically compatible-looking local
+  generations from silently producing incorrect global rankings. The internal
+  merge contract remains tested for the future coordinated implementation.
 - Ordinary search requests can now opt into explicit graph metric score
   blending with `graph_metric_rerank`. The first implementation validates that
   the requested graph metric has a published generation, honors

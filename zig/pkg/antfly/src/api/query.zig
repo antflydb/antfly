@@ -1208,7 +1208,7 @@ fn validateHitsPairMetricStatusesCompatible(
 ) !void {
     if (authority.published_generation == 0 or hub.published_generation == 0) return error.UnsupportedQueryRequest;
     if (authority.published_generation != hub.published_generation) return error.UnsupportedQueryRequest;
-    try validateGraphMetricStatusCompatible(authority, hub);
+    try validateGraphMetricStatusSchemaAndFilterCompatible(authority, hub);
 }
 
 fn validateGraphMetricFreshness(
@@ -1275,6 +1275,19 @@ fn ensureGraphMetricResultComparable(
 }
 
 fn validateGraphMetricStatusCompatible(
+    existing: db_mod.types.GraphMetricStatus,
+    incoming: db_mod.types.GraphMetricStatus,
+) !void {
+    try validateGraphMetricStatusSchemaAndFilterCompatible(existing, incoming);
+    if (existing.config_fingerprint != 0 and
+        incoming.config_fingerprint != 0 and
+        existing.config_fingerprint != incoming.config_fingerprint)
+    {
+        return error.UnsupportedQueryRequest;
+    }
+}
+
+fn validateGraphMetricStatusSchemaAndFilterCompatible(
     existing: db_mod.types.GraphMetricStatus,
     incoming: db_mod.types.GraphMetricStatus,
 ) !void {
@@ -1346,6 +1359,7 @@ pub fn mergeGraphMetricStatusInto(alloc: std.mem.Allocator, target: *db_mod.type
     target.state = mergeGraphMetricState(target.state, source.state);
     target.phase = mergeGraphMetricPhase(target.phase, source.phase);
     target.metadata_version = mergeGraphMetricMetadataVersion(target.metadata_version, source.metadata_version);
+    target.config_fingerprint = mergeComparableGeneration(target.config_fingerprint, source.config_fingerprint);
     target.maintenance_paused = target.maintenance_paused or source.maintenance_paused;
     target.build_queued = target.build_queued or source.build_queued;
     target.published_generation = mergeComparableGeneration(target.published_generation, source.published_generation);
@@ -1401,6 +1415,12 @@ pub fn mergeCompatibleGraphMetricStatusInto(
     {
         return error.GraphMetricStatusConflict;
     }
+    if (target.config_fingerprint != 0 and
+        source.config_fingerprint != 0 and
+        target.config_fingerprint != source.config_fingerprint)
+    {
+        return error.GraphMetricStatusConflict;
+    }
     if (!target.edge_filter.equivalent(source.edge_filter)) return error.GraphMetricStatusConflict;
     try mergeGraphMetricStatusInto(alloc, target, source);
 }
@@ -1415,6 +1435,7 @@ test "graph metric operational status aggregation rejects divergent shard defini
         .state = .fresh,
         .edge_filter = try cites_filter.cloneAlloc(alloc),
         .metadata_version = 2,
+        .config_fingerprint = 11,
         .published_generation = 7,
         .progress = 1.0,
     };
@@ -1442,11 +1463,24 @@ test "graph metric operational status aggregation rejects divergent shard defini
         mergeCompatibleGraphMetricStatusInto(alloc, &target, filter_mismatch),
     );
 
+    var fingerprint_mismatch = db_mod.types.GraphMetricStatus{
+        .name = try alloc.dupe(u8, "pagerank"),
+        .edge_filter = try cites_filter.cloneAlloc(alloc),
+        .metadata_version = 2,
+        .config_fingerprint = 12,
+    };
+    defer fingerprint_mismatch.deinit(alloc);
+    try std.testing.expectError(
+        error.GraphMetricStatusConflict,
+        mergeCompatibleGraphMetricStatusInto(alloc, &target, fingerprint_mismatch),
+    );
+
     var compatible = db_mod.types.GraphMetricStatus{
         .name = try alloc.dupe(u8, "pagerank"),
         .state = .stale,
         .edge_filter = try cites_filter.cloneAlloc(alloc),
         .metadata_version = 2,
+        .config_fingerprint = 11,
         .published_generation = 7,
         .progress = 0.5,
     };
@@ -1807,7 +1841,7 @@ fn validateGraphSearchHitsPairMetricStatusesCompatible(
 ) !void {
     if (authority.published_generation == 0 or hub.published_generation == 0) {
         if (authority.published_generation != 0 or hub.published_generation != 0) return error.UnsupportedQueryRequest;
-        try validateGraphMetricStatusCompatible(authority, hub);
+        try validateGraphMetricStatusSchemaAndFilterCompatible(authority, hub);
         return;
     }
     try validateHitsPairMetricStatusesCompatible(authority, hub);
@@ -2041,6 +2075,7 @@ pub fn cloneGraphMetricStatus(
         .phase = source.phase,
         .edge_filter = edge_filter,
         .metadata_version = source.metadata_version,
+        .config_fingerprint = source.config_fingerprint,
         .maintenance_paused = source.maintenance_paused,
         .build_queued = source.build_queued,
         .published_generation = source.published_generation,

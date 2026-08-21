@@ -74,6 +74,40 @@ fn graphSearchQueryNeedsInternalMetricStatus(query: graph_query_mod.GraphQuery) 
     return query.metrics.len > 0 or query.order_by.len > 0 or query.where_metric.len > 0;
 }
 
+fn rejectNonGlobalGraphMetricFanout(group_count: usize, req: db_mod.types.SearchRequest) !void {
+    if (group_count <= 1) return;
+    if (req.graph_metric_queries.len > 0 or req.graph_metric_rerank != null) {
+        return error.UnsupportedQueryRequest;
+    }
+    for (req.graph_queries) |named| {
+        if (graphSearchQueryNeedsInternalMetricStatus(named.query)) {
+            // Shard-local PageRank/eigenvector/HITS scores are normalized over
+            // different graphs and their numeric generations are not a global
+            // snapshot identity. Merging them would return plausible but
+            // mathematically invalid results. Fail closed until a coordinator
+            // supplies one globally materialized metric snapshot.
+            return error.UnsupportedQueryRequest;
+        }
+    }
+}
+
+test "multi-shard reads fail closed for shard-local graph metric scores" {
+    const metric_req = db_mod.types.SearchRequest{
+        .graph_metric_queries = &.{.{
+            .name = "central",
+            .query = .{ .index_name = "graph_idx", .metric_name = "pagerank" },
+        }},
+    };
+    try rejectNonGlobalGraphMetricFanout(1, metric_req);
+    try std.testing.expectError(error.UnsupportedQueryRequest, rejectNonGlobalGraphMetricFanout(2, metric_req));
+
+    const traversal_only = db_mod.types.SearchRequest{ .graph_queries = &.{.{
+        .name = "neighbors",
+        .query = .{ .query_type = .neighbors, .index_name = "graph_idx", .start_nodes = .{ .keys = &.{"doc-a"} } },
+    }} };
+    try rejectNonGlobalGraphMetricFanout(2, traversal_only);
+}
+
 fn prepareGraphMetricFanInShardRequest(
     alloc: std.mem.Allocator,
     req: db_mod.types.SearchRequest,
@@ -3104,6 +3138,7 @@ pub const ProvisionedTableReadSource = struct {
         const group_ids = prepared.group_ids;
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
+        try rejectNonGlobalGraphMetricFanout(group_ids.len, req);
         const start_ns = platform_time.monotonicNs();
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
             var execution = queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.managedReadRuntimeConfig(), table_name, req, .stale) catch |err| switch (err) {
@@ -3819,6 +3854,10 @@ pub const HostedProvisionedTableReadSource = struct {
     io_impl: ?*std.Io.Threaded = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     group_visible_root_generation: ?GroupVisibleRootGenerationSource = null,
+    // Private fixture capability used only by the synthetic cross-range merge
+    // contract tests below. Real sources always fail closed until graph metric
+    // materialization is globally coordinated.
+    testing_allow_non_global_graph_metric_fanout: bool = false,
 
     pub fn init(
         replica_root_dir: []const u8,
@@ -4115,6 +4154,9 @@ pub const HostedProvisionedTableReadSource = struct {
         defer alloc.free(group_ids);
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
+        if (!self.testing_allow_non_global_graph_metric_fanout) {
+            try rejectNonGlobalGraphMetricFanout(group_ids.len, req);
+        }
         const start_ns = platform_time.monotonicNs();
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
             var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_ids[0], routePolicyForConsistency(consistency))) orelse return null;
@@ -17826,6 +17868,7 @@ fn parseRemoteGraphMetricStatusValue(
         .phase = graphMetricPhaseFromName(status.phase) orelse return error.InvalidQueryResponse,
         .edge_filter = edge_filter,
         .metadata_version = try remoteOptionalU32(status.metadata_version),
+        .config_fingerprint = try remoteOptionalU64(status.config_fingerprint),
         .maintenance_paused = status.maintenance_paused orelse false,
         .build_queued = status.build_queued,
         .published_generation = try remoteU64(status.published_generation),
@@ -27724,6 +27767,7 @@ test "hosted cross-range graph metric fan-in merges compatible published shard g
         executor_state.iface(),
     );
     _ = hosted.withIo(&io_impl);
+    hosted.testing_allow_non_global_graph_metric_fanout = true;
 
     var response = (try hosted.source().query(alloc, "docs", .{
         .graph_metric_queries = &.{.{
@@ -27980,6 +28024,7 @@ test "hosted cross-range graph metric fan-in merges active stale shard for publi
         executor_state.iface(),
     );
     _ = hosted.withIo(&io_impl);
+    hosted.testing_allow_non_global_graph_metric_fanout = true;
 
     const active_metrics = [_][]const u8{ "manual_degree", "pagerank", "eigenvector" };
     for (active_metrics) |metric_name| {
@@ -28410,6 +28455,7 @@ test "hosted cross-range graph metric fan-in merges nonuniform promotion shard l
         executor_state.iface(),
     );
     _ = hosted.withIo(&io_impl);
+    hosted.testing_allow_non_global_graph_metric_fanout = true;
 
     for (metric_names) |metric_name| {
         var response = (try hosted.source().query(alloc, "docs", .{
@@ -28728,6 +28774,7 @@ test "hosted cross-range graph metric fan-in merges compatible hits pair" {
         executor_state.iface(),
     );
     _ = hosted.withIo(&io_impl);
+    hosted.testing_allow_non_global_graph_metric_fanout = true;
 
     var response = (try hosted.source().query(alloc, "docs", .{
         .graph_metric_queries = &.{
@@ -29121,6 +29168,7 @@ test "hosted cross-range graph metric fan-in rejects incompatible remote hits pa
         executor_state.iface(),
     );
     _ = hosted.withIo(&io_impl);
+    hosted.testing_allow_non_global_graph_metric_fanout = true;
 
     try std.testing.expectError(error.UnsupportedQueryRequest, hosted.source().query(alloc, "docs", .{
         .graph_metric_queries = &.{
@@ -29380,6 +29428,7 @@ test "hosted cross-range graph metric fan-in rejects missing remote hits status"
         executor_state.iface(),
     );
     _ = hosted.withIo(&io_impl);
+    hosted.testing_allow_non_global_graph_metric_fanout = true;
 
     try std.testing.expectError(error.UnsupportedQueryRequest, hosted.source().query(alloc, "docs", .{
         .graph_metric_queries = &.{
@@ -29581,6 +29630,7 @@ test "hosted cross-range graph metric fan-in rejects unpublished or incompatible
         executor_state.iface(),
     );
     _ = hosted.withIo(&io_impl);
+    hosted.testing_allow_non_global_graph_metric_fanout = true;
 
     const metric_req = db_mod.types.SearchRequest{
         .graph_metric_queries = &.{.{

@@ -18158,7 +18158,9 @@ pub const DB = struct {
         try entry.index.enableGraphMetric(metric_name);
         var status = try entry.index.runGraphMetric(metric_name);
         defer status.deinit(entry.index.alloc);
-        return try cloneGraphMetricStatusFromGraph(alloc, status);
+        const cloned = try cloneGraphMetricStatusFromGraph(alloc, status);
+        if (self.graph_metric_runtime) |runtime| runtime.notify();
+        return cloned;
     }
 
     pub fn rebuildGraphMetric(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
@@ -18166,11 +18168,12 @@ pub const DB = struct {
         lockApply(self);
         defer self.core.unlockApply();
         const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
-        try entry.index.deleteGraphMetricMaterialization(metric_name);
         try entry.index.enableGraphMetric(metric_name);
         var status = try entry.index.runGraphMetric(metric_name);
         defer status.deinit(entry.index.alloc);
-        return try cloneGraphMetricStatusFromGraph(alloc, status);
+        const cloned = try cloneGraphMetricStatusFromGraph(alloc, status);
+        if (self.graph_metric_runtime) |runtime| runtime.notify();
+        return cloned;
     }
 
     /// Durably enqueue metric work and return immediately. Public control-plane
@@ -18190,7 +18193,7 @@ pub const DB = struct {
             const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
             var current = try entry.index.graphMetricStatus(metric_name);
             defer current.deinit(entry.index.alloc);
-            if (!force and current.state == .disabled) {
+            if (current.state == .disabled) {
                 try entry.index.enableGraphMetric(metric_name);
                 current.deinit(entry.index.alloc);
                 current = try entry.index.graphMetricStatus(metric_name);
@@ -18199,14 +18202,10 @@ pub const DB = struct {
                 break :blk try cloneGraphMetricStatusFromGraph(alloc, current);
             }
             const target_generation = @max(current.edge_generation, current.target_edge_generation);
-            // Score generations are keyed by the graph edge generation. A
-            // forced rebuild therefore must unpublish the old materialization
-            // before workers rewrite that generation; readers can never
-            // observe a partially replaced score set.
-            if (force) {
-                try entry.index.deleteGraphMetricMaterialization(metric_name);
-                try entry.index.enableGraphMetric(metric_name);
-            }
+            // Force means "build another immutable score epoch", not
+            // "unpublish first". Repeated requests remain idempotent while a
+            // build is active, and readers keep the verified prior epoch until
+            // the new pointer is atomically published.
             var scheduled = try self.core.index_manager.ensureGraphMetricPlannedBuild(index_name, metric_name, target_generation);
             defer scheduled.deinit(self.core.index_manager.alloc);
             break :blk try cloneGraphMetricStatusFromGraph(alloc, scheduled);
@@ -18223,7 +18222,9 @@ pub const DB = struct {
         try entry.index.deleteGraphMetricMaterialization(metric_name);
         var status = try entry.index.graphMetricStatus(metric_name);
         defer status.deinit(entry.index.alloc);
-        return try cloneGraphMetricStatusFromGraph(alloc, status);
+        const cloned = try cloneGraphMetricStatusFromGraph(alloc, status);
+        if (self.graph_metric_runtime) |runtime| runtime.notify();
+        return cloned;
     }
 
     pub fn pauseGraphMetricMaintenance(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
@@ -20897,9 +20898,10 @@ pub const DB = struct {
             .state = source.state,
             .phase = source.phase,
             .metadata_version = source.metadata_version,
+            .config_fingerprint = source.config_fingerprint,
             .maintenance_paused = source.maintenance_paused,
             .build_queued = source.build_queued,
-            .published_generation = source.published_generation,
+            .published_generation = source.published_edge_generation,
             .edge_generation = source.edge_generation,
             .target_edge_generation = source.target_edge_generation,
             .queued_generation = source.queued_generation,

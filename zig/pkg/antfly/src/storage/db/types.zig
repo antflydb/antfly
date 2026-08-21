@@ -2132,6 +2132,7 @@ pub const GraphMetricStatus = struct {
     phase: graph_mod.GraphIndex.GraphMetricBuildPhase = .idle,
     edge_filter: graph_mod.GraphMetricEdgeFilter = .{},
     metadata_version: u32 = 0,
+    config_fingerprint: u64 = 0,
     maintenance_paused: bool = false,
     build_queued: bool = false,
     published_generation: u64 = 0,

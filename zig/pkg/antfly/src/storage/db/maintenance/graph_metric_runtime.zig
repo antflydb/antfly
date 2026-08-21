@@ -10992,7 +10992,7 @@ test "db graph metric runtime operations pause and resume controls background ma
         defer status.deinit(alloc);
         try std.testing.expect(status.maintenance_paused);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.stale, status.state);
-        try std.testing.expectEqual(first_generation, status.published_generation);
+        try std.testing.expectEqual(first_generation, status.published_edge_generation);
 
         const top = try graph_entry.index.graphMetricTopK("degree", 10);
         defer {

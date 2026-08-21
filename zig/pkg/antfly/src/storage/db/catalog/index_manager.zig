@@ -4027,7 +4027,6 @@ pub const IndexManager = struct {
 
     pub fn rebuildGraphMetric(self: *IndexManager, index_name: []const u8, metric_name: []const u8) !graph_mod.GraphIndex.GraphMetricStatus {
         const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
-        try entry.index.deleteGraphMetricMaterialization(metric_name);
         try entry.index.enableGraphMetric(metric_name);
         return try entry.index.runGraphMetric(metric_name);
     }
@@ -4592,9 +4591,21 @@ pub const IndexManager = struct {
                     return result;
                 }
 
+                if (try entry.index.cleanupDeletedGraphMetricMaterializationPage(cfg.name)) {
+                    result.metrics_scanned += 1;
+                    result.worker_steps += 1;
+                    result.pages_completed += 1;
+                    continue;
+                }
                 var status = try entry.index.graphMetricStatus(cfg.name);
                 defer status.deinit(entry.index.alloc);
                 if (status.maintenance_paused) continue;
+                if (try entry.index.cleanupRetiredGraphMetricScoreGenerationPage(cfg.name)) {
+                    result.metrics_scanned += 1;
+                    result.worker_steps += 1;
+                    result.pages_completed += 1;
+                    continue;
+                }
                 const active = status.state == .building or status.phase == .cleanup_old_generations;
                 if (!active) continue;
                 result.metrics_scanned += 1;

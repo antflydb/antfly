@@ -2509,6 +2509,10 @@ components:
           type: integer
           format: int64
           description: "Version of the published graph metric metadata schema."
+        config_fingerprint:
+          type: integer
+          format: int64
+          description: "Deterministic fingerprint of the configuration that produced the published metric snapshot."
         maintenance_paused:
           type: boolean
         build_queued:

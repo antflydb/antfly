@@ -6664,6 +6664,7 @@ fn cloneGraphMetricStatus(
         .phase = source.phase,
         .edge_filter = edge_filter,
         .metadata_version = source.metadata_version,
+        .config_fingerprint = source.config_fingerprint,
         .maintenance_paused = source.maintenance_paused,
         .build_queued = source.build_queued,
         .published_generation = source.published_generation,
@@ -6757,6 +6758,12 @@ fn validateDistributedGraphMetricStatusCompatible(
     {
         return error.UnsupportedQueryRequest;
     }
+    if (existing.config_fingerprint != 0 and
+        incoming.config_fingerprint != 0 and
+        existing.config_fingerprint != incoming.config_fingerprint)
+    {
+        return error.UnsupportedQueryRequest;
+    }
     if (!existing.edge_filter.equivalent(incoming.edge_filter)) return error.UnsupportedQueryRequest;
 }
 
@@ -6768,6 +6775,7 @@ fn mergeGraphMetricStatusInto(
     target.state = mergeGraphMetricState(target.state, source.state);
     target.phase = mergeGraphMetricPhase(target.phase, source.phase);
     target.metadata_version = mergeGraphMetricMetadataVersion(target.metadata_version, source.metadata_version);
+    target.config_fingerprint = mergeComparableGeneration(target.config_fingerprint, source.config_fingerprint);
     target.maintenance_paused = target.maintenance_paused or source.maintenance_paused;
     target.build_queued = target.build_queued or source.build_queued;
     target.published_generation = mergeComparableGeneration(target.published_generation, source.published_generation);
