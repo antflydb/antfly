@@ -3,7 +3,7 @@ name: Cancel Superseded PR Runs
 on:
   pull_request_target:
     branches: ["main"]
-    types: [synchronize]
+    types: [synchronize, closed]
 
 concurrency:
   group: cancel-superseded-${{ github.event.pull_request.number }}
@@ -21,12 +21,13 @@ jobs:
     runs-on: arc-antfly-standard
     timeout-minutes: 5
     steps:
-      - name: Cancel superseded PR workflow runs
+      - name: Cancel obsolete PR workflow runs
         uses: actions/github-script@v8
         with:
           script: |
             const { owner, repo } = context.repo;
             const eventPull = context.payload.pull_request;
+            const isClosedEvent = context.payload.action === "closed";
             const activeStatuses = new Set([
               "in_progress",
               "pending",
@@ -40,14 +41,21 @@ jobs:
               repo,
               pull_number: eventPull.number,
             });
-            if (pull.head.sha !== eventPull.head.sha) {
+            if (isClosedEvent && pull.state !== "closed") {
+              core.info(
+                `Skipping cleanup because PR #${pull.number} has been reopened`,
+              );
+              return;
+            }
+            if (!isClosedEvent && pull.head.sha !== eventPull.head.sha) {
               core.info(
                 `Skipping cleanup for ${eventPull.head.sha}; ` +
                 `PR #${pull.number} is now at ${pull.head.sha}`,
               );
               return;
             }
-            const pullHeadRepo = pull.head.repo?.full_name;
+            const pullHeadRepo =
+              pull.head.repo?.full_name ?? eventPull.head.repo?.full_name;
             if (!pullHeadRepo) {
               core.warning(
                 `Skipping cleanup because PR #${pull.number} has no head repository`,
@@ -61,27 +69,29 @@ jobs:
                 owner,
                 repo,
                 event: "pull_request",
-                branch: pull.head.ref,
+                branch: eventPull.head.ref,
                 per_page: 100,
               },
             );
-            const staleRuns = runs.filter((run) => {
-              const associatedWithPull = run.pull_requests.some(
+            const obsoleteRuns = runs.filter((run) => {
+              const associatedWithPull = (run.pull_requests ?? []).some(
                 (candidate) => candidate.number === pull.number,
               );
               const matchesPullHead =
                 run.head_repository?.full_name === pullHeadRepo &&
-                run.head_branch === pull.head.ref;
+                run.head_branch === eventPull.head.ref;
+              const belongsToClosedHead =
+                matchesPullHead && run.head_sha === eventPull.head.sha;
+              const isObsolete = isClosedEvent
+                ? associatedWithPull || belongsToClosedHead
+                : run.head_sha !== pull.head.sha &&
+                  (associatedWithPull || matchesPullHead);
 
-              return (
-                run.head_sha !== pull.head.sha &&
-                activeStatuses.has(run.status) &&
-                (associatedWithPull || matchesPullHead)
-              );
+              return activeStatuses.has(run.status) && isObsolete;
             });
 
-            if (staleRuns.length === 0) {
-              core.info("No superseded PR workflow runs are active");
+            if (obsoleteRuns.length === 0) {
+              core.info("No obsolete PR workflow runs are active");
               return;
             }
 
@@ -93,7 +103,13 @@ jobs:
               repo,
               pull_number: pull.number,
             });
-            if (latestPull.head.sha !== pull.head.sha) {
+            if (isClosedEvent && latestPull.state !== "closed") {
+              core.info(
+                `Skipping cleanup because PR #${pull.number} has been reopened`,
+              );
+              return;
+            }
+            if (!isClosedEvent && latestPull.head.sha !== pull.head.sha) {
               core.info(
                 `Skipping cleanup for ${pull.head.sha}; ` +
                 `PR #${pull.number} is now at ${latestPull.head.sha}`,
@@ -101,9 +117,10 @@ jobs:
               return;
             }
 
-            for (const run of staleRuns) {
+            const reason = isClosedEvent ? "closed" : "superseded";
+            for (const run of obsoleteRuns) {
               core.info(
-                `Requesting cancellation of superseded ${run.name} run ${run.id}`,
+                `Requesting cancellation of ${reason} PR ${run.name} run ${run.id}`,
               );
               try {
                 await github.rest.actions.cancelWorkflowRun({
@@ -120,7 +137,7 @@ jobs:
             const pollCount = 4;
             const stableChecksRequired = 3;
             const activeRuns = new Map(
-              staleRuns.map((run) => [
+              obsoleteRuns.map((run) => [
                 run.id,
                 { run, lastStatus: run.status, stableChecks: 1 },
               ]),
@@ -144,7 +161,7 @@ jobs:
                   status === candidate.lastStatus ? candidate.stableChecks + 1 : 1;
                 candidate.lastStatus = status;
                 core.info(
-                  `Superseded ${candidate.run.name} run ${runId} remains ${status} ` +
+                  `${reason} PR ${candidate.run.name} run ${runId} remains ${status} ` +
                   `(poll ${poll}/${pollCount})`,
                 );
               }
@@ -153,14 +170,14 @@ jobs:
             for (const [runId, candidate] of activeRuns) {
               if (candidate.stableChecks < stableChecksRequired) {
                 core.warning(
-                  `Leaving superseded ${candidate.run.name} run ${runId} to ` +
+                  `Leaving ${reason} PR ${candidate.run.name} run ${runId} to ` +
                   `ordinary cancellation because its status changed recently`,
                 );
                 continue;
               }
 
               core.warning(
-                `Force-cancelling stuck superseded ${candidate.run.name} run ${runId}`,
+                `Force-cancelling stuck ${reason} PR ${candidate.run.name} run ${runId}`,
               );
               try {
                 await github.request(
