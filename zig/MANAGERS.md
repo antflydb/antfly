@@ -82,6 +82,18 @@ The ordering contract for composed standalone startup is:
 5. during shutdown, stop and await submitted work, destroy the inference node,
    release lane leases, and finally destroy the `BackendRuntime`.
 
+Operational probes are deliberately outside expensive manager work. Dedicated
+inference computes its first usable-model inventory before publishing the HTTP
+listener, then a `Node`-owned `std.Io.Group` refreshes a last-known-good snapshot
+on the attached runtime. `/readyz` only copies that snapshot; it never traverses
+a shared model cache, parses manifests, loads a model, or waits for a refresh.
+External pull commands can therefore converge into readiness without coupling
+their process to the server, while transient cache failures fail closed before
+the first successful scan and do not erase a later known-good snapshot. Node
+teardown cancels and joins the refresher before releasing the borrowed executor
+or model-directory state. Full standalone retains its aggregate node readiness
+handler, so it does not create a redundant inference inventory task.
+
 Resource admission precedes scheduling: `ResourceManager` and `ModelManager`
 must reserve capacity before code submits allocation-producing work to a
 backend lane. Executor saturation may queue, reject during shutdown, or apply

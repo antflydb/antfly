@@ -2249,6 +2249,36 @@ const ModelCounts = struct {
     }
 };
 
+const ReadinessInventorySnapshot = struct {
+    counts: ModelCounts = .{},
+    initialized: bool = false,
+};
+
+/// A tiny, lock-protected publication point for the relatively expensive model
+/// inventory. Operational probes must never walk a shared model cache or parse
+/// manifests: they copy this snapshot and return immediately.
+const ReadinessInventory = struct {
+    lock: std.atomic.Mutex = .unlocked,
+    snapshot: ReadinessInventorySnapshot = .{},
+
+    fn publish(self: *@This(), counts: ModelCounts) void {
+        spinLock(&self.lock);
+        defer self.lock.unlock();
+        self.snapshot = .{ .counts = counts, .initialized = true };
+    }
+
+    fn load(self: *@This()) ReadinessInventorySnapshot {
+        spinLock(&self.lock);
+        defer self.lock.unlock();
+        return self.snapshot;
+    }
+};
+
+// External pull/install commands publish into the shared models directory
+// without going through this process. Refresh often enough for operational
+// state to converge, but avoid continuously reparsing a large remote cache.
+const readiness_inventory_refresh_interval_ms: u64 = 60_000;
+
 fn incrementModelCount(counts: *ModelCounts, task: []const u8) void {
     if (std.mem.eql(u8, task, "embedders")) counts.embedders += 1 else if (std.mem.eql(u8, task, "rerankers")) counts.rerankers += 1 else if (std.mem.eql(u8, task, "chunkers")) counts.chunkers += 1 else if (std.mem.eql(u8, task, "generators")) counts.generators += 1 else if (std.mem.eql(u8, task, "classifiers")) counts.classifiers += 1 else if (std.mem.eql(u8, task, "rewriters")) counts.rewriters += 1 else if (std.mem.eql(u8, task, "readers")) counts.readers += 1 else if (std.mem.eql(u8, task, "transcribers")) counts.transcribers += 1 else if (std.mem.eql(u8, task, "extractors")) counts.extractors += 1;
 }
@@ -2324,7 +2354,7 @@ fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) Mod
     return counts;
 }
 
-fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Allocator, io: std.Io) ModelCounts {
+fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Allocator, io: std.Io) !ModelCounts {
     const task_names = [_][]const u8{
         "embedders",  "rerankers",   "chunkers",
         "generators", "classifiers", "extractors",
@@ -2334,7 +2364,9 @@ fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Alloc
 
     var registry = registry_mod.ModelRegistry.init(allocator, models_dir);
     defer registry.deinit();
-    const discovered = registry.discover(io) catch &[_]registry_mod.ModelEntry{};
+    // The manifest is loaded below, so shallow discovery avoids parsing every
+    // manifest twice during each refresh.
+    const discovered = try registry.discoverShallow(io);
     defer {
         for (discovered) |entry| {
             allocator.free(entry.name);
@@ -2344,20 +2376,25 @@ fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Alloc
     }
 
     for (discovered) |entry| {
-        if (!model_manager_mod.isModelDirPotentiallyLoadableInCurrentBuild(allocator, entry.path)) continue;
+        // Read only listing metadata. Full manifest loading parses large GGUF
+        // tokenizer tables and was the dominant cost of readiness discovery.
+        var man = manifest_mod.loadListingFromDir(allocator, entry.path) catch continue;
+        defer man.deinit();
+        if (!model_manager_mod.isManifestPotentiallyLoadableInCurrentBuild(man)) continue;
 
-        var maybe_manifest: ?manifest_mod.ModelManifest = manifest_mod.loadFromDir(allocator, entry.path) catch null;
-        defer if (maybe_manifest) |*man| man.deinit();
-
-        const tasks = if (maybe_manifest) |*man| man.tasks else &.{};
-        const capabilities = if (maybe_manifest) |*man| man.capabilities else &.{};
-        const gliner_model_type = if (maybe_manifest) |*man| man.gliner_model_type else "";
-        const zero_shot_classification = if (maybe_manifest) |*man| manifestSupportsZeroShotClassification(man) else false;
+        const zero_shot_classification = manifestSupportsZeroShotClassification(&man);
 
         for (task_names) |task| {
             if (std.mem.eql(u8, task, "chunkers")) continue;
-            if (std.mem.eql(u8, task, "readers") and !readers_mod.isSupportedModelDir(allocator, entry.path)) continue;
-            if (taskMatchesModelListing(task, @tagName(entry.kind), gliner_model_type, tasks, capabilities, zero_shot_classification)) {
+            if (std.mem.eql(u8, task, "readers") and !readers_mod.isSupportedManifest(allocator, entry.path, man)) continue;
+            if (taskMatchesModelListing(
+                task,
+                @tagName(man.model_type),
+                man.gliner_model_type,
+                man.tasks,
+                man.capabilities,
+                zero_shot_classification,
+            )) {
                 incrementModelCount(&counts, task);
             }
         }
@@ -2572,6 +2609,10 @@ pub const Node = struct {
     admission_metrics_mutex: std.atomic.Mutex = .unlocked,
     compatibility_cache: std.StringHashMapUnmanaged(*CachedCompatibility) = .empty,
     compatibility_cache_lock: std.atomic.Mutex = .unlocked,
+    readiness_inventory: ReadinessInventory = .{},
+    readiness_refresh_group: std.Io.Group = .init,
+    readiness_refresh_io: ?std.Io = null,
+    readiness_refresh_started: bool = false,
     /// Runtime JIT qualification is limited to the single-threaded startup phase.
     request_surfaces_published: bool = false,
     /// Set after configured preloads, including declared optional sessions,
@@ -2806,6 +2847,9 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Node) void {
+        // The refresher borrows Node, its allocator, and the models directory.
+        // Cancel and join it before releasing any of those dependencies.
+        if (self.readiness_refresh_io) |io| self.readiness_refresh_group.cancel(io);
         self.model_manager.deinit();
         self.registry.deinit();
         self.extraction_reader_resolver.deinit();
@@ -2950,6 +2994,52 @@ pub const Node = struct {
     pub fn attachIo(self: *Node, io: std.Io) void {
         self.session_manager.io = io;
         self.model_manager.attachIo(io);
+    }
+
+    fn refreshReadinessInventory(self: *Node, io: std.Io) !void {
+        const counts = try collectDiscoveredModelCounts(
+            self.config.models_dir,
+            self.allocator,
+            io,
+        );
+        self.readiness_inventory.publish(counts);
+    }
+
+    fn readinessRefreshLoop(self: *Node, io: std.Io) std.Io.Cancelable!void {
+        while (true) {
+            try io.sleep(
+                std.Io.Duration.fromMilliseconds(readiness_inventory_refresh_interval_ms),
+                .awake,
+            );
+            self.refreshReadinessInventory(io) catch |err| {
+                // Preserve the last-known-good snapshot through transient cache
+                // or publication failures. A never-successful initialization
+                // remains not-ready.
+                std.log.warn(
+                    "readiness model inventory refresh failed err={s}",
+                    .{@errorName(err)},
+                );
+            };
+        }
+    }
+
+    /// Build the initial readiness view before listener publication and start
+    /// one runtime-owned refresher for model changes made by external pull
+    /// commands. Repeated calls are harmless (the runtime cannot be replaced).
+    pub fn startReadinessInventory(self: *Node, io: std.Io) void {
+        if (self.readiness_refresh_started) return;
+        self.refreshReadinessInventory(io) catch |err| {
+            // Liveness should still come up when a model volume is temporarily
+            // unavailable. The empty, uninitialized snapshot fails readiness
+            // closed until a later refresh succeeds.
+            std.log.warn(
+                "initial readiness model inventory failed err={s}",
+                .{@errorName(err)},
+            );
+        };
+        self.readiness_refresh_started = true;
+        self.readiness_refresh_io = io;
+        self.readiness_refresh_group.async(io, readinessRefreshLoop, .{ self, io });
     }
 
     pub fn detachPromptCacheResourceUsageObserver(self: *Node) void {
@@ -10524,6 +10614,7 @@ pub const Node = struct {
             return err;
         };
         self.attachIo(io);
+        self.startReadinessInventory(io);
         var server = httpx.Server.initWithConfig(allocator, io, self.httpServerConfig(host, port));
         defer server.deinit();
 
@@ -10586,12 +10677,13 @@ pub const Node = struct {
     }
 
     fn readyzHandler(self: *Node, ctx: *httpx.Context) anyerror!httpx.Response {
-        const counts = collectDiscoveredModelCounts(self.config.models_dir, ctx.allocator, ctx.io);
-        const status_text = if (counts.total() > 0) "ready" else "not_ready";
-        const status_code: u16 = if (counts.total() > 0) 200 else 503;
+        const snapshot = self.readiness_inventory.load();
+        const is_ready = snapshot.initialized and snapshot.counts.total() > 0;
+        const status_text = if (is_ready) "ready" else "not_ready";
+        const status_code: u16 = if (is_ready) 200 else 503;
         return ctx.status(status_code).json(.{
             .status = status_text,
-            .models = counts,
+            .models = snapshot.counts,
         });
     }
 };
@@ -14051,6 +14143,126 @@ test "root operational routes stay outside inference API prefix" {
     try std.testing.expect(server.hasRoute(.get, "/readyz"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/healthz"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/readyz"));
+}
+
+test "readyz serves only the published inventory snapshot" {
+    const allocator = std.testing.allocator;
+    var node = try Node.init(allocator, .{
+        // A request-path filesystem probe would fail against this path. The
+        // published snapshot must nevertheless be returned successfully.
+        .models_dir = "/nonexistent/antfly-readyz-must-not-scan",
+    });
+    defer node.deinit();
+
+    {
+        var request = try httpx.Request.init(allocator, .GET, "/readyz");
+        defer request.deinit();
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+
+        var response = try node.readyzHandler(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 503), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"status\":\"not_ready\"") != null);
+    }
+
+    node.readiness_inventory.publish(.{ .generators = 2, .embedders = 1 });
+    {
+        var request = try httpx.Request.init(allocator, .GET, "/readyz");
+        defer request.deinit();
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+
+        var response = try node.readyzHandler(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"status\":\"ready\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"generators\":2") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"embedders\":1") != null);
+    }
+}
+
+test "failed readiness refresh preserves the last known good inventory" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models-is-a-file",
+        .data = "not a directory",
+    });
+    const models_path = try std.fs.path.join(allocator, &.{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+        "models-is-a-file",
+    });
+    defer allocator.free(models_path);
+
+    var node = try Node.init(allocator, .{ .models_dir = models_path });
+    defer node.deinit();
+    node.readiness_inventory.publish(.{ .classifiers = 1 });
+
+    try std.testing.expectError(
+        error.NotDir,
+        node.refreshReadinessInventory(std.testing.io),
+    );
+    const snapshot = node.readiness_inventory.load();
+    try std.testing.expect(snapshot.initialized);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.counts.classifiers);
+}
+
+test "readiness refresh observes an externally published model" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const models_path = try std.fs.path.join(allocator, &.{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+    });
+    defer allocator.free(models_path);
+
+    var node = try Node.init(allocator, .{ .models_dir = models_path });
+    defer node.deinit();
+    try node.refreshReadinessInventory(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 0), node.readiness_inventory.load().counts.total());
+
+    // Model pulls happen in another process and atomically publish directories
+    // into this cache. A tiny GGUF marker is enough for listing discovery; no
+    // model is loaded or parsed by this test.
+    try tmp.dir.createDirPath(std.testing.io, "generators/acme/demo");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "generators/acme/demo/model.gguf",
+        .data = "listing-only fixture",
+    });
+    try node.refreshReadinessInventory(std.testing.io);
+
+    const refreshed = node.readiness_inventory.load();
+    try std.testing.expect(refreshed.initialized);
+    try std.testing.expectEqual(@as(usize, 1), refreshed.counts.generators);
+}
+
+test "readiness inventory initializes once and owns its refresh task" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const models_path = try std.fs.path.join(allocator, &.{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+    });
+    defer allocator.free(models_path);
+
+    var node = try Node.init(allocator, .{ .models_dir = models_path });
+    defer node.deinit();
+    node.startReadinessInventory(std.testing.io);
+    node.startReadinessInventory(std.testing.io);
+
+    const snapshot = node.readiness_inventory.load();
+    try std.testing.expect(snapshot.initialized);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.counts.total());
+    try std.testing.expect(node.readiness_refresh_started);
+    try std.testing.expect(node.readiness_refresh_io != null);
 }
 
 test "internal error response hides implementation error names" {
