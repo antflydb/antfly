@@ -10335,7 +10335,7 @@ export interface components {
             /** @enum {string} */
             state: "pending" | "leased" | "complete" | "failed";
             /** @enum {string} */
-            range_kind: "full" | "reverse_edges" | "nodes" | "scores" | "contributions" | "job_control";
+            range_kind: "full" | "reverse_edges" | "nodes" | "scores" | "contributions" | "job_control" | "summary";
             /** @description Worker id that owns or last failed this page. */
             worker_id?: string;
             /**
@@ -14344,7 +14344,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description The table topology or write-owner generation changed; retry the action */
+            /** @description The table topology or write-owner generation changed, or only some shards accepted the action; retrying is consistency-safe and reuses any still-active build */
             409: {
                 headers: {
                     [name: string]: unknown;

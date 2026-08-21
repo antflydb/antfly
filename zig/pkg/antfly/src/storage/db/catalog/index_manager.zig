@@ -4525,7 +4525,19 @@ pub const IndexManager = struct {
                 var active = status.state == .building;
                 if (!active and options.start_background_builds and cfg.refresh == .background) {
                     switch (status.state) {
-                        .not_ready, .stale => {
+                        .not_ready, .stale, .failed => {
+                            if (status.state == .failed) {
+                                // Preserve terminal failures for the same
+                                // generation, but do not let a superseded
+                                // snapshot permanently block newer graph
+                                // traffic. A newer dirty generation is a new
+                                // unit of work, not a blind retry.
+                                const failed_generation = if (status.recent_failures.len > 0)
+                                    status.recent_failures[0].target_generation
+                                else
+                                    status.target_edge_generation;
+                                if (failed_generation >= status.target_edge_generation) continue;
+                            }
                             if (options.auto_idle_options) |auto_options| {
                                 if (!graphMetricShouldAutoStartQueuedBuild(
                                     entry.metric_configs,
@@ -4547,7 +4559,7 @@ pub const IndexManager = struct {
                             index_scheduled_builds += 1;
                             active = true;
                         },
-                        .disabled, .fresh, .building, .failed => {},
+                        .disabled, .fresh, .building => {},
                     }
                 }
                 if (!active) continue;
@@ -4600,6 +4612,12 @@ pub const IndexManager = struct {
                     result.pages_completed += 1;
                     continue;
                 }
+                if (try entry.index.cleanupFailedGraphMetricBuildJobPage(cfg.name)) {
+                    result.metrics_scanned += 1;
+                    result.worker_steps += 1;
+                    result.pages_completed += 1;
+                    continue;
+                }
                 var status = try entry.index.graphMetricStatus(cfg.name);
                 defer status.deinit(entry.index.alloc);
                 if (status.maintenance_paused) continue;
@@ -4620,6 +4638,14 @@ pub const IndexManager = struct {
                 else
                     entry.index.runGraphMetricPlannedWorkerPageStepForMetric(cfg.name, options.worker_id)) catch |err| switch (err) {
                     error.GraphMetricBuildJobNotFound, error.GraphMetricBuildNotActive, error.GraphMetricDisabled => continue,
+                    // Graph mutations may supersede a snapshot after the
+                    // coordinator sweep but before this worker sweep. Treat
+                    // that as expected scheduler churn: the coordinator owns
+                    // durable failure/cancellation and will retire the exact
+                    // stale job on its next tick. A worker must neither turn
+                    // normal write traffic into a runtime error nor race a
+                    // replacement lease by failing a job it no longer owns.
+                    error.GraphMetricBuildSuperseded => continue,
                     else => return err,
                 };
                 result.worker_steps += 1;

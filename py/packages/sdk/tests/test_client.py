@@ -13,6 +13,10 @@ from antfly.client import normalize_base_url  # noqa: E402
 from antfly.client_generated.models.batch_request import BatchRequest  # noqa: E402
 from antfly.client_generated.models.graph_index_stats import GraphIndexStats  # noqa: E402
 from antfly.client_generated.models.graph_index_stats_index_type import GraphIndexStatsIndexType  # noqa: E402
+from antfly.client_generated.models.graph_metric_build_page_status import GraphMetricBuildPageStatus  # noqa: E402
+from antfly.client_generated.models.graph_metric_build_page_status_range_kind import (
+    GraphMetricBuildPageStatusRangeKind,  # noqa: E402
+)
 from antfly.client_generated.models.graph_metric_query import GraphMetricQuery  # noqa: E402
 from antfly.client_generated.models.graph_metric_query_metric_freshness import (
     GraphMetricQueryMetricFreshness,  # noqa: E402
@@ -68,6 +72,19 @@ class TestAntflyClient:
             "MIN": "$min",
             "MAX": "$max",
         }
+
+    def test_graph_metric_summary_build_page_deserializes(self) -> None:
+        page = GraphMetricBuildPageStatus.from_dict(
+            {
+                "phase": "reduce_ranks",
+                "iteration": 2,
+                "page_id": 0,
+                "state": "complete",
+                "range_kind": "summary",
+            }
+        )
+
+        assert page.range_kind is GraphMetricBuildPageStatusRangeKind.SUMMARY
 
     def test_min_transform_serializes_from_generated_models(self) -> None:
         request = BatchRequest(

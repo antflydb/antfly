@@ -2902,7 +2902,7 @@ test "db graph metric runtime background skips paused metrics" {
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), metric_result.graph_metric_results[0].scores[0].score, 0.001);
 }
 
-test "db graph metric runtime background idles on failed planned generation" {
+test "db graph metric runtime background idles after synchronously cleaning a small failed generation" {
     const DB = @import("../mod.zig").DB;
     const alloc = std.testing.allocator;
 
@@ -3247,18 +3247,24 @@ test "db graph metric runtime background starts automatically and drains notifie
 
     try db.executor.waitForAll(db.core.nextDerivedSequence());
 
-    const target_generation = blk: {
+    var target_generation = blk: {
         const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
         break :blk graph_entry.index.edge_generation;
     };
 
     var fresh = false;
-    for (0..200) |_| {
+    for (0..700) |_| {
         yieldToBackground(&db);
         const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
         var status = try graph_entry.index.graphMetricStatus("degree");
         defer status.deinit(alloc);
-        if (status.state == .fresh and status.published_generation == target_generation) {
+        // Derived graph updates and metric maintenance are independent
+        // background pipelines. Convergence means publishing the latest graph
+        // generation, which may legitimately be newer than the generation we
+        // first observed after the document executor drained.
+        const current_generation = graph_entry.index.edge_generation;
+        if (status.state == .fresh and status.published_edge_generation == current_generation) {
+            target_generation = current_generation;
             fresh = true;
             break;
         }
@@ -5779,6 +5785,11 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
         });
         defer coordinator.close();
 
+        const materialize_graph_entry = coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        const materialized = try materialize_graph_entry.index.runGraphMetricPlannedWorkerPageStepForMetric("pagerank", "runtime-publish-race-materializer");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.publish_generation, materialized.phase);
+        try std.testing.expect(materialized.completed_page);
+
         const resources = coordinator.core.asyncResources();
         var runtime = try GraphMetricRuntime.init(
             alloc,
@@ -6149,6 +6160,11 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
         );
         defer runtime.deinit();
 
+        const materialize_graph_entry = coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        const materialized = try materialize_graph_entry.index.runGraphMetricPlannedWorkerPageStepForMetric("eigenvector", "runtime-eigenvector-publish-race-materializer");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.publish_generation, materialized.phase);
+        try std.testing.expect(materialized.completed_page);
+
         const publish = try runtime.runCoordinatorOnce(false);
         try std.testing.expect(publish.phases_advanced > 0);
         try std.testing.expectEqual(@as(usize, 0), publish.worker_steps);
@@ -6495,6 +6511,11 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
         );
         defer runtime.deinit();
 
+        const materialize_graph_entry = coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        const materialized = try materialize_graph_entry.index.runGraphMetricPlannedWorkerPageStepForMetric("hits_authority", "runtime-hits-publish-race-materializer");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.publish_generation, materialized.phase);
+        try std.testing.expect(materialized.completed_page);
+
         const publish = try runtime.runCoordinatorOnce(false);
         try std.testing.expect(publish.phases_advanced > 0);
         try std.testing.expectEqual(@as(usize, 0), publish.worker_steps);
@@ -6544,9 +6565,9 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
         var hub = try graph_entry.index.graphMetricStatus("hits_hub");
         defer hub.deinit(alloc);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, authority.state);
-        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, hub.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, hub.state);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, authority.phase);
-        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, hub.phase);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, hub.phase);
         try std.testing.expectEqual(target_generation, authority.published_generation);
         try std.testing.expectEqual(authority.published_generation, hub.published_generation);
         try std.testing.expectEqual(@as(usize, 1), authority.recent_events.len);
@@ -6600,9 +6621,9 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
         var hub = try graph_entry.index.graphMetricStatus("hits_hub");
         defer hub.deinit(alloc);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, authority.state);
-        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, hub.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, hub.state);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, authority.phase);
-        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, hub.phase);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, hub.phase);
         try std.testing.expectEqual(target_generation, authority.published_generation);
         try std.testing.expectEqual(authority.published_generation, hub.published_generation);
         try std.testing.expectEqual(@as(usize, 1), authority.recent_events.len);
@@ -7741,6 +7762,8 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
         });
         defer coordinator.close();
 
+        const materialized = try coordinator.runGraphMetricPlannedWorkerPageStep("graph_idx", "pagerank", "db-publish-race-materializer");
+        try std.testing.expect(materialized.completed_page);
         const publish = try coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "pagerank");
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.publish_generation, publish.phase);
         try std.testing.expect(publish.advanced_phase);
@@ -7948,6 +7971,8 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
         });
         defer coordinator.close();
 
+        const materialized = try coordinator.runGraphMetricPlannedWorkerPageStep("graph_idx", "eigenvector", "db-eigenvector-publish-race-materializer");
+        try std.testing.expect(materialized.completed_page);
         const publish = try coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "eigenvector");
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.publish_generation, publish.phase);
         try std.testing.expect(publish.advanced_phase);
@@ -8154,6 +8179,8 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
         });
         defer coordinator.close();
 
+        const materialized = try coordinator.runGraphMetricPlannedWorkerPageStep("graph_idx", "hits_authority", "db-hits-publish-race-materializer");
+        try std.testing.expect(materialized.completed_page);
         const publish = try coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "hits_authority");
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.publish_generation, publish.phase);
         try std.testing.expect(publish.advanced_phase);
@@ -8164,9 +8191,9 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
         var hub = try graph_entry.index.graphMetricStatus("hits_hub");
         defer hub.deinit(alloc);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, authority.state);
-        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, hub.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, hub.state);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, authority.phase);
-        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, hub.phase);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, hub.phase);
         try std.testing.expectEqual(target_generation, authority.published_generation);
         try std.testing.expectEqual(authority.published_generation, hub.published_generation);
         try std.testing.expectEqual(@as(usize, 1), authority.recent_events.len);
@@ -8193,9 +8220,9 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
         var hub = try graph_entry.index.graphMetricStatus("hits_hub");
         defer hub.deinit(alloc);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, authority.state);
-        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, hub.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, hub.state);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, authority.phase);
-        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, hub.phase);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, hub.phase);
         try std.testing.expectEqual(target_generation, authority.published_generation);
         try std.testing.expectEqual(authority.published_generation, hub.published_generation);
         try std.testing.expectEqual(@as(usize, 1), authority.recent_events.len);

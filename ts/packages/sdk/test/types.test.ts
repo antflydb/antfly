@@ -15,6 +15,7 @@ import type {
   ConjunctionQuery,
   DisjunctionQuery,
   GraphIndexStats,
+  GraphMetricBuildPageStatus,
   GraphMetricQuery,
   GraphMetricRuntimeStats,
   MatchQuery,
@@ -44,6 +45,18 @@ function generatedSortProfileDeclaration(): string {
 }
 
 describe("Antfly Query Type Integration", () => {
+  it("accepts summary graph metric build pages", () => {
+    const page: GraphMetricBuildPageStatus = {
+      phase: "reduce_ranks",
+      iteration: 2,
+      page_id: 0,
+      state: "complete",
+      range_kind: "summary",
+    };
+
+    expect(page.range_kind).toBe("summary");
+  });
+
   describe("Batch transform types", () => {
     it("accepts the numeric $min transform operator", () => {
       const request: BatchRequest = {

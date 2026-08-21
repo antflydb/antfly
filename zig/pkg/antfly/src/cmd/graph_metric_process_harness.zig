@@ -1743,7 +1743,31 @@ fn prepareMetricBuildToPhaseAndIteration(
         const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
         var status = try graph_entry.index.graphMetricStatus(metric_name);
         defer status.deinit(alloc);
-        if (status.phase == target_phase and (status.build_iteration == target_iteration or target_phase == .publish_generation or target_phase == .cleanup_old_generations)) return;
+        if (status.phase == target_phase and (status.build_iteration == target_iteration or target_phase == .publish_generation or target_phase == .cleanup_old_generations)) {
+            if (target_phase == .publish_generation) {
+                // Iterative metrics materialize an unpublished score epoch on
+                // bounded worker pages before the coordinator atomically flips
+                // the published pointer. Drain those pages while deliberately
+                // leaving the coordinator transition for the process proof.
+                var publish_drained = false;
+                for (0..128) |_| {
+                    const publish_worker = try db.runGraphMetricPlannedWorkerPageStepAt(
+                        "graph_idx",
+                        metric_name,
+                        "process-phase-prep-publish-worker",
+                        now_ms,
+                    );
+                    now_ms += 1;
+                    if (publish_worker.failed_build) return error.GraphMetricBuildFailed;
+                    if (!publish_worker.claimed_page) {
+                        publish_drained = true;
+                        break;
+                    }
+                }
+                if (!publish_drained) return error.GraphMetricTargetPhaseNotReached;
+            }
+            return;
+        }
         if (status.phase == .publish_generation or status.phase == .cleanup_old_generations or status.phase == .complete) {
             std.debug.print("metric {s} advanced past target phase {}, got {}\n", .{ metric_name, target_phase, status.phase });
             return error.GraphMetricUnexpectedPhase;
@@ -1865,10 +1889,10 @@ fn assertHitsAfterPairedPublish(
         std.debug.print("expected HITS authority to be cleaning after paired publish, got {}/{}\n", .{ authority.state, authority.phase });
         return error.GraphMetricProcessProofFailed;
     }
-    if (hub.state != antfly.graph.GraphIndex.GraphMetricState.fresh or
-        hub.phase != antfly.graph.GraphIndex.GraphMetricBuildPhase.complete)
+    if (hub.state != antfly.graph.GraphIndex.GraphMetricState.building or
+        hub.phase != antfly.graph.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations)
     {
-        std.debug.print("expected HITS hub to be fresh/complete after paired publish, got {}/{}\n", .{ hub.state, hub.phase });
+        std.debug.print("expected HITS hub to share paired cleanup lifecycle, got {}/{}\n", .{ hub.state, hub.phase });
         return error.GraphMetricProcessProofFailed;
     }
     if (authority.published_generation != target_generation or hub.published_generation != target_generation) {
@@ -4849,14 +4873,17 @@ fn verifyProcessSupervisorTelemetry(
 fn verifyChildTelemetry(
     telemetry: ChildRuntimeTelemetry,
     role: RuntimeRole,
-    owner_id: []const u8,
+    logical_owner_id: []const u8,
     worker_count: usize,
     expect_worker_hash: bool,
 ) !void {
     if (telemetry.role != role) return error.SupervisorProcessFailed;
-    const expected_owner_hash = std.hash.Wyhash.hash(0, owner_id);
-    if (telemetry.runtime_id_hash != expected_owner_hash) return error.SupervisorProcessFailed;
-    if (telemetry.owner_id_hash != expected_owner_hash) return error.SupervisorProcessFailed;
+    const logical_owner_hash = std.hash.Wyhash.hash(0, logical_owner_id);
+    if (telemetry.runtime_id_hash != logical_owner_hash) return error.SupervisorProcessFailed;
+    // The command appends a process-incarnation fence to the logical owner ID.
+    // The runtime identity remains stable for observability, while the lease
+    // owner must be non-zero and distinct across process restarts.
+    if (telemetry.owner_id_hash == 0 or telemetry.owner_id_hash == logical_owner_hash) return error.SupervisorProcessFailed;
     if (telemetry.lease_key_hash == 0) return error.SupervisorProcessFailed;
     if (expect_worker_hash) {
         if (telemetry.worker_id_hash == 0) return error.SupervisorProcessFailed;
@@ -5787,6 +5814,26 @@ fn verifyPageRankServiceTargetedMultiPageWorkerPoolProcess(
             try assertOpenDbMetricActivePhase(alloc, &db, "pagerank", next_phase, target_generation);
         }
 
+        const publish_worker_now = try std.fmt.allocPrint(alloc, "{d}", .{now_ms});
+        defer alloc.free(publish_worker_now);
+        const publish_worker = try runServiceWorkerPoolRoleProcessAtWithMaxPages(
+            alloc,
+            io,
+            antfly_exe,
+            base_uri,
+            worker_pool_runtime,
+            "service-pagerank-multipage-worker-pool-publish",
+            "service-process-worker-a,service-process-worker-b",
+            "5000",
+            publish_worker_now,
+            "4",
+        );
+        now_ms += 1;
+        if (publish_worker.result.pages_completed == 0) {
+            std.debug.print("expected service worker-pool to materialize PageRank publish pages\n", .{});
+            return error.GraphMetricPageRankProcessProofFailed;
+        }
+
         const publish_now = try std.fmt.allocPrint(alloc, "{d}", .{now_ms});
         defer alloc.free(publish_now);
         const publish = try runServiceCoordinatorRoleProcessAt(
@@ -6175,6 +6222,26 @@ fn verifyEigenvectorServiceTargetedMultiPageWorkerPoolProcess(
                 else => unreachable,
             };
             try assertOpenDbMetricActivePhase(alloc, &db, "eigenvector", next_phase, target_generation);
+        }
+
+        const publish_worker_now = try std.fmt.allocPrint(alloc, "{d}", .{now_ms});
+        defer alloc.free(publish_worker_now);
+        const publish_worker = try runServiceWorkerPoolRoleProcessAtWithMaxPages(
+            alloc,
+            io,
+            antfly_exe,
+            base_uri,
+            worker_pool_runtime,
+            "service-eigenvector-multipage-worker-pool-publish",
+            "service-process-worker-a,service-process-worker-b",
+            "5000",
+            publish_worker_now,
+            "4",
+        );
+        now_ms += 1;
+        if (publish_worker.result.pages_completed == 0) {
+            std.debug.print("expected service worker-pool to materialize eigenvector publish pages\n", .{});
+            return error.GraphMetricProcessProofFailed;
         }
 
         const publish_now = try std.fmt.allocPrint(alloc, "{d}", .{now_ms});
@@ -6572,6 +6639,26 @@ fn verifyHitsServiceTargetedMultiPageWorkerPoolProcess(
             try assertOpenDbMetricActivePhase(alloc, &db, "hits_authority", next_phase, target_generation);
         }
 
+        const publish_worker_now = try std.fmt.allocPrint(alloc, "{d}", .{now_ms});
+        defer alloc.free(publish_worker_now);
+        const publish_worker = try runServiceWorkerPoolRoleProcessAtWithMaxPages(
+            alloc,
+            io,
+            antfly_exe,
+            base_uri,
+            worker_pool_runtime,
+            "service-hits-multipage-worker-pool-publish",
+            "service-process-worker-a,service-process-worker-b",
+            "5000",
+            publish_worker_now,
+            "4",
+        );
+        now_ms += 1;
+        if (publish_worker.result.pages_completed == 0) {
+            std.debug.print("expected service worker-pool to materialize HITS publish pages\n", .{});
+            return error.GraphMetricProcessProofFailed;
+        }
+
         const publish_now = try std.fmt.allocPrint(alloc, "{d}", .{now_ms});
         defer alloc.free(publish_now);
         const publish = try runServiceCoordinatorRoleProcessAt(
@@ -6700,10 +6787,10 @@ fn assertOpenDbHitsAfterPairedPublish(
         std.debug.print("expected service HITS authority to be cleaning after paired publish, got {}/{}\n", .{ authority.state, authority.phase });
         return error.GraphMetricProcessProofFailed;
     }
-    if (hub.state != antfly.graph.GraphIndex.GraphMetricState.fresh or
-        hub.phase != antfly.graph.GraphIndex.GraphMetricBuildPhase.complete)
+    if (hub.state != antfly.graph.GraphIndex.GraphMetricState.building or
+        hub.phase != antfly.graph.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations)
     {
-        std.debug.print("expected service HITS hub to be fresh/complete after paired publish, got {}/{}\n", .{ hub.state, hub.phase });
+        std.debug.print("expected service HITS hub to share paired cleanup lifecycle, got {}/{}\n", .{ hub.state, hub.phase });
         return error.GraphMetricProcessProofFailed;
     }
     if (authority.published_generation != target_generation or hub.published_generation != target_generation) {
@@ -9056,9 +9143,9 @@ fn verifyRoleProcessTelemetry(
 ) !void {
     const stats = summary.stats;
     if (stats.role != role) return error.GraphMetricRoleProcessFailed;
-    const expected_owner_hash = identityHash(owner_id);
-    if (stats.runtime_id_hash != expected_owner_hash) return error.GraphMetricRoleProcessFailed;
-    if (stats.owner_id_hash != expected_owner_hash) return error.GraphMetricRoleProcessFailed;
+    const logical_owner_hash = identityHash(owner_id);
+    if (stats.runtime_id_hash != logical_owner_hash) return error.GraphMetricRoleProcessFailed;
+    if (stats.owner_id_hash == 0 or stats.owner_id_hash == logical_owner_hash) return error.GraphMetricRoleProcessFailed;
     if (stats.lease_key_hash == 0) return error.GraphMetricRoleProcessFailed;
     if (stats.worker_id_hash != worker_id_hash) return error.GraphMetricRoleProcessFailed;
     if (stats.worker_count != worker_count) return error.GraphMetricRoleProcessFailed;
@@ -9081,7 +9168,8 @@ fn verifyServiceRoleProcessTelemetry(
     const stats = summary.stats;
     if (stats.role != role) return error.GraphMetricRoleProcessFailed;
     if (stats.runtime_id_hash != identityHash(runtime_id)) return error.GraphMetricRoleProcessFailed;
-    if (stats.owner_id_hash != identityHash(owner_id)) return error.GraphMetricRoleProcessFailed;
+    const logical_owner_hash = identityHash(owner_id);
+    if (stats.owner_id_hash == 0 or stats.owner_id_hash == logical_owner_hash) return error.GraphMetricRoleProcessFailed;
     if (stats.lease_key_hash == 0) return error.GraphMetricRoleProcessFailed;
     if (stats.worker_id_hash != worker_id_hash) return error.GraphMetricRoleProcessFailed;
     if (stats.worker_count != worker_count) return error.GraphMetricRoleProcessFailed;

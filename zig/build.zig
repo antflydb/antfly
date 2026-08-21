@@ -7273,6 +7273,10 @@ pub fn build(b: *std.Build) void {
         "graph metric metadata preserves score epoch input and decodes v3",
         "graph metric edge filter equality and fingerprint treat types as set",
         "graph metric rebuild at unchanged edge generation publishes an isolated score epoch",
+        "graph degree scan attempt adoption resumes in bounded pages",
+        "graph degree large-build summary counts filtered materialization without coordinator scan",
+        "graph degree planned build honors edge filter during scan page execution",
+        "graph pagerank planned build publishes scores matching local runner",
     };
     const graph_metric_unit_tests = b.addTest(.{
         .root_module = db_test_mod,

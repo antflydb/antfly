@@ -8,6 +8,7 @@ class GraphMetricBuildPageStatusRangeKind(str, Enum):
     NODES = "nodes"
     REVERSE_EDGES = "reverse_edges"
     SCORES = "scores"
+    SUMMARY = "summary"
 
     def __str__(self) -> str:
         return str(self.value)
