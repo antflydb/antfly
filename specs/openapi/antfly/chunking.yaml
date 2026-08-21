@@ -15,9 +15,9 @@ components:
     ChunkerConfig:
       description: "A unified configuration for a chunking provider."
       allOf:
-        - oneOf:
-            - $ref: "#/components/schemas/AntflyChunkerConfig"
-        - properties:
+        - $ref: "#/components/schemas/AntflyChunkerConfig"
+        - type: object
+          properties:
             provider:
               $ref: "#/components/schemas/ChunkerProvider"
             store_chunks:
@@ -36,10 +36,9 @@ components:
                 When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's _chunks field.
                 When absent, chunks use :c: suffix and are only used for vector embeddings.
               additionalProperties: true
-            # Repeat provider-specific fields and ChunkOptions here instead of
-            # relying only on the nested AntflyChunkerConfig allOf. Several
-            # generators flatten a single allOf level and otherwise drop these
-            # supported fields from the unified request/response type.
+            # Repeat all inherited fields for generators that flatten only one
+            # allOf level. This direct reference preserves the standalone
+            # AntflyChunkerConfig type without generating union state.
             api_url:
               type: string
               format: uri

@@ -67,6 +67,75 @@ func TestNewCreateIndexRequestPreservesFullTypedRequest(t *testing.T) {
 	}
 }
 
+func TestNewCreateIndexRequestConvertsNamedIndexConfig(t *testing.T) {
+	legacy, err := NewIndexConfig("semantic", EmbeddingsIndexConfig{
+		Dimension: 384,
+		Chunker: ChunkerConfig{
+			Provider: ChunkerProviderAntfly,
+			ApiUrl:   "https://inference.example/ai/v1",
+			Model:    "antfly/chunker-v2",
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewIndexConfig failed: %v", err)
+	}
+
+	request, err := NewCreateIndexRequest(legacy)
+	if err != nil {
+		t.Fatalf("NewCreateIndexRequest failed: %v", err)
+	}
+	data, err := json.Marshal(request)
+	if err != nil {
+		t.Fatalf("marshal create index request: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatalf("unmarshal create index request: %v", err)
+	}
+	if _, exists := body["name"]; exists {
+		t.Fatalf("request must not duplicate path-owned name: %s", data)
+	}
+	chunker, ok := body["chunker"].(map[string]any)
+	if !ok {
+		t.Fatalf("chunker missing from converted request: %s", data)
+	}
+	if chunker["model"] != "antfly/chunker-v2" || chunker["api_url"] != "https://inference.example/ai/v1" {
+		t.Fatalf("converted request lost chunker fields: %s", data)
+	}
+}
+
+func TestNewCreateIndexRequestPreservesLegacyVariantPayload(t *testing.T) {
+	var legacy IndexConfig
+	if err := json.Unmarshal([]byte(`{
+		"name":"relationships",
+		"type":"graph",
+		"source":{"kind":"artifact","artifact":"relations"},
+		"future_option":{"enabled":true}
+	}`), &legacy); err != nil {
+		t.Fatalf("unmarshal index config: %v", err)
+	}
+
+	request, err := NewCreateIndexRequest(legacy)
+	if err != nil {
+		t.Fatalf("NewCreateIndexRequest failed: %v", err)
+	}
+	data, err := json.Marshal(request)
+	if err != nil {
+		t.Fatalf("marshal create index request: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatalf("unmarshal create index request: %v", err)
+	}
+	if _, exists := body["name"]; exists {
+		t.Fatalf("request must not duplicate path-owned name: %s", data)
+	}
+	future, ok := body["future_option"].(map[string]any)
+	if !ok || future["enabled"] != true {
+		t.Fatalf("converted request lost variant payload: %s", data)
+	}
+}
+
 func TestNewArtifactEmbeddingIndexConfig(t *testing.T) {
 	embedder, err := NewEmbedderConfig(OllamaEmbedderConfig{Model: "embeddinggemma"})
 	if err != nil {

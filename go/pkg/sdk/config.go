@@ -177,6 +177,13 @@ func NewCreateIndexRequest(config any) (*CreateIndexRequest, error) {
 		return nil, fmt.Errorf("marshal index config: %w", err)
 	}
 	switch typed := config.(type) {
+	case IndexConfig:
+		return newCreateIndexRequestFromIndexConfig(data, typed.Type)
+	case *IndexConfig:
+		if typed == nil {
+			return nil, fmt.Errorf("index config must not be nil")
+		}
+		return newCreateIndexRequestFromIndexConfig(data, typed.Type)
 	case EmbeddingsIndexConfig, CreateEmbeddingsIndexRequest:
 		var variant oapi.CreateEmbeddingsIndexRequest
 		if err := json.Unmarshal(data, &variant); err != nil {
@@ -251,6 +258,30 @@ func NewCreateIndexRequest(config any) (*CreateIndexRequest, error) {
 		}
 	default:
 		return nil, fmt.Errorf("unsupported index config type: %T", config)
+	}
+	return request, nil
+}
+
+func newCreateIndexRequestFromIndexConfig(data []byte, indexType IndexType) (*CreateIndexRequest, error) {
+	switch indexType {
+	case IndexTypeEmbeddings, IndexTypeFullText, IndexTypeGraph, IndexTypeAlgebraic:
+	default:
+		return nil, fmt.Errorf("unsupported index config type: %q", indexType)
+	}
+
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(data, &body); err != nil {
+		return nil, fmt.Errorf("decode index config: %w", err)
+	}
+	delete(body, "name")
+
+	data, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal create index request: %w", err)
+	}
+	request := &CreateIndexRequest{}
+	if err := json.Unmarshal(data, request); err != nil {
+		return nil, fmt.Errorf("build create index request: %w", err)
 	}
 	return request, nil
 }

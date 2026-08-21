@@ -140,16 +140,15 @@ func TestCreateEmbeddingIndexUsesAntflyClipClap(t *testing.T) {
 		t.Fatalf("embedder model = %q, want %q", embedder.Model, DefaultEmbeddingModel)
 	}
 
-	chunker, err := cfg.Chunker.AsAntflyChunkerConfig()
-	if err != nil {
-		t.Fatalf("AsAntflyChunkerConfig failed: %v", err)
-	}
 	if cfg.Chunker.Provider != antfly.ChunkerProviderAntfly {
 		t.Fatalf("chunker provider = %q, want %q", cfg.Chunker.Provider, antfly.ChunkerProviderAntfly)
 	}
 	wantChunkerURL := DefaultInferenceURL + "/ai/v1"
-	if chunker.ApiUrl != wantChunkerURL {
-		t.Fatalf("chunker api URL = %q, want %q", chunker.ApiUrl, wantChunkerURL)
+	if cfg.Chunker.ApiUrl != wantChunkerURL {
+		t.Fatalf("chunker api URL = %q, want %q", cfg.Chunker.ApiUrl, wantChunkerURL)
+	}
+	if cfg.Chunker.Model != DefaultChunkerModel {
+		t.Fatalf("chunker model = %q, want %q", cfg.Chunker.Model, DefaultChunkerModel)
 	}
 }
 
