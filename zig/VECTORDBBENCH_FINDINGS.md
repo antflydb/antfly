@@ -645,19 +645,31 @@ records and an 8.52 MB tail. Median total mutation time was 733.35 ms:
 673.00 ms in the authoritative HBC apply and 58.56 ms capturing/appending the
 derived WAL. Full posting snapshots therefore added about 8.7% over the apply
 time and made the tail four times larger than the 2.10 MB checkpoint. This
-validates transaction capture but rejects full snapshots as the final
-steady-state encoding; use posting-local deltas and/or checkpoint much sooner.
+validated transaction capture but rejected full snapshots as the final
+steady-state encoding.
+
+The derived WAL now encodes replacement payloads as checksummed copy/literal
+deltas against the checkpoint or preceding replacement. Eight-byte anchors at
+a four-byte stride find unchanged packed-array runs even when insertion shifts
+the remainder of the payload. Explicit coverage records advance the source
+sequence when a committed transaction touches no posting payload, and
+kind-specific tombstones prevent fallback to stale values. The sidecar is
+admitted only at the exact durable source sequence. A short, corrupt, or
+ahead-of-source tail is rejected and rebuilt from the authoritative source
+journal. The production policy checkpoints at a 1 MiB tail, at 64 MiB
+unconditionally, or when the tail reaches half the checkpoint size.
 
 The direct-reinsert workload is supported internally but is not the public
 table replacement contract. The public path atomically deletes the old
-assignment and inserts the replacement. That exposed an independent fast-path
-quality problem: treating transaction-local deletes as proof that all writes
-were new let grouped insertion route the complete replacement batch against
-one pre-insert topology. A single diagnostic sample measured 0.566 recall and
-318.7 ms for this path. Restricting grouped routing to callers that knew the
-ids were absent before the transaction raised recall to 0.632 at 328.5 ms. The
-covered-by-delete proof still skips redundant existence lookups; it no longer
-selects the topology-sensitive grouped algorithm.
+assignment and inserts the replacement. That exposed two independent fast-path
+problems. Treating transaction-local deletes as proof that all writes were new
+let grouped insertion route the complete replacement batch against one
+pre-insert topology. Restricting grouped routing to callers that knew the ids
+were absent before the transaction preserves the existence-lookup saving
+without selecting the topology-sensitive grouped algorithm. Replacement also
+rewrote quantized payloads repeatedly as individual delete/insert steps changed
+the same postings. The replacement transaction now queues touched postings and
+rebuilds their quantized payload once at commit.
 
 Query latency is part of the same qualification, not a separate microbenchmark.
 Freshly reopened LSM and freshly reopened segment-plus-WAL reads produced the
@@ -665,35 +677,75 @@ same result digest and recall in every sample:
 
 | Reopened query path | Cold first query (median) | Warm p50 / p95 / p99 (median) | Warm QPS (median) | Recall@10 |
 | --- | ---: | ---: | ---: | ---: |
-| Authoritative HBC LSM | about 12.7 ms | 0.269 / 0.582 / 1.138 ms | about 3,064 | 0.632 |
-| Immutable segment + 7.86 MB WAL | about 2.5 ms | 0.268 / 0.551 / 1.008 ms | about 3,086 | 0.632 |
+| Authoritative HBC LSM | 14.15 ms | 0.268 / 0.683 / 1.141 ms | -- | 0.710 |
+| Immutable segment + 4.54 MB raw stress tail | 3.03 ms | 0.267 / 0.692 / 1.221 ms | -- | 0.710 |
 
 The sidecar preserved the exact ranked-result digest—not merely recall within
 a tolerance—in every paired LSM/sidecar run. Warm latency remained neutral and
-the cold query improved by roughly 80%. Activation of the oversized tail took
-about 35 ms, reinforcing the shallow-tail checkpoint policy.
+the cold query improved by about 79%. The 51.1 ms activation above deliberately
+reopened an oversized raw tail; production would have checkpointed it once it
+exceeded half of the 2.36 MB segment.
 
-Online-update quality is a separate unresolved issue. With the final corpus
-built from scratch, the default boundary-rerank policy reached 0.702 recall;
-public atomic replacement reached 0.632 after the grouped-routing fix. Turning
-quantization off made the updated topology better than the rebuilt topology
-(0.872 versus 0.800), localizing the remaining gap to incremental quantized
-state rather than tree layout. A full quantized refresh cost about 80 ms and
-raised default recall to 0.660. With exact reranking and a factor-10 candidate
-window, refreshed online recall was 0.754 versus 0.774 for a fresh build of the
-same corpus. That two-point gap is much closer but still outside a one-point
-qualification bar; widening to factor 16 reached 0.822 but roughly doubled
-reopened p95, so it is not an acceptable unconditional shortcut.
+With one deferred quantized rebuild per replacement transaction, ten
+100-vector replacement batches took 266.7 ms in authoritative HBC apply and
+125.7 ms in derived capture on the diagnostic 5K x 1,536-dimensional workload.
+Default boundary-rerank recall reached 0.710. The same final corpus built fresh
+reached 0.675, while forcing a global quantized rebuild cost another 104.8 ms
+and regressed recall to 0.628. The updated implementation therefore retains the
+existing rerank-policy boundary and avoids a global refresh or a wider
+candidate window: neither is justified by quality or latency.
 
 The efficient product design is therefore a packed immutable checkpoint plus
-a shallow, buffered derived WAL, not another general-purpose LSM. The primary
-source journal remains the durability authority. Derived WAL frames can be
-grouped without fsync on every source batch; after a crash, exact source
-coverage admission rejects a short tail and normal replay repairs it. Trigger
-a new immutable checkpoint by WAL bytes relative to segment bytes and by an
-absolute recovery-time budget. Production wiring must capture only postings
-touched by a successfully committed source transaction and should encode
-posting-local deltas rather than repeatedly writing full snapshots.
+a shallow, buffered derived WAL, not another general-purpose LSM. That design
+is now wired through normal HBC lifecycle and replay behind
+`ANTFLY_HBC_POSTING_SIDECAR=1`. The primary source journal remains the
+durability authority. Only postings touched by a successfully committed source
+transaction are captured, and the applied watermark is not published until
+derived capture completes. Derived failures never fail a committed source
+write: they durably invalidate `CURRENT`, after which ordinary replay repairs
+the acceleration. Queries use immutable admitted state; a concurrent write can
+disable future sidecar selection without freeing memory held by an in-flight
+query.
+
+### Public API qualification
+
+One ReleaseFast lifecycle for each official VectorDBBench case exercised the
+standalone public server, `/db/v1` table API, batch size 100 with four load
+workers, visibility catch-up, process restart, cold and warm serial queries,
+and Circus physical-footprint sampling. The adapter removed Antfly's default
+full-text index before adding the external-vector index, so these results do
+not charge unrelated asynchronous text work to HBC. They are diagnostic single
+runs, not the three-run publication sample required by the memory methodology.
+
+| Case | Insert | Catch-up | Total ready | Live recall | Live serial p50 / p95 / p99 | Live QPS at 1 / 4 / 16 | Reopened cold p50 / p95 / p99 | Reopened warm p50 / p95 / p99 | Demand / RSS peak |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OpenAI 1,536D 50K | 35.63 s | 9.04 s | 44.67 s | 0.9849 | 2.9 / 5.6 / 13.8 ms | 44.58 / 399.82 / 670.94 | 5.3 / 10.3 / 423.7 ms | 4.6 / 6.1 / 422.9 ms | 734 MB / 1.80 GB |
+| Cohere 768D 1M | 1,579.41 s | 32.21 s | 1,611.63 s | 0.9863 | 50.6 / 617.3 / 664.6 ms | 5.08 / 17.67 / 37.89 | 43.0 / 467.1 / 495.1 ms | 9.0 / 15.6 / 436.3 ms | 1.40 GB / 4.99 GB |
+
+The 50K result recovers the established 30--40 second insert range while
+keeping demand bounded. Its reopened recall was 0.9742 in both sidecar and a
+same-data sidecar-disabled LSM control, so the 1.07-point live-to-reopened
+change belongs to HBC persistence rather than the segment reader. At 1M,
+live/cold/warm recall was 0.9863/0.9863/0.9864. The internal paired harness
+also produced identical ranked-result digests between reopened LSM and
+segment-plus-WAL reads.
+
+The 1M load is about 46% faster than the reported 3,000-second run and finished
+with all vectors visible, 16 pressure compactions, and zero hard-limit debt.
+It does not meet the hoped-for 13-minute target. Its sawtooth throughput tracks
+aggregate LSM pressure: successful compactions repeatedly reduced L0 from near
+the hard limit, while the sidecar stopped publishing new generations during
+the long steady-state portion. Cumulative mutable snapshot copies reached
+1.89 GB, far below the earlier multi-gigabyte cloning observed before 28K rows,
+but still identify the remaining general optimization surface.
+
+The 1M artifact also exposes one lifecycle limitation. Incremental sidecar
+maintenance safely invalidated after an HBC write outside a captured source
+window; queries fell back to the authoritative LSM, and restart rebuilt a
+175 MB generation before the warm pass. This demonstrates safe fallback and
+strong warm-read potential, but not uninterrupted 1M derived-WAL maintenance.
+Maintenance-only HBC mutations need an ordered derived epoch (or a quiescent
+recheckpoint) that does not fabricate a new authoritative source sequence.
 
 ## Memory methodology
 
@@ -737,12 +789,12 @@ published.
    41.65 seconds with a 38.72--43.14 second range, but the single follow-up 1M
    lifecycle remains diagnostic because compaction scheduling produced
    materially different curves on the same host.
-5. Replace the transaction-capture prototype's full posting snapshots with
-   posting-local deltas, wire its sequence to authoritative replay, and
-   checkpoint before the tail harms activation or p95. Preserve fallback to
-   source replay across every crash boundary. Bring refreshed online
-   quantization within one recall point of a same-corpus rebuild without the
-   factor-16 p95 cost; LSM and sidecar ranked results must remain identical.
+5. Give maintenance-only HBC transactions an ordered derived epoch, then
+   repeat public 50K and 1M qualification with uninterrupted WAL coverage.
+   Preserve exact source-sequence admission, safe fallback, normal rerank-policy
+   boundaries, and identical LSM/sidecar ranked results. Separately trace the
+   50K live-to-reopened HBC recall change; a sidecar-disabled control reproduces
+   it, so widening rerank would only hide the persistence issue.
 6. Compare eager single-read segment admission with mmap and footer/index-first
    range admission at 50K and 1M. Include page-cache/RSS accounting; do not
    trade a lower startup timer for unbounded mapped or decoded residency.

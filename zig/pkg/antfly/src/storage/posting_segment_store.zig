@@ -34,6 +34,12 @@ pub const AppendOptions = struct {
     sync: bool = true,
 };
 
+pub const CheckpointPolicy = struct {
+    min_wal_bytes: u64 = 1 * 1024 * 1024,
+    max_wal_bytes: u64 = 64 * 1024 * 1024,
+    wal_to_segment_percent: u8 = 50,
+};
+
 pub const RecoveredWal = struct {
     alloc: Allocator,
     bytes: []u8,
@@ -55,6 +61,7 @@ pub const Store = struct {
     wal_committed_bytes: u64,
     last_committed_batch: ?u64,
     covered_source_sequence: u64,
+    segment_bytes: u64,
     poisoned: bool,
 
     pub fn open(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8) !Store {
@@ -96,6 +103,7 @@ pub const Store = struct {
             .wal_committed_bytes = 0,
             .last_committed_batch = null,
             .covered_source_sequence = 0,
+            .segment_bytes = 0,
             .poisoned = false,
         };
         errdefer store.deinit();
@@ -121,6 +129,7 @@ pub const Store = struct {
         const segment_bytes = try store.readSegmentAllocFor(checkpoint);
         var segment_owned = true;
         defer if (segment_owned) alloc.free(segment_bytes);
+        store.segment_bytes = @intCast(segment_bytes.len);
         var recovered = try store.recoverWal();
         defer recovered.deinit();
         if (recovered.replay.committed_bytes < checkpoint.wal_committed_bytes) {
@@ -202,6 +211,24 @@ pub const Store = struct {
         self.covered_source_sequence = covered_source_sequence;
     }
 
+    pub fn appendCoverage(self: *Store, batch_id: u64, covered_source_sequence: u64, options: AppendOptions) !void {
+        return try self.appendBatchWithOptions(batch_id, &.{.{
+            .kind = .coverage,
+            .posting_id = 0,
+            .source_sequence = covered_source_sequence,
+            .payload = &.{},
+        }}, covered_source_sequence, options);
+    }
+
+    pub fn shouldCheckpoint(self: *const Store, policy: CheckpointPolicy) bool {
+        if (self.checkpoint == null or self.wal_committed_bytes == 0) return false;
+        const proportional = std.math.mul(u64, self.segment_bytes, policy.wal_to_segment_percent) catch
+            std.math.maxInt(u64);
+        const ratio_threshold = proportional / 100;
+        const threshold = @min(policy.max_wal_bytes, @max(policy.min_wal_bytes, ratio_threshold));
+        return self.wal_committed_bytes >= threshold;
+    }
+
     pub fn publishCheckpoint(
         self: *Store,
         segment_generation: u64,
@@ -244,6 +271,7 @@ pub const Store = struct {
         self.wal_committed_bytes = 0;
         self.last_committed_batch = null;
         self.covered_source_sequence = covered_source_sequence;
+        self.segment_bytes = @intCast(segment_bytes.len);
 
         if (previous) |old| {
             const old_segment_path = try self.segmentPathAlloc(old.segment_generation);
@@ -302,6 +330,22 @@ pub const Store = struct {
         defer self.alloc.free(path);
         try atomicReplace(self.alloc, self.storage, path, contents);
         self.wal_committed_bytes = @intCast(contents.len);
+    }
+
+    /// Removes the publication pointer before an uncovered authoritative
+    /// mutation can commit. Segment and WAL generations are intentionally left
+    /// behind as harmless orphans; a later checkpoint replaces them.
+    pub fn invalidate(self: *Store) !void {
+        const current_path = try self.currentPathAlloc();
+        defer self.alloc.free(current_path);
+        self.storage.deleteFileAbsolute(current_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        try self.storage.syncParentAbsolute(current_path);
+        self.checkpoint = null;
+        self.covered_source_sequence = 0;
+        self.segment_bytes = 0;
     }
 
     fn currentPathAlloc(self: *const Store) ![]u8 {
@@ -425,4 +469,46 @@ test "storage.posting segment store truncates incomplete WAL tail before append"
     var replay = try store.recoverWal();
     defer replay.deinit();
     try std.testing.expectEqualStrings("two", replay.replay.latest(3, .base).?.payload);
+}
+
+test "storage.posting segment store bounds WAL tails relative to the segment" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+
+    var store = try Store.open(alloc, memory.storage(), "/posting-policy");
+    defer store.deinit();
+    var segment_writer = posting_segment.Writer.init(alloc);
+    defer segment_writer.deinit();
+    const base: [256]u8 = @splat('x');
+    try segment_writer.appendBaseAt(1, 1, &base);
+    const segment = try segment_writer.build();
+    defer alloc.free(segment);
+    try store.publishCheckpoint(1, 1, segment);
+    try std.testing.expect(!store.shouldCheckpoint(.{ .min_wal_bytes = 1, .max_wal_bytes = 1024, .wal_to_segment_percent = 50 }));
+
+    try store.appendCoverage(2, 2, .{ .sync = false });
+    try std.testing.expect(store.shouldCheckpoint(.{ .min_wal_bytes = 1, .max_wal_bytes = 1024, .wal_to_segment_percent = 1 }));
+}
+
+test "storage.posting segment invalidation removes only the publication pointer" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+
+    var store = try Store.open(alloc, memory.storage(), "/posting-invalidate");
+    var segment_writer = posting_segment.Writer.init(alloc);
+    defer segment_writer.deinit();
+    try segment_writer.appendBaseAt(1, 1, "base");
+    const segment = try segment_writer.build();
+    defer alloc.free(segment);
+    try store.publishCheckpoint(1, 1, segment);
+    try store.invalidate();
+    store.deinit();
+
+    try std.testing.expectError(error.FileNotFound, memory.storage().fileSize("/posting-invalidate/CURRENT"));
+    try std.testing.expect((try memory.storage().fileSize("/posting-invalidate/segment-1.afps")) > 0);
+    store = try Store.open(alloc, memory.storage(), "/posting-invalidate");
+    defer store.deinit();
+    try std.testing.expect(store.checkpoint == null);
 }

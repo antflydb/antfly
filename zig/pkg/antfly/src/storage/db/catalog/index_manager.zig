@@ -7368,6 +7368,45 @@ pub const IndexManager = struct {
         return entry.index.getWriteProfile();
     }
 
+    fn densePostingSidecarEnabled() bool {
+        const raw_z = getenv("ANTFLY_HBC_POSTING_SIDECAR") orelse return false;
+        const raw = std.mem.span(raw_z);
+        return raw.len == 0 or
+            std.ascii.eqlIgnoreCase(raw, "1") or
+            std.ascii.eqlIgnoreCase(raw, "true") or
+            std.ascii.eqlIgnoreCase(raw, "yes") or
+            std.ascii.eqlIgnoreCase(raw, "on");
+    }
+
+    pub fn beginDensePostingSidecarCaptureByName(self: *IndexManager, name: []const u8) !bool {
+        if (!densePostingSidecarEnabled()) return false;
+        const entry = self.denseIndex(name) orelse return error.IndexNotFound;
+        if (entry.index.experimentalPostingMutationCaptureActive()) return false;
+        if (entry.index.lsmSessionBatchingActive()) return false;
+        try entry.index.beginExperimentalPostingMutationCapture();
+        return true;
+    }
+
+    pub fn cancelDensePostingSidecarCaptureByName(self: *IndexManager, name: []const u8) void {
+        const entry = self.denseIndex(name) orelse return;
+        entry.index.cancelExperimentalPostingMutationCapture();
+    }
+
+    pub fn persistDensePostingSidecarByNameBestEffort(self: *IndexManager, name: []const u8, applied_sequence: u64) void {
+        if (!densePostingSidecarEnabled()) return;
+        const entry = self.denseIndex(name) orelse return;
+        entry.index.persistExperimentalPostingSidecarAtAppliedSequence(applied_sequence, .{}) catch |err| {
+            std.log.warn("dense posting sidecar disabled after publication failure index={s} sequence={} err={s}", .{
+                name,
+                applied_sequence,
+                @errorName(err),
+            });
+            entry.index.invalidateExperimentalPostingSidecar() catch |invalidate_err| {
+                std.log.warn("dense posting sidecar invalidation failed index={s} err={s}", .{ name, @errorName(invalidate_err) });
+            };
+        };
+    }
+
     pub fn beginDenseStreamingReplaySessionByName(self: *IndexManager, name: []const u8) !void {
         const entry = self.denseIndex(name) orelse return error.IndexNotFound;
         try entry.index.beginStreamingReplaySession();
@@ -10531,6 +10570,30 @@ pub const IndexManager = struct {
                 index.setExternalVectorBatchScratchLoader(vector_loader_context, loadDenseVectorsForHbcBatch);
                 index.setExternalVectorBatchTransformedMatrixLoader(vector_loader_context, loadDenseVectorsForHbcBatchIntoTransformedMatrix);
                 index.setExternalVectorBatchDistanceLoader(vector_loader_context, scoreDenseVectorsForHbcBatch);
+                if (densePostingSidecarEnabled()) {
+                    const applied_sequence = try apply_state.loadAppliedSequenceWithCheckpoint(
+                        self.alloc,
+                        self.checkpointIo(),
+                        store,
+                        self.applied_sequence_checkpoint_path,
+                        cfg.name,
+                    );
+                    index.activateExperimentalPostingReads(applied_sequence) catch |err| switch (err) {
+                        error.MissingPostingCheckpoint,
+                        error.PostingCheckpointSequenceMismatch,
+                        => {
+                            if (!read_only) index.invalidateExperimentalPostingSidecar() catch |invalidate_err| {
+                                std.log.warn("dense posting sidecar startup invalidation failed index={s} err={s}", .{ cfg.name, @errorName(invalidate_err) });
+                            };
+                        },
+                        else => {
+                            std.log.warn("dense posting sidecar startup validation failed index={s} err={s}", .{ cfg.name, @errorName(err) });
+                            if (!read_only) index.invalidateExperimentalPostingSidecar() catch |invalidate_err| {
+                                std.log.warn("dense posting sidecar startup invalidation failed index={s} err={s}", .{ cfg.name, @errorName(invalidate_err) });
+                            };
+                        },
+                    };
+                }
                 const apply_mutex = try self.allocIndexApplyMutex();
                 var apply_mutex_owned = true;
                 errdefer if (apply_mutex_owned) self.destroyIndexApplyMutex(apply_mutex);

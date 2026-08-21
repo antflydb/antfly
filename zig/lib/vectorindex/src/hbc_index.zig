@@ -3766,6 +3766,15 @@ fn updateInternalCentroidForLeafSplit(
 }
 
 pub fn collapseSingleChildParents(self: anytype, txn: anytype, start_node_id: u64) !void {
+    try collapseSingleChildParentsOptions(self, txn, start_node_id, .{});
+}
+
+fn collapseSingleChildParentsOptions(
+    self: anytype,
+    txn: anytype,
+    start_node_id: u64,
+    options: hbc_runtime.BatchInsertOptions,
+) !void {
     var node_id = start_node_id;
     while (node_id != 0) {
         var node = try loadNode(self, txn, node_id);
@@ -3777,7 +3786,7 @@ pub fn collapseSingleChildParents(self: anytype, txn: anytype, start_node_id: u6
         defer child.deinit(self.alloc);
         const parent_id = node.parent;
         child.parent = parent_id;
-        try self.saveNode(txn, &child);
+        try self.saveNodeWithOptions(txn, &child, options);
 
         if (parent_id == 0) {
             self.metadata.root_node = child_id;
@@ -3795,7 +3804,7 @@ pub fn collapseSingleChildParents(self: anytype, txn: anytype, start_node_id: u6
             }
         }
         try recomputeInternalCentroid(self, txn, &parent);
-        try self.saveNode(txn, &parent);
+        try self.saveNodeWithOptions(txn, &parent, options);
         try deleteNode(self, txn, node_id);
         node_id = parent_id;
     }
@@ -3837,9 +3846,13 @@ fn lessPreparedBatchDelete(_: void, lhs: PreparedBatchDelete, rhs: PreparedBatch
 }
 
 fn batchDeleteTxn(self: anytype, txn: anytype, vector_ids: []const u64) !void {
+    try batchDeleteTxnOptions(self, txn, vector_ids, .{});
+}
+
+fn batchDeleteTxnOptions(self: anytype, txn: anytype, vector_ids: []const u64, options: hbc_runtime.BatchInsertOptions) !void {
     try self.bindTxnLike(txn);
     if (vector_ids.len == 0) return;
-    if (vector_ids.len == 1) return deleteTxn(self, txn, vector_ids[0]) catch |err| switch (err) {
+    if (vector_ids.len == 1) return deleteTxnOptions(self, txn, vector_ids[0], options) catch |err| switch (err) {
         error.NotFound => {},
         else => return err,
     };
@@ -3911,15 +3924,15 @@ fn batchDeleteTxn(self: anytype, txn: anytype, vector_ids: []const u64) !void {
                 try parent.ensureUnbacked(self.alloc);
                 if (try removeChildLink(self, &parent, leaf_id)) {
                     try recomputeInternalCentroid(self, txn, &parent);
-                    try self.saveNode(txn, &parent);
+                    try self.saveNodeWithOptions(txn, &parent, options);
                     try deleteNode(self, txn, leaf_id);
-                    try collapseSingleChildParents(self, txn, leaf.parent);
+                    try collapseSingleChildParentsOptions(self, txn, leaf.parent, options);
                 } else {
                     try deleteNode(self, txn, leaf_id);
                 }
             }
         } else {
-            try self.saveNode(txn, &leaf);
+            try self.saveNodeWithOptions(txn, &leaf, options);
         }
 
         for (group) |entry| deleteVectorKeys(self, txn, entry.vector_id);
@@ -4252,6 +4265,10 @@ fn deleteVectorKeys(self: anytype, txn: anytype, vector_id: u64) void {
 }
 
 pub fn deleteTxn(self: anytype, txn: anytype, vector_id: u64) !void {
+    try deleteTxnOptions(self, txn, vector_id, .{});
+}
+
+fn deleteTxnOptions(self: anytype, txn: anytype, vector_id: u64, options: hbc_runtime.BatchInsertOptions) !void {
     try self.bindTxnLike(txn);
     var leaf_id = self.getVecLeaf(txn, vector_id) catch |err| blk: {
         if (!isNotFoundGeneric(err)) return err;
@@ -4300,14 +4317,14 @@ pub fn deleteTxn(self: anytype, txn: anytype, vector_id: u64) !void {
         try parent.ensureUnbacked(self.alloc);
         if (try removeChildLink(self, &parent, leaf_id)) {
             try recomputeInternalCentroid(self, txn, &parent);
-            try self.saveNode(txn, &parent);
+            try self.saveNodeWithOptions(txn, &parent, options);
             try deleteNode(self, txn, leaf_id);
-            try collapseSingleChildParents(self, txn, leaf.parent);
+            try collapseSingleChildParentsOptions(self, txn, leaf.parent, options);
         } else {
             try deleteNode(self, txn, leaf_id);
         }
     } else {
-        try self.saveNode(txn, &leaf);
+        try self.saveNodeWithOptions(txn, &leaf, options);
 
         if (leaf.parent != 0 and leaf.members.len < minLeafOccupancy(self)) skip_merge: {
             var parent = loadNode(self, txn, leaf.parent) catch |err| {
@@ -4350,14 +4367,14 @@ pub fn deleteTxn(self: anytype, txn: anytype, vector_id: u64) !void {
                 self.alloc.free(sibling.members);
                 sibling.members = merged;
                 try posting.PostingStore.recomputeCentroid(self, txn, &sibling);
-                try self.saveNode(txn, &sibling);
+                try self.saveNodeWithOptions(txn, &sibling, options);
                 for (leaf.members) |mid| try self.putVecLeaf(txn, mid, best_sibling_id);
 
                 if (try removeChildLink(self, &parent, leaf_id)) {
                     try recomputeInternalCentroid(self, txn, &parent);
-                    try self.saveNode(txn, &parent);
+                    try self.saveNodeWithOptions(txn, &parent, options);
                     try deleteNode(self, txn, leaf_id);
-                    try collapseSingleChildParents(self, txn, leaf.parent);
+                    try collapseSingleChildParentsOptions(self, txn, leaf.parent, options);
                 } else {
                     try deleteNode(self, txn, leaf_id);
                 }
@@ -5642,7 +5659,7 @@ pub fn batchApplyOptions(
 ) !void {
     if (writes.len == 0 and deletes.len == 0) return;
     if (writes.len == 0) {
-        if (deletes.len == 1) return self.delete(deletes[0]);
+        if (deletes.len == 1 and !options.defer_quantized_rebuild) return self.delete(deletes[0]);
 
         const Index = comptime childType(@TypeOf(self));
         var batch = if (options.bulk_ingest and comptime @hasDecl(Index, "beginRuntimeBatchTxnOptions"))
@@ -5650,7 +5667,7 @@ pub fn batchApplyOptions(
         else
             try self.beginRuntimeBatchTxn();
         errdefer batch.abort();
-        try batchDeleteTxn(self, &batch, deletes);
+        try batchDeleteTxnOptions(self, &batch, deletes, options);
         try finalizeWriteTxnOptions(self, &batch, options, now_fn, elapsed_fn);
         const commit_start = now_fn();
         const publishing = beginPublishSearchStateIfSupported(self);
@@ -5669,9 +5686,16 @@ pub fn batchApplyOptions(
         try self.beginRuntimeBatchTxn();
     errdefer batch.abort();
 
-    try batchDeleteTxn(self, &batch, deletes);
-
     var insert_options = options;
+    // Replacement batches change membership before adding vectors back. Do
+    // not repeatedly rewrite or append to quantized payloads whose centroid
+    // and membership changed earlier in this transaction. Queue every source
+    // and destination posting and rebuild each final payload once at commit.
+    if (insert_options.defer_quantized_rebuild) {
+        insert_options.suppress_quantized_payload_persist = true;
+    }
+    try batchDeleteTxnOptions(self, &batch, deletes, insert_options);
+
     const caller_assumed_absent = insert_options.assume_absent_ids;
     if (!insert_options.assume_absent_ids and
         try batchWritesAreUniqueAndCoveredByDeletes(self.alloc, writes, deletes))

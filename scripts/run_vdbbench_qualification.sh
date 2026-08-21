@@ -9,7 +9,7 @@ usage() {
   echo "  VDBBENCH_ROOT    VectorDBBench checkout (default: ../VectorDBBench)" >&2
   echo "  VDBBENCH_CASE    Case name (default: Performance1536D50K)" >&2
   echo "  VDBBENCH_BATCH   Insert batch size (default: 100)" >&2
-  echo "  VDBBENCH_WORKERS Load workers (default: 4)" >&2
+  echo "  VDBBENCH_WORKERS Load workers when supported by the checkout (default: 4)" >&2
   echo "  VDBBENCH_CONCURRENCY  Query concurrencies (default: 1,4,16)" >&2
   echo "  VDBBENCH_QUERY_SECONDS Seconds per concurrency (default: 10)" >&2
   exit 2
@@ -32,6 +32,8 @@ load_workers=${VDBBENCH_WORKERS:-4}
 query_concurrency=${VDBBENCH_CONCURRENCY:-1,4,16}
 query_seconds=${VDBBENCH_QUERY_SECONDS:-10}
 sampler=${FOOTPRINT_SAMPLER:-$main_checkout/../antfly-circus/benchmarks/CRAG-harness/footprint_sampler.py}
+supports_load_concurrency=false
+supports_serial_cooldown=false
 
 if [[ -e "$run_root" ]]; then
   echo "run root already exists: $run_root" >&2
@@ -43,6 +45,23 @@ for required in "$antfly_bin" "$vdbbench_root/.venv/bin/python" "$sampler"; do
     exit 2
   fi
 done
+
+# VectorDBBench removed --load-concurrency from newer releases and currently
+# runs the official load case through its SerialInsertRunner. Preserve support
+# for older checkouts without making the qualification script fail against the
+# current public CLI.
+vdbbench_help=$(
+  cd "$vdbbench_root"
+  .venv/bin/python -m vectordb_bench.cli.vectordbbench antflyaknn --help
+)
+if [[ "$vdbbench_help" == *"--load-concurrency"* ]]; then
+  supports_load_concurrency=true
+else
+  echo "VectorDBBench checkout has no --load-concurrency option; using its official serial load runner" >&2
+fi
+if [[ "$vdbbench_help" == *"--serial-cooldown"* ]]; then
+  supports_serial_cooldown=true
+fi
 
 mkdir -p "$run_root/results"
 python3 "$sampler" --capture-wired-baseline "$run_root/wired-baseline.json"
@@ -103,6 +122,22 @@ start_server() {
 run_vdbbench() {
   local label=$1
   shift
+  local cli_args=(
+    antflyaknn
+    --host 127.0.0.1
+    --port "$port"
+    --num-shards 1
+    --case-type "$vdbbench_case"
+    --db-label "$label"
+    --num-concurrency "$query_concurrency"
+    --concurrency-duration "$query_seconds"
+  )
+  if [[ "$supports_load_concurrency" == true ]]; then
+    cli_args+=(--load-concurrency "$load_workers")
+  fi
+  if [[ "$supports_serial_cooldown" == true ]]; then
+    cli_args+=(--serial-cooldown 2)
+  fi
   (
     cd "$vdbbench_root"
     ANTFLY_VDBBENCH_KEEP_DEFAULT_FULL_TEXT=0 \
@@ -114,17 +149,7 @@ run_vdbbench() {
     IR_DATASETS_HOME=${IR_DATASETS_HOME:-/private/tmp/vdbbench-ir} \
     IR_DATASETS_TMP=${IR_DATASETS_TMP:-/private/tmp/vdbbench-ir-tmp} \
     PYTHONPATH=. \
-    .venv/bin/python -m vectordb_bench.cli.vectordbbench antflyaknn \
-      --host 127.0.0.1 \
-      --port "$port" \
-      --num-shards 1 \
-      --load-concurrency "$load_workers" \
-      --case-type "$vdbbench_case" \
-      --db-label "$label" \
-      --num-concurrency "$query_concurrency" \
-      --concurrency-duration "$query_seconds" \
-      --serial-cooldown 2 \
-      "$@"
+    .venv/bin/python -m vectordb_bench.cli.vectordbbench "${cli_args[@]}" "$@"
   )
 }
 

@@ -26,7 +26,7 @@ const posting_segment = @import("posting_segment.zig");
 pub const PostingId = posting_segment.PostingId;
 
 const magic: u32 = 0x41465057; // AFPW
-const version: u16 = 3;
+const version: u16 = 4;
 const min_supported_version: u16 = 1;
 const frame_header_len: usize = 48;
 const checksum_offset: usize = 12;
@@ -43,8 +43,191 @@ pub const RecordKind = enum(u8) {
     base_tombstone = 7,
     quantized_checkpoint_tombstone = 8,
     posting_state_tombstone = 9,
+    /// Advances source coverage when a journal batch has no posting changes.
+    coverage = 10,
     commit = 255,
 };
+
+const replacement_patch_magic: [4]u8 = "AFPD".*;
+const replacement_patch_version: u8 = 2;
+const replacement_patch_header_len: usize = 32;
+const replacement_patch_anchor_len: usize = 8;
+const replacement_patch_min_copy_len: usize = 16;
+const replacement_patch_copy_op: u8 = 0;
+const replacement_patch_literal_op: u8 = 1;
+
+/// Encodes a posting-local replacement as copy and literal operations. Copy
+/// operations may reference any base offset, so an insertion or deletion in a
+/// packed id/code array does not turn the shifted suffix into a large literal.
+/// The base and result checksums make a patch fail closed if a WAL generation
+/// is paired with the wrong segment or an earlier delta is missing.
+pub fn encodeReplacementPatchAlloc(
+    alloc: Allocator,
+    target: RecordKind,
+    base: []const u8,
+    replacement: []const u8,
+) ![]u8 {
+    if (!isLookupValueKind(target)) return error.InvalidPostingPatchTarget;
+    if (base.len > std.math.maxInt(u32) or replacement.len > std.math.maxInt(u32)) {
+        return error.PostingWalRecordTooLarge;
+    }
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.resize(alloc, replacement_patch_header_len);
+
+    // Index every base anchor. Keeping one exact offset per anchor is enough
+    // for packed posting payloads, whose long unchanged spans have diverse
+    // code bytes; candidates are verified byte-for-byte before use.
+    var anchors = std.AutoHashMapUnmanaged(u64, u32).empty;
+    defer anchors.deinit(alloc);
+    if (base.len >= replacement_patch_anchor_len) {
+        const anchor_count = (base.len - replacement_patch_anchor_len) / 4 + 1;
+        try anchors.ensureTotalCapacity(alloc, @intCast(anchor_count));
+        var base_offset: usize = 0;
+        while (base_offset + replacement_patch_anchor_len <= base.len) : (base_offset += 4) {
+            const anchor = std.mem.readInt(u64, base[base_offset..][0..replacement_patch_anchor_len], .little);
+            const gop = anchors.getOrPutAssumeCapacity(anchor);
+            if (!gop.found_existing) gop.value_ptr.* = @intCast(base_offset);
+        }
+    }
+
+    var op_count: u32 = 0;
+    var replacement_offset: usize = 0;
+    var literal_start: usize = 0;
+    while (replacement_offset < replacement.len) {
+        var copy_offset: usize = 0;
+        var copy_len: usize = 0;
+        if (replacement_offset + replacement_patch_anchor_len <= replacement.len) {
+            const anchor = std.mem.readInt(u64, replacement[replacement_offset..][0..replacement_patch_anchor_len], .little);
+            if (anchors.get(anchor)) |candidate_u32| {
+                const candidate: usize = @intCast(candidate_u32);
+                var matched = replacement_patch_anchor_len;
+                while (candidate + matched < base.len and replacement_offset + matched < replacement.len and
+                    base[candidate + matched] == replacement[replacement_offset + matched]) : (matched += 1)
+                {}
+                if (matched >= replacement_patch_min_copy_len) {
+                    copy_offset = candidate;
+                    copy_len = matched;
+                }
+            }
+        }
+        if (copy_len == 0) {
+            replacement_offset += 1;
+            continue;
+        }
+
+        if (literal_start < replacement_offset) {
+            try appendReplacementPatchLiteral(alloc, &out, replacement[literal_start..replacement_offset]);
+            op_count += 1;
+        }
+        try out.append(alloc, replacement_patch_copy_op);
+        var copy_header: [8]u8 = undefined;
+        std.mem.writeInt(u32, copy_header[0..4], @intCast(copy_offset), .big);
+        std.mem.writeInt(u32, copy_header[4..8], @intCast(copy_len), .big);
+        try out.appendSlice(alloc, &copy_header);
+        op_count += 1;
+        replacement_offset += copy_len;
+        literal_start = replacement_offset;
+    }
+    if (literal_start < replacement.len) {
+        try appendReplacementPatchLiteral(alloc, &out, replacement[literal_start..]);
+        op_count += 1;
+    }
+
+    @memcpy(out.items[0..4], &replacement_patch_magic);
+    out.items[4] = replacement_patch_version;
+    out.items[5] = @intFromEnum(target);
+    @memset(out.items[6..8], 0);
+    std.mem.writeInt(u32, out.items[8..12], @intCast(base.len), .big);
+    std.mem.writeInt(u32, out.items[12..16], @intCast(replacement.len), .big);
+    std.mem.writeInt(u32, out.items[16..20], op_count, .big);
+    @memset(out.items[20..24], 0);
+    std.mem.writeInt(u32, out.items[24..28], std.hash.Crc32.hash(base), .big);
+    std.mem.writeInt(u32, out.items[28..32], std.hash.Crc32.hash(replacement), .big);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendReplacementPatchLiteral(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), bytes: []const u8) !void {
+    if (bytes.len > std.math.maxInt(u32)) return error.PostingWalRecordTooLarge;
+    try out.append(alloc, replacement_patch_literal_op);
+    var len_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_buf, @intCast(bytes.len), .big);
+    try out.appendSlice(alloc, &len_buf);
+    try out.appendSlice(alloc, bytes);
+}
+
+pub const DecodedReplacementPatch = struct {
+    target: RecordKind,
+    replacement: []u8,
+};
+
+pub fn applyReplacementPatchAlloc(
+    alloc: Allocator,
+    payload: []const u8,
+    base: []const u8,
+) !DecodedReplacementPatch {
+    if (payload.len < replacement_patch_header_len) return error.CorruptedPostingPatch;
+    if (!std.mem.eql(u8, payload[0..4], &replacement_patch_magic)) return error.BadPostingPatchMagic;
+    if (payload[4] != replacement_patch_version) return error.UnsupportedPostingPatchVersion;
+    if (payload[6] != 0 or payload[7] != 0) return error.UnsupportedPostingPatchFlags;
+    const target: RecordKind = switch (payload[5]) {
+        @intFromEnum(RecordKind.base) => .base,
+        @intFromEnum(RecordKind.quantized_checkpoint) => .quantized_checkpoint,
+        @intFromEnum(RecordKind.posting_state) => .posting_state,
+        else => return error.InvalidPostingPatchTarget,
+    };
+    const base_len: usize = @intCast(std.mem.readInt(u32, payload[8..12], .big));
+    const replacement_len: usize = @intCast(std.mem.readInt(u32, payload[12..16], .big));
+    const op_count: usize = @intCast(std.mem.readInt(u32, payload[16..20], .big));
+    if (payload[20] != 0 or payload[21] != 0 or payload[22] != 0 or payload[23] != 0) return error.UnsupportedPostingPatchFlags;
+    if (base.len != base_len or std.hash.Crc32.hash(base) != std.mem.readInt(u32, payload[24..28], .big)) {
+        return error.PostingPatchBaseMismatch;
+    }
+    const replacement = try alloc.alloc(u8, replacement_len);
+    errdefer alloc.free(replacement);
+    var payload_offset: usize = replacement_patch_header_len;
+    var replacement_offset: usize = 0;
+    for (0..op_count) |_| {
+        if (payload_offset >= payload.len) return error.CorruptedPostingPatch;
+        const op = payload[payload_offset];
+        payload_offset += 1;
+        switch (op) {
+            replacement_patch_copy_op => {
+                if (payload.len - payload_offset < 8) return error.CorruptedPostingPatch;
+                const copy_offset: usize = @intCast(std.mem.readInt(u32, payload[payload_offset..][0..4], .big));
+                const copy_len: usize = @intCast(std.mem.readInt(u32, payload[payload_offset + 4 ..][0..4], .big));
+                payload_offset += 8;
+                if (copy_offset > base.len or copy_len > base.len - copy_offset or
+                    replacement_offset > replacement.len or copy_len > replacement.len - replacement_offset)
+                {
+                    return error.CorruptedPostingPatch;
+                }
+                @memcpy(replacement[replacement_offset..][0..copy_len], base[copy_offset..][0..copy_len]);
+                replacement_offset += copy_len;
+            },
+            replacement_patch_literal_op => {
+                if (payload.len - payload_offset < 4) return error.CorruptedPostingPatch;
+                const literal_len: usize = @intCast(std.mem.readInt(u32, payload[payload_offset..][0..4], .big));
+                payload_offset += 4;
+                if (literal_len > payload.len - payload_offset or replacement_offset > replacement.len or
+                    literal_len > replacement.len - replacement_offset)
+                {
+                    return error.CorruptedPostingPatch;
+                }
+                @memcpy(replacement[replacement_offset..][0..literal_len], payload[payload_offset..][0..literal_len]);
+                payload_offset += literal_len;
+                replacement_offset += literal_len;
+            },
+            else => return error.CorruptedPostingPatch,
+        }
+    }
+    if (payload_offset != payload.len or replacement_offset != replacement.len) return error.CorruptedPostingPatch;
+    if (std.hash.Crc32.hash(replacement) != std.mem.readInt(u32, payload[28..32], .big)) {
+        return error.PostingPatchResultMismatch;
+    }
+    return .{ .target = target, .replacement = replacement };
+}
 
 pub const Record = struct {
     kind: RecordKind,
@@ -96,7 +279,8 @@ pub const Writer = struct {
         payload: []const u8,
     ) !void {
         if (kind == .commit) return error.InvalidPostingWalRecord;
-        if (isTombstone(kind) and payload.len != 0) return error.InvalidPostingWalRecord;
+        if ((isTombstone(kind) or kind == .coverage) and payload.len != 0) return error.InvalidPostingWalRecord;
+        if (kind == .coverage and posting_id != 0) return error.InvalidPostingWalRecord;
         const starts_batch = self.open_batch == null;
         if (self.open_batch) |open_batch| {
             if (batch_id != open_batch) return error.InterleavedPostingWalBatch;
@@ -188,7 +372,8 @@ pub const Replay = struct {
                 open_batch_records = 0;
                 open_batch_max_sequence = 0;
             } else {
-                if (isTombstone(record.kind) and record.payload.len != 0) return error.InvalidPostingWalRecord;
+                if ((isTombstone(record.kind) or record.kind == .coverage) and record.payload.len != 0) return error.InvalidPostingWalRecord;
+                if (record.kind == .coverage and record.posting_id != 0) return error.InvalidPostingWalRecord;
                 if (open_batch) |batch_id| {
                     if (record.batch_id != batch_id) return error.InterleavedPostingWalBatch;
                     if (record.source_sequence < open_batch_max_sequence) return error.OutOfOrderPostingWalSequence;
@@ -253,14 +438,14 @@ pub const Replay = struct {
     fn buildPostingIndex(self: *Replay) !void {
         try self.posting_order.ensureTotalCapacity(self.alloc, self.records.items.len);
         for (self.records.items, 0..) |record, index| {
-            self.posting_order.appendAssumeCapacity(index);
+            if (record.kind != .coverage) self.posting_order.appendAssumeCapacity(index);
             if (record.kind == .tombstone) {
                 inline for (lookup_record_kinds) |kind| {
                     try self.latest_by_kind.put(self.alloc, postingKindKey(record.posting_id, kind), .tombstone);
                 }
             } else if (tombstoneTarget(record.kind)) |target| {
                 try self.latest_by_kind.put(self.alloc, postingKindKey(record.posting_id, target), .tombstone);
-            } else {
+            } else if (record.kind != .coverage) {
                 try self.latest_by_kind.put(
                     self.alloc,
                     postingKindKey(record.posting_id, record.kind),
@@ -294,6 +479,10 @@ const lookup_record_kinds = [_]RecordKind{
     .quantized_checkpoint,
     .posting_state,
 };
+
+fn isLookupValueKind(kind: RecordKind) bool {
+    return kind == .base or kind == .quantized_checkpoint or kind == .posting_state;
+}
 
 fn postingKindKey(posting_id: PostingId, kind: RecordKind) u128 {
     return (@as(u128, posting_id) << 8) | @intFromEnum(kind);
@@ -383,6 +572,7 @@ fn decodeFrame(bytes: []const u8) !?DecodedFrame {
         @intFromEnum(RecordKind.base_tombstone) => .base_tombstone,
         @intFromEnum(RecordKind.quantized_checkpoint_tombstone) => .quantized_checkpoint_tombstone,
         @intFromEnum(RecordKind.posting_state_tombstone) => .posting_state_tombstone,
+        @intFromEnum(RecordKind.coverage) => .coverage,
         @intFromEnum(RecordKind.commit) => .commit,
         else => return error.InvalidPostingWalRecord,
     };
@@ -612,4 +802,49 @@ test "posting WAL kind tombstones mask only their target" {
     try std.testing.expectEqualStrings("base-v2", replay.resolve(7, .base).value.payload);
     try std.testing.expect(replay.resolve(7, .quantized_checkpoint) == .tombstone);
     try std.testing.expect(replay.resolve(7, .posting_state) == .missing);
+}
+
+test "posting WAL replacement patches round trip and reject the wrong base" {
+    const alloc = std.testing.allocator;
+    const base = "a long stable posting prefix: old-middle :and-stable-suffix";
+    const replacement = "a long stable posting prefix: NEW :and-stable-suffix";
+    const patch = try encodeReplacementPatchAlloc(alloc, .base, base, replacement);
+    defer alloc.free(patch);
+
+    const decoded = try applyReplacementPatchAlloc(alloc, patch, base);
+    defer alloc.free(decoded.replacement);
+    try std.testing.expectEqual(RecordKind.base, decoded.target);
+    try std.testing.expectEqualStrings(replacement, decoded.replacement);
+    try std.testing.expectError(error.PostingPatchBaseMismatch, applyReplacementPatchAlloc(alloc, patch, "wrong"));
+}
+
+test "posting WAL replacement patches preserve shifted binary runs" {
+    const alloc = std.testing.allocator;
+    var base: [4096]u8 = undefined;
+    for (&base, 0..) |*byte, i| byte.* = @truncate(i *% 131 +% i / 7);
+    var replacement: [4096]u8 = undefined;
+    @memcpy(replacement[0..173], base[0..173]);
+    @memset(replacement[173..189], 0xa5);
+    @memcpy(replacement[189..], base[173 .. base.len - 16]);
+
+    const patch = try encodeReplacementPatchAlloc(alloc, .quantized_checkpoint, &base, &replacement);
+    defer alloc.free(patch);
+    try std.testing.expect(patch.len < replacement.len / 8);
+    const decoded = try applyReplacementPatchAlloc(alloc, patch, &base);
+    defer alloc.free(decoded.replacement);
+    try std.testing.expectEqualSlices(u8, &replacement, decoded.replacement);
+}
+
+test "posting WAL coverage records advance a committed source sequence" {
+    const alloc = std.testing.allocator;
+    var writer = Writer.init(alloc);
+    defer writer.deinit();
+    try writer.append(.coverage, 1, 0, 42, &.{});
+    try writer.commit(1, 42);
+
+    var replay = try Replay.parse(alloc, writer.bytes());
+    defer replay.deinit();
+    try std.testing.expectEqual(@as(u64, 42), replay.covered_source_sequence);
+    try std.testing.expectEqual(@as(usize, 1), replay.records.items.len);
+    try std.testing.expectEqual(@as(usize, 0), replay.posting_order.items.len);
 }

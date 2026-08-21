@@ -36347,6 +36347,13 @@ fn checkpointManagedProjectionEffectsForAppliedSequenceUpdates(
             .name = update.index_name,
             .kind = cfg.kind,
         });
+        if (cfg.kind == .dense_vector) {
+            // The posting sidecar is optional derived acceleration. Publish it
+            // only after the authoritative HBC WAL is at a durable boundary,
+            // but before the source applied watermark can advance. Failure is
+            // handled by durable invalidation and never rolls back source/HBC.
+            index_manager.persistDensePostingSidecarByNameBestEffort(update.index_name, update.sequence);
+        }
     }
 }
 
@@ -37978,6 +37985,8 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
         .dense_vector => {
             const dense_apply_start_ns = monotonicTimeNs();
             const dense_finish_options = denseCatchUpFinishOptions();
+            const posting_capture_started = try ctx.index_manager.beginDensePostingSidecarCaptureByName(index_ref.name);
+            errdefer if (posting_capture_started) ctx.index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
             const use_local_streaming_session = denseApplyUsesLocalStreamingSession(ctx, index_ref.name);
             var dense_streaming_session_open = false;
             if (use_local_streaming_session) {
@@ -40676,6 +40685,8 @@ fn applyDerivedBatchToIndexReplay(ctx_ptr: *anyopaque, batch: derived_types.Deri
 fn beginDerivedCatchUpWindow(ctx_ptr: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) !void {
     if (index_ref.kind != .dense_vector) return;
     const replay_ctx: *ReplayApplyContext = @ptrCast(@alignCast(ctx_ptr));
+    const started_capture = try replay_ctx.db.core.batchExecutionResources().index_manager.beginDensePostingSidecarCaptureByName(index_ref.name);
+    errdefer if (started_capture) replay_ctx.db.core.batchExecutionResources().index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
     try replay_ctx.db.core.batchExecutionResources().index_manager.beginDenseStreamingReplaySessionByName(index_ref.name);
 }
 
@@ -40684,9 +40695,11 @@ fn finishDerivedCatchUpWindow(ctx_ptr: *anyopaque, index_ref: index_manager_mod.
     const replay_ctx: *ReplayApplyContext = @ptrCast(@alignCast(ctx_ptr));
     const resources = replay_ctx.db.core.batchExecutionResources();
     if (!success) {
+        resources.index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
         resources.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
         return;
     }
+    errdefer resources.index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
     errdefer resources.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
     const finish_start_ns = monotonicTimeNs();
     try resources.index_manager.finishDenseStreamingReplaySessionByNameWithOptions(index_ref.name, denseCatchUpFinishOptions());
@@ -40699,6 +40712,8 @@ fn finishDerivedCatchUpWindow(ctx_ptr: *anyopaque, index_ref: index_manager_mod.
 fn beginDerivedCatchUpWindowContext(ctx_ptr: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) !void {
     if (index_ref.kind != .dense_vector) return;
     const replay_ctx: *ReplayApplyContextBatch = @ptrCast(@alignCast(ctx_ptr));
+    const started_capture = try replay_ctx.batch.index_manager.beginDensePostingSidecarCaptureByName(index_ref.name);
+    errdefer if (started_capture) replay_ctx.batch.index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
     try replay_ctx.batch.index_manager.beginDenseStreamingReplaySessionByName(index_ref.name);
 }
 
@@ -40706,9 +40721,11 @@ fn finishDerivedCatchUpWindowContext(ctx_ptr: *anyopaque, index_ref: index_manag
     if (index_ref.kind != .dense_vector) return;
     const replay_ctx: *ReplayApplyContextBatch = @ptrCast(@alignCast(ctx_ptr));
     if (!success) {
+        replay_ctx.batch.index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
         replay_ctx.batch.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
         return;
     }
+    errdefer replay_ctx.batch.index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
     errdefer replay_ctx.batch.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
     const finish_start_ns = monotonicTimeNs();
     try replay_ctx.batch.index_manager.finishDenseStreamingReplaySessionByNameWithOptions(index_ref.name, denseCatchUpFinishOptions());
@@ -42266,6 +42283,8 @@ fn beginDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manager
 
     try beginDenseCatchUpSessionTracked(ctx, index_ref.name);
     errdefer finishDenseCatchUpSessionTrackedBestEffort(ctx, index_ref.name);
+    const started_capture = try ctx.index_manager.beginDensePostingSidecarCaptureByName(index_ref.name);
+    errdefer if (started_capture) ctx.index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
     try beginDenseStreamingReplaySessionForAsyncCatchUp(ctx, index_ref);
     errdefer abortDenseStreamingReplaySessionForAsyncCatchUp(ctx, index_ref);
     _ = ctx.stats.dense_catch_up.begin_calls.fetchAdd(1, .monotonic);
@@ -42280,6 +42299,7 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
         var seq_lock = lockAtomicWithBackoffProfiled(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex);
         ctx.applied_sequence_coalescer.removePending(ctx.alloc, index_ref.name);
         seq_lock.unlock();
+        ctx.index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
         abortDenseStreamingReplaySessionForAsyncCatchUp(ctx, index_ref);
         const lifecycle_completed = try finishDenseCatchUpSessionTrackedAndFinalize(ctx, index_ref.name);
         if (lifecycle_completed) DB.notifyQueryVisibilityHook(ctx, .publish_blocking);
@@ -42287,6 +42307,7 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
     }
     var catch_up_tracked = true;
     errdefer if (catch_up_tracked) finishDenseCatchUpSessionTrackedBestEffort(ctx, index_ref.name);
+    errdefer ctx.index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
     var streaming_session_finished = false;
     errdefer if (!streaming_session_finished) abortDenseStreamingReplaySessionForAsyncCatchUp(ctx, index_ref);
     const finish_start_ns = monotonicTimeNs();
