@@ -476,6 +476,7 @@ pub fn validateJsonSchemaValue(
         .document_root = schema_object,
         .scope_schema = schema_object,
     };
+    try validatePropertySchemaDefinitionWithContext(context, schema);
     const root_property = try parseAnonymousProperty(alloc, context, schema_object);
     defer {
         root_property.deinit(alloc);
@@ -861,7 +862,10 @@ fn validateDocumentSchemaKeywords(context: SchemaContext, object: std.json.Objec
         return error.InvalidSchemaUpdateRequest;
     }
     if (object.get("pattern")) |pattern| {
-        if (pattern != .null and pattern != .string) return error.InvalidSchemaUpdateRequest;
+        if (pattern != .null) {
+            if (pattern != .string) return error.InvalidSchemaUpdateRequest;
+            try validateRegexPattern(pattern.string);
+        }
     }
     if (object.get("minLength")) |min_length| {
         if (min_length != .null) try validateNonNegativeInteger(min_length);
@@ -1050,7 +1054,10 @@ fn validatePropertySchemaKeywords(context: SchemaContext, object: std.json.Objec
         return error.InvalidSchemaUpdateRequest;
     }
     if (object.get("pattern")) |pattern| {
-        if (pattern != .null and pattern != .string) return error.InvalidSchemaUpdateRequest;
+        if (pattern != .null) {
+            if (pattern != .string) return error.InvalidSchemaUpdateRequest;
+            try validateRegexPattern(pattern.string);
+        }
     }
     if (object.get("minLength")) |min_length| {
         if (min_length != .null) try validateNonNegativeInteger(min_length);
@@ -4667,6 +4674,20 @@ test "schema composition propagates operational validation errors" {
     );
 }
 
+test "schema rejects invalid patterns before instance evaluation" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        validateJsonSchemaJson(alloc, "{\"pattern\":\"[\"}", "5"),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchemaUpdateRequest(alloc,
+            \\{"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"name":{"type":"string","pattern":"["}}}}}}
+        ),
+    );
+}
+
 test "public schema mutations gate relational storage until runtime wiring lands" {
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchemaUpdateRequest(std.testing.allocator,
         \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
@@ -4831,6 +4852,10 @@ fn regexMatch(pattern: []const u8, text: []const u8) !bool {
         error.InvalidRegex => error.InvalidSchemaUpdateRequest,
         else => err,
     };
+}
+
+fn validateRegexPattern(pattern: []const u8) !void {
+    _ = try regexMatch(pattern, "");
 }
 
 fn parseTtlTimestampNs(value: std.json.Value) !u64 {
