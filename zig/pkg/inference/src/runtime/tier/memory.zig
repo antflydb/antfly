@@ -259,8 +259,8 @@ pub const SystemMemoryInfo = struct {
     /// large portion of RAM and can reject every positive admission while
     /// macOS still reports normal memory pressure.
     availability_basis: AvailabilityBasis = .mem_available,
-    /// When an operator-owned Linux process envelope is the tighter live
-    /// constraint, it already bounds the complete leaf-cgroup working set.
+    /// When an operator-owned process envelope is the tighter live constraint,
+    /// it already bounds the complete cgroup or process working set.
     /// Preserve only the emergency reserve inside that bounded view instead
     /// of applying dynamic host headroom a second time.
     live_admission_policy: LiveAdmissionPolicy = .dynamic_pressure,
@@ -1443,7 +1443,7 @@ fn macosLiveAdmissionGrace(total_bytes: usize) usize {
 /// Linux MemAvailable is an allocation-availability estimate. With automatic
 /// host/cgroup sizing, preserve half of current availability, with a 512 MiB
 /// emergency floor and the stable node headroom as a ceiling. An explicit
-/// process envelope already charges the complete leaf-cgroup usage and
+/// process envelope already charges the complete cgroup/process usage and
 /// expresses the operator's process headroom; inside that envelope preserve a
 /// fixed 512 MiB emergency reserve rather than dynamically reserving the
 /// bounded remainder a second time. macOS supplies a system pressure
@@ -1452,15 +1452,14 @@ fn macosLiveAdmissionGrace(total_bytes: usize) usize {
 /// reclaimable memory.
 fn liveHostAdmissionReserve(info: SystemMemoryInfo) usize {
     const available = info.available_bytes orelse return 0;
+    if (info.live_admission_policy == .explicit_process_envelope)
+        return @min(available, mib(512));
     const node_headroom = liveHostMemoryHeadroom(info.total_bytes);
     return switch (info.availability_basis) {
-        .mem_available => switch (info.live_admission_policy) {
-            .explicit_process_envelope => @min(available, mib(512)),
-            .dynamic_pressure => @min(
-                node_headroom,
-                @min(available, @max(mib(512), available / 2)),
-            ),
-        },
+        .mem_available => @min(
+            node_headroom,
+            @min(available, @max(mib(512), available / 2)),
+        ),
         .macos_memory_pressure, .macos_reclaimable_pages => blk: {
             const normal_capacity = available -| node_headroom;
             const emergency_reserve = @min(
@@ -1598,14 +1597,40 @@ pub fn currentSystemMemoryInfoForLimit(
                 provenance,
             );
         },
-        .macos => applyOptionalProcessMemoryLimit(
-            probeSystemMemoryInfoMacos(),
-            limit_bytes,
-            null,
-            provenance,
-        ),
+        .macos => blk: {
+            const detected = probeSystemMemoryInfoMacos();
+            if (limit_bytes == 0) break :blk detected;
+            break :blk applyOptionalProcessMemoryLimitWithProcessSnapshot(
+                detected,
+                limit_bytes,
+                provenance,
+                platform.process_memory.pressureSnapshot(),
+            );
+        },
         else => applyOptionalProcessMemoryLimit(null, limit_bytes, null, provenance),
     };
+}
+
+fn processWorkingSetBytesFromSnapshot(stats: platform.process_memory.Stats) ?usize {
+    if (!stats.available) return null;
+    const working_set = platform.process_memory.pressureWorkingSetBytes(stats);
+    // A wider platform counter must fail closed rather than wrap into apparent
+    // free capacity on a narrower target.
+    return std.math.cast(usize, working_set) orelse std.math.maxInt(usize);
+}
+
+fn applyOptionalProcessMemoryLimitWithProcessSnapshot(
+    detected: ?SystemMemoryInfo,
+    limit_bytes: usize,
+    provenance: ProcessMemoryLimitProvenance,
+    process_snapshot: platform.process_memory.Stats,
+) ?SystemMemoryInfo {
+    return applyOptionalProcessMemoryLimit(
+        detected,
+        limit_bytes,
+        processWorkingSetBytesFromSnapshot(process_snapshot),
+        provenance,
+    );
 }
 
 fn applyOptionalProcessMemoryLimit(
@@ -3013,6 +3038,48 @@ test "explicit process envelope charges leaf cgroup working set" {
         host_pressure.live_admission_policy,
     );
     try std.testing.expectEqual(gib(1), liveHostAdmissionReserve(host_pressure));
+}
+
+test "process snapshot charges explicit envelope without cgroup usage" {
+    const detected = SystemMemoryInfo{
+        .total_bytes = gib(64),
+        .available_bytes = gib(40),
+        .availability_basis = .macos_memory_pressure,
+    };
+    // Keep every platform's preferred pressure field equal so this test covers
+    // the snapshot-to-envelope wiring independent of the test host OS.
+    const snapshot = platform.process_memory.Stats{
+        .available = true,
+        .resident_bytes = gib(3),
+        .anonymous_bytes = gib(3),
+        .private_dirty_bytes = gib(3),
+        .footprint_bytes = gib(3),
+    };
+    const live = applyOptionalProcessMemoryLimitWithProcessSnapshot(
+        detected,
+        gib(14),
+        .explicit,
+        snapshot,
+    ).?;
+    try std.testing.expectEqual(gib(14), live.total_bytes);
+    try std.testing.expectEqual(@as(?usize, gib(11)), live.available_bytes);
+    try std.testing.expectEqual(
+        LiveAdmissionPolicy.explicit_process_envelope,
+        live.live_admission_policy,
+    );
+    try std.testing.expectEqual(mib(512), liveHostAdmissionReserve(live));
+
+    const unavailable = applyOptionalProcessMemoryLimitWithProcessSnapshot(
+        detected,
+        gib(14),
+        .explicit,
+        .{},
+    ).?;
+    try std.testing.expectEqual(@as(?usize, gib(14)), unavailable.available_bytes);
+    try std.testing.expectEqual(
+        LiveAdmissionPolicy.dynamic_pressure,
+        unavailable.live_admission_policy,
+    );
 }
 
 test "process envelope provenance preserves automatic cgroup pressure policy" {

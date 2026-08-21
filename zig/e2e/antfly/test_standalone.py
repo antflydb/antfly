@@ -127,14 +127,56 @@ def _normalize_model_ref_for_path(model_name: str) -> str:
 
 def _candidate_model_dirs(models_dir: Path, model_name: str) -> list[Path]:
     normalized = _normalize_model_ref_for_path(model_name)
-    return [
+    legacy_candidates = [
         models_dir / normalized,
         models_dir / "generators" / normalized,
     ]
+    candidates = list(legacy_candidates)
+    for legacy in legacy_candidates:
+        parent = legacy.parent
+        if not parent.is_dir():
+            continue
+        prefix = f"{legacy.name}--antfly-"
+        # Explicit variants are atomically published beside the legacy model
+        # directory using a 16-character SHA-256 prefix. Enumerating only that
+        # namespace keeps this preflight bounded and avoids accepting temporary
+        # download directories as complete models.
+        for child in sorted(parent.iterdir()):
+            if not child.is_dir() or not child.name.startswith(prefix):
+                continue
+            variant_hash = child.name[len(prefix) :]
+            if len(variant_hash) == 16 and all(
+                char in "0123456789abcdef" for char in variant_hash
+            ):
+                candidates.append(child)
+    return candidates
 
 
 def _model_exists(models_dir: Path, model_name: str) -> bool:
-    return any(path.exists() for path in _candidate_model_dirs(models_dir, model_name))
+    return any(path.is_dir() for path in _candidate_model_dirs(models_dir, model_name))
+
+
+def test_standalone_model_preflight_recognizes_atomic_variant_publication(
+    tmp_path: Path,
+):
+    models_dir = tmp_path / "models"
+    published = models_dir / "ggml-org" / "gemma-4-e2b-it-gguf--antfly-0123456789abcdef"
+    published.mkdir(parents=True)
+
+    assert _model_exists(models_dir, "ggml-org/gemma-4-e2b-it-gguf")
+
+
+def test_standalone_model_preflight_rejects_incomplete_variant_names(tmp_path: Path):
+    models_dir = tmp_path / "models"
+    incomplete = (
+        models_dir
+        / "generators"
+        / "ggml-org"
+        / "gemma-4-e2b-it-gguf--antfly-0123456789abcdef.tmp"
+    )
+    incomplete.mkdir(parents=True)
+
+    assert not _model_exists(models_dir, "ggml-org/gemma-4-e2b-it-gguf")
 
 
 class EmbeddedInferenceStandaloneServer:
@@ -264,7 +306,10 @@ def _warm_inference_generator(api_url: str, model_name: str) -> None:
         },
         timeout=300,
     )
-    response.raise_for_status()
+    if response.status_code >= 400:
+        raise AssertionError(
+            f"generator warmup failed: {response.status_code} {response.text}"
+        )
 
 
 @pytest.fixture(scope="session")
@@ -274,18 +319,23 @@ def embedded_standalone_runtime():
 
     binary = _resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     if not Path(binary).exists():
-        pytest.skip(f"Antfly binary not found: {binary}")
+        pytest.fail(
+            f"Standalone inference was explicitly enabled but the Antfly binary was not found: {binary}"
+        )
 
     models_dir = Path(
         os.environ.get("ANTFLY_INFERENCE_STANDALONE_MODELS_DIR", str(DEFAULT_INFERENCE_MODELS_DIR))
     ).expanduser().resolve()
     if not models_dir.exists():
-        pytest.skip(f"Antfly inference models directory not found: {models_dir}")
+        pytest.fail(
+            "Standalone inference was explicitly enabled but its models directory was not found: "
+            f"{models_dir}"
+        )
 
     model_name = os.environ.get("ANTFLY_INFERENCE_STANDALONE_MODEL_NAME", DEFAULT_INFERENCE_MODEL_NAME)
     if not _model_exists(models_dir, model_name):
-        pytest.skip(
-            "Antfly inference generator model not found under "
+        pytest.fail(
+            "Standalone inference was explicitly enabled but its generator model was not found under "
             f"{models_dir}. Pull it with: antfly inference pull hf:{_normalize_model_ref_for_path(model_name)}"
         )
 
@@ -317,7 +367,13 @@ def embedded_standalone_runtime():
     warmup_performed = False
     try:
         if not _integration_enabled("ANTFLY_INFERENCE_STANDALONE_SKIP_GENERATOR_WARMUP"):
-            _warm_inference_generator(server.inference_api_url, model_name)
+            try:
+                _warm_inference_generator(server.inference_api_url, model_name)
+            except Exception as exc:
+                raise AssertionError(
+                    f"standalone inference generator warmup failed for {model_name}: {exc}\n"
+                    f"server logs:\n{server.debug_logs()}"
+                ) from exc
             warmup_performed = True
         yield {
             "base_url": server.url,

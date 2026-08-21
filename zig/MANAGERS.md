@@ -137,6 +137,8 @@ the executor owner and “inference backend runtime descriptor” for the value.
    inference allocation.
    Linux envelopes use leaf-cgroup working set, matching kubelet pod-eviction
    accounting while excluding inactive file pages the kernel can reclaim.
+   macOS envelopes use the process physical footprint, including compressed
+   and unified-memory residency, from the low-overhead process pressure probe.
 8. Every retained `std.Io` interface has a live owning `BackendRuntime` lane
    lease, and the borrower stops and awaits its tasks before releasing that
    lease.
@@ -248,9 +250,10 @@ dedicated `antfly inference run` entry point. ResourceManager derives an
 aggregate managed-host-memory budget from it; every storage slice reservation
 charges that aggregate as well as its local policy slice. Stable model and
 request limits use the same envelope, and immediately before an inference
-allocation the controller checks the requested increment against current leaf
-cgroup working set plus safety headroom. On Linux, when the remaining explicit
-envelope is the tighter live constraint,
+allocation the controller checks the requested increment against the current
+leaf-cgroup working set on Linux or process physical footprint on macOS, plus
+safety headroom. When the remaining explicit envelope is the tighter live
+constraint,
 admission keeps a fixed 512 MiB emergency reserve inside that bounded view
 instead of reserving half of the remaining capacity a second time. Automatic
 host/cgroup sizing retains the dynamic pressure reserve. Current node or finite
@@ -449,6 +452,7 @@ Permanent tests cover:
 
 - cgroup hierarchy and explicit-envelope derivation;
 - raw leaf usage reducing explicit-envelope availability;
+- macOS process footprint reducing explicit-envelope availability;
 - fail-closed external ownership;
 - atomic external reserve/release and denial classification;
 - aggregate host admission across otherwise-independent slices;
