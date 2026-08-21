@@ -677,6 +677,37 @@ test "metadata raft apply store initializes one durable snapshotted cluster inca
     var source = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = source_root });
     try source.snapshotBuilder().applyBatch(.{ .group_id = group_id, .commit_index = 2, .entries_bytes = entries });
     try std.testing.expectEqual(first, (try source.getMetadataIncarnation(group_id)).?);
+    try std.testing.expectEqual(@as(u16, 0), try source.getRuntimeStatusProtocolActivationVersion(group_id));
+
+    var repair_indexes = [_]metadata.RuntimeIndexStatusReport{.{
+        .name = "visual_idx",
+        .kind = "dense_vector",
+        .repair_status = .rebuilding,
+        .repair_active_generation_serviceable = true,
+    }};
+    var runtime_statuses = [_]metadata.RuntimeGroupStatusReport{.{
+        .table_id = 11,
+        .table_name = "products",
+        .group_id = 12,
+        .store_id = 13,
+        .node_id = 1,
+        .indexes = repair_indexes[0..],
+    }};
+    const activate = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_store = .{
+        .store_id = 13,
+        .node_id = 1,
+        .runtime_statuses = runtime_statuses[0..],
+    } });
+    defer std.testing.allocator.free(activate);
+    const activate_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 2, .index = 3, .entry_type = .normal, .data = activate },
+    });
+    defer std.testing.allocator.free(activate_entries);
+    try source.snapshotBuilder().applyBatch(.{ .group_id = group_id, .commit_index = 3, .entries_bytes = activate_entries });
+    try std.testing.expectEqual(
+        runtime_status_protocol.repair_status_record_version,
+        try source.getRuntimeStatusProtocolActivationVersion(group_id),
+    );
     const snapshot = try source.snapshotBuilder().buildSnapshot(std.testing.allocator, group_id);
     defer std.testing.allocator.free(snapshot);
     source.deinit();
@@ -684,11 +715,19 @@ test "metadata raft apply store initializes one durable snapshotted cluster inca
     var reopened = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = source_root });
     defer reopened.deinit();
     try std.testing.expectEqual(first, (try reopened.getMetadataIncarnation(group_id)).?);
+    try std.testing.expectEqual(
+        runtime_status_protocol.repair_status_record_version,
+        try reopened.getRuntimeStatusProtocolActivationVersion(group_id),
+    );
 
     var target = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = target_root });
     defer target.deinit();
-    try std.testing.expect(try target.snapshotBuilder().installSnapshot(std.testing.allocator, group_id, 2, snapshot));
+    try std.testing.expect(try target.snapshotBuilder().installSnapshot(std.testing.allocator, group_id, 3, snapshot));
     try std.testing.expectEqual(first, (try target.getMetadataIncarnation(group_id)).?);
+    try std.testing.expectEqual(
+        runtime_status_protocol.repair_status_record_version,
+        try target.getRuntimeStatusProtocolActivationVersion(group_id),
+    );
 }
 
 test "metadata raft apply store snapshots and promotes the latest pending reallocation" {
@@ -1223,13 +1262,24 @@ pub const RaftApplyStore = struct {
             else => return err,
         };
         defer self.alloc.free(encoded);
-        if (encoded.len != @sizeOf(metadata_incarnation.MetadataClusterIncarnation)) {
-            return error.InvalidMetadataIncarnation;
-        }
-        var incarnation: metadata_incarnation.MetadataClusterIncarnation = undefined;
-        @memcpy(&incarnation, encoded);
-        if (!metadata_incarnation.isValid(incarnation)) return error.InvalidMetadataIncarnation;
-        return incarnation;
+        return (try decodeMetadataIncarnationRecord(encoded)).incarnation;
+    }
+
+    /// Returns the highest runtime-status record version durably activated by
+    /// this metadata group. Activation is stored with the cluster incarnation,
+    /// so it survives leader changes, process restarts, and Raft snapshots.
+    pub fn getRuntimeStatusProtocolActivationVersion(
+        self: *RaftApplyStore,
+        group_id: u64,
+    ) !u16 {
+        var key_buf: [160]u8 = undefined;
+        const key = try metadataIncarnationKeyForGroup(&key_buf, group_id);
+        const encoded = self.store.get(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => return 0,
+            else => return err,
+        };
+        defer self.alloc.free(encoded);
+        return (try decodeMetadataIncarnationRecord(encoded)).runtime_status_record_version;
     }
 
     pub fn listSplitTransitions(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.SplitTransitionRecord {
@@ -2349,12 +2399,7 @@ pub const RaftApplyStore = struct {
                     },
                     else => return err,
                 };
-                if (existing.len != @sizeOf(metadata_incarnation.MetadataClusterIncarnation)) {
-                    return error.InvalidMetadataIncarnation;
-                }
-                var committed: metadata_incarnation.MetadataClusterIncarnation = undefined;
-                @memcpy(&committed, existing);
-                if (!metadata_incarnation.isValid(committed)) return error.InvalidMetadataIncarnation;
+                _ = try decodeMetadataIncarnationRecord(existing);
                 // Initialization is first-writer-wins. A proposal accepted by a
                 // superseded leader may race a later term, but it must never
                 // replace the cluster identity selected by the committed log.
@@ -2400,6 +2445,9 @@ pub const RaftApplyStore = struct {
                 defer metadata_table_manager.freeStore(self.alloc, applied);
                 const value = try encodeStoreRecord(self.alloc, applied);
                 defer self.alloc.free(value);
+                if (storeHasRuntimeRepairStatus(applied)) {
+                    try activateRuntimeStatusProtocolTxn(txn, group_id);
+                }
                 try txn.put(key, value);
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
                 self.notifyProjectionListeners(.{
@@ -2416,6 +2464,9 @@ pub const RaftApplyStore = struct {
                 const applied = try self.normalizeStoreDrainIntentTxn(txn, group_id, record);
                 const value = try encodeStoreRecord(self.alloc, applied);
                 defer self.alloc.free(value);
+                if (storeHasRuntimeRepairStatus(applied)) {
+                    try activateRuntimeStatusProtocolTxn(txn, group_id);
+                }
                 try txn.put(key, value);
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
                 self.notifyProjectionListeners(.{
@@ -4192,6 +4243,8 @@ fn replicationCutoverRetirementCleared(
 
 const transition_magic = "afmd1";
 const group_status_record_version: u16 = 4;
+const metadata_incarnation_extension_magic = "afmi1";
+const metadata_incarnation_extension_version: u16 = 1;
 // Store records predate framing and are read by mixed-version metadata
 // replicas. Keep the existing prefix byte-for-byte compatible. Extensions are
 // self-identifying for current readers, but legacy readers do not ignore them;
@@ -4200,6 +4253,84 @@ const store_record_extension_magic = "afsx1";
 const store_record_extension_version: u16 = 1;
 const reallocation_request_extension_magic = "afrr1";
 const reallocation_request_extension_version: u16 = 1;
+
+const MetadataIncarnationRecord = struct {
+    incarnation: metadata_incarnation.MetadataClusterIncarnation,
+    runtime_status_record_version: u16 = 0,
+};
+
+fn decodeMetadataIncarnationRecord(encoded: []const u8) !MetadataIncarnationRecord {
+    const incarnation_len = @sizeOf(metadata_incarnation.MetadataClusterIncarnation);
+    if (encoded.len < incarnation_len) return error.InvalidMetadataIncarnation;
+
+    var incarnation: metadata_incarnation.MetadataClusterIncarnation = undefined;
+    @memcpy(&incarnation, encoded[0..incarnation_len]);
+    if (!metadata_incarnation.isValid(incarnation)) return error.InvalidMetadataIncarnation;
+    if (encoded.len == incarnation_len) return .{ .incarnation = incarnation };
+
+    const extension_len = metadata_incarnation_extension_magic.len + @sizeOf(u16) + @sizeOf(u16);
+    if (encoded.len != incarnation_len + extension_len or
+        !std.mem.eql(
+            u8,
+            encoded[incarnation_len..][0..metadata_incarnation_extension_magic.len],
+            metadata_incarnation_extension_magic,
+        ))
+    {
+        return error.InvalidMetadataIncarnation;
+    }
+    var pos: usize = incarnation_len + metadata_incarnation_extension_magic.len;
+    const extension_version = std.mem.readInt(u16, encoded[pos..][0..@sizeOf(u16)], .little);
+    pos += @sizeOf(u16);
+    if (extension_version != metadata_incarnation_extension_version) return error.InvalidMetadataIncarnation;
+    const runtime_status_record_version = std.mem.readInt(u16, encoded[pos..][0..@sizeOf(u16)], .little);
+    if (runtime_status_record_version < runtime_status_protocol.repair_status_record_version or
+        runtime_status_record_version > runtime_status_protocol.current_record_version)
+    {
+        return error.InvalidMetadataIncarnation;
+    }
+    return .{
+        .incarnation = incarnation,
+        .runtime_status_record_version = runtime_status_record_version,
+    };
+}
+
+fn activateRuntimeStatusProtocolTxn(
+    txn: *docstore.DocStore.Txn,
+    group_id: u64,
+) !void {
+    var key_buf: [160]u8 = undefined;
+    const key = try metadataIncarnationKeyForGroup(&key_buf, group_id);
+    const existing = txn.get(key) catch |err| switch (err) {
+        // Production admission requires an incarnation before v13 can be
+        // proposed. Preserve the historical state-machine behavior for direct
+        // test/embedding callers that apply a store before initialization.
+        error.NotFound => return,
+        else => return err,
+    };
+    const decoded = try decodeMetadataIncarnationRecord(existing);
+    if (decoded.runtime_status_record_version >= runtime_status_protocol.repair_status_record_version) return;
+
+    const incarnation_len = @sizeOf(metadata_incarnation.MetadataClusterIncarnation);
+    const encoded_len = incarnation_len + metadata_incarnation_extension_magic.len + @sizeOf(u16) + @sizeOf(u16);
+    var encoded: [encoded_len]u8 = undefined;
+    @memcpy(encoded[0..incarnation_len], &decoded.incarnation);
+    var pos: usize = incarnation_len;
+    @memcpy(encoded[pos..][0..metadata_incarnation_extension_magic.len], metadata_incarnation_extension_magic);
+    pos += metadata_incarnation_extension_magic.len;
+    std.mem.writeInt(u16, encoded[pos..][0..@sizeOf(u16)], metadata_incarnation_extension_version, .little);
+    pos += @sizeOf(u16);
+    std.mem.writeInt(u16, encoded[pos..][0..@sizeOf(u16)], runtime_status_protocol.repair_status_record_version, .little);
+    try txn.put(key, &encoded);
+}
+
+fn storeHasRuntimeRepairStatus(record: metadata.StoreRecord) bool {
+    for (record.runtime_statuses) |runtime_status| {
+        for (runtime_status.indexes) |index_status| {
+            if (index_status.repair_status != null) return true;
+        }
+    }
+    return false;
+}
 
 const TransitionTag = enum(u8) {
     initialize_metadata_incarnation = 45,

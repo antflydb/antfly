@@ -98,6 +98,9 @@ pub fn applyObservationsOwnedWithRepairStatus(
         const next_group_statuses = try table_manager.cloneGroupStatuses(alloc, observation.group_statuses);
         errdefer table_manager.freeGroupStatuses(alloc, next_group_statuses);
         const next_runtime_statuses = try table_manager.cloneRuntimeGroupStatusReports(alloc, observation.runtime_statuses);
+        if (!include_repair_status) {
+            preserveCommittedRuntimeRepairStatus(records[index].runtime_statuses, next_runtime_statuses);
+        }
         table_manager.freeGroupStatuses(alloc, records[index].group_statuses);
         table_manager.freeRuntimeGroupStatusReports(alloc, records[index].runtime_statuses);
         records[index].group_statuses = next_group_statuses;
@@ -105,6 +108,60 @@ pub fn applyObservationsOwnedWithRepairStatus(
         applied += 1;
     }
     return applied;
+}
+
+/// A capability probe that is pending or temporarily unavailable must not turn
+/// an ordinary heartbeat into deletion of repair facts that were already
+/// committed with the newer codec. New repair facts remain suppressed until
+/// activation, while facts for a different index incarnation fail closed.
+fn preserveCommittedRuntimeRepairStatus(
+    existing: []const table_manager.RuntimeGroupStatusReport,
+    next: []table_manager.RuntimeGroupStatusReport,
+) void {
+    for (next) |*next_runtime| {
+        const prior_runtime = findRuntimeRepairIdentity(existing, next_runtime.*);
+        for (next_runtime.indexes) |*next_index| {
+            next_index.repair_status = null;
+            next_index.repair_active_generation_serviceable = false;
+            const prior = prior_runtime orelse continue;
+            const prior_index = findRuntimeIndexRepairIdentity(prior.indexes, next_index.*) orelse continue;
+            next_index.repair_status = prior_index.repair_status;
+            next_index.repair_active_generation_serviceable =
+                prior_index.repair_status != null and prior_index.repair_active_generation_serviceable;
+        }
+    }
+}
+
+fn findRuntimeRepairIdentity(
+    statuses: []const table_manager.RuntimeGroupStatusReport,
+    target: table_manager.RuntimeGroupStatusReport,
+) ?table_manager.RuntimeGroupStatusReport {
+    for (statuses) |status| {
+        if (status.table_id == target.table_id and
+            status.group_id == target.group_id and
+            status.store_id == target.store_id and
+            status.node_id == target.node_id)
+        {
+            return status;
+        }
+    }
+    return null;
+}
+
+fn findRuntimeIndexRepairIdentity(
+    indexes: []const table_manager.RuntimeIndexStatusReport,
+    target: table_manager.RuntimeIndexStatusReport,
+) ?table_manager.RuntimeIndexStatusReport {
+    for (indexes) |index| {
+        if (std.mem.eql(u8, index.name, target.name) and
+            std.mem.eql(u8, index.kind, target.kind) and
+            index.coverage_generation == target.coverage_generation and
+            index.coverage_config_hash == target.coverage_config_hash)
+        {
+            return index;
+        }
+    }
+    return null;
 }
 
 pub fn findStoreIndex(records: []const table_manager.StoreRecord, store_id: u64) ?usize {
@@ -542,6 +599,66 @@ test "store observer can ignore unactivated repair fields without hiding other c
     try std.testing.expect(!observationChangesRecordWithRepairStatus(existing, observation, false));
     observed_indexes[0].doc_count += 1;
     try std.testing.expect(observationChangesRecordWithRepairStatus(existing, observation, false));
+}
+
+test "store observer preserves committed repair facts while capability is unknown" {
+    var existing_indexes = [_]table_manager.RuntimeIndexStatusReport{.{
+        .name = "visual_idx",
+        .kind = "dense_vector",
+        .doc_count = 10,
+        .coverage_generation = 7,
+        .coverage_config_hash = 8,
+        .repair_status = .rebuilding,
+        .repair_active_generation_serviceable = true,
+    }};
+    var existing_runtime = [_]table_manager.RuntimeGroupStatusReport{.{
+        .table_id = 1,
+        .table_name = "products",
+        .group_id = 2,
+        .store_id = 3,
+        .node_id = 4,
+        .source = "runtime",
+        .freshness = "fresh",
+        .indexes = existing_indexes[0..],
+    }};
+    var records = [_]table_manager.StoreRecord{try table_manager.cloneStore(std.testing.allocator, .{
+        .store_id = 3,
+        .node_id = 4,
+        .runtime_statuses = existing_runtime[0..],
+    })};
+    defer table_manager.freeStore(std.testing.allocator, records[0]);
+
+    var observed_indexes = existing_indexes;
+    observed_indexes[0].doc_count = 11;
+    observed_indexes[0].repair_status = .failed;
+    observed_indexes[0].repair_active_generation_serviceable = false;
+    var observed_runtime = existing_runtime;
+    observed_runtime[0].indexes = observed_indexes[0..];
+    const observation = StoreObservation{
+        .store_id = 3,
+        .runtime_statuses = observed_runtime[0..],
+    };
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try applyObservationsOwnedWithRepairStatus(std.testing.allocator, &records, &.{observation}, false),
+    );
+    try std.testing.expectEqual(@as(u64, 11), records[0].runtime_statuses[0].indexes[0].doc_count);
+    try std.testing.expectEqual(
+        table_manager.IndexRepairStatus.rebuilding,
+        records[0].runtime_statuses[0].indexes[0].repair_status.?,
+    );
+    try std.testing.expect(records[0].runtime_statuses[0].indexes[0].repair_active_generation_serviceable);
+
+    // A different materialization identity must not inherit stale repair state.
+    observed_indexes[0].doc_count = 12;
+    observed_indexes[0].coverage_generation = 9;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try applyObservationsOwnedWithRepairStatus(std.testing.allocator, &records, &.{observation}, false),
+    );
+    try std.testing.expect(records[0].runtime_statuses[0].indexes[0].repair_status == null);
+    try std.testing.expect(!records[0].runtime_statuses[0].indexes[0].repair_active_generation_serviceable);
 }
 
 test "metadata store observer detects exact voter set changes at a stable count" {

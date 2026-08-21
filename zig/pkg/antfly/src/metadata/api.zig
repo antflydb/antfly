@@ -34,6 +34,14 @@ pub const MetadataStatus = struct {
     /// Maximum embedded runtime-status record version this replica can apply;
     /// zero means the peer predates rolling-safe format negotiation.
     runtime_status_record_version: u16 = 0,
+    /// Highest runtime-status record version durably activated for this
+    /// metadata incarnation. Zero means activation has not committed yet.
+    runtime_status_protocol_activated_version: u16 = 0,
+    /// Whether this replica currently has one capability probe in flight.
+    runtime_status_protocol_probe_in_flight: bool = false,
+    /// Consecutive failed probes since the last successful probe or durable
+    /// activation. This is rate-limited by exponential backoff.
+    runtime_status_protocol_probe_failures: u32 = 0,
     metadata_incarnation: ?MetadataClusterIncarnation = null,
     metadata_epoch: u64 = 0,
     metadata_raft_local_node_id: u64 = 0,
