@@ -26,6 +26,7 @@ const segment_mod = @import("../segment/mod.zig");
 const wal_mod = @import("../wal/mod.zig");
 const builder_mod = @import("../build/builder.zig");
 const impact_planner = @import("../build/impact_planner.zig");
+const external_source_manifest = @import("../build/external_source_manifest.zig");
 const publication_plan = @import("../build/publication_plan.zig");
 const enrichment_pipeline = @import("../enrichment/pipeline.zig");
 const api_codec = @import("../api/codec.zig");
@@ -45,6 +46,7 @@ pub const CatalogService = struct {
     wal: *wal_mod.WalStore,
     builder: *builder_mod.Builder,
     store: *catalog_store.CatalogStore,
+    external_source_plan_resolver: ?publication_plan.ExternalSourcePlanResolver = null,
 
     pub fn init(
         alloc: Allocator,
@@ -63,11 +65,19 @@ pub const CatalogService = struct {
             .wal = wal,
             .builder = builder,
             .store = store,
+            .external_source_plan_resolver = null,
         };
     }
 
     pub fn deinit(self: *CatalogService) void {
         self.* = undefined;
+    }
+
+    pub fn setExternalSourcePlanResolver(
+        self: *CatalogService,
+        resolver: ?publication_plan.ExternalSourcePlanResolver,
+    ) void {
+        self.external_source_plan_resolver = resolver;
     }
 
     pub fn ensureNamespace(self: *CatalogService, name: []const u8, created_at_ns: u64) !bool {
@@ -675,6 +685,21 @@ pub const CatalogService = struct {
         return try self.alloc.dupe(u8, table_name);
     }
 
+    fn externalSourcePlanForTableAlloc(
+        self: *CatalogService,
+        namespace: []const u8,
+        table: catalog_types.TableNamespaceRecord,
+    ) !?external_source_manifest.Plan {
+        const resolver = self.external_source_plan_resolver orelse return null;
+        var binding = (try publication_plan.externalBindingFromSchemaJsonAlloc(self.alloc, table.schema_json)) orelse return null;
+        defer binding.deinit(self.alloc);
+        return try resolver.resolveAlloc(self.alloc, .{
+            .namespace = namespace,
+            .table_name = table.table_name,
+            .binding = binding.binding,
+        });
+    }
+
     fn publicationPlanForNamespaceAlloc(
         self: *CatalogService,
         namespace: []const u8,
@@ -826,15 +851,21 @@ pub const CatalogService = struct {
                     else
                         .recompute,
                 };
+                var table_definition = try publication_plan.tableDefinitionSnapshotAlloc(
+                    self.alloc,
+                    table.schema_json,
+                    table.read_schema_json,
+                    table.indexes_json,
+                );
+                errdefer table_definition.deinit(self.alloc);
+                var external_source_plan = try self.externalSourcePlanForTableAlloc(namespace, table);
+                errdefer if (external_source_plan) |*plan| plan.deinit(self.alloc);
 
                 return .{
                     .targets = targets,
                     .policy = effective_policy,
-                    .table_definition = .{
-                        .schema_json = try self.alloc.dupe(u8, table.schema_json),
-                        .read_schema_json = try self.alloc.dupe(u8, table.read_schema_json),
-                        .indexes_json = try self.alloc.dupe(u8, table.indexes_json),
-                    },
+                    .table_definition = table_definition,
+                    .external_source_plan = external_source_plan,
                     .metadata_republish = metadata_republish,
                     .artifact_actions = artifact_actions,
                     .full_text_index_actions = full_text_index_actions,
@@ -877,15 +908,21 @@ pub const CatalogService = struct {
                 0,
             );
             errdefer freeNamedArtifactActions(self.alloc, graph_index_actions);
+            var table_definition = try publication_plan.tableDefinitionSnapshotAlloc(
+                self.alloc,
+                table.schema_json,
+                table.read_schema_json,
+                table.indexes_json,
+            );
+            errdefer table_definition.deinit(self.alloc);
+            var external_source_plan = try self.externalSourcePlanForTableAlloc(namespace, table);
+            errdefer if (external_source_plan) |*plan| plan.deinit(self.alloc);
 
             return .{
                 .targets = targets,
                 .policy = effective_policy,
-                .table_definition = .{
-                    .schema_json = try self.alloc.dupe(u8, table.schema_json),
-                    .read_schema_json = try self.alloc.dupe(u8, table.read_schema_json),
-                    .indexes_json = try self.alloc.dupe(u8, table.indexes_json),
-                },
+                .table_definition = table_definition,
+                .external_source_plan = external_source_plan,
                 .metadata_republish = metadata_republish,
                 .artifact_actions = .{
                     .document_segment = .rebuild,

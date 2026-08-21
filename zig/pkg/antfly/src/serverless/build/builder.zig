@@ -17,6 +17,7 @@ const Allocator = std.mem.Allocator;
 const artifacts_mod = @import("../artifacts/mod.zig");
 const catalog_mod = @import("../catalog/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
+const manifest_base_source = @import("../manifest/base_source.zig");
 const wal_mod = @import("../wal/mod.zig");
 const query_mod = @import("../query/mod.zig");
 const query_reader = @import("../query/indexed_reader.zig");
@@ -31,6 +32,7 @@ const sparse_segment_mod = @import("../sparse_segment/mod.zig");
 const vector_segment_mod = @import("../vector_segment/mod.zig");
 const vector_index = @import("vector_index.zig");
 const publication_plan = @import("publication_plan.zig");
+const external_source_publication = @import("external_source_publication.zig");
 const enrichment_pipeline = @import("../enrichment/pipeline.zig");
 const api_codec = @import("../api/codec.zig");
 const api_types = @import("../api/types.zig");
@@ -403,6 +405,7 @@ pub const Builder = struct {
                 plan.table_definition,
             );
         defer manifest.deinit(self.alloc);
+        try attachResolvedExternalSourcePlanIfPresent(self.alloc, &manifest, plan);
 
         self.manifests.put(manifest) catch |err| switch (err) {
             error.ManifestVersionAlreadyExists => return error.HeadChanged,
@@ -596,6 +599,7 @@ pub const Builder = struct {
             plan.table_definition,
         );
         defer manifest.deinit(self.alloc);
+        try attachResolvedExternalSourcePlanIfPresent(self.alloc, &manifest, plan);
 
         self.manifests.put(manifest) catch |err| switch (err) {
             error.ManifestVersionAlreadyExists => return error.HeadChanged,
@@ -861,6 +865,11 @@ fn buildManifestAlloc(
         table_definition,
     );
     errdefer search_sources.deinitPublishedSearchSources(alloc, &manifest_sources);
+    const base_source = try cloneTableDefinitionBaseSourceAlloc(alloc, table_definition);
+    errdefer if (base_source) |descriptor| {
+        var cleanup = descriptor;
+        manifest_base_source.freeOwnedDescriptor(alloc, &cleanup);
+    };
 
     return .{
         .namespace = try alloc.dupe(u8, namespace),
@@ -884,6 +893,7 @@ fn buildManifestAlloc(
             .indexes_json = if (table_definition.indexes_json.len == 0) &.{} else try alloc.dupe(u8, table_definition.indexes_json),
         },
         .artifacts = artifacts,
+        .base_source = base_source,
     };
 }
 
@@ -978,6 +988,11 @@ fn buildRebasedManifestFromRefsAlloc(
         table_definition,
     );
     errdefer search_sources.deinitPublishedSearchSources(alloc, &manifest_sources);
+    const base_source = try cloneTableDefinitionBaseSourceAlloc(alloc, table_definition);
+    errdefer if (base_source) |descriptor| {
+        var cleanup = descriptor;
+        manifest_base_source.freeOwnedDescriptor(alloc, &cleanup);
+    };
 
     return .{
         .namespace = try alloc.dupe(u8, namespace),
@@ -1001,6 +1016,7 @@ fn buildRebasedManifestFromRefsAlloc(
             .indexes_json = if (table_definition.indexes_json.len == 0) &.{} else try alloc.dupe(u8, table_definition.indexes_json),
         },
         .artifacts = artifacts,
+        .base_source = base_source,
     };
 }
 
@@ -1057,6 +1073,11 @@ fn buildCompactedManifestFromRefsAlloc(
         table_definition,
     );
     errdefer search_sources.deinitPublishedSearchSources(alloc, &manifest_sources);
+    const base_source = try cloneTableDefinitionBaseSourceAlloc(alloc, table_definition);
+    errdefer if (base_source) |descriptor| {
+        var cleanup = descriptor;
+        manifest_base_source.freeOwnedDescriptor(alloc, &cleanup);
+    };
 
     return .{
         .namespace = try alloc.dupe(u8, namespace),
@@ -1080,7 +1101,32 @@ fn buildCompactedManifestFromRefsAlloc(
             .indexes_json = if (table_definition.indexes_json.len == 0) &.{} else try alloc.dupe(u8, table_definition.indexes_json),
         },
         .artifacts = artifacts,
+        .base_source = base_source,
     };
+}
+
+fn cloneTableDefinitionBaseSourceAlloc(
+    alloc: Allocator,
+    table_definition: publication_plan.TableDefinitionSnapshot,
+) !?manifest_base_source.BaseSourceDescriptor {
+    return if (table_definition.base_source) |descriptor|
+        try manifest_base_source.cloneDescriptorAlloc(alloc, descriptor)
+    else
+        null;
+}
+
+fn attachResolvedExternalSourcePlanIfPresent(
+    alloc: Allocator,
+    manifest: *manifest_mod.Manifest,
+    plan: publication_plan.TablePublicationPlan,
+) !void {
+    const external_plan = plan.external_source_plan orelse return;
+    _ = try external_source_publication.attachPlanToOwnedManifestAlloc(
+        alloc,
+        manifest,
+        external_plan,
+        .{},
+    );
 }
 
 pub fn detectMaterializedDerivedOutputsAlloc(

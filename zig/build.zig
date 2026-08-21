@@ -4152,6 +4152,22 @@ pub fn build(b: *std.Build) void {
     const serverless_manifest_test_step = b.step("lib-serverless-manifest-test", "Run focused serverless manifest object-store tests");
     serverless_manifest_test_step.dependOn(&run_serverless_manifest_tests.step);
 
+    const lake_scaffold_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lake_scaffold_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, lake_scaffold_test_mod, true, true);
+    const lake_scaffold_tests = b.addTest(.{
+        .root_module = lake_scaffold_test_mod,
+        .filters = &.{ "lake", "parquet", "iceberg", "external source", "row fragment", "sidecar" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_lake_scaffold_tests = addFilteredTestRunArtifact(b, lake_scaffold_tests);
+    const lake_test_step = b.step("lake-test", "Run Antfly lake-native tests");
+    lake_test_step.dependOn(&run_lake_scaffold_tests.step);
+    unit_test_step.dependOn(&run_lake_scaffold_tests.step);
+
     const lib_data_runtime_default_filters = [_][]const u8{
         "failed full index enrichment does not make resident reads unavailable",
         "enrichment runtime status reports worker lifecycle diagnostics",

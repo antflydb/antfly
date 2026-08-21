@@ -14,27 +14,18 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const artifact_ref = @import("artifact_ref.zig");
+const base_source = @import("base_source.zig");
 const catalog_types = @import("../catalog/types.zig");
 const search_sources = @import("../search_sources.zig");
 
-pub const ArtifactKind = enum(u8) {
-    text_segment = 1,
-    vector_segment = 2,
-    doc_values = 3,
-    stored_fields = 4,
-    mutation_segment = 5,
-    document_segment = 6,
-    sparse_segment = 7,
-    graph_segment = 8,
-};
-
-pub const ArtifactRef = struct {
-    kind: ArtifactKind,
-    name: []const u8 = &.{},
-    artifact_id: []const u8,
-    byte_len: u64,
-    checksum: []const u8,
-};
+pub const ArtifactKind = artifact_ref.ArtifactKind;
+pub const ArtifactRef = artifact_ref.ArtifactRef;
+pub const BaseSourceKind = base_source.BaseSourceKind;
+pub const ExternalBaseFormat = base_source.ExternalBaseFormat;
+pub const AntflyFragmentBaseSource = base_source.AntflyFragmentBaseSource;
+pub const ExternalBaseSource = base_source.ExternalBaseSource;
+pub const BaseSourceDescriptor = base_source.BaseSourceDescriptor;
 
 pub const PublishedGenerationStats = struct {
     document_count: u64 = 0,
@@ -58,6 +49,7 @@ pub const PublishedGeneration = struct {
     built_at_ns: u64,
     wal_start_lsn: u64,
     wal_end_lsn: u64,
+    base_source: ?BaseSourceDescriptor = null,
     stats: PublishedGenerationStats,
     artifacts: []ArtifactRef,
 
@@ -68,11 +60,8 @@ pub const PublishedGeneration = struct {
         if (self.stats.schema_json.len > 0) alloc.free(self.stats.schema_json);
         if (self.stats.read_schema_json.len > 0) alloc.free(self.stats.read_schema_json);
         if (self.stats.indexes_json.len > 0) alloc.free(self.stats.indexes_json);
-        for (self.artifacts) |artifact| {
-            if (artifact.name.len > 0) alloc.free(artifact.name);
-            alloc.free(artifact.artifact_id);
-            alloc.free(artifact.checksum);
-        }
+        if (self.base_source) |*descriptor| base_source.freeOwnedDescriptor(alloc, descriptor);
+        freeArtifactRefs(alloc, self.artifacts);
         alloc.free(self.artifacts);
         self.* = undefined;
     }
@@ -85,35 +74,70 @@ pub fn freeManifest(alloc: Allocator, manifest: *PublishedGeneration) void {
     manifest.deinit(alloc);
 }
 
+pub fn freeArtifactRefs(alloc: Allocator, artifacts: []const ArtifactRef) void {
+    for (artifacts) |artifact| {
+        if (artifact.name.len > 0) alloc.free(artifact.name);
+        alloc.free(artifact.artifact_id);
+        alloc.free(artifact.checksum);
+    }
+}
+
+pub fn cloneArtifactRefsAlloc(alloc: Allocator, artifacts: []const ArtifactRef) ![]ArtifactRef {
+    return try cloneAppendedArtifactRefsAlloc(alloc, &.{}, artifacts);
+}
+
+pub fn cloneAppendedArtifactRefsAlloc(
+    alloc: Allocator,
+    existing_artifacts: []const ArtifactRef,
+    extra_artifacts: []const ArtifactRef,
+) ![]ArtifactRef {
+    const out = try alloc.alloc(ArtifactRef, existing_artifacts.len + extra_artifacts.len);
+    errdefer alloc.free(out);
+    var initialized: usize = 0;
+    errdefer freeArtifactRefs(alloc, out[0..initialized]);
+
+    for (existing_artifacts) |artifact| {
+        out[initialized] = try cloneArtifactRefAlloc(alloc, artifact);
+        initialized += 1;
+    }
+    for (extra_artifacts) |artifact| {
+        out[initialized] = try cloneArtifactRefAlloc(alloc, artifact);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneArtifactRefAlloc(alloc: Allocator, artifact: ArtifactRef) !ArtifactRef {
+    const name = if (artifact.name.len == 0) &.{} else try alloc.dupe(u8, artifact.name);
+    errdefer if (name.len > 0) alloc.free(name);
+    const artifact_id = try alloc.dupe(u8, artifact.artifact_id);
+    errdefer alloc.free(artifact_id);
+    const checksum = try alloc.dupe(u8, artifact.checksum);
+    errdefer alloc.free(checksum);
+    return .{
+        .kind = artifact.kind,
+        .name = name,
+        .artifact_id = artifact_id,
+        .byte_len = artifact.byte_len,
+        .checksum = checksum,
+    };
+}
+
 pub fn cloneManifest(alloc: Allocator, src: PublishedGeneration) !PublishedGeneration {
     const namespace = try alloc.dupe(u8, src.namespace);
     errdefer alloc.free(namespace);
 
-    const artifacts = try alloc.alloc(ArtifactRef, src.artifacts.len);
-    errdefer alloc.free(artifacts);
-
-    var initialized: usize = 0;
+    const artifacts = try cloneArtifactRefsAlloc(alloc, src.artifacts);
     errdefer {
-        for (artifacts[0..initialized]) |artifact| {
-            alloc.free(artifact.artifact_id);
-            alloc.free(artifact.checksum);
-        }
+        freeArtifactRefs(alloc, artifacts);
+        alloc.free(artifacts);
     }
 
-    for (src.artifacts, 0..) |artifact, idx| {
-        const name = if (artifact.name.len == 0) &.{} else try alloc.dupe(u8, artifact.name);
-        errdefer if (name.len > 0) alloc.free(name);
-        const artifact_id = try alloc.dupe(u8, artifact.artifact_id);
-        errdefer alloc.free(artifact_id);
-        artifacts[idx] = .{
-            .kind = artifact.kind,
-            .name = name,
-            .artifact_id = artifact_id,
-            .byte_len = artifact.byte_len,
-            .checksum = try alloc.dupe(u8, artifact.checksum),
-        };
-        initialized += 1;
-    }
+    var base_source_copy: ?BaseSourceDescriptor = if (src.base_source) |descriptor|
+        try base_source.cloneDescriptorAlloc(alloc, descriptor)
+    else
+        null;
+    errdefer if (base_source_copy) |*descriptor| base_source.freeOwnedDescriptor(alloc, descriptor);
 
     return .{
         .namespace = namespace,
@@ -121,6 +145,7 @@ pub fn cloneManifest(alloc: Allocator, src: PublishedGeneration) !PublishedGener
         .built_at_ns = src.built_at_ns,
         .wal_start_lsn = src.wal_start_lsn,
         .wal_end_lsn = src.wal_end_lsn,
+        .base_source = base_source_copy,
         .stats = .{
             .document_count = src.stats.document_count,
             .document_base_version = src.stats.document_base_version,
@@ -181,6 +206,7 @@ test "cloneManifest duplicates owned storage" {
     try std.testing.expectEqual(@as(u64, 7), cloned.stats.document_base_version);
     try std.testing.expectEqual(catalog_types.DocumentPublishMode.inline_rebase, cloned.stats.document_publish_mode);
     try std.testing.expectEqual(@as(usize, 1), cloned.artifacts.len);
+    try std.testing.expectEqual(@as(?BaseSourceDescriptor, null), cloned.base_source);
     try std.testing.expect(cloned.namespace.ptr != original.namespace.ptr);
     try std.testing.expect(cloned.artifacts[0].name.ptr != original.artifacts[0].name.ptr);
     try std.testing.expect(cloned.artifacts[0].artifact_id.ptr != original.artifacts[0].artifact_id.ptr);

@@ -28,7 +28,7 @@ const vector_proto = @import("antfly_vector").proto;
 const vector_quantizer = @import("antfly_vector").quantizer;
 const vector_types = @import("antfly_vector").vector;
 
-const ScoredDoc = struct {
+pub const ScoredDoc = struct {
     doc_id: []const u8,
     score: u32,
     distance: ?f32 = null,
@@ -352,6 +352,18 @@ fn searchTextSegmentAlloc(alloc: Allocator, text_segment: text_segment_mod.Segme
     return try searchTextSegmentSpecAlloc(alloc, text_segment, req.text, req.operator, req.offset, req.limit, req.min_score, session);
 }
 
+pub fn searchTextSegmentDocIdsAlloc(
+    alloc: Allocator,
+    text_segment: text_segment_mod.Segment,
+    text: []const u8,
+    operator: query_request.QueryOperator,
+    offset: usize,
+    limit: usize,
+    min_score: u32,
+) ![]ScoredDoc {
+    return try searchTextSegmentSpecAlloc(alloc, text_segment, text, operator, offset, limit, min_score, null);
+}
+
 fn searchTextSegmentSpecAlloc(
     alloc: Allocator,
     text_segment: text_segment_mod.Segment,
@@ -505,7 +517,35 @@ fn resolveSparseArtifactIndex(
 }
 
 fn searchSparseSegmentAlloc(alloc: Allocator, sparse_segment: sparse_segment_mod.Segment, req: query_request.QueryRequest) ![]ScoredDoc {
-    const sparse_query = req.sparse orelse return error.SparseQueryRequired;
+    return try searchSparseSegmentSpecAlloc(
+        alloc,
+        sparse_segment,
+        req.sparse orelse return error.SparseQueryRequired,
+        req.offset,
+        req.limit,
+        req.min_score,
+    );
+}
+
+pub fn searchSparseSegmentDocIdsAlloc(
+    alloc: Allocator,
+    sparse_segment: sparse_segment_mod.Segment,
+    sparse_query: []const query_request.SparseTermWeight,
+    offset: usize,
+    limit: usize,
+    min_score: u32,
+) ![]ScoredDoc {
+    return try searchSparseSegmentSpecAlloc(alloc, sparse_segment, sparse_query, offset, limit, min_score);
+}
+
+fn searchSparseSegmentSpecAlloc(
+    alloc: Allocator,
+    sparse_segment: sparse_segment_mod.Segment,
+    sparse_query: []const query_request.SparseTermWeight,
+    offset: usize,
+    limit: usize,
+    min_score: u32,
+) ![]ScoredDoc {
     if (sparse_query.len == 0) return try alloc.alloc(ScoredDoc, 0);
 
     const scores = try alloc.alloc(f32, sparse_segment.docs.len);
@@ -533,7 +573,7 @@ fn searchSparseSegmentAlloc(alloc: Allocator, sparse_segment: sparse_segment_mod
         });
     }
     std.mem.sort(ScoredDoc, scored.items, {}, lessScoredDoc);
-    return try clipScoredDocsAlloc(alloc, scored.items, req.offset, req.limit, req.min_score);
+    return try clipScoredDocsAlloc(alloc, scored.items, offset, limit, min_score);
 }
 
 fn searchSparseArtifactAlloc(
@@ -742,6 +782,29 @@ fn searchVectorSegmentAlloc(
         trimScoredDocsToNeeded(alloc, &scored, needed);
     }
     return try clipScoredDocsAlloc(alloc, scored.items, req.offset, req.limit, req.min_score);
+}
+
+pub fn searchVectorSegmentDocIdsAlloc(
+    alloc: Allocator,
+    vector_segment: vector_segment_mod.Segment,
+    query_vector: []const f32,
+    offset: usize,
+    limit: usize,
+    min_score: u32,
+    num_probes: u32,
+    search_effort: ?f32,
+    stats: *SearchExecutionStats,
+) ![]ScoredDoc {
+    const req = query_request.QueryRequest{
+        .text = @constCast(""),
+        .vector = @constCast(query_vector),
+        .offset = offset,
+        .limit = limit,
+        .min_score = min_score,
+        .num_probes = num_probes,
+        .search_effort = search_effort,
+    };
+    return try searchVectorSegmentAlloc(alloc, vector_segment, req, query_vector, stats);
 }
 
 fn searchVectorArtifactAlloc(
@@ -1417,7 +1480,7 @@ fn clipScoredDocsAlloc(alloc: Allocator, scored: []ScoredDoc, offset: usize, lim
     return out;
 }
 
-fn freeScoredDocs(alloc: Allocator, hits: []ScoredDoc) void {
+pub fn freeScoredDocs(alloc: Allocator, hits: []ScoredDoc) void {
     for (hits) |hit| alloc.free(hit.doc_id);
     alloc.free(hits);
 }

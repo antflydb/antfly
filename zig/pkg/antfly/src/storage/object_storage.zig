@@ -19,6 +19,9 @@ const Allocator = std.mem.Allocator;
 
 pub const ObjectStorage = objectstore.Client;
 pub const ObjectMetadata = objectstore.ObjectMetadata;
+pub const ObjectChecksum = objectstore.ObjectChecksum;
+pub const ObjectChecksumAlgorithm = objectstore.ObjectChecksumAlgorithm;
+pub const ObjectChecksumScope = objectstore.ObjectChecksumScope;
 pub const PutOptions = objectstore.PutOptions;
 pub const GetOptions = objectstore.GetOptions;
 pub const DeleteOptions = objectstore.DeleteOptions;
