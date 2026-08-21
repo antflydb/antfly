@@ -440,6 +440,12 @@ Permanent tests cover:
 
 CI should give memory-heavy suites an explicit envelope when the runner cannot
 provide a finite cgroup limit. This is workload policy, not a runner resize.
+Build and execution must use separate runner lifetimes for an envelope
+calibration: compiler anonymous memory and active build-cache pages are sibling
+working set by design, so running a large-model test after compilation in the
+same leaf cgroup validates residual build pressure rather than the serving
+envelope. The tested binary is transferred as an immutable short-lived artifact;
+the execution job logs its cgroup baseline before starting inference.
 
 ## Non-goals and follow-ups
 
