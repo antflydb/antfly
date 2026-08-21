@@ -183,14 +183,14 @@ pub fn observationChangesRecordWithRepairStatus(
     observation: StoreObservation,
     include_repair_status: bool,
 ) bool {
-    // Until the v13 codec is activated, absence is not authoritative for an
-    // already-committed repair identity. A legacy or transient heartbeat can
-    // omit an index (or its whole runtime group), and replacing the owned
-    // snapshot in that case would erase the only admission-safety fact. Treat
-    // the heartbeat as unchanged so callers neither replace the projection nor
-    // propose the deletion. A same-name index with a different materialization
-    // identity remains authoritative and is handled as an explicit replacement.
-    if (!include_repair_status and observationOmitsCommittedRuntimeRepairIdentity(
+    // Until the v13 codec is activated, absence or an incomplete replacement
+    // identity is not authoritative for an already-committed repair identity.
+    // A legacy or transient heartbeat can omit an index (or its whole runtime
+    // group), and replacing the owned snapshot in that case would erase the
+    // only admission-safety fact. Treat the heartbeat as unchanged so callers
+    // neither replace the projection nor propose the deletion. A same-name
+    // index with a complete new materialization identity remains authoritative.
+    if (!include_repair_status and observationLacksAuthoritativeCommittedRepairIdentity(
         existing.runtime_statuses,
         observation.runtime_statuses,
     )) return false;
@@ -208,7 +208,7 @@ pub fn observationChangesRecordWithRepairStatus(
         !runtimeStatusesEqual(existing.runtime_statuses, observation.runtime_statuses, include_repair_status);
 }
 
-fn observationOmitsCommittedRuntimeRepairIdentity(
+fn observationLacksAuthoritativeCommittedRepairIdentity(
     existing: []const table_manager.RuntimeGroupStatusReport,
     next: []const table_manager.RuntimeGroupStatusReport,
 ) bool {
@@ -227,14 +227,24 @@ fn observationOmitsCommittedRuntimeRepairIdentity(
         const next_runtime = findRuntimeRepairIdentity(next, prior_runtime) orelse return true;
         for (prior_runtime.indexes) |prior_index| {
             if (prior_index.repair_status == null) continue;
-            var logical_index_present = false;
+            var replacement: ?table_manager.RuntimeIndexStatusReport = null;
             for (next_runtime.indexes) |next_index| {
                 if (std.mem.eql(u8, prior_index.name, next_index.name)) {
-                    logical_index_present = true;
+                    replacement = next_index;
                     break;
                 }
             }
-            if (!logical_index_present) return true;
+            const next_index = replacement orelse return true;
+            // A kind change is an explicit catalog replacement. For the same
+            // derived-index kind, changed generation/config values only prove a
+            // replacement once the producer says that identity is complete.
+            // Startup and degraded snapshots deliberately publish unknown
+            // identities and must not gain deletion authority from zero/stale
+            // values that happen not to match the committed generation.
+            if (!std.mem.eql(u8, prior_index.kind, next_index.kind)) continue;
+            const same_materialization = prior_index.coverage_generation == next_index.coverage_generation and
+                prior_index.coverage_config_hash == next_index.coverage_config_hash;
+            if (!same_materialization and !next_index.coverage_identity_ready) return true;
         }
     }
     return false;

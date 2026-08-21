@@ -6534,6 +6534,7 @@ test "metadata service status reporting never proposes deletion of committed rep
         .doc_count = 10,
         .coverage_generation = 7,
         .coverage_config_hash = 8,
+        .coverage_identity_ready = true,
         .repair_status = .rebuilding,
         .repair_active_generation_serviceable = true,
     }};
@@ -6607,12 +6608,26 @@ test "metadata service status reporting never proposes deletion of committed rep
     try std.testing.expect(storeHasRuntimeRepairStatus(projected[0]));
     try std.testing.expectEqual(@as(usize, 1), projected[0].runtime_statuses.len);
 
-    // A replacement materialization does not inherit stale repair identity and
-    // may continue publishing its legacy-compatible heartbeat.
+    // A same-name observation with an unknown identity is not proof of a new
+    // materialization. Startup/degraded defaults must not erase repair state.
     reports[0].runtime_statuses = observed_runtime[0..];
     observed_runtime[0].indexes = observed_indexes[0..];
     observed_indexes[0].doc_count = 13;
     observed_indexes[0].coverage_generation = 9;
+    observed_indexes[0].coverage_config_hash = 0;
+    observed_indexes[0].coverage_identity_ready = false;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try reportStoreStatusesWithProjected(&service, &projected, &reports),
+    );
+    try std.testing.expectEqual(@as(usize, 0), service.upserts);
+    try std.testing.expect(storeHasRuntimeRepairStatus(projected[0]));
+    try std.testing.expectEqual(@as(u64, 7), projected[0].runtime_statuses[0].indexes[0].coverage_generation);
+
+    // A replacement with a complete identity does not inherit stale repair
+    // state and may continue publishing its legacy-compatible heartbeat.
+    observed_indexes[0].doc_count = 14;
+    observed_indexes[0].coverage_identity_ready = true;
     try std.testing.expectEqual(
         @as(usize, 1),
         try reportStoreStatusesWithProjected(&service, &projected, &reports),
