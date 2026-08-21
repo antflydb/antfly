@@ -674,6 +674,20 @@ fn storesHaveRuntimeRepairStatus(stores: []const metadata_table_manager.StoreRec
     return false;
 }
 
+fn storesHaveRuntimeReporterFence(stores: []const metadata_table_manager.StoreRecord) bool {
+    for (stores) |store| {
+        if (store.reporter_incarnation != 0) return true;
+    }
+    return false;
+}
+
+fn reportsHaveRuntimeReporterFence(reports: []const metadata_table_manager.StoreStatusReport) bool {
+    for (reports) |report| {
+        if (report.reporter_incarnation != 0) return true;
+    }
+    return false;
+}
+
 fn stripRuntimeRepairStatus(record: *metadata_table_manager.StoreRecord) void {
     for (record.runtime_statuses) |*runtime_status| {
         for (runtime_status.indexes) |*index_status| {
@@ -695,8 +709,17 @@ fn runtimeStatusProtocolSafeCommand(
 ) !metadata_storage.TransitionCommand {
     switch (command) {
         .upsert_store => |record| {
-            const needs_current_protocol = storeHasRuntimeRepairStatus(record) or record.reporter_incarnation != 0;
+            if (!metadata_table_manager.reporterFenceValid(
+                record.reporter_incarnation,
+                record.status_generation,
+            )) return error.InvalidStoreReporterFence;
+            const needs_current_protocol = storeHasRuntimeRepairStatus(record) or
+                record.reporter_incarnation != 0 or record.status_generation != 0;
             if (!needs_current_protocol or service.runtimeStatusRepairProtocolReady()) return command;
+            // Unlike registration, an upsert carrying an incarnation may be a
+            // clone of already-committed v13 state. Downgrading it would erase
+            // causal authority. Retry after readiness can be proven instead.
+            if (record.reporter_incarnation != 0) return error.RuntimeStatusProtocolUnavailable;
             var legacy_record = try metadata_table_manager.cloneStore(service.alloc, record);
             stripRuntimeRepairStatus(&legacy_record);
             stripRuntimeReporterFence(&legacy_record);
@@ -704,7 +727,12 @@ fn runtimeStatusProtocolSafeCommand(
             return .{ .upsert_store = legacy_record };
         },
         .register_store => |record| {
-            const needs_current_protocol = storeHasRuntimeRepairStatus(record) or record.reporter_incarnation != 0;
+            if (!metadata_table_manager.reporterFenceValid(
+                record.reporter_incarnation,
+                record.status_generation,
+            )) return error.InvalidStoreReporterFence;
+            const needs_current_protocol = storeHasRuntimeRepairStatus(record) or
+                record.reporter_incarnation != 0 or record.status_generation != 0;
             if (!needs_current_protocol or service.runtimeStatusRepairProtocolReady()) return command;
             var legacy_record = try metadata_table_manager.cloneStore(service.alloc, record);
             stripRuntimeRepairStatus(&legacy_record);
@@ -6480,7 +6508,7 @@ test "metadata runtime repair status downgrade clears state and serviceability p
     try std.testing.expect(!indexes[0].repair_active_generation_serviceable);
 }
 
-test "metadata transition commands downgrade runtime repair status until protocol activation" {
+test "metadata service transition commands downgrade runtime repair status until protocol activation" {
     const FakeService = struct {
         alloc: std.mem.Allocator,
         ready: bool,
@@ -6517,6 +6545,17 @@ test "metadata transition commands downgrade runtime repair status until protoco
     try std.testing.expectEqual(@as(u64, 0), safe_command.register_store.reporter_incarnation);
     try std.testing.expect(storeHasRuntimeRepairStatus(store));
 
+    var refused_downgrade: ?metadata_table_manager.StoreRecord = null;
+    try std.testing.expectError(
+        error.RuntimeStatusProtocolUnavailable,
+        runtimeStatusProtocolSafeCommand(
+            &legacy_service,
+            .{ .upsert_store = store },
+            &refused_downgrade,
+        ),
+    );
+    try std.testing.expect(refused_downgrade == null);
+
     var current_service = FakeService{ .alloc = std.testing.allocator, .ready = true };
     var unexpectedly_owned: ?metadata_table_manager.StoreRecord = null;
     const current_command = try runtimeStatusProtocolSafeCommand(
@@ -6527,6 +6566,66 @@ test "metadata transition commands downgrade runtime repair status until protoco
     try std.testing.expect(unexpectedly_owned == null);
     try std.testing.expect(storeHasRuntimeRepairStatus(current_command.upsert_store));
     try std.testing.expectEqual(@as(u64, 77), current_command.upsert_store.reporter_incarnation);
+}
+
+test "metadata service defers reporter fence transitions while activation is unknown" {
+    const FakeService = struct {
+        alloc: std.mem.Allocator,
+        upserts: usize = 0,
+        last_reporter_incarnation: u64 = 0,
+
+        fn runtimeStatusRepairProtocolReady(_: *@This()) bool {
+            return false;
+        }
+
+        fn upsertStore(self: *@This(), record: metadata_table_manager.StoreRecord) !void {
+            self.upserts += 1;
+            self.last_reporter_incarnation = record.reporter_incarnation;
+        }
+    };
+
+    var projected = [_]metadata_table_manager.StoreRecord{
+        try metadata_table_manager.cloneStore(std.testing.allocator, .{
+            .store_id = 7,
+            .node_id = 9,
+            .reporter_incarnation = 0x1234,
+            .status_generation = 5,
+            .capacity_bytes = 100,
+        }),
+        try metadata_table_manager.cloneStore(std.testing.allocator, .{
+            .store_id = 8,
+            .node_id = 10,
+            .capacity_bytes = 100,
+        }),
+    };
+    defer for (&projected) |*store| metadata_table_manager.freeStore(std.testing.allocator, store.*);
+    const reports = [_]metadata_table_manager.StoreStatusReport{
+        .{
+            .store_id = 7,
+            .reporter_incarnation = 0x1234,
+            .status_generation = 6,
+            .capacity_bytes = 200,
+        },
+        .{
+            .store_id = 8,
+            .reporter_incarnation = 0x5678,
+            .status_generation = 1,
+            .capacity_bytes = 200,
+        },
+    };
+    var service = FakeService{ .alloc = std.testing.allocator };
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        try reportStoreStatusesWithProjected(&service, &projected, &reports),
+    );
+    // The committed fenced store must wait. The legacy store can still publish
+    // ordinary telemetry because reporter authority is established only by
+    // registration, so applying its report does not copy the incoming fence.
+    try std.testing.expectEqual(@as(usize, 1), service.upserts);
+    try std.testing.expectEqual(@as(u64, 0), service.last_reporter_incarnation);
+    try std.testing.expectEqual(@as(u64, 0x1234), projected[0].reporter_incarnation);
+    try std.testing.expectEqual(@as(u64, 0), projected[1].reporter_incarnation);
 }
 
 test "metadata service status reporting never proposes deletion of committed repair facts while activation is unknown" {
@@ -7275,19 +7374,26 @@ fn reportStoreStatusesWithProjected(
     projected: []metadata_table_manager.StoreRecord,
     reports: []const metadata_table_manager.StoreStatusReport,
 ) !usize {
-    // Both publishing and clearing repair facts are v13 transitions. Avoid the
-    // activation lookup for the overwhelmingly common all-v12 case, but once
-    // either side contains a repair fact, fail closed until activation is
-    // known. Otherwise a null/legacy heartbeat could erase committed repair
-    // admission state during startup or a transient activation-marker read
-    // failure.
+    // Reporter fences and both publishing and clearing repair facts are v13
+    // transitions. Avoid the activation lookup for the overwhelmingly common
+    // all-v12 case, but fail closed as soon as either side carries v13 state.
+    // Otherwise a status report could introduce an unreadable record or erase
+    // committed causal authority during startup or a transient marker failure.
     const repair_status_transition_possible = reportsHaveRuntimeRepairStatus(reports) or
         storesHaveRuntimeRepairStatus(projected);
-    const include_repair_status = !repair_status_transition_possible or
+    const current_protocol_transition_possible = repair_status_transition_possible or
+        reportsHaveRuntimeReporterFence(reports) or
+        storesHaveRuntimeReporterFence(projected);
+    const current_protocol_ready = !current_protocol_transition_possible or
         service.runtimeStatusRepairProtocolReady();
+    const include_repair_status = !repair_status_transition_possible or current_protocol_ready;
     var changed_indices = std.ArrayListUnmanaged(usize).empty;
     defer changed_indices.deinit(service.alloc);
     for (reports) |report| {
+        if (!metadata_table_manager.reporterFenceValid(
+            report.reporter_incarnation,
+            report.status_generation,
+        )) return error.InvalidStoreReporterFence;
         const index = metadata_store_observer.findStoreIndex(projected, report.store_id) orelse return error.UnknownStore;
         if (!metadata_store_observer.observationChangesRecordWithRepairStatus(
             projected[index],
@@ -7308,7 +7414,9 @@ fn reportStoreStatusesWithProjected(
         // do not feed them through the proposal-boundary downgrade (which has
         // no prior-record context and would erase them). The heartbeat is
         // retried after the background probe or durable marker becomes visible.
-        if (!include_repair_status and storeHasRuntimeRepairStatus(projected[index])) continue;
+        if (!current_protocol_ready and
+            (storeHasRuntimeRepairStatus(projected[index]) or
+                projected[index].reporter_incarnation != 0)) continue;
         try service.upsertStore(projected[index]);
     }
     return applied;

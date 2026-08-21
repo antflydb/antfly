@@ -656,6 +656,12 @@ pub const StoreStatusReport = struct {
     runtime_statuses: []RuntimeGroupStatusReport = &.{},
 };
 
+/// Generation zero is valid before the first snapshot, but a generation can
+/// never exist without the process incarnation that gives it meaning.
+pub fn reporterFenceValid(reporter_incarnation: u64, status_generation: u64) bool {
+    return reporter_incarnation != 0 or status_generation == 0;
+}
+
 pub const RuntimeEnrichmentStatusReport = struct {
     enabled: bool = false,
     lease_owned: bool = true,

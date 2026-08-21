@@ -282,6 +282,12 @@ pub const TransitionCommand = union(enum) {
 
 pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
     switch (command) {
+        .upsert_store, .register_store => |record| {
+            if (!metadata_table_manager.reporterFenceValid(
+                record.reporter_incarnation,
+                record.status_generation,
+            )) return error.InvalidStoreReporterFence;
+        },
         .compare_and_replace_table => |replacement| {
             if (replacement.expected.table_id == 0 or
                 replacement.replacement.table_id != replacement.expected.table_id or
@@ -4356,7 +4362,8 @@ fn storeHasRuntimeRepairStatus(record: metadata.StoreRecord) bool {
 }
 
 fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
-    if (record.reporter_incarnation != 0) return runtime_status_protocol.current_record_version;
+    if (record.reporter_incarnation != 0 or record.status_generation != 0)
+        return runtime_status_protocol.current_record_version;
     if (storeHasRuntimeRepairStatus(record)) return runtime_status_protocol.repair_status_record_version;
     return null;
 }
@@ -5147,6 +5154,10 @@ fn appendStoreRecordExtensions(
     out: *std.ArrayListUnmanaged(u8),
     record: metadata.StoreRecord,
 ) !void {
+    if (!metadata_table_manager.reporterFenceValid(
+        record.reporter_incarnation,
+        record.status_generation,
+    )) return error.InvalidStoreReporterFence;
     var observation_count: u32 = 0;
     for (record.group_statuses) |status| {
         if (status.observed_reallocation_request_id != 0) observation_count += 1;
@@ -10800,6 +10811,19 @@ test "metadata raft apply store transition codec preserves reporter fencing" {
         decoded.register_store.reporter_incarnation,
     );
     try std.testing.expectEqual(@as(u64, 42), decoded.register_store.status_generation);
+}
+
+test "metadata raft apply store transition codec rejects generation without incarnation" {
+    try std.testing.expectError(
+        error.InvalidStoreReporterFence,
+        encodeTransitionCommand(std.testing.allocator, .{
+            .register_store = .{
+                .store_id = 101,
+                .node_id = 201,
+                .status_generation = 42,
+            },
+        }),
+    );
 }
 
 test "metadata raft apply store projects placement intents from committed entries" {

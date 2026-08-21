@@ -2346,6 +2346,10 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
     const parsed = try std.json.parseFromSlice(Parsed, alloc, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     defer parsed.deinit();
     if (parsed.value.store_id == 0 or parsed.value.node_id == 0) return error.InvalidNodeID;
+    if (!metadata_table_manager.reporterFenceValid(
+        parsed.value.reporter_incarnation orelse 0,
+        parsed.value.status_generation orelse 0,
+    )) return error.InvalidStoreReporterFence;
     const group_statuses = try cloneParsedGroupStatuses(alloc, parsed.value.group_statuses orelse &.{});
     errdefer metadata_table_manager.freeGroupStatuses(alloc, group_statuses);
     const runtime_statuses = try cloneParsedRuntimeGroupStatuses(alloc, parsed.value.runtime_statuses orelse &.{});
@@ -2461,6 +2465,10 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
 
     const parsed = try std.json.parseFromSlice(Parsed, alloc, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     defer parsed.deinit();
+    if (!metadata_table_manager.reporterFenceValid(
+        parsed.value.reporter_incarnation orelse 0,
+        parsed.value.status_generation orelse 0,
+    )) return error.InvalidStoreReporterFence;
     const group_statuses = try cloneParsedGroupStatuses(alloc, parsed.value.group_statuses orelse &.{});
     errdefer metadata_table_manager.freeGroupStatuses(alloc, group_statuses);
     const runtime_statuses = try cloneParsedRuntimeGroupStatuses(alloc, parsed.value.runtime_statuses orelse &.{});

@@ -21,6 +21,7 @@ const indexes_api = @import("../api/indexes.zig");
 const json_helpers = @import("../api/json_helpers.zig");
 const fs_paths = @import("../common/fs_paths.zig");
 const runtime_status = @import("../api/runtime_status.zig");
+const metadata_runtime_status_protocol = @import("../metadata/runtime_status_protocol.zig");
 const api_http_test_runtime = if (@import("builtin").is_test) @import("../api/http_test_runtime.zig") else struct {};
 
 fn executeApiHttpxTestRequest(
@@ -3593,6 +3594,30 @@ test "data runtime store status scheduler keeps clean periodic reports tick gate
         StoreStatusReportKind.full,
         chooseStoreStatusReportKind(store_status_report_interval_ticks, false, 42, false, false, true),
     );
+}
+
+test "data runtime heartbeat cache cannot regress to an older full report" {
+    var server: DataServer = undefined;
+    server.alloc = std.testing.allocator;
+    server.store_status_cache_mutex = .unlocked;
+    server.store_status_heartbeat_cache = .{};
+    defer server.store_status_heartbeat_cache.clear(std.testing.allocator);
+
+    try server.storeStatusHeartbeatCacheReplace(.{
+        .store_id = 7,
+        .reporter_incarnation = 0x1234,
+        .status_generation = 11,
+        .capacity_bytes = 200,
+    });
+    try server.storeStatusHeartbeatCacheReplace(.{
+        .store_id = 7,
+        .reporter_incarnation = 0x1234,
+        .status_generation = 10,
+        .capacity_bytes = 100,
+    });
+
+    try std.testing.expectEqual(@as(u64, 11), server.store_status_heartbeat_cache.status_generation);
+    try std.testing.expectEqual(@as(u64, 200), server.store_status_heartbeat_cache.capacity_bytes);
 }
 
 test "idle cached runtime status stays fresh only for the published root generation" {
@@ -10336,13 +10361,11 @@ pub const DataServer = struct {
 
         const runtime = try self.ensureBackendRuntime();
         const io_impl = runtime.apiIoImpl() orelse return error.BackendRuntimeUnavailable;
+        var candidate: u64 = 0;
+        while (candidate == 0) try io_impl.io().randomSecure(std.mem.asBytes(&candidate));
         lockAtomic(&self.reporter_incarnation_mutex);
         defer self.reporter_incarnation_mutex.unlock();
-        if (self.reporter_incarnation == 0) {
-            while (self.reporter_incarnation == 0) {
-                try io_impl.io().randomSecure(std.mem.asBytes(&self.reporter_incarnation));
-            }
-        }
+        if (self.reporter_incarnation == 0) self.reporter_incarnation = candidate;
         return self.reporter_incarnation;
     }
 
@@ -10956,7 +10979,7 @@ pub const DataServer = struct {
         defer freeAdminSnapshotOwned(self.alloc, &snapshot);
         const reporter_incarnation = try self.reporterIncarnation();
         if (snapshot.status.runtime_status_protocol_ready_version >=
-            antfly.metadata.runtime_status_protocol.current_record_version and
+            metadata_runtime_status_protocol.current_record_version and
             !storeReporterIncarnationVisible(
                 snapshot.stores,
                 registration.store_id,
@@ -11443,14 +11466,19 @@ pub const DataServer = struct {
         self: *DataServer,
         report: antfly.metadata.table_manager.StoreStatusReport,
     ) !void {
-        lockAtomic(&self.store_status_cache_mutex);
-        defer self.store_status_cache_mutex.unlock();
-        self.store_status_heartbeat_cache.clear(self.alloc);
-        self.store_status_heartbeat_cache = .{
+        const health_class = try self.alloc.dupe(u8, report.health_class);
+        errdefer self.alloc.free(health_class);
+        const group_statuses = try antfly.metadata.table_manager.cloneGroupStatuses(self.alloc, report.group_statuses);
+        errdefer if (group_statuses.len > 0)
+            antfly.metadata.table_manager.freeGroupStatuses(self.alloc, group_statuses);
+        const runtime_statuses = try antfly.metadata.table_manager.cloneRuntimeGroupStatusReports(self.alloc, report.runtime_statuses);
+        errdefer if (runtime_statuses.len > 0)
+            antfly.metadata.table_manager.freeRuntimeGroupStatusReports(self.alloc, runtime_statuses);
+        var next: StoreStatusHeartbeatCache = .{
             .reporter_incarnation = report.reporter_incarnation,
             .status_generation = report.status_generation,
             .live = report.live,
-            .health_class = try self.alloc.dupe(u8, report.health_class),
+            .health_class = health_class,
             .owns_health_class = true,
             .capacity_bytes = report.capacity_bytes,
             .available_bytes = report.available_bytes,
@@ -11459,9 +11487,22 @@ pub const DataServer = struct {
             .write_load = report.write_load,
             .active_backfills = report.active_backfills,
             .backfill_progress_millis = report.backfill_progress_millis,
-            .group_statuses = try antfly.metadata.table_manager.cloneGroupStatuses(self.alloc, report.group_statuses),
-            .runtime_statuses = try antfly.metadata.table_manager.cloneRuntimeGroupStatusReports(self.alloc, report.runtime_statuses),
+            .group_statuses = group_statuses,
+            .runtime_statuses = runtime_statuses,
         };
+
+        lockAtomic(&self.store_status_cache_mutex);
+        const cache = &self.store_status_heartbeat_cache;
+        if (cache.reporter_incarnation == report.reporter_incarnation and
+            cache.status_generation > report.status_generation)
+        {
+            self.store_status_cache_mutex.unlock();
+            next.clear(self.alloc);
+            return;
+        }
+        self.store_status_heartbeat_cache.clear(self.alloc);
+        self.store_status_heartbeat_cache = next;
+        self.store_status_cache_mutex.unlock();
     }
 
     fn collectStoreRuntimeStatusReports(
