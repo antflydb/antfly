@@ -104,7 +104,8 @@ pub fn planAlloc(
     for (declarations) |decl| {
         const selected = desired.len == 0 or matchesDesired(decl, desired);
         if (!selected) {
-            try decisions.append(alloc, try makeDecision(
+            try decisions.ensureUnusedCapacity(alloc, 1);
+            decisions.appendAssumeCapacity(try makeDecision(
                 alloc,
                 decl,
                 .ignore_not_requested,
@@ -117,7 +118,8 @@ pub fn planAlloc(
             switch (policy.stale) {
                 .reject => return error.StaleLakeSidecar,
                 .ignore => {
-                    try decisions.append(alloc, try makeDecision(
+                    try decisions.ensureUnusedCapacity(alloc, 1);
+                    decisions.appendAssumeCapacity(try makeDecision(
                         alloc,
                         decl,
                         .ignore_stale,
@@ -128,7 +130,8 @@ pub fn planAlloc(
             }
         }
 
-        try decisions.append(alloc, try makeDecision(
+        try decisions.ensureUnusedCapacity(alloc, 1);
+        decisions.appendAssumeCapacity(try makeDecision(
             alloc,
             decl,
             .use,

@@ -611,7 +611,8 @@ fn appendGraphNeighborKeysAlloc(
     for (edges) |edge| {
         if (keys.items.len >= request.limit) return;
         if (!graphEdgeTypeMatches(request.edge_types, edge.edge_type)) continue;
-        try keys.append(alloc, try alloc.dupe(u8, edge.neighbor_id));
+        try keys.ensureUnusedCapacity(alloc, 1);
+        keys.appendAssumeCapacity(try alloc.dupe(u8, edge.neighbor_id));
     }
 }
 
@@ -646,7 +647,8 @@ fn graphTraversalCandidateKeysAlloc(
         const item = queue.items[cursor];
         if (item.depth > request.max_depth) continue;
         if (item.depth > 0 or request.include_start) {
-            try keys.append(alloc, try alloc.dupe(u8, item.node_id));
+            try keys.ensureUnusedCapacity(alloc, 1);
+            keys.appendAssumeCapacity(try alloc.dupe(u8, item.node_id));
             if (keys.items.len >= request.limit) break;
         }
         if (item.depth == request.max_depth) continue;
@@ -754,7 +756,7 @@ fn cloneRowRefsAlloc(alloc: Allocator, row_refs: []const rowsource.RowRef) ![]ro
         alloc.free(out);
     }
     for (row_refs, 0..) |row_ref, idx| {
-        out[idx] = try cloneRowRefAlloc(alloc, row_ref);
+        out[idx] = try source_binding.cloneRowRefAlloc(alloc, row_ref);
         initialized += 1;
     }
     return out;
@@ -773,15 +775,10 @@ fn intersectOwnedRowRefsAlloc(
     for (lhs) |row_ref| {
         if (!rowRefSliceContains(rhs, row_ref)) continue;
         if (rowRefSliceContains(out.items, row_ref)) continue;
-        try out.append(alloc, try cloneRowRefAlloc(alloc, row_ref));
+        try out.ensureUnusedCapacity(alloc, 1);
+        out.appendAssumeCapacity(try source_binding.cloneRowRefAlloc(alloc, row_ref));
     }
     return try out.toOwnedSlice(alloc);
-}
-
-fn cloneRowRefAlloc(alloc: Allocator, row_ref: rowsource.RowRef) !rowsource.RowRef {
-    const key = try source_binding.rowRefKeyAlloc(alloc, row_ref);
-    defer alloc.free(key);
-    return try source_binding.rowRefFromKeyAlloc(alloc, key);
 }
 
 fn rowRefSliceContains(values: []const rowsource.RowRef, needle: rowsource.RowRef) bool {

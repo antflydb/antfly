@@ -24,14 +24,84 @@ pub const Limits = struct {
     max_retained_items: usize = 20_000_000,
     max_output_bytes: usize = 512 * 1024 * 1024,
     max_replay_bytes: usize = 512 * 1024 * 1024,
+    /// Hard cap for live allocations made while building one sidecar or replay
+    /// buffer. This is deliberately separate from logical input/output limits:
+    /// tokenization and index construction can amplify compact source batches.
+    max_working_set_bytes: usize = 1024 * 1024 * 1024,
 
     pub fn validate(self: Limits) !void {
         if (self.max_batches == 0 or self.max_rows == 0 or self.max_input_bytes == 0 or
-            self.max_retained_items == 0 or self.max_output_bytes == 0 or self.max_replay_bytes == 0)
+            self.max_retained_items == 0 or self.max_output_bytes == 0 or self.max_replay_bytes == 0 or
+            self.max_working_set_bytes == 0)
         {
             return error.InvalidLakeSidecarBuildLimits;
         }
     }
+};
+
+/// Allocator wrapper that turns the build working-set limit into allocation
+/// admission rather than a post-allocation observation. Callers can distinguish
+/// a configured-limit denial from an actual backing-allocator OOM through
+/// `limit_exceeded` and preserve a stable user-facing budget error.
+pub const WorkingSetAllocator = struct {
+    backing: std.mem.Allocator,
+    live_bytes: usize = 0,
+    max_live_bytes: usize,
+    limit_exceeded: bool = false,
+
+    pub fn init(backing: std.mem.Allocator, limits: Limits) !WorkingSetAllocator {
+        try limits.validate();
+        return .{ .backing = backing, .max_live_bytes = limits.max_working_set_bytes };
+    }
+
+    pub fn allocator(self: *WorkingSetAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn permitsGrowth(self: *WorkingSetAllocator, additional_bytes: usize) bool {
+        if (additional_bytes <= self.max_live_bytes -| self.live_bytes) return true;
+        self.limit_exceeded = true;
+        return false;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *WorkingSetAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.permitsGrowth(len)) return null;
+        const memory = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.live_bytes += len;
+        return memory;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *WorkingSetAllocator = @ptrCast(@alignCast(ctx));
+        const growth = new_len -| memory.len;
+        if (growth > 0 and !self.permitsGrowth(growth)) return false;
+        if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        self.live_bytes = self.live_bytes -| memory.len +| new_len;
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *WorkingSetAllocator = @ptrCast(@alignCast(ctx));
+        const growth = new_len -| memory.len;
+        if (growth > 0 and !self.permitsGrowth(growth)) return null;
+        const remapped = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        self.live_bytes = self.live_bytes -| memory.len +| new_len;
+        return remapped;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *WorkingSetAllocator = @ptrCast(@alignCast(ctx));
+        self.backing.rawFree(memory, alignment, ret_addr);
+        self.live_bytes -|= memory.len;
+    }
+
+    const vtable = std.mem.Allocator.VTable{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
 };
 
 pub const Budget = struct {
@@ -119,4 +189,15 @@ test "lake build budget is cumulative across batches" {
     var budget = try Budget.init(.{ .max_input_bytes = estimateBatchBytes(batch) });
     try budget.admitBatch(batch);
     try std.testing.expectError(error.LakeSidecarBuildBudgetExceeded, budget.admitBatch(batch));
+}
+
+test "lake build working-set allocator rejects growth before allocation" {
+    const alloc = std.testing.allocator;
+    var bounded = try WorkingSetAllocator.init(alloc, .{ .max_working_set_bytes = 8 });
+    const bounded_alloc = bounded.allocator();
+    const first = try bounded_alloc.alloc(u8, 8);
+    defer bounded_alloc.free(first);
+    try std.testing.expectError(error.OutOfMemory, bounded_alloc.alloc(u8, 1));
+    try std.testing.expect(bounded.limit_exceeded);
+    try std.testing.expectEqual(@as(usize, 8), bounded.live_bytes);
 }

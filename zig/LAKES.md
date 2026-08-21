@@ -473,7 +473,11 @@ implementations mature:
    continue to declare source snapshot id, source schema fingerprint, source
    row-ref kind, source column bindings, and index config hash. The same sidecar
    model should work over document rows, relational rows, serverless row
-   fragments, Iceberg rows, and Lance rows.
+   fragments, Iceberg rows, and Lance rows. Sidecar builds and shared replay now
+   enforce cumulative input, output, retained-item, and replay ceilings plus a
+   hard live-allocation working-set ceiling. A configured allocation denial is
+   surfaced as the stable lake build/replay budget error instead of an ambiguous
+   process-level out-of-memory failure.
 
 8. Adaptive promotion policy.
 

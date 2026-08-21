@@ -200,8 +200,10 @@ pub const ProjectedCell = struct {
 pub const ProjectedRow = struct {
     row_ref: rowsource.RowRef,
     cells: []ProjectedCell,
+    owns_row_ref: bool = false,
 
     pub fn deinit(self: *ProjectedRow, alloc: Allocator) void {
+        if (self.owns_row_ref) source_binding.freeOwnedRowRef(alloc, self.row_ref);
         for (self.cells) |*cell| cell.deinit(alloc);
         alloc.free(self.cells);
         self.* = undefined;
@@ -220,6 +222,9 @@ pub const ProjectedRow = struct {
             @sizeOf(ProjectedRow),
             std.math.mul(usize, self.cells.len, @sizeOf(ProjectedCell)) catch return std.math.maxInt(usize),
         ) catch return std.math.maxInt(usize);
+        if (self.owns_row_ref) {
+            total = std.math.add(usize, total, rowRefPayloadBytes(self.row_ref)) catch return std.math.maxInt(usize);
+        }
         for (self.cells) |cell| {
             total = std.math.add(usize, total, cell.name.len) catch return std.math.maxInt(usize);
             if (cell.value) |value| {
@@ -409,12 +414,13 @@ pub fn scanRowsAlloc(
             if (total > request.limits.max_matching_rows) return error.LakeRowsScanBudgetExceeded;
             if (!limitReached(rows.items.len, request.limit)) {
                 if (rows.items.len >= request.limits.max_materialized_rows) return error.LakeRowsScanBudgetExceeded;
-                var projected = try projectRowAlloc(alloc, batch, row_idx, request.projected_columns);
-                errdefer projected.deinit(alloc);
-                const row_bytes = projected.allocatedBytes();
+                const row_bytes = try projectedRowAllocatedBytes(batch, row_idx, request.projected_columns);
                 materialized_bytes = std.math.add(usize, materialized_bytes, row_bytes) catch
                     return error.LakeRowsScanBudgetExceeded;
                 if (materialized_bytes > request.limits.max_materialized_bytes) return error.LakeRowsScanBudgetExceeded;
+                var projected = try projectRowAlloc(alloc, batch, row_idx, request.projected_columns);
+                errdefer projected.deinit(alloc);
+                std.debug.assert(projected.allocatedBytes() == row_bytes);
                 try rows.append(alloc, projected);
             }
         }
@@ -692,11 +698,13 @@ fn hydrateRowsInternalAlloc(
             if (rowIsDeletedLookup(deleted_lookup, deleted_row_filter, row_ref)) continue;
             const matched = wanted.map.getPtr(row_ref) orelse continue;
             if (matched.*) continue;
-            var projected = try projectRowAlloc(alloc, batch, row_idx, projected_columns);
-            errdefer projected.deinit(alloc);
-            materialized_bytes = std.math.add(usize, materialized_bytes, projected.allocatedBytes()) catch
+            const row_bytes = try projectedRowAllocatedBytes(batch, row_idx, projected_columns);
+            materialized_bytes = std.math.add(usize, materialized_bytes, row_bytes) catch
                 return error.LakeRowsHydrationBudgetExceeded;
             if (materialized_bytes > limits.max_materialized_bytes) return error.LakeRowsHydrationBudgetExceeded;
+            var projected = try projectRowAlloc(alloc, batch, row_idx, projected_columns);
+            errdefer projected.deinit(alloc);
+            std.debug.assert(projected.allocatedBytes() == row_bytes);
             try rows.append(alloc, projected);
             matched.* = true;
             if (rows.items.len == wanted_live_count) break;
@@ -1148,6 +1156,8 @@ fn projectRowAlloc(
     row_idx: usize,
     projected_columns: []const []const u8,
 ) !ProjectedRow {
+    const row_ref = try source_binding.cloneRowRefAlloc(alloc, batch.row_refs[row_idx]);
+    errdefer source_binding.freeOwnedRowRef(alloc, row_ref);
     const cells = try alloc.alloc(ProjectedCell, projected_columns.len);
     errdefer alloc.free(cells);
     var initialized: usize = 0;
@@ -1165,8 +1175,46 @@ fn projectRowAlloc(
     }
 
     return .{
-        .row_ref = batch.row_refs[row_idx],
+        .row_ref = row_ref,
         .cells = cells,
+        .owns_row_ref = true,
+    };
+}
+
+fn projectedRowAllocatedBytes(
+    batch: rowsource.ColumnBatch,
+    row_idx: usize,
+    projected_columns: []const []const u8,
+) !usize {
+    var total = std.math.add(
+        usize,
+        @sizeOf(ProjectedRow),
+        std.math.mul(usize, projected_columns.len, @sizeOf(ProjectedCell)) catch return std.math.maxInt(usize),
+    ) catch return std.math.maxInt(usize);
+    total = std.math.add(usize, total, rowRefPayloadBytes(batch.row_refs[row_idx])) catch return std.math.maxInt(usize);
+    for (projected_columns) |name| {
+        const column = batch.findColumn(name) orelse return error.RowSourceColumnNotFound;
+        total = std.math.add(usize, total, name.len) catch return std.math.maxInt(usize);
+        if (column.nulls.isNull(row_idx)) continue;
+        const payload_bytes = switch (column.values) {
+            .bytes, .json => |items| items[row_idx].len,
+            .vector_f32 => |items| std.math.mul(usize, items[row_idx].len, @sizeOf(f32)) catch return std.math.maxInt(usize),
+            .i64, .f64, .bool => 0,
+        };
+        total = std.math.add(usize, total, payload_bytes) catch return std.math.maxInt(usize);
+    }
+    return total;
+}
+
+fn rowRefPayloadBytes(row_ref: rowsource.RowRef) usize {
+    return switch (row_ref) {
+        .relational_key => |key| key.len,
+        .serverless => |value| value.fragment_id.len,
+        .external => |value| std.math.add(
+            usize,
+            std.math.add(usize, value.source_id.len, value.snapshot_id.len) catch return std.math.maxInt(usize),
+            value.file_id.len,
+        ) catch std.math.maxInt(usize),
     };
 }
 
@@ -1819,8 +1867,58 @@ test "lake rows scans projected local rows with a predicate" {
 
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
     try std.testing.expect(rowRefsEqual(row_refs[1], result.rows[0].row_ref));
+    try std.testing.expect(result.rows[0].owns_row_ref);
+    try std.testing.expect(@intFromPtr(result.rows[0].row_ref.relational_key.ptr) != @intFromPtr(row_refs[1].relational_key.ptr));
     try std.testing.expectEqual(@as(i64, 20), result.rows[0].find("amount").?.value.?.i64);
     try std.testing.expectEqual(true, result.rows[0].find("active").?.value.?.bool);
+}
+
+test "lake rows materialize row refs independently of source batch lifetime" {
+    const alloc = std.testing.allocator;
+
+    const ReleasingSource = struct {
+        key: ?[]u8 = null,
+        row_refs: [1]rowsource.RowRef = undefined,
+        values: [1]i64 = .{42},
+        columns: [1]rowsource.ColumnVector = undefined,
+        emitted: bool = false,
+
+        fn next(ptr: *anyopaque, a: Allocator) !?rowsource.ColumnBatch {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.emitted) {
+                if (self.key) |key| a.free(key);
+                self.key = null;
+                return null;
+            }
+            self.emitted = true;
+            self.key = try a.dupe(u8, "transient:row");
+            self.row_refs[0] = .{ .relational_key = self.key.? };
+            self.columns[0] = .{ .name = "amount", .values = .{ .i64 = &self.values } };
+            return .{
+                .snapshot = .{ .table_id = "orders", .snapshot_id = "lsm-1" },
+                .row_refs = &self.row_refs,
+                .columns = &self.columns,
+            };
+        }
+
+        fn deinit(self: *@This(), a: Allocator) void {
+            if (self.key) |key| a.free(key);
+            self.key = null;
+        }
+    };
+
+    var state = ReleasingSource{};
+    defer state.deinit(alloc);
+    var result = try scanRowsAlloc(alloc, .{
+        .kind = .relational_store,
+        .ctx = &state,
+        .next_batch = ReleasingSource.next,
+    }, .{ .projected_columns = &.{"amount"} });
+    defer result.deinit(alloc);
+
+    try std.testing.expect(state.key == null);
+    try std.testing.expect(result.rows[0].owns_row_ref);
+    try std.testing.expectEqualStrings("transient:row", result.rows[0].row_ref.relational_key);
 }
 
 test "lake rows numeric predicates match exact i64 and f64 representations" {

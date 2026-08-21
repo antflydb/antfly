@@ -306,8 +306,9 @@ pub fn planAlloc(
             try got.binding.validate();
             if (got.artifact.artifact_id.len == 0) return error.InvalidLakeRebuildPlan;
             try validatePublishedArtifact(got);
+            try decisions.ensureUnusedCapacity(alloc, 1);
             if (got.artifact.kind != want.kind) {
-                try decisions.append(alloc, try makeDecision(
+                decisions.appendAssumeCapacity(try makeDecision(
                     alloc,
                     want,
                     .rebuild,
@@ -315,7 +316,7 @@ pub fn planAlloc(
                     &.{},
                 ));
             } else if (!bindingsEqual(want.binding, got.binding)) {
-                try decisions.append(alloc, try makeDecision(
+                decisions.appendAssumeCapacity(try makeDecision(
                     alloc,
                     want,
                     .rebuild,
@@ -323,7 +324,7 @@ pub fn planAlloc(
                     &.{},
                 ));
             } else {
-                try decisions.append(alloc, try makeDecision(
+                decisions.appendAssumeCapacity(try makeDecision(
                     alloc,
                     want,
                     .reuse,
@@ -332,7 +333,8 @@ pub fn planAlloc(
                 ));
             }
         } else {
-            try decisions.append(alloc, try makeDecision(
+            try decisions.ensureUnusedCapacity(alloc, 1);
+            decisions.appendAssumeCapacity(try makeDecision(
                 alloc,
                 want,
                 .rebuild,
@@ -347,7 +349,8 @@ pub fn planAlloc(
         if (got.name.len == 0) return error.InvalidLakeRebuildPlan;
         try validatePublishedArtifact(got);
         if (findDesired(desired, got.name) != null) continue;
-        try decisions.append(alloc, try makeDropDecision(alloc, got));
+        try decisions.ensureUnusedCapacity(alloc, 1);
+        decisions.appendAssumeCapacity(try makeDropDecision(alloc, got));
     }
 
     std.mem.sort(Decision, decisions.items, {}, compareDecision);
@@ -799,7 +802,8 @@ pub fn reconcileExecutedOperationsAlloc(
                 }
                 if (!bindingsEqual(declaration.binding, operation.binding)) return error.InvalidLakeRebuildReconciliation;
                 if (declaration.artifact.kind != operation.artifact_kind) return error.InvalidLakeRebuildReconciliation;
-                try declarations.append(alloc, try cloneDeclarationAlloc(alloc, declaration));
+                try declarations.ensureUnusedCapacity(alloc, 1);
+                declarations.appendAssumeCapacity(try cloneDeclarationAlloc(alloc, declaration));
             },
             .reuse => {
                 const existing = findPublished(published, operation.name) orelse return error.InvalidLakeRebuildReconciliation;
@@ -812,7 +816,8 @@ pub fn reconcileExecutedOperationsAlloc(
                     return error.InvalidLakeRebuildReconciliation;
                 }
                 if (!bindingsEqual(existing.binding, operation.binding)) return error.InvalidLakeRebuildReconciliation;
-                try declarations.append(alloc, try declarationFromPublishedAlloc(alloc, existing));
+                try declarations.ensureUnusedCapacity(alloc, 1);
+                declarations.appendAssumeCapacity(try declarationFromPublishedAlloc(alloc, existing));
             },
             .drop => {
                 const existing = findPublished(published, operation.name) orelse return error.InvalidLakeRebuildReconciliation;
@@ -1149,7 +1154,8 @@ fn listGraphIndexNamesAlloc(alloc: Allocator, index_root: std.json.ObjectMap) ![
         else
             false;
         if (!is_graph) continue;
-        try names.append(alloc, try alloc.dupe(u8, entry.key_ptr.*));
+        try names.ensureUnusedCapacity(alloc, 1);
+        names.appendAssumeCapacity(try alloc.dupe(u8, entry.key_ptr.*));
     }
     std.mem.sort([]u8, names.items, {}, lessString);
     return try names.toOwnedSlice(alloc);

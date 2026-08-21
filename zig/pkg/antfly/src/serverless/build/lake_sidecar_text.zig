@@ -64,6 +64,19 @@ pub fn buildTextSidecarFromRowSourceAlloc(
     binding: source_binding.Binding,
     options: TextSidecarBuildOptions,
 ) !TextSidecarBuildResult {
+    var working_set = try lake_build_limits.WorkingSetAllocator.init(alloc, options.limits);
+    return buildTextSidecarBoundedAlloc(working_set.allocator(), source, binding, options) catch |err| {
+        if (err == error.OutOfMemory and working_set.limit_exceeded) return error.LakeSidecarBuildBudgetExceeded;
+        return err;
+    };
+}
+
+fn buildTextSidecarBoundedAlloc(
+    alloc: Allocator,
+    source: rowsource.Source,
+    binding: source_binding.Binding,
+    options: TextSidecarBuildOptions,
+) !TextSidecarBuildResult {
     try validateOptions(binding, source.kind, options);
     var budget = try lake_build_limits.Budget.init(options.limits);
 
@@ -516,6 +529,18 @@ test "lake text sidecar builder consumes external row source batches" {
             .name = "events.body.text",
             .text_column = "body",
             .limits = .{ .max_rows = 2 },
+        },
+    ));
+
+    var working_set_bounded_source = try external_rowsource.BatchSource.init(external_binding, &batches);
+    try std.testing.expectError(error.LakeSidecarBuildBudgetExceeded, buildTextSidecarFromRowSourceAlloc(
+        alloc,
+        working_set_bounded_source.rowSource(),
+        binding,
+        .{
+            .name = "events.body.text",
+            .text_column = "body",
+            .limits = .{ .max_working_set_bytes = 1 },
         },
     ));
 }

@@ -60,6 +60,19 @@ pub fn buildSparseSidecarFromRowSourceAlloc(
     binding: source_binding.Binding,
     options: SparseSidecarBuildOptions,
 ) !SparseSidecarBuildResult {
+    var working_set = try lake_build_limits.WorkingSetAllocator.init(alloc, options.limits);
+    return buildSparseSidecarBoundedAlloc(working_set.allocator(), source, binding, options) catch |err| {
+        if (err == error.OutOfMemory and working_set.limit_exceeded) return error.LakeSidecarBuildBudgetExceeded;
+        return err;
+    };
+}
+
+fn buildSparseSidecarBoundedAlloc(
+    alloc: Allocator,
+    source: rowsource.Source,
+    binding: source_binding.Binding,
+    options: SparseSidecarBuildOptions,
+) !SparseSidecarBuildResult {
     try validateOptions(binding, source.kind, options);
     var budget = try lake_build_limits.Budget.init(options.limits);
 

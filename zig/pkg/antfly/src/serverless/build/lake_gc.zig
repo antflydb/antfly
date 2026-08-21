@@ -198,7 +198,8 @@ fn appendUnique(
     for (list.items) |existing| {
         if (std.mem.eql(u8, existing, artifact_id)) return;
     }
-    try list.append(alloc, try alloc.dupe(u8, artifact_id));
+    try list.ensureUnusedCapacity(alloc, 1);
+    list.appendAssumeCapacity(try alloc.dupe(u8, artifact_id));
 }
 
 fn sortStrings(items: [][]u8) void {

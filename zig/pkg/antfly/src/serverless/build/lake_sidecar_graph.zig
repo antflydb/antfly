@@ -58,6 +58,19 @@ pub fn buildGraphSidecarFromRowSourceAlloc(
     binding: source_binding.Binding,
     options: GraphSidecarBuildOptions,
 ) !GraphSidecarBuildResult {
+    var working_set = try lake_build_limits.WorkingSetAllocator.init(alloc, options.limits);
+    return buildGraphSidecarBoundedAlloc(working_set.allocator(), source, binding, options) catch |err| {
+        if (err == error.OutOfMemory and working_set.limit_exceeded) return error.LakeSidecarBuildBudgetExceeded;
+        return err;
+    };
+}
+
+fn buildGraphSidecarBoundedAlloc(
+    alloc: Allocator,
+    source: rowsource.Source,
+    binding: source_binding.Binding,
+    options: GraphSidecarBuildOptions,
+) !GraphSidecarBuildResult {
     try validateOptions(binding, source.kind, options);
     var budget = try lake_build_limits.Budget.init(options.limits);
 

@@ -776,7 +776,7 @@ pub const ObjectRangeRowGroupSource = struct {
 
     pub fn rowSource(self: *ObjectRangeRowGroupSource) rowsource.Source {
         return .{
-            .kind = .external_parquet,
+            .kind = sourceKindForInventoryFormat(self.inventory.format),
             .ctx = self,
             .next_batch = nextBatch,
             .deinit_fn = deinitSource,
@@ -7499,6 +7499,10 @@ test "iceberg object range discovery enriches footer field ids" {
     try std.testing.expectEqual(@as(u64, 3), discovered.inventory.files[0].row_count);
     try std.testing.expectEqual(@as(?i32, 7), discovered.inventory.files[0].row_groups[0].column_chunks[0].field_id);
     try std.testing.expectEqual(@as(usize, 1), discovered.row_group_plan.row_groups.len);
+
+    var source = try ObjectRangeRowGroupSource.init(range_reader.reader(), discovered.inventory, discovered.row_group_plan.row_groups);
+    defer source.deinit(alloc);
+    try std.testing.expectEqual(rowsource.SourceKind.external_iceberg, source.rowSource().kind);
 }
 
 test "parquet test object builder supports multi-column footer discovery" {

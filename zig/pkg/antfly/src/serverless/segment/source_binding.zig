@@ -311,6 +311,29 @@ pub fn rowRefsFromKeysAlloc(
     return refs;
 }
 
+pub fn cloneRowRefAlloc(alloc: std.mem.Allocator, row_ref: rowsource.RowRef) !rowsource.RowRef {
+    return switch (row_ref) {
+        .relational_key => |key| .{ .relational_key = try alloc.dupe(u8, key) },
+        .serverless => |value| .{ .serverless = .{
+            .fragment_id = try alloc.dupe(u8, value.fragment_id),
+            .row_ordinal = value.row_ordinal,
+        } },
+        .external => |value| blk: {
+            const source_id = try alloc.dupe(u8, value.source_id);
+            errdefer alloc.free(source_id);
+            const snapshot_id = try alloc.dupe(u8, value.snapshot_id);
+            errdefer alloc.free(snapshot_id);
+            break :blk .{ .external = .{
+                .source_id = source_id,
+                .snapshot_id = snapshot_id,
+                .file_id = try alloc.dupe(u8, value.file_id),
+                .row_group_ordinal = value.row_group_ordinal,
+                .row_ordinal = value.row_ordinal,
+            } };
+        },
+    };
+}
+
 pub fn freeOwnedRowRef(alloc: std.mem.Allocator, row_ref: rowsource.RowRef) void {
     switch (row_ref) {
         .relational_key => |key| alloc.free(@constCast(key)),
@@ -427,6 +450,34 @@ test "sidecar source binding validates serverless and external sources" {
         .index_config_hash = "sha256:algebraic",
     };
     try std.testing.expectError(error.InvalidSidecarSourceBinding, invalid_relational.validate());
+}
+
+test "sidecar row-ref cloning owns every string and is allocation-failure safe" {
+    const alloc = std.testing.allocator;
+    const original = rowsource.RowRef{ .external = .{
+        .source_id = "events",
+        .snapshot_id = "iceberg-123",
+        .file_id = "part-a.parquet",
+        .row_group_ordinal = 7,
+        .row_ordinal = 42,
+    } };
+
+    const cloned = try cloneRowRefAlloc(alloc, original);
+    defer freeOwnedRowRef(alloc, cloned);
+    try std.testing.expectEqualStrings(original.external.source_id, cloned.external.source_id);
+    try std.testing.expectEqualStrings(original.external.snapshot_id, cloned.external.snapshot_id);
+    try std.testing.expectEqualStrings(original.external.file_id, cloned.external.file_id);
+    try std.testing.expect(@intFromPtr(original.external.source_id.ptr) != @intFromPtr(cloned.external.source_id.ptr));
+    try std.testing.expect(@intFromPtr(original.external.snapshot_id.ptr) != @intFromPtr(cloned.external.snapshot_id.ptr));
+    try std.testing.expect(@intFromPtr(original.external.file_id.ptr) != @intFromPtr(cloned.external.file_id.ptr));
+
+    const AllocationRunner = struct {
+        fn run(a: std.mem.Allocator, row_ref: rowsource.RowRef) !void {
+            const owned = try cloneRowRefAlloc(a, row_ref);
+            defer freeOwnedRowRef(a, owned);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, AllocationRunner.run, .{original});
 }
 
 test "sidecar source binding validates batches and creates stable row-ref keys" {

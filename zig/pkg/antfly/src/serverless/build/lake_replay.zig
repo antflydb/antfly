@@ -19,6 +19,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const rowsource = @import("../../storage/rowsource/types.zig");
+const source_binding = @import("../segment/source_binding.zig");
 const lake_build_limits = @import("lake_build_limits.zig");
 
 pub const Buffer = struct {
@@ -26,6 +27,14 @@ pub const Buffer = struct {
     batches: []OwnedBatch,
 
     pub fn captureAlloc(alloc: Allocator, source: rowsource.Source, limits: lake_build_limits.Limits) !Buffer {
+        var working_set = try lake_build_limits.WorkingSetAllocator.init(alloc, limits);
+        return captureBoundedAlloc(working_set.allocator(), source, limits) catch |err| {
+            if (err == error.OutOfMemory and working_set.limit_exceeded) return error.LakeSidecarReplayBudgetExceeded;
+            return err;
+        };
+    }
+
+    fn captureBoundedAlloc(alloc: Allocator, source: rowsource.Source, limits: lake_build_limits.Limits) !Buffer {
         var budget = try lake_build_limits.Budget.init(limits);
         var batches = std.ArrayListUnmanaged(OwnedBatch).empty;
         errdefer {
@@ -38,7 +47,8 @@ pub const Buffer = struct {
             replay_bytes = std.math.add(usize, replay_bytes, lake_build_limits.estimateBatchBytes(batch)) catch
                 return error.LakeSidecarReplayBudgetExceeded;
             if (replay_bytes > limits.max_replay_bytes) return error.LakeSidecarReplayBudgetExceeded;
-            try batches.append(alloc, try OwnedBatch.cloneAlloc(alloc, batch));
+            try batches.ensureUnusedCapacity(alloc, 1);
+            batches.appendAssumeCapacity(try OwnedBatch.cloneAlloc(alloc, batch));
         }
         return .{ .kind = source.kind, .batches = try batches.toOwnedSlice(alloc) };
     }
@@ -83,9 +93,9 @@ const OwnedBatch = struct {
         const row_refs = try alloc.alloc(rowsource.RowRef, batch.row_refs.len);
         errdefer alloc.free(row_refs);
         var initialized_refs: usize = 0;
-        errdefer for (row_refs[0..initialized_refs]) |*row_ref| freeRowRef(alloc, row_ref.*);
+        errdefer for (row_refs[0..initialized_refs]) |*row_ref| source_binding.freeOwnedRowRef(alloc, row_ref.*);
         for (batch.row_refs, row_refs) |row_ref, *out| {
-            out.* = try cloneRowRefAlloc(alloc, row_ref);
+            out.* = try source_binding.cloneRowRefAlloc(alloc, row_ref);
             initialized_refs += 1;
         }
 
@@ -110,48 +120,13 @@ const OwnedBatch = struct {
     fn deinit(self: *OwnedBatch, alloc: Allocator) void {
         alloc.free(@constCast(self.batch.snapshot.table_id));
         alloc.free(@constCast(self.batch.snapshot.snapshot_id));
-        for (self.batch.row_refs) |row_ref| freeRowRef(alloc, row_ref);
+        for (self.batch.row_refs) |row_ref| source_binding.freeOwnedRowRef(alloc, row_ref);
         alloc.free(@constCast(self.batch.row_refs));
         for (self.batch.columns) |column| freeColumn(alloc, column);
         alloc.free(@constCast(self.batch.columns));
         self.* = undefined;
     }
 };
-
-fn cloneRowRefAlloc(alloc: Allocator, row_ref: rowsource.RowRef) !rowsource.RowRef {
-    return switch (row_ref) {
-        .relational_key => |key| .{ .relational_key = try alloc.dupe(u8, key) },
-        .serverless => |value| .{ .serverless = .{
-            .fragment_id = try alloc.dupe(u8, value.fragment_id),
-            .row_ordinal = value.row_ordinal,
-        } },
-        .external => |value| blk: {
-            const source_id = try alloc.dupe(u8, value.source_id);
-            errdefer alloc.free(source_id);
-            const snapshot_id = try alloc.dupe(u8, value.snapshot_id);
-            errdefer alloc.free(snapshot_id);
-            break :blk .{ .external = .{
-                .source_id = source_id,
-                .snapshot_id = snapshot_id,
-                .file_id = try alloc.dupe(u8, value.file_id),
-                .row_group_ordinal = value.row_group_ordinal,
-                .row_ordinal = value.row_ordinal,
-            } };
-        },
-    };
-}
-
-fn freeRowRef(alloc: Allocator, row_ref: rowsource.RowRef) void {
-    switch (row_ref) {
-        .relational_key => |key| alloc.free(@constCast(key)),
-        .serverless => |value| alloc.free(@constCast(value.fragment_id)),
-        .external => |value| {
-            alloc.free(@constCast(value.source_id));
-            alloc.free(@constCast(value.snapshot_id));
-            alloc.free(@constCast(value.file_id));
-        },
-    }
-}
 
 fn cloneColumnAlloc(alloc: Allocator, column: rowsource.ColumnVector) !rowsource.ColumnVector {
     const name = try alloc.dupe(u8, column.name);
@@ -253,4 +228,24 @@ test "bounded replay scans a source once and supports independent cursors" {
         .{ .kind = .relational_store, .ctx = &bounded_state, .next_batch = TestSource.next },
         .{ .max_replay_bytes = lake_build_limits.estimateBatchBytes(batches[0]) - 1 },
     ));
+
+    var working_set_bounded_state = TestSource{ .batches = &batches };
+    try std.testing.expectError(error.LakeSidecarReplayBudgetExceeded, Buffer.captureAlloc(
+        alloc,
+        .{ .kind = .relational_store, .ctx = &working_set_bounded_state, .next_batch = TestSource.next },
+        .{ .max_working_set_bytes = 1 },
+    ));
+
+    const AllocationRunner = struct {
+        fn run(a: Allocator, test_batches: []const rowsource.ColumnBatch) !void {
+            var test_state = TestSource{ .batches = test_batches };
+            var test_replay = try Buffer.captureAlloc(
+                a,
+                .{ .kind = .relational_store, .ctx = &test_state, .next_batch = TestSource.next },
+                .{},
+            );
+            defer test_replay.deinit(a);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, AllocationRunner.run, .{batches[0..]});
 }
