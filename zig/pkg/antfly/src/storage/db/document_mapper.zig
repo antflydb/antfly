@@ -1783,6 +1783,7 @@ fn appendMappedSubfieldTypedDocValueConflicts(
 }
 
 fn directMappedSubfieldPath(field: runtime_schema.ExactField, path: []const u8) ?[]const u8 {
+    if (!std.mem.eql(u8, field.source_field, path)) return null;
     const exact_path = field.field;
     if (exact_path.len <= path.len + 1) return null;
     if (!std.mem.startsWith(u8, exact_path, path)) return null;
@@ -1803,11 +1804,11 @@ fn resolveArrayTypedDocValueMapping(
     items: []const std.json.Value,
 ) ?runtime_schema.FieldMapping {
     for (items) |item| {
-        if (runtime_schema.resolveFieldTypeForValue(schema, path, item)) |mapping| {
+        if (runtime_schema.resolveSourceFieldTypeForValue(schema, path, item)) |mapping| {
             if (mapping.doc_values) return mapping;
         }
     }
-    return runtime_schema.resolveFieldType(schema, path);
+    return runtime_schema.resolveSourceFieldType(schema, path);
 }
 
 fn appendSchemaTypedDocValueConflict(
@@ -1829,7 +1830,7 @@ fn mappedTypedDocValueFieldAlloc(
     path: []const u8,
     value: std.json.Value,
 ) !?introducer_mod.TypedFieldValue {
-    const mapping = runtime_schema.resolveFieldTypeForValue(schema, path, value) orelse return null;
+    const mapping = runtime_schema.resolveSourceFieldTypeForValue(schema, path, value) orelse return null;
     if (!mapping.doc_values) return null;
     const typed_value = (try typedDocValueForMappedFieldAlloc(alloc, mapping, value)) orelse return null;
     return .{
@@ -1939,7 +1940,7 @@ fn collectDynamicSchemaTextFields(
     if (path.len > 0 and !containsStringSlice(explicit_paths, path)) {
         if (document_schema) |resolved| {
             if (pathFallsUnderInferTypeDynamicPath(resolved, path) and
-                runtime_schema.resolveFieldTypeForValue(schema, path, value) == null)
+                runtime_schema.resolveSourceFieldTypeForValue(schema, path, value) == null)
             {
                 dynamic_typed_terminal = try appendDynamicInferredTypedField(alloc, typed_fields, path, value, text_analysis);
             }
@@ -2095,7 +2096,7 @@ fn resolveDynamicRule(document_schema: runtime_schema.FullTextDocument, path: []
 
 fn resolveDynamicTextMapping(schema: runtime_schema.TableSchema, path: []const u8, text: []const u8) ?runtime_schema.FieldMapping {
     const value = std.json.Value{ .string = text };
-    if (runtime_schema.resolveFieldTypeForValue(schema, path, value)) |mapping| {
+    if (runtime_schema.resolveSourceFieldTypeForValue(schema, path, value)) |mapping| {
         if (isTextFieldType(mapping.field_type)) return mapping;
     }
 
@@ -2107,7 +2108,7 @@ fn resolveDynamicTextMapping(schema: runtime_schema.TableSchema, path: []const u
 }
 
 fn resolveDynamicGeoPointMapping(schema: runtime_schema.TableSchema, path: []const u8, value: std.json.Value) ?runtime_schema.FieldMapping {
-    if (runtime_schema.resolveFieldTypeForValue(schema, path, value)) |mapping| {
+    if (runtime_schema.resolveSourceFieldTypeForValue(schema, path, value)) |mapping| {
         if (mapping.field_type == .geopoint) return mapping;
     }
 
@@ -3389,6 +3390,7 @@ test "document mapper emits mapped keyword subfield postings and typed doc value
     const text_analysis = introducer_mod.TextAnalysisConfig{};
     const exact_fields = [_]runtime_schema.ExactField{
         .{
+            .source_field = "title",
             .field = "title",
             .mapping = .{
                 .field_type = .text,
@@ -3398,6 +3400,7 @@ test "document mapper emits mapped keyword subfield postings and typed doc value
             },
         },
         .{
+            .source_field = "title",
             .field = "title.keyword",
             .mapping = .{
                 .field_type = .keyword,
@@ -3437,6 +3440,7 @@ test "document mapper emits mapped keyword subfield postings and typed doc value
 
 test "exact document mappings do not leak through dynamic leaf-name fallback" {
     const exact_fields = [_]runtime_schema.ExactField{.{
+        .source_field = "title",
         .field = "title",
         .mapping = .{ .field_type = .keyword, .analyzer = "keyword" },
     }};
@@ -3444,6 +3448,39 @@ test "exact document mappings do not leak through dynamic leaf-name fallback" {
 
     try std.testing.expect(resolveDynamicTextMapping(schema, "title", "top-level") != null);
     try std.testing.expect(resolveDynamicTextMapping(schema, "meta.title", "nested") == null);
+}
+
+test "nested exact mappings do not consume their parent value as a multi-field" {
+    const alloc = std.testing.allocator;
+    const exact_fields = [_]runtime_schema.ExactField{.{
+        .source_field = "meta.status",
+        .field = "meta.status",
+        .mapping = .{
+            .field_type = .keyword,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema: runtime_schema.TableSchema = .{ .exact_fields = &exact_fields };
+
+    const segment = (try buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:parent", .value = "{\"meta\":\"wrong-parent\"}" },
+        .{ .key = "doc:nested", .value = "{\"meta\":{\"status\":\"nested\"}}" },
+    }, .{}, schema)).?;
+    defer alloc.free(segment);
+
+    var reader = try segment_mod.SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+    const section = (try reader.getSection("meta.status", .typed_doc_values)) orelse return error.TestExpectedEqual;
+    var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
+    const first = try values.getBytesAlloc(0);
+    defer if (first) |owned| alloc.free(owned);
+    const second = try values.getBytesAlloc(1);
+    defer if (second) |owned| alloc.free(owned);
+    const present = if (first != null) first.? else second orelse return error.TestExpectedEqual;
+    try std.testing.expect((first == null) != (second == null));
+    try std.testing.expectEqualStrings("nested", present);
 }
 
 test "document mapper emits schema-derived mapped keyword subfield coverage" {

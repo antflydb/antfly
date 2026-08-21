@@ -2700,6 +2700,10 @@ fn appendRuntimeSchemaObject(
     for (schema.exact_fields, 0..) |field, i| {
         if (i > 0) try out.append(alloc, ',');
         try out.append(alloc, '{');
+        try appendJsonString(alloc, out, "source_field");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, field.source_field);
+        try out.append(alloc, ',');
         try appendJsonString(alloc, out, "field");
         try out.append(alloc, ':');
         try appendJsonString(alloc, out, field.field);

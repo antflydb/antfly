@@ -3574,6 +3574,7 @@ pub fn build(b: *std.Build) void {
         "document mapper accepts match-mapping-type dynamic template index_sort field",
         "document mapper emits mapped keyword subfield postings and typed doc values",
         "exact document mappings do not leak through dynamic leaf-name fallback",
+        "nested exact mappings do not consume their parent value as a multi-field",
         "distributed merge accepts cursors across the logical numeric domain",
         "sorted segment bounds compare across the logical numeric domain",
         "native sort execution accepts cursors across the logical numeric domain",

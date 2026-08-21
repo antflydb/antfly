@@ -128,10 +128,14 @@ pub const DeclaredField = struct {
     mapping: FieldMapping = .{},
 };
 
-/// An executable mapping for one concrete dotted document path. Exact fields
-/// are kept sorted by `field`, allowing exact-first binary lookup without
-/// mixing schema-sized property lists into the ordered wildcard rule scan.
+/// An executable mapping from one concrete dotted document source path to one
+/// concrete emitted field. Direct mappings have identical source and emitted
+/// paths; multi-fields retain their parent source so indexing never confuses a
+/// nested JSON property with a generated dotted subfield. Exact fields are kept
+/// sorted by `field`, allowing exact-first binary lookup without mixing
+/// schema-sized property lists into the ordered wildcard rule scan.
 pub const ExactField = struct {
+    source_field: []const u8,
     field: []const u8,
     mapping: FieldMapping = .{},
 };
@@ -195,14 +199,14 @@ const schema_version_prefix = "\x00\x00__metadata__:schema_v";
 
 /// Serialize a TableSchema to bytes. Caller owns the returned slice.
 pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
-    if (!exactFieldsStrictlySorted(schema.exact_fields)) return error.InvalidSchema;
+    if (!exactFieldsValid(schema.exact_fields)) return error.InvalidSchema;
 
     var buf = std.ArrayListUnmanaged(u8).empty;
     errdefer buf.deinit(alloc);
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 13); // format version
+    try appendU32(&buf, alloc, 14); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -248,6 +252,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
     // stays allocation-free and logarithmic.
     try appendU32(&buf, alloc, @intCast(schema.exact_fields.len));
     for (schema.exact_fields) |field| {
+        try appendStr(&buf, alloc, field.source_field);
         try appendStr(&buf, alloc, field.field);
         try buf.append(alloc, @intFromEnum(field.mapping.field_type));
         try buf.append(alloc, if (field.mapping.do_index) 1 else 0);
@@ -306,7 +311,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 13) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 14) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -470,14 +475,18 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         var fields_initialized: usize = 0;
         errdefer {
             for (fields[0..fields_initialized]) |field| {
+                alloc.free(field.source_field);
                 alloc.free(field.field);
                 alloc.free(field.mapping.analyzer);
             }
             alloc.free(fields);
         }
         for (fields) |*field| {
+            const serialized_source_field = if (fmt_version >= 14) readStr(data, &pos) else null;
             const field_name = try alloc.dupe(u8, readStr(data, &pos));
             errdefer alloc.free(field_name);
+            const source_field = try alloc.dupe(u8, serialized_source_field orelse field_name);
+            errdefer alloc.free(source_field);
             const field_type: AntflyType = @enumFromInt(data[pos]);
             pos += 1;
             const do_index = data[pos] == 1;
@@ -496,6 +505,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             const include_in_all = data[pos] == 1;
             pos += 1;
             field.* = .{
+                .source_field = source_field,
                 .field = field_name,
                 .mapping = .{
                     .field_type = field_type,
@@ -510,11 +520,12 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             };
             fields_initialized += 1;
         }
-        if (!exactFieldsStrictlySorted(fields)) return error.InvalidSchema;
+        if (!exactFieldsValid(fields)) return error.InvalidSchema;
         break :blk fields;
     } else &.{};
     errdefer {
         for (exact_fields) |field| {
+            alloc.free(field.source_field);
             alloc.free(field.field);
             alloc.free(field.mapping.analyzer);
         }
@@ -720,6 +731,7 @@ pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
     alloc.free(s.default_type);
     alloc.free(s.ttl_field);
     for (s.exact_fields) |field| {
+        alloc.free(field.source_field);
         alloc.free(field.field);
         alloc.free(field.mapping.analyzer);
     }
@@ -948,6 +960,24 @@ pub fn resolveFieldTypeForValue(schema: TableSchema, path: []const u8, value: ?s
     return resolveDynamicTemplateForValue(schema, path, value);
 }
 
+/// Resolve a mapping while consuming a JSON source path. Unlike public/query
+/// lookup, this excludes multi-fields whose emitted name happens to equal a
+/// nested JSON path; those are emitted only by the explicit source fan-out.
+pub fn resolveSourceFieldTypeForValue(schema: TableSchema, path: []const u8, value: ?std.json.Value) ?FieldMapping {
+    if (findExactField(schema.exact_fields, path)) |field| {
+        if (std.mem.eql(u8, field.source_field, path)) return field.mapping;
+        // The emitted name is reserved by an exact multi-field. Do not let a
+        // wildcard template reinterpret a coincident nested JSON path as the
+        // same physical column with different semantics.
+        return null;
+    }
+    return resolveDynamicTemplateForValue(schema, path, value);
+}
+
+pub fn resolveSourceFieldType(schema: TableSchema, path: []const u8) ?FieldMapping {
+    return resolveSourceFieldTypeForValue(schema, path, null);
+}
+
 /// Resolve only table-level wildcard templates. This is used by legacy leaf
 /// name fallback call sites; concrete document-schema paths must never be
 /// reinterpreted as leaf-name rules for a different dotted path.
@@ -981,6 +1011,23 @@ fn exactFieldsStrictlySorted(fields: []const ExactField) bool {
         if (std.mem.order(u8, previous.field, field.field) != .lt) return false;
     }
     return true;
+}
+
+fn exactFieldsValid(fields: []const ExactField) bool {
+    if (!exactFieldsStrictlySorted(fields)) return false;
+    for (fields) |field| {
+        if (!exactFieldSourceRouteIsValid(field)) return false;
+    }
+    return true;
+}
+
+fn exactFieldSourceRouteIsValid(field: ExactField) bool {
+    if (field.source_field.len == 0 or field.field.len == 0) return false;
+    if (std.mem.eql(u8, field.source_field, field.field)) return true;
+    if (field.field.len <= field.source_field.len + 1) return false;
+    if (!std.mem.startsWith(u8, field.field, field.source_field)) return false;
+    if (field.field[field.source_field.len] != '.') return false;
+    return std.mem.indexOfScalar(u8, field.field[field.source_field.len + 1 ..], '.') == null;
 }
 
 /// Lower bound for the virtual `path ++ "."` prefix without allocating that
@@ -1775,6 +1822,7 @@ test "schema serialize/deserialize round-trip" {
         .enforce_types = true,
         .exact_fields = &.{
             .{
+                .source_field = "created_at",
                 .field = "created_at",
                 .mapping = .{
                     .field_type = .datetime,
@@ -1901,6 +1949,7 @@ test "schema serialize/deserialize round-trip" {
     try std.testing.expect(loaded.dynamic_templates[0].mapping.sortable);
     try std.testing.expectEqual(MissingNullPolicy.missing_rejected, loaded.dynamic_templates[0].mapping.missing_null_policy);
     try std.testing.expectEqual(@as(usize, 1), loaded.exact_fields.len);
+    try std.testing.expectEqualStrings("created_at", loaded.exact_fields[0].source_field);
     try std.testing.expectEqualStrings("created_at", loaded.exact_fields[0].field);
     try std.testing.expect(loaded.exact_fields[0].mapping.sortable);
     try std.testing.expect(loaded.exact_fields[0].mapping.doc_values);
@@ -1940,16 +1989,21 @@ test "schema serialize/deserialize round-trip" {
 test "schema serialization rejects unsorted or duplicate exact fields" {
     const alloc = std.testing.allocator;
     const unsorted = [_]ExactField{
-        .{ .field = "zeta" },
-        .{ .field = "alpha" },
+        .{ .source_field = "zeta", .field = "zeta" },
+        .{ .source_field = "alpha", .field = "alpha" },
     };
     try std.testing.expectError(error.InvalidSchema, serializeSchema(alloc, .{ .exact_fields = &unsorted }));
 
     const duplicate = [_]ExactField{
-        .{ .field = "alpha" },
-        .{ .field = "alpha" },
+        .{ .source_field = "alpha", .field = "alpha" },
+        .{ .source_field = "alpha", .field = "alpha" },
     };
     try std.testing.expectError(error.InvalidSchema, serializeSchema(alloc, .{ .exact_fields = &duplicate }));
+
+    const invalid_source_route = [_]ExactField{
+        .{ .source_field = "title", .field = "meta.keyword" },
+    };
+    try std.testing.expectError(error.InvalidSchema, serializeSchema(alloc, .{ .exact_fields = &invalid_source_route }));
 }
 
 test "schema deserialization cleans initialized mappings on allocation failure" {
@@ -2488,11 +2542,11 @@ test "dynamic template selector and mapping-option resolution" {
 
 test "sorted exact fields resolve before wildcard templates and find subfields without allocation" {
     const exact_fields = [_]ExactField{
-        .{ .field = "a", .mapping = .{ .field_type = .keyword } },
-        .{ .field = "title", .mapping = .{ .field_type = .text } },
-        .{ .field = "title-other", .mapping = .{ .field_type = .text } },
-        .{ .field = "title.keyword", .mapping = .{ .field_type = .keyword, .sortable = true, .doc_values = true } },
-        .{ .field = "z", .mapping = .{ .field_type = .boolean } },
+        .{ .source_field = "a", .field = "a", .mapping = .{ .field_type = .keyword } },
+        .{ .source_field = "title", .field = "title", .mapping = .{ .field_type = .text } },
+        .{ .source_field = "title-other", .field = "title-other", .mapping = .{ .field_type = .text } },
+        .{ .source_field = "title", .field = "title.keyword", .mapping = .{ .field_type = .keyword, .sortable = true, .doc_values = true } },
+        .{ .source_field = "z", .field = "z", .mapping = .{ .field_type = .boolean } },
     };
     const templates = [_]DynamicTemplate{.{
         .name = "fallback",
@@ -2509,6 +2563,7 @@ test "sorted exact fields resolve before wildcard templates and find subfields w
     const keyword = resolveDeclaredFieldType(schema, "title.keyword") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(AntflyType.keyword, keyword.field_type);
     try std.testing.expect(keyword.sortable);
+    try std.testing.expect(resolveSourceFieldTypeForValue(schema, "title.keyword", .{ .string = "nested" }) == null);
     try std.testing.expectEqual(@as(usize, 3), exactSubfieldLowerBound(&exact_fields, "title"));
     try std.testing.expect(findExactField(&exact_fields, "missing") == null);
 }
