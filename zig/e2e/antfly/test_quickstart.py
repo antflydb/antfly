@@ -21,6 +21,10 @@ import requests
 
 from helpers import assert_single_top_hit, json_doc, upsert, wait_until
 
+
+pytestmark = pytest.mark.reuse_antfly_process
+
+
 CLIPCLAP_MODEL = "antflydb/clipclap"
 
 
