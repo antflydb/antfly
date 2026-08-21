@@ -264,6 +264,14 @@ harness, sibling processes, and active mapped pages while excluding file pages
 that the kernel can reclaim. The kubelet uses the same working-set signal to
 rank memory-pressure evictions.
 
+An explicit envelope also makes its live-usage probe mandatory. If the
+leaf-cgroup working set or macOS process footprint is temporarily unavailable,
+new allocation-producing work receives retryable resource pressure until a
+later probe succeeds. The runtime never substitutes the configured total as
+fresh free capacity; doing so would fail open by admitting the envelope a
+second time. Automatic sizing may continue without a live probe because its
+stable inference limits remain the only contract in that mode.
+
 When an mmap-backed model is evicted, teardown issues `MADV_DONTNEED` before
 unmapping and `POSIX_FADV_DONTNEED` after unmapping the whole weight file. These
 best-effort Linux hints release only clean, unshared file-cache residency;

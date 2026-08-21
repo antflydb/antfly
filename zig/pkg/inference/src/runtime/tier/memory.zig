@@ -1669,6 +1669,16 @@ fn applyProcessMemoryLimit(
         // configuration weaken a tighter physical signal.
         if (explicit_envelope_applies and envelope_available <= detected_available)
             live_admission_policy = .explicit_process_envelope;
+    } else if (explicit_envelope_applies) {
+        // An explicit process envelope is a hard bound on total live usage,
+        // not a pool of independently free bytes. If its usage signal is
+        // unavailable, admitting against `effective_limit` would fail open and
+        // could allocate the whole envelope again. Report zero transient
+        // capacity until the next probe succeeds. Callers classify this as
+        // retryable pressure, preserving both the hard bound and service
+        // recovery after a transient procfs/cgroup/platform failure.
+        available = 0;
+        live_admission_policy = .explicit_process_envelope;
     }
     return .{
         .total_bytes = effective_limit,
@@ -3075,10 +3085,14 @@ test "process snapshot charges explicit envelope without cgroup usage" {
         .explicit,
         .{},
     ).?;
-    try std.testing.expectEqual(@as(?usize, gib(14)), unavailable.available_bytes);
+    try std.testing.expectEqual(@as(?usize, 0), unavailable.available_bytes);
     try std.testing.expectEqual(
-        LiveAdmissionPolicy.dynamic_pressure,
+        LiveAdmissionPolicy.explicit_process_envelope,
         unavailable.live_admission_policy,
+    );
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        checkLiveHostMemoryWithInfo(unavailable, 1),
     );
 }
 
@@ -3191,8 +3205,9 @@ test "explicit process envelope remains authoritative without a host probe" {
     );
 
     const unmeasured = applyOptionalProcessMemoryLimit(null, gib(14), null, .explicit).?;
+    try std.testing.expectEqual(@as(?usize, 0), unmeasured.available_bytes);
     try std.testing.expectEqual(
-        LiveAdmissionPolicy.dynamic_pressure,
+        LiveAdmissionPolicy.explicit_process_envelope,
         unmeasured.live_admission_policy,
     );
 
