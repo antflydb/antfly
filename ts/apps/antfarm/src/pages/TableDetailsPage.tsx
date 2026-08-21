@@ -89,6 +89,7 @@ import {
   type TableQueryMetadataState,
   tableQueryErrorMessage,
   tableQueryInput,
+  tableQueryJsonSafetyBlocker,
   tableQueryMetadataBlocker,
 } from "./table-query";
 
@@ -317,6 +318,17 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   const [queryJsonString, setQueryJsonString] = useState(semanticQueryRequestString);
   const parsedJsonQuery = useMemo(() => parseTableQueryRequest(queryJsonString), [queryJsonString]);
   const isJsonQueryValid = parsedJsonQuery !== null;
+  const jsonArtifactRetrieval = useMemo(() => {
+    const requestedIndexes = Array.isArray(parsedJsonQuery?.indexes)
+      ? parsedJsonQuery.indexes.filter((index): index is string => typeof index === "string")
+      : [];
+    return artifactRetrievalDefaults(indexes, requestedIndexes, tableStatus);
+  }, [indexes, parsedJsonQuery, tableStatus]);
+  const jsonQuerySafetyBlocker = tableQueryJsonSafetyBlocker(
+    queryMetadataBlocker,
+    jsonArtifactRetrieval !== null,
+    parsedJsonQuery
+  );
 
   const handleQueryModeChange = (v: string) => {
     const mode = v as "builder" | "json";
@@ -541,6 +553,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         setError(artifactSelectionError);
         return;
       }
+      if (queryMode === "json" && jsonQuerySafetyBlocker) {
+        setError(jsonQuerySafetyBlocker);
+        return;
+      }
       const queryRequest = queryMode === "json" ? parsedJsonQuery : semanticQueryRequest;
       if (!queryRequest) {
         setError("The query editor must contain one JSON object.");
@@ -560,6 +576,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     parsedJsonQuery,
     semanticQueryRequest,
     artifactSelectionError,
+    jsonQuerySafetyBlocker,
     queryMetadataBlocker,
   ]);
 
@@ -1278,30 +1295,35 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                     </CardContent>
                   </Card>
                 </TabsContent>
-                <TabsContent value="json">
-                  {(() => {
-                    if (!parsedJsonQuery) {
-                      return (
-                        <div className="flex flex-col gap-2">
-                          <Alert variant="destructive">
-                            <AlertDescription>
-                              The current query must be one valid JSON object.
-                            </AlertDescription>
-                          </Alert>
-                          <Textarea
-                            value={queryJsonString}
-                            onChange={(event: React.ChangeEvent<HTMLTextAreaElement>) =>
-                              setQueryJsonString(event.target.value)
-                            }
-                            rows={20}
-                            className="font-mono"
-                          />
-                        </div>
-                      );
+                <TabsContent value="json" className="space-y-2">
+                  {!isJsonQueryValid && (
+                    <Alert variant="destructive">
+                      <AlertDescription>
+                        The current query must be one valid JSON object.
+                      </AlertDescription>
+                    </Alert>
+                  )}
+                  {jsonQuerySafetyBlocker && (
+                    <Alert
+                      variant={
+                        indexesMetadataState === "error" || tableMetadataState === "error"
+                          ? "destructive"
+                          : "default"
+                      }
+                    >
+                      <AlertDescription>{jsonQuerySafetyBlocker}</AlertDescription>
+                    </Alert>
+                  )}
+                  <Textarea
+                    aria-invalid={!isJsonQueryValid || Boolean(jsonQuerySafetyBlocker)}
+                    value={queryJsonString}
+                    onChange={(event: React.ChangeEvent<HTMLTextAreaElement>) =>
+                      setQueryJsonString(event.target.value)
                     }
-
-                    return <JsonViewer json={parsedJsonQuery} />;
-                  })()}
+                    rows={20}
+                    className="font-mono"
+                    spellCheck={false}
+                  />
                 </TabsContent>
               </div>
             </Tabs>
@@ -1310,7 +1332,8 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
               <Button
                 onClick={handleRunQuery}
                 disabled={
-                  (queryMode === "json" && !isJsonQueryValid) ||
+                  (queryMode === "json" &&
+                    (!isJsonQueryValid || Boolean(jsonQuerySafetyBlocker))) ||
                   (queryMode === "builder" && Boolean(queryMetadataBlocker)) ||
                   (queryMode === "builder" && Boolean(artifactSelectionError))
                 }

@@ -6,6 +6,7 @@ import {
   parseTableQueryRequest,
   tableQueryErrorMessage,
   tableQueryInput,
+  tableQueryJsonSafetyBlocker,
   tableQueryMetadataBlocker,
 } from "./table-query";
 
@@ -199,6 +200,35 @@ describe("table query builder UX", () => {
       "Query metadata could not be loaded safely. Retry before using the query builder, or use JSON mode with an explicit fields projection."
     );
     expect(tableQueryMetadataBlocker("ready", "ready")).toBeNull();
+  });
+
+  it("requires an explicit JSON projection while metadata is unavailable", () => {
+    const metadataBlocker = tableQueryMetadataBlocker("error", "ready");
+    expect(tableQueryJsonSafetyBlocker(metadataBlocker, false, { limit: 3 })).toBe(
+      'Query metadata is not ready. Add an explicit "fields" array before running this JSON query; use "fields": [] for identity-only results.'
+    );
+    expect(
+      tableQueryJsonSafetyBlocker(metadataBlocker, false, { fields: [], limit: 3 })
+    ).toBeNull();
+    expect(
+      tableQueryJsonSafetyBlocker(metadataBlocker, false, { fields: ["text"], limit: 3 })
+    ).toBeNull();
+    expect(
+      tableQueryJsonSafetyBlocker(metadataBlocker, false, {
+        fields: ["text", 42] as unknown as string[],
+        limit: 3,
+      })
+    ).not.toBeNull();
+    expect(tableQueryJsonSafetyBlocker(null, false, { limit: 3 })).toBeNull();
+    expect(tableQueryJsonSafetyBlocker(metadataBlocker, false, null)).toBeNull();
+  });
+
+  it("keeps known artifact-backed JSON queries projected after metadata becomes ready", () => {
+    expect(tableQueryJsonSafetyBlocker(null, true, { limit: 3 })).toBe(
+      'Artifact-backed JSON queries require an explicit "fields" array; use "fields": [] for identity-only results.'
+    );
+    expect(tableQueryJsonSafetyBlocker(null, true, { fields: ["text"], limit: 3 })).toBeNull();
+    expect(tableQueryJsonSafetyBlocker(null, false, { limit: 3 })).toBeNull();
   });
 
   it("detects artifact-backed full-text and vector indexes", () => {

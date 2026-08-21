@@ -28,6 +28,20 @@ export function tableQueryMetadataBlocker(
   return "Loading query metadata before enabling safe queries.";
 }
 
+export function tableQueryJsonSafetyBlocker(
+  metadataBlocker: string | null,
+  artifactProjectionRequired: boolean,
+  request: QueryRequest | null
+): string | null {
+  if ((!metadataBlocker && !artifactProjectionRequired) || !request) return null;
+  const fields = (request as { fields?: unknown }).fields;
+  if (Array.isArray(fields) && fields.every((field) => typeof field === "string")) return null;
+  if (!metadataBlocker) {
+    return 'Artifact-backed JSON queries require an explicit "fields" array; use "fields": [] for identity-only results.';
+  }
+  return 'Query metadata is not ready. Add an explicit "fields" array before running this JSON query; use "fields": [] for identity-only results.';
+}
+
 type ArtifactAwareIndexConfig = IndexStatus["config"] & {
   artifact_name?: string;
   embedding_name?: string;
