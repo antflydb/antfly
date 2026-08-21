@@ -228,6 +228,11 @@ pub const QueryRunner = struct {
     };
 
     pub const VTable = struct {
+        authorize_query: ?*const fn (
+            ptr: *anyopaque,
+            table_name: []const u8,
+            discovers_tree_roots: bool,
+        ) anyerror!void = null,
         run_query: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -251,6 +256,15 @@ pub const QueryRunner = struct {
             keys: []const []const u8,
         ) anyerror![]bool = null,
     };
+
+    pub fn authorizeQuery(
+        self: QueryRunner,
+        table_name: []const u8,
+        discovers_tree_roots: bool,
+    ) !void {
+        const fn_ptr = self.vtable.authorize_query orelse return;
+        return try fn_ptr(self.ptr, table_name, discovers_tree_roots);
+    }
 
     pub fn runQuery(
         self: QueryRunner,
@@ -570,6 +584,17 @@ fn executeInternal(
     if (request.query.len == 0) return error.InvalidRetrievalAgentRequest;
     if (raw_queries.len != retrieval_queries.len) return error.InvalidRetrievalAgentRequest;
     try validateRetrievalQueriesAllowedByTools(retrieval_queries, tool_policy, agentic_mode);
+    // Authorization belongs next to the canonical request parse so callers do
+    // not need a second JSON tree merely to inspect query tables. This also
+    // runs under the caller's query-admission lease and before any retrieval
+    // query or retrieval-agent event can run.
+    for (retrieval_queries) |retrieval_query| {
+        const table_name = retrieval_query.table orelse continue;
+        try runner.authorizeQuery(
+            table_name,
+            retrievalQueryDiscoversTreeRoots(retrieval_query),
+        );
+    }
 
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
     defer arena_impl.deinit();
@@ -5864,6 +5889,12 @@ fn buildTreeStartNodes(
         return .{ .result_ref = "$tree_search" };
     }
     return .{ .keys = try buildTreeStartKeysFromHits(alloc, previous_query_hits) };
+}
+
+fn retrievalQueryDiscoversTreeRoots(retrieval_query: RetrievalQueryRequest) bool {
+    const tree_search = retrieval_query.tree_search orelse return false;
+    const start_nodes = tree_search.start_nodes orelse return false;
+    return std.mem.eql(u8, std.mem.trim(u8, start_nodes, " \t\r\n"), "$roots");
 }
 
 fn hasInlineTreeSeedSearch(query_request: QueryRequest) bool {

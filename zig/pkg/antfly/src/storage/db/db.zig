@@ -57,6 +57,7 @@ const apply_state = @import("derived/apply_state.zig");
 const index_repair_state = @import("derived/index_repair_state.zig");
 const index_generation_manifest = @import("derived/index_generation_manifest.zig");
 const root_identity = @import("root_identity.zig");
+const runtime_error_abi = @import("../../runtime_error_abi.zig");
 
 test {
     _ = index_repair_state;
@@ -160,6 +161,7 @@ const zig_lmdb = if (builtin.is_test) @import("lmdb_engine") else struct {
 };
 const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
+const default_visibility_wait_timeout_ms: u64 = 5 * std.time.ms_per_min;
 const public_schema_json_key = "\x00\x00__metadata__:schema_json";
 const generated_embed_default_batch_items: usize = 8;
 const generated_embed_default_batch_bytes: usize = 256 * 1024;
@@ -1516,6 +1518,9 @@ const BatchExecutionOptions = struct {
     suppress_derived_replay_append: bool = false,
     extra_store_writes: []const docstore_mod.KVPair = &.{},
     transaction_resolution: ?TransactionResolution = null,
+    /// Borrowed by this synchronous call and consumed only after primary
+    /// durability, while waiting for requested derived visibility.
+    visibility_cancellation: types.CancellationToken = .none,
 };
 
 const TransactionResolution = struct {
@@ -3615,7 +3620,7 @@ pub const DB = struct {
 
         const target_sequence = self.core.nextEnrichmentSequence();
         if (target_sequence == 0) return;
-        try runtime.resumeFrom(target_sequence, target_sequence);
+        runtime.resumeTargetPreservingRetryDebt(target_sequence);
     }
 
     fn resumeAsyncReplayFromJournalIfNeeded(self: *DB) void {
@@ -3853,6 +3858,7 @@ pub const DB = struct {
             append_ctx,
             recordEnrichmentRequestFailure,
             enrichmentRequestFailurePending,
+            enrichmentRequestFailureRangePending,
             .{
                 .ptr = append_ctx,
                 .lock_fn = lockEnrichmentFailurePendingFence,
@@ -3864,10 +3870,29 @@ pub const DB = struct {
             enrichment_cfg,
         );
         errdefer runtime.deinit();
+        // The repair ledger and its sequence marker are committed before the
+        // enrichment runtime status. A crash in that narrow interval must not
+        // make replay invoke a permanently failing provider again. Rebuild the
+        // conservative in-memory gate from the authoritative marker index.
+        try mergeEnrichmentTerminalFailureEnvelope(resources.store, runtime);
         return .{
             .append_ctx = append_ctx,
             .runtime = runtime,
         };
+    }
+
+    fn mergeEnrichmentTerminalFailureEnvelope(
+        store: *docstore_mod.DocStore,
+        runtime: *enrichment_runtime_mod.EnrichmentRuntime,
+    ) !void {
+        const marker_envelope = try enrichmentTerminalFailureSequenceEnvelope(store);
+        if (marker_envelope.min != 0) {
+            runtime.terminal_failure_min_sequence = if (runtime.terminal_failure_min_sequence == 0)
+                marker_envelope.min
+            else
+                @min(runtime.terminal_failure_min_sequence, marker_envelope.min);
+            runtime.terminal_failure_max_sequence = @max(runtime.terminal_failure_max_sequence, marker_envelope.max);
+        }
     }
 
     fn initOptionalEnrichmentRuntime(self: *DB, enrichment_cfg: enrichment_runtime_mod.Config) !void {
@@ -3893,11 +3918,10 @@ pub const DB = struct {
         var detached = try self.createDetachedEnrichmentRuntime(owned_cfg);
         cfg_owned = false;
         errdefer if (detached) |*runtime| runtime.deinit(self.runtime_alloc);
+        if (builtin.is_test) {
+            if (test_enrichment_reconfigure_after_detached_hook) |hook| try hook(self);
+        }
         if (detached) |*runtime| {
-            if (self.core.hasGeneratedEnrichmentTargets()) {
-                const target_sequence = self.core.nextEnrichmentSequence();
-                if (target_sequence != 0) try runtime.runtime.?.resumeFrom(target_sequence, target_sequence);
-            }
             if (query_visibility_hook_present) {
                 runtime.runtime.?.setStatusHook(.{
                     .ptr = self.async_context,
@@ -3925,7 +3949,18 @@ pub const DB = struct {
         };
 
         if (should_start_replacement) {
-            try detached.?.runtime.?.start();
+            // stop() joins the previous worker. Only now is its durable
+            // checkpoint/status/repair-marker state final enough to seed the
+            // replacement. Taking this snapshot before the join can resurrect
+            // a terminal request that the old worker parks concurrently.
+            const replacement = detached.?.runtime.?;
+            try replacement.reloadDurableState();
+            try mergeEnrichmentTerminalFailureEnvelope(self.core.batchExecutionResources().store, replacement);
+            if (self.core.hasGeneratedEnrichmentTargets()) {
+                const target_sequence = self.core.nextEnrichmentSequence();
+                if (target_sequence != 0) replacement.resumeTargetPreservingRetryDebt(target_sequence);
+            }
+            try replacement.start();
         }
 
         lockAtomicWithBackoff(&self.async_context.enrichment_lifecycle_mutex);
@@ -5130,19 +5165,33 @@ pub const DB = struct {
         }
     }
 
+    pub fn batchWithVisibilityCancellation(self: *DB, req: types.BatchRequest, cancellation: types.CancellationToken) anyerror!void {
+        if (benchMetricsEnabled()) {
+            var profile = BatchProfile{};
+            try self.batchInternal(req, &profile, .{ .visibility_cancellation = cancellation });
+            logBatchProfile(req, profile);
+        } else {
+            try self.batchInternal(req, null, .{ .visibility_cancellation = cancellation });
+        }
+    }
+
     /// Applies a one-participant transaction through the ordinary atomic DB
     /// batch while preserving the distributed transaction's representability
     /// contract for transforms. This avoids durable 2PC bookkeeping without
     /// making graph-transform behavior depend on the current shard count.
     pub fn batchTransactionCompatible(self: *DB, req: types.BatchRequest) anyerror!void {
+        try self.batchTransactionCompatibleWithVisibilityCancellation(req, .none);
+    }
+
+    pub fn batchTransactionCompatibleWithVisibilityCancellation(self: *DB, req: types.BatchRequest, cancellation: types.CancellationToken) anyerror!void {
         var compatible_req = req;
         compatible_req.reject_graph_transform_projections = true;
         if (benchMetricsEnabled()) {
             var profile = BatchProfile{};
-            try self.batchInternal(compatible_req, &profile, .{});
+            try self.batchInternal(compatible_req, &profile, .{ .visibility_cancellation = cancellation });
             logBatchProfile(compatible_req, profile);
         } else {
-            try self.batchInternal(compatible_req, null, .{});
+            try self.batchInternal(compatible_req, null, .{ .visibility_cancellation = cancellation });
         }
     }
 
@@ -6403,7 +6452,7 @@ pub const DB = struct {
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.executor_notify_ns, notify_executor_start_ns);
             if (opts.wait_for_sync_level) {
                 const sync_wait_start_ns = monotonicTimeNs();
-                try self.waitForSyncLevel(effective_req.sync_level, sequence, sync_targets);
+                try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation);
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
             }
         } else {
@@ -6418,12 +6467,9 @@ pub const DB = struct {
             }
             if (opts.wait_for_sync_level) {
                 const sync_wait_start_ns = monotonicTimeNs();
-                try self.waitForSyncLevel(effective_req.sync_level, sequence, sync_targets);
+                try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation);
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
             }
-        }
-        if (opts.wait_for_sync_level and effective_req.sync_level == .full_index and self.text_merge_runtime == null) {
-            try self.drainScheduledTextMerges();
         }
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.wait_sync_ns, wait_sync_start_ns);
         if (!opts.suppress_derived_replay_append) {
@@ -6797,6 +6843,7 @@ pub const DB = struct {
     };
 
     var test_enrichment_restart_failures_remaining: std.atomic.Value(u32) = .init(0);
+    var test_enrichment_reconfigure_after_detached_hook: ?*const fn (*DB) anyerror!void = null;
 
     fn startEnrichmentRuntimeForLifecycle(runtime: *enrichment_runtime_mod.EnrichmentRuntime) !void {
         if (builtin.is_test) {
@@ -8602,6 +8649,16 @@ pub const DB = struct {
         try deletes.append(alloc, key);
         try deletes.append(alloc, kind_key);
         try deletes.appendSlice(alloc, extra_deletes);
+        if (existing_issue.reason == .enrichment_failed) {
+            try appendEnrichmentTerminalFailureMarkerDeletesForIssue(
+                alloc,
+                self.core.store,
+                key,
+                &deletes,
+                &owned_delete_keys,
+                true,
+            );
+        }
         try self.appendArtifactRepairSummaryDirty(alloc, &writes, &deletes, &owned_delete_keys);
         try self.core.store.putBatch(writes.items, deletes.items);
     }
@@ -9087,6 +9144,10 @@ pub const DB = struct {
         const now_ns = currentTimeNs();
         const existing = try self.loadArtifactRepairIssueByKey(alloc, key);
         const existing_was_pending = if (existing) |loaded| loaded.reason == .enrichment_failed else false;
+        const previous_terminal_sequence: ?u64 = if (existing) |loaded|
+            if (loaded.reason == .enrichment_failed) loaded.sequence else null
+        else
+            null;
         var stored = if (existing) |loaded|
             loaded
         else
@@ -9122,6 +9183,23 @@ pub const DB = struct {
         };
         if (existing_was_pending) completion.pending_issues = @max(completion.pending_issues, 1);
         if (stored.reason == .enrichment_failed) {
+            var marker_deletes = std.ArrayListUnmanaged([]const u8).empty;
+            defer marker_deletes.deinit(alloc);
+            var owned_marker_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
+            defer {
+                for (owned_marker_delete_keys.items) |marker_key| alloc.free(@constCast(marker_key));
+                owned_marker_delete_keys.deinit(alloc);
+            }
+            var terminal_marker = try EnrichmentTerminalFailureMarkerWrite.init(
+                alloc,
+                self.core.store,
+                key,
+                previous_terminal_sequence,
+                stored.sequence,
+                &marker_deletes,
+                &owned_marker_delete_keys,
+            );
+            defer terminal_marker.deinit(alloc);
             completion.epoch +%= 1;
             if (completion.epoch == 0) completion.epoch = 1;
             completion.completed_sequence = 0;
@@ -9133,11 +9211,33 @@ pub const DB = struct {
                 key,
                 stored,
                 existing == null,
-                &.{.{ .key = completion_key, .value = &encoded_completion }},
-                &.{},
+                &.{
+                    .{ .key = completion_key, .value = &encoded_completion },
+                    .{ .key = &internal_keys.enrichment_terminal_failure_generation_counter_key, .value = &terminal_marker.generation_counter_value },
+                    .{ .key = terminal_marker.generation_key, .value = &terminal_marker.generation_value },
+                    .{ .key = terminal_marker.marker.sequence_key, .value = terminal_marker.marker_value },
+                    .{ .key = terminal_marker.marker.issue_key, .value = terminal_marker.marker.sequence_key },
+                },
+                marker_deletes.items,
             );
         } else {
-            try self.saveArtifactRepairIssueWithSummary(alloc, key, stored, existing == null, &.{}, &.{completion_key});
+            var marker_deletes = std.ArrayListUnmanaged([]const u8).empty;
+            defer marker_deletes.deinit(alloc);
+            var owned_marker_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
+            defer {
+                for (owned_marker_delete_keys.items) |marker_key| alloc.free(@constCast(marker_key));
+                owned_marker_delete_keys.deinit(alloc);
+            }
+            try appendEnrichmentTerminalFailureMarkerDeletesForIssue(
+                alloc,
+                self.core.store,
+                key,
+                &marker_deletes,
+                &owned_marker_delete_keys,
+                true,
+            );
+            try marker_deletes.append(alloc, completion_key);
+            try self.saveArtifactRepairIssueWithSummary(alloc, key, stored, existing == null, &.{}, marker_deletes.items);
         }
     }
 
@@ -9162,6 +9262,10 @@ pub const DB = struct {
         const now_ns = currentTimeNs();
         const existing = try self.loadArtifactRepairIssueByKey(alloc, key);
         const existing_was_pending = if (existing) |loaded| loaded.reason == .enrichment_failed else false;
+        const previous_terminal_sequence: ?u64 = if (existing) |loaded|
+            if (loaded.reason == .enrichment_failed) loaded.sequence else null
+        else
+            null;
         var issue = if (existing) |loaded|
             loaded
         else
@@ -9205,6 +9309,23 @@ pub const DB = struct {
         };
         if (existing_was_pending) completion.pending_issues = @max(completion.pending_issues, 1);
         if (reason == .enrichment_failed) {
+            var marker_deletes = std.ArrayListUnmanaged([]const u8).empty;
+            defer marker_deletes.deinit(alloc);
+            var owned_marker_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
+            defer {
+                for (owned_marker_delete_keys.items) |marker_key| alloc.free(@constCast(marker_key));
+                owned_marker_delete_keys.deinit(alloc);
+            }
+            var terminal_marker = try EnrichmentTerminalFailureMarkerWrite.init(
+                alloc,
+                self.core.store,
+                key,
+                previous_terminal_sequence,
+                sequence,
+                &marker_deletes,
+                &owned_marker_delete_keys,
+            );
+            defer terminal_marker.deinit(alloc);
             completion.epoch +%= 1;
             if (completion.epoch == 0) completion.epoch = 1;
             completion.completed_sequence = 0;
@@ -9216,11 +9337,33 @@ pub const DB = struct {
                 key,
                 issue,
                 existing == null,
-                &.{.{ .key = completion_key, .value = &encoded_completion }},
-                &.{},
+                &.{
+                    .{ .key = completion_key, .value = &encoded_completion },
+                    .{ .key = &internal_keys.enrichment_terminal_failure_generation_counter_key, .value = &terminal_marker.generation_counter_value },
+                    .{ .key = terminal_marker.generation_key, .value = &terminal_marker.generation_value },
+                    .{ .key = terminal_marker.marker.sequence_key, .value = terminal_marker.marker_value },
+                    .{ .key = terminal_marker.marker.issue_key, .value = terminal_marker.marker.sequence_key },
+                },
+                marker_deletes.items,
             );
         } else {
-            try self.saveArtifactRepairIssueWithSummary(alloc, key, issue, existing == null, &.{}, &.{completion_key});
+            var marker_deletes = std.ArrayListUnmanaged([]const u8).empty;
+            defer marker_deletes.deinit(alloc);
+            var owned_marker_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
+            defer {
+                for (owned_marker_delete_keys.items) |marker_key| alloc.free(@constCast(marker_key));
+                owned_marker_delete_keys.deinit(alloc);
+            }
+            try appendEnrichmentTerminalFailureMarkerDeletesForIssue(
+                alloc,
+                self.core.store,
+                key,
+                &marker_deletes,
+                &owned_marker_delete_keys,
+                true,
+            );
+            try marker_deletes.append(alloc, completion_key);
+            try self.saveArtifactRepairIssueWithSummary(alloc, key, issue, existing == null, &.{}, marker_deletes.items);
         }
     }
 
@@ -14925,6 +15068,20 @@ pub const DB = struct {
         commit_version: u64,
         sync_level: types.SyncLevel,
     ) !void {
+        try self.resolveTransactionIntentsWithSyncLevelAndCancellation(txn_id, status, commit_version, sync_level, .none);
+    }
+
+    /// Cancellation applies only to the derived-visibility barrier after the
+    /// transaction decision and primary mutation are durable. It must never
+    /// turn an in-flight commit into a client-visible abort.
+    pub fn resolveTransactionIntentsWithSyncLevelAndCancellation(
+        self: *DB,
+        txn_id: transactions_mod.TxnId,
+        status: transactions_mod.TxnStatus,
+        commit_version: u64,
+        sync_level: types.SyncLevel,
+        visibility_cancellation: types.CancellationToken,
+    ) !void {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
@@ -14966,7 +15123,7 @@ pub const DB = struct {
                 };
                 self.core.unlockApply();
                 try self.flushTransactionHAOutbox(txn_id);
-                try self.waitForResolvedTransactionSync(sync_level, outcome.replay_sequence);
+                try self.waitForResolvedTransactionSyncWithCancellation(sync_level, outcome.replay_sequence, visibility_cancellation);
                 return;
             }
 
@@ -14979,6 +15136,7 @@ pub const DB = struct {
                 .timestamp_ns = commit_version,
                 .sync_level = sync_level,
             }, null, .{
+                .visibility_cancellation = visibility_cancellation,
                 .transaction_resolution = .{
                     .txn_id = txn_id,
                     .status = status,
@@ -17284,6 +17442,18 @@ pub const DB = struct {
         try self.runDerivedUntilWithOptions(sequence, .{});
     }
 
+    fn runDerivedUntilWithVisibilityWait(self: *DB, sequence: u64, wait: derived_executor_mod.VisibilityWait) !void {
+        if (sequence == 0) return;
+        if (!self.executor.hasWorkers()) {
+            try wait.check();
+            try replayPendingDerivedBatches(self, null, null, .{});
+            try wait.check();
+            return;
+        }
+        self.executor.notifySequence(sequence);
+        try self.executor.waitForAllWithVisibilityWait(sequence, wait);
+    }
+
     pub fn runDerivedUntilTargets(self: *DB, sequence: u64, index_names: []const []const u8) !void {
         if (sequence == 0 or index_names.len == 0) return;
         if (!self.executor.hasWorkers()) return;
@@ -17291,15 +17461,53 @@ pub const DB = struct {
         try self.executor.waitForIndexes(sequence, index_names);
     }
 
+    fn runDerivedUntilTargetsWithVisibilityWait(
+        self: *DB,
+        sequence: u64,
+        index_names: []const []const u8,
+        wait: derived_executor_mod.VisibilityWait,
+    ) !void {
+        if (sequence == 0 or index_names.len == 0) return;
+        try wait.check();
+        if (!self.executor.hasWorkers()) return;
+        self.executor.notifyIndexes(sequence, index_names);
+        try self.executor.waitForIndexesWithVisibilityWait(sequence, index_names, wait);
+    }
+
     pub fn runEnrichmentUntil(self: *DB, sequence: u64) !void {
+        try self.runEnrichmentUntilWithCancellation(sequence, .none);
+    }
+
+    fn runEnrichmentUntilWithCancellation(self: *DB, sequence: u64, cancellation: types.CancellationToken) !void {
+        try self.runEnrichmentUntilWithVisibilityDeadline(sequence, cancellation, null);
+    }
+
+    fn runEnrichmentUntilWithVisibilityDeadline(
+        self: *DB,
+        sequence: u64,
+        cancellation: types.CancellationToken,
+        deadline_ns: ?u64,
+    ) !void {
         if (sequence == 0) return;
         if (self.enrichment_runtime) |runtime| {
             if (!self.optional_runtime_workers_enabled) {
-                try runtime.catchUpUntil(sequence);
+                if (deadline_ns == null and cancellation.ptr == null) {
+                    // Explicit maintenance/drain callers historically execute
+                    // custom providers inline. They are not request waiters and
+                    // retain that source-compatible behavior; API visibility
+                    // always supplies the shared finite deadline below.
+                    try runtime.catchUpUntil(sequence);
+                    return;
+                }
+                // Foreground ownership is still a post-commit visibility
+                // barrier. Honor the borrowed request token and the runtime's
+                // hard wait deadline, but never reinterpret cancellation as a
+                // rollback of the durable primary mutation.
+                try runtime.catchUpUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns);
                 return;
             }
             runtime.notifySequence(sequence);
-            try runtime.waitForApplied(sequence);
+            try runtime.waitForAppliedWithVisibilityDeadline(sequence, cancellation, deadline_ns);
         }
     }
 
@@ -17367,6 +17575,32 @@ pub const DB = struct {
         try self.runMaintenanceUntilWithOptions(sequence, sync_targets, .{});
     }
 
+    fn runMaintenanceUntilWithCancellation(
+        self: *DB,
+        sequence: u64,
+        sync_targets: ManagedSyncTargets,
+        cancellation: types.CancellationToken,
+        deadline_ns: u64,
+    ) !void {
+        const wait = derived_executor_mod.VisibilityWait{
+            .cancellation = cancellation,
+            .deadline_ns = deadline_ns,
+        };
+        var stable_target = sequence;
+        while (true) {
+            try self.runDerivedUntilWithVisibilityWait(stable_target, wait);
+            try self.runEnrichmentUntilWithVisibilityDeadline(stable_target, cancellation, deadline_ns);
+
+            const next_target = self.core.nextDerivedSequence();
+            if (next_target <= stable_target) {
+                try waitForManagedIndexesApplied(self, sequence, sync_targets.all_indexes);
+                _ = try self.runArtifactRepairMetadataMaintenancePass();
+                return;
+            }
+            stable_target = next_target;
+        }
+    }
+
     pub fn runMaintenanceUntilTargets(self: *DB, sequence: u64, index_names: []const []const u8) !void {
         if (index_names.len == 0) return;
         var stable_target = sequence;
@@ -17384,6 +17618,10 @@ pub const DB = struct {
     }
 
     pub fn waitForCurrentSyncLevel(self: *DB, sync_level: types.SyncLevel) !void {
+        try self.waitForCurrentSyncLevelWithCancellation(sync_level, .none);
+    }
+
+    pub fn waitForCurrentSyncLevelWithCancellation(self: *DB, sync_level: types.SyncLevel, cancellation: types.CancellationToken) !void {
         try self.executor.failIfUnhealthy();
         const sequence = self.core.nextDerivedSequence();
         try self.markPrecomputedEnrichmentAppliedForSync(sync_level, sequence);
@@ -17392,10 +17630,14 @@ pub const DB = struct {
         if (self.executor.hasWorkers()) {
             notifyExecutorForSyncLevelWithDenseBulkDeferral(self.async_context, self.executor, sync_level, sequence, sync_targets);
         }
-        try self.waitForSyncLevel(sync_level, sequence, sync_targets);
+        try self.waitForSyncLevelWithCancellation(sync_level, sequence, sync_targets, cancellation);
     }
 
     fn waitForResolvedTransactionSync(self: *DB, sync_level: types.SyncLevel, sequence: u64) !void {
+        try self.waitForResolvedTransactionSyncWithCancellation(sync_level, sequence, .none);
+    }
+
+    fn waitForResolvedTransactionSyncWithCancellation(self: *DB, sync_level: types.SyncLevel, sequence: u64, cancellation: types.CancellationToken) !void {
         if (sequence == 0 or sync_level == .propose or sync_level == .write) {
             try self.executor.failIfUnhealthy();
             return;
@@ -17409,7 +17651,7 @@ pub const DB = struct {
         }
         if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
         self.notifyResolverReplayRuntimes(sequence);
-        try self.waitForSyncLevel(sync_level, sequence, sync_targets);
+        try self.waitForSyncLevelWithCancellation(sync_level, sequence, sync_targets, cancellation);
         if (sync_level == .full_index and self.text_merge_runtime == null) {
             try self.drainScheduledTextMerges();
         }
@@ -19619,17 +19861,38 @@ pub const DB = struct {
     }
 
     fn waitForSyncLevel(self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: ManagedSyncTargets) !void {
+        try self.waitForSyncLevelWithCancellation(sync_level, sequence, sync_targets, .none);
+    }
+
+    fn waitForSyncLevelWithCancellation(self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: ManagedSyncTargets, cancellation: types.CancellationToken) !void {
+        const timeout_ms = if (self.enrichment_runtime) |runtime|
+            runtime.syncWaitTimeoutMs()
+        else
+            default_visibility_wait_timeout_ms;
+        const timeout_ns = std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
+        const deadline_ns = platform_time.monotonicNs() +| timeout_ns;
+        const wait = derived_executor_mod.VisibilityWait{
+            .cancellation = cancellation,
+            .deadline_ns = deadline_ns,
+        };
         switch (sync_level) {
             .propose, .write => try self.executor.failIfUnhealthy(),
             .enrichments => {
                 try self.executor.failIfUnhealthy();
-                try self.runEnrichmentUntil(sequence);
+                try self.runEnrichmentUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns);
             },
             .full_text => {
-                try self.runDerivedUntilTargets(sequence, sync_targets.full_text_indexes);
+                try self.runDerivedUntilTargetsWithVisibilityWait(sequence, sync_targets.full_text_indexes, wait);
                 try waitForManagedIndexesApplied(self, sequence, sync_targets.full_text_indexes);
             },
-            .full_index => try self.runMaintenanceUntil(sequence, sync_targets),
+            .full_index => {
+                try self.runMaintenanceUntilWithCancellation(sequence, sync_targets, cancellation, deadline_ns);
+                if (self.text_merge_runtime == null) {
+                    try wait.check();
+                    try self.drainScheduledTextMerges();
+                    try wait.check();
+                }
+            },
         }
     }
 
@@ -35154,6 +35417,530 @@ fn enrichmentRequestFailurePending(
     return issue.reason == .enrichment_failed and issue.sequence >= failure.sequence;
 }
 
+fn enrichmentRequestFailureRangePending(
+    ctx_ptr: *anyopaque,
+    after_sequence: u64,
+    through_sequence: u64,
+) !bool {
+    const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
+    const async_ctx = ctx.async_context orelse return error.EnrichmentRuntimeUnavailable;
+    lockAtomicWithBackoff(&async_ctx.artifact_repair_issue_mutex);
+    defer async_ctx.artifact_repair_issue_mutex.unlock();
+    // Ordinary waits inspect (applied_at_entry, requested]. A delayed
+    // idempotent recovery may enter after its requested sequence has already
+    // been passed; in that case the write's exact source sequence remains the
+    // visibility boundary that must be checked.
+    const first_sequence = if (after_sequence < through_sequence)
+        after_sequence + 1
+    else
+        through_sequence;
+    const lower = try internal_keys.enrichmentTerminalFailureSequencePrefixAlloc(ctx.alloc, first_sequence);
+    defer ctx.alloc.free(lower);
+    const through_prefix = try internal_keys.enrichmentTerminalFailureSequencePrefixAlloc(ctx.alloc, through_sequence);
+    defer ctx.alloc.free(through_prefix);
+    const upper = try internal_keys.nextPrefixAlloc(ctx.alloc, through_prefix) orelse
+        return error.InvalidInternalUserKey;
+    defer ctx.alloc.free(upper);
+
+    const ScanState = struct {
+        const page_size: usize = enrichment_terminal_failure_lookup_entry_budget;
+        const Candidate = struct {
+            sequence_key: []u8,
+            issue_key: []u8,
+            generation: u64,
+
+            fn deinit(self: *@This(), alloc: Allocator) void {
+                alloc.free(self.sequence_key);
+                alloc.free(self.issue_key);
+            }
+        };
+
+        alloc: Allocator,
+        candidates: std.ArrayListUnmanaged(Candidate) = .empty,
+
+        fn deinit(self: *@This()) void {
+            for (self.candidates.items) |*candidate| candidate.deinit(self.alloc);
+            self.candidates.deinit(self.alloc);
+        }
+
+        fn scanEntry(raw_ctx: ?*anyopaque, key: []const u8, marker_value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const state: *@This() = @ptrCast(@alignCast(raw_ctx orelse return error.InvalidArgument));
+            _ = try internal_keys.enrichmentTerminalFailureSequence(key);
+            const decoded = try decodeEnrichmentTerminalFailureMarkerValue(marker_value);
+            const owned_sequence_key = try state.alloc.dupe(u8, key);
+            errdefer state.alloc.free(owned_sequence_key);
+            const owned_issue_key = try state.alloc.dupe(u8, decoded.issue_key);
+            errdefer state.alloc.free(owned_issue_key);
+            try state.candidates.append(state.alloc, .{
+                .sequence_key = owned_sequence_key,
+                .issue_key = owned_issue_key,
+                .generation = decoded.generation,
+            });
+            return if (state.candidates.items.len >= page_size) .stop else .@"continue";
+        }
+    };
+
+    // Page the secondary index so a wide stable-visibility range never scales
+    // request memory with the total repair backlog. Authoritative issue reads
+    // happen after each short scan transaction; the repair mutex keeps marker
+    // creation/retirement stable across those pages.
+    var owned_scan_lower: ?[]u8 = null;
+    defer if (owned_scan_lower) |value| ctx.alloc.free(value);
+    var entries_examined: usize = 0;
+    while (true) {
+        var state = ScanState{ .alloc = ctx.alloc };
+        defer state.deinit();
+        const scan_lower = owned_scan_lower orelse lower;
+        try ctx.store.scanWithContext(
+            scan_lower,
+            upper,
+            .{ .lower_exclusive = owned_scan_lower != null },
+            &state,
+            ScanState.scanEntry,
+        );
+        if (state.candidates.items.len == 0) return false;
+        entries_examined += state.candidates.items.len;
+
+        const next_scan_lower = try ctx.alloc.dupe(u8, state.candidates.items[state.candidates.items.len - 1].sequence_key);
+        var next_scan_lower_owned = true;
+        defer if (next_scan_lower_owned) ctx.alloc.free(next_scan_lower);
+        var found = false;
+        var stale_deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer stale_deletes.deinit(ctx.alloc);
+        var owned_stale_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (owned_stale_delete_keys.items) |key| ctx.alloc.free(@constCast(key));
+            owned_stale_delete_keys.deinit(ctx.alloc);
+        }
+        for (state.candidates.items) |candidate| {
+            const loaded = try loadArtifactRepairIssueFromStoreByKey(ctx.alloc, ctx.store, candidate.issue_key);
+            if (loaded) |value| {
+                var issue = value;
+                defer issue.deinit(ctx.alloc);
+                const candidate_sequence = try internal_keys.enrichmentTerminalFailureSequence(candidate.sequence_key);
+                const current_generation = try loadEnrichmentTerminalFailureGeneration(
+                    ctx.alloc,
+                    ctx.store,
+                    candidate.issue_key,
+                );
+                const candidate_pair_exists = try enrichmentTerminalFailureMarkerPairExists(
+                    ctx.alloc,
+                    ctx.store,
+                    candidate.issue_key,
+                    candidate.generation,
+                    candidate_sequence,
+                );
+                // The marker at the issue's current sequence is the incarnation
+                // witness. A rollback binary can delete and recreate the issue
+                // while leaving an older additive marker behind; it cannot create
+                // this witness. Older coalesced markers remain valid while the
+                // current witness exists.
+                const current_incarnation_exists = candidate.generation == current_generation and
+                    (candidate_sequence == issue.sequence or
+                        try enrichmentTerminalFailureMarkerPairExists(
+                            ctx.alloc,
+                            ctx.store,
+                            candidate.issue_key,
+                            current_generation,
+                            issue.sequence,
+                        ));
+                if (issue.reason == .enrichment_failed and candidate_pair_exists and current_incarnation_exists) {
+                    found = true;
+                    break;
+                }
+            }
+
+            // A rollback binary can retire an issue without knowing this additive
+            // index. Ignore and lazily remove that stale pair; current binaries
+            // create and retire both sides atomically under this same mutex.
+            try stale_deletes.append(ctx.alloc, candidate.sequence_key);
+            const sequence = try internal_keys.enrichmentTerminalFailureSequence(candidate.sequence_key);
+            const reverse_key = try internal_keys.enrichmentTerminalFailureIssueKeyAlloc(ctx.alloc, candidate.issue_key, sequence);
+            errdefer ctx.alloc.free(reverse_key);
+            try owned_stale_delete_keys.append(ctx.alloc, reverse_key);
+            try stale_deletes.append(ctx.alloc, reverse_key);
+        }
+        if (stale_deletes.items.len > 0) {
+            ctx.store.putBatch(&.{}, stale_deletes.items) catch |err| {
+                // Cleanup is an optimization. Classification above is based on the
+                // authoritative issue record and must not become a false repair
+                // result merely because stale-index GC failed.
+                std.log.warn("failed to clean stale enrichment terminal failure markers: {s}", .{@errorName(err)});
+            };
+        }
+        if (found) {
+            return true;
+        }
+        // Visibility classification is on the foreground write path and runs
+        // after the ordinary wait deadline. Bound total storage work, not just
+        // per-page memory. The caller converts this error into a conservative
+        // repair-required result; the stale deletes above make retries
+        // monotonically converge without extending this request indefinitely.
+        if (entries_examined >= enrichment_terminal_failure_lookup_entry_budget) {
+            return error.EnrichmentRepairLookupBudgetExceeded;
+        }
+        if (owned_scan_lower) |value| ctx.alloc.free(value);
+        owned_scan_lower = next_scan_lower;
+        next_scan_lower_owned = false;
+    }
+}
+
+const TerminalFailureSequenceEnvelope = struct {
+    min: u64 = 0,
+    max: u64 = 0,
+    entries_examined: u8 = 0,
+};
+
+fn enrichmentTerminalFailureSequenceEnvelope(store: *docstore_mod.DocStore) !TerminalFailureSequenceEnvelope {
+    const alloc = store.alloc;
+    const prefix = try internal_keys.enrichmentTerminalFailureSequenceRootPrefixAlloc(alloc);
+    defer alloc.free(prefix);
+    const upper = try internal_keys.nextPrefixAlloc(alloc, prefix);
+    defer if (upper) |value| alloc.free(value);
+
+    const EndpointState = struct {
+        sequence: u64 = 0,
+        entries_examined: u8 = 0,
+
+        fn scanEntry(raw_ctx: ?*anyopaque, key: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const state: *@This() = @ptrCast(@alignCast(raw_ctx orelse return error.InvalidArgument));
+            state.sequence = try internal_keys.enrichmentTerminalFailureSequence(key);
+            state.entries_examined += 1;
+            return .stop;
+        }
+    };
+
+    // Both endpoints come from one read snapshot. Each scan stops after its
+    // first entry, so runtime creation/reconfiguration is O(1) regardless of
+    // how much durable repair debt accumulated.
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    const scan_upper = if (upper) |value| value else "";
+    var min_state = EndpointState{};
+    try store.scanReadTxnWithContext(&txn, prefix, scan_upper, .{}, &min_state, EndpointState.scanEntry);
+    if (min_state.entries_examined == 0) return .{};
+
+    var max_state = EndpointState{};
+    try store.scanReadTxnWithContext(&txn, prefix, scan_upper, .{ .reverse = true }, &max_state, EndpointState.scanEntry);
+    return .{
+        .min = min_state.sequence,
+        .max = max_state.sequence,
+        .entries_examined = min_state.entries_examined + max_state.entries_examined,
+    };
+}
+
+const EnrichmentTerminalFailureMarkerPair = struct {
+    sequence_key: []u8,
+    issue_key: []u8,
+
+    fn init(alloc: Allocator, repair_issue_key: []const u8, sequence: u64) !@This() {
+        const sequence_key = try internal_keys.enrichmentTerminalFailureSequenceKeyAlloc(alloc, sequence, repair_issue_key);
+        errdefer alloc.free(sequence_key);
+        return .{
+            .sequence_key = sequence_key,
+            .issue_key = try internal_keys.enrichmentTerminalFailureIssueKeyAlloc(alloc, repair_issue_key, sequence),
+        };
+    }
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.sequence_key);
+        alloc.free(self.issue_key);
+        self.* = undefined;
+    }
+};
+
+const enrichment_terminal_failure_marker_value_version: u8 = 1;
+const enrichment_terminal_failure_marker_generation_len = @sizeOf(u64);
+const enrichment_terminal_failure_lookup_entry_budget: usize = 64;
+const enrichment_terminal_failure_retirement_page_size: usize = 64;
+
+const EnrichmentTerminalFailureMarkerValue = struct {
+    generation: u64,
+    issue_key: []const u8,
+};
+
+fn decodeEnrichmentTerminalFailureMarkerValue(value: []const u8) !EnrichmentTerminalFailureMarkerValue {
+    if (value.len > 0 and value[0] == enrichment_terminal_failure_marker_value_version) {
+        if (value.len <= 1 + enrichment_terminal_failure_marker_generation_len)
+            return error.InvalidEnrichmentTerminalFailureMarker;
+        return .{
+            .generation = std.mem.readInt(u64, value[1..][0..enrichment_terminal_failure_marker_generation_len], .big),
+            .issue_key = value[1 + enrichment_terminal_failure_marker_generation_len ..],
+        };
+    }
+    // Development/rollback compatibility for markers written before durable
+    // incarnation fencing. Repair issue keys live in replay namespace 0x02,
+    // so they cannot alias the version byte above.
+    if (value.len == 0) return error.InvalidEnrichmentTerminalFailureMarker;
+    return .{ .generation = 0, .issue_key = value };
+}
+
+fn encodeEnrichmentTerminalFailureMarkerValueAlloc(
+    alloc: Allocator,
+    repair_issue_key: []const u8,
+    generation: u64,
+) ![]u8 {
+    const value = try alloc.alloc(u8, 1 + enrichment_terminal_failure_marker_generation_len + repair_issue_key.len);
+    value[0] = enrichment_terminal_failure_marker_value_version;
+    std.mem.writeInt(u64, value[1..][0..enrichment_terminal_failure_marker_generation_len], generation, .big);
+    @memcpy(value[1 + enrichment_terminal_failure_marker_generation_len ..], repair_issue_key);
+    return value;
+}
+
+fn loadEnrichmentTerminalFailureGeneration(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    repair_issue_key: []const u8,
+) !u64 {
+    const key = try internal_keys.enrichmentTerminalFailureGenerationKeyAlloc(alloc, repair_issue_key);
+    defer alloc.free(key);
+    const value = store.get(alloc, key) catch |err| switch (err) {
+        error.NotFound => return 0,
+        else => return err,
+    };
+    defer alloc.free(value);
+    if (value.len != enrichment_terminal_failure_marker_generation_len)
+        return error.InvalidEnrichmentTerminalFailureGeneration;
+    return std.mem.readInt(u64, value[0..enrichment_terminal_failure_marker_generation_len], .big);
+}
+
+fn loadEnrichmentTerminalFailureGenerationCounter(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+) !u64 {
+    const value = store.get(
+        alloc,
+        &internal_keys.enrichment_terminal_failure_generation_counter_key,
+    ) catch |err| switch (err) {
+        error.NotFound => return 0,
+        else => return err,
+    };
+    defer alloc.free(value);
+    if (value.len != enrichment_terminal_failure_marker_generation_len)
+        return error.InvalidEnrichmentTerminalFailureGenerationCounter;
+    return std.mem.readInt(u64, value[0..enrichment_terminal_failure_marker_generation_len], .big);
+}
+
+fn encodeEnrichmentTerminalFailureGeneration(
+    out: *[enrichment_terminal_failure_marker_generation_len]u8,
+    generation: u64,
+) void {
+    std.mem.writeInt(u64, out, generation, .big);
+}
+
+fn nextEnrichmentTerminalFailureGeneration(current: u64) !u64 {
+    if (current == std.math.maxInt(u64)) return error.EnrichmentTerminalFailureGenerationExhausted;
+    return current + 1;
+}
+
+fn enrichmentTerminalFailureMarkerPairExists(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    repair_issue_key: []const u8,
+    generation: u64,
+    sequence: u64,
+) !bool {
+    var marker = try EnrichmentTerminalFailureMarkerPair.init(alloc, repair_issue_key, sequence);
+    defer marker.deinit(alloc);
+
+    const primary_value = store.get(alloc, marker.sequence_key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    defer alloc.free(primary_value);
+    const decoded = try decodeEnrichmentTerminalFailureMarkerValue(primary_value);
+    if (decoded.generation != generation or !std.mem.eql(u8, decoded.issue_key, repair_issue_key)) return false;
+
+    const reverse_value = store.get(alloc, marker.issue_key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    defer alloc.free(reverse_value);
+    return std.mem.eql(u8, reverse_value, marker.sequence_key);
+}
+
+/// Reuse a generation only while the previous authoritative issue retains its
+/// exact marker pair. Otherwise advance the durable incarnation generation so
+/// leftover markers from rollback or bounded retirement cannot resurrect when
+/// the new current witness is published.
+const EnrichmentTerminalFailureGenerationSelection = struct {
+    issue_generation: u64,
+    counter: u64,
+};
+
+fn enrichmentTerminalFailureGenerationForWrite(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    repair_issue_key: []const u8,
+    previous_sequence: ?u64,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_delete_keys: *std.ArrayListUnmanaged([]const u8),
+) !EnrichmentTerminalFailureGenerationSelection {
+    const current_generation = loadEnrichmentTerminalFailureGeneration(alloc, store, repair_issue_key) catch |err| switch (err) {
+        // A new counter token safely supersedes an unreadable live token, and
+        // the final atomic write repairs this sidecar. Preserve ordinary
+        // storage failures so parking cannot acknowledge debt that was never
+        // made durable.
+        error.InvalidEnrichmentTerminalFailureGeneration => 0,
+        else => return err,
+    };
+    const persisted_counter = try loadEnrichmentTerminalFailureGenerationCounter(alloc, store);
+    const high_water = @max(current_generation, persisted_counter);
+    if (previous_sequence) |previous| {
+        if (try enrichmentTerminalFailureMarkerPairExists(
+            alloc,
+            store,
+            repair_issue_key,
+            current_generation,
+            previous,
+        )) return .{
+            .issue_generation = current_generation,
+            .counter = high_water,
+        };
+    }
+    try appendEnrichmentTerminalFailureMarkerDeletesForIssue(
+        alloc,
+        store,
+        repair_issue_key,
+        deletes,
+        owned_delete_keys,
+        false,
+    );
+    // Allocate from one durable store-wide high-water mark. This survives
+    // bounded retirement without retaining a tombstone for every repaired
+    // artifact, and cannot reuse an old token when an identical source
+    // sequence is replayed later.
+    const next = try nextEnrichmentTerminalFailureGeneration(high_water);
+    return .{ .issue_generation = next, .counter = next };
+}
+
+const EnrichmentTerminalFailureMarkerWrite = struct {
+    marker: EnrichmentTerminalFailureMarkerPair,
+    generation_key: []u8,
+    marker_value: []u8,
+    generation_value: [enrichment_terminal_failure_marker_generation_len]u8,
+    generation_counter_value: [enrichment_terminal_failure_marker_generation_len]u8,
+
+    fn init(
+        alloc: Allocator,
+        store: *docstore_mod.DocStore,
+        repair_issue_key: []const u8,
+        previous_sequence: ?u64,
+        sequence: u64,
+        deletes: *std.ArrayListUnmanaged([]const u8),
+        owned_delete_keys: *std.ArrayListUnmanaged([]const u8),
+    ) !@This() {
+        const generation = try enrichmentTerminalFailureGenerationForWrite(
+            alloc,
+            store,
+            repair_issue_key,
+            previous_sequence,
+            deletes,
+            owned_delete_keys,
+        );
+        var marker = try EnrichmentTerminalFailureMarkerPair.init(alloc, repair_issue_key, sequence);
+        errdefer marker.deinit(alloc);
+        const generation_key = try internal_keys.enrichmentTerminalFailureGenerationKeyAlloc(alloc, repair_issue_key);
+        errdefer alloc.free(generation_key);
+        const marker_value = try encodeEnrichmentTerminalFailureMarkerValueAlloc(
+            alloc,
+            repair_issue_key,
+            generation.issue_generation,
+        );
+        errdefer alloc.free(marker_value);
+        var generation_value: [enrichment_terminal_failure_marker_generation_len]u8 = undefined;
+        encodeEnrichmentTerminalFailureGeneration(&generation_value, generation.issue_generation);
+        var generation_counter_value: [enrichment_terminal_failure_marker_generation_len]u8 = undefined;
+        encodeEnrichmentTerminalFailureGeneration(&generation_counter_value, generation.counter);
+        return .{
+            .marker = marker,
+            .generation_key = generation_key,
+            .marker_value = marker_value,
+            .generation_value = generation_value,
+            .generation_counter_value = generation_counter_value,
+        };
+    }
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        self.marker.deinit(alloc);
+        alloc.free(self.generation_key);
+        alloc.free(self.marker_value);
+        self.* = undefined;
+    }
+};
+
+/// Append at most one bounded page of marker pairs owned by a coalesced repair
+/// issue. The authoritative issue transition and generation fence make any
+/// remainder stale immediately; foreground lookup removes it incrementally.
+fn appendEnrichmentTerminalFailureMarkerDeletesForIssue(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    repair_issue_key: []const u8,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_delete_keys: *std.ArrayListUnmanaged([]const u8),
+    retire_generation: bool,
+) !void {
+    const prefix = try internal_keys.enrichmentTerminalFailureIssuePrefixAlloc(alloc, repair_issue_key);
+    defer alloc.free(prefix);
+    const upper = try internal_keys.nextPrefixAlloc(alloc, prefix);
+    defer if (upper) |value| alloc.free(value);
+
+    const ScanState = struct {
+        alloc: Allocator,
+        repair_issue_key: []const u8,
+        deletes: *std.ArrayListUnmanaged([]const u8),
+        owned_delete_keys: *std.ArrayListUnmanaged([]const u8),
+        entries_examined: usize = 0,
+
+        fn appendOwned(self: *@This(), value: []const u8) !void {
+            const owned = try self.alloc.dupe(u8, value);
+            errdefer self.alloc.free(owned);
+            try self.owned_delete_keys.append(self.alloc, owned);
+            try self.deletes.append(self.alloc, owned);
+        }
+
+        fn scanEntry(raw_ctx: ?*anyopaque, secondary_key: []const u8, sequence_key: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const state: *@This() = @ptrCast(@alignCast(raw_ctx orelse return error.InvalidArgument));
+            try state.appendOwned(secondary_key);
+
+            const sequence = internal_keys.enrichmentTerminalFailureSequence(sequence_key) catch {
+                state.entries_examined += 1;
+                return if (state.entries_examined >= enrichment_terminal_failure_retirement_page_size) .stop else .@"continue";
+            };
+
+            // A reverse entry is untrusted durable metadata. Reconstruct the
+            // only primary key this issue can own before allowing its value to
+            // name a second deletion. A malformed or cross-issue value retires
+            // only the corrupt reverse entry, preserving the other issue's
+            // authoritative marker and therefore failing visibility closed.
+            const expected_sequence_key = try internal_keys.enrichmentTerminalFailureSequenceKeyAlloc(
+                state.alloc,
+                sequence,
+                state.repair_issue_key,
+            );
+            defer state.alloc.free(expected_sequence_key);
+            if (std.mem.eql(u8, sequence_key, expected_sequence_key)) try state.appendOwned(sequence_key);
+
+            state.entries_examined += 1;
+            return if (state.entries_examined >= enrichment_terminal_failure_retirement_page_size) .stop else .@"continue";
+        }
+    };
+
+    var state = ScanState{
+        .alloc = alloc,
+        .repair_issue_key = repair_issue_key,
+        .deletes = deletes,
+        .owned_delete_keys = owned_delete_keys,
+    };
+    try store.scanWithContext(prefix, if (upper) |value| value else "", .{}, &state, ScanState.scanEntry);
+    if (retire_generation) {
+        const generation_key = try internal_keys.enrichmentTerminalFailureGenerationKeyAlloc(alloc, repair_issue_key);
+        errdefer alloc.free(generation_key);
+        try owned_delete_keys.append(alloc, generation_key);
+        try deletes.append(alloc, generation_key);
+    }
+}
+
 fn lockEnrichmentFailurePendingFence(ctx_ptr: *anyopaque) void {
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
     const async_ctx = ctx.async_context orelse return;
@@ -36561,6 +37348,16 @@ fn clearPublishedEmbeddingArtifactRepairIssueContext(
 
     try deletes.append(ctx.alloc, issue_key);
     try deletes.append(ctx.alloc, kind_key);
+    if (issue.reason == .enrichment_failed) {
+        try appendEnrichmentTerminalFailureMarkerDeletesForIssue(
+            ctx.alloc,
+            ctx.store,
+            issue_key,
+            &deletes,
+            &owned_delete_keys,
+            true,
+        );
+    }
     if (completion_key) |key| {
         if (completion.pending_issues == 0) {
             try deletes.append(ctx.alloc, key);
@@ -36638,6 +37435,10 @@ fn recordArtifactRepairIssueContextDetailed(
     const now_ns = currentTimeNs();
     const existing = try loadArtifactRepairIssueFromStoreByKey(ctx.alloc, ctx.store, issue_key);
     const existing_was_pending = if (existing) |loaded| loaded.reason == .enrichment_failed else false;
+    const previous_terminal_sequence: ?u64 = if (existing) |loaded|
+        if (loaded.reason == .enrichment_failed) loaded.sequence else null
+    else
+        null;
     var issue = if (existing) |loaded|
         loaded
     else
@@ -36701,6 +37502,23 @@ fn recordArtifactRepairIssueContextDetailed(
     const completion_key = try internal_keys.artifactRepairCompletionKeyAlloc(ctx.alloc, kind_name, issue_id);
     defer ctx.alloc.free(completion_key);
     if (reason == .enrichment_failed) {
+        var marker_deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer marker_deletes.deinit(ctx.alloc);
+        var owned_marker_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (owned_marker_delete_keys.items) |key| ctx.alloc.free(@constCast(key));
+            owned_marker_delete_keys.deinit(ctx.alloc);
+        }
+        var terminal_marker = try EnrichmentTerminalFailureMarkerWrite.init(
+            ctx.alloc,
+            ctx.store,
+            issue_key,
+            previous_terminal_sequence,
+            sequence,
+            &marker_deletes,
+            &owned_marker_delete_keys,
+        );
+        defer terminal_marker.deinit(ctx.alloc);
         var completion = (try loadArtifactRepairCompletionStateFromStore(ctx.alloc, ctx.store, completion_key)) orelse ArtifactRepairCompletionState{
             .pending_issues = @intFromBool(existing_was_pending),
         };
@@ -36717,13 +37535,38 @@ fn recordArtifactRepairIssueContextDetailed(
             issue_key,
             issue,
             existing == null,
-            &.{.{ .key = completion_key, .value = &encoded_completion }},
-            &.{},
+            &.{
+                .{ .key = completion_key, .value = &encoded_completion },
+                .{ .key = &internal_keys.enrichment_terminal_failure_generation_counter_key, .value = &terminal_marker.generation_counter_value },
+                .{ .key = terminal_marker.generation_key, .value = &terminal_marker.generation_value },
+                // The primary key is ordered by source sequence for exact
+                // visibility checks. The reverse key owns its lifecycle and
+                // points back to the primary key for bounded retirement.
+                .{ .key = terminal_marker.marker.sequence_key, .value = terminal_marker.marker_value },
+                .{ .key = terminal_marker.marker.issue_key, .value = terminal_marker.marker.sequence_key },
+            },
+            marker_deletes.items,
         );
     } else {
         // A non-enrichment diagnosis supersedes the shared success fence. It
         // must be invalidated in the same metadata transaction as the issue so
         // neither crashes nor concurrent repair can leave a stale marker.
+        var marker_deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer marker_deletes.deinit(ctx.alloc);
+        var owned_marker_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (owned_marker_delete_keys.items) |key| ctx.alloc.free(@constCast(key));
+            owned_marker_delete_keys.deinit(ctx.alloc);
+        }
+        try appendEnrichmentTerminalFailureMarkerDeletesForIssue(
+            ctx.alloc,
+            ctx.store,
+            issue_key,
+            &marker_deletes,
+            &owned_marker_delete_keys,
+            true,
+        );
+        try marker_deletes.append(ctx.alloc, completion_key);
         try saveArtifactRepairIssueToStoreWithSummary(
             ctx.alloc,
             ctx.store,
@@ -36731,7 +37574,7 @@ fn recordArtifactRepairIssueContextDetailed(
             issue,
             existing == null,
             &.{},
-            &.{completion_key},
+            marker_deletes.items,
         );
     }
     if (ctx.repair_issue_counter) |counter| _ = counter.fetchAdd(1, .monotonic);
@@ -43119,6 +43962,46 @@ const CountingDenseEmbedder = struct {
     }
 };
 
+const ValidatingChunkDenseEmbedder = struct {
+    deterministic: embedder_mod.DeterministicDenseEmbedder = .{},
+
+    fn embedDense(ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32) ![]f32 {
+        const self: *ValidatingChunkDenseEmbedder = @ptrCast(@alignCast(ptr));
+        return try embedder_mod.DeterministicDenseEmbedder.embedDense(&self.deterministic, alloc, embedding_name, text, dims);
+    }
+
+    fn embedDenseBatch(ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+        const self: *ValidatingChunkDenseEmbedder = @ptrCast(@alignCast(ptr));
+        const expected_chunks = [_][]const u8{ "abcdefgh", "ghijklmn", "mno" };
+        for (texts) |text| {
+            for (expected_chunks) |expected| {
+                if (std.mem.eql(u8, text, expected)) break;
+            } else return error.TestUnexpectedResult;
+        }
+
+        const batch = try alloc.alloc([]const f32, texts.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (batch[0..initialized]) |vector| alloc.free(@constCast(vector));
+            alloc.free(batch);
+        }
+        for (texts, 0..) |text, i| {
+            batch[i] = try embedder_mod.DeterministicDenseEmbedder.embedDense(&self.deterministic, alloc, embedding_name, text, dims);
+            initialized += 1;
+        }
+        return batch;
+    }
+
+    fn interface(self: *ValidatingChunkDenseEmbedder) embedder_mod.DenseEmbedder {
+        return .{
+            .ptr = self,
+            .dense_embed_fn = embedDense,
+            .dense_embed_batch_fn = embedDenseBatch,
+            .deinit_fn = null,
+        };
+    }
+};
+
 const ImageDecodingPartsEmbedder = struct {
     calls: usize = 0,
 
@@ -44649,6 +45532,84 @@ test "db enrichment reconfigure preserves active runtime when replacement cannot
         .dense_embedder = replacement_embedder.interface(),
     }));
     try std.testing.expectEqual(original_runtime, db.enrichment_runtime.?);
+}
+
+test "db enrichment reconfigure refreshes durable state after old worker joins" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var original_embedder = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{ .dense_embedder = original_embedder.interface() },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\"}}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+    try std.testing.expect(db.core.hasGeneratedEnrichmentTargets());
+    try std.testing.expect(db.core.nextEnrichmentSequence() != 0);
+    const original_runtime = db.enrichment_runtime.?;
+
+    const LateOldWorkerPublish = struct {
+        fn run(target_db: *DB) !void {
+            var status = try enrichment_state.loadRuntimeStatus(
+                target_db.runtime_alloc,
+                target_db.core.store,
+                enrichment_runtime_mod.scope_name,
+            );
+            status.error_count = 9;
+            status.retryable_error_count = 7;
+            status.fatal_error_count = 2;
+            status.consecutive_retry_count = 3;
+            status.retry_failure_fingerprint = 0xfeed;
+            status.retry_failure_count = 2;
+            status.worker_failed = true;
+            status.terminal_failure_min_sequence = 41;
+            status.terminal_failure_max_sequence = 43;
+            try enrichment_state.saveRuntimeStatus(
+                target_db.core.store,
+                enrichment_runtime_mod.scope_name,
+                status,
+            );
+        }
+    };
+    DB.test_enrichment_reconfigure_after_detached_hook = LateOldWorkerPublish.run;
+    defer DB.test_enrichment_reconfigure_after_detached_hook = null;
+
+    var replacement_embedder = embedder_mod.DeterministicDenseEmbedder{};
+    try db.reconfigureEnrichmentRuntime(.{ .dense_embedder = replacement_embedder.interface() });
+    const replacement = db.enrichment_runtime.?;
+    try std.testing.expect(replacement != original_runtime);
+    replacement.stop();
+    const stats = replacement.stats();
+    try std.testing.expectEqual(@as(u64, 9), stats.error_count);
+    try std.testing.expectEqual(@as(u64, 7), stats.retryable_error_count);
+    try std.testing.expectEqual(@as(u64, 2), stats.fatal_error_count);
+    try std.testing.expectEqual(@as(u32, 3), stats.consecutive_retry_count);
+    try std.testing.expectEqual(@as(u64, 0xfeed), replacement.retry_failure_fingerprint);
+    try std.testing.expectEqual(@as(u32, 2), replacement.retry_failure_count);
+    try std.testing.expect(stats.worker_failed);
+    try std.testing.expectEqual(@as(u64, 41), replacement.terminal_failure_min_sequence);
+    try std.testing.expectEqual(@as(u64, 43), replacement.terminal_failure_max_sequence);
+
+    const persisted = try enrichment_state.loadRuntimeStatus(
+        alloc,
+        db.core.store,
+        enrichment_runtime_mod.scope_name,
+    );
+    try std.testing.expectEqual(@as(u32, 3), persisted.consecutive_retry_count);
+    try std.testing.expectEqual(@as(u64, 0xfeed), persisted.retry_failure_fingerprint);
+    try std.testing.expectEqual(@as(u32, 2), persisted.retry_failure_count);
+    try std.testing.expect(persisted.worker_failed);
 }
 
 test "db enrichment restart supervisor recovers transient start failures" {
@@ -60923,6 +61884,467 @@ test "db upstream asset failure dominates downstream coverage in one replay sequ
     try std.testing.expectEqualStrings("summary_v1", issues[0].artifact_name);
 }
 
+test "db foreign inference provider failure releases enrichment waiter as terminal" {
+    const alloc = std.testing.allocator;
+
+    const ForeignFailingProducer = struct {
+        calls: usize = 0,
+
+        fn producer(self: *@This()) asset_producer_mod.Producer {
+            return .{ .ptr = self, .vtable = &.{ .produce = produce } };
+        }
+
+        fn produce(ptr: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            // Model a private error leaving the inference runtime artifact.
+            // The stable ABI must normalize it to the provider-level terminal
+            // identity instead of the generic RuntimeBoundaryFailure fallback.
+            const status = runtime_error_abi.statusFromErrorWithFallback(
+                error.PrivateInferenceParserFailure,
+                error.InferenceProviderFailure,
+            );
+            return runtime_error_abi.errorFromStatus(status);
+        }
+    };
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var failing = ForeignFailingProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = failing.producer(),
+            .inline_retry_max_attempts = 1,
+            .worker_retry_max_attempts = 3,
+            .sync_wait_timeout_ms = 1_000,
+        },
+    });
+    var db_open = true;
+    defer if (db_open) db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "edge":{},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"body","content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"mock"}}}
+        \\}
+        ,
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"Ada mention\"}" }},
+        .sync_level = .write,
+    });
+    const sequence = db.core.nextEnrichmentSequence();
+
+    try std.testing.expectError(
+        error.EnrichmentWorkerFailed,
+        db.enrichment_runtime.?.waitForApplied(sequence),
+    );
+
+    const stats = db.enrichment_runtime.?.stats();
+    try std.testing.expectEqual(sequence, stats.applied_sequence);
+    try std.testing.expectEqual(@as(usize, 1), failing.calls);
+    try std.testing.expectEqual(@as(u64, 0), stats.retryable_error_count);
+    try std.testing.expect(!stats.retrying);
+    try std.testing.expect(!stats.worker_failed);
+
+    const issues = try db.listArtifactRepairIssues(alloc, .asset, "relations_graph", 0);
+    defer types.freeArtifactRepairIssues(alloc, issues);
+    try std.testing.expectEqual(@as(usize, 1), issues.len);
+    try std.testing.expectEqualStrings("InferenceProviderFailure", issues[0].generation_error);
+    try std.testing.expectEqual(@as(u64, 1), issues[0].generation_attempts);
+    try std.testing.expect(try enrichmentRequestFailureRangePending(
+        db.enrichment_append_context.?,
+        sequence - 1,
+        sequence,
+    ));
+    try std.testing.expect(try enrichmentRequestFailureRangePending(
+        db.enrichment_append_context.?,
+        sequence + 10,
+        sequence,
+    ));
+    try std.testing.expect(!try enrichmentRequestFailureRangePending(
+        db.enrichment_append_context.?,
+        sequence,
+        sequence + 1,
+    ));
+
+    // Model a crash after publishing the durable terminal repair marker but
+    // before the projection checkpoint reaches the request. Restart must use
+    // the marker as the authoritative outcome and must not call the provider
+    // again merely because the checkpoint is stale.
+    try enrichment_state.saveAppliedSequence(db.core.store, enrichment_runtime_mod.scope_name, sequence - 1);
+    // Also erase the advisory runtime envelope to model a crash after the
+    // atomic repair marker write but before noteTerminalRequestFailure saves
+    // runtime status. Runtime creation must reconstruct this gate from the
+    // marker index itself.
+    var persisted_status = try enrichment_state.loadRuntimeStatus(alloc, db.core.store, enrichment_runtime_mod.scope_name);
+    persisted_status.terminal_failure_min_sequence = 0;
+    persisted_status.terminal_failure_max_sequence = 0;
+    try enrichment_state.saveRuntimeStatus(db.core.store, enrichment_runtime_mod.scope_name, persisted_status);
+    db.close();
+    db_open = false;
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-b",
+            .asset_producer = failing.producer(),
+            .inline_retry_max_attempts = 1,
+            .worker_retry_max_attempts = 3,
+            .sync_wait_timeout_ms = 1_000,
+        },
+    });
+    defer reopened.close();
+    try std.testing.expectError(
+        error.EnrichmentWorkerFailed,
+        reopened.enrichment_runtime.?.waitForApplied(sequence),
+    );
+    try std.testing.expectEqual(@as(usize, 1), failing.calls);
+    try std.testing.expectEqual(sequence, reopened.enrichment_runtime.?.stats().applied_sequence);
+}
+
+test "db terminal enrichment sequence index survives coalescing and retires with repair debt" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+    const artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(artifact_key);
+
+    for ([_]u64{ 10, 20 }) |sequence| {
+        try recordArtifactRepairIssueContextDetailed(
+            db.async_context,
+            .asset,
+            "relations_graph",
+            "doc:a",
+            "",
+            "",
+            "",
+            "relations_v1",
+            artifact_key,
+            null,
+            sequence,
+            .enrichment_failed,
+            1,
+            "UnexpectedToken",
+        );
+    }
+
+    const issues = try db.listArtifactRepairIssues(alloc, .asset, "relations_graph", 0);
+    defer types.freeArtifactRepairIssues(alloc, issues);
+    try std.testing.expectEqual(@as(usize, 1), issues.len);
+    try std.testing.expectEqual(@as(u64, 20), issues[0].sequence);
+
+    const append_ctx = db.enrichment_append_context.?;
+    try std.testing.expect(try enrichmentRequestFailureRangePending(append_ctx, 9, 10));
+    try std.testing.expect(!try enrichmentRequestFailureRangePending(append_ctx, 10, 15));
+    try std.testing.expect(try enrichmentRequestFailureRangePending(append_ctx, 15, 20));
+    // Recovery entered after both failures but is completing the older write.
+    try std.testing.expect(try enrichmentRequestFailureRangePending(append_ctx, 20, 10));
+
+    try db.clearArtifactRepairIssue(alloc, issues[0]);
+    try std.testing.expect(!try enrichmentRequestFailureRangePending(append_ctx, 9, 10));
+    try std.testing.expect(!try enrichmentRequestFailureRangePending(append_ctx, 15, 20));
+
+    // A broad stable-session recovery range may contain many additive markers
+    // left by an older binary. Put the authoritative marker beyond one scan
+    // page: lookup must bound request memory, clean each stale page, and still
+    // reach the live repair debt.
+    var stale_sequence: u64 = 21;
+    while (stale_sequence < 85) : (stale_sequence += 1) {
+        const stale_issue_key = try std.fmt.allocPrint(alloc, "stale-repair-issue-{d}", .{stale_sequence});
+        defer alloc.free(stale_issue_key);
+        const stale_marker_key = try internal_keys.enrichmentTerminalFailureSequenceKeyAlloc(alloc, stale_sequence, stale_issue_key);
+        defer alloc.free(stale_marker_key);
+        try db.core.store.put(stale_marker_key, stale_issue_key);
+    }
+    const live_artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:b", "asset", "relations_v1");
+    defer alloc.free(live_artifact_key);
+    try recordArtifactRepairIssueContextDetailed(
+        db.async_context,
+        .asset,
+        "relations_graph",
+        "doc:b",
+        "",
+        "",
+        "",
+        "relations_v1",
+        live_artifact_key,
+        null,
+        85,
+        .enrichment_failed,
+        1,
+        "UnexpectedToken",
+    );
+    const marker_envelope = try enrichmentTerminalFailureSequenceEnvelope(db.core.store);
+    try std.testing.expectEqual(@as(u64, 21), marker_envelope.min);
+    try std.testing.expectEqual(@as(u64, 85), marker_envelope.max);
+    try std.testing.expectEqual(@as(u8, 2), marker_envelope.entries_examined);
+    try std.testing.expectError(
+        error.EnrichmentRepairLookupBudgetExceeded,
+        enrichmentRequestFailureRangePending(append_ctx, 20, 85),
+    );
+    // The bounded probe cleaned one page and failed closed. A retry reaches
+    // the live marker without allowing the first request to overrun its UX
+    // deadline while processing rollback debris.
+    try std.testing.expect(try enrichmentRequestFailureRangePending(append_ctx, 20, 85));
+    const marker_root = try internal_keys.enrichmentTerminalFailureSequenceRootPrefixAlloc(alloc);
+    defer alloc.free(marker_root);
+    const remaining_markers = try db.core.store.scanPrefix(alloc, marker_root);
+    defer docstore_mod.DocStore.freeResults(alloc, remaining_markers);
+    try std.testing.expectEqual(@as(usize, 1), remaining_markers.len);
+}
+
+test "db terminal enrichment marker cleanup isolates corrupt cross issue reverse entries" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    var issue_a = types.ArtifactRepairIssue{
+        .artifact_kind = .asset,
+        .index_name = try alloc.dupe(u8, "relations_graph"),
+        .doc_key = try alloc.dupe(u8, "doc:a"),
+        .artifact_name = try alloc.dupe(u8, "relations_v1"),
+        .reason = .enrichment_failed,
+        .sequence = 10,
+    };
+    defer issue_a.deinit(alloc);
+    var issue_b = types.ArtifactRepairIssue{
+        .artifact_kind = .asset,
+        .index_name = try alloc.dupe(u8, "relations_graph"),
+        .doc_key = try alloc.dupe(u8, "doc:b"),
+        .artifact_name = try alloc.dupe(u8, "relations_v1"),
+        .reason = .enrichment_failed,
+        .sequence = 20,
+    };
+    defer issue_b.deinit(alloc);
+    try db.recordArtifactRepairIssue(alloc, issue_a);
+    try db.recordArtifactRepairIssue(alloc, issue_b);
+
+    const issue_a_key = try artifactRepairIssueKeyForIssueAlloc(alloc, issue_a);
+    defer alloc.free(issue_a_key);
+    const issue_b_key = try artifactRepairIssueKeyForIssueAlloc(alloc, issue_b);
+    defer alloc.free(issue_b_key);
+    var marker_a = try EnrichmentTerminalFailureMarkerPair.init(alloc, issue_a_key, issue_a.sequence);
+    defer marker_a.deinit(alloc);
+    var marker_b = try EnrichmentTerminalFailureMarkerPair.init(alloc, issue_b_key, issue_b.sequence);
+    defer marker_b.deinit(alloc);
+
+    // Model a corrupt reverse record for A that names B's valid primary
+    // marker. Retiring A must remove the corrupt reverse entry without
+    // deleting B's authoritative visibility debt.
+    const corrupt_reverse_key = try internal_keys.enrichmentTerminalFailureIssueKeyAlloc(
+        alloc,
+        issue_a_key,
+        issue_b.sequence,
+    );
+    defer alloc.free(corrupt_reverse_key);
+    try db.core.store.put(corrupt_reverse_key, marker_b.sequence_key);
+    const malformed_reverse_key = try internal_keys.enrichmentTerminalFailureIssueKeyAlloc(
+        alloc,
+        issue_a_key,
+        issue_b.sequence + 1,
+    );
+    defer alloc.free(malformed_reverse_key);
+    try db.core.store.put(malformed_reverse_key, "not-a-sequence-marker");
+
+    try db.clearArtifactRepairIssue(alloc, issue_a);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, marker_a.sequence_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, marker_a.issue_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, corrupt_reverse_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, malformed_reverse_key));
+
+    const primary_value = try db.core.store.get(alloc, marker_b.sequence_key);
+    defer alloc.free(primary_value);
+    const decoded_primary = try decodeEnrichmentTerminalFailureMarkerValue(primary_value);
+    try std.testing.expectEqualStrings(issue_b_key, decoded_primary.issue_key);
+    try std.testing.expectEqual(
+        try loadEnrichmentTerminalFailureGeneration(alloc, db.core.store, issue_b_key),
+        decoded_primary.generation,
+    );
+    const reverse_value = try db.core.store.get(alloc, marker_b.issue_key);
+    defer alloc.free(reverse_value);
+    try std.testing.expectEqualStrings(marker_b.sequence_key, reverse_value);
+    try std.testing.expect(try enrichmentRequestFailureRangePending(
+        db.enrichment_append_context.?,
+        issue_b.sequence - 1,
+        issue_b.sequence,
+    ));
+}
+
+test "db terminal enrichment marker retirement is bounded and fences stale generations" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    var issue = types.ArtifactRepairIssue{
+        .artifact_kind = .asset,
+        .index_name = try alloc.dupe(u8, "relations_graph"),
+        .doc_key = try alloc.dupe(u8, "doc:hot"),
+        .artifact_name = try alloc.dupe(u8, "relations_v1"),
+        .reason = .enrichment_failed,
+        .sequence = 1,
+    };
+    defer issue.deinit(alloc);
+    try db.recordArtifactRepairIssue(alloc, issue);
+
+    const issue_key = try artifactRepairIssueKeyForIssueAlloc(alloc, issue);
+    defer alloc.free(issue_key);
+    const old_generation = try loadEnrichmentTerminalFailureGeneration(alloc, db.core.store, issue_key);
+    try std.testing.expect(old_generation != 0);
+
+    // Build a hot-key backlog without repeatedly rewriting the same repair
+    // summary. These are the exact pairs that ordinary coalesced failures add.
+    var sequence: u64 = 2;
+    while (sequence < 130) : (sequence += 1) {
+        var marker = try EnrichmentTerminalFailureMarkerPair.init(alloc, issue_key, sequence);
+        defer marker.deinit(alloc);
+        const marker_value = try encodeEnrichmentTerminalFailureMarkerValueAlloc(alloc, issue_key, old_generation);
+        defer alloc.free(marker_value);
+        try db.core.store.putBatch(&.{
+            .{ .key = marker.sequence_key, .value = marker_value },
+            .{ .key = marker.issue_key, .value = marker.sequence_key },
+        }, &.{});
+    }
+    issue.sequence = 130;
+    try db.recordArtifactRepairIssue(alloc, issue);
+
+    try db.clearArtifactRepairIssue(alloc, issue);
+    const marker_root = try internal_keys.enrichmentTerminalFailureSequenceRootPrefixAlloc(alloc);
+    defer alloc.free(marker_root);
+    const after_clear = try db.core.store.scanPrefix(alloc, marker_root);
+    defer docstore_mod.DocStore.freeResults(alloc, after_clear);
+    try std.testing.expectEqual(@as(usize, 66), after_clear.len);
+    const generation_key = try internal_keys.enrichmentTerminalFailureGenerationKeyAlloc(alloc, issue_key);
+    defer alloc.free(generation_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, generation_key));
+    try std.testing.expectEqual(
+        old_generation,
+        try loadEnrichmentTerminalFailureGenerationCounter(alloc, db.core.store),
+    );
+
+    // Recreate at the exact original source sequence. Retirement removes only
+    // one more page, while the store-wide high-water counter gives the new
+    // incarnation a fresh token so the two remaining old markers cannot
+    // become authoritative again.
+    issue.sequence = 1;
+    try db.recordArtifactRepairIssue(alloc, issue);
+    const new_generation = try loadEnrichmentTerminalFailureGeneration(alloc, db.core.store, issue_key);
+    try std.testing.expect(new_generation > old_generation);
+    try std.testing.expectEqual(
+        new_generation,
+        try loadEnrichmentTerminalFailureGenerationCounter(alloc, db.core.store),
+    );
+    const after_recreate = try db.core.store.scanPrefix(alloc, marker_root);
+    defer docstore_mod.DocStore.freeResults(alloc, after_recreate);
+    try std.testing.expectEqual(@as(usize, 3), after_recreate.len);
+    try std.testing.expect(!try enrichmentRequestFailureRangePending(db.enrichment_append_context.?, 128, 129));
+    try std.testing.expect(try enrichmentRequestFailureRangePending(db.enrichment_append_context.?, 0, 1));
+}
+
+test "db terminal enrichment markers do not resurrect across rollback recreation" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+    var issue = types.ArtifactRepairIssue{
+        .artifact_kind = .asset,
+        .index_name = try alloc.dupe(u8, "relations_graph"),
+        .doc_key = try alloc.dupe(u8, "doc:a"),
+        .artifact_name = try alloc.dupe(u8, "relations_v1"),
+        .reason = .enrichment_failed,
+        .sequence = 7,
+    };
+    defer issue.deinit(alloc);
+    try db.recordArtifactRepairIssue(alloc, issue);
+
+    const issue_key = try artifactRepairIssueKeyForIssueAlloc(alloc, issue);
+    defer alloc.free(issue_key);
+    const kind_key = try artifactRepairIssueKindKeyForIssueAlloc(alloc, issue);
+    defer alloc.free(kind_key);
+    // Model a rollback binary that knows the established repair ledger but not
+    // the additive sequence indexes.
+    try db.core.store.putBatch(&.{}, &.{ issue_key, kind_key });
+
+    // Recreate the same logical issue before a marker-aware lookup gets a
+    // chance to lazily clean sequence 7. The recreated issue deliberately has
+    // no exact marker, just as it would when written by the rollback binary.
+    issue.sequence = 11;
+    try db.saveArtifactRepairIssueWithSummary(alloc, issue_key, issue, true, &.{}, &.{});
+
+    try std.testing.expect(!try enrichmentRequestFailureRangePending(db.enrichment_append_context.?, 6, 7));
+    const marker_root = try internal_keys.enrichmentTerminalFailureSequenceRootPrefixAlloc(alloc);
+    defer alloc.free(marker_root);
+    const after_lazy_cleanup = try db.core.store.scanPrefix(alloc, marker_root);
+    defer docstore_mod.DocStore.freeResults(alloc, after_lazy_cleanup);
+    try std.testing.expectEqual(@as(usize, 0), after_lazy_cleanup.len);
+
+    // Exercise the atomic creation path too: leave a second stale generation,
+    // recreate it through the rollback shape, then let the current writer
+    // coalesce a new failure before any range lookup runs.
+    issue.sequence = 12;
+    try db.recordArtifactRepairIssue(alloc, issue);
+    try db.core.store.putBatch(&.{}, &.{ issue_key, kind_key });
+    issue.sequence = 13;
+    try db.saveArtifactRepairIssueWithSummary(alloc, issue_key, issue, true, &.{}, &.{});
+    issue.sequence = 14;
+    try db.recordArtifactRepairIssue(alloc, issue);
+
+    try std.testing.expect(!try enrichmentRequestFailureRangePending(db.enrichment_append_context.?, 11, 12));
+    try std.testing.expect(try enrichmentRequestFailureRangePending(db.enrichment_append_context.?, 13, 14));
+    const remaining = try db.core.store.scanPrefix(alloc, marker_root);
+    defer docstore_mod.DocStore.freeResults(alloc, remaining);
+    try std.testing.expectEqual(@as(usize, 1), remaining.len);
+}
+
 test "db enrichment retry makes monotonic progress across provider batches" {
     const alloc = std.testing.allocator;
 
@@ -61308,11 +62730,11 @@ test "db addEnrichment supports explicit shared definitions" {
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var validating = ValidatingChunkDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
         .enrichment = .{
             .owner_id = "worker-a",
-            .dense_embedder = deterministic.interface(),
+            .dense_embedder = validating.interface(),
         },
     });
     defer db.close();
@@ -61348,7 +62770,7 @@ test "db addEnrichment supports explicit shared definitions" {
     try db.enrichment_runtime.?.waitForApplied(1);
     try waitForDerivedReplayTarget(&db);
 
-    const query_vec = try deterministic.interface().embedDense(alloc, "chunk_dense_v1", "abcdefgh", 3);
+    const query_vec = try validating.deterministic.interface().embedDense(alloc, "chunk_dense_v1", "abcdefgh", 3);
     defer alloc.free(query_vec);
 
     const req: types.SearchRequest = .{

@@ -25,6 +25,10 @@ pub const campaign_allowed_header = "X-Antfly-Raft-Batch-Campaign-Allowed";
 pub const outcome_header = "X-Antfly-Raft-Batch-Outcome";
 pub const outcome_not_proposed_v1 = "not-proposed-v1";
 pub const outcome_unknown_v1 = "unknown-v1";
+pub const outcome_committed_visibility_pending_v1 = "committed-visibility-pending-v1";
+pub const outcome_committed_repair_required_v1 = "committed-repair-required-v1";
+pub const committed_visibility_pending_body = "committed_visibility_pending";
+pub const committed_repair_required_body = "committed_repair_required";
 pub const max_forwards: u8 = 2;
 pub const max_remaining_ms: u32 = 5_000;
 

@@ -43,6 +43,14 @@ pub const ExecuteResult = struct {
     /// Participant writes are durable, but the requested visibility barrier
     /// was not reached before the response was produced.
     visibility_pending: bool = false,
+    /// The visibility barrier can still complete without operator repair.
+    /// Kept separate from terminal repair debt so a mixed outcome cannot
+    /// prematurely release stable transaction recovery.
+    visibility_retry_pending: bool = false,
+    /// The visibility barrier is pending because enrichment reached a
+    /// terminal worker failure. This is a strict subset of
+    /// `visibility_pending` and tells clients to repair rather than poll.
+    visibility_repair_required: bool = false,
 };
 
 pub const CommitOutcome = union(enum) {
