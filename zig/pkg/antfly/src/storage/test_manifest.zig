@@ -22,6 +22,7 @@ comptime {
     _ = @import("db/algebraic/cylinder.zig");
     _ = @import("db/algebraic/distributed.zig");
     _ = @import("db/algebraic/fact.zig");
+    _ = @import("db/algebraic/hll.zig");
     _ = @import("db/algebraic/index.zig");
     _ = @import("db/algebraic/ir.zig");
     _ = @import("db/algebraic/join.zig");
@@ -71,6 +72,7 @@ comptime {
     _ = @import("db/enrichment/chunker_stub.zig");
     _ = @import("db/enrichment/config_validation.zig");
     _ = @import("db/enrichment/document_extraction.zig");
+    _ = @import("db/enrichment/document_unit_fingerprint.zig");
     _ = @import("db/enrichment/embedder.zig");
     _ = @import("db/enrichment/enrichment_runtime.zig");
     _ = @import("db/enrichment/enrichment_state.zig");
@@ -86,10 +88,12 @@ comptime {
     _ = @import("db/planning_stats.zig");
     _ = @import("db/promotion_runtime.zig");
     _ = @import("db/query/graph_exec.zig");
+    _ = @import("db/query/projection.zig");
     _ = @import("db/query/result_shape.zig");
     _ = @import("db/query/search_exec.zig");
     _ = @import("db/query_metrics.zig");
     _ = @import("db/range_state.zig");
+    _ = @import("db/resolution_handoff.zig");
     _ = @import("db/resolution_runtime.zig");
     _ = @import("db/root_identity.zig");
     _ = @import("db/template_remote_stub.zig");
@@ -114,6 +118,7 @@ comptime {
     _ = @import("ha/http_admin.zig");
     _ = @import("ha/http_client.zig");
     _ = @import("ha/http_internal.zig");
+    _ = @import("ha/http_operation.zig");
     _ = @import("ha/http_replication_client.zig");
     _ = @import("ha/kubernetes_lease_watchdog.zig");
     _ = @import("ha/lifecycle_receipt_inventory_test.zig");
@@ -143,6 +148,7 @@ comptime {
     _ = @import("ha/validation.zig");
     _ = @import("ha/write_gate.zig");
     _ = @import("hbc_adapter.zig");
+    _ = @import("hierarchy_navigation.zig");
     _ = @import("internal_keys.zig");
     _ = @import("lite/backend.zig");
     _ = @import("lite/bridge.zig");
@@ -180,6 +186,7 @@ comptime {
     _ = @import("lsm_backend_sim_test.zig");
     _ = @import("maintenance.zig");
     _ = @import("mem_backend.zig");
+    _ = @import("mem_ordered.zig");
     _ = @import("object_storage.zig");
     _ = @import("persistent.zig");
     _ = @import("portable_backup.zig");

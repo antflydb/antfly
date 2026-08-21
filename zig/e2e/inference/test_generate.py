@@ -45,6 +45,19 @@ def _first_generator_model(api):
     pytest.skip("No generator models available for /api/generate tests")
 
 
+def _target_and_draft_generator_models(api):
+    target = _first_generator_model(api)
+    draft = os.environ.get("ANTFLY_INFERENCE_DRAFT_MODEL", "").strip()
+    if not draft:
+        pytest.skip(
+            "Speculative decoding requires a distinct compatible draft model; "
+            "set ANTFLY_INFERENCE_DRAFT_MODEL"
+        )
+    if draft.casefold() == target.casefold():
+        pytest.skip("ANTFLY_INFERENCE_DRAFT_MODEL must differ from the target model")
+    return target, draft
+
+
 def _first_tool_generator_model(api):
     generators = api.models().get("generators", {})
     model = find_tool_model_name(set(generators.keys()))
@@ -154,9 +167,13 @@ def test_max_tokens_respected(api):
 def test_generate_response_format_json_object(api):
     model = _first_generator_model(api)
     resp = api.generate(
-        [{"role": "user", "content": "Return a tiny JSON object"}],
+        [{"role": "user", "content": "Return exactly the JSON object {}, with no other text."}],
         model=model,
-        max_tokens=128,
+        # This is a grammar-wiring smoke, not an output-quality benchmark.
+        # Unconstrained JSON permits trailing whitespace, so a CPU-only Gemma
+        # decode can consume the entire budget even after emitting an object.
+        max_tokens=4,
+        chat_template_kwargs={"enable_thinking": False},
         response_format={"type": "json_object"},
     )
 
@@ -210,12 +227,13 @@ def test_generate_invalid_grammar_rejected(api):
 
 
 def test_generate_with_draft_model_smoke(api):
-    model = _first_generator_model(api)
+    model, draft_model = _target_and_draft_generator_models(api)
     resp = _generate_or_skip_unsupported(api, {
         "model": model,
         "messages": [{"role": "user", "content": "Say hello briefly"}],
         "max_tokens": 8,
-        "draft_model": model,
+        "chat_template_kwargs": {"enable_thinking": False},
+        "draft_model": draft_model,
         "speculative_k": 2,
     })
 
@@ -224,12 +242,12 @@ def test_generate_with_draft_model_smoke(api):
 
 
 def test_generate_json_schema_with_draft_model(api):
-    model = _first_generator_model(api)
+    model, draft_model = _target_and_draft_generator_models(api)
     resp = _generate_or_skip_unsupported(api, {
         "model": model,
         "messages": [{"role": "user", "content": "Return JSON with a string field named answer"}],
         "max_tokens": 128,
-        "draft_model": model,
+        "draft_model": draft_model,
         "speculative_k": 2,
         "response_format": {
             "type": "json_schema",
@@ -365,7 +383,7 @@ def test_multimodal_generation(api):
     messages = [{
         "role": "user",
         "content": [
-            {"type": "text", "text": "Describe this image in one short sentence."},
+            {"type": "text", "text": "Describe this image with one word."},
             {"type": "image_url", "image_url": {"url": TINY_PNG_URI}},
         ],
     }]
@@ -373,7 +391,10 @@ def test_multimodal_generation(api):
     r = api.post("/generate", json={
         "model": model,
         "messages": messages,
-        "max_tokens": 20,
+        # Projector execution and the first decoded content are the contract.
+        # Keep the CPU-only release smoke below the request deadline.
+        "max_tokens": 2,
+        "chat_template_kwargs": {"enable_thinking": False},
     })
     r.raise_for_status()
     resp = r.json()
@@ -406,7 +427,8 @@ def test_multimodal_audio_generation(api):
     response = api.post("/generate", json={
         "model": model,
         "messages": messages,
-        "max_tokens": 20,
+        "max_tokens": 8,
+        "chat_template_kwargs": {"enable_thinking": False},
     })
     assert response.status_code == 200, (
         "shipped Gemma decoder/projector failed audio inference: "
@@ -567,16 +589,21 @@ def test_stream_generate_with_tools_tool_model(api):
 def test_speculative_decode_matches_greedy(api):
     """Speculative decode with greedy sampling (temperature=0) should produce
     the same output as standard decode."""
-    model = _first_generator_model(api)
+    model, draft_model = _target_and_draft_generator_models(api)
     messages = [{"role": "user", "content": "Count from 1 to 5"}]
-    kwargs = dict(model=model, max_tokens=20, temperature=0, backend="native")
+    kwargs = dict(
+        model=model,
+        max_tokens=20,
+        temperature=0,
+        backend="native",
+        chat_template_kwargs={"enable_thinking": False},
+    )
 
     # Standard decode (no draft model)
     standard = api.generate(messages, **kwargs)
     standard_content = _message_content(standard) or ""
 
-    # Speculative decode (same model as draft)
-    speculative = api.generate(messages, draft_model=model, speculative_k=3, **kwargs)
+    speculative = api.generate(messages, draft_model=draft_model, speculative_k=3, **kwargs)
     speculative_content = _message_content(speculative) or ""
 
     assert standard_content, "Standard decode produced no content"
@@ -594,7 +621,13 @@ def test_generate_with_cache_dtype(api, cache_dtype):
     """Generation should succeed with each KV cache quantization format."""
     model = _first_generator_model(api)
     messages = [{"role": "user", "content": "Say hello"}]
-    resp = api.generate(messages, model=model, max_tokens=10, cache_dtype=cache_dtype)
+    resp = api.generate(
+        messages,
+        model=model,
+        max_tokens=10,
+        cache_dtype=cache_dtype,
+        chat_template_kwargs={"enable_thinking": False},
+    )
     content = _message_content(resp)
     assert content, f"No generated content with cache_dtype={cache_dtype}: {resp}"
 
@@ -606,7 +639,11 @@ def test_concurrent_requests_throughput(api):
     model = _first_generator_model(api)
     num_requests = 4
     messages = [{"role": "user", "content": "Say hello"}]
-    kwargs = dict(model=model, max_tokens=8)
+    kwargs = dict(
+        model=model,
+        max_tokens=8,
+        chat_template_kwargs={"enable_thinking": False},
+    )
 
     # Sequential baseline
     seq_start = time.monotonic()

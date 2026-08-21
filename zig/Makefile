@@ -57,29 +57,42 @@ inference-e2e-models: ## Prefetch the curated inference E2E model set with `antf
 # TLA+ Verification Commands
 # ====================================================================================
 
-.PHONY: generate generated-check tls-compat-check openapi-generate openapi-check snowball-generate snowball-check cabi-header-generate cabi-header-check license-headers license-check tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-check-lsm tla-trace-raft tla-trace-txn
+.PHONY: generate generated-check tls-compat-check openapi-generate openapi-check mcp-schema-fragments-generate mcp-schema-fragments-check snowball-generate snowball-check sql-grammar-generate sql-grammar-check cabi-header-generate cabi-header-check license-headers license-check tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-check-lsm tla-trace-raft tla-trace-txn
 
-generate: openapi-generate snowball-generate cabi-header-generate ## Regenerate checked-in generated sources.
+generate: openapi-generate snowball-generate sql-grammar-generate cabi-header-generate ## Regenerate checked-in generated sources.
 
-generated-check: tls-compat-check openapi-check snowball-check cabi-header-check ## Check all checked-in generated sources are current.
+generated-check: tls-compat-check openapi-check snowball-check sql-grammar-check cabi-header-check ## Check all checked-in generated sources are current.
 
 tls-compat-check: ## Verify the checked-in Zig 0.16 TLS compatibility patch has not drifted.
 	@sh lib/httpx/src/tls/check_client_compat.sh
 
-openapi-generate:
+openapi-generate: mcp-schema-fragments-generate
 	$(SCRIPTS_PY) ../scripts/join_public_openapi.py openapi.yaml
 	$(OPENAPI_ZIG_BUILD) regen-openapi
 
-openapi-check:
+openapi-check: mcp-schema-fragments-check
 	$(SCRIPTS_PY) ../scripts/join_public_openapi.py --compare openapi.yaml
 	$(OPENAPI_ZIG_BUILD) regen-openapi
-	test -z "$$(git status --porcelain -- ../openapi.yaml pkg/antfly/src/openapi/generated pkg/inference/src/api/generated)"
+	test -z "$$(git status --porcelain -- ../openapi.yaml pkg/antfly/src/api/generated/mcp_query_hierarchy_schema.json pkg/antfly/src/api/generated/mcp_query_input_schema.json pkg/antfly/src/openapi/generated pkg/inference/src/api/generated)"
+
+mcp-schema-fragments-generate:
+	$(SCRIPTS_PY) ../scripts/generate_mcp_schema_fragments.py
+
+mcp-schema-fragments-check:
+	cd .. && $(UV) run --project scripts --locked python -m unittest scripts.test_generate_mcp_schema_fragments
+	$(SCRIPTS_PY) ../scripts/generate_mcp_schema_fragments.py --check
 
 snowball-generate:
 	$(ZIG) build regen-snowball
 
 snowball-check:
 	$(ZIG) build check-snowball
+
+sql-grammar-generate:
+	$(ZIG) build regen-sql-grammar
+
+sql-grammar-check:
+	$(ZIG) build sql-grammar-generated-check
 
 cabi-header-generate:
 	$(SCRIPTS_PY) ../scripts/packaging/sync_cabi_header.py
@@ -113,7 +126,7 @@ tla-check-split: tla-tools
 	  -workers auto -deadlock
 
 tla-check-snap: tla-tools
-	@echo "==> Model checking snapshot transfer spec (safety only, ~90s)..."
+	@echo "==> Model checking snapshot transfer spec (safety only, symmetry reduced)..."
 	source ../scripts/tla-tools.sh && \
 	"$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
 	  -config specs/tla/AntflySnapshotTransfer-safety.cfg specs/tla/SnapshotTransferMC.tla \

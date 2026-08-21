@@ -73,6 +73,12 @@ class ModelSpec:
         return self.repo
 
     @property
+    def listing_name(self) -> str:
+        if self.variant == "auto":
+            return self.repo
+        return f"{self.repo}:{self.variant}"
+
+    @property
     def pull_ref(self) -> str:
         if self.variant == "auto":
             return f"hf:{self.repo}"
@@ -284,7 +290,6 @@ DEFAULT_MODEL_BY_PATH = {
     "/ai/v1/rerank": ("mixedbread-ai/mxbai-rerank-base-v1", "rerankers"),
     "/ai/v1/generate": (DEFAULT_GENERATOR_MODEL, "generators"),
     "/ai/v1/chat/completions": (DEFAULT_GENERATOR_MODEL, "generators"),
-    "/ai/v1/classify": ("cross-encoder/nli-distilroberta-base", "classifiers"),
     "/ai/v1/extract": (DEFAULT_EXTRACTOR_MODEL, "extractors"),
     "/ai/v1/read": ("antflydb/florence-2-base", "readers"),
     "/ai/v1/transcribe": ("openai/whisper-tiny", "transcribers"),
@@ -313,6 +318,7 @@ LISTING_BOOTSTRAP = {
 
 GENERATOR_ENV_VARS = (
     "ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL",
+    "ANTFLY_INFERENCE_DRAFT_MODEL",
     "ANTFLY_INFERENCE_TOOL_MODEL",
     "ANTFLY_INFERENCE_MULTIMODAL_GENERATOR_MODEL",
 )
@@ -698,19 +704,62 @@ def ensure_model_by_name(name: str, task_hint: str | None = None) -> Path | None
     return ensure_model(spec)
 
 
+def listed_model_name(
+    available_models: set[str], request_name: str
+) -> str | None:
+    """Resolve a bare request name to the exact identifier advertised by /models."""
+
+    exact = next(
+        (name for name in available_models if name.casefold() == request_name.casefold()),
+        None,
+    )
+    if exact is not None:
+        return exact
+
+    spec = spec_for_name(request_name)
+    if spec is not None:
+        preferred = next(
+            (
+                name
+                for name in available_models
+                if name.casefold() == spec.listing_name.casefold()
+            ),
+            None,
+        )
+        if preferred is not None:
+            return preferred
+
+    prefix = f"{request_name}:".casefold()
+    variants = sorted(
+        name for name in available_models if name.casefold().startswith(prefix)
+    )
+    return variants[0] if variants else None
+
+
+def _listed_name_for_model_path(
+    root: Path, model_path: Path, available_models: set[str]
+) -> str | None:
+    relative = model_path.relative_to(root)
+    parts = list(relative.parts)
+    parts[-1] = parts[-1].split("--antfly-", 1)[0]
+    return listed_model_name(available_models, PurePosixPath(*parts).as_posix())
+
+
 def default_generator_model_name(
     available_generators: set[str] | None = None,
 ) -> str | None:
     override = os.environ.get("ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL")
     if override:
+        if available_generators is not None:
+            return listed_model_name(available_generators, override) or override
         return override
 
     if available_generators is not None:
         if not available_generators:
             return None
         for candidate in (DEFAULT_GENERATOR_MODEL, DEFAULT_TOOL_GENERATOR_MODEL):
-            if candidate in available_generators:
-                return candidate
+            if listed := listed_model_name(available_generators, candidate):
+                return listed
         return sorted(available_generators)[0]
 
     return DEFAULT_GENERATOR_MODEL
@@ -749,6 +798,8 @@ def find_tool_model_name(available_generators: set[str] | None = None) -> str | 
 
     override = os.environ.get("ANTFLY_INFERENCE_TOOL_MODEL")
     if override:
+        if available_generators is not None:
+            return listed_model_name(available_generators, override) or override
         return override
 
     seen: set[Path] = set()
@@ -766,14 +817,15 @@ def find_tool_model_name(available_generators: set[str] | None = None) -> str | 
                 seen.add(model_path)
                 if detect_tool_call_format(model_path) is None:
                     continue
-                model_name = model_path.relative_to(root).as_posix()
-                if available_generators is None or model_name in available_generators:
+                if available_generators is None:
+                    return model_path.relative_to(root).as_posix()
+                if model_name := _listed_name_for_model_path(
+                    root, model_path, available_generators
+                ):
                     return model_name
 
     if available_generators is not None:
-        if DEFAULT_TOOL_GENERATOR_MODEL in available_generators:
-            return DEFAULT_TOOL_GENERATOR_MODEL
-        return None
+        return listed_model_name(available_generators, DEFAULT_TOOL_GENERATOR_MODEL)
 
     return DEFAULT_TOOL_GENERATOR_MODEL
 
@@ -823,6 +875,8 @@ def find_multimodal_generator_model_name(
 
     override = os.environ.get("ANTFLY_INFERENCE_MULTIMODAL_GENERATOR_MODEL")
     if override:
+        if available_generators is not None:
+            return listed_model_name(available_generators, override) or override
         return override
 
     seen: set[Path] = set()
@@ -837,17 +891,19 @@ def find_multimodal_generator_model_name(
             if not detect_multimodal_generator(model_path):
                 continue
 
-            model_name = model_path.relative_to(root).as_posix()
-
-            if available_generators is None or model_name in available_generators:
+            if available_generators is None:
+                return model_path.relative_to(root).as_posix()
+            if model_name := _listed_name_for_model_path(
+                root, model_path, available_generators
+            ):
                 return model_name
 
     if available_generators is not None:
         # The curated fallback is capability-reviewed and remains usable when
         # a GGUF package does not carry Hugging Face processor metadata.
-        if DEFAULT_MULTIMODAL_GENERATOR_MODEL in available_generators:
-            return DEFAULT_MULTIMODAL_GENERATOR_MODEL
-        return None
+        return listed_model_name(
+            available_generators, DEFAULT_MULTIMODAL_GENERATOR_MODEL
+        )
 
     return DEFAULT_MULTIMODAL_GENERATOR_MODEL
 

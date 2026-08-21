@@ -26,6 +26,10 @@ Usage:
 
     # Or start the local unified stateful entrypoint automatically:
     ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/antfly pytest e2e/antfly/test_schema_migration.py
+
+Modules marked ``reuse_antfly_process`` share one local process and clean their
+tables after each test. Set ANTFLY_E2E_DISABLE_PROCESS_REUSE=1 to compare or
+debug those modules with the original one-process-per-test isolation.
 """
 
 from __future__ import annotations
@@ -41,13 +45,16 @@ import subprocess
 import tempfile
 import threading
 import time
+from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 from typing import Any, Callable
 
 import pytest
 import requests
+
+from port_reservations import LoopbackPortReservations, find_free_port
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ANTFLY_BIN = REPO_ROOT / "zig-out" / "bin" / "antfly"
@@ -139,12 +146,6 @@ def inference_public_api_url(base_url: str) -> str:
     return with_api_root(base_url, INFERENCE_PUBLIC_API_ROOT)
 
 
-def find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
 def wait_for_server(
     url: str,
     timeout: float = float(os.environ.get("ANTFLY_E2E_SERVER_START_TIMEOUT_S", "30.0")),
@@ -206,6 +207,56 @@ def _start_stateful_server_with_retry(binary: str, port: int) -> PublicAntflySer
             time.sleep(0.5)
     assert last_error is not None
     raise last_error
+
+
+def _uses_reusable_antfly_process(request: pytest.FixtureRequest) -> bool:
+    disabled = os.environ.get("ANTFLY_E2E_DISABLE_PROCESS_REUSE", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    force_fresh = request.node.get_closest_marker("fresh_antfly_process") is not None
+    return (
+        not disabled
+        and not force_fresh
+        and request.node.get_closest_marker("reuse_antfly_process") is not None
+    )
+
+
+class ReusableAntflyRuntime:
+    """A module-owned server shared by explicitly opted-in API tests."""
+
+    def __init__(
+        self,
+        server: PublicAntflyServer | StandaloneAntflyServer | StatefulAntflyServer,
+        *,
+        default_api_root: str,
+    ):
+        self.server = server
+        self.default_api_root = default_api_root
+        self.test_failed = False
+
+
+def _cleanup_created_tables(api: Any, table_names: set[str]) -> list[str]:
+    """Remove resources owned by one test and return any cleanup diagnostics."""
+
+    cleanup_errors: list[str] = []
+    for table_name in reversed(sorted(table_names)):
+        try:
+            response = api.s.delete(f"{api.url}/tables/{quote(table_name, safe='')}", timeout=30)
+            if response.status_code not in (200, 202, 204, 404):
+                cleanup_errors.append(f"{table_name}: HTTP {response.status_code} {response.text[:500]}")
+        except requests.RequestException as err:
+            cleanup_errors.append(f"{table_name}: {err}")
+    return cleanup_errors
+
+
+def _created_table_from_path(path: str) -> str | None:
+    parts = path.partition("?")[0].strip("/").split("/")
+    if len(parts) != 2 or parts[0] != "tables" or not parts[1]:
+        return None
+    return unquote(parts[1])
 
 
 def ready_index_status(index_info: dict[str, Any], *, require_query_fresh: bool = False) -> dict[str, Any] | None:
@@ -425,24 +476,44 @@ def _write_remote_content_e2e_config(root: Path) -> Path:
 
 class AntflyServer:
     def __init__(self, binary: str, host: str, port: int):
-        self.url = f"http://{host}:{port}"
-        self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-e2e-")
-        root = Path(self.tempdir.name)
-        self.log_path = root / "server.log"
-        self.log_file = self.log_path.open("w")
-        env = os.environ.copy()
-        env.update(
-            {
-                "ANTFLY_SERVERLESS_ARTIFACTS_URI": f"file://{root / 'artifacts'}",
-                "ANTFLY_SERVERLESS_MANIFESTS_URI": f"file://{root / 'manifests'}",
-                "ANTFLY_SERVERLESS_WAL_URI": f"file://{root / 'wal'}",
-                "ANTFLY_SERVERLESS_PROGRESS_URI": f"file://{root / 'progress'}",
-                "ANTFLY_SERVERLESS_CATALOG_URI": f"file://{root / 'catalog'}",
-                "ANTFLY_SERVERLESS_QUERY_CACHE_DIR": str(root / "cache"),
-            }
-        )
-        command = _serverless_combined_command(binary, host=host, port=port, root=root)
-        self.proc = subprocess.Popen(command, stdout=self.log_file, stderr=subprocess.STDOUT, env=env, cwd=REPO_ROOT)
+        with ExitStack() as setup:
+            self.port_reservations = LoopbackPortReservations(host)
+            setup.callback(self.port_reservations.close)
+            port = self.port_reservations.reserve_requested(port)
+            self.url = f"http://{host}:{port}"
+            self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-e2e-")
+            setup.callback(self.tempdir.cleanup)
+            root = Path(self.tempdir.name)
+            self.log_path = root / "server.log"
+            self.log_file = setup.enter_context(self.log_path.open("w"))
+            env = os.environ.copy()
+            env.update(
+                {
+                    "ANTFLY_SERVERLESS_ARTIFACTS_URI": f"file://{root / 'artifacts'}",
+                    "ANTFLY_SERVERLESS_MANIFESTS_URI": f"file://{root / 'manifests'}",
+                    "ANTFLY_SERVERLESS_WAL_URI": f"file://{root / 'wal'}",
+                    "ANTFLY_SERVERLESS_PROGRESS_URI": f"file://{root / 'progress'}",
+                    "ANTFLY_SERVERLESS_CATALOG_URI": f"file://{root / 'catalog'}",
+                    "ANTFLY_SERVERLESS_QUERY_CACHE_DIR": str(root / "cache"),
+                }
+            )
+            command = _serverless_combined_command(binary, host=host, port=port, root=root)
+            self.proc: subprocess.Popen[str] | None = None
+            setup.pop_all()
+        try:
+            self.proc = self.port_reservations.handoff_to(
+                (port,),
+                lambda: subprocess.Popen(
+                    command,
+                    stdout=self.log_file,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    cwd=REPO_ROOT,
+                ),
+            )
+        except BaseException:
+            self.stop()
+            raise
         if not wait_for_server(self.url):
             self.stop()
             out = _read_log_tail(self.log_path)
@@ -453,6 +524,7 @@ class AntflyServer:
         return _read_log_tail(self.log_path)
 
     def stop(self) -> None:
+        self.port_reservations.close()
         if self.proc and self.proc.poll() is None:
             self.proc.send_signal(signal.SIGTERM)
             try:
@@ -469,16 +541,35 @@ class PublicAntflyServer:
     def __init__(self, binary: str, host: str, port: int):
         self.binary = binary
         self.host = host
-        self.port = port
-        self.url = f"http://{host}:{port}"
-        self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-public-e2e-")
-        root = Path(self.tempdir.name)
-        self.root = root
-        self.replica_root = root / "replicas"
-        self.log_path = root / "server.log"
-        self.log_file = self.log_path.open("w")
-        command = _legacy_stateful_command(binary, host=host, port=port, root=root)
-        self.proc = subprocess.Popen(command, stdout=self.log_file, stderr=subprocess.STDOUT, cwd=root)
+        with ExitStack() as setup:
+            self.port_reservations = LoopbackPortReservations(host)
+            setup.callback(self.port_reservations.close)
+            port = self.port_reservations.reserve_requested(port)
+            self.port = port
+            self.url = f"http://{host}:{port}"
+            self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-public-e2e-")
+            setup.callback(self.tempdir.cleanup)
+            root = Path(self.tempdir.name)
+            self.root = root
+            self.replica_root = root / "replicas"
+            self.log_path = root / "server.log"
+            self.log_file = setup.enter_context(self.log_path.open("w"))
+            command = _legacy_stateful_command(binary, host=host, port=port, root=root)
+            self.proc: subprocess.Popen[str] | None = None
+            setup.pop_all()
+        try:
+            self.proc = self.port_reservations.handoff_to(
+                (port,),
+                lambda: subprocess.Popen(
+                    command,
+                    stdout=self.log_file,
+                    stderr=subprocess.STDOUT,
+                    cwd=root,
+                ),
+            )
+        except BaseException:
+            self.stop()
+            raise
         if not wait_for_server(self.url):
             self.stop()
             out = _read_log_tail(self.log_path)
@@ -488,7 +579,7 @@ class PublicAntflyServer:
         self.log_file.flush()
         return _read_log_tail(self.log_path)
 
-    def pause(self) -> None:
+    def _stop_process(self) -> None:
         if self.proc and self.proc.poll() is None:
             self.proc.send_signal(signal.SIGTERM)
             try:
@@ -498,16 +589,29 @@ class PublicAntflyServer:
                 self.proc.wait()
         self.proc = None
 
+    def pause(self) -> None:
+        self._stop_process()
+        self.port_reservations.ensure_reserved(self.port)
+
     def resume(self) -> None:
         command = _legacy_stateful_command(self.binary, host=self.host, port=self.port, root=self.root)
-        self.proc = subprocess.Popen(command, stdout=self.log_file, stderr=subprocess.STDOUT, cwd=self.root)
+        self.proc = self.port_reservations.handoff_to(
+            (self.port,),
+            lambda: subprocess.Popen(
+                command,
+                stdout=self.log_file,
+                stderr=subprocess.STDOUT,
+                cwd=self.root,
+            ),
+        )
         if not wait_for_server(self.url):
             out = _read_log_tail(self.log_path)
             self.stop()
             raise RuntimeError(f"Public API server failed to resume at {self.url}\n{out}")
 
     def stop(self, *, test_failed: bool = False) -> None:
-        self.pause()
+        self._stop_process()
+        self.port_reservations.close()
         self.log_file.close()
         if not maybe_preserve_tempdir(self.tempdir, failed=test_failed):
             self.tempdir.cleanup()
@@ -578,6 +682,8 @@ def _standalone_stateful_command(binary: str, *, host: str, port: int, root: Pat
         str(root),
         "--control-tick-ms",
         "5",
+        "--health",
+        "false",
         "--replica-root-dir",
         str(root / "replicas"),
         "--replica-catalog-path",
@@ -599,6 +705,8 @@ def _metadata_command(binary: str, *, host: str, raft_port: int, admin_port: int
         host,
         "--api-port",
         str(admin_port),
+        "--health",
+        "false",
         "--data-dir",
         str(root),
         "--raft-tick-ms",
@@ -635,6 +743,8 @@ def _data_command(
         host,
         "--raft-port",
         str(raft_port),
+        "--health",
+        "false",
         "--metadata-api",
         metadata_admin_base_uri,
         "--node-id",
@@ -661,29 +771,42 @@ class StatefulAntflyServer:
     def __init__(self, binary: str, host: str, port: int, *, auth_enabled: bool = False):
         self.binary = binary
         self.host = host
-        self.port = port
         self.auth_enabled = auth_enabled
-        self.url = f"http://{host}:{port}"
-        self.api_url = antfly_public_api_url(self.url, binary=binary)
         self.metadata_admin_url: str | None = None
         self.metadata_proc: subprocess.Popen[str] | None = None
         self.data_proc: subprocess.Popen[str] | None = None
-        self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-stateful-e2e-")
-        self.root = Path(self.tempdir.name)
-        self.replica_root = self.root / "data-replicas"
-        self.metadata_log_path = self.root / "metadata.log"
-        self.data_log_path = self.root / "data.log"
-        self.metadata_log_file = self.metadata_log_path.open("w")
-        self.data_log_file = self.data_log_path.open("w")
-        metadata_port = find_free_port()
-        metadata_admin_port = find_free_port()
-        self.metadata_port = metadata_port
-        self.metadata_admin_port = metadata_admin_port
-        self.data_raft_port = find_free_port()
-        metadata_admin_url = f"http://{host}:{metadata_admin_port}"
-        self.metadata_admin_url = metadata_admin_url
+        with ExitStack() as setup:
+            self.port_reservations = LoopbackPortReservations(host)
+            setup.callback(self.port_reservations.close)
+            port = self.port_reservations.reserve_requested(port)
+            self.port = port
+            self.url = f"http://{host}:{port}"
+            self.api_url = antfly_public_api_url(self.url, binary=binary)
+            self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-stateful-e2e-")
+            setup.callback(self.tempdir.cleanup)
+            self.root = Path(self.tempdir.name)
+            self.replica_root = self.root / "data-replicas"
+            self.metadata_log_path = self.root / "metadata.log"
+            self.data_log_path = self.root / "data.log"
+            self.metadata_log_file = setup.enter_context(self.metadata_log_path.open("w"))
+            self.data_log_file = setup.enter_context(self.data_log_path.open("w"))
+            (
+                self.metadata_port,
+                self.metadata_admin_port,
+                self.data_raft_port,
+            ) = self.port_reservations.reserve_many(3)
+            self.metadata_admin_url = f"http://{host}:{self.metadata_admin_port}"
+            setup.pop_all()
 
-        self._start_processes(truncate_logs=False)
+        try:
+            self._start_processes(truncate_logs=False)
+        except BaseException:
+            # Startup failures inside wait_for_server already call stop(). A
+            # direct Popen failure does not, so release every reservation and
+            # close the fixture's files before propagating the original error.
+            if not self.metadata_log_file.closed or not self.data_log_file.closed:
+                self.stop()
+            raise
 
     def _start_processes(self, *, truncate_logs: bool) -> None:
         if truncate_logs:
@@ -696,11 +819,14 @@ class StatefulAntflyServer:
             admin_port=self.metadata_admin_port,
             root=self.root,
         )
-        self.metadata_proc = subprocess.Popen(
-            metadata_command,
-            stdout=self.metadata_log_file,
-            stderr=subprocess.STDOUT,
-            cwd=self.root,
+        self.metadata_proc = self.port_reservations.handoff_to(
+            (self.metadata_port, self.metadata_admin_port),
+            lambda: subprocess.Popen(
+                metadata_command,
+                stdout=self.metadata_log_file,
+                stderr=subprocess.STDOUT,
+                cwd=self.root,
+            ),
         )
         if not wait_for_server(
             self.metadata_admin_url,
@@ -721,11 +847,14 @@ class StatefulAntflyServer:
             root=self.root,
             auth_enabled=self.auth_enabled,
         )
-        self.data_proc = subprocess.Popen(
-            data_command,
-            stdout=self.data_log_file,
-            stderr=subprocess.STDOUT,
-            cwd=self.root,
+        self.data_proc = self.port_reservations.handoff_to(
+            (self.port, self.data_raft_port),
+            lambda: subprocess.Popen(
+                data_command,
+                stdout=self.data_log_file,
+                stderr=subprocess.STDOUT,
+                cwd=self.root,
+            ),
         )
         if not wait_for_server(
             self.api_url,
@@ -769,7 +898,7 @@ class StatefulAntflyServer:
         self.metadata_proc = None
 
     def restart(self) -> None:
-        self._stop_processes()
+        self.pause()
         self.data_log_file.close()
         self.metadata_log_file.close()
         self.metadata_log_file = self.metadata_log_path.open("a")
@@ -778,11 +907,18 @@ class StatefulAntflyServer:
 
     def pause(self) -> None:
         self._stop_processes()
+        self.port_reservations.ensure_reserved(
+            self.metadata_port,
+            self.metadata_admin_port,
+            self.port,
+            self.data_raft_port,
+        )
 
     def resume(self) -> None:
         self._start_processes(truncate_logs=False)
 
     def stop(self, *, test_failed: bool = False) -> None:
+        self.port_reservations.close()
         self._stop_processes()
         self.data_log_file.close()
         self.metadata_log_file.close()
@@ -794,22 +930,41 @@ class StandaloneAntflyServer:
     def __init__(self, binary: str, host: str, port: int):
         self.binary = binary
         self.host = host
-        self.port = port
-        self.url = f"http://{host}:{port}"
-        self.api_url = antfly_public_api_url(self.url, binary=binary)
-        self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-standalone-e2e-")
-        self.root = Path(self.tempdir.name)
-        self.replica_root = self.root / "replicas"
-        self.log_path = self.root / "server.log"
-        self.log_file = self.log_path.open("w")
-        self.proc: subprocess.Popen[str] | None = None
-        self._start_process(truncate_logs=False)
+        with ExitStack() as setup:
+            self.port_reservations = LoopbackPortReservations(host)
+            setup.callback(self.port_reservations.close)
+            port = self.port_reservations.reserve_requested(port)
+            self.port = port
+            self.url = f"http://{host}:{port}"
+            self.api_url = antfly_public_api_url(self.url, binary=binary)
+            self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-standalone-e2e-")
+            setup.callback(self.tempdir.cleanup)
+            self.root = Path(self.tempdir.name)
+            self.replica_root = self.root / "replicas"
+            self.log_path = self.root / "server.log"
+            self.log_file = setup.enter_context(self.log_path.open("w"))
+            self.proc: subprocess.Popen[str] | None = None
+            setup.pop_all()
+        try:
+            self._start_process(truncate_logs=False)
+        except BaseException:
+            if not self.log_file.closed:
+                self.stop()
+            raise
 
     def _start_process(self, *, truncate_logs: bool) -> None:
         if truncate_logs:
             self.log_file = self.log_path.open("w")
         command = _standalone_stateful_command(self.binary, host=self.host, port=self.port, root=self.root)
-        self.proc = subprocess.Popen(command, stdout=self.log_file, stderr=subprocess.STDOUT, cwd=self.root)
+        self.proc = self.port_reservations.handoff_to(
+            (self.port,),
+            lambda: subprocess.Popen(
+                command,
+                stdout=self.log_file,
+                stderr=subprocess.STDOUT,
+                cwd=self.root,
+            ),
+        )
         if not wait_for_server(self.api_url):
             self.stop()
             out = _read_log_tail(self.log_path)
@@ -824,6 +979,8 @@ class StandaloneAntflyServer:
             matches = re.findall(r"(?:standalone )?metadata admin api listening on (http://[^\s]+)", logs)
             if matches:
                 return matches[-1].rstrip("/")
+            if "standalone local metadata enabled (raft disabled)" in logs:
+                return ""
             time.sleep(0.1)
         return ""
 
@@ -842,19 +999,21 @@ class StandaloneAntflyServer:
         self.proc = None
 
     def restart(self) -> None:
-        self._stop_process()
+        self.pause()
         self.log_file.close()
         self.log_file = self.log_path.open("a")
         self._start_process(truncate_logs=False)
 
     def pause(self) -> None:
         self._stop_process()
+        self.port_reservations.ensure_reserved(self.port)
 
     def resume(self) -> None:
         self._start_process(truncate_logs=False)
 
     def stop(self, *, test_failed: bool = False) -> None:
         self._stop_process()
+        self.port_reservations.close()
         self.log_file.close()
         if not maybe_preserve_tempdir(self.tempdir, failed=test_failed):
             self.tempdir.cleanup()
@@ -1914,24 +2073,43 @@ def real_clipclap_backup_api(request, clipclap_model_available):
     return request.getfixturevalue("backup_api")
 
 
+@pytest.fixture(scope="module")
+def _reusable_stateful_runtime():
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    if not Path(binary).exists():
+        pytest.skip(f"Public API binary not found: {binary}")
+    server = _start_stateful_server_with_retry(binary, find_free_port())
+    default_api_root = ANTFLY_PUBLIC_API_ROOT if Path(binary).name == "antfly" else ""
+    runtime = ReusableAntflyRuntime(server, default_api_root=default_api_root)
+    yield runtime
+    server.stop(test_failed=runtime.test_failed)
+
+
 @pytest.fixture(scope="function")
 def stateful_api(request: pytest.FixtureRequest):
     base_url = os.environ.get("ANTFLY_STATEFUL_URL")
     server: PublicAntflyServer | StandaloneAntflyServer | StatefulAntflyServer | None = None
+    reusable_runtime: ReusableAntflyRuntime | None = None
     default_root = os.environ.get("ANTFLY_STATEFUL_API_ROOT")
     if not base_url:
-        binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
-        if not Path(binary).exists():
-            pytest.skip(f"Public API binary not found: {binary}")
-        port = find_free_port()
-        server = _start_stateful_server_with_retry(binary, port)
+        if _uses_reusable_antfly_process(request):
+            reusable_runtime = request.getfixturevalue("_reusable_stateful_runtime")
+            server = reusable_runtime.server
+            binary = server.binary
+            if default_root is None:
+                default_root = reusable_runtime.default_api_root
+        else:
+            binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+            if not Path(binary).exists():
+                pytest.skip(f"Public API binary not found: {binary}")
+            server = _start_stateful_server_with_retry(binary, find_free_port())
         base_url = server.url
         if default_root is None and Path(binary).name == "antfly":
             default_root = ANTFLY_PUBLIC_API_ROOT
 
     base = antfly_public_api_url(base_url, root=default_root if default_root is not None else "")
 
-    if not wait_for_server(base, timeout=10):
+    if reusable_runtime is None and not wait_for_server(base, timeout=10):
         pytest.skip(f"Public API at {base} is not reachable")
 
     session = requests.Session()
@@ -1949,6 +2127,7 @@ def stateful_api(request: pytest.FixtureRequest):
             self.url = base_url.rstrip("/")
             self._server = server_ref
             self._request_lock = threading.Lock()
+            self._created_tables: set[str] = set()
 
         def _raise_request_error(self, err: requests.RequestException) -> None:
             raise_request_error_with_logs(err, self._server)
@@ -2063,7 +2242,10 @@ def stateful_api(request: pytest.FixtureRequest):
         def post(self, path: str, payload: dict) -> Any:
             try:
                 with self._request_lock:
-                    return self._check(self.s.post(f"{self.url}{path}", json=payload, timeout=30))
+                    result = self._check(self.s.post(f"{self.url}{path}", json=payload, timeout=30))
+                if table_name := _created_table_from_path(path):
+                    self._created_tables.add(table_name)
+                return result
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
@@ -2103,7 +2285,9 @@ def stateful_api(request: pytest.FixtureRequest):
                     time.sleep(0.1)
                     continue
                 if response.status_code not in (404, 500):
-                    return self._check(response)
+                    created = self._check(response)
+                    self._created_tables.add(table_name)
+                    return created
                 if time.monotonic() >= deadline:
                     return self._check(response)
                 time.sleep(0.1)
@@ -2443,28 +2627,58 @@ def stateful_api(request: pytest.FixtureRequest):
                 return ""
             return self._server.debug_logs().strip()
 
-    yield PublicApi(session, base, server)
+    api = PublicApi(session, base, server)
+    yield api
+    report = getattr(request.node, "rep_call", None)
+    test_failed = bool(report and report.failed)
+    cleanup_errors = _cleanup_created_tables(api, api._created_tables) if reusable_runtime is not None else []
     session.close()
-    if server is not None:
-        report = getattr(request.node, "rep_call", None)
-        server.stop(test_failed=bool(report and report.failed))
+    if reusable_runtime is not None:
+        reusable_runtime.test_failed = reusable_runtime.test_failed or test_failed or bool(cleanup_errors)
+        if cleanup_errors:
+            message = "failed to clean reusable Antfly test tables:\n" + "\n".join(cleanup_errors)
+            if test_failed:
+                print(message)
+            else:
+                raise AssertionError(message)
+    elif server is not None:
+        server.stop(test_failed=test_failed)
 
 
-@pytest.fixture(scope="function")
-def backup_api():
+@pytest.fixture(scope="module")
+def _reusable_backup_runtime():
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     if not Path(binary).exists():
         pytest.skip(f"Public API binary not found: {binary}")
-
-    port = find_free_port()
     if Path(binary).name == "antfly":
-        server = StandaloneAntflyServer(binary, "127.0.0.1", port)
+        server = StandaloneAntflyServer(binary, "127.0.0.1", find_free_port())
     else:
-        server = PublicAntflyServer(binary, "127.0.0.1", port)
+        server = PublicAntflyServer(binary, "127.0.0.1", find_free_port())
+    default_api_root = ANTFLY_PUBLIC_API_ROOT if Path(binary).name == "antfly" else ""
+    runtime = ReusableAntflyRuntime(server, default_api_root=default_api_root)
+    yield runtime
+    server.stop(test_failed=runtime.test_failed)
+
+
+@pytest.fixture(scope="function")
+def backup_api(request: pytest.FixtureRequest):
+    reusable_runtime: ReusableAntflyRuntime | None = None
+    if _uses_reusable_antfly_process(request):
+        reusable_runtime = request.getfixturevalue("_reusable_backup_runtime")
+        server = reusable_runtime.server
+        binary = server.binary
+    else:
+        binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+        if not Path(binary).exists():
+            pytest.skip(f"Public API binary not found: {binary}")
+        if Path(binary).name == "antfly":
+            server = StandaloneAntflyServer(binary, "127.0.0.1", find_free_port())
+        else:
+            server = PublicAntflyServer(binary, "127.0.0.1", find_free_port())
 
     base = antfly_public_api_url(server.url, binary=binary)
 
-    if not wait_for_server(base, timeout=10):
+    if reusable_runtime is None and not wait_for_server(base, timeout=10):
         server.stop()
         pytest.skip(f"Public API at {base} is not reachable")
 
@@ -2483,6 +2697,7 @@ def backup_api():
             self.url = base_url.rstrip("/")
             self._server = server_ref
             self._request_lock = threading.Lock()
+            self._created_tables: set[str] = set()
 
         def _raise_request_error(self, err: requests.RequestException) -> None:
             raise_request_error_with_logs(err, self._server)
@@ -2523,7 +2738,10 @@ def backup_api():
         def post(self, path: str, payload: dict) -> Any:
             try:
                 with self._request_lock:
-                    return self._check(self.s.post(f"{self.url}{path}", json=payload, timeout=30))
+                    result = self._check(self.s.post(f"{self.url}{path}", json=payload, timeout=30))
+                if table_name := _created_table_from_path(path):
+                    self._created_tables.add(table_name)
+                return result
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
@@ -2563,7 +2781,9 @@ def backup_api():
                     time.sleep(0.1)
                     continue
                 if response.status_code not in (404, 500):
-                    return self._check(response)
+                    created = self._check(response)
+                    self._created_tables.add(table_name)
+                    return created
                 if time.monotonic() >= deadline:
                     return self._check(response)
                 time.sleep(0.1)
@@ -2760,9 +2980,22 @@ def backup_api():
             response = self.s.get(f"{self.url}/backups?location={location}&connection={E2E_BACKUP_CONNECTION}", timeout=30)
             return self._check(response)
 
-    yield PublicApi(session, base, server)
+    api = PublicApi(session, base, server)
+    yield api
+    report = getattr(request.node, "rep_call", None)
+    test_failed = bool(report and report.failed)
+    cleanup_errors = _cleanup_created_tables(api, api._created_tables) if reusable_runtime is not None else []
     session.close()
-    server.stop()
+    if reusable_runtime is not None:
+        reusable_runtime.test_failed = reusable_runtime.test_failed or test_failed or bool(cleanup_errors)
+        if cleanup_errors:
+            message = "failed to clean reusable Antfly test tables:\n" + "\n".join(cleanup_errors)
+            if test_failed:
+                print(message)
+            else:
+                raise AssertionError(message)
+    else:
+        server.stop(test_failed=test_failed)
 
 
 @pytest.fixture(scope="function", params=["stateful", "serverless"], ids=["stateful", "serverless"])

@@ -75,6 +75,54 @@ func TestSortProfileUsesClosedPublicDiagnosticShape(t *testing.T) {
 	}
 }
 
+func TestFieldMappingIndexPreservesAbsentAndFalse(t *testing.T) {
+	falseValue := false
+	tests := []struct {
+		name  string
+		value any
+	}{
+		{name: "document field", value: DocumentFieldMapping{Index: &falseValue}},
+		{name: "document subfield", value: DocumentSubfieldMapping{Index: &falseValue}},
+		{name: "dynamic template", value: TemplateFieldMapping{Index: &falseValue}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name+" explicit false", func(t *testing.T) {
+			encoded, err := json.Marshal(tt.value)
+			if err != nil {
+				t.Fatalf("marshal mapping: %v", err)
+			}
+
+			var payload map[string]any
+			if err := json.Unmarshal(encoded, &payload); err != nil {
+				t.Fatalf("unmarshal mapping: %v", err)
+			}
+			if index, found := payload["index"]; !found || index != false {
+				t.Fatalf("index = %v, present = %v, want explicit false; payload: %s", index, found, encoded)
+			}
+		})
+	}
+
+	absentMappings := []any{
+		DocumentFieldMapping{},
+		DocumentSubfieldMapping{},
+		TemplateFieldMapping{},
+	}
+	for _, mapping := range absentMappings {
+		encoded, err := json.Marshal(mapping)
+		if err != nil {
+			t.Fatalf("marshal mapping with absent index: %v", err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(encoded, &payload); err != nil {
+			t.Fatalf("unmarshal mapping with absent index: %v", err)
+		}
+		if _, found := payload["index"]; found {
+			t.Fatalf("absent index was serialized; payload: %s", encoded)
+		}
+	}
+}
+
 func TestDerivedCoveragePendingDistinguishesUnknownFromZero(t *testing.T) {
 	var unknown oapi.DerivedCoverageStatus
 	if err := json.Unmarshal([]byte(`{"pending":null}`), &unknown); err != nil {

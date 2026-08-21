@@ -124,8 +124,7 @@ pub const RebuildState = struct {
                         // A legacy cursor or a cursor from a same-name prior
                         // generation is never a valid resume point. Publish an
                         // owned restart marker before exposing the empty key.
-                        try self.publishOwnedRestartWithIo(io);
-                        try self.removeLegacyAfterMigrationWithIo(io);
+                        try self.restartWithIo(io);
                         break :blk try alloc.dupe(u8, "");
                     }
                 }
@@ -136,10 +135,7 @@ pub const RebuildState = struct {
                 // Pre-v1 cursors have no integrity envelope. Their position
                 // cannot be trusted after an upgrade, so preserve the active
                 // marker while forcing a safe rebuild from the beginning.
-                try self.updateWithIo(io, "");
-                if (self.owner_generation != null) {
-                    try self.removeLegacyAfterMigrationWithIo(io);
-                }
+                try self.restartWithIo(io);
                 break :blk try alloc.dupe(u8, "");
             },
             .corrupt => error.InvalidRebuildState,
@@ -215,6 +211,18 @@ pub const RebuildState = struct {
         try self.publishEncodedWithIo(alloc, io, encoded);
     }
 
+    /// Publishes a safe cursor at the beginning of the current owner
+    /// generation and retires any pre-generation cursor. Callers use this in
+    /// mutation-owning maintenance, never in readiness probes.
+    pub fn restartWithIo(self: RebuildState, io: std.Io) !void {
+        if (self.owner_generation != null) {
+            try self.publishOwnedRestartWithIo(io);
+            try self.removeLegacyAfterMigrationWithIo(io);
+            return;
+        }
+        try self.updateWithIo(io, "");
+    }
+
     pub fn clear(self: RebuildState) !void {
         if (builtin.os.tag == .freestanding) {
             if (self.storage == null) return;
@@ -245,6 +253,13 @@ pub const RebuildState = struct {
             else => return err,
         };
         try syncPublishedParent(io, path);
+    }
+
+    /// Clears both the current generation cursor and a possible pre-generation
+    /// cursor. This is idempotent and belongs to execution/cleanup paths.
+    pub fn clearAllWithIo(self: RebuildState, io: std.Io) !void {
+        try self.clearWithIo(io);
+        try self.removeLegacyAfterMigrationWithIo(io);
     }
 
     pub fn estimateProgress(self: RebuildState, range_start: []const u8, range_end: []const u8, alloc: Allocator) !?f64 {

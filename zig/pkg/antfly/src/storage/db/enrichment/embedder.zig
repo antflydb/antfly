@@ -49,6 +49,11 @@ pub const DenseEmbedder = struct {
     dense_embed_parts_fn: ?DenseEmbedPartsFn = null,
     media_part_limit_fn: ?DenseMediaPartLimitFn = null,
     deinit_fn: ?DenseEmbedDeinitFn = null,
+    /// The implementation guarantees that each provider invocation has its
+    /// own finite deadline. Foreground post-commit replay rejects legacy
+    /// implementations that cannot make this guarantee; background replay
+    /// remains source-compatible.
+    foreground_bounded: bool = false,
 
     pub fn embedDense(self: DenseEmbedder, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32) ![]f32 {
         var sanitized = try utf8_text.sanitizeWithoutSourceMapAlloc(alloc, text, "dense embedder");
@@ -103,6 +108,7 @@ pub const SparseEmbedder = struct {
     sparse_embed_fn: SparseEmbedFn,
     sparse_embed_batch_fn: ?SparseEmbedBatchFn = null,
     deinit_fn: ?SparseEmbedDeinitFn = null,
+    foreground_bounded: bool = false,
 
     pub fn embedSparse(self: SparseEmbedder, alloc: Allocator, embedding_name: []const u8, text: []const u8) !SparseEmbedding {
         var sanitized = try utf8_text.sanitizeWithoutSourceMapAlloc(alloc, text, "sparse embedder");

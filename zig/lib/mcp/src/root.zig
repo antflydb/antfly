@@ -14,6 +14,12 @@
 
 const std = @import("std");
 
+pub const testing = @import("testing.zig");
+
+test {
+    _ = testing;
+}
+
 pub const protocol_version = "2025-06-18";
 pub const session_id_header = "Mcp-Session-Id";
 pub const protocol_version_header = "Mcp-Protocol-Version";
@@ -29,6 +35,16 @@ pub const CallToolResult = struct {
     text: []const u8 = "",
     structured: ?std.json.Value = null,
 };
+
+/// Build a compatibility-safe JSON tool result. MCP clients are allowed to
+/// consume either TextContent or structuredContent, so useful JSON must be
+/// complete in both representations.
+pub fn jsonToolResultAlloc(alloc: std.mem.Allocator, value: std.json.Value) !CallToolResult {
+    return .{
+        .text = try stringifyValue(alloc, value),
+        .structured = value,
+    };
+}
 
 pub const ToolHandler = struct {
     ptr: *anyopaque,
@@ -275,6 +291,10 @@ pub const Server = struct {
     implementation: Implementation = .{},
     tools: std.ArrayListUnmanaged(Tool) = .empty,
     session_store: ?SessionStore = null,
+    /// Maximum serialized `tools/call` result size. Zero disables the guard.
+    /// This includes both TextContent and structuredContent when both are present.
+    max_tool_result_bytes: usize = 0,
+    tool_result_too_large_text: []const u8 = "Tool result exceeds the configured MCP response budget. Reduce the result limit or requested fields and retry.",
 
     pub fn deinit(self: *Server, alloc: std.mem.Allocator) void {
         self.tools.deinit(alloc);
@@ -439,6 +459,7 @@ pub const Server = struct {
             const result = self.toolsCallResult(alloc, params) catch |err| switch (err) {
                 error.UnknownTool => return try errorResponse(alloc, id, -32602, "unknown tool"),
                 error.InvalidParams => return try errorResponse(alloc, id, -32602, "invalid params"),
+                error.ToolResultBudgetTooSmall => return try errorResponse(alloc, id, -32603, "configured tool result budget is too small"),
                 else => return err,
             };
             return try successResponse(alloc, id, result);
@@ -502,23 +523,42 @@ pub const Server = struct {
         for (self.tools.items) |tool| {
             if (!std.mem.eql(u8, tool.name, name)) continue;
             const called = try tool.handler.call(alloc, args);
-            var text_part = std.json.ObjectMap.empty;
-            try text_part.put(alloc, "type", .{ .string = "text" });
-            try text_part.put(alloc, "text", .{ .string = called.text });
-            var content = std.json.Array.init(alloc);
-            try content.append(.{ .object = text_part });
-
-            var result = std.json.ObjectMap.empty;
-            try result.put(alloc, "content", .{ .array = content });
-            try result.put(alloc, "isError", .{ .bool = called.is_error });
-            if (called.structured) |structured| {
-                try result.put(alloc, "structuredContent", structured);
+            const result = try callToolResultValue(alloc, called);
+            if (self.max_tool_result_bytes > 0) {
+                const encoded = try stringifyValue(alloc, result);
+                if (encoded.len > self.max_tool_result_bytes) {
+                    const replacement = try callToolResultValue(alloc, .{
+                        .is_error = true,
+                        .text = self.tool_result_too_large_text,
+                    });
+                    const replacement_encoded = try stringifyValue(alloc, replacement);
+                    if (replacement_encoded.len > self.max_tool_result_bytes) {
+                        return error.ToolResultBudgetTooSmall;
+                    }
+                    return replacement;
+                }
             }
-            return .{ .object = result };
+            return result;
         }
         return error.UnknownTool;
     }
 };
+
+fn callToolResultValue(alloc: std.mem.Allocator, called: CallToolResult) !std.json.Value {
+    var text_part = std.json.ObjectMap.empty;
+    try text_part.put(alloc, "type", .{ .string = "text" });
+    try text_part.put(alloc, "text", .{ .string = called.text });
+    var content = std.json.Array.init(alloc);
+    try content.append(.{ .object = text_part });
+
+    var result = std.json.ObjectMap.empty;
+    try result.put(alloc, "content", .{ .array = content });
+    try result.put(alloc, "isError", .{ .bool = called.is_error });
+    if (called.structured) |structured| {
+        try result.put(alloc, "structuredContent", structured);
+    }
+    return .{ .object = result };
+}
 
 fn emptyObject() std.json.Value {
     return .{ .object = .empty };
@@ -588,22 +628,123 @@ test "mcp handles initialize and tool call" {
     ;
     const init_resp = (try server.handleJsonRpc(alloc, init_body)).?;
     defer alloc.free(init_resp);
-    try std.testing.expect(std.mem.indexOf(u8, init_resp, "\"protocolVersion\":\"2025-06-18\"") != null);
+    try testing.expectResultSubset(alloc, init_resp, "{\"protocolVersion\":\"2025-06-18\"}");
 
     const list_body =
         \\{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
     ;
     const list_resp = (try server.handleJsonRpc(alloc, list_body)).?;
     defer alloc.free(list_resp);
-    try std.testing.expect(std.mem.indexOf(u8, list_resp, "\"name\":\"echo\"") != null);
+    var parsed_tools = try testing.parseToolsListResponse(alloc, list_resp);
+    defer parsed_tools.deinit();
+    const echo_tool = testing.findTool(parsed_tools.value.result.tools, "echo") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("Echo text", echo_tool.description);
+    try std.testing.expectEqualStrings("object", echo_tool.inputSchema.object.get("type").?.string);
 
     const call_body =
         \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"text":"hello"}}}
     ;
     const call_resp = (try server.handleJsonRpc(alloc, call_body)).?;
     defer alloc.free(call_resp);
-    try std.testing.expect(std.mem.indexOf(u8, call_resp, "\"text\":\"hello\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, call_resp, "\"structuredContent\":{\"ok\":true}") != null);
+    var parsed_call = try testing.parseToolCallResponse(alloc, call_resp);
+    defer parsed_call.deinit();
+    try std.testing.expectEqualStrings("hello", testing.findTextContent(parsed_call.value.result.content).?);
+    try std.testing.expect(parsed_call.value.result.structuredContent.? == .object);
+    try std.testing.expectEqual(true, parsed_call.value.result.structuredContent.?.object.get("ok").?.bool);
+}
+
+test "mcp JSON tool results carry the complete value in text and structured content" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const value = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena,
+        "{\"hits\":[{\"_source\":{\"text\":\"hello\"}}]}",
+        .{},
+    );
+    const result = try jsonToolResultAlloc(arena, value);
+    try std.testing.expect(result.structured != null);
+
+    var parsed_text = try std.json.parseFromSlice(std.json.Value, alloc, result.text, .{});
+    defer parsed_text.deinit();
+    try std.testing.expectEqualStrings(
+        "hello",
+        parsed_text.value.object.get("hits").?.array.items[0].object.get("_source").?.object.get("text").?.string,
+    );
+}
+
+test "mcp replaces oversized tool results with a text error" {
+    const alloc = std.testing.allocator;
+
+    const Large = struct {
+        fn call(_: *anyopaque, a: std.mem.Allocator, _: std.json.Value) !CallToolResult {
+            return .{
+                .text = "a payload that is duplicated for compatibility",
+                .structured = try std.json.parseFromSliceLeaky(
+                    std.json.Value,
+                    a,
+                    "{\"hits\":[{\"_source\":{\"text\":\"a payload that is duplicated for compatibility\"}}]}",
+                    .{},
+                ),
+            };
+        }
+    };
+
+    var ctx: u8 = 0;
+    var server = Server{
+        .max_tool_result_bytes = 100,
+        .tool_result_too_large_text = "narrow the query",
+    };
+    defer server.deinit(alloc);
+    try server.addTool(alloc, .{
+        .name = "large",
+        .description = "Return a large result",
+        .handler = .{ .ptr = &ctx, .call_fn = Large.call },
+    });
+
+    const response = (try server.handleJsonRpc(alloc,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"large","arguments":{}}}
+    )).?;
+    defer alloc.free(response);
+    var parsed = try testing.parseToolCallResponse(alloc, response);
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.result.isError);
+    try std.testing.expectEqualStrings("narrow the query", testing.findTextContent(parsed.value.result.content).?);
+    try std.testing.expect(parsed.value.result.structuredContent == null);
+}
+
+test "mcp never returns a replacement above the tool result budget" {
+    const alloc = std.testing.allocator;
+
+    const Large = struct {
+        fn call(_: *anyopaque, _: std.mem.Allocator, _: std.json.Value) !CallToolResult {
+            return .{ .text = "a large successful tool result" };
+        }
+    };
+
+    var ctx: u8 = 0;
+    var server = Server{
+        .max_tool_result_bytes = 32,
+        .tool_result_too_large_text = "this replacement is also larger than the configured result budget",
+    };
+    defer server.deinit(alloc);
+    try server.addTool(alloc, .{
+        .name = "large",
+        .description = "Return a large result",
+        .handler = .{ .ptr = &ctx, .call_fn = Large.call },
+    });
+
+    const response = (try server.handleJsonRpc(alloc,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"large","arguments":{}}}
+    )).?;
+    defer alloc.free(response);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, response, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("result") == null);
+    try std.testing.expectEqual(@as(i64, -32603), parsed.value.object.get("error").?.object.get("code").?.integer);
 }
 
 test "mcp initialized notification has no response" {
@@ -619,22 +760,19 @@ test "mcp maps malformed and unknown tool requests to JSON-RPC errors" {
 
     const parse_resp = (try server.handleJsonRpc(alloc, "{")).?;
     defer alloc.free(parse_resp);
-    try std.testing.expect(std.mem.indexOf(u8, parse_resp, "\"code\":-32700") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parse_resp, "\"message\":\"parse error\"") != null);
+    try testing.expectError(alloc, parse_resp, -32700, "parse error");
 
     const invalid_params = (try server.handleJsonRpc(alloc,
         \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":[]}
     )).?;
     defer alloc.free(invalid_params);
-    try std.testing.expect(std.mem.indexOf(u8, invalid_params, "\"code\":-32602") != null);
-    try std.testing.expect(std.mem.indexOf(u8, invalid_params, "\"message\":\"invalid params\"") != null);
+    try testing.expectError(alloc, invalid_params, -32602, "invalid params");
 
     const unknown_tool = (try server.handleJsonRpc(alloc,
         \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"missing","arguments":{}}}
     )).?;
     defer alloc.free(unknown_tool);
-    try std.testing.expect(std.mem.indexOf(u8, unknown_tool, "\"code\":-32602") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unknown_tool, "\"message\":\"unknown tool\"") != null);
+    try testing.expectError(alloc, unknown_tool, -32602, "unknown tool");
 }
 
 test "mcp streamable http helpers map responses" {
@@ -717,7 +855,7 @@ test "mcp streamable http enforces sessions inside the transport" {
     var malformed = try server.handleStreamableHttpPostWithSession(alloc, "{", null);
     defer malformed.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), malformed.status);
-    try std.testing.expect(std.mem.indexOf(u8, malformed.body, "\"code\":-32700") != null);
+    try testing.expectError(alloc, malformed.body, -32700, "parse error");
 
     var missing_get = try server.handleStreamableHttpGetWithSession(alloc, "/mcp/v1", null, null);
     defer missing_get.deinit(alloc);
@@ -826,7 +964,7 @@ test "mcp stdio line dispatch frames responses" {
     )).?;
     defer alloc.free(response);
     try std.testing.expect(std.mem.endsWith(u8, response, "\n"));
-    try std.testing.expect(std.mem.indexOf(u8, response, "\"protocolVersion\":\"2025-06-18\"") != null);
+    try testing.expectResultSubset(alloc, response, "{\"protocolVersion\":\"2025-06-18\"}");
 
     try std.testing.expectEqual(@as(?[]u8, null), try server.handleStdioLine(alloc,
         \\{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}

@@ -19,6 +19,12 @@ const _skip_tape = @import("skip_tape.zig");
 const simd_typed = @import("simd_typed.zig");
 const simd_value = @import("simd_value.zig");
 
+pub const testing = @import("testing.zig");
+
+test {
+    _ = testing;
+}
+
 const Allocator = std.mem.Allocator;
 
 pub const ObjectMap = std.json.ObjectMap;

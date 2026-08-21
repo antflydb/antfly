@@ -3,6 +3,7 @@
 
 pub const types = @import("types.zig");
 
+pub const AdmissionConfig = types.AdmissionConfig;
 pub const AwsCredentialConfig = types.AwsCredentialConfig;
 pub const CdcConnectionConfig = types.CdcConnectionConfig;
 pub const CdcConnectionVariant = types.CdcConnectionVariant;
@@ -16,15 +17,18 @@ pub const FilesystemExternalIoConfig = types.FilesystemExternalIoConfig;
 pub const GcsCredentialConfig = types.GcsCredentialConfig;
 pub const GcsExternalIoConfig = types.GcsExternalIoConfig;
 pub const HttpExternalIoConfig = types.HttpExternalIoConfig;
+pub const InferenceAdmissionConfig = types.InferenceAdmissionConfig;
 pub const InferenceConnectionConfig = types.InferenceConnectionConfig;
 pub const InferenceConnectionVariant = types.InferenceConnectionVariant;
 pub const LiteStorageConfig = types.LiteStorageConfig;
 pub const LocalStorageConfig = types.LocalStorageConfig;
+pub const McpConfig = types.McpConfig;
 pub const MetadataInfo = types.MetadataInfo;
 pub const NamedChainLink = types.NamedChainLink;
 pub const ObjectStorageConfig = types.ObjectStorageConfig;
 pub const ObjectStorageLanes = types.ObjectStorageLanes;
 pub const ObjectStorageLocation = types.ObjectStorageLocation;
+pub const QueryAdmissionConfig = types.QueryAdmissionConfig;
 pub const S3ExternalIoConfig = types.S3ExternalIoConfig;
 pub const StorageConfig = types.StorageConfig;
 pub const StorageEngine = types.StorageEngine;
@@ -32,3 +36,4 @@ pub const TLSInfo = types.TLSInfo;
 pub const TransactionSessionConfig = types.TransactionSessionConfig;
 pub const WebSearchConnectionConfig = types.WebSearchConnectionConfig;
 pub const WebSearchConnectionVariant = types.WebSearchConnectionVariant;
+pub const WriteAdmissionConfig = types.WriteAdmissionConfig;

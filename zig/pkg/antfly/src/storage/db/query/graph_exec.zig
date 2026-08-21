@@ -17,6 +17,7 @@ const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
 const graph_query_mod = @import("../../../graph/query.zig");
 const graph_pattern_mod = @import("../../../graph/pattern.zig");
+const graph_node_identity = @import("../../../graph/node_identity.zig");
 const paths_mod = @import("../../../graph/paths.zig");
 const fusion_mod = @import("../../../search/fusion.zig");
 const geo_mod = @import("../../../search/geo.zig");
@@ -68,6 +69,7 @@ pub const PatternQueryExecutor = struct {
         alloc: Allocator,
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
+        target_nodes: []const graph_node_identity.Ref,
     ) anyerror![]graph_pattern_mod.PatternMatch,
     load_projected_document: *const fn (
         ctx: ?*anyopaque,
@@ -657,6 +659,7 @@ pub fn cloneNamedSetAsResult(alloc: Allocator, set: NamedResultSet, include_stor
             .id = try alloc.dupe(u8, hit.id),
             .doc_ordinal = hit.doc_ordinal,
             .score = hit.score,
+            .distance = hit.distance,
             .stored_data = if (include_stored and hit.stored_data != null)
                 try alloc.dupe(u8, hit.stored_data.?)
             else
@@ -694,7 +697,6 @@ pub fn fuseNamedSets(
     for (named_sets, 0..) |set, i| {
         var ranked_hits = try alloc.alloc(fusion_mod.RankedHit, set.hits.len);
         errdefer alloc.free(ranked_hits);
-        const distance_ordered = fusionUsesDistanceScore(req, set.name);
         for (set.hits, 0..) |hit, j| {
             const ranked_doc_id = if (ordinal_complete) blk: {
                 const entry = try ordinalFusionEntryForHit(alloc, &ordinal_fusion_keys, &fusion_key_entries, hit);
@@ -713,7 +715,7 @@ pub fn fuseNamedSets(
             const raw_score = if (hit.score) |score| score else 0.0;
             ranked_hits[j] = .{
                 .doc_id = ranked_doc_id,
-                .score = if (distance_ordered) -raw_score else raw_score,
+                .score = raw_score,
             };
         }
         ranked_results[i] = .{
@@ -980,11 +982,30 @@ pub fn executeSinglePatternQueryWithSets(
     const start_key_refs = try castOwnedKeysToConst(alloc, start_keys);
     defer alloc.free(start_key_refs);
 
+    var target_keys = if (named.query.target_nodes) |target_nodes|
+        try resolveGraphSelectorFromSets(alloc, target_nodes, named_sets, .{
+            .ctx = executor.ctx,
+            .func = executor.resolve_doc_set_doc_ids,
+            .identity_read_generation = req.identity_read_generation,
+        })
+    else
+        try alloc.alloc([]u8, 0);
+    defer freeOwnedKeySlice(alloc, target_keys);
+    if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
+        target_keys = try filterOwnedGraphKeys(alloc, req, target_keys, executor.ctx, executor.filter_keys);
+    }
+    const target_key_refs = try castOwnedKeysToConst(alloc, target_keys);
+    defer alloc.free(target_key_refs);
+    const target_nodes = try alloc.alloc(graph_node_identity.Ref, target_key_refs.len);
+    defer alloc.free(target_nodes);
+    for (target_key_refs, 0..) |key, i| target_nodes[i] = .{ .table = null, .key = key };
+
     var raw_matches = try executor.match_pattern(
         try graphExecutionContext(executor.predicate_aware, executor.graph_ctx, executor.ctx),
         alloc,
         named,
         start_key_refs,
+        target_nodes,
     );
     defer graph_pattern_mod.freeMatches(alloc, raw_matches);
     if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
@@ -997,7 +1018,10 @@ pub fn executeSinglePatternQueryWithSets(
         if (matches.len > 0) alloc.free(matches);
     }
 
-    const hits = try buildPatternDocumentHits(alloc, named.query, req.identity_read_generation, matches, executor);
+    const hits = if (patternQueryNeedsHits(req, named))
+        try buildPatternDocumentHits(alloc, named.query, req.identity_read_generation, matches, executor)
+    else
+        try alloc.alloc(types.SearchHit, 0);
     errdefer {
         for (hits) |*hit| hit.deinit(alloc);
         if (hits.len > 0) alloc.free(hits);
@@ -1011,6 +1035,57 @@ pub fn executeSinglePatternQueryWithSets(
         .hits = hits,
         .total_hits = @intCast(raw_matches.len),
     };
+}
+
+fn patternQueryNeedsHits(req: types.SearchRequest, named: *const types.NamedGraphQuery) bool {
+    if (named.query.include_documents or req.expand_strategy != null) return true;
+    for (req.graph_queries) |candidate| {
+        if (selectorReferencesGraphResult(candidate.query.start_nodes, named.name)) return true;
+        if (candidate.query.target_nodes) |selector| {
+            if (selectorReferencesGraphResult(selector, named.name)) return true;
+        }
+    }
+    return false;
+}
+
+fn selectorReferencesGraphResult(selector: graph_query_mod.NodeSelector, name: []const u8) bool {
+    return switch (selector) {
+        .keys => false,
+        .result_ref => |result_ref| blk: {
+            if (std.mem.eql(u8, result_ref.ref, name)) break :blk true;
+            const prefix = "$graph_results.";
+            break :blk std.mem.startsWith(u8, result_ref.ref, prefix) and
+                std.mem.eql(u8, result_ref.ref[prefix.len..], name);
+        },
+    };
+}
+
+test "pattern hit shaping is lazy but preserves graph dependencies" {
+    const seed = types.NamedGraphQuery{
+        .name = "seed",
+        .query = .{
+            .query_type = .pattern,
+            .index_name = "graph",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .pattern = &.{ .{ .alias = "a" }, .{ .alias = "b" } },
+        },
+    };
+    try std.testing.expect(!patternQueryNeedsHits(.{ .graph_queries = &.{seed} }, &seed));
+
+    const dependent = types.NamedGraphQuery{
+        .name = "dependent",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph",
+            .start_nodes = .{ .result_ref = .{ .ref = "$graph_results.seed" } },
+        },
+    };
+    try std.testing.expect(patternQueryNeedsHits(.{ .graph_queries = &.{ seed, dependent } }, &seed));
+
+    var with_documents = seed;
+    with_documents.query.include_documents = true;
+    try std.testing.expect(patternQueryNeedsHits(.{ .graph_queries = &.{with_documents} }, &with_documents));
+    try std.testing.expect(patternQueryNeedsHits(.{ .graph_queries = &.{seed}, .expand_strategy = .@"union" }, &seed));
 }
 
 pub fn executeSingleNonPatternQueryWithSets(
@@ -1819,16 +1894,6 @@ fn validateFusionWeights(weights: []const fusion_mod.NamedWeight, results: []con
         }
         if (!found) return error.InvalidQueryRequest;
     }
-}
-
-fn fusionUsesDistanceScore(req: types.SearchRequest, name: []const u8) bool {
-    if (std.mem.eql(u8, name, "$embeddings_results")) return req.dense != null;
-    if (std.mem.eql(u8, name, "dense")) return req.dense != null;
-    if (std.mem.startsWith(u8, name, "$aknn_results.")) return true;
-    for (req.dense_queries) |dense_query| {
-        if (std.mem.eql(u8, dense_query.name, name)) return true;
-    }
-    return false;
 }
 
 fn castOwnedKeysToConst(alloc: Allocator, keys: [][]u8) ![]const []const u8 {
@@ -4490,6 +4555,7 @@ test "buildPatternDocumentHits preserves resolved binding ordinals" {
             _: Allocator,
             _: *const types.NamedGraphQuery,
             _: []const []const u8,
+            _: []const graph_node_identity.Ref,
         ) anyerror![]graph_pattern_mod.PatternMatch {
             return error.TestUnexpectedResult;
         }

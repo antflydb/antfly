@@ -17,9 +17,14 @@
 from __future__ import annotations
 
 import time
+
+import pytest
 import requests
 
 from helpers import json_doc, query_hits_total_value, upsert, wait_until
+
+
+pytestmark = pytest.mark.reuse_antfly_process
 
 
 def _create_index(api, table_name: str, index_name: str, payload: dict) -> dict:
@@ -636,6 +641,7 @@ def test_serverless_graph_pattern_two_hop_and_documents(serverless_api):
                 "type": "pattern",
                 "index_name": "graph_idx",
                 "start_nodes": {"keys": ["doc-a"]},
+                "params": {"include_paths": True},
                 "pattern": [
                     {"alias": "a"},
                     {
@@ -942,6 +948,7 @@ def test_stateful_graph_pattern_two_hop_and_documents(backup_api):
                 "type": "pattern",
                 "index_name": "graph_idx",
                 "start_nodes": {"keys": ["doc-a"]},
+                "params": {"include_paths": True},
                 "pattern": [
                     {"alias": "a"},
                     {
@@ -1055,6 +1062,7 @@ def test_stateful_graph_pattern_variable_length_and_cycle(backup_api):
                 "type": "pattern",
                 "index_name": "graph_idx",
                 "start_nodes": {"keys": ["doc-a"]},
+                "params": {"include_paths": True},
                 "pattern": [
                     {"alias": "x"},
                     {

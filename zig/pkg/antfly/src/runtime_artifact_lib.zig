@@ -20,11 +20,9 @@ const builtin = @import("builtin");
 const std = @import("std");
 const platform = @import("antfly_platform");
 const bridge = @import("runtime_bridge.zig");
+const private_error_diagnostics = @import("runtime_private_error_diagnostics.zig");
 const unit_options = @import("runtime_library_options");
 const standalone_inference_bridge = @import("standalone/inference_bridge.zig");
-const runtime_http_abi = @import("runtime_http_abi.zig");
-const api_kernel_abi = @import("api/kernel_abi.zig");
-const httpx = @import("httpx");
 const restore_staging_exports = if (unit_options.unit == .distributed)
     @import("standalone/restore_staging_exports.zig")
 else
@@ -279,30 +277,7 @@ fn exportInternal(comptime function: anytype, comptime name: []const u8) void {
 comptime {
     switch (unit_options.unit) {
         .api_kernel => {
-            exportInternal(&api_kernel_exports.create, "antfly_api_kernel_create");
-            exportInternal(&api_kernel_exports.destroy, "antfly_api_kernel_destroy");
-            exportInternal(&api_kernel_exports.requestStats, "antfly_api_kernel_request_stats");
-            exportInternal(&api_kernel_exports.setProvider, "antfly_api_kernel_set_provider");
-            exportInternal(&api_kernel_exports.setHAExecutor, "antfly_api_kernel_set_ha_executor");
-            exportInternal(&api_kernel_exports.executor, "antfly_api_kernel_executor");
-            exportInternal(&api_kernel_exports.streamingExecutor, "antfly_api_kernel_streaming_executor");
-            exportInternal(&api_kernel_exports.attachRuntimeRestoreStore, "antfly_api_kernel_attach_runtime_restore_store");
-            exportInternal(&api_kernel_exports.attachReplicatedRestoreStore, "antfly_api_kernel_attach_replicated_restore_store");
-            exportInternal(&api_kernel_exports.resumeRestoreJobs, "antfly_api_kernel_resume_restore_jobs");
-            exportInternal(&api_kernel_exports.pollRestoreJobs, "antfly_api_kernel_poll_restore_jobs");
-            exportInternal(&api_kernel_exports.prepareRestoreLeadership, "antfly_api_kernel_prepare_restore_leadership");
-            exportInternal(&api_kernel_exports.scheduleSessionMaintenance, "antfly_api_kernel_schedule_session_maintenance");
-            exportInternal(&api_kernel_exports.storageMaintenanceActive, "antfly_api_kernel_storage_maintenance_active");
-            exportInternal(&api_kernel_exports.authorizeInference, "antfly_api_kernel_authorize_inference");
-            exportInternal(&api_kernel_exports.handle, "antfly_api_kernel_handle");
-            exportInternal(&api_kernel_exports.handleInternal, "antfly_api_kernel_handle_internal");
-            exportInternal(&api_kernel_exports.handlerCreate, "antfly_api_kernel_handler_create");
-            exportInternal(&api_kernel_exports.handlerInit, "antfly_api_kernel_handler_init");
-            exportInternal(&api_kernel_exports.handlerStats, "antfly_api_kernel_handler_stats");
-            exportInternal(&api_kernel_exports.handlerRegisterRoutes, "antfly_api_kernel_handler_register_routes");
-            exportInternal(&api_kernel_exports.handlerHandleHttp, "antfly_api_kernel_handler_handle_http");
-            exportInternal(&api_kernel_exports.handlerDestroyHttpResponse, "antfly_api_kernel_handler_destroy_http_response");
-            exportInternal(&api_kernel_exports.handlerDestroy, "antfly_api_kernel_handler_destroy");
+            exportInternal(&api_kernel_exports.getFunctionTable, "antfly_api_kernel_get_function_table");
         },
         .distributed => {
             // Importing the C ABI implementation makes its `pub export`
@@ -316,19 +291,10 @@ comptime {
             exportInternal(&standaloneEntry, "antfly_runtime_standalone");
             exportInternal(&restore_staging_exports.create, "antfly_restore_staging_create");
             exportInternal(&restore_staging_exports.destroy, "antfly_restore_staging_destroy");
-            exportInternal(&distributedHttpxRegister, "antfly_distributed_httpx_register");
-            exportInternal(&distributedInferenceHttpxRegister, "antfly_distributed_inference_httpx_register");
         },
         .inference => {
+            exportInternal(&standaloneInferenceGetFunctionTable, "antfly_standalone_inference_get_function_table");
             exportInternal(&inferenceEntry, "antfly_runtime_inference");
-            exportInternal(&standaloneInferenceCreate, "antfly_standalone_inference_create");
-            exportInternal(&standaloneInferenceConfigure, "antfly_standalone_inference_configure");
-            exportInternal(&standaloneInferenceInvokeProvider, "antfly_standalone_inference_invoke_provider");
-            exportInternal(&standaloneInferenceDestroyProviderResponse, "antfly_standalone_inference_destroy_provider_response");
-            exportInternal(&standaloneInferenceRegisterRoutes, "antfly_standalone_inference_register_routes");
-            exportInternal(&standaloneInferenceHandleHttp, "antfly_standalone_inference_handle_http");
-            exportInternal(&standaloneInferenceDestroyHttpResponse, "antfly_standalone_inference_destroy_http_response");
-            exportInternal(&standaloneInferenceDestroy, "antfly_standalone_inference_destroy");
         },
         .cli => {
             exportInternal(&cliEntry, "antfly_runtime_cli");
@@ -336,178 +302,12 @@ comptime {
     }
 }
 
-extern fn antfly_api_kernel_handler_handle_http(context: *const api_kernel_abi.HttpHandleContext) callconv(.c) api_kernel_abi.Status;
-extern fn antfly_api_kernel_handler_destroy_http_response(handle: *anyopaque) callconv(.c) void;
-
-fn distributedHttpxRegister(context: *const api_kernel_abi.RouteContext) callconv(.c) api_kernel_abi.Status {
-    if (context.abi_version != api_kernel_abi.abi_version or context._reserved != 0)
-        return api_kernel_abi.statusFromError(error.UnsupportedVersion);
-    const server: *httpx.Server = @ptrCast(@alignCast(context.server));
-    const path = context.path_ptr[0..context.path_len];
-    const method: httpx.Method = switch (context.method) {
-        .get => .GET,
-        .post => .POST,
-        .put => .PUT,
-        .delete => .DELETE,
-    };
-    const result = server.routeWithData(method, path, distributedApiHttpHandler, context.route_handle);
-    result catch |err| return api_kernel_abi.statusFromError(err);
-    return .ok;
-}
-
-fn distributedApiHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
-    const route_handle = context.route_data orelse return error.ApiKernelUnavailable;
-    const source_headers = context.request.headers.iterator();
-    const headers = try context.allocator.alloc(api_kernel_abi.HeaderView, source_headers.len);
-    defer context.allocator.free(headers);
-    for (source_headers, 0..) |header, i| {
-        headers[i] = .{
-            .name = api_kernel_abi.Bytes.init(header.name),
-            .value = api_kernel_abi.Bytes.init(header.value),
-        };
-    }
-    const params = try context.allocator.alloc(api_kernel_abi.RouteParamView, context.params.len);
-    defer context.allocator.free(params);
-    for (context.params, 0..) |param, i| {
-        params[i] = .{
-            .name = api_kernel_abi.Bytes.init(param.name),
-            .value = api_kernel_abi.Bytes.init(param.value),
-        };
-    }
-
-    var response_handle: ?*anyopaque = null;
-    var response_view: api_kernel_abi.HttpResponseView = undefined;
-    const request_view: api_kernel_abi.HttpRequestView = .{
-        .method = switch (context.request.method) {
-            .GET => .get,
-            .POST => .post,
-            .PUT => .put,
-            .DELETE => .delete,
-            else => return error.MethodNotAllowed,
-        },
-        .path = api_kernel_abi.Bytes.init(context.request.uri.path),
-        .query = api_kernel_abi.OptionalBytes.init(context.request.uri.query),
-        .headers_ptr = if (headers.len == 0) null else headers.ptr,
-        .headers_len = headers.len,
-        .params_ptr = if (params.len == 0) null else params.ptr,
-        .params_len = params.len,
-        .body = api_kernel_abi.Bytes.init(context.request.body orelse ""),
-        .authorization = api_kernel_abi.OptionalBytes.init(context.request.headers.get("Authorization")),
-        .content_type = api_kernel_abi.OptionalBytes.init(context.request.headers.get("Content-Type")),
-    };
-    const status = antfly_api_kernel_handler_handle_http(&.{
-        .abi_version = api_kernel_abi.abi_version,
-        .route_handle = route_handle,
-        .request = &request_view,
-        .out_response_handle = &response_handle,
-        .out_response = &response_view,
-    });
-    if (!status.isOk()) return api_kernel_abi.errorFromStatus(status);
-    const owned_response_handle = response_handle orelse return error.RuntimeBoundaryFailure;
-    defer antfly_api_kernel_handler_destroy_http_response(owned_response_handle);
-
-    var response = httpx.Response.init(context.allocator, response_view.status);
-    errdefer response.deinit();
-    if (response_view.content_type.slice()) |content_type|
-        try response.headers.set("Content-Type", content_type);
-    const response_headers = if (response_view.headers_ptr) |ptr| ptr[0..response_view.headers_len] else &.{};
-    for (response_headers) |header| {
-        if (response_view.content_type.slice() != null and
-            std.ascii.eqlIgnoreCase(header.name.slice(), "Content-Type")) continue;
-        try response.headers.append(header.name.slice(), header.value.slice());
-    }
-    const body = try context.allocator.dupe(u8, response_view.body.slice());
-    response.body = body;
-    response.body_owned = true;
-    return response;
-}
-
-extern fn antfly_standalone_inference_handle_http(context: *const standalone_inference_bridge.HttpHandleContext) callconv(.c) standalone_inference_bridge.Status;
-extern fn antfly_standalone_inference_destroy_http_response(handle: *anyopaque) callconv(.c) void;
-
-fn distributedInferenceHttpxRegister(context: *const standalone_inference_bridge.RouteContext) callconv(.c) standalone_inference_bridge.Status {
-    if (context.abi_version != standalone_inference_bridge.abi_version)
-        return standalone_inference_bridge.statusFromError(error.UnsupportedVersion);
-    const server: *httpx.Server = @ptrCast(@alignCast(context.registrar_handle));
-    const method: httpx.Method = switch (context.method) {
-        .get => .GET,
-        .post => .POST,
-        .put => .PUT,
-        .delete => .DELETE,
-    };
-    server.routeWithData(method, context.path.slice(), distributedInferenceHttpHandler, context.route_handle) catch |err|
-        return standalone_inference_bridge.statusFromError(err);
-    return .ok;
-}
-
-fn distributedInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
-    const route_handle = context.route_data orelse return error.InferenceRuntimeUnavailable;
-    const source_headers = context.request.headers.iterator();
-    const headers = try context.allocator.alloc(runtime_http_abi.HeaderView, source_headers.len);
-    defer context.allocator.free(headers);
-    for (source_headers, 0..) |header, i| {
-        headers[i] = .{
-            .name = runtime_http_abi.Bytes.init(header.name),
-            .value = runtime_http_abi.Bytes.init(header.value),
-        };
-    }
-    const params = try context.allocator.alloc(runtime_http_abi.RouteParamView, context.params.len);
-    defer context.allocator.free(params);
-    for (context.params, 0..) |param, i| {
-        params[i] = .{
-            .name = runtime_http_abi.Bytes.init(param.name),
-            .value = runtime_http_abi.Bytes.init(param.value),
-        };
-    }
-
-    const request_view: runtime_http_abi.HttpRequestView = .{
-        .method = switch (context.request.method) {
-            .GET => .get,
-            .POST => .post,
-            .PUT => .put,
-            .DELETE => .delete,
-            else => return error.MethodNotAllowed,
-        },
-        .path = runtime_http_abi.Bytes.init(context.request.uri.path),
-        .query = runtime_http_abi.OptionalBytes.init(context.request.uri.query),
-        .headers_ptr = if (headers.len == 0) null else headers.ptr,
-        .headers_len = headers.len,
-        .params_ptr = if (params.len == 0) null else params.ptr,
-        .params_len = params.len,
-        .body = runtime_http_abi.Bytes.init(context.request.body orelse ""),
-        .authorization = runtime_http_abi.OptionalBytes.init(context.request.headers.get("Authorization")),
-        .content_type = runtime_http_abi.OptionalBytes.init(context.request.headers.get("Content-Type")),
-    };
-    var response_handle: ?*anyopaque = null;
-    var response_view: runtime_http_abi.HttpResponseView = undefined;
-    const status = antfly_standalone_inference_handle_http(&.{
-        .abi_version = standalone_inference_bridge.abi_version,
-        .route_handle = route_handle,
-        .request = &request_view,
-        .out_response_handle = &response_handle,
-        .out_response = &response_view,
-    });
-    if (!status.isOk()) return standalone_inference_bridge.errorFromStatus(status);
-    const owned_response_handle = response_handle orelse return error.RuntimeBoundaryFailure;
-    defer antfly_standalone_inference_destroy_http_response(owned_response_handle);
-
-    var response = httpx.Response.init(context.allocator, response_view.status);
-    errdefer response.deinit();
-    if (response_view.content_type.slice()) |content_type|
-        try response.headers.set("Content-Type", content_type);
-    const response_headers = if (response_view.headers_ptr) |ptr| ptr[0..response_view.headers_len] else &.{};
-    for (response_headers) |header| {
-        if (response_view.content_type.slice() != null and
-            std.ascii.eqlIgnoreCase(header.name.slice(), "Content-Type")) continue;
-        try response.headers.append(header.name.slice(), header.value.slice());
-    }
-    response.body = try context.allocator.dupe(u8, response_view.body.slice());
-    response.body_owned = true;
-    return response;
-}
-
 fn standaloneInferenceCreate(context: *const standalone_inference_bridge.CreateContext) callconv(.c) standalone_inference_bridge.Status {
-    if (context.abi_version != standalone_inference_bridge.abi_version)
+    if (!standalone_inference_bridge.validContext(
+        standalone_inference_bridge.CreateContext,
+        context.abi_version,
+        context.struct_size,
+    ))
         return standalone_inference_bridge.statusFromError(error.UnsupportedVersion);
     context.out_handle.* = standalone_inference_host.linkedInferenceCreate(context) catch |err| {
         return reportStandaloneInferenceFailure("create", err);
@@ -516,7 +316,11 @@ fn standaloneInferenceCreate(context: *const standalone_inference_bridge.CreateC
 }
 
 fn standaloneInferenceConfigure(context: *const standalone_inference_bridge.ConfigureContext) callconv(.c) standalone_inference_bridge.Status {
-    if (context.abi_version != standalone_inference_bridge.abi_version)
+    if (!standalone_inference_bridge.validContext(
+        standalone_inference_bridge.ConfigureContext,
+        context.abi_version,
+        context.struct_size,
+    ))
         return standalone_inference_bridge.statusFromError(error.UnsupportedVersion);
     standalone_inference_host.linkedInferenceConfigure(context) catch |err| {
         return reportStandaloneInferenceFailure("configure", err);
@@ -524,11 +328,79 @@ fn standaloneInferenceConfigure(context: *const standalone_inference_bridge.Conf
     return .ok;
 }
 
+const inference_provider_operation_slots = 13;
+var inference_private_failure_counts = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** inference_provider_operation_slots;
+
+// Private inference errors are normalized at this archive boundary, so this is
+// the only place their original identity is available. Keep a fixed-size set
+// of per-operation/error/model counters: one noisy model must not consume the
+// first diagnostic for a different model, while model names supplied by a
+// client must never grow process memory or produce unbounded first-error logs.
+var inference_private_failure_diagnostics = [_]private_error_diagnostics.Diagnostic{.{}} ** private_error_diagnostics.slots_count;
+
+fn shouldLogInferencePrivateFailure(count: u64) bool {
+    // Keep the first few failures for diagnosis, then retain logarithmic
+    // visibility without allowing a bad model to amplify logs per request.
+    return count <= 4 or std.math.isPowerOfTwo(count);
+}
+
 fn standaloneInferenceInvokeProvider(context: *const standalone_inference_bridge.ProviderInvokeContext) callconv(.c) standalone_inference_bridge.Status {
-    if (context.abi_version != standalone_inference_bridge.abi_version)
+    if (!standalone_inference_bridge.validContext(
+        standalone_inference_bridge.ProviderInvokeContext,
+        context.abi_version,
+        context.struct_size,
+    ))
         return standalone_inference_bridge.statusFromError(error.UnsupportedVersion);
     standalone_inference_host.linkedInferenceInvokeProvider(context) catch |err| {
-        return standalone_inference_bridge.statusFromError(err);
+        // Stable errors retain their exact identity at the caller, which owns
+        // the request correlation and can log them once with table context.
+        // Only private inference-unit errors need an owner-side diagnostic
+        // before they are normalized to the stable provider failure.
+        if (standalone_inference_bridge.errorHasStableDetail(err))
+            return standalone_inference_bridge.statusFromError(err);
+        const provider_operation = std.enums.fromInt(
+            standalone_inference_bridge.ProviderOperation,
+            context.operation,
+        );
+        const operation_slot: usize = if (context.operation > 0 and context.operation < inference_provider_operation_slots)
+            @intCast(context.operation)
+        else
+            0;
+        const diagnostic_fingerprint = private_error_diagnostics.fingerprint(
+            context.operation,
+            err,
+            context.request_json.slice(),
+        );
+        if (private_error_diagnostics.note(
+            &inference_private_failure_diagnostics,
+            diagnostic_fingerprint,
+        )) |failure_count| {
+            if (shouldLogInferencePrivateFailure(failure_count)) {
+                std.log.err("standalone inference bridge failed operation=invoke_provider provider_operation={s} request_bytes={d} has_deadline={} diagnostic_fingerprint={x} observed_diagnostic_failures={d} err={}", .{
+                    if (provider_operation) |value| @tagName(value) else "unknown",
+                    context.request_json.len,
+                    context.has_deadline != 0,
+                    diagnostic_fingerprint,
+                    failure_count,
+                    err,
+                });
+            }
+        } else {
+            // Once the bounded fingerprint table is full, retain logarithmic
+            // aggregate visibility without allocating or logging once per new
+            // client-controlled model name.
+            const failure_count = inference_private_failure_counts[operation_slot].fetchAdd(1, .monotonic) +% 1;
+            if (shouldLogInferencePrivateFailure(failure_count)) {
+                std.log.err("standalone inference bridge failed operation=invoke_provider provider_operation={s} request_bytes={d} has_deadline={} diagnostic_table_saturated=true observed_overflow_failures={d} err={}", .{
+                    if (provider_operation) |value| @tagName(value) else "unknown",
+                    context.request_json.len,
+                    context.has_deadline != 0,
+                    failure_count,
+                    err,
+                });
+            }
+        }
+        return standalone_inference_bridge.statusFromErrorWithFallback(err, error.InferenceProviderFailure);
     };
     return .ok;
 }
@@ -537,17 +409,25 @@ fn standaloneInferenceDestroyProviderResponse(handle: *anyopaque) callconv(.c) v
     standalone_inference_host.linkedInferenceDestroyProviderResponse(handle);
 }
 
-fn standaloneInferenceRegisterRoutes(context: *const standalone_inference_bridge.RoutesContext) callconv(.c) standalone_inference_bridge.Status {
-    if (context.abi_version != standalone_inference_bridge.abi_version)
+fn standaloneInferenceRouteManifest(context: *const standalone_inference_bridge.RouteManifestContext) callconv(.c) standalone_inference_bridge.Status {
+    if (!standalone_inference_bridge.validContext(
+        standalone_inference_bridge.RouteManifestContext,
+        context.abi_version,
+        context.struct_size,
+    ))
         return standalone_inference_bridge.statusFromError(error.UnsupportedVersion);
-    standalone_inference_host.linkedInferenceRegisterRoutes(context) catch |err| {
-        return reportStandaloneInferenceFailure("register_routes", err);
+    standalone_inference_host.linkedInferenceRouteManifest(context) catch |err| {
+        return reportStandaloneInferenceFailure("route_manifest", err);
     };
     return .ok;
 }
 
 fn standaloneInferenceHandleHttp(context: *const standalone_inference_bridge.HttpHandleContext) callconv(.c) standalone_inference_bridge.Status {
-    if (context.abi_version != standalone_inference_bridge.abi_version)
+    if (!standalone_inference_bridge.validContext(
+        standalone_inference_bridge.HttpHandleContext,
+        context.abi_version,
+        context.struct_size,
+    ))
         return standalone_inference_bridge.statusFromError(error.UnsupportedVersion);
     standalone_inference_host.linkedInferenceHandleHttp(context) catch |err| {
         return reportStandaloneInferenceFailure("handle_http", err);
@@ -559,8 +439,47 @@ fn standaloneInferenceDestroyHttpResponse(handle: *anyopaque) callconv(.c) void 
     standalone_inference_host.linkedInferenceDestroyHttpResponse(handle);
 }
 
+fn standaloneInferenceTryAcquireRequest(handle: *anyopaque) callconv(.c) u8 {
+    return @intFromBool(standalone_inference_host.linkedInferenceTryAcquireRequest(handle));
+}
+
+fn standaloneInferenceReleaseRequest(handle: *anyopaque) callconv(.c) void {
+    standalone_inference_host.linkedInferenceReleaseRequest(handle);
+}
+
+fn standaloneInferenceRequestAdmissionStats(
+    handle: *anyopaque,
+    out: *standalone_inference_bridge.RequestAdmissionStats,
+) callconv(.c) void {
+    out.* = standalone_inference_host.linkedInferenceRequestAdmissionStats(handle);
+}
+
 fn standaloneInferenceDestroy(handle: *anyopaque) callconv(.c) void {
     standalone_inference_host.linkedInferenceDestroy(handle);
+}
+
+const standalone_inference_function_table: standalone_inference_bridge.FunctionTable = .{
+    .abi_version = standalone_inference_bridge.abi_version,
+    .struct_size = @sizeOf(standalone_inference_bridge.FunctionTable),
+    .capabilities = standalone_inference_bridge.Capability.provider |
+        standalone_inference_bridge.Capability.route_manifest |
+        standalone_inference_bridge.Capability.resource_budget |
+        standalone_inference_bridge.Capability.request_admission,
+    .create = &standaloneInferenceCreate,
+    .configure = &standaloneInferenceConfigure,
+    .invoke_provider = &standaloneInferenceInvokeProvider,
+    .destroy_provider_response = &standaloneInferenceDestroyProviderResponse,
+    .route_manifest = &standaloneInferenceRouteManifest,
+    .handle_http = &standaloneInferenceHandleHttp,
+    .destroy_http_response = &standaloneInferenceDestroyHttpResponse,
+    .try_acquire_request = &standaloneInferenceTryAcquireRequest,
+    .release_request = &standaloneInferenceReleaseRequest,
+    .request_admission_stats = &standaloneInferenceRequestAdmissionStats,
+    .destroy = &standaloneInferenceDestroy,
+};
+
+fn standaloneInferenceGetFunctionTable() callconv(.c) *const standalone_inference_bridge.FunctionTable {
+    return &standalone_inference_function_table;
 }
 
 fn reportStandaloneInferenceFailure(comptime operation: []const u8, err: anyerror) standalone_inference_bridge.Status {

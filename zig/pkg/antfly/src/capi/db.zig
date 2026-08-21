@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const antfly = @import("antfly_storage_root");
+const vector_mod = @import("antfly_vector").vector;
 const capi = @import("types.zig");
 const search_wire = @import("search_wire.zig");
 
@@ -2657,7 +2658,7 @@ fn resolveDenseHitsFromProfiled(
             (try entry.index.getMetadata(hit.vector_id)) orelse return error.Internal;
         resolved[i] = .{
             .id = id,
-            .score = hit.distance,
+            .score = vector_mod.similarityFromDistance(hit.distance, entry.metric),
         };
         resolved_count += 1;
     }
@@ -3357,7 +3358,7 @@ pub export fn antfly_db_lookup_artifact_json(
     const artifact_id = decodeBase64Alloc(handle.alloc, artifact_id_b64.bytes()) catch return .invalid_argument;
     defer handle.alloc.free(artifact_id);
 
-    var record = handle.db.getArtifact(handle.alloc, artifact_id) catch |err| return capi.mapError(err);
+    var record = handle.db.getPublicArtifact(handle.alloc, artifact_id) catch |err| return capi.mapError(err);
     if (record == null) return .not_found;
     defer record.?.deinit(handle.alloc);
 
@@ -8264,7 +8265,10 @@ test "capi artifact decode and lookup json" {
     defer artifact_ref.deinit(handle.alloc);
     const internal_key = try db_mod.artifact_ids.internalKeyForArtifactRefAlloc(handle.alloc, artifact_ref);
     defer handle.alloc.free(internal_key);
-    try handle.db.core.store.put(internal_key, "{\"body\":\"abcdefgh\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0}");
+    try handle.db.core.store.put(
+        internal_key,
+        "{\"body\":\"abcdefgh\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0,\"_artifact_unit_fingerprint\":\"private\"}",
+    );
 
     const artifact_id = try db_mod.artifact_ids.artifactPublicIdAlloc(handle.alloc, artifact_ref);
     defer handle.alloc.free(artifact_id);
@@ -8286,8 +8290,26 @@ test "capi artifact decode and lookup json" {
         .len = artifact_id_b64.len,
     }, &lookup_out));
     defer antfly_db_buffer_free(lookup_out.ptr, lookup_out.len);
-    try std.testing.expect(std.mem.indexOf(u8, lookup_out.ptr.?[0..lookup_out.len], "\"artifact_ref\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lookup_out.ptr.?[0..lookup_out.len], "\"_chunk_id\":0") != null);
+    var lookup_json = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        lookup_out.ptr.?[0..lookup_out.len],
+        .{},
+    );
+    defer lookup_json.deinit();
+    try std.testing.expect(lookup_json.value.object.get("artifact_ref") != null);
+    const value_b64 = lookup_json.value.object.get("value_b64") orelse return error.TestUnexpectedResult;
+    if (value_b64 != .string) return error.TestUnexpectedResult;
+    const public_value = try decodeBase64Alloc(alloc, value_b64.string);
+    defer alloc.free(public_value);
+    var public_json = try std.json.parseFromSlice(std.json.Value, alloc, public_value, .{});
+    defer public_json.deinit();
+    if (public_json.value != .object) return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 3), public_json.value.object.count());
+    try std.testing.expectEqualStrings("abcdefgh", public_json.value.object.get("body").?.string);
+    try std.testing.expectEqualStrings("body_chunks_v1", public_json.value.object.get("_artifact_name").?.string);
+    try std.testing.expectEqual(@as(i64, 0), public_json.value.object.get("_chunk_id").?.integer);
+    try std.testing.expect(public_json.value.object.get("_artifact_unit_fingerprint") == null);
 }
 
 test "capi dense search profile breakdown" {

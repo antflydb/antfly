@@ -22,6 +22,8 @@ LABEL org.opencontainers.image.source=https://github.com/antflydb/antfly
 LABEL org.opencontainers.image.description="AntflyDB Zig runtime image"
 LABEL org.opencontainers.image.licenses=Elastic-2.0
 
+RUN apk add --no-cache ca-certificates
+
 WORKDIR /
 COPY antfly /antfly
 COPY share/antfly /usr/share/antfly

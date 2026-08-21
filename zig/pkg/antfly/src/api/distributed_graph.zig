@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const raft_mod = struct {
     pub const ReadConsistency = @import("../raft/read_gate.zig").ReadConsistency;
 };
@@ -47,7 +48,7 @@ pub const Worker = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     execution_deadline_ns: ?u64 = null,
-    cancellation: ?*const std.atomic.Value(bool) = null,
+    cancellation: ?CancellationToken = null,
 
     pub const VTable = struct {
         execute_graph_expand: *const fn (
@@ -145,7 +146,7 @@ pub const Worker = struct {
 
     fn ensureActive(self: Worker) !void {
         if (self.cancellation) |value| {
-            if (value.load(.acquire)) return error.Cancelled;
+            if (value.isCancelled()) return error.Cancelled;
         }
         if (self.execution_deadline_ns) |deadline_ns| {
             if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
@@ -323,7 +324,7 @@ pub const GraphExpandRequest = struct {
     /// JSON contract; remote workers receive the deadline as their transport
     /// timeout and cancellation by connection interruption.
     timeout_ms: ?u32 = null,
-    cancellation: ?*const std.atomic.Value(bool) = null,
+    cancellation: ?CancellationToken = null,
 
     pub fn deinit(self: *GraphExpandRequest, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
@@ -427,7 +428,7 @@ pub const GraphHydrateRequest = struct {
     resolved_doc_filter_owned: bool = false,
     resolved_doc_filter_wire_context: ?db_mod.types.ResolvedDocFilterWireContext = null,
     timeout_ms: ?u32 = null,
-    cancellation: ?*const std.atomic.Value(bool) = null,
+    cancellation: ?CancellationToken = null,
 
     pub fn deinit(self: *GraphHydrateRequest, alloc: std.mem.Allocator) void {
         for (self.keys) |key| alloc.free(key);
@@ -463,17 +464,19 @@ pub const GraphHydrateResponse = struct {
 pub const GraphEdgesRequest = struct {
     index_name: []u8,
     key: []u8,
+    edge_types: [][]const u8 = &.{},
     direction: graph_mod.EdgeDirection,
     tensor_access_path: ?OwnedGraphTensorAccessPath = null,
     tensor_program: ?query_contract.OwnedAlgebraicTensorProgramEnvelope = null,
     topology_epoch: u64 = 0,
     identity_read_generation: ?u64 = null,
     timeout_ms: ?u32 = null,
-    cancellation: ?*const std.atomic.Value(bool) = null,
+    cancellation: ?CancellationToken = null,
 
     pub fn deinit(self: *GraphEdgesRequest, alloc: std.mem.Allocator) void {
         alloc.free(self.index_name);
         alloc.free(self.key);
+        freeConstStrings(alloc, self.edge_types);
         if (self.tensor_access_path) |*path| path.deinit(alloc);
         if (self.tensor_program) |*program| program.deinit(alloc);
         self.* = undefined;
@@ -546,6 +549,7 @@ const GraphExpandBatches = std.HashMapUnmanaged(
 
 const GraphHydrateBatchEntry = struct {
     group_id: u64,
+    identity_read_generation: ?u64,
     keys: []const []const u8,
 };
 
@@ -661,6 +665,7 @@ const GraphHydrateResponseJson = struct {
 const GraphEdgesRequestJson = struct {
     index_name: []const u8,
     key: []const u8,
+    edge_types: []const []const u8 = &.{},
     direction: []const u8 = "out",
     topology_epoch: u64 = 0,
     identity_read_generation: ?u64 = null,
@@ -718,8 +723,20 @@ pub fn supportsCrossRange(req: db_mod.types.SearchRequest) bool {
     return true;
 }
 
-pub fn rejectUnstampedResultRefs(req: db_mod.types.SearchRequest) !void {
-    if (req.identity_read_generation != null) return;
+fn resultHasIdentitySnapshot(
+    req: db_mod.types.SearchRequest,
+    base_result: db_mod.types.SearchResult,
+) bool {
+    return req.identity_read_generation != null or
+        base_result.identity_read_generation != null or
+        base_result.shard_identity_read_generations.len > 0;
+}
+
+fn rejectUnstampedResultRefs(
+    req: db_mod.types.SearchRequest,
+    base_result: db_mod.types.SearchResult,
+) !void {
+    if (resultHasIdentitySnapshot(req, base_result)) return;
     for (req.graph_queries) |graph_query| {
         if (selectorUsesResultRef(graph_query.query.start_nodes)) return error.UnsupportedQueryRequest;
         if (graph_query.query.target_nodes) |target_nodes| {
@@ -735,14 +752,52 @@ fn selectorUsesResultRef(selector: graph_query_mod.NodeSelector) bool {
     };
 }
 
-fn requireStampedCrossRangeRequest(req: db_mod.types.SearchRequest) !void {
+fn requireStampedCrossRangeRequest(
+    req: db_mod.types.SearchRequest,
+    base_result: db_mod.types.SearchResult,
+) !void {
     if (req.identity_read_generation != null) return;
     if (req.resolved_doc_filter != null or req.resolved_doc_filter_wire_context != null) return error.UnsupportedQueryRequest;
+    if (base_result.identity_read_generation != null or
+        base_result.shard_identity_read_generations.len > 0) return;
     for (req.graph_queries) |graph_query| {
         if (selectorUsesResultRef(graph_query.query.start_nodes)) return error.UnsupportedQueryRequest;
         if (graph_query.query.target_nodes) |target_nodes| {
             if (selectorUsesResultRef(target_nodes)) return error.UnsupportedQueryRequest;
         }
+    }
+}
+
+fn identityReadGenerationForGroup(
+    identity_read_generation: ?u64,
+    identity_read_generations: []const db_mod.types.ShardIdentityReadGeneration,
+    group_id: u64,
+) !?u64 {
+    if (identity_read_generations.len == 0) return identity_read_generation;
+
+    var generation: ?u64 = null;
+    for (identity_read_generations) |token| {
+        if (token.group_id != group_id) continue;
+        if (generation != null) return error.InvalidQueryResult;
+        generation = token.generation;
+    }
+    return generation orelse error.TopologyChanged;
+}
+
+fn validateSourceSnapshotGroupSet(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    base_result: db_mod.types.SearchResult,
+) !void {
+    const tokens = base_result.shard_identity_read_generations;
+    if (tokens.len == 0) return;
+
+    const group_ids = try table_catalog.resolveGroupsForSpan(alloc, catalog, table_name, "", "");
+    defer alloc.free(group_ids);
+    if (group_ids.len != tokens.len) return error.TopologyChanged;
+    for (group_ids) |group_id| {
+        _ = try identityReadGenerationForGroup(null, tokens, group_id);
     }
 }
 
@@ -756,8 +811,8 @@ pub fn executeCrossRange(
     consistency: raft_mod.ReadConsistency,
 ) ![]db_mod.types.GraphSearchResult {
     if (!supportsCrossRange(req)) return error.UnsupportedQueryRequest;
-    try requireStampedCrossRangeRequest(req);
-    try rejectUnstampedResultRefs(req);
+    try requireStampedCrossRangeRequest(req, base_result);
+    try rejectUnstampedResultRefs(req, base_result);
 
     var request_worker = worker;
     request_worker.execution_deadline_ns = req.execution_deadline_ns;
@@ -788,6 +843,7 @@ fn executeCrossRangeOnce(
 ) ![]db_mod.types.GraphSearchResult {
     if (!supportsCrossRange(req)) return error.UnsupportedQueryRequest;
     try table_catalog.validateDocIdentityReadyForTableStrict(alloc, catalog, table_name);
+    try validateSourceSnapshotGroupSet(alloc, catalog, table_name, base_result);
 
     const results = try alloc.alloc(db_mod.types.GraphSearchResult, req.graph_queries.len);
     var initialized: usize = 0;
@@ -905,6 +961,7 @@ const GraphAdmissionTableState = struct {
     table_name: []u8,
     topology_epoch: u64 = 0,
     identity_read_generation: ?u64 = null,
+    identity_read_generations: []const db_mod.types.ShardIdentityReadGeneration = &.{},
     filter_query_json: []u8 = &.{},
     exclusion_query_json: []u8 = &.{},
     resolved_doc_filter: ?*const anyopaque = null,
@@ -923,6 +980,14 @@ const GraphAdmissionTableState = struct {
         self.decisions.deinit(alloc);
         self.* = undefined;
     }
+
+    fn generationForGroup(self: *const GraphAdmissionTableState, group_id: u64) !?u64 {
+        return identityReadGenerationForGroup(
+            self.identity_read_generation,
+            self.identity_read_generations,
+            group_id,
+        );
+    }
 };
 
 /// Query-scoped graph document admission. Edge expansion remains on the shard
@@ -935,6 +1000,7 @@ const GraphNodeAdmissionContext = struct {
     source_table: []const u8,
     source_topology_epoch: u64,
     source_identity_read_generation: ?u64,
+    source_identity_read_generations: []const db_mod.types.ShardIdentityReadGeneration,
     source_filter_query_json: []const u8,
     source_exclusion_query_json: []const u8,
     source_resolved_doc_filter: ?*const anyopaque,
@@ -951,6 +1017,8 @@ const GraphNodeAdmissionContext = struct {
         source_table: []const u8,
         source_topology_epoch: u64,
         req: db_mod.types.SearchRequest,
+        source_result_identity_read_generation: ?u64,
+        source_identity_read_generations: []const db_mod.types.ShardIdentityReadGeneration,
         node_filter: graph_pattern_mod.NodeFilter,
         consistency: raft_mod.ReadConsistency,
     ) GraphNodeAdmissionContext {
@@ -960,7 +1028,8 @@ const GraphNodeAdmissionContext = struct {
             .worker = worker,
             .source_table = source_table,
             .source_topology_epoch = source_topology_epoch,
-            .source_identity_read_generation = req.identity_read_generation,
+            .source_identity_read_generation = req.identity_read_generation orelse source_result_identity_read_generation,
+            .source_identity_read_generations = source_identity_read_generations,
             .source_filter_query_json = req.filter_query_json,
             .source_exclusion_query_json = req.exclusion_query_json,
             .source_resolved_doc_filter = req.resolved_doc_filter,
@@ -1003,6 +1072,7 @@ const GraphNodeAdmissionContext = struct {
         errdefer if (exclusion_query_json_live) self.alloc.free(exclusion_query_json);
         var topology_epoch: u64 = 0;
         var identity_read_generation: ?u64 = null;
+        var identity_read_generations: []const db_mod.types.ShardIdentityReadGeneration = &.{};
         var resolved_doc_filter: ?*const anyopaque = null;
         var resolved_doc_filter_wire_context: ?db_mod.types.ResolvedDocFilterWireContext = null;
         var allowed = false;
@@ -1012,6 +1082,7 @@ const GraphNodeAdmissionContext = struct {
         if (std.mem.eql(u8, table_name, self.source_table)) {
             topology_epoch = self.source_topology_epoch;
             identity_read_generation = self.source_identity_read_generation;
+            identity_read_generations = self.source_identity_read_generations;
             resolved_doc_filter = self.source_resolved_doc_filter;
             resolved_doc_filter_wire_context = self.source_resolved_doc_filter_wire_context;
             allowed = true;
@@ -1069,6 +1140,7 @@ const GraphNodeAdmissionContext = struct {
             .table_name = owned_name,
             .topology_epoch = topology_epoch,
             .identity_read_generation = identity_read_generation,
+            .identity_read_generations = identity_read_generations,
             .filter_query_json = filter_query_json,
             .exclusion_query_json = exclusion_query_json,
             .resolved_doc_filter = resolved_doc_filter,
@@ -1149,6 +1221,7 @@ const GraphNodeAdmissionContext = struct {
                 state.table_name,
                 state.topology_epoch,
                 state.identity_read_generation,
+                state.identity_read_generations,
                 state.filter_query_json,
                 state.exclusion_query_json,
                 state.resolved_doc_filter,
@@ -1244,6 +1317,8 @@ fn executeSingleCrossRange(
         table_name,
         topology_epoch,
         req,
+        base_result.identity_read_generation,
+        base_result.shard_identity_read_generations,
         graph_query.query.params.node_filter,
         consistency,
     );
@@ -1313,6 +1388,7 @@ const DistributedEdgeReader = struct {
         a: std.mem.Allocator,
         table: ?[]const u8,
         key: []const u8,
+        edge_types: []const []const u8,
         direction: graph_mod.EdgeDirection,
     ) ![]graph_mod.Edge {
         const table_name = table orelse self.source_table;
@@ -1341,11 +1417,12 @@ const DistributedEdgeReader = struct {
         var req = GraphEdgesRequest{
             .index_name = index_name,
             .key = owned_key,
+            .edge_types = try dupConstStrings(a, edge_types),
             .direction = direction,
             .tensor_access_path = tensor_access_path,
             .tensor_program = tensor_program,
             .topology_epoch = table_state.topology_epoch,
-            .identity_read_generation = table_state.identity_read_generation,
+            .identity_read_generation = try table_state.generationForGroup(group_id),
         };
         defer req.deinit(a);
 
@@ -1387,6 +1464,17 @@ fn executeDistributedPattern(
         start_nodes[i] = .{ .table = item.table, .key = item.key };
     }
 
+    const target_frontier = if (graph_query.query.target_nodes) |selector|
+        try resolveStartFrontier(alloc, &state, req, base_result, prior_results, selector, false)
+    else
+        try alloc.alloc(FrontierState, 0);
+    defer freeFrontier(alloc, target_frontier);
+    const target_nodes = try alloc.alloc(graph_node_identity.Ref, target_frontier.len);
+    defer alloc.free(target_nodes);
+    for (target_frontier, 0..) |item, i| {
+        target_nodes[i] = .{ .table = item.table, .key = item.key };
+    }
+
     // Build distributed edge reader.
     const edge_reader = DistributedEdgeReader{
         .catalog = catalog,
@@ -1406,6 +1494,9 @@ fn executeDistributedPattern(
         .{
             .max_results = graph_query.query.params.max_results,
             .return_aliases = graph_query.query.return_aliases,
+            .target_nodes = target_nodes,
+            .target_required = graph_query.query.target_nodes != null,
+            .include_paths = graph_query.query.params.include_paths,
             .node_admission = admission.iface(),
         },
     );
@@ -2264,7 +2355,7 @@ fn findDistributedShortestPath(
         var one_frontier = [_]FrontierState{item};
         var step_req = try makeGraphExpandRequestWithAlgebraicMode(alloc, graph_query, one_frontier[0..], frontier_ids[0..], exclude_node_refs, exclude_edge_keys, true, algebraic_semiring_selected);
         step_req.topology_epoch = table_state.topology_epoch;
-        step_req.identity_read_generation = table_state.identity_read_generation;
+        step_req.identity_read_generation = try table_state.generationForGroup(group_id);
         defer step_req.deinit(alloc);
 
         var step_result = try worker.executeGraphExpand(alloc, group_id, expansion_table, step_req, consistency);
@@ -2381,10 +2472,10 @@ fn batchFrontierByGroup(
         if (!gop.found_existing) {
             gop.value_ptr.* = .{
                 .topology_epoch = table_state.topology_epoch,
-                .identity_read_generation = table_state.identity_read_generation,
+                .identity_read_generation = try table_state.generationForGroup(group_id),
             };
         } else if (gop.value_ptr.topology_epoch != table_state.topology_epoch or
-            gop.value_ptr.identity_read_generation != table_state.identity_read_generation)
+            gop.value_ptr.identity_read_generation != try table_state.generationForGroup(group_id))
         {
             return error.InvalidQueryResult;
         }
@@ -2637,6 +2728,7 @@ fn hydrateHitsForResultNodes(
             state.table_name,
             state.topology_epoch,
             state.identity_read_generation,
+            state.identity_read_generations,
             state.filter_query_json,
             state.exclusion_query_json,
             state.resolved_doc_filter,
@@ -2689,6 +2781,7 @@ fn hydrateHitsForResultNodes(
             state.table_name,
             state.topology_epoch,
             state.identity_read_generation,
+            state.identity_read_generations,
             state.filter_query_json,
             state.exclusion_query_json,
             state.resolved_doc_filter,
@@ -2744,6 +2837,7 @@ fn hydrateHitsForKeys(
     table_name: []const u8,
     topology_epoch: u64,
     identity_read_generation: ?u64,
+    identity_read_generations: []const db_mod.types.ShardIdentityReadGeneration,
     filter_query_json: []const u8,
     exclusion_query_json: []const u8,
     resolved_doc_filter: ?*const anyopaque,
@@ -2800,7 +2894,11 @@ fn hydrateHitsForKeys(
                     .keys = owned_keys,
                 };
                 req.topology_epoch = topology_epoch;
-                req.identity_read_generation = identity_read_generation;
+                req.identity_read_generation = try identityReadGenerationForGroup(
+                    identity_read_generation,
+                    identity_read_generations,
+                    entry.key_ptr.*,
+                );
                 req.filter_query_json = filter_query_json;
                 req.exclusion_query_json = exclusion_query_json;
                 req.include_stored = include_stored;
@@ -2825,6 +2923,11 @@ fn hydrateHitsForKeys(
         while (batch_it.next()) |entry| {
             entries[entry_index] = .{
                 .group_id = entry.key_ptr.*,
+                .identity_read_generation = try identityReadGenerationForGroup(
+                    identity_read_generation,
+                    identity_read_generations,
+                    entry.key_ptr.*,
+                ),
                 .keys = entry.value_ptr.items,
             };
             entry_index += 1;
@@ -2844,7 +2947,6 @@ fn hydrateHitsForKeys(
                 table_name_inner: []const u8,
                 entry: GraphHydrateBatchEntry,
                 topology_epoch_inner: u64,
-                identity_read_generation_inner: ?u64,
                 filter_query_json_inner: []const u8,
                 exclusion_query_json_inner: []const u8,
                 resolved_doc_filter_inner: ?*const anyopaque,
@@ -2861,7 +2963,7 @@ fn hydrateHitsForKeys(
                     .keys = owned_keys,
                 };
                 req.topology_epoch = topology_epoch_inner;
-                req.identity_read_generation = identity_read_generation_inner;
+                req.identity_read_generation = entry.identity_read_generation;
                 req.filter_query_json = filter_query_json_inner;
                 req.exclusion_query_json = exclusion_query_json_inner;
                 req.include_stored = include_stored_inner;
@@ -2879,7 +2981,7 @@ fn hydrateHitsForKeys(
             const end = @min(start + graph_fanout_plan.width, entries.len);
             var group: std.Io.Group = .init;
             for (entries[start..end], start..end) |entry, i| {
-                group.async(io, Fiber.run, .{ worker, &slots[i], table_name, entry, topology_epoch, identity_read_generation, filter_query_json, exclusion_query_json, resolved_doc_filter, resolved_doc_filter_wire_context, include_stored, consistency });
+                group.async(io, Fiber.run, .{ worker, &slots[i], table_name, entry, topology_epoch, filter_query_json, exclusion_query_json, resolved_doc_filter, resolved_doc_filter_wire_context, include_stored, consistency });
             }
             group.await(io) catch {};
         }
@@ -2902,7 +3004,11 @@ fn hydrateHitsForKeys(
             .keys = owned_keys,
         };
         req.topology_epoch = topology_epoch;
-        req.identity_read_generation = identity_read_generation;
+        req.identity_read_generation = try identityReadGenerationForGroup(
+            identity_read_generation,
+            identity_read_generations,
+            entry.key_ptr.*,
+        );
         req.filter_query_json = filter_query_json;
         req.exclusion_query_json = exclusion_query_json;
         req.include_stored = include_stored;
@@ -3239,6 +3345,7 @@ pub fn encodeGraphEdgesRequest(alloc: std.mem.Allocator, req: GraphEdgesRequest)
     return try jsonStringifyAlloc(alloc, GraphEdgesRequestJson{
         .index_name = req.index_name,
         .key = req.key,
+        .edge_types = req.edge_types,
         .direction = switch (req.direction) {
             .out => "out",
             .in => "in",
@@ -3267,6 +3374,7 @@ pub fn parseGraphEdgesRequest(alloc: std.mem.Allocator, body: []const u8) !Graph
     return .{
         .index_name = try alloc.dupe(u8, parsed.value.index_name),
         .key = try alloc.dupe(u8, parsed.value.key),
+        .edge_types = try dupConstStrings(alloc, parsed.value.edge_types),
         .direction = if (std.mem.eql(u8, parsed.value.direction, "in"))
             .in
         else if (std.mem.eql(u8, parsed.value.direction, "both"))
@@ -4092,7 +4200,7 @@ fn resolveResultRefNodes(
     prior_results: []const db_mod.types.GraphSearchResult,
     result_ref: graph_query_mod.ResultRef,
 ) ![]GraphNodeIdentity {
-    if (req.identity_read_generation == null) return error.UnsupportedQueryRequest;
+    if (!resultHasIdentitySnapshot(req, base_result)) return error.UnsupportedQueryRequest;
 
     if (std.mem.startsWith(u8, result_ref.ref, "$graph_results.")) {
         const name = result_ref.ref["$graph_results.".len..];
@@ -4163,7 +4271,7 @@ fn resolveResultRefKeys(
     prior_results: []const db_mod.types.GraphSearchResult,
     result_ref: graph_query_mod.ResultRef,
 ) ![][]u8 {
-    if (req.identity_read_generation == null) return error.UnsupportedQueryRequest;
+    if (!resultHasIdentitySnapshot(req, base_result)) return error.UnsupportedQueryRequest;
 
     if (std.mem.startsWith(u8, result_ref.ref, "$graph_results.")) {
         const name = result_ref.ref["$graph_results.".len..];
@@ -5915,6 +6023,8 @@ pub fn testCrossTableHydrateAppliesTargetAuthorizationAndClearsOrdinals(alloc: s
             .resolved_doc_filter_wire_context = context,
             .graph_table_read_authorizer = authorizer.iface(),
         },
+        null,
+        &.{},
         .{},
         .read_index,
     );
@@ -5941,6 +6051,8 @@ pub fn testCrossTableHydrateAppliesTargetAuthorizationAndClearsOrdinals(alloc: s
         "docs",
         0,
         .{ .graph_table_read_authorizer = denying_authorizer.iface() },
+        null,
+        &.{},
         .{},
         .read_index,
     );
@@ -6710,6 +6822,7 @@ test "distributed graph edges request preserves typed graph edge access path" {
     var req = GraphEdgesRequest{
         .index_name = try alloc.dupe(u8, "graph_idx"),
         .key = try alloc.dupe(u8, "doc:a"),
+        .edge_types = try dupConstStrings(alloc, &.{ "links", "mentions" }),
         .direction = .both,
         .topology_epoch = 42,
         .identity_read_generation = 12345,
@@ -6732,6 +6845,9 @@ test "distributed graph edges request preserves typed graph edge access path" {
     var parsed = try parseGraphEdgesRequest(alloc, encoded);
     defer parsed.deinit(alloc);
     try std.testing.expectEqual(graph_mod.EdgeDirection.both, parsed.direction);
+    try std.testing.expectEqual(@as(usize, 2), parsed.edge_types.len);
+    try std.testing.expectEqualStrings("links", parsed.edge_types[0]);
+    try std.testing.expectEqualStrings("mentions", parsed.edge_types[1]);
     try std.testing.expectEqual(@as(u64, 42), parsed.topology_epoch);
     try std.testing.expectEqual(@as(?u64, 12345), parsed.identity_read_generation);
     try std.testing.expect(parsed.tensor_access_path != null);
@@ -6855,6 +6971,8 @@ test "distributed graph edge reader carries identity generation" {
             try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
             try std.testing.expectEqualStrings("graph_idx", req.index_name);
             try std.testing.expectEqualStrings("doc:a", req.key);
+            try std.testing.expectEqual(@as(usize, 1), req.edge_types.len);
+            try std.testing.expectEqualStrings("links", req.edge_types[0]);
             try std.testing.expectEqual(graph_mod.EdgeDirection.out, req.direction);
             try std.testing.expectEqual(@as(u64, 0), req.topology_epoch);
             try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
@@ -6870,6 +6988,8 @@ test "distributed graph edge reader carries identity generation" {
         "docs",
         0,
         .{ .identity_read_generation = 12345 },
+        null,
+        &.{},
         .{},
         .read_index,
     );
@@ -6884,7 +7004,7 @@ test "distributed graph edge reader carries identity generation" {
         .admission = &admission,
     };
 
-    const edges = try reader.getEdges(alloc, null, "doc:a", .out);
+    const edges = try reader.getEdges(alloc, null, "doc:a", &.{"links"}, .out);
     defer reader.freeEdges(alloc, edges);
     try std.testing.expectEqual(@as(usize, 0), edges.len);
     try std.testing.expectEqual(@as(u32, 1), state.calls);
@@ -7274,14 +7394,13 @@ test "distributed graph rejects unstamped result refs before cross-range fanout"
             },
         },
     };
-    try std.testing.expectError(error.UnsupportedQueryRequest, rejectUnstampedResultRefs(req));
-
     const base_result = db_mod.types.SearchResult{
         .alloc = std.testing.allocator,
         .hits = @constCast((&[_]db_mod.types.SearchHit{})[0..]),
         .total_hits = 0,
         .graph_results = @constCast((&[_]db_mod.types.GraphSearchResult{})[0..]),
     };
+    try std.testing.expectError(error.UnsupportedQueryRequest, rejectUnstampedResultRefs(req, base_result));
     try std.testing.expect(supportsCrossRange(req));
 
     const DummyWorker = struct {
@@ -7330,7 +7449,7 @@ test "distributed graph rejects unstamped result refs before cross-range fanout"
 
     var stamped = req;
     stamped.identity_read_generation = 9;
-    try rejectUnstampedResultRefs(stamped);
+    try rejectUnstampedResultRefs(stamped, base_result);
 
     const explicit_keys = db_mod.types.SearchRequest{
         .graph_queries = &[_]db_mod.types.NamedGraphQuery{
@@ -7345,8 +7464,183 @@ test "distributed graph rejects unstamped result refs before cross-range fanout"
             },
         },
     };
-    try rejectUnstampedResultRefs(explicit_keys);
-    try requireStampedCrossRangeRequest(explicit_keys);
+    try rejectUnstampedResultRefs(explicit_keys, base_result);
+    try requireStampedCrossRangeRequest(explicit_keys, base_result);
+}
+
+pub fn testPerShardSnapshotsAcrossGraphPhases(alloc: std.mem.Allocator) !void {
+    const TestState = struct {
+        expand_calls: u32 = 0,
+        hydrate_calls: u32 = 0,
+    };
+
+    const FakeCatalog = struct {
+        const tables = [_]metadata_table_manager.TableRecord{
+            .{ .table_id = 7, .name = "docs", .placement_role = "data" },
+        };
+        const ranges = [_]metadata_table_manager.RangeRecord{
+            .{ .group_id = 11, .table_id = 7, .start_key = "", .end_key = "m" },
+            .{ .group_id = 22, .table_id = 7, .start_key = "m", .end_key = null },
+        };
+        const statuses = [_]metadata_reconciler.MergedGroupStatus{
+            .{ .group_id = 11 },
+            .{ .group_id = 22 },
+        };
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                .merged_group_statuses = @constCast(statuses[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeWorker = struct {
+        fn iface(state: *TestState) Worker {
+            return .{
+                .ptr = state,
+                .vtable = &.{
+                    .execute_graph_expand = executeGraphExpand,
+                    .execute_graph_hydrate = executeGraphHydrate,
+                },
+            };
+        }
+
+        fn executeGraphExpand(
+            ptr: *anyopaque,
+            alloc_inner: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: GraphExpandRequest,
+            _: raft_mod.ReadConsistency,
+        ) !GraphExpandResponse {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(@as(usize, 1), req.frontier.len);
+            state.expand_calls += 1;
+
+            if (group_id == 11) {
+                try std.testing.expectEqual(@as(?u64, 101), req.identity_read_generation);
+                try std.testing.expectEqualStrings("a", req.frontier[0].key);
+                const nodes = try alloc_inner.alloc(graph_query_mod.GraphResultNode, 1);
+                nodes[0] = try initGraphResultNode(alloc_inner, "z", null, 1, 1, null, null);
+                const expansions = try alloc_inner.alloc(GraphExpansion, 1);
+                expansions[0] = .{
+                    .frontier_id = req.frontier[0].id,
+                    .frontier_key = try alloc_inner.dupe(u8, req.frontier[0].key),
+                    .graph_result = .{
+                        .name = try alloc_inner.dupe(u8, req.name),
+                        .nodes = nodes,
+                        .paths = @constCast((&[_]db_mod.types.GraphPath{})[0..]),
+                        .hits = @constCast((&[_]db_mod.types.SearchHit{})[0..]),
+                        .total_hits = 1,
+                    },
+                };
+                return .{ .expansions = expansions };
+            }
+
+            try std.testing.expectEqual(@as(u64, 22), group_id);
+            try std.testing.expectEqual(@as(?u64, 202), req.identity_read_generation);
+            try std.testing.expectEqualStrings("z", req.frontier[0].key);
+            return .{ .expansions = @constCast((&[_]GraphExpansion{})[0..]) };
+        }
+
+        fn executeGraphHydrate(
+            ptr: *anyopaque,
+            alloc_inner: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: GraphHydrateRequest,
+            _: raft_mod.ReadConsistency,
+        ) !GraphHydrateResponse {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            state.hydrate_calls += 1;
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(@as(u64, 22), group_id);
+            try std.testing.expectEqual(@as(?u64, 202), req.identity_read_generation);
+            try std.testing.expectEqual(@as(usize, 1), req.keys.len);
+            try std.testing.expectEqualStrings("z", req.keys[0]);
+            const hits = try alloc_inner.alloc(db_mod.types.SearchHit, 1);
+            hits[0] = .{
+                .id = try alloc_inner.dupe(u8, "z"),
+                .stored_data = try alloc_inner.dupe(u8, "{\"title\":\"snapshot target\"}"),
+            };
+            return .{ .hits = hits };
+        }
+    };
+
+    const req = db_mod.types.SearchRequest{
+        .graph_queries = &[_]db_mod.types.NamedGraphQuery{
+            .{
+                .name = "walk",
+                .query = .{
+                    .query_type = .traverse,
+                    .index_name = "graph_idx",
+                    .start_nodes = .{ .result_ref = .{ .ref = "$full_text_results", .limit = 1 } },
+                    .include_documents = true,
+                    .params = .{ .max_depth = 2 },
+                },
+            },
+        },
+    };
+    var base_hits = [_]db_mod.types.SearchHit{.{ .id = @constCast("a") }};
+    const tokens = [_]db_mod.types.ShardIdentityReadGeneration{
+        .{ .group_id = 11, .generation = 101 },
+        .{ .group_id = 22, .generation = 202 },
+    };
+    const base_result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = base_hits[0..],
+        .total_hits = 1,
+        .shard_identity_read_generations = @constCast(tokens[0..]),
+    };
+    var incomplete_result = base_result;
+    incomplete_result.shard_identity_read_generations = @constCast(tokens[0..1]);
+    try std.testing.expectError(
+        error.TopologyChanged,
+        validateSourceSnapshotGroupSet(alloc, FakeCatalog.iface(), "docs", incomplete_result),
+    );
+
+    var state = TestState{};
+    const results = try executeCrossRange(
+        alloc,
+        FakeCatalog.iface(),
+        FakeWorker.iface(&state),
+        "docs",
+        req,
+        base_result,
+        .read_index,
+    );
+    defer {
+        for (results) |*result| result.deinit(alloc);
+        alloc.free(results);
+    }
+
+    try std.testing.expectEqual(@as(u32, 2), state.expand_calls);
+    try std.testing.expectEqual(@as(u32, 1), state.hydrate_calls);
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqual(@as(usize, 1), results[0].nodes.len);
+    try std.testing.expectEqualStrings("z", results[0].nodes[0].key);
+    try std.testing.expectEqual(@as(usize, 1), results[0].hits.len);
+    try std.testing.expectEqualStrings("z", results[0].hits[0].id);
 }
 
 test "distributed graph supports cross-range traverse target selectors" {

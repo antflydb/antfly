@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const data_raft_protocol = @import("../../common/data_raft_protocol.zig");
 const backend_erased = @import("../../storage/backend_erased.zig");
 const docstore = @import("../../storage/docstore.zig");
 const internal_keys = @import("../../storage/internal_keys.zig");
@@ -75,6 +76,8 @@ pub const DataOperation = union(enum) {
     acknowledge_split: SplitAcknowledgement,
     finalize_split: SplitTransition,
     rollback_split: SplitTransition,
+    /// Irreversibly activates a Raft batch log format for this group.
+    set_raft_batch_protocol: u16,
     /// Internal apply boundary. Split deltas use the committed Raft index as
     /// their stable cursor, independent of each replica's apply batching.
     flush_split_delta: u64,
@@ -171,6 +174,25 @@ pub fn currentRange(store: *docstore.DocStore, alloc: std.mem.Allocator, group_i
     var txn = try store.beginReadTxn();
     defer txn.abort();
     return try currentRangeTxn(&txn, alloc, group_id);
+}
+
+pub fn currentRaftBatchProtocolVersion(
+    store: *docstore.DocStore,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+) !u16 {
+    const key = try groupRaftBatchProtocolKeyAlloc(alloc, group_id);
+    defer alloc.free(key);
+    const value = store.get(alloc, key) catch |err| switch (err) {
+        error.NotFound => return 0,
+        else => return err,
+    };
+    defer alloc.free(value);
+    if (value.len != @sizeOf(u16)) return error.InvalidRaftBatchProtocolVersion;
+    const version = std.mem.readInt(u16, value[0..2], .little);
+    if (version == 0 or version > data_raft_protocol.batch_timestamp_protocol_version)
+        return error.InvalidRaftBatchProtocolVersion;
+    return version;
 }
 
 fn dupeRangeAlloc(alloc: std.mem.Allocator, byte_range: AppliedDataRange) !AppliedDataRange {
@@ -972,18 +994,20 @@ fn validateGroupStateSnapshotEntryBounds(
         try validateGroupControlEntry(alloc, group_id, control);
         const kind = groupControlKind(group_id, control.key) orelse unreachable;
         const control_order: u8 = switch (kind) {
-            .split_state => 0,
-            .delta_sequence => 1,
-            .acknowledgement => 2,
-            .terminal => 3,
-            .delta => 4,
+            .raft_batch_protocol => 0,
+            .split_state => 1,
+            .delta_sequence => 2,
+            .acknowledgement => 3,
+            .terminal => 4,
+            .delta => 5,
         };
         if (previous_control_order) |previous| {
-            if (control_order < previous or (control_order == previous and control_order != 4))
+            if (control_order < previous or (control_order == previous and control_order != 5))
                 return error.InvalidGroupStateSnapshot;
         }
         previous_control_order = control_order;
         switch (kind) {
+            .raft_batch_protocol => {},
             .split_state => state_entry = control,
             .delta_sequence => sequence = std.mem.readInt(u64, control.value[0..8], .little),
             .acknowledgement => acknowledgement_entry = control,
@@ -1082,6 +1106,7 @@ fn validateGroupStateSnapshotEntryBounds(
 }
 
 const GroupControlKind = union(enum) {
+    raft_batch_protocol,
     split_state,
     delta_sequence,
     acknowledgement,
@@ -1091,6 +1116,8 @@ const GroupControlKind = union(enum) {
 
 fn groupControlKind(group_id: u64, key: []const u8) ?GroupControlKind {
     var buf: [160]u8 = undefined;
+    const protocol_key = std.fmt.bufPrint(&buf, "\x00\x00__metadata__:data_group_raft_batch_protocol:{d}", .{group_id}) catch return null;
+    if (std.mem.eql(u8, protocol_key, key)) return .raft_batch_protocol;
     const state_key = std.fmt.bufPrint(&buf, "\x00\x00__metadata__:data_group_split_state:{d}", .{group_id}) catch return null;
     if (std.mem.eql(u8, state_key, key)) return .split_state;
     const sequence_key = std.fmt.bufPrint(&buf, "\x00\x00__metadata__:data_group_split_delta_seq:{d}", .{group_id}) catch return null;
@@ -1105,6 +1132,12 @@ fn groupControlKind(group_id: u64, key: []const u8) ?GroupControlKind {
 fn validateGroupControlEntry(alloc: std.mem.Allocator, group_id: u64, entry: AppliedDataKV) !void {
     const kind = groupControlKind(group_id, entry.key) orelse return error.InvalidGroupStateSnapshot;
     switch (kind) {
+        .raft_batch_protocol => {
+            if (entry.value.len != @sizeOf(u16)) return error.InvalidGroupStateSnapshot;
+            const version = std.mem.readInt(u16, entry.value[0..2], .little);
+            if (version == 0 or version > data_raft_protocol.batch_timestamp_protocol_version)
+                return error.InvalidGroupStateSnapshot;
+        },
         .split_state => {
             const state = decodeSplitStateAlloc(alloc, entry.value) catch return error.InvalidGroupStateSnapshot;
             defer freeSplitState(alloc, state);
@@ -1229,9 +1262,11 @@ fn groupControlStateTxn(txn: *docstore.DocStore.Txn, alloc: std.mem.Allocator, g
         out.deinit(alloc);
     }
 
-    var point_keys: [4][]u8 = undefined;
+    var point_keys: [5][]u8 = undefined;
     var initialized: usize = 0;
     defer for (point_keys[0..initialized]) |key| alloc.free(key);
+    point_keys[initialized] = try groupRaftBatchProtocolKeyAlloc(alloc, group_id);
+    initialized += 1;
     point_keys[initialized] = try groupSplitStateKeyAlloc(alloc, group_id);
     initialized += 1;
     point_keys[initialized] = try groupSplitDeltaSeqKeyAlloc(alloc, group_id);
@@ -2187,6 +2222,29 @@ fn appendPendingSplitDelta(
     delta_deletes.clearRetainingCapacity();
 }
 
+fn appendRaftBatchProtocolEffect(
+    store: *docstore.DocStore,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    version: u16,
+    writes: *std.ArrayListUnmanaged(docstore.OwnedKVPair),
+    deletes: *std.ArrayListUnmanaged([]u8),
+) !void {
+    if (version == 0 or version > data_raft_protocol.batch_timestamp_protocol_version)
+        return error.InvalidRaftBatchProtocolVersion;
+    const current = try currentRaftBatchProtocolVersion(store, alloc, group_id);
+    if (version < current) return error.RaftBatchProtocolVersionRegression;
+    if (version == current) return;
+    const key = try groupRaftBatchProtocolKeyAlloc(alloc, group_id);
+    errdefer alloc.free(key);
+    removeOwnedWriteByKey(alloc, writes, key);
+    removeDeleteByKey(alloc, deletes, key);
+    const value = try alloc.alloc(u8, @sizeOf(u16));
+    errdefer alloc.free(value);
+    std.mem.writeInt(u16, value[0..2], version, .little);
+    try writes.append(alloc, .{ .key = key, .value = value });
+}
+
 pub fn appendOperationEffects(
     store: *docstore.DocStore,
     alloc: std.mem.Allocator,
@@ -2195,6 +2253,16 @@ pub fn appendOperationEffects(
     writes: *std.ArrayListUnmanaged(docstore.OwnedKVPair),
     deletes: *std.ArrayListUnmanaged([]u8),
 ) !void {
+    // Protocol barriers are deliberately metadata-only. Keep their one-time
+    // activation path from opening split/range state and, more importantly,
+    // from manufacturing an empty split delta.
+    if (operations.len == 1) switch (operations[0]) {
+        .set_raft_batch_protocol => |version| {
+            try appendRaftBatchProtocolEffect(store, alloc, group_id, version, writes, deletes);
+            return;
+        },
+        else => {},
+    };
     var byte_range = try currentRange(store, alloc, group_id);
     defer range_state.freeRange(alloc, byte_range);
     var split_state = try currentSplitState(store, alloc, group_id);
@@ -2232,6 +2300,14 @@ pub fn appendOperationEffects(
     }
 
     for (operations) |op| switch (op) {
+        .set_raft_batch_protocol => |version| try appendRaftBatchProtocolEffect(
+            store,
+            alloc,
+            group_id,
+            version,
+            writes,
+            deletes,
+        ),
         .put => |put| {
             const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
                 .phase = state.phase,
@@ -2701,6 +2777,10 @@ fn groupDocumentStoreKeyAlloc(alloc: std.mem.Allocator, group_id: u64, key: []co
 
 fn groupRangeKeyAlloc(alloc: std.mem.Allocator, group_id: u64) ![]u8 {
     return try std.fmt.allocPrint(alloc, "\x00\x00__metadata__:data_group_range:{d}", .{group_id});
+}
+
+fn groupRaftBatchProtocolKeyAlloc(alloc: std.mem.Allocator, group_id: u64) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "\x00\x00__metadata__:data_group_raft_batch_protocol:{d}", .{group_id});
 }
 
 fn groupSplitStateKeyAlloc(alloc: std.mem.Allocator, group_id: u64) ![]u8 {

@@ -3,6 +3,7 @@
 
 pub const types = @import("types.zig");
 
+pub const AdmissionConfig = types.AdmissionConfig;
 pub const AudioChunkConfig = types.AudioChunkConfig;
 pub const BackendRuntimes = types.BackendRuntimes;
 pub const ChatMessage = types.ChatMessage;
@@ -52,11 +53,13 @@ pub const PromptCacheConfig = types.PromptCacheConfig;
 pub const ReadRequest = types.ReadRequest;
 pub const ReadResponse = types.ReadResponse;
 pub const ReadResult = types.ReadResult;
+pub const RequestAdmissionConfig = types.RequestAdmissionConfig;
 pub const RerankRequest = types.RerankRequest;
 pub const RerankResponse = types.RerankResponse;
 pub const RewriteRequest = types.RewriteRequest;
 pub const RewriteResponse = types.RewriteResponse;
 pub const Role = types.Role;
+pub const RuntimeConfig = types.RuntimeConfig;
 pub const SparseVector = types.SparseVector;
 pub const TextContentPart = types.TextContentPart;
 pub const TextRegion = types.TextRegion;

@@ -25,6 +25,7 @@ const inference = @import("inference_internal");
 const platform = inference.platform;
 const backends = inference.backends;
 const native_backend_choice = inference.native_backend_choice;
+const session_factory = inference.architectures.session_factory;
 const metal_generated_quant_stats = @import("metal_generated_quant_stats.zig");
 
 const print = std.debug.print;
@@ -101,10 +102,55 @@ pub fn main(init: std.process.Init) !void {
         const result = try runTimed(&pipeline, model.session, allocator, opts, opts.docs.items);
         printResult(opts, opts.docs.items.len, result);
     }
+
+    if (opts.format == .text and model.session.backend() != .onnx) {
+        var debug_backend = try session_factory.getComputeBackend(model.session, allocator);
+        defer debug_backend.deinit();
+        const provider_stats = debug_backend.debugTimingSnapshot().provider;
+        print(
+            "provider_stats dense_f16_mb={} dense_f16_slots={} qkv_pack_mb={} relative_cache_mb={} runtime_mb={} mps_linears={} quant_qkv={} quant_linear={} qkv_packed={}/{} ffn_fused={}/{}/{} attention_flash={} attention_legacy={} attention_gemm={}/{}\n",
+            .{
+                provider_stats.metal_runtime_dense_linear_f16_weight_bytes / (1024 * 1024),
+                provider_stats.metal_runtime_dense_linear_f16_slots,
+                provider_stats.metal_runtime_dense_qkv_packed_bytes / (1024 * 1024),
+                provider_stats.metal_runtime_deberta_relative_cache_bytes / (1024 * 1024),
+                provider_stats.metal_runtime_total_bytes / (1024 * 1024),
+                provider_stats.metal_runtime_last_frame_mps_dense_linear_count,
+                provider_stats.metal_runtime_last_frame_compute_quant_qkv_count,
+                provider_stats.metal_runtime_last_frame_compute_quant_linear_count,
+                provider_stats.metal_runtime_dense_qkv_packed_calls,
+                provider_stats.metal_runtime_dense_qkv_packed_fallbacks,
+                provider_stats.metal_runtime_deberta_ffn_fused_calls,
+                provider_stats.metal_runtime_deberta_ffn_fused_mps_matmuls,
+                provider_stats.metal_runtime_deberta_ffn_fused_fallbacks,
+                provider_stats.metal_runtime_deberta_attention_flash_calls,
+                provider_stats.metal_runtime_deberta_attention_legacy_calls,
+                provider_stats.metal_runtime_deberta_attention_gemm_calls,
+                provider_stats.metal_runtime_deberta_attention_gemm_fallbacks,
+            },
+        );
+        const stage = provider_stats.metal_stage_timing;
+        print(
+            "metal_timing cumulative_gpu_ms={d:.3} stage_enabled={} stage_supported={} stage_complete={} sampled={} attention_ms={d:.3} ffn_ms={d:.3} embedding_ms={d:.3} other_ms={d:.3} stage_failures={}\n",
+            .{
+                @as(f64, @floatFromInt(provider_stats.decoder_runtime_frame_gpu_nanos)) / 1.0e6,
+                stage.enabled,
+                stage.supported,
+                stage.complete,
+                stage.prefill.sampled_frames,
+                @as(f64, @floatFromInt(stage.prefill.attention_nanos)) / 1.0e6,
+                @as(f64, @floatFromInt(stage.prefill.ffn_nanos)) / 1.0e6,
+                @as(f64, @floatFromInt(stage.prefill.embedding_nanos)) / 1.0e6,
+                @as(f64, @floatFromInt(stage.prefill.other_nanos)) / 1.0e6,
+                stage.failureCount(),
+            },
+        );
+    }
 }
 
 const BenchResult = struct {
     avg_ms: f64,
+    p50_ms: f64,
     min_ms: f64,
     p95_ms: f64,
     docs_per_s: f64,
@@ -162,6 +208,7 @@ fn runTimed(
     }.lessThan);
 
     const avg_ms = nsToMs(total_ns / opts.measure_iters);
+    const p50_ms = medianMs(samples_ns);
     const min_ms = nsToMs(min_ns);
     const p95_ms = nsToMs(samples_ns[(samples_ns.len - 1) * 95 / 100]);
     const docs_per_s = if (avg_ms == 0)
@@ -171,6 +218,7 @@ fn runTimed(
 
     return .{
         .avg_ms = avg_ms,
+        .p50_ms = p50_ms,
         .min_ms = min_ms,
         .p95_ms = p95_ms,
         .docs_per_s = docs_per_s,
@@ -190,8 +238,9 @@ fn printResult(opts: Options, doc_count: usize, result: BenchResult) void {
                 opts.warmup_iters,
                 opts.measure_iters,
             });
-            print("avg_ms={d:.3} min_ms={d:.3} p95_ms={d:.3} docs_per_s={d:.3} checksum={d:.6}\n", .{
+            print("avg_ms={d:.3} p50_ms={d:.3} min_ms={d:.3} p95_ms={d:.3} docs_per_s={d:.3} checksum={d:.6}\n", .{
                 result.avg_ms,
+                result.p50_ms,
                 result.min_ms,
                 result.p95_ms,
                 result.docs_per_s,
@@ -243,7 +292,7 @@ fn printResult(opts: Options, doc_count: usize, result: BenchResult) void {
             });
         },
         .csv => {
-            print("{s},{s},{s},{s},{d},{d},{d},{d:.3},{d:.3},{d:.3},{d:.3},{d:.6},{d},{d},{d},{d},{d},{d},{d},{s}\n", .{
+            print("{s},{s},{s},{s},{d},{d},{d},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.6},{d},{d},{d},{d},{d},{d},{d},{s}\n", .{
                 @tagName(opts.backend),
                 graphModeName(),
                 qmatmulVariantName(),
@@ -252,6 +301,7 @@ fn printResult(opts: Options, doc_count: usize, result: BenchResult) void {
                 opts.warmup_iters,
                 opts.measure_iters,
                 result.avg_ms,
+                result.p50_ms,
                 result.min_ms,
                 result.p95_ms,
                 result.docs_per_s,
@@ -270,7 +320,7 @@ fn printResult(opts: Options, doc_count: usize, result: BenchResult) void {
 }
 
 fn printCsvHeader() void {
-    print("backend,graph_mode,qmatmul_variant,model,docs,warmup_iters,measure_iters,avg_ms,min_ms,p95_ms,docs_per_s,checksum,graph_captures,graph_replays,graph_fallbacks,graph_capture_failures,graph_buckets,graph_owned_bytes,graph_dynamic_copy_bytes,graph_last_fallback_reason\n", .{});
+    print("backend,graph_mode,qmatmul_variant,model,docs,warmup_iters,measure_iters,avg_ms,p50_ms,min_ms,p95_ms,docs_per_s,checksum,graph_captures,graph_replays,graph_fallbacks,graph_capture_failures,graph_buckets,graph_owned_bytes,graph_dynamic_copy_bytes,graph_last_fallback_reason\n", .{});
 }
 
 fn graphModeName() []const u8 {
@@ -302,6 +352,13 @@ fn nowNs() u64 {
 
 fn nsToMs(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+}
+
+fn medianMs(sorted_ns: []const u64) f64 {
+    std.debug.assert(sorted_ns.len > 0);
+    const upper = sorted_ns.len / 2;
+    if (sorted_ns.len % 2 != 0) return nsToMs(sorted_ns[upper]);
+    return (nsToMs(sorted_ns[upper - 1]) + nsToMs(sorted_ns[upper])) / 2.0;
 }
 
 fn wantsHelp(init: std.process.Init) bool {

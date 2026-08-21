@@ -19,7 +19,7 @@ if ! curl -s http://localhost:8080/db/v1/health > /dev/null 2>&1; then
     echo -e "${YELLOW}Warning: Antfly doesn't appear to be running${NC}"
     echo "Please start Antfly first:"
     echo "  cd ../../"
-    echo "  go run ./go/pkg/antfly/cmd standalone"
+    echo "  make build && ./antfly standalone"
     echo ""
     read -p "Continue anyway? (y/n) " -n 1 -r
     echo
@@ -62,9 +62,9 @@ read
 
 # Demo 2: One-step sync workflow
 echo -e "${BLUE}=== Demo 2: One-Step Sync Workflow ===${NC}"
-echo "Syncing Antfly's go/pkg/antfly/src/metadata directory..."
+echo "Syncing Antfly's zig/pkg/antfly/src/metadata directory..."
 ./docsaf sync \
-    --dir ../../go/pkg/antfly/src/metadata \
+    --dir ../../zig/pkg/antfly/src/metadata \
     --table metadata_docs \
     --create-table
 

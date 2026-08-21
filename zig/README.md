@@ -15,7 +15,7 @@ pkg/
   inference/         Inference runtime, OpenAPI server, tools, web UI
   inference-client/  Zig inference client package
 
-go/pkg/antfly/lib/
+lib/
   audio/             Shared audio decode and PCM boundary
   image/             Shared image decode/encode/preprocess boundary
   raft/              Reusable raft library
@@ -27,6 +27,7 @@ go/pkg/antfly/lib/
 
 bench/
   full_text/         Full-text indexing/query/codec benchmarks
+  graph/             Graph-pattern latency and demand-working-set benchmarks
   storage/           LMDB, LSM, WAL, replay, open, and storage-path benches
   vectors/           Dense, HBC, RaBitQ, recall, and sparse vector benches
   baselines/         Checked benchmark baseline JSONL outputs
@@ -44,7 +45,7 @@ testdata/            Shared checked-in fixture data
 
 Root-level Markdown files are design and operating notes for active AntflyDB
 areas. Library-specific design docs live next to their libraries, for example
-`go/pkg/antfly/lib/image/IMAGE.md` and `go/pkg/antfly/lib/audio/AUDIO.md`. Inference-specific design docs
+`lib/image/IMAGE.md` and `lib/audio/AUDIO.md`. Inference-specific design docs
 currently live under `pkg/inference/`.
 
 ## Build Requirements
@@ -136,6 +137,9 @@ Benchmark sources are grouped by domain, while build step names stay stable:
 
 ```sh
 zig build search-bench-build
+zig build graph-pattern-bench-build
+zig build graph-pattern-bench -- --mode exact --fanout 10000 --target-degree 100000
+zig build graph-pattern-bench -- --mode generic --fanout 10000 --target-degree 100000
 zig build text-segment-write-bench
 zig build lsm-backend-bench
 zig build wal-bench
@@ -144,6 +148,10 @@ zig build hbc-read-bench
 zig build json-bench
 zig build regex-bench
 ```
+
+Run each graph-pattern mode in a fresh process. The JSON output reports p50,
+p95, and p99 latency and query-allocation high-water marks. Process RSS is an
+OS high-water mark; use `--warmup 0 --samples 1` for a cold-query RSS comparison.
 
 The `search-benchmark-game/engines/antfly-zig` directory is an adapter for the
 external `search-benchmark-game` harness. It delegates to the root
@@ -170,7 +178,7 @@ pkg/inference/.debug/
 
 ## Development Notes
 
-- Prefer adding shared, reusable code under `go/pkg/antfly/lib/` and product-specific code
+- Prefer adding shared, reusable code under `lib/` and product-specific code
   under `pkg/antfly` or `pkg/inference`.
 - Keep package and library README files local when they explain how to use that
   component directly.

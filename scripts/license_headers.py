@@ -30,7 +30,6 @@ ROOT = SCRIPT_DIR.parent
 REPO_ROOT = ROOT
 
 ELV2_ROOTS = (
-    "go/pkg/antfly",
     "zig/pkg/antfly",
     "zig/pkg/antfly-embedded",
     "zig/e2e/antfly",
@@ -43,7 +42,7 @@ APACHE_ROOTS = (
     "zig/pkg/inference",
     "zig/lib",
     "zig/e2e/inference",
-    "go/e2e",
+    "go/pkg/antflylite",
     "go/pkg/docsaf",
     "go/pkg/evalaf",
     "go/pkg/generating",
@@ -53,7 +52,6 @@ APACHE_ROOTS = (
     "go/pkg/operator",
     "go/pkg/proxy",
     "go/pkg/sdk",
-    "go/pkg/termite",
     "scripts",
     "tools",
     "specs",
@@ -80,10 +78,7 @@ EXCLUDED_PARTS = {
 }
 
 EXCLUDED_GLOBS = (
-    "go/pkg/antfly/lib/httpx/**",
-    "go/pkg/antfly/lib/lmdb/**",
     "deps/**",
-    "go/pkg/termite/onnxruntime/**",
     "specs/tla/*etcdraft*",
     "scripts/uv.lock",
     "e2e/*/uv.lock",

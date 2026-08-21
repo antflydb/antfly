@@ -262,7 +262,6 @@ fn parseSupportedGraphQuery(
         },
         .pattern => {
             if (pattern.len == 0) return error.UnsupportedQueryRequest;
-            if (target_nodes != null) return error.UnsupportedQueryRequest;
         },
         else => unreachable,
     }
@@ -731,6 +730,7 @@ test "parse supported graph queries accepts pattern requests" {
         \\      "type": "pattern",
         \\      "index_name": "graph_idx",
         \\      "start_nodes": {"keys": ["doc-a"]},
+        \\      "target_nodes": {"keys": ["doc-z"]},
         \\      "pattern": [
         \\        {"alias": "a"},
         \\        {"alias": "b", "edge": {"types": ["links"], "direction": "out", "min_hops": 1, "max_hops": 2}}
@@ -750,6 +750,7 @@ test "parse supported graph queries accepts pattern requests" {
     try std.testing.expectEqual(@as(usize, 1), items.len);
     try std.testing.expectEqual(graph_query_mod.QueryType.pattern, items[0].query.query_type);
     try std.testing.expectEqual(@as(usize, 2), items[0].query.pattern.len);
+    try std.testing.expectEqualStrings("doc-z", items[0].query.target_nodes.?.keys[0]);
     try std.testing.expectEqual(@as(usize, 1), items[0].query.return_aliases.len);
     try std.testing.expect(items[0].query.include_documents);
     try std.testing.expectEqual(@as(usize, 1), items[0].query.fields.len);

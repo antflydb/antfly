@@ -19,6 +19,7 @@ const common_secrets = @import("../common/secrets.zig");
 const metadata_mod = @import("domain.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const metadata_api = @import("api.zig");
+const metadata_http_client = @import("http_client.zig");
 const raft_engine = @import("raft_engine");
 const metadata_control_loop = @import("control_loop.zig");
 const metadata_reconcile_lease = @import("reconcile_lease.zig");
@@ -59,6 +60,7 @@ const metadata_run_round_trace_max_phases: usize = 32;
 const linearizable_metadata_read_prefix = "metadata:linearizable-read:";
 const linearizable_metadata_read_timeout_ns: u64 = 5 * std.time.ns_per_s;
 const linearizable_metadata_read_retry_ns: u64 = 50 * std.time.ns_per_ms;
+const reallocation_protocol_probe_timeout_ns: u64 = 5 * std.time.ns_per_s;
 
 fn logMetadataRunRoundPhase(name: []const u8, elapsed_ns: u64) void {
     if (elapsed_ns > metadata_run_round_slow_phase_threshold_ns) {
@@ -431,7 +433,85 @@ pub const MetadataServiceConfig = struct {
     observe_local_replica_root: bool = true,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     secret_store: ?*common_secrets.FileStore = null,
+    reallocation_protocol_peers: []const ReallocationProtocolPeer = &.{},
 };
+
+pub const ReallocationProtocolPeer = struct {
+    node_id: u64,
+    orchestration_url: ?[]const u8 = null,
+};
+
+fn findReallocationProtocolPeer(peers: []const ReallocationProtocolPeer, node_id: u64) ?ReallocationProtocolPeer {
+    for (peers) |peer| {
+        if (peer.node_id == node_id) return peer;
+    }
+    return null;
+}
+
+fn collectReallocationBarrierNodeIds(
+    alloc: std.mem.Allocator,
+    conf_state: raft_engine.core.ConfState,
+    configured_peers: []const ReallocationProtocolPeer,
+) ![]u64 {
+    var required = std.AutoHashMapUnmanaged(u64, void).empty;
+    defer required.deinit(alloc);
+
+    const membership_sets = [_][]const u64{
+        conf_state.voters,
+        conf_state.voters_outgoing,
+        conf_state.learners,
+        conf_state.learners_next,
+    };
+    for (membership_sets) |node_ids| {
+        for (node_ids) |node_id| try required.put(alloc, node_id, {});
+    }
+    // The configured peer set is the target membership for this process.
+    // Probing it as well as the currently applied ConfState prevents a
+    // compatible request from racing a configured learner admission and later
+    // being exposed to an older leader after promotion.
+    for (configured_peers) |peer| try required.put(alloc, peer.node_id, {});
+
+    const node_ids = try alloc.alloc(u64, required.count());
+    var index: usize = 0;
+    var it = required.keyIterator();
+    while (it.next()) |node_id| : (index += 1) node_ids[index] = node_id.*;
+    std.mem.sort(u64, node_ids, {}, std.sort.asc(u64));
+    return node_ids;
+}
+
+const ReallocationBarrierContract = struct {
+    metadata_incarnation: metadata_mod.MetadataClusterIncarnation,
+    protected_metadata_member_count: u32,
+    protected_metadata_membership_fingerprint: metadata_reallocation_request.MembershipFingerprint,
+};
+
+fn reallocationBarrierContract(
+    incarnation: metadata_mod.MetadataClusterIncarnation,
+    sorted_node_ids: []const u64,
+) !ReallocationBarrierContract {
+    if (!metadata_mod.incarnation.isValid(incarnation) or sorted_node_ids.len == 0) {
+        return error.ReallocationProtocolUpgradeRequired;
+    }
+    return .{
+        .metadata_incarnation = incarnation,
+        .protected_metadata_member_count = std.math.cast(u32, sorted_node_ids.len) orelse
+            return error.ReallocationProtocolUpgradeRequired,
+        .protected_metadata_membership_fingerprint = metadata_reallocation_request.membershipFingerprint(sorted_node_ids),
+    };
+}
+
+fn reallocationBarrierStatusCompatible(
+    peer_status: MetadataStatus,
+    metadata_group_id: u64,
+    node_id: u64,
+    incarnation: metadata_mod.MetadataClusterIncarnation,
+) bool {
+    const peer_incarnation = peer_status.metadata_incarnation orelse return false;
+    return peer_status.metadata_group_id == metadata_group_id and
+        peer_status.metadata_raft_local_node_id == node_id and
+        std.mem.eql(u8, &peer_incarnation, &incarnation) and
+        peer_status.reallocation_barrier_protocol_version >= metadata_reallocation_request.barrier_protocol_version;
+}
 
 pub const MetadataServiceDeps = struct {
     host: raft_managed_host.ManagedHostDeps = .{},
@@ -672,6 +752,7 @@ const LocalProjectionInputs = struct {
 const ProjectedCoreSnapshot = struct {
     stores: []metadata_table_manager.StoreRecord = &.{},
     placement_intents: []raft_reconciler.PlacementIntent = &.{},
+    placement_version_fences: []metadata_reconciler.PlacementVersionFence = &.{},
     shuffle_join_leases: []metadata_table_manager.ShuffleJoinLeaseRecord = &.{},
     schema_progresses: []metadata_table_manager.SchemaProgressRecord = &.{},
     restore_progresses: []metadata_table_manager.RestoreProgressRecord = &.{},
@@ -684,6 +765,7 @@ const ProjectedCoreSnapshot = struct {
         if (self.stores.len > 0) alloc.free(self.stores);
         for (self.placement_intents) |intent| alloc.free(intent.peer_node_ids);
         if (self.placement_intents.len > 0) alloc.free(self.placement_intents);
+        if (self.placement_version_fences.len > 0) alloc.free(self.placement_version_fences);
         if (self.shuffle_join_leases.len > 0) alloc.free(self.shuffle_join_leases);
         if (self.schema_progresses.len > 0) alloc.free(self.schema_progresses);
         for (self.restore_progresses) |record| metadata_table_manager.freeRestoreProgress(alloc, record);
@@ -712,6 +794,7 @@ const ProjectedCoreSnapshot = struct {
             .merge_transitions = self.merge_transitions.len,
             .estimated_bytes = @sizeOf(metadata_table_manager.StoreRecord) * self.stores.len +
                 @sizeOf(raft_reconciler.PlacementIntent) * self.placement_intents.len +
+                @sizeOf(metadata_reconciler.PlacementVersionFence) * self.placement_version_fences.len +
                 @sizeOf(metadata_table_manager.ShuffleJoinLeaseRecord) * self.shuffle_join_leases.len +
                 @sizeOf(metadata_table_manager.SchemaProgressRecord) * self.schema_progresses.len +
                 @sizeOf(metadata_table_manager.RestoreProgressRecord) * self.restore_progresses.len +
@@ -1072,6 +1155,13 @@ fn cloneProjectedPlacementIntentsOwned(
         cloned = i + 1;
     }
     return out;
+}
+
+fn cloneProjectedPlacementVersionFencesOwned(
+    alloc: std.mem.Allocator,
+    fences: []const metadata_reconciler.PlacementVersionFence,
+) ![]metadata_reconciler.PlacementVersionFence {
+    return try alloc.dupe(metadata_reconciler.PlacementVersionFence, fences);
 }
 
 fn cloneProjectedSplitTransitionsOwned(
@@ -1809,14 +1899,26 @@ pub const MetadataService = struct {
         } });
     }
 
-    pub fn upsertReplicaIntent(self: *MetadataService, intent: raft_reconciler.PlacementIntent) !void {
-        try self.proposeTransitionCommand(.{ .upsert_replica_intent = intent });
+    pub fn upsertReplicaIntent(
+        self: *MetadataService,
+        intent: raft_reconciler.PlacementIntent,
+        expected_metadata_version: ?u64,
+        expected_version_fence: u64,
+        expected_target_drain_requested: bool,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .upsert_replica_intent = .{
+            .expected_metadata_version = expected_metadata_version,
+            .expected_version_fence = expected_version_fence,
+            .expected_target_drain_requested = expected_target_drain_requested,
+            .replacement = intent,
+        } });
     }
 
-    pub fn removeReplicaIntent(self: *MetadataService, group_id: u64, local_node_id: u64) !void {
+    pub fn removeReplicaIntent(self: *MetadataService, group_id: u64, local_node_id: u64, expected_metadata_version: u64) !void {
         try self.proposeTransitionCommand(.{ .remove_replica_intent = .{
             .group_id = group_id,
             .local_node_id = local_node_id,
+            .expected_metadata_version = expected_metadata_version,
         } });
     }
 
@@ -2124,11 +2226,33 @@ pub const MetadataService = struct {
     }
 
     pub fn requestReallocation(self: *MetadataService, requested_at_ms: u64) !void {
+        const raft_status = self.raft.host.host.raftStatus(self.metadata_group_id) orelse
+            return error.ReallocationProtocolUpgradeRequired;
+        const local_node_id = self.raft.host.host.cfg.local_node_id;
+        const required_node_ids = try collectReallocationBarrierNodeIds(
+            self.alloc,
+            raft_status.conf_state,
+            &.{},
+        );
+        defer if (required_node_ids.len > 0) self.alloc.free(required_node_ids);
+        // The non-HTTP service has no authenticated orchestration channel for
+        // remote capability probes. Keep it safe for its single-node use and
+        // require the HTTP service for multi-node request admission.
+        if (required_node_ids.len != 1 or required_node_ids[0] != local_node_id) {
+            return error.ReallocationProtocolUpgradeRequired;
+        }
+        const incarnation = (try self.metadataIncarnation()) orelse
+            return error.ReallocationProtocolUpgradeRequired;
+        const barrier = try reallocationBarrierContract(incarnation, required_node_ids);
         const runtime = try self.ensureBackendRuntime();
         const request_id = try metadata_reallocation_request.generateRequestId(runtime.io() orelse std.Options.debug_io);
         try self.proposeTransitionCommand(.{ .upsert_reallocation_request = .{
             .request_id = request_id,
             .requested_at_ms = requested_at_ms,
+            .barrier_protocol_version = metadata_reallocation_request.barrier_protocol_version,
+            .metadata_incarnation = barrier.metadata_incarnation,
+            .protected_metadata_member_count = barrier.protected_metadata_member_count,
+            .protected_metadata_membership_fingerprint = barrier.protected_metadata_membership_fingerprint,
         } });
     }
 
@@ -2271,13 +2395,21 @@ pub const MetadataService = struct {
     }
 
     pub fn applyReconciliationPlan(self: *MetadataService, plan: *const metadata_reconciler.ReconciliationPlan) !void {
-        for (plan.placement_upserts) |intent| try self.upsertReplicaIntent(intent);
+        std.debug.assert(plan.placement_upserts.len == plan.placement_upsert_preconditions.len);
+        for (plan.placement_upserts, plan.placement_upsert_preconditions) |intent, precondition| {
+            try self.upsertReplicaIntent(
+                intent,
+                precondition.expected_metadata_version,
+                precondition.expected_version_fence,
+                precondition.expected_target_drain_requested,
+            );
+        }
         for (plan.table_upserts) |record| try self.upsertTable(record);
         for (plan.split_admissions) |admission| try self.admitSplitTransition(admission);
         for (plan.range_upserts) |record| try self.upsertRange(record);
         for (plan.split_upserts) |record| try self.upsertSplitTransition(record);
         for (plan.merge_upserts) |record| try self.upsertMergeTransition(record);
-        for (plan.placement_removals) |record| try self.removeReplicaIntent(record.group_id, record.local_node_id);
+        for (plan.placement_removals) |record| try self.removeReplicaIntent(record.group_id, record.local_node_id, record.expected_metadata_version);
         for (plan.table_removals) |table_id| try self.removeTable(table_id);
         for (plan.range_removals) |group_id| try self.removeRange(group_id);
         for (plan.split_removals) |transition_id| try self.removeSplitTransition(transition_id);
@@ -2338,6 +2470,14 @@ pub const MetadataService = struct {
             .metadata_incarnation = self.metadataIncarnation() catch null,
             .metadata_epoch = projectedProvisioningFingerprint(self.alloc, self) catch self.lifecycle_signal.currentEpoch(),
         };
+    }
+
+    pub fn runtimeTopology(self: *MetadataService) !metadata_api.MetadataRuntimeTopology {
+        return metadataRuntimeTopology(
+            self.metadata_group_id,
+            try self.metadataIncarnation(),
+            serviceGroupRaftTopologyObservation(self, self.metadata_group_id),
+        );
     }
 
     pub fn status(self: *MetadataService) !MetadataStatus {
@@ -2585,6 +2725,14 @@ pub const MetadataService = struct {
     pub fn listProjectedPlacementIntents(self: *MetadataService, alloc: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         return try store.listPlacementIntents(alloc, self.metadata_group_id);
+    }
+
+    pub fn listProjectedPlacementVersionFences(
+        self: *MetadataService,
+        alloc: std.mem.Allocator,
+    ) ![]metadata_reconciler.PlacementVersionFence {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listPlacementVersionFences(alloc, self.metadata_group_id);
     }
 
     pub fn listProjectedNodes(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_table_manager.NodeRecord {
@@ -3112,6 +3260,7 @@ pub const MetadataHttpService = struct {
     metadata_group_id: u64,
     replica_root_dir: ?[]const u8,
     observe_local_replica_root: bool,
+    reallocation_protocol_peers: []const ReallocationProtocolPeer,
     store_status_ticks: usize,
     projection_epoch: std.atomic.Value(u64) = .init(1),
     catalog_epoch: std.atomic.Value(u64) = .init(1),
@@ -3216,6 +3365,7 @@ pub const MetadataHttpService = struct {
             .metadata_group_id = metadata_group_id,
             .replica_root_dir = host_cfg.http.host.replica_root_dir,
             .observe_local_replica_root = cfg.observe_local_replica_root,
+            .reallocation_protocol_peers = cfg.reallocation_protocol_peers,
             .store_status_ticks = 0,
             .local_placement_epoch = null,
             .last_local_placement_refresh_at_ms = 0,
@@ -3500,14 +3650,26 @@ pub const MetadataHttpService = struct {
         } });
     }
 
-    pub fn upsertReplicaIntent(self: *MetadataHttpService, intent: raft_reconciler.PlacementIntent) !void {
-        try self.proposeTransitionCommand(.{ .upsert_replica_intent = intent });
+    pub fn upsertReplicaIntent(
+        self: *MetadataHttpService,
+        intent: raft_reconciler.PlacementIntent,
+        expected_metadata_version: ?u64,
+        expected_version_fence: u64,
+        expected_target_drain_requested: bool,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .upsert_replica_intent = .{
+            .expected_metadata_version = expected_metadata_version,
+            .expected_version_fence = expected_version_fence,
+            .expected_target_drain_requested = expected_target_drain_requested,
+            .replacement = intent,
+        } });
     }
 
-    pub fn removeReplicaIntent(self: *MetadataHttpService, group_id: u64, local_node_id: u64) !void {
+    pub fn removeReplicaIntent(self: *MetadataHttpService, group_id: u64, local_node_id: u64, expected_metadata_version: u64) !void {
         try self.proposeTransitionCommand(.{ .remove_replica_intent = .{
             .group_id = group_id,
             .local_node_id = local_node_id,
+            .expected_metadata_version = expected_metadata_version,
         } });
     }
 
@@ -3833,12 +3995,82 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn requestReallocation(self: *MetadataHttpService, requested_at_ms: u64) !void {
+        const barrier = try self.ensureReallocationBarrierProtocolReady();
         const runtime = try self.ensureBackendRuntime();
         const request_id = try metadata_reallocation_request.generateRequestId(runtime.io() orelse std.Options.debug_io);
         try self.proposeTransitionCommand(.{ .upsert_reallocation_request = .{
             .request_id = request_id,
             .requested_at_ms = requested_at_ms,
+            .barrier_protocol_version = metadata_reallocation_request.barrier_protocol_version,
+            .metadata_incarnation = barrier.metadata_incarnation,
+            .protected_metadata_member_count = barrier.protected_metadata_member_count,
+            .protected_metadata_membership_fingerprint = barrier.protected_metadata_membership_fingerprint,
         } });
+    }
+
+    fn ensureReallocationBarrierProtocolReady(self: *MetadataHttpService) !ReallocationBarrierContract {
+        const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse
+            return error.ReallocationProtocolUpgradeRequired;
+        const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
+        if (std.mem.indexOfScalar(u64, raft_status.conf_state.voters, local_node_id) == null and
+            std.mem.indexOfScalar(u64, raft_status.conf_state.voters_outgoing, local_node_id) == null)
+        {
+            return error.ReallocationProtocolUpgradeRequired;
+        }
+        const incarnation = (try self.metadataIncarnation()) orelse
+            return error.ReallocationProtocolUpgradeRequired;
+        var client = metadata_http_client.MetadataHttpClient.init(
+            self.alloc,
+            self.raft.host.http_host.request_executor,
+        );
+        const probe_budget = metadata_http_client.RequestBudget{
+            .deadline_ns = platform_time.monotonicNs() +| reallocation_protocol_probe_timeout_ns,
+        };
+
+        const required_node_ids = try collectReallocationBarrierNodeIds(
+            self.alloc,
+            raft_status.conf_state,
+            self.reallocation_protocol_peers,
+        );
+        defer if (required_node_ids.len > 0) self.alloc.free(required_node_ids);
+        for (required_node_ids) |node_id| {
+            try self.requireReallocationBarrierPeer(&client, probe_budget, local_node_id, node_id, incarnation);
+        }
+        return try reallocationBarrierContract(incarnation, required_node_ids);
+    }
+
+    fn requireReallocationBarrierPeer(
+        self: *MetadataHttpService,
+        client: *metadata_http_client.MetadataHttpClient,
+        probe_budget: metadata_http_client.RequestBudget,
+        local_node_id: u64,
+        node_id: u64,
+        incarnation: metadata_mod.MetadataClusterIncarnation,
+    ) !void {
+        if (node_id == local_node_id) return;
+        const peer = findReallocationProtocolPeer(self.reallocation_protocol_peers, node_id) orelse {
+            std.log.warn("reallocation barrier blocked: metadata member {d} is not in the configured peer set", .{node_id});
+            return error.ReallocationProtocolUpgradeRequired;
+        };
+        const orchestration_url = peer.orchestration_url orelse {
+            std.log.warn("reallocation barrier blocked: metadata member {d} has no orchestration URL", .{node_id});
+            return error.ReallocationProtocolUpgradeRequired;
+        };
+        if (orchestration_url.len == 0) {
+            std.log.warn("reallocation barrier blocked: metadata member {d} has an empty orchestration URL", .{node_id});
+            return error.ReallocationProtocolUpgradeRequired;
+        }
+        const peer_status = client.fetchStatusWithBudget(orchestration_url, probe_budget) catch |err| {
+            std.log.warn("reallocation barrier blocked: metadata member {d} capability probe failed: {s}", .{ node_id, @errorName(err) });
+            return error.ReallocationProtocolUpgradeRequired;
+        };
+        if (!reallocationBarrierStatusCompatible(peer_status, self.metadata_group_id, node_id, incarnation)) {
+            std.log.warn(
+                "reallocation barrier blocked: metadata voter {d} reports node={d} group={d} protocol={d}",
+                .{ node_id, peer_status.metadata_raft_local_node_id, peer_status.metadata_group_id, peer_status.reallocation_barrier_protocol_version },
+            );
+            return error.ReallocationProtocolUpgradeRequired;
+        }
     }
 
     pub fn clearReallocationRequest(self: *MetadataHttpService, expected_request_id: u128) !void {
@@ -4120,13 +4352,21 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn applyReconciliationPlan(self: *MetadataHttpService, plan: *const metadata_reconciler.ReconciliationPlan) !void {
-        for (plan.placement_upserts) |intent| try self.upsertReplicaIntent(intent);
+        std.debug.assert(plan.placement_upserts.len == plan.placement_upsert_preconditions.len);
+        for (plan.placement_upserts, plan.placement_upsert_preconditions) |intent, precondition| {
+            try self.upsertReplicaIntent(
+                intent,
+                precondition.expected_metadata_version,
+                precondition.expected_version_fence,
+                precondition.expected_target_drain_requested,
+            );
+        }
         for (plan.table_upserts) |record| try self.upsertTable(record);
         for (plan.split_admissions) |admission| try self.admitSplitTransition(admission);
         for (plan.range_upserts) |record| try self.upsertRange(record);
         for (plan.split_upserts) |record| try self.upsertSplitTransition(record);
         for (plan.merge_upserts) |record| try self.upsertMergeTransition(record);
-        for (plan.placement_removals) |record| try self.removeReplicaIntent(record.group_id, record.local_node_id);
+        for (plan.placement_removals) |record| try self.removeReplicaIntent(record.group_id, record.local_node_id, record.expected_metadata_version);
         for (plan.table_removals) |table_id| try self.removeTable(table_id);
         for (plan.range_removals) |group_id| try self.removeRange(group_id);
         for (plan.split_removals) |transition_id| try self.removeSplitTransition(transition_id);
@@ -4186,9 +4426,18 @@ pub const MetadataHttpService = struct {
         };
     }
 
+    pub fn runtimeTopology(self: *MetadataHttpService) !metadata_api.MetadataRuntimeTopology {
+        return metadataRuntimeTopology(
+            self.metadata_group_id,
+            try self.metadataIncarnation(),
+            serviceGroupRaftTopologyObservation(self, self.metadata_group_id),
+        );
+    }
+
     fn fallbackStatus(self: *MetadataHttpService) MetadataStatus {
         return .{
             .metadata_group_id = self.metadata_group_id,
+            .reallocation_barrier_protocol_version = metadata_reallocation_request.barrier_protocol_version,
             .metadata_epoch = self.lifecycle_signal.currentEpoch(),
             .metrics = self.metrics(),
         };
@@ -4246,7 +4495,16 @@ pub const MetadataHttpService = struct {
         const now_ms = nowMs();
         var current_status = snapshotStatus(self.alloc, self.metadata_group_id, self, self.metrics()) catch |err| blk: {
             std.log.warn("metadata status refresh failed err={s}", .{@errorName(err)});
-            break :blk self.loadMetadataStatusCache() orelse self.fallbackStatus();
+            var fallback = self.loadMetadataStatusCache() orelse self.fallbackStatus();
+            // Projection/catalog status is intentionally cacheable, but Raft
+            // leadership and membership are live safety signals consumed by the
+            // operator. Refresh only those cheap in-memory fields so a snapshot
+            // failure can never present stale topology as current.
+            applyMetadataRaftTopology(
+                &fallback,
+                serviceGroupRaftTopologyObservation(self, self.metadata_group_id),
+            );
+            break :blk fallback;
         };
         current_status.metadata_epoch = self.lifecycle_signal.currentEpoch();
         current_status.metrics = self.metrics();
@@ -4491,6 +4749,7 @@ pub const MetadataHttpService = struct {
             const catalog = try self.catalogValidationSnapshotLocked();
             const core = try self.projectedCoreSnapshotLocked();
             const store = self.projectedStore() orelse return error.MissingMetadataStore;
+            snapshot.reallocation_request = try store.getReallocationRequest(self.metadata_group_id);
             snapshot.tables = try cloneProjectedTablesOwned(self.alloc, catalog.tables);
             snapshot.ranges = try cloneProjectedRangesOwned(self.alloc, catalog.ranges);
             snapshot.nodes = try store.listNodes(self.alloc, self.metadata_group_id);
@@ -4710,6 +4969,7 @@ pub const MetadataHttpService = struct {
         errdefer snapshot.deinit(self.alloc);
         snapshot.stores = try store.listStores(self.alloc, self.metadata_group_id);
         snapshot.placement_intents = try store.listPlacementIntents(self.alloc, self.metadata_group_id);
+        snapshot.placement_version_fences = try store.listPlacementVersionFences(self.alloc, self.metadata_group_id);
         snapshot.shuffle_join_leases = try store.listShuffleJoinLeases(self.alloc, self.metadata_group_id);
         snapshot.schema_progresses = try store.listSchemaProgress(self.alloc, self.metadata_group_id);
         snapshot.restore_progresses = try store.listRestoreProgress(self.alloc, self.metadata_group_id);
@@ -4906,6 +5166,16 @@ pub const MetadataHttpService = struct {
         defer self.unlockRuntime();
         const snapshot = try self.projectedCoreSnapshotLocked();
         return try cloneProjectedPlacementIntentsOwned(alloc, snapshot.placement_intents);
+    }
+
+    pub fn listProjectedPlacementVersionFences(
+        self: *MetadataHttpService,
+        alloc: std.mem.Allocator,
+    ) ![]metadata_reconciler.PlacementVersionFence {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const snapshot = try self.projectedCoreSnapshotLocked();
+        return try cloneProjectedPlacementVersionFencesOwned(alloc, snapshot.placement_version_fences);
     }
 
     pub fn listProjectedNodes(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.NodeRecord {
@@ -5517,6 +5787,51 @@ fn cdcLocalMetadataLeader(service: anytype) bool {
     service.lockRuntime();
     defer service.unlockRuntime();
     return service.raft.host.http_host.host.isLocalLeader(service.metadata_group_id);
+}
+
+test "metadata service reallocation barrier requires a current protocol from the exact metadata voter" {
+    const incarnation: metadata_mod.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
+    const legacy_status = MetadataStatus{
+        .metadata_group_id = 42,
+        .metadata_incarnation = incarnation,
+        .metadata_raft_local_node_id = 7,
+        .metrics = .{},
+    };
+    try std.testing.expect(!reallocationBarrierStatusCompatible(legacy_status, 42, 7, incarnation));
+
+    var current_status = legacy_status;
+    current_status.reallocation_barrier_protocol_version = metadata_reallocation_request.barrier_protocol_version;
+    try std.testing.expect(reallocationBarrierStatusCompatible(current_status, 42, 7, incarnation));
+    try std.testing.expect(!reallocationBarrierStatusCompatible(current_status, 43, 7, incarnation));
+    try std.testing.expect(!reallocationBarrierStatusCompatible(current_status, 42, 8, incarnation));
+    try std.testing.expect(!reallocationBarrierStatusCompatible(
+        current_status,
+        42,
+        7,
+        "fedcba9876543210fedcba9876543210".*,
+    ));
+    current_status.metadata_incarnation = null;
+    try std.testing.expect(!reallocationBarrierStatusCompatible(current_status, 42, 7, incarnation));
+}
+
+test "metadata service reallocation barrier covers configured and transitional members" {
+    const configured_peers = [_]ReallocationProtocolPeer{
+        .{ .node_id = 2, .orchestration_url = "http://127.0.0.1:12378" },
+        .{ .node_id = 6 },
+    };
+    const conf_state = raft_engine.core.ConfState{
+        .voters = @constCast((&[_]u64{ 1, 2 })[0..]),
+        .voters_outgoing = @constCast((&[_]u64{ 2, 3 })[0..]),
+        .learners = @constCast((&[_]u64{4})[0..]),
+        .learners_next = @constCast((&[_]u64{5})[0..]),
+    };
+    const required = try collectReallocationBarrierNodeIds(
+        std.testing.allocator,
+        conf_state,
+        &configured_peers,
+    );
+    defer std.testing.allocator.free(required);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3, 4, 5, 6 }, required);
 }
 
 fn shutdownCdcRuntimeJobs(service: anytype) void {
@@ -6611,6 +6926,9 @@ const ServiceGroupRaftObservation = struct {
     commit_index: u64 = 0,
     local_voter: bool = false,
     voter_count: usize = 0,
+    voter_set_fingerprint: ?metadata_api.MetadataRaftVoterSetFingerprint = null,
+    joint_consensus: bool = false,
+    learner_count: usize = 0,
     election_elapsed: u32 = 0,
     randomized_election_timeout: u32 = 0,
     votes_granted: usize = 0,
@@ -6630,11 +6948,23 @@ const ServiceGroupRaftObservation = struct {
     transport_pending_retries: usize = 0,
 };
 
-fn serviceGroupRaftObservation(service: anytype, group_id: u64) ServiceGroupRaftObservation {
+fn serviceGroupRaftTopologyObservation(service: anytype, group_id: u64) ServiceGroupRaftObservation {
     const Service = @TypeOf(service);
     if (Service == *MetadataService) {
         const raft_status = service.raft.host.host.raftStatus(group_id) orelse return .{};
-        var observation = raftObservationFromStatus(raft_status, service.raft.host.host.cfg.local_node_id);
+        return raftObservationFromStatus(raft_status, service.raft.host.host.cfg.local_node_id);
+    }
+    if (Service == *MetadataHttpService) {
+        const raft_status = service.raft.host.http_host.host.raftStatus(group_id) orelse return .{};
+        return raftObservationFromStatus(raft_status, service.raft.host.http_host.host.cfg.local_node_id);
+    }
+    return .{};
+}
+
+fn serviceGroupRaftObservation(service: anytype, group_id: u64) ServiceGroupRaftObservation {
+    const Service = @TypeOf(service);
+    var observation = serviceGroupRaftTopologyObservation(service, group_id);
+    if (Service == *MetadataService) {
         const host_metrics = service.raft.host.host.metricsSnapshot();
         observation.inbound_message_enqueues = host_metrics.inbound_message_enqueues;
         observation.inbound_message_drains = host_metrics.inbound_message_drains;
@@ -6642,8 +6972,6 @@ fn serviceGroupRaftObservation(service: anytype, group_id: u64) ServiceGroupRaft
         return observation;
     }
     if (Service == *MetadataHttpService) {
-        const raft_status = service.raft.host.http_host.host.raftStatus(group_id) orelse return .{};
-        var observation = raftObservationFromStatus(raft_status, service.raft.host.http_host.host.cfg.local_node_id);
         const host_metrics = service.raft.host.http_host.host.metricsSnapshot();
         observation.inbound_message_enqueues = host_metrics.inbound_message_enqueues;
         observation.inbound_message_drains = host_metrics.inbound_message_drains;
@@ -6663,6 +6991,44 @@ fn serviceGroupRaftObservation(service: anytype, group_id: u64) ServiceGroupRaft
     return .{};
 }
 
+fn applyMetadataRaftTopology(status: *MetadataStatus, observation: ServiceGroupRaftObservation) void {
+    status.metadata_raft_local_node_id = observation.local_node_id;
+    status.metadata_raft_role = observation.role;
+    status.metadata_raft_leader_id = observation.leader_id;
+    status.metadata_raft_term = observation.term;
+    status.metadata_raft_commit_index = observation.commit_index;
+    status.metadata_raft_local_voter = observation.local_voter;
+    status.metadata_raft_voter_count = observation.voter_count;
+    status.metadata_raft_voter_set_fingerprint = observation.voter_set_fingerprint;
+    status.metadata_raft_joint_consensus = observation.joint_consensus;
+    status.metadata_raft_learner_count = observation.learner_count;
+    status.metadata_raft_election_elapsed = observation.election_elapsed;
+    status.metadata_raft_randomized_election_timeout = observation.randomized_election_timeout;
+    status.metadata_raft_votes_granted = observation.votes_granted;
+    status.metadata_raft_votes_rejected = observation.votes_rejected;
+    status.metadata_raft_votes_unknown = observation.votes_unknown;
+}
+
+fn metadataRuntimeTopology(
+    metadata_group_id: u64,
+    metadata_incarnation: ?metadata_api.MetadataClusterIncarnation,
+    observation: ServiceGroupRaftObservation,
+) metadata_api.MetadataRuntimeTopology {
+    return .{
+        .metadata_group_id = metadata_group_id,
+        .metadata_incarnation = metadata_incarnation,
+        .metadata_raft_local_node_id = observation.local_node_id,
+        .metadata_raft_role = observation.role,
+        .metadata_raft_leader_id = observation.leader_id,
+        .metadata_raft_term = observation.term,
+        .metadata_raft_local_voter = observation.local_voter,
+        .metadata_raft_voter_count = observation.voter_count,
+        .metadata_raft_voter_set_fingerprint = observation.voter_set_fingerprint,
+        .metadata_raft_joint_consensus = observation.joint_consensus,
+        .metadata_raft_learner_count = observation.learner_count,
+    };
+}
+
 fn raftObservationFromStatus(
     raft_status: raft_engine.core.Status,
     local_node_id: u64,
@@ -6674,6 +7040,7 @@ fn raftObservationFromStatus(
             break;
         }
     }
+    const voter_set_fingerprint = metadata_table_manager.voterSetFingerprint(raft_status.conf_state.voters, null);
     return .{
         .local_node_id = local_node_id,
         .role = raftRoleName(raft_status.soft.role),
@@ -6682,12 +7049,38 @@ fn raftObservationFromStatus(
         .commit_index = raft_status.hard.commit_index,
         .local_voter = local_voter,
         .voter_count = raft_status.conf_state.voters.len,
+        .voter_set_fingerprint = std.fmt.bytesToHex(voter_set_fingerprint, .lower),
+        .joint_consensus = raft_status.conf_state.voters_outgoing.len > 0,
+        .learner_count = raft_status.conf_state.learners.len + raft_status.conf_state.learners_next.len,
         .election_elapsed = raft_status.election_elapsed,
         .randomized_election_timeout = raft_status.randomized_election_timeout,
         .votes_granted = raft_status.votes_granted,
         .votes_rejected = raft_status.votes_rejected,
         .votes_unknown = raft_status.votes_unknown,
     };
+}
+
+test "metadata service Raft observation exposes canonical membership configuration" {
+    var voters = [_]u64{ 3, 1, 2 };
+    var outgoing = [_]u64{ 1, 2 };
+    var learners = [_]u64{4};
+    var learners_next = [_]u64{5};
+    const observation = raftObservationFromStatus(.{
+        .id = 2,
+        .group_id = 1,
+        .soft = .{ .leader_id = 1 },
+        .hard = .{},
+        .conf_state = .{
+            .voters = &voters,
+            .voters_outgoing = &outgoing,
+            .learners = &learners,
+            .learners_next = &learners_next,
+        },
+    }, 2);
+    const expected = std.fmt.bytesToHex(metadata_table_manager.voterSetFingerprint(&voters, null), .lower);
+    try std.testing.expectEqualStrings(&expected, &(observation.voter_set_fingerprint orelse return error.TestUnexpectedResult));
+    try std.testing.expect(observation.joint_consensus);
+    try std.testing.expectEqual(@as(usize, 2), observation.learner_count);
 }
 
 fn raftRoleName(role: raft_engine.core.types.StateRole) []const u8 {
@@ -8423,6 +8816,7 @@ pub fn snapshotStatusWithOptions(
 
     return .{
         .metadata_group_id = metadata_group_id,
+        .reallocation_barrier_protocol_version = metadata_reallocation_request.barrier_protocol_version,
         .metadata_incarnation = metadata_incarnation,
         .metadata_raft_local_node_id = metadata_raft.local_node_id,
         .metadata_raft_role = metadata_raft.role,
@@ -8431,6 +8825,9 @@ pub fn snapshotStatusWithOptions(
         .metadata_raft_commit_index = metadata_raft.commit_index,
         .metadata_raft_local_voter = metadata_raft.local_voter,
         .metadata_raft_voter_count = metadata_raft.voter_count,
+        .metadata_raft_voter_set_fingerprint = metadata_raft.voter_set_fingerprint,
+        .metadata_raft_joint_consensus = metadata_raft.joint_consensus,
+        .metadata_raft_learner_count = metadata_raft.learner_count,
         .metadata_raft_election_elapsed = metadata_raft.election_elapsed,
         .metadata_raft_randomized_election_timeout = metadata_raft.randomized_election_timeout,
         .metadata_raft_votes_granted = metadata_raft.votes_granted,
@@ -9523,6 +9920,8 @@ test "metadata service projects committed placement intents into local hosted re
     try svc.campaignMetadataGroup();
     try svc.runRound();
 
+    try svc.upsertNode(.{ .node_id = 1 });
+    try svc.runRound();
     try svc.upsertReplicaIntent(.{
         .record = .{
             .group_id = 1951,
@@ -9531,7 +9930,7 @@ test "metadata service projects committed placement intents into local hosted re
             .bootstrap_mode = .empty,
         },
         .peer_node_ids = &.{ 1, 2, 3 },
-    });
+    }, null, 0, false);
 
     try runServiceRoundsUntilHostedStatus(&svc, 1951, .active, 8, "placement-intent activation");
 
@@ -9540,7 +9939,7 @@ test "metadata service projects committed placement intents into local hosted re
     try std.testing.expectEqual(@as(usize, 1), projected.len);
     try std.testing.expectEqual(@as(u64, 1951), projected[0].record.group_id);
 
-    try svc.removeReplicaIntent(1951, 1);
+    try svc.removeReplicaIntent(1951, 1, projected[0].record.metadata_version);
     try runServiceRoundsUntilHostedStatus(&svc, 1951, .absent, 8, "placement-intent removal");
 }
 
@@ -9622,6 +10021,10 @@ test "table workflow can drive placement intents through the real metadata contr
     try svc.campaignMetadataGroup();
     try svc.runRound();
 
+    try svc.upsertNode(.{ .node_id = 1 });
+    try svc.upsertNode(.{ .node_id = 2 });
+    try svc.upsertNode(.{ .node_id = 3 });
+    try svc.runRound();
     var workflow = metadata_table_workflow.TableWorkflow.init(std.testing.allocator);
     defer workflow.deinit();
     try workflow.setPlacementCandidates(&.{ 1, 2, 3 });
@@ -9739,6 +10142,12 @@ test "metadata service reports store status without losing placement attributes"
     });
     try svc.runRound();
 
+    var group_statuses = [_]metadata_table_manager.GroupStatusReport{.{
+        .group_id = 4201,
+        .disk_bytes = 4096,
+        .disk_bytes_known = true,
+        .updated_at_millis = 1_700_000_000_000,
+    }};
     try svc.reportStoreStatus(.{
         .store_id = 11,
         .live = false,
@@ -9750,6 +10159,25 @@ test "metadata service reports store status without losing placement attributes"
         .write_load = 130,
         .active_backfills = 2,
         .backfill_progress_millis = 375,
+        .group_statuses = group_statuses[0..],
+    });
+    try svc.runRound();
+
+    // The acknowledgement itself must be enough to publish another store
+    // record even when all coalesced status and capacity fields are unchanged.
+    group_statuses[0].observed_reallocation_request_id = 0x123456789abcdef00123456789abcdef;
+    try svc.reportStoreStatus(.{
+        .store_id = 11,
+        .live = false,
+        .health_class = "degraded",
+        .capacity_bytes = 2048,
+        .available_bytes = 0,
+        .lease_pressure = 92,
+        .read_load = 210,
+        .write_load = 130,
+        .active_backfills = 2,
+        .backfill_progress_millis = 375,
+        .group_statuses = group_statuses[0..],
     });
     try svc.runRound();
 
@@ -9770,6 +10198,11 @@ test "metadata service reports store status without losing placement attributes"
     try std.testing.expectEqual(@as(u32, 130), projected[0].write_load);
     try std.testing.expectEqual(@as(u32, 2), projected[0].active_backfills);
     try std.testing.expectEqual(@as(u16, 375), projected[0].backfill_progress_millis);
+    try std.testing.expectEqual(@as(usize, 1), projected[0].group_statuses.len);
+    try std.testing.expectEqual(
+        @as(u128, 0x123456789abcdef00123456789abcdef),
+        projected[0].group_statuses[0].observed_reallocation_request_id,
+    );
 
     const status = try svc.status();
     try std.testing.expectEqual(@as(usize, 1), status.backfill_stores);
@@ -9894,7 +10327,7 @@ test "metadata service batches store status reports" {
     try std.testing.expectEqual(@as(usize, 1), status.active_backfills);
 }
 
-test "metadata service persists and clears reallocation requests" {
+test "metadata service persists coalesces promotes and clears reallocation requests" {
     const Factory = struct {
         alloc: std.mem.Allocator,
         store: *raft_engine.core.MemoryStorage,
@@ -9970,7 +10403,7 @@ test "metadata service persists and clears reallocation requests" {
         .bootstrap_mode = .empty,
     });
     try svc.campaignMetadataGroup();
-    try svc.runRound();
+    try runServiceRoundsUntilMetadataReady(&svc);
 
     try svc.requestReallocation(77_000);
     try svc.runRound();
@@ -9978,21 +10411,43 @@ test "metadata service persists and clears reallocation requests" {
     try std.testing.expect(requested != null);
     try std.testing.expect(requested.?.request_id != 0);
     try std.testing.expectEqual(@as(u64, 77_000), requested.?.requested_at_ms);
+    try std.testing.expectEqual(metadata_reallocation_request.barrier_protocol_version, requested.?.barrier_protocol_version);
+    try std.testing.expectEqual(try svc.metadataIncarnation(), requested.?.metadata_incarnation);
+    try std.testing.expectEqual(@as(u32, 1), requested.?.protected_metadata_member_count);
+    try std.testing.expectEqualSlices(
+        u8,
+        &metadata_reallocation_request.membershipFingerprint(&.{1}),
+        &requested.?.protected_metadata_membership_fingerprint,
+    );
+    var requested_snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&requested_snapshot);
+    try std.testing.expectEqual(requested, requested_snapshot.reallocation_request);
 
+    // A reconcile plan may decide to clear this generation before a lifecycle
+    // mutation queues another reallocation. Apply two such triggers before the
+    // stale clear: they must coalesce into one private pending generation, and
+    // the clear must atomically promote the latest trigger instead of losing it.
+    try svc.requestReallocation(88_000);
+    try svc.requestReallocation(99_000);
+    var clear_active_plan = metadata_reconciler.ReconciliationPlan.empty();
+    clear_active_plan.clear_reallocation_request = requested.?.request_id;
+    try svc.applyReconciliationPlan(&clear_active_plan);
+    try svc.runRound();
+    const promoted = try svc.getProjectedReallocationRequest();
+    try std.testing.expect(promoted != null);
+    try std.testing.expect(promoted.?.request_id != requested.?.request_id);
+    try std.testing.expectEqual(@as(u64, 99_000), promoted.?.requested_at_ms);
+
+    // A repeated clear from the old plan cannot consume its promoted successor.
     var stale_plan = metadata_reconciler.ReconciliationPlan.empty();
     stale_plan.clear_reallocation_request = requested.?.request_id;
-    try svc.requestReallocation(88_000);
-    try svc.runRound();
     try svc.applyReconciliationPlan(&stale_plan);
     try svc.runRound();
-    const replacement = try svc.getProjectedReallocationRequest();
-    try std.testing.expect(replacement != null);
-    try std.testing.expect(replacement.?.request_id != requested.?.request_id);
-    try std.testing.expectEqual(@as(u64, 88_000), replacement.?.requested_at_ms);
+    try std.testing.expectEqual(promoted, try svc.getProjectedReallocationRequest());
 
-    var current_plan = metadata_reconciler.ReconciliationPlan.empty();
-    current_plan.clear_reallocation_request = replacement.?.request_id;
-    try svc.applyReconciliationPlan(&current_plan);
+    var clear_promoted_plan = metadata_reconciler.ReconciliationPlan.empty();
+    clear_promoted_plan.clear_reallocation_request = promoted.?.request_id;
+    try svc.applyReconciliationPlan(&clear_promoted_plan);
     try svc.runRound();
     try std.testing.expect((try svc.getProjectedReallocationRequest()) == null);
 }
@@ -11318,6 +11773,8 @@ test "metadata service status reports repair and rebalance counts" {
     try svc.campaignMetadataGroup();
     try svc.runRound();
 
+    try svc.upsertNode(.{ .node_id = 1 });
+    try svc.upsertNode(.{ .node_id = 2 });
     try svc.upsertStore(.{ .store_id = 31, .node_id = 1, .role = "data", .live = true, .capacity_bytes = 1024, .available_bytes = 900 });
     try svc.upsertStore(.{ .store_id = 32, .node_id = 2, .role = "data", .live = true, .capacity_bytes = 1024, .available_bytes = 850 });
     try svc.runRound();
@@ -11402,7 +11859,7 @@ test "metadata service status reports repair and rebalance counts" {
             },
         },
         .peer_node_ids = &.{2},
-    });
+    }, null, 0, false);
     try svc.upsertReplicaIntent(.{
         .record = .{
             .group_id = 8801,
@@ -11420,7 +11877,7 @@ test "metadata service status reports repair and rebalance counts" {
             },
         },
         .peer_node_ids = &.{1},
-    });
+    }, null, 0, false);
     try svc.runRound();
 
     try svc.reportStoreStatus(.{
@@ -11721,6 +12178,7 @@ test "metadata service committed metadata changes request lifecycle reconcile ho
     try std.testing.expect(capture.calls >= 1);
 
     capture.calls = 0;
+    try svc.upsertNode(.{ .node_id = 1 });
     try svc.upsertReplicaIntent(.{
         .record = .{
             .group_id = 9901,
@@ -11729,7 +12187,7 @@ test "metadata service committed metadata changes request lifecycle reconcile ho
         },
         .store_id = 0,
         .peer_node_ids = &.{},
-    });
+    }, null, 0, false);
     try svc.requestReallocation(1);
     try runServiceRounds(&svc, 8);
     try std.testing.expect(capture.calls >= 1);
@@ -12070,6 +12528,68 @@ test "metadata http service catalog cache is independent from volatile projectio
     defer svc.freeProjectedTables(std.testing.allocator, after);
     try std.testing.expectEqual(@as(usize, 0), after.len);
     try std.testing.expectEqual(catalog_epoch_after, svc.catalog_validation_cache.catalog_epoch);
+
+    var incarnation_rounds: usize = 0;
+    while (try svc.metadataIncarnation() == null and incarnation_rounds < 32) : (incarnation_rounds += 1) {
+        try svc.runRound();
+    }
+    try std.testing.expect(try svc.metadataIncarnation() != null);
+    try svc.requestReallocation(77_000);
+    try svc.runRound();
+    var admin_snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&admin_snapshot);
+    try std.testing.expect(admin_snapshot.reallocation_request != null);
+    try std.testing.expectEqual(@as(u64, 77_000), admin_snapshot.reallocation_request.?.requested_at_ms);
+    try std.testing.expectEqual(
+        metadata_reallocation_request.barrier_protocol_version,
+        admin_snapshot.reallocation_request.?.barrier_protocol_version,
+    );
+    try std.testing.expectEqual(try svc.metadataIncarnation(), admin_snapshot.reallocation_request.?.metadata_incarnation);
+
+    // A full status refresh may fail while cached projection data is still
+    // useful. Poison the cached Raft fields, force the projected store lookup
+    // to fail, and prove the fallback overlays the current in-memory topology.
+    const live_raft = serviceGroupRaftTopologyObservation(&svc, 2900);
+    try std.testing.expect(live_raft.voter_set_fingerprint != null);
+    var stale_status = try svc.status();
+    stale_status.metadata_raft_local_node_id = 99;
+    stale_status.metadata_raft_role = "leader";
+    stale_status.metadata_raft_leader_id = 99;
+    stale_status.metadata_raft_term += 100;
+    stale_status.metadata_raft_commit_index += 100;
+    stale_status.metadata_raft_local_voter = false;
+    stale_status.metadata_raft_voter_count = 99;
+    stale_status.metadata_raft_voter_set_fingerprint = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".*;
+    stale_status.metadata_raft_joint_consensus = true;
+    stale_status.metadata_raft_learner_count = 99;
+    stale_status.metadata_raft_election_elapsed += 100;
+    stale_status.metadata_raft_randomized_election_timeout += 100;
+    stale_status.metadata_raft_votes_granted += 100;
+    stale_status.metadata_raft_votes_rejected += 100;
+    stale_status.metadata_raft_votes_unknown += 100;
+    svc.storeMetadataStatusCache(stale_status, nowMs() + metadata_status_cache_refresh_interval_ms);
+
+    const fallback_status = blk: {
+        const projected_store = svc.raft.host.owned_metadata_store orelse return error.MissingMetadataStore;
+        svc.raft.host.owned_metadata_store = null;
+        defer svc.raft.host.owned_metadata_store = projected_store;
+        break :blk try svc.status();
+    };
+    try std.testing.expectEqual(live_raft.local_node_id, fallback_status.metadata_raft_local_node_id);
+    try std.testing.expectEqualStrings(live_raft.role, fallback_status.metadata_raft_role);
+    try std.testing.expectEqual(live_raft.leader_id, fallback_status.metadata_raft_leader_id);
+    try std.testing.expectEqual(live_raft.term, fallback_status.metadata_raft_term);
+    try std.testing.expectEqual(live_raft.commit_index, fallback_status.metadata_raft_commit_index);
+    try std.testing.expectEqual(live_raft.local_voter, fallback_status.metadata_raft_local_voter);
+    try std.testing.expectEqual(live_raft.voter_count, fallback_status.metadata_raft_voter_count);
+    try std.testing.expectEqual(live_raft.voter_set_fingerprint, fallback_status.metadata_raft_voter_set_fingerprint);
+    try std.testing.expectEqual(live_raft.joint_consensus, fallback_status.metadata_raft_joint_consensus);
+    try std.testing.expectEqual(live_raft.learner_count, fallback_status.metadata_raft_learner_count);
+    try std.testing.expectEqual(live_raft.election_elapsed, fallback_status.metadata_raft_election_elapsed);
+    try std.testing.expectEqual(live_raft.randomized_election_timeout, fallback_status.metadata_raft_randomized_election_timeout);
+    try std.testing.expectEqual(live_raft.votes_granted, fallback_status.metadata_raft_votes_granted);
+    try std.testing.expectEqual(live_raft.votes_rejected, fallback_status.metadata_raft_votes_rejected);
+    try std.testing.expectEqual(live_raft.votes_unknown, fallback_status.metadata_raft_votes_unknown);
 }
 
 test "metadata http service linearizable read waits for leader discovery" {
@@ -12381,6 +12901,7 @@ test "metadata service local replica root reconcile permit hook defers reconcile
 
     try svc.upsertTable(.{ .table_id = 99, .name = "docs" });
     try svc.upsertRange(.{ .group_id = 9901, .table_id = 99, .start_key = "", .end_key = null });
+    try svc.upsertNode(.{ .node_id = 1 });
     try svc.upsertReplicaIntent(.{
         .record = .{
             .group_id = 9901,
@@ -12389,7 +12910,7 @@ test "metadata service local replica root reconcile permit hook defers reconcile
         },
         .store_id = 0,
         .peer_node_ids = &.{},
-    });
+    }, null, 0, false);
 
     var capture = HookCapture{};
     var permit = PermitCapture{ .allow = false };

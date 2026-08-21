@@ -90,7 +90,7 @@ The Antfly Operator manages two types of nodes:
 
 ## Requirements
 
-- Kubernetes 1.20+
+- Kubernetes 1.23+
 - kubectl configured for your cluster
 - Storage class with dynamic provisioning
 - (Optional) metrics-server for autoscaling

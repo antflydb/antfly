@@ -78,6 +78,22 @@ pub const PatternMatch = struct {
     }
 };
 
+pub const MatchPlan = enum {
+    generic_expand,
+    exact_two_edge_probe,
+};
+
+/// Optional per-query instrumentation for benchmarks and request diagnostics.
+/// Counters describe logical matcher work rather than backend implementation
+/// details, so they remain comparable across local and serverless readers.
+pub const MatchStats = struct {
+    plan: MatchPlan = .generic_expand,
+    adjacency_reads: usize = 0,
+    adjacency_edges: usize = 0,
+    exact_edge_probes: usize = 0,
+    exact_edge_matches: usize = 0,
+};
+
 pub fn freeMatches(alloc: Allocator, matches: []PatternMatch) void {
     for (matches) |*match| match.deinit(alloc);
     if (matches.len > 0) alloc.free(matches);
@@ -86,8 +102,12 @@ pub fn freeMatches(alloc: Allocator, matches: []PatternMatch) void {
 pub const MatchOptions = struct {
     max_results: u32 = 100,
     return_aliases: []const []const u8 = &.{},
+    target_nodes: []const node_identity.Ref = &.{},
+    target_required: bool = false,
+    include_paths: bool = true,
     evaluator: ?FilterEvaluator = null,
     node_admission: ?NodeAdmission = null,
+    stats: ?*MatchStats = null,
     max_explored_nodes: usize = default_max_explored_nodes,
     max_explored_edges: usize = default_max_explored_edges,
     max_intermediate_states: usize = default_max_intermediate_states,
@@ -163,14 +183,33 @@ pub fn matchPattern(
             a: Allocator,
             table: ?[]const u8,
             key: []const u8,
+            edge_types: []const []const u8,
             direction: graph_mod.EdgeDirection,
         ) ![]graph_mod.Edge {
             if (table != null) return try a.alloc(graph_mod.Edge, 0);
-            return try self.graph_index.getEdges(a, key, "", direction);
+            return try self.graph_index.getEdgesByTypes(a, key, edge_types, direction);
         }
 
         pub fn freeEdges(_: @This(), a: Allocator, edges: []graph_mod.Edge) void {
             graph_mod.GraphIndex.freeEdges(a, edges);
+        }
+
+        pub fn probeEdges(
+            self: @This(),
+            a: Allocator,
+            table: ?[]const u8,
+            probes: []const graph_mod.EdgeProbe,
+        ) ![]?graph_mod.Edge {
+            if (table != null) {
+                const empty = try a.alloc(?graph_mod.Edge, probes.len);
+                @memset(empty, null);
+                return empty;
+            }
+            return try self.graph_index.probeEdgesAlloc(a, probes);
+        }
+
+        pub fn freeProbedEdges(_: @This(), a: Allocator, edges: []?graph_mod.Edge) void {
+            graph_mod.GraphIndex.freeProbedEdges(a, edges);
         }
     };
 
@@ -218,6 +257,9 @@ pub fn matchPatternFromRefsWithEdgeReader(
         if (min_hops > max_hops or max_hops > max_pattern_hops)
             return error.InvalidArgument;
     }
+    if (opts.stats) |stats| stats.* = .{};
+    if (opts.target_required and opts.target_nodes.len == 0)
+        return try alloc.alloc(PatternMatch, 0);
     var work_budget = WorkBudget{
         .remaining_nodes = opts.max_explored_nodes,
         .remaining_edges = opts.max_explored_edges,
@@ -233,6 +275,24 @@ pub fn matchPatternFromRefsWithEdgeReader(
                     std.math.maxInt(usize),
             ),
         );
+
+    // Fast-plan discovery is speculative. A reader may reveal a cross-table
+    // edge that makes the plan inapplicable; never charge that abandoned work
+    // to the generic fallback's public query budget.
+    var exact_budget = work_budget;
+    if (try matchExactTwoEdgePattern(
+        alloc,
+        edge_reader,
+        start_nodes,
+        pattern,
+        opts,
+        intermediate_limit,
+        &exact_budget,
+    )) |matches| {
+        work_budget = exact_budget;
+        if (opts.stats) |stats| stats.plan = .exact_two_edge_probe;
+        return matches;
+    }
 
     var current = std.ArrayListUnmanaged(MatchState).empty;
     defer {
@@ -320,9 +380,13 @@ pub fn matchPatternFromRefsWithEdgeReader(
                 current_binding.table,
                 step.edge,
                 step.node_filter,
+                if (step_idx + 1 == pattern.len) opts.target_nodes else &.{},
+                step_idx + 1 == pattern.len and opts.target_required,
                 opts.max_results,
                 opts.evaluator,
                 opts.node_admission,
+                opts.include_paths,
+                opts.stats,
                 &work_budget,
             );
             defer {
@@ -359,7 +423,10 @@ pub fn matchPatternFromRefsWithEdgeReader(
                     new_bindings = expanded;
                 }
 
-                const new_path = try concatPathEdges(alloc, match.path, reached.path);
+                const new_path = if (opts.include_paths)
+                    try concatPathEdges(alloc, match.path, reached.path)
+                else
+                    @constCast((&[_]paths_mod.PathEdge{})[0..]);
                 errdefer if (state_owned) freePathEdges(alloc, new_path);
                 try next.append(alloc, .{
                     .bindings = new_bindings,
@@ -387,7 +454,17 @@ pub fn matchPatternFromRefsWithEdgeReader(
         if (results.len > 0) alloc.free(results);
     }
 
-    for (current.items[0..limited_len], 0..) |match, i| {
+    for (current.items[0..limited_len], 0..) |*match, i| {
+        if (opts.return_aliases.len == 0) {
+            results[i] = .{
+                .bindings = match.bindings,
+                .path = match.path,
+            };
+            match.bindings = @constCast((&[_]PatternBinding{})[0..]);
+            match.path = @constCast((&[_]paths_mod.PathEdge{})[0..]);
+            initialized += 1;
+            continue;
+        }
         const filtered_bindings = try filterBindings(alloc, match.bindings, opts.return_aliases);
         errdefer {
             for (filtered_bindings) |*binding| binding.deinit(alloc);
@@ -395,12 +472,223 @@ pub fn matchPatternFromRefsWithEdgeReader(
         }
         results[i] = .{
             .bindings = filtered_bindings,
-            .path = try clonePathEdges(alloc, match.path),
+            .path = if (opts.include_paths)
+                try clonePathEdges(alloc, match.path)
+            else
+                @constCast((&[_]paths_mod.PathEdge{})[0..]),
         };
         initialized += 1;
     }
 
+    std.log.debug(
+        "antfly_graph_pattern_plan plan=generic_expand matches={d}",
+        .{results.len},
+    );
     return results;
+}
+
+/// For a fixed two-edge pattern with one exact start and endpoint, scan the
+/// start adjacency once and batch-probe the exact second relationship for each
+/// admitted middle node. The physical graph key already contains
+/// (source,index,type,target), so this plan is independent of global target
+/// degree and does not materialize the target's complete reverse adjacency.
+fn matchExactTwoEdgePattern(
+    alloc: Allocator,
+    edge_reader: anytype,
+    start_nodes: []const node_identity.Ref,
+    pattern: []const PatternStep,
+    opts: MatchOptions,
+    intermediate_limit: usize,
+    work_budget: *WorkBudget,
+) !?[]PatternMatch {
+    if (comptime !@hasDecl(@TypeOf(edge_reader), "probeEdges") or
+        !@hasDecl(@TypeOf(edge_reader), "freeProbedEdges"))
+    {
+        return null;
+    }
+    if (pattern.len != 3 or start_nodes.len != 1 or !opts.target_required or opts.target_nodes.len != 1 or
+        start_nodes[0].table != null or opts.target_nodes[0].table != null or
+        opts.node_admission != null)
+    {
+        return null;
+    }
+    for (pattern[1..]) |step| {
+        if (step.edge.types.len != 1 or step.edge.direction == .both) return null;
+        const min_hops = if (step.edge.min_hops == 0) @as(u32, 1) else step.edge.min_hops;
+        const max_hops = if (step.edge.max_hops == 0) @as(u32, 1) else step.edge.max_hops;
+        if (min_hops != 1 or max_hops != 1) return null;
+    }
+
+    var alias_bufs: [3][32]u8 = undefined;
+    const aliases = [3][]const u8{
+        effectiveAlias(pattern[0].alias, 0, &alias_bufs[0]),
+        effectiveAlias(pattern[1].alias, 1, &alias_bufs[1]),
+        effectiveAlias(pattern[2].alias, 2, &alias_bufs[2]),
+    };
+    if (std.mem.eql(u8, aliases[0], aliases[1]) or
+        std.mem.eql(u8, aliases[0], aliases[2]) or
+        std.mem.eql(u8, aliases[1], aliases[2])) return null;
+
+    const start_key = start_nodes[0].key;
+    const target_key = opts.target_nodes[0].key;
+    if (!(try passesNodeFilter(start_key, pattern[0].node_filter, opts.evaluator)) or
+        !(try passesNodeFilter(target_key, pattern[2].node_filter, opts.evaluator)))
+    {
+        return try alloc.alloc(PatternMatch, 0);
+    }
+
+    const forward_edges = try edge_reader.getEdges(
+        alloc,
+        null,
+        start_key,
+        pattern[1].edge.types,
+        pattern[1].edge.direction,
+    );
+    defer edge_reader.freeEdges(alloc, forward_edges);
+
+    const Candidate = struct {
+        middle_key: []const u8,
+        forward_edge_index: usize,
+    };
+    const expansion_limit: usize = if (opts.max_results == 0)
+        1000
+    else
+        @min(
+            std.math.mul(usize, @as(usize, opts.max_results), 10) catch std.math.maxInt(usize),
+            1000,
+        );
+    var candidates = std.ArrayListUnmanaged(Candidate).empty;
+    defer candidates.deinit(alloc);
+    for (forward_edges, 0..) |graph_edge, edge_index| {
+        if (!edgeMatches(graph_edge, pattern[1].edge)) continue;
+        if (traversal_mod.metadataTargetTable(graph_edge.metadata) != null) return null;
+        const middle_key = edgeTarget(graph_edge, start_key, pattern[1].edge.direction) orelse continue;
+        if (std.mem.eql(u8, middle_key, start_key)) continue;
+        if (edgeTargetTable(null, graph_edge, middle_key) != null) return null;
+        if (!(try passesNodeFilter(middle_key, pattern[1].node_filter, opts.evaluator))) continue;
+        try candidates.append(alloc, .{
+            .middle_key = middle_key,
+            .forward_edge_index = edge_index,
+        });
+        if (candidates.items.len > intermediate_limit)
+            return error.QueryCandidateBudgetExceeded;
+        // Keep the same deterministic first-hop window as generic expansion.
+        // The optimizer must not make nodes beyond that window newly visible.
+        if (candidates.items.len >= expansion_limit) break;
+    }
+
+    // Match generic-expansion accounting: one expanded start node, then one
+    // expanded middle node and one exact relationship probe per candidate.
+    try work_budget.consumeNode();
+    try work_budget.consumeEdges(forward_edges.len);
+    for (candidates.items) |_| try work_budget.consumeNode();
+    try work_budget.consumeEdges(candidates.items.len);
+
+    var matches = std.ArrayListUnmanaged(PatternMatch).empty;
+    errdefer {
+        for (matches.items) |*match| match.deinit(alloc);
+        matches.deinit(alloc);
+    }
+    const result_limit: usize = if (opts.max_results == 0) std.math.maxInt(usize) else opts.max_results;
+    var exact_edge_matches: usize = 0;
+    const probe_batch_size: usize = 256;
+    var candidate_offset: usize = 0;
+    while (candidate_offset < candidates.items.len) {
+        const batch_end = @min(candidate_offset +| probe_batch_size, candidates.items.len);
+        const batch_candidates = candidates.items[candidate_offset..batch_end];
+        const probes = try alloc.alloc(graph_mod.EdgeProbe, batch_candidates.len);
+        defer alloc.free(probes);
+        for (batch_candidates, 0..) |candidate, i| {
+            probes[i] = switch (pattern[2].edge.direction) {
+                .out => .{
+                    .source = candidate.middle_key,
+                    .target = target_key,
+                    .edge_type = pattern[2].edge.types[0],
+                },
+                .in => .{
+                    .source = target_key,
+                    .target = candidate.middle_key,
+                    .edge_type = pattern[2].edge.types[0],
+                },
+                .both => unreachable,
+            };
+        }
+        const probed_edges = try edge_reader.probeEdges(alloc, null, probes);
+        defer edge_reader.freeProbedEdges(alloc, probed_edges);
+        if (probed_edges.len != probes.len) return error.InvalidGraphEdgeProbeResult;
+
+        for (batch_candidates, probed_edges) |candidate, maybe_backward_edge| {
+            // Generic expansion never traverses a self-loop. Keep the
+            // candidate in the deterministic first-hop window, but do not
+            // admit an exact second edge back to the same middle node.
+            if (std.mem.eql(u8, candidate.middle_key, target_key)) continue;
+            const backward_edge = maybe_backward_edge orelse continue;
+            // A physical edge whose metadata changes node-table identity cannot
+            // use this table-local plan. Release already-built results before
+            // the successful null return hands control to generic expansion.
+            if (traversal_mod.metadataTargetTable(backward_edge.metadata) != null) {
+                for (matches.items) |*match| match.deinit(alloc);
+                matches.deinit(alloc);
+                matches = .empty;
+                return null;
+            }
+            if (!edgeMatches(backward_edge, pattern[2].edge)) continue;
+            exact_edge_matches += 1;
+            if (matches.items.len >= result_limit) continue;
+            const forward_edge = forward_edges[candidate.forward_edge_index];
+            const middle_key = candidate.middle_key;
+
+            var all_bindings = try alloc.alloc(PatternBinding, 3);
+            var initialized_bindings: usize = 0;
+            errdefer {
+                for (all_bindings[0..initialized_bindings]) |*binding| binding.deinit(alloc);
+                if (all_bindings.len > 0) alloc.free(all_bindings);
+            }
+            all_bindings[0] = try initPatternBinding(alloc, aliases[0], start_key, null, 0);
+            initialized_bindings += 1;
+            all_bindings[1] = try initPatternBinding(alloc, aliases[1], middle_key, null, 1);
+            initialized_bindings += 1;
+            all_bindings[2] = try initPatternBinding(alloc, aliases[2], target_key, null, 1);
+            initialized_bindings += 1;
+            const filtered_bindings = if (opts.return_aliases.len == 0) blk: {
+                const owned = all_bindings;
+                all_bindings = @constCast((&[_]PatternBinding{})[0..]);
+                initialized_bindings = 0;
+                break :blk owned;
+            } else blk: {
+                const filtered = try filterBindings(alloc, all_bindings, opts.return_aliases);
+                for (all_bindings) |*binding| binding.deinit(alloc);
+                alloc.free(all_bindings);
+                all_bindings = @constCast((&[_]PatternBinding{})[0..]);
+                initialized_bindings = 0;
+                break :blk filtered;
+            };
+            errdefer {
+                for (filtered_bindings) |*binding| binding.deinit(alloc);
+                if (filtered_bindings.len > 0) alloc.free(filtered_bindings);
+            }
+
+            const path = if (opts.include_paths) blk: {
+                const first = try appendPathEdge(alloc, &.{}, forward_edge, start_key, middle_key);
+                defer freePathEdges(alloc, first);
+                break :blk try appendPathEdge(alloc, first, backward_edge, middle_key, target_key);
+            } else @constCast((&[_]paths_mod.PathEdge{})[0..]);
+            errdefer freePathEdges(alloc, path);
+            try matches.append(alloc, .{ .bindings = filtered_bindings, .path = path });
+        }
+        candidate_offset = batch_end;
+    }
+    if (opts.stats) |stats| {
+        stats.adjacency_reads += 1;
+        stats.adjacency_edges += forward_edges.len;
+        stats.exact_edge_probes += candidates.items.len;
+        stats.exact_edge_matches += exact_edge_matches;
+    }
+    std.log.debug(
+        "antfly_graph_pattern_plan plan=exact_two_edge_probe adjacency_edges={d} probes={d} matches={d}",
+        .{ forward_edges.len, candidates.items.len, matches.items.len },
+    );
+    return try matches.toOwnedSlice(alloc);
 }
 
 fn findReachableNodes(
@@ -410,9 +698,13 @@ fn findReachableNodes(
     start_table: ?[]const u8,
     edge: PatternEdgeStep,
     node_filter: NodeFilter,
+    target_nodes: []const node_identity.Ref,
+    target_required: bool,
     max_results: u32,
     evaluator: ?FilterEvaluator,
     node_admission: ?NodeAdmission,
+    include_paths: bool,
+    stats: ?*MatchStats,
     work_budget: *WorkBudget,
 ) ![]ReachableNode {
     const min_hops = if (edge.min_hops == 0) @as(u32, 1) else edge.min_hops;
@@ -465,9 +757,14 @@ fn findReachableNodes(
                 alloc,
                 frontier.table,
                 frontier.key,
+                edge.types,
                 edge.direction,
             );
             defer edge_reader.freeEdges(alloc, edges);
+            if (stats) |active| {
+                active.adjacency_reads += 1;
+                active.adjacency_edges += edges.len;
+            }
             try work_budget.consumeEdges(edges.len);
 
             const admitted_edges = if (node_admission) |admission| blk: {
@@ -522,11 +819,17 @@ fn findReachableNodes(
                     graph_edge,
                     target_key,
                 );
-                const new_path = try appendPathEdge(alloc, frontier.path, graph_edge, frontier.key, target_key);
+                const new_path = if (include_paths)
+                    try appendPathEdge(alloc, frontier.path, graph_edge, frontier.key, target_key)
+                else
+                    @constCast((&[_]paths_mod.PathEdge{})[0..]);
                 var new_path_owned = true;
                 errdefer if (new_path_owned) freePathEdges(alloc, new_path);
 
-                if (new_hops >= min_hops and try passesNodeFilter(target_key, node_filter, evaluator)) {
+                if (new_hops >= min_hops and
+                    targetNodeMatches(.{ .table = target_table, .key = target_key }, target_nodes, target_required) and
+                    try passesNodeFilter(target_key, node_filter, evaluator))
+                {
                     var reached = try initReachableNode(
                         alloc,
                         target_key,
@@ -586,7 +889,7 @@ fn startNodeAdmitted(
     defer alloc.free(admitted);
     if (admitted[0] or direction == .out) return admitted[0];
 
-    const incoming = try edge_reader.getEdges(alloc, null, start_key, .in);
+    const incoming = try edge_reader.getEdges(alloc, null, start_key, &.{}, .in);
     defer edge_reader.freeEdges(alloc, incoming);
     for (incoming) |graph_edge| {
         if (std.mem.eql(u8, graph_edge.target, start_key) and
@@ -595,6 +898,14 @@ fn startNodeAdmitted(
         {
             return true;
         }
+    }
+    return false;
+}
+
+fn targetNodeMatches(node: node_identity.Ref, targets: []const node_identity.Ref, target_required: bool) bool {
+    if (targets.len == 0) return !target_required;
+    for (targets) |target| {
+        if (optionalTableEql(node.table, target.table) and std.mem.eql(u8, node.key, target.key)) return true;
     }
     return false;
 }
@@ -884,6 +1195,341 @@ fn freePathEdgeItems(alloc: Allocator, edges: []const paths_mod.PathEdge) void {
     }
 }
 
+test "exact two-edge pattern uses typed batch probes without paths" {
+    const Reader = struct {
+        forward_calls: *usize,
+        reverse_calls: *usize,
+
+        const forward = [_]graph_mod.Edge{
+            .{ .source = "forum", .target = "post:1", .edge_type = "CONTAINER_OF", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
+            .{ .source = "forum", .target = "post:2", .edge_type = "CONTAINER_OF", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
+        };
+        const backward = [_]graph_mod.Edge{
+            .{ .source = "post:2", .target = "tag", .edge_type = "HAS_TAG", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
+            .{ .source = "post:3", .target = "tag", .edge_type = "HAS_TAG", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
+        };
+
+        pub fn getEdges(
+            self: @This(),
+            _: Allocator,
+            _: ?[]const u8,
+            key: []const u8,
+            edge_types: []const []const u8,
+            direction: graph_mod.EdgeDirection,
+        ) ![]graph_mod.Edge {
+            try std.testing.expectEqual(@as(usize, 1), edge_types.len);
+            if (std.mem.eql(u8, key, "forum")) {
+                try std.testing.expectEqual(graph_mod.EdgeDirection.out, direction);
+                try std.testing.expectEqualStrings("CONTAINER_OF", edge_types[0]);
+                self.forward_calls.* += 1;
+                return @constCast(forward[0..]);
+            }
+            if (std.mem.eql(u8, key, "tag")) {
+                try std.testing.expectEqual(graph_mod.EdgeDirection.in, direction);
+                try std.testing.expectEqualStrings("HAS_TAG", edge_types[0]);
+                self.reverse_calls.* += 1;
+                return @constCast(backward[0..]);
+            }
+            return error.TestUnexpectedResult;
+        }
+
+        pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
+
+        pub fn probeEdges(
+            self: @This(),
+            alloc: Allocator,
+            _: ?[]const u8,
+            probes: []const graph_mod.EdgeProbe,
+        ) ![]?graph_mod.Edge {
+            self.reverse_calls.* += 1;
+            const results = try alloc.alloc(?graph_mod.Edge, probes.len);
+            @memset(results, null);
+            for (probes, 0..) |probe, i| {
+                if (std.mem.eql(u8, probe.source, "post:2") and
+                    std.mem.eql(u8, probe.target, "tag") and
+                    std.mem.eql(u8, probe.edge_type, "HAS_TAG"))
+                {
+                    results[i] = backward[0];
+                }
+            }
+            return results;
+        }
+
+        pub fn freeProbedEdges(_: @This(), alloc: Allocator, edges: []?graph_mod.Edge) void {
+            alloc.free(edges);
+        }
+    };
+
+    var forward_calls: usize = 0;
+    var reverse_calls: usize = 0;
+    var stats = MatchStats{};
+    const matches = try matchPatternWithEdgeReader(
+        std.testing.allocator,
+        Reader{ .forward_calls = &forward_calls, .reverse_calls = &reverse_calls },
+        &.{"forum"},
+        &.{
+            .{ .alias = "forum" },
+            .{ .alias = "post", .edge = .{ .types = &.{"CONTAINER_OF"} } },
+            .{ .alias = "tag", .edge = .{ .types = &.{"HAS_TAG"} } },
+        },
+        .{
+            .target_nodes = &.{.{ .table = null, .key = "tag" }},
+            .target_required = true,
+            .include_paths = false,
+            .stats = &stats,
+        },
+    );
+    defer freeMatches(std.testing.allocator, matches);
+
+    try std.testing.expectEqual(@as(usize, 1), forward_calls);
+    try std.testing.expectEqual(@as(usize, 1), reverse_calls);
+    try std.testing.expectEqual(@as(usize, 1), matches.len);
+    try std.testing.expectEqual(MatchPlan.exact_two_edge_probe, stats.plan);
+    try std.testing.expectEqual(@as(usize, 2), stats.exact_edge_probes);
+    try std.testing.expectEqual(@as(usize, 0), matches[0].path.len);
+    try std.testing.expectEqualStrings("post:2", matches[0].bindings[1].key);
+    try std.testing.expectEqualStrings("tag", matches[0].bindings[2].key);
+}
+
+test "exact two-edge probe plan is equivalent to generic expansion" {
+    const GenericReader = struct {
+        const forward = [_]graph_mod.Edge{
+            .{ .source = "forum", .target = "post:1", .edge_type = "CONTAINER_OF", .weight = 1, .created_at = 1, .updated_at = 2, .metadata = "{\"first\":1}" },
+            .{ .source = "forum", .target = "post:2", .edge_type = "CONTAINER_OF", .weight = 1, .created_at = 1, .updated_at = 2, .metadata = "{\"first\":2}" },
+        };
+        const post_one = [_]graph_mod.Edge{
+            .{ .source = "post:1", .target = "tag", .edge_type = "HAS_TAG", .weight = 0.5, .created_at = 3, .updated_at = 4, .metadata = "{\"second\":1}" },
+        };
+        const post_two = [_]graph_mod.Edge{
+            .{ .source = "post:2", .target = "other", .edge_type = "HAS_TAG", .weight = 1, .created_at = 3, .updated_at = 4, .metadata = "" },
+            .{ .source = "post:2", .target = "tag", .edge_type = "HAS_TAG", .weight = 0.8, .created_at = 3, .updated_at = 4, .metadata = "{\"second\":2}" },
+        };
+
+        pub fn getEdges(_: @This(), _: Allocator, _: ?[]const u8, key: []const u8, _: []const []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            if (std.mem.eql(u8, key, "forum")) return @constCast(forward[0..]);
+            if (std.mem.eql(u8, key, "post:1")) return @constCast(post_one[0..]);
+            if (std.mem.eql(u8, key, "post:2")) return @constCast(post_two[0..]);
+            return @constCast((&[_]graph_mod.Edge{})[0..]);
+        }
+
+        pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
+    };
+    const ExactReader = struct {
+        pub fn getEdges(_: @This(), alloc: Allocator, table: ?[]const u8, key: []const u8, types: []const []const u8, direction: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            return (GenericReader{}).getEdges(alloc, table, key, types, direction);
+        }
+
+        pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
+
+        pub fn probeEdges(_: @This(), alloc: Allocator, _: ?[]const u8, probes: []const graph_mod.EdgeProbe) ![]?graph_mod.Edge {
+            const results = try alloc.alloc(?graph_mod.Edge, probes.len);
+            @memset(results, null);
+            for (probes, 0..) |probe, i| {
+                if (std.mem.eql(u8, probe.source, "post:1") and std.mem.eql(u8, probe.target, "tag")) {
+                    results[i] = GenericReader.post_one[0];
+                } else if (std.mem.eql(u8, probe.source, "post:2") and std.mem.eql(u8, probe.target, "tag")) {
+                    results[i] = GenericReader.post_two[1];
+                }
+            }
+            return results;
+        }
+
+        pub fn freeProbedEdges(_: @This(), alloc: Allocator, edges: []?graph_mod.Edge) void {
+            alloc.free(edges);
+        }
+    };
+
+    const pattern = [_]PatternStep{
+        .{ .alias = "forum" },
+        .{ .alias = "post", .edge = .{ .types = &.{"CONTAINER_OF"} } },
+        .{ .alias = "tag", .edge = .{ .types = &.{"HAS_TAG"}, .min_weight = 0.6 } },
+    };
+    const returned_aliases = [_][]const u8{ "post", "tag" };
+    var exact_stats = MatchStats{};
+    const exact = try matchPatternWithEdgeReader(std.testing.allocator, ExactReader{}, &.{"forum"}, &pattern, .{
+        .target_nodes = &.{.{ .table = null, .key = "tag" }},
+        .target_required = true,
+        .return_aliases = &returned_aliases,
+        .include_paths = true,
+        .stats = &exact_stats,
+    });
+    defer freeMatches(std.testing.allocator, exact);
+    var generic_stats = MatchStats{};
+    const generic = try matchPatternWithEdgeReader(std.testing.allocator, GenericReader{}, &.{"forum"}, &pattern, .{
+        .target_nodes = &.{.{ .table = null, .key = "tag" }},
+        .target_required = true,
+        .return_aliases = &returned_aliases,
+        .include_paths = true,
+        .stats = &generic_stats,
+    });
+    defer freeMatches(std.testing.allocator, generic);
+
+    try std.testing.expectEqual(MatchPlan.exact_two_edge_probe, exact_stats.plan);
+    try std.testing.expectEqual(MatchPlan.generic_expand, generic_stats.plan);
+    try std.testing.expectEqual(generic.len, exact.len);
+    try std.testing.expectEqual(@as(usize, 1), exact.len);
+    try std.testing.expectEqual(generic[0].bindings.len, exact[0].bindings.len);
+    for (generic[0].bindings, exact[0].bindings) |expected, actual| {
+        try std.testing.expectEqualStrings(expected.alias, actual.alias);
+        try std.testing.expectEqualStrings(expected.key, actual.key);
+        try std.testing.expectEqual(expected.depth, actual.depth);
+    }
+    try std.testing.expectEqual(generic[0].path.len, exact[0].path.len);
+    for (generic[0].path, exact[0].path) |expected, actual| {
+        try std.testing.expectEqualStrings(expected.source, actual.source);
+        try std.testing.expectEqualStrings(expected.target, actual.target);
+        try std.testing.expectEqualStrings(expected.edge_type, actual.edge_type);
+        try std.testing.expectEqual(expected.weight, actual.weight);
+        try std.testing.expectEqualStrings(expected.metadata, actual.metadata);
+    }
+}
+
+test "exact two-edge probe honors incoming final direction" {
+    const Reader = struct {
+        const first = [_]graph_mod.Edge{.{
+            .source = "start",
+            .target = "middle",
+            .edge_type = "FIRST",
+            .weight = 1,
+            .created_at = 0,
+            .updated_at = 0,
+            .metadata = "",
+        }};
+        const second = graph_mod.Edge{
+            .source = "target",
+            .target = "middle",
+            .edge_type = "SECOND",
+            .weight = 1,
+            .created_at = 0,
+            .updated_at = 0,
+            .metadata = "",
+        };
+
+        pub fn getEdges(_: @This(), _: Allocator, _: ?[]const u8, key: []const u8, _: []const []const u8, direction: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            try std.testing.expectEqualStrings("start", key);
+            try std.testing.expectEqual(graph_mod.EdgeDirection.out, direction);
+            return @constCast(first[0..]);
+        }
+
+        pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
+
+        pub fn probeEdges(_: @This(), alloc: Allocator, _: ?[]const u8, probes: []const graph_mod.EdgeProbe) ![]?graph_mod.Edge {
+            try std.testing.expectEqual(@as(usize, 1), probes.len);
+            try std.testing.expectEqualStrings("target", probes[0].source);
+            try std.testing.expectEqualStrings("middle", probes[0].target);
+            try std.testing.expectEqualStrings("SECOND", probes[0].edge_type);
+            const result = try alloc.alloc(?graph_mod.Edge, 1);
+            result[0] = second;
+            return result;
+        }
+
+        pub fn freeProbedEdges(_: @This(), alloc: Allocator, edges: []?graph_mod.Edge) void {
+            alloc.free(edges);
+        }
+    };
+
+    const matches = try matchPatternWithEdgeReader(std.testing.allocator, Reader{}, &.{"start"}, &.{
+        .{ .alias = "start" },
+        .{ .alias = "middle", .edge = .{ .types = &.{"FIRST"} } },
+        .{ .alias = "target", .edge = .{ .types = &.{"SECOND"}, .direction = .in } },
+    }, .{
+        .target_nodes = &.{.{ .table = null, .key = "target" }},
+        .target_required = true,
+        .include_paths = false,
+    });
+    defer freeMatches(std.testing.allocator, matches);
+    try std.testing.expectEqual(@as(usize, 1), matches.len);
+    try std.testing.expectEqualStrings("target", matches[0].bindings[2].key);
+}
+
+test "exact two-edge probe excludes final self loops like generic expansion" {
+    const Reader = struct {
+        const first = [_]graph_mod.Edge{.{
+            .source = "start",
+            .target = "middle",
+            .edge_type = "FIRST",
+            .weight = 1,
+            .created_at = 0,
+            .updated_at = 0,
+            .metadata = "",
+        }};
+        const self_loop = graph_mod.Edge{
+            .source = "middle",
+            .target = "middle",
+            .edge_type = "SECOND",
+            .weight = 1,
+            .created_at = 0,
+            .updated_at = 0,
+            .metadata = "",
+        };
+
+        pub fn getEdges(_: @This(), _: Allocator, _: ?[]const u8, key: []const u8, _: []const []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            try std.testing.expectEqualStrings("start", key);
+            return @constCast(first[0..]);
+        }
+
+        pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
+
+        pub fn probeEdges(_: @This(), alloc: Allocator, _: ?[]const u8, probes: []const graph_mod.EdgeProbe) ![]?graph_mod.Edge {
+            try std.testing.expectEqual(@as(usize, 1), probes.len);
+            const result = try alloc.alloc(?graph_mod.Edge, 1);
+            result[0] = self_loop;
+            return result;
+        }
+
+        pub fn freeProbedEdges(_: @This(), alloc: Allocator, edges: []?graph_mod.Edge) void {
+            alloc.free(edges);
+        }
+    };
+
+    var stats = MatchStats{};
+    const matches = try matchPatternWithEdgeReader(std.testing.allocator, Reader{}, &.{"start"}, &.{
+        .{ .alias = "start" },
+        .{ .alias = "middle", .edge = .{ .types = &.{"FIRST"} } },
+        .{ .alias = "target", .edge = .{ .types = &.{"SECOND"} } },
+    }, .{
+        .target_nodes = &.{.{ .table = null, .key = "middle" }},
+        .target_required = true,
+        .include_paths = false,
+        .stats = &stats,
+    });
+    defer freeMatches(std.testing.allocator, matches);
+
+    try std.testing.expectEqual(MatchPlan.exact_two_edge_probe, stats.plan);
+    try std.testing.expectEqual(@as(usize, 0), matches.len);
+}
+
+test "exact endpoint constrains the final pattern step before limiting" {
+    const Reader = struct {
+        const edges = [_]graph_mod.Edge{
+            .{ .source = "a", .target = "wrong", .edge_type = "link", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
+            .{ .source = "a", .target = "wanted", .edge_type = "link", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
+        };
+
+        pub fn getEdges(_: @This(), _: Allocator, _: ?[]const u8, _: []const u8, types: []const []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            try std.testing.expectEqualStrings("link", types[0]);
+            return @constCast(edges[0..]);
+        }
+
+        pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
+    };
+
+    const matches = try matchPatternWithEdgeReader(
+        std.testing.allocator,
+        Reader{},
+        &.{"a"},
+        &.{
+            .{ .alias = "source" },
+            .{ .alias = "target", .edge = .{ .types = &.{"link"} } },
+        },
+        .{ .max_results = 1, .target_nodes = &.{.{ .table = null, .key = "wanted" }}, .target_required = true, .include_paths = false },
+    );
+    defer freeMatches(std.testing.allocator, matches);
+    try std.testing.expectEqual(@as(usize, 1), matches.len);
+    try std.testing.expectEqualStrings("wanted", matches[0].bindings[1].key);
+    try std.testing.expectEqual(@as(usize, 0), matches[0].path.len);
+}
+
 test "pattern matching rejects unbounded hops and exploration" {
     const Reader = struct {
         const edges = [_]graph_mod.Edge{
@@ -891,7 +1537,7 @@ test "pattern matching rejects unbounded hops and exploration" {
             .{ .source = "A", .target = "C", .edge_type = "e", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
         };
 
-        pub fn getEdges(_: @This(), _: Allocator, _: ?[]const u8, _: []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+        pub fn getEdges(_: @This(), _: Allocator, _: ?[]const u8, _: []const u8, _: []const []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
             return @constCast(edges[0..]);
         }
 
@@ -938,7 +1584,7 @@ test "pattern matching keeps equal keys from distinct tables" {
             },
         };
 
-        pub fn getEdges(_: @This(), _: Allocator, _: ?[]const u8, _: []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+        pub fn getEdges(_: @This(), _: Allocator, _: ?[]const u8, _: []const u8, _: []const []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
             return @constCast(edges[0..]);
         }
 
@@ -973,6 +1619,83 @@ test "pattern matching keeps equal keys from distinct tables" {
     try std.testing.expectEqual(@as(usize, 1), external_count);
 }
 
+test "exact pattern targets preserve table identity" {
+    const Reader = struct {
+        const edges = [_]graph_mod.Edge{
+            .{ .source = "A", .target = "shared", .edge_type = "local", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
+            .{ .source = "A", .target = "shared", .edge_type = "external", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "{\"target_table\":\"entities\"}" },
+        };
+
+        pub fn getEdges(_: @This(), _: Allocator, _: ?[]const u8, _: []const u8, _: []const []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            return @constCast(edges[0..]);
+        }
+
+        pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
+    };
+    const matches = try matchPatternWithEdgeReader(
+        std.testing.allocator,
+        Reader{},
+        &.{"A"},
+        &.{
+            .{ .alias = "source" },
+            .{ .alias = "target" },
+        },
+        .{
+            .max_results = 10,
+            .target_required = true,
+            .target_nodes = &.{.{ .table = "entities", .key = "shared" }},
+        },
+    );
+    defer freeMatches(std.testing.allocator, matches);
+
+    try std.testing.expectEqual(@as(usize, 1), matches.len);
+    try std.testing.expectEqualStrings("entities", matches[0].bindings[1].table.?);
+}
+
+test "inapplicable exact plan does not consume generic fallback budget" {
+    const Reader = struct {
+        const start_edges = [_]graph_mod.Edge{
+            .{ .source = "A", .target = "B", .edge_type = "first", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
+            .{ .source = "A", .target = "X", .edge_type = "first", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "{\"target_table\":\"entities\"}" },
+        };
+        const middle_edges = [_]graph_mod.Edge{
+            .{ .source = "B", .target = "C", .edge_type = "second", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
+        };
+
+        pub fn getEdges(_: @This(), _: Allocator, table: ?[]const u8, key: []const u8, _: []const []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            if (std.mem.eql(u8, key, "A")) return @constCast(start_edges[0..]);
+            if (table == null and std.mem.eql(u8, key, "B")) return @constCast(middle_edges[0..]);
+            return @constCast((&[_]graph_mod.Edge{})[0..]);
+        }
+
+        pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
+
+        pub fn probeEdges(_: @This(), _: Allocator, _: ?[]const u8, _: []const graph_mod.EdgeProbe) ![]?graph_mod.Edge {
+            return error.TestUnexpectedResult;
+        }
+
+        pub fn freeProbedEdges(_: @This(), _: Allocator, _: []?graph_mod.Edge) void {}
+    };
+    const matches = try matchPatternWithEdgeReader(
+        std.testing.allocator,
+        Reader{},
+        &.{"A"},
+        &.{
+            .{ .alias = "a" },
+            .{ .alias = "b", .edge = .{ .types = &.{"first"} } },
+            .{ .alias = "c", .edge = .{ .types = &.{"second"} } },
+        },
+        .{
+            .target_required = true,
+            .target_nodes = &.{.{ .table = null, .key = "C" }},
+            .max_explored_nodes = 3,
+            .max_explored_edges = 3,
+        },
+    );
+    defer freeMatches(std.testing.allocator, matches);
+    try std.testing.expectEqual(@as(usize, 1), matches.len);
+}
+
 test "pattern matching routes later hops through the bound table" {
     const Reader = struct {
         const source_edges = [_]graph_mod.Edge{.{
@@ -999,6 +1722,7 @@ test "pattern matching routes later hops through the bound table" {
             _: Allocator,
             table: ?[]const u8,
             key: []const u8,
+            _: []const []const u8,
             _: graph_mod.EdgeDirection,
         ) ![]graph_mod.Edge {
             if (std.mem.eql(u8, key, "A")) {
@@ -1050,6 +1774,7 @@ test "pattern matching preserves a table-scoped start reference" {
             _: Allocator,
             table: ?[]const u8,
             key: []const u8,
+            _: []const []const u8,
             _: graph_mod.EdgeDirection,
         ) ![]graph_mod.Edge {
             try std.testing.expectEqualStrings("entities", table.?);

@@ -206,7 +206,10 @@ pub const StdHttpExecutor = struct {
             .headers = header_pairs,
             .body = if (req.body.len == 0) null else req.body,
             .timeout_ms = if (req.timeout_ms) |timeout_ms| timeout_ms else null,
-            .cancellation = if (req.cancellation) |cancellation| cancellation.signal() else null,
+            .cancellation = if (req.cancellation) |cancellation| blk: {
+                const token_value = cancellation.token();
+                break :blk httpx.CancellationToken.fromCallback(token_value.ptr, token_value.is_cancelled_fn);
+            } else null,
             .follow_redirects = false,
         });
         defer response.deinit();
@@ -349,8 +352,8 @@ pub const StdHttpExecutor = struct {
             }
 
             // The network completion event wakes this caller immediately. A
-            // bounded timeout is needed only to sample the listener-owned
-            // atomic cancellation token; it does not allocate a polling task
+            // bounded timeout is needed only to sample the caller-owned
+            // semantic cancellation token; it does not allocate a polling task
             // or a second OS thread per outbound request.
             const wait_deadline = if (req.cancellation != null) blk: {
                 const poll_deadline = std.Io.Clock.Timestamp.fromNow(io, .{

@@ -4808,6 +4808,31 @@ pub const HBCIndex = struct {
         );
     }
 
+    pub fn loadPostingVectorsTransformed(
+        self: *HBCIndex,
+        txn: anytype,
+        vector_ids: []const u64,
+        matrix: []f32,
+    ) !void {
+        try vectorindex_hbc_index.loadPostingVectorsTransformed(self, txn, vector_ids, matrix);
+    }
+
+    pub fn loadPostingVectorsTransformedWithOptions(
+        self: *HBCIndex,
+        txn: anytype,
+        vector_ids: []const u64,
+        matrix: []f32,
+        options: anytype,
+    ) !void {
+        try vectorindex_hbc_index.loadPostingVectorsTransformedWithOptions(
+            self,
+            txn,
+            vector_ids,
+            matrix,
+            options,
+        );
+    }
+
     fn loadExternalVectorsTransformedIntoMatrixUncached(
         self: *HBCIndex,
         txn: anytype,
@@ -6204,6 +6229,7 @@ pub const HBCIndex = struct {
 pub const SearchResult = vectorindex_search_results.SearchResult;
 const ApproxSearchResult = vectorindex_search_results.ApproxSearchResult;
 pub const SearchRequest = vectorindex_search_types.SearchRequest;
+pub const CancellationToken = vectorindex_search_types.CancellationToken;
 pub const SearchProfile = vectorindex_search_types.SearchProfile;
 
 pub const WriteProfile = vectorindex_hbc_runtime.WriteProfile;

@@ -41,6 +41,7 @@ from .models import (
     ensure_model_by_name,
     inference_command,
     inference_download_enabled,
+    listed_model_name,
     local_model_exists,
     run_clipclap_contract_tests,
 )
@@ -204,7 +205,7 @@ def test_published_clipclap_pair_server_contract(api):
         assert abs(l2_norm(embedding) - 1.0) < 1e-4
 
     embedders = api.models().get("embedders", {})
-    assert CLIPCLAP_MODEL in embedders, (
+    assert listed_model_name(set(embedders), CLIPCLAP_MODEL) is not None, (
         f"{CLIPCLAP_MODEL} executed but is absent from /models embedders: "
         f"{sorted(embedders)}"
     )

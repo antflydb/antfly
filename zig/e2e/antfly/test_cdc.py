@@ -27,7 +27,6 @@ from conftest import (
     ANTFLY_PUBLIC_API_ROOT,
     DEFAULT_ANTFLY_BIN,
     StatefulAntflyServer,
-    find_free_port,
     lookup_key_path,
     raise_request_error_with_logs,
     resolve_binary_path,
@@ -35,6 +34,7 @@ from conftest import (
     with_api_root,
 )
 from helpers import wait_until
+from port_reservations import find_free_port
 
 pytestmark = pytest.mark.postgres_integration
 

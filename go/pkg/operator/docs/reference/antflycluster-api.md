@@ -43,7 +43,7 @@ named `<cluster-name>-inference` in the same namespace and owned by the
 
 If `spec.inference.image` is omitted, the operator uses the configured
 `--inference-antfly-image` value for Inference pods. The binary default is
-`ghcr.io/antflydb/antfly:omni`. Override it during deployment if that image is
+`ghcr.io/antflydb/antfly:latest`. Override it during deployment if that image is
 unavailable in your environment. The image must provide the `/antfly inference`
 runtime contract.
 
@@ -69,7 +69,7 @@ Configuration for metadata nodes (Raft consensus, API coordination).
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `replicas` | int32 | No | 3 | Number of metadata nodes |
+| `replicas` | int32 | No | 3 | Number of metadata nodes; immutable after cluster creation |
 | `resources` | [ResourceSpec](#resourcespec) | Yes | - | Resource requirements |
 | `metadataAPI` | [APISpec](#apispec) | Yes | - | Metadata API configuration |
 | `metadataRaft` | [APISpec](#apispec) | Yes | - | Metadata Raft configuration |
@@ -83,6 +83,7 @@ Configuration for metadata nodes (Raft consensus, API coordination).
 
 **Notes**:
 - `replicas` should be an odd number (3 or 5) for Raft quorum
+- To change `replicas`, back up and restore into a differently named cluster with fresh metadata PVCs; do not reuse retained metadata PVCs
 - `useSpotPods` must be false when `spec.gke.autopilot=true`
 - `nodeSelector` must not be set when `spec.gke.autopilot=true` (Autopilot uses compute classes)
 - Scheduling fields (`tolerations`, `nodeSelector`, `affinity`, `topologySpreadConstraints`) are merged with cloud-provider-specific values (e.g., EKS Spot tolerations)
@@ -254,6 +255,7 @@ The status section is read-only and managed by the operator.
 |-------|------|-------------|
 | `phase` | string | Cluster phase (`Pending`, `Running`, `Degraded`, `Failed`) |
 | `conditions` | []Condition | Current conditions |
+| `metadataTopologyReplicas` | int32 | Immutable metadata replica count recorded by the controller |
 | `metadataNodesReady` | int32 | Ready metadata node count |
 | `dataNodesReady` | int32 | Ready data node count |
 | `autoScalingStatus` | [AutoScalingStatus](#autoscalingstatus) | Autoscaling state |

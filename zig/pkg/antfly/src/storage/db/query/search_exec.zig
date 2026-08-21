@@ -17,6 +17,7 @@ const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
 const aggregations_mod = @import("../aggregations.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
+const artifact_ids = @import("../artifact_ids.zig");
 const runtime_schema_mod = @import("../../schema.zig");
 const docstore_mod = @import("../../docstore.zig");
 const internal_keys = @import("../../internal_keys.zig");
@@ -58,6 +59,7 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
 
 const default_balanced_search_effort: f32 = 0.5;
 const default_late_visibility_exact_candidate_budget: u32 = 100_000;
+const default_grouped_candidate_budget: u32 = 100_000;
 const default_exact_native_filter_candidate_budget: u32 = 1024;
 // Exact filtered search performs one storage lookup and one distance evaluation
 // per candidate. Bound both sources of work: candidate count protects the
@@ -2819,6 +2821,17 @@ fn lateVisibilityExactCandidateBudget() u32 {
     return lateVisibilityExactCandidateBudgetFromRaw(getenv("ANTFLY_TEXT_LATE_VISIBILITY_EXACT_CANDIDATE_BUDGET"));
 }
 
+fn groupedCandidateBudgetFromRaw(raw: ?[]const u8) u32 {
+    const value = raw orelse return default_grouped_candidate_budget;
+    if (value.len == 0) return default_grouped_candidate_budget;
+    const parsed = std.fmt.parseUnsigned(u32, value, 10) catch return default_grouped_candidate_budget;
+    return if (parsed == 0) std.math.maxInt(u32) else parsed;
+}
+
+fn groupedCandidateBudget() u32 {
+    return groupedCandidateBudgetFromRaw(getenv("ANTFLY_GROUPED_QUERY_CANDIDATE_BUDGET"));
+}
+
 fn distributedSortShardWindowBudgetFromRaw(raw: ?[]const u8) u32 {
     const value = raw orelse return default_distributed_sort_shard_window_budget;
     if (value.len == 0) return default_distributed_sort_shard_window_budget;
@@ -2906,10 +2919,32 @@ fn logExactSortBudgetRejection(
 
 fn checkSearchRequestDeadline(req: types.SearchRequest) !void {
     if (req.cancellation) |cancellation| {
-        if (cancellation.load(.acquire)) return error.Cancelled;
+        if (cancellation.isCancelled()) return error.Cancelled;
     }
     const deadline_ns = req.execution_deadline_ns orelse return;
     if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+}
+
+test "storage search observes callback-backed cancellation without an atomic signal" {
+    const State = struct {
+        canceled: bool,
+
+        fn isCancelled(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return self.canceled;
+        }
+    };
+
+    var state = State{ .canceled = false };
+    const req = types.SearchRequest{
+        .cancellation = .{
+            .ptr = &state,
+            .is_cancelled_fn = State.isCancelled,
+        },
+    };
+    try checkSearchRequestDeadline(req);
+    state.canceled = true;
+    try std.testing.expectError(error.Cancelled, checkSearchRequestDeadline(req));
 }
 
 test "exact sort budget rejection reason names are stable for diagnostics" {
@@ -2970,6 +3005,14 @@ test "text late visibility exact candidate budget parses disabled and fallback v
     try std.testing.expectEqual(default_late_visibility_exact_candidate_budget, lateVisibilityExactCandidateBudgetFromRaw("bad"));
     try std.testing.expectEqual(@as(u32, 42), lateVisibilityExactCandidateBudgetFromRaw("42"));
     try std.testing.expectEqual(std.math.maxInt(u32), lateVisibilityExactCandidateBudgetFromRaw("0"));
+}
+
+test "grouped candidate budget parses disabled and fallback values" {
+    try std.testing.expectEqual(default_grouped_candidate_budget, groupedCandidateBudgetFromRaw(null));
+    try std.testing.expectEqual(default_grouped_candidate_budget, groupedCandidateBudgetFromRaw(""));
+    try std.testing.expectEqual(default_grouped_candidate_budget, groupedCandidateBudgetFromRaw("bad"));
+    try std.testing.expectEqual(@as(u32, 42), groupedCandidateBudgetFromRaw("42"));
+    try std.testing.expectEqual(std.math.maxInt(u32), groupedCandidateBudgetFromRaw("0"));
 }
 
 test "distributed sort shard window budget parses disabled and fallback values" {
@@ -4923,7 +4966,7 @@ test "distributed merge uses runtime schema for typed date cursors" {
     }, &.{ left_after, right_after }, schema));
 }
 
-test "distributed merge rejects cursor outside concrete shard sort tuple domain" {
+test "distributed merge accepts cursors across the logical numeric domain" {
     const alloc = std.testing.allocator;
 
     const rank_mapping = runtime_schema_mod.DynamicTemplate{
@@ -4964,19 +5007,17 @@ test "distributed merge rejects cursor outside concrete shard sort tuple domain"
         .{ .number_string = "1.5" },
         .{ .string = "doc:a" },
     };
-    resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.InvalidQueryRequest, mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+    const fractional_page = try mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
         .order_by = &order_by,
         .search_after = &fractional_cursor,
         .limit = 1,
-    }, &.{after_result}, schema));
-    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("rank", diagnostic.field);
-    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
-    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+    }, &.{after_result}, schema);
+    defer testFreeOwnedHits(alloc, fractional_page.hits);
+    try std.testing.expectEqual(@as(usize, 1), fractional_page.hits.len);
+    try std.testing.expectEqualStrings("doc:b", fractional_page.hits[0].id);
 }
 
-test "sorted segment bounds reject cursor outside concrete bound domain" {
+test "sorted segment bounds compare across the logical numeric domain" {
     const templates = [_]runtime_schema_mod.DynamicTemplate{.{
         .name = "rank",
         .path_match = "rank",
@@ -5017,14 +5058,9 @@ test "sorted segment bounds reject cursor outside concrete bound domain" {
         .{ .number_string = "10.5" },
         .{ .string = "doc:a" },
     };
-    resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.InvalidQueryRequest, compareSortedSegmentBoundToCursor(.{
+    try std.testing.expectEqual(std.math.Order.lt, try compareSortedSegmentBoundToCursor(.{
         .order_by = &order_by,
     }, plan, bounds[0..], fractional_cursor[0..]));
-    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("rank", diagnostic.field);
-    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
-    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
 }
 
 test "distributed merge validates mapped sort fields when runtime schema is present" {
@@ -6104,6 +6140,7 @@ fn nativeSortValueRejectionReason(mapping: runtime_schema_mod.FieldMapping, valu
         .numeric => switch (value) {
             .integer, .u64_value => null,
             .number => |number| if (std.math.isFinite(number)) null else .invalid_doc_value_type,
+            .number_string => |text| if (jsonNumberStringIsNumeric(text)) null else .invalid_doc_value_type,
             else => .invalid_doc_value_type,
         },
         .boolean => if (value == .bool_value) null else .invalid_doc_value_type,
@@ -6225,6 +6262,11 @@ fn cursorRejectionReasonForConcreteSortKey(
     const schema = plan.runtime_schema orelse return null;
     const mapping = sortFieldMapping(schema, field) orelse return .unmapped_field;
     if (mapping.field_type == .datetime) return mappedSortCursorRejectionReason(mapping, cursor_value);
+    // Numeric columns have one logical domain even when the concrete hit is
+    // represented as signed, unsigned, floating, or an exact JSON number
+    // string. Cursor validity must not depend on whichever candidate happens
+    // to be compared first.
+    if (mapping.field_type == .numeric) return mappedSortCursorRejectionReason(mapping, cursor_value);
     if (cursor_value == .null) return switch (mapping.missing_null_policy) {
         .missing_rejected => .missing_null_policy,
     };
@@ -6771,6 +6813,23 @@ fn nativeSortValueFromTextDocValuesAlloc(
                 return error.UnsupportedExactSort;
             };
             return .{ .number = value };
+        },
+        .numeric_val => {
+            const value = reader.getNumeric(resolved.local_id) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    logNativeDocValueLoadFailure(field, "malformed_doc_values_section");
+                    return error.UnsupportedExactSort;
+                },
+            } orelse {
+                logNativeDocValueLoadFailure(field, "sparse_live_doc_values");
+                return error.UnsupportedExactSort;
+            };
+            return switch (value) {
+                .u64_val => |number| .{ .u64_value = number },
+                .i64_val => |number| .{ .integer = number },
+                .f64_val => |number| .{ .number = number },
+            };
         },
         .bool_val => {
             const value = reader.getBool(resolved.local_id) catch |err| switch (err) {
@@ -11567,8 +11626,7 @@ pub fn searchTextQuery(
         (effective_req.count_only or
             effective_req.limit == 0 or
             effective_req.aggregations_json.len != 0 or
-            effective_req.graph_queries.len != 0 or
-            group_chunk_parents);
+            effective_req.graph_queries.len != 0);
     const exact_candidate_budget = lateVisibilityExactCandidateBudget();
     if (exact_late_visibility_totals) {
         enforceLateVisibilityExactCandidateBudget(full_candidate_limit, exact_candidate_budget) catch |err| {
@@ -11586,13 +11644,26 @@ pub fn searchTextQuery(
     const adaptive_late_visibility = late_visibility_paginate and !exact_late_visibility_totals;
     const requested_visible_end = effective_req.offset +| effective_req.limit;
     const collect_window_candidates = group_chunk_parents or late_visibility_paginate or requires_field_sort;
+    const grouped_requires_full_window = group_chunk_parents and
+        (effective_req.count_only or
+            effective_req.limit == 0 or
+            effective_req.aggregations_json.len != 0 or
+            effective_req.graph_queries.len != 0);
+    const candidate_ceiling = if (group_chunk_parents)
+        @min(full_candidate_limit, groupedCandidateBudget())
+    else
+        full_candidate_limit;
     var candidate_limit: u32 = if (collect_window_candidates)
         if (requires_field_sort)
-            @min(full_candidate_limit, exact_candidate_budget)
+            @min(candidate_ceiling, exact_candidate_budget)
+        else if (grouped_requires_full_window)
+            candidate_ceiling
+        else if (group_chunk_parents)
+            initialAdaptiveCandidateWindow(candidate_ceiling, paging)
         else if (adaptive_late_visibility)
-            @min(full_candidate_limit, @max(@as(u32, 1), @max(paging.limit, requested_visible_end)))
+            @min(candidate_ceiling, @max(@as(u32, 1), @max(paging.limit, requested_visible_end)))
         else
-            full_candidate_limit
+            candidate_ceiling
     else
         paging.limit;
     var candidate_iterations: u32 = 0;
@@ -11604,10 +11675,18 @@ pub fn searchTextQuery(
         try checkSearchRequestDeadline(effective_req);
         candidate_iterations += 1;
         var postprocess_req = effective_req;
-        if (late_visibility_paginate or requires_field_sort) {
+        if (late_visibility_paginate or requires_field_sort or group_chunk_parents) {
             postprocess_req.offset = 0;
             postprocess_req.limit = candidate_limit;
         }
+        // Explicit document-ID constraints have already been resolved against
+        // this exact text snapshot and enforced by its native collector. Do
+        // not apply them a second time to derived artifact hit IDs in the
+        // stored-pattern layer, where source and artifact IDs intentionally
+        // use different representations of the same document.
+        postprocess_req.filter_doc_ids = &.{};
+        postprocess_req.filter_doc_ids_positive = false;
+        postprocess_req.exclude_doc_ids = &.{};
 
         const execute_start_ns = if (collect_score_timing) platform_time.monotonicNs() else 0;
         var result = if (effective_req.count_only)
@@ -11629,6 +11708,11 @@ pub fn searchTextQuery(
         const candidates_exhausted = !collect_window_candidates or
             candidate_limit >= full_candidate_limit or
             (result.total_hits_relation == .exact and result.total_hits <= candidate_limit);
+        const candidate_ceiling_reached = candidate_limit >= candidate_ceiling;
+        const candidate_tail_score: ?f32 = if (result.hits.len > 0)
+            result.hits[result.hits.len - 1].score
+        else
+            null;
 
         const hits_start_ns = if (collect_score_timing) platform_time.monotonicNs() else 0;
         var hits = try alloc.alloc(types.SearchHit, result.hits.len);
@@ -11684,8 +11768,7 @@ pub fn searchTextQuery(
 
         owns_hits = false;
         const postprocess_start_ns = if (collect_score_timing) platform_time.monotonicNs() else 0;
-        const exhaustive_candidate_window = paging.offset == 0 and
-            paging.limit >= full_candidate_limit and
+        const exhaustive_candidate_window = candidate_limit >= full_candidate_limit and
             result.hits.len == @as(usize, result.total_hits);
         var out = try executor.postprocess(executor.ctx, alloc, postprocess_req, .{
             .alloc = alloc,
@@ -11705,14 +11788,41 @@ pub fn searchTextQuery(
         if (collect_score_timing) postprocess_ns += platform_time.monotonicNs() - postprocess_start_ns;
 
         const visible_candidate_count: u32 = @intCast(@min(out.hits.len, @as(usize, std.math.maxInt(u32))));
-        if (adaptive_late_visibility and !candidates_exhausted and visible_candidate_count < requested_visible_end) {
+        const grouped_page_is_stable = group_chunk_parents and groupedResultHasStableRequestedPage(
+            paging,
+            out,
+            candidate_tail_score,
+            candidates_exhausted,
+        );
+        if (group_chunk_parents and
+            !grouped_requires_full_window and
+            !candidates_exhausted and
+            !candidate_ceiling_reached and
+            !grouped_page_is_stable)
+        {
             out.deinit();
-            const grown_limit = @min(full_candidate_limit, @max(candidate_limit +| 1, candidate_limit *| 2));
+            const grown_limit = growAdaptiveCandidateWindow(candidate_limit, candidate_ceiling, requested_visible_end);
             if (grown_limit == candidate_limit) return error.InvalidQueryRequest;
             candidate_limit = grown_limit;
             continue;
         }
-        if (adaptive_late_visibility and !candidates_exhausted) {
+        if (group_chunk_parents and !grouped_requires_full_window) {
+            try enforceGroupedPageBoundaryAtCandidateCeiling(
+                paging,
+                out,
+                candidate_tail_score,
+                candidates_exhausted,
+                candidate_ceiling_reached,
+            );
+        }
+        if (adaptive_late_visibility and !candidates_exhausted and !candidate_ceiling_reached and visible_candidate_count < requested_visible_end) {
+            out.deinit();
+            const grown_limit = growAdaptiveCandidateWindow(candidate_limit, candidate_ceiling, requested_visible_end);
+            if (grown_limit == candidate_limit) return error.InvalidQueryRequest;
+            candidate_limit = grown_limit;
+            continue;
+        }
+        if ((adaptive_late_visibility or group_chunk_parents) and !candidates_exhausted) {
             out.total_hits = visible_candidate_count;
             out.total_hits_relation = .gte;
         }
@@ -11739,7 +11849,7 @@ pub fn searchTextQuery(
             } else {
                 try sortAndPageSearchResultInPlace(&out, effective_req, executor.ctx, executor.load_stored, field_sort_plan, null);
             }
-        } else if (late_visibility_paginate and !effective_req.count_only) {
+        } else if ((late_visibility_paginate or group_chunk_parents) and !effective_req.count_only) {
             try paginateSearchResultInPlace(&out, effective_req.offset, effective_req.limit);
         }
         if (!requires_field_sort and !effective_req.count_only and collect_score_profile) {
@@ -11938,7 +12048,7 @@ fn textDocNumsForDocIdsAlloc(
                     if (deleted.contains(local_doc)) continue;
                 }
                 const stored = (try seg.reader.storedDoc(local_doc)) orelse continue;
-                if (!doc_id_set.contains(stored.id)) continue;
+                if (!(try storedDocumentMatchesPublicDocIdFilterAlloc(alloc, stored.id, &doc_id_set))) continue;
                 const doc_num = doc_offset + local_doc;
                 const gop = try doc_num_set.getOrPut(alloc, doc_num);
                 if (gop.found_existing) continue;
@@ -11948,6 +12058,30 @@ fn textDocNumsForDocIdsAlloc(
         doc_offset += seg.reader.doc_count;
     }
     return try out.toOwnedSlice(alloc);
+}
+
+/// A public document-id filter targets both the primary document and records
+/// derived from it. Chunk-backed text indexes store canonical artifact IDs, so
+/// exact ID comparison alone would make a source-level filter silently empty.
+/// Keep artifact identity decoding here at the shared text-ID boundary rather
+/// than teaching hierarchy grouping about a particular index representation.
+fn storedDocumentMatchesPublicDocIdFilterAlloc(
+    alloc: Allocator,
+    stored_id: []const u8,
+    doc_ids: *const BorrowedDocIdSet,
+) !bool {
+    if (doc_ids.contains(stored_id)) return true;
+    if (try artifact_ids.decodeArtifactRefAlloc(alloc, stored_id)) |decoded| {
+        var artifact_ref = decoded;
+        defer artifact_ref.deinit(alloc);
+        return doc_ids.contains(artifact_ref.document_id);
+    }
+    if (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, stored_id)) |decoded| {
+        var artifact_ref = decoded;
+        defer artifact_ref.deinit(alloc);
+        return doc_ids.contains(artifact_ref.document_id);
+    }
+    return false;
 }
 
 test "text doc id conversion checks deadline while scanning" {
@@ -11967,6 +12101,34 @@ test "text doc id conversion checks deadline while scanning" {
     try std.testing.expectError(error.Timeout, textDocNumsForDocIdsAlloc(alloc, .{
         .execution_deadline_ns = 0,
     }, snapshot, &.{"doc:a"}));
+}
+
+test "text doc id conversion resolves source ids to derived artifacts" {
+    const alloc = std.testing.allocator;
+
+    const artifact_id = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, .{
+        .document_id = @constCast("doc:a"),
+        .name = @constCast("body_chunks_v1"),
+        .kind = .chunk,
+        .chunk_id = 0,
+    });
+    defer alloc.free(artifact_id);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    try seg_writer.addStoredDoc(artifact_id, "{\"text\":\"alpha\"}");
+    try seg_writer.addStoredDoc("doc:b", "{\"text\":\"beta\"}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+
+    const mapped = try textDocNumsForDocIdsAlloc(alloc, .{}, snapshot, &.{"doc:a"});
+    defer alloc.free(mapped);
+    try std.testing.expectEqualSlices(u32, &.{0}, mapped);
 }
 
 pub fn collectSearchRequestTextStats(
@@ -12757,14 +12919,9 @@ fn searchDenseInternal(
     );
     const full_candidate_window = group_chunk_parents or unresolved_stored_filters;
     const page_candidate_window = pagingCandidateWindow(paging);
-    const effective_k: u32 = if (full_candidate_window)
-        @intCast(index_stats.active_count)
-    else
-        scoreOrderCandidateWindowK(dense.k, paging);
+    const score_order_k = scoreOrderCandidateWindowK(dense.k, paging);
     const effort = resolvedSearchEffort(req.search_effort);
-    const resolved_search_width = resolveSearchWidth(dense.k, effort, index_stats);
     const resolved_epsilon = resolveSearchEpsilon(effort);
-    profile.resolved_search_width = resolved_search_width;
     profile.resolved_epsilon = resolved_epsilon;
     const bench_query_profile = shouldLogBenchQueryProfile();
     const collect_sort_profile = bench_query_profile or req.profile;
@@ -12805,7 +12962,7 @@ fn searchDenseInternal(
         // Only pay for active-membership verification when the broad exclusion
         // could make this candidate window exhaustive. The common large-table
         // top-k path remains an O(tombstones) mapping plus the normal HBC query.
-        if (effective_k >= bounded_full_candidate_count - coarse_excluded) {
+        if (!full_candidate_window and score_order_k >= bounded_full_candidate_count - coarse_excluded) {
             const active_excluded = try countActiveDenseVectorIdsAlloc(
                 alloc,
                 entry,
@@ -12814,15 +12971,25 @@ fn searchDenseInternal(
             bounded_full_candidate_count -|= active_excluded;
         }
     }
-    var candidate_window: u32 = if (full_candidate_window)
-        initialDenseFullCandidateWindow(bounded_full_candidate_count, paging)
+    const candidate_ceiling = if (group_chunk_parents)
+        @min(bounded_full_candidate_count, groupedCandidateBudget())
     else
-        effective_k;
+        bounded_full_candidate_count;
+    var candidate_window: u32 = if (full_candidate_window)
+        initialAdaptiveCandidateWindow(candidate_ceiling, paging)
+    else
+        score_order_k;
 
     while (true) {
         var score_exactness = SortPlanExactness.approximate;
         var projected_source_profile = ProjectedSourceLoadProfile{};
-        const hbc_effective_k: u32 = if (full_candidate_window) candidate_window else effective_k;
+        const hbc_effective_k: u32 = if (full_candidate_window) candidate_window else score_order_k;
+        // Adaptive hierarchy grouping can grow k well beyond the original
+        // query page. Calibrate recall for the window actually sent to HBC on
+        // every iteration; otherwise a larger k repeatedly searches the same
+        // too-small leaf budget and can miss additional source groups.
+        const resolved_search_width = resolveSearchWidth(hbc_effective_k, effort, index_stats);
+        profile.resolved_search_width = resolved_search_width;
         const exhaustive_broad_live_window = !full_candidate_window and
             native_constraints.broad_live_exclude_ids.len > 0 and
             hbc_effective_k >= bounded_full_candidate_count;
@@ -12843,7 +13010,10 @@ fn searchDenseInternal(
             .distance_under = req.distance_under,
             .filter_ids = effective_filter_ids,
             .exclude_ids = effective_exclude_ids,
-            .cancellation = req.cancellation,
+            .cancellation = if (req.cancellation) |token|
+                vectorindex_mod.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+            else
+                null,
         };
 
         const hbc_search_start = platform_time.monotonicNs();
@@ -12947,7 +13117,12 @@ fn searchDenseInternal(
 
         const raw_hits = results.getHits();
         profile.raw_hit_count = @intCast(raw_hits.len);
-        const candidate_window_incomplete = denseCandidateWindowIncomplete(hbc_effective_k, bounded_full_candidate_count, raw_hits.len);
+        const candidate_tail_score: ?f32 = if (raw_hits.len > 0)
+            vector_mod.similarityFromDistance(raw_hits[raw_hits.len - 1].distance, entry.metric)
+        else
+            null;
+        const candidate_window_incomplete = candidateWindowIncomplete(hbc_effective_k, bounded_full_candidate_count);
+        const candidate_ceiling_reached = candidate_window >= candidate_ceiling;
         if (!candidate_window_incomplete and exhaustive_broad_live_window) {
             score_exactness = .exact;
         }
@@ -13006,7 +13181,8 @@ fn searchDenseInternal(
             try hits.append(alloc, .{
                 .id = doc_key,
                 .doc_ordinal = null,
-                .score = hit.distance,
+                .score = vector_mod.similarityFromDistance(hit.distance, entry.metric),
+                .distance = hit.distance,
                 .stored_data = stored_data,
             });
             doc_key_owned = false;
@@ -13017,9 +13193,14 @@ fn searchDenseInternal(
         profile.doc_ordinal_lookup_ns += platform_time.monotonicNs() - ordinal_lookup_start;
 
         const postprocess_start = platform_time.monotonicNs();
+        var candidate_postprocess_req = postprocess_req;
+        if (full_candidate_window) {
+            candidate_postprocess_req.offset = 0;
+            candidate_postprocess_req.limit = candidate_window;
+        }
         const dense_hits_total: u32 = @intCast(@min(raw_hits.len, @as(usize, std.math.maxInt(u32))));
         const dense_hits = try hits.toOwnedSlice(alloc);
-        var result = try executor.postprocess(executor.ctx, alloc, postprocess_req, .{
+        var result = try executor.postprocess(executor.ctx, alloc, candidate_postprocess_req, .{
             .alloc = alloc,
             .hits = dense_hits,
             .total_hits = dense_hits_total,
@@ -13028,16 +13209,36 @@ fn searchDenseInternal(
         }, chunk_backed);
         errdefer result.deinit();
 
-        const visible_candidate_count = result.total_hits;
-        if (full_candidate_window and candidate_window_incomplete and visible_candidate_count < page_candidate_window) {
+        const visible_candidate_count: u32 = @intCast(@min(result.hits.len, @as(usize, std.math.maxInt(u32))));
+        const needs_more_grouped_candidates = group_chunk_parents and !groupedResultHasStableRequestedPage(
+            paging,
+            result,
+            candidate_tail_score,
+            !candidate_window_incomplete,
+        );
+        const needs_more_visible_candidates = unresolved_stored_filters and visible_candidate_count < page_candidate_window;
+        if (full_candidate_window and
+            candidate_window_incomplete and
+            !candidate_ceiling_reached and
+            (needs_more_grouped_candidates or needs_more_visible_candidates))
+        {
             result.deinit();
-            const grown_window = growDenseFullCandidateWindow(candidate_window, bounded_full_candidate_count, page_candidate_window);
+            const grown_window = growAdaptiveCandidateWindow(candidate_window, candidate_ceiling, page_candidate_window);
             if (grown_window == candidate_window) return error.InvalidQueryRequest;
             candidate_window = grown_window;
             continue;
         }
+        if (group_chunk_parents) {
+            try enforceGroupedPageBoundaryAtCandidateCeiling(
+                paging,
+                result,
+                candidate_tail_score,
+                !candidate_window_incomplete,
+                candidate_ceiling_reached,
+            );
+        }
         if (candidate_window_incomplete) result.total_hits_relation = .gte;
-        if (unresolved_stored_filters) {
+        if (full_candidate_window) {
             result = try pageSearchResultInPlace(alloc, result, paging);
         }
         profile.postprocess_ns += platform_time.monotonicNs() - postprocess_start;
@@ -13205,24 +13406,73 @@ fn scoreOrderWindowTotalHitsRelation(effective_k: u32, bounded_candidate_count: 
     return .exact;
 }
 
-fn initialDenseFullCandidateWindow(bounded_full_candidate_count: u32, paging: ComponentPaging) u32 {
-    if (bounded_full_candidate_count == 0) return 0;
+fn initialAdaptiveCandidateWindow(candidate_ceiling: u32, paging: ComponentPaging) u32 {
+    if (candidate_ceiling == 0) return 0;
     const overfetch_window = @max(paging.limit *| 32, @as(u32, 1024));
-    return @min(bounded_full_candidate_count, @max(overfetch_window, pagingCandidateWindow(paging)));
+    return @min(candidate_ceiling, @max(overfetch_window, pagingCandidateWindow(paging)));
 }
 
-fn growDenseFullCandidateWindow(current: u32, bounded_full_candidate_count: u32, requested_visible_end: u32) u32 {
-    if (current >= bounded_full_candidate_count) return current;
+fn growAdaptiveCandidateWindow(current: u32, candidate_ceiling: u32, requested_visible_end: u32) u32 {
+    if (current >= candidate_ceiling) return current;
     const grown = @max(current +| 1, @max(current *| 2, requested_visible_end));
-    return @min(bounded_full_candidate_count, grown);
+    return @min(candidate_ceiling, grown);
 }
 
-fn denseCandidateWindowIncomplete(candidate_window: u32, bounded_full_candidate_count: u32, raw_hits_len: usize) bool {
-    _ = raw_hits_len;
+fn candidateWindowIncomplete(candidate_window: u32, bounded_full_candidate_count: u32) bool {
     return candidate_window < bounded_full_candidate_count;
 }
 
-test "dense full candidate window covers requested offset page and grows bounded" {
+/// Return whether adaptive collection has discovered the requested component
+/// page of groups. Nested `max_chunks_per_parent` is an output cap, not a fill
+/// target: a group may legitimately have fewer matching descendants, and
+/// requiring every group to reach the cap would force collection to exhaust
+/// the index.
+fn groupedResultHasRequestedPage(paging: ComponentPaging, result: types.SearchResult) bool {
+    if (paging.limit == 0) return true;
+    const available: u32 = @intCast(@min(result.hits.len, @as(usize, std.math.maxInt(u32))));
+    const start = @min(paging.offset, available);
+    const end = @min(start +| paging.limit, available);
+    return end - start == paging.limit;
+}
+
+/// Prove that unseen candidates cannot change the requested grouped page.
+/// Raw text/vector streams use implementation-specific tie breakers, while
+/// grouped source hits use their public IDs. A full-looking page is therefore
+/// not stable until the raw candidate score has moved strictly below its last
+/// visible group, or until the candidate stream is exhausted.
+fn groupedResultHasStableRequestedPage(
+    paging: ComponentPaging,
+    result: types.SearchResult,
+    candidate_tail_score: ?f32,
+    candidates_exhausted: bool,
+) bool {
+    if (!groupedResultHasRequestedPage(paging, result)) return false;
+    if (candidates_exhausted or paging.limit == 0) return true;
+
+    const boundary_index: usize = @intCast((paging.offset +| paging.limit) - 1);
+    if (boundary_index >= result.hits.len) return false;
+    const boundary_score = result.hits[boundary_index].score orelse return false;
+    const tail_score = candidate_tail_score orelse return false;
+    return tail_score < boundary_score;
+}
+
+/// A bounded adaptive query may return an explicitly inexact short page, but
+/// it must never return a full page whose deterministic public-ID tie order is
+/// still unknown. Fail closed when the safety budget prevents that proof.
+fn enforceGroupedPageBoundaryAtCandidateCeiling(
+    paging: ComponentPaging,
+    result: types.SearchResult,
+    candidate_tail_score: ?f32,
+    candidates_exhausted: bool,
+    candidate_ceiling_reached: bool,
+) !void {
+    if (!candidate_ceiling_reached or candidates_exhausted) return;
+    if (!groupedResultHasRequestedPage(paging, result)) return;
+    if (groupedResultHasStableRequestedPage(paging, result, candidate_tail_score, false)) return;
+    return error.QueryCandidateBudgetExceeded;
+}
+
+test "adaptive candidate window covers requested offset page and grows bounded" {
     const paging = ComponentPaging{ .offset = 1024, .limit = 1 };
     try std.testing.expectEqual(@as(u32, 1025), scoreOrderCandidateWindowK(10, paging));
     try std.testing.expectEqual(@as(u32, 4096), scoreOrderCandidateWindowK(4096, paging));
@@ -13233,11 +13483,61 @@ test "dense full candidate window covers requested offset page and grows bounded
     try std.testing.expectEqual(types.TotalHitsRelation.gte, scoreOrderWindowTotalHitsRelation(2, 3, 2));
     try std.testing.expectEqual(types.TotalHitsRelation.exact, scoreOrderWindowTotalHitsRelation(2, 3, 1));
     try std.testing.expectEqual(types.TotalHitsRelation.exact, scoreOrderWindowTotalHitsRelation(3, 3, 3));
-    try std.testing.expectEqual(@as(u32, 1025), initialDenseFullCandidateWindow(2000, paging));
-    try std.testing.expectEqual(@as(u32, 2000), growDenseFullCandidateWindow(1025, 2000, 1025));
-    try std.testing.expect(denseCandidateWindowIncomplete(1025, 2000, 1025));
-    try std.testing.expect(!denseCandidateWindowIncomplete(2000, 2000, 1025));
-    try std.testing.expectEqual(@as(u32, 7), initialDenseFullCandidateWindow(7, paging));
+    try std.testing.expectEqual(@as(u32, 1025), initialAdaptiveCandidateWindow(2000, paging));
+    try std.testing.expectEqual(@as(u32, 2000), growAdaptiveCandidateWindow(1025, 2000, 1025));
+    try std.testing.expect(candidateWindowIncomplete(1025, 2000));
+    try std.testing.expect(!candidateWindowIncomplete(2000, 2000));
+    try std.testing.expectEqual(@as(u32, 7), initialAdaptiveCandidateWindow(7, paging));
+
+    // Group collection starts with an overfetch window and may grow it again.
+    // Search width must be resolved from each effective HBC k, not the much
+    // smaller user-visible page size.
+    const stats = testIndexStats(1_000_000, 17_591, 128);
+    const initial_k = initialAdaptiveCandidateWindow(10_000, .{ .offset = 0, .limit = 1 });
+    const grown_k = growAdaptiveCandidateWindow(initial_k, 10_000, 1);
+    const page_width = resolveSearchWidth(1, 0.0, stats);
+    const initial_width = resolveSearchWidth(initial_k, 0.0, stats);
+    const grown_width = resolveSearchWidth(grown_k, 0.0, stats);
+    try std.testing.expect(page_width < initial_width);
+    try std.testing.expect(initial_width < grown_width);
+}
+
+test "grouped result page satisfaction treats nested match count as a maximum" {
+    var first_chunks = [_]types.ChunkHit{
+        .{ .id = @constCast("chunk-1") },
+        .{ .id = @constCast("chunk-2") },
+    };
+    var second_chunks = [_]types.ChunkHit{
+        .{ .id = @constCast("chunk-3") },
+    };
+    var hits = [_]types.SearchHit{
+        .{ .id = @constCast("source-1"), .score = 2, .chunk_hits = &first_chunks },
+        .{ .id = @constCast("source-2"), .score = 1, .chunk_hits = &second_chunks },
+    };
+    const result = types.SearchResult{
+        .alloc = std.testing.allocator,
+        .hits = &hits,
+        .total_hits = 2,
+        .graph_results = &.{},
+    };
+    try std.testing.expect(groupedResultHasRequestedPage(.{ .offset = 0, .limit = 2 }, result));
+    try std.testing.expect(groupedResultHasRequestedPage(.{ .offset = 0, .limit = 1 }, result));
+    try std.testing.expect(!groupedResultHasRequestedPage(.{ .offset = 1, .limit = 2 }, result));
+
+    try std.testing.expect(groupedResultHasStableRequestedPage(.{ .offset = 0, .limit = 2 }, result, 0.5, false));
+    try std.testing.expect(!groupedResultHasStableRequestedPage(.{ .offset = 0, .limit = 2 }, result, 1, false));
+    try std.testing.expect(groupedResultHasStableRequestedPage(.{ .offset = 0, .limit = 2 }, result, 1, true));
+    try std.testing.expect(!groupedResultHasStableRequestedPage(.{ .offset = 1, .limit = 2 }, result, 0.5, false));
+
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, enforceGroupedPageBoundaryAtCandidateCeiling(
+        .{ .offset = 0, .limit = 2 },
+        result,
+        1,
+        false,
+        true,
+    ));
+    try enforceGroupedPageBoundaryAtCandidateCeiling(.{ .offset = 0, .limit = 2 }, result, 0.5, false, true);
+    try enforceGroupedPageBoundaryAtCandidateCeiling(.{ .offset = 0, .limit = 2 }, result, 1, true, true);
 }
 
 fn exactScoreNativeDenseFilter(
@@ -13327,7 +13627,7 @@ fn exactScoreNativeDenseFilter(
 
 inline fn checkVectorSearchCancelled(req: vectorindex_mod.SearchRequest) !void {
     if (req.cancellation) |cancellation| {
-        if (cancellation.load(.acquire)) return error.Cancelled;
+        if (cancellation.isCancelled()) return error.Cancelled;
     }
 }
 
@@ -13497,7 +13797,7 @@ test "one percent filtered route preserves exact recall with candidate-linear IO
         .query = &query,
         .k = result_count,
         .filter_ids = filter_ids,
-        .cancellation = &cancellation,
+        .cancellation = vectorindex_mod.CancellationToken.fromAtomic(&cancellation),
     }));
     try std.testing.expectEqual(exact_native_filter_cancellation_stride, counter.count);
 }
@@ -14072,8 +14372,13 @@ pub fn searchSparse(
         @as(u64, native_constraints.filter_doc_ids.len) +| @as(u64, native_constraints.filter_doc_nums.len)
     else
         entry.index.next_doc_num;
-    const effective_k: u32 = if (full_candidate_window)
-        @intCast(entry.index.next_doc_num)
+    const bounded_candidate_count = boundedU32(bounded_sparse_candidate_count);
+    const candidate_ceiling = if (group_chunk_parents)
+        @min(bounded_candidate_count, groupedCandidateBudget())
+    else
+        bounded_candidate_count;
+    var candidate_window: u32 = if (full_candidate_window)
+        initialAdaptiveCandidateWindow(candidate_ceiling, paging)
     else
         scoreOrderCandidateWindowK(sparse.k, paging);
     const query = sparse_mod.SparseVector{
@@ -14090,113 +14395,159 @@ pub fn searchSparse(
             .graph_results = &.{},
         };
     }
-    const index_search_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-    const raw_hits = try entry.index.searchConstrained(alloc, &query, effective_k, .{
-        .filter_doc_ids = native_constraints.filter_doc_ids,
-        .exclude_doc_ids = native_constraints.exclude_doc_ids,
-        .filter_doc_nums = native_constraints.filter_doc_nums,
-        .exclude_doc_nums = native_constraints.exclude_doc_nums,
-        .cancellation = req.cancellation,
-    });
-    try checkSearchRequestDeadline(req);
-    if (bench_query_profile) index_search_ns = platform_time.monotonicNs() - index_search_start_ns;
-    defer sparse_mod.SparseIndex.freeResults(alloc, raw_hits);
-
-    const start: u32 = if (full_candidate_window) 0 else @min(paging.offset, @as(u32, @intCast(raw_hits.len)));
-    const end: u32 = if (full_candidate_window) @intCast(raw_hits.len) else @min(start + paging.limit, @as(u32, @intCast(raw_hits.len)));
     const sparse_doc_nums_are_ordinals =
         !chunk_backed and
         native_constraints.positive_filter and
         native_constraints.filter_doc_nums.len > 0 and
         native_constraints.filter_doc_ids.len == 0;
 
-    var hits = try alloc.alloc(types.SearchHit, end - start);
-    var initialized: usize = 0;
-    var owns_hits = true;
-    errdefer {
-        if (owns_hits) {
-            for (hits[0..initialized]) |*hit| hit.deinit(alloc);
-            alloc.free(hits);
-        }
-    }
+    while (true) {
+        const effective_k = candidate_window;
+        const index_search_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+        const raw_hits = try entry.index.searchConstrained(alloc, &query, effective_k, .{
+            .filter_doc_ids = native_constraints.filter_doc_ids,
+            .exclude_doc_ids = native_constraints.exclude_doc_ids,
+            .filter_doc_nums = native_constraints.filter_doc_nums,
+            .exclude_doc_nums = native_constraints.exclude_doc_nums,
+            .cancellation = req.cancellation,
+        });
+        defer sparse_mod.SparseIndex.freeResults(alloc, raw_hits);
+        try checkSearchRequestDeadline(req);
+        if (bench_query_profile) index_search_ns += platform_time.monotonicNs() - index_search_start_ns;
 
-    var batch_doc_ordinals: []?doc_set.DocOrdinal = &.{};
-    defer if (batch_doc_ordinals.len > 0) alloc.free(batch_doc_ordinals);
-    if (!chunk_backed and !sparse_doc_nums_are_ordinals) {
-        if (executor.lookup_doc_ordinals) |lookup_many| {
-            const selected = raw_hits[@intCast(start)..@intCast(end)];
-            if (selected.len > 0) {
-                const doc_ids = try alloc.alloc([]const u8, selected.len);
-                defer alloc.free(doc_ids);
-                for (selected, 0..) |hit, i| doc_ids[i] = hit.doc_id;
-                batch_doc_ordinals = try lookup_many(executor.ctx, alloc, doc_ids, req.identity_read_generation);
-                if (batch_doc_ordinals.len != selected.len) return error.InvalidDocIdentity;
+        const window_relation = scoreOrderWindowTotalHitsRelation(effective_k, bounded_sparse_candidate_count, raw_hits.len);
+        const candidate_window_incomplete = window_relation == .gte;
+        const candidate_ceiling_reached = candidate_window >= candidate_ceiling;
+        const candidate_tail_score: ?f32 = if (raw_hits.len > 0)
+            raw_hits[raw_hits.len - 1].score
+        else
+            null;
+        const start: u32 = if (full_candidate_window) 0 else @min(paging.offset, @as(u32, @intCast(raw_hits.len)));
+        const end: u32 = if (full_candidate_window) @intCast(raw_hits.len) else @min(start +| paging.limit, @as(u32, @intCast(raw_hits.len)));
+
+        var hits = try alloc.alloc(types.SearchHit, end - start);
+        var initialized: usize = 0;
+        var owns_hits = true;
+        errdefer {
+            if (owns_hits) {
+                for (hits[0..initialized]) |*hit| hit.deinit(alloc);
+                alloc.free(hits);
             }
         }
-    }
 
-    const hit_build_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-    for (raw_hits[@intCast(start)..@intCast(end)], 0..) |hit, i| {
-        hits[i] = .{
-            .id = try alloc.dupe(u8, hit.doc_id),
-            .doc_ordinal = if (chunk_backed)
-                try sparseHitParentOrdinal(alloc, executor, hit.doc_id, req.identity_read_generation)
-            else if (sparse_doc_nums_are_ordinals and hit.doc_num != null)
-                hit.doc_num.?
-            else if (batch_doc_ordinals.len > 0)
-                batch_doc_ordinals[i]
-            else
-                try sparseHitOrdinal(alloc, executor, hit.doc_id, req.identity_read_generation),
-            .score = hit.score,
-            .stored_data = null,
-        };
-        initialized += 1;
-    }
-    if (bench_query_profile) hit_build_ns = platform_time.monotonicNs() - hit_build_start_ns;
+        var batch_doc_ordinals: []?doc_set.DocOrdinal = &.{};
+        defer if (batch_doc_ordinals.len > 0) alloc.free(batch_doc_ordinals);
+        if (!chunk_backed and !sparse_doc_nums_are_ordinals) {
+            if (executor.lookup_doc_ordinals) |lookup_many| {
+                const selected = raw_hits[@intCast(start)..@intCast(end)];
+                if (selected.len > 0) {
+                    const doc_ids = try alloc.alloc([]const u8, selected.len);
+                    defer alloc.free(doc_ids);
+                    for (selected, 0..) |hit, i| doc_ids[i] = hit.doc_id;
+                    batch_doc_ordinals = try lookup_many(executor.ctx, alloc, doc_ids, req.identity_read_generation);
+                    if (batch_doc_ordinals.len != selected.len) return error.InvalidDocIdentity;
+                }
+            }
+        }
 
-    owns_hits = false;
-    const postprocess_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-    var result = try executor.postprocess(executor.ctx, alloc, postprocess_req, .{
-        .alloc = alloc,
-        .hits = hits,
-        .total_hits = @intCast(raw_hits.len),
-        .total_hits_relation = scoreOrderWindowTotalHitsRelation(effective_k, bounded_sparse_candidate_count, raw_hits.len),
-        .graph_results = &.{},
-    }, chunk_backed);
-    if (bench_query_profile) postprocess_ns = platform_time.monotonicNs() - postprocess_start_ns;
-    errdefer result.deinit();
-    if (unresolved_stored_filters) {
-        const page_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-        result = try pageSearchResultInPlace(alloc, result, paging);
-        if (bench_query_profile) page_ns = platform_time.monotonicNs() - page_start_ns;
-    }
-    if (postprocess_req.include_stored and !(chunk_backed and group_chunk_parents)) {
-        projected_source_profile = try loadMissingProjectedSparseHitDocuments(alloc, postprocess_req, executor, result.hits);
-        if (bench_query_profile) hit_build_ns += projected_source_profile.total_ns;
-    }
-    if (collect_sort_profile) {
-        result.sort_profile = vectorScoreTopKSortProfile(req, collect_sort_profile, .exact, raw_hits.len, result.hits.len, platform_time.monotonicNs() - total_start_ns);
-        applyProjectedSourceLoadProfileToSortProfile(&result, projected_source_profile);
-    }
-    try decorateVectorScoreOrderIfRequested(&result, req);
-    if (bench_query_profile) {
-        std.log.info(
-            "antfly_bench_sparse_query total_us={d} constraint_us={d} index_search_us={d} hit_build_us={d} postprocess_us={d} page_us={d} raw_hits={d} returned_hits={d} filter_doc_nums={d} exclude_doc_nums={d}",
-            .{
-                nsToUs(platform_time.monotonicNs() - total_start_ns),
-                nsToUs(constraint_ns),
-                nsToUs(index_search_ns),
-                nsToUs(hit_build_ns),
-                nsToUs(postprocess_ns),
-                nsToUs(page_ns),
-                raw_hits.len,
-                result.hits.len,
-                native_constraints.filter_doc_nums.len,
-                native_constraints.exclude_doc_nums.len,
-            },
+        const hit_build_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+        for (raw_hits[@intCast(start)..@intCast(end)], 0..) |hit, i| {
+            hits[i] = .{
+                .id = try alloc.dupe(u8, hit.doc_id),
+                .doc_ordinal = if (chunk_backed)
+                    try sparseHitParentOrdinal(alloc, executor, hit.doc_id, req.identity_read_generation)
+                else if (sparse_doc_nums_are_ordinals and hit.doc_num != null)
+                    hit.doc_num.?
+                else if (batch_doc_ordinals.len > 0)
+                    batch_doc_ordinals[i]
+                else
+                    try sparseHitOrdinal(alloc, executor, hit.doc_id, req.identity_read_generation),
+                .score = hit.score,
+                .stored_data = null,
+            };
+            initialized += 1;
+        }
+        if (bench_query_profile) hit_build_ns += platform_time.monotonicNs() - hit_build_start_ns;
+
+        owns_hits = false;
+        var candidate_postprocess_req = postprocess_req;
+        if (full_candidate_window) {
+            candidate_postprocess_req.offset = 0;
+            candidate_postprocess_req.limit = candidate_window;
+        }
+        const postprocess_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+        var result = try executor.postprocess(executor.ctx, alloc, candidate_postprocess_req, .{
+            .alloc = alloc,
+            .hits = hits,
+            .total_hits = @intCast(raw_hits.len),
+            .total_hits_relation = window_relation,
+            .graph_results = &.{},
+        }, chunk_backed);
+        if (bench_query_profile) postprocess_ns += platform_time.monotonicNs() - postprocess_start_ns;
+        errdefer result.deinit();
+
+        const visible_candidate_count: u32 = @intCast(@min(result.hits.len, @as(usize, std.math.maxInt(u32))));
+        const needs_more_grouped_candidates = group_chunk_parents and !groupedResultHasStableRequestedPage(
+            paging,
+            result,
+            candidate_tail_score,
+            !candidate_window_incomplete,
         );
+        const needs_more_visible_candidates = unresolved_stored_filters and visible_candidate_count < pagingCandidateWindow(paging);
+        if (full_candidate_window and
+            candidate_window_incomplete and
+            !candidate_ceiling_reached and
+            (needs_more_grouped_candidates or needs_more_visible_candidates))
+        {
+            result.deinit();
+            const grown_window = growAdaptiveCandidateWindow(candidate_window, candidate_ceiling, pagingCandidateWindow(paging));
+            if (grown_window == candidate_window) return error.InvalidQueryRequest;
+            candidate_window = grown_window;
+            continue;
+        }
+        if (group_chunk_parents) {
+            try enforceGroupedPageBoundaryAtCandidateCeiling(
+                paging,
+                result,
+                candidate_tail_score,
+                !candidate_window_incomplete,
+                candidate_ceiling_reached,
+            );
+        }
+        if (candidate_window_incomplete) result.total_hits_relation = .gte;
+        if (full_candidate_window) {
+            const page_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+            result = try pageSearchResultInPlace(alloc, result, paging);
+            if (bench_query_profile) page_ns += platform_time.monotonicNs() - page_start_ns;
+        }
+        if (postprocess_req.include_stored and !(chunk_backed and group_chunk_parents)) {
+            projected_source_profile = try loadMissingProjectedSparseHitDocuments(alloc, postprocess_req, executor, result.hits);
+            if (bench_query_profile) hit_build_ns += projected_source_profile.total_ns;
+        }
+        if (collect_sort_profile) {
+            result.sort_profile = vectorScoreTopKSortProfile(req, collect_sort_profile, .exact, raw_hits.len, result.hits.len, platform_time.monotonicNs() - total_start_ns);
+            applyProjectedSourceLoadProfileToSortProfile(&result, projected_source_profile);
+        }
+        try decorateVectorScoreOrderIfRequested(&result, req);
+        if (bench_query_profile) {
+            std.log.info(
+                "antfly_bench_sparse_query total_us={d} constraint_us={d} index_search_us={d} hit_build_us={d} postprocess_us={d} page_us={d} raw_hits={d} returned_hits={d} filter_doc_nums={d} exclude_doc_nums={d}",
+                .{
+                    nsToUs(platform_time.monotonicNs() - total_start_ns),
+                    nsToUs(constraint_ns),
+                    nsToUs(index_search_ns),
+                    nsToUs(hit_build_ns),
+                    nsToUs(postprocess_ns),
+                    nsToUs(page_ns),
+                    raw_hits.len,
+                    result.hits.len,
+                    native_constraints.filter_doc_nums.len,
+                    native_constraints.exclude_doc_nums.len,
+                },
+            );
+        }
+        return result;
     }
-    return result;
 }
 
 fn loadMissingProjectedSparseHitDocuments(
@@ -14555,7 +14906,7 @@ fn typedDocValuesTypeMatchesMappedSortField(
 ) bool {
     return switch (mapping.field_type) {
         .keyword, .link => value_type == .bytes_val,
-        .numeric => value_type == .u64_val or value_type == .i64_val or value_type == .f64_val,
+        .numeric => value_type == .u64_val or value_type == .i64_val or value_type == .f64_val or value_type == .numeric_val,
         .boolean => value_type == .bool_val,
         .datetime => value_type == .u64_val,
         else => false,
@@ -14638,19 +14989,37 @@ fn snapshotTypedDocValuesCoverageDetailsForMapping(
     field: []const u8,
     mapping: runtime_schema_mod.FieldMapping,
 ) !TypedDocValuesCoverage {
+    return snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(snapshot, field, mapping, null);
+}
+
+fn snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(
+    snapshot: *const index_mod.IndexSnapshot,
+    field: []const u8,
+    mapping: runtime_schema_mod.FieldMapping,
+    validation: ?index_mod.CoverageValidation,
+) !TypedDocValuesCoverage {
     var expected_value_type: ?typed_dv.ValueType = null;
     for (snapshot.segments) |*segment| {
         if (segment.liveDocCount() == 0) continue;
-        const section_data = (try segment.reader.getSection(field, .typed_doc_values)) orelse return .{ .status = .missing_doc_values_section };
-        const reader = typed_dv.TypedDocValuesReader.init(snapshot.alloc, section_data) catch return .{ .status = .malformed_doc_values_section };
-        if (!typedDocValuesTypeMatchesMappedSortField(reader.value_type, mapping)) return .{ .status = .doc_values_kind_mismatch };
+        const cached = (segment.typedDocValuesCoverageWithValidation(field, validation) catch |err| switch (err) {
+            // Search requests use the historical double-l spelling at this
+            // layer; keep that public contract while the shared token remains
+            // transport-neutral.
+            error.Canceled => return error.Cancelled,
+            else => return err,
+        }) orelse return .{ .status = .missing_doc_values_section };
+        const value_type = cached.value_type orelse return .{ .status = cached.status };
+        if (!typedDocValuesTypeMatchesMappedSortField(value_type, mapping)) return .{ .status = .doc_values_kind_mismatch };
         if (expected_value_type) |expected| {
-            if (reader.value_type != expected) return .{ .status = .doc_values_kind_mismatch };
+            const both_numeric = mapping.field_type == .numeric and
+                typedDocValuesTypeMatchesMappedSortField(expected, mapping) and
+                typedDocValuesTypeMatchesMappedSortField(value_type, mapping);
+            if (value_type != expected and !both_numeric) return .{ .status = .doc_values_kind_mismatch };
+            if (value_type != expected and both_numeric) expected_value_type = .numeric_val;
         } else {
-            expected_value_type = reader.value_type;
+            expected_value_type = value_type;
         }
-        const live_status = try typed_dv_coverage.readerCoversLiveDocsAlloc(snapshot.alloc, segment, &reader);
-        if (live_status != .covered) return .{ .status = live_status, .value_type = expected_value_type };
+        if (cached.status != .covered) return .{ .status = cached.status, .value_type = expected_value_type };
     }
     return .{ .status = .covered, .value_type = expected_value_type };
 }
@@ -14669,11 +15038,10 @@ fn snapshotGeoPointDocValuesCoverage(
 ) !TypedDocValuesCoverageStatus {
     for (snapshot.segments) |*segment| {
         if (segment.liveDocCount() == 0) continue;
-        const section_data = (try segment.reader.getSection(field, .typed_doc_values)) orelse return .missing_doc_values_section;
-        const reader = typed_dv.TypedDocValuesReader.init(snapshot.alloc, section_data) catch return .malformed_doc_values_section;
-        if (reader.value_type != .geo_point) return .doc_values_kind_mismatch;
-        const live_status = try typed_dv_coverage.readerCoversLiveDocsAlloc(snapshot.alloc, segment, &reader);
-        if (live_status != .covered) return live_status;
+        const cached = (try segment.typedDocValuesCoverage(field)) orelse return .missing_doc_values_section;
+        const value_type = cached.value_type orelse return cached.status;
+        if (value_type != .geo_point) return .doc_values_kind_mismatch;
+        if (cached.status != .covered) return cached.status;
     }
     return .covered;
 }
@@ -14846,6 +15214,7 @@ fn mappedSortCursorRejectionReasonForDocValueType(
             else => .invalid_cursor_type,
         },
         .f64_val => if (jsonValueIsNumeric(value)) null else .invalid_cursor_type,
+        .numeric_val => if (jsonValueIsNumeric(value)) null else .invalid_cursor_type,
         .bool_val => if (value == .bool) null else .invalid_cursor_type,
         .bytes_val => if (value == .string) null else .invalid_cursor_type,
         .geo_point => .invalid_cursor_type,
@@ -15119,7 +15488,10 @@ fn planTextNativeSortFields(
             }
         }
         if (snapshot.liveDocCount() == 0) continue;
-        const coverage = try snapshotTypedDocValuesCoverageDetailsForMapping(snapshot, field.field, mapping);
+        const coverage = try snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(snapshot, field.field, mapping, .{
+            .execution_deadline_ns = effective_req.execution_deadline_ns,
+            .cancellation = effective_req.cancellation,
+        });
         if (coverage.status != .covered) {
             const reason = typedDocValuesCoverageRejectionReason(coverage.status) orelse .missing_doc_values_capability;
             logNativeSortPlanRejection(
@@ -17045,7 +17417,7 @@ fn resolveDynamicTemplateFieldAnalyzer(schema: runtime_schema_mod.TableSchema, f
     }
     const field_name = fieldNameFromPath(field);
     if (!std.mem.eql(u8, field_name, field)) {
-        if (runtime_schema_mod.resolveFieldType(schema, field_name)) |mapping| {
+        if (runtime_schema_mod.resolveDynamicTemplateForValue(schema, field_name, null)) |mapping| {
             if (isTextFieldType(mapping.field_type)) return mapping.analyzer;
         }
     }
@@ -20400,6 +20772,42 @@ test "native text sort validation rejects cursors outside doc value column type"
     try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
 }
 
+test "mixed numeric concrete sort keys share one cursor domain" {
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "rank",
+        .path_match = "rank",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const plan = SortExecutionPlan{
+        .kind = .native_doc_values_top_n,
+        .runtime_schema = .{ .dynamic_templates = &templates },
+    };
+
+    try std.testing.expect(cursorRejectionReasonForConcreteSortKey(
+        plan,
+        "rank",
+        .{ .u64_value = std.math.maxInt(u64) },
+        .{ .integer = -9_007_199_254_740_993 },
+    ) == null);
+    try std.testing.expect(cursorRejectionReasonForConcreteSortKey(
+        plan,
+        "rank",
+        .{ .integer = -1 },
+        .{ .float = 10.5 },
+    ) == null);
+    try std.testing.expect(cursorRejectionReasonForConcreteSortKey(
+        plan,
+        "rank",
+        .{ .number = 10.5 },
+        .{ .number_string = "18446744073709551615" },
+    ) == null);
+}
+
 test "native sort planner classifies mapping and cursor rejection reasons" {
     const keyword_mapping = runtime_schema_mod.FieldMapping{
         .field_type = .keyword,
@@ -20614,7 +21022,7 @@ test "native sort coverage diagnostics classify physical doc value failures" {
         const snapshot = writer.snapshot();
 
         try std.testing.expectEqual(
-            TypedDocValuesCoverageStatus.doc_values_kind_mismatch,
+            TypedDocValuesCoverageStatus.covered,
             try snapshotTypedDocValuesCoverageForMapping(snapshot, "price", numeric_mapping),
         );
     }
@@ -20640,6 +21048,18 @@ test "native sort coverage diagnostics classify physical doc value failures" {
         try writer.addSegment(seg_bytes);
         const snapshot = writer.snapshot();
 
+        try std.testing.expectEqual(
+            TypedDocValuesCoverageStatus.sparse_live_doc_values,
+            try snapshotTypedDocValuesCoverageForMapping(snapshot, "price", numeric_mapping),
+        );
+
+        const delete_infos = try writer.deleteAllByIdsTracked(alloc, &.{"doc:b"});
+        defer index_mod.IndexWriter.freeDeleteInfos(alloc, delete_infos);
+        try std.testing.expectEqual(
+            TypedDocValuesCoverageStatus.covered,
+            try snapshotTypedDocValuesCoverageForMapping(snapshot, "price", numeric_mapping),
+        );
+        writer.rollbackDeleteInfos(delete_infos);
         try std.testing.expectEqual(
             TypedDocValuesCoverageStatus.sparse_live_doc_values,
             try snapshotTypedDocValuesCoverageForMapping(snapshot, "price", numeric_mapping),
@@ -20694,6 +21114,66 @@ test "native sort coverage diagnostics classify physical doc value failures" {
             TypedDocValuesCoverageStatus.duplicate_doc_value_doc_id,
             try snapshotTypedDocValuesCoverageForMapping(snapshot, "price", numeric_mapping),
         );
+    }
+}
+
+test "native sort cold coverage validation observes request deadline and cancellation" {
+    const alloc = std.testing.allocator;
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .numeric_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .numeric_val = .{ .i64_val = -9_007_199_254_740_993 } });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const price_idx = try seg_writer.addField("price");
+    try seg_writer.addSection(price_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("doc:a", "{\"price\":-9007199254740993}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "price",
+        .path_match = "price",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+    const order_by = [_]types.SortField{.{ .field = "price" }};
+
+    try std.testing.expectError(error.Timeout, validateTextNativeSortFields(.{
+        .order_by = &order_by,
+        .limit = 1,
+        .execution_deadline_ns = platform_time.monotonicNs(),
+    }, snapshot, schema));
+
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, validateTextNativeSortFields(.{
+        .order_by = &order_by,
+        .limit = 1,
+        .cancellation = types.CancellationToken.fromAtomic(&canceled),
+    }, snapshot, schema));
+
+    // Failed admissions must not publish a partial coverage summary.
+    switch (snapshot.segments[0].cachedTypedDocValuesCoverage("price")) {
+        .uninitialized => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try validateTextNativeSortFields(.{ .order_by = &order_by, .limit = 1 }, snapshot, schema);
+    switch (snapshot.segments[0].cachedTypedDocValuesCoverage("price")) {
+        .initialized => {},
+        else => return error.TestUnexpectedResult,
     }
 }
 
@@ -21779,7 +22259,7 @@ test "native datetime sort rejects values that cannot serialize as timestamps" {
     }));
 }
 
-test "native sort execution rejects cursors outside concrete doc value key type" {
+test "native sort execution accepts cursors across the logical numeric domain" {
     const alloc = std.testing.allocator;
 
     const templates = [_]runtime_schema_mod.DynamicTemplate{.{
@@ -21816,8 +22296,7 @@ test "native sort execution rejects cursors outside concrete doc value key type"
         .{ .number_string = "10.5" },
         .{ .string = "doc:a" },
     };
-    resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.InvalidQueryRequest, sortAndPageSearchResultInPlace(&result, .{
+    try sortAndPageSearchResultInPlace(&result, .{
         .order_by = &order_by,
         .search_after = &cursor,
         .include_stored = false,
@@ -21829,11 +22308,8 @@ test "native sort execution rejects cursors outside concrete doc value key type"
     }, .{
         .require_native = true,
         .load = Loader.load,
-    }));
-    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("rank", diagnostic.field);
-    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
-    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+    });
+    try std.testing.expectEqual(@as(usize, 0), result.hits.len);
 }
 
 test "native numeric sort rejects non-finite doc values" {
@@ -25653,7 +26129,7 @@ test "match_all aborts the real search execution path when request cancellation 
     try std.testing.expectError(error.Cancelled, searchMatchAll(alloc, .{
         .include_stored = false,
         .limit = 10,
-        .cancellation = &cancellation,
+        .cancellation = types.CancellationToken.fromAtomic(&cancellation),
     }, testMatchAllExecutor(&ctx)));
 }
 
@@ -25705,7 +26181,7 @@ test "match_all primary scan aborts promptly when cancellation arrives mid-fligh
 
         fn run(self: *@This()) void {
             var candidates = collectMatchAllCandidatesWithOptions(std.heap.page_allocator, .{
-                .cancellation = self.cancellation,
+                .cancellation = types.CancellationToken.fromAtomic(self.cancellation),
             }, .{
                 .ctx = self.harness,
                 .scan_store_range = Harness.scanUnexpected,

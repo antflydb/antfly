@@ -98,5 +98,6 @@ If the Docker image isn't being found, ensure you're building with Minikube's Do
 
 ```bash
 eval $(minikube docker-env)
-docker build -f go/Dockerfile -t antfly:latest .
+docker pull ghcr.io/antflydb/antfly:latest
+docker tag ghcr.io/antflydb/antfly:latest antfly:latest
 ```

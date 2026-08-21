@@ -37,7 +37,6 @@ from .antfly_embedder_config import AntflyEmbedderConfig
 from .antfly_generator_config import AntflyGeneratorConfig
 from .antfly_reranker_config import AntflyRerankerConfig
 from .antfly_type import AntflyType
-from .antfly_type_2 import AntflyType2
 from .anthropic_generator_config import AnthropicGeneratorConfig
 from .api_key import ApiKey
 from .api_key_row_filter_type_0 import ApiKeyRowFilterType0
@@ -66,6 +65,7 @@ from .brave_search_config import BraveSearchConfig
 from .brave_search_config_freshness import BraveSearchConfigFreshness
 from .calendar_interval import CalendarInterval
 from .capability import Capability
+from .cardinality_mode import CardinalityMode
 from .cdc_connection import CdcConnection
 from .chain_condition import ChainCondition
 from .chain_link import ChainLink
@@ -150,8 +150,13 @@ from .document_artifact_table_reprocess_response_reprocess import DocumentArtifa
 from .document_artifact_table_reprocess_response_reprocess_status import (
     DocumentArtifactTableReprocessResponseReprocessStatus,
 )
+from .document_field_mapping import DocumentFieldMapping
+from .document_field_mapping_fields import DocumentFieldMappingFields
+from .document_field_mapping_missing_null_policy import DocumentFieldMappingMissingNullPolicy
 from .document_schema import DocumentSchema
 from .document_schema_schema import DocumentSchemaSchema
+from .document_subfield_mapping import DocumentSubfieldMapping
+from .document_subfield_mapping_missing_null_policy import DocumentSubfieldMappingMissingNullPolicy
 from .drop_extension_request import DropExtensionRequest
 from .drop_extension_request_mode import DropExtensionRequestMode
 from .drop_extension_response import DropExtensionResponse
@@ -234,6 +239,7 @@ from .field_capability import FieldCapability
 from .field_capability_index_sort_order import FieldCapabilityIndexSortOrder
 from .field_capability_query_modes_item import FieldCapabilityQueryModesItem
 from .field_capability_sort_lifecycle_state import FieldCapabilitySortLifecycleState
+from .field_mapping_type import FieldMappingType
 from .field_statistics import FieldStatistics
 from .filter_spec import FilterSpec
 from .filter_spec_operator import FilterSpecOperator
@@ -287,6 +293,34 @@ from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
 from .ground_truth import GroundTruth
+from .hierarchy_ancestor import HierarchyAncestor
+from .hierarchy_ancestor_document import HierarchyAncestorDocument
+from .hierarchy_ancestors import HierarchyAncestors
+from .hierarchy_artifact import HierarchyArtifact
+from .hierarchy_artifact_kind import HierarchyArtifactKind
+from .hierarchy_artifact_source import HierarchyArtifactSource
+from .hierarchy_artifact_source_kind import HierarchyArtifactSourceKind
+from .hierarchy_child_parent import HierarchyChildParent
+from .hierarchy_child_parent_level import HierarchyChildParentLevel
+from .hierarchy_children import HierarchyChildren
+from .hierarchy_children_level import HierarchyChildrenLevel
+from .hierarchy_children_order_by_item import HierarchyChildrenOrderByItem
+from .hierarchy_children_order_by_item_field import HierarchyChildrenOrderByItemField
+from .hierarchy_cursor_stale_error import HierarchyCursorStaleError
+from .hierarchy_cursor_stale_error_action import HierarchyCursorStaleErrorAction
+from .hierarchy_cursor_stale_error_error import HierarchyCursorStaleErrorError
+from .hierarchy_cursor_stale_error_restart_without import HierarchyCursorStaleErrorRestartWithout
+from .hierarchy_cursor_stale_error_status import HierarchyCursorStaleErrorStatus
+from .hierarchy_evidence import HierarchyEvidence
+from .hierarchy_evidence_canonical import HierarchyEvidenceCanonical
+from .hierarchy_evidence_mention import HierarchyEvidenceMention
+from .hierarchy_group_by import HierarchyGroupBy
+from .hierarchy_group_by_level import HierarchyGroupByLevel
+from .hierarchy_match_context import HierarchyMatchContext
+from .hierarchy_match_hit import HierarchyMatchHit
+from .hierarchy_match_hit_source import HierarchyMatchHitSource
+from .hierarchy_matches import HierarchyMatches
+from .hierarchy_projection import HierarchyProjection
 from .image_url import ImageURL
 from .image_url_content_part import ImageURLContentPart
 from .image_url_content_part_type import ImageURLContentPartType
@@ -298,9 +332,12 @@ from .index_repair_status_state import IndexRepairStatusState
 from .index_status import IndexStatus
 from .index_status_shard_status import IndexStatusShardStatus
 from .index_type import IndexType
+from .inference_admission_config import InferenceAdmissionConfig
 from .inference_audio_chunk_config import InferenceAudioChunkConfig
 from .inference_backend_runtimes import InferenceBackendRuntimes
 from .inference_binary_content import InferenceBinaryContent
+from .inference_capacity_error import InferenceCapacityError
+from .inference_capacity_error_reason import InferenceCapacityErrorReason
 from .inference_chat_message import InferenceChatMessage
 from .inference_chunk import InferenceChunk
 from .inference_chunk_config import InferenceChunkConfig
@@ -310,8 +347,6 @@ from .inference_chunk_request import InferenceChunkRequest
 from .inference_chunk_response import InferenceChunkResponse
 from .inference_chunk_response_object import InferenceChunkResponseObject
 from .inference_config import InferenceConfig
-from .inference_config_model_strategies import InferenceConfigModelStrategies
-from .inference_config_model_strategies_additional_property import InferenceConfigModelStrategiesAdditionalProperty
 from .inference_connection import InferenceConnection
 from .inference_connection_models import InferenceConnectionModels
 from .inference_content_security_config import InferenceContentSecurityConfig
@@ -406,6 +441,7 @@ from .inference_read_response import InferenceReadResponse
 from .inference_read_response_object import InferenceReadResponseObject
 from .inference_read_result import InferenceReadResult
 from .inference_read_result_fields import InferenceReadResultFields
+from .inference_request_admission_config import InferenceRequestAdmissionConfig
 from .inference_rerank_multimodal_document import InferenceRerankMultimodalDocument
 from .inference_rerank_multimodal_request import InferenceRerankMultimodalRequest
 from .inference_rerank_object import InferenceRerankObject
@@ -419,6 +455,11 @@ from .inference_rewrite_request import InferenceRewriteRequest
 from .inference_rewrite_response import InferenceRewriteResponse
 from .inference_rewrite_response_object import InferenceRewriteResponseObject
 from .inference_role import InferenceRole
+from .inference_runtime_config import InferenceRuntimeConfig
+from .inference_runtime_config_model_strategies import InferenceRuntimeConfigModelStrategies
+from .inference_runtime_config_model_strategies_additional_property import (
+    InferenceRuntimeConfigModelStrategiesAdditionalProperty,
+)
 from .inference_sparse_vector import InferenceSparseVector
 from .inference_style import InferenceStyle
 from .inference_text_content import InferenceTextContent
@@ -448,7 +489,6 @@ from .installed_extension import InstalledExtension
 from .installed_extension_status import InstalledExtensionStatus
 from .invoke_inference_connection_body import InvokeInferenceConnectionBody
 from .invoke_inference_connection_operation import InvokeInferenceConnectionOperation
-from .invoke_inference_connection_response_200 import InvokeInferenceConnectionResponse200
 from .ip_range_query import IPRangeQuery
 from .join_clause import JoinClause
 from .join_condition import JoinCondition
@@ -533,11 +573,10 @@ from .query_builder_request_example_documents_item import QueryBuilderRequestExa
 from .query_builder_result import QueryBuilderResult
 from .query_builder_result_plan import QueryBuilderResultPlan
 from .query_builder_result_query import QueryBuilderResultQuery
+from .query_hierarchy import QueryHierarchy
 from .query_hit import QueryHit
 from .query_hit_hierarchy import QueryHitHierarchy
 from .query_hit_hierarchy_ancestors import QueryHitHierarchyAncestors
-from .query_hit_hierarchy_artifact import QueryHitHierarchyArtifact
-from .query_hit_hierarchy_chunks_item import QueryHitHierarchyChunksItem
 from .query_hit_hierarchy_level import QueryHitHierarchyLevel
 from .query_hit_index_scores import QueryHitIndexScores
 from .query_hit_source import QueryHitSource
@@ -559,6 +598,8 @@ from .query_result_analyses import QueryResultAnalyses
 from .query_result_graph_results import QueryResultGraphResults
 from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
+from .query_temporarily_unavailable_error import QueryTemporarilyUnavailableError
+from .query_temporarily_unavailable_error_code import QueryTemporarilyUnavailableErrorCode
 from .regexp_query import RegexpQuery
 from .repair_issue_list_request import RepairIssueListRequest
 from .repair_run_request import RepairRunRequest
@@ -760,7 +801,6 @@ __all__ = (
     "AntflyGeneratorConfig",
     "AntflyRerankerConfig",
     "AntflyType",
-    "AntflyType2",
     "AnthropicGeneratorConfig",
     "ApiKey",
     "ApiKeyRowFilterType0",
@@ -789,6 +829,7 @@ __all__ = (
     "BraveSearchConfigFreshness",
     "CalendarInterval",
     "Capability",
+    "CardinalityMode",
     "CdcConnection",
     "ChainCondition",
     "ChainLink",
@@ -871,8 +912,13 @@ __all__ = (
     "DocumentArtifactTableReprocessResponse",
     "DocumentArtifactTableReprocessResponseReprocess",
     "DocumentArtifactTableReprocessResponseReprocessStatus",
+    "DocumentFieldMapping",
+    "DocumentFieldMappingFields",
+    "DocumentFieldMappingMissingNullPolicy",
     "DocumentSchema",
     "DocumentSchemaSchema",
+    "DocumentSubfieldMapping",
+    "DocumentSubfieldMappingMissingNullPolicy",
     "DropExtensionRequest",
     "DropExtensionRequestMode",
     "DropExtensionResponse",
@@ -955,6 +1001,7 @@ __all__ = (
     "FieldCapabilityIndexSortOrder",
     "FieldCapabilityQueryModesItem",
     "FieldCapabilitySortLifecycleState",
+    "FieldMappingType",
     "FieldStatistics",
     "FilterSpec",
     "FilterSpecOperator",
@@ -1008,6 +1055,34 @@ __all__ = (
     "GraphResultNodeDocument",
     "GraphResultNodeEvidence",
     "GroundTruth",
+    "HierarchyAncestor",
+    "HierarchyAncestorDocument",
+    "HierarchyAncestors",
+    "HierarchyArtifact",
+    "HierarchyArtifactKind",
+    "HierarchyArtifactSource",
+    "HierarchyArtifactSourceKind",
+    "HierarchyChildParent",
+    "HierarchyChildParentLevel",
+    "HierarchyChildren",
+    "HierarchyChildrenLevel",
+    "HierarchyChildrenOrderByItem",
+    "HierarchyChildrenOrderByItemField",
+    "HierarchyCursorStaleError",
+    "HierarchyCursorStaleErrorAction",
+    "HierarchyCursorStaleErrorError",
+    "HierarchyCursorStaleErrorRestartWithout",
+    "HierarchyCursorStaleErrorStatus",
+    "HierarchyEvidence",
+    "HierarchyEvidenceCanonical",
+    "HierarchyEvidenceMention",
+    "HierarchyGroupBy",
+    "HierarchyGroupByLevel",
+    "HierarchyMatchContext",
+    "HierarchyMatches",
+    "HierarchyMatchHit",
+    "HierarchyMatchHitSource",
+    "HierarchyProjection",
     "ImageURL",
     "ImageURLContentPart",
     "ImageURLContentPartType",
@@ -1019,9 +1094,12 @@ __all__ = (
     "IndexStatus",
     "IndexStatusShardStatus",
     "IndexType",
+    "InferenceAdmissionConfig",
     "InferenceAudioChunkConfig",
     "InferenceBackendRuntimes",
     "InferenceBinaryContent",
+    "InferenceCapacityError",
+    "InferenceCapacityErrorReason",
     "InferenceChatMessage",
     "InferenceChunk",
     "InferenceChunkConfig",
@@ -1031,8 +1109,6 @@ __all__ = (
     "InferenceChunkResponse",
     "InferenceChunkResponseObject",
     "InferenceConfig",
-    "InferenceConfigModelStrategies",
-    "InferenceConfigModelStrategiesAdditionalProperty",
     "InferenceConnection",
     "InferenceConnectionModels",
     "InferenceContentSecurityConfig",
@@ -1127,6 +1203,7 @@ __all__ = (
     "InferenceReadResponseObject",
     "InferenceReadResult",
     "InferenceReadResultFields",
+    "InferenceRequestAdmissionConfig",
     "InferenceRerankMultimodalDocument",
     "InferenceRerankMultimodalRequest",
     "InferenceRerankObject",
@@ -1140,6 +1217,9 @@ __all__ = (
     "InferenceRewriteResponse",
     "InferenceRewriteResponseObject",
     "InferenceRole",
+    "InferenceRuntimeConfig",
+    "InferenceRuntimeConfigModelStrategies",
+    "InferenceRuntimeConfigModelStrategiesAdditionalProperty",
     "InferenceschemasConfig",
     "InferenceSparseVector",
     "InferenceStyle",
@@ -1169,7 +1249,6 @@ __all__ = (
     "InstallManifest",
     "InvokeInferenceConnectionBody",
     "InvokeInferenceConnectionOperation",
-    "InvokeInferenceConnectionResponse200",
     "IPRangeQuery",
     "JoinClause",
     "JoinCondition",
@@ -1254,11 +1333,10 @@ __all__ = (
     "QueryBuilderResult",
     "QueryBuilderResultPlan",
     "QueryBuilderResultQuery",
+    "QueryHierarchy",
     "QueryHit",
     "QueryHitHierarchy",
     "QueryHitHierarchyAncestors",
-    "QueryHitHierarchyArtifact",
-    "QueryHitHierarchyChunksItem",
     "QueryHitHierarchyLevel",
     "QueryHitIndexScores",
     "QueryHits",
@@ -1280,6 +1358,8 @@ __all__ = (
     "QueryResultGraphResults",
     "QueryStrategy",
     "QueryStringQuery",
+    "QueryTemporarilyUnavailableError",
+    "QueryTemporarilyUnavailableErrorCode",
     "RegexpQuery",
     "RepairIssueListRequest",
     "RepairRunRequest",

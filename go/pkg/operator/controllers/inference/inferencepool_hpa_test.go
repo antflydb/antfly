@@ -135,7 +135,7 @@ func TestReconcileStatefulSetDoesNotResetReplicasWhenAutoscaled(t *testing.T) {
 	reconciler := &InferencePoolReconciler{
 		Client:      client,
 		Scheme:      s,
-		AntflyImage: "ghcr.io/antflydb/antfly:omni-test",
+		AntflyImage: "ghcr.io/antflydb/antfly:zig-test",
 	}
 
 	g.Expect(reconciler.reconcileConfigMap(ctx, pool)).To(Succeed())

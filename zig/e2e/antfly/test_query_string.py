@@ -19,9 +19,13 @@ from __future__ import annotations
 import json
 import time
 
+import pytest
 import requests
 
 from helpers import wait_until
+
+
+pytestmark = pytest.mark.reuse_antfly_process
 
 
 def _hit_ids(result: dict, response_index: int = 0) -> list[str]:

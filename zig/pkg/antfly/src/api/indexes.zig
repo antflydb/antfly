@@ -387,7 +387,7 @@ pub fn sortArtifactEnrichmentsByDependency(configs: []db_mod.types.EnrichmentCon
     std.mem.sort(db_mod.types.EnrichmentConfig, configs, {}, artifactEnrichmentLessThan);
 }
 
-fn collectArtifactEnrichmentsFromValue(
+pub fn collectArtifactEnrichmentsFromValue(
     alloc: std.mem.Allocator,
     value: std.json.Value,
     out: *std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig),
@@ -512,6 +512,43 @@ pub fn encodeSingleIndex(
     return try encodeSingleIndexForTableWithTopology(alloc, table, index_name, expected_group_ids, local_statuses);
 }
 
+pub const IndexRuntimeIdentity = struct {
+    coverage_generation: u64,
+    coverage_config_hash: u64,
+};
+
+/// Returns the runtime identity carried by an incarnation-scoped index.
+/// Non-embedding indexes have no catalog incarnation and therefore use the
+/// existing name-scoped status selection.
+pub fn indexRuntimeIdentity(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    config: std.json.Value,
+) !?IndexRuntimeIdentity {
+    const coverage_generation = coverage_policy_mod.incarnation(config) orelse return null;
+    return .{
+        .coverage_generation = coverage_generation,
+        .coverage_config_hash = try expectedCoverageConfigHash(alloc, index_name, config),
+    };
+}
+
+/// Encodes an already-resolved index lookup while retaining the table's shard
+/// topology. The public GET path uses this to reject missing indexes before
+/// consulting runtime owners and to avoid parsing the catalog config twice.
+pub fn encodeSingleIndexLookupForTable(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    table: *const metadata_table_manager.TableRecord,
+    index_name: []const u8,
+    config: std.json.Value,
+    runtime_identity: ?IndexRuntimeIdentity,
+    local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
+) ![]u8 {
+    const expected_group_ids = try expectedTableGroupIds(alloc, snapshot, table.table_id);
+    defer if (expected_group_ids.len > 0) alloc.free(expected_group_ids);
+    return try encodeSingleIndexLookupWithTopology(alloc, index_name, config, runtime_identity, expected_group_ids, local_statuses);
+}
+
 pub fn encodeSingleIndexForTable(
     alloc: std.mem.Allocator,
     table: *const metadata_table_manager.TableRecord,
@@ -530,7 +567,8 @@ fn encodeSingleIndexForTableWithTopology(
 ) !?[]u8 {
     var lookup = (try lookupSingleIndexConfig(alloc, table.indexes_json, index_name)) orelse return null;
     defer lookup.deinit();
-    return try encodeSingleIndexLookupWithTopology(alloc, index_name, lookup.config, expected_group_ids, local_statuses);
+    const runtime_identity = try indexRuntimeIdentity(alloc, index_name, lookup.config);
+    return try encodeSingleIndexLookupWithTopology(alloc, index_name, lookup.config, runtime_identity, expected_group_ids, local_statuses);
 }
 
 pub fn encodeSingleIndexLookup(
@@ -539,13 +577,15 @@ pub fn encodeSingleIndexLookup(
     config: std.json.Value,
     local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
 ) ![]u8 {
-    return try encodeSingleIndexLookupWithTopology(alloc, index_name, config, &.{}, local_statuses);
+    const runtime_identity = try indexRuntimeIdentity(alloc, index_name, config);
+    return try encodeSingleIndexLookupWithTopology(alloc, index_name, config, runtime_identity, &.{}, local_statuses);
 }
 
 fn encodeSingleIndexLookupWithTopology(
     alloc: std.mem.Allocator,
     index_name: []const u8,
     config: std.json.Value,
+    runtime_identity: ?IndexRuntimeIdentity,
     expected_group_ids: []const u64,
     local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
 ) ![]u8 {
@@ -555,7 +595,7 @@ fn encodeSingleIndexLookupWithTopology(
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
-    try appendIndexStatus(alloc, &out, index_name, config, expected_group_ids, local_statuses, &status_lookup);
+    try appendIndexStatusWithIdentity(alloc, &out, index_name, config, runtime_identity, expected_group_ids, local_statuses, &status_lookup);
     return try out.toOwnedSlice(alloc);
 }
 
@@ -688,7 +728,7 @@ fn isReservedIndexMetadataEntry(name: []const u8) bool {
     return std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments");
 }
 
-fn expectedTableGroupIds(
+pub fn expectedTableGroupIds(
     alloc: std.mem.Allocator,
     snapshot: *const metadata_api.AdminSnapshot,
     table_id: u64,
@@ -767,6 +807,29 @@ fn appendIndexStatus(
     local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
     status_lookup: *const RuntimeStatusLookup,
 ) !void {
+    const runtime_identity = try indexRuntimeIdentity(alloc, index_name, config);
+    return try appendIndexStatusWithIdentity(
+        alloc,
+        out,
+        index_name,
+        config,
+        runtime_identity,
+        expected_group_ids,
+        local_statuses,
+        status_lookup,
+    );
+}
+
+fn appendIndexStatusWithIdentity(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    index_name: []const u8,
+    config: std.json.Value,
+    runtime_identity: ?IndexRuntimeIdentity,
+    expected_group_ids: []const u64,
+    local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
+    status_lookup: *const RuntimeStatusLookup,
+) !void {
     const index_type = inferIndexType(index_name, config) orelse return error.InvalidTableIndexMetadata;
     const embeddings_coverage_policy = if (index_type == .embeddings)
         embeddingsCoveragePolicy(config)
@@ -780,14 +843,8 @@ fn appendIndexStatus(
         graphSourceStatus(config)
     else
         null;
-    const coverage_generation = if (index_type == .embeddings)
-        coverage_policy_mod.incarnation(config) orelse 0
-    else
-        0;
-    const coverage_config_hash = if (coverage_generation != 0)
-        try expectedCoverageConfigHash(alloc, index_name, config)
-    else
-        0;
+    const coverage_generation = if (runtime_identity) |identity| identity.coverage_generation else 0;
+    const coverage_config_hash = if (runtime_identity) |identity| identity.coverage_config_hash else 0;
     try out.appendSlice(alloc, "{\"config\":");
     try appendIndexConfig(alloc, out, index_name, config);
     try out.appendSlice(alloc, ",\"status\":");
@@ -4051,7 +4108,10 @@ test "index encoders expose compact algebraic public status" {
     const encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "alg", &local_status)).?;
     defer alloc.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"index_type\":\"algebraic\"") != null);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, encoded, "\"index_type\""));
+    // `index_type` is emitted once in the aggregate `status` and once per group
+    // in `shard_status`, consistent with how every other index kind reports its
+    // type in both views. This fixture has a single group, so it appears twice.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, encoded, "\"index_type\""));
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"healthy\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"parse_error_count\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"schema_version\":42") != null);

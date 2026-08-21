@@ -431,14 +431,33 @@ def api(base_url):
 
         def classify(self, text: list[str], labels: list[str], model: str = "", **kwargs):
             multi_label = bool(kwargs.pop("multi_label", False))
-            body = {
-                "model": model or "cross-encoder/nli-distilroberta-base",
-                "texts": text,
+            hypothesis_template = kwargs.pop("hypothesis_template", None)
+            top_k = kwargs.pop("top_k", None)
+            threshold = kwargs.pop("threshold", None)
+            include_confidence = bool(kwargs.pop("include_confidence", True))
+            if kwargs:
+                raise TypeError(f"unsupported classify options: {sorted(kwargs)}")
+            classification_schema = {
+                "name": "classification",
                 "labels": labels,
                 "multi_label": multi_label,
-                **kwargs,
             }
-            r = self.post("/classify", json=body)
+            if hypothesis_template is not None:
+                classification_schema["hypothesis_template"] = hypothesis_template
+            if top_k is not None:
+                classification_schema["top_k"] = top_k
+            body = {
+                "model": model or "cross-encoder/nli-distilroberta-base",
+                "inputs": [
+                    {"id": f"input-{index}", "content": value}
+                    for index, value in enumerate(text)
+                ],
+                "schema": {"classifications": [classification_schema]},
+                "options": {"include_confidence": include_confidence},
+            }
+            if threshold is not None:
+                body["options"]["threshold"] = threshold
+            r = self.post("/extract", json=body)
             _check(r)
             return r.json()
 

@@ -737,7 +737,7 @@ pub const Client = struct {
 
     /// Invoke an Antfly-compatible inference connection
     /// POST /db/v1/connections/{connection_id}/inference/{operation}
-    pub fn invokeInferenceConnection(self: *@This(), connection_id: []const u8, operation: []const u8, body: std.json.Value) !ApiResponse(std.json.Value) {
+    pub fn invokeInferenceConnection(self: *@This(), connection_id: []const u8, operation: []const u8, body: std.json.Value) !RawResponse {
         const encoded_connection_id = try httpx.PercentEncoding.encode(self.allocator, connection_id);
         defer self.allocator.free(encoded_connection_id);
         const encoded_operation = try httpx.PercentEncoding.encode(self.allocator, operation);
@@ -747,7 +747,8 @@ pub const Client = struct {
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
     }
 
     /// Standalone evaluation endpoint

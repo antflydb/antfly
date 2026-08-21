@@ -374,6 +374,19 @@ pub fn distance(a: []const f32, b: []const f32, metric: DistanceMetric) f32 {
     };
 }
 
+/// Convert a metric-specific distance into a public relevance score.
+///
+/// Every returned score is monotonic with the underlying distance and follows
+/// one invariant: larger scores rank ahead of smaller scores. Callers that
+/// need thresholding or diagnostics should retain the raw distance separately.
+pub fn similarityFromDistance(value: f32, metric: DistanceMetric) f32 {
+    return switch (metric) {
+        .l2_squared => 1.0 / (1.0 + @max(value, 0.0)),
+        .inner_product => -value,
+        .cosine => 1.0 - value,
+    };
+}
+
 /// Compute distance from a fixed query using a precomputed query magnitude.
 /// For `.l2_squared`, `query_measure` must be `dot(query, query)`.
 /// For `.cosine`, `query_measure` must be `norm(query)`.
@@ -532,6 +545,17 @@ test "subTo" {
     try std.testing.expectApproxEqAbs(dst[0], 4.0, 1e-6);
     try std.testing.expectApproxEqAbs(dst[1], 1.0, 1e-6);
     try std.testing.expectApproxEqAbs(dst[2], -2.0, 1e-6);
+}
+
+test "distance conversion produces higher-is-better similarity scores" {
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), similarityFromDistance(0.0, .l2_squared), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), similarityFromDistance(3.0, .l2_squared), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), similarityFromDistance(0.2, .cosine), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.5), similarityFromDistance(-2.5, .inner_product), 1e-6);
+
+    inline for (.{ DistanceMetric.l2_squared, .inner_product, .cosine }) |metric| {
+        try std.testing.expect(similarityFromDistance(0.25, metric) > similarityFromDistance(0.75, metric));
+    }
 }
 
 test "random orthogonal transformer round trips" {

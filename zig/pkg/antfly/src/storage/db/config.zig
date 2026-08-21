@@ -37,7 +37,7 @@ const primary_wal_soft_limit_segments: u64 = 8;
 const primary_wal_hard_limit_segments: u64 = 32;
 const primary_wal_soft_limit_bytes: u64 = 512 * mib;
 const primary_wal_hard_limit_bytes: u64 = 2 * gib;
-
+const primary_wal_checkpoint_dirty_bytes_floor: u64 = 32 * mib;
 const index_wal_soft_limit_segments: u64 = 4;
 const index_wal_hard_limit_segments: u64 = 16;
 const index_wal_soft_limit_bytes: u64 = 256 * mib;
@@ -78,6 +78,10 @@ pub const primary_lsm_options_default = lsm_backend_mod.Options{
     .l0_hard_limit_runs = 128,
     .l0_soft_limit_bytes = 512 * 1024 * 1024,
     .l0_hard_limit_bytes = 2 * 1024 * 1024 * 1024,
+    // Public bulk windows can remain continuously active under concurrent
+    // upload. Preserve their batching, but do not let that implementation
+    // detail suspend the primary store's hard L0 safety bound indefinitely.
+    .write_pressure_during_bulk_ingest = true,
     .level_target_bytes_base = doc_lsm_level_target_bytes_base,
     .level_target_bytes_multiplier = doc_lsm_level_target_bytes_multiplier,
     .max_compaction_input_bytes = 2 * gib,
@@ -87,7 +91,10 @@ pub const primary_lsm_options_default = lsm_backend_mod.Options{
     .wal_soft_limit_bytes = primary_wal_soft_limit_bytes,
     .wal_hard_limit_bytes = primary_wal_hard_limit_bytes,
     .wal_checkpoint_dirty_bytes_multiplier = 2,
-    .wal_checkpoint_dirty_bytes_floor = mib,
+    // This floor prevents replay payloads from turning sustained batch
+    // ingestion into tiny foreground flushes. It is safe only because point
+    // and recovery reads no longer clone the growing mutable memtable.
+    .wal_checkpoint_dirty_bytes_floor = primary_wal_checkpoint_dirty_bytes_floor,
     .foreground_soft_wal_checkpoint = true,
     .max_deferred_immutable_bytes = 256 * mib,
     .table_prefix_extractor = .first_separator,
@@ -160,6 +167,11 @@ pub const dense_hbc_lsm_options_default = lsm_backend_mod.Options{
     .l0_hard_limit_runs = 128,
     .l0_soft_limit_bytes = 1024 * 1024 * 1024,
     .l0_hard_limit_bytes = 4 * 1024 * 1024 * 1024,
+    // Live dense replay deliberately uses bulk transaction mode for node and
+    // posting coalescing. Unlike a finite offline builder, that stream may be
+    // continuously replenished, so bulk mode must not suspend the hard L0
+    // bounds for the lifetime of the upload.
+    .write_pressure_during_bulk_ingest = true,
     .level_target_bytes_base = dense_lsm_level_target_bytes_base,
     .level_target_bytes_multiplier = doc_lsm_level_target_bytes_multiplier,
     .wal_soft_limit_segments = index_wal_soft_limit_segments,
@@ -506,6 +518,7 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(@as(usize, 128), opts.dense_lsm_options.l0_hard_limit_runs);
     try std.testing.expectEqual(@as(u64, 1024 * 1024 * 1024), opts.dense_lsm_options.l0_soft_limit_bytes);
     try std.testing.expectEqual(@as(u64, 4 * 1024 * 1024 * 1024), opts.dense_lsm_options.l0_hard_limit_bytes);
+    try std.testing.expect(opts.dense_lsm_options.write_pressure_during_bulk_ingest);
     try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024), opts.dense_lsm_options.level_target_bytes_base);
     try std.testing.expectEqual(@as(usize, 10), opts.dense_lsm_options.level_target_bytes_multiplier);
     try std.testing.expectEqual(index_wal_soft_limit_segments, opts.dense_lsm_options.wal_soft_limit_segments);
@@ -564,8 +577,9 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(primary_wal_soft_limit_bytes, primary_opts.wal_soft_limit_bytes);
     try std.testing.expectEqual(primary_wal_hard_limit_bytes, primary_opts.wal_hard_limit_bytes);
     try std.testing.expectEqual(@as(u32, 2), primary_opts.wal_checkpoint_dirty_bytes_multiplier);
-    try std.testing.expectEqual(@as(u64, mib), primary_opts.wal_checkpoint_dirty_bytes_floor);
+    try std.testing.expectEqual(primary_wal_checkpoint_dirty_bytes_floor, primary_opts.wal_checkpoint_dirty_bytes_floor);
     try std.testing.expectEqual(@as(u64, 256 * mib), primary_opts.max_deferred_immutable_bytes);
+    try std.testing.expect(primary_opts.write_pressure_during_bulk_ingest);
     try std.testing.expect(primary_opts.foreground_soft_wal_checkpoint);
     try std.testing.expectEqual(@as(@TypeOf(primary_opts.table_prefix_extractor), .first_separator), primary_opts.table_prefix_extractor);
     try std.testing.expectEqual(@as(usize, 1), primary_opts.run_partition_prefix_bytes);

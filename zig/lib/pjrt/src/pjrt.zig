@@ -535,7 +535,8 @@ pub const Client = struct {
 
     /// Initialize PJRT client by searching for the plugin in standard locations.
     /// Search order:
-    ///   1. TERMITE_XLA_PLUGIN, TERMITE_PJRT_PLUGIN, PJRT_PLUGIN_PATH, or PJRT_PLUGIN
+    ///   1. ANTFLY_INFERENCE_XLA_PLUGIN, ANTFLY_INFERENCE_PJRT_PLUGIN,
+    ///      TERMITE_XLA_PLUGIN, TERMITE_PJRT_PLUGIN, PJRT_PLUGIN_PATH, or PJRT_PLUGIN
     ///   2. ~/.termite/pjrt/<os>-<arch>/pjrt_c_api_cpu_plugin.dylib (or .so)
     ///   3. If neither resolves to an existing file, returns error.PjrtPluginNotFound
     pub fn initFromEnv(allocator: std.mem.Allocator) !Client {
@@ -598,6 +599,8 @@ fn pathExists(allocator: std.mem.Allocator, path: []const u8) !bool {
 
 fn resolvePjrtPluginPath(allocator: std.mem.Allocator) ![]u8 {
     // 1. Check environment variable
+    if (try getEnvVarOwned(allocator, "ANTFLY_INFERENCE_XLA_PLUGIN")) |env_path| return env_path;
+    if (try getEnvVarOwned(allocator, "ANTFLY_INFERENCE_PJRT_PLUGIN")) |env_path| return env_path;
     if (try getEnvVarOwned(allocator, "TERMITE_XLA_PLUGIN")) |env_path| return env_path;
     if (try getEnvVarOwned(allocator, "TERMITE_PJRT_PLUGIN")) |env_path| return env_path;
     if (try getEnvVarOwned(allocator, "PJRT_PLUGIN_PATH")) |env_path| return env_path;

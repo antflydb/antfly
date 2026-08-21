@@ -28,6 +28,9 @@ from conftest import ready_index_status
 from helpers import json_doc, upsert, wait_until
 
 
+pytestmark = pytest.mark.reuse_antfly_process
+
+
 def _table_name(created: dict) -> str:
     return created.get("name") or created.get("table_name") or ""
 
@@ -171,6 +174,30 @@ def _ready_index(stateful_api, table_name: str, index_name: str, *, expected_doc
     if total_indexed < expected_docs:
         return None
     return stats
+
+
+def _ready_algebraic_index(stateful_api, table_name: str, index_name: str) -> dict | None:
+    try:
+        index_info = stateful_api.get_index(table_name, index_name)
+    except Exception:
+        return None
+    return ready_index_status(index_info, require_query_fresh=True)
+
+
+def _algebraic_aggregations(stateful_api, table_name: str) -> dict:
+    result = stateful_api.query_table(
+        table_name,
+        {
+            "limit": 1,
+            "aggregations": {
+                "amount_sum": {"type": "sum", "field": "amount"},
+                "category_terms": {"type": "terms", "field": "category", "size": 10},
+            },
+        },
+    )
+    responses = result.get("responses", [result])
+    assert responses
+    return responses[0].get("aggregations", {})
 
 
 def test_ready_index_status_requires_current_coverage_observation():
@@ -320,6 +347,94 @@ def test_stateful_table_accepts_public_full_text_create_index(stateful_api):
     assert detail["config"]["type"] == "full_text"
 
 
+@pytest.mark.fresh_antfly_process
+def test_stateful_managed_algebraic_generation_rebuild_catches_up_and_reopens(stateful_api):
+    table_name = f"managed_algebraic_generation_{time.time_ns()}"
+    index_name = "analytics_idx"
+
+    created = stateful_api.create_table(table_name, num_shards=1)
+    assert _table_name(created) == table_name
+    stateful_api.update_schema(
+        table_name,
+        {
+            "default_type": "doc",
+            "document_schemas": {
+                "doc": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "category": {"type": "keyword"},
+                            "amount": {"type": "number"},
+                        },
+                    }
+                }
+            },
+        },
+    )
+    initial = stateful_api.batch_write(
+        table_name,
+        inserts={
+            "doc:a": {"category": "tools", "amount": 3},
+            "doc:b": {"category": "books", "amount": 5},
+        },
+        sync_level="write",
+    )
+    assert initial["inserted"] == 2
+
+    assert (
+        stateful_api.create_index(
+            table_name,
+            index_name,
+            {
+                "name": index_name,
+                "type": "algebraic",
+                "derive_from_schema": True,
+            },
+        )
+        == {}
+    )
+    # This write lands after admission while the snapshot generation may still
+    # be building. Durable replay must carry it into the activated generation.
+    concurrent = stateful_api.batch_write(
+        table_name,
+        inserts={"doc:c": {"category": "tools", "amount": 7}},
+        sync_level="write",
+    )
+    assert concurrent["inserted"] == 1
+
+    ready = wait_until(
+        lambda: _ready_algebraic_index(stateful_api, table_name, index_name),
+        timeout_s=60.0,
+        interval_s=0.25,
+    )
+    assert ready is not None, json.dumps(
+        stateful_api.get_index(table_name, index_name),
+        indent=2,
+        sort_keys=True,
+    )
+    aggregations = _algebraic_aggregations(stateful_api, table_name)
+    assert aggregations["amount_sum"]["value"] == 15
+    assert {
+        bucket["key"]: bucket["doc_count"]
+        for bucket in aggregations["category_terms"]["buckets"]
+    } == {"books": 1, "tools": 2}
+
+    assert stateful_api.supports_restart
+    stateful_api.restart_server()
+    reopened = wait_until(
+        lambda: _ready_algebraic_index(stateful_api, table_name, index_name),
+        timeout_s=60.0,
+        interval_s=0.25,
+    )
+    assert reopened is not None, json.dumps(
+        stateful_api.get_index(table_name, index_name),
+        indent=2,
+        sort_keys=True,
+    )
+    reopened_aggregations = _algebraic_aggregations(stateful_api, table_name)
+    assert reopened_aggregations == aggregations
+
+
 def test_stateful_table_registers_public_artifact_enrichment_for_default_full_text(stateful_api):
     table_name = f"artifact_enrichment_{time.time_ns()}"
 
@@ -434,7 +549,7 @@ def test_stateful_table_registers_public_artifact_enrichment_for_default_full_te
     assert stateful_api.delete(f"/tables/{table_name}/artifacts/document_units_v1/enrichment") == {}
 
 
-def test_stateful_table_accepts_document_full_text_create_index_with_inline_enrichments(stateful_api):
+def test_stateful_table_cleans_document_full_text_inline_enrichments_on_index_delete(stateful_api):
     table_name = f"document_full_text_inline_{time.time_ns()}"
 
     created = stateful_api.create_table(table_name, num_shards=1)
@@ -474,6 +589,24 @@ def test_stateful_table_accepts_document_full_text_create_index_with_inline_enri
     detail = json.dumps(index, sort_keys=True)
     assert "document_units_v1" in detail
     assert "document_chunks_v1" in detail
+
+    assert stateful_api.delete_index(table_name, "document_text") == {}
+    table = stateful_api.get_table(table_name)
+    enrichment_names = {
+        enrichment["name"] for enrichment in table.get("artifact_enrichments", [])
+    }
+    assert "document_units_v1" not in enrichment_names
+    assert "document_chunks_v1" not in enrichment_names
+
+    # Exercise the first post-delete write through the same resident writer.
+    # A dangling generated-enrichment target must not retain full-index debt.
+    batch = stateful_api.batch_write(
+        table_name,
+        inserts={"doc:after-delete": {"body": "index and inline producers are gone"}},
+        sync_level="full_index",
+    )
+    assert batch["status"] == "committed"
+    assert batch["inserted"] == 1
 
 
 def test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_query(stateful_api):
@@ -571,6 +704,74 @@ def test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_qu
     assert hits[0]["_id"] == "doc:a"
 
 
+def test_stateful_back_to_back_external_embedding_indexes_admit_immediate_batch(stateful_api):
+    table_name = f"stateful_external_embeddings_online_admission_{time.time_ns()}"
+    index_names = ("vectors_one", "vectors_two")
+    vector = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+
+    created = stateful_api.create_table(table_name, num_shards=1)
+    assert created["name"] == table_name
+
+    for index_name in index_names:
+        # Do not wait for runtime readiness between creates. The regression
+        # requires each short write-capability admission to complete while the
+        # prior index can still have background lifecycle work queued.
+        assert (
+            stateful_api.post(
+                f"/tables/{table_name}/indexes/{index_name}",
+                {
+                    "name": index_name,
+                    "type": "embeddings",
+                    "external": True,
+                    "dimension": len(vector),
+                    "distance_metric": "cosine",
+                },
+            )
+            == {}
+        )
+
+    batch = stateful_api.batch_write(
+        table_name,
+        inserts={
+            "doc:a": {
+                "content": "one document, two vectors",
+                "_embeddings": {index_name: vector for index_name in index_names},
+            }
+        },
+        sync_level="full_index",
+    )
+    assert batch["status"] == "committed"
+    assert batch["inserted"] == 1
+
+    for index_name in index_names:
+        ready = wait_until(
+            lambda index_name=index_name: _ready_index(
+                stateful_api,
+                table_name,
+                index_name,
+                expected_docs=1,
+            ),
+            timeout_s=30.0,
+            interval_s=0.25,
+        )
+        assert ready is not None, json.dumps(
+            stateful_api.get_index(table_name, index_name),
+            indent=2,
+            sort_keys=True,
+        )
+        assert int(ready.get("total_indexed", ready.get("doc_count", 0))) == 1
+
+        result = stateful_api.query_table(
+            table_name,
+            {
+                "embeddings": {index_name: vector},
+                "indexes": [index_name],
+                "limit": 5,
+            },
+        )
+        assert _response_hit_ids(result) == ["doc:a"]
+
+
 def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
     stateful_api,
     openai_embedder,
@@ -601,7 +802,7 @@ def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
         == {}
     )
     assert wait_until(
-        lambda: ready_index_status(stateful_api.get_index(table_name, index_name)),
+        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=10.0,
         interval_s=0.1,
     )
@@ -694,7 +895,11 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_rate_limited
 
     assert stateful_api.create_index(table_name, index_name, index_payload) == {}
     assert wait_until(
-        lambda: ready_index_status(stateful_api.get_index(table_name, index_name)),
+        # A metadata snapshot can expose the index config before the table's
+        # shard topology and runtime observation arrive. Do not begin the
+        # rate-limit scenario from that config-only response: it has an empty
+        # shard_status and cannot prove that the managed worker is running.
+        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
         interval_s=0.5,
     )
@@ -808,8 +1013,8 @@ def test_stateful_drop_tables_with_pending_enrichment_preserves_unrelated_owner(
         for table_name in hot_tables:
             assert stateful_api.create_index(table_name, index_name, index_payload) == {}
             assert wait_until(
-                lambda table_name=table_name: ready_index_status(
-                    stateful_api.get_index(table_name, index_name)
+                lambda table_name=table_name: _ready_index(
+                    stateful_api, table_name, index_name, expected_docs=0
                 ),
                 timeout_s=30.0,
                 interval_s=0.1,
@@ -922,7 +1127,11 @@ def test_stateful_managed_embeddings_backfill_recovers_after_rate_limited_enrich
 
     assert stateful_api.create_index(table_name, index_name, index_payload) == {}
     assert wait_until(
-        lambda: ready_index_status(stateful_api.get_index(table_name, index_name)),
+        # A metadata snapshot can expose the index config before the table's
+        # shard topology and runtime observation arrive. Do not begin the
+        # rate-limit scenario from that config-only response: it has an empty
+        # shard_status and cannot prove that the managed worker is running.
+        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
         interval_s=0.5,
     )
@@ -994,6 +1203,7 @@ def test_stateful_managed_embeddings_backfill_recovers_after_rate_limited_enrich
     assert _response_hit_ids(alpha_query)[0] == "doc:a"
 
 
+@pytest.mark.fresh_antfly_process
 def test_stateful_managed_embeddings_backfill_resumes_after_process_restart(
     single_item_enrichment_batches,
     stateful_api,
@@ -1023,7 +1233,7 @@ def test_stateful_managed_embeddings_backfill_resumes_after_process_restart(
         == {}
     )
     assert wait_until(
-        lambda: ready_index_status(stateful_api.get_index(table_name, index_name)),
+        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
         interval_s=0.25,
     )
@@ -1107,7 +1317,7 @@ def test_stateful_managed_embeddings_status_reports_partial_retrying_backfill_af
 
     assert stateful_api.create_index(table_name, index_name, index_payload) == {}
     assert wait_until(
-        lambda: ready_index_status(stateful_api.get_index(table_name, index_name)),
+        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
         interval_s=0.5,
     )
@@ -1207,7 +1417,7 @@ def test_stateful_managed_embeddings_provider_pacing_avoids_rate_limit_bursts(
 
     assert stateful_api.create_index(table_name, index_name, index_payload) == {}
     assert wait_until(
-        lambda: ready_index_status(stateful_api.get_index(table_name, index_name)),
+        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
         interval_s=0.5,
     )
@@ -1382,6 +1592,7 @@ def test_stateful_managed_embeddings_provider_pacing_is_shared_across_tables(
     assert stats["rate_limited_requests"] <= 1
 
 
+@pytest.mark.fresh_antfly_process
 def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_artifact(
     stateful_api,
     openai_embedder,
@@ -1406,7 +1617,7 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_arti
 
     assert stateful_api.create_index(table_name, index_name, index_payload) == {}
     assert wait_until(
-        lambda: ready_index_status(stateful_api.get_index(table_name, index_name)),
+        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
         interval_s=0.5,
     )
@@ -1632,14 +1843,18 @@ def test_table_chunker_full_text_index_routes_template_chunks(table_api, openai_
         if table_api.backend == "serverless":
             assert table_api.publish_table(table_name) is not None
 
-        hits = wait_until(
-            lambda: (
-                current
-                if ((current := query_ids(table_name)) and full_text_enabled)
-                else None
-            ),
-            timeout_s=30.0,
-            interval_s=0.5,
+        # `full_index` is the positive completion barrier for stateful tables;
+        # serverless tables additionally complete publication above. Do not
+        # poll for an absent hit when full text is disabled: that predicate can
+        # never succeed and previously consumed the entire 30-second timeout.
+        hits = (
+            wait_until(
+                lambda: current if (current := query_ids(table_name)) else None,
+                timeout_s=30.0,
+                interval_s=0.5,
+            )
+            if full_text_enabled
+            else None
         )
         return table_name, {"hits": hits or []}
 
@@ -2108,21 +2323,17 @@ def test_serverless_named_embedding_indexes_report_publication_actions(serverles
     )
     assert serverless_api.delete_index(table_name, "semantic_a") == {}
 
-    planned = wait_until(
-        lambda: (
-            current
-            if (
-                (current := serverless_api.table_build_status(table_name)).get("head_republish_recommended") is True
-                and _named_action(current, "vector_index_actions", "semantic_b") == "reuse"
-                and _named_action(current, "sparse_index_actions", "sparse_a") == "reuse"
-                and _named_action(current, "sparse_index_actions", "sparse_b") == "rebuild"
-            )
-            else None
-        ),
-        timeout_s=30.0,
-        interval_s=0.5,
-    )
-    if planned is not None:
+    # The pre-build plan is a transient diagnostic snapshot: the test's
+    # required contract is the post-build action set below. Inspect it when it
+    # is already observable, but do not spend 30 seconds waiting for an
+    # optional intermediate state.
+    planned = serverless_api.table_build_status(table_name)
+    if (
+        planned.get("head_republish_recommended") is True
+        and _named_action(planned, "vector_index_actions", "semantic_b") == "reuse"
+        and _named_action(planned, "sparse_index_actions", "sparse_a") == "reuse"
+        and _named_action(planned, "sparse_index_actions", "sparse_b") == "rebuild"
+    ):
         assert _named_action(planned, "vector_index_actions", "semantic_a") == "drop"
         assert planned["artifact_actions"]["dense_vector"] == "reuse"
         assert planned["artifact_actions"]["sparse_vector"] == "rebuild"

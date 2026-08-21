@@ -144,9 +144,8 @@ To use the previous key-value format, specify it explicitly:
 
 ## Implementation Details
 
-- **Default template**: Changed in `go/pkg/antfly/lib/ai/genkit.go:320`
-- **Helper function**: Implemented in `go/pkg/antfly/lib/template/template.go:103-136`
-- **Powered by**: [github.com/alpkeskin/gotoon](https://github.com/alpkeskin/gotoon)
+TOON encoding and template integration are implemented by the Zig runtime in
+`zig/lib/toon/` and `zig/pkg/antfly/src/template.zig`.
 
 ## See Also
 

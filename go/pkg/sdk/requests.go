@@ -55,9 +55,11 @@ type BatchRequest struct {
 
 // BatchResult represents the result of a batch operation with detailed failure information
 type BatchResult struct {
-	// Status is "committed" or "committed_pending". A pending result has a
-	// durable commit decision but has not yet reached the requested visibility
-	// or participant-recovery barrier.
+	// Status is "committed", "committed_pending", or
+	// "committed_repair_required". A pending result has a durable commit
+	// decision but has not yet reached the requested visibility or
+	// participant-recovery barrier. Repair-required means the primary write
+	// committed but terminal enrichment debt needs operator action.
 	Status string `json:"status,omitempty"`
 
 	// Deleted Number of documents successfully deleted
@@ -78,6 +80,30 @@ type BatchResult struct {
 		Id string `json:"id,omitempty"`
 	} `json:"failed,omitempty"`
 }
+
+type HierarchyAncestors = oapi.HierarchyAncestors
+type HierarchyChildParent = oapi.HierarchyChildParent
+type HierarchyChildParentLevel = oapi.HierarchyChildParentLevel
+type HierarchyChildren = oapi.HierarchyChildren
+type HierarchyChildrenLevel = oapi.HierarchyChildrenLevel
+type HierarchyChildrenOrderBy = oapi.HierarchyChildrenOrderBy
+type HierarchyChildrenOrderByDesc = oapi.HierarchyChildrenOrderByDesc
+type HierarchyChildrenOrderByField = oapi.HierarchyChildrenOrderByField
+type HierarchyChildrenSearchAfter = oapi.HierarchyChildrenSearchAfter
+type HierarchyGroupBy = oapi.HierarchyGroupBy
+type HierarchyGroupByLevel = oapi.HierarchyGroupByLevel
+type HierarchyMatches = oapi.HierarchyMatches
+type HierarchyProjection = oapi.HierarchyProjection
+type QueryHierarchy = oapi.QueryHierarchy
+
+const (
+	HierarchyChildParentLevelSource                          = oapi.HierarchyChildParentLevelSource
+	HierarchyChildrenLevelUnit                               = oapi.HierarchyChildrenLevelUnit
+	HierarchyChildrenOrderByDescFalse                        = oapi.HierarchyChildrenOrderByDescFalse
+	HierarchyChildrenOrderByFieldUnderscoreHierarchyPosition = oapi.HierarchyChildrenOrderByFieldUnderscoreHierarchyPosition
+	HierarchyGroupByLevelSource                              = oapi.HierarchyGroupByLevelSource
+	HierarchyGroupByLevelUnit                                = oapi.HierarchyGroupByLevelUnit
+)
 
 // QueryRequest represents a query request with strongly-typed query fields.
 // This is the SDK-friendly version of oapi.QueryRequest with Query types instead of json.RawMessage.
@@ -161,6 +187,10 @@ type QueryRequest struct {
 	// Results can reference search results using node selectors like $full_text_results.
 	GraphSearches map[string]GraphQuery `json:"graph_searches,omitempty"`
 
+	// Hierarchy controls top-level result shape, bounded child hits, and projected ancestors.
+	// A non-nil empty object selects direct index matches without ancestor hydration.
+	Hierarchy *QueryHierarchy `json:"hierarchy,omitempty"`
+
 	// Join configuration for joining data from another table.
 	// Supports inner, left, and right joins with automatic strategy selection.
 	Join JoinClause `json:"join"`
@@ -185,7 +215,7 @@ func (q QueryRequest) MarshalJSON() ([]byte, error) {
 		DistanceUnder:    q.DistanceUnder,
 		Embeddings:       q.Embeddings,
 		Aggregations:     q.Aggregations,
-		Fields:           q.Fields,
+		Fields:           nil,
 		FilterPrefix:     q.FilterPrefix,
 		Indexes:          q.Indexes,
 		Limit:            q.Limit,
@@ -199,7 +229,14 @@ func (q QueryRequest) MarshalJSON() ([]byte, error) {
 		SemanticSearch:   q.SemanticSearch,
 		DocumentRenderer: q.DocumentRenderer,
 		GraphSearches:    q.GraphSearches,
+		Hierarchy:        q.Hierarchy,
 		ForeignSources:   q.ForeignSources,
+	}
+	// Preserve the distinction between an omitted projection and an explicitly
+	// empty identity-only projection. The generated OpenAPI type uses a pointer
+	// for this optional array so [] remains present on the wire.
+	if q.Fields != nil {
+		oapiReq.Fields = &q.Fields
 	}
 	if !reflect.ValueOf(q.Join).IsZero() {
 		oapiReq.Join = q.Join
@@ -258,7 +295,10 @@ func (q *QueryRequest) UnmarshalJSON(data []byte) error {
 	q.DistanceUnder = oapiReq.DistanceUnder
 	q.Embeddings = oapiReq.Embeddings
 	q.Aggregations = oapiReq.Aggregations
-	q.Fields = oapiReq.Fields
+	q.Fields = nil
+	if oapiReq.Fields != nil {
+		q.Fields = *oapiReq.Fields
+	}
 	q.FilterPrefix = oapiReq.FilterPrefix
 	q.Indexes = oapiReq.Indexes
 	q.Limit = oapiReq.Limit
@@ -272,6 +312,7 @@ func (q *QueryRequest) UnmarshalJSON(data []byte) error {
 	q.SemanticSearch = oapiReq.SemanticSearch
 	q.DocumentRenderer = oapiReq.DocumentRenderer
 	q.GraphSearches = oapiReq.GraphSearches
+	q.Hierarchy = oapiReq.Hierarchy
 	q.Join = oapiReq.Join
 	q.ForeignSources = oapiReq.ForeignSources
 
@@ -310,7 +351,7 @@ type MultiBatchRequest struct {
 // MultiBatchResult represents the result of a cross-table batch operation.
 type MultiBatchResult struct {
 	// Status is "committed", "committed_visibility_pending",
-	// "committed_recovery_pending", or "aborted". "committed_pending" is
+	// "committed_recovery_pending", "committed_repair_required", or "aborted". "committed_pending" is
 	// used as a generic fallback when an older server returns HTTP 202 without
 	// a status field.
 	Status string `json:"status,omitempty"`
@@ -326,7 +367,7 @@ type MultiBatchResult struct {
 // TransactionCommitResult represents the result of an OCC transaction commit.
 type TransactionCommitResult struct {
 	// Status is "committed", "committed_visibility_pending",
-	// "committed_recovery_pending", or "aborted".
+	// "committed_recovery_pending", "committed_repair_required", or "aborted".
 	Status string `json:"status"`
 
 	// Conflict details (only present when status is "aborted").

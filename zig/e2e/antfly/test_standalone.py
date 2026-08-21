@@ -19,11 +19,11 @@ from __future__ import annotations
 import json
 import os
 import signal
-import socket
 import subprocess
 import tempfile
 import threading
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -33,6 +33,7 @@ import requests
 
 from conftest import antfly_public_api_url, inference_public_api_url
 from helpers import wait_until
+from port_reservations import LoopbackPortReservations
 
 
 pytestmark = pytest.mark.standalone_integration
@@ -62,12 +63,6 @@ def _env_int(name: str, default: int) -> int:
     if value is None or value == "":
         return default
     return int(value)
-
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def _wait_for_server(url: str, timeout_s: float = 30.0, path: str = "/status") -> bool:
@@ -156,18 +151,27 @@ class EmbeddedInferenceStandaloneServer:
         self.model_name = model_name
         self.host = host
         self.inference_budget_mb = inference_budget_mb or {}
-        self.public_port = _find_free_port()
-        self.health_port = _find_free_port()
-        self.public_url = f"http://{host}:{self.public_port}"
-        self.url = antfly_public_api_url(self.public_url)
-        self.health_url = f"http://{host}:{self.health_port}"
-        self.inference_api_url = inference_public_api_url(self.public_url)
-        self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-standalone-e2e-")
-        self.root = Path(self.tempdir.name)
-        self.log_path = self.root / "server.log"
-        self.log_file = self.log_path.open("w")
-        self.proc: subprocess.Popen[str] | None = None
-        self._start()
+        with ExitStack() as setup:
+            self.port_reservations = LoopbackPortReservations(host)
+            setup.callback(self.port_reservations.close)
+            self.public_port, self.health_port = self.port_reservations.reserve_many(2)
+            self.public_url = f"http://{host}:{self.public_port}"
+            self.url = antfly_public_api_url(self.public_url)
+            self.health_url = f"http://{host}:{self.health_port}"
+            self.inference_api_url = inference_public_api_url(self.public_url)
+            self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-standalone-e2e-")
+            setup.callback(self.tempdir.cleanup)
+            self.root = Path(self.tempdir.name)
+            self.log_path = self.root / "server.log"
+            self.log_file = setup.enter_context(self.log_path.open("w"))
+            self.proc: subprocess.Popen[str] | None = None
+            setup.pop_all()
+        try:
+            self._start()
+        except BaseException:
+            if not self.log_file.closed:
+                self.stop()
+            raise
 
     def _start(self) -> None:
         command = [
@@ -201,11 +205,14 @@ class EmbeddedInferenceStandaloneServer:
         ):
             if value > 0:
                 command.extend([flag_name, str(value)])
-        self.proc = subprocess.Popen(
-            command,
-            stdout=self.log_file,
-            stderr=subprocess.STDOUT,
-            cwd=REPO_ROOT,
+        self.proc = self.port_reservations.handoff_to(
+            (self.public_port, self.health_port),
+            lambda: subprocess.Popen(
+                command,
+                stdout=self.log_file,
+                stderr=subprocess.STDOUT,
+                cwd=REPO_ROOT,
+            ),
         )
         if not _wait_for_server(self.url):
             logs = _read_log_tail(self.log_path)
@@ -221,6 +228,7 @@ class EmbeddedInferenceStandaloneServer:
         return _read_log_tail(self.log_path)
 
     def stop(self) -> None:
+        self.port_reservations.close()
         if self.proc is not None and self.proc.poll() is None:
             self.proc.send_signal(signal.SIGTERM)
             try:

@@ -86,18 +86,22 @@ pub const Router = struct {
     }
 
     /// Adds a route to the router.
-    pub fn add(self: *Self, method: types.Method, pattern: []const u8, handler: Handler) !void {
+    pub fn add(self: *Self, method: types.Method, pattern: []const u8, handler: anytype) !void {
         return self.addWithData(method, pattern, handler, null);
     }
 
     /// Adds a route with borrowed opaque request data.
-    pub fn addWithData(self: *Self, method: types.Method, pattern: []const u8, handler: Handler, data: ?*anyopaque) !void {
+    pub fn addWithData(self: *Self, method: types.Method, pattern: []const u8, handler: anytype, data: ?*anyopaque) !void {
         const segments = try self.parsePattern(pattern);
+        errdefer self.allocator.free(segments);
+        for (self.routesForConst(method)) |route| {
+            if (sameRouteShape(route.segments, segments)) return error.DuplicateRoute;
+        }
         try self.routesFor(method).append(self.allocator, .{
             .method = method,
             .pattern = pattern,
             .segments = segments,
-            .handler = handler,
+            .handler = Handler.from(handler),
             .data = data,
         });
     }
@@ -107,6 +111,10 @@ pub const Router = struct {
         const owned = try self.allocator.dupe(u8, pattern);
         errdefer self.allocator.free(owned);
         const segments = try self.parsePattern(owned);
+        errdefer self.allocator.free(segments);
+        for (self.routesForConst(method)) |route| {
+            if (sameRouteShape(route.segments, segments)) return error.DuplicateRoute;
+        }
         try self.routesFor(method).append(self.allocator, .{
             .method = method,
             .pattern = owned,
@@ -114,6 +122,29 @@ pub const Router = struct {
             .segments = segments,
             .handler = handler,
         });
+    }
+
+    fn sameRouteShape(left: []const Segment, right: []const Segment) bool {
+        if (left.len != right.len) return false;
+        for (left, right) |left_segment, right_segment| switch (left_segment) {
+            .literal => |left_literal| switch (right_segment) {
+                .literal => |right_literal| if (!mem.eql(u8, left_literal, right_literal)) return false,
+                else => return false,
+            },
+            .param => switch (right_segment) {
+                .param => {},
+                else => return false,
+            },
+            .param_suffix => |left_param| switch (right_segment) {
+                .param_suffix => |right_param| if (!mem.eql(u8, left_param.suffix, right_param.suffix)) return false,
+                else => return false,
+            },
+            .wildcard => switch (right_segment) {
+                .wildcard => {},
+                else => return false,
+            },
+        };
+        return true;
     }
 
     fn parsePattern(self: *Self, pattern: []const u8) ![]const Segment {
@@ -242,48 +273,48 @@ pub const RouteGroup = struct {
     }
 
     /// Adds a route to the group.
-    pub fn add(self: *Self, method: types.Method, path: []const u8, handler: Handler) !void {
+    pub fn add(self: *Self, method: types.Method, path: []const u8, handler: anytype) !void {
         var full_path = std.ArrayListUnmanaged(u8).empty;
         defer full_path.deinit(self.router.allocator);
 
         try full_path.appendSlice(self.router.allocator, self.prefix);
         try full_path.appendSlice(self.router.allocator, path);
 
-        try self.router.addOwned(method, full_path.items, handler);
+        try self.router.addOwned(method, full_path.items, Handler.from(handler));
     }
 
     /// Adds a GET route.
-    pub fn get(self: *Self, path: []const u8, handler: Handler) !void {
+    pub fn get(self: *Self, path: []const u8, handler: anytype) !void {
         try self.add(.GET, path, handler);
     }
 
     /// Adds a POST route.
-    pub fn post(self: *Self, path: []const u8, handler: Handler) !void {
+    pub fn post(self: *Self, path: []const u8, handler: anytype) !void {
         try self.add(.POST, path, handler);
     }
 
     /// Adds a PUT route.
-    pub fn put(self: *Self, path: []const u8, handler: Handler) !void {
+    pub fn put(self: *Self, path: []const u8, handler: anytype) !void {
         try self.add(.PUT, path, handler);
     }
 
     /// Adds a DELETE route.
-    pub fn delete(self: *Self, path: []const u8, handler: Handler) !void {
+    pub fn delete(self: *Self, path: []const u8, handler: anytype) !void {
         try self.add(.DELETE, path, handler);
     }
 
     /// Adds a PATCH route.
-    pub fn patch(self: *Self, path: []const u8, handler: Handler) !void {
+    pub fn patch(self: *Self, path: []const u8, handler: anytype) !void {
         try self.add(.PATCH, path, handler);
     }
 
     /// Adds a HEAD route.
-    pub fn head(self: *Self, path: []const u8, handler: Handler) !void {
+    pub fn head(self: *Self, path: []const u8, handler: anytype) !void {
         try self.add(.HEAD, path, handler);
     }
 
     /// Adds an OPTIONS route.
-    pub fn options(self: *Self, path: []const u8, handler: Handler) !void {
+    pub fn options(self: *Self, path: []const u8, handler: anytype) !void {
         try self.add(.OPTIONS, path, handler);
     }
 };
@@ -528,12 +559,12 @@ test "Router route priority" {
 
     const result1 = router.find(.GET, "/users/me", &pbuf);
     try std.testing.expect(result1 != null);
-    try std.testing.expectEqual(literal_handler, result1.?.handler);
+    try std.testing.expectEqual(literal_handler, result1.?.handler.function);
     try std.testing.expectEqual(@as(usize, 0), result1.?.params.len);
 
     const result2 = router.find(.GET, "/users/123", &pbuf);
     try std.testing.expect(result2 != null);
-    try std.testing.expectEqual(param_handler, result2.?.handler);
+    try std.testing.expectEqual(param_handler, result2.?.handler.function);
     try std.testing.expectEqual(@as(usize, 1), result2.?.params.len);
     try std.testing.expectEqualStrings("id", result2.?.params[0].name);
     try std.testing.expectEqualStrings("123", result2.?.params[0].value);
@@ -597,6 +628,28 @@ test "Router no routes registered" {
 
     const result3 = router.find(.DELETE, "/some/deep/path", &pbuf);
     try std.testing.expect(result3 == null);
+}
+
+test "Router rejects duplicate method and pattern registrations" {
+    const allocator = std.testing.allocator;
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const handler = struct {
+        fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
+            return error.TestUnexpectedResult;
+        }
+    }.h;
+
+    try router.add(.GET, "/healthz", handler);
+    try std.testing.expectError(error.DuplicateRoute, router.add(.GET, "/healthz", handler));
+    try router.add(.POST, "/healthz", handler);
+
+    try router.add(.GET, "/tables/:table_name/indexes/:index_name", handler);
+    try std.testing.expectError(
+        error.DuplicateRoute,
+        router.add(.GET, "/tables/:table/indexes/:index", handler),
+    );
 }
 
 test "RouteGroup routes use owned pattern strings" {

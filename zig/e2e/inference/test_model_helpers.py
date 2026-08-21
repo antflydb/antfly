@@ -307,6 +307,17 @@ def test_generator_environment_override_preserves_curated_variant(monkeypatch):
     assert qwen.pull_ref == "hf:unsloth/Qwen3-1.7B-GGUF:gguf:Q4_K_M"
 
 
+def test_draft_generator_environment_override_is_bootstrapped(monkeypatch):
+    for env_name in (*models.GENERATOR_ENV_VARS, *models.READER_ENV_VARS):
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setenv("ANTFLY_INFERENCE_DRAFT_MODEL", "unsloth/Qwen3-1.7B-GGUF")
+
+    specs = _env_model_specs()
+
+    assert [spec.repo for spec in specs] == ["unsloth/Qwen3-1.7B-GGUF"]
+    assert specs[0].pull_ref == "hf:unsloth/Qwen3-1.7B-GGUF:gguf:Q4_K_M"
+
+
 def test_generation_defaults_share_one_model():
     assert DEFAULT_GENERATOR_MODEL == DEFAULT_TOOL_GENERATOR_MODEL
     assert DEFAULT_GENERATOR_MODEL == DEFAULT_MULTIMODAL_GENERATOR_MODEL
@@ -356,6 +367,38 @@ def test_multimodal_model_selection_uses_shared_gemma_default(monkeypatch, tmp_p
         models.find_multimodal_generator_model_name({DEFAULT_GENERATOR_MODEL})
         == DEFAULT_GENERATOR_MODEL
     )
+
+
+def test_model_selection_returns_advertised_managed_variant(monkeypatch, tmp_path):
+    monkeypatch.delenv("ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL", raising=False)
+    monkeypatch.delenv("ANTFLY_INFERENCE_TOOL_MODEL", raising=False)
+    monkeypatch.delenv("ANTFLY_INFERENCE_MULTIMODAL_GENERATOR_MODEL", raising=False)
+    monkeypatch.setenv("ANTFLY_INFERENCE_MODELS_DIR", str(tmp_path))
+
+    spec = models.spec_for_name(DEFAULT_GENERATOR_MODEL, "generators")
+    assert spec is not None
+    model_dir = models._model_path(spec)
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Gemma4ForConditionalGeneration"],
+                "vision_config": {},
+            }
+        )
+    )
+    (model_dir / "genai_config.json").write_text(
+        json.dumps({"tool_call_format": "functiongemma"})
+    )
+    advertised = {spec.listing_name}
+
+    assert models.default_generator_model_name(advertised) == spec.listing_name
+    monkeypatch.setenv(
+        "ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL", DEFAULT_GENERATOR_MODEL
+    )
+    assert models.default_generator_model_name(advertised) == spec.listing_name
+    assert models.find_tool_model_name(advertised) == spec.listing_name
+    assert models.find_multimodal_generator_model_name(advertised) == spec.listing_name
 
 
 def test_explicit_large_generator_is_bootstrapped(monkeypatch):

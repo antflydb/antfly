@@ -6,7 +6,7 @@ This guide covers installing the Antfly Operator in your Kubernetes cluster.
 
 Before installing the operator, ensure you have:
 
-- **Kubernetes 1.20+** cluster running
+- **Kubernetes 1.23+** cluster running
 - **kubectl** installed and configured to access your cluster
 - **Storage class** with dynamic provisioning (most cloud providers include this by default)
 - **Cluster admin permissions** to create CRDs and cluster-scoped resources
@@ -31,10 +31,17 @@ This installs:
 - Operator Deployment
 
 The operator binary defaults `--inference-antfly-image` to
-`ghcr.io/antflydb/antfly:omni`. If you use `spec.inference` and that image is not
+`ghcr.io/antflydb/antfly:latest`. If you use `spec.inference` and that image is not
 mirrored or available to your cluster, add `--inference-antfly-image=<image>` to
 the deployment args. The image must provide the `/antfly inference` runtime
 contract.
+
+For TPU-backed `InferencePool` resources, the controller downloads the
+checksum-pinned PJRT `libtpu.so` plugin into an ephemeral volume before starting
+the inference container. TPU pods therefore need outbound HTTPS access to
+`storage.googleapis.com`. The published Antfly runtime image provides the shell,
+certificate roots, and download utilities used by that init container; custom
+InferencePool images must provide the same utilities.
 
 For production environments that manage CRDs through GitOps or another platform
 workflow, run the operator with `--skip-crd-install=true` and remove the

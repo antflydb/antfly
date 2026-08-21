@@ -445,6 +445,68 @@ func TestReadErrorResponseCapsBody(t *testing.T) {
 	}
 }
 
+func TestQueryPreservesHierarchyCursorRestartGuidance(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"status":409,"error":"hierarchy_cursor_stale","message":"the source artifact changed during traversal","action":"restart_hierarchy_traversal","restart_without":"search_after","retryable":false}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+
+	_, err = client.Query(context.Background(), QueryRequest{Table: "files", Limit: 10})
+	if err == nil {
+		t.Fatal("Query error = nil, want HierarchyCursorStaleError")
+	}
+	var stale *HierarchyCursorStaleError
+	if !errors.As(err, &stale) {
+		t.Fatalf("error = %T %[1]v, want HierarchyCursorStaleError", err)
+	}
+	if stale.StatusCode != http.StatusConflict ||
+		stale.Code != "hierarchy_cursor_stale" ||
+		stale.Action != "restart_hierarchy_traversal" ||
+		stale.RestartWithout != "search_after" ||
+		stale.Retryable {
+		t.Fatalf("stale cursor error = %#v, want restart-without-search-after guidance", stale)
+	}
+}
+
+func TestQueryPreservesTemporaryAvailabilityRetryGuidance(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "3")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"code":"storage_read_temporarily_unavailable","message":"storage read temporarily unavailable","retryable":true}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+
+	_, err = client.Query(context.Background(), QueryRequest{Table: "files", Limit: 10})
+	if err == nil {
+		t.Fatal("Query error = nil, want QueryTemporarilyUnavailableError")
+	}
+	var unavailable *QueryTemporarilyUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("error = %T %[1]v, want QueryTemporarilyUnavailableError", err)
+	}
+	if unavailable.StatusCode != http.StatusServiceUnavailable ||
+		unavailable.Code != "storage_read_temporarily_unavailable" ||
+		!unavailable.Retryable ||
+		unavailable.RetryAfterSeconds != 3 {
+		t.Fatalf("temporary availability error = %#v, want retryable 3-second guidance", unavailable)
+	}
+}
+
 func TestBatchRejectsOversizedRequestBeforeSending(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

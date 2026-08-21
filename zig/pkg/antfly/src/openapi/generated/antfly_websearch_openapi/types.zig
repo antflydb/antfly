@@ -88,7 +88,7 @@ pub const ExaSearchConfig = struct {
     exclude_domains: ?[]const []const u8 = null,
 };
 
-/// Configuration for URL content fetching. Uses go/pkg/antfly/lib/scraping for downloading and processing. Supports: - HTTP/HTTPS URLs with security validation - HTML pages (extracts readable text via go-readability) - PDF files (extracts text) - Images (returns as data URIs) - Plain text files - S3 URLs (requires s3_credentials) Security features (from go/pkg/antfly/lib/scraping.ContentSecurityConfig): - Allowed host whitelist - Private IP blocking (SSRF prevention) - Download size limits - Timeout controls
+/// Configuration for URL content fetching. Uses Antfly's content fetcher for downloading and processing. Supports: - HTTP/HTTPS URLs with security validation - HTML pages (extracts readable text via go-readability) - PDF files (extracts text) - Images (returns as data URIs) - Plain text files - S3 URLs (requires s3_credentials) Security features include: - Allowed host whitelist - Private IP blocking (SSRF prevention) - Download size limits - Timeout controls
 pub const FetchConfig = struct {
     /// S3 credentials for fetching S3 URLs. If not set, uses package-level defaults.
     s3_credentials: ?antfly_s3_openapi.Credentials = null,
@@ -104,7 +104,7 @@ pub const FetchConfig = struct {
     timeout_seconds: ?i64 = null,
 };
 
-/// Result from fetching a URL via go/pkg/antfly/lib/scraping. Content is automatically processed based on MIME type: - HTML: Readable text extracted via go-readability - PDF: Text extracted from all pages - Images: Returned as base64 data URIs - Text: Returned as-is
+/// Result from fetching a URL through Antfly's content fetcher. Content is automatically processed based on MIME type: - HTML: Readable text extracted via go-readability - PDF: Text extracted from all pages - Images: Returned as base64 data URIs - Text: Returned as-is
 pub const FetchResult = struct {
     /// The URL that was fetched
     url: []const u8,

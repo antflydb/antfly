@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Python tooling for antfly-zig build and OpenAPI helpers"
 requires-python = ">=3.11"
 dependencies = [
+    "jsonschema>=4.26.0",
     "openapi-spec-validator>=0.7.2",
     "PyYAML>=6.0",
 ]

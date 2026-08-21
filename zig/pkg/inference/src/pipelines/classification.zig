@@ -87,7 +87,20 @@ pub const ClassificationPipeline = struct {
         texts: []const []const u8,
         labels: []const []const u8,
     ) ![][]ClassificationResult {
+        var prompt_tokens: usize = 0;
+        return self.classifyBatchWithPromptTokens(texts, labels, &prompt_tokens);
+    }
+
+    /// Classify a batch and report the exact number of non-padding tokens sent
+    /// to the NLI model across every text-label hypothesis pair.
+    pub fn classifyBatchWithPromptTokens(
+        self: *ClassificationPipeline,
+        texts: []const []const u8,
+        labels: []const []const u8,
+        prompt_tokens: *usize,
+    ) ![][]ClassificationResult {
         const alloc = self.allocator;
+        prompt_tokens.* = 0;
         const results = try alloc.alloc([]ClassificationResult, texts.len);
         var initialized: usize = 0;
         errdefer {
@@ -137,6 +150,12 @@ pub const ClassificationPipeline = struct {
                 const pair_i = text_i * labels.len + label_i;
                 var result = try self.tok.encodeForPair(alloc, text, hyp, max_len);
                 defer result.deinit();
+                for (result.attention_mask) |mask| {
+                    if (mask != 0) {
+                        prompt_tokens.* = std.math.add(usize, prompt_tokens.*, 1) catch
+                            return error.ClassificationBatchTooLarge;
+                    }
+                }
                 @memcpy(all_ids[pair_i * max_len .. (pair_i + 1) * max_len], result.ids);
                 @memcpy(all_mask[pair_i * max_len .. (pair_i + 1) * max_len], result.attention_mask);
             }
@@ -319,7 +338,8 @@ test "classifyBatch runs all text-label pairs in one session batch" {
 
     const texts = [_][]const u8{ "first", "second", "third" };
     const labels = [_][]const u8{ "negative", "positive" };
-    const results = try pipeline.classifyBatch(&texts, &labels);
+    var prompt_tokens: usize = 0;
+    const results = try pipeline.classifyBatchWithPromptTokens(&texts, &labels, &prompt_tokens);
     defer {
         for (results) |row| allocator.free(row);
         allocator.free(results);
@@ -327,6 +347,7 @@ test "classifyBatch runs all text-label pairs in one session batch" {
 
     try std.testing.expectEqual(@as(usize, 1), fake_session.run_count);
     try std.testing.expectEqual(@as(usize, 6), fake_session.last_batch);
+    try std.testing.expectEqual(@as(usize, 30), prompt_tokens);
     try std.testing.expectEqual(@as(usize, texts.len), results.len);
     for (results) |row| {
         try std.testing.expectEqual(@as(usize, labels.len), row.len);

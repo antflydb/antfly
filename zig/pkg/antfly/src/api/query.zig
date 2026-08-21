@@ -15,6 +15,7 @@
 const std = @import("std");
 const db_mod = @import("../storage/db/mod.zig");
 const db_query_search = @import("../storage/db/query/search_exec.zig");
+const hierarchy_navigation = @import("../storage/hierarchy_navigation.zig");
 const runtime_schema_mod = @import("../storage/schema.zig");
 const graph_paths = @import("../graph/paths.zig");
 const graph_query_mod = @import("../graph/query.zig");
@@ -94,6 +95,25 @@ pub fn mergeSearchResultsWithRuntimeSchema(
     limit: u32,
     runtime_schema: ?runtime_schema_mod.TableSchema,
 ) !db_mod.types.SearchResult {
+    if (req.hierarchy_children != null) {
+        return try mergeHierarchyChildrenSearchResults(alloc, req, results, offset, limit);
+    }
+
+    if (requestReturnsHierarchyUnitGroups(req)) {
+        return try mergeHierarchyUnitSearchResults(alloc, req, results, offset, limit, runtime_schema);
+    }
+
+    return try mergeGenericSearchResultsWithRuntimeSchema(alloc, req, results, offset, limit, runtime_schema);
+}
+
+fn mergeGenericSearchResultsWithRuntimeSchema(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    results: []const db_mod.types.SearchResult,
+    offset: u32,
+    limit: u32,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) !db_mod.types.SearchResult {
     var total_hits: u32 = 0;
     var total_hits_relation: db_mod.types.TotalHitsRelation = .exact;
     var has_graph_results = false;
@@ -139,38 +159,50 @@ pub fn mergeSearchResultsWithRuntimeSchema(
         };
     }
 
-    var merged_hits = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
-    defer {
-        for (merged_hits.items) |*hit| hit.deinit(alloc);
-        merged_hits.deinit(alloc);
-    }
+    // Borrow payloads and retain only the requested top-(offset+limit) window.
+    // An unbounded request still needs every reference, but ordinary pages no
+    // longer allocate either payload copies or an O(total candidates) pointer
+    // array at the coordinator.
+    var merged_hits = std.ArrayListUnmanaged(*const db_mod.types.SearchHit).empty;
+    defer merged_hits.deinit(alloc);
+    var bounded_hits = std.PriorityQueue(
+        *const db_mod.types.SearchHit,
+        ScoreMergeOrder,
+        searchHitRefWorstFirst,
+    ).initContext(.{ .use_score = requestUsesScoreOrderedMerge(req) });
+    defer bounded_hits.deinit(alloc);
 
     const score_ordered_merge = requestUsesScoreOrderedMerge(req);
+    var candidate_count: usize = 0;
+    for (results) |result| candidate_count = std.math.add(usize, candidate_count, result.hits.len) catch std.math.maxInt(usize);
+    const retained_window = std.math.add(usize, @as(usize, offset), @as(usize, limit)) catch std.math.maxInt(usize);
+    const use_bounded_window = limit != 0 and retained_window < candidate_count;
+    if (use_bounded_window) try bounded_hits.ensureTotalCapacity(alloc, retained_window);
     for (results) |result| {
-        for (result.hits) |hit| {
-            if (score_ordered_merge) try validateScoreOrderedMergeHit(hit);
-            try merged_hits.append(alloc, try hit.clone(alloc));
+        for (result.hits) |*hit| {
+            if (score_ordered_merge) try validateScoreOrderedMergeHit(hit.*);
+            if (!use_bounded_window) {
+                try merged_hits.append(alloc, hit);
+                continue;
+            }
+            if (bounded_hits.items.len < retained_window) {
+                try bounded_hits.push(alloc, hit);
+                continue;
+            }
+            const worst = bounded_hits.peek().?;
+            if (!searchHitRefComesBefore(.{ .use_score = score_ordered_merge }, hit, worst)) continue;
+            _ = bounded_hits.pop();
+            try bounded_hits.push(alloc, hit);
         }
     }
 
-    std.sort.pdq(db_mod.types.SearchHit, merged_hits.items, ScoreMergeOrder{
+    const candidate_refs = if (use_bounded_window) bounded_hits.items else merged_hits.items;
+    std.sort.pdq(*const db_mod.types.SearchHit, candidate_refs, ScoreMergeOrder{
         .use_score = score_ordered_merge,
-        .ascending_scores = isPureDenseRequest(req),
-    }, struct {
-        fn lessThan(order: ScoreMergeOrder, a: db_mod.types.SearchHit, b: db_mod.types.SearchHit) bool {
-            if (order.use_score) {
-                const a_score = a.score.?;
-                const b_score = b.score.?;
-                if (a_score != b_score) {
-                    return if (order.ascending_scores) a_score < b_score else a_score > b_score;
-                }
-            }
-            return std.mem.order(u8, a.id, b.id) == .lt;
-        }
-    }.lessThan);
+    }, searchHitRefComesBefore);
 
-    const start: usize = @min(offset, merged_hits.items.len);
-    const max_count: usize = if (limit == 0) merged_hits.items.len - start else @min(limit, merged_hits.items.len - start);
+    const start: usize = @min(offset, candidate_refs.len);
+    const max_count: usize = if (limit == 0) candidate_refs.len - start else @min(limit, candidate_refs.len - start);
     const end = start + max_count;
 
     var final_hits = try alloc.alloc(db_mod.types.SearchHit, max_count);
@@ -180,7 +212,7 @@ pub fn mergeSearchResultsWithRuntimeSchema(
         alloc.free(final_hits);
     }
 
-    for (merged_hits.items[start..end], 0..) |hit, i| {
+    for (candidate_refs[start..end], 0..) |hit, i| {
         final_hits[i] = try hit.clone(alloc);
         moved += 1;
     }
@@ -206,6 +238,510 @@ pub fn mergeSearchResultsWithRuntimeSchema(
         .total_hits_relation = total_hits_relation,
         .identity_read_generation = mergedSearchResultIdentityReadGeneration(req, results),
         .graph_results = graph_results,
+    };
+}
+
+fn searchHitRefComesBefore(
+    order: ScoreMergeOrder,
+    a: *const db_mod.types.SearchHit,
+    b: *const db_mod.types.SearchHit,
+) bool {
+    if (order.use_score) {
+        const a_score = a.score.?;
+        const b_score = b.score.?;
+        if (a_score != b_score) return a_score > b_score;
+    }
+    return std.mem.order(u8, a.id, b.id) == .lt;
+}
+
+fn searchHitRefWorstFirst(
+    order: ScoreMergeOrder,
+    a: *const db_mod.types.SearchHit,
+    b: *const db_mod.types.SearchHit,
+) std.math.Order {
+    if (searchHitRefComesBefore(order, a, b)) return .gt;
+    if (searchHitRefComesBefore(order, b, a)) return .lt;
+    return .eq;
+}
+
+fn requestReturnsHierarchyUnitGroups(req: db_mod.types.SearchRequest) bool {
+    return req.hierarchy_group_level == .unit and
+        (req.return_mode == .unit or req.return_mode == .unit_with_chunks);
+}
+
+fn mergeHierarchyUnitSearchResults(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    results: []const db_mod.types.SearchResult,
+    offset: u32,
+    limit: u32,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) !db_mod.types.SearchResult {
+    if (req.order_by.len > 0 or req.search_after.len > 0 or req.search_before.len > 0) {
+        return error.UnsupportedQueryRequest;
+    }
+    // A single shard already owns an exact local distinct count. Coalescing is
+    // only needed once multiple shard-local unit sets form a distributed union.
+    if (results.len <= 1) {
+        return try mergeGenericSearchResultsWithRuntimeSchema(alloc, req, results, offset, limit, runtime_schema);
+    }
+
+    const page_window_u32 = std.math.add(u32, offset, limit) catch
+        return error.QueryCandidateBudgetExceeded;
+    if (page_window_u32 == 0 or page_window_u32 > db_mod.types.max_canonical_hierarchy_total_matches) {
+        return error.QueryCandidateBudgetExceeded;
+    }
+    const page_window: usize = @intCast(page_window_u32);
+
+    var candidates = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
+    errdefer {
+        for (candidates.items) |*hit| hit.deinit(alloc);
+        candidates.deinit(alloc);
+    }
+    var by_id = std.StringHashMapUnmanaged(usize).empty;
+    defer by_id.deinit(alloc);
+    const CandidateOrigin = struct {
+        result_index: usize,
+        hit_index: usize,
+    };
+    var origins = std.ArrayListUnmanaged(CandidateOrigin).empty;
+    defer origins.deinit(alloc);
+
+    const cursors = try alloc.alloc(usize, results.len);
+    defer alloc.free(cursors);
+    @memset(cursors, 0);
+
+    var largest_shard_total: u32 = 0;
+    var every_shard_complete = true;
+    for (results) |result| {
+        largest_shard_total = @max(largest_shard_total, result.total_hits);
+        if (result.total_hits_relation != .exact or result.total_hits != result.hits.len) {
+            every_shard_complete = false;
+        }
+        try validateHierarchyUnitShardOrder(req, result.hits);
+    }
+
+    // Every shard has already produced its local top window. Merge those
+    // sorted streams directly so coordinator memory depends on the requested
+    // page, not on shard fanout. The first occurrence of an ID is its globally
+    // best representative; a second bounded pass below aggregates matches for
+    // only the selected IDs.
+    var exhausted = false;
+    while (candidates.items.len < page_window) {
+        var best_result_index: ?usize = null;
+        for (results, 0..) |result, result_index| {
+            if (cursors[result_index] >= result.hits.len) continue;
+            if (best_result_index) |current_best| {
+                const candidate = result.hits[cursors[result_index]];
+                const best = results[current_best].hits[cursors[current_best]];
+                if (hierarchyUnitHitLessThan(req, candidate, best)) best_result_index = result_index;
+            } else {
+                best_result_index = result_index;
+            }
+        }
+        const result_index = best_result_index orelse {
+            exhausted = true;
+            break;
+        };
+        const hit_index = cursors[result_index];
+        cursors[result_index] += 1;
+        const hit = results[result_index].hits[hit_index];
+        if (by_id.contains(hit.id)) continue;
+
+        // Reserve every fallible container operation before cloning so the
+        // cloned hit has one unambiguous owner even under allocation failure.
+        try candidates.ensureUnusedCapacity(alloc, 1);
+        try origins.ensureUnusedCapacity(alloc, 1);
+        try by_id.ensureUnusedCapacity(alloc, 1);
+        const cloned = try hit.clone(alloc);
+        candidates.appendAssumeCapacity(cloned);
+        origins.appendAssumeCapacity(.{ .result_index = result_index, .hit_index = hit_index });
+        const candidate_index = candidates.items.len - 1;
+        by_id.putAssumeCapacity(candidates.items[candidate_index].id, candidate_index);
+    }
+
+    // Expansion results may contain the same selected unit on several chunk
+    // owners. Aggregate only those bounded selected groups, including all of
+    // their shard-local top matches, without retaining non-page candidates.
+    for (results, 0..) |result, result_index| {
+        for (result.hits, 0..) |hit, hit_index| {
+            const candidate_index = by_id.get(hit.id) orelse continue;
+            const origin = origins.items[candidate_index];
+            if (origin.result_index == result_index and origin.hit_index == hit_index) continue;
+            try mergeHierarchyUnitHit(alloc, req, &candidates.items[candidate_index], hit);
+        }
+    }
+
+    const observed_total: u32 = @intCast(candidates.items.len);
+    const exact_union_observed = exhausted and every_shard_complete;
+    const total_hits = if (exact_union_observed)
+        observed_total
+    else
+        @max(observed_total, largest_shard_total);
+    const total_hits_relation: db_mod.types.TotalHitsRelation = if (exact_union_observed) .exact else .gte;
+    const identity_generation = mergedSearchResultIdentityReadGeneration(req, results);
+
+    var coalesced = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = try candidates.toOwnedSlice(alloc),
+        .total_hits = total_hits,
+        .total_hits_relation = total_hits_relation,
+        .identity_read_generation = identity_generation,
+    };
+    candidates = .empty;
+    defer coalesced.deinit();
+
+    var merged = try mergeGenericSearchResultsWithRuntimeSchema(
+        alloc,
+        req,
+        &.{coalesced},
+        offset,
+        limit,
+        runtime_schema,
+    );
+    errdefer merged.deinit();
+    merged.total_hits = total_hits;
+    merged.total_hits_relation = total_hits_relation;
+    merged.identity_read_generation = identity_generation;
+
+    var has_graph_results = false;
+    for (results) |result| {
+        if (result.graph_results.len > 0) {
+            has_graph_results = true;
+            break;
+        }
+    }
+    if (has_graph_results) {
+        const graph_results = try mergeGraphSearchResults(alloc, results);
+        errdefer {
+            for (graph_results) |*graph_result| graph_result.deinit(alloc);
+            if (graph_results.len > 0) alloc.free(graph_results);
+        }
+        merged.graph_results = graph_results;
+    }
+    if (results.len > 1) {
+        clearMergedDocOrdinals(merged.hits);
+        for (merged.graph_results) |*graph_result| clearMergedDocOrdinals(graph_result.hits);
+    }
+    return merged;
+}
+
+fn validateHierarchyUnitShardOrder(
+    req: db_mod.types.SearchRequest,
+    hits: []const db_mod.types.SearchHit,
+) !void {
+    const score_ordered = requestUsesScoreOrderedMerge(req);
+    for (hits, 0..) |hit, i| {
+        if (score_ordered) validateScoreOrderedMergeHit(hit) catch
+            return error.StorageReadTemporarilyUnavailable;
+        if (i > 0 and hierarchyUnitHitLessThan(req, hit, hits[i - 1])) {
+            return error.StorageReadTemporarilyUnavailable;
+        }
+    }
+}
+
+fn hierarchyUnitHitLessThan(
+    req: db_mod.types.SearchRequest,
+    left: db_mod.types.SearchHit,
+    right: db_mod.types.SearchHit,
+) bool {
+    if (requestUsesScoreOrderedMerge(req)) {
+        if (left.score.? != right.score.?) return left.score.? > right.score.?;
+    }
+    return std.mem.order(u8, left.id, right.id) == .lt;
+}
+
+fn mergeHierarchyUnitHit(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    existing: *db_mod.types.SearchHit,
+    incoming: db_mod.types.SearchHit,
+) !void {
+    try validateMatchingHierarchyUnitIdentity(existing.*, incoming);
+
+    if (existing.stored_data != null and incoming.stored_data != null and
+        !std.mem.eql(u8, existing.stored_data.?, incoming.stored_data.?))
+    {
+        return error.StorageReadTemporarilyUnavailable;
+    }
+    if (existing.stored_data == null and incoming.stored_data != null) {
+        existing.stored_data = try alloc.dupe(u8, incoming.stored_data.?);
+    }
+
+    // Merge descendant ownership first. Once ranking metadata is transferred
+    // below, no later fallible operation may unwind through both owners.
+    try mergeHierarchyUnitChunks(alloc, existing, incoming.chunk_hits, req.max_chunks_per_parent);
+
+    if (requestUsesHierarchyUnitScoreOrdering(req) and hierarchyUnitHitHasBetterScore(incoming, existing.*)) {
+        const index_scores = try db_mod.types.cloneIndexScores(alloc, incoming.index_scores);
+        errdefer db_mod.types.freeIndexScores(alloc, index_scores);
+        const sort_values: ?[]std.json.Value = if (req.order_by.len > 0)
+            try db_mod.types.cloneJsonValues(alloc, incoming.sort_values)
+        else
+            null;
+        db_mod.types.freeIndexScores(alloc, existing.index_scores);
+        if (sort_values) |values| {
+            db_mod.types.freeJsonValues(alloc, existing.sort_values);
+            existing.sort_values = values;
+        }
+        existing.index_scores = index_scores;
+        existing.score = incoming.score;
+        existing.distance = incoming.distance;
+    }
+}
+
+fn validateMatchingHierarchyUnitIdentity(
+    existing: db_mod.types.SearchHit,
+    incoming: db_mod.types.SearchHit,
+) !void {
+    // These hits were produced by independent storage placements, not supplied
+    // by the user. Conflicting identities indicate a transient topology/revision
+    // seam and must remain retryable instead of being exposed as a client 400.
+    if (!std.mem.eql(u8, existing.id, incoming.id)) return error.StorageReadTemporarilyUnavailable;
+    const left = existing.artifact_ref orelse return error.StorageReadTemporarilyUnavailable;
+    const right = incoming.artifact_ref orelse return error.StorageReadTemporarilyUnavailable;
+    if (left.kind != right.kind or
+        !std.mem.eql(u8, left.document_id, right.document_id) or
+        !std.mem.eql(u8, left.name, right.name) or
+        !optionalBytesEqual(left.unit_id, right.unit_id))
+    {
+        return error.StorageReadTemporarilyUnavailable;
+    }
+}
+
+fn optionalBytesEqual(left: ?[]u8, right: ?[]u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
+fn hierarchyUnitHitHasBetterScore(candidate: db_mod.types.SearchHit, current: db_mod.types.SearchHit) bool {
+    if (candidate.score == null) return false;
+    if (current.score == null) return true;
+    return candidate.score.? > current.score.?;
+}
+
+fn requestUsesHierarchyUnitScoreOrdering(req: db_mod.types.SearchRequest) bool {
+    return requestUsesScoreOrderedMerge(req) or
+        (req.order_by.len > 0 and std.mem.eql(u8, req.order_by[0].field, "_score"));
+}
+
+fn mergeHierarchyUnitChunks(
+    alloc: std.mem.Allocator,
+    existing: *db_mod.types.SearchHit,
+    incoming: []const db_mod.types.ChunkHit,
+    requested_limit: u32,
+) !void {
+    const combined_len = std.math.add(usize, existing.chunk_hits.len, incoming.len) catch
+        return error.QueryCandidateBudgetExceeded;
+    if (combined_len > db_mod.types.max_canonical_hierarchy_total_matches) {
+        return error.QueryCandidateBudgetExceeded;
+    }
+
+    const refs = try alloc.alloc(*const db_mod.types.ChunkHit, combined_len);
+    defer alloc.free(refs);
+    var ref_index: usize = 0;
+    for (existing.chunk_hits) |*chunk| {
+        refs[ref_index] = chunk;
+        ref_index += 1;
+    }
+    for (incoming) |*chunk| {
+        refs[ref_index] = chunk;
+        ref_index += 1;
+    }
+    std.sort.pdq(*const db_mod.types.ChunkHit, refs, {}, hierarchyChunkHitPtrLessThan);
+
+    const limit: usize = @min(@as(usize, @intCast(requested_limit)), combined_len);
+    var kept = std.ArrayListUnmanaged(db_mod.types.ChunkHit).empty;
+    errdefer {
+        for (kept.items) |*chunk| chunk.deinit(alloc);
+        kept.deinit(alloc);
+    }
+    try kept.ensureTotalCapacity(alloc, limit);
+    for (refs) |chunk| {
+        if (kept.items.len >= limit) break;
+        var duplicate = false;
+        for (kept.items) |prior| {
+            if (std.mem.eql(u8, prior.id, chunk.id)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) kept.appendAssumeCapacity(try chunk.clone(alloc));
+    }
+    const owned = try kept.toOwnedSlice(alloc);
+    for (existing.chunk_hits) |*chunk| chunk.deinit(alloc);
+    if (existing.chunk_hits.len > 0) alloc.free(existing.chunk_hits);
+    existing.chunk_hits = owned;
+}
+
+fn hierarchyChunkHitPtrLessThan(
+    _: void,
+    left: *const db_mod.types.ChunkHit,
+    right: *const db_mod.types.ChunkHit,
+) bool {
+    if (left.score != null and right.score != null and left.score.? != right.score.?) {
+        return left.score.? > right.score.?;
+    }
+    if (left.score != null and right.score == null) return true;
+    if (left.score == null and right.score != null) return false;
+    return std.mem.order(u8, left.id, right.id) == .lt;
+}
+
+fn hierarchyNavigationHitTuple(hit: db_mod.types.SearchHit) !struct { position: []const u8, id: []const u8 } {
+    if (hit.sort_values.len != 2 or hit.sort_values[0] != .string or hit.sort_values[1] != .string) {
+        return error.StorageReadTemporarilyUnavailable;
+    }
+    if (!std.mem.eql(u8, hit.sort_values[1].string, hit.id)) return error.StorageReadTemporarilyUnavailable;
+    return .{ .position = hit.sort_values[0].string, .id = hit.sort_values[1].string };
+}
+
+fn hierarchyNavigationTupleOrder(
+    left_position: []const u8,
+    left_id: []const u8,
+    right_position: []const u8,
+    right_id: []const u8,
+) std.math.Order {
+    const position_order = std.mem.order(u8, left_position, right_position);
+    if (position_order != .eq) return position_order;
+    return std.mem.order(u8, left_id, right_id);
+}
+
+fn hierarchyNavigationHitLessThan(_: void, left: db_mod.types.SearchHit, right: db_mod.types.SearchHit) bool {
+    const left_tuple = hierarchyNavigationHitTuple(left) catch unreachable;
+    const right_tuple = hierarchyNavigationHitTuple(right) catch unreachable;
+    return hierarchyNavigationTupleOrder(left_tuple.position, left_tuple.id, right_tuple.position, right_tuple.id) == .lt;
+}
+
+fn mergeHierarchyChildrenSearchResults(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    results: []const db_mod.types.SearchResult,
+    offset: u32,
+    limit: u32,
+) !db_mod.types.SearchResult {
+    if (req.order_by.len != 2 or
+        !std.mem.eql(u8, req.order_by[0].field, "_hierarchy.position") or
+        req.order_by[0].desc or
+        !std.mem.eql(u8, req.order_by[1].field, "_id") or
+        req.order_by[1].desc or
+        req.search_before.len != 0)
+    {
+        return error.InvalidQueryRequest;
+    }
+    if (req.search_after.len > 0 and
+        (req.search_after.len != 2 or req.search_after[0] != .string or req.search_after[1] != .string))
+    {
+        return error.InvalidQueryRequest;
+    }
+
+    var candidates = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
+    errdefer {
+        for (candidates.items) |*hit| hit.deinit(alloc);
+        candidates.deinit(alloc);
+    }
+    var by_id = std.StringHashMapUnmanaged(usize).empty;
+    defer by_id.deinit(alloc);
+    var total_hits: u32 = 0;
+    var total_hits_relation: db_mod.types.TotalHitsRelation = .exact;
+
+    for (results) |result| {
+        // Child planning is parent-owned. During a topology handoff two
+        // placements may briefly expose the same plan, so use the largest
+        // logical total and deduplicate identical unit IDs instead of summing.
+        total_hits = @max(total_hits, result.total_hits);
+        if (result.total_hits_relation == .gte) total_hits_relation = .gte;
+        for (result.hits) |hit| {
+            const tuple = try hierarchyNavigationHitTuple(hit);
+            const gop = try by_id.getOrPut(alloc, hit.id);
+            if (gop.found_existing) {
+                const existing = &candidates.items[gop.value_ptr.*];
+                const existing_tuple = try hierarchyNavigationHitTuple(existing.*);
+                if (hierarchyNavigationTupleOrder(tuple.position, tuple.id, existing_tuple.position, existing_tuple.id) != .eq) {
+                    // Duplicate plans are expected briefly during ownership
+                    // handoff. Disagreement between server-generated positions
+                    // means the placements observed different hierarchy revisions;
+                    // retry rather than blaming the request with a 400.
+                    return error.StorageReadTemporarilyUnavailable;
+                }
+                if (existing.stored_data == null and hit.stored_data != null) {
+                    var richer = try hit.clone(alloc);
+                    errdefer richer.deinit(alloc);
+                    existing.deinit(alloc);
+                    existing.* = richer;
+                    gop.key_ptr.* = existing.id;
+                }
+                continue;
+            }
+            if (candidates.items.len >= db_mod.types.max_canonical_hierarchy_total_matches) {
+                return error.QueryCandidateBudgetExceeded;
+            }
+            const cloned = try hit.clone(alloc);
+            errdefer {
+                var owned = cloned;
+                owned.deinit(alloc);
+            }
+            try candidates.append(alloc, cloned);
+            gop.key_ptr.* = candidates.items[candidates.items.len - 1].id;
+            gop.value_ptr.* = candidates.items.len - 1;
+        }
+    }
+
+    // Shard-local absence is expected because hierarchy planning is parent-
+    // owned while distributed queries fan out to every table group. Only the
+    // outer coordinator can conclude that no shard observed the parent plan.
+    // Preserve direct/internal shard behavior by leaving deferred requests as
+    // empty partial plans for their caller to merge.
+    if (!req.defer_hierarchy_child_hydration and
+        req.search_after.len > 0 and
+        total_hits == 0 and
+        candidates.items.len == 0)
+    {
+        _ = hierarchy_navigation.parsePosition(req.search_after[0].string) catch |err| switch (err) {
+            error.HierarchyNavigationPositionVersionStale => return error.HierarchyCursorStale,
+            error.InvalidHierarchyNavigationPosition => return error.InvalidQueryRequest,
+        };
+        return error.HierarchyCursorStale;
+    }
+
+    std.mem.sort(db_mod.types.SearchHit, candidates.items, {}, hierarchyNavigationHitLessThan);
+    const cursor_position = if (req.search_after.len > 0) req.search_after[0].string else null;
+    const cursor_id = if (req.search_after.len > 0) req.search_after[1].string else null;
+    const skip: usize = if (req.search_after.len > 0) 0 else @intCast(offset);
+    var admitted: usize = 0;
+    var page = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
+    errdefer {
+        for (page.items) |*hit| hit.deinit(alloc);
+        page.deinit(alloc);
+    }
+    for (candidates.items) |*hit| {
+        const tuple = try hierarchyNavigationHitTuple(hit.*);
+        if (cursor_position) |position| {
+            if (hierarchyNavigationTupleOrder(tuple.position, tuple.id, position, cursor_id.?) != .gt) continue;
+        }
+        if (admitted < skip) {
+            admitted += 1;
+            continue;
+        }
+        if (page.items.len >= @as(usize, @intCast(limit))) break;
+        var cloned = try hit.clone(alloc);
+        errdefer cloned.deinit(alloc);
+        try page.append(alloc, cloned);
+        admitted += 1;
+    }
+
+    // Candidate windows are bounded by the public traversal limit; cloning the
+    // selected page keeps ownership simple across duplicate-placement merges.
+    for (candidates.items) |*hit| {
+        hit.deinit(alloc);
+    }
+    candidates.deinit(alloc);
+    candidates = .empty;
+
+    return .{
+        .alloc = alloc,
+        .hits = try page.toOwnedSlice(alloc),
+        .total_hits = total_hits,
+        .total_hits_relation = total_hits_relation,
     };
 }
 
@@ -240,7 +776,6 @@ fn validateScoreOrderedMergeHit(hit: db_mod.types.SearchHit) !void {
 
 const ScoreMergeOrder = struct {
     use_score: bool,
-    ascending_scores: bool,
 };
 
 fn requestUsesScoreOrderedMerge(req: db_mod.types.SearchRequest) bool {
@@ -332,16 +867,6 @@ fn textBoolQueryIsScoreBearing(query: db_mod.types.TextBoolQuery) bool {
         if (textQueryIsScoreBearing(child)) return true;
     }
     return false;
-}
-
-fn isPureDenseRequest(req: db_mod.types.SearchRequest) bool {
-    return req.dense_queries.len > 0 and
-        req.full_text_queries.len == 0 and
-        req.full_text == null and
-        req.sparse_queries.len == 0 and
-        req.graph_queries.len == 0 and
-        req.sparse == null and
-        req.merge_config == null;
 }
 
 const GraphSearchResultBuilder = struct {
@@ -1159,6 +1684,19 @@ test "query parser accepts graph pattern searches" {
     try std.testing.expectEqual(@as(usize, 2), owned.req.graph_queries[0].query.pattern.len);
     try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries[0].query.return_aliases.len);
     try std.testing.expect(owned.req.graph_queries[0].query.include_documents);
+    try std.testing.expect(owned.req.graph_queries[0].query.include_all_fields);
+}
+
+test "query parser treats explicit graph document fields as a projection" {
+    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+        \\{"graph_searches":{"pattern_walk":{"type":"pattern","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]},"pattern":[{"alias":"a"}],"include_documents":true,"fields":["title"]}},"limit":10}
+    );
+    defer owned.deinit(std.testing.allocator);
+
+    const graph_query = owned.req.graph_queries[0].query;
+    try std.testing.expect(!graph_query.include_all_fields);
+    try std.testing.expectEqual(@as(usize, 1), graph_query.fields.len);
+    try std.testing.expectEqualStrings("title", graph_query.fields[0]);
 }
 
 test "query parser rejects semantic search offsets" {
@@ -1490,6 +2028,33 @@ test "query merge applies global score ordering and offset" {
     try std.testing.expectEqual(@as(?u32, null), merged.hits[0].doc_ordinal);
 }
 
+test "query merge allocation scales with the selected page" {
+    const large_stored = "x" ** 1024;
+    var input_hits: [2048]db_mod.types.SearchHit = undefined;
+    for (&input_hits) |*hit| {
+        hit.* = .{
+            .id = @constCast("doc:a"),
+            .stored_data = @constCast(large_stored),
+        };
+    }
+    const input = db_mod.types.SearchResult{
+        .alloc = std.testing.allocator,
+        .hits = &input_hits,
+        .total_hits = input_hits.len,
+    };
+
+    // Enough for a bounded top-one heap plus one cloned page hit, but not for
+    // an O(candidate count) pointer array or cloned stored candidates.
+    var backing: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    var merged = try mergeSearchResults(fba.allocator(), .{}, &.{input}, 0, 1);
+    defer merged.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
+    try std.testing.expectEqualStrings("doc:a", merged.hits[0].id);
+    try std.testing.expectEqual(@as(usize, large_stored.len), merged.hits[0].stored_data.?.len);
+}
+
 test "query merge rejects score ordered hits without finite scores" {
     const alloc = std.testing.allocator;
 
@@ -1582,6 +2147,412 @@ fn testScoreSortedQueryHitAlloc(alloc: std.mem.Allocator, id: []const u8, score:
         .score = score,
         .sort_values = sort_values,
     };
+}
+
+fn testHierarchyNavigationHitAlloc(
+    alloc: std.mem.Allocator,
+    id: []const u8,
+    position: []const u8,
+) !db_mod.types.SearchHit {
+    const sort_values = try alloc.alloc(std.json.Value, 2);
+    errdefer alloc.free(sort_values);
+    sort_values[0] = .{ .string = try alloc.dupe(u8, position) };
+    errdefer db_mod.types.deinitJsonValue(alloc, &sort_values[0]);
+    sort_values[1] = .{ .string = try alloc.dupe(u8, id) };
+    errdefer db_mod.types.deinitJsonValue(alloc, &sort_values[1]);
+    return .{
+        .id = try alloc.dupe(u8, id),
+        .sort_values = sort_values,
+    };
+}
+
+const TestHierarchyUnitChunk = struct { id: []const u8, score: f32 };
+
+fn testHierarchyUnitHitForIdAlloc(
+    alloc: std.mem.Allocator,
+    unit_id: []const u8,
+    score: f32,
+    chunks: []const TestHierarchyUnitChunk,
+) !db_mod.types.SearchHit {
+    const id = try std.fmt.allocPrint(
+        alloc,
+        "doc:a/_artifact/asset/document_units_v1/{s}",
+        .{unit_id},
+    );
+    defer alloc.free(id);
+    const chunk_hits = try alloc.alloc(db_mod.types.ChunkHit, chunks.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (chunk_hits[0..initialized]) |*chunk| chunk.deinit(alloc);
+        alloc.free(chunk_hits);
+    }
+    for (chunks, 0..) |chunk, i| {
+        chunk_hits[i] = .{
+            .id = try alloc.dupe(u8, chunk.id),
+            .score = chunk.score,
+        };
+        initialized += 1;
+    }
+    return .{
+        .id = try alloc.dupe(u8, id),
+        .score = score,
+        .stored_data = try alloc.dupe(u8, "{\"_hierarchy_unit_revision_token\":\"revision-a\"}"),
+        .artifact_ref = .{
+            .document_id = try alloc.dupe(u8, "doc:a"),
+            .name = try alloc.dupe(u8, "document_units_v1"),
+            .kind = .asset,
+            .unit_id = try alloc.dupe(u8, unit_id),
+        },
+        .chunk_hits = chunk_hits,
+    };
+}
+
+fn testHierarchyUnitHitAlloc(
+    alloc: std.mem.Allocator,
+    score: f32,
+    chunks: []const TestHierarchyUnitChunk,
+) !db_mod.types.SearchHit {
+    return testHierarchyUnitHitForIdAlloc(alloc, "unit:0", score, chunks);
+}
+
+fn testHierarchyUnitShardResultAlloc(
+    alloc: std.mem.Allocator,
+    shard_index: usize,
+    hit_count: usize,
+) !db_mod.types.SearchResult {
+    const hits = try alloc.alloc(db_mod.types.SearchHit, hit_count);
+    var initialized: usize = 0;
+    errdefer {
+        for (hits[0..initialized]) |*hit| hit.deinit(alloc);
+        alloc.free(hits);
+    }
+    for (hits, 0..) |*hit, hit_index| {
+        const unit_id = try std.fmt.allocPrint(
+            alloc,
+            "unit:{d:0>2}:{d:0>3}",
+            .{ shard_index, hit_index },
+        );
+        defer alloc.free(unit_id);
+        const score: f32 = @floatFromInt(hit_count - hit_index);
+        hit.* = try testHierarchyUnitHitForIdAlloc(alloc, unit_id, score, &.{});
+        initialized += 1;
+    }
+    return .{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = @intCast(hit_count),
+    };
+}
+
+test "query merge treats hierarchy navigation positions as opaque cursor values" {
+    const alloc = std.testing.allocator;
+    const order_by = [_]db_mod.types.SortField{
+        .{ .field = "_hierarchy.position" },
+        .{ .field = "_id" },
+    };
+    const cursor = [_]std.json.Value{
+        .{ .string = "document_units_v1/00000000000000000007/00000000000000000000" },
+        .{ .string = "artifact:page:1" },
+    };
+
+    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    left_hits[0] = try testHierarchyNavigationHitAlloc(
+        alloc,
+        "artifact:page:1",
+        "document_units_v1/00000000000000000007/00000000000000000000",
+    );
+    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    right_hits[0] = try testHierarchyNavigationHitAlloc(
+        alloc,
+        "artifact:page:2",
+        "document_units_v1/00000000000000000007/00000000000000000001",
+    );
+    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 2 };
+    defer left.deinit();
+    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 2 };
+    defer right.deinit();
+
+    var merged = try mergeSearchResultsWithRuntimeSchema(alloc, .{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .order_by = &order_by,
+        .search_after = &cursor,
+        .limit = 20,
+    }, &.{ left, right }, 0, 20, .{});
+    defer merged.deinit();
+
+    // Duplicate parent plans use a logical maximum rather than inflating the
+    // unit count, and the coordinator applies the opaque tuple cursor.
+    try std.testing.expectEqual(@as(u32, 2), merged.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
+    try std.testing.expectEqualStrings("artifact:page:2", merged.hits[0].id);
+}
+
+test "query merge treats conflicting hierarchy navigation plans as retryable" {
+    const alloc = std.testing.allocator;
+    const order_by = [_]db_mod.types.SortField{
+        .{ .field = "_hierarchy.position" },
+        .{ .field = "_id" },
+    };
+
+    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    left_hits[0] = try testHierarchyNavigationHitAlloc(alloc, "artifact:page:1", "hn3/revision-a/page/1");
+    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    right_hits[0] = try testHierarchyNavigationHitAlloc(alloc, "artifact:page:1", "hn3/revision-b/page/1");
+    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 1 };
+    defer left.deinit();
+    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
+    defer right.deinit();
+
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, mergeSearchResultsWithRuntimeSchema(
+        alloc,
+        .{
+            .hierarchy_children = .{ .parent_id = "doc:a" },
+            .order_by = &order_by,
+            .limit = 20,
+        },
+        &.{ left, right },
+        0,
+        20,
+        .{},
+    ));
+}
+
+test "query merge treats malformed hierarchy navigation shard tuples as retryable" {
+    const alloc = std.testing.allocator;
+    const order_by = [_]db_mod.types.SortField{
+        .{ .field = "_hierarchy.position" },
+        .{ .field = "_id" },
+    };
+    var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    hits[0] = try testHierarchyNavigationHitAlloc(alloc, "artifact:page:1", "hn3/revision-a/page/1");
+    alloc.free(hits[0].sort_values[1].string);
+    hits[0].sort_values[1] = .{ .string = try alloc.dupe(u8, "artifact:wrong-tiebreaker") };
+    var result = db_mod.types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 1 };
+    defer result.deinit();
+
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, mergeSearchResultsWithRuntimeSchema(
+        alloc,
+        .{
+            .hierarchy_children = .{ .parent_id = "doc:a" },
+            .order_by = &order_by,
+            .limit = 20,
+        },
+        &.{result},
+        0,
+        20,
+        .{},
+    ));
+}
+
+test "query merge releases hierarchy navigation candidates once at the global budget" {
+    const alloc = std.testing.allocator;
+    const order_by = [_]db_mod.types.SortField{
+        .{ .field = "_hierarchy.position" },
+        .{ .field = "_id" },
+    };
+    const hit_count = db_mod.types.max_canonical_hierarchy_total_matches + 1;
+    const hits = try alloc.alloc(db_mod.types.SearchHit, hit_count);
+    var initialized: usize = 0;
+    errdefer {
+        for (hits[0..initialized]) |*hit| hit.deinit(alloc);
+        alloc.free(hits);
+    }
+    for (hits, 0..) |*hit, i| {
+        const id = try std.fmt.allocPrint(alloc, "unit:{d}", .{i});
+        defer alloc.free(id);
+        const position = try std.fmt.allocPrint(alloc, "position/{d:0>8}", .{i});
+        defer alloc.free(position);
+        hit.* = try testHierarchyNavigationHitAlloc(alloc, id, position);
+        initialized += 1;
+    }
+    var result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = hit_count,
+    };
+    defer result.deinit();
+
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, mergeSearchResultsWithRuntimeSchema(
+        alloc,
+        .{
+            .hierarchy_children = .{ .parent_id = "doc:a" },
+            .order_by = &order_by,
+            .limit = 20,
+        },
+        &.{result},
+        0,
+        20,
+        .{},
+    ));
+}
+
+test "query merge globally coalesces hierarchy unit groups and bounded chunks" {
+    const alloc = std.testing.allocator;
+    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    left_hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.8, &.{
+        .{ .id = "chunk:a", .score = 0.8 },
+        .{ .id = "chunk:shared", .score = 0.4 },
+    });
+    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    right_hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.9, &.{
+        .{ .id = "chunk:b", .score = 0.9 },
+        .{ .id = "chunk:shared", .score = 0.5 },
+    });
+    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 1 };
+    defer left.deinit();
+    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
+    defer right.deinit();
+
+    var merged = try mergeSearchResults(alloc, .{
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .return_mode = .unit_with_chunks,
+        .hierarchy_group_level = .unit,
+        .hierarchy_grouped_matches = true,
+        .max_chunks_per_parent = 2,
+        .limit = 10,
+    }, &.{ left, right }, 0, 10);
+    defer merged.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), merged.total_hits);
+    try std.testing.expectEqual(db_mod.types.TotalHitsRelation.exact, merged.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
+    try std.testing.expectEqual(@as(?f32, 0.9), merged.hits[0].score);
+    try std.testing.expectEqual(@as(usize, 2), merged.hits[0].chunk_hits.len);
+    try std.testing.expectEqualStrings("chunk:b", merged.hits[0].chunk_hits[0].id);
+    try std.testing.expectEqualStrings("chunk:a", merged.hits[0].chunk_hits[1].id);
+}
+
+test "query merge treats conflicting hierarchy unit identities as retryable" {
+    const alloc = std.testing.allocator;
+    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    left_hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.8, &.{});
+    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    right_hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.9, &.{});
+    const right_ref = &right_hits[0].artifact_ref.?;
+    alloc.free(right_ref.name);
+    right_ref.name = try alloc.dupe(u8, "document_units_v2");
+
+    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 1 };
+    defer left.deinit();
+    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
+    defer right.deinit();
+
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, mergeSearchResults(
+        alloc,
+        .{
+            .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+            .return_mode = .unit,
+            .hierarchy_group_level = .unit,
+            .limit = 10,
+        },
+        &.{ left, right },
+        0,
+        10,
+    ));
+}
+
+test "query merge treats malformed hierarchy unit shard ranking as retryable" {
+    const alloc = std.testing.allocator;
+    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    left_hits[0] = try testHierarchyUnitHitForIdAlloc(alloc, "unit:0", 0.8, &.{});
+    left_hits[0].score = null;
+    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    right_hits[0] = try testHierarchyUnitHitForIdAlloc(alloc, "unit:1", 0.7, &.{});
+    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 1 };
+    defer left.deinit();
+    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
+    defer right.deinit();
+
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, mergeSearchResults(
+        alloc,
+        .{
+            .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+            .return_mode = .unit,
+            .hierarchy_group_level = .unit,
+            .limit = 10,
+        },
+        &.{ left, right },
+        0,
+        10,
+    ));
+}
+
+test "query merge reports an honest lower bound for a partial hierarchy unit union" {
+    const alloc = std.testing.allocator;
+    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    left_hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.8, &.{});
+    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    right_hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.9, &.{});
+    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 10 };
+    defer left.deinit();
+    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 12 };
+    defer right.deinit();
+
+    var merged = try mergeSearchResults(alloc, .{
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .return_mode = .unit,
+        .hierarchy_group_level = .unit,
+        .limit = 10,
+    }, &.{ left, right }, 0, 10);
+    defer merged.deinit();
+
+    try std.testing.expectEqual(@as(u32, 12), merged.total_hits);
+    try std.testing.expectEqual(db_mod.types.TotalHitsRelation.gte, merged.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
+}
+
+test "query merge rejects exact sorting for hierarchy unit groups" {
+    const alloc = std.testing.allocator;
+    const order_by = [_]db_mod.types.SortField{
+        .{ .field = "_score", .desc = true },
+        .{ .field = "_id" },
+    };
+    var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.8, &.{});
+    var result = db_mod.types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 1 };
+    defer result.deinit();
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .return_mode = .unit,
+        .hierarchy_group_level = .unit,
+        .order_by = &order_by,
+        .limit = 10,
+    }, &.{result}, 0, 10));
+}
+
+test "query merge bounds hierarchy unit selection by page instead of shard fanout" {
+    const alloc = std.testing.allocator;
+    const shard_count = 11;
+    const hits_per_shard = 100;
+    const results = try alloc.alloc(db_mod.types.SearchResult, shard_count);
+    var initialized: usize = 0;
+    defer {
+        for (results[0..initialized]) |*result| result.deinit();
+        alloc.free(results);
+    }
+    for (results, 0..) |*result, shard_index| {
+        result.* = try testHierarchyUnitShardResultAlloc(alloc, shard_index, hits_per_shard);
+        initialized += 1;
+    }
+
+    var merged = try mergeSearchResults(alloc, .{
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .return_mode = .unit,
+        .hierarchy_group_level = .unit,
+        .limit = hits_per_shard,
+    }, results, 0, hits_per_shard);
+    defer merged.deinit();
+
+    try std.testing.expectEqual(@as(usize, hits_per_shard), merged.hits.len);
+    try std.testing.expectEqual(@as(u32, hits_per_shard), merged.total_hits);
+    try std.testing.expectEqual(db_mod.types.TotalHitsRelation.gte, merged.total_hits_relation);
+    for (merged.hits, 0..) |hit, i| {
+        if (i > 0) try std.testing.expect(merged.hits[i - 1].score.? >= hit.score.?);
+        for (merged.hits[0..i]) |previous| {
+            try std.testing.expect(!std.mem.eql(u8, previous.id, hit.id));
+        }
+    }
 }
 
 fn testDateSortedQueryHitAlloc(alloc: std.mem.Allocator, id: []const u8, created_at_ns: u64) !db_mod.types.SearchHit {
@@ -2134,24 +3105,27 @@ test "query merge preserves common identity read generation" {
     try std.testing.expectEqual(@as(?u64, null), mixed.identity_read_generation);
 }
 
-test "query merge orders pure dense results by ascending distance" {
+test "query merge orders pure dense results by descending relevance score" {
     const alloc = std.testing.allocator;
 
     var left_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
     left_hits[0] = .{
         .id = try alloc.dupe(u8, "doc:b"),
-        .score = 1.0,
+        .score = 0.5,
+        .distance = 1.0,
         .stored_data = null,
     };
     left_hits[1] = .{
         .id = try alloc.dupe(u8, "doc:c"),
-        .score = 0.2,
+        .score = 0.8,
+        .distance = 0.2,
         .stored_data = null,
     };
     var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
     right_hits[0] = .{
         .id = try alloc.dupe(u8, "doc:a"),
-        .score = 0.0,
+        .score = 1.0,
+        .distance = 0.0,
         .stored_data = null,
     };
 
@@ -2184,4 +3158,5 @@ test "query merge orders pure dense results by ascending distance" {
     try std.testing.expectEqualStrings("doc:a", merged.hits[0].id);
     try std.testing.expectEqualStrings("doc:c", merged.hits[1].id);
     try std.testing.expectEqualStrings("doc:b", merged.hits[2].id);
+    try std.testing.expectEqual(@as(?f32, 0.0), merged.hits[0].distance);
 }

@@ -847,10 +847,10 @@ test "hosted shard operation adapter rediscovers leader across placed replicas" 
 
 test "hosted shard db adapter routes median key to remote leader" {
     const api_http_server = @import("../api/http_server.zig");
+    const http_test_runtime = @import("../api/http_test_runtime.zig");
     const metadata_table_manager = @import("../metadata/table_manager.zig");
     const raft_reconciler = @import("reconciler.zig");
     const std_http_executor = @import("transport/std_http_executor.zig");
-    const std_http_listener = @import("transport/std_http_listener.zig");
 
     const FakeCatalog = struct {
         fn iface() api_table_catalog.CatalogSource {
@@ -930,9 +930,8 @@ test "hosted shard db adapter routes median key to remote leader" {
         .shard_db_adapter = FakeRemoteShardDb.adapter(),
     }, FakeStatus.iface(), null, null);
     defer server.deinit();
-    var listener = std_http_listener.StdHttpListener.init(std.heap.page_allocator, .{}, server.executor());
+    var listener = try http_test_runtime.Runtime.startOwned(std.heap.page_allocator, &server);
     defer listener.deinit();
-    try listener.start();
 
     const remote_base_uri = try listener.baseUri(std.heap.page_allocator);
     defer std.heap.page_allocator.free(remote_base_uri);

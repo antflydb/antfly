@@ -184,6 +184,73 @@ tags:
       - `search_as_you_type` + `keyword` allowed without primary type (auto-adds `text`)
 
 
+      `x-antfly-types` remains supported as the compact multi-mapping/search
+
+      shorthand. Exact scalar names in that array describe how a field is
+
+      searched, but do not opt the field into the typed doc-value storage
+
+      required by production `order_by`.
+
+
+      ### `x-antfly-field`
+
+      Use an explicit field mapping for fields that participate in exact sort.
+
+      Set `sortable: true` on a keyword, numeric/number/integer,
+
+      boolean/bool, datetime/date/timestamp, or link mapping. Antfly derives
+
+      the internal typed doc values; `doc_values` is intentionally not a public
+
+      setting. The mapping type must accept the property's JSON Schema value
+
+      type. Explicit property mappings take precedence over dynamic templates.
+
+      When multiple document types declare the same dotted field path, their
+
+      normalized physical mappings must be identical.
+
+
+      ```json
+
+      {
+        "created_at": {
+          "type": "string",
+          "format": "date-time",
+          "x-antfly-field": {"type": "date", "sortable": true}
+        },
+        "title": {
+          "type": "string",
+          "x-antfly-field": {
+            "type": "text",
+            "fields": {
+              "keyword": {"type": "keyword", "sortable": true}
+            }
+          }
+        }
+      }
+
+      ```
+
+
+      Sort the examples above with `created_at` and `title.keyword`,
+
+      respectively. An analyzed `text` field is never directly sortable.
+
+      Adding `sortable: true` to an existing table is a physical mapping
+
+      change. Once the write or rebuild visibility barrier completes, clients
+
+      may issue `order_by` directly. Antfly validates cold physical coverage on
+
+      first use and fails closed when it is incomplete; status reads do not
+
+      warm columns, so `sort_lifecycle_state` may remain `declared` until that
+
+      validation succeeds.
+
+
       ### `x-antfly-index`
 
       Boolean to disable indexing for a field:
@@ -2213,6 +2280,14 @@ paths:
   /db/v1/connections/{connection_id}/inference/{operation}:
     post:
       summary: Invoke an Antfly-compatible inference connection
+      description: >
+        Invokes an inference operation through the selected connection.
+
+        Requires `inference/*` write permission. Generation requests with
+
+        `stream: true` return the provider's Server-Sent Events stream; all
+
+        other responses are returned as buffered JSON.
       tags:
         - cluster_management
       operationId: invokeInferenceConnection
@@ -2248,6 +2323,10 @@ paths:
         '200':
           description: Inference provider response
           content:
+            text/event-stream:
+              schema:
+                type: string
+                description: Streaming inference events when requested by the operation payload.
             application/json:
               schema:
                 type: object
@@ -2257,9 +2336,12 @@ paths:
         '401':
           description: Unauthorized - authentication required
         '403':
-          description: The connection does not declare the capability required by this operation
+          description: Inference write permission is missing, or the connection does not declare the required
+            capability
         '502':
           description: Inference provider request failed
+        '503':
+          $ref: '#/components/responses/InferenceTransientCapacity'
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -3343,8 +3425,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '409':
+          $ref: '#/components/responses/HierarchyCursorStale'
         '422':
           $ref: '#/components/responses/UnsupportedExactSort'
+        '503':
+          $ref: '#/components/responses/QueryTemporarilyUnavailable'
         '500':
           $ref: '#/components/responses/QueryInternalServerError'
       security:
@@ -3815,10 +3901,14 @@ paths:
                 $ref: '#/components/schemas/QueryResponses'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/HierarchyCursorStale'
         '422':
           $ref: '#/components/responses/UnsupportedExactSort'
         '404':
           $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/QueryTemporarilyUnavailable'
         '500':
           $ref: '#/components/responses/QueryInternalServerError'
       security:
@@ -6476,7 +6566,7 @@ paths:
 
         to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
 
-        `max_concurrent_requests` is positive—16 MiB times that capacity. A zero configured
+        `admission.inference.max_concurrent_requests` is positive—16 MiB times that capacity. A zero configured
 
         download limit disables nonempty media. Remote URL byte potential is reserved before
 
@@ -6486,7 +6576,8 @@ paths:
 
         decoded source pixels are admitted at a conservative 16 bytes per pixel against
 
-        the lower of 512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero
+        the lower of 512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`;
+        a zero
 
         concurrency setting still uses the finite 512 MiB ceiling. `max_image_dimension`
 
@@ -6845,14 +6936,14 @@ paths:
 
         read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
 
-        `max_concurrent_requests`. Admission happens before model resolution or download.
+        `admission.inference.max_concurrent_requests`. Admission happens before model resolution or download.
 
 
         After download, image headers are validated before model loading. Decoded source
 
         pixels are admitted at a conservative 16 bytes per pixel against the lower of
 
-        512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero concurrency
+        512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a zero concurrency
 
         setting still uses the finite 512 MiB ceiling. The reservation grows atomically
 
@@ -7694,6 +7785,37 @@ components:
           example: An error message
       required:
         - error
+    InferenceCapacityError:
+      type: object
+      description: Actionable retry contract for temporary inference-capacity failures.
+      required:
+        - error
+        - message
+        - reason
+        - retryable
+        - retry_after_ms
+      properties:
+        error:
+          type: string
+          description: Stable machine-readable error code.
+        message:
+          type: string
+          description: Human-readable error description.
+        reason:
+          type: string
+          enum:
+            - inference_capacity
+            - inference_admission
+          description: Machine-readable capacity source.
+        retryable:
+          type: boolean
+          enum:
+            - true
+          description: Always true for a transient-capacity response.
+        retry_after_ms:
+          type: integer
+          minimum: 1
+          description: Minimum retry delay in milliseconds.
     TableStorageUnreadableError:
       type: object
       additionalProperties: false
@@ -7720,6 +7842,73 @@ components:
           enum:
             - false
           description: Always false; recovery requires repair, restore, or table replacement.
+    QueryTemporarilyUnavailableError:
+      type: object
+      additionalProperties: false
+      description: A transient query dependency or read-availability failure that is safe to retry.
+      required:
+        - code
+        - message
+        - retryable
+      properties:
+        code:
+          type: string
+          enum:
+            - doc_identity_unavailable
+            - read_requires_primary
+            - standby_read_unavailable
+            - storage_read_temporarily_unavailable
+            - index_rebuilding
+            - query_embedding_temporarily_unavailable
+          description: Stable machine-readable retry classification.
+        message:
+          type: string
+          description: Human-readable error summary.
+        retryable:
+          type: boolean
+          enum:
+            - true
+          description: Always true; retry after the response's Retry-After delay.
+    HierarchyCursorStaleError:
+      type: object
+      additionalProperties: false
+      description: A hierarchy traversal cursor bound to an older source-artifact revision.
+      required:
+        - status
+        - error
+        - message
+        - action
+        - restart_without
+        - retryable
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum:
+            - 409
+        error:
+          type: string
+          enum:
+            - hierarchy_cursor_stale
+          description: Stable machine-readable error code.
+        message:
+          type: string
+          description: Human-readable explanation of why traversal cannot continue.
+        action:
+          type: string
+          enum:
+            - restart_hierarchy_traversal
+          description: Stable client action for recovering from the conflict.
+        restart_without:
+          type: string
+          enum:
+            - search_after
+          description: Request field to omit when restarting at the first unit.
+        retryable:
+          type: boolean
+          enum:
+            - false
+          description: Retrying the same cursor cannot succeed; restart traversal instead.
     ExactSortError:
       type: object
       additionalProperties: false
@@ -9722,9 +9911,9 @@ components:
           description: >
             Whether this concrete field is declared sortable in the effective
 
-            capability model. Public exact order_by accepts it only when
+            capability model. A cold declared field is validated on first
 
-            sort_lifecycle_state is queryable or accelerated.
+            exact order_by use; clients do not need to poll lifecycle status.
         provenance:
           type: string
           description: Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
@@ -9740,9 +9929,9 @@ components:
             - covered
             - queryable
             - accelerated
-          description: Operational lifecycle state for exact sort use. Queryable fields are accepted by
-            public exact sort; accelerated fields are queryable and participate in the configured index_sort
-            tuple.
+          description: Cached operational lifecycle state for exact sort use. Declared or indexed fields
+            are validated on first public exact-sort use; queryable fields have validated native coverage;
+            accelerated fields are queryable and participate in the configured index_sort tuple.
         analyzer:
           type: string
           description: Analyzer name for text/searchable fields, when applicable.
@@ -9862,6 +10051,20 @@ components:
         - Geo: geohash_grid, geo_distance
 
         - Analytics: significant_terms
+    CardinalityMode:
+      type: string
+      enum:
+        - auto
+        - exact
+        - approximate
+      description: >
+        Exact-vs-approximate selection for a cardinality aggregation:
+
+        - auto: use a materialized HyperLogLog sketch when one applies and is
+          current, else an exact distinct scan (default).
+        - exact: always compute an exact distinct count.
+
+        - approximate: require a matching sketch; error if none applies.
     AggregationRange:
       type: object
       required:
@@ -10002,6 +10205,14 @@ components:
           type: string
           description: Field to aggregate on. Required unless `fields` is supplied for a multi-field terms
             aggregation.
+        mode:
+          x-go-type-skip-optional-pointer: false
+          allOf:
+            - $ref: '#/components/schemas/CardinalityMode'
+          description: Selection mode for a cardinality aggregation. `auto` (default) uses a materialized
+            HyperLogLog sketch when one applies and is current, else falls back to an exact distinct scan.
+            `exact` always scans. `approximate` requires a sketch and errors if none applies. Ignored
+            for other types.
         fields:
           type: array
           items:
@@ -10136,6 +10347,19 @@ components:
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Single value for metric aggregations (sum, avg, min, max, count, cardinality)
+        approximate:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: For cardinality aggregations, whether the value is an approximate estimate from
+            a HyperLogLog sketch (true) or an exact distinct count (false). Absent for non-cardinality
+            aggregations.
+        relative_error:
+          type: number
+          format: float
+          x-go-type: float64
+          x-go-type-skip-optional-pointer: false
+          description: For an approximate cardinality value, the relative standard error of the estimate.
+            Present only when approximate is true.
         count:
           type: integer
           x-go-type-skip-optional-pointer: false
@@ -10853,7 +11077,15 @@ components:
           enum:
             - committed
             - committed_pending
-          description: Durable commit and visibility/participant recovery state.
+            - committed_repair_required
+          description: >
+            Durable commit outcome. `committed_pending` means requested visibility or
+
+            participant propagation is still completing. `committed_repair_required`
+
+            means the primary write committed, but a terminal enrichment failure needs
+
+            operator repair and will not be retried indefinitely.
         inserted:
           type: integer
           description: Number of documents successfully inserted
@@ -10935,11 +11167,19 @@ components:
       properties:
         status:
           type: string
-          description: Durable commit and visibility/propagation state.
+          description: >
+            Durable commit outcome. Pending states mean requested visibility or
+
+            participant propagation is still completing. `committed_repair_required`
+
+            means the primary writes committed, but a terminal enrichment failure needs
+
+            operator repair and will not be retried indefinitely.
           enum:
             - committed
             - committed_visibility_pending
             - committed_recovery_pending
+            - committed_repair_required
         tables:
           type: object
           description: Per-table batch results
@@ -11090,13 +11330,18 @@ components:
             - committed
             - committed_visibility_pending
             - committed_recovery_pending
+            - committed_repair_required
             - aborted
           description: >
             Durable transaction outcome. Pending committed states mean the
 
             commit decision is durable while its requested visibility barrier
 
-            or participant recovery is still completing.
+            or participant recovery is still completing. `committed_repair_required`
+
+            means the commit decision is durable and coordination may be released, but
+
+            a terminal enrichment failure requires operator repair.
         conflict:
           description: Details about the conflict that caused an abort (only present when status is "aborted")
           $ref: '#/components/schemas/TransactionConflict'
@@ -12942,8 +13187,383 @@ components:
         - $ref: '#/components/schemas/Query'
       x-go-type: json.RawMessage
       description: A validated Antfly query retained as raw JSON by Go servers and clients.
+    HierarchyProjection:
+      type: object
+      additionalProperties: false
+      required:
+        - fields
+      properties:
+        fields:
+          type: array
+          items:
+            type: string
+          description: >
+            Fields to include from the hydrated hierarchy document. This projection is
+
+            required whenever the ancestor is requested so hierarchy hydration cannot
+
+            accidentally return an unbounded document. Use an empty array to return
+
+            hierarchy identity without stored document fields.
+    HierarchyMatches:
+      type: object
+      additionalProperties: false
+      required:
+        - fields
+      properties:
+        limit:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 100
+          default: 3
+          description: >
+            Maximum matching descendant hits attached to each group, independent of
+
+            the top-level query limit. Matches follow the effective query order, and
+
+            the group score is the score of its best matching descendant. The maximum
+
+            bounds nested response growth. Group selection uses an adaptive candidate
+
+            window, then each returned group is expanded with a separately bounded query,
+
+            so a group with fewer matches never forces a global exhaustive scan. To bound
+
+            execution as well as response growth, grouped queries accept at most 100
+
+            top-level groups and 1,000 requested matches across the complete result page.
+        fields:
+          type: array
+          items:
+            type: string
+          description: >
+            Fields to include in each nested match. This projection is required because
+
+            grouped and matching records commonly have different schemas. Use an empty
+
+            array to return match identity and hierarchy metadata without stored fields.
+    HierarchyGroupBy:
+      type: object
+      additionalProperties: false
+      required:
+        - level
+      properties:
+        level:
+          type: string
+          enum:
+            - source
+            - unit
+          description: >
+            Hierarchy level used to group the records matched by the targeted index.
+
+            Unit groups are relevance-ranked and do not accept `order_by`, `search_after`,
+
+            or `search_before`; use `hierarchy.children` for sequential, cursor-paginated
+
+            unit traversal.
+        matches:
+          $ref: '#/components/schemas/HierarchyMatches'
+          x-go-type-skip-optional-pointer: false
+    HierarchyChildParent:
+      type: object
+      additionalProperties: false
+      required:
+        - level
+        - id
+      properties:
+        level:
+          type: string
+          enum:
+            - source
+        id:
+          type: string
+          minLength: 1
+    HierarchyChildren:
+      type: object
+      additionalProperties: false
+      required:
+        - parent
+        - level
+      properties:
+        parent:
+          $ref: '#/components/schemas/HierarchyChildParent'
+        level:
+          type: string
+          enum:
+            - unit
+          description: >
+            Child level to enumerate. Unit traversal reads the versioned extraction
+
+            hierarchy rather than a relevance index, so empty and failed units are included.
+    HierarchyChildrenOrderBy:
+      type: array
+      minItems: 1
+      maxItems: 1
+      description: >
+        The required public order for sequential hierarchy traversal. Specify
+
+        `_hierarchy.position` ascending; Antfly appends `_id` ascending as the
+
+        deterministic tie-breaker and returns both values in each hit's `_sort`.
+      items:
+        type: object
+        additionalProperties: false
+        required:
+          - field
+        properties:
+          field:
+            type: string
+            enum:
+              - _hierarchy.position
+          desc:
+            type: boolean
+            enum:
+              - false
+            default: false
+    HierarchyChildrenSearchAfter:
+      type: array
+      minItems: 2
+      maxItems: 2
+      description: Opaque position and unit-id tuple returned in the preceding hit's `_sort`.
+      items:
+        type: string
+    HierarchyAncestors:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        source:
+          $ref: '#/components/schemas/HierarchyProjection'
+          x-go-type-skip-optional-pointer: false
+        unit:
+          $ref: '#/components/schemas/HierarchyProjection'
+          x-go-type-skip-optional-pointer: false
+    QueryHierarchy:
+      type: object
+      additionalProperties: false
+      description: >
+        Returns direct index matches with optional projected ancestor context, or groups
+
+        those matches at a hierarchy level through `group_by`. A group's nested `matches`
+
+        projection is independently bounded and defaults to three hits while the top-level
+
+        `limit` continues to control the number of groups.
+
+
+        `children` is a separate sequential-browsing operation. It enumerates every unit
+
+        in the selected source revision, including units with no searchable chunk, and uses
+
+        the top-level `_sort`/`search_after` cursor contract.
+
+
+        Ancestor and nested-match field projections are always explicit to keep response
+
+        size predictable. The presence of this object selects the canonical contract:
+
+        without `group_by` or `children`, including when the object is empty, direct index
+
+        matches are returned. `ancestors` only controls projected context and never changes result
+
+        cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
+      allOf:
+        - not:
+            description: Relevance grouping and sequential child traversal are separate operations.
+            required:
+              - group_by
+              - children
+        - not:
+            description: Sequential child traversal cannot request per-hit ancestor hydration.
+            required:
+              - children
+              - ancestors
+        - not:
+            description: A source group already carries its projected source document.
+            required:
+              - group_by
+              - ancestors
+            properties:
+              group_by:
+                required:
+                  - level
+                properties:
+                  level:
+                    type: string
+                    enum:
+                      - source
+              ancestors:
+                required:
+                  - source
+      properties:
+        group_by:
+          $ref: '#/components/schemas/HierarchyGroupBy'
+          x-go-type-skip-optional-pointer: false
+        ancestors:
+          $ref: '#/components/schemas/HierarchyAncestors'
+          x-go-type-skip-optional-pointer: false
+        children:
+          $ref: '#/components/schemas/HierarchyChildren'
+          x-go-type-skip-optional-pointer: false
     QueryRequest:
       type: object
+      not:
+        anyOf:
+          - description: Hierarchy grouping requires an explicit top-level field projection.
+            allOf:
+              - required:
+                  - hierarchy
+                properties:
+                  hierarchy:
+                    required:
+                      - group_by
+              - not:
+                  required:
+                    - fields
+          - description: Hierarchy child traversal requires an explicit top-level field projection.
+            allOf:
+              - required:
+                  - hierarchy
+                properties:
+                  hierarchy:
+                    required:
+                      - children
+              - not:
+                  required:
+                    - fields
+          - description: Hierarchy child traversal requires its revision-bound ascending position order.
+            allOf:
+              - required:
+                  - hierarchy
+                properties:
+                  hierarchy:
+                    required:
+                      - children
+              - not:
+                  required:
+                    - order_by
+          - description: Hierarchy child traversal accepts only `_hierarchy.position` ascending.
+            required:
+              - hierarchy
+              - order_by
+            properties:
+              hierarchy:
+                required:
+                  - children
+              order_by:
+                not:
+                  $ref: '#/components/schemas/HierarchyChildrenOrderBy'
+          - description: Hierarchy child traversal pages contain between one and 100 units.
+            required:
+              - hierarchy
+              - limit
+            properties:
+              hierarchy:
+                required:
+                  - children
+              limit:
+                type: integer
+                anyOf:
+                  - maximum: 0
+                  - minimum: 101
+          - description: Hierarchy child traversal cursors are exact two-string `_sort` tuples.
+            required:
+              - hierarchy
+              - search_after
+            properties:
+              hierarchy:
+                required:
+                  - children
+              search_after:
+                not:
+                  $ref: '#/components/schemas/HierarchyChildrenSearchAfter'
+          - description: Relevance-ranked unit grouping does not expose exact sort tuples or cursors.
+            allOf:
+              - required:
+                  - hierarchy
+                properties:
+                  hierarchy:
+                    required:
+                      - group_by
+                    properties:
+                      group_by:
+                        required:
+                          - level
+                        properties:
+                          level:
+                            type: string
+                            enum:
+                              - unit
+              - anyOf:
+                  - required:
+                      - order_by
+                  - required:
+                      - search_after
+                  - required:
+                      - search_before
+          - description: Relevance, filtering, backward/offset pagination, and result transforms do not
+              apply to sequential child traversal.
+            allOf:
+              - required:
+                  - hierarchy
+                properties:
+                  hierarchy:
+                    required:
+                      - children
+              - anyOf:
+                  - required:
+                      - query
+                  - required:
+                      - full_text_search
+                  - required:
+                      - filter_query
+                  - required:
+                      - exclusion_query
+                  - required:
+                      - semantic_search
+                  - required:
+                      - embedding_template
+                  - required:
+                      - indexes
+                  - required:
+                      - embeddings
+                  - required:
+                      - offset
+                  - required:
+                      - search_before
+                  - required:
+                      - filter_prefix
+                  - required:
+                      - distance_under
+                  - required:
+                      - distance_over
+                  - required:
+                      - search_effort
+                  - required:
+                      - merge_config
+                  - required:
+                      - count
+                  - required:
+                      - profile
+                  - required:
+                      - reranker
+                  - required:
+                      - analyses
+                  - required:
+                      - aggregations
+                  - required:
+                      - graph_searches
+                  - required:
+                      - expand_strategy
+                  - required:
+                      - document_renderer
+                  - required:
+                      - pruner
+                  - required:
+                      - join
+                  - required:
+                      - foreign_sources
       properties:
         table:
           type: string
@@ -13152,6 +13772,13 @@ components:
             configuration.
 
 
+            When `hierarchy.group_by` is present, aggregations operate on the complete
+
+            set of top-level grouped source or unit records. Nested `group_by.matches` are
+
+            bounded evidence projections and are not counted as aggregation rows.
+
+
             Supports metric aggregations (sum, avg, min, max, count, stats, cardinality),
 
             bucketing aggregations (terms, range, date_range, histogram, date_histogram),
@@ -13221,11 +13848,18 @@ components:
             lower-level vector search overrides are provided internally.
           example: 0.5
         fields:
+          x-go-type-skip-optional-pointer: false
           type: array
           description: >
             List of fields to include in the results. If not specified, all fields are returned.
 
-            Use to reduce response size and improve performance.
+            Use to reduce response size and improve performance. This field is required when
+
+            hierarchy.group_by is present so a grouped query cannot accidentally hydrate an
+
+            entire grouped document. Use an empty array for identity-only groups.
+
+            This projection is also required for hierarchy.children traversal.
           items:
             type: string
           example:
@@ -13233,12 +13867,21 @@ components:
             - url
             - summary
             - created_at
+        hierarchy:
+          $ref: '#/components/schemas/QueryHierarchy'
+          x-go-type-skip-optional-pointer: false
         limit:
           type: integer
           description: >
-            Maximum number of results to return. For semantic_search, this is the topk parameter.
+            Maximum number of top-level results to return. For semantic_search, this is the topk parameter.
 
-            Default varies by query type (typically 10).
+            This does not limit nested matches attached through hierarchy.group_by.matches;
+
+            use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10).
+
+            Queries using hierarchy.group_by.matches are limited to 100 top-level groups
+
+            and a groups-times-matches execution budget of 1,000.
           example: 20
         offset:
           type: integer
@@ -13272,6 +13915,10 @@ components:
 
             Antfly appends `_id` ascending as a stable tie-breaker when it is omitted.
 
+            Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque,
+
+            sortable value is bound to the complete source hierarchy revision.
+
             Supported for exact text-backed, match_all, and filter-only requests
 
             when each non-`_id` field is a mapped exact scalar field with sortable
@@ -13280,7 +13927,11 @@ components:
 
             numeric/number/integer, boolean/bool, datetime/date/timestamp, and
 
-            link. Analyzed `text` fields and `search_as_you_type`, geo, embedding,
+            link. Declare the field with `x-antfly-field` and `sortable: true`;
+
+            `x-antfly-types` shorthand declarations alone are not sortable.
+
+            Analyzed `text` fields and `search_as_you_type`, geo, embedding,
 
             blob, html, object, and array fields are not directly sortable; sort
 
@@ -13321,6 +13972,12 @@ components:
             Supported for exact text-backed, match_all, and filter-only requests;
 
             not supported for semantic_search or count-only requests.
+
+            For hierarchy child traversal, a cursor whose source-artifact revision
+
+            changed returns `409 hierarchy_cursor_stale`; restart the same traversal
+
+            without `search_after` rather than retrying the stale tuple.
         search_before:
           type: array
           items: {}
@@ -14251,6 +14908,196 @@ components:
             type: number
             format: float
             x-go-type: float64
+    HierarchyArtifactSource:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - kind
+      properties:
+        name:
+          type: string
+        kind:
+          type: string
+          enum:
+            - chunk
+            - asset
+            - embedding
+        chunk_id:
+          type: integer
+          format: uint32
+          x-go-type-skip-optional-pointer: false
+        unit_id:
+          type: string
+    HierarchyArtifact:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - kind
+      properties:
+        name:
+          type: string
+        kind:
+          type: string
+          enum:
+            - chunk
+            - asset
+            - embedding
+        chunk_id:
+          type: integer
+          format: uint32
+          x-go-type-skip-optional-pointer: false
+        unit_id:
+          type: string
+        source:
+          $ref: '#/components/schemas/HierarchyArtifactSource'
+    HierarchyAncestor:
+      type: object
+      additionalProperties: true
+      properties:
+        id:
+          type: string
+        document:
+          type: object
+          additionalProperties: true
+        key:
+          type: string
+        artifact_name:
+          type: string
+        source_field:
+          type: string
+        provenance: {}
+    QueryHitHierarchyAncestors:
+      type: object
+      additionalProperties: false
+      required:
+        - source
+      properties:
+        source:
+          $ref: '#/components/schemas/HierarchyAncestor'
+        unit:
+          $ref: '#/components/schemas/HierarchyAncestor'
+    QueryHitHierarchyLevel:
+      type: string
+      enum:
+        - source
+        - unit
+        - chunk
+        - mention
+        - artifact
+        - embedding
+    HierarchyMatchContext:
+      type: object
+      additionalProperties: false
+      properties:
+        level:
+          $ref: '#/components/schemas/QueryHitHierarchyLevel'
+        parent_doc_key:
+          type: string
+        parent_unit_id:
+          type: string
+        artifact:
+          $ref: '#/components/schemas/HierarchyArtifact'
+        ancestors:
+          $ref: '#/components/schemas/QueryHitHierarchyAncestors'
+    HierarchyEvidence:
+      type: object
+      additionalProperties: false
+      properties:
+        local_id:
+          type: string
+        decision:
+          type: string
+        confidence:
+          type: number
+          format: float
+          x-go-type: float64
+          x-go-type-skip-optional-pointer: false
+        source_artifact:
+          type: string
+        source_artifact_key:
+          type: string
+        resolution_artifact:
+          type: string
+        resolution_artifact_key:
+          type: string
+        resolver:
+          type: string
+        resolver_table:
+          type: string
+        mention:
+          type: object
+          additionalProperties: true
+        canonical:
+          type: object
+          additionalProperties: true
+    HierarchyMatchHit:
+      type: object
+      additionalProperties: false
+      required:
+        - _id
+        - _score
+      properties:
+        _id:
+          type: string
+          x-go-name: ID
+        _score:
+          type: number
+          format: float
+          x-go-type: float64
+          x-go-name: score
+          description: Relevance score, normalized so higher values always rank first.
+        _distance:
+          type: number
+          format: float
+          x-go-type: float64
+          x-go-name: distance
+          x-go-type-skip-optional-pointer: false
+          description: Raw vector distance when this hit came directly from a dense-vector search; lower
+            values are better.
+        _source:
+          type: object
+          additionalProperties: true
+          x-go-name: source
+        hierarchy:
+          $ref: '#/components/schemas/HierarchyMatchContext'
+    QueryHitHierarchy:
+      type: object
+      additionalProperties: false
+      properties:
+        level:
+          $ref: '#/components/schemas/QueryHitHierarchyLevel'
+          description: Hierarchy level represented by this hit.
+        parent_doc_key:
+          type: string
+          description: Source document key that owns this derived hit.
+        parent_unit_id:
+          type: string
+          description: Unit identifier when the hit is attached to a document unit.
+        artifact:
+          $ref: '#/components/schemas/HierarchyArtifact'
+        ancestors:
+          $ref: '#/components/schemas/QueryHitHierarchyAncestors'
+        evidence:
+          $ref: '#/components/schemas/HierarchyEvidence'
+        matches:
+          type: array
+          description: Matching descendant hits attached by the canonical hierarchy.group_by request.
+          items:
+            $ref: '#/components/schemas/HierarchyMatchHit'
+        position:
+          type: string
+          description: Opaque format-neutral position used for sequential hierarchy traversal.
+        revision:
+          type: string
+          description: Composite source hierarchy revision to which the position and cursor are bound.
+        chunks:
+          type: array
+          deprecated: true
+          description: Legacy child chunk hits included for source-level rollups.
+          items:
+            $ref: '#/components/schemas/HierarchyMatchHit'
     QueryHit:
       type: object
       description: A single query result hit
@@ -14266,8 +15113,22 @@ components:
           type: number
           format: float
           x-go-type: float64
-          description: Relevance score of the hit.
+          description: Relevance score of the hit, normalized so higher values always rank first.
           x-go-name: score
+        _distance:
+          type: number
+          format: float
+          x-go-type: float64
+          x-go-name: distance
+          x-go-type-skip-optional-pointer: false
+          description: >
+            Raw vector distance for direct dense-vector hits; lower values are better.
+
+            For a source group ranked by dense descendants, this is the distance of
+
+            the best matching descendant that supplied the group score. Omitted for
+
+            non-dense and fused results.
         _index_scores:
           type: object
           additionalProperties: true
@@ -14278,50 +15139,19 @@ components:
           additionalProperties: true
           x-go-name: source
         hierarchy:
-          type: object
-          additionalProperties: true
+          $ref: '#/components/schemas/QueryHitHierarchy'
           description: >
             Stable ancestry envelope for derived document hierarchy hits. Present when
 
             the hit is a derived unit/chunk/embedding artifact or when a source-level
 
-            rollup includes child chunks. Standard fields include `level`,
+            group includes nested matches. Standard fields include `level`,
 
-            `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and
+            `parent_doc_key`, optional `parent_unit_id`, `artifact`, `matches`, and
 
             `ancestors` with response-local or requested DB-backed source/unit context when available.
-          properties:
-            level:
-              type: string
-              enum:
-                - source
-                - unit
-                - chunk
-                - artifact
-                - embedding
-              description: Hierarchy level represented by this hit.
-            parent_doc_key:
-              type: string
-              description: Source document key that owns this derived hit.
-            parent_unit_id:
-              type: string
-              description: Unit identifier when the hit is attached to a document unit.
-            artifact:
-              type: object
-              additionalProperties: true
-              description: Artifact identity with `name`, `kind`, and optional `unit_id` or `chunk_id`.
-            ancestors:
-              type: object
-              additionalProperties: true
-              description: Ancestor context. Includes `source.id` for derived hits, `source.document`
-                for materialized source rollups or requested source hydration, and `unit.document` for
-                direct unit hits or requested unit hydration when the unit payload is present.
-            chunks:
-              type: array
-              description: Child chunk hits included for source-level rollups.
-              items:
-                type: object
-                additionalProperties: true
+
+            Legacy rollup requests continue to use `chunks` instead of `matches`.
         _sort:
           type: array
           items: {}
@@ -14354,7 +15184,7 @@ components:
           type: number
           format: float
           x-go-type: float64
-          description: Maximum score of the results.
+          description: Best relevance score among the returned results. Scores are always higher-is-better.
     QueryHitsTotal:
       x-omitempty: false
       x-omitzero: false
@@ -16970,7 +17800,6 @@ components:
           description: Optional description of the index and its purpose
         type:
           $ref: '#/components/schemas/IndexType'
-          x-go-name: type
         version:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -16995,6 +17824,130 @@ components:
               field: text
               source_artifact_name: document_chunks_v1
               expected_dims: 768
+    FieldMappingType:
+      type: string
+      description: >
+        Field types accepted by detailed `x-antfly-field` and dynamic-template
+
+        mappings. JSON-schema-oriented aliases are normalized to Antfly's
+
+        corresponding runtime type: number/integer to numeric, bool to boolean,
+
+        date/timestamp to datetime, geo_point to geopoint, and geo_shape to
+
+        geoshape.
+      enum:
+        - text
+        - html
+        - keyword
+        - numeric
+        - number
+        - integer
+        - boolean
+        - bool
+        - datetime
+        - date
+        - timestamp
+        - geopoint
+        - geo_point
+        - geoshape
+        - geo_shape
+        - embedding
+        - blob
+        - link
+        - search_as_you_type
+    DocumentSubfieldMapping:
+      type: object
+      additionalProperties: false
+      description: Mapping for one named multifield emitted from its parent document property. Multifields
+        are intentionally one level deep and read the parent property's JSON value rather than a nested
+        JSON property.
+      properties:
+        type:
+          $ref: '#/components/schemas/FieldMappingType'
+        analyzer:
+          type: string
+          description: Analyzer name for text-oriented mappings.
+        index:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: Whether to index the field. Omit to use the server default of true.
+        store:
+          type: boolean
+          default: false
+          description: Whether to store the field value (default false)
+        include_in_all:
+          type: boolean
+          default: false
+          description: Whether to include in the _all field for cross-field search
+        sortable:
+          type: boolean
+          default: false
+          description: Whether this exact scalar subfield can be used in order_by. Antfly derives the
+            required typed doc values when enabled.
+        missing_null_policy:
+          type: string
+          enum:
+            - missing_rejected
+          default: missing_rejected
+          description: Missing/null sort policy. The current production policy rejects missing or null
+            native sort values.
+    DocumentFieldMapping:
+      type: object
+      additionalProperties: false
+      description: Executable physical mapping used by a document property's `x-antfly-field` annotation.
+        The mapping must accept the JSON Schema value type. Declarations for the same dotted path across
+        document types must normalize to an identical physical mapping, and present values that cannot
+        be encoded are rejected at write admission. Mappings contributed by `anyOf` or `oneOf` must normalize
+        to the same mapping in every alternative; conditional and dynamically named mappings are rejected.
+      properties:
+        type:
+          $ref: '#/components/schemas/FieldMappingType'
+        analyzer:
+          type: string
+          description: Analyzer name for text-oriented mappings.
+        index:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: Whether to index the field. Omit to use the server default of true.
+        store:
+          type: boolean
+          default: false
+          description: Whether to store the field value (default false)
+        include_in_all:
+          type: boolean
+          default: false
+          description: Whether to include in the _all field for cross-field search
+        sortable:
+          type: boolean
+          default: false
+          description: >
+            Whether this exact scalar field can be used in order_by. Supported
+
+            sortable mapping types are keyword, numeric/number/integer,
+
+            boolean/bool, datetime/date/timestamp, and link. Analyzed text,
+
+            search_as_you_type, geo, embedding, blob, html, object, and array
+
+            fields are not directly sortable; use an exact scalar subfield such
+
+            as title.keyword for sorted string pagination. Antfly derives the
+
+            required typed doc values when enabled.
+        missing_null_policy:
+          type: string
+          enum:
+            - missing_rejected
+          default: missing_rejected
+          description: Missing/null sort policy. The current production policy rejects missing or null
+            native sort values.
+        fields:
+          type: object
+          description: Named one-level multifields emitted from this property's value. For example, a
+            text title can expose a sortable keyword subfield.
+          additionalProperties:
+            $ref: '#/components/schemas/DocumentSubfieldMapping'
     DocumentSchema:
       type: object
       description: Defines the structure of a document type
@@ -17009,29 +17962,17 @@ components:
             A valid JSON Schema defining the document's structure.
 
             This is used to infer indexing rules and field types.
-    AntflyType-2:
-      type: string
-      description: Field type annotations for schema fields
-      enum:
-        - text
-        - html
-        - keyword
-        - numeric
-        - boolean
-        - datetime
-        - geopoint
-        - geoshape
-        - embedding
-        - blob
-        - link
-        - search_as_you_type
+          x-antfly-field-mapping-schema:
+            $ref: '#/components/schemas/DocumentFieldMapping'
     TemplateFieldMapping:
       type: object
       additionalProperties: false
-      description: Field mapping to apply when a dynamic template matches
+      description: Field mapping used by a dynamic template. Dynamic templates match one physical field
+        at a time and therefore do not accept multifields; use a DocumentFieldMapping in a document property's
+        `x-antfly-field` annotation when named subfields are required.
       properties:
         type:
-          $ref: '#/components/schemas/AntflyType-2'
+          $ref: '#/components/schemas/FieldMappingType'
         analyzer:
           type: string
           description: >
@@ -17040,8 +17981,8 @@ components:
             Used for text fields to control tokenization and normalization.
         index:
           type: boolean
-          default: true
-          description: Whether to index the field (default true)
+          x-go-type-skip-optional-pointer: false
+          description: Whether to index the field. Omit to use the server default of true.
         store:
           type: boolean
           default: false
@@ -18932,7 +19873,7 @@ components:
         Configuration for URL content fetching.
 
 
-        Uses go/pkg/antfly/lib/scraping for downloading and processing. Supports:
+        Uses Antfly's content fetcher for downloading and processing. Supports:
 
         - HTTP/HTTPS URLs with security validation
 
@@ -18947,7 +19888,7 @@ components:
         - S3 URLs (requires s3_credentials)
 
 
-        Security features (from go/pkg/antfly/lib/scraping.ContentSecurityConfig):
+        Security features include:
 
         - Allowed host whitelist
 
@@ -20547,7 +21488,9 @@ components:
           description: Starting node(s) for the query
         target_nodes:
           $ref: '#/components/schemas/GraphNodeSelector'
-          description: Target nodes (for pathfinding only)
+          description: Exact target nodes for pathfinding or the final binding of a pattern query. When
+            a pattern endpoint is known, prefer this selector over an exact node_filter.filter_prefix
+            so Antfly can use an exact edge-probe plan.
         params:
           $ref: '#/components/schemas/GraphQueryParams'
           description: Traversal/pathfinding parameters
@@ -20810,7 +21753,7 @@ components:
           description: Machine-readable capacity source when the failure is retryable
           enum:
             - inference_capacity
-            - request_queue
+            - inference_admission
         retryable:
           type: boolean
           x-go-type-skip-optional-pointer: false
@@ -20840,7 +21783,7 @@ components:
           description: Machine-readable capacity source
           enum:
             - inference_capacity
-            - request_queue
+            - inference_admission
         retryable:
           type: boolean
           enum:
@@ -22549,11 +23492,80 @@ components:
 
             hit, so only entries left unused for this duration expire.
           default: 300000
+    InferenceAdmissionConfig:
+      type: object
+      additionalProperties: false
+      description: Process-local foreground request admission settings.
+      properties:
+        inference:
+          $ref: '#/components/schemas/InferenceRequestAdmissionConfig'
+    InferenceRequestAdmissionConfig:
+      type: object
+      additionalProperties: false
+      properties:
+        max_concurrent_requests:
+          type: integer
+          x-go-type-skip-optional-pointer: false
+          description: >
+            Maximum concurrent inference requests in this process. The same
+
+            value also sizes the weighted work budget shared by every executing
+
+            inference endpoint: each request consumes one request slot and at
+
+            least one unit, while request body size, generation workload, and
+
+            image byte/count reservations can consume more than one unit. The
+
+            request count can therefore never exceed this value, while expensive
+
+            requests may exhaust weighted capacity sooner. Read and
+
+            image-extraction admission reserves the effective downloaded-byte ceiling at 16 MiB
+
+            per unit and at least one unit per two images. A positive capacity also
+
+            clamps each such request's downloaded-image ceiling to 16 MiB times
+
+            this value. When either ceiling is exhausted, new HTTP requests are
+
+            rejected immediately with 503 Service Unavailable and Retry-After: 1;
+
+            they are not retained
+
+            in an in-process queue. Set to 0 to disable both ceilings, admission
+
+            unit accounting, and the capacity-derived clamp. The default is 32.
+          minimum: 0
+          maximum: 4294967295
+          default: 32
+          example: 32
     InferenceConfig:
+      allOf:
+        - $ref: '#/components/schemas/InferenceRuntimeConfig'
+        - type: object
+          properties:
+            admission:
+              $ref: '#/components/schemas/InferenceAdmissionConfig'
+    InferenceRuntimeConfig:
       type: object
       required:
         - api_url
       properties:
+        max_concurrent_requests:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          deprecated: true
+          description: >
+            Deprecated compatibility alias for
+
+            `admission.inference.max_concurrent_requests`. New configurations
+
+            should use the process-level admission setting. If both spellings
+
+            are supplied, they must have the same value.
+          example: 32
         api_url:
           type: string
           format: uri
@@ -22601,14 +23613,15 @@ components:
             and the connection is pinned to a vetted address. Setting it to false explicitly opts into
             private and special destinations. Across generate, dense embed, and multimodal rerank, downloaded
             and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes,
-            and—when max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes
-            disables nonempty media. Remote URL byte potential is reserved before fetch, while inline
-            sources use their actual encoded size. Accepted image inputs also undergo header-only dimension
-            and aggregate decoded-pixel admission before model execution. Batch generation rejects multimodal
-            content before fetch. Embedded direct transcription and extraction use the configured encoded-media
-            per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image
-            admission. In unified Antfly configuration, an empty inference policy may first inherit a
-            nonempty remote_content security policy, which is then merged over this baseline.
+            and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity;
+            zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved
+            before fetch, while inline sources use their actual encoded size. Accepted image inputs also
+            undergo header-only dimension and aggregate decoded-pixel admission before model execution.
+            Batch generation rejects multimodal content before fetch. Embedded direct transcription and
+            extraction use the configured encoded-media per-call ceiling, and direct dense embedding also
+            applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty
+            inference policy may first inherit a nonempty remote_content security policy, which is then
+            merged over this baseline.
         s3_credentials:
           $ref: '#/components/schemas/InferenceCredentials'
           description: S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
@@ -22659,35 +23672,6 @@ components:
 
             configuring this list has no effect.
           deprecated: true
-        max_concurrent_requests:
-          type: integer
-          description: >
-            Maximum concurrent weighted inference admission units in the Zig runtime.
-
-            Request body size, generation workload, and image byte/count reservations
-
-            can consume more than one unit. Read and image-extraction admission reserves the
-
-            effective downloaded-byte ceiling at 16 MiB per unit and at least one unit per
-
-            two images. A positive capacity also clamps each such request's downloaded-image
-
-            ceiling to 16 MiB times this value. Set to 0 disables both admission accounting
-
-            and that capacity-derived clamp.
-
-            When a positive limit is exhausted, new requests are rejected immediately
-
-            with 503 Service Unavailable and Retry-After: 1; they are not retained in
-
-            an in-process queue. Set to 0 only as an operational escape hatch for
-
-            trusted testing environments; unlimited admission is not recommended for
-
-            production native generation. Use a positive production limit. The default is 32.
-          minimum: 0
-          default: 32
-          example: 32
         max_queue_size:
           type: integer
           description: >
@@ -23439,6 +24423,27 @@ components:
         multi_label:
           type: boolean
           default: false
+          description: >
+            When false, return the highest-ranked labels up to `top_k` (one by
+
+            default). When true, return every label meeting `options.threshold`.
+        hypothesis_template:
+          type: string
+          default: This example is {}.
+          description: >
+            NLI hypothesis template for this named taxonomy. Use `{}` as the
+
+            candidate-label placeholder. Non-NLI extractors ignore this field.
+        top_k:
+          type: integer
+          minimum: 1
+          default: 1
+          description: >
+            Maximum labels returned for single-label classification. Ignored
+
+            when `multi_label` is true, where `options.threshold` controls the
+
+            returned set.
     ExtractionStructureField:
       oneOf:
         - type: string
@@ -23768,6 +24773,19 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    InferenceTransientCapacity:
+      description: Inference capacity is temporarily unavailable
+      headers:
+        Retry-After:
+          required: true
+          description: Minimum number of seconds clients should wait before retrying.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/InferenceCapacityError'
     StatelessTransactionFailure:
       description: >
         Internal transaction failure. If the response says that the outcome is
@@ -23808,6 +24826,26 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ExactSortError'
+    HierarchyCursorStale:
+      description: The hierarchy changed after the traversal cursor was issued
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/HierarchyCursorStaleError'
+    QueryTemporarilyUnavailable:
+      description: A query dependency or read path is temporarily unavailable and the request is safe
+        to retry
+      headers:
+        Retry-After:
+          required: true
+          description: Minimum number of seconds clients should wait before retrying.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/QueryTemporarilyUnavailableError'
     InternalServerError:
       description: Internal server error
       content:
