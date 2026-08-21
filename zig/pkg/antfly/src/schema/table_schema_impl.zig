@@ -1940,9 +1940,11 @@ fn isRelationalStorageProperty(property: DocumentProperty) bool {
             std.mem.eql(u8, field_type, "object") or
             std.mem.eql(u8, field_type, "array");
     }
-    return property.integer_only or
-        property.properties.len != 0 or
-        property.item != null;
+    // JSON Schema object/array keywords do not imply an instance type. Without
+    // an explicit type this property can admit values that the inferred
+    // physical column would reject, so it is not a representable relational
+    // column contract.
+    return false;
 }
 
 fn relationalPropertyContainsRootRef(property: DocumentProperty) bool {
@@ -3237,7 +3239,7 @@ fn validateDocumentFieldValueWithContext(
     if (property.any_of.len > 0) {
         var matched = false;
         for (property.any_of) |variant| {
-            validateDocumentFieldValueWithContext(context, variant, value, composed_enforce_types) catch continue;
+            if (!try schemaMatchesValue(context, variant, value, composed_enforce_types)) continue;
             matched = true;
             break;
         }
@@ -3247,20 +3249,18 @@ fn validateDocumentFieldValueWithContext(
     if (property.one_of.len > 0) {
         var matches: usize = 0;
         for (property.one_of) |variant| {
-            validateDocumentFieldValueWithContext(context, variant, value, composed_enforce_types) catch continue;
+            if (!try schemaMatchesValue(context, variant, value, composed_enforce_types)) continue;
             matches += 1;
         }
         if (matches != 1) return error.InvalidBatchRequest;
     }
 
     if (property.not_schema) |not_schema| {
-        if (validateDocumentFieldValueWithContext(context, not_schema.*, value, composed_enforce_types)) |_| {
-            return error.InvalidBatchRequest;
-        } else |_| {}
+        if (try schemaMatchesValue(context, not_schema.*, value, composed_enforce_types)) return error.InvalidBatchRequest;
     }
 
     if (property.if_schema) |if_schema| {
-        const matched = if (validateDocumentFieldValueWithContext(context, if_schema.*, value, composed_enforce_types)) |_| true else |_| false;
+        const matched = try schemaMatchesValue(context, if_schema.*, value, composed_enforce_types);
         if (matched) {
             if (property.then_schema) |then_schema| try validateDocumentFieldValueWithContext(context, then_schema.*, value, composed_enforce_types);
         } else {
@@ -3299,53 +3299,34 @@ fn validateDocumentFieldValueWithContext(
     }
 
     if (property.pattern) |pattern| {
-        const string_value = switch (value.*) {
-            .string => |string| string,
-            else => return error.InvalidBatchRequest,
-        };
-        if (!try regexMatch(pattern, string_value)) return error.InvalidBatchRequest;
+        if (value.* == .string and !try regexMatch(pattern, value.string)) return error.InvalidBatchRequest;
     }
 
     if (property.format) |format| {
-        const string_value = switch (value.*) {
-            .string => |string| string,
-            else => return error.InvalidBatchRequest,
-        };
-        try validateStringFormat(format, string_value);
+        if (value.* == .string) try validateStringFormat(format, value.string);
     }
 
-    if (property.min_length != null or property.max_length != null) {
-        if (value.* == .string) {
-            const codepoints = std.unicode.utf8CountCodepoints(value.string) catch return error.InvalidBatchRequest;
-            if (property.min_length) |min_length| {
-                if (codepoints < min_length) return error.InvalidBatchRequest;
-            }
-            if (property.max_length) |max_length| {
-                if (codepoints > max_length) return error.InvalidBatchRequest;
-            }
-        } else if (property.field_type == null) {
-            return error.InvalidBatchRequest;
+    if ((property.min_length != null or property.max_length != null) and value.* == .string) {
+        const codepoints = std.unicode.utf8CountCodepoints(value.string) catch return error.InvalidBatchRequest;
+        if (property.min_length) |min_length| {
+            if (codepoints < min_length) return error.InvalidBatchRequest;
+        }
+        if (property.max_length) |max_length| {
+            if (codepoints > max_length) return error.InvalidBatchRequest;
         }
     }
 
-    if (property.min_items != null or property.max_items != null) {
-        if (value.* == .array) {
-            if (property.min_items) |min_items| {
-                if (value.array.items.len < min_items) return error.InvalidBatchRequest;
-            }
-            if (property.max_items) |max_items| {
-                if (value.array.items.len > max_items) return error.InvalidBatchRequest;
-            }
-        } else if (property.item == null and property.field_type == null) {
-            return error.InvalidBatchRequest;
+    if ((property.min_items != null or property.max_items != null) and value.* == .array) {
+        if (property.min_items) |min_items| {
+            if (value.array.items.len < min_items) return error.InvalidBatchRequest;
+        }
+        if (property.max_items) |max_items| {
+            if (value.array.items.len > max_items) return error.InvalidBatchRequest;
         }
     }
 
-    if (property.prefix_items.len > 0) {
-        const array = switch (value.*) {
-            .array => |array| array,
-            else => return error.InvalidBatchRequest,
-        };
+    if (property.prefix_items.len > 0 and value.* == .array) {
+        const array = value.array;
         const prefix_len = @min(property.prefix_items.len, array.items.len);
         for (property.prefix_items[0..prefix_len], array.items[0..prefix_len]) |prefix_item, item_value| {
             try validateDocumentFieldValueWithContext(context, prefix_item, &item_value, enforce_types);
@@ -3357,11 +3338,8 @@ fn validateDocumentFieldValueWithContext(
         }
     }
 
-    if (property.unique_items) {
-        const array = switch (value.*) {
-            .array => |array| array,
-            else => return error.InvalidBatchRequest,
-        };
+    if (property.unique_items and value.* == .array) {
+        const array = value.array;
         for (array.items, 0..) |item, i| {
             for (array.items[i + 1 ..]) |other| {
                 if (jsonValueEqual(item, other)) return error.InvalidBatchRequest;
@@ -3369,15 +3347,12 @@ fn validateDocumentFieldValueWithContext(
         }
     }
 
-    if (property.contains_schema != null or property.min_contains != null or property.max_contains != null) {
-        const array = switch (value.*) {
-            .array => |array| array,
-            else => return error.InvalidBatchRequest,
-        };
+    if ((property.contains_schema != null or property.min_contains != null or property.max_contains != null) and value.* == .array) {
+        const array = value.array;
         const contains_schema = property.contains_schema orelse return error.InvalidBatchRequest;
         var match_count: u64 = 0;
         for (array.items) |item_value| {
-            validateDocumentFieldValueWithContext(context, contains_schema.*, &item_value, enforce_types) catch continue;
+            if (!try schemaMatchesValue(context, contains_schema.*, &item_value, enforce_types)) continue;
             match_count += 1;
         }
         const min_contains = property.min_contains orelse 1;
@@ -3387,11 +3362,8 @@ fn validateDocumentFieldValueWithContext(
         }
     }
 
-    if (property.unevaluated_items_allowed != null or property.unevaluated_items_schema != null) {
-        const array = switch (value.*) {
-            .array => |array| array,
-            else => return error.InvalidBatchRequest,
-        };
+    if ((property.unevaluated_items_allowed != null or property.unevaluated_items_schema != null) and value.* == .array) {
+        const array = value.array;
         var evaluated_indices = std.AutoHashMapUnmanaged(usize, void).empty;
         defer evaluated_indices.deinit(context.alloc);
         try collectEvaluatedArrayIndices(context, property, value, enforce_types, &evaluated_indices, false);
@@ -3407,7 +3379,7 @@ fn validateDocumentFieldValueWithContext(
         }
     }
 
-    if (property.properties.len > 0 or
+    if ((property.properties.len > 0 or
         property.pattern_properties.len > 0 or
         property.required_fields.len > 0 or
         property.additional_properties_allowed != null or
@@ -3418,12 +3390,9 @@ fn validateDocumentFieldValueWithContext(
         property.dependent_required.len > 0 or
         property.dependent_schemas.len > 0 or
         property.min_properties != null or
-        property.max_properties != null)
+        property.max_properties != null) and value.* == .object)
     {
-        const object = switch (value.*) {
-            .object => |object| object,
-            else => return error.InvalidBatchRequest,
-        };
+        const object = value.object;
         try validateObjectCardinality(object, property.properties, property.min_properties, property.max_properties);
         try validateRequiredFieldsPresent(object, property.required_fields);
         if (property.property_names) |property_names| try validatePropertyNames(context, object, property.properties, property_names.*, enforce_types);
@@ -3462,18 +3431,17 @@ fn validateDocumentFieldValueWithContext(
     }
 
     if (property.item) |item| {
-        const array = switch (value.*) {
-            .array => |array| array,
-            else => return error.InvalidBatchRequest,
-        };
-        if (property.min_items) |min_items| {
-            if (array.items.len < min_items) return error.InvalidBatchRequest;
+        if (value.* == .array) {
+            const array = value.array;
+            if (property.min_items) |min_items| {
+                if (array.items.len < min_items) return error.InvalidBatchRequest;
+            }
+            if (property.max_items) |max_items| {
+                if (array.items.len > max_items) return error.InvalidBatchRequest;
+            }
+            const start_index = @min(property.prefix_items.len, array.items.len);
+            for (array.items[start_index..]) |item_value| try validateDocumentFieldValueWithContext(context, item.*, &item_value, enforce_types);
         }
-        if (property.max_items) |max_items| {
-            if (array.items.len > max_items) return error.InvalidBatchRequest;
-        }
-        const start_index = @min(property.prefix_items.len, array.items.len);
-        for (array.items[start_index..]) |item_value| try validateDocumentFieldValueWithContext(context, item.*, &item_value, enforce_types);
     }
 
     try validateNumericKeywordsWithContext(context, property, value.*);
@@ -3898,9 +3866,12 @@ fn schemaMatchesValue(
     property: DocumentProperty,
     value: *const std.json.Value,
     enforce_types: bool,
-) bool {
+) anyerror!bool {
     _ = enforce_types;
-    validateDocumentFieldValueWithContext(context, property, value, false) catch return false;
+    validateDocumentFieldValueWithContext(context, property, value, false) catch |err| switch (err) {
+        error.InvalidBatchRequest => return false,
+        else => return err,
+    };
     return true;
 }
 
@@ -3987,34 +3958,34 @@ fn collectComposedObjectFieldCoverage(
 
     const object_value: std.json.Value = .{ .object = object };
     for (property.all_of) |variant| {
-        if (!schemaMatchesValue(context, variant, &object_value, enforce_types)) continue;
+        if (!try schemaMatchesValue(context, variant, &object_value, enforce_types)) continue;
         try collectComposedObjectFieldCoverage(context, variant, object, enforce_types, evaluated_fields, true);
     }
     for (property.any_of) |variant| {
-        if (!schemaMatchesValue(context, variant, &object_value, enforce_types)) continue;
+        if (!try schemaMatchesValue(context, variant, &object_value, enforce_types)) continue;
         try collectComposedObjectFieldCoverage(context, variant, object, enforce_types, evaluated_fields, true);
     }
     for (property.one_of) |variant| {
-        if (!schemaMatchesValue(context, variant, &object_value, enforce_types)) continue;
+        if (!try schemaMatchesValue(context, variant, &object_value, enforce_types)) continue;
         try collectComposedObjectFieldCoverage(context, variant, object, enforce_types, evaluated_fields, true);
     }
     if (property.if_schema) |if_schema| {
-        if (schemaMatchesValue(context, if_schema.*, &object_value, enforce_types)) {
+        if (try schemaMatchesValue(context, if_schema.*, &object_value, enforce_types)) {
             try collectComposedObjectFieldCoverage(context, if_schema.*, object, enforce_types, evaluated_fields, true);
             if (property.then_schema) |then_schema| {
-                if (schemaMatchesValue(context, then_schema.*, &object_value, enforce_types)) {
+                if (try schemaMatchesValue(context, then_schema.*, &object_value, enforce_types)) {
                     try collectComposedObjectFieldCoverage(context, then_schema.*, object, enforce_types, evaluated_fields, true);
                 }
             }
         } else if (property.else_schema) |else_schema| {
-            if (schemaMatchesValue(context, else_schema.*, &object_value, enforce_types)) {
+            if (try schemaMatchesValue(context, else_schema.*, &object_value, enforce_types)) {
                 try collectComposedObjectFieldCoverage(context, else_schema.*, object, enforce_types, evaluated_fields, true);
             }
         }
     }
     for (property.dependent_schemas) |dependency| {
         if (!object.contains(dependency.name)) continue;
-        if (!schemaMatchesValue(context, dependency.schema.*, &object_value, enforce_types)) continue;
+        if (!try schemaMatchesValue(context, dependency.schema.*, &object_value, enforce_types)) continue;
         try collectComposedObjectFieldCoverage(context, dependency.schema.*, object, enforce_types, evaluated_fields, true);
     }
 
@@ -4068,33 +4039,33 @@ fn collectEvaluatedArrayIndices(
 
     if (property.contains_schema) |contains_schema| {
         for (array.items, 0..) |item_value, index| {
-            if (!schemaMatchesValue(context, contains_schema.*, &item_value, enforce_types)) continue;
+            if (!try schemaMatchesValue(context, contains_schema.*, &item_value, enforce_types)) continue;
             try evaluated_indices.put(context.alloc, index, {});
         }
     }
 
     for (property.all_of) |variant| {
-        if (!schemaMatchesValue(context, variant, value, enforce_types)) continue;
+        if (!try schemaMatchesValue(context, variant, value, enforce_types)) continue;
         try collectEvaluatedArrayIndices(context, variant, value, enforce_types, evaluated_indices, true);
     }
     for (property.any_of) |variant| {
-        if (!schemaMatchesValue(context, variant, value, enforce_types)) continue;
+        if (!try schemaMatchesValue(context, variant, value, enforce_types)) continue;
         try collectEvaluatedArrayIndices(context, variant, value, enforce_types, evaluated_indices, true);
     }
     for (property.one_of) |variant| {
-        if (!schemaMatchesValue(context, variant, value, enforce_types)) continue;
+        if (!try schemaMatchesValue(context, variant, value, enforce_types)) continue;
         try collectEvaluatedArrayIndices(context, variant, value, enforce_types, evaluated_indices, true);
     }
     if (property.if_schema) |if_schema| {
-        if (schemaMatchesValue(context, if_schema.*, value, enforce_types)) {
+        if (try schemaMatchesValue(context, if_schema.*, value, enforce_types)) {
             try collectEvaluatedArrayIndices(context, if_schema.*, value, enforce_types, evaluated_indices, true);
             if (property.then_schema) |then_schema| {
-                if (schemaMatchesValue(context, then_schema.*, value, enforce_types)) {
+                if (try schemaMatchesValue(context, then_schema.*, value, enforce_types)) {
                     try collectEvaluatedArrayIndices(context, then_schema.*, value, enforce_types, evaluated_indices, true);
                 }
             }
         } else if (property.else_schema) |else_schema| {
-            if (schemaMatchesValue(context, else_schema.*, value, enforce_types)) {
+            if (try schemaMatchesValue(context, else_schema.*, value, enforce_types)) {
                 try collectEvaluatedArrayIndices(context, else_schema.*, value, enforce_types, evaluated_indices, true);
             }
         }
@@ -4507,6 +4478,12 @@ test "relational schemas reject contracts the row codec cannot represent" {
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
         \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"qty":{"type":"integer","minimum":0.5}},"additionalProperties":false}}}}
     ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"attrs":{"properties":{"id":{"type":"keyword"}}}},"additionalProperties":false}}}}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"tags":{"items":{"type":"keyword"}}},"additionalProperties":false}}}}
+    ));
 }
 
 test "relational schemas validate declared underscore properties and reject undeclared metadata" {
@@ -4633,6 +4610,61 @@ test "schema.composed numeric keywords apply without a local type" {
         validateJsonSchemaJson(alloc, "{\"type\":\"number\",\"allOf\":[{\"minimum\":5}]}", "1"),
     );
     try validateJsonSchemaJson(alloc, "{\"allOf\":[{\"minimum\":5}]}", "\"not-a-number\"");
+}
+
+test "schema keywords ignore unrelated instance types" {
+    const alloc = std.testing.allocator;
+    try validateJsonSchemaJson(
+        alloc,
+        "{\"type\":\"number\",\"allOf\":[{\"pattern\":\"^x$\",\"format\":\"email\",\"minLength\":3}]}",
+        "5",
+    );
+    try validateJsonSchemaJson(
+        alloc,
+        "{\"type\":\"string\",\"allOf\":[{\"minItems\":2,\"prefixItems\":[{\"const\":0}],\"uniqueItems\":true,\"contains\":{\"const\":0},\"unevaluatedItems\":false}]}",
+        "\"ok\"",
+    );
+    try validateJsonSchemaJson(
+        alloc,
+        "{\"type\":\"boolean\",\"allOf\":[{\"properties\":{\"x\":{\"const\":1}},\"required\":[\"x\"],\"additionalProperties\":false,\"unevaluatedProperties\":false,\"minProperties\":2}]}",
+        "true",
+    );
+
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateJsonSchemaJson(alloc, "{\"type\":\"string\",\"pattern\":\"^x$\"}", "\"y\""),
+    );
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateJsonSchemaJson(alloc, "{\"type\":\"array\",\"minItems\":1}", "[]"),
+    );
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateJsonSchemaJson(alloc, "{\"type\":\"object\",\"required\":[\"x\"]}", "{}"),
+    );
+}
+
+test "schema composition propagates operational validation errors" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        validateJsonSchemaJson(alloc, "{\"not\":{\"pattern\":\"[\"}}", "\"value\""),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        validateJsonSchemaJson(alloc, "{\"type\":\"array\",\"contains\":{\"pattern\":\"[\"},\"maxContains\":0}", "[\"value\"]"),
+    );
+
+    var forbidden = DocumentProperty{ .name = "", .const_value = "1" };
+    const schema = DocumentProperty{ .name = "", .not_schema = &forbidden };
+    const value: std.json.Value = .{ .integer = 1 };
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    var context = RuntimeValidationContext{ .alloc = failing.allocator() };
+    defer context.deinit();
+    try std.testing.expectError(
+        error.OutOfMemory,
+        validateDocumentFieldValueWithContext(&context, schema, &value, false),
+    );
 }
 
 test "public schema mutations gate relational storage until runtime wiring lands" {
