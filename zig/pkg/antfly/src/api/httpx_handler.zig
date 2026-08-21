@@ -7331,13 +7331,25 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
     for (0..convergence_poll_attempts) |_| {
         const admission = api_server.queryAdmissionStats();
         const runtime = e2e_server.server.httpRuntimeStats();
-        if (admission.in_flight == 0 and runtime.active_h1_cancellation_observers == 0 and reads.cancelled.load(.acquire) == 8) break;
+        const started = reads.started.load(.acquire);
+        const cancelled = reads.cancelled.load(.acquire);
+        if (admission.in_flight == 0 and
+            runtime.active_h1_cancellation_observers == 0 and
+            started >= 8 and
+            cancelled == started) break;
         var delay = std.posix.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
         _ = std.posix.system.nanosleep(&delay, &delay);
     }
     try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().in_flight);
     try std.testing.expectEqual(@as(usize, 0), e2e_server.server.httpRuntimeStats().active_h1_cancellation_observers);
-    try std.testing.expectEqual(@as(u32, 8), reads.cancelled.load(.acquire));
+    const started = reads.started.load(.acquire);
+    const cancelled = reads.cancelled.load(.acquire);
+    // Once cancellation releases one of the original eight admission slots,
+    // a request already waiting in the kernel backlog may legitimately enter
+    // and immediately observe its reset. Require complete accounting instead
+    // of assuming that no queued request can cross that concurrency boundary.
+    try std.testing.expect(started >= 8);
+    try std.testing.expectEqual(started, cancelled);
 
     reads.release.store(true, .release);
     const query_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/query", .{base_url});

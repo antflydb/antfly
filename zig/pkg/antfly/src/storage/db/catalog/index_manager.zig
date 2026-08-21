@@ -18763,7 +18763,7 @@ test "graph shorthand asset maps template source without field ambiguity" {
 
     const asset = cfg.shorthand_asset orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("", asset.source_field);
-    try std.testing.expectEqualStrings("{{ title }} {{ body }}", asset.template_source);
+    try std.testing.expectEqualStrings("{{ title }} {{ body }}", asset.source_template);
 }
 
 test "graph config parses artifact mapping templates and context fields" {
