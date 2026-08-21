@@ -711,6 +711,9 @@ def _encode_ha_backup_manifest(
 
 def _promotion_fence_request(cluster: HACluster, required_lsn: int) -> dict[str, Any]:
     return {
+        # Model the exact Kubernetes Lease transition generation supplied by
+        # the operator. Runtime receipts must preserve this external value.
+        "generation": 1,
         "identity": _identity(cluster),
         "old_primary_id": cluster.primary.node_id,
         "promoted_node_id": cluster.standby.node_id,
@@ -1033,7 +1036,7 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     assert fence["receipt"]["new_epoch"] == 2
     assert fence["receipt"]["required_lsn"] == second_lsn
     assert fence["receipt"]["observed_lsn"] == second_lsn
-    assert fence["receipt"]["generation"] >= 1
+    assert fence["receipt"]["generation"] == fence_request["generation"]
     assert fence["receipt"]["forced"] is False
     assert fence["receipt"]["token"]
 
@@ -1201,6 +1204,7 @@ def test_forced_promotion_receipt_records_lossy_runtime_evidence(ha_cluster: HAC
 
     required_lsn = 1
     forced_request = {
+        "generation": 1,
         "identity": _whole_instance_identity(ha_cluster),
         "old_primary_id": ha_cluster.primary.node_id,
         "promoted_node_id": ha_cluster.standby.node_id,
@@ -1224,6 +1228,7 @@ def test_forced_promotion_receipt_records_lossy_runtime_evidence(ha_cluster: HAC
     assert fence["receipt"]["forced"] is True
     assert fence["receipt"]["required_lsn"] == required_lsn
     assert fence["receipt"]["observed_lsn"] == 0
+    assert fence["receipt"]["generation"] == forced_request["generation"]
     assert fence["receipt"]["token"]
 
     assessment = ha_cluster.standby.admin_post(
