@@ -10316,6 +10316,11 @@ export interface components {
              * @description Version of the published graph metric metadata schema.
              */
             metadata_version?: number;
+            /**
+             * Format: int64
+             * @description Deterministic fingerprint of the configuration that produced the published metric snapshot.
+             */
+            config_fingerprint?: number;
             maintenance_paused?: boolean;
             /** @description Whether a local or distributed build is queued after the currently published or building generation. */
             build_queued: boolean;
