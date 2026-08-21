@@ -4966,7 +4966,7 @@ test "distributed merge uses runtime schema for typed date cursors" {
     }, &.{ left_after, right_after }, schema));
 }
 
-test "distributed merge rejects cursor outside concrete shard sort tuple domain" {
+test "distributed merge accepts cursors across the logical numeric domain" {
     const alloc = std.testing.allocator;
 
     const rank_mapping = runtime_schema_mod.DynamicTemplate{
@@ -5007,19 +5007,17 @@ test "distributed merge rejects cursor outside concrete shard sort tuple domain"
         .{ .number_string = "1.5" },
         .{ .string = "doc:a" },
     };
-    resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.InvalidQueryRequest, mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+    const fractional_page = try mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
         .order_by = &order_by,
         .search_after = &fractional_cursor,
         .limit = 1,
-    }, &.{after_result}, schema));
-    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("rank", diagnostic.field);
-    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
-    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+    }, &.{after_result}, schema);
+    defer testFreeOwnedHits(alloc, fractional_page.hits);
+    try std.testing.expectEqual(@as(usize, 1), fractional_page.hits.len);
+    try std.testing.expectEqualStrings("doc:b", fractional_page.hits[0].id);
 }
 
-test "sorted segment bounds reject cursor outside concrete bound domain" {
+test "sorted segment bounds compare across the logical numeric domain" {
     const templates = [_]runtime_schema_mod.DynamicTemplate{.{
         .name = "rank",
         .path_match = "rank",
@@ -5060,14 +5058,9 @@ test "sorted segment bounds reject cursor outside concrete bound domain" {
         .{ .number_string = "10.5" },
         .{ .string = "doc:a" },
     };
-    resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.InvalidQueryRequest, compareSortedSegmentBoundToCursor(.{
+    try std.testing.expectEqual(std.math.Order.lt, try compareSortedSegmentBoundToCursor(.{
         .order_by = &order_by,
     }, plan, bounds[0..], fractional_cursor[0..]));
-    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("rank", diagnostic.field);
-    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
-    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
 }
 
 test "distributed merge validates mapped sort fields when runtime schema is present" {
@@ -6147,6 +6140,7 @@ fn nativeSortValueRejectionReason(mapping: runtime_schema_mod.FieldMapping, valu
         .numeric => switch (value) {
             .integer, .u64_value => null,
             .number => |number| if (std.math.isFinite(number)) null else .invalid_doc_value_type,
+            .number_string => |text| if (jsonNumberStringIsNumeric(text)) null else .invalid_doc_value_type,
             else => .invalid_doc_value_type,
         },
         .boolean => if (value == .bool_value) null else .invalid_doc_value_type,
@@ -6268,6 +6262,11 @@ fn cursorRejectionReasonForConcreteSortKey(
     const schema = plan.runtime_schema orelse return null;
     const mapping = sortFieldMapping(schema, field) orelse return .unmapped_field;
     if (mapping.field_type == .datetime) return mappedSortCursorRejectionReason(mapping, cursor_value);
+    // Numeric columns have one logical domain even when the concrete hit is
+    // represented as signed, unsigned, floating, or an exact JSON number
+    // string. Cursor validity must not depend on whichever candidate happens
+    // to be compared first.
+    if (mapping.field_type == .numeric) return mappedSortCursorRejectionReason(mapping, cursor_value);
     if (cursor_value == .null) return switch (mapping.missing_null_policy) {
         .missing_rejected => .missing_null_policy,
     };
@@ -6814,6 +6813,23 @@ fn nativeSortValueFromTextDocValuesAlloc(
                 return error.UnsupportedExactSort;
             };
             return .{ .number = value };
+        },
+        .numeric_val => {
+            const value = reader.getNumeric(resolved.local_id) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    logNativeDocValueLoadFailure(field, "malformed_doc_values_section");
+                    return error.UnsupportedExactSort;
+                },
+            } orelse {
+                logNativeDocValueLoadFailure(field, "sparse_live_doc_values");
+                return error.UnsupportedExactSort;
+            };
+            return switch (value) {
+                .u64_val => |number| .{ .u64_value = number },
+                .i64_val => |number| .{ .integer = number },
+                .f64_val => |number| .{ .number = number },
+            };
         },
         .bool_val => {
             const value = reader.getBool(resolved.local_id) catch |err| switch (err) {
@@ -14890,7 +14906,7 @@ fn typedDocValuesTypeMatchesMappedSortField(
 ) bool {
     return switch (mapping.field_type) {
         .keyword, .link => value_type == .bytes_val,
-        .numeric => value_type == .u64_val or value_type == .i64_val or value_type == .f64_val,
+        .numeric => value_type == .u64_val or value_type == .i64_val or value_type == .f64_val or value_type == .numeric_val,
         .boolean => value_type == .bool_val,
         .datetime => value_type == .u64_val,
         else => false,
@@ -14973,19 +14989,37 @@ fn snapshotTypedDocValuesCoverageDetailsForMapping(
     field: []const u8,
     mapping: runtime_schema_mod.FieldMapping,
 ) !TypedDocValuesCoverage {
+    return snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(snapshot, field, mapping, null);
+}
+
+fn snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(
+    snapshot: *const index_mod.IndexSnapshot,
+    field: []const u8,
+    mapping: runtime_schema_mod.FieldMapping,
+    validation: ?index_mod.CoverageValidation,
+) !TypedDocValuesCoverage {
     var expected_value_type: ?typed_dv.ValueType = null;
     for (snapshot.segments) |*segment| {
         if (segment.liveDocCount() == 0) continue;
-        const section_data = (try segment.reader.getSection(field, .typed_doc_values)) orelse return .{ .status = .missing_doc_values_section };
-        const reader = typed_dv.TypedDocValuesReader.init(snapshot.alloc, section_data) catch return .{ .status = .malformed_doc_values_section };
-        if (!typedDocValuesTypeMatchesMappedSortField(reader.value_type, mapping)) return .{ .status = .doc_values_kind_mismatch };
+        const cached = (segment.typedDocValuesCoverageWithValidation(field, validation) catch |err| switch (err) {
+            // Search requests use the historical double-l spelling at this
+            // layer; keep that public contract while the shared token remains
+            // transport-neutral.
+            error.Canceled => return error.Cancelled,
+            else => return err,
+        }) orelse return .{ .status = .missing_doc_values_section };
+        const value_type = cached.value_type orelse return .{ .status = cached.status };
+        if (!typedDocValuesTypeMatchesMappedSortField(value_type, mapping)) return .{ .status = .doc_values_kind_mismatch };
         if (expected_value_type) |expected| {
-            if (reader.value_type != expected) return .{ .status = .doc_values_kind_mismatch };
+            const both_numeric = mapping.field_type == .numeric and
+                typedDocValuesTypeMatchesMappedSortField(expected, mapping) and
+                typedDocValuesTypeMatchesMappedSortField(value_type, mapping);
+            if (value_type != expected and !both_numeric) return .{ .status = .doc_values_kind_mismatch };
+            if (value_type != expected and both_numeric) expected_value_type = .numeric_val;
         } else {
-            expected_value_type = reader.value_type;
+            expected_value_type = value_type;
         }
-        const live_status = try typed_dv_coverage.readerCoversLiveDocsAlloc(snapshot.alloc, segment, &reader);
-        if (live_status != .covered) return .{ .status = live_status, .value_type = expected_value_type };
+        if (cached.status != .covered) return .{ .status = cached.status, .value_type = expected_value_type };
     }
     return .{ .status = .covered, .value_type = expected_value_type };
 }
@@ -15004,11 +15038,10 @@ fn snapshotGeoPointDocValuesCoverage(
 ) !TypedDocValuesCoverageStatus {
     for (snapshot.segments) |*segment| {
         if (segment.liveDocCount() == 0) continue;
-        const section_data = (try segment.reader.getSection(field, .typed_doc_values)) orelse return .missing_doc_values_section;
-        const reader = typed_dv.TypedDocValuesReader.init(snapshot.alloc, section_data) catch return .malformed_doc_values_section;
-        if (reader.value_type != .geo_point) return .doc_values_kind_mismatch;
-        const live_status = try typed_dv_coverage.readerCoversLiveDocsAlloc(snapshot.alloc, segment, &reader);
-        if (live_status != .covered) return live_status;
+        const cached = (try segment.typedDocValuesCoverage(field)) orelse return .missing_doc_values_section;
+        const value_type = cached.value_type orelse return cached.status;
+        if (value_type != .geo_point) return .doc_values_kind_mismatch;
+        if (cached.status != .covered) return cached.status;
     }
     return .covered;
 }
@@ -15181,6 +15214,7 @@ fn mappedSortCursorRejectionReasonForDocValueType(
             else => .invalid_cursor_type,
         },
         .f64_val => if (jsonValueIsNumeric(value)) null else .invalid_cursor_type,
+        .numeric_val => if (jsonValueIsNumeric(value)) null else .invalid_cursor_type,
         .bool_val => if (value == .bool) null else .invalid_cursor_type,
         .bytes_val => if (value == .string) null else .invalid_cursor_type,
         .geo_point => .invalid_cursor_type,
@@ -15454,7 +15488,10 @@ fn planTextNativeSortFields(
             }
         }
         if (snapshot.liveDocCount() == 0) continue;
-        const coverage = try snapshotTypedDocValuesCoverageDetailsForMapping(snapshot, field.field, mapping);
+        const coverage = try snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(snapshot, field.field, mapping, .{
+            .execution_deadline_ns = effective_req.execution_deadline_ns,
+            .cancellation = effective_req.cancellation,
+        });
         if (coverage.status != .covered) {
             const reason = typedDocValuesCoverageRejectionReason(coverage.status) orelse .missing_doc_values_capability;
             logNativeSortPlanRejection(
@@ -17380,7 +17417,7 @@ fn resolveDynamicTemplateFieldAnalyzer(schema: runtime_schema_mod.TableSchema, f
     }
     const field_name = fieldNameFromPath(field);
     if (!std.mem.eql(u8, field_name, field)) {
-        if (runtime_schema_mod.resolveFieldType(schema, field_name)) |mapping| {
+        if (runtime_schema_mod.resolveDynamicTemplateForValue(schema, field_name, null)) |mapping| {
             if (isTextFieldType(mapping.field_type)) return mapping.analyzer;
         }
     }
@@ -20735,6 +20772,42 @@ test "native text sort validation rejects cursors outside doc value column type"
     try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
 }
 
+test "mixed numeric concrete sort keys share one cursor domain" {
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "rank",
+        .path_match = "rank",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const plan = SortExecutionPlan{
+        .kind = .native_doc_values_top_n,
+        .runtime_schema = .{ .dynamic_templates = &templates },
+    };
+
+    try std.testing.expect(cursorRejectionReasonForConcreteSortKey(
+        plan,
+        "rank",
+        .{ .u64_value = std.math.maxInt(u64) },
+        .{ .integer = -9_007_199_254_740_993 },
+    ) == null);
+    try std.testing.expect(cursorRejectionReasonForConcreteSortKey(
+        plan,
+        "rank",
+        .{ .integer = -1 },
+        .{ .float = 10.5 },
+    ) == null);
+    try std.testing.expect(cursorRejectionReasonForConcreteSortKey(
+        plan,
+        "rank",
+        .{ .number = 10.5 },
+        .{ .number_string = "18446744073709551615" },
+    ) == null);
+}
+
 test "native sort planner classifies mapping and cursor rejection reasons" {
     const keyword_mapping = runtime_schema_mod.FieldMapping{
         .field_type = .keyword,
@@ -20949,7 +21022,7 @@ test "native sort coverage diagnostics classify physical doc value failures" {
         const snapshot = writer.snapshot();
 
         try std.testing.expectEqual(
-            TypedDocValuesCoverageStatus.doc_values_kind_mismatch,
+            TypedDocValuesCoverageStatus.covered,
             try snapshotTypedDocValuesCoverageForMapping(snapshot, "price", numeric_mapping),
         );
     }
@@ -20975,6 +21048,18 @@ test "native sort coverage diagnostics classify physical doc value failures" {
         try writer.addSegment(seg_bytes);
         const snapshot = writer.snapshot();
 
+        try std.testing.expectEqual(
+            TypedDocValuesCoverageStatus.sparse_live_doc_values,
+            try snapshotTypedDocValuesCoverageForMapping(snapshot, "price", numeric_mapping),
+        );
+
+        const delete_infos = try writer.deleteAllByIdsTracked(alloc, &.{"doc:b"});
+        defer index_mod.IndexWriter.freeDeleteInfos(alloc, delete_infos);
+        try std.testing.expectEqual(
+            TypedDocValuesCoverageStatus.covered,
+            try snapshotTypedDocValuesCoverageForMapping(snapshot, "price", numeric_mapping),
+        );
+        writer.rollbackDeleteInfos(delete_infos);
         try std.testing.expectEqual(
             TypedDocValuesCoverageStatus.sparse_live_doc_values,
             try snapshotTypedDocValuesCoverageForMapping(snapshot, "price", numeric_mapping),
@@ -21029,6 +21114,66 @@ test "native sort coverage diagnostics classify physical doc value failures" {
             TypedDocValuesCoverageStatus.duplicate_doc_value_doc_id,
             try snapshotTypedDocValuesCoverageForMapping(snapshot, "price", numeric_mapping),
         );
+    }
+}
+
+test "native sort cold coverage validation observes request deadline and cancellation" {
+    const alloc = std.testing.allocator;
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .numeric_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .numeric_val = .{ .i64_val = -9_007_199_254_740_993 } });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const price_idx = try seg_writer.addField("price");
+    try seg_writer.addSection(price_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("doc:a", "{\"price\":-9007199254740993}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "price",
+        .path_match = "price",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+    const order_by = [_]types.SortField{.{ .field = "price" }};
+
+    try std.testing.expectError(error.Timeout, validateTextNativeSortFields(.{
+        .order_by = &order_by,
+        .limit = 1,
+        .execution_deadline_ns = platform_time.monotonicNs(),
+    }, snapshot, schema));
+
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, validateTextNativeSortFields(.{
+        .order_by = &order_by,
+        .limit = 1,
+        .cancellation = types.CancellationToken.fromAtomic(&canceled),
+    }, snapshot, schema));
+
+    // Failed admissions must not publish a partial coverage summary.
+    switch (snapshot.segments[0].cachedTypedDocValuesCoverage("price")) {
+        .uninitialized => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try validateTextNativeSortFields(.{ .order_by = &order_by, .limit = 1 }, snapshot, schema);
+    switch (snapshot.segments[0].cachedTypedDocValuesCoverage("price")) {
+        .initialized => {},
+        else => return error.TestUnexpectedResult,
     }
 }
 
@@ -22114,7 +22259,7 @@ test "native datetime sort rejects values that cannot serialize as timestamps" {
     }));
 }
 
-test "native sort execution rejects cursors outside concrete doc value key type" {
+test "native sort execution accepts cursors across the logical numeric domain" {
     const alloc = std.testing.allocator;
 
     const templates = [_]runtime_schema_mod.DynamicTemplate{.{
@@ -22151,8 +22296,7 @@ test "native sort execution rejects cursors outside concrete doc value key type"
         .{ .number_string = "10.5" },
         .{ .string = "doc:a" },
     };
-    resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.InvalidQueryRequest, sortAndPageSearchResultInPlace(&result, .{
+    try sortAndPageSearchResultInPlace(&result, .{
         .order_by = &order_by,
         .search_after = &cursor,
         .include_stored = false,
@@ -22164,11 +22308,8 @@ test "native sort execution rejects cursors outside concrete doc value key type"
     }, .{
         .require_native = true,
         .load = Loader.load,
-    }));
-    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("rank", diagnostic.field);
-    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
-    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+    });
+    try std.testing.expectEqual(@as(usize, 0), result.hits.len);
 }
 
 test "native numeric sort rejects non-finite doc values" {

@@ -94,6 +94,7 @@ comptime {
     _ = @import("db/query/search_exec.zig");
     _ = @import("db/query_metrics.zig");
     _ = @import("db/range_state.zig");
+    _ = @import("db/relational_store.zig");
     _ = @import("db/resolution_handoff.zig");
     _ = @import("db/resolution_runtime.zig");
     _ = @import("db/root_identity.zig");

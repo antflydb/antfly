@@ -54,6 +54,7 @@
 //!       bool_val  : 1 byte
 //!       geo_point : 16 bytes (lat f64, lon f64)
 //!       bytes_val : u32 len + len bytes
+//!       numeric_val: subtype u8 + 8 bytes (exact u64/i64/f64 domain)
 //!
 //! Cells are stored in declared-column order, and only present columns are
 //! stored (absent nullable columns are skipped) — matching the segment path,
@@ -125,6 +126,7 @@ fn serializedLenWithAllocator(alloc: Allocator, cells: []const Cell) !usize {
         if (cell.is_null) continue;
         encoded_len = try serializedLenAdd(encoded_len, switch (cell.value) {
             .u64_val, .i64_val, .f64_val => @sizeOf(u64),
+            .numeric_val => 1 + @sizeOf(u64),
             .bool_val => 1,
             .geo_point => 2 * @sizeOf(u64),
             .bytes_val => |bytes| blk: {
@@ -164,6 +166,23 @@ fn serializeIntoUnchecked(buf: []u8, cells: []const Cell) []u8 {
             .u64_val => |value| writeU64(out, &pos, value),
             .i64_val => |value| writeU64(out, &pos, @bitCast(value)),
             .f64_val => |value| writeU64(out, &pos, @bitCast(value)),
+            .numeric_val => |value| switch (value) {
+                .u64_val => |number| {
+                    out[pos] = 0;
+                    pos += 1;
+                    writeU64(out, &pos, number);
+                },
+                .i64_val => |number| {
+                    out[pos] = 1;
+                    pos += 1;
+                    writeU64(out, &pos, @bitCast(number));
+                },
+                .f64_val => |number| {
+                    out[pos] = 2;
+                    pos += 1;
+                    writeU64(out, &pos, @bitCast(number));
+                },
+            },
             .bool_val => |value| {
                 out[pos] = if (value) 1 else 0;
                 pos += 1;
@@ -197,6 +216,7 @@ fn cellValueMatchesType(cell: Cell) bool {
         .bytes_val => cell.value == .bytes_val,
         .geo_point => cell.value == .geo_point,
         .bool_val => cell.value == .bool_val,
+        .numeric_val => cell.value == .numeric_val,
     };
     return matches;
 }
@@ -206,6 +226,10 @@ fn cellValueIsSerializable(cell: Cell) bool {
     return switch (cell.value) {
         .f64_val => |value| std.math.isFinite(value),
         .geo_point => |value| geo_mod.latitudeIsValid(value.lat) and geo_mod.longitudeIsValid(value.lon),
+        .numeric_val => |value| switch (value) {
+            .f64_val => |number| std.math.isFinite(number),
+            else => true,
+        },
         else => true,
     };
 }
@@ -367,6 +391,7 @@ fn readCellAt(data: []const u8, pos: *usize) !Cell {
         .u64_val => .{ .u64_val = try readU64Checked(data, pos) },
         .i64_val => .{ .i64_val = @bitCast(try readU64Checked(data, pos)) },
         .f64_val => .{ .f64_val = @bitCast(try readU64Checked(data, pos)) },
+        .numeric_val => .{ .numeric_val = try readNumericValue(data, pos) },
         .bool_val => blk: {
             if (pos.* + 1 > data.len) return error.InvalidRelationalRow;
             if (data[pos.*] > 1) return error.InvalidRelationalRow;
@@ -410,6 +435,7 @@ fn zeroValue(value_type: typed_dv.ValueType) typed_dv.TypedValue {
         .bytes_val => .{ .bytes_val = "" },
         .geo_point => .{ .geo_point = .{ .lat = 0, .lon = 0 } },
         .bool_val => .{ .bool_val = false },
+        .numeric_val => .{ .numeric_val = .{ .u64_val = 0 } },
     };
 }
 
@@ -524,6 +550,11 @@ fn appendValidatedCellValue(
         .f64_val => try appendFmt(alloc, out, "{d}", .{cell.value.f64_val}),
         .u64_val => try appendFmt(alloc, out, "{d}", .{cell.value.u64_val}),
         .i64_val => try appendFmt(alloc, out, "{d}", .{cell.value.i64_val}),
+        .numeric_val => switch (cell.value.numeric_val) {
+            .u64_val => |number| try appendFmt(alloc, out, "{d}", .{number}),
+            .i64_val => |number| try appendFmt(alloc, out, "{d}", .{number}),
+            .f64_val => |number| try appendFmt(alloc, out, "{d}", .{number}),
+        },
         .bool_val => try out.appendSlice(alloc, if (cell.value.bool_val) "true" else "false"),
         .geo_point => try appendFmt(alloc, out, "{{\"lat\":{d},\"lon\":{d}}}", .{ cell.value.geo_point.lat, cell.value.geo_point.lon }),
         .bytes_val => {
@@ -596,6 +627,19 @@ fn readU64Checked(data: []const u8, pos: *usize) !u64 {
     return val;
 }
 
+fn readNumericValue(data: []const u8, pos: *usize) !typed_dv.NumericValue {
+    if (pos.* + 1 > data.len) return error.InvalidRelationalRow;
+    const tag = data[pos.*];
+    pos.* += 1;
+    const raw = try readU64Checked(data, pos);
+    return switch (tag) {
+        0 => .{ .u64_val = raw },
+        1 => .{ .i64_val = @bitCast(raw) },
+        2 => .{ .f64_val = @bitCast(raw) },
+        else => error.InvalidRelationalRow,
+    };
+}
+
 fn readStr(data: []const u8, pos: *usize) ![]const u8 {
     if (pos.* + 4 > data.len) return error.InvalidRelationalRow;
     const len = readU32(data, pos);
@@ -610,6 +654,9 @@ test "relational row codec round-trips every value type and reconstructs canonic
     const cells = [_]Cell{
         .{ .path = "id", .value_type = .bytes_val, .value = .{ .bytes_val = "abc" } },
         .{ .path = "amount", .value_type = .f64_val, .value = .{ .f64_val = 12.5 } },
+        .{ .path = "exact_int", .value_type = .numeric_val, .value = .{ .numeric_val = .{ .i64_val = -9007199254740993 } } },
+        .{ .path = "exact_uint", .value_type = .numeric_val, .value = .{ .numeric_val = .{ .u64_val = 9007199254740993 } } },
+        .{ .path = "fraction", .value_type = .numeric_val, .value = .{ .numeric_val = .{ .f64_val = 10.5 } } },
         .{ .path = "ts", .value_type = .u64_val, .value = .{ .u64_val = 1000 } },
         .{ .path = "active", .value_type = .bool_val, .value = .{ .bool_val = true } },
         .{ .path = "loc", .value_type = .geo_point, .value = .{ .geo_point = .{ .lat = 1.5, .lon = -2.5 } } },
@@ -622,19 +669,22 @@ test "relational row codec round-trips every value type and reconstructs canonic
 
     var row = try deserialize(alloc, encoded);
     defer row.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 6), row.cells.len);
+    try std.testing.expectEqual(@as(usize, 9), row.cells.len);
     try std.testing.expectEqualStrings("id", row.cells[0].path);
     try std.testing.expectEqualStrings("abc", row.cells[0].value.bytes_val);
     try std.testing.expectEqual(@as(f64, 12.5), row.cells[1].value.f64_val);
-    try std.testing.expectEqual(@as(u64, 1000), row.cells[2].value.u64_val);
-    try std.testing.expect(row.cells[3].value.bool_val);
-    try std.testing.expectEqual(@as(f64, -2.5), row.cells[4].value.geo_point.lon);
-    try std.testing.expect(row.cells[5].is_json);
+    try std.testing.expectEqual(typed_dv.NumericValue{ .i64_val = -9007199254740993 }, row.cells[2].value.numeric_val);
+    try std.testing.expectEqual(typed_dv.NumericValue{ .u64_val = 9007199254740993 }, row.cells[3].value.numeric_val);
+    try std.testing.expectEqual(typed_dv.NumericValue{ .f64_val = 10.5 }, row.cells[4].value.numeric_val);
+    try std.testing.expectEqual(@as(u64, 1000), row.cells[5].value.u64_val);
+    try std.testing.expect(row.cells[6].value.bool_val);
+    try std.testing.expectEqual(@as(f64, -2.5), row.cells[7].value.geo_point.lon);
+    try std.testing.expect(row.cells[8].is_json);
 
     const json = try reconstructDocumentAlloc(alloc, row.cells);
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
-        "{\"id\":\"abc\",\"amount\":12.5,\"ts\":1000,\"active\":true,\"loc\":{\"lat\":1.5,\"lon\":-2.5},\"payload\":{\"k\":1}}",
+        "{\"id\":\"abc\",\"amount\":12.5,\"exact_int\":-9007199254740993,\"exact_uint\":9007199254740993,\"fraction\":10.5,\"ts\":1000,\"active\":true,\"loc\":{\"lat\":1.5,\"lon\":-2.5},\"payload\":{\"k\":1}}",
         json,
     );
 }

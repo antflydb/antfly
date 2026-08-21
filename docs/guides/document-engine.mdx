@@ -108,13 +108,36 @@ subfield:
 field-value structures needed for exact sort and filters. Do not configure
 `doc_values` directly.
 
+SDKs expose `DocumentFieldMapping` and `DocumentSubfieldMapping` for the
+`x-antfly-field` shape above. `TemplateFieldMapping` is intentionally narrower:
+it represents one dynamic-template output and does not accept `fields`.
+
+The compact `x-antfly-types` shorthand remains supported for simple and
+multi-field search mappings, but does not implicitly enable exact sort. Use
+`x-antfly-field` as the detailed form when a field needs physical options such
+as `sortable: true`. This intentionally avoids adding doc-value storage and
+build cost to every scalar field. The mapping change rebuilds physical
+coverage. Once the write or rebuild visibility barrier completes, clients may
+issue `order_by` directly: Antfly validates a cold field on first use and fails
+closed if physical coverage is incomplete. Status reads never warm columns, so
+a safe but not-yet-validated field can remain `declared` until that first sort.
+
+Explicit mappings are exact, table-wide physical declarations. Present values
+must be encodable by the mapping—for example, a `date` mapping accepts an RFC
+3339/date string or a non-negative nanosecond timestamp—and invalid writes are
+rejected before indexing. An `allOf` may contribute an exact mapping. Every
+alternative of an `anyOf` or `oneOf` must contribute the same normalized
+mapping; conditional or dynamically named mappings are rejected because they
+cannot guarantee one stable physical type for the dotted path.
+
 Field capabilities report what the planner can safely do with a concrete field:
 
 - `query_modes` describes modes such as `full_text`, `exact`, `range`, `geo`,
   and `autocomplete`.
 - `sortable` says the field is declared sortable.
-- `sort_lifecycle_state` says whether the field is accepted for exact public
-  sort. Public sort requires `queryable` or `accelerated`.
+- `sort_lifecycle_state` reports cached physical evidence. `queryable` and
+  `accelerated` are already validated; `declared` or `indexed` can be validated
+  by the first exact-sort request. `unsupported` is not sortable.
 - `index_sort_position` and `index_sort_order` identify fields participating in
   the table's physical index sort.
 
@@ -264,4 +287,3 @@ the selected plan, source, candidate source, selection reason, exactness,
 candidate counts, source-load behavior, and rejection reasons. Lower-level
 executor counters belong in logs, traces, benchmarks, or explicit debug
 surfaces rather than normal SDK responses.
-
