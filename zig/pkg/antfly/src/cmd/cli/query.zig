@@ -14,8 +14,57 @@
 
 const std = @import("std");
 const antfly_client = @import("antfly-client");
+const httpx = antfly_client.httpx;
 const cli = @import("mod.zig");
 const index_readiness = @import("index_readiness.zig");
+
+fn shouldRunSemanticReadinessAdvisory(
+    semantic_search: ?[]const u8,
+    indexes: ?[]const []const u8,
+) bool {
+    // With implicit selection only the server knows which index actually ran;
+    // warning about every table index creates false positives. The query
+    // response remains authoritative in that case.
+    return semantic_search != null and indexes != null;
+}
+
+const SemanticReadinessAdvisory = struct {
+    group: std.Io.Group = .init,
+    active: bool = false,
+
+    fn start(
+        self: *@This(),
+        io: std.Io,
+        client: *antfly_client.AntflyClient,
+        table_name: []const u8,
+        indexes: []const []const u8,
+    ) !void {
+        const Task = struct {
+            fn run(
+                _: std.Io,
+                task_client: *antfly_client.AntflyClient,
+                task_table_name: []const u8,
+                task_indexes: []const []const u8,
+            ) std.Io.Cancelable!void {
+                index_readiness.warnIfSemanticIndexesAreNotReady(task_client, task_table_name, task_indexes);
+            }
+        };
+        try self.group.concurrent(io, Task.run, .{ io, client, table_name, indexes });
+        self.active = true;
+    }
+
+    fn cancel(self: *@This(), io: std.Io) void {
+        if (!self.active) return;
+        self.group.cancel(io);
+        self.active = false;
+    }
+
+    fn awaitOnQueryFailure(self: *@This(), io: std.Io) void {
+        if (!self.active) return;
+        self.group.await(io) catch {};
+        self.active = false;
+    }
+};
 
 const QueryOptions = struct {
     table_name: ?[]const u8 = null,
@@ -202,8 +251,22 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
     };
 
     if (table_name) |tbl| {
-        if (semantic_search != null) index_readiness.warnIfSemanticIndexesAreNotReady(client, tbl, indexes);
-        var resp = try client.queryTable(tbl, body);
+        // Readiness is diagnostic, so overlap it with the data-plane request
+        // and cancel it as soon as a successful query returns. On query
+        // failure, allow the bounded advisory to finish so users retain useful
+        // diagnostics for missing or incompatible explicitly selected indexes.
+        var advisory: SemanticReadinessAdvisory = .{};
+        defer advisory.cancel(io);
+        if (shouldRunSemanticReadinessAdvisory(semantic_search, indexes)) {
+            // Never fail a real query because its best-effort diagnostic could
+            // not be scheduled on this I/O backend.
+            advisory.start(io, client, tbl, indexes.?) catch {};
+        }
+        var resp = client.queryTable(tbl, body) catch |err| {
+            advisory.awaitOnQueryFailure(io);
+            return err;
+        };
+        advisory.cancel(io);
         defer resp.deinit();
         if (resp.data) |data| {
             try cli.writeJson(allocator, io, data.value);
@@ -251,6 +314,122 @@ test "query parser fails closed for missing malformed duplicate and incompatible
     const global_full_text = parseQueryOptions(std.process.Args.Iterator.init(.{ .vector = global_full_text_argv[0..] }));
     try std.testing.expect(global_full_text == .value);
     try std.testing.expect(global_full_text.value.table_name == null);
+}
+
+test "semantic readiness advisory only observes explicitly selected indexes" {
+    const selected = [_][]const u8{"dense"};
+    try std.testing.expect(shouldRunSemanticReadinessAdvisory("alpha", &selected));
+    try std.testing.expect(!shouldRunSemanticReadinessAdvisory("alpha", null));
+    try std.testing.expect(!shouldRunSemanticReadinessAdvisory(null, &selected));
+}
+
+test "successful semantic query cancels a slow readiness advisory" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const State = struct {
+        var test_io: std.Io = undefined;
+        var status_entered = std.atomic.Value(bool).init(false);
+        var release_status = std.atomic.Value(bool).init(false);
+
+        fn statusRequest(_: httpx.testing_mod.RequestInfo) !void {
+            status_entered.store(true, .release);
+            while (!release_status.load(.acquire)) {
+                try test_io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+            }
+        }
+
+        fn queryRequest(_: httpx.testing_mod.RequestInfo) !void {
+            // Ensure the advisory owns a live, deliberately stalled request
+            // before the data-plane response is allowed to complete.
+            while (!status_entered.load(.acquire)) {
+                try test_io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+            }
+        }
+    };
+    State.test_io = io;
+    State.status_entered.store(false, .release);
+    State.release_status.store(false, .release);
+
+    var server = try httpx.TestServer.start(alloc, io, &.{
+        .{
+            .method = .GET,
+            .path = "/db/v1/tables/docs/indexes",
+            .respond = .{ .body = "[]" },
+            .assert_request = State.statusRequest,
+        },
+        .{
+            .method = .POST,
+            .path = "/db/v1/tables/docs/query",
+            .respond = .{ .body = "{\"responses\":[]}" },
+            .assert_request = State.queryRequest,
+        },
+    });
+    defer server.deinit();
+
+    var http = httpx.Client.initWithConfig(alloc, io, .{
+        .keep_alive = false,
+        .retry_policy = .{ .max_retries = 0 },
+    });
+    defer http.deinit();
+    var client = try antfly_client.AntflyClient.init(alloc, &http, server.baseUrl());
+    defer client.deinit();
+
+    const ServerTask = struct {
+        fn runServer(test_server: *httpx.TestServer) std.Io.Cancelable!void {
+            test_server.handleOne() catch return;
+        }
+    };
+    var server_group: std.Io.Group = .init;
+    try server_group.concurrent(io, ServerTask.runServer, .{&server});
+    try server_group.concurrent(io, ServerTask.runServer, .{&server});
+    var server_group_active = true;
+    defer if (server_group_active) server_group.cancel(io);
+
+    var query_succeeded = std.atomic.Value(bool).init(false);
+    var query_failed = std.atomic.Value(bool).init(false);
+    const QueryTask = struct {
+        fn runQuery(
+            test_io: std.Io,
+            test_client: *antfly_client.AntflyClient,
+            succeeded: *std.atomic.Value(bool),
+            failed: *std.atomic.Value(bool),
+        ) std.Io.Cancelable!void {
+            var argv = [_][*:0]const u8{
+                "--table",
+                "docs",
+                "--semantic-search",
+                "alpha",
+                "--indexes",
+                "dense",
+            };
+            var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+            run(std.testing.allocator, test_io, test_client, &args) catch {
+                failed.store(true, .release);
+                return;
+            };
+            succeeded.store(true, .release);
+        }
+    };
+    var query_group: std.Io.Group = .init;
+    try query_group.concurrent(io, QueryTask.runQuery, .{ io, &client, &query_succeeded, &query_failed });
+    var query_group_active = true;
+    defer if (query_group_active) query_group.cancel(io);
+
+    // The status handler remains blocked until after this loop. Completion
+    // therefore proves that a successful query canceled instead of awaiting
+    // the advisory request.
+    for (0..500) |_| {
+        if (query_succeeded.load(.acquire) or query_failed.load(.acquire)) break;
+        try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    const completed_before_status = query_succeeded.load(.acquire);
+    State.release_status.store(true, .release);
+    try query_group.await(io);
+    query_group_active = false;
+    server_group.await(io) catch {};
+    server_group_active = false;
+    try std.testing.expect(!query_failed.load(.acquire));
+    try std.testing.expect(completed_before_status);
 }
 
 test "semantic readiness requires compatible policy-aware coverage" {

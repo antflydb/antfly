@@ -667,6 +667,13 @@ fn reportsHaveRuntimeRepairStatus(reports: []const metadata_table_manager.StoreS
     return false;
 }
 
+fn storesHaveRuntimeRepairStatus(stores: []const metadata_table_manager.StoreRecord) bool {
+    for (stores) |store| {
+        if (storeHasRuntimeRepairStatus(store)) return true;
+    }
+    return false;
+}
+
 fn stripRuntimeRepairStatus(record: *metadata_table_manager.StoreRecord) void {
     for (record.runtime_statuses) |*runtime_status| {
         for (runtime_status.indexes) |*index_status| {
@@ -6505,7 +6512,7 @@ test "metadata transition commands downgrade runtime repair status until protoco
     try std.testing.expect(storeHasRuntimeRepairStatus(current_command.upsert_store));
 }
 
-test "metadata status reporting never proposes deletion of committed repair facts while activation is unknown" {
+test "metadata service status reporting never proposes deletion of committed repair facts while activation is unknown" {
     const FakeService = struct {
         alloc: std.mem.Allocator,
         upserts: usize = 0,
@@ -6561,9 +6568,25 @@ test "metadata status reporting never proposes deletion of committed repair fact
     try std.testing.expectEqual(@as(usize, 0), service.upserts);
     try std.testing.expect(storeHasRuntimeRepairStatus(projected[0]));
 
+    // Absence is also a repair-state transition. A legacy/null heartbeat must
+    // not clear a committed repair fact while activation is unavailable.
+    observed_indexes[0].doc_count = 12;
+    observed_indexes[0].repair_status = null;
+    observed_indexes[0].repair_active_generation_serviceable = false;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try reportStoreStatusesWithProjected(&service, &projected, &reports),
+    );
+    try std.testing.expectEqual(@as(usize, 0), service.upserts);
+    try std.testing.expect(storeHasRuntimeRepairStatus(projected[0]));
+    try std.testing.expectEqual(
+        metadata_table_manager.IndexRepairStatus.rebuilding,
+        projected[0].runtime_statuses[0].indexes[0].repair_status.?,
+    );
+
     // A replacement materialization does not inherit stale repair identity and
     // may continue publishing its legacy-compatible heartbeat.
-    observed_indexes[0].doc_count = 12;
+    observed_indexes[0].doc_count = 13;
     observed_indexes[0].coverage_generation = 9;
     try std.testing.expectEqual(
         @as(usize, 1),
@@ -7155,7 +7178,15 @@ fn reportStoreStatusesWithProjected(
     projected: []metadata_table_manager.StoreRecord,
     reports: []const metadata_table_manager.StoreStatusReport,
 ) !usize {
-    const include_repair_status = !reportsHaveRuntimeRepairStatus(reports) or
+    // Both publishing and clearing repair facts are v13 transitions. Avoid the
+    // activation lookup for the overwhelmingly common all-v12 case, but once
+    // either side contains a repair fact, fail closed until activation is
+    // known. Otherwise a null/legacy heartbeat could erase committed repair
+    // admission state during startup or a transient activation-marker read
+    // failure.
+    const repair_status_transition_possible = reportsHaveRuntimeRepairStatus(reports) or
+        storesHaveRuntimeRepairStatus(projected);
+    const include_repair_status = !repair_status_transition_possible or
         service.runtimeStatusRepairProtocolReady();
     var changed_indices = std.ArrayListUnmanaged(usize).empty;
     defer changed_indices.deinit(service.alloc);

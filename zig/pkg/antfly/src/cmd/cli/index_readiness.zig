@@ -117,6 +117,10 @@ fn warnIfSemanticIndexesAreNotReadyWithTimeout(
     timeout_ms: u64,
 ) void {
     var resp = client.listIndexesResponseWithTimeout(table_name, timeout_ms) catch |err| {
+        // Direct queries cancel their advisory as soon as the data-plane
+        // response arrives. Cancellation is the healthy fast path, not a
+        // user-facing readiness failure.
+        if (err == error.Canceled or err == error.Cancelled) return;
         std.debug.print("warning: unable to verify semantic index readiness: {s}\n", .{@errorName(err)});
         return;
     };
