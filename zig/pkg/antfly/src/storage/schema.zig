@@ -206,7 +206,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 14); // format version
+    try appendU32(&buf, alloc, 12); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -311,7 +311,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 14) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 12) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -469,7 +469,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         if (declared_fields.len > 0) alloc.free(declared_fields);
     }
 
-    const exact_fields: []ExactField = if (fmt_version >= 13) blk: {
+    const exact_fields: []ExactField = if (fmt_version >= 12) blk: {
         const field_count = readU32(data, &pos);
         const fields = try alloc.alloc(ExactField, field_count);
         var fields_initialized: usize = 0;
@@ -482,11 +482,10 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             alloc.free(fields);
         }
         for (fields) |*field| {
-            const serialized_source_field = if (fmt_version >= 14) readStr(data, &pos) else null;
+            const source_field = try alloc.dupe(u8, readStr(data, &pos));
+            errdefer alloc.free(source_field);
             const field_name = try alloc.dupe(u8, readStr(data, &pos));
             errdefer alloc.free(field_name);
-            const source_field = try alloc.dupe(u8, serialized_source_field orelse field_name);
-            errdefer alloc.free(source_field);
             const field_type: AntflyType = @enumFromInt(data[pos]);
             pos += 1;
             const do_index = data[pos] == 1;
@@ -1930,6 +1929,9 @@ test "schema serialize/deserialize round-trip" {
 
     const data = try serializeSchema(alloc, schema);
     defer alloc.free(data);
+
+    var format_pos: usize = 4;
+    try std.testing.expectEqual(@as(u32, 12), readU32(data, &format_pos));
 
     const loaded = try deserializeSchema(alloc, data);
     defer freeSchema(alloc, loaded);
