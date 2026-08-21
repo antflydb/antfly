@@ -823,7 +823,8 @@ fn validateFenceResponse(response: admin_api.HAFenceResponse, request: admin_api
         response.receipt.identity.timeline_id != request.new_timeline_id or
         response.receipt.identity.epoch != request.new_epoch or
         response.receipt.parent_timeline_id != request.identity.timeline_id or
-        response.receipt.parent_epoch != request.identity.epoch)
+        response.receipt.parent_epoch != request.identity.epoch or
+        response.receipt.generation != request.generation)
     {
         return error.AdminFenceResponseMismatch;
     }
@@ -1518,6 +1519,7 @@ test "storage.ha http client round trips admin commands" {
         .promoted_node_id = "standby-a",
         .new_timeline_id = 2,
         .new_epoch = 2,
+        .generation = 1,
         .required_lsn = 1,
         .observed_lsn = 1,
         .force = false,
@@ -1862,6 +1864,7 @@ test "storage.ha http client round trips typed safety operations" {
         .promoted_node_id = "standby-a",
         .new_timeline_id = 2,
         .new_epoch = 2,
+        .generation = 1,
         .required_lsn = 1,
         .observed_lsn = 1,
         .force = false,
@@ -2035,6 +2038,7 @@ test "storage.ha http client rejects mismatched promotion admin responses" {
         .promoted_node_id = "standby-a",
         .new_timeline_id = 2,
         .new_epoch = 2,
+        .generation = 1,
         .required_lsn = 1,
         .observed_lsn = 1,
         .force = false,
@@ -2057,6 +2061,7 @@ test "storage.ha http client accepts empty fence receipt reason" {
         .promoted_node_id = "standby-a",
         .new_timeline_id = 2,
         .new_epoch = 2,
+        .generation = 1,
         .required_lsn = 1,
         .observed_lsn = 1,
         .force = false,
@@ -2074,6 +2079,7 @@ test "storage.ha http client validates live upgraded fence boundary and topology
         .promoted_node_id = "standby-a",
         .new_timeline_id = 2,
         .new_epoch = 2,
+        .generation = 1,
         .required_lsn = 1,
         .observed_lsn = 1,
         .force = false,
@@ -2140,6 +2146,7 @@ test "storage.ha http client accepts already applied idempotent admin receipts" 
             .promoted_node_id = "standby-a",
             .new_timeline_id = 2,
             .new_epoch = 2,
+            .generation = 1,
             .required_lsn = 1,
             .observed_lsn = 1,
             .force = false,

@@ -2659,6 +2659,7 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 			"--promoted-node-id", action.StandbyName,
 			"--new-timeline-id", strconv.FormatUint(identity.TimelineID+1, 10),
 			"--new-epoch", strconv.FormatUint(identity.Epoch+1, 10),
+			"--generation", strconv.FormatUint(action.FenceGeneration, 10),
 			"--required-lsn", strconv.FormatUint(action.TargetLSN, 10),
 			"--observed-lsn", strconv.FormatUint(action.TargetLSN, 10),
 			"--reason", reason,
@@ -2689,6 +2690,7 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 				"--promoted-node-id", promotedNodeID,
 				"--new-timeline-id", strconv.FormatUint(identity.TimelineID+1, 10),
 				"--new-epoch", strconv.FormatUint(identity.Epoch+1, 10),
+				"--generation", strconv.FormatUint(action.FenceGeneration, 10),
 				"--required-lsn", strconv.FormatUint(action.TargetLSN, 10),
 				"--observed-lsn", strconv.FormatUint(action.TargetLSN, 10),
 				"--reason", reason,
@@ -2705,6 +2707,7 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 			"--promoted-node-id", promotion.PromotedStandbyID,
 			"--new-timeline-id", strconv.FormatUint(promotion.NewTimelineID, 10),
 			"--new-epoch", strconv.FormatUint(promotion.NewEpoch, 10),
+			"--generation", strconv.FormatUint(promotion.FenceGeneration, 10),
 			"--required-lsn", strconv.FormatUint(haPromotionRequiredLSN(promotion), 10),
 			"--observed-lsn", strconv.FormatUint(haPromotionObservedLSN(promotion), 10),
 			"--reason", promotion.FenceReason,
@@ -3703,7 +3706,27 @@ func standbyRemoteApplyReady(status *antflyv1.HAStatus, standby antflyv1.HAStand
 }
 
 func standbyPromotionEligible(standby antflyv1.HAStandbyStatus) bool {
-	return standby.Active && !standby.ReseedRequired && strings.TrimSpace(standby.LastError) == ""
+	if !standby.Active || standby.ReseedRequired {
+		return false
+	}
+	errName := strings.TrimSpace(standby.LastError)
+	if errName == "" {
+		return true
+	}
+	// Losing the old primary is the event automatic failover is designed to
+	// survive. A standby that has durably applied everything it received and can
+	// still serve that boundary remains a valid candidate when its only error is
+	// that the upstream transport disappeared. Semantic replication failures
+	// (identity, timeline, decoding, storage, etc.) continue to fail closed.
+	if !standby.CaughtUpToReceived || !standby.CanServeSafeReads {
+		return false
+	}
+	switch errName {
+	case "ConnectionRefused", "ConnectionResetByPeer", "BrokenPipe", "EndOfStream", "HttpConnectionClosing", "NoAddressReturned", "NotListening":
+		return true
+	default:
+		return false
+	}
 }
 
 func standbySafeReadLSN(standby antflyv1.HAStandbyStatus) uint64 {
@@ -3857,9 +3880,25 @@ func haPromotionAlreadyRecorded(ha *antflyv1.HighAvailabilitySpec, status *antfl
 	if identity == nil {
 		return false
 	}
-	return promotion.OldPrimaryID == identity.CurrentPrimaryID &&
-		promotion.ParentTimelineID == identity.TimelineID &&
-		promotion.ParentEpoch == identity.Epoch
+	return haIdentityMatchesPromotionParentOrChild(identity, promotion)
+}
+
+// haIdentityMatchesPromotionParentOrChild keeps a durable promotion receipt
+// valid across the spec update that adopts its new primary and timeline. The
+// receipt may be observed immediately before or immediately after that update;
+// accepting any unrelated identity would permit stale topology evidence.
+func haIdentityMatchesPromotionParentOrChild(identity *antflyv1.HAReplicationIdentitySpec, promotion *antflyv1.HAPromotionStatus) bool {
+	if identity == nil || promotion == nil ||
+		(promotion.ClusterID != 0 && promotion.ClusterID != identity.ClusterID) ||
+		(promotion.ShardID != 0 && promotion.ShardID != identity.ShardID) ||
+		(promotion.TableID != 0 && promotion.TableID != identity.TableID) {
+		return false
+	}
+	parent := strings.TrimSpace(identity.CurrentPrimaryID) == strings.TrimSpace(promotion.OldPrimaryID) &&
+		identity.TimelineID == promotion.ParentTimelineID && identity.Epoch == promotion.ParentEpoch
+	child := strings.TrimSpace(identity.CurrentPrimaryID) == strings.TrimSpace(promotion.PromotedStandbyID) &&
+		identity.TimelineID == promotion.NewTimelineID && identity.Epoch == promotion.NewEpoch
+	return parent || child
 }
 
 func haSyncPolicyDegraded(ha *antflyv1.HighAvailabilitySpec, plan haPlan) bool {

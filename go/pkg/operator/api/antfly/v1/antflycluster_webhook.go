@@ -1543,7 +1543,9 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		} else if fencingAuthority != HAFencingAuthorityKubernetesLease {
 			errors = append(errors, "spec.highAvailability.automaticFailover.fencingAuthority must be KubernetesLease for operator-managed automatic failover")
 		}
-		if ha.Admin == nil || !ha.Admin.ExecutePlannedActions {
+		stagedStandby := ha.Runtime != nil && ha.Runtime.Role == HARuntimeRoleStandby &&
+			ha.Admin != nil && !ha.Admin.ExecutePlannedActions
+		if ha.Admin == nil || (!ha.Admin.ExecutePlannedActions && !stagedStandby) {
 			errors = append(errors, "spec.highAvailability.automaticFailover requires spec.highAvailability.admin.executePlannedActions=true")
 		}
 		for i, standby := range ha.Standbys {

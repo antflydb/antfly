@@ -36,6 +36,8 @@ pub const FenceAcquireRequest = struct {
     promoted_node_id: HANodeID,
     new_timeline_id: i64,
     new_epoch: i64,
+    /// Exact Kubernetes Lease transition generation authorizing this fence.
+    generation: i64,
     required_lsn: i64,
     observed_lsn: i64,
     force: bool,

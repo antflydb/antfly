@@ -2111,6 +2111,41 @@ func TestValidateCreate_HighAvailabilityAutomaticFailoverRequiresNoLossDurabilit
 	}
 }
 
+func TestValidateCreate_AutomaticFailoverAllowsNonExecutingStagedStandby(t *testing.T) {
+	cluster := baseStandaloneCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Runtime: &HARuntimeSpec{
+			Role: HARuntimeRoleStandby, NodeID: "standby-a",
+			AdminTokenEnvVar:    "ANTFLY_HA_ADMIN_TOKEN",
+			AdminTokenSecretRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"}, Key: "token"},
+			FencingLease:        &HARuntimeFencingLeaseSpec{Name: "topology-ha-fence", TopologyID: "topology-anchor-uid", WatchdogGraceSeconds: 10},
+			Standby:             &HAStandbyRuntimeSpec{UpstreamURL: "http://primary-ha.default.svc:8080", SlotName: "standby-a"},
+		},
+		Admin: &HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081", ExecutePlannedActions: false},
+		Standbys: []HAStandbySpec{{
+			Name: "future-peer", AdminURL: "http://future-peer-ha.default.svc:8081",
+			RouteSelector: map[string]string{"app.kubernetes.io/instance": "future-peer"},
+		}},
+		Identity:          &HAReplicationIdentitySpec{ClusterID: 100, TimelineID: 1, Epoch: 1, CurrentPrimaryID: "primary-a"},
+		AutomaticFailover: &HAAutomaticFailoverPolicy{Enabled: true, FencingAuthority: HAFencingAuthorityKubernetesLease},
+		SyncPolicy: &HASyncPolicy{
+			Mode: HADurabilityModeRemoteApply, Required: 1,
+			StandbyNames: []string{"future-peer"}, FailurePolicy: HAFailurePolicyBlock,
+		},
+	}
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected staged standby to retain dormant automatic-failover policy: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.Role = HARuntimeRolePrimary
+	cluster.Spec.HighAvailability.Runtime.NodeID = "primary-a"
+	cluster.Spec.HighAvailability.Runtime.Standby = nil
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "admin.executePlannedActions=true") {
+		t.Fatalf("expected non-staged primary to require action execution, got: %v", err)
+	}
+}
+
 func TestValidateCreate_HighAvailabilityAllowsEmptyDisabledConfig(t *testing.T) {
 	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{}

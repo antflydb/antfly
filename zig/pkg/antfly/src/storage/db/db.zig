@@ -66985,6 +66985,7 @@ test "storage.ha db write gate rejects fenced former primary writes" {
         .promoted_node_id = "standby-a",
         .new_timeline_id = 2,
         .new_epoch = 2,
+        .generation = 1,
         .required_lsn = 1,
         .observed_lsn = 1,
         .reason = "db-write-gate-test",

@@ -3190,6 +3190,7 @@ func TestHAFenceAdminCommandUsesFenceReasonFallback(t *testing.T) {
 		"--promoted-node-id", "standby-a",
 		"--new-timeline-id", "5",
 		"--new-epoch", "7",
+		"--generation", "3",
 		"--required-lsn", "12",
 		"--observed-lsn", "12",
 		"--reason", "LeaseHeld",
@@ -3764,6 +3765,7 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 		"--promoted-node-id", "standby-a",
 		"--new-timeline-id", "5",
 		"--new-epoch", "7",
+		"--generation", "1",
 		"--required-lsn", "12",
 		"--observed-lsn", "12",
 		"--reason", "AutomaticFailoverReady",
@@ -6325,5 +6327,81 @@ func readyFencingStatus() antflyv1.HAFencingStatus {
 		Holder:     "standby-a",
 		Generation: 1,
 		Reason:     "LeaseHeld",
+	}
+}
+
+func TestStandbyPromotionEligibleAllowsOnlyCaughtUpUpstreamTransportLoss(t *testing.T) {
+	base := antflyv1.HAStandbyStatus{
+		Active: true, CaughtUpToReceived: true, CanServeSafeReads: true,
+		ReceivedLSN: 12, AppliedLSN: 12, SafeReadLSN: 12,
+	}
+	tests := []struct {
+		name      string
+		lastError string
+		mutate    func(*antflyv1.HAStandbyStatus)
+		want      bool
+	}{
+		{name: "healthy", want: true},
+		{name: "old primary refused connection", lastError: "ConnectionRefused", want: true},
+		{name: "old primary reset connection", lastError: "ConnectionResetByPeer", want: true},
+		{name: "semantic timeline failure", lastError: "WrongTimeline", want: false},
+		{name: "unknown timeout remains fail closed", lastError: "standby admin timeout", want: false},
+		{name: "transport loss before apply caught up", lastError: "ConnectionRefused", mutate: func(s *antflyv1.HAStandbyStatus) { s.CaughtUpToReceived = false }, want: false},
+		{name: "transport loss without safe read proof", lastError: "EndOfStream", mutate: func(s *antflyv1.HAStandbyStatus) { s.CanServeSafeReads = false }, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			standby := base
+			standby.LastError = tt.lastError
+			if tt.mutate != nil {
+				tt.mutate(&standby)
+			}
+			if got := standbyPromotionEligible(standby); got != tt.want {
+				t.Fatalf("standbyPromotionEligible() = %t, want %t for %#v", got, tt.want, standby)
+			}
+		})
+	}
+}
+
+func TestPromotionReceiptRemainsRecordedAfterIdentityAdoptsChildTopology(t *testing.T) {
+	promotion := haCompletePromotionReceipt("primary-a", "standby-a")
+	ha := haCluster().Spec.HighAvailability
+	ha.Identity = &antflyv1.HAReplicationIdentitySpec{
+		ClusterID: 100, ShardID: 10, TableID: 20,
+		TimelineID: promotion.NewTimelineID, Epoch: promotion.NewEpoch,
+		CurrentPrimaryID: promotion.PromotedStandbyID,
+	}
+	status := &antflyv1.HAStatus{LastPromotion: promotion}
+	if !haPromotionAlreadyRecorded(ha, status) {
+		t.Fatal("expected durable promotion receipt to remain valid after spec adopts child identity")
+	}
+	ha.Identity.Epoch++
+	if haPromotionAlreadyRecorded(ha, status) {
+		t.Fatal("expected unrelated advanced identity to reject stale promotion receipt")
+	}
+}
+
+func TestPhysicalIsolationReceiptRemainsValidAfterTopologyAdoption(t *testing.T) {
+	cluster, action := validPhysicalIsolationReceiptFixture(time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC))
+	promotion := haCompletePromotionReceipt(action.StandbyName, action.RouteTo)
+	promotion.FenceGeneration = action.FenceGeneration
+	promotion.ShardID = cluster.Spec.HighAvailability.Identity.ShardID
+	promotion.TableID = cluster.Spec.HighAvailability.Identity.TableID
+	cluster.Status.HAStatus.LastPromotion = promotion
+	cluster.Status.HAStatus.PlannedActions = []antflyv1.HAPlannedActionStatus{action}
+	cluster.Spec.HighAvailability.Identity.CurrentPrimaryID = promotion.PromotedStandbyID
+	cluster.Spec.HighAvailability.Identity.TimelineID = promotion.NewTimelineID
+	cluster.Spec.HighAvailability.Identity.Epoch = promotion.NewEpoch
+
+	if !haPhysicalIsolationTopologyAdvanced(cluster, &action) {
+		t.Fatal("expected exact promotion receipt to identify adopted child topology")
+	}
+	if !haPhysicalIsolationSucceededWithEvidence(cluster, action) {
+		t.Fatal("expected completed parent isolation evidence to survive child topology adoption")
+	}
+
+	cluster.Status.HAStatus.LastPromotion.FenceGeneration++
+	if haPhysicalIsolationSucceededWithEvidence(cluster, action) {
+		t.Fatal("expected mismatched promotion generation to reject historical isolation evidence")
 	}
 }

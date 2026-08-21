@@ -143,6 +143,8 @@ const (
 	haSeedCheckpointLSNAnnotation           = "antfly.io/ha-seed-checkpoint-lsn"
 	haSeedGenerationVolumeName              = "ha-seed-generation"
 	haSeedLiveDataPath                      = "/antflydb/data"
+	haSeedLiveMetadataPath                  = "/antflydb/metadata"
+	haSeedLiveExtensionsPath                = "/antflydb/extensions"
 	haSeedActivationRelativeRoot            = ".antfly-ha/active"
 
 	haAdminJobPhaseWaitingDependency   = "WaitingDependency"
@@ -3951,10 +3953,21 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 				corev1.Volume{Name: storageVolumeName, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: required.TargetPVCName}}},
 				corev1.Volume{Name: haSeedGenerationVolumeName, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: required.TargetPVCName}}},
 			)
-			volumeMounts = append(volumeMounts, corev1.VolumeMount{
-				Name: haSeedGenerationVolumeName, MountPath: haSeedLiveDataPath,
-				SubPath: path.Join(haSeedActivationRelativeRoot, "live-generations", required.Generation),
-			})
+			generationRoot := path.Join(haSeedActivationRelativeRoot, "live-generations", required.Generation)
+			volumeMounts = append(volumeMounts,
+				corev1.VolumeMount{
+					Name: haSeedGenerationVolumeName, MountPath: haSeedLiveDataPath,
+					SubPath: path.Join(generationRoot, "data"),
+				},
+				corev1.VolumeMount{
+					Name: haSeedGenerationVolumeName, MountPath: haSeedLiveMetadataPath,
+					SubPath: path.Join(generationRoot, "metadata"),
+				},
+				corev1.VolumeMount{
+					Name: haSeedGenerationVolumeName, MountPath: haSeedLiveExtensionsPath,
+					SubPath: path.Join(generationRoot, "extensions"),
+				},
+			)
 		}
 		statefulSet.Spec.Template = corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
@@ -7232,6 +7245,7 @@ func haFenceAcquireBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlann
 			PromotedNodeId: frozen.FencePromotedNodeID,
 			NewTimelineId:  frozen.FenceNewTimelineID,
 			NewEpoch:       frozen.FenceNewEpoch,
+			Generation:     frozen.FenceGeneration,
 			RequiredLsn:    frozen.FenceRequiredLSN,
 			ObservedLsn:    frozen.FenceObservedLSN,
 			Force:          frozen.FenceForced,
@@ -7248,6 +7262,7 @@ func haFenceAcquireBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlann
 		PromotedNodeId: action.StandbyName,
 		NewTimelineId:  identity.TimelineID + 1,
 		NewEpoch:       identity.Epoch + 1,
+		Generation:     action.FenceGeneration,
 		RequiredLsn:    action.TargetLSN,
 		ObservedLsn:    action.TargetLSN,
 		Reason:         reason,
@@ -7281,6 +7296,7 @@ func haFormerPrimaryFenceAcquireBody(cluster *antflyv1.AntflyCluster, action ant
 			PromotedNodeId: promotedNodeID,
 			NewTimelineId:  identity.TimelineID + 1,
 			NewEpoch:       identity.Epoch + 1,
+			Generation:     action.FenceGeneration,
 			RequiredLsn:    action.TargetLSN,
 			ObservedLsn:    action.TargetLSN,
 			Reason:         reason,
@@ -7317,6 +7333,7 @@ func haFormerPrimaryFenceAcquireBody(cluster *antflyv1.AntflyCluster, action ant
 		PromotedNodeId: promotion.PromotedStandbyID,
 		NewTimelineId:  promotion.NewTimelineID,
 		NewEpoch:       promotion.NewEpoch,
+		Generation:     promotion.FenceGeneration,
 		RequiredLsn:    haPromotionRequiredLSN(promotion),
 		ObservedLsn:    haPromotionObservedLSN(promotion),
 		Force:          promotion.Forced,

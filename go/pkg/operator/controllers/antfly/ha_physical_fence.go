@@ -49,6 +49,17 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 		if err := validateHAFormerPrimaryIsolationAction(cluster, action); err != nil {
 			return err
 		}
+		// Once the topology has adopted this exact promotion, the completed
+		// receipt is historical authority. The shared Lease is expected to move
+		// on to the child scope and must not retroactively invalidate the proof
+		// that fenced the parent. We still revalidate every immutable receipt and
+		// promotion binding below.
+		if haPhysicalIsolationTopologyAdvanced(cluster, action) {
+			if !haPhysicalIsolationSucceededWithEvidence(cluster, *action) {
+				return fmt.Errorf("isolate former primary: advanced topology lacks a complete matching physical-isolation receipt")
+			}
+			return nil
+		}
 		lease := &coordinationv1.Lease{}
 		reader := r.haBoundaryReader()
 		if err := reader.Get(ctx, types.NamespacedName{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, lease); err != nil {
@@ -536,13 +547,41 @@ func validateHAFormerPrimaryIsolationAction(cluster *antflyv1.AntflyCluster, act
 	ha := cluster.Spec.HighAvailability
 	identity := haReplicationIdentity(ha)
 	if identity == nil || strings.TrimSpace(identity.CurrentPrimaryID) == "" ||
-		strings.TrimSpace(action.StandbyName) != strings.TrimSpace(identity.CurrentPrimaryID) ||
+		!haPhysicalIsolationActionMatchesIdentity(cluster, action, identity) ||
 		strings.TrimSpace(action.RouteTo) == "" || strings.TrimSpace(action.RouteTo) != strings.TrimSpace(action.FenceHolder) ||
 		action.FenceAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
 		ha.AutomaticFailover.FencingAuthority != antflyv1.HAFencingAuthorityKubernetesLease || action.FenceGeneration == 0 || action.TargetLSN == 0 {
 		return fmt.Errorf("isolate former primary: action identity or Kubernetes Lease authority is incomplete")
 	}
 	return nil
+}
+
+func haPhysicalIsolationActionMatchesIdentity(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus, identity *antflyv1.HAReplicationIdentitySpec) bool {
+	if cluster == nil || action == nil || identity == nil {
+		return false
+	}
+	if strings.TrimSpace(action.StandbyName) == strings.TrimSpace(identity.CurrentPrimaryID) {
+		return true
+	}
+	promotion := haPromotionReceipt(cluster.Status.HAStatus)
+	return promotion != nil && haIdentityMatchesPromotionParentOrChild(identity, promotion) &&
+		strings.TrimSpace(action.StandbyName) == strings.TrimSpace(promotion.OldPrimaryID) &&
+		strings.TrimSpace(action.RouteTo) == strings.TrimSpace(promotion.PromotedStandbyID) &&
+		action.FenceGeneration == promotion.FenceGeneration
+}
+
+func haPhysicalIsolationTopologyAdvanced(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus) bool {
+	if cluster == nil || action == nil || action.AdminJobPhase != haAdminJobPhaseSucceeded {
+		return false
+	}
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	promotion := haPromotionReceipt(cluster.Status.HAStatus)
+	return identity != nil && promotion != nil &&
+		strings.TrimSpace(identity.CurrentPrimaryID) == strings.TrimSpace(promotion.PromotedStandbyID) &&
+		identity.TimelineID == promotion.NewTimelineID && identity.Epoch == promotion.NewEpoch &&
+		strings.TrimSpace(action.StandbyName) == strings.TrimSpace(promotion.OldPrimaryID) &&
+		strings.TrimSpace(action.RouteTo) == strings.TrimSpace(promotion.PromotedStandbyID) &&
+		action.FenceGeneration == promotion.FenceGeneration
 }
 
 func validateHAPhysicalIsolationIntent(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus) error {
@@ -558,9 +597,20 @@ func validateHAPhysicalIsolationIntent(cluster *antflyv1.AntflyCluster, action *
 	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
 	scope, ok := haPhysicalIsolationReceiptScope(receipt)
 	configuredMaxFenceLatencyMS, latencyOK := haRuntimeLeaseMaxFenceLatencyMS(cluster)
-	if identity == nil || !ok || scope.clusterID != identity.ClusterID || scope.shardID != identity.ShardID ||
-		scope.tableID != identity.TableID || scope.timelineID != identity.TimelineID || scope.epoch != identity.Epoch ||
-		strings.TrimSpace(scope.currentPrimaryID) != strings.TrimSpace(identity.CurrentPrimaryID) ||
+	identityMatchesScope := identity != nil && scope.clusterID == identity.ClusterID && scope.shardID == identity.ShardID &&
+		scope.tableID == identity.TableID && scope.timelineID == identity.TimelineID && scope.epoch == identity.Epoch &&
+		strings.TrimSpace(scope.currentPrimaryID) == strings.TrimSpace(identity.CurrentPrimaryID)
+	if !identityMatchesScope && identity != nil {
+		promotion := haPromotionReceipt(cluster.Status.HAStatus)
+		identityMatchesScope = promotion != nil && haIdentityMatchesPromotionParentOrChild(identity, promotion) &&
+			scope.clusterID == identity.ClusterID && scope.shardID == identity.ShardID && scope.tableID == identity.TableID &&
+			scope.timelineID == promotion.ParentTimelineID && scope.epoch == promotion.ParentEpoch &&
+			strings.TrimSpace(scope.currentPrimaryID) == strings.TrimSpace(promotion.OldPrimaryID) &&
+			strings.TrimSpace(action.StandbyName) == strings.TrimSpace(promotion.OldPrimaryID) &&
+			strings.TrimSpace(action.RouteTo) == strings.TrimSpace(promotion.PromotedStandbyID) &&
+			action.FenceGeneration == promotion.FenceGeneration
+	}
+	if identity == nil || !ok || !identityMatchesScope ||
 		scope.primaryLSN == 0 || scope.primaryLSN > action.TargetLSN ||
 		strings.TrimSpace(receipt.LeaseScope.TopologyID) != haFencingLeaseTopologyID(cluster) || !latencyOK ||
 		receipt.WatchdogMaxFenceLatencyMS != configuredMaxFenceLatencyMS {

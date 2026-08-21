@@ -321,6 +321,16 @@ const RuntimeLeaseWatchdog = struct {
         return .{ .ptr = self, .snapshot_fn = proofSnapshot };
     }
 
+    /// `Watchdog.Config` borrows its scope strings. `initFromEnv` necessarily
+    /// constructs the return value through a temporary, so its initial slice
+    /// cannot safely point at the temporary process_boot_id array after the
+    /// value is moved into the caller's final storage. Rebind exactly once at
+    /// that final address before the watchdog can be observed by another
+    /// thread.
+    fn bindOwnedProcessBootID(self: *RuntimeLeaseWatchdog) void {
+        self.watchdog.cfg.scope.process_boot_id = &self.process_boot_id;
+    }
+
     fn repairReceiptSink(self: *RuntimeLeaseWatchdog) antfly.ha.http_admin.Server.AuthOptions.RepairReceiptSink {
         return .{ .ptr = self, .record_fn = recordRepairReceipt };
     }
@@ -2021,6 +2031,7 @@ pub fn runFromIterator(
         cli,
         ha_pod_uid,
     );
+    if (ha_lease_watchdog) |*watchdog| watchdog.bindOwnedProcessBootID();
     defer if (ha_lease_watchdog) |*watchdog| watchdog.deinit(alloc);
 
     // Initialize DataServer without starting its listener — the unified
@@ -7065,6 +7076,35 @@ test "runtime lease watchdog fetch and validation failures publish no bootstrap 
         try std.testing.expectEqual(@as(i64, 0), proof.observed_lease_transitions);
         try std.testing.expectEqual(@as(usize, 0), proof.observed_holder_node_id.len);
     }
+
+    var source = RuntimeLeaseWatchdog{
+        .watchdog = try antfly.ha.kubernetes_lease_watchdog.Watchdog.init(.{
+            .scope = .{
+                .topology_id = "topology-7",
+                .node_id = "primary-a",
+                .data_generation = "initial",
+            },
+            .grace_ns = 10 * std.time.ns_per_s,
+            .sentinel_path = "/tmp/lease-fenced",
+        }, null, null),
+        .executor = undefined,
+        .uri = undefined,
+        .token_path = "",
+        .lease_name = "topology-ha-fence",
+        .lease_namespace = "default",
+        .stable_topology_id = "topology-7",
+        .node_id = "primary-a",
+        .pod_uid = "primary-pod-uid",
+        .process_boot_id = [_]u8{'a'} ** 64,
+    };
+    source.watchdog.cfg.scope.process_boot_id = &source.process_boot_id;
+
+    var placed = source;
+    placed.process_boot_id = [_]u8{'b'} ** 64;
+    placed.bindOwnedProcessBootID();
+
+    try std.testing.expectEqualStrings(&placed.process_boot_id, placed.watchdog.cfg.scope.process_boot_id);
+    try std.testing.expect(placed.watchdog.cfg.scope.process_boot_id.ptr == placed.process_boot_id[0..].ptr);
 }
 
 test "runtime lease watchdog retains a bounded Kubernetes response budget" {

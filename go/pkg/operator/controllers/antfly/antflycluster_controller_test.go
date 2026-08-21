@@ -14441,7 +14441,13 @@ func TestReconcileStandaloneStatefulSetStartupGateRequiresExactObservedReceipt(t
 	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-target-local-node-id '1'`))
 	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-target-replica-id '1'`))
 	g.Expect(container.VolumeMounts).To(ContainElement(corev1.VolumeMount{
-		Name: "ha-seed-generation", MountPath: "/antflydb/data", SubPath: ".antfly-ha/active/live-generations/prod-standby-a-10",
+		Name: "ha-seed-generation", MountPath: "/antflydb/data", SubPath: ".antfly-ha/active/live-generations/prod-standby-a-10/data",
+	}))
+	g.Expect(container.VolumeMounts).To(ContainElement(corev1.VolumeMount{
+		Name: "ha-seed-generation", MountPath: "/antflydb/metadata", SubPath: ".antfly-ha/active/live-generations/prod-standby-a-10/metadata",
+	}))
+	g.Expect(container.VolumeMounts).To(ContainElement(corev1.VolumeMount{
+		Name: "ha-seed-generation", MountPath: "/antflydb/extensions", SubPath: ".antfly-ha/active/live-generations/prod-standby-a-10/extensions",
 	}))
 
 	cluster.Status.HAStatus.StartupGate.ActivationReceipt.TargetPVCUID = "stale-pvc-uid"

@@ -1315,6 +1315,7 @@ fn fenceRequestOpenApi(request: ha.fencing.FenceRequest) !admin_api.openapi.Fenc
         .promoted_node_id = request.promoted_node_id,
         .new_timeline_id = try i64FromU64(request.new_timeline_id),
         .new_epoch = try i64FromU64(request.new_epoch),
+        .generation = try i64FromU64(request.generation),
         .required_lsn = try i64FromU64(request.required_lsn),
         .observed_lsn = try i64FromU64(request.observed_lsn),
         .force = request.force,

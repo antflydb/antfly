@@ -2209,6 +2209,7 @@ fn adminFenceRequestFromOpenApi(request: admin_api.FenceAcquireRequest) !fencing
         .promoted_node_id = request.promoted_node_id,
         .new_timeline_id = try positiveUint64FromJson(request.new_timeline_id),
         .new_epoch = try positiveUint64FromJson(request.new_epoch),
+        .generation = try positiveUint64FromJson(request.generation),
         .required_lsn = try positiveUint64FromJson(request.required_lsn),
         .observed_lsn = try uint64FromJson(request.observed_lsn),
         .force = request.force,
@@ -3339,7 +3340,7 @@ test "storage.ha http admin serves health and command endpoint" {
         .method = .POST,
         .uri = admin_api.routes.ha_fence,
         .content_type = "application/json",
-        .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"force\":false,\"reason\":\"http-admin-test\"}",
+        .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"generation\":1,\"required_lsn\":1,\"observed_lsn\":1,\"force\":false,\"reason\":\"http-admin-test\"}",
     });
     defer typed_fence.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_fence.status);
@@ -3529,7 +3530,7 @@ test "storage.ha http admin reports unsafe promotion as conflict" {
         .method = .POST,
         .uri = admin_api.routes.ha_fence,
         .content_type = "application/json",
-        .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"force\":false,\"reason\":\"unsafe-promotion-test\"}",
+        .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"generation\":1,\"required_lsn\":2,\"observed_lsn\":2,\"force\":false,\"reason\":\"unsafe-promotion-test\"}",
     });
     defer typed_fence.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_fence.status);
@@ -3823,7 +3824,7 @@ test "storage.ha http admin accepts whole instance identity" {
         .method = .POST,
         .uri = admin_api.routes.ha_fence,
         .content_type = "application/json",
-        .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":0,\"table_id\":0,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":0,\"force\":true,\"reason\":\"whole-instance\"}",
+        .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":0,\"table_id\":0,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"generation\":1,\"required_lsn\":1,\"observed_lsn\":0,\"force\":true,\"reason\":\"whole-instance\"}",
     });
     defer typed_fence.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_fence.status);
@@ -3868,7 +3869,7 @@ test "storage.ha http admin promotes from operation-specific fence request body"
         .method = .POST,
         .uri = admin_api.routes.ha_promotion,
         .content_type = "application/json",
-        .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":0,\"table_id\":0,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":0,\"force\":true,\"reason\":\"direct-promote\"}",
+        .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":0,\"table_id\":0,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"generation\":1,\"required_lsn\":1,\"observed_lsn\":0,\"force\":true,\"reason\":\"direct-promote\"}",
     });
     defer typed_promote.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_promote.status);
