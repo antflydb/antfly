@@ -7449,6 +7449,7 @@ pub fn build(b: *std.Build) void {
             "storage.persistent.",
             "storage.portable_backup.",
             "storage.resource_manager.",
+            "storage.rowsource.",
             "storage.schema.",
             "storage.shard.",
             "storage.sim_runtime.",
