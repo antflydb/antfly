@@ -21,6 +21,7 @@ pub const ObjectStorage = objectstore.Client;
 pub const ObjectMetadata = objectstore.ObjectMetadata;
 pub const ObjectChecksum = objectstore.ObjectChecksum;
 pub const ObjectChecksumAlgorithm = objectstore.ObjectChecksumAlgorithm;
+pub const ObjectChecksumType = objectstore.ObjectChecksumType;
 pub const ObjectChecksumScope = objectstore.ObjectChecksumScope;
 pub const PutOptions = objectstore.PutOptions;
 pub const GetOptions = objectstore.GetOptions;

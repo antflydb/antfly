@@ -524,6 +524,25 @@ Antfly's storage design.
 
 ## Implementation Tracker
 
+### Extraction Boundary
+
+This tracker records the implementation state of the combined mega branch so
+that later extraction PRs do not lose design or completed work. It is not a
+claim that every integration named below is compiled in this PR. In particular,
+references to `api/table_reads.zig`, `api/http_server.zig`, typed relational row
+HTTP/SQL lowering, and catalog/namespace routing describe the mega-branch
+prototype. Those public adapters depend on the separately extracted relational
+row-query and catalog surfaces and belong in the final lake integration layer;
+copying them here would re-import those unrelated stacks and defeat the PR
+restructure.
+
+This PR owns the standalone row-source, manifest/publication, object-store,
+Parquet/Iceberg scan, cache, sidecar, rebuild, GC, and explain machinery. Its
+production boundary is the typed resolver and `RowSource` interfaces. Public
+table routing must be ported only after the relational row API and catalog
+routing prerequisites land, and should then consume these interfaces without
+forking the lake implementation.
+
 The current branch has the Antfly-owned scaffold in place: shared `RowSource`
 types, local/external batch adapters, serverless row fragments and stats with
 `vector_f32` payload colocation, manifest base-source/artifact kinds,

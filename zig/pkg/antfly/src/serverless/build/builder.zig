@@ -32,6 +32,7 @@ const sparse_segment_mod = @import("../sparse_segment/mod.zig");
 const vector_segment_mod = @import("../vector_segment/mod.zig");
 const vector_index = @import("vector_index.zig");
 const publication_plan = @import("publication_plan.zig");
+const external_source_manifest = @import("external_source_manifest.zig");
 const external_source_publication = @import("external_source_publication.zig");
 const enrichment_pipeline = @import("../enrichment/pipeline.zig");
 const api_codec = @import("../api/codec.zig");
@@ -243,6 +244,13 @@ pub const Builder = struct {
         defer wal_mod.freeRecords(self.alloc, records);
 
         if (records.len == 0) {
+            if (plan.external_source_plan) |external_plan| {
+                if (current_manifest == null or !externalSourcePlanMatchesManifest(external_plan, current_manifest.?)) {
+                    return try self.publishExternalManifestWithoutWal(namespace, current_head, next_version, start_lsn, plan);
+                }
+            } else if (current_head == 0 and plan.table_definition.base_source != null) {
+                return try self.publishExternalManifestWithoutWal(namespace, current_head, next_version, start_lsn, plan);
+            }
             if (current_head != 0 and plan.forceRepublishFromHead()) {
                 return try self.republishHeadWithPlan(namespace, current_head, vector_metric, plan);
             }
@@ -420,6 +428,39 @@ pub const Builder = struct {
             .version = next_version,
             .wal_start_lsn = if (inline_document_rebase) wal_end_lsn else start_lsn,
             .wal_end_lsn = wal_end_lsn,
+            .artifact_count = manifest.artifacts.len,
+        };
+    }
+
+    fn publishExternalManifestWithoutWal(
+        self: *Builder,
+        namespace: []const u8,
+        current_head: u64,
+        version: u64,
+        start_lsn: u64,
+        plan: publication_plan.TablePublicationPlan,
+    ) !BuildResult {
+        var manifest = try buildEmptyExternalManifestAlloc(self.alloc, namespace, version, start_lsn, plan);
+        defer manifest.deinit(self.alloc);
+        try attachResolvedExternalSourcePlanIfPresent(self.alloc, &manifest, plan);
+
+        self.manifests.put(manifest) catch |err| switch (err) {
+            error.ManifestVersionAlreadyExists => return error.HeadChanged,
+            else => return err,
+        };
+        const published = try self.progress.compareAndSwapHead(
+            namespace,
+            if (current_head == 0) null else current_head,
+            version,
+        );
+        if (!published) return error.HeadChanged;
+
+        return .{
+            .namespace = try self.alloc.dupe(u8, namespace),
+            .published = true,
+            .version = version,
+            .wal_start_lsn = start_lsn,
+            .wal_end_lsn = start_lsn - 1,
             .artifact_count = manifest.artifacts.len,
         };
     }
@@ -897,6 +938,56 @@ fn buildManifestAlloc(
     };
 }
 
+fn buildEmptyExternalManifestAlloc(
+    alloc: Allocator,
+    namespace: []const u8,
+    version: u64,
+    start_lsn: u64,
+    plan: publication_plan.TablePublicationPlan,
+) !manifest_mod.Manifest {
+    const namespace_copy = try alloc.dupe(u8, namespace);
+    errdefer alloc.free(namespace_copy);
+    const artifacts = try alloc.alloc(manifest_mod.ArtifactRef, 0);
+    errdefer alloc.free(artifacts);
+    var base_source = try cloneTableDefinitionBaseSourceAlloc(alloc, plan.table_definition);
+    errdefer if (base_source) |*descriptor| manifest_base_source.freeOwnedDescriptor(alloc, descriptor);
+    const schema_json: []u8 = if (plan.table_definition.schema_json.len == 0)
+        &.{}
+    else
+        try alloc.dupe(u8, plan.table_definition.schema_json);
+    errdefer if (schema_json.len > 0) alloc.free(schema_json);
+    const read_schema_json: []u8 = if (plan.table_definition.read_schema_json.len == 0)
+        &.{}
+    else
+        try alloc.dupe(u8, plan.table_definition.read_schema_json);
+    errdefer if (read_schema_json.len > 0) alloc.free(read_schema_json);
+    const indexes_json: []u8 = if (plan.table_definition.indexes_json.len == 0)
+        &.{}
+    else
+        try alloc.dupe(u8, plan.table_definition.indexes_json);
+    errdefer if (indexes_json.len > 0) alloc.free(indexes_json);
+
+    return .{
+        .namespace = namespace_copy,
+        .version = version,
+        .built_at_ns = 0,
+        .wal_start_lsn = start_lsn,
+        .wal_end_lsn = start_lsn - 1,
+        .stats = .{
+            .document_count = 0,
+            .document_base_version = 0,
+            .document_publish_mode = .append_mutation_tail,
+            .published_search_sources = .{},
+            .policy = plan.policy,
+            .schema_json = schema_json,
+            .read_schema_json = read_schema_json,
+            .indexes_json = indexes_json,
+        },
+        .artifacts = artifacts,
+        .base_source = base_source,
+    };
+}
+
 fn buildCompactedManifestAlloc(
     alloc: Allocator,
     namespace: []const u8,
@@ -1127,6 +1218,54 @@ fn attachResolvedExternalSourcePlanIfPresent(
         external_plan,
         .{},
     );
+}
+
+fn externalSourcePlanMatchesManifest(
+    plan: external_source_manifest.Plan,
+    manifest: manifest_mod.Manifest,
+) bool {
+    const current = manifest.base_source orelse return false;
+    if (std.meta.activeTag(plan.base_source) != std.meta.activeTag(current)) return false;
+    const sources_match = switch (plan.base_source) {
+        .external_parquet => |planned| externalSourceDescriptorMatches(planned, current.external_parquet),
+        .external_iceberg => |planned| externalSourceDescriptorMatches(planned, current.external_iceberg),
+        .external_lance => |planned| externalSourceDescriptorMatches(planned, current.external_lance),
+        else => false,
+    };
+    if (!sources_match or plan.artifacts.len == 0) return false;
+    for (plan.artifacts) |planned_artifact| {
+        var found = false;
+        for (manifest.artifacts) |current_artifact| {
+            if (planned_artifact.kind == current_artifact.kind and
+                std.mem.eql(u8, planned_artifact.artifact_id, current_artifact.artifact_id) and
+                planned_artifact.byte_len == current_artifact.byte_len and
+                std.mem.eql(u8, planned_artifact.checksum, current_artifact.checksum))
+            {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+fn externalSourceDescriptorMatches(
+    planned: manifest_base_source.ExternalBaseSource,
+    current: manifest_base_source.ExternalBaseSource,
+) bool {
+    return planned.format == current.format and
+        std.mem.eql(u8, planned.source_uri, current.source_uri) and
+        std.mem.eql(u8, planned.snapshot_id, current.snapshot_id) and
+        std.mem.eql(u8, planned.schema_fingerprint, current.schema_fingerprint) and
+        optionalStringEql(planned.file_inventory_artifact, current.file_inventory_artifact) and
+        optionalStringEql(planned.row_group_metadata_artifact, current.row_group_metadata_artifact) and
+        optionalStringEql(planned.delete_metadata_artifact, current.delete_metadata_artifact);
+}
+
+fn optionalStringEql(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
 }
 
 pub fn detectMaterializedDerivedOutputsAlloc(
@@ -5269,6 +5408,123 @@ test "builder rebases document segment inline when mutation lineage exceeds thre
     try std.testing.expectEqual(@as(u64, 3), third_manifest.stats.document_base_version);
     try std.testing.expectEqual(catalog_types.DocumentPublishMode.inline_rebase, third_manifest.stats.document_publish_mode);
     try std.testing.expect(!std.mem.eql(u8, reused_document_ref.artifact_id, third_manifest.artifacts[findArtifactIndex(third_manifest, .document_segment).?].artifact_id));
+}
+
+test "serverless builder publishes initial external manifest without wal records" {
+    const alloc = std.testing.allocator;
+
+    var artifact_root_buf: [256]u8 = undefined;
+    var manifest_root_buf: [256]u8 = undefined;
+    var wal_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-initial-external");
+    const manifest_root = tmpPath(&manifest_root_buf, "manifests-initial-external");
+    const wal_root = tmpPath(&wal_root_buf, "wal-initial-external");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(manifest_root);
+    defer cleanupTmp(wal_root);
+
+    var fs_artifacts = try artifacts_mod.FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+    var fs_manifests = try manifest_mod.FsStore.init(alloc, std.mem.span(manifest_root));
+    var manifest_store = fs_manifests.manifestStore();
+    defer manifest_store.deinit();
+    var fs_progress = try catalog_mod.FsProgressStore.init(alloc, std.mem.span(manifest_root));
+    var progress_store = fs_progress.progressStore();
+    defer progress_store.deinit();
+    var fs_wal = try wal_mod.FsStore.init(alloc, std.mem.span(wal_root));
+    var wal_store = fs_wal.walStore();
+    defer wal_store.deinit();
+
+    var external_plan = try external_source_manifest.planAlloc(
+        alloc,
+        .parquet_prefix,
+        "s3://bucket/events",
+        "snapshot-1",
+        "schema-v1",
+        .{
+            .artifact_id = "external-inventory-1",
+            .byte_len = 128,
+            .checksum = "sha256:inventory-1",
+        },
+    );
+    defer external_plan.deinit(alloc);
+
+    var builder = Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    var result = try builder.publishNamespaceWithMetricAndPlan("events", .cosine, .{
+        .targets = .{ .published_search_sources = search_sources.defaultPublishedSearchSources() },
+        .external_source_plan = external_plan,
+        .table_definition = .{
+            .schema_json = @constCast("{\"storage_mode\":\"relational\"}"),
+            .read_schema_json = @constCast("{}"),
+            .indexes_json = @constCast("{}"),
+        },
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expect(result.published);
+    try std.testing.expectEqual(@as(u64, 1), result.version);
+    try std.testing.expectEqual(@as(u64, 1), result.wal_start_lsn);
+    try std.testing.expectEqual(@as(u64, 0), result.wal_end_lsn);
+    try std.testing.expectEqual(@as(usize, 1), result.artifact_count);
+
+    var manifest = try manifest_store.getAlloc("events", 1);
+    defer manifest.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 0), manifest.wal_end_lsn);
+    try std.testing.expectEqual(@as(usize, 1), manifest.artifacts.len);
+    try std.testing.expectEqual(@as(u64, 0), manifest.stats.document_base_version);
+    try std.testing.expect(manifest.stats.published_search_sources.findText() == null);
+    try std.testing.expect(manifest.stats.published_search_sources.findVector() == null);
+    try std.testing.expect(manifest.stats.published_search_sources.findSparse() == null);
+    try std.testing.expectEqual(manifest_mod.ArtifactKind.external_base_source, manifest.artifacts[0].kind);
+    try std.testing.expectEqualStrings("external-inventory-1", manifest.artifacts[0].artifact_id);
+    try std.testing.expect(manifest.base_source != null);
+    try std.testing.expectEqualStrings("snapshot-1", manifest.base_source.?.external_parquet.snapshot_id);
+
+    var unchanged = try builder.publishNamespaceWithMetricAndPlan("events", .cosine, .{
+        .targets = .{ .published_search_sources = search_sources.defaultPublishedSearchSources() },
+        .external_source_plan = external_plan,
+        .table_definition = .{
+            .schema_json = @constCast("{\"storage_mode\":\"relational\"}"),
+            .read_schema_json = @constCast("{}"),
+            .indexes_json = @constCast("{}"),
+        },
+    });
+    defer unchanged.deinit(alloc);
+    try std.testing.expect(!unchanged.published);
+    try std.testing.expectEqual(@as(u64, 1), unchanged.version);
+
+    var updated_plan = try external_source_manifest.planAlloc(
+        alloc,
+        .parquet_prefix,
+        "s3://bucket/events",
+        "snapshot-2",
+        "schema-v1",
+        .{
+            .artifact_id = "external-inventory-2",
+            .byte_len = 144,
+            .checksum = "sha256:inventory-2",
+        },
+    );
+    defer updated_plan.deinit(alloc);
+    var updated = try builder.publishNamespaceWithMetricAndPlan("events", .cosine, .{
+        .targets = .{ .published_search_sources = search_sources.defaultPublishedSearchSources() },
+        .external_source_plan = updated_plan,
+        .table_definition = .{
+            .schema_json = @constCast("{\"storage_mode\":\"relational\"}"),
+            .read_schema_json = @constCast("{}"),
+            .indexes_json = @constCast("{}"),
+        },
+    });
+    defer updated.deinit(alloc);
+    try std.testing.expect(updated.published);
+    try std.testing.expectEqual(@as(u64, 2), updated.version);
+
+    var updated_manifest = try manifest_store.getAlloc("events", 2);
+    defer updated_manifest.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), updated_manifest.artifacts.len);
+    try std.testing.expectEqualStrings("external-inventory-2", updated_manifest.artifacts[0].artifact_id);
+    try std.testing.expectEqualStrings("snapshot-2", updated_manifest.base_source.?.external_parquet.snapshot_id);
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

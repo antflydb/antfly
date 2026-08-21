@@ -82,7 +82,7 @@ pub const ObjectStorageRangeReader = struct {
         defer result.deinit(alloc);
         if (result.body.len != len) return error.InvalidLakeRangeRead;
         try validatePlannedObjectMetadata(read, result.metadata);
-        try validatePlannedObjectChecksum(alloc, read, result.metadata, result.body);
+        try validatePlannedObjectChecksum(read, result.metadata, result.body);
         return try alloc.dupe(u8, result.body);
     }
 
@@ -119,7 +119,6 @@ fn validatePlannedObjectMetadata(read: lake_range_io.RangeRead, metadata: object
 }
 
 fn validatePlannedObjectChecksum(
-    alloc: Allocator,
     read: lake_range_io.RangeRead,
     metadata: object_storage.ObjectMetadata,
     body: []const u8,
@@ -127,8 +126,40 @@ fn validatePlannedObjectChecksum(
     const checksum = metadata.checksum orelse return;
     if (body.len != read.range.len) return error.InvalidLakeRangeRead;
     if (!try plannedChecksumCoversBody(read, metadata, body.len)) return;
+    // Multipart/composite checksums do not describe the bytes returned by a
+    // normal full-object GET. Treat them as provider metadata, not a digest we
+    // can compare to the response body.
+    if (checksum.checksum_type == .composite) return;
+    if (metadata.checksum_scope == .object and checksum.checksum_type == .unknown) return;
 
     switch (checksum.algorithm) {
+        .crc32_base64 => {
+            var digest: [4]u8 = undefined;
+            std.mem.writeInt(u32, &digest, std.hash.crc.Crc32.hash(body), .big);
+            try validateBase64Digest(checksum.value, &digest);
+        },
+        .crc32c_base64 => {
+            var digest: [4]u8 = undefined;
+            std.mem.writeInt(u32, &digest, std.hash.crc.Crc32Iscsi.hash(body), .big);
+            try validateBase64Digest(checksum.value, &digest);
+        },
+        .crc64nvme_base64 => {
+            const Crc64Nvme = std.hash.crc.Crc(u64, .{
+                .polynomial = 0xad93d23594c93659,
+                .initial = 0xffffffffffffffff,
+                .reflect_input = true,
+                .reflect_output = true,
+                .xor_output = 0xffffffffffffffff,
+            });
+            var digest: [8]u8 = undefined;
+            std.mem.writeInt(u64, &digest, Crc64Nvme.hash(body), .big);
+            try validateBase64Digest(checksum.value, &digest);
+        },
+        .sha1_base64 => {
+            var digest: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
+            std.crypto.hash.Sha1.hash(body, &digest, .{});
+            try validateBase64Digest(checksum.value, &digest);
+        },
         .sha256_hex => {
             var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
@@ -142,22 +173,34 @@ fn validatePlannedObjectChecksum(
         .sha256_base64 => {
             var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
-            const encoded_len = std.base64.standard.Encoder.calcSize(digest.len);
-            const encoded = try alloc.alloc(u8, encoded_len);
-            defer alloc.free(encoded);
-            _ = std.base64.standard.Encoder.encode(encoded, &digest);
-            if (!std.mem.eql(u8, encoded, checksum.value)) return error.PreconditionFailed;
+            try validateBase64Digest(checksum.value, &digest);
+        },
+        .sha512_base64 => {
+            var digest: [std.crypto.hash.sha2.Sha512.digest_length]u8 = undefined;
+            std.crypto.hash.sha2.Sha512.hash(body, &digest, .{});
+            try validateBase64Digest(checksum.value, &digest);
         },
         .md5_base64 => {
             const digest = std.crypto.hash.Md5.hashResult(body);
-            const encoded_len = std.base64.standard.Encoder.calcSize(digest.len);
-            const encoded = try alloc.alloc(u8, encoded_len);
-            defer alloc.free(encoded);
-            _ = std.base64.standard.Encoder.encode(encoded, &digest);
-            if (!std.mem.eql(u8, encoded, checksum.value)) return error.PreconditionFailed;
+            try validateBase64Digest(checksum.value, &digest);
         },
-        else => return error.UnsupportedObjectChecksum,
+        // Provider byte-order and XXH3-128 portability are not part of the
+        // object-store contract yet. Identity guards still fail closed via
+        // ETag/version; optional algorithms must not make valid objects
+        // unreadable until their encoding semantics are explicit.
+        .xxhash64_base64, .xxhash3_base64, .xxhash128_base64 => return,
     }
+}
+
+fn validateBase64Digest(
+    expected: []const u8,
+    digest: []const u8,
+) !void {
+    const encoded_len = std.base64.standard.Encoder.calcSize(digest.len);
+    var encoded_buffer: [std.base64.standard.Encoder.calcSize(std.crypto.hash.sha2.Sha512.digest_length)]u8 = undefined;
+    const encoded = encoded_buffer[0..encoded_len];
+    _ = std.base64.standard.Encoder.encode(encoded, digest);
+    if (!std.mem.eql(u8, encoded, expected)) return error.PreconditionFailed;
 }
 
 fn plannedChecksumCoversBody(read: lake_range_io.RangeRead, metadata: object_storage.ObjectMetadata, body_len: usize) !bool {
@@ -338,7 +381,7 @@ test "object storage range reader validates returned planned object metadata" {
     try std.testing.expectEqualStrings("456789", bytes);
 }
 
-test "object storage range reader validates full object checksums" {
+test "lake object storage range reader validates full object checksums" {
     const alloc = std.testing.allocator;
     const ChecksumObjectStorage = struct {
         const ContentLengthScope = enum { object, body };
@@ -346,6 +389,7 @@ test "object storage range reader validates full object checksums" {
         checksum: ?struct {
             algorithm: object_storage.ObjectChecksumAlgorithm,
             value: []const u8,
+            checksum_type: object_storage.ObjectChecksumType = .full_object,
         } = null,
         checksum_scope: object_storage.ObjectChecksumScope = .object,
         content_length_scope: ContentLengthScope = .object,
@@ -394,6 +438,7 @@ test "object storage range reader validates full object checksums" {
                     .checksum = if (self.checksum) |checksum| .{
                         .algorithm = checksum.algorithm,
                         .value = try a.dupe(u8, checksum.value),
+                        .checksum_type = checksum.checksum_type,
                     } else null,
                     .checksum_scope = self.checksum_scope,
                     .content_length = if (self.content_length_scope == .body) @intCast(body.len) else full_body.len,
@@ -448,6 +493,29 @@ test "object storage range reader validates full object checksums" {
     } };
     var mismatched_reader = ObjectStorageRangeReader.init(mismatched.client());
     try std.testing.expectError(error.PreconditionFailed, mismatched_reader.parquetReader().readPlannedAlloc(alloc, full_read));
+
+    var crc32c_digest: [4]u8 = undefined;
+    std.mem.writeInt(u32, &crc32c_digest, std.hash.crc.Crc32Iscsi.hash("0123456789"), .big);
+    var crc32c_encoded: [std.base64.standard.Encoder.calcSize(crc32c_digest.len)]u8 = undefined;
+    _ = std.base64.standard.Encoder.encode(&crc32c_encoded, &crc32c_digest);
+    var gcs_crc32c = ChecksumObjectStorage{ .checksum = .{
+        .algorithm = .crc32c_base64,
+        .value = &crc32c_encoded,
+    } };
+    var gcs_crc32c_reader = ObjectStorageRangeReader.init(gcs_crc32c.client());
+    const gcs_bytes = try gcs_crc32c_reader.parquetReader().readPlannedAlloc(alloc, full_read);
+    defer alloc.free(gcs_bytes);
+    try std.testing.expectEqualStrings("0123456789", gcs_bytes);
+
+    var composite = ChecksumObjectStorage{ .checksum = .{
+        .algorithm = .sha256_base64,
+        .value = "not-a-full-object-digest",
+        .checksum_type = .composite,
+    } };
+    var composite_reader = ObjectStorageRangeReader.init(composite.client());
+    const composite_bytes = try composite_reader.parquetReader().readPlannedAlloc(alloc, full_read);
+    defer alloc.free(composite_bytes);
+    try std.testing.expectEqualStrings("0123456789", composite_bytes);
 
     var partial_reader = ObjectStorageRangeReader.init(mismatched.client());
     const partial_bytes = try partial_reader.parquetReader().readPlannedAlloc(alloc, partial_read);

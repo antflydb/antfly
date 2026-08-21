@@ -690,9 +690,14 @@ pub const CatalogService = struct {
         namespace: []const u8,
         table: catalog_types.TableNamespaceRecord,
     ) !?external_source_manifest.Plan {
-        const resolver = self.external_source_plan_resolver orelse return null;
         var binding = (try publication_plan.externalBindingFromSchemaJsonAlloc(self.alloc, table.schema_json)) orelse return null;
         defer binding.deinit(self.alloc);
+        const resolver = self.external_source_plan_resolver orelse {
+            if (binding.binding.snapshot_mode.requiresDiscoveryPin()) {
+                return error.ExternalSourcePlanResolverUnavailable;
+            }
+            return null;
+        };
         return try resolver.resolveAlloc(self.alloc, .{
             .namespace = namespace,
             .table_name = table.table_name,
@@ -4734,6 +4739,30 @@ test "catalog service auto-enables chunk embeddings for chunked embedding indexe
     defer status.deinit(alloc);
     try std.testing.expect(status.chunk_embeddings_enabled);
     try std.testing.expectEqual(catalog_types.DerivedOutputPublicationAction.reuse, status.derived_output_actions.chunk_embeddings);
+}
+
+test "serverless catalog service fails closed for current external binding without resolver" {
+    const alloc = std.testing.allocator;
+    const current_schema =
+        \\{"version":5,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://bucket/events","snapshot":"current","schema_fingerprint":"schema-v5","write_policy":"read_only"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var table = catalog_types.TableNamespaceRecord{
+        .table_name = try alloc.dupe(u8, "events"),
+        .namespace = try alloc.dupe(u8, "events"),
+        .created_at_ns = 1,
+        .schema_json = try alloc.dupe(u8, current_schema),
+        .read_schema_json = try alloc.dupe(u8, ""),
+        .indexes_json = try alloc.dupe(u8, "{}"),
+    };
+    defer table.deinit(alloc);
+
+    var catalog: CatalogService = undefined;
+    catalog.alloc = alloc;
+    catalog.external_source_plan_resolver = null;
+    try std.testing.expectError(
+        error.ExternalSourcePlanResolverUnavailable,
+        catalog.externalSourcePlanForTableAlloc("events", table),
+    );
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
