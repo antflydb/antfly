@@ -50,6 +50,31 @@ const RuntimeLibraryUnit = enum {
     cli,
 };
 
+// Static archives must be presented from consumers to providers. The
+// distributed/application unit calls into both the API kernel and inference
+// unit, while the remote CLI is an executable-facing leaf. Keep this separate
+// from RuntimeLibraryUnit declaration order: declaration order controls build
+// graph construction, not the final link's dependency topology.
+const runtime_library_link_order = [_]RuntimeLibraryUnit{
+    .cli,
+    .distributed,
+    .api_kernel,
+    .inference,
+};
+
+comptime {
+    const unit_count = std.meta.fields(RuntimeLibraryUnit).len;
+    if (runtime_library_link_order.len != unit_count)
+        @compileError("runtime_library_link_order must contain every runtime library unit exactly once");
+    var seen = [_]bool{false} ** unit_count;
+    for (runtime_library_link_order) |unit| {
+        const index = @intFromEnum(unit);
+        if (seen[index])
+            @compileError("runtime_library_link_order contains a duplicate runtime library unit");
+        seen[index] = true;
+    }
+}
+
 const snowball_languages = [_][]const u8{
     "danish",
     "dutch",
@@ -9727,12 +9752,15 @@ pub fn build(b: *std.Build) void {
         if (unit == .distributed) {
             libantfly_link_mod.linkLibrary(role_artifact);
         }
-        antfly_main.root_module.linkLibrary(role_artifact);
         if (strip) {
             var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
             defer visited.deinit();
             setStripRecursively(role_mod, &visited);
         }
+    }
+
+    for (runtime_library_link_order) |unit| {
+        antfly_main.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(unit)].?);
     }
 
     if (runtime_artifact_role) |role| {
@@ -9762,15 +9790,15 @@ pub fn build(b: *std.Build) void {
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
             },
             .data, .metadata => {
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?);
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?);
             },
             .inference => {
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?);
             },
             .standalone => {
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?);
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?);
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?);
             },
         }
