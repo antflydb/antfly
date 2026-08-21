@@ -11,6 +11,7 @@ import {
   tableQueryInput,
   tableQueryJsonSafetyBlocker,
   tableQueryMetadataBlocker,
+  tableRequiresSafeProjection,
 } from "./table-query";
 
 describe("buildTableQueryRequest", () => {
@@ -58,6 +59,38 @@ describe("buildTableQueryRequest", () => {
       })
     ).toEqual({
       full_text_search: { query: "singularity" },
+      limit: 10,
+    });
+  });
+
+  it("keeps artifact-backed source queries identity-only without changing retrieval level", () => {
+    expect(
+      buildTableQueryRequest({
+        query: "",
+        queryIndexes: [],
+        selectedFields: [],
+        semanticQuery: "{}",
+        filterQuery: "{}",
+        includeProfile: false,
+        requireSafeProjection: true,
+      })
+    ).toEqual({
+      fields: [],
+      limit: 10,
+    });
+    expect(
+      buildTableQueryRequest({
+        query: "",
+        queryIndexes: [],
+        selectedFields: [],
+        semanticQuery: "{}",
+        filterQuery: '{"term":{"status":"active"}}',
+        includeProfile: false,
+        requireSafeProjection: true,
+      })
+    ).toEqual({
+      fields: [],
+      filter_query: { term: { status: "active" } },
       limit: 10,
     });
   });
@@ -281,6 +314,7 @@ describe("table query builder UX", () => {
       ],
     } as TableStatus;
 
+    expect(tableRequiresSafeProjection(indexes, tableStatus)).toBe(true);
     expect(builderArtifactRetrievalDefaults(indexes, "", [], tableStatus)).toBeNull();
     expect(builderArtifactRetrievalDefaults(indexes, "singularity", [], tableStatus)).toEqual({
       searchFields: ["text"],
@@ -713,6 +747,7 @@ describe("table query builder UX", () => {
       },
     ] as IndexStatus[];
 
+    expect(tableRequiresSafeProjection(indexes)).toBe(false);
     expect(artifactRetrievalDefaults(indexes, [])).toBeNull();
   });
 

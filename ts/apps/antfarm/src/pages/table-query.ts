@@ -10,6 +10,7 @@ export interface TableQueryBuilderState {
   artifactSearchFields?: string[];
   artifactProjectionFields?: string[];
   returnArtifactMatches?: boolean;
+  requireSafeProjection?: boolean;
 }
 
 export const DEFAULT_TABLE_QUERY_LIMIT = 10;
@@ -77,6 +78,35 @@ export interface ArtifactRetrievalDefaults {
   projectionFields: string[];
   returnMatches: boolean;
   selectionError?: string;
+}
+
+// Source rows for artifact-backed tables commonly contain large input fields
+// such as inline URLs. This is deliberately independent from whether the
+// current request retrieves generated artifacts: match-all and filter-only
+// source queries still need an explicit projection.
+export function tableRequiresSafeProjection(
+  indexes: IndexStatus[],
+  tableStatus?: TableStatus | null
+): boolean {
+  const tableEnrichments = structuredEnrichments(tableStatus?.artifact_enrichments);
+  if (tableEnrichments.some(isArtifactBackedEnrichment)) return true;
+
+  return indexes.some((index) => {
+    const config = index.config as ArtifactAwareIndexConfig;
+    if (config.artifact_name || config.source_artifact_name) return true;
+    const enrichments = structuredEnrichments(
+      tableStatus?.indexes?.[config.name]?.enrichments ?? config.enrichments
+    );
+    return enrichments.some(isArtifactBackedEnrichment);
+  });
+}
+
+function isArtifactBackedEnrichment(enrichment: ArtifactEnrichment): boolean {
+  return (
+    enrichment.kind === "chunk" ||
+    enrichment.kind === "asset" ||
+    Boolean(enrichment.source_artifact_name)
+  );
 }
 
 export function builderArtifactRetrievalDefaults(
@@ -394,6 +424,7 @@ export function buildTableQueryRequest({
   artifactSearchFields,
   artifactProjectionFields,
   returnArtifactMatches = false,
+  requireSafeProjection = false,
 }: TableQueryBuilderState): QueryRequest {
   const request: QueryRequest = {};
   const trimmedQuery = query.trim();
@@ -417,6 +448,8 @@ export function buildTableQueryRequest({
     request.fields = selectedFields;
   } else if (returnArtifactMatches) {
     request.fields = normalizedProjection;
+  } else if (requireSafeProjection) {
+    request.fields = [];
   }
   if (returnArtifactMatches) {
     request.hierarchy = {};

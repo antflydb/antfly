@@ -93,6 +93,7 @@ import {
   tableQueryInput,
   tableQueryJsonSafetyBlocker,
   tableQueryMetadataBlocker,
+  tableRequiresSafeProjection,
 } from "./table-query";
 
 const formatBytes = (bytes: number, decimals = 2) => {
@@ -291,6 +292,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   );
   const artifactSelectionError = hasSemanticQuery ? artifactRetrieval?.selectionError : undefined;
   const queryMetadataBlocker = tableQueryMetadataBlocker(indexesMetadataState, tableMetadataState);
+  const artifactPayloadProjectionRequired = useMemo(
+    () => tableRequiresSafeProjection(indexes, tableStatus),
+    [indexes, tableStatus]
+  );
 
   const semanticQueryRequest = useMemo(() => {
     return buildTableQueryRequest({
@@ -303,6 +308,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       artifactSearchFields: artifactRetrieval?.searchFields,
       artifactProjectionFields: artifactRetrieval?.projectionFields,
       returnArtifactMatches: artifactRetrieval?.returnMatches,
+      requireSafeProjection: artifactPayloadProjectionRequired,
     });
   }, [
     query,
@@ -312,6 +318,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     selectedFields,
     includeProfile,
     artifactRetrieval,
+    artifactPayloadProjectionRequired,
   ]);
   const semanticQueryRequestString = useMemo(
     () => JSON.stringify(semanticQueryRequest, null, 2),
@@ -327,7 +334,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   );
   const jsonQuerySafetyBlocker = tableQueryJsonSafetyBlocker(
     queryMetadataBlocker,
-    jsonArtifactRetrieval !== null,
+    artifactPayloadProjectionRequired || jsonArtifactRetrieval !== null,
     parsedJsonQuery
   );
 
@@ -372,6 +379,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
           artifactSearchFields: nextArtifactRetrieval?.searchFields,
           artifactProjectionFields: nextArtifactRetrieval?.projectionFields,
           returnArtifactMatches: nextArtifactRetrieval?.returnMatches,
+          requireSafeProjection: artifactPayloadProjectionRequired,
         });
         const conversionBlocker = tableQueryBuilderConversionBlocker(queryRequest, rebuilt);
         if (conversionBlocker) {
@@ -1125,11 +1133,13 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                         </div>
                       </AccordionTrigger>
                       <AccordionContent className="pb-3 pt-1 space-y-2.5">
-                        {artifactRetrieval && selectedFields.length === 0 && (
+                        {artifactPayloadProjectionRequired && selectedFields.length === 0 && (
                           <p className="text-xs text-muted-foreground">
-                            {artifactRetrieval.projectionFields.length > 0
+                            {artifactRetrieval && artifactRetrieval.projectionFields.length > 0
                               ? `Artifact retrieval defaults to the ${artifactRetrieval.projectionFields.join(", ")} ${artifactRetrieval.projectionFields.length === 1 ? "field" : "fields"} so source files and inline URLs are not returned.`
-                              : "Generated asset output fields are not declared, so artifact retrieval defaults to identity-only results."}{" "}
+                              : artifactRetrieval
+                                ? "Generated asset output fields are not declared, so artifact retrieval defaults to identity-only results."
+                                : "Artifact-backed source browsing defaults to identity-only results so large source fields are not returned."}{" "}
                             Select fields here to override that projection.
                           </p>
                         )}
