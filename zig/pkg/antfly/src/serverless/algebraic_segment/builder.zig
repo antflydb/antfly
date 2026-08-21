@@ -17,6 +17,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const algebraic_segment = @import("types.zig");
+const aggregate_math = @import("aggregate_math.zig");
 const codec = @import("codec.zig");
 const rowsource = @import("../../storage/rowsource/types.zig");
 
@@ -80,7 +81,7 @@ pub fn buildGroupByAggregateAlloc(
             entry.value_ptr.* = next_value;
         } else {
             alloc.free(owned_key);
-            entry.value_ptr.* = try combine(entry.value_ptr.*, next_value);
+            entry.value_ptr.* = try aggregate_math.combine(entry.value_ptr.*, next_value);
         }
     }
     defer {
@@ -203,7 +204,7 @@ fn rowAggregateValue(
 ) !?algebraic_segment.AggregateValue {
     return switch (op) {
         .count => .{ .count = 1 },
-        .sum_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .sum_i64 = value_column.?.values.i64[row_idx] },
+        .sum_i64 => .{ .sum_i64 = if (value_column.?.nulls.isNull(row_idx)) 0 else value_column.?.values.i64[row_idx] },
         .min_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .min_i64 = value_column.?.values.i64[row_idx] },
         .max_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .max_i64 = value_column.?.values.i64[row_idx] },
         .avg_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .avg_i64 = .{
@@ -219,12 +220,12 @@ fn expressionValue(
     row_count: usize,
 ) !algebraic_segment.AggregateValue {
     return switch (op) {
-        .count => .{ .count = @intCast(row_count) },
+        .count => .{ .count = try aggregate_math.addCount(0, row_count) },
         .sum_i64 => blk: {
             var total: i64 = 0;
             for (0..row_count) |row_idx| {
                 if (value_column.?.nulls.isNull(row_idx)) continue;
-                total += value_column.?.values.i64[row_idx];
+                total = try aggregate_math.addI64(total, value_column.?.values.i64[row_idx]);
             }
             break :blk .{ .sum_i64 = total };
         },
@@ -261,28 +262,12 @@ fn expressionValue(
             var count: u64 = 0;
             for (0..row_count) |row_idx| {
                 if (value_column.?.nulls.isNull(row_idx)) continue;
-                total += value_column.?.values.i64[row_idx];
-                count += 1;
+                total = try aggregate_math.addI64(total, value_column.?.values.i64[row_idx]);
+                count = try aggregate_math.addCount(count, 1);
             }
             if (count == 0) return error.EmptyAlgebraicExpressionFold;
             break :blk .{ .avg_i64 = .{ .sum_i64 = total, .count = count } };
         },
-    };
-}
-
-fn combine(
-    lhs: algebraic_segment.AggregateValue,
-    rhs: algebraic_segment.AggregateValue,
-) !algebraic_segment.AggregateValue {
-    return switch (lhs) {
-        .count => |left| .{ .count = left + rhs.count },
-        .sum_i64 => |left| .{ .sum_i64 = left + rhs.sum_i64 },
-        .min_i64 => |left| .{ .min_i64 = @min(left, rhs.min_i64) },
-        .max_i64 => |left| .{ .max_i64 = @max(left, rhs.max_i64) },
-        .avg_i64 => |left| .{ .avg_i64 = .{
-            .sum_i64 = left.sum_i64 + rhs.avg_i64.sum_i64,
-            .count = left.count + rhs.avg_i64.count,
-        } },
     };
 }
 

@@ -28,12 +28,14 @@ const source_binding = @import("../segment/source_binding.zig");
 const text_segment = @import("../text_segment/mod.zig");
 const external_rowsource = @import("../../storage/rowsource/external.zig");
 const rowsource = @import("../../storage/rowsource/types.zig");
+const lake_build_limits = @import("lake_build_limits.zig");
 
 pub const TextSidecarBuildOptions = struct {
     name: []const u8,
     text_column: []const u8,
     config_json: []const u8 = "{}",
     artifact_id: []const u8 = &.{},
+    limits: lake_build_limits.Limits = .{},
 };
 
 pub const TextSidecarBuildResult = struct {
@@ -63,6 +65,7 @@ pub fn buildTextSidecarFromRowSourceAlloc(
     options: TextSidecarBuildOptions,
 ) !TextSidecarBuildResult {
     try validateOptions(binding, source.kind, options);
+    var budget = try lake_build_limits.Budget.init(options.limits);
 
     var docs = std.ArrayListUnmanaged(text_segment.DocumentEntry).empty;
     errdefer docs.deinit(alloc);
@@ -73,8 +76,10 @@ pub fn buildTextSidecarFromRowSourceAlloc(
         for (term_map.values()) |*postings| postings.deinit(alloc);
         term_map.deinit(alloc);
     }
+    var posting_count: usize = 0;
 
     while (try source.next(alloc)) |batch| {
+        try budget.admitBatch(batch);
         try sidecar_manifest.validateBatchAgainstDeclaredArtifact(.{
             .name = options.name,
             .binding = binding,
@@ -88,7 +93,13 @@ pub fn buildTextSidecarFromRowSourceAlloc(
         }, batch);
 
         const column = batch.findColumn(options.text_column).?;
-        try appendBatchText(alloc, &docs, &term_map, batch, column);
+        posting_count = std.math.add(usize, posting_count, try appendBatchText(alloc, &docs, &term_map, batch, column)) catch
+            return error.LakeSidecarBuildBudgetExceeded;
+        const retained_items = std.math.add(usize, docs.items.len, term_map.count()) catch
+            return error.LakeSidecarBuildBudgetExceeded;
+        const total_retained_items = std.math.add(usize, retained_items, posting_count) catch
+            return error.LakeSidecarBuildBudgetExceeded;
+        try budget.checkRetainedItems(total_retained_items);
     }
 
     const doc_entries = try docs.toOwnedSlice(alloc);
@@ -124,6 +135,7 @@ pub fn buildTextSidecarFromRowSourceAlloc(
 
     const payload = try text_segment.encodeAlloc(alloc, segment);
     errdefer alloc.free(payload);
+    try budget.checkOutputBytes(payload.len);
 
     var declaration = try declaredArtifactAlloc(alloc, binding, options, payload.len);
     errdefer freeOwnedDeclaration(alloc, declaration);
@@ -184,22 +196,26 @@ fn appendBatchText(
     term_map: *std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(text_segment.Posting)),
     batch: rowsource.ColumnBatch,
     column: rowsource.ColumnVector,
-) !void {
+) !usize {
+    var posting_count: usize = 0;
     switch (column.values) {
         .bytes => |values| {
             for (values, 0..) |value, row| {
                 if (column.nulls.isNull(row)) continue;
-                try appendDocument(alloc, docs, term_map, batch.row_refs[row], value);
+                posting_count = std.math.add(usize, posting_count, try appendDocument(alloc, docs, term_map, batch.row_refs[row], value)) catch
+                    return error.LakeSidecarBuildBudgetExceeded;
             }
         },
         .json => |values| {
             for (values, 0..) |value, row| {
                 if (column.nulls.isNull(row)) continue;
-                try appendDocument(alloc, docs, term_map, batch.row_refs[row], value);
+                posting_count = std.math.add(usize, posting_count, try appendDocument(alloc, docs, term_map, batch.row_refs[row], value)) catch
+                    return error.LakeSidecarBuildBudgetExceeded;
             }
         },
         else => return error.UnsupportedLakeSidecarTextColumn,
     }
+    return posting_count;
 }
 
 fn appendDocument(
@@ -208,7 +224,7 @@ fn appendDocument(
     term_map: *std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(text_segment.Posting)),
     row_ref: rowsource.RowRef,
     source_text: []const u8,
-) !void {
+) !usize {
     if (docs.items.len > std.math.maxInt(u32)) return error.LakeSidecarTextTooManyDocs;
     const doc_index: u32 = @intCast(docs.items.len);
 
@@ -249,6 +265,7 @@ fn appendDocument(
     });
     doc_id_owned = false;
     normalized_owned = false;
+    return per_doc.count();
 }
 
 fn declaredArtifactAlloc(
@@ -489,6 +506,18 @@ test "lake text sidecar builder consumes external row source batches" {
     try std.testing.expectEqual(@as(usize, 2), beta.postings.len);
     try std.testing.expectEqual(@as(u32, 1), beta.postings[0].term_freq);
     try std.testing.expectEqual(@as(u32, 2), beta.postings[1].term_freq);
+
+    var bounded_source = try external_rowsource.BatchSource.init(external_binding, &batches);
+    try std.testing.expectError(error.LakeSidecarBuildBudgetExceeded, buildTextSidecarFromRowSourceAlloc(
+        alloc,
+        bounded_source.rowSource(),
+        binding,
+        .{
+            .name = "events.body.text",
+            .text_column = "body",
+            .limits = .{ .max_rows = 2 },
+        },
+    ));
 }
 
 test "lake text sidecar builder rejects stale source batches" {

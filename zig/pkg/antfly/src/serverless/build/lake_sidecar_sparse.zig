@@ -25,11 +25,13 @@ const source_binding = @import("../segment/source_binding.zig");
 const sparse_segment = @import("../sparse_segment/mod.zig");
 const external_rowsource = @import("../../storage/rowsource/external.zig");
 const rowsource = @import("../../storage/rowsource/types.zig");
+const lake_build_limits = @import("lake_build_limits.zig");
 
 pub const SparseSidecarBuildOptions = struct {
     name: []const u8,
     sparse_column: []const u8,
     artifact_id: []const u8 = &.{},
+    limits: lake_build_limits.Limits = .{},
 };
 
 pub const SparseSidecarBuildResult = struct {
@@ -59,6 +61,7 @@ pub fn buildSparseSidecarFromRowSourceAlloc(
     options: SparseSidecarBuildOptions,
 ) !SparseSidecarBuildResult {
     try validateOptions(binding, source.kind, options);
+    var budget = try lake_build_limits.Budget.init(options.limits);
 
     var docs = std.ArrayListUnmanaged(sparse_segment.DocumentEntry).empty;
     errdefer docs.deinit(alloc);
@@ -70,8 +73,10 @@ pub fn buildSparseSidecarFromRowSourceAlloc(
         for (term_map.values()) |*postings| postings.deinit(alloc);
         term_map.deinit(alloc);
     }
+    var posting_count: usize = 0;
 
     while (try source.next(alloc)) |batch| {
+        try budget.admitBatch(batch);
         try sidecar_manifest.validateBatchAgainstDeclaredArtifact(.{
             .name = options.name,
             .binding = binding,
@@ -85,7 +90,13 @@ pub fn buildSparseSidecarFromRowSourceAlloc(
         }, batch);
 
         const column = batch.findColumn(options.sparse_column).?;
-        try appendBatchSparse(alloc, &docs, &term_map, batch, column);
+        posting_count = std.math.add(usize, posting_count, try appendBatchSparse(alloc, &docs, &term_map, batch, column)) catch
+            return error.LakeSidecarBuildBudgetExceeded;
+        const retained_items = std.math.add(usize, docs.items.len, term_map.count()) catch
+            return error.LakeSidecarBuildBudgetExceeded;
+        const total_retained_items = std.math.add(usize, retained_items, posting_count) catch
+            return error.LakeSidecarBuildBudgetExceeded;
+        try budget.checkRetainedItems(total_retained_items);
     }
 
     const doc_entries = try docs.toOwnedSlice(alloc);
@@ -118,6 +129,7 @@ pub fn buildSparseSidecarFromRowSourceAlloc(
 
     const payload = try sparse_segment.encodeAlloc(alloc, segment);
     errdefer alloc.free(payload);
+    try budget.checkOutputBytes(payload.len);
 
     var declaration = try declaredArtifactAlloc(alloc, binding, options, payload.len);
     errdefer freeOwnedDeclaration(alloc, declaration);
@@ -178,22 +190,26 @@ fn appendBatchSparse(
     term_map: *std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(sparse_segment.Posting)),
     batch: rowsource.ColumnBatch,
     column: rowsource.ColumnVector,
-) !void {
+) !usize {
+    var posting_count: usize = 0;
     switch (column.values) {
         .bytes => |values| {
             for (values, 0..) |value, row| {
                 if (column.nulls.isNull(row)) continue;
-                try appendSparseDocument(alloc, docs, term_map, batch.row_refs[row], value);
+                posting_count = std.math.add(usize, posting_count, try appendSparseDocument(alloc, docs, term_map, batch.row_refs[row], value)) catch
+                    return error.LakeSidecarBuildBudgetExceeded;
             }
         },
         .json => |values| {
             for (values, 0..) |value, row| {
                 if (column.nulls.isNull(row)) continue;
-                try appendSparseDocument(alloc, docs, term_map, batch.row_refs[row], value);
+                posting_count = std.math.add(usize, posting_count, try appendSparseDocument(alloc, docs, term_map, batch.row_refs[row], value)) catch
+                    return error.LakeSidecarBuildBudgetExceeded;
             }
         },
         else => return error.UnsupportedLakeSidecarSparseColumn,
     }
+    return posting_count;
 }
 
 fn appendSparseDocument(
@@ -202,20 +218,21 @@ fn appendSparseDocument(
     term_map: *std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(sparse_segment.Posting)),
     row_ref: rowsource.RowRef,
     source_value: []const u8,
-) !void {
+) !usize {
     if (docs.items.len > std.math.maxInt(u32)) return error.LakeSidecarSparseTooManyDocs;
     const doc_index: u32 = @intCast(docs.items.len);
 
     var feature_count: u32 = 0;
     if (try appendProjectionSparseFeatures(alloc, term_map, doc_index, source_value, &feature_count)) {
         try appendSparseDocEntry(alloc, docs, row_ref, feature_count);
-        return;
+        return feature_count;
     }
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source_value, .{});
     defer parsed.deinit();
     try appendSparseFeaturesFromJsonValue(alloc, term_map, doc_index, parsed.value, &feature_count);
     try appendSparseDocEntry(alloc, docs, row_ref, feature_count);
+    return feature_count;
 }
 
 fn appendProjectionSparseFeatures(

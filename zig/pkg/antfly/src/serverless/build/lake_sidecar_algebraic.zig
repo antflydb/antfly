@@ -17,12 +17,14 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const algebraic_segment = @import("../algebraic_segment/mod.zig");
+const aggregate_math = algebraic_segment.aggregate_math;
 const artifact_ref = @import("../manifest/artifact_ref.zig");
 const artifact_store = @import("../artifacts/store.zig");
 const sidecar_manifest = @import("../segment/sidecar_manifest.zig");
 const source_binding = @import("../segment/source_binding.zig");
 const external_rowsource = @import("../../storage/rowsource/external.zig");
 const rowsource = @import("../../storage/rowsource/types.zig");
+const lake_build_limits = @import("lake_build_limits.zig");
 
 pub const AlgebraicGroupBySidecarBuildOptions = struct {
     name: []const u8,
@@ -30,6 +32,7 @@ pub const AlgebraicGroupBySidecarBuildOptions = struct {
     value_column: []const u8 = &.{},
     op: algebraic_segment.AggregateOp,
     artifact_id: []const u8 = &.{},
+    limits: lake_build_limits.Limits = .{},
 };
 
 pub const AlgebraicGroupBySidecarBuildResult = struct {
@@ -56,6 +59,7 @@ pub const AlgebraicExpressionSidecarBuildOptions = struct {
     name: []const u8,
     expressions: []const algebraic_segment.ExpressionSpec,
     artifact_id: []const u8 = &.{},
+    limits: lake_build_limits.Limits = .{},
 };
 
 pub const AlgebraicExpressionSidecarBuildResult = struct {
@@ -85,6 +89,7 @@ pub fn buildAlgebraicGroupBySidecarFromRowSourceAlloc(
     options: AlgebraicGroupBySidecarBuildOptions,
 ) !AlgebraicGroupBySidecarBuildResult {
     try validateGroupByOptions(binding, source.kind, options);
+    var budget = try lake_build_limits.Budget.init(options.limits);
 
     var folds = std.StringHashMapUnmanaged(algebraic_segment.AggregateValue).empty;
     defer {
@@ -94,6 +99,7 @@ pub fn buildAlgebraicGroupBySidecarFromRowSourceAlloc(
     }
 
     while (try source.next(alloc)) |batch| {
+        try budget.admitBatch(batch);
         try sidecar_manifest.validateBatchAgainstDeclaredArtifact(.{
             .name = options.name,
             .binding = binding,
@@ -106,6 +112,7 @@ pub fn buildAlgebraicGroupBySidecarFromRowSourceAlloc(
             },
         }, batch);
         try appendBatchGroupBy(alloc, &folds, batch, options);
+        try budget.checkRetainedItems(folds.count());
     }
 
     if (folds.count() == 0) return error.EmptyLakeSidecarAlgebraicSegment;
@@ -115,6 +122,7 @@ pub fn buildAlgebraicGroupBySidecarFromRowSourceAlloc(
 
     const payload = try algebraic_segment.encodeAlloc(alloc, segment);
     errdefer alloc.free(payload);
+    try budget.checkOutputBytes(payload.len);
 
     var declaration = try declaredArtifactAlloc(alloc, binding, options, payload.len);
     errdefer freeOwnedDeclaration(alloc, declaration);
@@ -159,6 +167,8 @@ pub fn buildAlgebraicExpressionSidecarFromRowSourceAlloc(
     options: AlgebraicExpressionSidecarBuildOptions,
 ) !AlgebraicExpressionSidecarBuildResult {
     try validateExpressionOptions(binding, source.kind, options);
+    var budget = try lake_build_limits.Budget.init(options.limits);
+    try budget.checkRetainedItems(options.expressions.len);
 
     const accumulators = try alloc.alloc(ExpressionAccumulator, options.expressions.len);
     defer alloc.free(accumulators);
@@ -167,6 +177,7 @@ pub fn buildAlgebraicExpressionSidecarFromRowSourceAlloc(
     }
 
     while (try source.next(alloc)) |batch| {
+        try budget.admitBatch(batch);
         try source_binding.validateBatchAgainstBinding(binding, batch);
         try appendBatchExpressions(accumulators, batch, options);
     }
@@ -176,6 +187,7 @@ pub fn buildAlgebraicExpressionSidecarFromRowSourceAlloc(
 
     const payload = try algebraic_segment.encodeExpressionAlloc(alloc, materialization);
     errdefer alloc.free(payload);
+    try budget.checkOutputBytes(payload.len);
 
     var declaration = try declaredArtifactForNameAlloc(
         alloc,
@@ -316,7 +328,7 @@ fn appendBatchGroupBy(
             entry.value_ptr.* = next_value;
         } else {
             alloc.free(owned_key);
-            entry.value_ptr.* = try combine(entry.value_ptr.*, next_value);
+            entry.value_ptr.* = try aggregate_math.combine(entry.value_ptr.*, next_value);
         }
     }
 }
@@ -328,28 +340,12 @@ fn rowAggregateValue(
 ) !?algebraic_segment.AggregateValue {
     return switch (op) {
         .count => .{ .count = 1 },
-        .sum_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .sum_i64 = value_column.?.values.i64[row_idx] },
+        .sum_i64 => .{ .sum_i64 = if (value_column.?.nulls.isNull(row_idx)) 0 else value_column.?.values.i64[row_idx] },
         .min_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .min_i64 = value_column.?.values.i64[row_idx] },
         .max_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .max_i64 = value_column.?.values.i64[row_idx] },
         .avg_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .avg_i64 = .{
             .sum_i64 = value_column.?.values.i64[row_idx],
             .count = 1,
-        } },
-    };
-}
-
-fn combine(
-    lhs: algebraic_segment.AggregateValue,
-    rhs: algebraic_segment.AggregateValue,
-) !algebraic_segment.AggregateValue {
-    return switch (lhs) {
-        .count => |left| .{ .count = left + rhs.count },
-        .sum_i64 => |left| .{ .sum_i64 = left + rhs.sum_i64 },
-        .min_i64 => |left| .{ .min_i64 = @min(left, rhs.min_i64) },
-        .max_i64 => |left| .{ .max_i64 = @max(left, rhs.max_i64) },
-        .avg_i64 => |left| .{ .avg_i64 = .{
-            .sum_i64 = left.sum_i64 + rhs.avg_i64.sum_i64,
-            .count = left.count + rhs.avg_i64.count,
         } },
     };
 }
@@ -382,7 +378,7 @@ fn appendBatchExpressions(
 ) !void {
     for (options.expressions, accumulators) |expression, *accumulator| {
         if (expression.op == .count) {
-            accumulator.value.count += @intCast(batch.rowCount());
+            accumulator.value.count = try aggregate_math.addCount(accumulator.value.count, batch.rowCount());
             continue;
         }
 
@@ -393,10 +389,10 @@ fn appendBatchExpressions(
             const value = value_column.values.i64[row_idx];
             switch (expression.op) {
                 .count => unreachable,
-                .sum_i64 => accumulator.value.sum_i64 += value,
+                .sum_i64 => accumulator.value.sum_i64 = try aggregate_math.addI64(accumulator.value.sum_i64, value),
                 .avg_i64 => {
-                    accumulator.value.avg_i64.sum_i64 += value;
-                    accumulator.value.avg_i64.count += 1;
+                    accumulator.value.avg_i64.sum_i64 = try aggregate_math.addI64(accumulator.value.avg_i64.sum_i64, value);
+                    accumulator.value.avg_i64.count = try aggregate_math.addCount(accumulator.value.avg_i64.count, 1);
                     accumulator.seen_non_null = true;
                 },
                 .min_i64 => {

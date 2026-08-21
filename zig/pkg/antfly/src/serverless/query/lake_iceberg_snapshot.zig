@@ -447,12 +447,22 @@ pub fn readPositionDeleteRowRefsAlloc(
     try request.delete_plan.validate();
     try request.application_limits.validate();
     try request.materialization_limits.validate();
-    if (request.delete_plan.activePositionDeleteFileCount() == 0) return try alloc.alloc(rowsource.RowRef, 0);
-
-    const columns = [_][]const u8{ "file_path", "pos" };
     var budget = DeleteApplicationBudget{ .limits = request.application_limits };
     var out = std.ArrayListUnmanaged(rowsource.RowRef).empty;
     errdefer out.deinit(alloc);
+    try appendPositionDeleteRowRefsAlloc(alloc, request, &budget, &out);
+    out.shrinkRetainingCapacity(sortAndDeduplicateExternalRowRefs(out.items));
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendPositionDeleteRowRefsAlloc(
+    alloc: Allocator,
+    request: PositionDeleteRowRefsReadRequest,
+    budget: *DeleteApplicationBudget,
+    out: *std.ArrayListUnmanaged(rowsource.RowRef),
+) !void {
+    if (request.delete_plan.activePositionDeleteFileCount() == 0) return;
+    const columns = [_][]const u8{ "file_path", "pos" };
 
     for (request.delete_plan.files) |delete_file| {
         if (delete_file.content != .position_deletes) continue;
@@ -513,8 +523,6 @@ pub fn readPositionDeleteRowRefsAlloc(
             }
         }
     }
-    out.shrinkRetainingCapacity(sortAndDeduplicateExternalRowRefs(out.items));
-    return try out.toOwnedSlice(alloc);
 }
 
 pub fn readDeleteRowRefsAlloc(
@@ -524,36 +532,30 @@ pub fn readDeleteRowRefsAlloc(
     try request.data_inventory.validate();
     if (request.data_inventory.format != .iceberg) return error.InvalidIcebergPositionDeleteInventory;
     try request.delete_plan.validate();
+    try request.application_limits.validate();
+    try request.materialization_limits.validate();
 
+    var budget = DeleteApplicationBudget{ .limits = request.application_limits };
     var out = std.ArrayListUnmanaged(rowsource.RowRef).empty;
     errdefer out.deinit(alloc);
 
-    const position_refs = try readPositionDeleteRowRefsAlloc(alloc, request);
-    defer alloc.free(position_refs);
-    try out.appendSlice(alloc, position_refs);
-
-    const equality_refs = try readEqualityDeleteRowRefsAlloc(alloc, request);
-    defer alloc.free(equality_refs);
-    try out.appendSlice(alloc, equality_refs);
+    try appendPositionDeleteRowRefsAlloc(alloc, request, &budget, &out);
+    try appendEqualityDeleteRowRefsAlloc(alloc, request, &budget, &out);
 
     out.shrinkRetainingCapacity(sortAndDeduplicateExternalRowRefs(out.items));
     return try out.toOwnedSlice(alloc);
 }
 
-fn readEqualityDeleteRowRefsAlloc(
+fn appendEqualityDeleteRowRefsAlloc(
     alloc: Allocator,
     request: DeleteRowRefsReadRequest,
-) ![]rowsource.RowRef {
-    if (request.delete_plan.activeEqualityDeleteFileCount() == 0) return try alloc.alloc(rowsource.RowRef, 0);
-    try request.application_limits.validate();
-    try request.materialization_limits.validate();
-
-    var out = std.ArrayListUnmanaged(rowsource.RowRef).empty;
-    errdefer out.deinit(alloc);
+    budget: *DeleteApplicationBudget,
+    out: *std.ArrayListUnmanaged(rowsource.RowRef),
+) !void {
+    if (request.delete_plan.activeEqualityDeleteFileCount() == 0) return;
     const processed = try alloc.alloc(bool, request.delete_plan.files.len);
     defer alloc.free(processed);
     @memset(processed, false);
-    var budget = DeleteApplicationBudget{ .limits = request.application_limits };
 
     for (request.delete_plan.files, 0..) |group_file, group_idx| {
         if (processed[group_idx] or group_file.content != .equality_deletes) continue;
@@ -720,9 +722,6 @@ fn readEqualityDeleteRowRefsAlloc(
             }
         }
     }
-
-    out.shrinkRetainingCapacity(sortAndDeduplicateExternalRowRefs(out.items));
-    return try out.toOwnedSlice(alloc);
 }
 
 fn equalityColumnSetsEqual(left: []const []const u8, right: []const []const u8) bool {
@@ -1872,7 +1871,7 @@ test "iceberg position deletes enforce sequence and partition scope" {
     try std.testing.expectError(error.UnsupportedIcebergPartitionDeleteScope, positionDeleteAppliesToFile(file, delete_file));
 }
 
-test "iceberg snapshot reader discovers data footers for equality deletes" {
+test "iceberg snapshot reader applies one global position and equality delete budget" {
     const alloc = std.testing.allocator;
 
     const data_file_path = "s3://bucket/t/data/a.parquet";
@@ -1887,14 +1886,31 @@ test "iceberg snapshot reader discovers data footers for equality deletes" {
     const delete_file_path = "s3://bucket/t/deletes/eq-a.parquet";
     const delete_columns = [_]lake_parquet_rowgroup.TestPlainI64Column{.{
         .column_id = "amount",
-        .values = &[_]i64{10},
+        .values = &[_]i64{20},
     }};
     const delete_object = try lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(alloc, &delete_columns);
     defer alloc.free(delete_object);
 
+    const position_file_path = "s3://bucket/t/deletes/pos-a.parquet";
+    const position_columns = [_]lake_parquet_rowgroup.TestPlainI64Column{.{
+        .column_id = "pos",
+        .values = &[_]i64{0},
+    }};
+    const position_path_columns = [_]lake_parquet_rowgroup.TestPlainByteArrayColumn{.{
+        .column_id = "file_path",
+        .values = &[_][]const u8{data_file_path},
+    }};
+    const position_object = try lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(
+        alloc,
+        &position_columns,
+        &position_path_columns,
+    );
+    defer alloc.free(position_object);
+
     const MemoryRangeReader = struct {
         data_body: []const u8,
         delete_body: []const u8,
+        position_body: []const u8,
 
         fn reader(self: *@This()) lake_parquet_rowgroup.ObjectRangeReader {
             return .{
@@ -1917,6 +1933,8 @@ test "iceberg snapshot reader discovers data footers for equality deletes" {
                 self.data_body
             else if (std.mem.eql(u8, key, "t/deletes/eq-a.parquet"))
                 self.delete_body
+            else if (std.mem.eql(u8, key, "t/deletes/pos-a.parquet"))
+                self.position_body
             else
                 return error.ObjectNotFound;
             const start: usize = std.math.cast(usize, offset) orelse return error.InvalidLakeRangeRead;
@@ -1927,6 +1945,7 @@ test "iceberg snapshot reader discovers data footers for equality deletes" {
     var range_reader = MemoryRangeReader{
         .data_body = data_object,
         .delete_body = delete_object,
+        .position_body = position_object,
     };
 
     var inventory = external_source.Inventory{
@@ -1945,10 +1964,11 @@ test "iceberg snapshot reader discovers data footers for equality deletes" {
         .byte_len = data_object.len,
         .row_count = 3,
         .data_sequence_number = 5,
+        .partition_spec_id = 0,
         .row_groups = &.{},
     };
 
-    var plan = IcebergDeletePlan{ .files = try alloc.alloc(IcebergDeleteFile, 1) };
+    var plan = IcebergDeletePlan{ .files = try alloc.alloc(IcebergDeleteFile, 2) };
     defer plan.deinit(alloc);
     plan.files[0] = .{
         .content = .equality_deletes,
@@ -1963,10 +1983,36 @@ test "iceberg snapshot reader discovers data footers for equality deletes" {
         .file_size_in_bytes = delete_object.len,
     };
     plan.files[0].equality_columns[0] = try alloc.dupe(u8, "amount");
+    plan.files[1] = .{
+        .content = .position_deletes,
+        .file_path = try alloc.dupe(u8, position_file_path),
+        .file_format = try alloc.dupe(u8, "PARQUET"),
+        .snapshot_id = 12,
+        .data_sequence_number = 7,
+        .file_sequence_number = 9,
+        .record_count = 1,
+        .file_size_in_bytes = position_object.len,
+    };
+
+    var discovered_data = try lake_parquet_rowgroup.discoverSupportedI64ObjectRangeRowGroupsFromFootersAlloc(
+        alloc,
+        range_reader.reader(),
+        inventory,
+        &[_][]const u8{"amount"},
+        64 * 1024,
+    );
+    defer discovered_data.deinit(alloc);
+
+    try std.testing.expectError(error.IcebergDeleteApplicationTooLarge, readDeleteRowRefsAlloc(alloc, .{
+        .reader = range_reader.reader(),
+        .data_inventory = discovered_data.inventory,
+        .delete_plan = plan,
+        .application_limits = .{ .max_deleted_rows = 1 },
+    }));
 
     const refs = try readDeleteRowRefsAlloc(alloc, .{
         .reader = range_reader.reader(),
-        .data_inventory = inventory,
+        .data_inventory = discovered_data.inventory,
         .delete_plan = plan,
     });
     defer alloc.free(refs);
@@ -1975,7 +2021,7 @@ test "iceberg snapshot reader discovers data footers for equality deletes" {
     try std.testing.expectEqualStrings(data_file_path, refs[0].external.file_id);
     try std.testing.expectEqual(@as(u64, 0), refs[0].external.row_ordinal);
     try std.testing.expectEqualStrings(data_file_path, refs[1].external.file_id);
-    try std.testing.expectEqual(@as(u64, 2), refs[1].external.row_ordinal);
+    try std.testing.expectEqual(@as(u64, 1), refs[1].external.row_ordinal);
 }
 
 test "iceberg equality deletes enforce partition spec and tuple scope" {

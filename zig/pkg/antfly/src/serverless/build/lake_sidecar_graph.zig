@@ -23,11 +23,13 @@ const sidecar_manifest = @import("../segment/sidecar_manifest.zig");
 const source_binding = @import("../segment/source_binding.zig");
 const external_rowsource = @import("../../storage/rowsource/external.zig");
 const rowsource = @import("../../storage/rowsource/types.zig");
+const lake_build_limits = @import("lake_build_limits.zig");
 
 pub const GraphSidecarBuildOptions = struct {
     name: []const u8,
     graph_column: []const u8,
     artifact_id: []const u8 = &.{},
+    limits: lake_build_limits.Limits = .{},
 };
 
 pub const GraphSidecarBuildResult = struct {
@@ -57,12 +59,14 @@ pub fn buildGraphSidecarFromRowSourceAlloc(
     options: GraphSidecarBuildOptions,
 ) !GraphSidecarBuildResult {
     try validateOptions(binding, source.kind, options);
+    var budget = try lake_build_limits.Budget.init(options.limits);
 
     var node_map = std.StringArrayHashMapUnmanaged(NodeEdges).empty;
     defer deinitNodeMap(alloc, &node_map);
     var total_edges: usize = 0;
 
     while (try source.next(alloc)) |batch| {
+        try budget.admitBatch(batch);
         try sidecar_manifest.validateBatchAgainstDeclaredArtifact(.{
             .name = options.name,
             .binding = binding,
@@ -76,7 +80,11 @@ pub fn buildGraphSidecarFromRowSourceAlloc(
         }, batch);
 
         const column = batch.findColumn(options.graph_column).?;
-        total_edges += try appendBatchGraph(alloc, &node_map, batch, column);
+        total_edges = std.math.add(usize, total_edges, try appendBatchGraph(alloc, &node_map, batch, column)) catch
+            return error.LakeSidecarBuildBudgetExceeded;
+        const retained_items = std.math.add(usize, node_map.count(), total_edges) catch
+            return error.LakeSidecarBuildBudgetExceeded;
+        try budget.checkRetainedItems(retained_items);
     }
 
     if (total_edges == 0) return error.EmptyLakeSidecarGraphSegment;
@@ -86,6 +94,7 @@ pub fn buildGraphSidecarFromRowSourceAlloc(
 
     const payload = try graph_segment.encodeAlloc(alloc, segment);
     errdefer alloc.free(payload);
+    try budget.checkOutputBytes(payload.len);
 
     var declaration = try declaredArtifactAlloc(alloc, binding, options, payload.len);
     errdefer freeOwnedDeclaration(alloc, declaration);
@@ -151,13 +160,15 @@ fn appendBatchGraph(
         .bytes => |values| {
             for (values, 0..) |value, row| {
                 if (column.nulls.isNull(row)) continue;
-                total_edges += try appendGraphDocument(alloc, node_map, batch.row_refs[row], value);
+                total_edges = std.math.add(usize, total_edges, try appendGraphDocument(alloc, node_map, batch.row_refs[row], value)) catch
+                    return error.LakeSidecarBuildBudgetExceeded;
             }
         },
         .json => |values| {
             for (values, 0..) |value, row| {
                 if (column.nulls.isNull(row)) continue;
-                total_edges += try appendGraphDocument(alloc, node_map, batch.row_refs[row], value);
+                total_edges = std.math.add(usize, total_edges, try appendGraphDocument(alloc, node_map, batch.row_refs[row], value)) catch
+                    return error.LakeSidecarBuildBudgetExceeded;
             }
         },
         else => return error.UnsupportedLakeSidecarGraphColumn,

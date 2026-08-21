@@ -16,6 +16,7 @@ pub const types = @import("types.zig");
 pub const codec = @import("codec.zig");
 pub const builder = @import("builder.zig");
 pub const reader = @import("reader.zig");
+pub const aggregate_math = @import("aggregate_math.zig");
 
 pub const SourceKind = types.SourceKind;
 pub const AggregateOp = types.AggregateOp;
@@ -50,6 +51,7 @@ test "serverless algebraic segment module compiles" {
     _ = codec;
     _ = builder;
     _ = reader;
+    _ = aggregate_math;
     _ = Segment;
     _ = ExpressionMaterialization;
     _ = BuildOptions;

@@ -26,6 +26,7 @@ const vector_index = @import("vector_index.zig");
 const vector_segment = @import("../vector_segment/mod.zig");
 const external_rowsource = @import("../../storage/rowsource/external.zig");
 const rowsource = @import("../../storage/rowsource/types.zig");
+const lake_build_limits = @import("lake_build_limits.zig");
 
 pub const VectorSidecarBuildOptions = struct {
     name: []const u8,
@@ -34,6 +35,7 @@ pub const VectorSidecarBuildOptions = struct {
     policy: vector_index.BuildPolicy = .{},
     embedding_name: ?[]const u8 = null,
     artifact_id: []const u8 = &.{},
+    limits: lake_build_limits.Limits = .{},
 };
 
 pub const VectorSidecarBuildResult = struct {
@@ -63,6 +65,7 @@ pub fn buildVectorSidecarFromRowSourceAlloc(
     options: VectorSidecarBuildOptions,
 ) !VectorSidecarBuildResult {
     try validateOptions(binding, source.kind, options);
+    var budget = try lake_build_limits.Budget.init(options.limits);
 
     var entries = std.ArrayListUnmanaged(vector_segment.Entry).empty;
     var entries_owned_by_list = true;
@@ -73,6 +76,7 @@ pub fn buildVectorSidecarFromRowSourceAlloc(
     var dims: ?u32 = null;
 
     while (try source.next(alloc)) |batch| {
+        try budget.admitBatch(batch);
         try sidecar_manifest.validateBatchAgainstDeclaredArtifact(.{
             .name = options.name,
             .binding = binding,
@@ -87,6 +91,7 @@ pub fn buildVectorSidecarFromRowSourceAlloc(
 
         const column = batch.findColumn(options.vector_column).?;
         try appendBatchVectors(alloc, &entries, &dims, batch, column, options.embedding_name);
+        try budget.checkRetainedItems(entries.items.len);
     }
 
     if (entries.items.len == 0 or dims == null) return error.EmptyLakeSidecarVectorSegment;
@@ -105,6 +110,7 @@ pub fn buildVectorSidecarFromRowSourceAlloc(
 
     const payload = try vector_segment.encodeAlloc(alloc, segment);
     errdefer alloc.free(payload);
+    try budget.checkOutputBytes(payload.len);
 
     var declaration = try declaredArtifactAlloc(alloc, binding, options, payload.len);
     errdefer freeOwnedDeclaration(alloc, declaration);
