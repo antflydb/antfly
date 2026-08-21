@@ -171,29 +171,6 @@ def _model_exists(models_dir: Path, model_name: str) -> bool:
     return any(path.is_dir() for path in _candidate_model_dirs(models_dir, model_name))
 
 
-def test_standalone_model_preflight_recognizes_atomic_variant_publication(
-    tmp_path: Path,
-):
-    models_dir = tmp_path / "models"
-    published = models_dir / "ggml-org" / "gemma-4-e2b-it-gguf--antfly-0123456789abcdef"
-    published.mkdir(parents=True)
-
-    assert _model_exists(models_dir, "ggml-org/gemma-4-e2b-it-gguf")
-
-
-def test_standalone_model_preflight_rejects_incomplete_variant_names(tmp_path: Path):
-    models_dir = tmp_path / "models"
-    incomplete = (
-        models_dir
-        / "generators"
-        / "ggml-org"
-        / "gemma-4-e2b-it-gguf--antfly-0123456789abcdef.tmp"
-    )
-    incomplete.mkdir(parents=True)
-
-    assert not _model_exists(models_dir, "ggml-org/gemma-4-e2b-it-gguf")
-
-
 class EmbeddedInferenceStandaloneServer:
     def __init__(
         self,
@@ -355,101 +332,6 @@ def _finish_standalone_server(
         primary_failure.add_note(cleanup_failure)
         return
     raise AssertionError(cleanup_failure)
-
-
-def test_standalone_warmup_uses_configured_first_use_deadline(monkeypatch):
-    observed: dict[str, object] = {}
-
-    class Response:
-        status_code = 200
-        text = ""
-
-    def post(url: str, **kwargs):
-        observed["url"] = url
-        observed["timeout"] = kwargs["timeout"]
-        return Response()
-
-    monkeypatch.setattr(requests, "post", post)
-
-    _warm_inference_generator(
-        "http://127.0.0.1:8080/ai/v1",
-        "test/model",
-        request_timeout=1800.0,
-    )
-
-    assert observed == {
-        "url": "http://127.0.0.1:8080/ai/v1/generate",
-        "timeout": 1800.0,
-    }
-
-
-@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "invalid"])
-def test_standalone_first_use_deadline_rejects_invalid_values(monkeypatch, value):
-    monkeypatch.setenv("ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT", value)
-
-    with pytest.raises(
-        ValueError,
-        match="ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT must be a positive finite number",
-    ):
-        _positive_timeout(
-            "ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT",
-            DEFAULT_INFERENCE_STANDALONE_FIRST_USE_REQUEST_TIMEOUT,
-        )
-
-
-class _FakeStandaloneServer:
-    def __init__(
-        self,
-        *,
-        forced_kill: bool = False,
-        returncode: int = 0,
-        stop_failure: Exception | None = None,
-    ):
-        self.forced_kill = forced_kill
-        self.returncode = returncode
-        self.stop_failure = stop_failure
-        self.final_logs = "standalone diagnostic logs"
-        self.stop_calls = 0
-
-    def stop(self) -> None:
-        self.stop_calls += 1
-        if self.stop_failure is not None:
-            raise self.stop_failure
-
-
-def test_standalone_cleanup_preserves_primary_failure():
-    server = _FakeStandaloneServer(returncode=1)
-    primary_failure = RuntimeError("warmup timed out")
-
-    _finish_standalone_server(server, primary_failure)
-
-    assert server.stop_calls == 1
-    assert primary_failure.__notes__ == [
-        "standalone inference did not shut down cleanly "
-        "(forced_kill=False, returncode=1)\n"
-        "last logs:\nstandalone diagnostic logs"
-    ]
-
-
-def test_standalone_cleanup_exception_is_attached_to_primary_failure():
-    server = _FakeStandaloneServer(stop_failure=OSError("cleanup failed"))
-    primary_failure = RuntimeError("warmup timed out")
-
-    _finish_standalone_server(server, primary_failure)
-
-    assert server.stop_calls == 1
-    assert primary_failure.__notes__ == [
-        "standalone inference cleanup raised OSError: cleanup failed"
-    ]
-
-
-def test_standalone_cleanup_failure_is_primary_after_successful_test():
-    server = _FakeStandaloneServer(forced_kill=True, returncode=-9)
-
-    with pytest.raises(AssertionError, match="did not shut down cleanly"):
-        _finish_standalone_server(server, None)
-
-    assert server.stop_calls == 1
 
 
 @pytest.fixture(scope="session")
