@@ -122,13 +122,37 @@ pub const Reader = struct {
                 .lt => lo = mid + 1,
                 .gt => hi = mid,
                 .eq => {
-                    const value = self.data[found.offset..][0..found.len];
-                    if (std.hash.Crc32.hash(value) != found.checksum) return error.VectorDirectoryChecksumMismatch;
-                    return value;
+                    return try self.checkedValue(found);
                 },
             }
         }
         return null;
+    }
+
+    pub const Item = struct {
+        kind: Kind,
+        id: u64,
+        value: []const u8,
+    };
+
+    pub const Iterator = struct {
+        reader: Reader,
+        index: usize = 0,
+
+        pub fn next(self: *Iterator) !?Item {
+            if (self.index >= self.reader.count) return null;
+            const found = try self.reader.entry(self.index);
+            self.index += 1;
+            return .{
+                .kind = found.kind,
+                .id = found.id,
+                .value = try self.reader.checkedValue(found),
+            };
+        }
+    };
+
+    pub fn iterator(self: Reader) Iterator {
+        return .{ .reader = self };
     }
 
     const Entry = struct { kind: Kind, id: u64, offset: usize, len: usize, checksum: u32 };
@@ -145,6 +169,12 @@ pub const Reader = struct {
         const len = std.math.cast(usize, readU64(raw[17..25])) orelse return error.CorruptedVectorDirectory;
         if (offset < header_size or offset > self.index_offset or len > self.index_offset - offset) return error.CorruptedVectorDirectory;
         return .{ .kind = kind, .id = readU64(raw[1..9]), .offset = offset, .len = len, .checksum = readU32(raw[25..29]) };
+    }
+
+    fn checkedValue(self: Reader, entry_value: Entry) ![]const u8 {
+        const value = self.data[entry_value.offset..][0..entry_value.len];
+        if (std.hash.Crc32.hash(value) != entry_value.checksum) return error.VectorDirectoryChecksumMismatch;
+        return value;
     }
 
     fn validate(self: Reader) !void {
@@ -201,6 +231,15 @@ test "HBC vector directory round trips compact ordered values" {
     try std.testing.expectEqualStrings("leaf-42", (try reader.get(.leaf, 42)).?);
     try std.testing.expectEqualStrings("doc:7", (try reader.get(.metadata, 7)).?);
     try std.testing.expectEqual(@as(?[]const u8, null), try reader.get(.metadata, 42));
+
+    var it = reader.iterator();
+    const first = (try it.next()).?;
+    try std.testing.expectEqual(Kind.leaf, first.kind);
+    try std.testing.expectEqual(@as(u64, 7), first.id);
+    try std.testing.expectEqualStrings("leaf-7", first.value);
+    try std.testing.expect((try it.next()) != null);
+    try std.testing.expect((try it.next()) != null);
+    try std.testing.expect((try it.next()) == null);
 }
 
 test "HBC vector directory verifies values lazily" {

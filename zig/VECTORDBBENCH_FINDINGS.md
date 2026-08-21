@@ -805,17 +805,30 @@ ready in 51.60 seconds. Batch-reading all touched vector values once and only
 patching large packed/quantized posting families recovered the expected load
 rate:
 
-| Public 50K full-derived checkpoint | Insert | Catch-up | Total ready | Snapshot copies | Sidecar | Peak RSS | Peak attributable demand |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Before capture fast path | 44.79 s | 6.81 s | 51.60 s | 133 MB | 19 MB | 1.60 GB | 1.16 GB during load |
-| Batched tiny-value capture | 36.19 s | 13.41 s | 49.61 s | 116 MB | 17 MB + 5.9 MB WAL | 1.80 GB | 1.23 GB |
+| Public 50K full-derived checkpoint | Insert | Catch-up | Total ready | Snapshot copies | Sidecar | Physical footprint / RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Before capture fast path | 44.79 s | 6.81 s | 51.60 s | 133 MB | 19 MB | 829 MB / 1.60 GB during load |
+| Batched tiny-value capture | 36.19 s | 13.41 s | 49.61 s | 116 MB | 17 MB + 5.9 MB WAL | 533 MB / 1.80 GB |
+| Immutable flatten, half-segment policy | 45.05 s | 9.00 s | 54.05 s | 192 MB | 19 MB | 905 MB / 1.41 GB |
+| Immutable flatten, bounded full-segment policy | 41.37 s | 9.01 s | 50.38 s | 164 MB | 19 MB | 576 MB / 1.54 GB |
 
-The optimized insert is back in the 30--40 second target range. Total-ready
-time varies with asynchronous catch-up/checkpoint scheduling, so insert and
-catch-up are reported separately. Both runs reached sequence 501 with all
-50,000 vectors query-visible. The second row is a single diagnostic sample;
-the RSS high-water occurred after the peak attributable-demand sample and is
-cache-inclusive.
+The capture-only optimized insert reached the 30--40 second target range.
+Total-ready time varies with asynchronous catch-up/checkpoint scheduling, so
+insert and catch-up are reported separately. All runs reached sequence 501
+with all 50,000 vectors query-visible. These are single diagnostic samples;
+RSS is cache-inclusive and its high-water need not coincide with the native
+physical-footprint ledger high-water.
+
+At 1M, the half-segment policy exposed a repeat-checkpoint scalability issue.
+The diagnostic was stopped at 451,500 query-visible rows after about 757
+seconds: a fresh authoritative LSM scan during checkpointing temporarily put
+replay about 120 source batches behind and pushed the sampler above its memory
+target. Subsequent checkpoints now merge the complete leased immutable
+directory and WAL overlays, so only generation 1 scans the authoritative LSM.
+The production policy waits for at least 4 MiB and a tail equal to the current
+segment size, with the existing unconditional 64 MiB cap. On 50K this reduced
+checkpoint publications from ten to six and recovered 3.67 seconds versus the
+half-segment flatten run while ending with an empty WAL.
 
 The full-derived query run preserved the existing boundary-rerank policy and
 measured recall 0.9842 with serial p50/p95/p99 of 2.5/3.0/6.8 ms. Throughput

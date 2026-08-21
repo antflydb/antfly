@@ -1589,6 +1589,76 @@ fn experimentalPostingValueKeyId(key: u128) u64 {
     return @intCast(key >> 8);
 }
 
+const ExperimentalPostingLatestValues = std.AutoHashMapUnmanaged(u128, ?[]const u8);
+
+fn experimentalPostingRootState(generation: *ExperimentalPostingReadGeneration) ?*ExperimentalPostingReadState {
+    var current: ?*ExperimentalPostingReadGeneration = generation;
+    while (current) |item| : (current = item.parent) {
+        if (item.root) |state| return state;
+    }
+    return null;
+}
+
+/// Collects only values changed since the immutable root, newest first. The
+/// slices remain borrowed from `generation`, which the caller must retain.
+fn collectExperimentalPostingLatestValues(
+    alloc: Allocator,
+    generation: *ExperimentalPostingReadGeneration,
+    latest: *ExperimentalPostingLatestValues,
+) !void {
+    var current: ?*ExperimentalPostingReadGeneration = generation;
+    while (current) |item| : (current = item.parent) {
+        var values = item.values.iterator();
+        while (values.next()) |entry| {
+            const result = try latest.getOrPut(alloc, entry.key_ptr.*);
+            if (!result.found_existing) result.value_ptr.* = entry.value_ptr.*;
+        }
+        if (item.root) |state| {
+            var materialized = state.materialized.iterator();
+            while (materialized.next()) |entry| {
+                const result = try latest.getOrPut(alloc, entry.key_ptr.*);
+                if (!result.found_existing) result.value_ptr.* = entry.value_ptr.*;
+            }
+            break;
+        }
+    }
+}
+
+fn experimentalPostingCheckpointValue(
+    latest: *const ExperimentalPostingLatestValues,
+    root: *ExperimentalPostingReadState,
+    id: u64,
+    kind: vectorindex_posting_wal.RecordKind,
+) !?[]const u8 {
+    if (latest.get(experimentalPostingValueKey(id, kind))) |value| return value;
+    return root.value(id, kind) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+}
+
+const ExperimentalVectorOverride = struct {
+    kind: vectorindex_hbc_vector_directory.Kind,
+    id: u64,
+    value: ?[]const u8,
+
+    fn lessThan(_: void, lhs: ExperimentalVectorOverride, rhs: ExperimentalVectorOverride) bool {
+        return compare(lhs, rhs) == .lt;
+    }
+
+    fn compare(lhs: ExperimentalVectorOverride, rhs: ExperimentalVectorOverride) std.math.Order {
+        const lhs_kind = @intFromEnum(lhs.kind);
+        const rhs_kind = @intFromEnum(rhs.kind);
+        if (lhs_kind < rhs_kind) return .lt;
+        if (lhs_kind > rhs_kind) return .gt;
+        return std.math.order(lhs.id, rhs.id);
+    }
+
+    fn compareItem(lhs: ExperimentalVectorOverride, rhs: vectorindex_hbc_vector_directory.Reader.Item) std.math.Order {
+        return compare(lhs, .{ .kind = rhs.kind, .id = rhs.id, .value = rhs.value });
+    }
+};
+
 fn experimentalPostingValueKeyKind(key: u128) !vectorindex_posting_wal.RecordKind {
     return switch (@as(u8, @truncate(key))) {
         @intFromEnum(vectorindex_posting_wal.RecordKind.base) => .base,
@@ -1607,6 +1677,7 @@ pub const PostingCheckpointStats = struct {
     covered_source_sequence: u64,
     posting_count: u64,
     segment_bytes: u64,
+    flattened_generation: bool,
 };
 
 pub const PostingWalAppendStats = struct {
@@ -1618,6 +1689,17 @@ pub const PostingWalAppendStats = struct {
 
 pub const ExperimentalPostingWalAppendOptions = struct {
     sync: bool = true,
+};
+
+/// Query generations are published per coherent dense replay window, so the
+/// in-memory overlay chain remains shallow even when the durable WAL is larger
+/// than half a small early checkpoint. Avoid repeatedly rewriting the complete
+/// vector directory during bulk catch-up while retaining a hard 64 MiB restart
+/// and recovery bound.
+const managedPostingCheckpointPolicy: posting_segment_store_mod.CheckpointPolicy = .{
+    .min_wal_bytes = 4 * 1024 * 1024,
+    .max_wal_bytes = 64 * 1024 * 1024,
+    .wal_to_segment_percent = 100,
 };
 
 const ExperimentalPostingMaintenanceCapture = struct {
@@ -3175,7 +3257,7 @@ pub const HBCIndex = struct {
         // the writer handle, so resolve it again before applying the tail
         // policy.
         posting_store = &self.experimental_posting_write_store.?;
-        if (posting_store.shouldCheckpoint(.{})) {
+        if (posting_store.shouldCheckpoint(managedPostingCheckpointPolicy)) {
             _ = try self.publishExperimentalPostingCheckpoint(posting_store.covered_source_sequence);
         }
     }
@@ -3259,7 +3341,7 @@ pub const HBCIndex = struct {
             .{},
         );
         posting_store = &self.experimental_posting_write_store.?;
-        if (posting_store.shouldCheckpoint(.{})) {
+        if (posting_store.shouldCheckpoint(managedPostingCheckpointPolicy)) {
             _ = try self.publishExperimentalPostingCheckpoint(capture.covered_source_sequence);
         }
     }
@@ -3520,6 +3602,92 @@ pub const HBCIndex = struct {
         };
     }
 
+    /// Rewrites a checkpoint from the already complete immutable query
+    /// generation. This avoids opening a new LSM snapshot and scanning all
+    /// derived namespaces every time the sidecar WAL is flattened.
+    fn appendExperimentalPostingCheckpointFromGeneration(
+        self: *HBCIndex,
+        writer: *vectorindex_posting_segment.Writer,
+        generation: *ExperimentalPostingReadGeneration,
+        covered_source_sequence: u64,
+    ) !?u64 {
+        const root = experimentalPostingRootState(generation) orelse return null;
+        const base_directory = root.vector_directory orelse return null;
+
+        var latest: ExperimentalPostingLatestValues = .empty;
+        defer latest.deinit(self.alloc);
+        try collectExperimentalPostingLatestValues(self.alloc, generation, &latest);
+
+        var metadata_buf: [IndexMetadata.encoded_size]u8 = undefined;
+        try writer.appendValueAt(0, .index_metadata, covered_source_sequence, self.metadata.encode(&metadata_buf));
+
+        var posting_count: u64 = 0;
+        var node_id: u64 = 1;
+        while (node_id <= self.metadata.node_count) : (node_id = std.math.add(u64, node_id, 1) catch break) {
+            const packed_node = (try experimentalPostingCheckpointValue(&latest, root, node_id, .base)) orelse continue;
+            try writer.appendBaseAt(node_id, covered_source_sequence, packed_node);
+            posting_count += 1;
+            if (try experimentalPostingCheckpointValue(&latest, root, node_id, .node_range)) |range| {
+                try writer.appendValueAt(node_id, .node_range, covered_source_sequence, range);
+            }
+            if (try experimentalPostingCheckpointValue(&latest, root, node_id, .posting_state)) |posting_state| {
+                try writer.appendPostingStateAt(node_id, covered_source_sequence, posting_state);
+            }
+            if (try experimentalPostingCheckpointValue(&latest, root, node_id, .quantized_checkpoint)) |quantized| {
+                try writer.appendQuantizedCheckpointAt(node_id, covered_source_sequence, quantized);
+            }
+        }
+
+        var vector_overrides = std.ArrayListUnmanaged(ExperimentalVectorOverride).empty;
+        defer vector_overrides.deinit(self.alloc);
+        try vector_overrides.ensureTotalCapacity(self.alloc, latest.count());
+        var latest_it = latest.iterator();
+        while (latest_it.next()) |entry| {
+            const record_kind = experimentalPostingValueKeyKind(entry.key_ptr.*) catch continue;
+            const directory_kind: vectorindex_hbc_vector_directory.Kind = switch (record_kind) {
+                .vector_leaf => .leaf,
+                .vector_metadata => .metadata,
+                else => continue,
+            };
+            vector_overrides.appendAssumeCapacity(.{
+                .kind = directory_kind,
+                .id = experimentalPostingValueKeyId(entry.key_ptr.*),
+                .value = entry.value_ptr.*,
+            });
+        }
+        std.mem.sort(ExperimentalVectorOverride, vector_overrides.items, {}, ExperimentalVectorOverride.lessThan);
+
+        var directory_writer = try vectorindex_hbc_vector_directory.Writer.init(self.alloc);
+        defer directory_writer.deinit();
+        var base_it = base_directory.iterator();
+        var override_index: usize = 0;
+        while (try base_it.next()) |base| {
+            while (override_index < vector_overrides.items.len and
+                ExperimentalVectorOverride.compareItem(vector_overrides.items[override_index], base) == .lt)
+            {
+                const replacement = vector_overrides.items[override_index];
+                if (replacement.value) |value| try directory_writer.append(replacement.kind, replacement.id, value);
+                override_index += 1;
+            }
+            if (override_index < vector_overrides.items.len and
+                ExperimentalVectorOverride.compareItem(vector_overrides.items[override_index], base) == .eq)
+            {
+                const replacement = vector_overrides.items[override_index];
+                if (replacement.value) |value| try directory_writer.append(replacement.kind, replacement.id, value);
+                override_index += 1;
+            } else {
+                try directory_writer.append(base.kind, base.id, base.value);
+            }
+        }
+        while (override_index < vector_overrides.items.len) : (override_index += 1) {
+            const replacement = vector_overrides.items[override_index];
+            if (replacement.value) |value| try directory_writer.append(replacement.kind, replacement.id, value);
+        }
+        const vector_directory = try directory_writer.build();
+        try writer.appendValueOwnedAt(0, .vector_directory, covered_source_sequence, vector_directory);
+        return posting_count;
+    }
+
     /// Materializes the currently committed packed HBC node and RaBitQ values
     /// into a durable immutable generation. The caller supplies the upstream
     /// source sequence whose complete effects are represented by this state.
@@ -3531,6 +3699,8 @@ pub const HBCIndex = struct {
         covered_source_sequence: u64,
     ) !PostingCheckpointStats {
         if (self.write_session_depth != 0) return error.ActiveWriteSession;
+        const source_generation = self.retainCurrentExperimentalPostingReadGeneration();
+        defer if (source_generation) |generation| generation.release();
         self.discardExperimentalPostingDeltaBaseState();
         self.closeExperimentalPostingWalWriter();
         var posting_store = try self.openExperimentalPostingStore();
@@ -3544,72 +3714,92 @@ pub const HBCIndex = struct {
         defer writer.deinit();
         var posting_count: u64 = 0;
 
-        var txn = try self.store.beginRead();
-        defer txn.abort();
+        const flattened_generation = if (source_generation) |read_generation|
+            if (try self.appendExperimentalPostingCheckpointFromGeneration(
+                &writer,
+                read_generation,
+                covered_source_sequence,
+            )) |count| blk: {
+                posting_count = count;
+                break :blk true;
+            } else false
+        else
+            false;
 
-        if (txn.get(.meta, meta_key)) |metadata| {
-            try writer.appendValueAt(0, .index_metadata, covered_source_sequence, metadata);
-        } else |err| switch (err) {
-            error.NotFound => {},
-            else => return err,
-        }
-        var node_id: u64 = 1;
-        while (node_id <= self.metadata.node_count) : (node_id = std.math.add(u64, node_id, 1) catch break) {
-            var node_key_buf: [12]u8 = undefined;
-            const packed_node = txn.get(.nodes, encodeNodeKey(&node_key_buf, node_id, .packed_node)) catch |err| switch (err) {
-                error.NotFound => continue,
-                else => return err,
-            };
-            try writer.appendBaseAt(node_id, covered_source_sequence, packed_node);
-            posting_count += 1;
+        if (!flattened_generation) {
+            var txn = try self.store.beginRead();
+            defer txn.abort();
 
-            var range_key_buf: [12]u8 = undefined;
-            if (txn.get(.nodes, encodeNodeKey(&range_key_buf, node_id, .range))) |range| {
-                try writer.appendValueAt(node_id, .node_range, covered_source_sequence, range);
+            if (txn.get(.meta, meta_key)) |metadata| {
+                try writer.appendValueAt(0, .index_metadata, covered_source_sequence, metadata);
             } else |err| switch (err) {
                 error.NotFound => {},
                 else => return err,
             }
+            var node_id: u64 = 1;
+            while (node_id <= self.metadata.node_count) : (node_id = std.math.add(u64, node_id, 1) catch break) {
+                var node_key_buf: [12]u8 = undefined;
+                const packed_node = txn.get(.nodes, encodeNodeKey(&node_key_buf, node_id, .packed_node)) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                };
+                try writer.appendBaseAt(node_id, covered_source_sequence, packed_node);
+                posting_count += 1;
 
-            var posting_key_buf: [12]u8 = undefined;
-            if (txn.get(.nodes, encodeNodeKey(&posting_key_buf, node_id, .posting))) |posting_state| {
-                try writer.appendPostingStateAt(node_id, covered_source_sequence, posting_state);
-            } else |err| switch (err) {
-                error.NotFound => {},
-                else => return err,
+                var range_key_buf: [12]u8 = undefined;
+                if (txn.get(.nodes, encodeNodeKey(&range_key_buf, node_id, .range))) |range| {
+                    try writer.appendValueAt(node_id, .node_range, covered_source_sequence, range);
+                } else |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                }
+
+                var posting_key_buf: [12]u8 = undefined;
+                if (txn.get(.nodes, encodeNodeKey(&posting_key_buf, node_id, .posting))) |posting_state| {
+                    try writer.appendPostingStateAt(node_id, covered_source_sequence, posting_state);
+                } else |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                }
+
+                var quant_key_buf: [10]u8 = undefined;
+                if (txn.get(.quant, encodeQuantKey(&quant_key_buf, node_id))) |quantized| {
+                    try writer.appendQuantizedCheckpointAt(node_id, covered_source_sequence, quantized);
+                } else |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                }
             }
 
-            var quant_key_buf: [10]u8 = undefined;
-            if (txn.get(.quant, encodeQuantKey(&quant_key_buf, node_id))) |quantized| {
-                try writer.appendQuantizedCheckpointAt(node_id, covered_source_sequence, quantized);
-            } else |err| switch (err) {
-                error.NotFound => {},
-                else => return err,
+            // Vector-to-leaf assignments and external-vector metadata share
+            // one compact ordered block. The first checkpoint (or a legacy
+            // root without that block) must source it from the LSM; subsequent
+            // checkpoints merge the immutable directory with live overlays.
+            var vector_directory_writer = try vectorindex_hbc_vector_directory.Writer.init(self.alloc);
+            defer vector_directory_writer.deinit();
+            var vec_cursor = try txn.openCursor(.vecs);
+            defer vec_cursor.close();
+            var vec_entry = try vec_cursor.first();
+            while (vec_entry) |entry| : (vec_entry = try vec_cursor.next()) {
+                const decoded = decodeVectorDerivedKey(entry.key) orelse continue;
+                try vector_directory_writer.append(switch (decoded.kind) {
+                    .vector_leaf => .leaf,
+                    .vector_metadata => .metadata,
+                    else => unreachable,
+                }, decoded.vector_id, entry.value);
             }
+            const vector_directory = try vector_directory_writer.build();
+            try writer.appendValueOwnedAt(0, .vector_directory, covered_source_sequence, vector_directory);
         }
-
-        // Vector-to-leaf assignments and external-vector metadata share one
-        // compact ordered block instead of creating millions of generic
-        // segment entries and allocator objects at 1M scale. Raw `v:` vectors
-        // deliberately remain in the source store.
-        var vector_directory_writer = try vectorindex_hbc_vector_directory.Writer.init(self.alloc);
-        defer vector_directory_writer.deinit();
-        var vec_cursor = try txn.openCursor(.vecs);
-        defer vec_cursor.close();
-        var vec_entry = try vec_cursor.first();
-        while (vec_entry) |entry| : (vec_entry = try vec_cursor.next()) {
-            const decoded = decodeVectorDerivedKey(entry.key) orelse continue;
-            try vector_directory_writer.append(switch (decoded.kind) {
-                .vector_leaf => .leaf,
-                .vector_metadata => .metadata,
-                else => unreachable,
-            }, decoded.vector_id, entry.value);
-        }
-        const vector_directory = try vector_directory_writer.build();
-        try writer.appendValueOwnedAt(0, .vector_directory, covered_source_sequence, vector_directory);
         const segment_bytes = try writer.build();
         defer self.alloc.free(segment_bytes);
         try posting_store.publishCheckpoint(generation, covered_source_sequence, segment_bytes);
+        std.log.info("dense posting checkpoint published generation={} sequence={} bytes={} source={s}", .{
+            generation,
+            covered_source_sequence,
+            segment_bytes.len,
+            if (flattened_generation) "immutable_generation" else "authoritative_lsm",
+        });
         // Collapse the live overlay chain at the same point the durable WAL is
         // checkpointed. Failure leaves the equivalent old generation active.
         self.refreshExperimentalPostingReadGenerationBestEffort(covered_source_sequence);
@@ -3618,6 +3808,7 @@ pub const HBCIndex = struct {
             .covered_source_sequence = covered_source_sequence,
             .posting_count = posting_count,
             .segment_bytes = @intCast(segment_bytes.len),
+            .flattened_generation = flattened_generation,
         };
     }
 
@@ -8416,6 +8607,7 @@ test "experimental posting checkpoint reopens safely and publishes immutable gen
         const checkpoint = try idx.publishExperimentalPostingCheckpoint(2);
         try std.testing.expectEqual(@as(u64, 2), checkpoint.covered_source_sequence);
         try std.testing.expect(checkpoint.posting_count > 0);
+        try std.testing.expect(!checkpoint.flattened_generation);
         const wal = try idx.appendExperimentalPostingWalSnapshotBatch(1, 3, &.{1});
         try std.testing.expect(wal.record_count > 0);
         try std.testing.expectEqual(@as(u64, 3), wal.covered_source_sequence);
@@ -8474,6 +8666,16 @@ test "experimental posting checkpoint reopens safely and publishes immutable gen
         try std.testing.expect(!std.mem.eql(u8, old_root, try reopened.getNamespaced(&new_txn, .nodes, root_key)));
         try std.testing.expectEqualStrings("doc:3", (try reopened.getMetadataInTxn(&new_txn, 3)).?);
         _ = try reopened.getVecLeaf(&new_txn, 3);
+
+        // A subsequent checkpoint flattens the complete leased generation,
+        // including a vector id that was absent from the root directory.
+        const flattened = try reopened.publishExperimentalPostingCheckpoint(4);
+        try std.testing.expectEqual(@as(u64, 2), flattened.generation);
+        try std.testing.expect(flattened.flattened_generation);
+        var flattened_txn = try reopened.beginReadTxn();
+        defer flattened_txn.abort();
+        try std.testing.expectEqualStrings("doc:3", (try reopened.getMetadataInTxn(&flattened_txn, 3)).?);
+        _ = try reopened.getVecLeaf(&flattened_txn, 3);
 
         var after_write = try reopened.search(&[_]f32{ 0.5, 0.5 }, 3);
         defer after_write.deinit();
