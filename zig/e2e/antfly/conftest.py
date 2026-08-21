@@ -54,6 +54,7 @@ from typing import Any, Callable
 import pytest
 import requests
 
+from helpers import start_http_server
 from port_reservations import LoopbackPortReservations, find_free_port
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -1059,8 +1060,7 @@ class InferenceRerankerServer:
                 _ = args
 
         self._server = ThreadingHTTPServer((host, port), Handler)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._thread.start()
+        self._thread = start_http_server(self._server)
         if not wait_for_listener(self.url):
             raise RuntimeError(f"Inference reranker server failed to start at {self.url}")
 
@@ -1122,8 +1122,7 @@ class InferenceGeneratorServer:
                 _ = args
 
         self._server = ThreadingHTTPServer((host, port), Handler)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._thread.start()
+        self._thread = start_http_server(self._server)
         if not wait_for_listener(self.url):
             raise RuntimeError(f"Inference generator server failed to start at {self.url}")
 
@@ -1288,8 +1287,7 @@ class PdfOcrE2EServer:
                 _ = args
 
         self._server = ThreadingHTTPServer((host, port), Handler)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._thread.start()
+        self._thread = start_http_server(self._server)
         if not wait_for_listener(self.base_url):
             raise RuntimeError(f"PDF OCR E2E server failed to start at {self.base_url}")
 
@@ -1378,8 +1376,7 @@ class OpenAiEmbeddingServer:
                 _ = args
 
         self._server = ThreadingHTTPServer((host, port), Handler)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._thread.start()
+        self._thread = start_http_server(self._server)
         if not wait_for_listener(self.url):
             raise RuntimeError(f"OpenAI embedding server failed to start at {self.url}")
 
@@ -1484,8 +1481,7 @@ class RateLimitedOpenAiEmbeddingServer:
                 _ = args
 
         self._server = ThreadingHTTPServer((host, port), Handler)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._thread.start()
+        self._thread = start_http_server(self._server)
         if not wait_for_listener(self.url):
             raise RuntimeError(f"Rate-limited OpenAI embedding server failed to start at {self.url}")
 
@@ -1598,8 +1594,7 @@ class PacingSensitiveOpenAiEmbeddingServer:
                 _ = args
 
         self._server = ThreadingHTTPServer((host, port), Handler)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._thread.start()
+        self._thread = start_http_server(self._server)
         if not wait_for_listener(self.url):
             raise RuntimeError(f"Pacing-sensitive OpenAI embedding server failed to start at {self.url}")
 
@@ -1744,8 +1739,7 @@ class InferenceEmbeddingServer:
                 _ = args
 
         self._server = ThreadingHTTPServer((host, port), Handler)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._thread.start()
+        self._thread = start_http_server(self._server)
         if not wait_for_listener(self.url):
             raise RuntimeError(f"Inference embedding server failed to start at {self.url}")
 
