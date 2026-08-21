@@ -36,6 +36,8 @@ class GraphMetricStatus:
         computed_at_ms (int):
         edge_filter (GraphMetricEdgeFilterStatus | Unset):
         metadata_version (int | Unset): Version of the published graph metric metadata schema.
+        config_fingerprint (int | Unset): Deterministic fingerprint of the configuration that produced the published
+            metric snapshot.
         maintenance_paused (bool | Unset):
         queued_generation (int | Unset): Pending edge generation waiting to build, or 0 when no build is queued.
         building_generation (int | Unset): Edge generation currently held by an active build lease, or 0 when idle.
@@ -76,6 +78,7 @@ class GraphMetricStatus:
     computed_at_ms: int
     edge_filter: GraphMetricEdgeFilterStatus | Unset = UNSET
     metadata_version: int | Unset = UNSET
+    config_fingerprint: int | Unset = UNSET
     maintenance_paused: bool | Unset = UNSET
     queued_generation: int | Unset = UNSET
     building_generation: int | Unset = UNSET
@@ -123,6 +126,8 @@ class GraphMetricStatus:
             edge_filter = self.edge_filter.to_dict()
 
         metadata_version = self.metadata_version
+
+        config_fingerprint = self.config_fingerprint
 
         maintenance_paused = self.maintenance_paused
 
@@ -191,6 +196,8 @@ class GraphMetricStatus:
             field_dict["edge_filter"] = edge_filter
         if metadata_version is not UNSET:
             field_dict["metadata_version"] = metadata_version
+        if config_fingerprint is not UNSET:
+            field_dict["config_fingerprint"] = config_fingerprint
         if maintenance_paused is not UNSET:
             field_dict["maintenance_paused"] = maintenance_paused
         if queued_generation is not UNSET:
@@ -266,6 +273,8 @@ class GraphMetricStatus:
 
         metadata_version = d.pop("metadata_version", UNSET)
 
+        config_fingerprint = d.pop("config_fingerprint", UNSET)
+
         maintenance_paused = d.pop("maintenance_paused", UNSET)
 
         queued_generation = d.pop("queued_generation", UNSET)
@@ -333,6 +342,7 @@ class GraphMetricStatus:
             computed_at_ms=computed_at_ms,
             edge_filter=edge_filter,
             metadata_version=metadata_version,
+            config_fingerprint=config_fingerprint,
             maintenance_paused=maintenance_paused,
             queued_generation=queued_generation,
             building_generation=building_generation,
