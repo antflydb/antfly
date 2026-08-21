@@ -145,6 +145,29 @@ test "metal donated-slot on-frame attention defaults off" {
     try std.testing.expect(!donatedSlotAttentionOnFrameEnabled());
 }
 
+fn activePagedSlotAttentionDeferredPolicy(
+    a4b_runtime: bool,
+    enable_requested: bool,
+    disable_requested: bool,
+) bool {
+    return !disable_requested and (a4b_runtime or enable_requested);
+}
+
+fn activePagedSlotAttentionDeferredEnabled(a4b_runtime: bool) bool {
+    return activePagedSlotAttentionDeferredPolicy(
+        a4b_runtime,
+        getenvBool("TERMITE_METAL_ENABLE_ACTIVE_PAGED_SLOT_ATTENTION_DEFERRED"),
+        getenvBool("TERMITE_METAL_DISABLE_ACTIVE_PAGED_SLOT_ATTENTION_DEFERRED"),
+    );
+}
+
+test "metal active paged-slot attention deferred completion policy" {
+    try std.testing.expect(activePagedSlotAttentionDeferredPolicy(true, false, false));
+    try std.testing.expect(!activePagedSlotAttentionDeferredPolicy(false, false, false));
+    try std.testing.expect(activePagedSlotAttentionDeferredPolicy(false, true, false));
+    try std.testing.expect(!activePagedSlotAttentionDeferredPolicy(true, true, true));
+}
+
 fn getenvUsize(comptime name: [*:0]const u8) ?usize {
     if (comptime @import("builtin").os.tag == .freestanding) return null;
     const c = @cImport(@cInclude("stdlib.h"));
@@ -691,6 +714,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     active_deberta_encoder_frame_plan_key: ?ActiveDebertaEncoderFramePlanKey = null,
     pending_prefill_kv_device_seeds: std.ArrayListUnmanaged(PendingKvDeviceSeed) = .empty,
     timing_stats: ops.NativeQuantTimingStats = .{},
+    // Candidate identity directory for the bounded A4B expert arena. The
+    // current host dispatch remains authoritative until weight bytes are
+    // copied into these slots and route-slot kernels can replay misses.
+    a4b_expert_slot_arena: ?runtime_root.moe.expert_slot_arena.ExpertSlotArena = null,
+    a4b_moe_checkpoint_active: bool = false,
+    a4b_moe_checkpoint_layer_count: usize = 0,
+    a4b_moe_checkpoint_top_k: usize = 0,
+    a4b_moe_synchronized_replay: bool = false,
     runtime_frame_begin_baseline: u64 = 0,
     runtime_frame_submit_baseline: u64 = 0,
     runtime_frame_wait_baseline: u64 = 0,
@@ -4564,6 +4595,520 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }))) return null;
         try self.dynamic_linear_slots.put(self.allocator, key, slot);
         return slot;
+    }
+
+    fn ensurePackedMoeLinearDescriptor(
+        self: *MetalCompute,
+        weight: CT,
+        in_dim: usize,
+        out_dim: usize,
+    ) !?metal_runtime.PackedMoeLinearDescriptor {
+        if (!self.provider_impl.hasDecoderRuntime()) return null;
+        const weight_buf = toBuf(weight);
+        const storage = weight_buf.quantized_storage orelse weight_buf.runtime_quantized_storage orelse return null;
+        const packed_meta = storage.packed_expert orelse return null;
+        const source_out_dim: usize = blk: {
+            if (storage.shape.len != 3) return null;
+            const expert_axis: usize = @intCast(packed_meta.expert_axis);
+            if (expert_axis >= storage.shape.len) return null;
+            var result: ?usize = null;
+            for (storage.shape, 0..) |dim, axis| {
+                if (axis == expert_axis or dim == @as(i64, @intCast(in_dim))) continue;
+                const candidate: usize = @intCast(dim);
+                if (candidate == out_dim or candidate == out_dim * 2) {
+                    result = candidate;
+                    break;
+                }
+            }
+            break :blk result orelse return null;
+        };
+        const expert_count: usize = @intCast(packed_meta.expert_count);
+        const flat_out_dim = std.math.mul(usize, source_out_dim, expert_count) catch return null;
+        const key = DynamicLinearSlotKey{
+            .weight_buf = @intFromPtr(storage.raw_bytes.ptr),
+            .bias_buf = std.math.maxInt(usize),
+            .quantized_storage = storage.raw_bytes.len,
+            .in_dim = in_dim,
+            .out_dim = flat_out_dim,
+        };
+        if (self.dynamic_linear_slots.get(key)) |slot| {
+            return metal_runtime.decoderRuntimePreparePackedMoeLinear(
+                self.provider_impl,
+                storage,
+                slot,
+                in_dim,
+                out_dim,
+            );
+        }
+        const slot = self.nextFreeDynamicLinearSlot() orelse return null;
+        const descriptor = (try metal_runtime.decoderRuntimePreparePackedMoeLinear(
+            self.provider_impl,
+            storage,
+            slot,
+            in_dim,
+            out_dim,
+        )) orelse return null;
+        try self.dynamic_linear_slots.put(self.allocator, key, slot);
+        return descriptor;
+    }
+
+    fn mulMatIdOp(ctx: *anyopaque, request: *const ops.MulMatIdRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (request.rows == 0 or request.expert_ids.len != request.rows) return null;
+        self.timing_stats.a4b_packed_q4_0_linear_attempts += 1;
+        const descriptor = (try self.ensurePackedMoeLinearDescriptor(
+            request.weight,
+            request.in_dim,
+            request.out_dim,
+        )) orelse {
+            self.timing_stats.a4b_packed_q4_0_linear_fallbacks += 1;
+            if (self.data.a4b_inference != null) return error.A4bMetalRouteUnavailable;
+            return null;
+        };
+        var input = try self.ownedDeviceMetalTensorFromCt(request.input);
+        defer input.deinit();
+        const output = (try metal_runtime.decoderRuntimeApplyPackedMoeLinear(
+            self.provider_impl,
+            descriptor,
+            input,
+            request.expert_ids,
+            request.in_dim,
+            request.out_dim,
+        )) orelse {
+            self.timing_stats.a4b_packed_q4_0_linear_fallbacks += 1;
+            if (self.data.a4b_inference != null) return error.A4bMetalRouteDispatchFailed;
+            return null;
+        };
+        self.timing_stats.a4b_packed_q4_0_linear_successes += 1;
+        return self.ctFromOwnedMetalTensor(output);
+    }
+
+    fn moeSelectRoutesOp(
+        ctx: *anyopaque,
+        layer_index: usize,
+        logits_ct: CT,
+        rows: usize,
+        num_experts: usize,
+        top_k: usize,
+        logit_scale: f32,
+        allocator: std.mem.Allocator,
+    ) anyerror!?ops.MoeRouteSelection {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (self.data.a4b_inference == null) return null;
+        self.timing_stats.a4b_moe_route_select_attempts += 1;
+        if (getenvBool("TERMITE_METAL_DISABLE_DEVICE_MOE_ROUTE_SELECT")) {
+            self.timing_stats.a4b_moe_route_select_fallbacks += 1;
+            return null;
+        }
+        if (rows == 0 or num_experts == 0 or top_k == 0 or top_k > 8) {
+            self.timing_stats.a4b_moe_route_select_fallbacks += 1;
+            return null;
+        }
+        const logits_buf = toBuf(logits_ct);
+        if (logits_buf.quantized_storage != null or logits_buf.runtime_quantized_storage != null) {
+            self.timing_stats.a4b_moe_route_select_fallbacks += 1;
+            return null;
+        }
+        const logits = logits_buf.metal_tensor orelse {
+            self.timing_stats.a4b_moe_route_select_fallbacks += 1;
+            return null;
+        };
+        if (!logits.isDevice()) {
+            self.timing_stats.a4b_moe_route_select_fallbacks += 1;
+            return null;
+        }
+        const route_count = std.math.mul(usize, rows, top_k) catch {
+            self.timing_stats.a4b_moe_route_select_fallbacks += 1;
+            return null;
+        };
+        const expert_ids = try allocator.alloc(u32, route_count);
+        errdefer allocator.free(expert_ids);
+        const route_weights = try allocator.alloc(f32, route_count);
+        errdefer allocator.free(route_weights);
+        if (!(try metal_runtime.decoderRuntimeSelectMoeRoutesDevice(
+            self.provider_impl,
+            layer_index,
+            logits,
+            rows,
+            num_experts,
+            top_k,
+            logit_scale,
+            expert_ids,
+            route_weights,
+        ))) {
+            allocator.free(route_weights);
+            allocator.free(expert_ids);
+            self.timing_stats.a4b_moe_route_select_fallbacks += 1;
+            return null;
+        }
+        self.timing_stats.a4b_moe_route_select_successes += 1;
+        return .{
+            .expert_ids = expert_ids,
+            .route_weights = route_weights,
+            .rows = rows,
+            .top_k = top_k,
+        };
+    }
+
+    const MoeSlotLayout = struct {
+        gate_offset: usize,
+        up_offset: usize,
+        down_offset: usize,
+        expert_stride: usize,
+        gate_bytes: usize,
+        down_bytes: usize,
+    };
+
+    fn qualifiedMoeSlotLayout(request: *const ops.RunMoeBlockRequest) ?MoeSlotLayout {
+        if (request.hidden_size % 32 != 0 or request.inter_size % 32 != 0) return null;
+        const gate_row_bytes = std.math.mul(usize, request.hidden_size / 32, 18) catch return null;
+        const down_row_bytes = std.math.mul(usize, request.inter_size / 32, 18) catch return null;
+        const gate_bytes = std.math.mul(usize, request.inter_size, gate_row_bytes) catch return null;
+        const down_bytes = std.math.mul(usize, request.hidden_size, down_row_bytes) catch return null;
+        const twice_gate = std.math.mul(usize, gate_bytes, 2) catch return null;
+        const encoded_bytes = std.math.add(usize, twice_gate, down_bytes) catch return null;
+        const stride = std.mem.alignForward(usize, encoded_bytes, backend_contracts.A4bInferenceConfig.expert_arena_alignment);
+        return .{
+            .gate_offset = 0,
+            .up_offset = gate_bytes,
+            .down_offset = twice_gate,
+            .expert_stride = stride,
+            .gate_bytes = gate_bytes,
+            .down_bytes = down_bytes,
+        };
+    }
+
+    fn packedMoeQ4Storage(tensor: CT, expert_count: usize) ?*const QuantizedStorage {
+        const buf = toBuf(tensor);
+        const storage = buf.quantized_storage orelse buf.runtime_quantized_storage orelse return null;
+        const packed_view = storage.packed_expert orelse return null;
+        if (!storage.tensor_type.eql(.{ .known = .Q4_0 }) or packed_view.expert_count != expert_count) return null;
+        return storage;
+    }
+
+    fn copyPackedMoeQ4Projection(
+        storage: *const QuantizedStorage,
+        expert: u32,
+        in_dim: usize,
+        out_dim: usize,
+        destination: []u8,
+    ) !void {
+        const packed_view = storage.packed_expert orelse return error.A4bMetalRouteUnavailable;
+        const meta = try quant_codec.packedExpertLinearMeta(
+            storage.shape,
+            @intCast(packed_view.expert_axis),
+            expert,
+            in_dim,
+            out_dim,
+            storage.tensor_type,
+        );
+        const row_bytes = try std.math.mul(usize, meta.row_blocks, meta.block_size);
+        const projection_bytes = try std.math.mul(usize, out_dim, row_bytes);
+        if (destination.len != projection_bytes) return error.A4bMetalRouteUnavailable;
+        for (0..out_dim) |row| {
+            const block_base = try quant_codec.packedExpertLinearRowBlockBase(
+                meta,
+                expert,
+                row,
+                @intCast(packed_view.row_offset),
+            );
+            const source_offset = try std.math.mul(usize, block_base, meta.block_size);
+            if (source_offset > storage.raw_bytes.len or row_bytes > storage.raw_bytes.len - source_offset) {
+                return error.A4bMetalRouteUnavailable;
+            }
+            @memcpy(destination[row * row_bytes ..][0..row_bytes], storage.raw_bytes[source_offset..][0..row_bytes]);
+        }
+    }
+
+    fn publishMoeSlotDirectory(
+        self: *MetalCompute,
+        arena: *const runtime_root.moe.expert_slot_arena.ExpertSlotArena,
+        layer_index: usize,
+        expert_count: usize,
+    ) bool {
+        var expert_to_slot = [_]u32{std.math.maxInt(u32)} ** runtime_root.moe.expert_slot_arena.max_experts;
+        arena.writeExpertToSlotMap(layer_index, expert_count, &expert_to_slot) catch return false;
+        return metal_runtime.decoderRuntimePublishMoeExpertSlotMap(
+            self.provider_impl,
+            layer_index,
+            expert_to_slot[0..expert_count],
+        );
+    }
+
+    fn runMoeBlockOp(ctx: *anyopaque, request: *const ops.RunMoeBlockRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const config = self.data.a4b_inference orelse return null;
+        if (!getenvBool("TERMITE_METAL_ENABLE_A4B_EXPERT_SLOT_ARENA")) return null;
+        if (request.total != 1 or request.activation != .gelu_new or request.layer_index >= config.geometry.moe_layer_count or
+            request.hidden_size != config.geometry.hidden_size or request.inter_size != config.geometry.expert_intermediate_size or
+            request.num_experts != config.geometry.expert_count or request.top_k != config.geometry.top_k) return null;
+        const layout = qualifiedMoeSlotLayout(request) orelse return null;
+        if (layout.gate_bytes * 2 + layout.down_bytes != config.geometry.encoded_expert_bytes) return null;
+        const gate_storage = packedMoeQ4Storage(request.w1, request.num_experts) orelse return null;
+        const up_storage = packedMoeQ4Storage(request.w3, request.num_experts) orelse return null;
+        const down_storage = packedMoeQ4Storage(request.w2, request.num_experts) orelse return null;
+        const logits_buf = toBuf(request.router_logits);
+        const logits = logits_buf.metal_tensor orelse return null;
+        if (!logits.isDevice()) return null;
+
+        self.timing_stats.a4b_moe_slot_arena_attempts += 1;
+        if (self.a4b_moe_checkpoint_active and !self.a4b_moe_synchronized_replay) {
+            self.timing_stats.a4b_moe_route_select_attempts += 1;
+            if (!metal_runtime.decoderRuntimeSelectMoeRoutesOptimisticDevice(
+                self.provider_impl,
+                request.layer_index,
+                logits,
+                request.total,
+                request.num_experts,
+                request.top_k,
+                request.router_logit_scale,
+            )) {
+                self.timing_stats.a4b_moe_route_select_fallbacks += 1;
+                self.timing_stats.a4b_moe_slot_arena_failures += 1;
+                return error.A4bMetalRouteUnavailable;
+            }
+            self.timing_stats.a4b_moe_route_select_successes += 1;
+            var input = try self.ownedDeviceMetalTensorFromCt(request.input);
+            defer input.deinit();
+            var scale: ?MetalTensor = null;
+            defer if (scale) |*value| value.deinit();
+            if (request.expert_scale) |scale_ct| scale = try self.ownedDeviceMetalTensorFromCt(scale_ct);
+            const output = (try metal_runtime.decoderRuntimeMoeForwardQ4_0SlotsDevice(
+                self.provider_impl,
+                request.layer_index,
+                input,
+                request.total,
+                request.hidden_size,
+                request.inter_size,
+                request.num_experts,
+                request.top_k,
+                request.activation,
+                scale,
+            )) orelse {
+                self.timing_stats.a4b_moe_slot_arena_failures += 1;
+                return error.A4bMetalRouteDispatchFailed;
+            };
+            self.timing_stats.a4b_moe_slot_arena_successes += 1;
+            return self.ctFromOwnedMetalTensor(output);
+        }
+        const routes = (try moeSelectRoutesOp(
+            self,
+            request.layer_index,
+            request.router_logits,
+            request.total,
+            request.num_experts,
+            request.top_k,
+            request.router_logit_scale,
+            self.allocator,
+        )) orelse {
+            self.timing_stats.a4b_moe_slot_arena_failures += 1;
+            return error.A4bMetalRouteUnavailable;
+        };
+        defer self.allocator.free(routes.expert_ids);
+        defer self.allocator.free(routes.route_weights);
+
+        if (!metal_runtime.decoderRuntimePrepareMoeQ4_0SlotArena(
+            self.provider_impl,
+            request.layer_index,
+            config.expert_cache_slots,
+            layout.expert_stride,
+            layout.gate_offset,
+            layout.up_offset,
+            layout.down_offset,
+            request.hidden_size,
+            request.inter_size,
+        )) {
+            self.timing_stats.a4b_moe_slot_arena_failures += 1;
+            return error.A4bMetalRouteUnavailable;
+        }
+        if (self.a4b_expert_slot_arena == null) {
+            self.a4b_expert_slot_arena = runtime_root.moe.expert_slot_arena.ExpertSlotArena.init(config.expert_cache_slots) catch {
+                self.timing_stats.a4b_moe_slot_arena_failures += 1;
+                return error.A4bMetalRouteUnavailable;
+            };
+        }
+        const arena = &self.a4b_expert_slot_arena.?;
+        const prior_arena = arena.*;
+        const observation = arena.observeRoute(
+            request.layer_index,
+            request.num_experts,
+            routes.expert_ids[0..request.top_k],
+        ) catch {
+            self.timing_stats.a4b_moe_slot_arena_failures += 1;
+            return error.A4bMetalRouteUnavailable;
+        };
+
+        var repaired_slots: [runtime_root.moe.expert_slot_arena.max_route_width]u32 = undefined;
+        var repaired_count: usize = 0;
+        const upload_len = std.math.mul(usize, observation.miss_count, layout.expert_stride) catch {
+            arena.* = prior_arena;
+            return error.OutOfMemory;
+        };
+        const upload = try self.allocator.alloc(u8, upload_len);
+        defer self.allocator.free(upload);
+        @memset(upload, 0);
+        for (routes.expert_ids[0..request.top_k], 0..) |expert, route_index| {
+            if (!observation.repaired[route_index]) continue;
+            const base = repaired_count * layout.expert_stride;
+            copyPackedMoeQ4Projection(
+                gate_storage,
+                expert,
+                request.hidden_size,
+                request.inter_size,
+                upload[base + layout.gate_offset ..][0..layout.gate_bytes],
+            ) catch |err| {
+                arena.* = prior_arena;
+                return err;
+            };
+            copyPackedMoeQ4Projection(
+                up_storage,
+                expert,
+                request.hidden_size,
+                request.inter_size,
+                upload[base + layout.up_offset ..][0..layout.gate_bytes],
+            ) catch |err| {
+                arena.* = prior_arena;
+                return err;
+            };
+            copyPackedMoeQ4Projection(
+                down_storage,
+                expert,
+                request.inter_size,
+                request.hidden_size,
+                upload[base + layout.down_offset ..][0..layout.down_bytes],
+            ) catch |err| {
+                arena.* = prior_arena;
+                return err;
+            };
+            repaired_slots[repaired_count] = observation.route_slots[route_index];
+            repaired_count += 1;
+        }
+        std.debug.assert(repaired_count == observation.miss_count);
+        if (!self.publishMoeSlotDirectory(arena, request.layer_index, request.num_experts)) {
+            arena.* = prior_arena;
+            self.timing_stats.a4b_moe_slot_map_publish_failures += 1;
+            self.timing_stats.a4b_moe_slot_arena_failures += 1;
+            return error.A4bMetalRouteUnavailable;
+        }
+        self.timing_stats.a4b_moe_slot_map_publications += 1;
+        if (!metal_runtime.decoderRuntimeUploadMoeQ4_0Slots(
+            self.provider_impl,
+            request.layer_index,
+            repaired_slots[0..repaired_count],
+            upload,
+            layout.expert_stride,
+        )) {
+            arena.* = prior_arena;
+            _ = self.publishMoeSlotDirectory(arena, request.layer_index, request.num_experts);
+            self.timing_stats.a4b_moe_slot_arena_failures += 1;
+            return error.A4bMetalRouteDispatchFailed;
+        }
+        self.timing_stats.a4b_moe_slot_uploads += repaired_count;
+        self.timing_stats.a4b_moe_slot_upload_bytes += upload.len;
+
+        var input = try self.ownedDeviceMetalTensorFromCt(request.input);
+        defer input.deinit();
+        var scale: ?MetalTensor = null;
+        defer if (scale) |*value| value.deinit();
+        if (request.expert_scale) |scale_ct| scale = try self.ownedDeviceMetalTensorFromCt(scale_ct);
+        const output = (try metal_runtime.decoderRuntimeMoeForwardQ4_0SlotsDevice(
+            self.provider_impl,
+            request.layer_index,
+            input,
+            request.total,
+            request.hidden_size,
+            request.inter_size,
+            request.num_experts,
+            request.top_k,
+            request.activation,
+            scale,
+        )) orelse {
+            self.timing_stats.a4b_moe_slot_arena_failures += 1;
+            return error.A4bMetalRouteDispatchFailed;
+        };
+        self.timing_stats.a4b_moe_slot_arena_successes += 1;
+        return self.ctFromOwnedMetalTensor(output);
+    }
+
+    fn moeLinearNoBiasPairOp(
+        ctx: *anyopaque,
+        input_ct: CT,
+        expert_ids: []const u32,
+        weight_a: CT,
+        weight_b: CT,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) anyerror!?ops.MoeLinearNoBiasPairResult {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (rows == 0 or expert_ids.len != rows) return null;
+        self.timing_stats.a4b_packed_q4_0_pair_attempts += 1;
+        self.timing_stats.a4b_packed_q4_0_linear_attempts += 2;
+        const descriptor_a = (try self.ensurePackedMoeLinearDescriptor(weight_a, in_dim, out_dim)) orelse {
+            self.timing_stats.a4b_packed_q4_0_pair_fallbacks += 1;
+            self.timing_stats.a4b_packed_q4_0_linear_fallbacks += 2;
+            if (self.data.a4b_inference != null) return error.A4bMetalRouteUnavailable;
+            return null;
+        };
+        const descriptor_b = (try self.ensurePackedMoeLinearDescriptor(weight_b, in_dim, out_dim)) orelse {
+            self.timing_stats.a4b_packed_q4_0_pair_fallbacks += 1;
+            self.timing_stats.a4b_packed_q4_0_linear_fallbacks += 2;
+            if (self.data.a4b_inference != null) return error.A4bMetalRouteUnavailable;
+            return null;
+        };
+        var input = try self.ownedDeviceMetalTensorFromCt(input_ct);
+        defer input.deinit();
+        var result = (try metal_runtime.decoderRuntimeApplyPackedMoeLinearPair(
+            self.provider_impl,
+            descriptor_a,
+            descriptor_b,
+            input,
+            expert_ids,
+            in_dim,
+            out_dim,
+        )) orelse {
+            self.timing_stats.a4b_packed_q4_0_pair_fallbacks += 1;
+            self.timing_stats.a4b_packed_q4_0_linear_fallbacks += 2;
+            if (self.data.a4b_inference != null) return error.A4bMetalRouteDispatchFailed;
+            return null;
+        };
+        const first = self.ctFromOwnedMetalTensor(result.first) catch |err| {
+            result.first.deinit();
+            result.second.deinit();
+            return err;
+        };
+        const second = self.ctFromOwnedMetalTensor(result.second) catch |err| {
+            freeOp(self, first);
+            result.second.deinit();
+            return err;
+        };
+        self.timing_stats.a4b_packed_q4_0_pair_successes += 1;
+        self.timing_stats.a4b_packed_q4_0_linear_successes += 2;
+        return .{ .first = first, .second = second };
+    }
+
+    fn moeScatterAddOp(ctx: *anyopaque, request: *const ops.MoeScatterAddRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (request.rows == 0 or request.row_ids.len != request.rows or request.row_weights.len != request.rows) return null;
+        self.timing_stats.a4b_moe_scatter_attempts += 1;
+        var base = try self.ownedDeviceMetalTensorFromCt(request.base);
+        defer base.deinit();
+        var updates = try self.ownedDeviceMetalTensorFromCt(request.updates);
+        defer updates.deinit();
+        const output = (try metal_runtime.decoderRuntimeMoeScatterAdd(
+            self.provider_impl,
+            base,
+            updates,
+            request.row_ids,
+            request.row_weights,
+            request.dim,
+        )) orelse {
+            self.timing_stats.a4b_moe_scatter_fallbacks += 1;
+            if (self.data.a4b_inference != null) return error.A4bMetalScatterDispatchFailed;
+            return null;
+        };
+        self.timing_stats.a4b_moe_scatter_successes += 1;
+        return self.ctFromOwnedMetalTensor(output);
     }
 
     fn dequantizeQuantTensorWithRuntimeRowCopy(
@@ -14035,7 +14580,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         defer if (block_offsets_opt) |block_offsets| block_offsets.deinit(self.allocator);
                         if (block_offsets_opt) |block_offsets_result| {
                             const block_offsets = block_offsets_result.values();
-                            if (try metal_runtime.decoderRuntimeApplyPagedKvAttentionSlot(self.provider_impl, .{
+                            const slot_request = .{
                                 .q = q_mt,
                                 .slot = paged_layer.slot,
                                 .format = paged_layer.format,
@@ -14051,7 +14596,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                                 .query_position_offset = query_position_offset,
                                 .kv_position_offset = attention.kv_position_offset,
                                 .sliding_window = attention.sliding_window,
-                            })) |tensor| return self.ctFromOwnedMetalTensor(tensor);
+                            };
+                            if (activePagedSlotAttentionDeferredEnabled(self.data.a4b_inference != null)) {
+                                if (try metal_runtime.decoderRuntimeApplyPagedKvAttentionSlotOnActiveFrame(
+                                    self.provider_impl,
+                                    slot_request,
+                                )) |tensor| return self.ctFromOwnedMetalTensor(tensor);
+                            }
+                            if (try metal_runtime.decoderRuntimeApplyPagedKvAttentionSlot(
+                                self.provider_impl,
+                                slot_request,
+                            )) |tensor| return self.ctFromOwnedMetalTensor(tensor);
                         }
                     }
                     if (paged_layer.ring_page_count > 0) return error.KvRingAttentionUnavailable;
@@ -22864,6 +23419,57 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime);
     }
 
+    fn decoderRuntimeBeginMoeCheckpointOp(
+        ctx: *anyopaque,
+        layer_count: usize,
+        top_k: usize,
+    ) anyerror!bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!getenvBool("TERMITE_METAL_ENABLE_A4B_EXPERT_SLOT_CHECKPOINT_REPLAY") or
+            !getenvBool("TERMITE_METAL_ENABLE_A4B_EXPERT_SLOT_ARENA") or
+            self.a4b_moe_synchronized_replay or self.a4b_moe_checkpoint_active) return false;
+        const config = self.data.a4b_inference orelse return false;
+        if (layer_count != config.geometry.moe_layer_count or top_k != config.geometry.top_k) return false;
+        const arena = if (self.a4b_expert_slot_arena) |*value| value else return false;
+        if (!arena.layersAreFullyPopulated(layer_count)) return false;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return false;
+        if (!metal_runtime.hasActiveFrame(runtime)) return false;
+        self.timing_stats.a4b_moe_checkpoint_attempts += 1;
+        if (!metal_runtime.decoderRuntimeBeginMoeCheckpoint(self.provider_impl, layer_count)) return false;
+        self.a4b_moe_checkpoint_active = true;
+        self.a4b_moe_checkpoint_layer_count = layer_count;
+        self.a4b_moe_checkpoint_top_k = top_k;
+        return true;
+    }
+
+    fn decoderRuntimeFinishMoeCheckpointOp(ctx: *anyopaque) anyerror!bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!self.a4b_moe_checkpoint_active) return false;
+        const layer_count = self.a4b_moe_checkpoint_layer_count;
+        const top_k = self.a4b_moe_checkpoint_top_k;
+        self.a4b_moe_checkpoint_active = false;
+        self.a4b_moe_checkpoint_layer_count = 0;
+        self.a4b_moe_checkpoint_top_k = 0;
+        const miss_mask = try metal_runtime.decoderRuntimeFinishMoeCheckpoint(
+            self.provider_impl,
+            layer_count,
+            top_k,
+        );
+        if (miss_mask == 0) {
+            self.timing_stats.a4b_moe_checkpoint_all_hit_tokens += 1;
+            return false;
+        }
+        self.timing_stats.a4b_moe_checkpoint_miss_tokens += 1;
+        return true;
+    }
+
+    fn decoderRuntimeSetMoeReplayModeOp(ctx: *anyopaque, enabled: bool) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (enabled and self.a4b_moe_checkpoint_active) return error.A4bMetalRouteUnavailable;
+        self.a4b_moe_synchronized_replay = enabled;
+        if (enabled) self.timing_stats.a4b_moe_checkpoint_replays += 1;
+    }
+
     fn decoderRuntimeSubmitAndWaitFrameOp(ctx: *anyopaque) anyerror!void {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const runtime = self.provider_impl.raw_decode_runtime orelse return;
@@ -22882,6 +23488,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const runtime = self.provider_impl.raw_decode_runtime orelse return;
         var active = metal_runtime.hasActiveFrame(runtime);
         self.cancelDecoderRuntimeFrame(runtime, &active);
+        self.a4b_moe_checkpoint_active = false;
+        self.a4b_moe_checkpoint_layer_count = 0;
+        self.a4b_moe_checkpoint_top_k = 0;
     }
 
     fn gatherPagedKvLayerCacheOp(
@@ -23057,6 +23666,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_tensor_to_host_calls = tensor_stats.to_host_calls;
         stats.metal_tensor_to_host_device_calls = tensor_stats.to_host_device_calls;
         const runtime_stats = metal_runtime.runtimeMemorySnapshot(self.provider_impl.raw_decode_runtime);
+        stats.a4b_moe_route_select_attempts = runtime_stats.moe_route_select_attempt_count;
+        stats.a4b_moe_route_select_successes = runtime_stats.moe_route_select_success_count;
+        stats.a4b_moe_route_select_fallbacks = runtime_stats.moe_route_select_attempt_count -| runtime_stats.moe_route_select_success_count;
+        stats.a4b_moe_slot_lookup_attempts = runtime_stats.moe_slot_lookup_attempt_count;
+        stats.a4b_moe_slot_route_hits = runtime_stats.moe_slot_route_hit_count;
+        stats.a4b_moe_slot_route_misses = runtime_stats.moe_slot_route_miss_count;
+        stats.a4b_moe_slot_all_hit_layers = runtime_stats.moe_slot_all_hit_layer_count;
         stats.decoder_runtime_frame_begins = runtime_stats.frame_begin_count -| self.runtime_frame_begin_baseline;
         stats.decoder_runtime_frame_submits = runtime_stats.frame_submit_count -| self.runtime_frame_submit_baseline;
         stats.decoder_runtime_frame_wait_nanos = runtime_stats.frame_wait_nanos -| self.runtime_frame_wait_baseline;
@@ -24891,6 +25507,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.decoderRuntimeArgmaxRowsSuppress = decoderRuntimeArgmaxRowsSuppressOp;
         vt.gemma4MtpVerifyCommit = gemma4MtpVerifyCommitOp;
         vt.linearNoBiasPair = linearNoBiasPairOp;
+        vt.mulMatId = mulMatIdOp;
+        vt.moeLinearNoBias = mulMatIdOp;
+        vt.moeLinearNoBiasPair = moeLinearNoBiasPairOp;
+        vt.moeScatterAdd = moeScatterAddOp;
+        vt.moeSelectRoutes = moeSelectRoutesOp;
+        vt.runMoeBlock = runMoeBlockOp;
         vt.splitLastDim3 = splitLastDim3Op;
         vt.linearPair = linearPairOp;
         vt.linearTriple = linearTripleOp;
@@ -24931,6 +25553,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.decoderRuntimePushPlannedComputeBarrierSuppression = decoderRuntimePushPlannedComputeBarrierSuppressionOp;
         vt.decoderRuntimePopPlannedComputeBarrierSuppression = decoderRuntimePopPlannedComputeBarrierSuppressionOp;
         vt.decoderRuntimeHasActiveFrame = decoderRuntimeHasActiveFrameOp;
+        vt.decoderRuntimeBeginMoeCheckpoint = decoderRuntimeBeginMoeCheckpointOp;
+        vt.decoderRuntimeFinishMoeCheckpoint = decoderRuntimeFinishMoeCheckpointOp;
+        vt.decoderRuntimeSetMoeReplayMode = decoderRuntimeSetMoeReplayModeOp;
         vt.decoderRuntimeSubmitAndWaitFrame = decoderRuntimeSubmitAndWaitFrameOp;
         vt.decoderRuntimeFlushActiveFrame = decoderRuntimeFlushActiveFrameOp;
         vt.decoderRuntimeCancelFrame = decoderRuntimeCancelFrameOp;
@@ -31486,6 +32111,56 @@ test "metal_compute: primitive tanh saturates large finite inputs" {
         try std.testing.expect(std.math.isFinite(actual_value));
         try std.testing.expectApproxEqAbs(expected_value, actual_value, 1e-5);
     }
+}
+
+test "metal_compute: qualified A4B slot layout is bounded and page aligned" {
+    var request: ops.RunMoeBlockRequest = undefined;
+    request.hidden_size = 2816;
+    request.inter_size = 704;
+    const layout = MetalCompute.qualifiedMoeSlotLayout(&request) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), layout.gate_offset);
+    try std.testing.expectEqual(@as(usize, 1_115_136), layout.gate_bytes);
+    try std.testing.expectEqual(@as(usize, 2_230_272), layout.down_offset);
+    try std.testing.expectEqual(@as(usize, 1_115_136), layout.down_bytes);
+    try std.testing.expectEqual(@as(usize, 3_358_720), layout.expert_stride);
+    try std.testing.expectEqual(@as(usize, 0), layout.expert_stride % (16 * 1024));
+    try std.testing.expectEqual(@as(usize, 806_092_800), layout.expert_stride * 8 * 30);
+}
+
+test "metal_compute: packed Q4 slot copier honors expert and fused projection offsets" {
+    const allocator = std.testing.allocator;
+    const in_dim: usize = 32;
+    const out_dim: usize = 32;
+    const expert_count: usize = 2;
+    const fused_out_dim = out_dim * 2;
+    const row_bytes: usize = 18;
+    const projection_bytes = out_dim * row_bytes;
+    const fused_values = try allocator.alloc(f32, expert_count * fused_out_dim * in_dim);
+    defer allocator.free(fused_values);
+    for (fused_values, 0..) |*value, index| {
+        const signed = @as(i32, @intCast(index % 41)) - 20;
+        value.* = @as(f32, @floatFromInt(signed)) * 0.0625;
+    }
+    const fused_q4 = try quant_codec.quantizeQ4_0FromF32(allocator, fused_values);
+    defer allocator.free(fused_q4);
+    const fused_shape = [_]i64{ in_dim, fused_out_dim, expert_count };
+    var gate_storage = QuantizedStorage{
+        .tensor_type = .{ .known = .Q4_0 },
+        .raw_bytes = fused_q4,
+        .shape = &fused_shape,
+        .packed_expert = .{ .expert_index = 0, .expert_count = expert_count, .expert_axis = 2, .row_offset = 0 },
+        .raw_owned = false,
+        .allocator = allocator,
+    };
+    var up_storage = gate_storage;
+    up_storage.packed_expert.?.row_offset = out_dim;
+    var copied_gate: [projection_bytes]u8 = undefined;
+    var copied_up: [projection_bytes]u8 = undefined;
+    try MetalCompute.copyPackedMoeQ4Projection(&gate_storage, 1, in_dim, out_dim, &copied_gate);
+    try MetalCompute.copyPackedMoeQ4Projection(&up_storage, 1, in_dim, out_dim, &copied_up);
+    const expert_base = fused_out_dim * row_bytes;
+    try std.testing.expectEqualSlices(u8, fused_q4[expert_base..][0..projection_bytes], &copied_gate);
+    try std.testing.expectEqualSlices(u8, fused_q4[expert_base + projection_bytes ..][0..projection_bytes], &copied_up);
 }
 
 test "metal decoder runtime consumes effective RoPE theta once" {

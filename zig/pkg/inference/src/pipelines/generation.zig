@@ -458,6 +458,7 @@ pub const ChatTemplate = struct {
 
 pub const GenerationResult = struct {
     text: []const u8,
+    reasoning_text: ?[]const u8 = null,
     token_ids: ?[]i32 = null,
     prompt_tokens: usize = 0,
     tokens_used: usize,
@@ -469,6 +470,7 @@ pub const GenerationResult = struct {
 
     pub fn deinit(self: *GenerationResult) void {
         self.allocator.free(self.text);
+        if (self.reasoning_text) |reasoning| self.allocator.free(reasoning);
         if (self.token_ids) |ids| self.allocator.free(ids);
     }
 };
@@ -681,6 +683,10 @@ fn promptOpensGemma4FinalChannel(prompt: []const u8) bool {
     );
 }
 
+fn configPromptOpensGemma4FinalChannel(config: gpt_mod.Config, prompt: []const u8) bool {
+    return config.usesGemma4Channels() and promptOpensGemma4FinalChannel(prompt);
+}
+
 /// Grammar-constrained generation must start in a public channel because the
 /// grammar applies to the first generated token. Leaving the normal private
 /// `thought` channel open would make the grammar reject the final-channel
@@ -867,6 +873,75 @@ fn finalResponseTokenSlice(
     // token is private regardless of whether generation ended by length,
     // EOS, cancellation, or a malformed protocol boundary.
     return token_ids[0..0];
+}
+
+/// Private thought-channel content, excluding protocol headers. This mirrors
+/// finalResponseTokenSlice so callers can expose reasoning separately without
+/// ever decoding channel-control tokens into public text.
+fn reasoningResponseTokenSlice(
+    token_ids: []const i64,
+    final_channel_required: bool,
+    final_channel_preopened: bool,
+    marker_id: ?i32,
+    final_header_token_ids: []const i32,
+    channel_start_id: ?i32,
+    turn_end_id: ?i32,
+) []const i64 {
+    if (!final_channel_required or final_channel_preopened) return token_ids[0..0];
+    const marker = marker_id orelse return token_ids[0..0];
+    const channel_start = channel_start_id orelse return token_ids[0..0];
+    const turn_end = turn_end_id orelse return token_ids[0..0];
+    if (final_header_token_ids.len == 0) return token_ids[0..0];
+
+    var reasoning_end = token_ids.len;
+    if (completeFinalChannelRange(
+        token_ids,
+        final_header_token_ids,
+        marker,
+        channel_start,
+        turn_end,
+    )) |range| {
+        reasoning_end = range.start - final_header_token_ids.len;
+    } else if (bareChannelCloseRange(
+        token_ids,
+        marker,
+        channel_start,
+        turn_end,
+    )) |range| {
+        reasoning_end = range.start - 1;
+    } else if (firstPublicChannelBoundary(
+        token_ids,
+        marker,
+        channel_start,
+        turn_end,
+    )) |boundary| {
+        reasoning_end = boundary;
+    }
+
+    // A model may explicitly reopen a private channel before transitioning to
+    // final. Keep only that channel's content, not its name/header tokens.
+    var reasoning_start: usize = 0;
+    var idx: usize = 0;
+    while (idx < reasoning_end) : (idx += 1) {
+        if (token_ids[idx] != channel_start) continue;
+        var close = idx + 1;
+        while (close < reasoning_end and token_ids[close] != marker) : (close += 1) {}
+        if (close >= reasoning_end) {
+            reasoning_end = idx;
+            break;
+        }
+        reasoning_start = close + 1;
+        idx = close;
+    }
+    while (reasoning_end > reasoning_start and
+        (token_ids[reasoning_end - 1] == marker or
+            token_ids[reasoning_end - 1] == channel_start or
+            token_ids[reasoning_end - 1] == turn_end))
+    {
+        reasoning_end -= 1;
+    }
+    if (reasoning_end <= reasoning_start) return token_ids[0..0];
+    return token_ids[reasoning_start..reasoning_end];
 }
 
 fn generationResultTokenSlice(
@@ -3089,8 +3164,7 @@ pub const NativeGenerationPipeline = struct {
         const started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         const grammar_opens_public_final_channel =
             config.grammar != null and
-            self.gpt_config.family == .gemma and
-            self.gpt_config.hasPle();
+            self.gpt_config.usesGemma4Channels();
         var fallback_decode_state = NativeDecodeState.initContiguous(allocator);
         defer fallback_decode_state.deinit();
         const decode_state = self.decode_state orelse &fallback_decode_state;
@@ -3118,9 +3192,7 @@ pub const NativeGenerationPipeline = struct {
             prompt = public_prompt;
         }
         const prompt_opens_public_final_channel =
-            self.gpt_config.family == .gemma and
-            self.gpt_config.hasPle() and
-            promptOpensGemma4FinalChannel(prompt);
+            configPromptOpensGemma4FinalChannel(self.gpt_config, prompt);
         const formatted_prompt_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
 
         const has_images = messagesHaveImages(messages);
@@ -3555,9 +3627,7 @@ pub const NativeGenerationPipeline = struct {
             }
         }
         const stream_enabled = on_token_fn != null and on_token_ctx != null;
-        const final_channel_required =
-            self.gpt_config.family == .gemma and
-            self.gpt_config.hasPle();
+        const final_channel_required = self.gpt_config.usesGemma4Channels();
         // Resolve the channel protocol once for the whole request. Buffered and
         // streaming callers must use the same exact final-header projection;
         // resolving only the generic terminator at completion can expose a
@@ -4233,6 +4303,15 @@ pub const NativeGenerationPipeline = struct {
             turn_end_token_id,
         );
         const raw_gen_token_ids = token_ids[gen_start..seq_len];
+        const reasoning_gen_token_ids = reasoningResponseTokenSlice(
+            raw_gen_token_ids,
+            streaming_text.final_channel_required,
+            streaming_text.final_channel_preopened,
+            final_channel_end_token_id,
+            streaming_text.final_channel_header_token_ids,
+            streaming_text.channel_start_token_id,
+            turn_end_token_id,
+        );
         const result_gen_token_ids = generationResultTokenSlice(
             raw_gen_token_ids,
             projected_gen_token_ids,
@@ -4269,6 +4348,14 @@ pub const NativeGenerationPipeline = struct {
 
         const text_decode_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         const text = try self.tokenizer.decode(allocator, text_gen_ids);
+        errdefer allocator.free(text);
+        const reasoning_text = if (reasoning_gen_token_ids.len > 0) blk: {
+            const reasoning_ids = try allocator.alloc(i32, reasoning_gen_token_ids.len);
+            defer allocator.free(reasoning_ids);
+            for (reasoning_gen_token_ids, 0..) |token_id, idx| reasoning_ids[idx] = @intCast(token_id);
+            break :blk try self.tokenizer.decode(allocator, reasoning_ids);
+        } else null;
+        errdefer if (reasoning_text) |reasoning| allocator.free(reasoning);
         if (stream_enabled) {
             _ = emitCompletedProjectionDelta(
                 &streaming_text,
@@ -4333,6 +4420,7 @@ pub const NativeGenerationPipeline = struct {
         }
         return .{
             .text = text,
+            .reasoning_text = reasoning_text,
             .token_ids = result_gen_ids,
             .prompt_tokens = prompt_token_count,
             .tokens_used = tokens_generated,
@@ -5166,7 +5254,7 @@ pub const NativeGenerationPipeline = struct {
     }
 
     fn resolveFinalChannelEndTokenId(self: *NativeGenerationPipeline) !?i32 {
-        if (self.gpt_config.family != .gemma or !self.gpt_config.hasPle()) return null;
+        if (!self.gpt_config.usesGemma4Channels()) return null;
         return resolveTokenId(self.tokenizer, self.allocator, "<channel|>");
     }
 
@@ -5191,7 +5279,7 @@ pub const NativeGenerationPipeline = struct {
     }
 
     fn resolveTurnEndTokenId(self: *NativeGenerationPipeline) !?i32 {
-        if (self.gpt_config.family != .gemma or !self.gpt_config.hasPle()) return null;
+        if (!self.gpt_config.usesGemma4Channels()) return null;
         return resolveTokenId(self.tokenizer, self.allocator, "<turn|>");
     }
 
@@ -10612,6 +10700,13 @@ test "chat template enable_thinking false opens an explicit final channel" {
     try std.testing.expect(promptOpensGemma4FinalChannel(
         "<bos><|channel>final\n<channel|>\n",
     ));
+    try std.testing.expect(configPromptOpensGemma4FinalChannel(.{
+        .family = .gemma,
+        .gemma4_channel_protocol = true,
+    }, final_prompt));
+    try std.testing.expect(!configPromptOpensGemma4FinalChannel(.{
+        .family = .gemma,
+    }, final_prompt));
 }
 
 test "final channel projection requires exact header and stops before trailing channels" {
@@ -10723,6 +10818,41 @@ test "bare channel close projects public content when no final header exists" {
         i64,
         &.{},
         finalResponseTokenSlice(&.{ 102, 103, 7, 8 }, true, false, 101, &header, 102, 106),
+    );
+}
+
+test "reasoning channel projection separates private thought from public content" {
+    const header = [_]i32{ 102, 103, 104, 101 };
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{ 7, 8, 9 },
+        reasoningResponseTokenSlice(&.{ 7, 8, 9, 101, 20, 21, 106 }, true, false, 101, &header, 102, 106),
+    );
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{ 7, 8 },
+        reasoningResponseTokenSlice(&.{ 7, 8, 102, 103, 104, 101, 20, 106 }, true, false, 101, &header, 102, 106),
+    );
+    // An explicitly emitted private header is protocol, not reasoning text.
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{ 7, 8 },
+        reasoningResponseTokenSlice(&.{ 102, 103, 105, 101, 7, 8, 101, 20, 106 }, true, false, 101, &header, 102, 106),
+    );
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{ 7, 8 },
+        reasoningResponseTokenSlice(&.{ 7, 8 }, true, false, 101, &header, 102, 106),
+    );
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{},
+        reasoningResponseTokenSlice(&.{ 20, 21 }, true, true, 101, &header, 102, 106),
+    );
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{},
+        reasoningResponseTokenSlice(&.{ 7, 8 }, false, false, null, &.{}, null, null),
     );
 }
 

@@ -36,7 +36,30 @@ pub fn shouldSkipSharedDecoderPrewarm(config: gpt_mod.Config) bool {
     return config.gemma4_mtp_assistant;
 }
 
+pub fn isQualifiedA4bArchitecture(config: gpt_mod.Config) bool {
+    if (config.family != .gemma or !config.usesMoe()) return false;
+    if (config.gemma4_mtp_assistant or config.isMultimodal() or config.num_shared_experts != 1) return false;
+    const moe_layer_count = std.math.cast(u16, config.num_hidden_layers) orelse return false;
+    const expert_count = std.math.cast(u16, config.num_local_experts) orelse return false;
+    const top_k = std.math.cast(u8, config.num_experts_per_tok) orelse return false;
+    return contracts.isQualifiedA4bGeometry(.{
+        .moe_layer_count = moe_layer_count,
+        .expert_count = expert_count,
+        .top_k = top_k,
+        .hidden_size = config.hidden_size,
+        .expert_intermediate_size = config.expertIntermediateSize(),
+        .encoded_expert_bytes = contracts.qualified_a4b_geometries[0].encoded_expert_bytes,
+    });
+}
+
 pub fn supportsRuntimeConfig(config: gpt_mod.Config) bool {
+    return config.family == .gemma and (!config.usesMoe() or isQualifiedA4bArchitecture(config));
+}
+
+/// The existing prepared whole-frame decoder owns dense FFNs. Qualified A4B
+/// is accepted by the containing Metal executor but must use the MoE graph
+/// path until its dedicated prepared runtime is installed.
+pub fn supportsPreparedDenseRuntimeConfig(config: gpt_mod.Config) bool {
     return config.family == .gemma and !config.usesMoe();
 }
 
@@ -45,11 +68,32 @@ pub fn wholeFramePrefillExplicitlyDisabled() bool {
 }
 
 pub fn supportsWholeFramePrefill(config: gpt_mod.Config, configured_layer_count: usize) bool {
-    if (!supportsRuntimeConfig(config)) return false;
+    if (!supportsPreparedDenseRuntimeConfig(config)) return false;
     if (config.num_hidden_layers == 0 or config.num_hidden_layers > max_runtime_layers) return false;
     if (preparedLayers(@min(configured_layer_count, config.num_hidden_layers)) != config.num_hidden_layers) return false;
     if (wholeFramePrefillExplicitlyDisabled()) return false;
     return true;
+}
+
+test "Gemma4 runtime admits only the qualified A4B architecture" {
+    var config = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2816,
+        .num_hidden_layers = 30,
+        .num_local_experts = 128,
+        .num_experts_per_tok = 8,
+        .num_shared_experts = 1,
+        .expert_intermediate_size = 704,
+    };
+    try std.testing.expect(isQualifiedA4bArchitecture(config));
+    try std.testing.expect(supportsRuntimeConfig(config));
+    try std.testing.expect(!supportsPreparedDenseRuntimeConfig(config));
+
+    config.num_local_experts = 64;
+    try std.testing.expect(!isQualifiedA4bArchitecture(config));
+    try std.testing.expect(!supportsRuntimeConfig(config));
+    config.num_local_experts = 65_536;
+    try std.testing.expect(!isQualifiedA4bArchitecture(config));
 }
 
 pub fn preparedLayers(configured_layers: usize) usize {

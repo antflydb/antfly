@@ -10,6 +10,7 @@
 """Fast contract tests for the paired Gemma4 long-output benchmark."""
 
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from gemma4_metal_long_output import (  # noqa: E402
     BenchmarkContractError,
+    _file_sha256,
     audit_llama_loaded_libraries,
     build_result,
     canonical_git_untracked_paths,
@@ -69,6 +71,39 @@ def b10182_perf_block(tokens: int = OUTPUT_TOKENS) -> str:
 
 
 class ParserContractTests(unittest.TestCase):
+    def test_file_sha256_reads_incrementally(self) -> None:
+        payload = b"gemma4-a4b" * 257
+
+        class GuardedReader(io.BytesIO):
+            read_sizes: list[int]
+
+            def __init__(self, value: bytes) -> None:
+                super().__init__(value)
+                self.read_sizes = []
+
+            def read(self, size: int = -1) -> bytes:
+                if size <= 0:
+                    raise AssertionError("file hashing must use bounded reads")
+                self.read_sizes.append(size)
+                return super().read(min(size, 97))
+
+        class GuardedPath:
+            def __init__(self, reader: GuardedReader) -> None:
+                self.reader = reader
+
+            def open(self, mode: str) -> GuardedReader:
+                if mode != "rb":
+                    raise AssertionError(f"unexpected hash open mode: {mode}")
+                return self.reader
+
+        reader = GuardedReader(payload)
+        self.assertEqual(
+            _file_sha256(GuardedPath(reader)),  # type: ignore[arg-type]
+            hashlib.sha256(payload).hexdigest(),
+        )
+        self.assertGreater(len(reader.read_sizes), 1)
+        self.assertTrue(all(size == 1024 * 1024 for size in reader.read_sizes))
+
     def test_canonical_git_worktree_rejects_existing_untracked_content(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             repo = Path(raw)

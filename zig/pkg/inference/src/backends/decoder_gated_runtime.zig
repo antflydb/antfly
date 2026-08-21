@@ -1420,7 +1420,7 @@ pub fn supportsConfig(gpt_config: gpt_mod.Config) bool {
         // the retained KV. The remaining unsupported cases are the extra
         // decoder-side sublayers that still branch the block structure.
         .llama, .mistral, .qwen2, .qwen3 => !gpt_config.usesMoe() and !gpt_config.hasPle(),
-        .gemma => gemma4_runtime.supportsRuntimeConfig(gpt_config),
+        .gemma => gemma4_runtime.supportsPreparedDenseRuntimeConfig(gpt_config),
         else => false,
     };
 }

@@ -328,6 +328,7 @@ pub const MoeScatterAddAttrs = struct {
 };
 
 pub const MoeSelectRoutesAttrs = struct {
+    layer_index: u32 = 0,
     rows: u32,
     num_experts: u32,
     top_k: u32,

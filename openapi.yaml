@@ -23197,6 +23197,23 @@ components:
           $ref: '#/components/schemas/InferenceModelFormat'
         quantization:
           $ref: '#/components/schemas/InferenceModelQuantization'
+        residency_mode:
+          type: string
+          enum:
+            - auto
+            - streamed
+            - resident
+          default: auto
+          description: Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal runtime.
+            Other model geometries reject this field.
+        memory_budget_mb:
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 1048576
+          default: 0
+          description: Per-model A4B memory envelope in MiB. Zero selects the conservative 2048 MiB streamed
+            floor; explicit smaller values fail model load.
     InferencePromptCacheConfig:
       type: object
       description: Native generator prompt KV cache configuration.

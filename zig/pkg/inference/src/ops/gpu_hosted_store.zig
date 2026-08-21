@@ -24,6 +24,7 @@ const tier_cache_mod = runtime.tier.cache;
 const prefetch_mod = runtime.tier.prefetch;
 const tier_shared_mod = runtime.tier.shared;
 const moe_residency = runtime.moe.residency;
+const backend_contracts = @import("../graph/backend_contracts.zig");
 const supports_native_metal_provider = build_options.enable_metal;
 const metal_native_provider_mod = if (supports_native_metal_provider) @import("../backends/metal_native_provider.zig") else struct {
     pub const MetalNativeProvider = void;
@@ -206,6 +207,7 @@ pub const WeightStore = struct {
     prefetch_initialized: bool = false,
     tensor_store: ?tensor_store_mod.TensorStore = null,
     moe_num_experts: usize = 0,
+    a4b_inference: ?backend_contracts.A4bInferenceConfig = null,
     residency: ?moe_residency.SharedResidency = null,
     tier_cache: ?tier_cache_mod.SharedCache = null,
     shared_prefetch: ?*tier_shared_mod.SharedPrefetchState = null,
@@ -294,7 +296,18 @@ pub fn ensureHostLazyWeightLoadedSimple(data: *WeightStore, entry: *LazyWeightEn
     const tensor_store = data.tensor_store orelse return error.MissingWeight;
     if (data.allow_direct_quant and !entry.prefer_dense) {
         if (try tensor_store.loadQuantizedStorageRef(&entry.tensor_ref)) |loaded_storage| {
-            entry.loaded_bytes = loaded_storage.raw_bytes.len + loaded_storage.prepared.ownedBytes();
+            // The qualified A4B route borrows packed tensors from the model
+            // mmap. Charge its bounded physical working set through the
+            // session admission contract, not the full virtual file span for
+            // every projection alias.
+            const a4b_mapped_packed = data.a4b_inference != null and
+                loaded_storage.packed_expert != null and
+                loaded_storage.raw_mmap_backed and
+                !loaded_storage.raw_owned;
+            entry.loaded_bytes = if (a4b_mapped_packed)
+                loaded_storage.prepared.ownedBytes()
+            else
+                loaded_storage.raw_bytes.len + loaded_storage.prepared.ownedBytes();
             entry.quantized_storage = loaded_storage;
             entry.active_tier = .host;
             if (entry.loaded_bytes != 0) {

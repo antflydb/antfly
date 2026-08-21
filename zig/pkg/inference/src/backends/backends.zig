@@ -17,6 +17,7 @@ const build_options = @import("build_options");
 const manifest_mod = @import("../models/manifest.zig");
 const c_file = @import("../util/c_file.zig");
 const kernel_jit_mod = @import("../graph/kernel_jit.zig");
+const backend_contracts = @import("../graph/backend_contracts.zig");
 const graph_runtime_mod = @import("../graph/runtime.zig");
 const backend_runtime_mod = @import("backend_runtime.zig");
 
@@ -127,6 +128,9 @@ pub const SessionManager = struct {
     graph_runtime_strategy: ?graph_runtime_mod.Strategy = null,
     kernel_jit: kernel_jit_mod.Config = .{},
     kernel_jit_load_context: kernel_jit_mod.LoadContext = .dynamic,
+    /// Load-time A4B policy. It is copied into the created session and is
+    /// never consulted as mutable process-global state during inference.
+    a4b_inference_request: ?backend_contracts.A4bInferenceRequest = null,
     /// Provider preference for the external ONNX Runtime backend. Automatic is
     /// resolved before admission; candidate SessionManagers then carry only
     /// the resolved CPU/CUDA value through construction.
@@ -237,11 +241,12 @@ pub const SessionManager = struct {
                         continue;
                     }
                 else if (build_options.enable_metal)
-                    session_factory.createMetalSessionWithKernelJitAndLoadContext(
+                    session_factory.createMetalSessionWithKernelJitAndLoadContextAndA4bRequest(
                         self.allocator,
                         model_path,
                         self.kernel_jit,
                         self.kernel_jit_load_context,
+                        self.a4b_inference_request,
                     ) catch |err| {
                         std.log.err("Metal session create failed for {s}: {s}", .{ model_path, @errorName(err) });
                         if (self.kernel_jit.qualified_profile_path != null or self.kernel_jit.profile_capture_only) return err;
@@ -475,6 +480,7 @@ test "session manager preferred-backend clone preserves runtime kernel JIT" {
         .preload_budget_ms = 120_000,
     };
     source.kernel_jit_load_context = .startup_preload;
+    source.a4b_inference_request = .{ .residency_mode = .streamed, .memory_budget_mb = 4096 };
     const preferred = [_]BackendType{.onnx};
 
     const cloned = source.withPreferredBackends(std.testing.allocator, &preferred);
@@ -485,6 +491,7 @@ test "session manager preferred-backend clone preserves runtime kernel JIT" {
     try std.testing.expectEqual(source.kernel_jit.max_cache_bytes_mb, cloned.kernel_jit.max_cache_bytes_mb);
     try std.testing.expectEqual(source.kernel_jit.preload_budget_ms, cloned.kernel_jit.preload_budget_ms);
     try std.testing.expectEqual(source.kernel_jit_load_context, cloned.kernel_jit_load_context);
+    try std.testing.expectEqual(source.a4b_inference_request, cloned.a4b_inference_request);
     try std.testing.expectEqualSlices(BackendType, &preferred, cloned.preferred_backends);
 }
 

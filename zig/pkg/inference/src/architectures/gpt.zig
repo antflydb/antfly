@@ -40,6 +40,7 @@ const native_compute_mod = @import("../ops/native_compute.zig");
 const metal_compute_mod = @import("../ops/metal_compute.zig");
 const deepseek_v4 = @import("deepseek_v4.zig");
 const deepseek_v4_host = @import("deepseek_v4_host.zig");
+const gemma4_runtime = @import("gemma4_runtime.zig");
 const tensor_mod = @import("../backends/tensor.zig");
 const weight_source_mod = @import("../models/weight_source.zig");
 
@@ -2733,7 +2734,53 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     errdefer if (layer0_k_pending) |override| cb.free(override);
     errdefer if (layer0_v_pending) |override| cb.free(override);
 
-    var reserved_hidden = try ReservedHiddenCarrier.init(cb, hidden, total, hidden_size);
+    // Own one frame across the full A4B stack. Once every expert arena layer is
+    // warm, checkpoint/replay removes the router completion point: the first
+    // pass maps routes on-device and records only per-layer miss counts. The
+    // terminal frame wait decides whether the token is accepted or replayed
+    // once through synchronized bounded repair.
+    var owns_a4b_forward_frame = false;
+    if (cb.kind() == .metal and
+        isDecodeStep(decode_context) and
+        gemma4_runtime.isQualifiedA4bArchitecture(config) and
+        !getenvBool("TERMITE_METAL_DISABLE_A4B_LAYER_FRAME") and
+        !getenvBool("TERMITE_METAL_DISABLE_A4B_FORWARD_FRAME") and
+        !cb.decoderRuntimeHasActiveFrame())
+    {
+        owns_a4b_forward_frame = try cb.decoderRuntimeBeginFrame();
+        if (owns_a4b_forward_frame) {
+            try cb.decoderRuntimeSetActiveFrameRegime(.decode);
+        }
+    }
+    defer if (owns_a4b_forward_frame) cb.decoderRuntimeCancelFrame() catch {};
+
+    var a4b_moe_checkpoint_started = false;
+    var a4b_replay_checkpoint: ?CT = null;
+    defer if (a4b_replay_checkpoint) |checkpoint| cb.free(checkpoint);
+    if (owns_a4b_forward_frame and pre_norm_out == null and trace_sink == null and
+        layer0DecoderOverridesEmpty(effective_overrides))
+    {
+        const top_k: usize = @intCast(config.num_experts_per_tok);
+        a4b_moe_checkpoint_started = try cb.decoderRuntimeBeginMoeCheckpoint(
+            config.num_hidden_layers,
+            top_k,
+        );
+        if (a4b_moe_checkpoint_started) {
+            // A real device copy is required: a retained tensor view would
+            // alias storage that decoder ops are allowed to recycle.
+            a4b_replay_checkpoint = (try cb.copyTensorFromBackend(cb, hidden)) orelse
+                return error.A4bMoeCheckpointCopyUnavailable;
+        }
+    }
+
+    // The reserved carrier copies every layer result into alternating fixed
+    // buffers. Those copies are useful for per-layer frames, but inside this
+    // cross-layer frame they add one blit and a long dependency chain per
+    // layer. Let the naturally device-resident result flow directly instead.
+    var reserved_hidden: ?ReservedHiddenCarrier = if (owns_a4b_forward_frame)
+        null
+    else
+        try ReservedHiddenCarrier.init(cb, hidden, total, hidden_size);
     errdefer if (reserved_hidden) |*carrier| carrier.deinit(cb, false);
     if (reserved_hidden) |*carrier| {
         cb.free(hidden);
@@ -2864,6 +2911,36 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     }
     try cb.debugCudaTraceTensor("gpt.final_hidden", hidden);
     try maybeCaptureActivationTrace(trace_sink, cb, allocator, "final_norm", null, hidden, hidden_size);
+    if (owns_a4b_forward_frame) {
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        owns_a4b_forward_frame = false;
+        const replay_required = if (a4b_moe_checkpoint_started)
+            try cb.decoderRuntimeFinishMoeCheckpoint()
+        else
+            false;
+        a4b_moe_checkpoint_started = false;
+        if (replay_required) {
+            const replay_input = a4b_replay_checkpoint orelse return error.A4bMoeCheckpointCopyUnavailable;
+            a4b_replay_checkpoint = null;
+            if (owns_hidden) cb.free(hidden);
+            owns_hidden = false;
+            try cb.decoderRuntimeSetMoeReplayMode(true);
+            defer cb.decoderRuntimeSetMoeReplayMode(false) catch {};
+            return forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
+                cb,
+                allocator,
+                config,
+                replay_input,
+                overrides,
+                batch,
+                seq_len,
+                decode_context,
+                ple_vectors,
+                pre_norm_out,
+                trace_sink,
+            );
+        }
+    }
 
     return .{
         .hidden = hidden,
@@ -4834,6 +4911,72 @@ fn decoderBlock(
     layer0_v_override: ?CT,
     trace_sink: ?*ActivationTraceSink,
 ) !CT {
+    // A4B needs host synchronization to read the selected experts and a few
+    // scalar weights. Keep the device work framed across those explicit
+    // boundaries: host readbacks flush and reopen the active frame. This
+    // replaces the per-op synchronous command buffers used by the generic
+    // path without changing routing or residency.
+    var owns_a4b_layer_frame = false;
+    if (cb.kind() == .metal and
+        isDecodeStep(decode_context) and
+        gemma4_runtime.isQualifiedA4bArchitecture(config) and
+        !getenvBool("TERMITE_METAL_DISABLE_A4B_LAYER_FRAME") and
+        !cb.decoderRuntimeHasActiveFrame())
+    {
+        owns_a4b_layer_frame = try cb.decoderRuntimeBeginFrame();
+        if (owns_a4b_layer_frame) {
+            try cb.decoderRuntimeSetActiveFrameRegime(.decode);
+        }
+    }
+    defer if (owns_a4b_layer_frame) cb.decoderRuntimeCancelFrame() catch {};
+
+    const result = try decoderBlockImpl(
+        cb,
+        allocator,
+        config,
+        hidden,
+        batch,
+        seq_len,
+        num_kv_heads,
+        head_dim,
+        layer,
+        decode_context,
+        ple_vectors,
+        raw_overrides,
+        layer0_attn_norm_override,
+        layer0_fused_qkv_override,
+        layer0_q_override,
+        layer0_k_override,
+        layer0_v_override,
+        trace_sink,
+    );
+    if (owns_a4b_layer_frame) {
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        owns_a4b_layer_frame = false;
+    }
+    return result;
+}
+
+fn decoderBlockImpl(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden: CT,
+    batch: usize,
+    seq_len: usize,
+    num_kv_heads: u32,
+    head_dim: u32,
+    layer: usize,
+    decode_context: ?*const DecodeContext,
+    ple_vectors: ?CT,
+    raw_overrides: Layer0DecoderOverrides,
+    layer0_attn_norm_override: ?CT,
+    layer0_fused_qkv_override: ?CT,
+    layer0_q_override: ?CT,
+    layer0_k_override: ?CT,
+    layer0_v_override: ?CT,
+    trace_sink: ?*ActivationTraceSink,
+) !CT {
     const attn_started_at = monotonicNowNs();
     const hidden_size = config.hidden_size;
     const num_heads = config.num_attention_heads;
@@ -5659,7 +5802,7 @@ fn decoderBlock(
                 defer cb.free(moe_normed);
                 debug_timing_stats.norm_nanos += @intCast(monotonicNowNs() - norm_started_at);
                 const moe_started_at = monotonicNowNs();
-                const moe_out = try moeFeedForwardRoutedOnly(cb, allocator, config, moe_normed, total, layer, &name_buf, decode_context);
+                const moe_out = try moeFeedForwardRoutedOnly(cb, allocator, config, moe_normed, sa_out, total, layer, &name_buf, decode_context);
                 defer cb.free(moe_out);
                 debug_timing_stats.ffn_nanos += @intCast(monotonicNowNs() - moe_started_at);
                 norm_started_at = monotonicNowNs();
@@ -8113,22 +8256,25 @@ fn moeFeedForward(
     name_buf: *[256]u8,
     decode_context: ?*const DecodeContext,
 ) !CT {
-    return moeFeedForwardInner(cb, allocator, config, input, total, layer, name_buf, decode_context, false);
+    return moeFeedForwardInner(cb, allocator, config, input, null, total, layer, name_buf, decode_context, false);
 }
 
 /// MoE feed-forward that skips the shared expert addition (used when the caller
 /// already handles the shared expert in a separate sublayer, e.g. Gemma 4).
+/// Gemma 4 routes from the attention residual, independently of the learned
+/// pre-FFN norm used as the expert input.
 fn moeFeedForwardRoutedOnly(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     config: Config,
     input: CT,
+    router_source: CT,
     total: usize,
     layer: usize,
     name_buf: *[256]u8,
     decode_context: ?*const DecodeContext,
 ) !CT {
-    return moeFeedForwardInner(cb, allocator, config, input, total, layer, name_buf, decode_context, true);
+    return moeFeedForwardInner(cb, allocator, config, input, router_source, total, layer, name_buf, decode_context, true);
 }
 
 fn moeFeedForwardInner(
@@ -8136,6 +8282,7 @@ fn moeFeedForwardInner(
     allocator: std.mem.Allocator,
     config: Config,
     input: CT,
+    router_source: ?CT,
     total: usize,
     layer: usize,
     name_buf: *[256]u8,
@@ -8152,17 +8299,27 @@ fn moeFeedForwardInner(
     debug_timing_stats.moe_router_weight_fetch_nanos += @intCast(monotonicNowNs() - router_weight_fetch_started_at);
     defer cb.free(router_w);
 
-    const router_input = try scaleMoeRouterInput(cb, config, input, hidden_size, layer, name_buf);
-    defer if (router_input != input) cb.free(router_input);
+    const raw_router_input = router_source orelse input;
+    // Move Gemma's positive 1/sqrt(hidden) factor through the bias-free router
+    // projection and apply it inside route selection. This preserves routing
+    // math while avoiding a separate device multiply in the framed decode path.
+    const defer_router_hidden_scale = config.family == .gemma and cb.kind() == .metal;
+    const router_logit_scale: f32 = if (defer_router_hidden_scale)
+        1.0 / @sqrt(@as(f32, @floatFromInt(hidden_size)))
+    else
+        1.0;
+    const router_input = try scaleMoeRouterInput(cb, config, raw_router_input, hidden_size, layer, name_buf, !defer_router_hidden_scale);
+    defer if (router_input != raw_router_input) cb.free(router_input);
 
     const router_proj_started_at = monotonicNowNs();
     const router_logits_ct = try cb.linearNoBias(router_input, router_w, total, hidden_size, num_experts);
     defer cb.free(router_logits_ct);
     debug_timing_stats.moe_router_proj_nanos += @intCast(monotonicNowNs() - router_proj_started_at);
 
-    // The fused Metal MoE kernel is SiLU-only. Models with other expert
-    // activations must use the generic path for correctness.
-    if (cb.kind() != .graph and config.activation == .silu) {
+    // Backends own the exact activation/geometry qualification for this
+    // optional whole-MoE contract. In particular, qualified Gemma A4B uses
+    // gelu_new rather than SiLU.
+    if (cb.kind() != .graph and cb.vtable.runMoeBlock != null) {
         const w1 = getMoeExpertWeight(cb, config, layer, 0, "w1", name_buf) catch null;
         const w3 = getMoeExpertWeight(cb, config, layer, 0, "w3", name_buf) catch null;
         const w2 = getMoeExpertWeight(cb, config, layer, 0, "w2", name_buf) catch null;
@@ -8176,6 +8333,7 @@ fn moeFeedForwardInner(
             };
             defer if (expert_scale_ct) |s| cb.free(s);
             if (try cb.runMoeBlock(&.{
+                .layer_index = layer,
                 .input = input,
                 .router_logits = router_logits_ct,
                 .w1 = w1.?,
@@ -8187,6 +8345,8 @@ fn moeFeedForwardInner(
                 .inter_size = inter_size,
                 .num_experts = num_experts,
                 .top_k = top_k,
+                .router_logit_scale = router_logit_scale,
+                .activation = decoderRuntimeActivationKind(config.activation),
             })) |routed_output| {
                 if (skip_shared_expert) return routed_output;
                 return maybeAddSharedExpert(cb, allocator, config, input, routed_output, total, layer, name_buf);
@@ -8195,7 +8355,7 @@ fn moeFeedForwardInner(
     }
 
     const route_select_started_at = monotonicNowNs();
-    const backend_routes = try cb.moeSelectRoutes(router_logits_ct, total, num_experts, top_k, allocator);
+    const backend_routes = try cb.moeSelectRoutes(layer, router_logits_ct, total, num_experts, top_k, router_logit_scale, allocator);
     debug_timing_stats.moe_route_select_nanos += @intCast(monotonicNowNs() - route_select_started_at);
     defer if (backend_routes) |routes| {
         allocator.free(routes.expert_ids);
@@ -8250,7 +8410,7 @@ fn moeFeedForwardInner(
                 else blk: {
                     const downloaded = router_logits.?;
                     const routing_logits = downloaded[row * num_experts ..][0..num_experts];
-                    break :blk try selectTopExperts(allocator, routing_logits, top_k);
+                    break :blk try selectTopExperts(allocator, routing_logits, top_k, router_logit_scale);
                 };
                 for (0..selection.count) |i| {
                     const append_started_at = monotonicNowNs();
@@ -8281,14 +8441,14 @@ fn moeFeedForwardInner(
                 }
             }
         } else {
-            if (try runMoeWithLocalBatches(cb, allocator, config, router_logits, backend_routes, input, output, layer, num_experts, top_k, hidden_size, inter_size, name_buf, expert_output_scale)) |grouped_output| {
+            if (try runMoeWithLocalBatches(cb, allocator, config, router_logits, backend_routes, input, output, layer, num_experts, top_k, hidden_size, inter_size, name_buf, expert_output_scale, router_logit_scale)) |grouped_output| {
                 allocator.free(output);
                 if (skip_shared_expert) return grouped_output;
                 return maybeAddSharedExpert(cb, allocator, config, input, grouped_output, total, layer, name_buf);
             }
         }
     } else {
-        if (try runMoeWithLocalBatches(cb, allocator, config, router_logits, backend_routes, input, output, layer, num_experts, top_k, hidden_size, inter_size, name_buf, expert_output_scale)) |grouped_output| {
+        if (try runMoeWithLocalBatches(cb, allocator, config, router_logits, backend_routes, input, output, layer, num_experts, top_k, hidden_size, inter_size, name_buf, expert_output_scale, router_logit_scale)) |grouped_output| {
             allocator.free(output);
             if (skip_shared_expert) return grouped_output;
             return maybeAddSharedExpert(cb, allocator, config, input, grouped_output, total, layer, name_buf);
@@ -8377,6 +8537,7 @@ fn runMoeWithLocalBatches(
     inter_size: usize,
     name_buf: *[256]u8,
     expert_output_scale: ?[]const f32,
+    router_logit_scale: f32,
 ) !?CT {
     const total = output.len / hidden_size;
     const selections = try allocator.alloc(MoeSelection, total);
@@ -8392,7 +8553,7 @@ fn runMoeWithLocalBatches(
         else blk: {
             const downloaded = router_logits.?;
             const routing_logits_row = downloaded[row * num_experts ..][0..num_experts];
-            break :blk try selectTopExperts(allocator, routing_logits_row, top_k);
+            break :blk try selectTopExperts(allocator, routing_logits_row, top_k, router_logit_scale);
         };
         selections[row] = selection;
         for (selection.indices[0..selection.count]) |expert_index| {
@@ -8613,11 +8774,17 @@ fn runMoeWithRuntimeBatches(
     return null;
 }
 
-fn selectTopExperts(allocator: std.mem.Allocator, router_logits: []const f32, top_k: usize) !MoeSelection {
+fn selectTopExperts(allocator: std.mem.Allocator, router_logits: []const f32, top_k: usize, logit_scale: f32) !MoeSelection {
     const num_experts = router_logits.len;
     const probs_buf = try allocator.alloc(f32, num_experts);
     defer allocator.free(probs_buf);
-    @memcpy(probs_buf, router_logits);
+    if (logit_scale == 1.0) {
+        @memcpy(probs_buf, router_logits);
+    } else {
+        for (router_logits, probs_buf) |logit, *prob| {
+            prob.* = logit * logit_scale;
+        }
+    }
     activations.softmax(probs_buf, num_experts);
 
     var selection = MoeSelection{
@@ -8772,9 +8939,24 @@ fn runGroupedExpertBatch(
     const w3 = try getMoeExpertWeight(cb, config, layer, representative_expert, "w3", name_buf);
     defer cb.free(w3);
     debug_timing_stats.moe_expert_weight_fetch_nanos += @intCast(monotonicNowNs() - expert_weight_fetch_started_at);
-    const gate_proj = (try cb.moeLinearNoBias(expert_input_ct, grouped.expert_ids, grouped.expert_tile_ids, grouped.tile_row_starts, grouped.tile_row_counts, w1, batch_size, hidden_size, inter_size)) orelse return false;
-    const up_proj = (try cb.moeLinearNoBias(expert_input_ct, grouped.expert_ids, grouped.expert_tile_ids, grouped.tile_row_starts, grouped.tile_row_counts, w3, batch_size, hidden_size, inter_size)) orelse return false;
+    const gate_up_pair = try cb.moeLinearNoBiasPair(
+        expert_input_ct,
+        grouped.expert_ids,
+        w1,
+        w3,
+        batch_size,
+        hidden_size,
+        inter_size,
+    );
+    const gate_proj = if (gate_up_pair) |pair|
+        pair.first
+    else
+        (try cb.moeLinearNoBias(expert_input_ct, grouped.expert_ids, grouped.expert_tile_ids, grouped.tile_row_starts, grouped.tile_row_counts, w1, batch_size, hidden_size, inter_size)) orelse return false;
     defer cb.free(gate_proj);
+    const up_proj = if (gate_up_pair) |pair|
+        pair.second
+    else
+        (try cb.moeLinearNoBias(expert_input_ct, grouped.expert_ids, grouped.expert_tile_ids, grouped.tile_row_starts, grouped.tile_row_counts, w3, batch_size, hidden_size, inter_size)) orelse return false;
     defer cb.free(up_proj);
     const gate_act = try applyActivation(cb, config, gate_proj);
     defer cb.free(gate_act);
@@ -8854,6 +9036,22 @@ fn runGroupedExpertBatchTensor(
     if (cb.vtable.moeLinearNoBias == null or cb.vtable.moeScatterAdd == null) return null;
     if (grouped.rows.len == 0) return null;
 
+    // A4B's routed FFN is a compact sequence of device-only operations. Keep
+    // the pair projection, activation/multiply, down projection, and scatter
+    // in one command buffer instead of paying a synchronous submission for
+    // every operation. Other MoE layouts retain their existing scheduling.
+    var a4b_frame_active = false;
+    if (cb.kind() == .metal and
+        gemma4_runtime.supportsRuntimeConfig(config) and
+        !cb.decoderRuntimeHasActiveFrame())
+    {
+        a4b_frame_active = try cb.decoderRuntimeBeginFrame();
+        if (a4b_frame_active) {
+            try cb.decoderRuntimeSetActiveFrameRegime(if (total_rows > 1) .prefill else .decode);
+        }
+    }
+    defer if (a4b_frame_active) cb.decoderRuntimeCancelFrame() catch {};
+
     const batch_size = grouped.rows.len;
     const input_upload_started_at = monotonicNowNs();
     const expert_input_ct = (try cb.takeRows(input, grouped.rows, batch_size, hidden_size)) orelse return null;
@@ -8879,28 +9077,42 @@ fn runGroupedExpertBatchTensor(
         debug_timing_stats.moe_grouped_cleanup_nanos += @intCast(monotonicNowNs() - cleanup_started_at);
     }
     debug_timing_stats.moe_expert_weight_fetch_nanos += @intCast(monotonicNowNs() - expert_weight_fetch_started_at);
-    const gate_proj = (try cb.moeLinearNoBias(expert_input_ct, grouped.expert_ids, grouped.expert_tile_ids, grouped.tile_row_starts, grouped.tile_row_counts, w1, batch_size, hidden_size, inter_size)) orelse return null;
-    errdefer cb.free(gate_proj);
-    if (enableMoeSyncProfileDebug()) {
-        const sync_started_at = monotonicNowNs();
-        try cb.evalTensor(gate_proj);
-        debug_timing_stats.moe_grouped_sync_w1_nanos += @intCast(monotonicNowNs() - sync_started_at);
-    }
-    const up_proj = (try cb.moeLinearNoBias(expert_input_ct, grouped.expert_ids, grouped.expert_tile_ids, grouped.tile_row_starts, grouped.tile_row_counts, w3, batch_size, hidden_size, inter_size)) orelse return null;
-    if (enableMoeSyncProfileDebug()) {
-        const sync_started_at = monotonicNowNs();
-        try cb.evalTensor(up_proj);
-        debug_timing_stats.moe_grouped_sync_w3_nanos += @intCast(monotonicNowNs() - sync_started_at);
-    }
+    const gate_up_pair = try cb.moeLinearNoBiasPair(
+        expert_input_ct,
+        grouped.expert_ids,
+        w1,
+        w3,
+        batch_size,
+        hidden_size,
+        inter_size,
+    );
+    const gate_proj = if (gate_up_pair) |pair|
+        pair.first
+    else
+        (try cb.moeLinearNoBias(expert_input_ct, grouped.expert_ids, grouped.expert_tile_ids, grouped.tile_row_starts, grouped.tile_row_counts, w1, batch_size, hidden_size, inter_size)) orelse return null;
     defer {
         const cleanup_started_at = monotonicNowNs();
         cb.free(gate_proj);
         debug_timing_stats.moe_grouped_cleanup_nanos += @intCast(monotonicNowNs() - cleanup_started_at);
     }
+    const up_proj = if (gate_up_pair) |pair|
+        pair.second
+    else
+        (try cb.moeLinearNoBias(expert_input_ct, grouped.expert_ids, grouped.expert_tile_ids, grouped.tile_row_starts, grouped.tile_row_counts, w3, batch_size, hidden_size, inter_size)) orelse return null;
     defer {
         const cleanup_started_at = monotonicNowNs();
         cb.free(up_proj);
         debug_timing_stats.moe_grouped_cleanup_nanos += @intCast(monotonicNowNs() - cleanup_started_at);
+    }
+    if (enableMoeSyncProfileDebug()) {
+        const sync_started_at = monotonicNowNs();
+        try cb.evalTensor(gate_proj);
+        debug_timing_stats.moe_grouped_sync_w1_nanos += @intCast(monotonicNowNs() - sync_started_at);
+    }
+    if (enableMoeSyncProfileDebug()) {
+        const sync_started_at = monotonicNowNs();
+        try cb.evalTensor(up_proj);
+        debug_timing_stats.moe_grouped_sync_w3_nanos += @intCast(monotonicNowNs() - sync_started_at);
     }
 
     const gate_act = try applyActivation(cb, config, gate_proj);
@@ -8962,6 +9174,10 @@ fn runGroupedExpertBatchTensor(
 
     const scattered_ct = (try cb.moeScatterAdd(output_ct, grouped.rows, grouped.route_weights, expert_out_ct, batch_size, hidden_size)) orelse return null;
     debug_timing_stats.moe_grouped_scatter_nanos += @intCast(monotonicNowNs() - scatter_started_at);
+    if (a4b_frame_active) {
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        a4b_frame_active = false;
+    }
     if (enableMoeSyncProfileDebug()) {
         const sync_started_at = monotonicNowNs();
         try cb.evalTensor(scattered_ct);
@@ -10178,15 +10394,36 @@ fn scaleMoeRouterInput(
     hidden_size: usize,
     layer: usize,
     name_buf: *[256]u8,
+    apply_hidden_scale: bool,
 ) !CT {
-    const scaled = input;
-
-    _ = hidden_size;
-
-    const scale_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.block_sparse_moe.gate.input_scale", .{layer}) catch return scaled;
-    const scale_w = getModelWeight(cb, config, scale_name) catch return scaled;
+    const scale_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.block_sparse_moe.gate.input_scale", .{layer}) catch return error.NameTooLong;
+    const scale_w = getModelWeight(cb, config, scale_name) catch |err| {
+        // Gemma 4's learned router scale is part of the architecture, not an
+        // optional optimization. Other MoE families retain their legacy
+        // unscaled fallback when no such tensor exists.
+        if (config.family == .gemma and config.usesMoe()) return err;
+        return input;
+    };
     defer cb.free(scale_w);
-    return cb.multiply(scaled, scale_w);
+
+    if (config.family == .gemma) {
+        // Gemma 4 routing is independent of pre_feedforward_layernorm_2:
+        // rms_norm(attention_residual) * router.scale / sqrt(hidden_size).
+        // Folding router.scale into the RMSNorm weight saves one device op.
+        const normed_scaled = try cb.rmsNorm(input, scale_w, hidden_size, config.norm_eps);
+        if (!apply_hidden_scale) return normed_scaled;
+        defer cb.free(normed_scaled);
+
+        const inv_sqrt_hidden = 1.0 / @sqrt(@as(f32, @floatFromInt(hidden_size)));
+        if (try cb.multiplyScalar(normed_scaled, inv_sqrt_hidden)) |result| return result;
+
+        const scalar_shape = [_]i32{1};
+        const scalar = try cb.fromFloat32Shape(&.{inv_sqrt_hidden}, &scalar_shape);
+        defer cb.free(scalar);
+        return cb.multiply(normed_scaled, scalar);
+    }
+
+    return cb.multiply(input, scale_w);
 }
 
 pub fn applyActivation(cb: *const ComputeBackend, config: Config, input: CT) !CT {
@@ -10257,16 +10494,66 @@ test "final logit softcap greedy argmax fast path policy is Gemma-only" {
     try std.testing.expectEqual(@as(usize, 0), activations.argmax(&logits));
 }
 
+test "Gemma 4 router independently RMS-normalizes and hidden-scales its source" {
+    const allocator = std.testing.allocator;
+    var store = native_compute_mod.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitDeepSeekV4TestWeightStore(allocator, &store);
+    var compute = native_compute_mod.NativeCompute.init(allocator, &store, null);
+    defer compute.weight_reservations.deinit(allocator);
+    var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute_mod.vtable_impl };
+
+    try putDeepSeekV4TestWeight(
+        allocator,
+        &store,
+        "model.layers.0.block_sparse_moe.gate.input_scale",
+        &.{4},
+        &.{ 2.0, 3.0, 4.0, 5.0 },
+    );
+
+    const source = try cb.fromFloat32Shape(&.{ 3.0, 4.0, 0.0, 0.0 }, &.{ 1, 4 });
+    defer cb.free(source);
+    const config: Config = .{
+        .family = .gemma,
+        .hidden_size = 4,
+        .num_local_experts = 2,
+        .num_experts_per_tok = 1,
+        .norm_eps = 0.0,
+    };
+    var name_buf: [256]u8 = undefined;
+    const router_input = try scaleMoeRouterInput(&cb, config, source, 4, 0, &name_buf, true);
+    defer cb.free(router_input);
+    const actual = try cb.toFloat32(router_input, allocator);
+    defer allocator.free(actual);
+
+    // rms([3, 4, 0, 0]) = 2.5, followed by learned scale and 1/sqrt(4).
+    try std.testing.expectEqual(@as(usize, 4), actual.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.2), actual[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.4), actual[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), actual[2], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), actual[3], 1e-6);
+}
+
 test "selectTopExperts picks correct top-k from 8 experts" {
     const allocator = std.testing.allocator;
     const logits = [_]f32{ 1.0, 3.0, 0.5, 2.0, 4.0, 0.1, 0.2, 1.5 };
-    const sel = try selectTopExperts(allocator, &logits, 2);
+    const sel = try selectTopExperts(allocator, &logits, 2, 1.0);
     try std.testing.expectEqual(@as(usize, 2), sel.count);
     // top-1 should be index 4 (value 4.0), top-2 should be index 1 (value 3.0)
     try std.testing.expectEqual(@as(u32, 4), sel.indices[0]);
     try std.testing.expectEqual(@as(u32, 1), sel.indices[1]);
     // weights should be normalized to sum to 1.0
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), sel.weights[0] + sel.weights[1], 1e-5);
+}
+
+test "selectTopExperts applies a deferred positive router-logit scale" {
+    const allocator = std.testing.allocator;
+    const logits = [_]f32{ 0.0, 2.0, 1.0 };
+    const sel = try selectTopExperts(allocator, &logits, 2, 0.5);
+
+    try std.testing.expectEqual(@as(u32, 1), sel.indices[0]);
+    try std.testing.expectEqual(@as(u32, 2), sel.indices[1]);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.62245935), sel.weights[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.37754068), sel.weights[1], 1e-6);
 }
 
 test "selectTopExperts handles 128 experts with top_k=8" {
@@ -10276,7 +10563,7 @@ test "selectTopExperts handles 128 experts with top_k=8" {
         v.* = @floatFromInt(i);
     }
     // Highest values: 127, 126, 125, ..., 120
-    const sel = try selectTopExperts(allocator, &logits, 8);
+    const sel = try selectTopExperts(allocator, &logits, 8, 1.0);
     try std.testing.expectEqual(@as(usize, 8), sel.count);
     try std.testing.expectEqual(@as(u32, 127), sel.indices[0]);
     try std.testing.expectEqual(@as(u32, 126), sel.indices[1]);

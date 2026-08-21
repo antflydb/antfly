@@ -455,6 +455,7 @@ pub const DebertaEmbeddingsRequest = struct {
 /// Fused MoE forward: route selection + expert compute + scatter-add,
 /// entirely on GPU with no CPU round-trips for routing.
 pub const MoeForwardFusedRequest = struct {
+    layer_index: usize,
     input: CT, // [total, hidden_size]
     router_logits: CT, // [total, num_experts]
     w1: CT, // gate weight (packed experts)
@@ -466,9 +467,16 @@ pub const MoeForwardFusedRequest = struct {
     inter_size: usize,
     num_experts: usize,
     top_k: usize,
+    router_logit_scale: f32 = 1.0,
+    activation: DecoderRuntimeActivationKind,
 };
 
 pub const RunMoeBlockRequest = MoeForwardFusedRequest;
+
+pub const A4bResidencyMode = backend_contracts.A4bResidencyMode;
+pub const A4bInferenceRequest = backend_contracts.A4bInferenceRequest;
+pub const A4bExpertGeometry = backend_contracts.A4bExpertGeometry;
+pub const A4bInferenceConfig = backend_contracts.A4bInferenceConfig;
 
 pub const DecoderRuntimeGreedyRequest = backend_contracts.DecoderRuntimeGreedyRequest;
 pub const DecoderRuntimePrepareAbsoluteEmbeddingsRequest = backend_contracts.DecoderRuntimePrepareAbsoluteEmbeddingsRequest;
@@ -566,6 +574,33 @@ pub const NativeQuantTimingStats = struct {
     calls: u64 = 0,
     pair_calls: u64 = 0,
     grouped_calls: u64 = 0,
+    a4b_moe_route_select_attempts: u64 = 0,
+    a4b_moe_route_select_successes: u64 = 0,
+    a4b_moe_route_select_fallbacks: u64 = 0,
+    a4b_moe_slot_lookup_attempts: u64 = 0,
+    a4b_moe_slot_route_hits: u64 = 0,
+    a4b_moe_slot_route_misses: u64 = 0,
+    a4b_moe_slot_all_hit_layers: u64 = 0,
+    a4b_moe_slot_map_publications: u64 = 0,
+    a4b_moe_slot_map_publish_failures: u64 = 0,
+    a4b_moe_slot_arena_attempts: u64 = 0,
+    a4b_moe_slot_arena_successes: u64 = 0,
+    a4b_moe_slot_arena_failures: u64 = 0,
+    a4b_moe_checkpoint_attempts: u64 = 0,
+    a4b_moe_checkpoint_all_hit_tokens: u64 = 0,
+    a4b_moe_checkpoint_miss_tokens: u64 = 0,
+    a4b_moe_checkpoint_replays: u64 = 0,
+    a4b_moe_slot_uploads: u64 = 0,
+    a4b_moe_slot_upload_bytes: u64 = 0,
+    a4b_packed_q4_0_linear_attempts: u64 = 0,
+    a4b_packed_q4_0_linear_successes: u64 = 0,
+    a4b_packed_q4_0_linear_fallbacks: u64 = 0,
+    a4b_packed_q4_0_pair_attempts: u64 = 0,
+    a4b_packed_q4_0_pair_successes: u64 = 0,
+    a4b_packed_q4_0_pair_fallbacks: u64 = 0,
+    a4b_moe_scatter_attempts: u64 = 0,
+    a4b_moe_scatter_successes: u64 = 0,
+    a4b_moe_scatter_fallbacks: u64 = 0,
     grouped_q5_k_calls: u64 = 0,
     grouped_q6_k_calls: u64 = 0,
     grouped_q5_k_expand_calls: u64 = 0,
@@ -1604,7 +1639,7 @@ pub const ComputeBackend = struct {
 
         /// Select top-k expert ids and normalized routing weights from router
         /// logits. Returns flat row-major arrays of length rows * top_k.
-        moeSelectRoutes: ?*const fn (ctx: *anyopaque, logits: CT, rows: usize, num_experts: usize, top_k: usize, allocator: std.mem.Allocator) anyerror!?MoeRouteSelection = null,
+        moeSelectRoutes: ?*const fn (ctx: *anyopaque, layer_index: usize, logits: CT, rows: usize, num_experts: usize, top_k: usize, logit_scale: f32, allocator: std.mem.Allocator) anyerror!?MoeRouteSelection = null,
 
         /// Fused MoE forward: route selection + expert compute + scatter-add,
         /// entirely on GPU with no CPU round-trips for routing. Backends that
@@ -2084,6 +2119,18 @@ pub const ComputeBackend = struct {
 
         /// Return true when a backend-owned decoder frame is already active.
         decoderRuntimeHasActiveFrame: ?*const fn (ctx: *anyopaque) bool = null,
+
+        /// Arm a per-layer MoE miss ledger for an optimistic decode frame.
+        /// Returns false before encoding when the arena is not fully warm.
+        decoderRuntimeBeginMoeCheckpoint: ?*const fn (ctx: *anyopaque, layer_count: usize, top_k: usize) anyerror!bool = null,
+
+        /// Inspect the armed ledger after the frame's terminal wait. Returns
+        /// true when the token must be replayed through synchronized repair.
+        decoderRuntimeFinishMoeCheckpoint: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
+
+        /// Force the bounded replay through the synchronized route/repair
+        /// path. Backends without optimistic MoE routing ignore this.
+        decoderRuntimeSetMoeReplayMode: ?*const fn (ctx: *anyopaque, enabled: bool) anyerror!void = null,
 
         /// Submit and wait for the active backend-owned decoder frame.
         decoderRuntimeSubmitAndWaitFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
@@ -3085,14 +3132,16 @@ pub const ComputeBackend = struct {
 
     pub fn moeSelectRoutes(
         self: *const ComputeBackend,
+        layer_index: usize,
         logits: CT,
         rows: usize,
         num_experts: usize,
         top_k: usize,
+        logit_scale: f32,
         allocator: std.mem.Allocator,
     ) !?MoeRouteSelection {
         if (self.vtable.moeSelectRoutes) |moe_select_routes| {
-            return moe_select_routes(self.ptr, logits, rows, num_experts, top_k, allocator);
+            return moe_select_routes(self.ptr, layer_index, logits, rows, num_experts, top_k, logit_scale, allocator);
         }
         return null;
     }
@@ -3896,6 +3945,26 @@ pub const ComputeBackend = struct {
             return op(self.ptr);
         }
         return false;
+    }
+
+    pub fn decoderRuntimeBeginMoeCheckpoint(self: *const ComputeBackend, layer_count: usize, top_k: usize) !bool {
+        if (self.vtable.decoderRuntimeBeginMoeCheckpoint) |op| {
+            return op(self.ptr, layer_count, top_k);
+        }
+        return false;
+    }
+
+    pub fn decoderRuntimeFinishMoeCheckpoint(self: *const ComputeBackend) !bool {
+        if (self.vtable.decoderRuntimeFinishMoeCheckpoint) |op| {
+            return op(self.ptr);
+        }
+        return false;
+    }
+
+    pub fn decoderRuntimeSetMoeReplayMode(self: *const ComputeBackend, enabled: bool) !void {
+        if (self.vtable.decoderRuntimeSetMoeReplayMode) |op| {
+            try op(self.ptr, enabled);
+        }
     }
 
     pub fn decoderRuntimeSubmitAndWaitFrame(self: *const ComputeBackend) !void {

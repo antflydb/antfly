@@ -15,6 +15,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const activations = @import("activations.zig");
+const gemma4_runtime = @import("../architectures/gemma4_runtime.zig");
 const decoder_bitnet_runtime = @import("decoder_bitnet_runtime.zig");
 const decoder_gated_runtime = @import("decoder_gated_runtime.zig");
 const decoder_gpt_runtime = @import("decoder_gpt_runtime.zig");
@@ -847,6 +848,19 @@ pub const MetalQuantFormat = enum(u32) {
     tl2 = 30,
 };
 
+pub const PackedMoeLinearDescriptor = struct {
+    slot: usize,
+    format: MetalQuantFormat,
+    source_out_dim: usize,
+    row_offset: usize,
+    expert_count: usize,
+};
+
+pub const PackedMoeLinearPairResult = struct {
+    first: MetalTensor,
+    second: MetalTensor,
+};
+
 pub const PackedWeightDescriptor = struct {
     format: MetalQuantFormat,
     tensor_type: gguf_tensor_types.TensorType,
@@ -1676,7 +1690,7 @@ pub fn supportsDecoderRuntimeConfig(gpt_config: anytype) bool {
         // multimodal/PLE Gemma variants even when the deepest family-local
         // decoder-runtime fast path declines and falls back to the generic GPT
         // path. Do not reject those models at the top-level executor gate.
-        .gemma => !gpt_config.usesMoe(),
+        .gemma => gemma4_runtime.supportsRuntimeConfig(gpt_config),
         else => false,
     };
 }
@@ -2978,6 +2992,24 @@ pub fn decoderRuntimeApplyPagedKvAttentionSlot(self: anytype, request: anytype) 
 }
 
 pub fn decoderRuntimeApplyPagedKvAttentionSlotOnRuntime(runtime: *RawMetalDecodeRuntime, request: anytype) !?MetalTensor {
+    return decoderRuntimeApplyPagedKvAttentionSlotOnRuntimeWithFlush(runtime, request, true);
+}
+
+/// Encode paged-slot attention onto this provider's already-active frame and
+/// leave completion to that frame's eventual submit/wait. Callers must keep
+/// every consumer on the same frame; the ordinary wrapper above retains its
+/// synchronous completion contract.
+pub fn decoderRuntimeApplyPagedKvAttentionSlotOnActiveFrame(self: anytype, request: anytype) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_has_active_frame(runtime) == 0) return null;
+    return decoderRuntimeApplyPagedKvAttentionSlotOnRuntimeWithFlush(runtime, request, false);
+}
+
+fn decoderRuntimeApplyPagedKvAttentionSlotOnRuntimeWithFlush(
+    runtime: *RawMetalDecodeRuntime,
+    request: anytype,
+    flush_active_frame: bool,
+) !?MetalTensor {
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (!request.q.isDevice()) return null;
     if (request.q.ndim() != 2) return null;
@@ -3084,8 +3116,9 @@ pub fn decoderRuntimeApplyPagedKvAttentionSlotOnRuntime(runtime: *RawMetalDecode
     // caller may consume `output` from a DIFFERENT runtime's queue with no
     // cross-queue ordering. Drain the owner's frame before handing the
     // output back so it is complete.
-    if (termite_metal_decode_runtime_has_active_frame(runtime) != 0 or
-        termite_metal_decode_runtime_has_submitted_frame(runtime) != 0)
+    if (flush_active_frame and
+        (termite_metal_decode_runtime_has_active_frame(runtime) != 0 or
+            termite_metal_decode_runtime_has_submitted_frame(runtime) != 0))
     {
         if (termite_metal_decode_runtime_flush_active_frame(runtime) != 0) {
             output.deinit();
@@ -5116,6 +5149,185 @@ pub fn decoderRuntimeApplySoftmaxDevice(self: anytype, input: MetalTensor, rows:
         output_device.deviceByteOffset(),
     );
     return finishDeviceOutput(&output_device, rc);
+}
+
+pub fn decoderRuntimeSelectMoeRoutesDevice(
+    self: anytype,
+    layer_index: usize,
+    logits: MetalTensor,
+    rows: usize,
+    num_experts: usize,
+    top_k: usize,
+    logit_scale: f32,
+    route_ids: []u32,
+    route_weights: []f32,
+) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0 or !logits.isDevice()) return false;
+    if (layer_index >= 32 or rows == 0 or num_experts == 0 or num_experts > 128 or top_k == 0 or top_k > 8 or top_k > num_experts) return false;
+    const logits_count = std.math.mul(usize, rows, num_experts) catch return false;
+    const route_count = std.math.mul(usize, rows, top_k) catch return false;
+    if (logits.elemCount() != logits_count or route_ids.len != route_count or route_weights.len != route_count) return false;
+    return termite_metal_decode_runtime_select_moe_routes_device(
+        runtime,
+        layer_index,
+        logits.deviceHandle(),
+        logits.deviceByteOffset(),
+        rows,
+        num_experts,
+        top_k,
+        logit_scale,
+        route_ids.ptr,
+        route_weights.ptr,
+    ) == 0;
+}
+
+pub fn decoderRuntimeSelectMoeRoutesOptimisticDevice(
+    self: anytype,
+    layer_index: usize,
+    logits: MetalTensor,
+    rows: usize,
+    num_experts: usize,
+    top_k: usize,
+    logit_scale: f32,
+) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0 or !logits.isDevice()) return false;
+    if (layer_index >= 32 or rows == 0 or num_experts == 0 or num_experts > 128 or top_k == 0 or top_k > 8 or top_k > num_experts) return false;
+    const logits_count = std.math.mul(usize, rows, num_experts) catch return false;
+    if (logits.elemCount() != logits_count) return false;
+    return termite_metal_decode_runtime_select_moe_routes_device(
+        runtime,
+        layer_index,
+        logits.deviceHandle(),
+        logits.deviceByteOffset(),
+        rows,
+        num_experts,
+        top_k,
+        logit_scale,
+        null,
+        null,
+    ) == 0;
+}
+
+pub const MoeCheckpointError = error{MoeCheckpointUnavailable};
+
+pub fn decoderRuntimeBeginMoeCheckpoint(self: anytype, layer_count: usize) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    return termite_metal_decode_runtime_begin_moe_checkpoint(runtime, layer_count) == 0;
+}
+
+pub fn decoderRuntimeFinishMoeCheckpoint(self: anytype, layer_count: usize, top_k: usize) MoeCheckpointError!u64 {
+    const runtime = self.raw_decode_runtime orelse return error.MoeCheckpointUnavailable;
+    var miss_mask: u64 = 0;
+    if (termite_metal_decode_runtime_finish_moe_checkpoint(runtime, layer_count, top_k, &miss_mask) != 0) {
+        return error.MoeCheckpointUnavailable;
+    }
+    return miss_mask;
+}
+
+/// Publish a fail-closed expert-id -> arena-slot directory for one MoE layer.
+/// The C runtime rejects publication while a non-empty frame is in flight, so
+/// callers cannot mutate a Shared table still referenced by queued GPU work.
+pub fn decoderRuntimePublishMoeExpertSlotMap(
+    self: anytype,
+    layer_index: usize,
+    expert_to_slot: []const u32,
+) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (layer_index >= 32 or expert_to_slot.len == 0 or expert_to_slot.len > 128) return false;
+    return termite_metal_decode_runtime_publish_moe_expert_slot_map(
+        runtime,
+        layer_index,
+        expert_to_slot.ptr,
+        expert_to_slot.len,
+    ) == 0;
+}
+
+pub fn decoderRuntimePrepareMoeQ4_0SlotArena(
+    self: anytype,
+    layer_index: usize,
+    slot_count: usize,
+    expert_stride: usize,
+    gate_offset: usize,
+    up_offset: usize,
+    down_offset: usize,
+    hidden_size: usize,
+    inter_size: usize,
+) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    return termite_metal_decode_runtime_prepare_moe_q4_0_slot_arena(
+        runtime,
+        layer_index,
+        slot_count,
+        expert_stride,
+        gate_offset,
+        up_offset,
+        down_offset,
+        hidden_size,
+        inter_size,
+    ) == 0;
+}
+
+pub fn decoderRuntimeUploadMoeQ4_0Slots(
+    self: anytype,
+    layer_index: usize,
+    slot_indices: []const u32,
+    slot_bytes: []const u8,
+    expert_stride: usize,
+) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    const expected = std.math.mul(usize, slot_indices.len, expert_stride) catch return false;
+    if (slot_bytes.len != expected) return false;
+    return termite_metal_decode_runtime_upload_moe_q4_0_slots(
+        runtime,
+        layer_index,
+        slot_indices.ptr,
+        slot_indices.len,
+        slot_bytes.ptr,
+        expert_stride,
+    ) == 0;
+}
+
+pub fn decoderRuntimeMoeForwardQ4_0SlotsDevice(
+    self: anytype,
+    layer_index: usize,
+    input: MetalTensor,
+    rows: usize,
+    hidden_size: usize,
+    inter_size: usize,
+    num_experts: usize,
+    top_k: usize,
+    activation_kind: ops.DecoderRuntimeActivationKind,
+    expert_scale: ?MetalTensor,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0 or !input.isDevice()) return null;
+    if (expert_scale) |scale| if (!scale.isDevice() or scale.elemCount() != num_experts) return null;
+    const output_count = std.math.mul(usize, rows, hidden_size) catch return null;
+    if (input.elemCount() != output_count) return null;
+    var output = try MetalTensor.deviceAllocate(runtime, output_count * @sizeOf(f32), .private, input.shape());
+    errdefer output.deinit();
+    const rc = termite_metal_decode_runtime_moe_forward_q4_0_slots_device(
+        runtime,
+        layer_index,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        rows,
+        hidden_size,
+        inter_size,
+        num_experts,
+        top_k,
+        @intFromEnum(activation_kind),
+        if (expert_scale) |scale| scale.deviceHandle() else null,
+        if (expert_scale) |scale| scale.deviceByteOffset() else 0,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    return finishDeviceOutput(&output, rc);
 }
 
 pub fn decoderRuntimeMaskedBceWithLogitsLossDevice(
@@ -9558,6 +9770,12 @@ pub const RawRuntimeMemoryStats = extern struct {
     prepared_frame_fallback_calls: u64 = 0,
     frame_begin_count: u64 = 0,
     frame_submit_count: u64 = 0,
+    moe_route_select_attempt_count: u64 = 0,
+    moe_route_select_success_count: u64 = 0,
+    moe_slot_lookup_attempt_count: u64 = 0,
+    moe_slot_route_hit_count: u64 = 0,
+    moe_slot_route_miss_count: u64 = 0,
+    moe_slot_all_hit_layer_count: u64 = 0,
     frame_wait_nanos: u64 = 0,
     frame_gpu_nanos: u64 = 0,
     compute_encoder_count: u64 = 0,
@@ -15187,6 +15405,11 @@ pub extern fn termite_metal_decode_runtime_memory_snapshot(
     runtime: ?*RawMetalDecodeRuntime,
     snapshot: *RawRuntimeMemoryStats,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_expert_subbuffer_cache_snapshot(
+    runtime: ?*const RawMetalDecodeRuntime,
+    hits: *u64,
+    misses: *u64,
+) c_int;
 pub extern fn termite_metal_provider_generated_quant_snapshot(
     provider: ?*RawMetalProvider,
     snapshot: *RawRuntimeMemoryStats,
@@ -15878,6 +16101,19 @@ pub fn runtimeMemorySnapshot(runtime: ?*RawMetalDecodeRuntime) RawRuntimeMemoryS
     var snapshot: RawRuntimeMemoryStats = .{};
     _ = termite_metal_decode_runtime_memory_snapshot(runtime, &snapshot);
     return snapshot;
+}
+
+pub const ExpertSubbufferCacheStats = struct {
+    hits: u64,
+    misses: u64,
+};
+
+pub fn expertSubbufferCacheSnapshot(runtime: ?*const RawMetalDecodeRuntime) !ExpertSubbufferCacheStats {
+    var stats: ExpertSubbufferCacheStats = .{ .hits = 0, .misses = 0 };
+    if (termite_metal_decode_runtime_expert_subbuffer_cache_snapshot(runtime, &stats.hits, &stats.misses) != 0) {
+        return error.MetalExpertSubbufferCacheStatsUnavailable;
+    }
+    return stats;
 }
 
 pub fn decodeGqaSplitScheduleSnapshot(
@@ -16770,6 +17006,58 @@ pub extern fn termite_metal_decode_runtime_apply_quantized_linear_slot_device(
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_apply_quantized_linear_id_slot_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    format: u32,
+    slot: usize,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    expert_ids: [*]const u32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    source_out_dim: usize,
+    row_offset: usize,
+    expert_count: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_apply_quantized_linear_pair_id_slots_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    format: u32,
+    slot_a: usize,
+    slot_b: usize,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    expert_ids: [*]const u32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    source_out_dim_a: usize,
+    row_offset_a: usize,
+    expert_count_a: usize,
+    source_out_dim_b: usize,
+    row_offset_b: usize,
+    expert_count_b: usize,
+    output_a_handle: ?*anyopaque,
+    output_a_offset: usize,
+    output_b_handle: ?*anyopaque,
+    output_b_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_moe_scatter_add_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    base_handle: ?*anyopaque,
+    base_offset: usize,
+    updates_handle: ?*anyopaque,
+    updates_offset: usize,
+    row_ids: [*]const u32,
+    route_weights: [*]const f32,
+    base_rows: usize,
+    route_rows: usize,
+    dim: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_apply_quantized_linear_q4_k_bias_slot_device(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
@@ -17510,6 +17798,69 @@ pub extern fn termite_metal_decode_runtime_apply_softmax_device(
     rows: usize,
     dim: usize,
     log_softmax: u32,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_select_moe_routes_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    layer_index: usize,
+    logits_handle: ?*anyopaque,
+    logits_offset: usize,
+    rows: usize,
+    num_experts: usize,
+    top_k: usize,
+    logit_scale: f32,
+    output_route_ids: [*c]u32,
+    output_route_weights: [*c]f32,
+) c_int;
+pub extern fn termite_metal_decode_runtime_begin_moe_checkpoint(
+    runtime: ?*RawMetalDecodeRuntime,
+    layer_count: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_finish_moe_checkpoint(
+    runtime: ?*RawMetalDecodeRuntime,
+    layer_count: usize,
+    top_k: usize,
+    miss_mask_out: *u64,
+) c_int;
+pub extern fn termite_metal_decode_runtime_publish_moe_expert_slot_map(
+    runtime: ?*RawMetalDecodeRuntime,
+    layer_index: usize,
+    expert_to_slot: [*c]const u32,
+    expert_count: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_prepare_moe_q4_0_slot_arena(
+    runtime: ?*RawMetalDecodeRuntime,
+    layer_index: usize,
+    slot_count: usize,
+    expert_stride: usize,
+    gate_offset: usize,
+    up_offset: usize,
+    down_offset: usize,
+    hidden_size: usize,
+    inter_size: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_upload_moe_q4_0_slots(
+    runtime: ?*RawMetalDecodeRuntime,
+    layer_index: usize,
+    slot_indices: [*c]const u32,
+    upload_count: usize,
+    slot_bytes: [*c]const u8,
+    expert_stride: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_moe_forward_q4_0_slots_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    layer_index: usize,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    rows: usize,
+    hidden_size: usize,
+    inter_size: usize,
+    num_experts: usize,
+    top_k: usize,
+    activation_kind: u32,
+    expert_scale_handle: ?*anyopaque,
+    expert_scale_offset: usize,
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
@@ -20989,6 +21340,374 @@ pub fn tryApplyQuantizedRuntimeLinearBiasGelu(
         in_dim,
         out_dim,
     );
+}
+
+/// Publish a packed expert tensor as one no-copy linear slot. A descriptor
+/// identifies the logical projection inside the [expert, out, in] storage;
+/// the model-owned mmap remains the single source of truth.
+pub fn decoderRuntimePreparePackedMoeLinear(
+    self: anytype,
+    storage: *const QuantizedStorage,
+    slot: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !?PackedMoeLinearDescriptor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0 or slot >= decoder_runtime_linear_slot_capacity) return null;
+    const packed_meta = storage.packed_expert orelse return null;
+    const expert_count: usize = @intCast(packed_meta.expert_count);
+    if (expert_count == 0) return null;
+    const meta = quant_codec.packedExpertLinearMeta(
+        storage.shape,
+        @intCast(packed_meta.expert_axis),
+        packed_meta.expert_index,
+        in_dim,
+        out_dim,
+        storage.tensor_type,
+    ) catch return null;
+    const row_offset: usize = @intCast(packed_meta.row_offset);
+    if (row_offset > meta.source_out_dim or out_dim > meta.source_out_dim - row_offset) return null;
+    const flat_out_dim = std.math.mul(usize, meta.source_out_dim, expert_count) catch return null;
+    const kind = quantizedRuntimeLinearKind(storage);
+    if (kind != .q4_0) return null;
+    const format = metalQuantFormatForKind(kind);
+
+    if (self.raw_linear_slots_prepared[slot]) {
+        if (self.raw_linear_slot_kinds[slot] != .quantized or
+            self.raw_linear_slot_in_dims[slot] != in_dim or
+            self.raw_linear_slot_out_dims[slot] != flat_out_dim or
+            self.raw_linear_slot_runtime_prepared_kind[slot] != kind)
+        {
+            return null;
+        }
+        return .{
+            .slot = slot,
+            .format = format,
+            .source_out_dim = meta.source_out_dim,
+            .row_offset = row_offset,
+            .expert_count = expert_count,
+        };
+    }
+
+    // A private upload of the routed expert set duplicates most of the 26B
+    // checkpoint. Only a page-backed shared mapping is an admissible source.
+    const span = mappedQuantRawSpan(storage, storage.raw_bytes, @alignOf(u16)) orelse return null;
+    const started_at = monotonicNowNs();
+    incrementRuntimeQuantMappedAttempts(self);
+    const rc = termite_metal_decode_runtime_prepare_quantized_linear_slot_no_copy_region(
+        runtime,
+        @intFromEnum(format),
+        slot,
+        span.base_ptr,
+        span.base_len,
+        span.weight_offset,
+        span.weight_len,
+        in_dim,
+        flat_out_dim,
+    );
+    addRuntimeQuantMappedPrepareNanos(self, monotonicNowNs() - started_at);
+    if (rc != 0) {
+        incrementRuntimeQuantMappedFailures(self);
+        return null;
+    }
+    self.raw_linear_slots_prepared[slot] = true;
+    self.raw_linear_slot_kinds[slot] = .quantized;
+    self.raw_linear_slot_in_dims[slot] = in_dim;
+    self.raw_linear_slot_out_dims[slot] = flat_out_dim;
+    self.raw_linear_slot_quantized_storage[slot] = null;
+    self.raw_linear_slot_runtime_prepared_kind[slot] = kind;
+    self.raw_linear_slot_runtime_prepared_modes[slot] = .mapped_shared;
+    self.raw_linear_slot_disable_mapped_quant_weight[slot] = false;
+    return .{
+        .slot = slot,
+        .format = format,
+        .source_out_dim = meta.source_out_dim,
+        .row_offset = row_offset,
+        .expert_count = expert_count,
+    };
+}
+
+pub fn decoderRuntimeApplyPackedMoeLinear(
+    self: anytype,
+    descriptor: PackedMoeLinearDescriptor,
+    input: MetalTensor,
+    expert_ids: []const u32,
+    in_dim: usize,
+    out_dim: usize,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0 or !input.isDevice()) return null;
+    if (descriptor.format != .q4_0 or expert_ids.len == 0 or input.ndim() != 2) return null;
+    for (expert_ids) |expert_id| if (expert_id >= descriptor.expert_count) return null;
+    const rows = expert_ids.len;
+    if (@as(usize, @intCast(input.dim(0))) != rows or @as(usize, @intCast(input.dim(1))) != in_dim) return null;
+    const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
+    var output = try MetalTensor.deviceAllocate(runtime, rows * out_dim * @sizeOf(f32), .private, &shape);
+    errdefer output.deinit();
+    const rc = termite_metal_decode_runtime_apply_quantized_linear_id_slot_device(
+        runtime,
+        @intFromEnum(descriptor.format),
+        descriptor.slot,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        expert_ids.ptr,
+        rows,
+        in_dim,
+        out_dim,
+        descriptor.source_out_dim,
+        descriptor.row_offset,
+        descriptor.expert_count,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (rc != 0) return null;
+    return output;
+}
+
+pub fn decoderRuntimeApplyPackedMoeLinearPair(
+    self: anytype,
+    first_descriptor: PackedMoeLinearDescriptor,
+    second_descriptor: PackedMoeLinearDescriptor,
+    input: MetalTensor,
+    expert_ids: []const u32,
+    in_dim: usize,
+    out_dim: usize,
+) !?PackedMoeLinearPairResult {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0 or !input.isDevice()) return null;
+    if (first_descriptor.format != .q4_0 or second_descriptor.format != .q4_0 or
+        expert_ids.len == 0 or input.ndim() != 2) return null;
+    for (expert_ids) |expert_id| {
+        if (expert_id >= first_descriptor.expert_count or
+            expert_id >= second_descriptor.expert_count) return null;
+    }
+    const rows = expert_ids.len;
+    if (@as(usize, @intCast(input.dim(0))) != rows or @as(usize, @intCast(input.dim(1))) != in_dim) return null;
+    const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
+    var first = try MetalTensor.deviceAllocate(runtime, rows * out_dim * @sizeOf(f32), .private, &shape);
+    errdefer first.deinit();
+    var second = try MetalTensor.deviceAllocate(runtime, rows * out_dim * @sizeOf(f32), .private, &shape);
+    errdefer second.deinit();
+    const rc = termite_metal_decode_runtime_apply_quantized_linear_pair_id_slots_device(
+        runtime,
+        @intFromEnum(first_descriptor.format),
+        first_descriptor.slot,
+        second_descriptor.slot,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        expert_ids.ptr,
+        rows,
+        in_dim,
+        out_dim,
+        first_descriptor.source_out_dim,
+        first_descriptor.row_offset,
+        first_descriptor.expert_count,
+        second_descriptor.source_out_dim,
+        second_descriptor.row_offset,
+        second_descriptor.expert_count,
+        first.deviceHandle(),
+        first.deviceByteOffset(),
+        second.deviceHandle(),
+        second.deviceByteOffset(),
+    );
+    if (rc != 0) return null;
+    return .{ .first = first, .second = second };
+}
+
+pub fn decoderRuntimeMoeScatterAdd(
+    self: anytype,
+    base: MetalTensor,
+    updates: MetalTensor,
+    row_ids: []const u32,
+    route_weights: []const f32,
+    dim: usize,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0 or !base.isDevice() or !updates.isDevice()) return null;
+    if (base.ndim() != 2 or updates.ndim() != 2 or row_ids.len == 0 or row_ids.len != route_weights.len) return null;
+    const base_rows: usize = @intCast(base.dim(0));
+    const route_rows = row_ids.len;
+    if (@as(usize, @intCast(base.dim(1))) != dim or
+        @as(usize, @intCast(updates.dim(0))) != route_rows or
+        @as(usize, @intCast(updates.dim(1))) != dim) return null;
+    for (row_ids) |row_id| if (row_id >= base_rows) return null;
+    var output = try MetalTensor.deviceAllocate(runtime, base_rows * dim * @sizeOf(f32), .private, base.shape());
+    errdefer output.deinit();
+    const rc = termite_metal_decode_runtime_moe_scatter_add_device(
+        runtime,
+        base.deviceHandle(),
+        base.deviceByteOffset(),
+        updates.deviceHandle(),
+        updates.deviceByteOffset(),
+        row_ids.ptr,
+        route_weights.ptr,
+        base_rows,
+        route_rows,
+        dim,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (rc != 0) return null;
+    return output;
+}
+
+test "A4B Metal Q4_0 expert-id linear and routed scatter match host reference" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    const expert_count: usize = 3;
+    const in_dim: usize = 32;
+    const out_dim: usize = 3;
+    const source_out_dim: usize = out_dim * 2;
+    const row_bytes: usize = 18;
+    const mapped = try std.heap.page_allocator.alloc(u8, std.heap.page_size_min);
+    defer std.heap.page_allocator.free(mapped);
+    @memset(mapped, 0);
+    const raw = mapped[0 .. expert_count * source_out_dim * row_bytes];
+    var dense_rows: [expert_count * source_out_dim][in_dim]f32 = undefined;
+    for (0..expert_count) |expert| {
+        for (0..source_out_dim) |row| {
+            const flat_row = expert * source_out_dim + row;
+            for (&dense_rows[flat_row], 0..) |*value, col| {
+                const signed = @as(i32, @intCast((expert * 31 + row * 17 + col * 7 + 5) % 67)) - 33;
+                value.* = @as(f32, @floatFromInt(signed)) / 29.0;
+            }
+            quant_codec.quantizeQ4_0Block(&dense_rows[flat_row], raw[flat_row * row_bytes ..][0..row_bytes]);
+        }
+    }
+
+    const slot: usize = decoder_runtime_linear_slot_capacity - 1;
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_quantized_linear_slot_no_copy_region(
+        runtime,
+        @intFromEnum(MetalQuantFormat.q4_0),
+        slot,
+        mapped.ptr,
+        mapped.len,
+        0,
+        raw.len,
+        in_dim,
+        expert_count * source_out_dim,
+    ));
+
+    const input_data = [_]f32{1.0} ** in_dim ++ [_]f32{-0.5} ** in_dim;
+    var input = try testDeviceTensorFromSlice(runtime, &input_data, &[_]i32{ 2, @intCast(in_dim) });
+    defer input.deinit();
+    const expert_ids = [_]u32{ 2, 0 };
+    var result = (try decoderRuntimeApplyPackedMoeLinear(
+        &provider,
+        .{
+            .slot = slot,
+            .format = .q4_0,
+            .source_out_dim = source_out_dim,
+            .row_offset = 0,
+            .expert_count = expert_count,
+        },
+        input,
+        &expert_ids,
+        in_dim,
+        out_dim,
+    )) orelse return error.UnexpectedNull;
+    defer result.deinit();
+
+    const dequant = try allocator.alloc(f32, expert_count * source_out_dim * in_dim);
+    defer allocator.free(dequant);
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q4_0 }, raw, dequant);
+    var expected_first: [2 * out_dim]f32 = @splat(0.0);
+    var expected_second: [2 * out_dim]f32 = @splat(0.0);
+    for (0..2) |input_row| {
+        const expert = expert_ids[input_row];
+        for (0..out_dim) |out_row| {
+            const first_weight_base = (@as(usize, expert) * source_out_dim + out_row) * in_dim;
+            const second_weight_base = (@as(usize, expert) * source_out_dim + out_dim + out_row) * in_dim;
+            for (0..in_dim) |col| {
+                const input_value = input_data[input_row * in_dim + col];
+                expected_first[input_row * out_dim + out_row] += input_value * dequant[first_weight_base + col];
+                expected_second[input_row * out_dim + out_row] += input_value * dequant[second_weight_base + col];
+            }
+        }
+    }
+    const actual = try tensorHostSlice(&result);
+    try std.testing.expectEqual(expected_first.len, actual.len);
+    for (expected_first, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 2e-3);
+
+    const cache_after_first = try expertSubbufferCacheSnapshot(runtime);
+    var repeated = (try decoderRuntimeApplyPackedMoeLinear(
+        &provider,
+        .{
+            .slot = slot,
+            .format = .q4_0,
+            .source_out_dim = source_out_dim,
+            .row_offset = 0,
+            .expert_count = expert_count,
+        },
+        input,
+        &expert_ids,
+        in_dim,
+        out_dim,
+    )) orelse return error.UnexpectedNull;
+    defer repeated.deinit();
+    const repeated_actual = try tensorHostSlice(&repeated);
+    for (expected_first, repeated_actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 2e-3);
+    const cache_after_repeat = try expertSubbufferCacheSnapshot(runtime);
+    try std.testing.expect(cache_after_first.misses > 0);
+    try std.testing.expect(cache_after_repeat.hits > cache_after_first.hits);
+    try std.testing.expectEqual(cache_after_first.misses, cache_after_repeat.misses);
+
+    var pair = (try decoderRuntimeApplyPackedMoeLinearPair(
+        &provider,
+        .{
+            .slot = slot,
+            .format = .q4_0,
+            .source_out_dim = source_out_dim,
+            .row_offset = 0,
+            .expert_count = expert_count,
+        },
+        .{
+            .slot = slot,
+            .format = .q4_0,
+            .source_out_dim = source_out_dim,
+            .row_offset = out_dim,
+            .expert_count = expert_count,
+        },
+        input,
+        &expert_ids,
+        in_dim,
+        out_dim,
+    )) orelse return error.UnexpectedNull;
+    defer pair.first.deinit();
+    defer pair.second.deinit();
+    const pair_first = try tensorHostSlice(&pair.first);
+    const pair_second = try tensorHostSlice(&pair.second);
+    for (expected_first, expected_second, pair_first, pair_second) |want_first, want_second, first_value, second_value| {
+        try std.testing.expectApproxEqAbs(want_first, first_value, 2e-3);
+        try std.testing.expectApproxEqAbs(want_second, second_value, 2e-3);
+    }
+
+    const base_data = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const update_data = [_]f32{ 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4 };
+    var base = try testDeviceTensorFromSlice(runtime, &base_data, &[_]i32{ 2, 3 });
+    defer base.deinit();
+    var updates = try testDeviceTensorFromSlice(runtime, &update_data, &[_]i32{ 4, 3 });
+    defer updates.deinit();
+    const row_ids = [_]u32{ 0, 1, 0, 1 };
+    const route_weights = [_]f32{ 0.25, 0.5, 0.75, 1.0 };
+    var scattered = (try decoderRuntimeMoeScatterAdd(
+        &provider,
+        base,
+        updates,
+        &row_ids,
+        &route_weights,
+        3,
+    )) orelse return error.UnexpectedNull;
+    defer scattered.deinit();
+    const scattered_host = try tensorHostSlice(&scattered);
+    try std.testing.expectEqualSlices(f32, &.{ 3.5, 4.5, 5.5, 9.0, 10.0, 11.0 }, scattered_host);
 }
 
 pub fn tryApplyQuantizedRuntimeLinear(
@@ -35933,6 +36652,246 @@ fn testDeviceTensorFromSlice(runtime: *RawMetalDecodeRuntime, data: []const f32,
     return tensor;
 }
 
+test "A4B Metal device route selection returns compact top-k ids and normalized weights" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+
+    const rows: usize = 2;
+    const num_experts: usize = 8;
+    const top_k: usize = 3;
+    const logits = [_]f32{
+        1.0, 3.0, 0.5, 2.0, 4.0, 0.1, 0.2, 1.5,
+        8.0, 1.0, 7.0, 2.0, 6.0, 3.0, 5.0, 4.0,
+    };
+    var device_logits = try testDeviceTensorFromSlice(runtime, &logits, &[_]i32{ rows, num_experts });
+    defer device_logits.deinit();
+    var route_ids: [rows * top_k]u32 = undefined;
+    var route_weights: [rows * top_k]f32 = undefined;
+    const counters_before = runtimeMemorySnapshot(runtime);
+
+    // Exercise the same producer-frame join used by decode. The selector must
+    // drain this frame once and return only compact route metadata.
+    try beginFrame(runtime);
+    try std.testing.expect(try decoderRuntimeSelectMoeRoutesDevice(
+        &provider,
+        0,
+        device_logits,
+        rows,
+        num_experts,
+        top_k,
+        0.5,
+        &route_ids,
+        &route_weights,
+    ));
+    const counters_after = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(counters_before.moe_route_select_attempt_count + 1, counters_after.moe_route_select_attempt_count);
+    try std.testing.expectEqual(counters_before.moe_route_select_success_count + 1, counters_after.moe_route_select_success_count);
+    try std.testing.expectEqual(counters_before.moe_slot_lookup_attempt_count + 1, counters_after.moe_slot_lookup_attempt_count);
+    try std.testing.expectEqual(counters_before.moe_slot_route_miss_count + rows * top_k, counters_after.moe_slot_route_miss_count);
+    try std.testing.expectEqualSlices(u32, &.{ 4, 1, 3, 0, 2, 4 }, &route_ids);
+    for (0..rows) |row| {
+        var sum: f32 = 0.0;
+        for (route_weights[row * top_k ..][0..top_k]) |weight| {
+            try std.testing.expect(weight > 0.0 and weight < 1.0);
+            sum += weight;
+        }
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), sum, 2e-5);
+    }
+    const expected_first = [_]f32{ @exp(2.0), @exp(1.5), @exp(1.0) };
+    const expected_sum = expected_first[0] + expected_first[1] + expected_first[2];
+    for (expected_first, route_weights[0..top_k]) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected / expected_sum, actual, 2e-4);
+    }
+
+    var slot_map = [_]u32{std.math.maxInt(u32)} ** num_experts;
+    for (route_ids, 0..) |expert, route| slot_map[expert] = @intCast(route % top_k);
+    try std.testing.expect(decoderRuntimePublishMoeExpertSlotMap(&provider, 0, &slot_map));
+    try std.testing.expect(try decoderRuntimeSelectMoeRoutesDevice(
+        &provider,
+        0,
+        device_logits,
+        rows,
+        num_experts,
+        top_k,
+        0.5,
+        &route_ids,
+        &route_weights,
+    ));
+    const counters_all_hit = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(counters_after.moe_slot_lookup_attempt_count + 1, counters_all_hit.moe_slot_lookup_attempt_count);
+    try std.testing.expectEqual(counters_after.moe_slot_route_hit_count + rows * top_k, counters_all_hit.moe_slot_route_hit_count);
+    try std.testing.expectEqual(counters_after.moe_slot_route_miss_count, counters_all_hit.moe_slot_route_miss_count);
+    try std.testing.expectEqual(counters_after.moe_slot_all_hit_layer_count + 1, counters_all_hit.moe_slot_all_hit_layer_count);
+
+    // Expert 4 appears in both rows. A sentinel entry must fail closed for
+    // both routes while preserving the other four slot hits.
+    slot_map[4] = std.math.maxInt(u32);
+    try std.testing.expect(decoderRuntimePublishMoeExpertSlotMap(&provider, 0, &slot_map));
+    try std.testing.expect(try decoderRuntimeSelectMoeRoutesDevice(
+        &provider,
+        0,
+        device_logits,
+        rows,
+        num_experts,
+        top_k,
+        0.5,
+        &route_ids,
+        &route_weights,
+    ));
+    const counters_mixed = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(counters_all_hit.moe_slot_route_hit_count + 4, counters_mixed.moe_slot_route_hit_count);
+    try std.testing.expectEqual(counters_all_hit.moe_slot_route_miss_count + 2, counters_mixed.moe_slot_route_miss_count);
+    try std.testing.expectEqual(counters_all_hit.moe_slot_all_hit_layer_count, counters_mixed.moe_slot_all_hit_layer_count);
+}
+
+test "A4B Metal optimistic route checkpoint preserves frame and reports layer misses" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+
+    const num_experts: usize = 4;
+    const top_k: usize = 2;
+    const layer_count: usize = 2;
+    const logits_data = [_]f32{ 0.0, 3.0, 0.5, 2.0 };
+    var logits = try testDeviceTensorFromSlice(runtime, &logits_data, &[_]i32{ 1, num_experts });
+    defer logits.deinit();
+    var all_hit_map = [_]u32{std.math.maxInt(u32)} ** num_experts;
+    all_hit_map[1] = 0;
+    all_hit_map[3] = 1;
+    try std.testing.expect(decoderRuntimePublishMoeExpertSlotMap(&provider, 0, &all_hit_map));
+    try std.testing.expect(decoderRuntimePublishMoeExpertSlotMap(&provider, 1, &all_hit_map));
+
+    const before = runtimeMemorySnapshot(runtime);
+    try beginFrame(runtime);
+    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    try std.testing.expect(decoderRuntimeBeginMoeCheckpoint(&provider, layer_count));
+    for (0..layer_count) |layer| {
+        try std.testing.expect(decoderRuntimeSelectMoeRoutesOptimisticDevice(
+            &provider,
+            layer,
+            logits,
+            1,
+            num_experts,
+            top_k,
+            1.0,
+        ));
+        try std.testing.expect(hasActiveFrame(runtime));
+        try std.testing.expectEqual(before.frame_submit_count, runtimeMemorySnapshot(runtime).frame_submit_count);
+    }
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+    try std.testing.expectEqual(@as(u64, 0), try decoderRuntimeFinishMoeCheckpoint(&provider, layer_count, top_k));
+    const after_all_hit = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(before.frame_submit_count + 1, after_all_hit.frame_submit_count);
+    try std.testing.expectEqual(before.moe_slot_route_hit_count + layer_count * top_k, after_all_hit.moe_slot_route_hit_count);
+    try std.testing.expectEqual(before.moe_slot_route_miss_count, after_all_hit.moe_slot_route_miss_count);
+
+    var miss_map = all_hit_map;
+    miss_map[3] = std.math.maxInt(u32);
+    try std.testing.expect(decoderRuntimePublishMoeExpertSlotMap(&provider, 1, &miss_map));
+    try beginFrame(runtime);
+    try std.testing.expect(decoderRuntimeBeginMoeCheckpoint(&provider, layer_count));
+    for (0..layer_count) |layer| {
+        try std.testing.expect(decoderRuntimeSelectMoeRoutesOptimisticDevice(
+            &provider,
+            layer,
+            logits,
+            1,
+            num_experts,
+            top_k,
+            1.0,
+        ));
+    }
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+    try std.testing.expectEqual(@as(u64, 1) << 1, try decoderRuntimeFinishMoeCheckpoint(&provider, layer_count, top_k));
+    const after_miss = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(after_all_hit.moe_slot_route_hit_count + 3, after_miss.moe_slot_route_hit_count);
+    try std.testing.expectEqual(after_all_hit.moe_slot_route_miss_count + 1, after_miss.moe_slot_route_miss_count);
+}
+
+test "A4B Metal device route selection matches host top-8 routing" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+
+    const rows: usize = 3;
+    const num_experts: usize = 128;
+    const top_k: usize = 8;
+    const logit_scale: f32 = 1.0 / @sqrt(@as(f32, 2816.0));
+    var logits: [rows * num_experts]f32 = undefined;
+    for (&logits, 0..) |*value, index| {
+        const row = index / num_experts;
+        const expert = index % num_experts;
+        const mixed = (expert * 37 + row * 53) % 131;
+        value.* = @as(f32, @floatFromInt(mixed)) * 0.73 -
+            @as(f32, @floatFromInt(expert)) * 0.011 +
+            @as(f32, @floatFromInt(row)) * 0.19;
+    }
+
+    var device_logits = try testDeviceTensorFromSlice(runtime, &logits, &[_]i32{ rows, num_experts });
+    defer device_logits.deinit();
+    var route_ids: [rows * top_k]u32 = undefined;
+    var route_weights: [rows * top_k]f32 = undefined;
+    try beginFrame(runtime);
+    try std.testing.expect(try decoderRuntimeSelectMoeRoutesDevice(
+        &provider,
+        1,
+        device_logits,
+        rows,
+        num_experts,
+        top_k,
+        logit_scale,
+        &route_ids,
+        &route_weights,
+    ));
+
+    for (0..rows) |row| {
+        var probabilities: [num_experts]f32 = undefined;
+        for (logits[row * num_experts ..][0..num_experts], &probabilities) |logit, *probability| {
+            probability.* = logit * logit_scale;
+        }
+        activations.softmax(&probabilities, num_experts);
+        var used = [_]bool{false} ** num_experts;
+        var expected_ids: [top_k]u32 = undefined;
+        var expected_weights: [top_k]f32 = undefined;
+        var expected_sum: f32 = 0.0;
+        for (0..top_k) |slot| {
+            var best_id: usize = 0;
+            var best_weight: f32 = -std.math.inf(f32);
+            for (probabilities, 0..) |probability, expert| {
+                if (!used[expert] and probability > best_weight) {
+                    best_id = expert;
+                    best_weight = probability;
+                }
+            }
+            used[best_id] = true;
+            expected_ids[slot] = @intCast(best_id);
+            expected_weights[slot] = best_weight;
+            expected_sum += best_weight;
+        }
+        for (&expected_weights) |*weight| weight.* /= expected_sum;
+
+        try std.testing.expectEqualSlices(u32, &expected_ids, route_ids[row * top_k ..][0..top_k]);
+        for (expected_weights, route_weights[row * top_k ..][0..top_k]) |expected, actual| {
+            try std.testing.expectApproxEqAbs(expected, actual, 2e-5);
+        }
+    }
+}
+
 test "metal native decoder runtime prepares rms norm from device weight without host download" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
@@ -36942,6 +37901,159 @@ test "metal native decoder runtime batched multi-row argmax matches per-row" {
     try std.testing.expect(!hasActiveFrame(runtime));
 }
 
+test "A4B Metal Q4_0 expert slot arena matches dequantized routed FFN" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const layer: usize = 2;
+    const hidden: usize = 32;
+    const inter: usize = 32;
+    const num_experts: usize = 4;
+    const top_k: usize = 2;
+    const slot_count: usize = 2;
+    const projection_values = hidden * inter;
+    const projection_bytes = inter * (hidden / 32) * 18;
+    const gate_offset: usize = 0;
+    const up_offset = projection_bytes;
+    const down_offset = projection_bytes * 2;
+    const expert_stride: usize = 16 * 1024;
+
+    const slot_images = try allocator.alloc(u8, slot_count * expert_stride);
+    defer allocator.free(slot_images);
+    @memset(slot_images, 0);
+    var dequantized = [_][3][projection_values]f32{
+        [_][projection_values]f32{[_]f32{0} ** projection_values} ** 3,
+    } ** slot_count;
+    const diagonal_scales = [_][3]f32{
+        .{ 0.5, 1.0, 1.0 },
+        .{ 1.0, 0.25, 2.0 },
+    };
+    const offsets = [_]usize{ gate_offset, up_offset, down_offset };
+    for (0..slot_count) |slot| {
+        for (0..3) |projection| {
+            var dense = [_]f32{0} ** projection_values;
+            for (0..hidden) |row| {
+                dense[row * hidden + row] = diagonal_scales[slot][projection];
+                dense[row * hidden + (row + 7) % hidden] = diagonal_scales[slot][projection] * 0.125;
+            }
+            const encoded = try quant_codec.quantizeQ4_0FromF32(allocator, &dense);
+            defer allocator.free(encoded);
+            try std.testing.expectEqual(projection_bytes, encoded.len);
+            const destination = slot * expert_stride + offsets[projection];
+            @memcpy(slot_images[destination..][0..projection_bytes], encoded);
+            try quant_codec.dequantizeToFloat32(.{ .known = .Q4_0 }, encoded, &dequantized[slot][projection]);
+        }
+    }
+
+    const input_data = [_]f32{
+        0.25,   -0.5,    0.75,   -1.0,    0.125,  -0.25,   0.5,    -0.75,
+        1.0,    -0.125,  0.375,  -0.625,  0.875,  -1.125,  0.2,    -0.4,
+        0.6,    -0.8,    1.2,    -1.4,    0.3,    -0.6,    0.9,    -1.2,
+        0.0625, -0.1875, 0.3125, -0.4375, 0.5625, -0.6875, 0.8125, -0.9375,
+    };
+    const logits_data = [_]f32{ 0.0, 3.0, 0.5, 2.0 };
+    var input = try testDeviceTensorFromSlice(runtime, &input_data, &[_]i32{ 1, hidden });
+    defer input.deinit();
+    var logits = try testDeviceTensorFromSlice(runtime, &logits_data, &[_]i32{ 1, num_experts });
+    defer logits.deinit();
+
+    var slot_map = [_]u32{std.math.maxInt(u32)} ** num_experts;
+    slot_map[1] = 0;
+    slot_map[3] = 1;
+    const uploaded_slots = [_]u32{ 0, 1 };
+    var expected: [hidden]f32 = undefined;
+
+    for (0..2) |pass| {
+        var route_ids: [top_k]u32 = undefined;
+        var route_weights: [top_k]f32 = undefined;
+        try beginFrame(runtime);
+        errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+        try std.testing.expect(try decoderRuntimeSelectMoeRoutesDevice(
+            &provider,
+            layer,
+            logits,
+            1,
+            num_experts,
+            top_k,
+            1.0,
+            &route_ids,
+            &route_weights,
+        ));
+        try std.testing.expectEqualSlices(u32, &.{ 1, 3 }, &route_ids);
+        if (pass == 0) {
+            try std.testing.expect(decoderRuntimePrepareMoeQ4_0SlotArena(
+                &provider,
+                layer,
+                slot_count,
+                expert_stride,
+                gate_offset,
+                up_offset,
+                down_offset,
+                hidden,
+                inter,
+            ));
+            try std.testing.expect(decoderRuntimePublishMoeExpertSlotMap(&provider, layer, &slot_map));
+            try std.testing.expect(decoderRuntimeUploadMoeQ4_0Slots(
+                &provider,
+                layer,
+                &uploaded_slots,
+                slot_images,
+                expert_stride,
+            ));
+        }
+        var output = (try decoderRuntimeMoeForwardQ4_0SlotsDevice(
+            &provider,
+            layer,
+            input,
+            1,
+            hidden,
+            inter,
+            num_experts,
+            top_k,
+            .gelu_new,
+            null,
+        )) orelse return error.UnexpectedNull;
+        defer output.deinit();
+        try submitFrame(runtime);
+        try waitFrame(runtime);
+
+        @memset(&expected, 0);
+        for (0..top_k) |route| {
+            const slot: usize = if (route_ids[route] == 1) 0 else 1;
+            var gate: [inter]f32 = undefined;
+            var up: [inter]f32 = undefined;
+            for (0..inter) |row| {
+                gate[row] = 0;
+                up[row] = 0;
+                for (0..hidden) |column| {
+                    gate[row] += input_data[column] * dequantized[slot][0][row * hidden + column];
+                    up[row] += input_data[column] * dequantized[slot][1][row * hidden + column];
+                }
+            }
+            applyActivationHost(&gate, .gelu_new);
+            for (&gate, up) |*gate_value, up_value| gate_value.* *= up_value;
+            for (0..hidden) |row| {
+                var down: f32 = 0;
+                for (0..inter) |column| down += gate[column] * dequantized[slot][2][row * inter + column];
+                expected[row] += down * route_weights[route];
+            }
+        }
+        var output_mut = output;
+        const actual = try tensorHostSlice(&output_mut);
+        for (expected, actual, 0..) |want, got, index| {
+            if (!std.math.approxEqAbs(f32, want, got, 2e-3)) {
+                std.debug.print("A4B slot arena mismatch pass={d} index={d} expected={d} got={d}\n", .{ pass, index, want, got });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+}
+
 test "metal native decoder runtime can prepare bf16 linear without copying model-owned bytes" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
@@ -37688,6 +38800,74 @@ test "metal donated KV on-frame attention executes on caller frame" {
     ));
     try submitFrame(frame_runtime);
     try waitFrame(frame_runtime);
+
+    const actual = try tensorHostSlice(&output);
+    try std.testing.expectEqual(@as(usize, 1), actual.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 7.0), actual[0], 1e-6);
+}
+
+test "metal same-runtime paged-slot attention can defer completion to active frame" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(runtime);
+    defer _ = termite_metal_decode_runtime_reset_state(runtime);
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return error.SkipZigTest;
+
+    var q = try testDeviceTensorFromSlice(runtime, &[_]f32{1.0}, &[_]i32{ 1, 1 });
+    defer q.deinit();
+    var k = try testDeviceTensorFromSlice(runtime, &[_]f32{2.0}, &[_]i32{ 1, 1 });
+    defer k.deinit();
+    var v = try testDeviceTensorFromSlice(runtime, &[_]f32{7.0}, &[_]i32{ 1, 1 });
+    defer v.deinit();
+
+    const block_table = [_]u32{0};
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_reset_attention_span_slot(runtime, 0));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_update_attention_paged_from_f32_key_device_slot(
+        runtime,
+        0,
+        2,
+        k.deviceHandle(),
+        k.deviceByteOffset(),
+        v.deviceHandle(),
+        v.deviceByteOffset(),
+        1,
+        1,
+        1,
+        1,
+        @sizeOf(f32),
+        @sizeOf(f32),
+        1,
+        0,
+        &block_table,
+        block_table.len,
+        16,
+    ));
+
+    try beginFrame(runtime);
+    const provider = .{ .raw_decode_runtime = @as(?*RawMetalDecodeRuntime, runtime) };
+    var output = (try decoderRuntimeApplyPagedKvAttentionSlotOnActiveFrame(provider, .{
+        .q = q,
+        .slot = @as(usize, 0),
+        .format = @as(u32, 2),
+        .block_token_offsets = block_table[0..],
+        .page_size = @as(usize, 16),
+        .kv_tokens = @as(usize, 1),
+        .num_heads = @as(usize, 1),
+        .num_kv_heads = @as(usize, 1),
+        .head_dim = @as(usize, 1),
+        .key_row_bytes = @as(usize, @sizeOf(f32)),
+        .base_key_row_bytes = @as(usize, @sizeOf(f32)),
+        .query_position = @as(usize, 0),
+        .query_position_offset = @as(usize, 0),
+        .kv_position_offset = @as(usize, 0),
+        .sliding_window = @as(usize, 0),
+    })) orelse return error.SkipZigTest;
+    defer output.deinit();
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_decode_runtime_has_active_frame(runtime));
+    try submitFrame(runtime);
+    try waitFrame(runtime);
 
     const actual = try tensorHostSlice(&output);
     try std.testing.expectEqual(@as(usize, 1), actual.len);

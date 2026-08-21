@@ -850,6 +850,60 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
     );
     const gpt_stats = gpt_arch.getDebugTimingStats();
     std.debug.print(
+        "gpt_timing_ms: attention={d} attn_norm={d} attn_qkv={d} attn_core={d} attn_rope={d} attn_gqa={d} attn_out_proj={d} ffn={d} moe_router_weight_fetch={d} moe_router_proj={d} moe_route_select={d} moe_router_download={d} moe_expert_scale_download={d} moe_expert_weight_fetch={d} moe_input_download={d} moe_prepare_layer={d} moe_append_route={d} moe_finalize_layer={d} moe_prefetch_hint={d}\n",
+        .{
+            @divTrunc(gpt_stats.attention_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.attention_norm_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.attention_qkv_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.attention_core_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.attention_rope_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.attention_gqa_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.attention_out_proj_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.ffn_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_router_weight_fetch_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_router_proj_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_route_select_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_router_download_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_expert_scale_download_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_expert_weight_fetch_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_input_download_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_prepare_layer_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_append_route_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_finalize_layer_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_prefetch_hint_nanos, std.time.ns_per_ms),
+        },
+    );
+    std.debug.print(
+        "gpt_moe_timing_ms: grouped_attempts={d} grouped_successes={d} moe_grouped={d} moe_fallback={d} moe_grouped_input_copy={d} moe_grouped_input_upload={d} moe_grouped_ops={d} moe_grouped_sync_w1={d} moe_grouped_sync_w3={d} moe_grouped_sync_gate={d} moe_grouped_sync_w2={d} moe_grouped_sync_ops={d} moe_grouped_output_download={d} moe_grouped_scatter={d} moe_grouped_sync_scatter={d} moe_grouped_cleanup={d}\n",
+        .{
+            gpt_stats.moe_grouped_attempts,
+            gpt_stats.moe_grouped_successes,
+            @divTrunc(gpt_stats.moe_grouped_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_fallback_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_grouped_input_copy_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_grouped_input_upload_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_grouped_ops_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_grouped_sync_w1_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_grouped_sync_w3_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_grouped_sync_gate_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_grouped_sync_w2_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_grouped_sync_ops_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_grouped_output_download_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_grouped_scatter_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_grouped_sync_scatter_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_grouped_cleanup_nanos, std.time.ns_per_ms),
+        },
+    );
+    std.debug.print(
+        "gpt_overhead_ms: eval={d} eval_count={d} shared_expert_ffn={d} norm={d}\n",
+        .{
+            @divTrunc(gpt_stats.eval_nanos, std.time.ns_per_ms),
+            gpt_stats.eval_count,
+            @divTrunc(gpt_stats.shared_expert_ffn_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.norm_nanos, std.time.ns_per_ms),
+        },
+    );
+    std.debug.print(
         "gpt_block_counts: dense_attempts={d} dense_successes={d} gated_attempts={d} gated_successes={d} gated_input_attempts={d} gated_input_successes={d} gated_input_prefill={d} gated_input_decode={d} gated_qkv_attempts={d} gated_qkv_successes={d}\n",
         .{
             gpt_stats.dense_block_attempts,

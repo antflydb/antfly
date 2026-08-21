@@ -119,6 +119,9 @@ const Options = struct {
     combined_budget_mb: usize = 0,
     kv_budget_mb: usize = 0,
     scratch_budget_mb: usize = 0,
+    a4b_residency_mode: ops.A4bResidencyMode = .auto,
+    a4b_memory_budget_mb: u32 = 0,
+    a4b_options_explicit: bool = false,
     raw_prompt: bool = false,
     no_bos: bool = false,
     raw_decode_bench: bool = false,
@@ -504,6 +507,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     var session_manager = backends.SessionManager.initWithIo(allocator, io);
     configureBackendPreference(&session_manager, if (route_onnx_whole_model_graph) .native else opts.backend);
+    session_manager.a4b_inference_request = a4bInferenceRequest(opts);
     session_manager.kernel_jit = jit_config;
     session_manager.kernel_jit_load_context = .startup_preload;
 
@@ -3731,6 +3735,24 @@ fn metalStatsCompactJson(
         \\"runtime_mapped_attempts":{d},
         \\"runtime_mapped_fallbacks":{d},
         \\"runtime_mapped_failures":{d},
+        \\"a4b_linear_attempts":{d},
+        \\"a4b_linear_successes":{d},
+        \\"a4b_linear_fallbacks":{d},
+        \\"a4b_pair_attempts":{d},
+        \\"a4b_pair_successes":{d},
+        \\"a4b_pair_fallbacks":{d},
+        \\"a4b_scatter_attempts":{d},
+        \\"a4b_scatter_successes":{d},
+        \\"a4b_scatter_fallbacks":{d},
+        \\"a4b_slot_arena_attempts":{d},
+        \\"a4b_slot_arena_successes":{d},
+        \\"a4b_slot_arena_failures":{d},
+        \\"a4b_checkpoint_attempts":{d},
+        \\"a4b_checkpoint_all_hit_tokens":{d},
+        \\"a4b_checkpoint_miss_tokens":{d},
+        \\"a4b_checkpoint_replays":{d},
+        \\"a4b_slot_uploads":{d},
+        \\"a4b_slot_upload_bytes":{d},
         \\"active_frame_bootstrap_misses":{d},
         \\"misses":{d}
         \\}}
@@ -3748,6 +3770,24 @@ fn metalStatsCompactJson(
             provider.metal_provider_quantized_runtime_mapped_attempts,
             provider.metal_provider_quantized_runtime_mapped_fallbacks,
             provider.metal_provider_quantized_runtime_mapped_failures,
+            provider.a4b_packed_q4_0_linear_attempts,
+            provider.a4b_packed_q4_0_linear_successes,
+            provider.a4b_packed_q4_0_linear_fallbacks,
+            provider.a4b_packed_q4_0_pair_attempts,
+            provider.a4b_packed_q4_0_pair_successes,
+            provider.a4b_packed_q4_0_pair_fallbacks,
+            provider.a4b_moe_scatter_attempts,
+            provider.a4b_moe_scatter_successes,
+            provider.a4b_moe_scatter_fallbacks,
+            provider.a4b_moe_slot_arena_attempts,
+            provider.a4b_moe_slot_arena_successes,
+            provider.a4b_moe_slot_arena_failures,
+            provider.a4b_moe_checkpoint_attempts,
+            provider.a4b_moe_checkpoint_all_hit_tokens,
+            provider.a4b_moe_checkpoint_miss_tokens,
+            provider.a4b_moe_checkpoint_replays,
+            provider.a4b_moe_slot_uploads,
+            provider.a4b_moe_slot_upload_bytes,
             provider.compressed_block_active_frame_bootstrap_misses,
             metalResidencyMisses(provider),
         },
@@ -5497,6 +5537,29 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
     const top_fallback = graph_mod.executor_stats.quantKernelTopFallbackReason(plan_stats);
     const fast_path_misses = graph_mod.executor_stats.quantKernelFastPathMisses(plan_stats);
     print(
+        "metal_a4b_moe: linear_attempts={d} linear_successes={d} linear_fallbacks={d} pair_attempts={d} pair_successes={d} pair_fallbacks={d} scatter_attempts={d} scatter_successes={d} scatter_fallbacks={d} slot_arena_attempts={d} slot_arena_successes={d} slot_arena_failures={d} checkpoint_attempts={d} checkpoint_all_hit_tokens={d} checkpoint_miss_tokens={d} checkpoint_replays={d} slot_uploads={d} slot_upload_bytes={d}\n",
+        .{
+            metal_snapshot.provider.a4b_packed_q4_0_linear_attempts,
+            metal_snapshot.provider.a4b_packed_q4_0_linear_successes,
+            metal_snapshot.provider.a4b_packed_q4_0_linear_fallbacks,
+            metal_snapshot.provider.a4b_packed_q4_0_pair_attempts,
+            metal_snapshot.provider.a4b_packed_q4_0_pair_successes,
+            metal_snapshot.provider.a4b_packed_q4_0_pair_fallbacks,
+            metal_snapshot.provider.a4b_moe_scatter_attempts,
+            metal_snapshot.provider.a4b_moe_scatter_successes,
+            metal_snapshot.provider.a4b_moe_scatter_fallbacks,
+            metal_snapshot.provider.a4b_moe_slot_arena_attempts,
+            metal_snapshot.provider.a4b_moe_slot_arena_successes,
+            metal_snapshot.provider.a4b_moe_slot_arena_failures,
+            metal_snapshot.provider.a4b_moe_checkpoint_attempts,
+            metal_snapshot.provider.a4b_moe_checkpoint_all_hit_tokens,
+            metal_snapshot.provider.a4b_moe_checkpoint_miss_tokens,
+            metal_snapshot.provider.a4b_moe_checkpoint_replays,
+            metal_snapshot.provider.a4b_moe_slot_uploads,
+            metal_snapshot.provider.a4b_moe_slot_upload_bytes,
+        },
+    );
+    print(
         "metal_quant_kernel_plan: planned={d} handwritten_production={d} generated_production={d} unsupported_routes={d} fast_path_misses={d} generated_candidates={d} generated_artifact_missing={d} generated_runtime_not_wired={d} unsupported={d} unsupported_format={d} unsupported_shape={d} unsupported_epilogue={d} unsupported_backend={d} tensor_core_repack_required={d} top_fallback_reason={s} top_fallback_count={d}\n",
         .{
             plan_stats.quant_kernel_planned_ops,
@@ -7105,6 +7168,7 @@ fn serverGenerateSupportsOptions(opts: Options) bool {
         opts.combined_budget_mb == 0 and
         opts.kv_budget_mb == 0 and
         opts.scratch_budget_mb == 0 and
+        !opts.a4b_options_explicit and
         opts.artifact_dir == null and
         opts.json_timing_path == null and
         !hasLocalKernelJitOptions(opts) and
@@ -7375,6 +7439,17 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingScratchBudget;
             opts.scratch_budget_mb = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--a4b-residency-mode")) {
+            i += 1;
+            if (i >= args.len) return error.MissingA4bResidencyMode;
+            opts.a4b_residency_mode = std.meta.stringToEnum(ops.A4bResidencyMode, args[i]) orelse
+                return error.InvalidA4bResidencyMode;
+            opts.a4b_options_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--a4b-memory-budget-mb")) {
+            i += 1;
+            if (i >= args.len) return error.MissingA4bMemoryBudget;
+            opts.a4b_memory_budget_mb = try std.fmt.parseInt(u32, args[i], 10);
+            opts.a4b_options_explicit = true;
         } else if (std.mem.eql(u8, arg, "--server")) {
             i += 1;
             if (i >= args.len) return error.MissingServerUrl;
@@ -7648,12 +7723,34 @@ fn configureBackendPreference(session_manager: *backends.SessionManager, choice:
     native_backend_choice.configureSessionPreference(session_manager, choice);
 }
 
+fn a4bInferenceRequest(opts: Options) ?ops.A4bInferenceRequest {
+    if (!opts.a4b_options_explicit) return null;
+    return .{
+        .residency_mode = opts.a4b_residency_mode,
+        .memory_budget_mb = opts.a4b_memory_budget_mb,
+    };
+}
+
 fn preflightModelLoadBudget(
     allocator: std.mem.Allocator,
     manifest: *const manifest_mod.ModelManifest,
     opts: Options,
 ) !void {
     const reservation_tier = predictedWeightTier(allocator, manifest, opts.backend) orelse return;
+    const predicted_backend_type = predictedBackendType(opts.backend, reservation_tier);
+    if (predicted_backend_type == .metal) {
+        if (try session_factory.resolveA4bInferenceConfigForModelListing(
+            allocator,
+            opts.model_dir,
+            manifest.*,
+            a4bInferenceRequest(opts),
+        ) != null) {
+            // Exact A4B loads are leased as one bounded weights+KV+scratch
+            // envelope by ModelManager. Reserving the full encoded GGUF here
+            // would reject the compact path before that authoritative gate.
+            return;
+        }
+    }
     const weight_bytes = estimatePreflightWeightBytes(allocator, manifest, opts) catch 0;
     if (weight_bytes == 0) return;
 
@@ -7662,7 +7759,6 @@ fn preflightModelLoadBudget(
         .backend => .gpu,
         .disk => return,
     });
-    const predicted_backend_type = predictedBackendType(opts.backend, reservation_tier);
     limits = try session_factory.widenBudgetLimitsForModelPath(
         allocator,
         opts.model_dir,
@@ -7761,7 +7857,7 @@ fn metalEagerDenseMaxBytes() u64 {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
+        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--a4b-residency-mode auto|streamed|resident] [--a4b-memory-budget-mb N] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  With --server or ANTFLY_INFERENCE_SERVER_URL, sends the request to an already-running inference server.
         \\  --stream prints generated text incrementally as token deltas arrive.
@@ -7880,6 +7976,10 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     snapshot.provider.metal_provider_quantized_runtime_mapped_fallbacks = 10;
     snapshot.provider.compressed_block_active_frame_bootstrap_misses = 11;
     snapshot.provider.metal_provider_quantized_runtime_mapped_failures = 12;
+    snapshot.provider.a4b_moe_checkpoint_attempts = 3;
+    snapshot.provider.a4b_moe_checkpoint_all_hit_tokens = 2;
+    snapshot.provider.a4b_moe_checkpoint_miss_tokens = 1;
+    snapshot.provider.a4b_moe_checkpoint_replays = 1;
 
     const graph_stats = graph_mod.executor_stats.ExecutionStats{
         .quant_kernel_planned_ops = 12,
@@ -7986,6 +8086,10 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     try std.testing.expectEqual(@as(i64, 10), root.get("residency").?.object.get("runtime_mapped_fallbacks").?.integer);
     try std.testing.expectEqual(@as(i64, 11), root.get("residency").?.object.get("active_frame_bootstrap_misses").?.integer);
     try std.testing.expectEqual(@as(i64, 12), root.get("residency").?.object.get("runtime_mapped_failures").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), root.get("residency").?.object.get("a4b_checkpoint_attempts").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), root.get("residency").?.object.get("a4b_checkpoint_all_hit_tokens").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), root.get("residency").?.object.get("a4b_checkpoint_miss_tokens").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), root.get("residency").?.object.get("a4b_checkpoint_replays").?.integer);
     try std.testing.expectEqual(@as(i64, 33), root.get("residency").?.object.get("misses").?.integer);
 
     const null_json = try metalStatsCompactJson(std.testing.allocator, null, .{});
@@ -8171,6 +8275,28 @@ test "parseArgs accepts artifact dir" {
     try std.testing.expectEqualStrings("/tmp/artifacts", opts.artifact_dir.?);
     try std.testing.expectEqual(@as(i32, 1), opts.max_tokens);
     try std.testing.expect(opts.raw_prompt);
+}
+
+test "parseArgs builds the explicit A4B residency request" {
+    const opts = try parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--a4b-residency-mode",
+        "streamed",
+        "--a4b-memory-budget-mb",
+        "4096",
+    });
+    const request = a4bInferenceRequest(opts).?;
+    try std.testing.expectEqual(ops.A4bResidencyMode.streamed, request.residency_mode);
+    try std.testing.expectEqual(@as(u32, 4096), request.memory_budget_mb);
+    try std.testing.expect(!serverGenerateSupportsOptions(opts));
+
+    try std.testing.expectError(error.InvalidA4bResidencyMode, parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--a4b-residency-mode",
+        "partial",
+    }));
 }
 
 test "parseArgs preserves explicit chat template thinking mode" {
