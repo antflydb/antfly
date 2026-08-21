@@ -912,13 +912,21 @@ fn appendPublicIndexConfig(
         if (public_index_contract.isWriteOnlyConfigField(entry.key_ptr.*)) continue;
         if (isSensitivePublicConfigField(entry.key_ptr.*)) continue;
         if (isSensitivePublicConfigValue(entry.key_ptr.*, entry.value_ptr.*)) continue;
+        const object_shape = public_index_contract.createdObjectShapeForRootField(index_type, entry.key_ptr.*);
+        if (!public_index_contract.createdValueMatchesShape(object_shape, entry.value_ptr.*)) continue;
         try out.append(alloc, ',');
         try appendJsonString(alloc, out, entry.key_ptr.*);
         try out.append(alloc, ':');
         if (canonicalize_enrichments and std.mem.eql(u8, entry.key_ptr.*, "enrichments")) {
             try appendCanonicalIndexEnrichments(alloc, out, entry.value_ptr.*);
         } else {
-            try appendPublicConfigValue(alloc, out, entry.value_ptr.*, entry.key_ptr.*);
+            try appendPublicConfigValue(
+                alloc,
+                out,
+                entry.value_ptr.*,
+                entry.key_ptr.*,
+                object_shape,
+            );
         }
     }
     try out.append(alloc, '}');
@@ -1058,6 +1066,7 @@ fn appendPublicConfigValue(
     out: *std.ArrayListUnmanaged(u8),
     value: std.json.Value,
     field_name: ?[]const u8,
+    object_shape: public_index_contract.CreatedObjectShape,
 ) !void {
     if (field_name) |name| {
         if (std.ascii.endsWithIgnoreCase(name, "_json") and value == .string) {
@@ -1070,7 +1079,7 @@ fn appendPublicConfigValue(
             defer parsed.deinit();
             var nested = std.ArrayListUnmanaged(u8).empty;
             defer nested.deinit(alloc);
-            try appendPublicConfigValue(alloc, &nested, parsed.value, null);
+            try appendPublicConfigValue(alloc, &nested, parsed.value, null, .unrestricted);
             return appendJsonString(alloc, out, nested.items);
         }
     }
@@ -1081,14 +1090,7 @@ fn appendPublicConfigValue(
             var first = true;
             var it = object.iterator();
             while (it.next()) |entry| {
-                if (field_name) |parent_field| {
-                    if ((std.mem.eql(u8, parent_field, "embedder") or
-                        std.mem.eql(u8, parent_field, "summarizer")) and
-                        !public_index_contract.isAllowedCreatedProviderField(entry.key_ptr.*))
-                    {
-                        continue;
-                    }
-                }
+                if (!public_index_contract.isAllowedCreatedObjectField(object_shape, entry.key_ptr.*)) continue;
                 // Asset producers are intentionally opaque and may gain new
                 // provider-specific credential fields at any time. A
                 // deny-list cannot safely project them into a public response,
@@ -1097,19 +1099,31 @@ fn appendPublicConfigValue(
                 if (public_index_contract.isWriteOnlyConfigField(entry.key_ptr.*)) continue;
                 if (isSensitivePublicConfigField(entry.key_ptr.*)) continue;
                 if (isSensitivePublicConfigValue(entry.key_ptr.*, entry.value_ptr.*)) continue;
+                const child_shape = public_index_contract.createdObjectShapeForChild(object_shape, entry.key_ptr.*);
+                if (!public_index_contract.createdValueMatchesShape(child_shape, entry.value_ptr.*)) continue;
                 if (!first) try out.append(alloc, ',');
                 first = false;
                 try appendJsonString(alloc, out, entry.key_ptr.*);
                 try out.append(alloc, ':');
-                try appendPublicConfigValue(alloc, out, entry.value_ptr.*, entry.key_ptr.*);
+                try appendPublicConfigValue(
+                    alloc,
+                    out,
+                    entry.value_ptr.*,
+                    entry.key_ptr.*,
+                    child_shape,
+                );
             }
             try out.append(alloc, '}');
         },
         .array => |array| {
             try out.append(alloc, '[');
-            for (array.items, 0..) |item, i| {
-                if (i > 0) try out.append(alloc, ',');
-                try appendPublicConfigValue(alloc, out, item, null);
+            const item_shape = public_index_contract.createdObjectShapeForArrayItem(object_shape);
+            var first = true;
+            for (array.items) |item| {
+                if (!public_index_contract.createdValueMatchesShape(item_shape, item)) continue;
+                if (!first) try out.append(alloc, ',');
+                first = false;
+                try appendPublicConfigValue(alloc, out, item, null, item_shape);
             }
             try out.append(alloc, ']');
         },
@@ -3892,24 +3906,55 @@ test "public index config encoders redact coverage incarnation" {
     );
 }
 
-test "created provider response allowlist covers the generated schema" {
-    inline for (@typeInfo(indexes_openapi.CreatedProviderConfig).@"struct".fields) |field| {
-        try std.testing.expect(public_index_contract.isAllowedCreatedProviderField(field.name));
+fn expectCreatedObjectAllowlistCovers(
+    comptime T: type,
+    shape: public_index_contract.CreatedObjectShape,
+) !void {
+    inline for (@typeInfo(T).@"struct".fields) |field| {
+        try std.testing.expect(public_index_contract.isAllowedCreatedObjectField(shape, field.name));
     }
-    try std.testing.expect(!public_index_contract.isAllowedCreatedProviderField("client_value"));
-    try std.testing.expect(!public_index_contract.isAllowedCreatedProviderField("settings"));
+}
+
+test "created nested response allowlists cover generated schemas" {
+    try expectCreatedObjectAllowlistCovers(indexes_openapi.CreatedProviderConfig, .provider);
+    try expectCreatedObjectAllowlistCovers(indexes_openapi.CreatedEnrichmentConfig, .enrichment);
+    try expectCreatedObjectAllowlistCovers(indexes_openapi.GraphArtifactSourceConfig, .graph_source);
+    try expectCreatedObjectAllowlistCovers(indexes_openapi.CreatedGraphArtifactProducerConfig, .graph_artifact);
+    try expectCreatedObjectAllowlistCovers(indexes_openapi.GraphResolverConfig, .graph_resolver);
+    try expectCreatedObjectAllowlistCovers(indexes_openapi.IndexExecutionConfig, .index_execution);
+    try expectCreatedObjectAllowlistCovers(indexes_openapi.ExecutionPolicy, .execution_policy);
+
+    inline for (@typeInfo(indexes_openapi.GraphArtifactProducerConfig).@"struct".fields) |field| {
+        try std.testing.expect(public_index_contract.isAllowedGraphArtifactRequestField(field.name));
+    }
+    inline for (@typeInfo(indexes_openapi.EnrichmentConfig).@"struct".fields) |field| {
+        try std.testing.expect(public_index_contract.isAllowedEnrichmentRequestField(field.name));
+    }
+
+    inline for (.{
+        public_index_contract.CreatedObjectShape.provider,
+        .enrichment,
+        .graph_source,
+        .graph_artifact,
+        .graph_resolver,
+        .index_execution,
+        .execution_policy,
+    }) |shape| {
+        try std.testing.expect(!public_index_contract.isAllowedCreatedObjectField(shape, "client_value"));
+        try std.testing.expect(!public_index_contract.isAllowedCreatedObjectField(shape, "settings"));
+    }
 }
 
 test "public index config encoders redact nested credentials" {
     const indexes_json =
-        \\{"embed_idx":{"type":"embeddings","dimension":384,"embedder":{"provider":"openai","model":"text-embedding-3-small","api_key":"sk-private","secret_key":"private-secret-key","url":"https://alice:private-password@example.com/v1","endpoint":"https://example.com/v1?auth=private-endpoint-auth","base_url":"https://example.com/oauth/callback#access_token=private-fragment-token","client_value":"private-unknown-field","settings":{"opaque":"private-nested-value"}},"summarizer":{"provider":"gemini","model":"gemini-2.5-flash","api_key":"${secret:gemini_key}","api_url":"https://example.com/v1?access%5Fkey%5Fid=private-url-key"},"enrichments":[{"name":"asset_v1","kind":"asset","producer_json":"{\"provider\":\"s3\",\"secret_access_key\":\"unknown-provider-secret\",\"access_token\":\"private-token\",\"headers\":{\"Authorization\":\"Bearer private-auth\",\"X-Auth\":\"future-private-header\",\"Accept\":\"text/html\"},\"format\":\"html\"}"}]}}
+        \\{"embed_idx":{"type":"embeddings","dimension":384,"embedder":{"provider":"openai","model":"text-embedding-3-small","api_key":"sk-private","secret_key":"private-secret-key","url":"https://alice:private-password@example.com/v1","endpoint":"https://example.com/v1?auth=private-endpoint-auth","base_url":"https://example.com/oauth/callback#access_token=private-fragment-token","client_value":"private-unknown-field","settings":{"opaque":"private-nested-value"}},"summarizer":{"provider":"gemini","model":"gemini-2.5-flash","api_key":"${secret:gemini_key}","api_url":"https://example.com/v1?access%5Fkey%5Fid=private-url-key"},"execution":{"embedding":{"batch_items":32,"client_value":"private-execution-value"},"chunking":"private-malformed-policy","settings":{"opaque":"private-execution-settings"}},"enrichments":[{"name":"asset_v1","kind":"asset","client_value":"private-enrichment-value","producer_json":"{\"provider\":\"s3\",\"secret_access_key\":\"unknown-provider-secret\",\"access_token\":\"private-token\",\"headers\":{\"Authorization\":\"Bearer private-auth\",\"X-Auth\":\"future-private-header\",\"Accept\":\"text/html\"},\"format\":\"html\"}","execution":{"batch_items":4,"settings":{"opaque":"private-policy-settings"}}}]}}
     ;
 
     const encoded_single = (try encodeSingleIndexConfig(std.testing.allocator, indexes_json, "embed_idx")).?;
     defer std.testing.allocator.free(encoded_single);
     try ant_json.testing.expectEqualJsonText(
         std.testing.allocator,
-        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":384,\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\"},\"summarizer\":{\"provider\":\"gemini\",\"model\":\"gemini-2.5-flash\"},\"enrichments\":[\"asset_v1\"]}",
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":384,\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\"},\"summarizer\":{\"provider\":\"gemini\",\"model\":\"gemini-2.5-flash\"},\"execution\":{\"embedding\":{\"batch_items\":32}},\"enrichments\":[\"asset_v1\"]}",
         encoded_single,
     );
 
@@ -3917,7 +3962,7 @@ test "public index config encoders redact nested credentials" {
     defer std.testing.allocator.free(created);
     try ant_json.testing.expectEqualJsonText(
         std.testing.allocator,
-        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":384,\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\"},\"summarizer\":{\"provider\":\"gemini\",\"model\":\"gemini-2.5-flash\"},\"enrichments\":[{\"name\":\"asset_v1\",\"kind\":\"asset\"}]}",
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":384,\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\"},\"summarizer\":{\"provider\":\"gemini\",\"model\":\"gemini-2.5-flash\"},\"execution\":{\"embedding\":{\"batch_items\":32}},\"enrichments\":[{\"name\":\"asset_v1\",\"kind\":\"asset\",\"execution\":{\"batch_items\":4}}]}",
         created,
     );
 }
@@ -3948,17 +3993,21 @@ test "public index config encoders omit root write-only producer documents" {
     );
 }
 
-test "created graph index response omits write-only artifact producer fields" {
+test "created graph index response projects closed nested schemas" {
     const config =
-        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]"},"artifact":{"name":"relations_v1","kind":"asset","field":"relations","producer_json":{"provider":"private","api_key":"private-key"}},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_search":"prefix"}]}
+        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","client_value":"private-source-value","settings":{"opaque":"private-source-settings"}},"artifact":{"name":"relations_v1","kind":"asset","field":"relations","producer_json":{"provider":"private","api_key":"private-key"},"client_value":"private-artifact-value","settings":{"opaque":"private-artifact-settings"}},"edge_types":[{"name":"mentions"}],"resolvers":["private-malformed-resolver",{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_search":"prefix","client_value":"private-resolver-value","settings":{"opaque":"private-resolver-settings"}}]}
+    ;
+    const expected =
+        \\{"name":"relations_graph","type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]"},"artifact":{"name":"relations_v1","kind":"asset","field":"relations"},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_search":"prefix"}]}
     ;
     const created = try encodeCreatedIndexConfig(std.testing.allocator, "relations_graph", config);
     defer std.testing.allocator.free(created);
-    try ant_json.testing.expectEqualJsonText(
-        std.testing.allocator,
-        "{\"name\":\"relations_graph\",\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"field\":\"relations\"},\"edge_types\":[{\"name\":\"mentions\"}],\"resolvers\":[{\"name\":\"kg\",\"table\":\"entities\",\"source_artifact\":\"relations_v1\",\"resolution_artifact\":\"resolution_v1\",\"key_template\":\"{{label}}\",\"candidate_search\":\"prefix\"}]}",
-        created,
-    );
+    try ant_json.testing.expectEqualJsonText(std.testing.allocator, expected, created);
+
+    const indexes_json = "{\"relations_graph\":" ++ config ++ "}";
+    const stored = (try encodeSingleIndexConfig(std.testing.allocator, indexes_json, "relations_graph")).?;
+    defer std.testing.allocator.free(stored);
+    try ant_json.testing.expectEqualJsonText(std.testing.allocator, expected, stored);
 }
 
 test "identical index mutation retries preserve coverage incarnation" {

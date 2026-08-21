@@ -396,6 +396,55 @@ fn validatePublicIndexObject(object: anytype) !void {
         return error.InvalidCreateIndexRequest;
     try validatePublicInlineArtifactEnrichments(object);
     try validatePublicIndexFields(object, index_type);
+    try validatePublicNestedIndexFields(object, index_type);
+}
+
+fn validatePublicNestedIndexFields(object: anytype, index_type: public_index_contract.Kind) !void {
+    const Object = @TypeOf(object);
+    if (index_type == .embeddings) {
+        const execution = if (@hasField(Object, "map")) object.map.get("execution") else object.get("execution");
+        if (execution) |value| {
+            if (value != .null) try validatePublicIndexExecution(value);
+        }
+        return;
+    }
+    if (index_type != .graph) return;
+
+    const source = if (@hasField(Object, "map")) object.map.get("source") else object.get("source");
+    if (source) |value| {
+        if (value != .null) try validateClosedObjectFields(value, public_index_contract.isAllowedGraphArtifactSourceField);
+    }
+
+    const artifact = if (@hasField(Object, "map")) object.map.get("artifact") else object.get("artifact");
+    if (artifact) |value| {
+        if (value != .null) try validateClosedObjectFields(value, public_index_contract.isAllowedGraphArtifactRequestField);
+    }
+
+    const resolvers = if (@hasField(Object, "map")) object.map.get("resolvers") else object.get("resolvers");
+    if (resolvers) |value| {
+        if (value == .null) return;
+        if (value != .array) return error.InvalidCreateIndexRequest;
+        for (value.array.items) |item| {
+            try validateClosedObjectFields(item, public_index_contract.isAllowedGraphResolverField);
+        }
+    }
+}
+
+fn validatePublicIndexExecution(value: std.json.Value) !void {
+    if (value != .object) return error.InvalidCreateIndexRequest;
+    var it = value.object.iterator();
+    while (it.next()) |entry| {
+        if (!public_index_contract.isAllowedIndexExecutionField(entry.key_ptr.*)) return error.InvalidCreateIndexRequest;
+        try validateClosedObjectFields(entry.value_ptr.*, public_index_contract.isAllowedExecutionPolicyField);
+    }
+}
+
+fn validateClosedObjectFields(value: std.json.Value, comptime is_allowed: fn ([]const u8) bool) !void {
+    if (value != .object) return error.InvalidCreateIndexRequest;
+    var it = value.object.iterator();
+    while (it.next()) |entry| {
+        if (!is_allowed(entry.key_ptr.*)) return error.InvalidCreateIndexRequest;
+    }
 }
 
 fn validatePublicInlineArtifactEnrichments(object: anytype) !void {
@@ -462,12 +511,12 @@ fn validatePublicArtifactEnrichmentObject(object: anytype) !void {
     if (@hasField(Object, "map")) {
         var it = object.map.iterator();
         while (it.next()) |entry| {
-            if (!isAllowedPublicArtifactEnrichmentField(entry.key_ptr.*)) return error.InvalidArtifactEnrichmentRequest;
+            if (!public_index_contract.isAllowedEnrichmentRequestField(entry.key_ptr.*)) return error.InvalidArtifactEnrichmentRequest;
         }
     } else {
         var it = object.iterator();
         while (it.next()) |entry| {
-            if (!isAllowedPublicArtifactEnrichmentField(entry.key_ptr.*)) return error.InvalidArtifactEnrichmentRequest;
+            if (!public_index_contract.isAllowedEnrichmentRequestField(entry.key_ptr.*)) return error.InvalidArtifactEnrichmentRequest;
         }
     }
 
@@ -482,30 +531,12 @@ fn validatePublicEnrichmentExecution(value: std.json.Value) !void {
     if (value != .object) return error.InvalidArtifactEnrichmentRequest;
     var it = value.object.iterator();
     while (it.next()) |entry| {
-        if (!std.mem.eql(u8, entry.key_ptr.*, "batch_items") and
-            !std.mem.eql(u8, entry.key_ptr.*, "batch_bytes"))
-        {
+        if (!public_index_contract.isAllowedExecutionPolicyField(entry.key_ptr.*)) {
             return error.InvalidArtifactEnrichmentRequest;
         }
         if (entry.value_ptr.* != .integer or entry.value_ptr.integer <= 0)
             return error.InvalidArtifactEnrichmentRequest;
     }
-}
-
-fn isAllowedPublicArtifactEnrichmentField(field_name: []const u8) bool {
-    return std.mem.eql(u8, field_name, "name") or
-        std.mem.eql(u8, field_name, "kind") or
-        std.mem.eql(u8, field_name, "field") or
-        std.mem.eql(u8, field_name, "template") or
-        std.mem.eql(u8, field_name, "source_artifact_name") or
-        std.mem.eql(u8, field_name, "expected_dims") or
-        std.mem.eql(u8, field_name, "chunk_size") or
-        std.mem.eql(u8, field_name, "chunk_overlap") or
-        std.mem.eql(u8, field_name, "chunker_json") or
-        std.mem.eql(u8, field_name, "full_text_index") or
-        std.mem.eql(u8, field_name, "content_type") or
-        std.mem.eql(u8, field_name, "producer_json") or
-        std.mem.eql(u8, field_name, "execution");
 }
 
 fn extractPublicIndexType(object: anytype) ?[]const u8 {
@@ -865,7 +896,7 @@ test "table contract public response omits unknown nested provider fields" {
 test "table contract canonicalizes generated optional null fields" {
     var request = try parseCreateTableRequest(
         std.testing.allocator,
-        "{\"num_shards\":1,\"description\":null,\"indexes\":{\"title_body\":{\"description\":null,\"version\":null,\"enrichments\":null,\"coverage_policy\":null,\"external\":null,\"sparse\":null,\"dimension\":3,\"field\":null,\"template\":\"{{title}} {{body}}\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"antfly-embed-v1\",\"api_url\":\"http://127.0.0.1:8080/ai/v1\",\"dimensions\":null},\"summarizer\":null,\"chunker\":null,\"type\":\"embeddings\"}},\"schema\":null,\"replication_sources\":null}",
+        "{\"num_shards\":1,\"description\":null,\"indexes\":{\"title_body\":{\"description\":null,\"version\":null,\"enrichments\":null,\"coverage_policy\":null,\"external\":null,\"sparse\":null,\"dimension\":3,\"field\":null,\"template\":\"{{title}} {{body}}\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"antfly-embed-v1\",\"api_url\":\"http://127.0.0.1:8080/ai/v1\",\"dimensions\":null},\"summarizer\":null,\"chunker\":null,\"execution\":null,\"type\":\"embeddings\"}},\"schema\":null,\"replication_sources\":null}",
     );
     defer request.deinit(std.testing.allocator);
     var indexes = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, request.indexes_json.?, .{});
@@ -903,6 +934,41 @@ test "table contract preserves typed artifact-backed graph configuration" {
         std.testing.allocator,
         "{\"relations_graph\":{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\"},\"resolvers\":[{\"name\":\"kg\"}]}}",
         table_req.indexes_json.?,
+    );
+}
+
+test "table contract rejects unknown fields in closed nested index objects" {
+    const invalid_requests = [_][]const u8{
+        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","client_value":"private"}}
+        ,
+        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","client_value":"private"}}
+        ,
+        \\{"type":"graph","resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","client_value":"private"}]}
+        ,
+        \\{"type":"embeddings","dimension":384,"execution":{"embedding":{"batch_items":32,"client_value":"private"}}}
+        ,
+        \\{"type":"embeddings","dimension":384,"execution":{"client_value":{"batch_items":32}}}
+        ,
+    };
+    for (invalid_requests) |request| {
+        try std.testing.expectError(
+            error.InvalidCreateIndexRequest,
+            parseCreateIndexRequest(std.testing.allocator, "test_idx", request),
+        );
+    }
+}
+
+test "table contract treats nullable nested index fields as omitted" {
+    const config_json = try parseCreateIndexRequest(
+        std.testing.allocator,
+        "relations_graph",
+        "{\"type\":\"graph\",\"source\":null,\"artifact\":null,\"resolvers\":null}",
+    );
+    defer std.testing.allocator.free(config_json);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"name\":\"relations_graph\",\"type\":\"graph\"}",
+        config_json,
     );
 }
 
