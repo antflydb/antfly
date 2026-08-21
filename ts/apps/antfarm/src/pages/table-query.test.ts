@@ -6,6 +6,7 @@ import {
   parseTableQueryRequest,
   tableQueryErrorMessage,
   tableQueryInput,
+  tableQueryMetadataBlocker,
 } from "./table-query";
 
 describe("buildTableQueryRequest", () => {
@@ -117,6 +118,32 @@ describe("buildTableQueryRequest", () => {
     });
   });
 
+  it("searches every artifact field with a structured disjunction", () => {
+    expect(
+      buildTableQueryRequest({
+        query: "event horizon",
+        queryIndexes: [],
+        selectedFields: [],
+        semanticQuery: "{}",
+        filterQuery: "{}",
+        includeProfile: false,
+        artifactSearchField: "text",
+        artifactProjectionFields: ["text", "caption", "text"],
+        returnArtifactMatches: true,
+      })
+    ).toEqual({
+      full_text_search: {
+        disjuncts: [
+          { field: "text", match: "event horizon" },
+          { field: "caption", match: "event horizon" },
+        ],
+      },
+      fields: ["text", "caption"],
+      hierarchy: {},
+      limit: 3,
+    });
+  });
+
   it("preserves semantic and filter searches", () => {
     expect(
       buildTableQueryRequest({
@@ -161,6 +188,19 @@ describe("buildTableQueryRequest", () => {
 });
 
 describe("table query builder UX", () => {
+  it("blocks the builder until both metadata sources are ready", () => {
+    expect(tableQueryMetadataBlocker("loading", "ready")).toBe(
+      "Loading query metadata before enabling safe queries."
+    );
+    expect(tableQueryMetadataBlocker("ready", "loading")).toBe(
+      "Loading query metadata before enabling safe queries."
+    );
+    expect(tableQueryMetadataBlocker("error", "ready")).toBe(
+      "Query metadata could not be loaded safely. Retry before using the query builder, or use JSON mode with an explicit fields projection."
+    );
+    expect(tableQueryMetadataBlocker("ready", "ready")).toBeNull();
+  });
+
   it("detects artifact-backed full-text and vector indexes", () => {
     const indexes = [
       {

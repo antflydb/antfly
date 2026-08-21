@@ -214,6 +214,23 @@ describe("AntflyClient", () => {
       });
     });
 
+    it("formats table metadata Problem Details errors", async () => {
+      mockGet.mockResolvedValueOnce({
+        data: undefined,
+        error: {
+          type: "about:blank",
+          title: "Bad Gateway",
+          status: 502,
+          detail: "upstream table metadata request failed",
+        },
+        response: new Response(undefined, { status: 502 }),
+      });
+
+      await expect(client.tables.get("products")).rejects.toThrow(
+        "Failed to get table: upstream table metadata request failed"
+      );
+    });
+
     it("should create a table", async () => {
       const mockTable = { name: "new_table", indexes: {}, shards: {} };
 

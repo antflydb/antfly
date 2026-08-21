@@ -937,7 +937,7 @@ export class AntflyClient {
       const { data, error } = await this.client.GET("/db/v1/tables/{tableName}", {
         params: { path: { tableName } },
       });
-      if (error) throw new Error(`Failed to get table: ${error.error}`);
+      if (error) throw new Error(`Failed to get table: ${apiErrorMessage(error)}`);
       return data;
     },
 

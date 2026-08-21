@@ -86,8 +86,10 @@ import {
   artifactRetrievalDefaults,
   buildTableQueryRequest,
   parseTableQueryRequest,
+  type TableQueryMetadataState,
   tableQueryErrorMessage,
   tableQueryInput,
+  tableQueryMetadataBlocker,
 } from "./table-query";
 
 const formatBytes = (bytes: number, decimals = 2) => {
@@ -239,9 +241,14 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   const { tableName } = useParams<{ tableName: string }>();
   const activeTableName = useRef(tableName);
   activeTableName.current = tableName;
+  const indexesRequestSequence = useRef(0);
+  const tableMetadataRequestSequence = useRef(0);
   const navigate = useNavigate();
   const [indexes, setIndexes] = useState<IndexStatus[]>([]);
+  const [indexesMetadataState, setIndexesMetadataState] =
+    useState<TableQueryMetadataState>("loading");
   const [tableStatus, setTableStatus] = useState<TableStatus | null>(null);
+  const [tableMetadataState, setTableMetadataState] = useState<TableQueryMetadataState>("loading");
   const [tableSchema, setTableSchema] = useState<TableSchema | null>(null);
   const [storageStatus, setStorageStatus] = useState<TableStatus["storage_status"] | null>(null);
   const [documentCount, setDocumentCount] = useState<number | null>(null);
@@ -279,6 +286,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     [indexes, hasSemanticQuery, queryIndexes, tableStatus]
   );
   const artifactSelectionError = hasSemanticQuery ? artifactRetrieval?.selectionError : undefined;
+  const queryMetadataBlocker = tableQueryMetadataBlocker(indexesMetadataState, tableMetadataState);
 
   const semanticQueryRequest = useMemo(() => {
     return buildTableQueryRequest({
@@ -357,10 +365,18 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
 
   const fetchIndexes = useCallback(async () => {
     if (!tableName) return;
+    if (activeTableName.current !== tableName) return;
+    const requestSequence = ++indexesRequestSequence.current;
+    setIndexesMetadataState("loading");
     try {
       const response = await api.indexes.list(tableName);
-      if (activeTableName.current !== tableName) return;
-      const nextIndexes = (response ?? []) as IndexStatus[];
+      if (
+        activeTableName.current !== tableName ||
+        requestSequence !== indexesRequestSequence.current
+      )
+        return;
+      if (!Array.isArray(response)) throw new Error("Index metadata response was empty.");
+      const nextIndexes = response as IndexStatus[];
       const liveVectorIndexes = new Set(
         nextIndexes
           .filter((index) => index.config.type === "embeddings")
@@ -368,8 +384,14 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       );
       setIndexes(nextIndexes);
       setQueryIndexes((current) => current.filter((name) => liveVectorIndexes.has(name)));
+      setIndexesMetadataState("ready");
     } catch (e) {
-      if (activeTableName.current !== tableName) return;
+      if (
+        activeTableName.current !== tableName ||
+        requestSequence !== indexesRequestSequence.current
+      )
+        return;
+      setIndexesMetadataState("error");
       setError(`Failed to fetch indexes for table ${tableName}.`);
       console.error(e);
     }
@@ -377,10 +399,18 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
 
   const fetchTableSchema = useCallback(async () => {
     if (!tableName) return;
+    if (activeTableName.current !== tableName) return;
+    const requestSequence = ++tableMetadataRequestSequence.current;
+    setTableMetadataState("loading");
     try {
       const response = await api.tables.get(tableName);
-      if (activeTableName.current !== tableName) return;
-      setTableStatus((response as TableStatus | undefined) ?? null);
+      if (
+        activeTableName.current !== tableName ||
+        requestSequence !== tableMetadataRequestSequence.current
+      )
+        return;
+      if (!response) throw new Error("Table metadata response was empty.");
+      setTableStatus(response as TableStatus);
       if (response?.schema && Object.keys(response.schema).length > 0) {
         setTableSchema(response.schema as TableSchema);
       } else {
@@ -388,13 +418,18 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       }
       setStorageStatus((response as TableStatus | undefined)?.storage_status ?? null);
       setMigration(response?.migration);
-    } catch {
-      if (activeTableName.current !== tableName) return;
-      // This is a 404, so we can ignore it.
-      setTableSchema(null);
-      setTableStatus(null);
-      setStorageStatus(null);
-      setMigration(undefined);
+      setTableMetadataState("ready");
+    } catch (e) {
+      if (
+        activeTableName.current !== tableName ||
+        requestSequence !== tableMetadataRequestSequence.current
+      )
+        return;
+      // Keep the last known-good metadata. Clearing it here can silently remove
+      // artifact projections and turn a bounded query into a source rollup.
+      setTableMetadataState("error");
+      setError(tableQueryErrorMessage(e, `Failed to fetch table metadata for ${tableName}.`));
+      console.error(e);
     }
   }, [tableName]);
 
@@ -427,12 +462,19 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     fetchDocumentCount();
   }, [fetchDocumentCount]);
 
+  const refreshQueryMetadata = useCallback(async () => {
+    setError(null);
+    await Promise.all([fetchIndexes(), fetchTableSchema()]);
+  }, [fetchIndexes, fetchTableSchema]);
+
   // Reset table-specific editor state when switching tables.
   useEffect(() => {
     if (!tableName) return;
     setIsEditingSchema(false);
     setIndexes([]);
+    setIndexesMetadataState("loading");
     setTableStatus(null);
+    setTableMetadataState("loading");
     setQuery("");
     setQueryResult(null);
     setQueryIndexes([]);
@@ -453,7 +495,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   };
 
   const handleIndexCreated = () => {
-    void Promise.all([fetchIndexes(), fetchTableSchema()]);
+    void refreshQueryMetadata();
   };
 
   const handleOpenDropDialog = (index: IndexStatus) => {
@@ -471,7 +513,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       const droppedIndexName = selectedIndex.config.name;
       await api.indexes.drop(tableName, droppedIndexName);
       setQueryIndexes((current) => current.filter((name) => name !== droppedIndexName));
-      await Promise.all([fetchIndexes(), fetchTableSchema()]);
+      await refreshQueryMetadata();
       handleCloseDropDialog();
     } catch (e) {
       setError(`Failed to drop index ${selectedIndex.config.name}.`);
@@ -491,6 +533,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     if (!tableName) return;
     setError(null);
     try {
+      if (queryMode === "builder" && queryMetadataBlocker) {
+        setError(queryMetadataBlocker);
+        return;
+      }
       if (queryMode === "builder" && artifactSelectionError) {
         setError(artifactSelectionError);
         return;
@@ -508,7 +554,14 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       setError(tableQueryErrorMessage(e, `Failed to run query on table ${tableName}.`));
       console.error(e);
     }
-  }, [tableName, queryMode, parsedJsonQuery, semanticQueryRequest, artifactSelectionError]);
+  }, [
+    tableName,
+    queryMode,
+    parsedJsonQuery,
+    semanticQueryRequest,
+    artifactSelectionError,
+    queryMetadataBlocker,
+  ]);
 
   // Global Ctrl+Enter handler for search section
   useEffect(() => {
@@ -1062,6 +1115,31 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                       </AccordionTrigger>
                       <AccordionContent className="pb-3 pt-1">
                         <div className="space-y-2.5">
+                          {queryMetadataBlocker && (
+                            <Alert
+                              variant={
+                                indexesMetadataState === "error" || tableMetadataState === "error"
+                                  ? "destructive"
+                                  : "default"
+                              }
+                              className="py-2 px-3"
+                            >
+                              <AlertDescription className="flex items-center justify-between gap-3 text-xs">
+                                <span>{queryMetadataBlocker}</span>
+                                {(indexesMetadataState === "error" ||
+                                  tableMetadataState === "error") && (
+                                  <Button
+                                    type="button"
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={() => void refreshQueryMetadata()}
+                                  >
+                                    Retry
+                                  </Button>
+                                )}
+                              </AlertDescription>
+                            </Alert>
+                          )}
                           <div>
                             <Label className="text-xs mb-1 block">Vector Index (optional)</Label>
                             {indexes.filter((idx) => idx.config.type === "embeddings").length ===
@@ -1233,6 +1311,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                 onClick={handleRunQuery}
                 disabled={
                   (queryMode === "json" && !isJsonQueryValid) ||
+                  (queryMode === "builder" && Boolean(queryMetadataBlocker)) ||
                   (queryMode === "builder" && Boolean(artifactSelectionError))
                 }
                 size="lg"

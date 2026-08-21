@@ -15,6 +15,19 @@ export interface TableQueryBuilderState {
 export const DEFAULT_TABLE_QUERY_LIMIT = 10;
 export const DEFAULT_ARTIFACT_QUERY_LIMIT = 3;
 
+export type TableQueryMetadataState = "loading" | "ready" | "error";
+
+export function tableQueryMetadataBlocker(
+  indexesState: TableQueryMetadataState,
+  tableState: TableQueryMetadataState
+): string | null {
+  if (indexesState === "ready" && tableState === "ready") return null;
+  if (indexesState === "error" || tableState === "error") {
+    return "Query metadata could not be loaded safely. Retry before using the query builder, or use JSON mode with an explicit fields projection.";
+  }
+  return "Loading query metadata before enabling safe queries.";
+}
+
 type ArtifactAwareIndexConfig = IndexStatus["config"] & {
   artifact_name?: string;
   embedding_name?: string;
@@ -196,12 +209,29 @@ export function tableQueryErrorMessage(error: unknown, fallback: string): string
   return fallback;
 }
 
-function artifactFullTextQuery(field: string, query: string): QueryRequest["full_text_search"] {
+function artifactFullTextQuery(fields: string[], query: string): QueryRequest["full_text_search"] {
+  if (fields.length > 1) {
+    return {
+      disjuncts: fields.map((field) => ({ match: query, field })),
+    };
+  }
+  const field = fields[0] ?? "text";
   const reservedOperator = ["AND", "OR", "NOT"].includes(query.toUpperCase());
   if (!reservedOperator && /^[\p{L}\p{N}_]+$/u.test(query)) {
     return { query: `${field}:${query}` };
   }
   return { match: query, field };
+}
+
+function normalizedArtifactFields(primaryField: string, projectionFields?: string[]): string[] {
+  const fields = Array.from(
+    new Set(
+      (projectionFields?.length ? projectionFields : [primaryField])
+        .map((field) => field.trim())
+        .filter(Boolean)
+    )
+  );
+  return fields.length > 0 ? fields : [primaryField.trim() || "text"];
 }
 
 export function buildTableQueryRequest({
@@ -218,26 +248,24 @@ export function buildTableQueryRequest({
   const request: QueryRequest = {};
   const trimmedQuery = query.trim();
   const hasSemanticQuery = trimmedQuery.length > 0 && queryIndexes.length > 0;
+  const artifactFields = artifactSearchField
+    ? normalizedArtifactFields(artifactSearchField, artifactProjectionFields)
+    : [];
 
   if (hasSemanticQuery) {
     request.indexes = queryIndexes;
     request.semantic_search = trimmedQuery;
   } else if (trimmedQuery.length > 0) {
-    request.full_text_search = artifactSearchField
-      ? artifactFullTextQuery(artifactSearchField, trimmedQuery)
-      : { query: trimmedQuery };
+    if (artifactSearchField) {
+      request.full_text_search = artifactFullTextQuery(artifactFields, trimmedQuery);
+    } else {
+      request.full_text_search = { query: trimmedQuery };
+    }
   }
   if (selectedFields.length > 0) {
     request.fields = selectedFields;
   } else if (returnArtifactMatches && artifactSearchField) {
-    request.fields = Array.from(
-      new Set(
-        (artifactProjectionFields?.length
-          ? artifactProjectionFields
-          : [artifactSearchField]
-        ).filter((field) => field.trim().length > 0)
-      )
-    );
+    request.fields = artifactFields;
   }
   if (returnArtifactMatches) {
     request.hierarchy = {};
