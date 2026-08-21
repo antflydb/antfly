@@ -5,18 +5,17 @@ from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 
+from ..models.document_subfield_mapping_missing_null_policy import DocumentSubfieldMappingMissingNullPolicy
 from ..models.field_mapping_type import FieldMappingType
-from ..models.template_field_mapping_missing_null_policy import TemplateFieldMappingMissingNullPolicy
 from ..types import UNSET, Unset
 
-T = TypeVar("T", bound="TemplateFieldMapping")
+T = TypeVar("T", bound="DocumentSubfieldMapping")
 
 
 @_attrs_define
-class TemplateFieldMapping:
-    """Field mapping used by a dynamic template. Dynamic templates match one physical field at a time and therefore do not
-    accept multifields; use a DocumentFieldMapping in a document property's `x-antfly-field` annotation when named
-    subfields are required.
+class DocumentSubfieldMapping:
+    """Mapping for one named multifield emitted from its parent document property. Multifields are intentionally one level
+    deep and read the parent property's JSON value rather than a nested JSON property.
 
         Attributes:
             type_ (FieldMappingType | Unset): Field types accepted by detailed `x-antfly-field` and dynamic-template
@@ -24,25 +23,15 @@ class TemplateFieldMapping:
                 corresponding runtime type: number/integer to numeric, bool to boolean,
                 date/timestamp to datetime, geo_point to geopoint, and geo_shape to
                 geoshape.
-            analyzer (str | Unset): Analyzer name (e.g., "standard", "keyword", "en", "html_analyzer").
-                Used for text fields to control tokenization and normalization.
+            analyzer (str | Unset): Analyzer name for text-oriented mappings.
             index (bool | Unset): Whether to index the field (default true) Default: True.
             store (bool | Unset): Whether to store the field value (default false) Default: False.
             include_in_all (bool | Unset): Whether to include in the _all field for cross-field search Default: False.
-            sortable (bool | Unset): Whether this exact scalar field can be used in order_by. Supported
-                sortable mapping types are keyword, numeric/number/integer,
-                boolean/bool, datetime/date/timestamp, and link. Analyzed text,
-                search_as_you_type, geo, embedding, blob, html, object, and array
-                fields are not directly sortable; use an exact scalar subfield such
-                as title.keyword for sorted string pagination. When true, Antfly
-                derives the internal typed doc-value structures required for exact
-                sorting; users should not configure doc_values directly.
-                 Default: False.
-            missing_null_policy (TemplateFieldMappingMissingNullPolicy | Unset): Missing/null sort policy for this mapped
-                field. The current production
-                policy rejects missing or null native sort values so sorted cursors
-                remain replayable JSON scalar tuples.
-                 Default: TemplateFieldMappingMissingNullPolicy.MISSING_REJECTED.
+            sortable (bool | Unset): Whether this exact scalar subfield can be used in order_by. Antfly derives the required
+                typed doc values when enabled. Default: False.
+            missing_null_policy (DocumentSubfieldMappingMissingNullPolicy | Unset): Missing/null sort policy. The current
+                production policy rejects missing or null native sort values. Default:
+                DocumentSubfieldMappingMissingNullPolicy.MISSING_REJECTED.
     """
 
     type_: FieldMappingType | Unset = UNSET
@@ -51,8 +40,8 @@ class TemplateFieldMapping:
     store: bool | Unset = False
     include_in_all: bool | Unset = False
     sortable: bool | Unset = False
-    missing_null_policy: TemplateFieldMappingMissingNullPolicy | Unset = (
-        TemplateFieldMappingMissingNullPolicy.MISSING_REJECTED
+    missing_null_policy: DocumentSubfieldMappingMissingNullPolicy | Unset = (
+        DocumentSubfieldMappingMissingNullPolicy.MISSING_REJECTED
     )
 
     def to_dict(self) -> dict[str, Any]:
@@ -115,13 +104,13 @@ class TemplateFieldMapping:
         sortable = d.pop("sortable", UNSET)
 
         _missing_null_policy = d.pop("missing_null_policy", UNSET)
-        missing_null_policy: TemplateFieldMappingMissingNullPolicy | Unset
+        missing_null_policy: DocumentSubfieldMappingMissingNullPolicy | Unset
         if isinstance(_missing_null_policy, Unset):
             missing_null_policy = UNSET
         else:
-            missing_null_policy = TemplateFieldMappingMissingNullPolicy(_missing_null_policy)
+            missing_null_policy = DocumentSubfieldMappingMissingNullPolicy(_missing_null_policy)
 
-        template_field_mapping = cls(
+        document_subfield_mapping = cls(
             type_=type_,
             analyzer=analyzer,
             index=index,
@@ -131,4 +120,4 @@ class TemplateFieldMapping:
             missing_null_policy=missing_null_policy,
         )
 
-        return template_field_mapping
+        return document_subfield_mapping

@@ -237,6 +237,8 @@ export type AggregationDateRange = components["schemas"]["AggregationDateRange"]
 export type DistanceRange = components["schemas"]["DistanceRange"];
 export type AntflyType = components["schemas"]["AntflyType"];
 export type FieldMappingType = components["schemas"]["FieldMappingType"];
+export type DocumentFieldMapping = components["schemas"]["DocumentFieldMapping"];
+export type DocumentSubfieldMapping = components["schemas"]["DocumentSubfieldMapping"];
 export type TemplateFieldMapping = components["schemas"]["TemplateFieldMapping"];
 export type DynamicTemplate = components["schemas"]["DynamicTemplate"];
 

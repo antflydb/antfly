@@ -108,6 +108,10 @@ subfield:
 field-value structures needed for exact sort and filters. Do not configure
 `doc_values` directly.
 
+SDKs expose `DocumentFieldMapping` and `DocumentSubfieldMapping` for the
+`x-antfly-field` shape above. `TemplateFieldMapping` is intentionally narrower:
+it represents one dynamic-template output and does not accept `fields`.
+
 The compact `x-antfly-types` shorthand remains supported for simple and
 multi-field search mappings, but does not implicitly enable exact sort. Use
 `x-antfly-field` as the detailed form when a field needs physical options such

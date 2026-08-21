@@ -2313,12 +2313,48 @@ pub const DocumentArtifactTableReprocessResponse = struct {
     shard_cursors: []const DocumentArtifactReprocessShardCursor,
 };
 
+/// Executable physical mapping used by a document property's `x-antfly-field` annotation. The mapping must accept the JSON Schema value type. Declarations for the same dotted path across document types must normalize to an identical physical mapping, and present values that cannot be encoded are rejected at write admission. Mappings contributed by `anyOf` or `oneOf` must normalize to the same mapping in every alternative; conditional and dynamically named mappings are rejected.
+pub const DocumentFieldMapping = struct {
+    type: ?FieldMappingType = null,
+    /// Analyzer name for text-oriented mappings.
+    analyzer: ?[]const u8 = null,
+    /// Whether to index the field (default true)
+    index: ?bool = null,
+    /// Whether to store the field value (default false)
+    store: ?bool = null,
+    /// Whether to include in the _all field for cross-field search
+    include_in_all: ?bool = null,
+    /// Whether this exact scalar field can be used in order_by. Supported sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Analyzed text, search_as_you_type, geo, embedding, blob, html, object, and array fields are not directly sortable; use an exact scalar subfield such as title.keyword for sorted string pagination. Antfly derives the required typed doc values when enabled.
+    sortable: ?bool = null,
+    /// Missing/null sort policy. The current production policy rejects missing or null native sort values.
+    missing_null_policy: ?[]const u8 = null,
+    /// Named one-level multifields emitted from this property's value. For example, a text title can expose a sortable keyword subfield.
+    fields: ?std.json.ArrayHashMap(DocumentSubfieldMapping) = null,
+};
+
 /// Defines the structure of a document type
 pub const DocumentSchema = struct {
     /// A description of the document type.
     description: ?[]const u8 = null,
     /// A valid JSON Schema defining the document's structure. This is used to infer indexing rules and field types.
     schema: ?std.json.Value = null,
+};
+
+/// Mapping for one named multifield emitted from its parent document property. Multifields are intentionally one level deep and read the parent property's JSON value rather than a nested JSON property.
+pub const DocumentSubfieldMapping = struct {
+    type: ?FieldMappingType = null,
+    /// Analyzer name for text-oriented mappings.
+    analyzer: ?[]const u8 = null,
+    /// Whether to index the field (default true)
+    index: ?bool = null,
+    /// Whether to store the field value (default false)
+    store: ?bool = null,
+    /// Whether to include in the _all field for cross-field search
+    include_in_all: ?bool = null,
+    /// Whether this exact scalar subfield can be used in order_by. Antfly derives the required typed doc values when enabled.
+    sortable: ?bool = null,
+    /// Missing/null sort policy. The current production policy rejects missing or null native sort values.
+    missing_null_policy: ?[]const u8 = null,
 };
 
 pub const DropExtensionRequest = struct {
@@ -8483,7 +8519,7 @@ pub const TavilySearchConfig = struct {
     exclude_domains: ?[]const []const u8 = null,
 };
 
-/// Field mapping used by a dynamic template or a document property's `x-antfly-field` annotation. A property mapping must accept the JSON Schema value type. Explicit property mappings take precedence over dynamic templates, and declarations for the same dotted path across document types must normalize to an identical physical mapping. Present values that cannot be encoded by that mapping are rejected at write admission. Mappings contributed by `anyOf` or `oneOf` must normalize to the same mapping in every alternative; conditional and dynamically named property mappings are rejected.
+/// Field mapping used by a dynamic template. Dynamic templates match one physical field at a time and therefore do not accept multifields; use a DocumentFieldMapping in a document property's `x-antfly-field` annotation when named subfields are required.
 pub const TemplateFieldMapping = struct {
     type: ?FieldMappingType = null,
     /// Analyzer name (e.g., "standard", "keyword", "en", "html_analyzer"). Used for text fields to control tokenization and normalization.

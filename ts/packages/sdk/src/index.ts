@@ -179,7 +179,9 @@ export type {
   DocumentArtifactTableReprocessRequest,
   DocumentArtifactTableReprocessResponse,
   // Schema types
+  DocumentFieldMapping,
   DocumentSchema,
+  DocumentSubfieldMapping,
   DynamicTemplate,
   // Graph index types
   Edge,

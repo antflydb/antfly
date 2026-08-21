@@ -150,8 +150,13 @@ from .document_artifact_table_reprocess_response_reprocess import DocumentArtifa
 from .document_artifact_table_reprocess_response_reprocess_status import (
     DocumentArtifactTableReprocessResponseReprocessStatus,
 )
+from .document_field_mapping import DocumentFieldMapping
+from .document_field_mapping_fields import DocumentFieldMappingFields
+from .document_field_mapping_missing_null_policy import DocumentFieldMappingMissingNullPolicy
 from .document_schema import DocumentSchema
 from .document_schema_schema import DocumentSchemaSchema
+from .document_subfield_mapping import DocumentSubfieldMapping
+from .document_subfield_mapping_missing_null_policy import DocumentSubfieldMappingMissingNullPolicy
 from .drop_extension_request import DropExtensionRequest
 from .drop_extension_request_mode import DropExtensionRequestMode
 from .drop_extension_response import DropExtensionResponse
@@ -907,8 +912,13 @@ __all__ = (
     "DocumentArtifactTableReprocessResponse",
     "DocumentArtifactTableReprocessResponseReprocess",
     "DocumentArtifactTableReprocessResponseReprocessStatus",
+    "DocumentFieldMapping",
+    "DocumentFieldMappingFields",
+    "DocumentFieldMappingMissingNullPolicy",
     "DocumentSchema",
     "DocumentSchemaSchema",
+    "DocumentSubfieldMapping",
+    "DocumentSubfieldMappingMissingNullPolicy",
     "DropExtensionRequest",
     "DropExtensionRequestMode",
     "DropExtensionResponse",

@@ -17824,20 +17824,6 @@ components:
               field: text
               source_artifact_name: document_chunks_v1
               expected_dims: 768
-    DocumentSchema:
-      type: object
-      description: Defines the structure of a document type
-      properties:
-        description:
-          type: string
-          description: A description of the document type.
-        schema:
-          type: object
-          additionalProperties: true
-          description: >
-            A valid JSON Schema defining the document's structure.
-
-            This is used to infer indexing rules and field types.
     FieldMappingType:
       type: string
       description: >
@@ -17870,16 +17856,120 @@ components:
         - blob
         - link
         - search_as_you_type
+    DocumentSubfieldMapping:
+      type: object
+      additionalProperties: false
+      description: Mapping for one named multifield emitted from its parent document property. Multifields
+        are intentionally one level deep and read the parent property's JSON value rather than a nested
+        JSON property.
+      properties:
+        type:
+          $ref: '#/components/schemas/FieldMappingType'
+        analyzer:
+          type: string
+          description: Analyzer name for text-oriented mappings.
+        index:
+          type: boolean
+          default: true
+          description: Whether to index the field (default true)
+        store:
+          type: boolean
+          default: false
+          description: Whether to store the field value (default false)
+        include_in_all:
+          type: boolean
+          default: false
+          description: Whether to include in the _all field for cross-field search
+        sortable:
+          type: boolean
+          default: false
+          description: Whether this exact scalar subfield can be used in order_by. Antfly derives the
+            required typed doc values when enabled.
+        missing_null_policy:
+          type: string
+          enum:
+            - missing_rejected
+          default: missing_rejected
+          description: Missing/null sort policy. The current production policy rejects missing or null
+            native sort values.
+    DocumentFieldMapping:
+      type: object
+      additionalProperties: false
+      description: Executable physical mapping used by a document property's `x-antfly-field` annotation.
+        The mapping must accept the JSON Schema value type. Declarations for the same dotted path across
+        document types must normalize to an identical physical mapping, and present values that cannot
+        be encoded are rejected at write admission. Mappings contributed by `anyOf` or `oneOf` must normalize
+        to the same mapping in every alternative; conditional and dynamically named mappings are rejected.
+      properties:
+        type:
+          $ref: '#/components/schemas/FieldMappingType'
+        analyzer:
+          type: string
+          description: Analyzer name for text-oriented mappings.
+        index:
+          type: boolean
+          default: true
+          description: Whether to index the field (default true)
+        store:
+          type: boolean
+          default: false
+          description: Whether to store the field value (default false)
+        include_in_all:
+          type: boolean
+          default: false
+          description: Whether to include in the _all field for cross-field search
+        sortable:
+          type: boolean
+          default: false
+          description: >
+            Whether this exact scalar field can be used in order_by. Supported
+
+            sortable mapping types are keyword, numeric/number/integer,
+
+            boolean/bool, datetime/date/timestamp, and link. Analyzed text,
+
+            search_as_you_type, geo, embedding, blob, html, object, and array
+
+            fields are not directly sortable; use an exact scalar subfield such
+
+            as title.keyword for sorted string pagination. Antfly derives the
+
+            required typed doc values when enabled.
+        missing_null_policy:
+          type: string
+          enum:
+            - missing_rejected
+          default: missing_rejected
+          description: Missing/null sort policy. The current production policy rejects missing or null
+            native sort values.
+        fields:
+          type: object
+          description: Named one-level multifields emitted from this property's value. For example, a
+            text title can expose a sortable keyword subfield.
+          additionalProperties:
+            $ref: '#/components/schemas/DocumentSubfieldMapping'
+    DocumentSchema:
+      type: object
+      description: Defines the structure of a document type
+      properties:
+        description:
+          type: string
+          description: A description of the document type.
+        schema:
+          type: object
+          additionalProperties: true
+          description: >
+            A valid JSON Schema defining the document's structure.
+
+            This is used to infer indexing rules and field types.
+          x-antfly-field-mapping-schema:
+            $ref: '#/components/schemas/DocumentFieldMapping'
     TemplateFieldMapping:
       type: object
       additionalProperties: false
-      description: Field mapping used by a dynamic template or a document property's `x-antfly-field`
-        annotation. A property mapping must accept the JSON Schema value type. Explicit property mappings
-        take precedence over dynamic templates, and declarations for the same dotted path across document
-        types must normalize to an identical physical mapping. Present values that cannot be encoded by
-        that mapping are rejected at write admission. Mappings contributed by `anyOf` or `oneOf` must
-        normalize to the same mapping in every alternative; conditional and dynamically named property
-        mappings are rejected.
+      description: Field mapping used by a dynamic template. Dynamic templates match one physical field
+        at a time and therefore do not accept multifields; use a DocumentFieldMapping in a document property's
+        `x-antfly-field` annotation when named subfields are required.
       properties:
         type:
           $ref: '#/components/schemas/FieldMappingType'

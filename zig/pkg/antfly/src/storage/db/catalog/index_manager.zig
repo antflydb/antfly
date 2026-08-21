@@ -19257,7 +19257,7 @@ const TextProjectionProvenance = struct {
         schema: ?schema_mod.TableSchema,
     ) !TextProjectionProvenance {
         const schema_fingerprint = if (schema) |value| blk: {
-            const encoded = try schema_mod.serializeSchema(alloc, value);
+            const encoded = try schema_mod.serializeTextProjectionSchema(alloc, value);
             defer alloc.free(encoded);
             break :blk std.hash.Wyhash.hash(0x41545052534d0001, encoded);
         } else std.hash.Wyhash.hash(0x41545052534d0001, "schema-less");
@@ -22615,6 +22615,63 @@ test "fresh text generation persists provenance before its first segment" {
     try std.testing.expect(!entry.persistent.hasPhysicalSegments());
     try reopened.indexBatch(&store, &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }});
     try std.testing.expect(entry.persistent.hasPhysicalSegments());
+}
+
+test "non-empty text generation accepts deployed v11 schema provenance" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    const fields = [_]schema_mod.FullTextField{.{
+        .path = "state",
+        .emitted_name = "state",
+        .analyzer = "keyword",
+    }};
+    const documents = [_]schema_mod.FullTextDocument{.{
+        .name = "product",
+        .fields = &fields,
+    }};
+    const schema = schema_mod.TableSchema{
+        .version = 3,
+        .default_type = "product",
+        .full_text_documents = &documents,
+    };
+    try std.testing.expect(try schema_mod.saveSchema(&store, alloc, schema));
+
+    const projection = try schema_mod.serializeTextProjectionSchema(alloc, schema);
+    defer alloc.free(projection);
+    try std.testing.expectEqualSlices(u8, "ASCH\x0b\x00\x00\x00", projection[0..8]);
+
+    {
+        var manager = try IndexManager.init(alloc, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        }});
+        try manager.indexBatch(&store, &.{.{
+            .key = "doc:a",
+            .value = "{\"_type\":\"product\",\"state\":\"published\"}",
+        }});
+        try std.testing.expect(manager.textIndexEntry("ft_v1").?.persistent.hasPhysicalSegments());
+    }
+
+    var reopened = try IndexManager.init(alloc, path);
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.load(&store);
+    const entry = reopened.textIndexEntry("ft_v1") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("keyword", IndexManager.textFieldAnalyzerName(entry, "state").?);
+    try std.testing.expect(reopened.loadFailure("ft_v1") == null);
 }
 
 test "empty generation adopts schema provenance after schema-only crash boundary" {

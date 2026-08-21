@@ -199,14 +199,35 @@ const schema_version_prefix = "\x00\x00__metadata__:schema_v";
 
 /// Serialize a TableSchema to bytes. Caller owns the returned slice.
 pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
+    return serializeSchemaFormat(alloc, schema, 12);
+}
+
+/// Serialize only the schema state that changes a full-text generation's
+/// physical projection. This encoding is deliberately independent of the
+/// current schema storage format: schemas without executable exact mappings
+/// retain the deployed v11 byte representation, while exact mappings use the
+/// v12 extension. Capability-only declarations are excluded because changing
+/// query diagnostics must not make existing postings unavailable.
+pub fn serializeTextProjectionSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
+    var projection_schema = schema;
+    projection_schema.declared_fields = &.{};
+    const projection_format_version: u32 = if (projection_schema.exact_fields.len == 0) 11 else 12;
+    return serializeSchemaFormat(alloc, projection_schema, projection_format_version);
+}
+
+fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: u32) ![]u8 {
+    std.debug.assert(format_version == 11 or format_version == 12);
     if (!exactFieldsValid(schema.exact_fields)) return error.InvalidSchema;
+    if (format_version < 12 and (schema.declared_fields.len != 0 or schema.exact_fields.len != 0)) {
+        return error.InvalidSchema;
+    }
 
     var buf = std.ArrayListUnmanaged(u8).empty;
     errdefer buf.deinit(alloc);
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 12); // format version
+    try appendU32(&buf, alloc, format_version);
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -232,36 +253,38 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         try appendStr(&buf, alloc, tmpl.mapping.analyzer);
     }
 
-    // Capability-only exact declarations. These intentionally remain
-    // separate from executable dynamic templates.
-    try appendU32(&buf, alloc, @intCast(schema.declared_fields.len));
-    for (schema.declared_fields) |field| {
-        try appendStr(&buf, alloc, field.field);
-        try buf.append(alloc, @intFromEnum(field.mapping.field_type));
-        try buf.append(alloc, if (field.mapping.do_index) 1 else 0);
-        try buf.append(alloc, if (field.mapping.store) 1 else 0);
-        try buf.append(alloc, if (field.mapping.doc_values) 1 else 0);
-        try buf.append(alloc, if (field.mapping.sortable) 1 else 0);
-        try buf.append(alloc, @intFromEnum(field.mapping.missing_null_policy));
-        try buf.append(alloc, if (field.mapping.include_in_all) 1 else 0);
-        try appendStr(&buf, alloc, field.mapping.analyzer);
-    }
+    if (format_version >= 12) {
+        // Capability-only exact declarations. These intentionally remain
+        // separate from executable dynamic templates.
+        try appendU32(&buf, alloc, @intCast(schema.declared_fields.len));
+        for (schema.declared_fields) |field| {
+            try appendStr(&buf, alloc, field.field);
+            try buf.append(alloc, @intFromEnum(field.mapping.field_type));
+            try buf.append(alloc, if (field.mapping.do_index) 1 else 0);
+            try buf.append(alloc, if (field.mapping.store) 1 else 0);
+            try buf.append(alloc, if (field.mapping.doc_values) 1 else 0);
+            try buf.append(alloc, if (field.mapping.sortable) 1 else 0);
+            try buf.append(alloc, @intFromEnum(field.mapping.missing_null_policy));
+            try buf.append(alloc, if (field.mapping.include_in_all) 1 else 0);
+            try appendStr(&buf, alloc, field.mapping.analyzer);
+        }
 
-    // Executable exact document-property mappings. The slice is serialized in
-    // lexical path order and retains that order after deserialization so lookup
-    // stays allocation-free and logarithmic.
-    try appendU32(&buf, alloc, @intCast(schema.exact_fields.len));
-    for (schema.exact_fields) |field| {
-        try appendStr(&buf, alloc, field.source_field);
-        try appendStr(&buf, alloc, field.field);
-        try buf.append(alloc, @intFromEnum(field.mapping.field_type));
-        try buf.append(alloc, if (field.mapping.do_index) 1 else 0);
-        try buf.append(alloc, if (field.mapping.store) 1 else 0);
-        try buf.append(alloc, if (field.mapping.doc_values) 1 else 0);
-        try buf.append(alloc, if (field.mapping.sortable) 1 else 0);
-        try buf.append(alloc, @intFromEnum(field.mapping.missing_null_policy));
-        try buf.append(alloc, if (field.mapping.include_in_all) 1 else 0);
-        try appendStr(&buf, alloc, field.mapping.analyzer);
+        // Executable exact document-property mappings. The slice is serialized
+        // in lexical path order and retains that order after deserialization so
+        // lookup stays allocation-free and logarithmic.
+        try appendU32(&buf, alloc, @intCast(schema.exact_fields.len));
+        for (schema.exact_fields) |field| {
+            try appendStr(&buf, alloc, field.source_field);
+            try appendStr(&buf, alloc, field.field);
+            try buf.append(alloc, @intFromEnum(field.mapping.field_type));
+            try buf.append(alloc, if (field.mapping.do_index) 1 else 0);
+            try buf.append(alloc, if (field.mapping.store) 1 else 0);
+            try buf.append(alloc, if (field.mapping.doc_values) 1 else 0);
+            try buf.append(alloc, if (field.mapping.sortable) 1 else 0);
+            try buf.append(alloc, @intFromEnum(field.mapping.missing_null_policy));
+            try buf.append(alloc, if (field.mapping.include_in_all) 1 else 0);
+            try appendStr(&buf, alloc, field.mapping.analyzer);
+        }
     }
 
     try appendU32(&buf, alloc, @intCast(schema.full_text_documents.len));
@@ -2006,6 +2029,75 @@ test "schema serialization rejects unsorted or duplicate exact fields" {
         .{ .source_field = "title", .field = "meta.keyword" },
     };
     try std.testing.expectError(error.InvalidSchema, serializeSchema(alloc, .{ .exact_fields = &invalid_source_route }));
+}
+
+test "text projection serialization preserves v11 witnesses and excludes declarations" {
+    const alloc = std.testing.allocator;
+    const templates = [_]DynamicTemplate{.{
+        .name = "dates",
+        .match_pattern = "*_at",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const fields = [_]FullTextField{.{
+        .path = "created_at",
+        .emitted_name = "created_at",
+        .analyzer = "keyword",
+    }};
+    const documents = [_]FullTextDocument{.{
+        .name = "doc",
+        .fields = &fields,
+    }};
+    const declared = [_]DeclaredField{.{
+        .field = "title.keyword",
+        .mapping = .{ .field_type = .keyword, .analyzer = "keyword" },
+    }};
+    const schema = TableSchema{
+        .version = 7,
+        .default_type = "doc",
+        .dynamic_templates = &templates,
+        .declared_fields = &declared,
+        .full_text_documents = &documents,
+    };
+
+    const projection = try serializeTextProjectionSchema(alloc, schema);
+    defer alloc.free(projection);
+    var projection_pos: usize = 4;
+    try std.testing.expectEqual(@as(u32, 11), readU32(projection, &projection_pos));
+
+    var legacy_schema = schema;
+    legacy_schema.declared_fields = &.{};
+    const legacy = try serializeSchemaFormat(alloc, legacy_schema, 11);
+    defer alloc.free(legacy);
+    try std.testing.expectEqualSlices(u8, legacy, projection);
+
+    var without_declaration = schema;
+    without_declaration.declared_fields = &.{};
+    const projection_without_declaration = try serializeTextProjectionSchema(alloc, without_declaration);
+    defer alloc.free(projection_without_declaration);
+    try std.testing.expectEqualSlices(u8, projection, projection_without_declaration);
+
+    const exact_fields = [_]ExactField{.{
+        .source_field = "created_at",
+        .field = "created_at",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    var with_exact = schema;
+    with_exact.exact_fields = &exact_fields;
+    const exact_projection = try serializeTextProjectionSchema(alloc, with_exact);
+    defer alloc.free(exact_projection);
+    var exact_projection_pos: usize = 4;
+    try std.testing.expectEqual(@as(u32, 12), readU32(exact_projection, &exact_projection_pos));
+    try std.testing.expect(!std.mem.eql(u8, projection, exact_projection));
 }
 
 test "schema deserialization cleans initialized mappings on allocation failure" {
