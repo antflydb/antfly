@@ -3,7 +3,7 @@ name: Cancel Superseded PR Runs
 on:
   pull_request_target:
     branches: ["main"]
-    types: [synchronize, closed]
+    types: [synchronize, closed, reopened]
 
 concurrency:
   group: cancel-superseded-${{ github.event.pull_request.number }}
@@ -133,13 +133,16 @@ jobs:
               }
             }
 
-            const pollIntervalMs = 30_000;
-            const pollCount = 4;
+            // Give ordinary cancellation a short, bounded opportunity to land.
+            // Holding a standard runner for two minutes also lets obsolete heavy
+            // jobs consume scarce ARC capacity longer than necessary.
+            const pollIntervalMs = 5_000;
+            const pollCount = 3;
             const stableChecksRequired = 3;
             const activeRuns = new Map(
               obsoleteRuns.map((run) => [
                 run.id,
-                { run, lastStatus: run.status, stableChecks: 1 },
+                { run, lastStatus: run.status, stableChecks: 0 },
               ]),
             );
 
@@ -165,6 +168,28 @@ jobs:
                   `(poll ${poll}/${pollCount})`,
                 );
               }
+            }
+
+            // A close cleanup can race a reopen, while a synchronize cleanup can
+            // race another push or a head reversion. Revalidate immediately before
+            // the irreversible escalation so current PR work is never force-cancelled.
+            const { data: forcePull } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: pull.number,
+            });
+            if (isClosedEvent && forcePull.state !== "closed") {
+              core.info(
+                `Skipping force cancellation because PR #${pull.number} was reopened`,
+              );
+              return;
+            }
+            if (!isClosedEvent && forcePull.head.sha !== pull.head.sha) {
+              core.info(
+                `Skipping force cancellation for ${pull.head.sha}; ` +
+                `PR #${pull.number} is now at ${forcePull.head.sha}`,
+              );
+              return;
             }
 
             for (const [runId, candidate] of activeRuns) {

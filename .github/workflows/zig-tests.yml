@@ -248,10 +248,30 @@ jobs:
     # Keep the outer job timeout above the in-step hard watchdog so true hangs
     # produce the watchdog stack dump instead of an opaque GitHub cancellation.
     timeout-minutes: 120
+    permissions:
+      contents: read
+      pull-requests: read
     env:
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
     steps:
+      - name: Verify current PR head
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const expected = context.payload.pull_request.head.sha;
+            const { data: pull } = await github.rest.pulls.get({
+              ...context.repo,
+              pull_number: context.payload.pull_request.number,
+            });
+            if (pull.state !== "open" || pull.head.sha !== expected) {
+              core.setFailed(
+                `Obsolete PR run: PR #${pull.number} is ${pull.state}; ` +
+                `expected head ${expected}, current ${pull.head.sha}`,
+              );
+            }
+
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
@@ -736,9 +756,10 @@ jobs:
               ...context.repo,
               pull_number: context.payload.pull_request.number,
             });
-            if (pull.head.sha !== expected) {
+            if (pull.state !== "open" || pull.head.sha !== expected) {
               core.setFailed(
-                `Superseded PR head: expected ${expected}, current ${pull.head.sha}`,
+                `Obsolete PR run: PR #${pull.number} is ${pull.state}; ` +
+                `expected head ${expected}, current ${pull.head.sha}`,
               );
             }
 
@@ -811,9 +832,10 @@ jobs:
               ...context.repo,
               pull_number: context.payload.pull_request.number,
             });
-            if (pull.head.sha !== expected) {
+            if (pull.state !== "open" || pull.head.sha !== expected) {
               core.setFailed(
-                `Superseded PR head: expected ${expected}, current ${pull.head.sha}`,
+                `Obsolete PR run: PR #${pull.number} is ${pull.state}; ` +
+                `expected head ${expected}, current ${pull.head.sha}`,
               );
             }
 
