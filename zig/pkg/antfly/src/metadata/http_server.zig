@@ -2635,19 +2635,23 @@ fn cloneParsedRuntimeIndexStatus(
 test "metadata status JSON preserves compact managed repair admission state" {
     const alloc = std.testing.allocator;
     const report = try parseStoreStatusReport(alloc,
-        \\{"store_id":20,"runtime_statuses":[{"group_id":10,"indexes":[{"name":"thumbnail","kind":"dense_vector","repair_status":"waiting","repair_active_generation_serviceable":true},{"name":"legacy","kind":"full_text","repair_active_generation_serviceable":true}]}]}
+        \\{"store_id":20,"runtime_statuses":[{"group_id":10,"indexes":[{"name":"thumbnail","kind":"dense_vector","repair_status":"waiting","repair_active_generation_serviceable":true},{"name":"legacy","kind":"full_text","repair_active_generation_serviceable":true},{"name":"mixed_version","coverage_generation":7,"coverage_config_hash":8}]}]}
     );
     defer freeStoreStatusReport(alloc, report);
 
     try std.testing.expectEqual(@as(usize, 1), report.runtime_statuses.len);
     const indexes = report.runtime_statuses[0].indexes;
-    try std.testing.expectEqual(@as(usize, 2), indexes.len);
+    try std.testing.expectEqual(@as(usize, 3), indexes.len);
     try std.testing.expectEqual(metadata_table_manager.IndexRepairStatus.waiting, indexes[0].repair_status.?);
     try std.testing.expect(indexes[0].repair_active_generation_serviceable);
     // Proof without a repair lifecycle is not actionable and must not survive
     // normalization from a malformed or mixed-version producer.
     try std.testing.expect(indexes[1].repair_status == null);
     try std.testing.expect(!indexes[1].repair_active_generation_serviceable);
+    // A mixed-version producer can omit both fields. Preserve that absence as
+    // an incomplete identity so it cannot authorize repair-state deletion.
+    try std.testing.expectEqualStrings("", indexes[2].kind);
+    try std.testing.expect(!indexes[2].coverage_identity_ready);
 }
 
 fn parseU64Field(value: std.json.Value) !u64 {

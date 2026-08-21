@@ -235,14 +235,13 @@ fn observationLacksAuthoritativeCommittedRepairIdentity(
                 }
             }
             const next_index = replacement orelse return true;
-            // A kind change is an explicit catalog replacement. For the same
-            // derived-index kind, changed generation/config values only prove a
-            // replacement once the producer says that identity is complete.
-            // Startup and degraded snapshots deliberately publish unknown
-            // identities and must not gain deletion authority from zero/stale
-            // values that happen not to match the committed generation.
-            if (!std.mem.eql(u8, prior_index.kind, next_index.kind)) continue;
-            const same_materialization = prior_index.coverage_generation == next_index.coverage_generation and
+            // A kind change is only an explicit catalog replacement once the
+            // producer supplies a complete identity. Legacy reports may omit
+            // kind entirely, and startup/degraded snapshots deliberately
+            // publish unknown identities; neither may gain deletion authority
+            // from values that happen not to match the committed incarnation.
+            const same_materialization = std.mem.eql(u8, prior_index.kind, next_index.kind) and
+                prior_index.coverage_generation == next_index.coverage_generation and
                 prior_index.coverage_config_hash == next_index.coverage_config_hash;
             if (!same_materialization and !next_index.coverage_identity_ready) return true;
         }
@@ -705,9 +704,37 @@ test "store observer preserves committed repair facts while capability is unknow
     );
     try std.testing.expect(records[0].runtime_statuses[0].indexes[0].repair_active_generation_serviceable);
 
+    // Missing or changed kind without a complete identity is not proof of a
+    // catalog replacement. This covers legacy JSON, where kind defaults empty.
+    observed_indexes[0].doc_count = 12;
+    observed_indexes[0].kind = "";
+    observed_indexes[0].coverage_identity_ready = false;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try applyObservationsOwnedWithRepairStatus(std.testing.allocator, &records, &.{observation}, false),
+    );
+    try std.testing.expectEqual(@as(u64, 11), records[0].runtime_statuses[0].indexes[0].doc_count);
+    try std.testing.expectEqualStrings("dense_vector", records[0].runtime_statuses[0].indexes[0].kind);
+    try std.testing.expectEqual(
+        table_manager.IndexRepairStatus.rebuilding,
+        records[0].runtime_statuses[0].indexes[0].repair_status.?,
+    );
+
+    observed_indexes[0].kind = "sparse_vector";
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try applyObservationsOwnedWithRepairStatus(std.testing.allocator, &records, &.{observation}, false),
+    );
+    try std.testing.expectEqualStrings("dense_vector", records[0].runtime_statuses[0].indexes[0].kind);
+    try std.testing.expectEqual(
+        table_manager.IndexRepairStatus.rebuilding,
+        records[0].runtime_statuses[0].indexes[0].repair_status.?,
+    );
+
     // A different but incomplete materialization identity has no authority to
     // erase the committed repair fact.
-    observed_indexes[0].doc_count = 12;
+    observed_indexes[0].kind = "dense_vector";
+    observed_indexes[0].doc_count = 13;
     observed_indexes[0].coverage_generation = 9;
     observed_indexes[0].coverage_config_hash = 0;
     observed_indexes[0].coverage_identity_ready = false;
@@ -729,7 +756,7 @@ test "store observer preserves committed repair facts while capability is unknow
         @as(usize, 1),
         try applyObservationsOwnedWithRepairStatus(std.testing.allocator, &records, &.{observation}, false),
     );
-    try std.testing.expectEqual(@as(u64, 12), records[0].runtime_statuses[0].indexes[0].doc_count);
+    try std.testing.expectEqual(@as(u64, 13), records[0].runtime_statuses[0].indexes[0].doc_count);
     try std.testing.expect(records[0].runtime_statuses[0].indexes[0].repair_status == null);
     try std.testing.expect(!records[0].runtime_statuses[0].indexes[0].repair_active_generation_serviceable);
 }
