@@ -29796,6 +29796,24 @@ test "api http server create index installs exact visible config and defers lagg
         writes.source(),
     );
 
+    // Runtime-semantic graph validation must happen before metadata commit.
+    // Otherwise reconciliation would retry a permanently invalid config after
+    // this endpoint had already reported success.
+    var invalid_graph_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs/indexes/invalid_graph",
+        .content_type = "application/json",
+        .body = "{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}",
+    });
+    defer invalid_graph_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), invalid_graph_resp.status);
+    var rejected_lookup = try indexes_api.lookupSingleIndexConfig(alloc, source.indexes_json, "invalid_graph");
+    defer if (rejected_lookup) |*found| found.deinit();
+    try std.testing.expect(rejected_lookup == null);
+    try std.testing.expect(source.pending_indexes_json == null);
+    try std.testing.expectEqual(@as(usize, 0), writes.create_calls);
+    try std.testing.expectEqual(@as(usize, 0), writes.enqueue_calls);
+
     const create_index_body = try test_contract_helpers.encodeCreateIndexRequest(alloc, "embed_idx");
     defer alloc.free(create_index_body);
     var create_index_resp = try executeHttpxTestRequest(&server, .{

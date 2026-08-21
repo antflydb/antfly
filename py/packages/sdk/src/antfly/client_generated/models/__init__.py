@@ -309,6 +309,8 @@ from .graph_artifact_node_mapping_config_model import GraphArtifactNodeMappingCo
 from .graph_artifact_producer_config import GraphArtifactProducerConfig
 from .graph_artifact_producer_config_kind import GraphArtifactProducerConfigKind
 from .graph_artifact_producer_config_producer_json import GraphArtifactProducerConfigProducerJson
+from .graph_artifact_producer_source_config import GraphArtifactProducerSourceConfig
+from .graph_artifact_producer_source_config_type import GraphArtifactProducerSourceConfigType
 from .graph_artifact_source_config import GraphArtifactSourceConfig
 from .graph_artifact_source_config_format import GraphArtifactSourceConfigFormat
 from .graph_artifact_source_config_kind import GraphArtifactSourceConfigKind
@@ -1132,6 +1134,8 @@ __all__ = (
     "GraphArtifactProducerConfig",
     "GraphArtifactProducerConfigKind",
     "GraphArtifactProducerConfigProducerJson",
+    "GraphArtifactProducerSourceConfig",
+    "GraphArtifactProducerSourceConfigType",
     "GraphArtifactSourceConfig",
     "GraphArtifactSourceConfigFormat",
     "GraphArtifactSourceConfigKind",

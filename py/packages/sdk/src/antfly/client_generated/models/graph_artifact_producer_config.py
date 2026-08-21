@@ -11,6 +11,7 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.execution_policy import ExecutionPolicy
     from ..models.graph_artifact_producer_config_producer_json import GraphArtifactProducerConfigProducerJson
+    from ..models.graph_artifact_producer_source_config import GraphArtifactProducerSourceConfig
 
 
 T = TypeVar("T", bound="GraphArtifactProducerConfig")
@@ -18,13 +19,13 @@ T = TypeVar("T", bound="GraphArtifactProducerConfig")
 
 @_attrs_define
 class GraphArtifactProducerConfig:
-    """Asset producer used by an artifact-backed graph index. At least one non-empty field or template source is required.
+    """Asset producer used by an artifact-backed graph index.
 
     Attributes:
         name (str):
         kind (GraphArtifactProducerConfigKind):
-        field (str | Unset):
-        template (str | Unset):
+        source (GraphArtifactProducerSourceConfig): Document input used by an artifact producer. Field sources read one
+            document field; template sources render a Handlebars template.
         content_type (str | Unset):
         execution (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance
             operation. These fields tune how work is batched and do not change generated artifact identity.
@@ -34,8 +35,7 @@ class GraphArtifactProducerConfig:
 
     name: str
     kind: GraphArtifactProducerConfigKind
-    field: str | Unset = UNSET
-    template: str | Unset = UNSET
+    source: GraphArtifactProducerSourceConfig
     content_type: str | Unset = UNSET
     execution: ExecutionPolicy | Unset = UNSET
     producer_json: GraphArtifactProducerConfigProducerJson | Unset = UNSET
@@ -45,9 +45,7 @@ class GraphArtifactProducerConfig:
 
         kind = self.kind.value
 
-        field = self.field
-
-        template = self.template
+        source = self.source.to_dict()
 
         content_type = self.content_type
 
@@ -65,12 +63,9 @@ class GraphArtifactProducerConfig:
             {
                 "name": name,
                 "kind": kind,
+                "source": source,
             }
         )
-        if field is not UNSET:
-            field_dict["field"] = field
-        if template is not UNSET:
-            field_dict["template"] = template
         if content_type is not UNSET:
             field_dict["content_type"] = content_type
         if execution is not UNSET:
@@ -84,15 +79,14 @@ class GraphArtifactProducerConfig:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.execution_policy import ExecutionPolicy
         from ..models.graph_artifact_producer_config_producer_json import GraphArtifactProducerConfigProducerJson
+        from ..models.graph_artifact_producer_source_config import GraphArtifactProducerSourceConfig
 
         d = dict(src_dict)
         name = d.pop("name")
 
         kind = GraphArtifactProducerConfigKind(d.pop("kind"))
 
-        field = d.pop("field", UNSET)
-
-        template = d.pop("template", UNSET)
+        source = GraphArtifactProducerSourceConfig.from_dict(d.pop("source"))
 
         content_type = d.pop("content_type", UNSET)
 
@@ -113,8 +107,7 @@ class GraphArtifactProducerConfig:
         graph_artifact_producer_config = cls(
             name=name,
             kind=kind,
-            field=field,
-            template=template,
+            source=source,
             content_type=content_type,
             execution=execution,
             producer_json=producer_json,

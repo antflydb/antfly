@@ -2,6 +2,7 @@ from antfly.client_generated.models.created_graph_artifact_producer_config impor
     CreatedGraphArtifactProducerConfig,
 )
 from antfly.client_generated.models.created_graph_index import CreatedGraphIndex
+from antfly.client_generated.models.execution_policy import ExecutionPolicy
 from antfly.client_generated.models.graph_algebraic_planning_config import (
     GraphAlgebraicPlanningConfig,
 )
@@ -13,6 +14,12 @@ from antfly.client_generated.models.graph_artifact_node_mapping_config import (
 )
 from antfly.client_generated.models.graph_artifact_node_mapping_config_model import (
     GraphArtifactNodeMappingConfigModel,
+)
+from antfly.client_generated.models.graph_artifact_producer_source_config import (
+    GraphArtifactProducerSourceConfig,
+)
+from antfly.client_generated.models.graph_artifact_producer_source_config_type import (
+    GraphArtifactProducerSourceConfigType,
 )
 
 
@@ -35,7 +42,7 @@ def test_created_graph_index_exposes_artifact_mapping_and_planning() -> None:
             "artifact": {
                 "name": "relations_v1",
                 "kind": "asset",
-                "template": "{{ body }}",
+                "source": {"type": "template", "value": "{{ body }}"},
                 "execution": {"batch_items": 8},
             },
             "algebraic_planning": {
@@ -52,6 +59,9 @@ def test_created_graph_index_exposes_artifact_mapping_and_planning() -> None:
     assert created.edge.weight == 0.75
     assert isinstance(created.algebraic_planning, GraphAlgebraicPlanningConfig)
     assert isinstance(created.artifact, CreatedGraphArtifactProducerConfig)
-    assert created.artifact.template == "{{ body }}"
+    assert isinstance(created.artifact.source, GraphArtifactProducerSourceConfig)
+    assert created.artifact.source.type_ is GraphArtifactProducerSourceConfigType.TEMPLATE
+    assert created.artifact.source.value == "{{ body }}"
+    assert isinstance(created.artifact.execution, ExecutionPolicy)
     assert created.artifact.execution.batch_items == 8
     assert created.to_dict()["algebraic_planning"]["bounded_traversal"]["law"] == ("provenance_semiring")

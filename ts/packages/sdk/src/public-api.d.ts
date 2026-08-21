@@ -9291,13 +9291,18 @@ export interface components {
             format?: "extraction_relation" | "extraction_graph";
             mention_edge_type?: string;
         };
-        /** @description Asset producer used by an artifact-backed graph index. At least one non-empty field or template source is required. */
+        /** @description Document input used by an artifact producer. Field sources read one document field; template sources render a Handlebars template. */
+        GraphArtifactProducerSourceConfig: {
+            /** @enum {string} */
+            type: "field" | "template";
+            value: string;
+        };
+        /** @description Asset producer used by an artifact-backed graph index. */
         GraphArtifactProducerConfig: {
             name: string;
             /** @enum {string} */
             kind: "asset";
-            field?: string;
-            template?: string;
+            source: components["schemas"]["GraphArtifactProducerSourceConfig"];
             content_type?: string;
             execution?: components["schemas"]["ExecutionPolicy"];
             /** @description Write-only producer configuration; it may contain credentials and is never returned. */
@@ -11997,13 +12002,12 @@ export interface components {
              */
             type: "embeddings";
         };
-        /** @description Credential-free graph artifact producer configuration returned after creation. At least one non-empty field or template source is present. */
+        /** @description Credential-free graph artifact producer configuration returned after creation. */
         CreatedGraphArtifactProducerConfig: {
             name: string;
             /** @enum {string} */
             kind: "asset";
-            field?: string;
-            template?: string;
+            source: components["schemas"]["GraphArtifactProducerSourceConfig"];
             content_type?: string;
             execution?: components["schemas"]["ExecutionPolicy"];
         };

@@ -173,9 +173,12 @@ func TestNewCreateIndexRequestSupportsTypedGraphMapping(t *testing.T) {
 			Format:   GraphArtifactSourceConfigFormatExtractionGraph,
 		},
 		Artifact: GraphArtifactProducerConfig{
-			Name:     "relations_v1",
-			Kind:     GraphArtifactProducerConfigKindAsset,
-			Template: "{{ body }}",
+			Name: "relations_v1",
+			Kind: GraphArtifactProducerConfigKindAsset,
+			Source: GraphArtifactProducerSourceConfig{
+				Type:  GraphArtifactProducerSourceConfigTypeTemplate,
+				Value: "{{ body }}",
+			},
 			Execution: ExecutionPolicy{
 				BatchItems: 8,
 			},
@@ -224,8 +227,9 @@ func TestNewCreateIndexRequestSupportsTypedGraphMapping(t *testing.T) {
 		t.Fatalf("bounded traversal must use presence semantics without enabled: %s", data)
 	}
 	artifact := body["artifact"].(map[string]any)
-	if artifact["template"] != "{{ body }}" {
-		t.Fatalf("artifact template = %v: %s", artifact["template"], data)
+	sourceConfig := artifact["source"].(map[string]any)
+	if sourceConfig["type"] != "template" || sourceConfig["value"] != "{{ body }}" {
+		t.Fatalf("artifact source = %v: %s", sourceConfig, data)
 	}
 	execution := artifact["execution"].(map[string]any)
 	if execution["batch_items"] != float64(8) {

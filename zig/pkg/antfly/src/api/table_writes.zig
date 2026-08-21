@@ -18154,7 +18154,7 @@ fn parseIndexConfigWithOptions(
 }
 
 pub fn validateIndexConfig(alloc: std.mem.Allocator, index_name: []const u8, index_json: []const u8) !void {
-    return try validateIndexConfigWithOptions(alloc, index_name, index_json, .{});
+    return table_index_config.validateIndexConfig(alloc, index_name, index_json);
 }
 
 pub fn validateIndexConfigWithOptions(
@@ -18163,19 +18163,7 @@ pub fn validateIndexConfigWithOptions(
     index_json: []const u8,
     options: managed_embedder.InitOptions,
 ) !void {
-    const cfg = try parseIndexConfigWithOptions(alloc, index_name, index_json, options);
-    defer {
-        alloc.free(cfg.name);
-        alloc.free(cfg.config_json);
-    }
-    if (cfg.kind == .algebraic) {
-        var parsed = std.json.parseFromSlice(db_mod.algebraic.index.Config, alloc, cfg.config_json, .{
-            .allocate = .alloc_always,
-            .ignore_unknown_fields = true,
-        }) catch return error.InvalidCreateTableRequest;
-        defer parsed.deinit();
-        db_mod.algebraic.index.validateConfig(parsed.value) catch return error.InvalidCreateTableRequest;
-    }
+    return table_index_config.validateIndexConfigWithOptions(alloc, index_name, index_json, options);
 }
 
 fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, value: std.json.Value) ![]u8 {
@@ -18303,6 +18291,16 @@ test "table write index validation checks expanded algebraic config semantics" {
 
     try std.testing.expectError(error.InvalidCreateTableRequest, validateIndexConfig(alloc, "sales_rollup",
         \\{"type":"algebraic","table":"sales","schema_version":1,"capability_fingerprint":"sales:v1","group_fields":[{"name":"customer","path":"customer","type":"keyword"}],"measure_fields":[{"name":"amount","path":"amount","type":"number"}],"materializations":[{"name":"sum_by_customer","op":"sum","group_by":["missing"],"measure":"amount"}]}
+    ));
+
+    try validateIndexConfig(alloc, "relations_graph",
+        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]"}}
+    );
+    try std.testing.expectError(error.InvalidCreateTableRequest, validateIndexConfig(alloc, "relations_graph",
+        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[0]"}}
+    ));
+    try std.testing.expectError(error.InvalidCreateTableRequest, validateIndexConfig(alloc, "relations_graph",
+        \\{"type":"graph","edge_types":[{"name":"mentions","topology":"dag"}]}
     ));
 }
 
@@ -20953,7 +20951,7 @@ test "provisioning detects model backed graph shorthand assets inside config_jso
         \\[{
         \\  "name":"relations_graph",
         \\  "kind":"graph",
-        \\  "config_json":"{\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"field\":\"body\",\"producer_json\":{\"type\":\"extractor\",\"config\":{\"provider\":\"antfly\"}}}}"
+        \\  "config_json":"{\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"body\"},\"producer_json\":{\"type\":\"extractor\",\"config\":{\"provider\":\"antfly\"}}}}"
         \\}]
     ));
 }
@@ -20964,14 +20962,14 @@ test "provisioning does not require asset producer for copy graph shorthand asse
         \\[{
         \\  "name":"relations_graph",
         \\  "kind":"graph",
-        \\  "config_json":"{\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"field\":\"relations\"}}"
+        \\  "config_json":"{\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"relations\"}}}"
         \\}]
     )));
     try std.testing.expect(try indexesJsonHasGeneratedEnrichment(alloc,
         \\[{
         \\  "name":"relations_graph",
         \\  "kind":"graph",
-        \\  "config_json":"{\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"field\":\"relations\"}}"
+        \\  "config_json":"{\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"relations\"}}}"
         \\}]
     ));
 }

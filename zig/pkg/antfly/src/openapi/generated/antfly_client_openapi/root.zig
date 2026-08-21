@@ -226,6 +226,7 @@ pub const GraphArtifactContextConfig = types.GraphArtifactContextConfig;
 pub const GraphArtifactEdgeMappingConfig = types.GraphArtifactEdgeMappingConfig;
 pub const GraphArtifactNodeMappingConfig = types.GraphArtifactNodeMappingConfig;
 pub const GraphArtifactProducerConfig = types.GraphArtifactProducerConfig;
+pub const GraphArtifactProducerSourceConfig = types.GraphArtifactProducerSourceConfig;
 pub const GraphArtifactSourceConfig = types.GraphArtifactSourceConfig;
 pub const GraphBoundedTraversalConfig = types.GraphBoundedTraversalConfig;
 pub const GraphIndexConfig = types.GraphIndexConfig;

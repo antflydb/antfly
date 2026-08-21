@@ -43,7 +43,7 @@ class CreatedGraphIndex:
         max_edges_per_document (int | Unset):
         source (GraphArtifactSourceConfig | Unset): Artifact stream materialized into graph edges.
         artifact (CreatedGraphArtifactProducerConfig | Unset): Credential-free graph artifact producer configuration
-            returned after creation. At least one non-empty field or template source is present.
+            returned after creation.
         nodes (GraphArtifactNodeMappingConfig | Unset): Maps each artifact item to graph node identifiers.
         edge (GraphArtifactEdgeMappingConfig | Unset): Maps each artifact item to an edge type, weight, and public
             metadata.

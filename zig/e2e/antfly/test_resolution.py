@@ -79,7 +79,7 @@ DOCUMENTS_INDEXES = {
         "artifact": {
             "name": "relations_v1",
             "kind": "asset",
-            "field": "relations",
+            "source": {"type": "field", "value": "relations"},
             "content_type": "application/json",
         },
         "edge_types": [{"name": "mentions"}],

@@ -67,7 +67,7 @@ def _document_units_index_config() -> dict:
         "artifact": {
             "name": DOCUMENT_UNITS_ARTIFACT,
             "kind": "asset",
-            "field": "url",
+            "source": {"type": "field", "value": "url"},
             "content_type": "application/json",
             "producer_json": {
                 "type": "document_extraction",

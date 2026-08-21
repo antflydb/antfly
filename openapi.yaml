@@ -18105,14 +18105,31 @@ components:
           default: extraction_relation
         mention_edge_type:
           type: string
+    GraphArtifactProducerSourceConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - type
+        - value
+      description: Document input used by an artifact producer. Field sources read one document field;
+        template sources render a Handlebars template.
+      properties:
+        type:
+          type: string
+          enum:
+            - field
+            - template
+        value:
+          type: string
+          minLength: 1
     GraphArtifactProducerConfig:
       type: object
       additionalProperties: false
       required:
         - name
         - kind
-      description: Asset producer used by an artifact-backed graph index. At least one non-empty field
-        or template source is required.
+        - source
+      description: Asset producer used by an artifact-backed graph index.
       properties:
         name:
           type: string
@@ -18121,12 +18138,8 @@ components:
           type: string
           enum:
             - asset
-        field:
-          type: string
-          minLength: 1
-        template:
-          type: string
-          minLength: 1
+        source:
+          $ref: '#/components/schemas/GraphArtifactProducerSourceConfig'
         content_type:
           type: string
         execution:
@@ -22543,8 +22556,8 @@ components:
       required:
         - name
         - kind
-      description: Credential-free graph artifact producer configuration returned after creation. At least
-        one non-empty field or template source is present.
+        - source
+      description: Credential-free graph artifact producer configuration returned after creation.
       properties:
         name:
           type: string
@@ -22553,12 +22566,8 @@ components:
           type: string
           enum:
             - asset
-        field:
-          type: string
-          minLength: 1
-        template:
-          type: string
-          minLength: 1
+        source:
+          $ref: '#/components/schemas/GraphArtifactProducerSourceConfig'
         content_type:
           type: string
         execution:

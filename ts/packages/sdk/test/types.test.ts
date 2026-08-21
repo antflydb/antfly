@@ -128,7 +128,7 @@ describe("Antfly Query Type Integration", () => {
         artifact: {
           name: "relations_v1",
           kind: "asset",
-          template: "{{ body }}",
+          source: { type: "template", value: "{{ body }}" },
           execution: { batch_items: 8 },
         },
         nodes: {

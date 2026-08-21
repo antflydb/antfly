@@ -19,6 +19,7 @@ const db_types = @import("../storage/db/types.zig");
 const algebraic = @import("../storage/db/algebraic/mod.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const coverage_policy_mod = @import("coverage_policy.zig");
+const index_manager = @import("../storage/db/catalog/index_manager.zig");
 
 pub fn parseIndexKind(value: std.json.Value) !db_types.IndexKind {
     if (value != .object) return .full_text;
@@ -82,6 +83,11 @@ pub fn validateIndexConfigWithOptions(
         }) catch return error.InvalidCreateTableRequest;
         defer parsed.deinit();
         algebraic.index.validateConfig(parsed.value) catch return error.InvalidCreateTableRequest;
+    } else if (cfg.kind == .graph) {
+        index_manager.validateGraphConfig(alloc, cfg.config_json) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidCreateTableRequest,
+        };
     }
 }
 
@@ -181,4 +187,27 @@ pub fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u
     const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
     defer alloc.free(escaped);
     try out.appendSlice(alloc, escaped);
+}
+
+test "graph index validation runs the runtime parser before catalog admission" {
+    const alloc = std.testing.allocator;
+
+    try validateIndexConfig(
+        alloc,
+        "relations_graph",
+        "{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"relations\"}}}",
+    );
+
+    const invalid_configs = [_][]const u8{
+        "{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}",
+        "{\"type\":\"graph\",\"edge_types\":[{\"name\":\"mentions\",\"topology\":\"dag\"}]}",
+        "{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"nodes\":{\"source\":\"{{ _doc.value.tenant }}\"}}",
+        "{\"type\":\"graph\",\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"source\":{\"type\":\"document\",\"value\":\"relations\"}}}",
+    };
+    for (invalid_configs) |config| {
+        try std.testing.expectError(
+            error.InvalidCreateTableRequest,
+            validateIndexConfig(alloc, "relations_graph", config),
+        );
+    }
 }

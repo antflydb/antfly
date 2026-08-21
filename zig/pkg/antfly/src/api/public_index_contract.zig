@@ -35,6 +35,7 @@ pub const CreatedObjectShape = enum {
     enrichment,
     graph_source,
     graph_artifact,
+    graph_artifact_producer_source,
     graph_nodes,
     graph_edge,
     graph_context,
@@ -183,7 +184,9 @@ pub fn createdValueMatchesShape(shape: CreatedObjectShape, value: std.json.Value
 fn createdObjectHasRequiredFields(shape: CreatedObjectShape, object: std.json.ObjectMap) bool {
     const required_fields: []const []const u8 = switch (shape) {
         .provider, .chunker => &.{"provider"},
-        .enrichment, .graph_artifact => &.{ "name", "kind" },
+        .enrichment => &.{ "name", "kind" },
+        .graph_artifact => &.{ "name", "kind", "source" },
+        .graph_artifact_producer_source => &.{ "type", "value" },
         .graph_source => &.{ "kind", "artifact" },
         .edge_type => &.{"name"},
         .graph_resolver => &.{ "name", "table", "source_artifact", "resolution_artifact", "key_template" },
@@ -193,11 +196,6 @@ fn createdObjectHasRequiredFields(shape: CreatedObjectShape, object: std.json.Ob
     for (required_fields) |field| {
         const value = object.get(field) orelse return false;
         if (value == .null or !createdFieldValueMatches(shape, field, value)) return false;
-    }
-    if (shape == .graph_artifact) {
-        const has_field = objectHasNonEmptyString(object, "field");
-        const has_template = objectHasNonEmptyString(object, "template");
-        if (!has_field and !has_template) return false;
     }
     return true;
 }
@@ -212,7 +210,12 @@ pub fn createdObjectShapeForChild(parent: CreatedObjectShape, field: []const u8)
         else
             .unrestricted,
         .index_execution => if (isAllowedIndexExecutionField(field)) .execution_policy else .unrestricted,
-        .graph_artifact => if (std.mem.eql(u8, field, "execution")) .execution_policy else .unrestricted,
+        .graph_artifact => if (std.mem.eql(u8, field, "source"))
+            .graph_artifact_producer_source
+        else if (std.mem.eql(u8, field, "execution"))
+            .execution_policy
+        else
+            .unrestricted,
         .graph_algebraic_planning => if (std.mem.eql(u8, field, "bounded_traversal")) .graph_bounded_traversal else .unrestricted,
         else => .unrestricted,
     };
@@ -226,6 +229,7 @@ pub fn isAllowedCreatedObjectField(shape: CreatedObjectShape, field: []const u8)
         .enrichment => isAllowedCreatedEnrichmentField(field),
         .graph_source => isAllowedGraphArtifactSourceField(field),
         .graph_artifact => isAllowedCreatedGraphArtifactField(field),
+        .graph_artifact_producer_source => std.mem.eql(u8, field, "type") or std.mem.eql(u8, field, "value"),
         .graph_nodes => isAllowedGraphNodeMappingField(field),
         .graph_edge => isAllowedGraphEdgeMappingField(field),
         .graph_context => isAllowedGraphContextField(field),
@@ -301,6 +305,7 @@ pub fn createdFieldValueMatches(shape: CreatedObjectShape, field: []const u8, va
         .enrichment => enrichmentFieldValueMatches(field, value),
         .graph_source => graphArtifactSourceFieldValueMatches(field, value),
         .graph_artifact => graphArtifactFieldValueMatches(field, value),
+        .graph_artifact_producer_source => graphArtifactProducerSourceFieldValueMatches(field, value),
         .graph_nodes => graphNodeMappingFieldValueMatches(field, value),
         .graph_edge => graphEdgeMappingFieldValueMatches(field, value),
         .graph_context => isNonEmptyStringArray(value),
@@ -387,14 +392,15 @@ fn graphArtifactFieldValueMatches(field: []const u8, value: std.json.Value) bool
     if (std.mem.eql(u8, field, "kind"))
         return value == .string and std.mem.eql(u8, value.string, "asset");
     if (std.mem.eql(u8, field, "name")) return isNonEmptyString(value);
-    if (std.mem.eql(u8, field, "field") or std.mem.eql(u8, field, "template"))
-        return isNonEmptyString(value);
+    if (std.mem.eql(u8, field, "source")) return value == .object;
     if (std.mem.eql(u8, field, "execution")) return value == .object;
     return isString(value);
 }
 
-fn objectHasNonEmptyString(object: std.json.ObjectMap, field: []const u8) bool {
-    const value = object.get(field) orelse return false;
+fn graphArtifactProducerSourceFieldValueMatches(field: []const u8, value: std.json.Value) bool {
+    if (std.mem.eql(u8, field, "type"))
+        return value == .string and
+            (std.mem.eql(u8, value.string, "field") or std.mem.eql(u8, value.string, "template"));
     return isNonEmptyString(value);
 }
 
@@ -508,8 +514,7 @@ pub fn isAllowedGraphArtifactRequestField(field: []const u8) bool {
 pub fn isAllowedCreatedGraphArtifactField(field: []const u8) bool {
     return std.mem.eql(u8, field, "name") or
         std.mem.eql(u8, field, "kind") or
-        std.mem.eql(u8, field, "field") or
-        std.mem.eql(u8, field, "template") or
+        std.mem.eql(u8, field, "source") or
         std.mem.eql(u8, field, "content_type") or
         std.mem.eql(u8, field, "execution");
 }

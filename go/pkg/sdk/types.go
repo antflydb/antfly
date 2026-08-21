@@ -267,28 +267,30 @@ type (
 	ReplicationRoute       = oapi.ReplicationRoute
 
 	// Graph index types
-	GraphIndexConfig                    = oapi.GraphIndexConfig
-	GraphIndexStats                     = oapi.GraphIndexStats
-	GraphArtifactSourceConfig           = oapi.GraphArtifactSourceConfig
-	GraphArtifactSourceConfigFormat     = oapi.GraphArtifactSourceConfigFormat
-	GraphArtifactSourceConfigKind       = oapi.GraphArtifactSourceConfigKind
-	GraphArtifactProducerConfig         = oapi.GraphArtifactProducerConfig
-	GraphArtifactProducerConfigKind     = oapi.GraphArtifactProducerConfigKind
-	GraphArtifactNodeMappingConfig      = oapi.GraphArtifactNodeMappingConfig
-	GraphArtifactNodeMappingConfigModel = oapi.GraphArtifactNodeMappingConfigModel
-	GraphArtifactEdgeMappingConfig      = oapi.GraphArtifactEdgeMappingConfig
-	GraphArtifactContextConfig          = oapi.GraphArtifactContextConfig
-	GraphAlgebraicPlanningConfig        = oapi.GraphAlgebraicPlanningConfig
-	GraphBoundedTraversalConfig         = oapi.GraphBoundedTraversalConfig
-	GraphBoundedTraversalConfigLaw      = oapi.GraphBoundedTraversalConfigLaw
-	GraphTemplateValue                  = oapi.GraphTemplateValue
-	GraphTemplateValue0                 = oapi.GraphTemplateValue0
-	GraphTemplateValue1                 = oapi.GraphTemplateValue1
-	EdgeTypeConfig                      = oapi.EdgeTypeConfig
-	EdgeTypeConfigTopology              = oapi.EdgeTypeConfigTopology
-	EdgeDirection                       = oapi.EdgeDirection
-	Edge                                = oapi.Edge
-	EdgesResponse                       = oapi.EdgesResponse
+	GraphIndexConfig                      = oapi.GraphIndexConfig
+	GraphIndexStats                       = oapi.GraphIndexStats
+	GraphArtifactSourceConfig             = oapi.GraphArtifactSourceConfig
+	GraphArtifactSourceConfigFormat       = oapi.GraphArtifactSourceConfigFormat
+	GraphArtifactSourceConfigKind         = oapi.GraphArtifactSourceConfigKind
+	GraphArtifactProducerConfig           = oapi.GraphArtifactProducerConfig
+	GraphArtifactProducerConfigKind       = oapi.GraphArtifactProducerConfigKind
+	GraphArtifactProducerSourceConfig     = oapi.GraphArtifactProducerSourceConfig
+	GraphArtifactProducerSourceConfigType = oapi.GraphArtifactProducerSourceConfigType
+	GraphArtifactNodeMappingConfig        = oapi.GraphArtifactNodeMappingConfig
+	GraphArtifactNodeMappingConfigModel   = oapi.GraphArtifactNodeMappingConfigModel
+	GraphArtifactEdgeMappingConfig        = oapi.GraphArtifactEdgeMappingConfig
+	GraphArtifactContextConfig            = oapi.GraphArtifactContextConfig
+	GraphAlgebraicPlanningConfig          = oapi.GraphAlgebraicPlanningConfig
+	GraphBoundedTraversalConfig           = oapi.GraphBoundedTraversalConfig
+	GraphBoundedTraversalConfigLaw        = oapi.GraphBoundedTraversalConfigLaw
+	GraphTemplateValue                    = oapi.GraphTemplateValue
+	GraphTemplateValue0                   = oapi.GraphTemplateValue0
+	GraphTemplateValue1                   = oapi.GraphTemplateValue1
+	EdgeTypeConfig                        = oapi.EdgeTypeConfig
+	EdgeTypeConfigTopology                = oapi.EdgeTypeConfigTopology
+	EdgeDirection                         = oapi.EdgeDirection
+	Edge                                  = oapi.Edge
+	EdgesResponse                         = oapi.EdgesResponse
 
 	// Graph query types
 	GraphQuery        = oapi.GraphQuery
@@ -751,6 +753,8 @@ const (
 	GraphArtifactSourceConfigFormatExtractionGraph    = oapi.GraphArtifactSourceConfigFormatExtractionGraph
 	GraphArtifactSourceConfigFormatExtractionRelation = oapi.GraphArtifactSourceConfigFormatExtractionRelation
 	GraphArtifactProducerConfigKindAsset              = oapi.GraphArtifactProducerConfigKindAsset
+	GraphArtifactProducerSourceConfigTypeField        = oapi.GraphArtifactProducerSourceConfigTypeField
+	GraphArtifactProducerSourceConfigTypeTemplate     = oapi.GraphArtifactProducerSourceConfigTypeTemplate
 	CreatedGraphArtifactProducerConfigKindAsset       = oapi.CreatedGraphArtifactProducerConfigKindAsset
 	GraphArtifactNodeMappingConfigModelDocument       = oapi.GraphArtifactNodeMappingConfigModelDocument
 	GraphArtifactNodeMappingConfigModelExternal       = oapi.GraphArtifactNodeMappingConfigModelExternal

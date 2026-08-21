@@ -442,12 +442,11 @@ pub const CreatedFullTextIndex = struct {
     type: []const u8,
 };
 
-/// Credential-free graph artifact producer configuration returned after creation. At least one non-empty field or template source is present.
+/// Credential-free graph artifact producer configuration returned after creation.
 pub const CreatedGraphArtifactProducerConfig = struct {
     name: []const u8,
     kind: []const u8,
-    field: ?[]const u8 = null,
-    template: ?[]const u8 = null,
+    source: GraphArtifactProducerSourceConfig,
     content_type: ?[]const u8 = null,
     execution: ?ExecutionPolicy = null,
 };
@@ -1198,16 +1197,21 @@ pub const GraphArtifactNodeMappingConfig = struct {
     target: ?GraphTemplateValue = null,
 };
 
-/// Asset producer used by an artifact-backed graph index. At least one non-empty field or template source is required.
+/// Asset producer used by an artifact-backed graph index.
 pub const GraphArtifactProducerConfig = struct {
     name: []const u8,
     kind: []const u8,
-    field: ?[]const u8 = null,
-    template: ?[]const u8 = null,
+    source: GraphArtifactProducerSourceConfig,
     content_type: ?[]const u8 = null,
     execution: ?ExecutionPolicy = null,
     /// Write-only producer configuration; it may contain credentials and is never returned.
     producer_json: ?std.json.Value = null,
+};
+
+/// Document input used by an artifact producer. Field sources read one document field; template sources render a Handlebars template.
+pub const GraphArtifactProducerSourceConfig = struct {
+    type: []const u8,
+    value: []const u8,
 };
 
 /// Artifact stream materialized into graph edges.

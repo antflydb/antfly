@@ -966,13 +966,13 @@ test "table contract canonicalizes generated optional null fields" {
 
 test "table contract preserves typed artifact-backed graph configuration" {
     const body =
-        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions"},"artifact":{"name":"relations_v1","kind":"asset","template":"{{ body }}","content_type":"application/json","producer_json":{"type":"document_extraction","api_key":"write-only"},"execution":{"batch_items":8,"batch_bytes":262144}},"nodes":{"model":"document","source":"{{ _doc.key }}","target":"{{ _item.target.text }}"},"edge":{"type":"{{ _item.predicate }}","weight":0.75,"metadata":{"source":"{{ _item.source }}"}},"context":{"doc_fields":["title","body"]},"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring"}},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}]}
+        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions"},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"template","value":"{{ body }}"},"content_type":"application/json","producer_json":{"type":"document_extraction","api_key":"write-only"},"execution":{"batch_items":8,"batch_bytes":262144}},"nodes":{"model":"document","source":"{{ _doc.key }}","target":"{{ _item.target.text }}"},"edge":{"type":"{{ _item.predicate }}","weight":0.75,"metadata":{"source":"{{ _item.source }}"}},"context":{"doc_fields":["title","body"]},"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring"}},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}]}
     ;
     const config_json = try parseCreateIndexRequest(std.testing.allocator, "relations_graph", body);
     defer std.testing.allocator.free(config_json);
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
-        "{\"name\":\"relations_graph\",\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"template\":\"{{ body }}\",\"execution\":{\"batch_items\":8,\"batch_bytes\":262144}},\"nodes\":{\"model\":\"document\",\"target\":\"{{ _item.target.text }}\"},\"edge\":{\"weight\":0.75},\"context\":{\"doc_fields\":[\"title\",\"body\"]},\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}},\"resolvers\":[{\"name\":\"kg\",\"candidate_search\":\"prefix\"}]}",
+        "{\"name\":\"relations_graph\",\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"source\":{\"type\":\"template\",\"value\":\"{{ body }}\"},\"execution\":{\"batch_items\":8,\"batch_bytes\":262144}},\"nodes\":{\"model\":\"document\",\"target\":\"{{ _item.target.text }}\"},\"edge\":{\"weight\":0.75},\"context\":{\"doc_fields\":[\"title\",\"body\"]},\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}},\"resolvers\":[{\"name\":\"kg\",\"candidate_search\":\"prefix\"}]}",
         config_json,
     );
 
@@ -996,15 +996,21 @@ test "table contract rejects unknown fields in closed nested index objects" {
         ,
         \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset"}}
         ,
-        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"chunk","field":"relations"}}
+        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"chunk","source":{"type":"field","value":"relations"}}}
         ,
-        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","field":""}}
+        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":""}}}
         ,
-        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","field":"relations","template":""}}
+        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","source":{"type":"document","value":"relations"}}}
         ,
-        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","template":42}}
+        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","source":{"type":"template","value":42}}}
         ,
-        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","field":"relations","execution":{"batch_items":0}}}
+        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations","client_value":"private"}}}
+        ,
+        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","source":"relations"}}
+        ,
+        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","field":"relations"}}
+        ,
+        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"execution":{"batch_items":0}}}
         ,
         \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","format":"unsupported"}}
         ,
