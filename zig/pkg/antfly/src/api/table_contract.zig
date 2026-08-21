@@ -19,6 +19,7 @@ const tables_api = @import("tables.zig");
 const indexes_api = @import("indexes.zig");
 const coverage_policy = @import("coverage_policy.zig");
 const public_index_contract = @import("public_index_contract.zig");
+const table_index_config = @import("table_index_config.zig");
 
 fn stringifyJsonAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
@@ -90,7 +91,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
         // adds private coverage incarnations, so re-running the public
         // allow-list against its normalized output would reject trusted
         // metadata that the caller never supplied.
-        try validateCreateTableArtifactEnrichments(
+        try validateCreateTableIndexSemantics(
             alloc,
             fallback.indexes_json orelse tables_api.default_indexes_json,
         );
@@ -116,7 +117,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     } else {
         req.indexes_json = try alloc.dupe(u8, tables_api.default_indexes_json);
     }
-    try validateCreateTableArtifactEnrichments(alloc, req.indexes_json.?);
+    try validateCreateTableIndexSemantics(alloc, req.indexes_json.?);
 
     if (raw_root.get("schema")) |schema_value| {
         if (schema_value != .null) {
@@ -302,8 +303,12 @@ pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, index_name: []const u8,
     return normalized;
 }
 
-fn validateCreateTableArtifactEnrichments(alloc: std.mem.Allocator, indexes_json: []const u8) !void {
+fn validateCreateTableIndexSemantics(alloc: std.mem.Allocator, indexes_json: []const u8) !void {
     indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidCreateTableRequest,
+    };
+    table_index_config.validateGraphIndexesJson(alloc, indexes_json) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidCreateTableRequest,
     };
@@ -1125,6 +1130,16 @@ test "table contract rejects unsupported index kinds before admission" {
         parseCreateTableRequest(
             std.testing.allocator,
             "{\"indexes\":{\"bad\":{\"type\":7}}}",
+        ),
+    );
+}
+
+test "table contract rejects graph configs the runtime cannot materialize" {
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        parseCreateTableRequest(
+            std.testing.allocator,
+            "{\"indexes\":{\"relations\":{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}}}",
         ),
     );
 }

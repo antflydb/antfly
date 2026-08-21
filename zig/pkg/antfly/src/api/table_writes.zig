@@ -18166,6 +18166,8 @@ pub fn validateIndexConfigWithOptions(
     return table_index_config.validateIndexConfigWithOptions(alloc, index_name, index_json, options);
 }
 
+pub const validateGraphIndexesJson = table_index_config.validateGraphIndexesJson;
+
 fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, value: std.json.Value) ![]u8 {
     return try extractIndexConfigJsonWithOptions(alloc, index_name, value, .{});
 }

@@ -5932,6 +5932,10 @@ fn findNamedArtifactPublicationAction(
 }
 
 fn validateServerlessIndexCatalog(alloc: Allocator, indexes_json: []const u8) !void {
+    table_writes.validateGraphIndexesJson(alloc, indexes_json) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidTableIndexMetadata,
+    };
     var parsed = try std.json.parseFromSlice(JsonValueMap, alloc, indexes_json, .{});
     defer parsed.deinit();
 
@@ -8400,7 +8404,7 @@ test "serverless create index normalization resolves and persists one probed emb
     );
 }
 
-test "serverless algebraic index catalog validation rejects malformed configs" {
+test "serverless index catalog validation rejects malformed configs" {
     const alloc = std.testing.allocator;
 
     try validateServerlessIndexCatalog(alloc,
@@ -8417,6 +8421,10 @@ test "serverless algebraic index catalog validation rejects malformed configs" {
 
     try std.testing.expectError(error.InvalidTableIndexMetadata, validateServerlessIndexCatalog(alloc,
         \\{"sales_rollup":{"type":"algebraic","version":1,"time_fields":[{"name":"created_at","path":"created_at","type":"datetime"}],"materializations":[{"name":"bad","op":"count","time":"created_at","bucket":"week"}]}}
+    ));
+
+    try std.testing.expectError(error.InvalidTableIndexMetadata, validateServerlessIndexCatalog(alloc,
+        \\{"relations":{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[0]"}}}
     ));
 }
 

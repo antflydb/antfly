@@ -84,10 +84,36 @@ pub fn validateIndexConfigWithOptions(
         defer parsed.deinit();
         algebraic.index.validateConfig(parsed.value) catch return error.InvalidCreateTableRequest;
     } else if (cfg.kind == .graph) {
-        index_manager.validateGraphConfig(alloc, cfg.config_json) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return error.InvalidCreateTableRequest,
-        };
+        try validateGraphConfig(alloc, cfg.config_json);
+    }
+}
+
+fn validateGraphConfig(alloc: std.mem.Allocator, config_json: []const u8) !void {
+    index_manager.validateGraphConfig(alloc, config_json) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidCreateTableRequest,
+    };
+}
+
+/// Validate the runtime semantics of every graph index in a table definition.
+/// This is intentionally graph-only: managed embedding normalization may need
+/// provider I/O and algebraic validation needs the expanded table schema, while
+/// graph parsing is pure and must complete before any catalog mutation.
+pub fn validateGraphIndexesJson(alloc: std.mem.Allocator, indexes_json: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer parsed.deinit();
+    const indexes = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidCreateTableRequest,
+    };
+
+    var it = indexes.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) return error.InvalidCreateTableRequest;
+        if (try parseIndexKind(entry.value_ptr.*) != .graph) continue;
+        const config_json = try extractIndexConfigJson(alloc, entry.key_ptr.*, entry.value_ptr.*);
+        defer alloc.free(config_json);
+        try validateGraphConfig(alloc, config_json);
     }
 }
 
@@ -210,4 +236,19 @@ test "graph index validation runs the runtime parser before catalog admission" {
             validateIndexConfig(alloc, "relations_graph", config),
         );
     }
+}
+
+test "table graph validation rejects runtime-invalid configs before catalog admission" {
+    const alloc = std.testing.allocator;
+    try validateGraphIndexesJson(
+        alloc,
+        "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"relations_graph\":{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\"}}}",
+    );
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        validateGraphIndexesJson(
+            alloc,
+            "{\"relations_graph\":{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}}",
+        ),
+    );
 }
