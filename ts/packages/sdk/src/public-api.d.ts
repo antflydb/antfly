@@ -11387,23 +11387,24 @@ export interface components {
             where?: components["schemas"]["GraphWhereExpression"];
             optional?: components["schemas"]["GraphOptionalMatch"][];
         };
+        GraphBindingsReturn: {
+            bindings: string[];
+            /** @default 100 */
+            limit?: number;
+        };
         GraphCountAggregate: {
-            /** @enum {string} */
-            type: "count";
             /** @description Use `*` to count rows, or an alias to count non-null bindings. */
-            of: string;
+            count: string;
             /** @default false */
             distinct?: boolean;
         };
-        /** @description Return bindings or exact aggregates. Bindings and aggregates are mutually exclusive. */
-        GraphReturn: {
-            bindings?: string[];
-            /** @default 100 */
-            limit?: number;
-            aggregates?: {
+        GraphAggregatesReturn: {
+            aggregates: {
                 [key: string]: components["schemas"]["GraphCountAggregate"];
             };
-        } & (unknown | unknown);
+        };
+        /** @description Return bindings or exact aggregates. Bindings and aggregates are mutually exclusive. */
+        GraphReturn: components["schemas"]["GraphBindingsReturn"] | components["schemas"]["GraphAggregatesReturn"];
         GraphMatchQuery: {
             index: string;
             match: components["schemas"]["GraphMatch"];
@@ -11667,13 +11668,14 @@ export interface components {
             };
             path?: components["schemas"]["PathEdge"][];
         };
+        GraphResultBinding: components["schemas"]["GraphResultNode"] | null;
+        GraphResultRow: {
+            [key: string]: components["schemas"]["GraphResultBinding"];
+        };
         GraphAggregateValue: {
             /** @description Decimal string so counts remain lossless in JavaScript. */
             value: string;
             exact: boolean;
-        };
-        GraphQueryPage: {
-            next_cursor?: string;
         };
         GraphQueryStats: {
             /** Format: uint64 */
@@ -11701,13 +11703,10 @@ export interface components {
              * @description Deprecated graph_searches result count; use stats or a named count aggregate.
              */
             total?: number;
-            rows?: {
-                [key: string]: unknown;
-            }[];
+            rows?: components["schemas"]["GraphResultRow"][];
             aggregates?: {
                 [key: string]: components["schemas"]["GraphAggregateValue"];
             };
-            page?: components["schemas"]["GraphQueryPage"];
             stats?: components["schemas"]["GraphQueryStats"];
             /**
              * Format: int64

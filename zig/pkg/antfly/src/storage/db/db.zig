@@ -15519,6 +15519,69 @@ pub const DB = struct {
         });
     }
 
+    fn aggregateConjunctivePatternWithNodeAdmission(
+        self: *DB,
+        alloc: Allocator,
+        named: *const types.NamedGraphQuery,
+        start_keys: []const []const u8,
+        node_admission: ?NodeAdmission,
+    ) ![]types.GraphAggregateResult {
+        if (start_keys.len == 0) {
+            const empty = try alloc.alloc(types.GraphAggregateResult, named.query.aggregates.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (empty[0..initialized]) |*aggregate| aggregate.deinit(alloc);
+                alloc.free(empty);
+            }
+            for (named.query.aggregates, 0..) |aggregate, i| {
+                empty[i] = .{ .name = try alloc.dupe(u8, aggregate.name), .value = 0 };
+                initialized += 1;
+            }
+            return empty;
+        }
+        const specs = try alloc.alloc(graph_pattern_mod.CountAggregateSpec, named.query.aggregates.len);
+        defer alloc.free(specs);
+        for (named.query.aggregates, 0..) |aggregate, i| specs[i] = .{
+            .alias = if (std.mem.eql(u8, aggregate.of, "*")) null else aggregate.of,
+            .distinct = aggregate.distinct,
+        };
+
+        var filter_ctx = PatternNodeFilterContext.init(self, alloc);
+        defer filter_ctx.deinit();
+        const computed = try self.core.graphAggregateConjunctivePattern(
+            alloc,
+            named.query.index_name,
+            start_keys,
+            named.query.match_pattern orelse return error.InvalidArgument,
+            specs,
+            .{
+                .evaluator = .{ .ctx = &filter_ctx, .func = patternNodeFilterEvaluator },
+                .node_admission = node_admission,
+            },
+        );
+        defer {
+            for (computed) |*aggregate| aggregate.deinit(alloc);
+            if (computed.len > 0) alloc.free(computed);
+        }
+        const results = try alloc.alloc(types.GraphAggregateResult, computed.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (results[0..initialized]) |*result| result.deinit(alloc);
+            if (results.len > 0) alloc.free(results);
+        }
+        for (computed, 0..) |*aggregate, i| {
+            const name = try alloc.dupe(u8, named.query.aggregates[i].name);
+            results[i] = .{
+                .name = name,
+                .value = aggregate.value,
+                .distinct_values = aggregate.distinct_values,
+            };
+            aggregate.distinct_values = &.{};
+            initialized += 1;
+        }
+        return results;
+    }
+
     const PatternNodeFilterContext = struct {
         db: *DB,
         cache: db_query_graph.PreparedPatternFilterCache,
@@ -24824,6 +24887,10 @@ pub const DB = struct {
                 executeConjunctiveMatchWithAdmissionCallback
             else
                 executeConjunctiveMatchCallback,
+            .aggregate_conjunctive = if (predicate_aware)
+                executeConjunctiveAggregateWithAdmissionCallback
+            else
+                executeConjunctiveAggregateCallback,
             .load_projected_document = loadPatternProjectedDocumentCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsForGraphCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
@@ -25177,7 +25244,7 @@ pub const DB = struct {
             named.query.index_name,
             start_key_refs,
             named.query.match_pattern orelse return error.InvalidArgument,
-            named.query.params.max_results,
+            conjunctiveShardResultLimit(named.query),
             named.query.return_aliases,
             null,
         );
@@ -25195,10 +25262,35 @@ pub const DB = struct {
             named.query.index_name,
             start_key_refs,
             named.query.match_pattern orelse return error.InvalidArgument,
-            named.query.params.max_results,
+            conjunctiveShardResultLimit(named.query),
             named.query.return_aliases,
             execution.admission.iface(),
         );
+    }
+
+    fn executeConjunctiveAggregateCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        named: *const types.NamedGraphQuery,
+        start_key_refs: []const []const u8,
+    ) anyerror![]types.GraphAggregateResult {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.aggregateConjunctivePatternWithNodeAdmission(alloc, named, start_key_refs, null);
+    }
+
+    fn executeConjunctiveAggregateWithAdmissionCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        named: *const types.NamedGraphQuery,
+        start_key_refs: []const []const u8,
+    ) anyerror![]types.GraphAggregateResult {
+        const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try execution.db.aggregateConjunctivePatternWithNodeAdmission(alloc, named, start_key_refs, execution.admission.iface());
+    }
+
+    fn conjunctiveShardResultLimit(query: graph_query_mod.GraphQuery) u32 {
+        if (query.return_limit == 0) return query.params.max_results;
+        return std.math.add(u32, query.return_limit, 1) catch query.return_limit;
     }
 
     fn loadPatternProjectedDocumentCallback(
@@ -33139,9 +33231,9 @@ fn isExpiredDocumentKeyCallback(
     return try isExpiredDocumentKey(self, alloc, key);
 }
 
-fn patternNodeFilterEvaluator(ctx: ?*anyopaque, key: []const u8, filter: graph_pattern_mod.NodeFilter) anyerror!bool {
+fn patternNodeFilterEvaluator(ctx: ?*anyopaque, node: graph_node_identity.Ref, filter: graph_pattern_mod.NodeFilter) anyerror!bool {
     const active: *DB.PatternNodeFilterContext = @ptrCast(@alignCast(ctx orelse return error.UnsupportedNodeFilterQuery));
-    return try matchesPatternNodeFilter(active, key, filter);
+    return try matchesPatternNodeFilter(active, node.key, filter);
 }
 
 fn matchesPatternNodeFilter(active: *DB.PatternNodeFilterContext, key: []const u8, filter: graph_pattern_mod.NodeFilter) !bool {

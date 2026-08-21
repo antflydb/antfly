@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 
 if TYPE_CHECKING:
+    from ..models.graph_aggregates_return import GraphAggregatesReturn
+    from ..models.graph_bindings_return import GraphBindingsReturn
     from ..models.graph_match import GraphMatch
 
 
@@ -18,20 +20,26 @@ class GraphMatchQuery:
     Attributes:
         index (str):
         match (GraphMatch):
-        return_ (Any): Return bindings or exact aggregates. Bindings and aggregates are mutually exclusive.
+        return_ (GraphAggregatesReturn | GraphBindingsReturn): Return bindings or exact aggregates. Bindings and
+            aggregates are mutually exclusive.
     """
 
     index: str
     match: GraphMatch
-    return_: Any
+    return_: GraphAggregatesReturn | GraphBindingsReturn
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.graph_bindings_return import GraphBindingsReturn
+
         index = self.index
 
         match = self.match.to_dict()
 
-        return_: Any
-        return_ = self.return_
+        return_: dict[str, Any]
+        if isinstance(self.return_, GraphBindingsReturn):
+            return_ = self.return_.to_dict()
+        else:
+            return_ = self.return_.to_dict()
 
         field_dict: dict[str, Any] = {}
 
@@ -47,6 +55,8 @@ class GraphMatchQuery:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.graph_aggregates_return import GraphAggregatesReturn
+        from ..models.graph_bindings_return import GraphBindingsReturn
         from ..models.graph_match import GraphMatch
 
         d = dict(src_dict)
@@ -54,8 +64,20 @@ class GraphMatchQuery:
 
         match = GraphMatch.from_dict(d.pop("match"))
 
-        def _parse_return_(data: object) -> Any:
-            return cast(Any, data)
+        def _parse_return_(data: object) -> GraphAggregatesReturn | GraphBindingsReturn:
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_graph_return_type_0 = GraphBindingsReturn.from_dict(data)
+
+                return componentsschemas_graph_return_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            if not isinstance(data, dict):
+                raise TypeError()
+            componentsschemas_graph_return_type_1 = GraphAggregatesReturn.from_dict(data)
+
+            return componentsschemas_graph_return_type_1
 
         return_ = _parse_return_(d.pop("return"))
 

@@ -17593,6 +17593,7 @@ fn parseRemoteGraphResults(
             .aggregates = aggregates,
             .hits = try concatGraphResultHits(alloc, parsed_nodes.hits, parsed_matches.hits),
             .total_hits = @intCast(@max(parsed_nodes.nodes.len, @max(paths.len, parsed_matches.matches.len))),
+            .truncated = if (result_value.stats) |stats| stats.truncated else false,
         };
         initialized += 1;
     }

@@ -34,7 +34,7 @@ pub const NodeFilter = struct {
 
 pub const FilterEvaluator = struct {
     ctx: ?*anyopaque = null,
-    func: ?*const fn (?*anyopaque, []const u8, NodeFilter) anyerror!bool = null,
+    func: ?*const fn (?*anyopaque, node_identity.Ref, NodeFilter) anyerror!bool = null,
 };
 
 pub const PatternEdgeStep = struct {
@@ -140,6 +140,9 @@ pub fn freeMatches(alloc: Allocator, matches: []PatternMatch) void {
 
 pub const MatchOptions = struct {
     max_results: u32 = 100,
+    /// Disable row-oriented expansion windows. Safety still comes from the
+    /// explicit node, edge, and intermediate-state budgets, which fail closed.
+    require_complete: bool = false,
     return_aliases: []const []const u8 = &.{},
     target_nodes: []const node_identity.Ref = &.{},
     target_required: bool = false,
@@ -377,7 +380,7 @@ pub fn matchPatternFromRefsWithEdgeReader(
     defer if (admitted_starts) |mask| alloc.free(mask);
     for (start_nodes, 0..) |start, start_index| {
         if (admitted_starts) |mask| if (!mask[start_index]) continue;
-        if (!(try passesNodeFilter(start.key, pattern[0].node_filter, opts.evaluator))) continue;
+        if (!(try passesNodeFilter(start, pattern[0].node_filter, opts.evaluator))) continue;
 
         const bindings = try alloc.alloc(PatternBinding, 1);
         bindings[0] = initPatternBinding(alloc, first_alias, start.key, start.table, 0) catch |err| {
@@ -422,6 +425,7 @@ pub fn matchPatternFromRefsWithEdgeReader(
                 if (step_idx + 1 == pattern.len) opts.target_nodes else &.{},
                 step_idx + 1 == pattern.len and opts.target_required,
                 opts.max_results,
+                opts.require_complete,
                 opts.evaluator,
                 opts.node_admission,
                 opts.include_paths,
@@ -570,8 +574,8 @@ fn matchExactTwoEdgePattern(
 
     const start_key = start_nodes[0].key;
     const target_key = opts.target_nodes[0].key;
-    if (!(try passesNodeFilter(start_key, pattern[0].node_filter, opts.evaluator)) or
-        !(try passesNodeFilter(target_key, pattern[2].node_filter, opts.evaluator)))
+    if (!(try passesNodeFilter(start_nodes[0], pattern[0].node_filter, opts.evaluator)) or
+        !(try passesNodeFilter(opts.target_nodes[0], pattern[2].node_filter, opts.evaluator)))
     {
         return try alloc.alloc(PatternMatch, 0);
     }
@@ -604,7 +608,7 @@ fn matchExactTwoEdgePattern(
         const middle_key = edgeTarget(graph_edge, start_key, pattern[1].edge.direction) orelse continue;
         if (std.mem.eql(u8, middle_key, start_key)) continue;
         if (edgeTargetTable(null, graph_edge, middle_key) != null) return null;
-        if (!(try passesNodeFilter(middle_key, pattern[1].node_filter, opts.evaluator))) continue;
+        if (!(try passesNodeFilter(.{ .table = null, .key = middle_key }, pattern[1].node_filter, opts.evaluator))) continue;
         try candidates.append(alloc, .{
             .middle_key = middle_key,
             .forward_edge_index = edge_index,
@@ -740,6 +744,7 @@ fn findReachableNodes(
     target_nodes: []const node_identity.Ref,
     target_required: bool,
     max_results: u32,
+    require_complete: bool,
     evaluator: ?FilterEvaluator,
     node_admission: ?NodeAdmission,
     include_paths: bool,
@@ -748,7 +753,9 @@ fn findReachableNodes(
 ) ![]ReachableNode {
     const min_hops = if (edge.min_hops == 0) @as(u32, 1) else edge.min_hops;
     const max_hops = if (edge.max_hops == 0) @as(u32, 1) else edge.max_hops;
-    const result_limit: usize = if (max_results == 0)
+    const result_limit: usize = if (require_complete)
+        std.math.maxInt(usize)
+    else if (max_results == 0)
         1000
     else
         @min(
@@ -867,7 +874,7 @@ fn findReachableNodes(
 
                 if (new_hops >= min_hops and
                     targetNodeMatches(.{ .table = target_table, .key = target_key }, target_nodes, target_required) and
-                    try passesNodeFilter(target_key, node_filter, evaluator))
+                    try passesNodeFilter(.{ .table = target_table, .key = target_key }, node_filter, evaluator))
                 {
                     var reached = try initReachableNode(
                         alloc,
@@ -994,12 +1001,12 @@ fn passesPrefixFilter(key: []const u8, filter: NodeFilter) bool {
     return std.mem.startsWith(u8, key, filter.filter_prefix);
 }
 
-fn passesNodeFilter(key: []const u8, filter: NodeFilter, evaluator: ?FilterEvaluator) !bool {
-    if (!passesPrefixFilter(key, filter)) return false;
+fn passesNodeFilter(node: node_identity.Ref, filter: NodeFilter, evaluator: ?FilterEvaluator) !bool {
+    if (!passesPrefixFilter(node.key, filter)) return false;
     if (filter.filter_query_json == null) return true;
     const active = evaluator orelse return error.UnsupportedNodeFilterQuery;
     const eval_fn = active.func orelse return error.UnsupportedNodeFilterQuery;
-    return try eval_fn(active.ctx, key, filter);
+    return try eval_fn(active.ctx, node, filter);
 }
 
 fn effectiveAlias(alias: []const u8, step_idx: usize, buf: []u8) []const u8 {
@@ -1053,6 +1060,30 @@ pub fn matchConjunctivePatternWithEdgeReader(
     pattern: ConjunctivePattern,
     opts: MatchOptions,
 ) ![]PatternMatch {
+    var current = try buildConjunctiveStates(alloc, edge_reader, start_keys, pattern, opts);
+    defer freeConjunctiveStates(alloc, &current);
+
+    const result_len = if (opts.max_results == 0) current.items.len else @min(current.items.len, opts.max_results);
+    const results = try alloc.alloc(PatternMatch, result_len);
+    var initialized: usize = 0;
+    errdefer {
+        for (results[0..initialized]) |*result| result.deinit(alloc);
+        if (results.len > 0) alloc.free(results);
+    }
+    for (current.items[0..result_len], 0..) |state, i| {
+        results[i] = try projectConjunctiveState(alloc, state, opts.return_aliases);
+        initialized += 1;
+    }
+    return results;
+}
+
+fn buildConjunctiveStates(
+    alloc: Allocator,
+    edge_reader: anytype,
+    start_keys: []const []const u8,
+    pattern: ConjunctivePattern,
+    opts: MatchOptions,
+) !std.ArrayListUnmanaged(ConjunctiveState) {
     if (pattern.nodes.len == 0 or pattern.nodes.len > max_pattern_steps) return error.InvalidArgument;
     try validateConjunctivePattern(pattern);
 
@@ -1064,10 +1095,10 @@ pub fn matchConjunctivePatternWithEdgeReader(
     };
 
     var current = std.ArrayListUnmanaged(ConjunctiveState).empty;
-    defer freeConjunctiveStates(alloc, &current);
+    errdefer freeConjunctiveStates(alloc, &current);
     for (start_keys) |key| {
         try work_budget.consumeNode();
-        if (!(try passesNodeFilter(key, anchor_node.filter, opts.evaluator))) continue;
+        if (!(try passesNodeFilter(.{ .table = null, .key = key }, anchor_node.filter, opts.evaluator))) continue;
         const bindings = try alloc.alloc(PatternBinding, 1);
         bindings[0] = initPatternBinding(alloc, anchor_alias, key, null, 0) catch |err| {
             alloc.free(bindings);
@@ -1114,27 +1145,124 @@ pub fn matchConjunctivePatternWithEdgeReader(
         freeConjunctiveStates(alloc, &current);
         current = next;
     }
+    return current;
+}
 
-    const result_len = if (opts.max_results == 0) current.items.len else @min(current.items.len, opts.max_results);
-    const results = try alloc.alloc(PatternMatch, result_len);
+pub const CountAggregateSpec = struct {
+    alias: ?[]const u8 = null,
+    distinct: bool = false,
+};
+
+pub const CountAggregateResult = struct {
+    value: u128,
+    distinct_values: []node_identity.Ref = &.{},
+
+    pub fn deinit(self: *CountAggregateResult, alloc: Allocator) void {
+        for (self.distinct_values) |identity| {
+            if (identity.table) |table| alloc.free(table);
+            alloc.free(identity.key);
+        }
+        if (self.distinct_values.len > 0) alloc.free(self.distinct_values);
+        self.* = undefined;
+    }
+};
+
+/// Aggregate directly from matcher states. Exact aggregate queries therefore
+/// avoid allocating and converting one public result row per graph binding.
+pub fn aggregateConjunctivePattern(
+    alloc: Allocator,
+    graph_index: *graph_mod.GraphIndex,
+    start_keys: []const []const u8,
+    pattern: ConjunctivePattern,
+    specs: []const CountAggregateSpec,
+    opts: MatchOptions,
+) ![]CountAggregateResult {
+    const Reader = struct {
+        graph_index: *graph_mod.GraphIndex,
+
+        pub fn getEdges(self: @This(), a: Allocator, table: ?[]const u8, key: []const u8, types: []const []const u8, direction: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            if (table != null) return try a.alloc(graph_mod.Edge, 0);
+            return try self.graph_index.getEdgesByTypes(a, key, types, direction);
+        }
+
+        pub fn freeEdges(_: @This(), a: Allocator, edges: []graph_mod.Edge) void {
+            graph_mod.GraphIndex.freeEdges(a, edges);
+        }
+    };
+    return try aggregateConjunctivePatternWithEdgeReader(alloc, Reader{ .graph_index = graph_index }, start_keys, pattern, specs, opts);
+}
+
+pub fn aggregateConjunctivePatternWithEdgeReader(
+    alloc: Allocator,
+    edge_reader: anytype,
+    start_keys: []const []const u8,
+    pattern: ConjunctivePattern,
+    specs: []const CountAggregateSpec,
+    opts: MatchOptions,
+) ![]CountAggregateResult {
+    var aggregate_opts = opts;
+    aggregate_opts.max_results = 0;
+    aggregate_opts.require_complete = true;
+    var states = try buildConjunctiveStates(alloc, edge_reader, start_keys, pattern, aggregate_opts);
+    defer freeConjunctiveStates(alloc, &states);
+
+    const results = try alloc.alloc(CountAggregateResult, specs.len);
     var initialized: usize = 0;
     errdefer {
         for (results[0..initialized]) |*result| result.deinit(alloc);
         if (results.len > 0) alloc.free(results);
     }
-    for (current.items[0..result_len], 0..) |state, i| {
-        results[i] = try projectConjunctiveState(alloc, state, opts.return_aliases);
+    for (specs, 0..) |spec, i| {
+        results[i] = try aggregateConjunctiveStates(alloc, states.items, spec);
         initialized += 1;
     }
     return results;
 }
 
-fn validateConjunctivePattern(pattern: ConjunctivePattern) !void {
+fn aggregateConjunctiveStates(alloc: Allocator, states: []const ConjunctiveState, spec: CountAggregateSpec) !CountAggregateResult {
+    if (spec.alias == null) return .{ .value = states.len };
+    if (!spec.distinct) {
+        var count: u128 = 0;
+        for (states) |state| if (findBinding(state.bindings, spec.alias.?) != null) {
+            count += 1;
+        };
+        return .{ .value = count };
+    }
+
+    var seen = node_identity.Map(void){};
+    defer seen.deinit(alloc);
+    var values = std.ArrayListUnmanaged(node_identity.Ref).empty;
+    errdefer {
+        for (values.items) |identity| {
+            if (identity.table) |table| alloc.free(table);
+            alloc.free(identity.key);
+        }
+        values.deinit(alloc);
+    }
+    for (states) |state| {
+        const binding = findBinding(state.bindings, spec.alias.?) orelse continue;
+        if (!try seen.putIfAbsent(alloc, .{ .table = binding.table, .key = binding.key }, {})) continue;
+        try appendOwnedIdentity(alloc, &values, binding.table, binding.key);
+    }
+    const distinct_values = try values.toOwnedSlice(alloc);
+    return .{ .value = distinct_values.len, .distinct_values = distinct_values };
+}
+
+fn appendOwnedIdentity(alloc: Allocator, values: *std.ArrayListUnmanaged(node_identity.Ref), table_name: ?[]const u8, key_name: []const u8) !void {
+    const table = if (table_name) |name| try alloc.dupe(u8, name) else null;
+    errdefer if (table) |name| alloc.free(name);
+    const key = try alloc.dupe(u8, key_name);
+    errdefer alloc.free(key);
+    try values.append(alloc, .{ .table = table, .key = key });
+}
+
+pub fn validateConjunctivePattern(pattern: ConjunctivePattern) !void {
     for (pattern.nodes, 0..) |node, i| {
         if (node.alias.len == 0) return error.InvalidArgument;
         for (pattern.nodes[0..i]) |prior| if (std.mem.eql(u8, prior.alias, node.alias)) return error.InvalidArgument;
     }
     for (pattern.edges) |edge| try validateMatchEdge(pattern.nodes, edge);
+    try validateRequiredPatternConnected(pattern.nodes, pattern.edges);
     for (pattern.predicates) |predicate| try validateMatchPredicate(pattern.nodes, predicate);
     for (pattern.optional, 0..) |optional_pattern, optional_index| {
         for (optional_pattern.nodes, 0..) |node, node_index| {
@@ -1153,6 +1281,7 @@ fn validateConjunctivePattern(pattern: ConjunctivePattern) !void {
                 return error.InvalidArgument;
             try validateEdgeHops(edge);
         }
+        try validateOptionalPatternConnected(pattern, optional_index);
         for (optional_pattern.predicates) |predicate| switch (predicate) {
             .not_equal => |neq| {
                 if (!optionalAliasVisible(pattern, optional_index, neq.left) or
@@ -1167,6 +1296,73 @@ fn validateConjunctivePattern(pattern: ConjunctivePattern) !void {
             },
         };
     }
+}
+
+/// Required MATCH has conjunctive semantics, not an implicit Cartesian
+/// product. Every declared alias must therefore be reachable from the anchor.
+fn validateRequiredPatternConnected(nodes: []const MatchNode, edges: []const MatchEdge) !void {
+    if (nodes.len == 1) return;
+    if (edges.len == 0 or nodes.len > max_pattern_steps) return error.InvalidArgument;
+
+    var connected: [max_pattern_steps]bool = @splat(false);
+    connected[0] = true;
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (edges) |edge| {
+            const from_index = matchNodeIndex(nodes, edge.from) orelse return error.InvalidArgument;
+            const to_index = matchNodeIndex(nodes, edge.to) orelse return error.InvalidArgument;
+            if (connected[from_index] == connected[to_index]) continue;
+            connected[from_index] = true;
+            connected[to_index] = true;
+            changed = true;
+        }
+    }
+    for (connected[0..nodes.len]) |is_connected| if (!is_connected) return error.InvalidArgument;
+}
+
+/// OPTIONAL groups must be correlated with aliases already visible to the
+/// query, and every alias introduced by the group must participate in that
+/// connected component. This prevents silently ignored declarations.
+fn validateOptionalPatternConnected(pattern: ConjunctivePattern, optional_index: usize) !void {
+    const group = pattern.optional[optional_index];
+    if (group.nodes.len == 0) return;
+    if (group.nodes.len > max_pattern_steps or group.edges.len == 0) return error.InvalidArgument;
+
+    var connected: [max_pattern_steps]bool = @splat(false);
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (group.edges) |edge| {
+            const from_index = matchNodeIndex(group.nodes, edge.from);
+            const to_index = matchNodeIndex(group.nodes, edge.to);
+            const from_connected = if (from_index) |index| connected[index] else optionalAliasVisibleBefore(pattern, optional_index, edge.from);
+            const to_connected = if (to_index) |index| connected[index] else optionalAliasVisibleBefore(pattern, optional_index, edge.to);
+            if (!from_connected and !to_connected) continue;
+            if (from_index) |index| if (!connected[index]) {
+                connected[index] = true;
+                changed = true;
+            };
+            if (to_index) |index| if (!connected[index]) {
+                connected[index] = true;
+                changed = true;
+            };
+        }
+    }
+    for (connected[0..group.nodes.len]) |is_connected| if (!is_connected) return error.InvalidArgument;
+}
+
+fn optionalAliasVisibleBefore(pattern: ConjunctivePattern, optional_index: usize, alias: []const u8) bool {
+    if (findMatchNode(pattern.nodes, alias) != null) return true;
+    for (pattern.optional[0..optional_index]) |prior_group| {
+        if (findMatchNode(prior_group.nodes, alias) != null) return true;
+    }
+    return false;
+}
+
+fn matchNodeIndex(nodes: []const MatchNode, alias: []const u8) ?usize {
+    for (nodes, 0..) |node, index| if (std.mem.eql(u8, node.alias, alias)) return index;
+    return null;
 }
 
 fn optionalAliasVisible(pattern: ConjunctivePattern, optional_index: usize, alias: []const u8) bool {
@@ -1292,6 +1488,7 @@ fn expandConjunctiveEdge(
         target_nodes,
         target != null,
         0,
+        opts.require_complete,
         opts.evaluator,
         opts.node_admission,
         false,
@@ -1329,7 +1526,7 @@ fn correlatedEdgesExist(alloc: Allocator, edge_reader: anytype, state: Conjuncti
         const from = findBinding(state.bindings, edge.from) orelse return false;
         const to = findBinding(state.bindings, edge.to) orelse return false;
         const targets = [_]node_identity.Ref{.{ .key = to.key, .table = to.table }};
-        const reachable = try findReachableNodes(alloc, edge_reader, from.key, from.table, edge.step, .{}, &targets, true, 1, opts.evaluator, opts.node_admission, false, opts.stats, work_budget);
+        const reachable = try findReachableNodes(alloc, edge_reader, from.key, from.table, edge.step, .{}, &targets, true, 1, false, opts.evaluator, opts.node_admission, false, opts.stats, work_budget);
         defer {
             for (reachable) |*node| node.deinit(alloc);
             if (reachable.len > 0) alloc.free(reachable);
@@ -1734,6 +1931,22 @@ test "conjunctive match supports branches anti joins inequality and optional nul
     try std.testing.expect(saw_liker);
     try std.testing.expect(saw_follower);
     try std.testing.expect(saw_null);
+
+    const specs = [_]CountAggregateSpec{ .{}, .{ .alias = "left", .distinct = true } };
+    const aggregates = try aggregateConjunctivePatternWithEdgeReader(
+        alloc,
+        Reader{},
+        &.{ "a", "x" },
+        .{ .nodes = &nodes, .edges = &required, .predicates = &predicates, .optional = &optional },
+        &specs,
+        .{},
+    );
+    defer {
+        for (aggregates) |*aggregate| aggregate.deinit(alloc);
+        alloc.free(aggregates);
+    }
+    try std.testing.expectEqual(@as(u128, 4), aggregates[0].value);
+    try std.testing.expectEqual(@as(u128, 4), aggregates[1].value);
 }
 
 test "conjunctive optional predicates reject aliases outside their ordered scope" {
@@ -1752,6 +1965,71 @@ test "conjunctive optional predicates reject aliases outside their ordered scope
         .edges = &.{},
         .optional = &optional,
     }));
+}
+
+test "conjunctive validation rejects disconnected and unused aliases" {
+    const disconnected_nodes = [_]MatchNode{ .{ .alias = "a" }, .{ .alias = "b" }, .{ .alias = "unused" } };
+    const disconnected_edges = [_]MatchEdge{.{ .from = "a", .to = "b" }};
+    try std.testing.expectError(error.InvalidArgument, validateConjunctivePattern(.{
+        .nodes = &disconnected_nodes,
+        .edges = &disconnected_edges,
+    }));
+
+    const base_nodes = [_]MatchNode{.{ .alias = "a" }};
+    const optional_nodes = [_]MatchNode{ .{ .alias = "b" }, .{ .alias = "unused" } };
+    const optional_edges = [_]MatchEdge{.{ .from = "a", .to = "b" }};
+    const optional = [_]OptionalPattern{.{ .nodes = &optional_nodes, .edges = &optional_edges }};
+    try std.testing.expectError(error.InvalidArgument, validateConjunctivePattern(.{
+        .nodes = &base_nodes,
+        .edges = &.{},
+        .optional = &optional,
+    }));
+}
+
+test "exact conjunctive aggregate does not inherit row expansion window" {
+    const alloc = std.testing.allocator;
+    var targets: [1001][4]u8 = undefined;
+    for (&targets, 0..) |*target, i| std.mem.writeInt(u32, target, @intCast(i), .little);
+
+    const Reader = struct {
+        targets: []const [4]u8,
+
+        pub fn getEdges(self: @This(), a: Allocator, _: ?[]const u8, key: []const u8, _: []const []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            if (!std.mem.eql(u8, key, "anchor")) return try a.alloc(graph_mod.Edge, 0);
+            const edges = try a.alloc(graph_mod.Edge, self.targets.len);
+            for (edges, self.targets) |*edge, *target| edge.* = .{
+                .source = "anchor",
+                .target = target,
+                .edge_type = "related",
+                .weight = 1,
+                .created_at = 0,
+                .updated_at = 0,
+                .metadata = "",
+            };
+            return edges;
+        }
+
+        pub fn freeEdges(_: @This(), a: Allocator, edges: []graph_mod.Edge) void {
+            if (edges.len > 0) a.free(edges);
+        }
+    };
+
+    const nodes = [_]MatchNode{ .{ .alias = "a" }, .{ .alias = "b" } };
+    const edges = [_]MatchEdge{.{ .from = "a", .to = "b" }};
+    const specs = [_]CountAggregateSpec{.{}};
+    const aggregates = try aggregateConjunctivePatternWithEdgeReader(
+        alloc,
+        Reader{ .targets = &targets },
+        &.{"anchor"},
+        .{ .nodes = &nodes, .edges = &edges },
+        &specs,
+        .{ .max_explored_edges = 2_000, .max_intermediate_states = 2_000 },
+    );
+    defer {
+        for (aggregates) |*aggregate| aggregate.deinit(alloc);
+        alloc.free(aggregates);
+    }
+    try std.testing.expectEqual(@as(u128, targets.len), aggregates[0].value);
 }
 
 test "exact two-edge pattern uses typed batch probes without paths" {

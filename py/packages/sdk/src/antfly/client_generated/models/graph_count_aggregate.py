@@ -5,7 +5,6 @@ from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 
-from ..models.graph_count_aggregate_type import GraphCountAggregateType
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="GraphCountAggregate")
@@ -15,19 +14,15 @@ T = TypeVar("T", bound="GraphCountAggregate")
 class GraphCountAggregate:
     """
     Attributes:
-        type_ (GraphCountAggregateType):
-        of (str): Use `*` to count rows, or an alias to count non-null bindings.
+        count (str): Use `*` to count rows, or an alias to count non-null bindings.
         distinct (bool | Unset):  Default: False.
     """
 
-    type_: GraphCountAggregateType
-    of: str
+    count: str
     distinct: bool | Unset = False
 
     def to_dict(self) -> dict[str, Any]:
-        type_ = self.type_.value
-
-        of = self.of
+        count = self.count
 
         distinct = self.distinct
 
@@ -35,8 +30,7 @@ class GraphCountAggregate:
 
         field_dict.update(
             {
-                "type": type_,
-                "of": of,
+                "count": count,
             }
         )
         if distinct is not UNSET:
@@ -47,15 +41,12 @@ class GraphCountAggregate:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        type_ = GraphCountAggregateType(d.pop("type"))
-
-        of = d.pop("of")
+        count = d.pop("count")
 
         distinct = d.pop("distinct", UNSET)
 
         graph_count_aggregate = cls(
-            type_=type_,
-            of=of,
+            count=count,
             distinct=distinct,
         )
 

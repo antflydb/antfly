@@ -3822,14 +3822,22 @@ pub const GraphAggregateValue = struct {
     exact: bool,
 };
 
+pub const GraphAggregatesReturn = struct {
+    aggregates: std.json.ArrayHashMap(GraphCountAggregate),
+};
+
 pub const GraphAliasOperand = struct {
     alias: []const u8,
 };
 
+pub const GraphBindingsReturn = struct {
+    bindings: []const []const u8,
+    limit: ?i64 = null,
+};
+
 pub const GraphCountAggregate = struct {
-    type: []const u8,
     /// Use `*` to count rows, or an alias to count non-null bindings.
-    of: []const u8,
+    count: []const u8,
     distinct: ?bool = null,
 };
 
@@ -4094,10 +4102,6 @@ pub const GraphQuery = union(enum) {
     }
 };
 
-pub const GraphQueryPage = struct {
-    next_cursor: ?[]const u8 = null,
-};
-
 /// Deprecated graph_searches traversal and path parameters.
 pub const GraphQueryParams = struct {
     edge_types: ?[]const []const u8 = null,
@@ -4127,9 +4131,8 @@ pub const GraphQueryResult = struct {
     matches: ?[]const PatternMatch = null,
     /// Deprecated graph_searches result count; use stats or a named count aggregate.
     total: ?i64 = null,
-    rows: ?[]const std.json.Value = null,
+    rows: ?[]const GraphResultRow = null,
     aggregates: ?std.json.ArrayHashMap(GraphAggregateValue) = null,
-    page: ?GraphQueryPage = null,
     stats: ?GraphQueryStats = null,
     /// Query execution time
     took: ?i64 = null,
@@ -4175,6 +4178,8 @@ pub const GraphQueryType = enum {
     }
 };
 
+pub const GraphResultBinding = std.json.Value;
+
 /// A node in graph query results
 pub const GraphResultNode = struct {
     /// Document key
@@ -4199,27 +4204,56 @@ pub const GraphResultNode = struct {
     edges: ?[]const Edge = null,
 };
 
+pub const GraphResultRow = std.json.Value;
+
 /// Return bindings or exact aggregates. Bindings and aggregates are mutually exclusive.
-pub const GraphReturn = struct {
-    bindings: ?[]const []const u8 = null,
-    limit: ?i64 = null,
-    aggregates: ?std.json.ArrayHashMap(GraphCountAggregate) = null,
+pub const GraphReturn = union(enum) {
+    graph_bindings_return: *GraphBindingsReturn,
+    graph_aggregates_return: *GraphAggregatesReturn,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "bindings",
+            "limit",
+        })) {
+            if (try parseStructuralVariant(GraphBindingsReturn, allocator, source, options)) |parsed| return .{ .graph_bindings_return = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "aggregates",
+        })) {
+            if (try parseStructuralVariant(GraphAggregatesReturn, allocator, source, options)) |parsed| return .{ .graph_aggregates_return = parsed };
+        }
+        return error.UnexpectedToken;
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.bindings) |value| {
-            try jw.objectField("bindings");
-            try jw.write(value);
+        switch (self) {
+            .graph_bindings_return => |v| try jw.write(v.*),
+            .graph_aggregates_return => |v| try jw.write(v.*),
         }
-        if (self.limit) |value| {
-            try jw.objectField("limit");
-            try jw.write(value);
-        }
-        if (self.aggregates) |value| {
-            try jw.objectField("aggregates");
-            try jw.write(value);
-        }
-        try jw.endObject();
     }
 };
 

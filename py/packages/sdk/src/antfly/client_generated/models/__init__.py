@@ -273,9 +273,11 @@ from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDe
 from .google_embedder_config import GoogleEmbedderConfig
 from .google_generator_config import GoogleGeneratorConfig
 from .graph_aggregate_value import GraphAggregateValue
+from .graph_aggregates_return import GraphAggregatesReturn
+from .graph_aggregates_return_aggregates import GraphAggregatesReturnAggregates
 from .graph_alias_operand import GraphAliasOperand
+from .graph_bindings_return import GraphBindingsReturn
 from .graph_count_aggregate import GraphCountAggregate
-from .graph_count_aggregate_type import GraphCountAggregateType
 from .graph_index_config import GraphIndexConfig
 from .graph_index_stats import GraphIndexStats
 from .graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
@@ -301,17 +303,16 @@ from .graph_not_exists_pattern import GraphNotExistsPattern
 from .graph_optional_match import GraphOptionalMatch
 from .graph_optional_match_nodes import GraphOptionalMatchNodes
 from .graph_path_endpoint import GraphPathEndpoint
-from .graph_query_page import GraphQueryPage
 from .graph_query_params import GraphQueryParams
 from .graph_query_params_algorithm_params import GraphQueryParamsAlgorithmParams
 from .graph_query_result import GraphQueryResult
 from .graph_query_result_aggregates import GraphQueryResultAggregates
-from .graph_query_result_rows_item import GraphQueryResultRowsItem
 from .graph_query_stats import GraphQueryStats
 from .graph_query_type import GraphQueryType
 from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
+from .graph_result_row_type_0 import GraphResultRowType0
 from .graph_shortest_path import GraphShortestPath
 from .graph_shortest_path_filter import GraphShortestPathFilter
 from .graph_shortest_path_query import GraphShortestPathQuery
@@ -1065,10 +1066,12 @@ __all__ = (
     "GetDocumentArtifactManifestDetail",
     "GoogleEmbedderConfig",
     "GoogleGeneratorConfig",
+    "GraphAggregatesReturn",
+    "GraphAggregatesReturnAggregates",
     "GraphAggregateValue",
     "GraphAliasOperand",
+    "GraphBindingsReturn",
     "GraphCountAggregate",
-    "GraphCountAggregateType",
     "GraphIndexConfig",
     "GraphIndexStats",
     "GraphIndexStatsAlgebraicGraph",
@@ -1094,17 +1097,16 @@ __all__ = (
     "GraphOptionalMatch",
     "GraphOptionalMatchNodes",
     "GraphPathEndpoint",
-    "GraphQueryPage",
     "GraphQueryParams",
     "GraphQueryParamsAlgorithmParams",
     "GraphQueryResult",
     "GraphQueryResultAggregates",
-    "GraphQueryResultRowsItem",
     "GraphQueryStats",
     "GraphQueryType",
     "GraphResultNode",
     "GraphResultNodeDocument",
     "GraphResultNodeEvidence",
+    "GraphResultRowType0",
     "GraphShortestPath",
     "GraphShortestPathFilter",
     "GraphShortestPathQuery",

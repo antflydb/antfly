@@ -18,6 +18,7 @@ const graph_mod = @import("../../graph/graph.zig");
 const traversal_mod = @import("../../graph/traversal.zig");
 const paths_mod = @import("../../graph/paths.zig");
 const graph_query_mod = @import("../../graph/query.zig");
+const graph_node_identity = @import("../../graph/node_identity.zig");
 const fusion_mod = @import("../../search/fusion.zig");
 const distributed_stats_mod = @import("../../search/distributed_stats.zig");
 const docstore_mod = @import("../docstore.zig");
@@ -2005,6 +2006,7 @@ pub const GraphSearchResult = struct {
     aggregates: []GraphAggregateResult = &.{},
     hits: []SearchHit,
     total_hits: u32,
+    truncated: bool = false,
 
     pub fn deinit(self: *GraphSearchResult, alloc: Allocator) void {
         alloc.free(self.name);
@@ -2026,9 +2028,17 @@ pub const GraphAggregateResult = struct {
     name: []u8,
     value: u128,
     exact: bool = true,
+    /// Exact shard-merge payload for count(distinct alias). This is internal
+    /// execution data and is never exposed by the public response contract.
+    distinct_values: []graph_node_identity.Ref = &.{},
 
     pub fn deinit(self: *GraphAggregateResult, alloc: Allocator) void {
         alloc.free(self.name);
+        for (self.distinct_values) |value| {
+            if (value.table) |table| alloc.free(table);
+            alloc.free(value.key);
+        }
+        if (self.distinct_values.len > 0) alloc.free(self.distinct_values);
         self.* = undefined;
     }
 };

@@ -106,6 +106,9 @@ pub const GraphQuery = struct {
     pattern: []const pattern_mod.PatternStep = &.{},
     match_pattern: ?pattern_mod.ConjunctivePattern = null,
     return_aliases: []const []const u8 = &.{},
+    /// Query-wide row limit for canonical MATCH results. Shards may over-fetch
+    /// to let the coordinator determine truncation accurately.
+    return_limit: u32 = 0,
     aggregates: []const NamedCountAggregate = &.{},
     include_documents: bool = false,
     fields: []const []const u8 = &.{},

@@ -3689,8 +3689,10 @@ fn validateGeneratedQueryBuilderGraphQuery(
     switch (query) {
         .graph_match_query => |match_query| {
             if (match_query.match.nodes.map.count() == 0) return error.InvalidQueryBuilderGeneration;
-            if (match_query.@"return".bindings == null and match_query.@"return".aggregates == null) return error.InvalidQueryBuilderGeneration;
-            if (match_query.@"return".bindings != null and match_query.@"return".aggregates != null) return error.InvalidQueryBuilderGeneration;
+            switch (match_query.@"return") {
+                .graph_bindings_return => |return_value| if (return_value.bindings.len == 0) return error.InvalidQueryBuilderGeneration,
+                .graph_aggregates_return => |return_value| if (return_value.aggregates.map.count() == 0) return error.InvalidQueryBuilderGeneration,
+            }
         },
         .graph_traverse_query => |traverse_query| try validateGeneratedGraphNodeSelector(traverse_query.traverse.start),
         .graph_shortest_path_query => |path_query| if (path_query.shortest_path.from.key.len == 0 or path_query.shortest_path.to.key.len == 0) return error.InvalidQueryBuilderGeneration,
@@ -4792,10 +4794,12 @@ fn queryBuilderInferredGraphSearches(
             }
         }
         const return_alias = try queryBuilderPatternAlias(alloc, edge_count);
+        const return_value = try alloc.create(indexes_openapi.GraphBindingsReturn);
+        return_value.* = .{ .bindings = try alloc.dupe([]const u8, &[_][]const u8{return_alias}) };
         query.* = .{
             .index = try alloc.dupe(u8, std.mem.trim(u8, index, " \t\r\n")),
             .match = .{ .nodes = nodes, .edges = edges },
-            .@"return" = .{ .bindings = try alloc.dupe([]const u8, &[_][]const u8{return_alias}) },
+            .@"return" = .{ .graph_bindings_return = return_value },
         };
         try graph_queries.map.put(alloc, "graph_search", .{ .graph_match_query = query });
         return graph_queries;
@@ -9758,7 +9762,7 @@ test "query builder infers graph multi hop pattern from intent" {
     try std.testing.expectEqual(@as(i64, 1), match_query.match.edges[0].max_hops.?);
     try std.testing.expectEqualStrings("b", match_query.match.edges[1].from);
     try std.testing.expectEqualStrings("c", match_query.match.edges[1].to);
-    try std.testing.expectEqualStrings("c", match_query.@"return".bindings.?[0]);
+    try std.testing.expectEqualStrings("c", match_query.@"return".graph_bindings_return.bindings[0]);
 }
 
 test "query builder maps tree search into retrieval query request" {

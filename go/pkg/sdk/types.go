@@ -276,6 +276,9 @@ type (
 	GraphKShortestPathsQuery = oapi.GraphKShortestPathsQuery
 	GraphMatch               = oapi.GraphMatch
 	GraphReturn              = oapi.GraphReturn
+	GraphBindingsReturn      = oapi.GraphBindingsReturn
+	GraphAggregatesReturn    = oapi.GraphAggregatesReturn
+	GraphCountAggregate      = oapi.GraphCountAggregate
 	GraphWhereExpression     = oapi.GraphWhereExpression
 
 	// Graph traversal types

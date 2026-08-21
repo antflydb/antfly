@@ -21,6 +21,7 @@ const hierarchy_navigation = @import("../storage/hierarchy_navigation.zig");
 const graph_pattern_mod = @import("../graph/pattern.zig");
 const graph_query_mod = @import("../graph/query.zig");
 const graph_mod = @import("../graph/graph.zig");
+const graph_node_identity = @import("../graph/node_identity.zig");
 const fusion_mod = @import("../search/fusion.zig");
 const aggregations_mod = @import("../storage/db/aggregations.zig");
 const public_search_request_mod = @import("public_search_request.zig");
@@ -5152,7 +5153,7 @@ fn toOpenApiGraphQueryResult(
         .aggregates = aggregates,
         .stats = .{
             .returned_rows = @intCast(if (rows) |items| items.len else 0),
-            .truncated = query.params.max_results > 0 and graph_result.matches.len >= query.params.max_results,
+            .truncated = graph_result.truncated,
         },
         .took = meta.took_ms,
     };
@@ -5277,17 +5278,14 @@ fn countGraphAlias(
     distinct: bool,
 ) !usize {
     var count: usize = 0;
-    var seen = std.StringHashMapUnmanaged(void).empty;
+    var seen = graph_node_identity.Map(void){};
     defer seen.deinit(alloc);
     for (matches) |match| {
         for (match.bindings) |binding| {
             if (!std.mem.eql(u8, binding.alias, alias)) continue;
             if (!distinct) {
                 count += 1;
-            } else {
-                const gop = try seen.getOrPut(alloc, binding.node.key);
-                if (!gop.found_existing) count += 1;
-            }
+            } else if (try seen.putIfAbsent(alloc, .{ .table = binding.node.table, .key = binding.node.key }, {})) count += 1;
             break;
         }
     }
@@ -8746,38 +8744,48 @@ fn parseGraphMatchQuery(alloc: std.mem.Allocator, value: indexes_openapi.GraphMa
     const optional = if (value.match.optional) |groups| try parseGraphOptionalPatterns(alloc, groups) else &.{};
     errdefer freeGraphOptionalPatterns(alloc, optional);
 
-    const has_bindings = value.@"return".bindings != null;
-    const has_aggregates = value.@"return".aggregates != null;
-    if (has_bindings == has_aggregates) return error.InvalidQueryRequest;
-    if (value.@"return".bindings) |items| {
+    const bindings_return: ?*const indexes_openapi.GraphBindingsReturn = switch (value.@"return") {
+        .graph_bindings_return => |return_value| return_value,
+        .graph_aggregates_return => null,
+    };
+    const aggregates_return: ?*const indexes_openapi.GraphAggregatesReturn = switch (value.@"return") {
+        .graph_bindings_return => null,
+        .graph_aggregates_return => |return_value| return_value,
+    };
+    if (bindings_return) |return_value| {
+        const items = return_value.bindings;
         if (items.len == 0) return error.InvalidQueryRequest;
         for (items) |alias| {
             if (!graphAliasIsDeclared(nodes, optional, alias)) return error.InvalidQueryRequest;
         }
     }
-    if (value.@"return".aggregates) |items| {
+    if (aggregates_return) |return_value| {
+        const items = return_value.aggregates;
         var aggregate_it = items.map.iterator();
         while (aggregate_it.next()) |entry| {
             const aggregate = entry.value_ptr.*;
-            if (std.mem.eql(u8, aggregate.of, "*")) {
+            if (std.mem.eql(u8, aggregate.count, "*")) {
                 if (aggregate.distinct == true) return error.InvalidQueryRequest;
-            } else if (!graphAliasIsDeclared(nodes, optional, aggregate.of)) {
+            } else if (!graphAliasIsDeclared(nodes, optional, aggregate.count)) {
                 return error.InvalidQueryRequest;
             }
         }
     }
-    const aliases = if (value.@"return".bindings) |items| try cloneFields(alloc, items) else &.{};
+    const aliases = if (bindings_return) |return_value| try cloneFields(alloc, return_value.bindings) else &.{};
     errdefer freeOwnedStringSlice(alloc, aliases);
-    const aggregates = if (value.@"return".aggregates) |items| try parseGraphCountAggregates(alloc, items) else &.{};
+    const aggregates = if (aggregates_return) |return_value| try parseGraphCountAggregates(alloc, return_value.aggregates) else &.{};
     errdefer freeGraphCountAggregates(alloc, aggregates);
-    const limit = if (has_aggregates) 0 else try parseGraphBoundedU32(value.@"return".limit, 100, 1, 10_000);
+    const limit = if (bindings_return) |return_value| try parseGraphBoundedU32(return_value.limit, 100, 1, 10_000) else 0;
+    const match_pattern = graph_pattern_mod.ConjunctivePattern{ .nodes = nodes, .edges = edges, .predicates = predicates, .optional = optional };
+    graph_pattern_mod.validateConjunctivePattern(match_pattern) catch return error.InvalidQueryRequest;
     return .{
         .query_type = .pattern,
         .index_name = index,
         .start_nodes = .{ .result_ref = .{ .ref = base_ref, .limit = 0 } },
         .params = .{ .max_results = limit },
-        .match_pattern = .{ .nodes = nodes, .edges = edges, .predicates = predicates, .optional = optional },
+        .match_pattern = match_pattern,
         .return_aliases = aliases,
+        .return_limit = limit,
         .aggregates = aggregates,
     };
 }
@@ -8925,10 +8933,9 @@ fn parseGraphCountAggregates(alloc: std.mem.Allocator, value: std.json.ArrayHash
     }
     var it = value.map.iterator();
     while (it.next()) |entry| {
-        if (!std.mem.eql(u8, entry.value_ptr.type, "count")) return error.InvalidQueryRequest;
         const name = try alloc.dupe(u8, entry.key_ptr.*);
         errdefer alloc.free(name);
-        const of = try alloc.dupe(u8, entry.value_ptr.of);
+        const of = try alloc.dupe(u8, entry.value_ptr.count);
         errdefer alloc.free(of);
         aggregates[initialized] = .{
             .name = name,

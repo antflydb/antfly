@@ -21,6 +21,7 @@ const hierarchy_navigation = @import("../storage/hierarchy_navigation.zig");
 const runtime_schema_mod = @import("../storage/schema.zig");
 const graph_paths = @import("../graph/paths.zig");
 const graph_query_mod = @import("../graph/query.zig");
+const graph_node_identity = @import("../graph/node_identity.zig");
 const query_contract = @import("query_contract.zig");
 
 pub const QueryResponse = query_contract.QueryResponse;
@@ -879,6 +880,7 @@ const GraphSearchResultBuilder = struct {
     aggregates: std.ArrayListUnmanaged(db_mod.types.GraphAggregateResult) = .empty,
     hits: std.ArrayListUnmanaged(db_mod.types.SearchHit) = .empty,
     total_hits: u32 = 0,
+    truncated: bool = false,
 
     fn deinit(self: *GraphSearchResultBuilder, alloc: std.mem.Allocator) void {
         if (self.name.len > 0) alloc.free(self.name);
@@ -932,6 +934,7 @@ const GraphSearchResultBuilder = struct {
             .aggregates = aggregates,
             .hits = hits,
             .total_hits = self.total_hits,
+            .truncated = self.truncated,
         };
     }
 };
@@ -962,6 +965,7 @@ fn mergeGraphSearchResults(
             };
             var builder = &builders.items[idx];
             builder.total_hits +|= graph_result.total_hits;
+            builder.truncated = builder.truncated or graph_result.truncated;
 
             for (graph_result.nodes) |node| {
                 var owned = try cloneGraphResultNode(alloc, node);
@@ -978,6 +982,11 @@ fn mergeGraphSearchResults(
                 };
             }
             for (graph_result.matches) |match| {
+                const limit = graphQueryReturnLimit(queries, graph_result.name);
+                if (limit > 0 and builder.matches.items.len >= limit) {
+                    builder.truncated = true;
+                    continue;
+                }
                 var owned = try cloneGraphPatternMatch(alloc, match);
                 builder.matches.append(alloc, owned) catch |err| {
                     owned.deinit(alloc);
@@ -988,24 +997,29 @@ fn mergeGraphSearchResults(
                 var found = false;
                 for (builder.aggregates.items) |*existing| {
                     if (!std.mem.eql(u8, existing.name, aggregate.name)) continue;
-                    existing.value = std.math.add(u128, existing.value, aggregate.value) catch return error.Overflow;
                     existing.exact = existing.exact and aggregate.exact;
                     if (graphAggregateIsDistinct(queries, graph_result.name, aggregate.name)) {
-                        // A shard-local distinct count cannot be summed exactly when
-                        // the same binding may occur on more than one shard.
-                        existing.exact = false;
+                        try mergeDistinctGraphAggregate(alloc, existing, aggregate);
+                    } else {
+                        existing.value = std.math.add(u128, existing.value, aggregate.value) catch return error.Overflow;
                     }
                     found = true;
                     break;
                 }
                 if (!found) {
                     const name = try alloc.dupe(u8, aggregate.name);
+                    const distinct_values = cloneGraphNodeRefs(alloc, aggregate.distinct_values) catch |err| {
+                        alloc.free(name);
+                        return err;
+                    };
                     builder.aggregates.append(alloc, .{
                         .name = name,
                         .value = aggregate.value,
                         .exact = aggregate.exact,
+                        .distinct_values = distinct_values,
                     }) catch |err| {
                         alloc.free(name);
+                        freeGraphNodeRefs(alloc, distinct_values);
                         return err;
                     };
                 }
@@ -1046,6 +1060,86 @@ fn graphAggregateIsDistinct(
         return false;
     }
     return false;
+}
+
+fn graphQueryReturnLimit(
+    queries: []const db_mod.types.NamedGraphQuery,
+    query_name: []const u8,
+) u32 {
+    for (queries) |named| {
+        if (std.mem.eql(u8, named.name, query_name)) return named.query.return_limit;
+    }
+    return 0;
+}
+
+fn mergeDistinctGraphAggregate(
+    alloc: std.mem.Allocator,
+    existing: *db_mod.types.GraphAggregateResult,
+    incoming: db_mod.types.GraphAggregateResult,
+) !void {
+    if ((existing.value > 0 and existing.distinct_values.len == 0) or
+        (incoming.value > 0 and incoming.distinct_values.len == 0))
+        return error.InvalidQueryRequest;
+
+    var seen = graph_node_identity.Map(void){};
+    defer seen.deinit(alloc);
+    for (existing.distinct_values) |value| {
+        _ = try seen.putIfAbsent(alloc, value, {});
+    }
+
+    var merged = std.ArrayListUnmanaged(graph_node_identity.Ref).empty;
+    errdefer {
+        for (merged.items) |value| {
+            if (value.table) |table| alloc.free(table);
+            alloc.free(value.key);
+        }
+        merged.deinit(alloc);
+    }
+    try merged.ensureTotalCapacity(alloc, existing.distinct_values.len + incoming.distinct_values.len);
+    for (existing.distinct_values) |value| try appendClonedGraphNodeRef(alloc, &merged, value);
+    for (incoming.distinct_values) |value| {
+        if (!try seen.putIfAbsent(alloc, value, {})) continue;
+        try appendClonedGraphNodeRef(alloc, &merged, value);
+    }
+
+    const owned = try merged.toOwnedSlice(alloc);
+    freeGraphNodeRefs(alloc, existing.distinct_values);
+    existing.distinct_values = owned;
+    existing.value = existing.distinct_values.len;
+}
+
+fn cloneGraphNodeRefs(alloc: std.mem.Allocator, values: []const graph_node_identity.Ref) ![]graph_node_identity.Ref {
+    var out = std.ArrayListUnmanaged(graph_node_identity.Ref).empty;
+    errdefer {
+        for (out.items) |value| {
+            if (value.table) |table| alloc.free(table);
+            alloc.free(value.key);
+        }
+        out.deinit(alloc);
+    }
+    try out.ensureTotalCapacity(alloc, values.len);
+    for (values) |value| try appendClonedGraphNodeRef(alloc, &out, value);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendClonedGraphNodeRef(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(graph_node_identity.Ref),
+    value: graph_node_identity.Ref,
+) !void {
+    const table = if (value.table) |table_name| try alloc.dupe(u8, table_name) else null;
+    errdefer if (table) |table_name| alloc.free(table_name);
+    const key = try alloc.dupe(u8, value.key);
+    errdefer alloc.free(key);
+    try out.append(alloc, .{ .table = table, .key = key });
+}
+
+fn freeGraphNodeRefs(alloc: std.mem.Allocator, values: []const graph_node_identity.Ref) void {
+    for (values) |value| {
+        if (value.table) |table| alloc.free(table);
+        alloc.free(value.key);
+    }
+    if (values.len > 0) alloc.free(values);
 }
 
 fn cloneGraphSearchResult(
@@ -1105,11 +1199,12 @@ fn cloneGraphSearchResult(
         if (source.aggregates.len > 0) alloc.free(aggregates);
     }
     for (source.aggregates, 0..) |aggregate, i| {
-        aggregates[i] = .{
-            .name = try alloc.dupe(u8, aggregate.name),
-            .value = aggregate.value,
-            .exact = aggregate.exact,
+        const name = try alloc.dupe(u8, aggregate.name);
+        const distinct_values = cloneGraphNodeRefs(alloc, aggregate.distinct_values) catch |err| {
+            alloc.free(name);
+            return err;
         };
+        aggregates[i] = .{ .name = name, .value = aggregate.value, .exact = aggregate.exact, .distinct_values = distinct_values };
         initialized_aggregates += 1;
     }
 
@@ -1121,6 +1216,7 @@ fn cloneGraphSearchResult(
         .aggregates = aggregates,
         .hits = hits,
         .total_hits = source.total_hits,
+        .truncated = source.truncated,
     };
 }
 
@@ -1787,7 +1883,7 @@ test "query parser accepts graph pattern searches" {
 
 test "query parser accepts exact graph count aggregates" {
     var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"graph_queries":{"pattern_count":{"index":"graph_idx","match":{"nodes":{"a":{}},"edges":[]},"return":{"aggregates":{"count":{"type":"count","of":"*"}}}}},"limit":10}
+        \\{"graph_queries":{"pattern_count":{"index":"graph_idx","match":{"nodes":{"a":{}},"edges":[]},"return":{"aggregates":{"count":{"count":"*"}}}}},"limit":10}
     );
     defer owned.deinit(std.testing.allocator);
 
@@ -3134,6 +3230,56 @@ test "query merge preserves graph table provenance under allocation failure" {
         expectGraphTableProvenanceMerge,
         .{},
     );
+}
+
+test "graph merge enforces query-wide row limit and exact distinct identity" {
+    const alloc = std.testing.allocator;
+    var binding_a = [_]db_mod.types.GraphPatternBinding{.{ .alias = @constCast("n"), .node = .{ .key = @constCast("shared"), .table = @constCast("people"), .depth = 0, .distance = 0, .path = &.{}, .path_edges = &.{} } }};
+    var binding_b = [_]db_mod.types.GraphPatternBinding{.{ .alias = @constCast("n"), .node = .{ .key = @constCast("other"), .table = @constCast("people"), .depth = 0, .distance = 0, .path = &.{}, .path_edges = &.{} } }};
+    var binding_c = [_]db_mod.types.GraphPatternBinding{.{ .alias = @constCast("n"), .node = .{ .key = @constCast("shared"), .table = @constCast("companies"), .depth = 0, .distance = 0, .path = &.{}, .path_edges = &.{} } }};
+    var shard_one_matches = [_]db_mod.types.GraphPatternMatch{ .{ .bindings = &binding_a, .path = &.{} }, .{ .bindings = &binding_b, .path = &.{} } };
+    var shard_two_matches = [_]db_mod.types.GraphPatternMatch{.{ .bindings = &binding_c, .path = &.{} }};
+    var shard_one_distinct = [_]graph_node_identity.Ref{.{ .table = "people", .key = "shared" }};
+    var shard_two_distinct = [_]graph_node_identity.Ref{ .{ .table = "people", .key = "shared" }, .{ .table = "companies", .key = "shared" } };
+    var shard_one_aggregates = [_]db_mod.types.GraphAggregateResult{.{ .name = @constCast("unique"), .value = 1, .distinct_values = &shard_one_distinct }};
+    var shard_two_aggregates = [_]db_mod.types.GraphAggregateResult{.{ .name = @constCast("unique"), .value = 2, .distinct_values = &shard_two_distinct }};
+    var first_graph = [_]db_mod.types.GraphSearchResult{
+        .{ .name = @constCast("rows"), .matches = &shard_one_matches, .hits = &.{}, .total_hits = 2 },
+        .{ .name = @constCast("distinct"), .aggregates = &shard_one_aggregates, .hits = &.{}, .total_hits = 0 },
+    };
+    var second_graph = [_]db_mod.types.GraphSearchResult{
+        .{ .name = @constCast("rows"), .matches = &shard_two_matches, .hits = &.{}, .total_hits = 1 },
+        .{ .name = @constCast("distinct"), .aggregates = &shard_two_aggregates, .hits = &.{}, .total_hits = 0 },
+    };
+    const shard_results = [_]db_mod.types.SearchResult{
+        .{ .alloc = alloc, .hits = &.{}, .total_hits = 0, .graph_results = &first_graph },
+        .{ .alloc = alloc, .hits = &.{}, .total_hits = 0, .graph_results = &second_graph },
+    };
+    const aggregates = [_]graph_query_mod.NamedCountAggregate{.{ .name = "unique", .of = "n", .distinct = true }};
+    const queries = [_]db_mod.types.NamedGraphQuery{
+        .{ .name = "rows", .query = .{
+            .query_type = .pattern,
+            .index_name = "graph",
+            .start_nodes = .{ .keys = &.{} },
+            .return_limit = 2,
+        } },
+        .{ .name = "distinct", .query = .{
+            .query_type = .pattern,
+            .index_name = "graph",
+            .start_nodes = .{ .keys = &.{} },
+            .aggregates = &aggregates,
+        } },
+    };
+
+    const merged = try mergeGraphSearchResults(alloc, &queries, &shard_results);
+    defer {
+        for (merged) |*result| result.deinit(alloc);
+        alloc.free(merged);
+    }
+    try std.testing.expectEqual(@as(usize, 2), merged[0].matches.len);
+    try std.testing.expect(merged[0].truncated);
+    try std.testing.expectEqual(@as(u128, 2), merged[1].aggregates[0].value);
+    try std.testing.expectEqual(@as(usize, 2), merged[1].aggregates[0].distinct_values.len);
 }
 
 test "query merge preserves lower-bound total relation" {

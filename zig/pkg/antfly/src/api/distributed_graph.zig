@@ -716,7 +716,7 @@ pub fn supportsCrossRange(req: db_mod.types.SearchRequest) bool {
                 if (graph_query.query.k == 0) return false;
             },
             .pattern => {
-                if (graph_query.query.pattern.len == 0) return false;
+                if (graph_query.query.pattern.len == 0 and graph_query.query.match_pattern == null) return false;
             },
         }
     }
@@ -1485,6 +1485,19 @@ fn executeDistributedPattern(
         .admission = admission,
     };
 
+    if (graph_query.query.match_pattern) |conjunctive_pattern| {
+        return try executeDistributedConjunctivePattern(
+            alloc,
+            edge_reader,
+            req,
+            graph_query,
+            frontier,
+            conjunctive_pattern,
+            admission,
+            &state,
+        );
+    }
+
     // Run pattern matching with distributed edges.
     const raw_matches = try graph_pattern_mod.matchPatternFromRefsWithEdgeReader(
         alloc,
@@ -1539,6 +1552,152 @@ fn executeDistributedPattern(
         .total_hits = @intCast(raw_matches.len),
     };
 }
+
+fn executeDistributedConjunctivePattern(
+    alloc: std.mem.Allocator,
+    edge_reader: DistributedEdgeReader,
+    req: db_mod.types.SearchRequest,
+    graph_query: db_mod.types.NamedGraphQuery,
+    frontier: []const FrontierState,
+    pattern: graph_pattern_mod.ConjunctivePattern,
+    admission: *GraphNodeAdmissionContext,
+    state: *QueryState,
+) !db_mod.types.GraphSearchResult {
+    const start_keys = try alloc.alloc([]const u8, frontier.len);
+    defer alloc.free(start_keys);
+    for (frontier, 0..) |item, i| start_keys[i] = item.key;
+
+    var filter_evaluator = DistributedPatternFilterEvaluator{ .admission = admission };
+    defer filter_evaluator.deinit();
+    const opts = graph_pattern_mod.MatchOptions{
+        .max_results = if (graph_query.query.return_limit > 0)
+            std.math.add(u32, graph_query.query.return_limit, 1) catch graph_query.query.return_limit
+        else
+            graph_query.query.params.max_results,
+        .return_aliases = graph_query.query.return_aliases,
+        .include_paths = false,
+        .evaluator = .{ .ctx = &filter_evaluator, .func = DistributedPatternFilterEvaluator.evaluate },
+        .node_admission = admission.iface(),
+    };
+
+    if (graph_query.query.aggregates.len > 0) {
+        const specs = try alloc.alloc(graph_pattern_mod.CountAggregateSpec, graph_query.query.aggregates.len);
+        defer alloc.free(specs);
+        for (graph_query.query.aggregates, 0..) |aggregate, i| specs[i] = .{
+            .alias = if (std.mem.eql(u8, aggregate.of, "*")) null else aggregate.of,
+            .distinct = aggregate.distinct,
+        };
+        const computed = try graph_pattern_mod.aggregateConjunctivePatternWithEdgeReader(
+            alloc,
+            edge_reader,
+            start_keys,
+            pattern,
+            specs,
+            opts,
+        );
+        defer {
+            for (computed) |*aggregate| aggregate.deinit(alloc);
+            if (computed.len > 0) alloc.free(computed);
+        }
+        const aggregates = try alloc.alloc(db_mod.types.GraphAggregateResult, computed.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (aggregates[0..initialized]) |*aggregate| aggregate.deinit(alloc);
+            if (aggregates.len > 0) alloc.free(aggregates);
+        }
+        for (computed, 0..) |*aggregate, i| {
+            aggregates[i] = .{
+                .name = try alloc.dupe(u8, graph_query.query.aggregates[i].name),
+                .value = aggregate.value,
+                .distinct_values = aggregate.distinct_values,
+            };
+            aggregate.distinct_values = &.{};
+            initialized += 1;
+        }
+        const name = state.name;
+        state.name = &.{};
+        return .{ .name = name, .aggregates = aggregates, .hits = &.{}, .total_hits = 0 };
+    }
+
+    const raw_matches = try graph_pattern_mod.matchConjunctivePatternWithEdgeReader(
+        alloc,
+        edge_reader,
+        start_keys,
+        pattern,
+        opts,
+    );
+    defer graph_pattern_mod.freeMatches(alloc, raw_matches);
+    const result_len = if (graph_query.query.return_limit > 0)
+        @min(raw_matches.len, graph_query.query.return_limit)
+    else
+        raw_matches.len;
+    const matches = try convertPatternMatches(alloc, raw_matches[0..result_len]);
+    errdefer {
+        for (matches) |*match| match.deinit(alloc);
+        if (matches.len > 0) alloc.free(matches);
+    }
+    const unique_nodes = try graph_query_mod.collectUniqueNodesFromMatches(alloc, raw_matches[0..result_len]);
+    defer {
+        for (unique_nodes) |*node| node.deinit(alloc);
+        if (unique_nodes.len > 0) alloc.free(unique_nodes);
+    }
+    const hits = if (graph_query.query.include_documents or req.expand_strategy != null)
+        try hydrateHitsForResultNodes(alloc, admission, unique_nodes)
+    else
+        try alloc.alloc(db_mod.types.SearchHit, 0);
+    const name = state.name;
+    state.name = &.{};
+    return .{
+        .name = name,
+        .matches = matches,
+        .hits = hits,
+        .total_hits = @intCast(raw_matches.len),
+        .truncated = graph_query.query.return_limit > 0 and raw_matches.len > graph_query.query.return_limit,
+    };
+}
+
+const DistributedPatternFilterEvaluator = struct {
+    admission: *GraphNodeAdmissionContext,
+    contexts: std.StringArrayHashMapUnmanaged(GraphNodeAdmissionContext) = .empty,
+
+    fn evaluate(ctx: ?*anyopaque, node: graph_node_identity.Ref, filter: graph_pattern_mod.NodeFilter) anyerror!bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        if (filter.filter_query_json == null) return true;
+        const scoped = try self.contextFor(filter);
+        const nodes = [_]graph_node_admission.NodeRef{.{ .table = node.table, .key = node.key }};
+        const decisions = try GraphNodeAdmissionContext.filterMany(scoped, self.admission.alloc, &nodes);
+        defer self.admission.alloc.free(decisions);
+        return decisions[0];
+    }
+
+    fn contextFor(self: *@This(), filter: graph_pattern_mod.NodeFilter) !*GraphNodeAdmissionContext {
+        const encoded = filter.filter_query_json orelse return error.InvalidArgument;
+        if (self.contexts.getPtr(encoded)) |context| return context;
+        var request = db_mod.types.SearchRequest{};
+        request.graph_table_read_authorizer = self.admission.table_authorizer;
+        var scoped = GraphNodeAdmissionContext.init(
+            self.admission.alloc,
+            self.admission.catalog,
+            self.admission.worker,
+            self.admission.source_table,
+            self.admission.source_topology_epoch,
+            request,
+            self.admission.source_identity_read_generation,
+            self.admission.source_identity_read_generations,
+            filter,
+            self.admission.consistency,
+        );
+        errdefer scoped.deinit();
+        try self.contexts.put(self.admission.alloc, encoded, scoped);
+        return self.contexts.getPtr(encoded).?;
+    }
+
+    fn deinit(self: *@This()) void {
+        for (self.contexts.values()) |*context| context.deinit();
+        self.contexts.deinit(self.admission.alloc);
+        self.* = undefined;
+    }
+};
 
 fn convertPatternMatches(
     alloc: std.mem.Allocator,
@@ -5084,6 +5243,7 @@ pub fn cloneGraphSearchResult(
         .aggregates = aggregates,
         .hits = hits,
         .total_hits = src.total_hits,
+        .truncated = src.truncated,
     };
 }
 
@@ -6351,10 +6511,29 @@ fn cloneGraphAggregates(
         alloc.free(out);
     }
     for (aggregates, 0..) |aggregate, i| {
+        const distinct_values = try alloc.alloc(graph_node_identity.Ref, aggregate.distinct_values.len);
+        var distinct_initialized: usize = 0;
+        errdefer {
+            for (distinct_values[0..distinct_initialized]) |identity| {
+                if (identity.table) |table| alloc.free(table);
+                alloc.free(identity.key);
+            }
+            if (distinct_values.len > 0) alloc.free(distinct_values);
+        }
+        for (aggregate.distinct_values, 0..) |identity, identity_index| {
+            const table = if (identity.table) |table_name| try alloc.dupe(u8, table_name) else null;
+            errdefer if (table) |table_name| alloc.free(table_name);
+            distinct_values[identity_index] = .{
+                .table = table,
+                .key = try alloc.dupe(u8, identity.key),
+            };
+            distinct_initialized += 1;
+        }
         out[i] = .{
             .name = try alloc.dupe(u8, aggregate.name),
             .value = aggregate.value,
             .exact = aggregate.exact,
+            .distinct_values = distinct_values,
         };
         initialized += 1;
     }

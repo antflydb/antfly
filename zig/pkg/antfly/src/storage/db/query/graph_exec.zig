@@ -77,6 +77,12 @@ pub const PatternQueryExecutor = struct {
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
     ) anyerror![]graph_pattern_mod.PatternMatch = null,
+    aggregate_conjunctive: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        named: *const types.NamedGraphQuery,
+        start_key_refs: []const []const u8,
+    ) anyerror![]types.GraphAggregateResult = null,
     load_projected_document: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -1012,6 +1018,29 @@ pub fn executeSinglePatternQueryWithSets(
     const start_key_refs = try castOwnedKeysToConst(alloc, start_keys);
     defer alloc.free(start_key_refs);
 
+    if (named.query.match_pattern != null and named.query.aggregates.len > 0 and
+        (executor.predicate_aware or !searchRequestHasGraphPredicates(req)))
+    {
+        if (executor.aggregate_conjunctive) |aggregate_conjunctive| {
+            const aggregates = try aggregate_conjunctive(
+                try graphExecutionContext(executor.predicate_aware, executor.graph_ctx, executor.ctx),
+                alloc,
+                named,
+                start_key_refs,
+            );
+            errdefer {
+                for (aggregates) |*aggregate| aggregate.deinit(alloc);
+                if (aggregates.len > 0) alloc.free(aggregates);
+            }
+            return .{
+                .name = try alloc.dupe(u8, named.name),
+                .aggregates = aggregates,
+                .hits = &.{},
+                .total_hits = 0,
+            };
+        }
+    }
+
     var target_keys = if (named.query.target_nodes) |target_nodes|
         try resolveGraphSelectorFromSets(alloc, target_nodes, named_sets, .{
             .ctx = executor.ctx,
@@ -1094,12 +1123,22 @@ fn computePatternAggregates(
         alloc.free(out);
     }
     for (requested, 0..) |aggregate, i| {
-        out[i] = .{
-            .name = try alloc.dupe(u8, aggregate.name),
-            .value = if (std.mem.eql(u8, aggregate.of, "*"))
-                @intCast(matches.len)
+        out[i] = blk: {
+            const distinct_values = if (aggregate.distinct)
+                try collectDistinctPatternAlias(alloc, matches, aggregate.of)
             else
-                try countPatternAlias(alloc, matches, aggregate.of, aggregate.distinct),
+                @constCast((&[_]graph_node_identity.Ref{})[0..]);
+            errdefer freeOwnedNodeRefs(alloc, distinct_values);
+            break :blk .{
+                .name = try alloc.dupe(u8, aggregate.name),
+                .value = if (std.mem.eql(u8, aggregate.of, "*"))
+                    @intCast(matches.len)
+                else if (aggregate.distinct)
+                    @intCast(distinct_values.len)
+                else
+                    try countPatternAlias(matches, aggregate.of),
+                .distinct_values = distinct_values,
+            };
         };
         initialized += 1;
     }
@@ -1107,27 +1146,81 @@ fn computePatternAggregates(
 }
 
 fn countPatternAlias(
-    alloc: Allocator,
     matches: []const types.GraphPatternMatch,
     alias: []const u8,
-    distinct: bool,
 ) !u128 {
     var count: u128 = 0;
-    var seen = std.StringHashMapUnmanaged(void).empty;
-    defer seen.deinit(alloc);
     for (matches) |match| {
         for (match.bindings) |binding| {
             if (!std.mem.eql(u8, binding.alias, alias)) continue;
-            if (!distinct) {
-                count += 1;
-            } else {
-                const gop = try seen.getOrPut(alloc, binding.node.key);
-                if (!gop.found_existing) count += 1;
-            }
+            count += 1;
             break;
         }
     }
     return count;
+}
+
+fn collectDistinctPatternAlias(
+    alloc: Allocator,
+    matches: []const types.GraphPatternMatch,
+    alias: []const u8,
+) ![]graph_node_identity.Ref {
+    var seen = graph_node_identity.Map(void){};
+    defer seen.deinit(alloc);
+    var values = std.ArrayListUnmanaged(graph_node_identity.Ref).empty;
+    errdefer {
+        for (values.items) |value| {
+            if (value.table) |table| alloc.free(table);
+            alloc.free(value.key);
+        }
+        values.deinit(alloc);
+    }
+    for (matches) |match| {
+        for (match.bindings) |binding| {
+            if (!std.mem.eql(u8, binding.alias, alias)) continue;
+            if (try seen.putIfAbsent(alloc, .{ .table = binding.node.table, .key = binding.node.key }, {})) {
+                const table = if (binding.node.table) |table_name| try alloc.dupe(u8, table_name) else null;
+                errdefer if (table) |table_name| alloc.free(table_name);
+                const key = try alloc.dupe(u8, binding.node.key);
+                errdefer alloc.free(key);
+                try values.append(alloc, .{ .table = table, .key = key });
+            }
+            break;
+        }
+    }
+    return try values.toOwnedSlice(alloc);
+}
+
+fn freeOwnedNodeRefs(alloc: Allocator, values: []const graph_node_identity.Ref) void {
+    for (values) |value| {
+        if (value.table) |table| alloc.free(table);
+        alloc.free(value.key);
+    }
+    if (values.len > 0) alloc.free(values);
+}
+
+test "distinct graph aggregates include table identity" {
+    const alloc = std.testing.allocator;
+    var people_binding = [_]types.GraphPatternBinding{.{
+        .alias = @constCast("entity"),
+        .node = .{ .key = @constCast("shared"), .table = @constCast("people"), .depth = 0, .distance = 0, .path = &.{}, .path_edges = &.{} },
+    }};
+    var company_binding = [_]types.GraphPatternBinding{.{
+        .alias = @constCast("entity"),
+        .node = .{ .key = @constCast("shared"), .table = @constCast("companies"), .depth = 0, .distance = 0, .path = &.{}, .path_edges = &.{} },
+    }};
+    const matches = [_]types.GraphPatternMatch{
+        .{ .bindings = &people_binding, .path = &.{} },
+        .{ .bindings = &company_binding, .path = &.{} },
+    };
+    const requested = [_]graph_query_mod.NamedCountAggregate{.{ .name = "entities", .of = "entity", .distinct = true }};
+    const aggregates = try computePatternAggregates(alloc, &requested, &matches);
+    defer {
+        for (aggregates) |*aggregate| aggregate.deinit(alloc);
+        alloc.free(aggregates);
+    }
+    try std.testing.expectEqual(@as(u128, 2), aggregates[0].value);
+    try std.testing.expectEqual(@as(usize, 2), aggregates[0].distinct_values.len);
 }
 
 fn patternQueryNeedsHits(req: types.SearchRequest, named: *const types.NamedGraphQuery) bool {

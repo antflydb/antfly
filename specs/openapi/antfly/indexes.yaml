@@ -2332,18 +2332,16 @@ components:
     GraphCountAggregate:
       type: object
       additionalProperties: false
-      required: [type, of]
+      required: [count]
       properties:
-        type:
-          type: string
-          enum: [count]
-        of:
+        count:
           type: string
           description: Use `*` to count rows, or an alias to count non-null bindings.
         distinct: { type: boolean, default: false }
-    GraphReturn:
+    GraphBindingsReturn:
       type: object
       additionalProperties: false
+      required: [bindings]
       properties:
         bindings:
           type: array
@@ -2355,13 +2353,19 @@ components:
           minimum: 1
           maximum: 10000
           default: 100
+    GraphAggregatesReturn:
+      type: object
+      additionalProperties: false
+      required: [aggregates]
+      properties:
         aggregates:
           type: object
           minProperties: 1
           additionalProperties: { $ref: '#/components/schemas/GraphCountAggregate' }
+    GraphReturn:
       oneOf:
-        - required: [bindings]
-        - required: [aggregates]
+        - $ref: '#/components/schemas/GraphBindingsReturn'
+        - $ref: '#/components/schemas/GraphAggregatesReturn'
       description: Return bindings or exact aggregates. Bindings and aggregates are mutually exclusive.
     GraphMatchQuery:
       type: object
@@ -2481,10 +2485,6 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/PathEdge'
-    GraphQueryPage:
-      type: object
-      properties:
-        next_cursor: { type: string }
     GraphQueryStats:
       type: object
       required: [returned_rows, truncated]
@@ -2526,14 +2526,11 @@ components:
           description: Deprecated graph_searches result count; use stats or a named count aggregate.
         rows:
           type: array
-          items:
-            type: object
-            additionalProperties: true
+          items: { $ref: '#/components/schemas/GraphResultRow' }
         aggregates:
           type: object
           additionalProperties:
             $ref: '#/components/schemas/GraphAggregateValue'
-        page: { $ref: '#/components/schemas/GraphQueryPage' }
         stats: { $ref: '#/components/schemas/GraphQueryStats' }
         took:
           x-go-type-skip-optional-pointer: true
@@ -2541,3 +2538,11 @@ components:
           format: int64
           x-go-type: time.Duration
           description: "Query execution time"
+    GraphResultBinding:
+      oneOf:
+        - $ref: '#/components/schemas/GraphResultNode'
+        - enum: [null]
+    GraphResultRow:
+      anyOf:
+        - type: object
+          additionalProperties: { $ref: '#/components/schemas/GraphResultBinding' }

@@ -4862,12 +4862,12 @@ fn patternEdgeTypeRequested(edge_type: []const u8, requested: []const []const u8
     return false;
 }
 
-fn publishedPatternNodeFilterEvaluator(ctx: ?*anyopaque, key: []const u8, filter: graph_pattern_mod.NodeFilter) anyerror!bool {
+fn publishedPatternNodeFilterEvaluator(ctx: ?*anyopaque, node: graph_node_identity.Ref, filter: graph_pattern_mod.NodeFilter) anyerror!bool {
     const active: *PatternDocumentFilterContext = @ptrCast(@alignCast(ctx orelse return error.UnsupportedNodeFilterQuery));
     if (filter.filter_query_json == null) return true;
-    const body = findMaterializedDocumentBody(active.docs, key) orelse return false;
+    const body = findMaterializedDocumentBody(active.docs, node.key) orelse return false;
     const prepared = try active.cache.getOrPrepare(filter.filter_query_json.?);
-    return try prepared.matchesStored(active.alloc, key, body);
+    return try prepared.matchesStored(active.alloc, node.key, body);
 }
 
 fn removeDocumentMutationById(

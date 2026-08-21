@@ -560,7 +560,7 @@ test "parse supported graph queries accepts branches predicates optional groups 
         \\          "edges": [{"from": "d", "to": "b", "types": ["likes"]}]
         \\        }]
         \\      },
-        \\      "return": {"aggregates": {"count": {"type": "count", "of": "*"}}}
+        \\      "return": {"aggregates": {"count": {"count": "*"}}}
         \\    }
         \\  }
         \\}
