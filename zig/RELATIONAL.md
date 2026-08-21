@@ -92,6 +92,12 @@ In `relational` mode the following are implied/enforced:
   dynamic rules inside `json` columns require the later JSON-subdocument
   lifecycle integration.
 
+The parsed public schema is cached once per schema generation inside the DB.
+Every storage entry point validates its final post-transform rows against that
+same cached contract, including embedded batches, transaction prepares,
+replicated callers, and recovery resolution. API validation remains an early
+feedback optimization rather than the only integrity boundary.
+
 The raw JSON Schema type `json` is accepted for a relational property. It is
 not a dynamic-template `AntflyType`: a `json` column is stored as a `bytes`
 column and later indexed like a document subtree (path facts + dynamic
@@ -152,6 +158,14 @@ typed value. Point reads reconstruct canonical JSON without a schema lookup;
 metadata and derived-artifact keyspaces are never passed through the row
 decoder. Portable backup format v2 retains the packed payload and row key kind
 exactly, including timestamps and relational schema metadata.
+
+Portable restore performs a bounded-memory two-pass preflight. The first pass
+binds the archive header, runtime schema, public schema, and physical row mode;
+the second validates each packed row against those authoritative schemas.
+Mixed document/relational keyspaces, v1 relational flags, schema-mode
+mismatches, and schema-invalid rows fail before the destination is mutated.
+After import, an already-open DB reloads the durable schema and refreshes every
+schema-dependent runtime context before reads, writes, or index rebuilds resume.
 
 `schema_capability.projectRelationalRowJsonAlloc` parses and turns a document into one typed
 cell per declared column (`RelationalRow` / `RelationalCell` / `ColumnValue`),

@@ -2979,6 +2979,11 @@ pub const DB = struct {
     primary_lsm_storage: ?lsm_backend_mod.Storage,
     index_backends: db_config.IndexBackendOptions,
     core: db_core.DBCore,
+    /// Parsed once per authoritative schema generation. The apply lock guards
+    /// replacement and every write-side read; startup initializes it before
+    /// workers are published.
+    relational_schema_validator: ?public_table_schema.ParsedTableSchema = null,
+    relational_schema_validator_loaded: bool = false,
     /// Durable identity of the physical DB root. Unlike `core.root_generation`,
     /// this survives process restart and changes whenever a root is rebound.
     root_incarnation: u128 = 0,
@@ -3408,6 +3413,8 @@ pub const DB = struct {
                 .primary_lsm_storage = resolved_config.primary_lsm_storage,
                 .index_backends = resolved_config.index_backends,
                 .core = db_core.DBCore.fromOpened(alloc, core),
+                .relational_schema_validator = null,
+                .relational_schema_validator_loaded = false,
                 .async_context = async_context,
                 .backend_runtime = backend_runtime,
                 .backend_owner_id = backend_owner_id,
@@ -3466,8 +3473,11 @@ pub const DB = struct {
                 // open; no index runtime exists yet and the metadata record is
                 // already the durable authority for this replica projection.
                 try db.core.setSchema(table_schema);
+                try db.removeStoredPublicSchemaLocked();
+                db.clearRelationalSchemaValidatorLocked(true);
                 db.refreshRelationalRuntimeMode();
             }
+            try db.loadRelationalSchemaValidatorFromStoreLocked();
             const optional_runtimes_initialized = opts.open_mode.allowsOptionalRuntimes() and opts.start_optional_runtimes and !ha_standby_role;
             const optional_runtime_workers_enabled = optional_runtimes_initialized and opts.start_optional_runtime_workers;
             db.optional_runtime_workers_enabled = optional_runtime_workers_enabled;
@@ -4366,6 +4376,7 @@ pub const DB = struct {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
         }
+        self.clearRelationalSchemaValidatorLocked(false);
         self.core.deinit();
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
         self.async_context.deinit(self.runtime_alloc);
@@ -5438,6 +5449,8 @@ pub const DB = struct {
             defer self.core.unlockApply();
             try self.validateStorageModeCompatibilityLocked(table_schema);
             try self.core.setSchema(table_schema);
+            try self.removeStoredPublicSchemaLocked();
+            self.clearRelationalSchemaValidatorLocked(true);
             self.refreshRelationalRuntimeMode();
         }
         if (applied_lsn_marker) |lsn| try self.markHAReplicationRecordApplied(lsn);
@@ -5766,6 +5779,11 @@ pub const DB = struct {
             .sync_level = req.sync_level,
         };
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.merge_effective_req_ns, merge_effective_req_start_ns);
+
+        // Validate the final post-transform rows at the storage boundary. API
+        // preflight remains useful for early UX feedback, but every embedded,
+        // replicated, recovery, and direct DB caller gets the same contract.
+        try self.validateRelationalWritesLocked(effective_req.writes);
 
         // Prepared transaction intents fence the ordinary single-group fast
         // path too. The key-oriented intent index keeps this O(touched keys)
@@ -14917,6 +14935,16 @@ pub const DB = struct {
             defer self.core.unlockApply();
             try self.validateStorageModeCompatibilityLocked(table_schema);
             try self.core.setSchema(table_schema);
+            // The public schema is an inseparable validator for the runtime
+            // schema that produced it. Direct compiled-schema callers do not
+            // supply a replacement, so remove any previous copy atomically
+            // with respect to in-process writers instead of reviving it after
+            // a restart.
+            try self.removeStoredPublicSchemaLocked();
+            // A direct compiled-schema update has no matching public-schema
+            // ownership transfer. Keep validation strict through the compiled
+            // column fallback and never reuse a stale JSON validator.
+            self.clearRelationalSchemaValidatorLocked(true);
             self.refreshRelationalRuntimeMode();
         }
         try self.mirrorHASchemaMetadataCommit(table_schema);
@@ -14938,6 +14966,44 @@ pub const DB = struct {
             ctx.relational_base_rows = enabled;
             ctx.relational_columns = relationalColumns(self) orelse &.{};
         }
+    }
+
+    fn clearRelationalSchemaValidatorLocked(self: *DB, loaded: bool) void {
+        if (self.relational_schema_validator) |*schema| schema.deinit(self.alloc);
+        self.relational_schema_validator = null;
+        self.relational_schema_validator_loaded = loaded;
+    }
+
+    fn removeStoredPublicSchemaLocked(self: *DB) !void {
+        const existing = try self.core.getStoreValue(self.alloc, public_schema_json_key) orelse return;
+        self.alloc.free(existing);
+        try self.core.putStoreBatch(&.{}, &.{public_schema_json_key});
+    }
+
+    fn loadRelationalSchemaValidatorFromStoreLocked(self: *DB) !void {
+        if (self.relational_schema_validator_loaded) return;
+        if (relationalColumns(self) == null) {
+            self.relational_schema_validator_loaded = true;
+            return;
+        }
+        const schema_json = try self.core.getStoreValue(self.alloc, public_schema_json_key) orelse {
+            self.relational_schema_validator_loaded = true;
+            return;
+        };
+        defer self.alloc.free(schema_json);
+        var parsed = try public_table_schema.parseValidatedTableSchema(self.alloc, schema_json);
+        errdefer parsed.deinit(self.alloc);
+        if (parsed.storage_mode != .relational) return error.InvalidSchemaUpdateRequest;
+        const derived = try public_table_schema.deriveRuntimeTableSchema(self.alloc, parsed);
+        defer schema_mod.freeSchema(self.alloc, derived);
+        const persisted = self.core.schema orelse return error.InvalidSchemaUpdateRequest;
+        const schemas_match = schema_mod.schemasEqual(self.alloc, persisted, derived) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidSchemaUpdateRequest,
+        };
+        if (!schemas_match) return error.InvalidSchemaUpdateRequest;
+        self.relational_schema_validator = parsed;
+        self.relational_schema_validator_loaded = true;
     }
 
     fn validateStorageModeCompatibilityLocked(self: *DB, next_schema: schema_mod.TableSchema) !void {
@@ -14965,23 +15031,43 @@ pub const DB = struct {
         if (saw_relational and next_schema.storage_mode != .relational) return error.InvalidSchemaUpdateRequest;
     }
 
-    fn setSchemaJsonGuarded(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
-        var parsed_schema = try public_table_schema.parseValidatedTableSchema(alloc, schema_json);
-        defer parsed_schema.deinit(alloc);
-        const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed_schema);
-        defer schema_mod.freeSchema(alloc, runtime_schema);
+    fn setSchemaJsonGuarded(self: *DB, schema_json: []const u8) !void {
+        var parsed_schema = try public_table_schema.parseValidatedTableSchema(self.alloc, schema_json);
+        var parsed_schema_owned = true;
+        defer if (parsed_schema_owned) parsed_schema.deinit(self.alloc);
+        const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(self.alloc, parsed_schema);
+        defer schema_mod.freeSchema(self.alloc, runtime_schema);
 
-        try self.setSchemaGuarded(runtime_schema);
-        try self.core.putStoreBatch(&.{.{
-            .key = public_schema_json_key,
-            .value = schema_json,
-        }}, &.{});
+        try self.enforceHAWriteGate();
+        try self.preflightHAMetadataSyncCommit();
+        {
+            lockApply(self);
+            defer self.core.unlockApply();
+            try self.validateStorageModeCompatibilityLocked(runtime_schema);
+            try self.core.setSchema(runtime_schema);
+            const current_schema_json = try self.core.getStoreValue(self.alloc, public_schema_json_key);
+            defer if (current_schema_json) |value| self.alloc.free(value);
+            if (current_schema_json == null or !std.mem.eql(u8, current_schema_json.?, schema_json)) {
+                try self.core.putStoreBatch(&.{.{
+                    .key = public_schema_json_key,
+                    .value = schema_json,
+                }}, &.{});
+            }
+            self.clearRelationalSchemaValidatorLocked(true);
+            if (parsed_schema.storage_mode == .relational) {
+                self.relational_schema_validator = parsed_schema;
+                parsed_schema_owned = false;
+            }
+            self.refreshRelationalRuntimeMode();
+        }
+        try self.mirrorHASchemaMetadataCommit(runtime_schema);
     }
 
     pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
+        _ = alloc;
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
-        try self.setSchemaJsonGuarded(alloc, schema_json);
+        try self.setSchemaJsonGuarded(schema_json);
     }
 
     pub fn getSchemaJson(self: *DB, alloc: Allocator) !?[]u8 {
@@ -15139,7 +15225,7 @@ pub const DB = struct {
             if (intent.value == null or isMetadataKey(intent.key)) continue;
             try identity_upsert_keys.append(self.alloc, intent.key);
         }
-        try self.validateRelationalTransactionWritesLocked(effective_ops.writes);
+        try self.validateRelationalWritesLocked(effective_ops.writes);
         try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
         try self.core.writeIntents(txn_id, intents.items, predicates.items);
     }
@@ -15156,28 +15242,34 @@ pub const DB = struct {
             if (isMetadataKey(intent.key)) continue;
             try writes.append(self.alloc, .{ .key = intent.key, .value = value });
         }
-        try self.validateRelationalTransactionWritesLocked(writes.items);
+        try self.validateRelationalWritesLocked(writes.items);
     }
 
-    fn validateRelationalTransactionWritesLocked(self: *DB, writes: anytype) !void {
+    fn validateRelationalWritesLocked(self: *DB, writes: anytype) !void {
         const columns = relationalColumns(self) orelse return;
         if (writes.len == 0) return;
 
-        // Production tables retain the authoritative JSON schema alongside the
-        // compiled runtime schema. Revalidate at the DB intent boundary so all
-        // callers—including replicated and low-level prepare paths—share the
-        // same constraints instead of relying on API-layer preflight alone.
-        if (try self.core.getStoreValue(self.alloc, public_schema_json_key)) |schema_json| {
-            defer self.alloc.free(schema_json);
-            var parsed = try public_table_schema.parseValidatedTableSchema(self.alloc, schema_json);
-            defer parsed.deinit(self.alloc);
-            try public_table_schema.validateWritesAgainstTableSchema(self.alloc, parsed, writes);
+        try self.loadRelationalSchemaValidatorFromStoreLocked();
+        if (self.relational_schema_validator) |validator| {
+            var metadata_count: usize = 0;
+            for (writes) |write| metadata_count += @intFromBool(isMetadataKey(write.key));
+            if (metadata_count == 0) {
+                try public_table_schema.validateWritesAgainstTableSchema(self.alloc, validator, writes);
+                return;
+            }
+            var document_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+            defer document_writes.deinit(self.alloc);
+            try document_writes.ensureTotalCapacity(self.alloc, writes.len - metadata_count);
+            for (writes) |write| {
+                if (isMetadataKey(write.key)) continue;
+                document_writes.appendAssumeCapacity(.{ .key = write.key, .value = write.value });
+            }
+            try public_table_schema.validateWritesAgainstTableSchema(self.alloc, validator, document_writes.items);
             return;
         }
 
-        // Embedders and tests may install only a compiled schema. Preserve a
-        // strict closed-row contract in that case, including required fields,
-        // nullability, physical numeric domains, and unknown-field rejection.
+        // Runtime-only embedders have no richer public constraints to cache.
+        // Preserve the closed physical-row contract as a strict fallback.
         for (writes) |write| {
             if (isMetadataKey(write.key)) continue;
             const encoded = try relational_store.encodeValueAlloc(self.alloc, write.value, columns);
@@ -20971,6 +21063,18 @@ pub const DB = struct {
         try doc_identity.reassignNamespaceAlloc(self.alloc, self.core.store, namespace);
         self.core.identity_namespace = namespace;
         if (self.transaction_recovery_identity_context) |ctx| ctx.identity_namespace = namespace;
+    }
+
+    /// Refresh every schema-dependent runtime view after a portable restore
+    /// has replaced durable metadata beneath this already-open DB.
+    pub fn reloadSchemaForInternalRestore(self: *DB) !void {
+        if (self.open_mode == .status_only) return error.UnsupportedOperation;
+        lockApply(self);
+        defer self.core.unlockApply();
+        self.clearRelationalSchemaValidatorLocked(false);
+        try self.core.reloadSchemaFromStore();
+        self.refreshRelationalRuntimeMode();
+        try self.loadRelationalSchemaValidatorFromStoreLocked();
     }
 
     fn dbDocIdentityStats(raw: doc_identity.Stats, namespace: doc_identity.Namespace) types.DocIdentityStats {
@@ -45974,6 +46078,11 @@ test "db relational mode stores authoritative packed rows across reopen scan and
         try std.testing.expectEqual(@as(?u64, 1234), try db.getGroupCreatedAtMillis(alloc, 7));
         try db.addIndex(.{ .name = "ft_rows", .kind = .full_text, .config_json = "{}" });
 
+        try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .writes = &.{.{
+            .key = "row:invalid-direct",
+            .value = "{\"id\":\"invalid-direct\",\"count\":1,\"status\":\"inactive\",\"title\":\"bad\"}",
+        }} }));
+
         try db.batch(.{ .writes = &.{.{
             .key = "row:a",
             .value = "{\"id\":\"a\",\"count\":9007199254740993,\"status\":\"active\",\"title\":\"replayed relational row\",\"payload\":{\"n\":0.10000000000000001}}",
@@ -46056,6 +46165,45 @@ test "db relational mode stores authoritative packed rows across reopen scan and
         defer alloc.free(row_key);
         try std.testing.expectError(error.NotFound, db.core.store.get(alloc, row_key));
     }
+}
+
+test "db portable relational restore refreshes open runtime before returning" {
+    const alloc = std.testing.allocator;
+    var source_buf: [256]u8 = undefined;
+    const source_path = tempPath(&source_buf);
+    defer cleanupTempDir(source_path);
+    var target_buf: [256]u8 = undefined;
+    const target_path = tempPath(&target_buf);
+    defer cleanupTempDir(target_path);
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","enum":["active"]}},"required":["id","status"],"additionalProperties":false}}}}
+    ;
+    var portable = std.ArrayList(u8).empty;
+    defer portable.deinit(alloc);
+
+    {
+        var source = try DB.open(alloc, std.mem.span(source_path), .{ .start_index_workers = false });
+        defer source.close();
+        try source.setSchemaJson(alloc, schema_json);
+        try source.batch(.{ .writes = &.{.{
+            .key = "row:a",
+            .value = "{\"id\":\"a\",\"status\":\"active\"}",
+        }} });
+        try portable_backup.exportPortable(alloc, source.core.store, &portable);
+    }
+
+    var target = try DB.open(alloc, std.mem.span(target_path), .{ .start_index_workers = false });
+    defer target.close();
+    try portable_backup.importPortable(alloc, target.core.store, portable.items);
+    try target.reloadSchemaForInternalRestore();
+
+    const restored = (try target.get(alloc, "row:a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(restored);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"active\"}", restored);
+    try std.testing.expectError(error.InvalidBatchRequest, target.batch(.{ .writes = &.{.{
+        .key = "row:invalid",
+        .value = "{\"id\":\"invalid\",\"status\":\"inactive\"}",
+    }} }));
 }
 
 test "db relational one-shot recovery resolves orphaned intents into packed rows" {
@@ -66144,7 +66292,7 @@ test "storage.ha schema json mutation does not reacquire shared barrier behind q
     const schema_json =
         \\{"version":1,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true}}}}
     ;
-    try db.setSchemaJsonGuarded(alloc, schema_json);
+    try db.setSchemaJsonGuarded(schema_json);
     outer.release();
     try std.testing.expect(waitForAtomicFlag(&probe.acquired, 1, 10_000));
     probe.release.store(1, .release);

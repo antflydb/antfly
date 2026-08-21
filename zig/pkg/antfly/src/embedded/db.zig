@@ -292,6 +292,7 @@ pub const DB = struct {
         }
         try support.portable_backup.validatePortable(alloc, backup);
         try support.portable_backup.importPortable(alloc, self.inner.core.store, backup);
+        try self.inner.reloadSchemaForInternalRestore();
         const target_identity = self.inner.core.identity_namespace;
         try self.inner.reassignIdentityNamespaceForInternalTransition(target_identity);
     }
@@ -799,6 +800,45 @@ test "embedded db openLite persists schema json in aflite file" {
         defer alloc.free(loaded);
         try std.testing.expectEqualStrings(schema_json, loaded);
     }
+}
+
+test "embedded db portable relational restore is immediately readable and validated" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_path = try testLitePath(alloc, tmp, "embedded-relational-source.aflite");
+    defer alloc.free(source_path);
+    const target_path = try testLitePath(alloc, tmp, "embedded-relational-target.aflite");
+    defer alloc.free(target_path);
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","enum":["active"]}},"required":["id","status"],"additionalProperties":false}}}}
+    ;
+
+    var backup = std.ArrayList(u8).empty;
+    defer backup.deinit(alloc);
+    {
+        var source = try DB.createLite(alloc, source_path, .{});
+        defer source.close();
+        try source.setSchemaJson(alloc, schema_json);
+        try source.batch(.{ .writes = &.{.{
+            .key = "row:a",
+            .value = "{\"id\":\"a\",\"status\":\"active\"}",
+        }} });
+        try source.exportPortable(alloc, &backup);
+    }
+
+    var target = try DB.createLite(alloc, target_path, .{});
+    defer target.close();
+    try target.importPortable(alloc, backup.items);
+
+    var restored = (try target.lookup(alloc, "row:a", .{})) orelse return error.MissingLiteDocument;
+    defer restored.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"active\"") != null);
+    try std.testing.expectError(error.InvalidBatchRequest, target.batch(.{ .writes = &.{.{
+        .key = "row:invalid",
+        .value = "{\"id\":\"invalid\",\"status\":\"inactive\"}",
+    }} }));
 }
 
 test "embedded db openLite persists index and enrichment catalogs in aflite file" {

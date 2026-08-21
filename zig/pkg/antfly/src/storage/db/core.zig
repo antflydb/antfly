@@ -1009,6 +1009,16 @@ pub const DBCore = struct {
         self.schema = next_schema;
     }
 
+    /// Replace the in-memory schema from already-restored durable metadata.
+    /// Portable restore writes the logical store directly, so it must refresh
+    /// this ownership boundary before any key encoding or index rebuild runs.
+    pub fn reloadSchemaFromStore(self: *DBCore) !void {
+        const next_schema = try schema_mod.loadSchema(self.store, self.alloc);
+        errdefer if (next_schema) |schema| schema_mod.freeSchema(self.alloc, schema);
+        if (self.schema) |existing| schema_mod.freeSchema(self.alloc, existing);
+        self.schema = next_schema;
+    }
+
     pub fn saveSchemaCloneTo(self: *DBCore, dest_store: *docstore_mod.DocStore) !void {
         try schema_mod.copySchemas(self.store, dest_store, self.alloc);
     }

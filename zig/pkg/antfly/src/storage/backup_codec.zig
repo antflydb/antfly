@@ -214,6 +214,10 @@ pub const SliceReader = struct {
         return .{ .data = data, .pos = 0 };
     }
 
+    pub fn reset(self: *SliceReader) void {
+        self.pos = 0;
+    }
+
     fn readExact(self: *SliceReader, n: usize) ![]const u8 {
         if (self.pos + n > self.data.len) return error.EndOfStream;
         const slice = self.data[self.pos..][0..n];
@@ -295,6 +299,10 @@ pub const FileReader = struct {
 
     pub fn init(io: std.Io, file: std.Io.File, size: u64) FileReader {
         return .{ .io = io, .file = file, .size = size };
+    }
+
+    pub fn reset(self: *FileReader) void {
+        self.pos = 0;
     }
 
     fn readExact(self: *FileReader, out: []u8) !void {

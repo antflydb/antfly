@@ -4774,6 +4774,7 @@ pub const BoundTableWriteSource = struct {
                 var restored = try db_mod.DB.open(alloc, staged.path(), staged_open_options);
                 defer restored.close();
                 try importPortableBackupFile(alloc, restored.core.store, snapshot_root, shared_io);
+                try restored.reloadSchemaForInternalRestore();
                 _ = try restored.rebuildDenseIndexesForTargetCoverage(alloc);
                 _ = try restored.rebuildSparseIndexesForTargetCoverage(alloc);
                 try restored.rebuildGraphIndexesForTargetCoverage(alloc);
@@ -23077,24 +23078,12 @@ fn applyLocalTableSchemaJson(
 ) !void {
     if (schema_json.len == 0) return;
 
-    const previous_schema_json = try loadLocalTableSchemaJson(alloc, db);
-    defer if (previous_schema_json) |value| alloc.free(value);
-    const marker_changed = if (previous_schema_json) |value|
-        !std.mem.eql(u8, value, schema_json)
-    else
-        true;
-
-    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
-    defer parsed_schema.deinit(alloc);
-
-    const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
-    defer storage_schema.freeSchema(alloc, runtime_schema);
-
-    try db.setSchema(runtime_schema);
+    // Install the public and runtime forms together so storage-boundary writes
+    // immediately use the same authoritative validator as API writes.
+    try db.setSchemaJson(alloc, schema_json);
     // Propagate schema-derived changes to live algebraic indexes so dynamic
     // template updates take effect without a reopen.
     try db.reloadAlgebraicSchemaConfigs(schema_json);
-    if (marker_changed) try db.core.store.put(local_schema_json_key, schema_json);
 }
 
 fn loadTableIndexesJson(

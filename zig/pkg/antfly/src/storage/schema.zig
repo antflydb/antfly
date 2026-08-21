@@ -243,6 +243,18 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
     return serializeSchemaFormat(alloc, schema, 13);
 }
 
+/// Compare complete runtime schemas through their canonical durable encoding.
+/// This is intended for cold control-plane paths such as startup and restore,
+/// where accepting a partially matching public/runtime schema pair would make
+/// subsequent reads and index maintenance depend on which representation won.
+pub fn schemasEqual(alloc: Allocator, a: TableSchema, b: TableSchema) !bool {
+    const encoded_a = try serializeSchema(alloc, a);
+    defer alloc.free(encoded_a);
+    const encoded_b = try serializeSchema(alloc, b);
+    defer alloc.free(encoded_b);
+    return std.mem.eql(u8, encoded_a, encoded_b);
+}
+
 /// Serialize only the schema state that changes a full-text generation's
 /// physical projection. This encoding is deliberately independent of the
 /// current schema storage format: schemas without executable exact mappings
