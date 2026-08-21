@@ -223,7 +223,7 @@ function nodeTypeColors() {
 function resultSummary(result: GraphQueryResult | null) {
   if (!result) return { total: 0, paths: 0 };
   return {
-    total: result.total ?? result.nodes?.length ?? result.paths?.length ?? 0,
+    total: result.nodes?.length ?? result.paths?.length ?? result.rows?.length ?? 0,
     paths: result.paths?.length ?? 0,
   };
 }
@@ -331,29 +331,39 @@ export function GraphIndexExplorer({
     setError(null);
     setSelectedNode(null);
 
-    const params = {
-      edge_types: selectedEdgeTypes.length > 0 ? selectedEdgeTypes : undefined,
-      direction,
-      max_depth: maxDepth,
-      max_results: mode === "shortest_path" ? undefined : maxResults,
-      min_weight: minWeight > 0 ? minWeight : undefined,
-      include_paths: includePaths,
-      deduplicate_nodes: true,
-      weight_mode: mode === "shortest_path" ? weightMode : undefined,
-    };
-    const graphQuery: GraphQuery = {
-      type: mode,
-      index_name: selectedIndex.config.name,
-      start_nodes: { keys: [startKey.trim()] },
-      target_nodes: mode === "shortest_path" ? { keys: [targetKey.trim()] } : undefined,
-      params,
-      include_documents: true,
-      include_edges: true,
-    };
+    const graphQuery: GraphQuery =
+      mode === "shortest_path"
+        ? {
+            index: selectedIndex.config.name,
+            shortest_path: {
+              from: { key: startKey.trim() },
+              to: { key: targetKey.trim() },
+              edge_types: selectedEdgeTypes.length > 0 ? selectedEdgeTypes : undefined,
+              direction,
+              max_depth: maxDepth,
+              min_weight: minWeight > 0 ? minWeight : undefined,
+              weight_mode: weightMode,
+              include_documents: true,
+            },
+          }
+        : {
+            index: selectedIndex.config.name,
+            traverse: {
+              start: { keys: [startKey.trim()] },
+              edge_types: selectedEdgeTypes.length > 0 ? selectedEdgeTypes : undefined,
+              direction,
+              max_depth: mode === "neighbors" ? 1 : maxDepth,
+              limit: maxResults,
+              min_weight: minWeight > 0 ? minWeight : undefined,
+              include_paths: includePaths,
+              include_documents: true,
+              deduplicate_nodes: true,
+            },
+          };
 
     try {
       const response = await api.tables.query(tableName, {
-        graph_searches: { explorer: graphQuery },
+        graph_queries: { explorer: graphQuery },
         limit: 10,
       } as QueryRequest);
       const graphResult = response?.responses?.[0]?.graph_results?.explorer ?? null;

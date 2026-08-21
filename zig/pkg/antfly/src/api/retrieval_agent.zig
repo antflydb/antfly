@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const generating_api_openapi = @import("antfly_generating_api_openapi");
 const eval_openapi = @import("antfly_eval_openapi");
 const generating_openapi = @import("antfly_generating_openapi");
@@ -117,11 +118,11 @@ pub const EventSink = struct {
 };
 
 fn parseJsonBody(comptime T: type, alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(T) {
-    return try std.json.parseFromSlice(T, alloc, body, .{ .ignore_unknown_fields = true });
+    return try ant_json.parseFromSlice(T, alloc, body, .{ .ignore_unknown_fields = true });
 }
 
 fn parseQueryRequestBody(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(QueryRequest) {
-    return try std.json.parseFromSlice(QueryRequest, alloc, body, .{ .ignore_unknown_fields = true });
+    return try ant_json.parseFromSlice(QueryRequest, alloc, body, .{ .ignore_unknown_fields = true });
 }
 
 fn expectFullTextQueryValue(value: std.json.Value, expected: []const u8) !void {
@@ -2290,8 +2291,8 @@ fn hasAggregationRetrievalFields(retrieval_query: RetrievalQueryRequest) bool {
 }
 
 fn hasGraphRetrievalFields(retrieval_query: RetrievalQueryRequest) bool {
-    const graph_searches = retrieval_query.graph_searches orelse return false;
-    return graph_searches.map.count() > 0;
+    const graph_queries = retrieval_query.graph_queries orelse return false;
+    return graph_queries.map.count() > 0;
 }
 
 fn buildToolModeStepDetails(
@@ -5457,7 +5458,7 @@ fn encodeQueryValueForRetrievalQuery(
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var parsed = std.json.parseFromSlice(QueryRequest, arena, encoded, .{
+    var parsed = ant_json.parseFromSlice(QueryRequest, arena, encoded, .{
         .ignore_unknown_fields = true,
     }) catch return error.InvalidRetrievalAgentRequest;
     defer parsed.deinit();
@@ -5470,8 +5471,8 @@ fn encodeQueryValueForRetrievalQuery(
     query_request.filter_query = mandatory_predicates.filter_query;
     query_request.exclusion_query = mandatory_predicates.exclusion_query;
     if (retrieval_query.tree_search) |tree_search| {
-        if (query_request.graph_searches != null) return error.UnsupportedRetrievalAgentRequest;
-        query_request.graph_searches = try buildTreeGraphSearches(
+        if (query_request.graph_queries != null) return error.UnsupportedRetrievalAgentRequest;
+        query_request.graph_queries = try buildTreeGraphSearches(
             arena,
             runner,
             retrieval_query.table orelse return error.InvalidRetrievalAgentRequest,
@@ -5829,8 +5830,8 @@ fn buildTreeGraphSearches(
     previous_query_hits: []const QueryHit,
     query_limit: ?i64,
 ) !std.json.ArrayHashMap(indexes_openapi.GraphQuery) {
-    var graph_searches = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
-    errdefer graph_searches.deinit(alloc);
+    var graph_queries = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
+    errdefer graph_queries.deinit(alloc);
 
     const start_nodes = try buildTreeStartNodes(alloc, runner, table_name, query_request, tree_search, previous_query_hits);
     const max_depth = tree_search.max_depth orelse 5;
@@ -5840,19 +5841,19 @@ fn buildTreeGraphSearches(
     else
         @max(@as(i64, 1), max_depth * beam_width);
 
-    try graph_searches.map.put(alloc, "tree_search", .{
-        .type = .traverse,
-        .index_name = tree_search.index,
-        .start_nodes = start_nodes,
-        .params = .{
+    const traverse_query = try alloc.create(indexes_openapi.GraphTraverseQuery);
+    traverse_query.* = .{
+        .index = tree_search.index,
+        .traverse = .{
+            .start = start_nodes,
             .direction = .out,
             .max_depth = max_depth,
-            .max_results = max_results,
+            .limit = max_results,
             .deduplicate_nodes = true,
         },
-        .include_documents = true,
-    });
-    return graph_searches;
+    };
+    try graph_queries.map.put(alloc, "tree_search", .{ .graph_traverse_query = traverse_query });
+    return graph_queries;
 }
 
 fn buildTreeStartNodes(
@@ -6229,14 +6230,17 @@ fn extractTreeFallbackRootKey(
     alloc: std.mem.Allocator,
     query_json: []const u8,
 ) !?[]const u8 {
-    var parsed = std.json.parseFromSlice(QueryRequest, alloc, query_json, .{
+    var parsed = ant_json.parseFromSlice(QueryRequest, alloc, query_json, .{
         .ignore_unknown_fields = true,
     }) catch return null;
     defer parsed.deinit();
 
-    const graph_searches = parsed.value.graph_searches orelse return null;
-    const tree_query = graph_searches.map.get("tree_search") orelse return null;
-    const start_nodes = tree_query.start_nodes orelse return null;
+    const graph_queries = parsed.value.graph_queries orelse return null;
+    const tree_query = graph_queries.map.get("tree_search") orelse return null;
+    const start_nodes = switch (tree_query) {
+        .graph_traverse_query => |query| query.traverse.start,
+        else => return null,
+    };
     const keys = start_nodes.keys orelse return null;
     if (keys.len != 1) return null;
     return keys[0];
@@ -6291,7 +6295,7 @@ test "retrieval agent rejects removed search tool name" {
 
 test "retrieval agent requires every tool used by a combined retrieval query" {
     const semantic_graph_body =
-        \\{"query":"find related alpha docs","stream":false,"tools":{"enabled_tools":["semantic_search"]},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"graph_searches":{"related":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]}}},"limit":5}]}
+        \\{"query":"find related alpha docs","stream":false,"tools":{"enabled_tools":["semantic_search"]},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"graph_queries":{"related":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]},"max_depth":1}}},"limit":5}]}
     ;
     try std.testing.expectError(
         error.UnsupportedRetrievalAgentRequest,
@@ -6327,8 +6331,8 @@ test "retrieval agent ignores empty map-valued tool fields for policy and strate
             if (parsed_query.value.aggregations) |aggregations| {
                 try std.testing.expectEqual(@as(usize, 0), aggregations.map.count());
             }
-            if (parsed_query.value.graph_searches) |graph_searches| {
-                try std.testing.expectEqual(@as(usize, 0), graph_searches.map.count());
+            if (parsed_query.value.graph_queries) |graph_queries| {
+                try std.testing.expectEqual(@as(usize, 0), graph_queries.map.count());
             }
 
             return .{
@@ -6351,7 +6355,7 @@ test "retrieval agent ignores empty map-valued tool fields for policy and strate
     try std.testing.expectEqual(RetrievalStrategy.bm25, empty_aggregations_result.value.strategy_used.?);
 
     const empty_graph_body =
-        \\{"query":"find alpha","stream":false,"tools":{"enabled_tools":["semantic_search"]},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"graph_searches":{},"limit":5}]}
+        \\{"query":"find alpha","stream":false,"tools":{"enabled_tools":["semantic_search"]},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"graph_queries":{},"limit":5}]}
     ;
     const empty_graph_encoded = try executeJson(std.testing.allocator, runner.ifaceWithState(), null, empty_graph_body);
     defer std.testing.allocator.free(empty_graph_encoded);
@@ -6432,12 +6436,12 @@ test "retrieval agent supports inline tree search" {
             try std.testing.expectEqualStrings("docs", table_name);
             var parsed_query = try parseJsonBody(QueryRequest, alloc, query_json);
             defer parsed_query.deinit();
-            const graph_searches = parsed_query.value.graph_searches.?;
-            const tree_query = graph_searches.map.get("tree_search").?;
-            try std.testing.expectEqualStrings("$tree_search", tree_query.start_nodes.?.result_ref.?);
+            const graph_queries = parsed_query.value.graph_queries.?;
+            const tree_query = graph_queries.map.get("tree_search").?;
+            try std.testing.expectEqualStrings("$tree_search", tree_query.graph_traverse_query.traverse.start.result_ref.?);
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"type":"traverse","nodes":[{"key":"doc:b","depth":1,"document":{"title":"beta"}}],"paths":[],"total":1,"took":1}}}]}
+                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"nodes":[{"key":"doc:b","depth":1,"document":{"title":"beta"}}],"paths":[],"took":1}}}]}
                 ),
             };
         }
@@ -6484,7 +6488,7 @@ test "retrieval agent supports pipeline tree search from previous hits" {
             try std.testing.expectEqualStrings("doc:a", start_key);
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"type":"traverse","nodes":[{"key":"doc:b","depth":1,"document":{"title":"beta"}}],"paths":[],"total":1,"took":1}}}]}
+                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"nodes":[{"key":"doc:b","depth":1,"document":{"title":"beta"}}],"paths":[],"took":1}}}]}
                 ),
             };
         }
@@ -6566,7 +6570,7 @@ test "retrieval agent supports roots tree search" {
             try std.testing.expectEqualStrings("doc:root", start_key);
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"type":"traverse","nodes":[{"key":"doc:child","depth":1,"document":{"title":"child"}}],"paths":[],"total":1,"took":1}}}]}
+                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"nodes":[{"key":"doc:child","depth":1,"document":{"title":"child"}}],"paths":[],"took":1}}}]}
                 ),
             };
         }
@@ -7196,14 +7200,14 @@ test "extract tree hits prefers strongest branches and ancestor ordering" {
     const alloc = std.testing.allocator;
 
     const response_json =
-        \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"type":"traverse","nodes":[
+        \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"nodes":[
         \\{"key":"doc:b","depth":1,"document":{"title":"branch b"}},
         \\{"key":"doc:a","depth":1,"document":{"title":"branch a"}},
         \\{"key":"doc:a:leaf","depth":2,"document":{"title":"branch a leaf"}}
         \\],"paths":[
         \\{"nodes":["doc:root","doc:a","doc:a:leaf"]},
         \\{"nodes":["doc:root","doc:b"]}
-        \\],"total":3,"took":1}}}]}
+        \\],"took":1}}}]}
     ;
 
     var parsed = try std.json.parseFromSlice(QueryResponses, alloc, response_json, .{});
@@ -7842,7 +7846,7 @@ test "retrieval agent streaming emits go-shaped tree search progress" {
         fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"type":"traverse","nodes":[{"key":"doc:child","depth":1,"document":{"title":"child","body":"details about the architecture"}}],"paths":[{"nodes":["doc:root","doc:child"]}],"total":1,"took":1}}}]}
+                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"nodes":[{"key":"doc:child","depth":1,"document":{"title":"child","body":"details about the architecture"}}],"paths":[{"nodes":["doc:root","doc:child"]}],"took":1}}}]}
                 ),
             };
         }

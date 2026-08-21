@@ -453,7 +453,7 @@ class AntflyClient:
         profile: bool | None = None,
         reranker: dict[str, Any] | None = None,
         analyses: dict[str, Any] | None = None,
-        graph_searches: dict[str, Any] | None = None,
+        graph_queries: dict[str, Any] | None = None,
         expand_strategy: str | None = None,
         document_renderer: str | None = None,
         pruner: dict[str, Any] | None = None,
@@ -495,7 +495,7 @@ class AntflyClient:
             profile: Include execution profile when true
             reranker: Reranker configuration
             analyses: Analysis configuration
-            graph_searches: Graph query configuration
+            graph_queries: Graph query configuration
             expand_strategy: Graph result expansion strategy
             document_renderer: Handlebars document renderer
             pruner: Result pruning configuration
@@ -543,7 +543,7 @@ class AntflyClient:
             "profile": profile,
             "reranker": reranker,
             "analyses": analyses,
-            "graph_searches": graph_searches,
+            "graph_queries": graph_queries,
             "expand_strategy": expand_strategy,
             "document_renderer": document_renderer,
             "pruner": pruner,

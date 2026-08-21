@@ -691,22 +691,18 @@ func (h *Handler) SearchMemories(ctx context.Context, args SearchMemoriesArgs, u
 			for _, e := range queryEntities {
 				entityKeys = append(entityKeys, entityKey(e.Label, e.Text))
 			}
-			reqMap["graph_searches"] = map[string]any{
+			reqMap["graph_queries"] = map[string]any{
 				"entity_expansion": map[string]any{
-					"type":       "neighbors",
-					"index_name": graphIndex,
-					"start_nodes": map[string]any{
-						"keys": entityKeys,
-					},
-					"params": map[string]any{
+					"index": graphIndex,
+					"traverse": map[string]any{
+						"start":      map[string]any{"keys": entityKeys},
 						"edge_types": []string{"mentions"},
 						"direction":  "in",
 						"max_depth":  1,
 					},
-					"include_documents": true,
 				},
 			}
-			reqMap["graph_merge_strategy"] = "union"
+			reqMap["expand_strategy"] = "union"
 		}
 	}
 
@@ -756,23 +752,19 @@ func (h *Handler) FindRelated(ctx context.Context, args FindRelatedArgs, uctx Us
 		"table":            table,
 		"full_text_search": json.RawMessage(mustMarshal(query.NewMatchAll())),
 		"limit":            limit,
-		"graph_searches": map[string]any{
+		"graph_queries": map[string]any{
 			"related": map[string]any{
-				"type":       "traverse",
-				"index_name": graphIndex,
-				"start_nodes": map[string]any{
-					"keys": []string{mKey},
+				"index": graphIndex,
+				"traverse": map[string]any{
+					"start":      map[string]any{"keys": []string{mKey}},
+					"edge_types": []string{"mentions", "related_to"},
+					"direction":  "both",
+					"max_depth":  depth,
+					"limit":      limit,
 				},
-				"params": map[string]any{
-					"edge_types":  []string{"mentions", "related_to"},
-					"direction":   "both",
-					"max_depth":   depth,
-					"max_results": limit,
-				},
-				"include_documents": true,
 			},
 		},
-		"graph_merge_strategy": "union",
+		"expand_strategy": "union",
 	}
 
 	resp, err := h.client.QueryWithBody(ctx, mustMarshal(reqMap))
@@ -817,22 +809,18 @@ func (h *Handler) GetEntityMemories(ctx context.Context, args EntityMemoriesArgs
 		"table":            table,
 		"full_text_search": json.RawMessage(mustMarshal(query.NewMatchAll())),
 		"limit":            limit,
-		"graph_searches": map[string]any{
+		"graph_queries": map[string]any{
 			"mentions": map[string]any{
-				"type":       "neighbors",
-				"index_name": graphIndex,
-				"start_nodes": map[string]any{
-					"keys": []string{eKey},
-				},
-				"params": map[string]any{
+				"index": graphIndex,
+				"traverse": map[string]any{
+					"start":      map[string]any{"keys": []string{eKey}},
 					"edge_types": []string{"mentions"},
 					"direction":  "in",
 					"max_depth":  1,
 				},
-				"include_documents": true,
 			},
 		},
-		"graph_merge_strategy": "union",
+		"expand_strategy": "union",
 	}
 
 	resp, err := h.client.QueryWithBody(ctx, mustMarshal(reqMap))

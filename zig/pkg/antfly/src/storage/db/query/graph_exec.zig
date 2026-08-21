@@ -71,6 +71,12 @@ pub const PatternQueryExecutor = struct {
         start_key_refs: []const []const u8,
         target_nodes: []const graph_node_identity.Ref,
     ) anyerror![]graph_pattern_mod.PatternMatch,
+    match_conjunctive: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        named: *const types.NamedGraphQuery,
+        start_key_refs: []const []const u8,
+    ) anyerror![]graph_pattern_mod.PatternMatch = null,
     load_projected_document: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -244,18 +250,27 @@ pub fn executeGraphQueries(
     var base_resolved_doc_set: ?doc_set.ResolvedDocSet = null;
     defer if (base_resolved_doc_set) |*set| set.deinit(alloc);
     var base_resolved_doc_set_ref: ?*const doc_set.ResolvedDocSet = null;
-    if (graphQueriesNeedBaseResolvedDocSet(graph_queries)) if (executor.resolve_hits_to_doc_set) |resolve| {
+    const match_all_anchor = graphQueriesNeedAllDocuments(graph_queries);
+    if (match_all_anchor) {
+        base_resolved_doc_set = .all;
+        base_resolved_doc_set_ref = &base_resolved_doc_set.?;
+    } else if (graphQueriesNeedBaseResolvedDocSet(graph_queries)) if (executor.resolve_hits_to_doc_set) |resolve| {
         base_resolved_doc_set = try resolve(executor.ctx, alloc, req, base_hits);
         if (base_resolved_doc_set) |*set| base_resolved_doc_set_ref = set;
     };
     const handoff_total_hits = baseGraphHandoffTotalHits(req, base_hits, base_total_hits);
-    const base_resolved_doc_set_complete = @as(u64, handoff_total_hits) <= base_hits.len;
+    const base_resolved_doc_set_complete = match_all_anchor or @as(u64, handoff_total_hits) <= base_hits.len;
     const named_sets = [_]NamedResultSet{
         .{ .name = "$full_text_results", .hits = base_hits, .total_hits = handoff_total_hits, .resolved_doc_set = base_resolved_doc_set_ref, .resolved_doc_set_complete = base_resolved_doc_set_complete },
         .{ .name = "$fused_results", .hits = base_hits, .total_hits = handoff_total_hits, .resolved_doc_set = base_resolved_doc_set_ref, .resolved_doc_set_complete = base_resolved_doc_set_complete },
         .{ .name = "$embeddings_results", .hits = base_hits, .total_hits = handoff_total_hits, .resolved_doc_set = base_resolved_doc_set_ref, .resolved_doc_set_complete = base_resolved_doc_set_complete },
     };
     return try executeGraphQueriesWithSets(alloc, req, graph_queries, &named_sets, executor);
+}
+
+fn graphQueriesNeedAllDocuments(graph_queries: []const types.NamedGraphQuery) bool {
+    for (graph_queries) |query| if (query.query.match_pattern != null) return true;
+    return false;
 }
 
 fn baseGraphHandoffTotalHits(req: types.SearchRequest, base_hits: []const types.SearchHit, base_total_hits: u32) u32 {
@@ -950,11 +965,26 @@ pub fn convertPatternMatchesToGraphMatches(
         matches[i] = .{
             .bindings = bindings,
             .path = path,
+            .null_aliases = try cloneOwnedStringSlice(alloc, raw_match.null_aliases),
         };
         initialized += 1;
     }
 
     return matches;
+}
+
+fn cloneOwnedStringSlice(alloc: Allocator, values: []const []const u8) ![][]u8 {
+    const out = try alloc.alloc([]u8, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |value| alloc.free(value);
+        if (out.len > 0) alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        out[i] = try alloc.dupe(u8, value);
+        initialized += 1;
+    }
+    return out;
 }
 
 pub fn executeSinglePatternQueryWithSets(
@@ -1000,13 +1030,21 @@ pub fn executeSinglePatternQueryWithSets(
     defer alloc.free(target_nodes);
     for (target_key_refs, 0..) |key, i| target_nodes[i] = .{ .table = null, .key = key };
 
-    var raw_matches = try executor.match_pattern(
-        try graphExecutionContext(executor.predicate_aware, executor.graph_ctx, executor.ctx),
-        alloc,
-        named,
-        start_key_refs,
-        target_nodes,
-    );
+    var raw_matches = if (named.query.match_pattern != null)
+        try (executor.match_conjunctive orelse return error.UnsupportedQueryRequest)(
+            try graphExecutionContext(executor.predicate_aware, executor.graph_ctx, executor.ctx),
+            alloc,
+            named,
+            start_key_refs,
+        )
+    else
+        try executor.match_pattern(
+            try graphExecutionContext(executor.predicate_aware, executor.graph_ctx, executor.ctx),
+            alloc,
+            named,
+            start_key_refs,
+            target_nodes,
+        );
     defer graph_pattern_mod.freeMatches(alloc, raw_matches);
     if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
         raw_matches = try filterPatternMatches(alloc, req, raw_matches, executor.ctx, executor.filter_keys);
@@ -1027,14 +1065,69 @@ pub fn executeSinglePatternQueryWithSets(
         if (hits.len > 0) alloc.free(hits);
     }
 
+    const aggregates = try computePatternAggregates(alloc, named.query.aggregates, matches);
+    errdefer {
+        for (aggregates) |*aggregate| aggregate.deinit(alloc);
+        if (aggregates.len > 0) alloc.free(aggregates);
+    }
+
     return .{
         .name = try alloc.dupe(u8, named.name),
         .nodes = &.{},
         .paths = &.{},
         .matches = matches,
+        .aggregates = aggregates,
         .hits = hits,
         .total_hits = @intCast(raw_matches.len),
     };
+}
+
+fn computePatternAggregates(
+    alloc: Allocator,
+    requested: []const graph_query_mod.NamedCountAggregate,
+    matches: []const types.GraphPatternMatch,
+) ![]types.GraphAggregateResult {
+    const out = try alloc.alloc(types.GraphAggregateResult, requested.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*aggregate| aggregate.deinit(alloc);
+        alloc.free(out);
+    }
+    for (requested, 0..) |aggregate, i| {
+        out[i] = .{
+            .name = try alloc.dupe(u8, aggregate.name),
+            .value = if (std.mem.eql(u8, aggregate.of, "*"))
+                @intCast(matches.len)
+            else
+                try countPatternAlias(alloc, matches, aggregate.of, aggregate.distinct),
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn countPatternAlias(
+    alloc: Allocator,
+    matches: []const types.GraphPatternMatch,
+    alias: []const u8,
+    distinct: bool,
+) !u128 {
+    var count: u128 = 0;
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+    for (matches) |match| {
+        for (match.bindings) |binding| {
+            if (!std.mem.eql(u8, binding.alias, alias)) continue;
+            if (!distinct) {
+                count += 1;
+            } else {
+                const gop = try seen.getOrPut(alloc, binding.node.key);
+                if (!gop.found_existing) count += 1;
+            }
+            break;
+        }
+    }
+    return count;
 }
 
 fn patternQueryNeedsHits(req: types.SearchRequest, named: *const types.NamedGraphQuery) bool {

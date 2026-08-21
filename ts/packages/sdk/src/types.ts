@@ -184,9 +184,14 @@ export type TraversalResult = components["schemas"]["TraversalResult"];
 export type GraphQuery = components["schemas"]["GraphQuery"];
 export type GraphQueryResult = components["schemas"]["GraphQueryResult"];
 export type GraphResultNode = components["schemas"]["GraphResultNode"];
-export type GraphQueryType = components["schemas"]["GraphQueryType"];
 export type GraphNodeSelector = components["schemas"]["GraphNodeSelector"];
-export type GraphQueryParams = components["schemas"]["GraphQueryParams"];
+export type GraphMatchQuery = components["schemas"]["GraphMatchQuery"];
+export type GraphTraverseQuery = components["schemas"]["GraphTraverseQuery"];
+export type GraphShortestPathQuery = components["schemas"]["GraphShortestPathQuery"];
+export type GraphKShortestPathsQuery = components["schemas"]["GraphKShortestPathsQuery"];
+export type GraphMatch = components["schemas"]["GraphMatch"];
+export type GraphReturn = components["schemas"]["GraphReturn"];
+export type GraphWhereExpression = components["schemas"]["GraphWhereExpression"];
 export type PathWeightMode = components["schemas"]["PathWeightMode"];
 
 // User and permission types

@@ -3920,7 +3920,7 @@ fn jsonDBStatsProjection(stats: db_mod.types.DBStats, indexes: []JsonDBIndexStat
 fn requestLooksLikePublicQueryJson(bytes: []const u8) bool {
     return std.mem.indexOf(u8, bytes, "\"full_text_search\"") != null or
         std.mem.indexOf(u8, bytes, "\"embeddings\"") != null or
-        std.mem.indexOf(u8, bytes, "\"graph_searches\"") != null or
+        std.mem.indexOf(u8, bytes, "\"graph_queries\"") != null or
         std.mem.indexOf(u8, bytes, "\"merge_config\"") != null or
         std.mem.indexOf(u8, bytes, "\"indexes\"") != null or
         std.mem.indexOf(u8, bytes, "\"query\"") != null;

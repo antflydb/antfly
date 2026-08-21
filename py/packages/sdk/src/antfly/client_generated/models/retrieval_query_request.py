@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from ..models.query_request_aggregations import QueryRequestAggregations
     from ..models.query_request_embeddings import QueryRequestEmbeddings
     from ..models.query_request_foreign_sources import QueryRequestForeignSources
-    from ..models.query_request_graph_searches import QueryRequestGraphSearches
+    from ..models.query_request_graph_queries import QueryRequestGraphQueries
     from ..models.query_request_query import QueryRequestQuery
     from ..models.query_string_query import QueryStringQuery
     from ..models.regexp_query import RegexpQuery
@@ -283,9 +283,9 @@ class RetrievalQueryRequest:
             reranker (RerankerConfig | Unset): A unified configuration for a reranking provider. Example: {'provider':
                 'ollama', 'model': 'dengcao/Qwen3-Reranker-0.6B:F16', 'field': 'content'}.
             analyses (Analyses | Unset):
-            graph_searches (QueryRequestGraphSearches | Unset): Declarative graph queries to execute after full-text/vector
-                searches.
-                Results can reference search results using node selectors like $full_text_results.
+            graph_queries (QueryRequestGraphQueries | Unset): Declarative graph matching, traversal, and path queries. A
+                nested node
+                `filter` uses the same canonical query DSL as document search.
             expand_strategy (QueryRequestExpandStrategy | Unset): Strategy for merging graph results with search results:
                 - union: Include nodes from both search and graph results
                 - intersection: Only include nodes appearing in both
@@ -339,7 +339,7 @@ class RetrievalQueryRequest:
                 product catalogs, etc.) without ingesting that data into Antfly.
 
                 **Supported operations on foreign tables:** filter_query, field selection, limit/offset.
-                **Not supported:** full_text_search, semantic_search, graph_searches, aggregations, reranker.
+                **Not supported:** full_text_search, semantic_search, graph_queries, aggregations, reranker.
 
                 **Example - Join Antfly products with Postgres customers:**
                 ```json
@@ -475,7 +475,7 @@ class RetrievalQueryRequest:
     profile: bool | Unset = UNSET
     reranker: RerankerConfig | Unset = UNSET
     analyses: Analyses | Unset = UNSET
-    graph_searches: QueryRequestGraphSearches | Unset = UNSET
+    graph_queries: QueryRequestGraphQueries | Unset = UNSET
     expand_strategy: QueryRequestExpandStrategy | Unset = UNSET
     document_renderer: str | Unset = UNSET
     pruner: Pruner | Unset = UNSET
@@ -754,9 +754,9 @@ class RetrievalQueryRequest:
         if not isinstance(self.analyses, Unset):
             analyses = self.analyses.to_dict()
 
-        graph_searches: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.graph_searches, Unset):
-            graph_searches = self.graph_searches.to_dict()
+        graph_queries: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.graph_queries, Unset):
+            graph_queries = self.graph_queries.to_dict()
 
         expand_strategy: str | Unset = UNSET
         if not isinstance(self.expand_strategy, Unset):
@@ -837,8 +837,8 @@ class RetrievalQueryRequest:
             field_dict["reranker"] = reranker
         if analyses is not UNSET:
             field_dict["analyses"] = analyses
-        if graph_searches is not UNSET:
-            field_dict["graph_searches"] = graph_searches
+        if graph_queries is not UNSET:
+            field_dict["graph_queries"] = graph_queries
         if expand_strategy is not UNSET:
             field_dict["expand_strategy"] = expand_strategy
         if document_renderer is not UNSET:
@@ -885,7 +885,7 @@ class RetrievalQueryRequest:
         from ..models.query_request_aggregations import QueryRequestAggregations
         from ..models.query_request_embeddings import QueryRequestEmbeddings
         from ..models.query_request_foreign_sources import QueryRequestForeignSources
-        from ..models.query_request_graph_searches import QueryRequestGraphSearches
+        from ..models.query_request_graph_queries import QueryRequestGraphQueries
         from ..models.query_request_query import QueryRequestQuery
         from ..models.query_string_query import QueryStringQuery
         from ..models.regexp_query import RegexpQuery
@@ -1710,12 +1710,12 @@ class RetrievalQueryRequest:
         else:
             analyses = Analyses.from_dict(_analyses)
 
-        _graph_searches = d.pop("graph_searches", UNSET)
-        graph_searches: QueryRequestGraphSearches | Unset
-        if isinstance(_graph_searches, Unset):
-            graph_searches = UNSET
+        _graph_queries = d.pop("graph_queries", UNSET)
+        graph_queries: QueryRequestGraphQueries | Unset
+        if isinstance(_graph_queries, Unset):
+            graph_queries = UNSET
         else:
-            graph_searches = QueryRequestGraphSearches.from_dict(_graph_searches)
+            graph_queries = QueryRequestGraphQueries.from_dict(_graph_queries)
 
         _expand_strategy = d.pop("expand_strategy", UNSET)
         expand_strategy: QueryRequestExpandStrategy | Unset
@@ -1782,7 +1782,7 @@ class RetrievalQueryRequest:
             profile=profile,
             reranker=reranker,
             analyses=analyses,
-            graph_searches=graph_searches,
+            graph_queries=graph_queries,
             expand_strategy=expand_strategy,
             document_renderer=document_renderer,
             pruner=pruner,

@@ -266,7 +266,7 @@ func TestGraphVisualizationQueryUsesAutographIndex(t *testing.T) {
 	if !ok || fullText["query"] != "Maxwell" {
 		t.Fatalf("unexpected full-text search: %#v", req["full_text_search"])
 	}
-	graphSearches, ok := req["graph_searches"].(map[string]any)
+	graphSearches, ok := req["graph_queries"].(map[string]any)
 	if !ok {
 		t.Fatalf("graph searches missing: %#v", req)
 	}
@@ -274,22 +274,19 @@ func TestGraphVisualizationQueryUsesAutographIndex(t *testing.T) {
 	if !ok {
 		t.Fatalf("relations graph search missing: %#v", graphSearches)
 	}
-	if graph["type"] != "traverse" {
-		t.Fatalf("graph type = %q, want traverse", graph["type"])
+	if graph["index"] != DefaultAutographIndex {
+		t.Fatalf("graph index = %q, want %s", graph["index"], DefaultAutographIndex)
 	}
-	if graph["index_name"] != DefaultAutographIndex {
-		t.Fatalf("graph index = %q, want %s", graph["index_name"], DefaultAutographIndex)
+	traverse, ok := graph["traverse"].(map[string]any)
+	if !ok {
+		t.Fatalf("traverse operation missing: %#v", graph)
 	}
-	startNodes, ok := graph["start_nodes"].(map[string]any)
+	startNodes, ok := traverse["start"].(map[string]any)
 	if !ok || startNodes["result_ref"] != "$full_text_results" || startNodes["limit"] != 8 {
-		t.Fatalf("unexpected start nodes: %#v", graph["start_nodes"])
+		t.Fatalf("unexpected start nodes: %#v", traverse["start"])
 	}
-	if graph["include_documents"] != true {
-		t.Fatalf("graph query should include documents")
-	}
-	params, ok := graph["params"].(map[string]any)
-	if !ok || params["direction"] != "both" || params["max_depth"] != 1 {
-		t.Fatalf("unexpected graph params: %#v", graph["params"])
+	if traverse["direction"] != "both" || traverse["max_depth"] != 1 {
+		t.Fatalf("unexpected traversal: %#v", traverse)
 	}
 }
 
@@ -299,7 +296,6 @@ func TestBuildGraphVisualizationConvertsGraphResults(t *testing.T) {
 			{
 				GraphResults: map[string]antfly.GraphQueryResult{
 					"relations": {
-						Type: antfly.GraphQueryTypeTraverse,
 						Nodes: []antfly.GraphResultNode{
 							{
 								Key:   "doc-a",

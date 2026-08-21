@@ -466,18 +466,17 @@ def _wait_for_mention_hydration(
 ) -> dict:
     payload = {
         "query": {"match_all": {}},
-        "graph_searches": {
+        "graph_queries": {
             "mentions": {
-                "type": "neighbors",
-                "index_name": "relations_graph",
-                "start_nodes": {"keys": [start_node]},
-                "params": {
+                "index": "relations_graph",
+                "traverse": {
+                    "start": {"keys": [start_node]},
                     "edge_types": ["mentions"],
                     "direction": "out",
-                    "max_results": 10,
+                    "limit": 10,
+                    "include_documents": True,
+                    "fields": ["entity_type", "canonical_name", "aliases"],
                 },
-                "include_documents": True,
-                "fields": ["entity_type", "canonical_name", "aliases"],
             }
         },
         "limit": 10,

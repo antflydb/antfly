@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const Allocator = std.mem.Allocator;
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
@@ -1180,7 +1181,7 @@ pub const HttpHandler = struct {
         cancellation: CancellationToken,
     ) anyerror!?[]u8 {
         try cancellation.check();
-        var parsed_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
+        var parsed_request = ant_json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
             .allocate = .alloc_always,
         }) catch return error.InvalidQueryRequest;
         defer parsed_request.deinit();
@@ -1441,7 +1442,7 @@ pub const HttpHandler = struct {
         if (request.merge_config != null) return error.UnsupportedQueryRequest;
         if (request.reranker != null) return error.UnsupportedQueryRequest;
         if (request.analyses != null) return error.UnsupportedQueryRequest;
-        if (request.graph_searches != null) return error.UnsupportedQueryRequest;
+        if (request.graph_queries != null) return error.UnsupportedQueryRequest;
         if (request.expand_strategy != null) return error.UnsupportedQueryRequest;
         if (request.document_renderer != null) return error.UnsupportedQueryRequest;
         if (request.pruner != null) return error.UnsupportedQueryRequest;
@@ -2609,13 +2610,36 @@ pub const HttpHandler = struct {
         public_graph_query.rejectInternalDocIdentityFields(self.alloc, body) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
         };
-        var parsed_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
+        var raw_request = ant_json.parseFromSlice(std.json.Value, self.alloc, body, .{}) catch return null;
+        defer raw_request.deinit();
+        if (raw_request.value == .object and raw_request.value.object.get("graph_queries") != null) {
+            const unsupported_controls = [_][]const u8{
+                "aggregations",
+                "analyses",
+                "order_by",
+                "search_after",
+                "search_before",
+                "document_renderer",
+                "join",
+                "foreign_sources",
+                "merge_config",
+                "pruner",
+                "reranker",
+                "expand_strategy",
+                "distance_over",
+                "distance_under",
+            };
+            for (unsupported_controls) |field| {
+                if (raw_request.value.object.get(field) != null) return error.UnsupportedQueryRequest;
+            }
+        }
+        var parsed_request = ant_json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
         }) catch return null;
         defer parsed_request.deinit();
         const request = parsed_request.value;
-        if (request.graph_searches == null) return null;
+        if (request.graph_queries == null) return null;
 
         if (request.aggregations != null or
             request.analyses != null or
@@ -2659,7 +2683,7 @@ pub const HttpHandler = struct {
 
         if (requestHasSearchInputs(request)) {
             var search_request = request;
-            search_request.graph_searches = null;
+            search_request.graph_queries = null;
             const search_body = try std.json.Stringify.valueAlloc(self.alloc, search_request, .{});
             defer self.alloc.free(search_body);
 
@@ -3543,9 +3567,21 @@ pub const HttpHandler = struct {
                 initialized_path += 1;
             }
 
+            const null_aliases = try self.alloc.alloc([]u8, raw_match.null_aliases.len);
+            var initialized_null_aliases: usize = 0;
+            errdefer {
+                for (null_aliases[0..initialized_null_aliases]) |alias| self.alloc.free(alias);
+                if (null_aliases.len > 0) self.alloc.free(null_aliases);
+            }
+            for (raw_match.null_aliases, 0..) |alias, alias_index| {
+                null_aliases[alias_index] = try self.alloc.dupe(u8, alias);
+                initialized_null_aliases += 1;
+            }
+
             matches[i] = .{
                 .bindings = bindings,
                 .path = path,
+                .null_aliases = null_aliases,
             };
             initialized += 1;
         }
@@ -6296,7 +6332,7 @@ test "typed index status response rejects extended variant fields but raw json p
 }
 
 fn parseJsonTestBody(comptime T: type, alloc: Allocator, body: []const u8) !std.json.Parsed(T) {
-    return try std.json.parseFromSlice(T, alloc, body, .{
+    return try ant_json.parseFromSlice(T, alloc, body, .{
         .ignore_unknown_fields = true,
     });
 }
@@ -9628,7 +9664,7 @@ test "http handler serves published graph query endpoints" {
         .method = .post,
         .path = "/tables/docs/query",
         .body =
-        \\{"full_text_search":{"query":"alpha"},"graph_searches":{"neighbors_from_search":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"result_ref":"$full_text_results","limit":1},"params":{"edge_types":["cites","related"]}}},"limit":10}
+        \\{"full_text_search":{"query":"alpha"},"graph_queries":{"neighbors_from_search":{"index":"graph_idx","traverse":{"start":{"result_ref":"$full_text_results","limit":1},"edge_types":["cites","related"],"max_depth":1}}},"limit":10}
         ,
     });
     defer from_search.deinit(alloc);
@@ -9638,8 +9674,7 @@ test "http handler serves published graph query endpoints" {
     try std.testing.expectEqual(@as(usize, 1), parsed_from_search.value.responses.?.len);
     try std.testing.expectEqual(@as(i64, 1), parsed_from_search.value.responses.?[0].hits.?.total.?.value);
     const neighbors_from_search = parsed_from_search.value.responses.?[0].graph_results.?.map.get("neighbors_from_search").?;
-    try std.testing.expectEqual(indexes_openapi.GraphQueryType.neighbors, neighbors_from_search.type);
-    try std.testing.expectEqual(@as(i64, 2), neighbors_from_search.total);
+    try std.testing.expectEqual(@as(usize, 2), neighbors_from_search.nodes.?.len);
     try std.testing.expectEqualStrings("doc-b", neighbors_from_search.nodes.?[0].key);
     try std.testing.expectEqualStrings("doc-c", neighbors_from_search.nodes.?[1].key);
 
@@ -9647,7 +9682,7 @@ test "http handler serves published graph query endpoints" {
         .method = .post,
         .path = "/tables/docs/query",
         .body =
-        \\{"full_text_search":{"query":"alpha"},"graph_searches":{"neighbors_from_fused":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"result_ref":"$fused_results","limit":1},"params":{"edge_types":["cites","related"]}}},"limit":10}
+        \\{"full_text_search":{"query":"alpha"},"graph_queries":{"neighbors_from_fused":{"index":"graph_idx","traverse":{"start":{"result_ref":"$fused_results","limit":1},"edge_types":["cites","related"],"max_depth":1}}},"limit":10}
         ,
     });
     defer from_fused.deinit(alloc);
@@ -9657,8 +9692,7 @@ test "http handler serves published graph query endpoints" {
     try std.testing.expectEqual(@as(usize, 1), parsed_from_fused.value.responses.?.len);
     try std.testing.expectEqual(@as(i64, 1), parsed_from_fused.value.responses.?[0].hits.?.total.?.value);
     const neighbors_from_fused = parsed_from_fused.value.responses.?[0].graph_results.?.map.get("neighbors_from_fused").?;
-    try std.testing.expectEqual(indexes_openapi.GraphQueryType.neighbors, neighbors_from_fused.type);
-    try std.testing.expectEqual(@as(i64, 2), neighbors_from_fused.total);
+    try std.testing.expectEqual(@as(usize, 2), neighbors_from_fused.nodes.?.len);
     try std.testing.expectEqualStrings("doc-b", neighbors_from_fused.nodes.?[0].key);
     try std.testing.expectEqualStrings("doc-c", neighbors_from_fused.nodes.?[1].key);
 
@@ -9666,7 +9700,7 @@ test "http handler serves published graph query endpoints" {
         .method = .post,
         .path = "/tables/docs/query",
         .body =
-        \\{"graph_searches":{"two_hop":{"type":"pattern","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]},"target_nodes":{"keys":["doc-c"]},"pattern":[{"alias":"a"},{"alias":"b","node_filter":{"filter_query":{"term":"beta","field":"title"}},"edge":{"types":["cites"],"direction":"out","min_hops":1,"max_hops":1}},{"alias":"c","node_filter":{"filter_query":{"prefix":"ga","field":"title"}},"edge":{"types":["cites"],"direction":"out","min_hops":1,"max_hops":1}}],"params":{"include_paths":false},"include_documents":true,"fields":["title"]}},"limit":10}
+        \\{"graph_queries":{"two_hop":{"index":"graph_idx","match":{"nodes":{"a":{"filter":{"ids":["doc-a"]}},"b":{"filter":{"term":{"path":"title","value":"beta"}}},"c":{"filter":{"prefix":"ga","field":"title"}}},"edges":[{"from":"a","to":"b","types":["cites"]},{"from":"b","to":"c","types":["cites"]}]},"return":{"bindings":["a","b","c"],"limit":10}}},"limit":10}
         ,
     });
     defer pattern.deinit(alloc);
@@ -9674,17 +9708,11 @@ test "http handler serves published graph query endpoints" {
     var parsed_pattern = try parseJsonTestBody(metadata_openapi.QueryResponses, alloc, pattern.body);
     defer parsed_pattern.deinit();
     const two_hop = parsed_pattern.value.responses.?[0].graph_results.?.map.get("two_hop").?;
-    try std.testing.expectEqual(indexes_openapi.GraphQueryType.pattern, two_hop.type);
-    try std.testing.expectEqual(@as(i64, 1), two_hop.total);
-    try std.testing.expectEqual(@as(usize, 1), two_hop.matches.?.len);
-    try std.testing.expect(two_hop.matches.?[0].path == null);
-    const bindings = two_hop.matches.?[0].bindings.?;
-    try std.testing.expect(bindings.map.get("a") != null);
-    try std.testing.expect(bindings.map.get("b") != null);
-    try std.testing.expect(bindings.map.get("c") != null);
-    try std.testing.expectEqualStrings("alpha", bindings.map.get("a").?.document.?.object.get("title").?.string);
-    try std.testing.expectEqualStrings("beta", bindings.map.get("b").?.document.?.object.get("title").?.string);
-    try std.testing.expectEqualStrings("gamma", bindings.map.get("c").?.document.?.object.get("title").?.string);
+    try std.testing.expectEqual(@as(usize, 1), two_hop.rows.?.len);
+    const row = two_hop.rows.?[0].object;
+    try std.testing.expectEqualStrings("doc-a", row.get("a").?.object.get("key").?.string);
+    try std.testing.expectEqualStrings("doc-b", row.get("b").?.object.get("key").?.string);
+    try std.testing.expectEqualStrings("doc-c", row.get("c").?.object.get("key").?.string);
 
     var invalid_version_neighbors = try handler.handle(.{
         .method = .post,
@@ -9895,13 +9923,13 @@ test "serverless public graph query rejects exact sort controls" {
     try std.testing.expectError(error.UnsupportedQueryRequest, handler.handleTablePublicGraphQueryRequest(
         "docs",
         "docs",
-        "{\"graph_searches\":{\"related\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc:1\"]}}},\"order_by\":[{\"field\":\"created_at\"}]}",
+        "{\"graph_queries\":{\"related\":{\"index\":\"graph_idx\",\"traverse\":{\"start\":{\"keys\":[\"doc:1\"]},\"max_depth\":1}}},\"order_by\":[{\"field\":\"created_at\"}]}",
         .none,
     ));
     try std.testing.expectError(error.UnsupportedQueryRequest, handler.handleTablePublicGraphQueryRequest(
         "docs",
         "docs",
-        "{\"graph_searches\":{\"related\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc:1\"]}}},\"search_after\":[\"2026-01-01T00:00:00Z\",\"doc:1\"]}",
+        "{\"graph_queries\":{\"related\":{\"index\":\"graph_idx\",\"traverse\":{\"start\":{\"keys\":[\"doc:1\"]},\"max_depth\":1}}},\"search_after\":[\"2026-01-01T00:00:00Z\",\"doc:1\"]}",
         .none,
     ));
 }

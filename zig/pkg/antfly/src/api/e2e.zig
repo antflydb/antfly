@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const platform = @import("antfly_platform");
 const common_config = @import("../common/config.zig");
 const group_ids = @import("../common/group_ids.zig");
@@ -53,11 +54,11 @@ const AgentStatus = metadata_openapi.AgentStatus;
 const RetrievalStrategy = metadata_openapi.RetrievalStrategy;
 
 fn parseJsonBody(comptime T: type, alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(T) {
-    return try std.json.parseFromSlice(T, alloc, body, .{});
+    return try ant_json.parseFromSlice(T, alloc, body, .{});
 }
 
 fn parseJsonBodyIgnoreUnknown(comptime T: type, alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(T) {
-    return try std.json.parseFromSlice(T, alloc, body, .{ .ignore_unknown_fields = true });
+    return try ant_json.parseFromSlice(T, alloc, body, .{ .ignore_unknown_fields = true });
 }
 
 fn runMetadataUntilIncarnationReady(svc: *metadata_service.MetadataService) !void {
@@ -6302,12 +6303,10 @@ test "public api e2e supports graph queries" {
     var graph_query = try client.fetchQuery(base_uri, "docs", graph_query_body);
     defer graph_query.deinit(std.testing.allocator);
 
-    var parsed_graph = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, graph_query.body, .{});
+    var parsed_graph = try parseJsonBody(metadata_openapi.QueryResponses, std.testing.allocator, graph_query.body);
     defer parsed_graph.deinit();
     try std.testing.expectEqual(@as(i64, 0), parsed_graph.value.responses.?[0].hits.?.total.?.value);
     const neighbors = try expectSingleGraphResult.get(parsed_graph.value, "neighbors");
-    try std.testing.expectEqual(indexes_openapi.GraphQueryType.neighbors, neighbors.type);
-    try std.testing.expectEqual(@as(i64, 2), neighbors.total);
     try std.testing.expectEqual(@as(usize, 2), neighbors.nodes.?.len);
     try std.testing.expectEqualStrings("doc-b", neighbors.nodes.?[0].key);
     try std.testing.expectEqualStrings("doc-c", neighbors.nodes.?[1].key);
@@ -6324,11 +6323,9 @@ test "public api e2e supports graph queries" {
     defer std.testing.allocator.free(traverse_query_body);
     var traverse_query = try client.fetchQuery(base_uri, "docs", traverse_query_body);
     defer traverse_query.deinit(std.testing.allocator);
-    var parsed_traverse = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, traverse_query.body, .{});
+    var parsed_traverse = try parseJsonBody(metadata_openapi.QueryResponses, std.testing.allocator, traverse_query.body);
     defer parsed_traverse.deinit();
     const traverse = try expectSingleGraphResult.get(parsed_traverse.value, "traverse");
-    try std.testing.expectEqual(indexes_openapi.GraphQueryType.traverse, traverse.type);
-    try std.testing.expectEqual(@as(i64, 2), traverse.total);
     try std.testing.expectEqual(@as(usize, 2), traverse.nodes.?.len);
     try std.testing.expectEqualStrings("doc-b", traverse.nodes.?[0].key);
     try std.testing.expectEqualStrings("doc-c", traverse.nodes.?[1].key);
@@ -6351,11 +6348,9 @@ test "public api e2e supports graph queries" {
     defer std.testing.allocator.free(shortest_path_query_body);
     var shortest_path_query = try client.fetchQuery(base_uri, "docs", shortest_path_query_body);
     defer shortest_path_query.deinit(std.testing.allocator);
-    var parsed_shortest = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, shortest_path_query.body, .{});
+    var parsed_shortest = try parseJsonBody(metadata_openapi.QueryResponses, std.testing.allocator, shortest_path_query.body);
     defer parsed_shortest.deinit();
     const shortest = try expectSingleGraphResult.get(parsed_shortest.value, "shortest");
-    try std.testing.expectEqual(indexes_openapi.GraphQueryType.shortest_path, shortest.type);
-    try std.testing.expectEqual(@as(i64, 1), shortest.total);
     try std.testing.expectEqual(@as(usize, 1), shortest.nodes.?.len);
     try std.testing.expectEqualStrings("doc-c", shortest.nodes.?[0].key);
     try std.testing.expectEqual(@as(i64, 2), shortest.nodes.?[0].depth.?);
@@ -6369,7 +6364,7 @@ test "public api e2e supports graph queries" {
         client.fetchQuery(
             base_uri,
             "docs",
-            "{\"graph_searches\":{\"neighbors\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"params\":{\"edge_types\":[\"cites\"]}}}}",
+            "{\"graph_queries\":{\"neighbors\":{\"index\":\"graph_idx\",\"traverse\":{\"edge_types\":[\"cites\"]}}}}",
         ),
     );
     try std.testing.expectError(
@@ -6377,7 +6372,7 @@ test "public api e2e supports graph queries" {
         client.fetchQuery(
             base_uri,
             "docs",
-            "{\"graph_searches\":{\"traverse\":{\"type\":\"traverse\",\"index_name\":\"graph_idx\",\"params\":{\"edge_types\":[\"cites\"],\"max_depth\":2}}}}",
+            "{\"graph_queries\":{\"traverse\":{\"index\":\"graph_idx\",\"traverse\":{\"edge_types\":[\"cites\"],\"max_depth\":2}}}}",
         ),
     );
     try std.testing.expectError(
@@ -6385,7 +6380,7 @@ test "public api e2e supports graph queries" {
         client.fetchQuery(
             base_uri,
             "docs",
-            "{\"graph_searches\":{\"shortest\":{\"type\":\"shortest_path\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc-a\"]},\"params\":{\"edge_types\":[\"cites\"],\"max_depth\":4}}}}",
+            "{\"graph_queries\":{\"shortest\":{\"index\":\"graph_idx\",\"shortest_path\":{\"from\":{\"key\":\"doc-a\"},\"edge_types\":[\"cites\"],\"max_depth\":4}}}}",
         ),
     );
 }
@@ -6497,10 +6492,10 @@ test "public api e2e graph queries respect full_index sync level" {
 
     var graph_query = try client.fetchQuery(base_uri, "docs", graph_query_body);
     defer graph_query.deinit(std.testing.allocator);
-    var parsed_graph = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, graph_query.body, .{});
+    var parsed_graph = try parseJsonBody(metadata_openapi.QueryResponses, std.testing.allocator, graph_query.body);
     defer parsed_graph.deinit();
     const neighbors = try expectSingleGraphResult.get(parsed_graph.value, "neighbors");
-    try std.testing.expectEqual(@as(i64, 2), neighbors.total);
+    try std.testing.expectEqual(@as(usize, 2), neighbors.nodes.?.len);
     try std.testing.expectEqualStrings("doc-b", neighbors.nodes.?[0].key);
     try std.testing.expectEqualStrings("doc-c", neighbors.nodes.?[1].key);
 
@@ -6513,10 +6508,10 @@ test "public api e2e graph queries respect full_index sync level" {
 
     var graph_query_after = try client.fetchQuery(base_uri, "docs", graph_query_body);
     defer graph_query_after.deinit(std.testing.allocator);
-    var parsed_after = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, graph_query_after.body, .{});
+    var parsed_after = try parseJsonBody(metadata_openapi.QueryResponses, std.testing.allocator, graph_query_after.body);
     defer parsed_after.deinit();
     const neighbors_after = try expectSingleGraphResult.get(parsed_after.value, "neighbors");
-    try std.testing.expectEqual(@as(i64, 1), neighbors_after.total);
+    try std.testing.expectEqual(@as(usize, 1), neighbors_after.nodes.?.len);
     try std.testing.expectEqualStrings("doc-c", neighbors_after.nodes.?[0].key);
 }
 
@@ -6628,10 +6623,10 @@ test "public api e2e restores graph indexes from table backup" {
     defer std.testing.allocator.free(graph_query_body);
     var graph_query_before = try client.fetchQuery(base_uri, "docs", graph_query_body);
     defer graph_query_before.deinit(std.testing.allocator);
-    var parsed_graph_before = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, graph_query_before.body, .{});
+    var parsed_graph_before = try parseJsonBody(metadata_openapi.QueryResponses, std.testing.allocator, graph_query_before.body);
     defer parsed_graph_before.deinit();
     const neighbors_before = try expectSingleGraphResult.get(parsed_graph_before.value, "neighbors");
-    try std.testing.expectEqual(@as(i64, 2), neighbors_before.total);
+    try std.testing.expectEqual(@as(usize, 2), neighbors_before.nodes.?.len);
     try std.testing.expectEqualStrings("doc-b", neighbors_before.nodes.?[0].key);
     try std.testing.expectEqualStrings("doc-c", neighbors_before.nodes.?[1].key);
 
@@ -6693,10 +6688,10 @@ test "public api e2e restores graph indexes from table backup" {
 
     var graph_query_after = try client.fetchQuery(base_uri, "docs", graph_query_body);
     defer graph_query_after.deinit(std.testing.allocator);
-    var parsed_graph_after = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, graph_query_after.body, .{});
+    var parsed_graph_after = try parseJsonBody(metadata_openapi.QueryResponses, std.testing.allocator, graph_query_after.body);
     defer parsed_graph_after.deinit();
     const neighbors_after = try expectSingleGraphResult.get(parsed_graph_after.value, "neighbors");
-    try std.testing.expectEqual(@as(i64, 2), neighbors_after.total);
+    try std.testing.expectEqual(@as(usize, 2), neighbors_after.nodes.?.len);
     try std.testing.expectEqualStrings("doc-b", neighbors_after.nodes.?[0].key);
     try std.testing.expectEqualStrings("doc-c", neighbors_after.nodes.?[1].key);
 }

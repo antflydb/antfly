@@ -260,17 +260,17 @@ type (
 	EdgesResponse          = oapi.EdgesResponse
 
 	// Graph query types
-	GraphQuery        = oapi.GraphQuery
-	GraphQueryParams  = oapi.GraphQueryParams
-	GraphQueryResult  = oapi.GraphQueryResult
-	GraphQueryType    = oapi.GraphQueryType
-	GraphNodeSelector = oapi.GraphNodeSelector
-	GraphResultNode   = oapi.GraphResultNode
-
-	// Graph pattern types
-	PatternEdgeStep = oapi.PatternEdgeStep
-	PatternMatch    = oapi.PatternMatch
-	PatternStep     = oapi.PatternStep
+	GraphQuery               = oapi.GraphQuery
+	GraphQueryResult         = oapi.GraphQueryResult
+	GraphNodeSelector        = oapi.GraphNodeSelector
+	GraphResultNode          = oapi.GraphResultNode
+	GraphMatchQuery          = oapi.GraphMatchQuery
+	GraphTraverseQuery       = oapi.GraphTraverseQuery
+	GraphShortestPathQuery   = oapi.GraphShortestPathQuery
+	GraphKShortestPathsQuery = oapi.GraphKShortestPathsQuery
+	GraphMatch               = oapi.GraphMatch
+	GraphReturn              = oapi.GraphReturn
+	GraphWhereExpression     = oapi.GraphWhereExpression
 
 	// Graph traversal types
 	TraverseResponse = oapi.TraverseResponse
@@ -581,13 +581,6 @@ const (
 	// EdgeTypeConfigTopology values
 	EdgeTypeConfigTopologyGraph = oapi.EdgeTypeConfigTopologyGraph
 	EdgeTypeConfigTopologyTree  = oapi.EdgeTypeConfigTopologyTree
-
-	// GraphQueryType values
-	GraphQueryTypeKShortestPaths = oapi.GraphQueryTypeKShortestPaths
-	GraphQueryTypeNeighbors      = oapi.GraphQueryTypeNeighbors
-	GraphQueryTypePattern        = oapi.GraphQueryTypePattern
-	GraphQueryTypeShortestPath   = oapi.GraphQueryTypeShortestPath
-	GraphQueryTypeTraverse       = oapi.GraphQueryTypeTraverse
 
 	// PathFindWeightMode values
 	PathFindWeightModeMaxWeight = oapi.PathFindWeightModeMaxWeight

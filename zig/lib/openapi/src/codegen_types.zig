@@ -671,6 +671,15 @@ pub const TypeGenerator = struct {
         if (variants.items.len == 0) {
             try self.generateEmptyUnionJsonStubs();
         } else {
+            try self.w.line("pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {{", .{});
+            self.w.indent();
+            try self.w.line("const value = try std.json.innerParse(std.json.Value, allocator, source, options);", .{});
+            try self.w.line("return try jsonParseFromValue(allocator, value, options);", .{});
+            self.w.dedent();
+            try self.w.line("}}", .{});
+
+            try self.w.blank();
+
             try self.w.line("pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {{", .{});
             self.w.indent();
             try self.w.line("if (source != .object) return error.UnexpectedToken;", .{});
@@ -1105,6 +1114,7 @@ test "undiscriminated recursive oneOf generates structural union" {
     try std.testing.expect(std.mem.indexOf(u8, output, "pub const Query = union(enum) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "match_query: *MatchQuery,") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "boolean_query: *BooleanQuery,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "pub fn jsonParse(allocator: std.mem.Allocator, source: anytype") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "if (objectHasAnyKey(source.object, &.{") != null);
 }
 

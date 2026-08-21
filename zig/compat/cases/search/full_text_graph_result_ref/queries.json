@@ -11,17 +11,16 @@
       },
       "graph_queries": {
         "citations": {
-          "type": "neighbors",
-          "index_name": "gr_v1",
-          "include_documents": true,
-          "start_nodes": {
-            "result_ref": "$full_text_results",
-            "limit": 5
-          },
-          "params": {
+          "index": "gr_v1",
+          "traverse": {
+            "start": {
+              "result_ref": "$full_text_results",
+              "limit": 5
+            },
             "direction": "out",
             "edge_types": ["cites"],
-            "max_results": 5
+            "max_depth": 1,
+            "limit": 5
           }
         }
       },

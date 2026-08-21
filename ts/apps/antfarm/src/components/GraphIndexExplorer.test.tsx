@@ -103,14 +103,11 @@ describe("GraphIndexExplorer", () => {
     expect(mocks.query).toHaveBeenCalledWith(
       "papers",
       expect.objectContaining({
-        graph_searches: {
+        graph_queries: {
           explorer: expect.objectContaining({
-            type: "traverse",
-            index_name: "graph_idx",
-            start_nodes: { keys: ["alice"] },
-            include_documents: true,
-            include_edges: true,
-            params: expect.objectContaining({
+            index: "graph_idx",
+            traverse: expect.objectContaining({
+              start: { keys: ["alice"] },
               include_paths: true,
               deduplicate_nodes: true,
               max_depth: 2,

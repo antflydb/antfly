@@ -12,7 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! Graph Query API — structured DSL matching Go antfly's graph_searches.
+//! Graph Query API — structured DSL matching Go antfly's graph_queries.
 //!
 //! Provides a unified query interface over the graph module's traversal and
 //! path-finding primitives:
@@ -101,10 +101,18 @@ pub const GraphQuery = struct {
     target_nodes: ?NodeSelector = null,
     k: u32 = 1,
     pattern: []const pattern_mod.PatternStep = &.{},
+    match_pattern: ?pattern_mod.ConjunctivePattern = null,
     return_aliases: []const []const u8 = &.{},
+    aggregates: []const NamedCountAggregate = &.{},
     include_documents: bool = false,
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
+};
+
+pub const NamedCountAggregate = struct {
+    name: []const u8,
+    of: []const u8,
+    distinct: bool = false,
 };
 
 pub const ExpandStrategy = enum { @"union", intersection };

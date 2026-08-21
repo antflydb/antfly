@@ -1717,6 +1717,11 @@ pub const ContentPart = union(enum) {
         return false;
     }
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
         if (objectHasAnyKey(source.object, &.{
@@ -3811,6 +3816,23 @@ pub const GoogleGeneratorConfig = struct {
     url: ?[]const u8 = null,
 };
 
+pub const GraphAggregateValue = struct {
+    /// Decimal string so counts remain lossless in JavaScript.
+    value: []const u8,
+    exact: bool,
+};
+
+pub const GraphAliasOperand = struct {
+    alias: []const u8,
+};
+
+pub const GraphCountAggregate = struct {
+    type: []const u8,
+    /// Use `*` to count rows, or an alias to count non-null bindings.
+    of: []const u8,
+    distinct: ?bool = null,
+};
+
 /// Configuration for graph index type
 pub const GraphIndexConfig = struct {
     /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
@@ -3920,6 +3942,59 @@ pub const GraphIndexStats = struct {
     algebraic_graph: ?std.json.Value = null,
 };
 
+pub const GraphKShortestPaths = struct {
+    from: GraphPathEndpoint,
+    to: GraphPathEndpoint,
+    edge_types: ?[]const []const u8 = null,
+    direction: ?EdgeDirection = null,
+    max_depth: ?i64 = null,
+    min_weight: ?f64 = null,
+    max_weight: ?f64 = null,
+    weight_mode: ?PathWeightMode = null,
+    /// Canonical Antfly document-query AST.
+    filter: ?std.json.Value = null,
+    /// Include stored documents on nodes returned with the path.
+    include_documents: ?bool = null,
+    /// Document fields to include when include_documents is true. Omit to include all fields.
+    fields: ?[]const []const u8 = null,
+    k: i64,
+};
+
+pub const GraphKShortestPathsQuery = struct {
+    index: []const u8,
+    k_shortest_paths: GraphKShortestPaths,
+};
+
+pub const GraphMatch = struct {
+    nodes: std.json.ArrayHashMap(GraphMatchNode),
+    edges: []const GraphMatchEdge,
+    where: ?GraphWhereExpression = null,
+    optional: ?[]const GraphOptionalMatch = null,
+};
+
+pub const GraphMatchEdge = struct {
+    from: []const u8,
+    to: []const u8,
+    /// Empty or omitted matches every edge type.
+    types: ?[]const []const u8 = null,
+    direction: ?EdgeDirection = null,
+    min_hops: ?i64 = null,
+    max_hops: ?i64 = null,
+    min_weight: ?f64 = null,
+    max_weight: ?f64 = null,
+};
+
+pub const GraphMatchNode = struct {
+    /// Canonical Antfly document-query expression evaluated for this alias.
+    filter: ?std.json.Value = null,
+};
+
+pub const GraphMatchQuery = struct {
+    index: []const u8,
+    match: GraphMatch,
+    @"return": GraphReturn,
+};
+
 /// Defines how to select start/target nodes for graph queries
 pub const GraphNodeSelector = struct {
     /// Explicit list of node keys
@@ -3932,105 +4007,114 @@ pub const GraphNodeSelector = struct {
     node_filter: ?NodeFilter = null,
 };
 
-/// Declarative graph query to execute after full-text/vector searches
-pub const GraphQuery = struct {
-    type: GraphQueryType,
-    /// Graph index name (must be graph type)
-    index_name: []const u8,
-    /// Starting node(s) for the query
-    start_nodes: ?GraphNodeSelector = null,
-    /// Exact target nodes for pathfinding or the final binding of a pattern query. When a pattern endpoint is known, prefer this selector over an exact node_filter.filter_prefix so Antfly can use an exact edge-probe plan.
-    target_nodes: ?GraphNodeSelector = null,
-    /// Traversal/pathfinding parameters
-    params: ?GraphQueryParams = null,
-    /// Pattern steps for pattern query type
-    pattern: ?[]const PatternStep = null,
-    /// Which aliases to return from pattern query (empty = all)
-    return_aliases: ?[]const []const u8 = null,
-    /// Fetch full documents for graph results
-    include_documents: ?bool = null,
-    /// Include edge details for each node
-    include_edges: ?bool = null,
-    /// Which fields to return from documents
-    fields: ?[]const []const u8 = null,
+pub const GraphNotEqualPredicate = struct {
+    left: GraphAliasOperand,
+    right: GraphAliasOperand,
 };
 
-/// Parameters for graph traversal and pathfinding
-pub const GraphQueryParams = struct {
-    /// Filter by edge types
-    edge_types: ?[]const []const u8 = null,
-    direction: ?EdgeDirection = null,
-    /// Maximum traversal depth
-    max_depth: ?i64 = null,
-    /// Minimum edge weight
-    min_weight: ?f64 = null,
-    /// Maximum edge weight
-    max_weight: ?f64 = null,
-    /// Maximum number of results (traversal)
-    max_results: ?i64 = null,
-    /// Remove duplicate nodes (traversal)
-    deduplicate_nodes: ?bool = null,
-    /// Include path information (traversal)
-    include_paths: ?bool = null,
-    weight_mode: ?PathWeightMode = null,
-    /// Number of paths to find (k-shortest-paths)
-    k: ?i64 = null,
-    /// Filter which nodes to visit during traversal
-    node_filter: ?NodeFilter = null,
-    /// Graph algorithm to run (e.g., 'pagerank', 'betweenness')
-    algorithm: ?[]const u8 = null,
-    /// Parameters for the graph algorithm
-    algorithm_params: ?std.json.Value = null,
+pub const GraphNotExistsPattern = struct {
+    edges: []const GraphMatchEdge,
+};
+
+pub const GraphOptionalMatch = struct {
+    nodes: ?std.json.ArrayHashMap(GraphMatchNode) = null,
+    edges: []const GraphMatchEdge,
+    where: ?GraphWhereExpression = null,
+};
+
+pub const GraphPathEndpoint = struct {
+    key: []const u8,
+};
+
+pub const GraphQuery = union(enum) {
+    graph_match_query: *GraphMatchQuery,
+    graph_k_shortest_paths_query: *GraphKShortestPathsQuery,
+    graph_shortest_path_query: *GraphShortestPathQuery,
+    graph_traverse_query: *GraphTraverseQuery,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "index",
+            "match",
+            "return",
+        })) {
+            if (try parseStructuralVariant(GraphMatchQuery, allocator, source, options)) |parsed| return .{ .graph_match_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "index",
+            "k_shortest_paths",
+        })) {
+            if (try parseStructuralVariant(GraphKShortestPathsQuery, allocator, source, options)) |parsed| return .{ .graph_k_shortest_paths_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "index",
+            "shortest_path",
+        })) {
+            if (try parseStructuralVariant(GraphShortestPathQuery, allocator, source, options)) |parsed| return .{ .graph_shortest_path_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "index",
+            "traverse",
+        })) {
+            if (try parseStructuralVariant(GraphTraverseQuery, allocator, source, options)) |parsed| return .{ .graph_traverse_query = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .graph_match_query => |v| try jw.write(v.*),
+            .graph_k_shortest_paths_query => |v| try jw.write(v.*),
+            .graph_shortest_path_query => |v| try jw.write(v.*),
+            .graph_traverse_query => |v| try jw.write(v.*),
+        }
+    }
+};
+
+pub const GraphQueryPage = struct {
+    next_cursor: ?[]const u8 = null,
 };
 
 /// Results of a graph query
 pub const GraphQueryResult = struct {
-    type: GraphQueryType,
     /// Result nodes
     nodes: ?[]const GraphResultNode = null,
     /// Result paths (for pathfinding queries)
     paths: ?[]const Path = null,
-    /// Pattern matches (for pattern queries)
-    matches: ?[]const PatternMatch = null,
-    /// Total number of results
-    total: i64,
+    rows: ?[]const std.json.Value = null,
+    aggregates: ?std.json.ArrayHashMap(GraphAggregateValue) = null,
+    page: ?GraphQueryPage = null,
+    stats: ?GraphQueryStats = null,
     /// Query execution time
     took: ?i64 = null,
 };
 
-/// Type of graph query to execute
-pub const GraphQueryType = enum {
-    traverse,
-    neighbors,
-    shortest_path,
-    k_shortest_paths,
-    pattern,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .traverse => "traverse",
-            .neighbors => "neighbors",
-            .shortest_path => "shortest_path",
-            .k_shortest_paths => "k_shortest_paths",
-            .pattern => "pattern",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "traverse", .traverse },
-            .{ "neighbors", .neighbors },
-            .{ "shortest_path", .shortest_path },
-            .{ "k_shortest_paths", .k_shortest_paths },
-            .{ "pattern", .pattern },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
+pub const GraphQueryStats = struct {
+    returned_rows: i64,
+    truncated: bool,
 };
 
 /// A node in graph query results
@@ -4053,8 +4137,145 @@ pub const GraphResultNode = struct {
     provenance: ?[]const []const u8 = null,
     /// Parsed evidence envelope for provenance labels and edge metadata
     evidence: ?std.json.Value = null,
-    /// Connected edges (when include_edges=true)
+    /// Connected edges when supplied by the graph executor.
     edges: ?[]const Edge = null,
+};
+
+/// Return bindings or exact aggregates. Bindings and aggregates are mutually exclusive.
+pub const GraphReturn = struct {
+    bindings: ?[]const []const u8 = null,
+    limit: ?i64 = null,
+    aggregates: ?std.json.ArrayHashMap(GraphCountAggregate) = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.bindings) |value| {
+            try jw.objectField("bindings");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        if (self.aggregates) |value| {
+            try jw.objectField("aggregates");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const GraphShortestPath = struct {
+    from: GraphPathEndpoint,
+    to: GraphPathEndpoint,
+    edge_types: ?[]const []const u8 = null,
+    direction: ?EdgeDirection = null,
+    max_depth: ?i64 = null,
+    min_weight: ?f64 = null,
+    max_weight: ?f64 = null,
+    weight_mode: ?PathWeightMode = null,
+    /// Canonical Antfly document-query AST.
+    filter: ?std.json.Value = null,
+    /// Include stored documents on nodes returned with the path.
+    include_documents: ?bool = null,
+    /// Document fields to include when include_documents is true. Omit to include all fields.
+    fields: ?[]const []const u8 = null,
+};
+
+pub const GraphShortestPathQuery = struct {
+    index: []const u8,
+    shortest_path: GraphShortestPath,
+};
+
+pub const GraphTraversal = struct {
+    start: GraphNodeSelector,
+    edge_types: ?[]const []const u8 = null,
+    direction: ?EdgeDirection = null,
+    max_depth: ?i64 = null,
+    min_weight: ?f64 = null,
+    max_weight: ?f64 = null,
+    limit: ?i64 = null,
+    deduplicate_nodes: ?bool = null,
+    include_paths: ?bool = null,
+    /// Include each result node's stored document.
+    include_documents: ?bool = null,
+    /// Document fields to include when include_documents is true. Omit to include all fields.
+    fields: ?[]const []const u8 = null,
+    /// Canonical Antfly document-query AST (the same shape accepted by QueryRequest.filter_query).
+    filter: ?std.json.Value = null,
+};
+
+pub const GraphTraverseQuery = struct {
+    index: []const u8,
+    traverse: GraphTraversal,
+};
+
+pub const GraphWhereAnd = struct {
+    @"and": []const GraphWhereExpression,
+};
+
+pub const GraphWhereExpression = union(enum) {
+    graph_where_and: *GraphWhereAnd,
+    graph_where_not_equal: *GraphWhereNotEqual,
+    graph_where_not_exists: *GraphWhereNotExists,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "and",
+        })) {
+            if (try parseStructuralVariant(GraphWhereAnd, allocator, source, options)) |parsed| return .{ .graph_where_and = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "not_equal",
+        })) {
+            if (try parseStructuralVariant(GraphWhereNotEqual, allocator, source, options)) |parsed| return .{ .graph_where_not_equal = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "not_exists",
+        })) {
+            if (try parseStructuralVariant(GraphWhereNotExists, allocator, source, options)) |parsed| return .{ .graph_where_not_exists = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .graph_where_and => |v| try jw.write(v.*),
+            .graph_where_not_equal => |v| try jw.write(v.*),
+            .graph_where_not_exists => |v| try jw.write(v.*),
+        }
+    }
+};
+
+pub const GraphWhereNotEqual = struct {
+    not_equal: GraphNotEqualPredicate,
+};
+
+pub const GraphWhereNotExists = struct {
+    not_exists: GraphNotExistsPattern,
 };
 
 /// Ground truth data for evaluation
@@ -4577,6 +4798,11 @@ pub const InferenceChunkContentPart = union(enum) {
             if (object.contains(key)) return true;
         }
         return false;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
@@ -6545,39 +6771,6 @@ pub const PathWeightMode = enum {
     }
 };
 
-/// Edge constraints in a pattern step
-pub const PatternEdgeStep = struct {
-    /// Edge types to traverse (empty = any)
-    types: ?[]const []const u8 = null,
-    direction: ?EdgeDirection = null,
-    /// Minimum number of hops (1 = direct edge)
-    min_hops: ?i64 = null,
-    /// Maximum number of hops (>1 = variable-length path)
-    max_hops: ?i64 = null,
-    /// Minimum edge weight filter
-    min_weight: ?f64 = null,
-    /// Maximum edge weight filter
-    max_weight: ?f64 = null,
-};
-
-/// A single match from a pattern query
-pub const PatternMatch = struct {
-    /// Map of alias to matched node
-    bindings: ?std.json.ArrayHashMap(GraphResultNode) = null,
-    /// Edges traversed in this match
-    path: ?[]const PathEdge = null,
-};
-
-/// A step in a graph pattern query
-pub const PatternStep = struct {
-    /// Name for this node (reuse alias for cycle detection)
-    alias: ?[]const u8 = null,
-    /// Filter constraints for nodes at this step
-    node_filter: ?NodeFilter = null,
-    /// Edge to traverse to reach this step (null for first step)
-    edge: ?PatternEdgeStep = null,
-};
-
 pub const Permission = struct {
     /// Resource name (e.g., table name, target username, or '*' for all inference operations or a global grant).
     resource: []const u8,
@@ -6696,6 +6889,11 @@ pub const Query = union(enum) {
             if (object.contains(key)) return true;
         }
         return false;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
@@ -7125,8 +7323,8 @@ pub const QueryRequest = struct {
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?RerankerConfig = null,
     analyses: ?Analyses = null,
-    /// Declarative graph queries to execute after full-text/vector searches. Results can reference search results using node selectors like $full_text_results.
-    graph_searches: ?std.json.ArrayHashMap(GraphQuery) = null,
+    /// Declarative graph matching, traversal, and path queries. A nested node `filter` uses the same canonical query DSL as document search.
+    graph_queries: ?std.json.ArrayHashMap(GraphQuery) = null,
     /// Strategy for merging graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
     expand_strategy: ?[]const u8 = null,
     /// Optional Handlebars template string for rendering document content in RAG queries. Template has access to document fields via `{{this.fields.fieldName}}`. **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction: ```handlebars {{encodeToon this.fields}} ``` **Available Helpers**: - `encodeToon` - Renders fields in compact TOON format with configurable options: - `lengthMarker` (bool): Add # prefix to array counts (default: true) - `indent` (int): Indentation spacing (default: 2) - `delimiter` (string): Field separator for tabular arrays - `scrubHtml` - Removes HTML tags and extracts text - `media` - Wraps data URIs for GenKit multimodal support - `eq` - Equality comparison for conditionals **Examples**: - Basic TOON: `{{encodeToon this.fields}}` - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}` - Tabular data: `{{encodeToon this.fields delimiter="\t"}}` - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}` - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}` TOON format produces compact, LLM-optimized output like: ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml ``` **References**: - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon
@@ -7135,7 +7333,7 @@ pub const QueryRequest = struct {
     pruner: ?Pruner = null,
     /// Cross-table join configuration for combining results from multiple tables. Joins allow you to enrich query results with data from related tables, similar to SQL JOINs but optimized for distributed execution. **Join Types:** - `inner`: Only return rows that have matches in both tables - `left`: Return all rows from the primary table, with NULL for non-matching right rows - `right`: Return all rows from the joined table, with NULL for non-matching left rows **Join Strategies** (auto-selected based on table sizes): - `broadcast`: Small table broadcast to all shards (best for dimension tables < 10MB) - `index_lookup`: Batch key lookups using indexes (best for selective joins) - `shuffle`: Hash-partition both tables (best for large-large joins) **Example - Enrich orders with customer data:** ```json { "table": "orders", "full_text_search": {"query": "status:pending"}, "join": { "right_table": "customers", "join_type": "inner", "on": { "left_field": "customer_id", "right_field": "id" }, "right_filters": { "filter_query": {"query": "tier:premium"} } }, "fields": ["order_id", "amount", "customers.name", "customers.email"] } ``` **Multi-way joins** (nested): ```json { "table": "orders", "join": { "right_table": "customers", "on": {"left_field": "customer_id", "right_field": "id"}, "nested_join": { "right_table": "addresses", "on": {"left_field": "customers.address_id", "right_field": "id"} } } } ``` **Performance Tips:** - Filter the driving table first to reduce join input size - Put the smaller table on the right side for broadcast joins - Use indexed fields in join conditions for index_lookup strategy - Limit result fields to reduce data transfer
     join: ?JoinClause = null,
-    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, field selection, limit/offset. **Not supported:** full_text_search, semantic_search, graph_searches, aggregations, reranker. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
+    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, field selection, limit/offset. **Not supported:** full_text_search, semantic_search, graph_queries, aggregations, reranker. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
     foreign_sources: ?std.json.ArrayHashMap(ForeignSource) = null,
 };
 
@@ -7680,8 +7878,8 @@ pub const RetrievalQueryRequest = struct {
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?RerankerConfig = null,
     analyses: ?Analyses = null,
-    /// Declarative graph queries to execute after full-text/vector searches. Results can reference search results using node selectors like $full_text_results.
-    graph_searches: ?std.json.ArrayHashMap(GraphQuery) = null,
+    /// Declarative graph matching, traversal, and path queries. A nested node `filter` uses the same canonical query DSL as document search.
+    graph_queries: ?std.json.ArrayHashMap(GraphQuery) = null,
     /// Strategy for merging graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
     expand_strategy: ?[]const u8 = null,
     /// Optional Handlebars template string for rendering document content in RAG queries. Template has access to document fields via `{{this.fields.fieldName}}`. **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction: ```handlebars {{encodeToon this.fields}} ``` **Available Helpers**: - `encodeToon` - Renders fields in compact TOON format with configurable options: - `lengthMarker` (bool): Add # prefix to array counts (default: true) - `indent` (int): Indentation spacing (default: 2) - `delimiter` (string): Field separator for tabular arrays - `scrubHtml` - Removes HTML tags and extracts text - `media` - Wraps data URIs for GenKit multimodal support - `eq` - Equality comparison for conditionals **Examples**: - Basic TOON: `{{encodeToon this.fields}}` - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}` - Tabular data: `{{encodeToon this.fields delimiter="\t"}}` - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}` - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}` TOON format produces compact, LLM-optimized output like: ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml ``` **References**: - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon
@@ -7690,7 +7888,7 @@ pub const RetrievalQueryRequest = struct {
     pruner: ?Pruner = null,
     /// Cross-table join configuration for combining results from multiple tables. Joins allow you to enrich query results with data from related tables, similar to SQL JOINs but optimized for distributed execution. **Join Types:** - `inner`: Only return rows that have matches in both tables - `left`: Return all rows from the primary table, with NULL for non-matching right rows - `right`: Return all rows from the joined table, with NULL for non-matching left rows **Join Strategies** (auto-selected based on table sizes): - `broadcast`: Small table broadcast to all shards (best for dimension tables < 10MB) - `index_lookup`: Batch key lookups using indexes (best for selective joins) - `shuffle`: Hash-partition both tables (best for large-large joins) **Example - Enrich orders with customer data:** ```json { "table": "orders", "full_text_search": {"query": "status:pending"}, "join": { "right_table": "customers", "join_type": "inner", "on": { "left_field": "customer_id", "right_field": "id" }, "right_filters": { "filter_query": {"query": "tier:premium"} } }, "fields": ["order_id", "amount", "customers.name", "customers.email"] } ``` **Multi-way joins** (nested): ```json { "table": "orders", "join": { "right_table": "customers", "on": {"left_field": "customer_id", "right_field": "id"}, "nested_join": { "right_table": "addresses", "on": {"left_field": "customers.address_id", "right_field": "id"} } } } ``` **Performance Tips:** - Filter the driving table first to reduce join input size - Put the smaller table on the right side for broadcast joins - Use indexed fields in join conditions for index_lookup strategy - Limit result fields to reduce data transfer
     join: ?JoinClause = null,
-    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, field selection, limit/offset. **Not supported:** full_text_search, semantic_search, graph_searches, aggregations, reranker. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
+    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, field selection, limit/offset. **Not supported:** full_text_search, semantic_search, graph_queries, aggregations, reranker. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
     foreign_sources: ?std.json.ArrayHashMap(ForeignSource) = null,
     /// Optional tree search configuration
     tree_search: ?TreeSearchConfig = null,

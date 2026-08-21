@@ -1748,16 +1748,6 @@ components:
         - out: Outgoing edges from the node
         - in: Incoming edges to the node
         - both: Both outgoing and incoming edges
-    GraphQueryType:
-      x-go-type-skip-optional-pointer: true
-      type: string
-      enum:
-        - traverse
-        - neighbors
-        - shortest_path
-        - k_shortest_paths
-        - pattern
-      description: "Type of graph query to execute"
     PathWeightMode:
       x-go-type-skip-optional-pointer: true
       type: string
@@ -2019,69 +2009,269 @@ components:
         node_filter:
           $ref: "#/components/schemas/NodeFilter"
           description: "Filter which nodes to use as start/target"
-    GraphQueryParams:
-      x-go-type-skip-optional-pointer: true
+    GraphTraversal:
       type: object
-      description: "Parameters for graph traversal and pathfinding"
+      additionalProperties: false
+      required: [start]
       properties:
+        start:
+          $ref: '#/components/schemas/GraphNodeSelector'
         edge_types:
-          x-go-type-skip-optional-pointer: true
           type: array
-          items:
-            type: string
-          description: "Filter by edge types"
+          items: { type: string }
         direction:
-          $ref: "#/components/schemas/EdgeDirection"
+          $ref: '#/components/schemas/EdgeDirection'
         max_depth:
-          x-go-type-skip-optional-pointer: true
           type: integer
           minimum: 1
           maximum: 64
-          description: "Maximum traversal depth"
-        min_weight:
-          x-go-type-skip-optional-pointer: true
-          type: number
-          format: double
-          description: "Minimum edge weight"
-        max_weight:
-          x-go-type-skip-optional-pointer: true
-          type: number
-          format: double
-          description: "Maximum edge weight"
-        max_results:
-          x-go-type-skip-optional-pointer: true
+          default: 3
+        min_weight: { type: number, format: double }
+        max_weight: { type: number, format: double }
+        limit:
           type: integer
           minimum: 1
           maximum: 10000
-          description: "Maximum number of results (traversal)"
-        deduplicate_nodes:
-          x-go-type-skip-optional-pointer: true
+          default: 100
+        deduplicate_nodes: { type: boolean, default: true }
+        include_paths: { type: boolean, default: false }
+        include_documents:
           type: boolean
-          description: "Remove duplicate nodes (traversal)"
-        include_paths:
-          x-go-type-skip-optional-pointer: true
-          type: boolean
-          description: "Include path information (traversal)"
-        weight_mode:
-          $ref: "#/components/schemas/PathWeightMode"
-        k:
-          x-go-type-skip-optional-pointer: true
-          type: integer
-          minimum: 1
-          maximum: 100
-          description: "Number of paths to find (k-shortest-paths)"
-        node_filter:
-          $ref: "#/components/schemas/NodeFilter"
-          description: "Filter which nodes to visit during traversal"
-        algorithm:
-          x-go-type-skip-optional-pointer: true
-          type: string
-          description: "Graph algorithm to run (e.g., 'pagerank', 'betweenness')"
-        algorithm_params:
-          x-go-type-skip-optional-pointer: true
+          default: false
+          description: Include each result node's stored document.
+        fields:
+          type: array
+          items: { type: string }
+          description: Document fields to include when include_documents is true. Omit to include all fields.
+        filter:
           type: object
           additionalProperties: true
-          description: "Parameters for the graph algorithm"
+          description: Canonical Antfly document-query AST (the same shape accepted by QueryRequest.filter_query).
+    GraphPathEndpoint:
+      type: object
+      additionalProperties: false
+      required: [key]
+      properties:
+        key: { type: string }
+    GraphShortestPath:
+      type: object
+      additionalProperties: false
+      required: [from, to]
+      properties:
+        from: { $ref: '#/components/schemas/GraphPathEndpoint' }
+        to: { $ref: '#/components/schemas/GraphPathEndpoint' }
+        edge_types:
+          type: array
+          items: { type: string }
+        direction: { $ref: '#/components/schemas/EdgeDirection' }
+        max_depth:
+          type: integer
+          minimum: 1
+          maximum: 64
+          default: 10
+        min_weight: { type: number, format: double }
+        max_weight: { type: number, format: double }
+        weight_mode: { $ref: '#/components/schemas/PathWeightMode' }
+        filter:
+          type: object
+          additionalProperties: true
+          description: Canonical Antfly document-query AST.
+        include_documents:
+          type: boolean
+          default: false
+          description: Include stored documents on nodes returned with the path.
+        fields:
+          type: array
+          items: { type: string }
+          description: Document fields to include when include_documents is true. Omit to include all fields.
+    GraphKShortestPaths:
+      allOf:
+        - $ref: '#/components/schemas/GraphShortestPath'
+        - type: object
+          required: [k]
+          properties:
+            k:
+              type: integer
+              minimum: 1
+              maximum: 100
+    GraphMatchNode:
+      type: object
+      additionalProperties: false
+      properties:
+        filter:
+          type: object
+          additionalProperties: true
+          description: Canonical Antfly document-query expression evaluated for this alias.
+    GraphMatchEdge:
+      type: object
+      additionalProperties: false
+      required: [from, to]
+      properties:
+        from: { type: string }
+        to: { type: string }
+        types:
+          type: array
+          items: { type: string }
+          description: Empty or omitted matches every edge type.
+        direction: { $ref: '#/components/schemas/EdgeDirection' }
+        min_hops:
+          type: integer
+          minimum: 1
+          maximum: 64
+          default: 1
+        max_hops:
+          type: integer
+          minimum: 1
+          maximum: 64
+          default: 1
+        min_weight: { type: number, format: double }
+        max_weight: { type: number, format: double }
+    GraphAliasOperand:
+      type: object
+      additionalProperties: false
+      required: [alias]
+      properties:
+        alias: { type: string }
+    GraphNotEqualPredicate:
+      type: object
+      additionalProperties: false
+      required: [left, right]
+      properties:
+        left: { $ref: '#/components/schemas/GraphAliasOperand' }
+        right: { $ref: '#/components/schemas/GraphAliasOperand' }
+    GraphNotExistsPattern:
+      type: object
+      additionalProperties: false
+      required: [edges]
+      properties:
+        edges:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/GraphMatchEdge' }
+    GraphWhereAnd:
+      type: object
+      additionalProperties: false
+      required: [and]
+      properties:
+        and:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/GraphWhereExpression' }
+    GraphWhereNotEqual:
+      type: object
+      additionalProperties: false
+      required: [not_equal]
+      properties:
+        not_equal: { $ref: '#/components/schemas/GraphNotEqualPredicate' }
+    GraphWhereNotExists:
+      type: object
+      additionalProperties: false
+      required: [not_exists]
+      properties:
+        not_exists: { $ref: '#/components/schemas/GraphNotExistsPattern' }
+    GraphWhereExpression:
+      oneOf:
+        - $ref: '#/components/schemas/GraphWhereAnd'
+        - $ref: '#/components/schemas/GraphWhereNotEqual'
+        - $ref: '#/components/schemas/GraphWhereNotExists'
+    GraphOptionalMatch:
+      type: object
+      additionalProperties: false
+      required: [edges]
+      properties:
+        nodes:
+          type: object
+          additionalProperties: { $ref: '#/components/schemas/GraphMatchNode' }
+        edges:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/GraphMatchEdge' }
+        where: { $ref: '#/components/schemas/GraphWhereExpression' }
+    GraphMatch:
+      type: object
+      additionalProperties: false
+      required: [nodes, edges]
+      properties:
+        nodes:
+          type: object
+          minProperties: 1
+          additionalProperties: { $ref: '#/components/schemas/GraphMatchNode' }
+        edges:
+          type: array
+          items: { $ref: '#/components/schemas/GraphMatchEdge' }
+        where: { $ref: '#/components/schemas/GraphWhereExpression' }
+        optional:
+          type: array
+          items: { $ref: '#/components/schemas/GraphOptionalMatch' }
+    GraphCountAggregate:
+      type: object
+      additionalProperties: false
+      required: [type, of]
+      properties:
+        type:
+          type: string
+          enum: [count]
+        of:
+          type: string
+          description: Use `*` to count rows, or an alias to count non-null bindings.
+        distinct: { type: boolean, default: false }
+    GraphReturn:
+      type: object
+      additionalProperties: false
+      properties:
+        bindings:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { type: string }
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 10000
+          default: 100
+        aggregates:
+          type: object
+          minProperties: 1
+          additionalProperties: { $ref: '#/components/schemas/GraphCountAggregate' }
+      oneOf:
+        - required: [bindings]
+        - required: [aggregates]
+      description: Return bindings or exact aggregates. Bindings and aggregates are mutually exclusive.
+    GraphMatchQuery:
+      type: object
+      additionalProperties: false
+      required: [index, match, return]
+      properties:
+        index: { type: string }
+        match: { $ref: '#/components/schemas/GraphMatch' }
+        return: { $ref: '#/components/schemas/GraphReturn' }
+    GraphTraverseQuery:
+      type: object
+      additionalProperties: false
+      required: [index, traverse]
+      properties:
+        index: { type: string }
+        traverse: { $ref: '#/components/schemas/GraphTraversal' }
+    GraphShortestPathQuery:
+      type: object
+      additionalProperties: false
+      required: [index, shortest_path]
+      properties:
+        index: { type: string }
+        shortest_path: { $ref: '#/components/schemas/GraphShortestPath' }
+    GraphKShortestPathsQuery:
+      type: object
+      additionalProperties: false
+      required: [index, k_shortest_paths]
+      properties:
+        index: { type: string }
+        k_shortest_paths: { $ref: '#/components/schemas/GraphKShortestPaths' }
+    GraphQuery:
+      oneOf:
+        - $ref: '#/components/schemas/GraphMatchQuery'
+        - $ref: '#/components/schemas/GraphTraverseQuery'
+        - $ref: '#/components/schemas/GraphShortestPathQuery'
+        - $ref: '#/components/schemas/GraphKShortestPathsQuery'
     GraphResultNode:
       x-go-type-skip-optional-pointer: true
       type: object
@@ -2139,133 +2329,31 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Edge'
-          description: "Connected edges (when include_edges=true)"
-    PatternEdgeStep:
-      x-go-type-skip-optional-pointer: true
+          description: "Connected edges when supplied by the graph executor."
+    GraphAggregateValue:
       type: object
-      description: "Edge constraints in a pattern step"
+      required: [value, exact]
       properties:
-        types:
-          x-go-type-skip-optional-pointer: true
-          type: array
-          items:
-            type: string
-          description: "Edge types to traverse (empty = any)"
-        direction:
-          $ref: "#/components/schemas/EdgeDirection"
-        min_hops:
-          x-go-type-skip-optional-pointer: true
-          type: integer
-          default: 1
-          minimum: 1
-          description: "Minimum number of hops (1 = direct edge)"
-        max_hops:
-          x-go-type-skip-optional-pointer: true
-          type: integer
-          default: 1
-          minimum: 1
-          description: "Maximum number of hops (>1 = variable-length path)"
-        min_weight:
-          x-go-type-skip-optional-pointer: true
-          type: number
-          format: double
-          description: "Minimum edge weight filter"
-        max_weight:
-          x-go-type-skip-optional-pointer: true
-          type: number
-          format: double
-          description: "Maximum edge weight filter"
-    PatternStep:
-      x-go-type-skip-optional-pointer: true
-      type: object
-      description: "A step in a graph pattern query"
-      properties:
-        alias:
-          x-go-type-skip-optional-pointer: true
+        value:
           type: string
-          description: "Name for this node (reuse alias for cycle detection)"
-        node_filter:
-          $ref: "#/components/schemas/NodeFilter"
-          description: "Filter constraints for nodes at this step"
-        edge:
-          $ref: "#/components/schemas/PatternEdgeStep"
-          description: "Edge to traverse to reach this step (null for first step)"
-    GraphQuery:
-      x-go-type-skip-optional-pointer: true
+          pattern: '^[0-9]+$'
+          description: Decimal string so counts remain lossless in JavaScript.
+        exact: { type: boolean }
+    GraphQueryPage:
       type: object
-      description: "Declarative graph query to execute after full-text/vector searches"
-      required:
-        - type
-        - index_name
       properties:
-        type:
-          $ref: "#/components/schemas/GraphQueryType"
-        index_name:
-          x-go-type-skip-optional-pointer: true
-          type: string
-          description: "Graph index name (must be graph type)"
-        start_nodes:
-          $ref: '#/components/schemas/GraphNodeSelector'
-          description: "Starting node(s) for the query"
-        target_nodes:
-          $ref: '#/components/schemas/GraphNodeSelector'
-          description: "Exact target nodes for pathfinding or the final binding of a pattern query. When a pattern endpoint is known, prefer this selector over an exact node_filter.filter_prefix so Antfly can use an exact edge-probe plan."
-        params:
-          $ref: '#/components/schemas/GraphQueryParams'
-          description: "Traversal/pathfinding parameters"
-        pattern:
-          x-go-type-skip-optional-pointer: true
-          type: array
-          items:
-            $ref: '#/components/schemas/PatternStep'
-          description: "Pattern steps for pattern query type"
-        return_aliases:
-          x-go-type-skip-optional-pointer: true
-          type: array
-          items:
-            type: string
-          description: "Which aliases to return from pattern query (empty = all)"
-        include_documents:
-          x-go-type-skip-optional-pointer: true
-          type: boolean
-          description: "Fetch full documents for graph results"
-        include_edges:
-          x-go-type-skip-optional-pointer: true
-          type: boolean
-          description: "Include edge details for each node"
-        fields:
-          x-go-type-skip-optional-pointer: true
-          type: array
-          items:
-            type: string
-          description: "Which fields to return from documents"
-    PatternMatch:
-      x-go-type-skip-optional-pointer: true
+        next_cursor: { type: string }
+    GraphQueryStats:
       type: object
-      description: "A single match from a pattern query"
+      required: [returned_rows, truncated]
       properties:
-        bindings:
-          x-go-type-skip-optional-pointer: true
-          type: object
-          additionalProperties:
-            $ref: '#/components/schemas/GraphResultNode'
-          description: "Map of alias to matched node"
-        path:
-          x-go-type-skip-optional-pointer: true
-          type: array
-          items:
-            $ref: '#/components/schemas/PathEdge'
-          description: "Edges traversed in this match"
+        returned_rows: { type: integer, format: uint64 }
+        truncated: { type: boolean }
     GraphQueryResult:
       x-go-type-skip-optional-pointer: true
       type: object
       description: "Results of a graph query"
-      required:
-        - type
-        - total
       properties:
-        type:
-          $ref: "#/components/schemas/GraphQueryType"
         nodes:
           x-go-type-skip-optional-pointer: true
           type: array
@@ -2278,16 +2366,17 @@ components:
           items:
             $ref: '#/components/schemas/Path'
           description: "Result paths (for pathfinding queries)"
-        matches:
-          x-go-type-skip-optional-pointer: true
+        rows:
           type: array
           items:
-            $ref: '#/components/schemas/PatternMatch'
-          description: "Pattern matches (for pattern queries)"
-        total:
-          x-go-type-skip-optional-pointer: true
-          type: integer
-          description: "Total number of results"
+            type: object
+            additionalProperties: true
+        aggregates:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/GraphAggregateValue'
+        page: { $ref: '#/components/schemas/GraphQueryPage' }
+        stats: { $ref: '#/components/schemas/GraphQueryStats' }
         took:
           x-go-type-skip-optional-pointer: true
           type: integer

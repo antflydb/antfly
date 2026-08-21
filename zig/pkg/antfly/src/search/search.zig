@@ -139,7 +139,7 @@ pub const SearchRequest = struct {
     sort: ?SortSpec = null,
     search_after: ?SearchCursor = null,
     hbc_indexes: []const HBCIndexRef = &.{},
-    graph_searches: []const NamedGraphQuery = &.{},
+    graph_queries: []const NamedGraphQuery = &.{},
     expand_strategy: graph_query.ExpandStrategy = .@"union",
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
     filter_doc_nums: []const u32 = &.{},
@@ -509,7 +509,7 @@ pub fn execute(
     };
     errdefer result.deinit();
 
-    if (request.graph_searches.len > 0) {
+    if (request.graph_queries.len > 0) {
         try executeGraphSearches(alloc, &result, request);
     }
 
@@ -547,10 +547,10 @@ pub fn executeCountCandidates(
 }
 
 fn executeGraphSearches(alloc: Allocator, result: *SearchResult, request: SearchRequest) !void {
-    var graph_results = try alloc.alloc(NamedGraphResult, request.graph_searches.len);
+    var graph_results = try alloc.alloc(NamedGraphResult, request.graph_queries.len);
     errdefer alloc.free(graph_results);
 
-    for (request.graph_searches, 0..) |gs, i| {
+    for (request.graph_queries, 0..) |gs, i| {
         // Resolve start node keys
         const resolved_keys = switch (gs.query.start_nodes) {
             .keys => |k| k,
@@ -1328,7 +1328,7 @@ fn executeQueryAllScored(
     sub_request.aggregations = &.{};
     sub_request.sort = null;
     sub_request.search_after = null;
-    sub_request.graph_searches = &.{};
+    sub_request.graph_queries = &.{};
 
     var result = try execute(alloc, snap, sub_request);
     defer result.deinit();

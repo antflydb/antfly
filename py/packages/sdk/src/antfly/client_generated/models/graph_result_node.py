@@ -33,7 +33,7 @@ class GraphResultNode:
         provenance (list[str] | Unset): Algebraic provenance labels folded into this result, when requested by an
             algebraic graph executor
         evidence (GraphResultNodeEvidence | Unset): Parsed evidence envelope for provenance labels and edge metadata
-        edges (list[Edge] | Unset): Connected edges (when include_edges=true)
+        edges (list[Edge] | Unset): Connected edges when supplied by the graph executor.
     """
 
     key: str

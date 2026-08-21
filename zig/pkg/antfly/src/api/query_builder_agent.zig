@@ -118,11 +118,11 @@ pub const QueryBuilderPlanValidator = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        validate_graph_searches: ?*const fn (
+        validate_graph_queries: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             request: metadata_openapi.QueryBuilderRequest,
-            graph_searches: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
+            graph_queries: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
         ) anyerror!?[]const u8 = null,
         validate_bleve_query: ?*const fn (
             ptr: *anyopaque,
@@ -144,10 +144,10 @@ pub const QueryBuilderPlanValidator = struct {
         self: QueryBuilderPlanValidator,
         alloc: std.mem.Allocator,
         request: metadata_openapi.QueryBuilderRequest,
-        graph_searches: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
+        graph_queries: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
     ) !?[]const u8 {
-        const func = self.vtable.validate_graph_searches orelse return null;
-        return try func(self.ptr, alloc, request, graph_searches);
+        const func = self.vtable.validate_graph_queries orelse return null;
+        return try func(self.ptr, alloc, request, graph_queries);
     }
 
     pub fn validateBleveQuery(
@@ -468,7 +468,7 @@ pub fn metadataBackedPlanValidator(context: *const QueryBuilderTableContext) Que
     return .{
         .ptr = @ptrCast(@constCast(context)),
         .vtable = &.{
-            .validate_graph_searches = metadataValidateGraphSearches,
+            .validate_graph_queries = metadataValidateGraphSearches,
             .validate_bleve_query = metadataValidateBleveQuery,
             .validate_query_request = metadataValidateQueryRequest,
         },
@@ -479,11 +479,11 @@ fn metadataValidateGraphSearches(
     ptr: *anyopaque,
     alloc: std.mem.Allocator,
     request: metadata_openapi.QueryBuilderRequest,
-    graph_searches: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
+    graph_queries: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
 ) !?[]const u8 {
     _ = request;
     const context: *const QueryBuilderTableContext = @ptrCast(@alignCast(ptr));
-    return metadataValidateGraphSearchesAgainstContext(alloc, context, graph_searches);
+    return metadataValidateGraphSearchesAgainstContext(alloc, context, graph_queries);
 }
 
 fn metadataValidateBleveQuery(
@@ -854,8 +854,8 @@ fn preflightQueryRequestAgainstContext(
     defer if (runtime_preflight) |*summary| summary.deinit(alloc);
     var contract_preflight = query_contract.preflightQueryRequestAlloc(alloc, query_request) catch |err| blk: {
         if (!metadataSortOrderShapeInvalid(query_request) and !metadataSortCursorShapeInvalid(query_request)) {
-            const feedback = if (query_request.graph_searches != null)
-                try std.fmt.allocPrint(alloc, "query_request.graph_searches failed executor preflight: {s}", .{@errorName(err)})
+            const feedback = if (query_request.graph_queries != null)
+                try std.fmt.allocPrint(alloc, "query_request.graph_queries failed executor preflight: {s}", .{@errorName(err)})
             else
                 try std.fmt.allocPrint(alloc, "query_request failed contract preflight: {s}", .{@errorName(err)});
             defer alloc.free(feedback);
@@ -939,14 +939,14 @@ fn preflightQueryRequestAgainstContext(
         defer alloc.free(feedback.message);
         try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "invalid_sort_cursor", feedback.path, feedback.message);
     }
-    if (query_request.graph_searches) |graph_searches| {
-        if (try metadataValidateGraphSearchesAgainstContext(alloc, context, graph_searches)) |feedback| {
+    if (query_request.graph_queries) |graph_queries| {
+        if (try metadataValidateGraphSearchesAgainstContext(alloc, context, graph_queries)) |feedback| {
             defer alloc.free(feedback);
-            try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "invalid_graph_search", "query_request.graph_searches", feedback);
+            try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "invalid_graph_search", "query_request.graph_queries", feedback);
         }
-        if (try metadataValidateGraphSearchResultRefs(alloc, query_request, graph_searches)) |feedback| {
+        if (try metadataValidateGraphSearchResultRefs(alloc, query_request, graph_queries)) |feedback| {
             defer alloc.free(feedback);
-            try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "invalid_graph_result_ref", "query_request.graph_searches", feedback);
+            try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "invalid_graph_result_ref", "query_request.graph_queries", feedback);
         }
     }
     if (retrieval_query_request) |retrieval_query| {
@@ -1501,52 +1501,50 @@ fn deinitOwnedStringSlice(alloc: std.mem.Allocator, values: []const []const u8) 
 fn metadataValidateGraphSearchesAgainstContext(
     alloc: std.mem.Allocator,
     context: *const QueryBuilderTableContext,
-    graph_searches: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
+    graph_queries: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
 ) !?[]const u8 {
-    var it = graph_searches.map.iterator();
+    var it = graph_queries.map.iterator();
     while (it.next()) |entry| {
         const query = entry.value_ptr.*;
-        if (!metadataContextHasGraphIndex(context, query.index_name)) {
-            return try std.fmt.allocPrint(alloc, "graph_searches.{s} references unknown graph index '{s}'", .{ entry.key_ptr.*, query.index_name });
+        const index = generatedGraphQueryIndex(query);
+        if (!metadataContextHasGraphIndex(context, index)) {
+            return try std.fmt.allocPrint(alloc, "graph_queries.{s} references unknown graph index '{s}'", .{ entry.key_ptr.*, index });
         }
-        if (query.params) |params| {
-            if (params.edge_types) |edge_types| {
-                if (try metadataValidateGraphEdgeTypesForIndex(alloc, context, entry.key_ptr.*, query.index_name, edge_types)) |feedback| return feedback;
-            }
-        }
-        if (query.pattern) |pattern| {
-            for (pattern) |step| {
-                if (step.edge) |edge| {
-                    if (edge.types) |edge_types| {
-                        if (try metadataValidateGraphEdgeTypesForIndex(alloc, context, entry.key_ptr.*, query.index_name, edge_types)) |feedback| return feedback;
-                    }
-                }
-            }
-        }
-        if (query.fields) |fields| {
-            for (fields) |field| {
-                if (!metadataContextAllowsField(context, field)) {
-                    return try std.fmt.allocPrint(alloc, "graph_searches.{s}.fields references unknown field '{s}'", .{ entry.key_ptr.*, field });
-                }
-            }
+        switch (query) {
+            .graph_match_query => |match_query| {
+                for (match_query.match.edges) |edge| if (edge.types) |types| {
+                    if (try metadataValidateGraphEdgeTypesForIndex(alloc, context, entry.key_ptr.*, index, types)) |feedback| return feedback;
+                };
+                if (match_query.match.optional) |groups| for (groups) |group| for (group.edges) |edge| if (edge.types) |types| {
+                    if (try metadataValidateGraphEdgeTypesForIndex(alloc, context, entry.key_ptr.*, index, types)) |feedback| return feedback;
+                };
+            },
+            .graph_traverse_query => |traverse_query| if (traverse_query.traverse.edge_types) |types| {
+                if (try metadataValidateGraphEdgeTypesForIndex(alloc, context, entry.key_ptr.*, index, types)) |feedback| return feedback;
+            },
+            .graph_shortest_path_query => |path_query| if (path_query.shortest_path.edge_types) |types| {
+                if (try metadataValidateGraphEdgeTypesForIndex(alloc, context, entry.key_ptr.*, index, types)) |feedback| return feedback;
+            },
+            .graph_k_shortest_paths_query => |path_query| if (path_query.k_shortest_paths.edge_types) |types| {
+                if (try metadataValidateGraphEdgeTypesForIndex(alloc, context, entry.key_ptr.*, index, types)) |feedback| return feedback;
+            },
         }
     }
-    if (try metadataPreflightGraphSearchesAgainstExecutorParser(alloc, graph_searches)) |feedback| return feedback;
+    if (try metadataPreflightGraphSearchesAgainstExecutorParser(alloc, graph_queries)) |feedback| return feedback;
     return null;
 }
 
 fn metadataValidateGraphSearchResultRefs(
     alloc: std.mem.Allocator,
     query_request: metadata_openapi.QueryRequest,
-    graph_searches: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
+    graph_queries: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
 ) !?[]const u8 {
-    validateGeneratedGraphResultDependencies(graph_searches) catch {
-        return try alloc.dupe(u8, "query_request.graph_searches contains an invalid graph result dependency");
+    validateGeneratedGraphResultDependencies(graph_queries) catch {
+        return try alloc.dupe(u8, "query_request.graph_queries contains an invalid graph result dependency");
     };
-    var it = graph_searches.map.iterator();
+    var it = graph_queries.map.iterator();
     while (it.next()) |entry| {
-        if (try metadataValidateGraphSelectorResultRef(alloc, query_request, graph_searches, entry.key_ptr.*, "start_nodes", entry.value_ptr.*.start_nodes)) |feedback| return feedback;
-        if (try metadataValidateGraphSelectorResultRef(alloc, query_request, graph_searches, entry.key_ptr.*, "target_nodes", entry.value_ptr.*.target_nodes)) |feedback| return feedback;
+        if (try metadataValidateGraphSelectorResultRef(alloc, query_request, graph_queries, entry.key_ptr.*, "traverse.start", generatedGraphQueryStartSelector(entry.value_ptr.*))) |feedback| return feedback;
     }
     return null;
 }
@@ -1554,37 +1552,37 @@ fn metadataValidateGraphSearchResultRefs(
 fn metadataValidateGraphSelectorResultRef(
     alloc: std.mem.Allocator,
     query_request: metadata_openapi.QueryRequest,
-    graph_searches: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
+    graph_queries: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
     search_name: []const u8,
     selector_name: []const u8,
     selector: ?indexes_openapi.GraphNodeSelector,
 ) !?[]const u8 {
     const result_ref = (selector orelse return null).result_ref orelse return null;
     if (generatedGraphResultDependencyName(result_ref)) |dependency_name| {
-        if (graph_searches.map.get(dependency_name) == null) {
-            return try std.fmt.allocPrint(alloc, "graph_searches.{s}.{s} references missing graph result '{s}'", .{ search_name, selector_name, result_ref });
+        if (graph_queries.map.get(dependency_name) == null) {
+            return try std.fmt.allocPrint(alloc, "graph_queries.{s}.{s} references missing graph result '{s}'", .{ search_name, selector_name, result_ref });
         }
         return null;
     }
     if (std.mem.eql(u8, result_ref, "$full_text_results")) {
         if (query_request.full_text_search == null) {
-            return try std.fmt.allocPrint(alloc, "graph_searches.{s}.{s} references $full_text_results but query_request.full_text_search is absent", .{ search_name, selector_name });
+            return try std.fmt.allocPrint(alloc, "graph_queries.{s}.{s} references $full_text_results but query_request.full_text_search is absent", .{ search_name, selector_name });
         }
         return null;
     }
     if (std.mem.eql(u8, result_ref, "$fused_results")) {
         if (query_request.full_text_search == null or !metadataQueryRequestHasVectorResults(query_request)) {
-            return try std.fmt.allocPrint(alloc, "graph_searches.{s}.{s} references $fused_results but the query_request cannot produce fused full-text and vector results", .{ search_name, selector_name });
+            return try std.fmt.allocPrint(alloc, "graph_queries.{s}.{s} references $fused_results but the query_request cannot produce fused full-text and vector results", .{ search_name, selector_name });
         }
         return null;
     }
     if (std.mem.eql(u8, result_ref, "$embeddings_results")) {
         if (!metadataQueryRequestHasVectorResults(query_request)) {
-            return try std.fmt.allocPrint(alloc, "graph_searches.{s}.{s} references {s} but query_request has no semantic_search or embeddings", .{ search_name, selector_name, result_ref });
+            return try std.fmt.allocPrint(alloc, "graph_queries.{s}.{s} references {s} but query_request has no semantic_search or embeddings", .{ search_name, selector_name, result_ref });
         }
         return null;
     }
-    return try std.fmt.allocPrint(alloc, "graph_searches.{s}.{s} references unsupported result ref '{s}'", .{ search_name, selector_name, result_ref });
+    return try std.fmt.allocPrint(alloc, "graph_queries.{s}.{s} references unsupported result ref '{s}'", .{ search_name, selector_name, result_ref });
 }
 
 fn metadataQueryRequestHasVectorResults(query_request: metadata_openapi.QueryRequest) bool {
@@ -1593,14 +1591,14 @@ fn metadataQueryRequestHasVectorResults(query_request: metadata_openapi.QueryReq
 
 fn metadataPreflightGraphSearchesAgainstExecutorParser(
     alloc: std.mem.Allocator,
-    graph_searches: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
+    graph_queries: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
 ) !?[]const u8 {
     const request = metadata_openapi.QueryRequest{
-        .graph_searches = graph_searches,
+        .graph_queries = graph_queries,
     };
     query_contract.preflightGraphSearchesAlloc(alloc, request) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return try std.fmt.allocPrint(alloc, "query_request.graph_searches failed executor preflight: {s}", .{@errorName(err)}),
+        else => return try std.fmt.allocPrint(alloc, "query_request.graph_queries failed executor preflight: {s}", .{@errorName(err)}),
     };
     return null;
 }
@@ -2021,7 +2019,7 @@ fn metadataValidateGraphEdgeTypesForIndex(
     if (graph_metadata.edge_types.len == 0) return null;
     for (edge_types) |edge_type| {
         if (!metadataGraphIndexHasEdgeType(graph_metadata, edge_type)) {
-            return try std.fmt.allocPrint(alloc, "graph_searches.{s} references unknown edge type '{s}' for graph index '{s}'", .{ search_name, edge_type, index_name });
+            return try std.fmt.allocPrint(alloc, "graph_queries.{s} references unknown edge type '{s}' for graph index '{s}'", .{ search_name, edge_type, index_name });
         }
     }
     return null;
@@ -2202,8 +2200,8 @@ pub fn buildQueryBuilderResponseWithContext(
             try warnings.append(alloc, "Filter mode was requested, but no standalone structured predicate was detected, so a full-text query request was generated.");
         } else if (std.ascii.eqlIgnoreCase(mode, "tree") and retrieval_query_request == null) {
             try warnings.append(alloc, "Tree mode requires constraints.tree_search or constraints.tree_index, so only the seed query_request was generated.");
-        } else if (std.ascii.eqlIgnoreCase(mode, "graph") and query_request.graph_searches == null) {
-            try warnings.append(alloc, "Graph mode requires constraints.graph_searches, constraints.graph_index, or table graph index metadata, so the deterministic full-text/filter builder was used.");
+        } else if (std.ascii.eqlIgnoreCase(mode, "graph") and query_request.graph_queries == null) {
+            try warnings.append(alloc, "Graph mode requires constraints.graph_queries, constraints.graph_index, or table graph index metadata, so the deterministic full-text/filter builder was used.");
         }
     }
     if (request.generator != null and generation_runner == null) {
@@ -2285,7 +2283,7 @@ const BuiltQueryBuilderQuery = struct {
     date_inclusive_end: bool = false,
     term_filters: []const QueryBuilderTermFilter = &.{},
     indexes: ?[]const []const u8 = null,
-    graph_searches: ?std.json.ArrayHashMap(indexes_openapi.GraphQuery) = null,
+    graph_queries: ?std.json.ArrayHashMap(indexes_openapi.GraphQuery) = null,
     llm_explanation: ?[]const u8 = null,
     llm_confidence: ?f64 = null,
     llm_warnings: ?[]const []const u8 = null,
@@ -2566,14 +2564,14 @@ const GeneratedSemanticQueryBuilderAttempt = union(enum) {
 };
 
 const GeneratedGraphQueryBuilderResponse = struct {
-    graph_searches: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
+    graph_queries: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
     explanation: ?[]const u8 = null,
     confidence: ?f64 = null,
     warnings: ?[]const []const u8 = null,
 };
 
 const GeneratedGraphQueryBuilderPlan = struct {
-    graph_searches: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
+    graph_queries: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
     explanation: ?[]const u8 = null,
     confidence: ?f64 = null,
     warnings: ?[]const []const u8 = null,
@@ -2883,7 +2881,7 @@ fn buildGeneratedGraphQueryBuilder(
         try warnings.append(alloc, "Generator-backed graph query building failed, so the deterministic graph builder was used.");
         return base;
     };
-    base.graph_searches = generated.graph_searches;
+    base.graph_queries = generated.graph_queries;
     base.llm_explanation = generated.explanation;
     base.llm_confidence = normalizeQueryBuilderConfidence(generated.confidence);
     base.llm_warnings = generated.warnings;
@@ -2954,18 +2952,18 @@ fn buildGeneratedGraphQueryBuilderAttemptFromMessages(
         .ignore_unknown_fields = true,
     }) catch return error.InvalidQueryBuilderGeneration;
     defer parsed.deinit();
-    try validateGeneratedQueryBuilderGraphSearches(request, fields, graph_indexes, parsed.value.graph_searches);
-    if (try metadataValidateGraphSearchResultRefs(alloc, seed_query_request, parsed.value.graph_searches)) |feedback| {
+    try validateGeneratedQueryBuilderGraphSearches(request, fields, graph_indexes, parsed.value.graph_queries);
+    if (try metadataValidateGraphSearchResultRefs(alloc, seed_query_request, parsed.value.graph_queries)) |feedback| {
         return .{ .feedback = feedback };
     }
     if (plan_validator) |validator| {
-        if (try validator.validateGraphSearches(alloc, request, parsed.value.graph_searches)) |feedback| {
+        if (try validator.validateGraphSearches(alloc, request, parsed.value.graph_queries)) |feedback| {
             return .{ .feedback = feedback };
         }
     }
 
     return .{ .valid = .{
-        .graph_searches = try cloneGraphSearchesLeaky(alloc, parsed.value.graph_searches),
+        .graph_queries = try cloneGraphSearchesLeaky(alloc, parsed.value.graph_queries),
         .explanation = if (parsed.value.explanation) |explanation| try alloc.dupe(u8, explanation) else null,
         .confidence = parsed.value.confidence,
         .warnings = if (parsed.value.warnings) |warning_values| try cloneStringSlice(alloc, warning_values) else null,
@@ -3018,15 +3016,15 @@ fn buildGraphQueryBuilderRepairMessages(
     feedback: ?[]const u8,
 ) ![]const generating.ChatMessage {
     const base_prompt =
-        \\The previous graph_searches response failed deterministic validation. Regenerate a valid response.
+        \\The previous graph_queries response failed deterministic validation. Regenerate a valid response.
         \\
         \\Requirements:
         \\- Return only the corrected JSON object.
-        \\- graph_searches must be non-empty.
+        \\- graph_queries must be non-empty.
         \\- Every GraphQuery must include index_name and start_nodes.
         \\- Use only listed graph indexes.
         \\- Use start_nodes/target_nodes keys or one of $full_text_results, $fused_results, $embeddings_results, or $graph_results.<search_name>.
-        \\- $graph_results.<search_name> refs must point to another graph_searches entry and must not form a cycle.
+        \\- $graph_results.<search_name> refs must point to another graph_queries entry and must not form a cycle.
         \\- node_filter is supported in params and pattern steps, but not inside start_nodes or target_nodes.
         \\- Do not include algorithm, algorithm_params, include_edges, or unknown fields.
         \\- shortest_path and k_shortest_paths require target_nodes.
@@ -3519,10 +3517,10 @@ fn buildGraphQueryBuilderMessages(
         alloc,
         \\User's graph retrieval intent: "{s}"
         \\
-        \\Generate Antfly graph_searches JSON that fulfills this intent.
+        \\Generate Antfly graph_queries JSON that fulfills this intent.
         \\Return your response in JSON format:
         \\{{
-        \\  "graph_searches": {{
+        \\  "graph_queries": {{
         \\    "graph_search": {{ ... GraphQuery ... }}
         \\  }},
         \\  "explanation": "brief explanation of the graph plan",
@@ -3551,15 +3549,15 @@ fn buildGraphQueryBuilderSystemPrompt(
     defer out.deinit(alloc);
 
     try out.appendSlice(alloc,
-        \\You are an expert Antfly graph query builder. Translate natural-language graph retrieval intent into Antfly graph_searches JSON.
+        \\You are an expert Antfly graph query builder. Translate natural-language graph retrieval intent into Antfly graph_queries JSON.
         \\
         \\GraphQuery forms:
-        \\- Neighbors: {"type":"neighbors","index_name":"graph_idx","start_nodes":{"result_ref":"$full_text_results","limit":5},"params":{"edge_types":["links"],"max_depth":1}}
-        \\- Traverse: {"type":"traverse","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]},"params":{"edge_types":["references"],"max_depth":2,"deduplicate_nodes":true}}
-        \\- Shortest path: {"type":"shortest_path","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]},"target_nodes":{"keys":["doc:b"]},"params":{"edge_types":["depends_on"],"max_depth":6,"include_paths":true}}
-        \\- Pattern with an exact endpoint: {"type":"pattern","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]},"target_nodes":{"keys":["doc:c"]},"pattern":[{"alias":"a"},{"alias":"b","edge":{"types":["links"],"direction":"out","min_hops":1,"max_hops":1}},{"alias":"c","edge":{"types":["links"],"direction":"out","min_hops":1,"max_hops":1}}],"return_aliases":["c"]}
+        \\- Neighbors: {"index":"graph_idx","traverse":{"start":{"result_ref":"$full_text_results","limit":5},"edge_types":["links"],"max_depth":1}}
+        \\- Traverse: {"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]},"edge_types":["references"],"max_depth":2,"deduplicate_nodes":true}}
+        \\- Shortest path: {"index":"graph_idx","shortest_path":{"from":{"key":"doc:a"},"to":{"key":"doc:b"},"edge_types":["depends_on"],"max_depth":6}}
+        \\- Match with exact endpoints: {"index":"graph_idx","match":{"nodes":{"a":{"filter":{"ids":["doc:a"]}},"b":{},"c":{"filter":{"ids":["doc:c"]}}},"edges":[{"from":"a","to":"b","types":["links"]},{"from":"b","to":"c","types":["links"]}]},"return":{"bindings":["c"]}}
         \\
-        \\Always include index_name and start_nodes. Use {"result_ref":"$full_text_results"} when node keys are not explicit. Prefer named graph indexes listed below.
+        \\Always include index and exactly one operation key. For traversal, use {"result_ref":"$full_text_results"} when node keys are not explicit. Prefer named graph indexes listed below.
         \\Use fields only from the schema context. Do not invent fields or indexes.
         \\
     );
@@ -3620,7 +3618,7 @@ fn buildGraphQueryBuilderSystemPrompt(
 
     try out.appendSlice(alloc,
         \\
-        \\Return a JSON object with graph_searches, explanation, confidence, and warnings. Do not include markdown fences.
+        \\Return a JSON object with graph_queries, explanation, confidence, and warnings. Do not include markdown fences.
         \\
     );
     return try out.toOwnedSlice(alloc);
@@ -3652,9 +3650,9 @@ fn cloneJsonValueLeaky(alloc: std.mem.Allocator, value: std.json.Value) !std.jso
 
 fn cloneGraphSearchesLeaky(
     alloc: std.mem.Allocator,
-    graph_searches: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
+    graph_queries: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
 ) !std.json.ArrayHashMap(indexes_openapi.GraphQuery) {
-    const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(graph_searches, .{})});
+    const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(graph_queries, .{})});
     return try std.json.parseFromSliceLeaky(std.json.ArrayHashMap(indexes_openapi.GraphQuery), alloc, encoded, .{
         .ignore_unknown_fields = true,
     });
@@ -3666,15 +3664,15 @@ fn validateGeneratedQueryBuilderGraphSearches(
     request: metadata_openapi.QueryBuilderRequest,
     fields: []const []const u8,
     graph_indexes: []const []const u8,
-    graph_searches: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
+    graph_queries: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
 ) QueryBuilderValidationError!void {
-    if (graph_searches.map.count() == 0) return error.InvalidQueryBuilderGeneration;
-    var it = graph_searches.map.iterator();
+    if (graph_queries.map.count() == 0) return error.InvalidQueryBuilderGeneration;
+    var it = graph_queries.map.iterator();
     while (it.next()) |entry| {
         if (entry.key_ptr.*.len == 0) return error.InvalidQueryBuilderGeneration;
         try validateGeneratedQueryBuilderGraphQuery(request, fields, graph_indexes, entry.value_ptr.*);
     }
-    try validateGeneratedGraphResultDependencies(graph_searches);
+    try validateGeneratedGraphResultDependencies(graph_queries);
 }
 
 fn validateGeneratedQueryBuilderGraphQuery(
@@ -3683,29 +3681,20 @@ fn validateGeneratedQueryBuilderGraphQuery(
     graph_indexes: []const []const u8,
     query: indexes_openapi.GraphQuery,
 ) QueryBuilderValidationError!void {
-    if (query.index_name.len == 0) return error.InvalidQueryBuilderGeneration;
-    if (graph_indexes.len > 0 and !queryBuilderFieldInSlice(graph_indexes, query.index_name)) return error.InvalidQueryBuilderGeneration;
-    if (query.include_edges == true) return error.InvalidQueryBuilderGeneration;
-    try validateGeneratedGraphNodeSelector(query.start_nodes orelse return error.InvalidQueryBuilderGeneration);
-    if (query.target_nodes) |target_nodes| try validateGeneratedGraphNodeSelector(target_nodes);
-    if (query.params) |params| try validateGeneratedGraphQueryParams(query.type, params);
-    if (query.fields) |query_fields| {
-        for (query_fields) |field| {
-            if (!queryBuilderFieldAllowed(request.constraints, fields, field)) return error.InvalidQueryBuilderGeneration;
-        }
-    }
-    switch (query.type) {
-        .pattern => {
-            const pattern = query.pattern orelse return error.InvalidQueryBuilderGeneration;
-            try validateGeneratedGraphPattern(pattern, query.return_aliases);
+    _ = request;
+    _ = fields;
+    const index = generatedGraphQueryIndex(query);
+    if (index.len == 0) return error.InvalidQueryBuilderGeneration;
+    if (graph_indexes.len > 0 and !queryBuilderFieldInSlice(graph_indexes, index)) return error.InvalidQueryBuilderGeneration;
+    switch (query) {
+        .graph_match_query => |match_query| {
+            if (match_query.match.nodes.map.count() == 0) return error.InvalidQueryBuilderGeneration;
+            if (match_query.@"return".bindings == null and match_query.@"return".aggregates == null) return error.InvalidQueryBuilderGeneration;
+            if (match_query.@"return".bindings != null and match_query.@"return".aggregates != null) return error.InvalidQueryBuilderGeneration;
         },
-        .shortest_path, .k_shortest_paths => {
-            if (query.target_nodes == null) return error.InvalidQueryBuilderGeneration;
-            if (query.pattern != null or query.return_aliases != null) return error.InvalidQueryBuilderGeneration;
-        },
-        else => {
-            if (query.pattern != null or query.return_aliases != null) return error.InvalidQueryBuilderGeneration;
-        },
+        .graph_traverse_query => |traverse_query| try validateGeneratedGraphNodeSelector(traverse_query.traverse.start),
+        .graph_shortest_path_query => |path_query| if (path_query.shortest_path.from.key.len == 0 or path_query.shortest_path.to.key.len == 0) return error.InvalidQueryBuilderGeneration,
+        .graph_k_shortest_paths_query => |path_query| if (path_query.k_shortest_paths.from.key.len == 0 or path_query.k_shortest_paths.to.key.len == 0 or path_query.k_shortest_paths.k <= 0) return error.InvalidQueryBuilderGeneration,
     }
 }
 
@@ -3727,128 +3716,49 @@ fn validateGeneratedGraphNodeSelector(selector: indexes_openapi.GraphNodeSelecto
 }
 
 fn validateGeneratedGraphResultDependencies(
-    graph_searches: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
+    graph_queries: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
 ) QueryBuilderValidationError!void {
-    const max_depth = graph_searches.map.count();
-    var it = graph_searches.map.iterator();
+    const max_depth = graph_queries.map.count();
+    var it = graph_queries.map.iterator();
     while (it.next()) |entry| {
-        try validateGeneratedGraphSelectorDependency(graph_searches, entry.value_ptr.*.start_nodes, max_depth);
-        if (entry.value_ptr.*.target_nodes) |target_nodes| {
-            try validateGeneratedGraphSelectorDependency(graph_searches, target_nodes, max_depth);
-        }
+        try validateGeneratedGraphSelectorDependency(graph_queries, generatedGraphQueryStartSelector(entry.value_ptr.*), max_depth);
     }
 }
 
 fn validateGeneratedGraphSelectorDependency(
-    graph_searches: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
+    graph_queries: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
     selector: ?indexes_openapi.GraphNodeSelector,
     max_depth: usize,
 ) QueryBuilderValidationError!void {
     const result_ref = (selector orelse return).result_ref orelse return;
     const dep_name = generatedGraphResultDependencyName(result_ref) orelse return;
-    try validateGeneratedGraphDependencyChain(graph_searches, dep_name, max_depth);
+    try validateGeneratedGraphDependencyChain(graph_queries, dep_name, max_depth);
 }
 
 fn validateGeneratedGraphDependencyChain(
-    graph_searches: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
+    graph_queries: std.json.ArrayHashMap(indexes_openapi.GraphQuery),
     dep_name: []const u8,
     remaining_depth: usize,
 ) QueryBuilderValidationError!void {
     if (remaining_depth == 0) return error.InvalidQueryBuilderGeneration;
-    const query = graph_searches.map.get(dep_name) orelse return error.InvalidQueryBuilderGeneration;
-    try validateGeneratedGraphSelectorDependency(graph_searches, query.start_nodes, remaining_depth - 1);
-    if (query.target_nodes) |target_nodes| {
-        try validateGeneratedGraphSelectorDependency(graph_searches, target_nodes, remaining_depth - 1);
-    }
+    const query = graph_queries.map.get(dep_name) orelse return error.InvalidQueryBuilderGeneration;
+    try validateGeneratedGraphSelectorDependency(graph_queries, generatedGraphQueryStartSelector(query), remaining_depth - 1);
 }
 
-fn validateGeneratedGraphQueryParams(
-    query_type: indexes_openapi.GraphQueryType,
-    params: indexes_openapi.GraphQueryParams,
-) QueryBuilderValidationError!void {
-    if (params.algorithm != null or params.algorithm_params != null) return error.InvalidQueryBuilderGeneration;
-    if (params.node_filter) |filter| try validateGeneratedGraphNodeFilter(filter);
-    if (params.edge_types) |edge_types| try validateGeneratedGraphEdgeTypes(edge_types);
-    if (params.max_depth) |max_depth| {
-        if (max_depth < 1 or max_depth > 64) return error.InvalidQueryBuilderGeneration;
-    }
-    if (params.max_results) |max_results| {
-        if (max_results < 1 or max_results > 10_000) return error.InvalidQueryBuilderGeneration;
-    }
-    if (params.k) |k| {
-        if (query_type != .k_shortest_paths or k < 1 or k > 100) return error.InvalidQueryBuilderGeneration;
-    }
-    if (query_type == .pattern) {
-        if (params.edge_types != null or params.direction != null or params.include_paths != null or params.weight_mode != null or params.k != null) {
-            return error.InvalidQueryBuilderGeneration;
-        }
-    }
+fn generatedGraphQueryIndex(query: indexes_openapi.GraphQuery) []const u8 {
+    return switch (query) {
+        .graph_match_query => |value| value.index,
+        .graph_traverse_query => |value| value.index,
+        .graph_shortest_path_query => |value| value.index,
+        .graph_k_shortest_paths_query => |value| value.index,
+    };
 }
 
-fn validateGeneratedGraphPattern(
-    pattern: []const indexes_openapi.PatternStep,
-    return_aliases: ?[]const []const u8,
-) QueryBuilderValidationError!void {
-    if (pattern.len < 2 or pattern.len > 8) return error.InvalidQueryBuilderGeneration;
-    for (pattern, 0..) |step, i| {
-        const alias = step.alias orelse return error.InvalidQueryBuilderGeneration;
-        if (alias.len == 0) return error.InvalidQueryBuilderGeneration;
-        for (pattern[0..i]) |previous| {
-            if (previous.alias) |previous_alias| {
-                if (std.mem.eql(u8, previous_alias, alias)) return error.InvalidQueryBuilderGeneration;
-            }
-        }
-        if (step.node_filter) |filter| try validateGeneratedGraphNodeFilter(filter);
-        if (i == 0) {
-            if (step.edge != null) return error.InvalidQueryBuilderGeneration;
-        } else {
-            const edge = step.edge orelse return error.InvalidQueryBuilderGeneration;
-            try validateGeneratedGraphPatternEdge(edge);
-        }
-    }
-    if (return_aliases) |aliases| {
-        if (aliases.len == 0) return error.InvalidQueryBuilderGeneration;
-        for (aliases) |alias| {
-            if (!generatedGraphPatternHasAlias(pattern, alias)) return error.InvalidQueryBuilderGeneration;
-        }
-    }
-}
-
-fn validateGeneratedGraphNodeFilter(
-    filter: indexes_openapi.NodeFilter,
-) QueryBuilderValidationError!void {
-    const has_prefix = if (filter.filter_prefix) |prefix| prefix.len > 0 else false;
-    const has_query = filter.filter_query != null;
-    if (!has_prefix and !has_query) return error.InvalidQueryBuilderGeneration;
-}
-
-fn validateGeneratedGraphPatternEdge(edge: indexes_openapi.PatternEdgeStep) QueryBuilderValidationError!void {
-    if (edge.types) |types| try validateGeneratedGraphEdgeTypes(types);
-    if (edge.min_hops) |min_hops| {
-        if (min_hops <= 0) return error.InvalidQueryBuilderGeneration;
-    }
-    if (edge.max_hops) |max_hops| {
-        if (max_hops <= 0) return error.InvalidQueryBuilderGeneration;
-        if (edge.min_hops) |min_hops| {
-            if (max_hops < min_hops) return error.InvalidQueryBuilderGeneration;
-        }
-    }
-}
-
-fn validateGeneratedGraphEdgeTypes(edge_types: []const []const u8) QueryBuilderValidationError!void {
-    if (edge_types.len == 0) return error.InvalidQueryBuilderGeneration;
-    for (edge_types) |edge_type| {
-        if (edge_type.len == 0) return error.InvalidQueryBuilderGeneration;
-    }
-}
-
-fn generatedGraphPatternHasAlias(pattern: []const indexes_openapi.PatternStep, alias: []const u8) bool {
-    for (pattern) |step| {
-        if (step.alias) |candidate| {
-            if (std.mem.eql(u8, candidate, alias)) return true;
-        }
-    }
-    return false;
+fn generatedGraphQueryStartSelector(query: indexes_openapi.GraphQuery) ?indexes_openapi.GraphNodeSelector {
+    return switch (query) {
+        .graph_traverse_query => |value| value.traverse.start,
+        else => null,
+    };
 }
 
 fn isAllowedGeneratedGraphResultRef(result_ref: []const u8) bool {
@@ -4352,7 +4262,7 @@ fn buildQueryBuilderQueryRequest(
     );
     out.filter_prefix = queryBuilderConstraintString(request.constraints, "filter_prefix");
     out.exclusion_query = try buildQueryBuilderConstraintExclusionQueryValue(alloc, request.constraints, fields);
-    out.graph_searches = try queryBuilderGraphSearches(alloc, request, built, graph_indexes);
+    out.graph_queries = try queryBuilderGraphSearches(alloc, request, built, graph_indexes);
     out.expand_strategy = queryBuilderConstraintString(request.constraints, "expand_strategy");
 
     switch (built.query_kind) {
@@ -4797,15 +4707,15 @@ fn queryBuilderGraphSearches(
     built: BuiltQueryBuilderQuery,
     graph_indexes: []const []const u8,
 ) !?std.json.ArrayHashMap(indexes_openapi.GraphQuery) {
-    if (try queryBuilderConstraintGraphSearches(alloc, request.constraints)) |graph_searches| return graph_searches;
-    if (built.graph_searches) |graph_searches| return graph_searches;
+    if (try queryBuilderConstraintGraphSearches(alloc, request.constraints)) |graph_queries| return graph_queries;
+    if (built.graph_queries) |graph_queries| return graph_queries;
     return try queryBuilderInferredGraphSearches(alloc, request, built, graph_indexes);
 }
 
 fn queryBuilderHasConstraintGraphSearches(constraints: ?std.json.Value) bool {
     const value = constraints orelse return false;
     if (value != .object) return false;
-    return value.object.get("graph_searches") != null or value.object.get("graphs") != null;
+    return value.object.get("graph_queries") != null or value.object.get("graphs") != null;
 }
 
 fn queryBuilderConstraintGraphSearches(
@@ -4814,7 +4724,7 @@ fn queryBuilderConstraintGraphSearches(
 ) !?std.json.ArrayHashMap(indexes_openapi.GraphQuery) {
     const value = constraints orelse return null;
     if (value != .object) return null;
-    const raw = value.object.get("graph_searches") orelse value.object.get("graphs") orelse return null;
+    const raw = value.object.get("graph_queries") orelse value.object.get("graphs") orelse return null;
     if (raw != .object) return null;
 
     const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(raw, .{})});
@@ -4834,25 +4744,101 @@ fn queryBuilderInferredGraphSearches(
     const start_nodes = try queryBuilderGraphStartNodes(alloc, request, built) orelse return null;
     const edge_types = try queryBuilderGraphEdgeTypes(alloc, request);
 
-    var graph_searches = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
-    errdefer graph_searches.deinit(alloc);
-    try graph_searches.map.put(alloc, "graph_search", .{
-        .type = graph_mode.query_type,
-        .index_name = try alloc.dupe(u8, std.mem.trim(u8, index, " \t\r\n")),
-        .start_nodes = start_nodes,
-        .target_nodes = try queryBuilderGraphTargetNodes(alloc, request, graph_mode),
-        .params = queryBuilderGraphQueryParams(request, graph_mode, edge_types),
-        .pattern = try queryBuilderGraphPatternSteps(alloc, graph_mode, edge_types),
-        .return_aliases = try queryBuilderGraphReturnAliases(alloc, graph_mode),
-        .include_documents = true,
-        .include_edges = queryBuilderConstraintOptionalBool(request.constraints, "graph_include_edges") orelse graph_mode.include_edges,
-        .fields = try queryBuilderConstraintStringSliceOrNull(alloc, request.constraints, "graph_fields"),
-    });
-    return graph_searches;
+    var graph_queries = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
+    errdefer graph_queries.deinit(alloc);
+    if (graph_mode.query_type == .shortest_path) {
+        const target_nodes = try queryBuilderGraphTargetNodes(alloc, request, graph_mode) orelse return null;
+        const from = graphNodeSelectorSingleKey(start_nodes) orelse return null;
+        const to = graphNodeSelectorSingleKey(target_nodes) orelse return null;
+        const query = try alloc.create(indexes_openapi.GraphShortestPathQuery);
+        query.* = .{
+            .index = try alloc.dupe(u8, std.mem.trim(u8, index, " \t\r\n")),
+            .shortest_path = .{
+                .from = .{ .key = from },
+                .to = .{ .key = to },
+                .edge_types = edge_types,
+                .max_depth = queryBuilderConstraintInteger(request.constraints, "graph_max_depth") orelse graph_mode.max_depth,
+            },
+        };
+        try graph_queries.map.put(alloc, "graph_search", .{ .graph_shortest_path_query = query });
+        return graph_queries;
+    }
+    if (graph_mode.query_type == .pattern) {
+        const hops = graph_mode.pattern_hops orelse return null;
+        if (hops < 1 or hops > 3) return null;
+        const target_nodes = try queryBuilderGraphTargetNodes(alloc, request, graph_mode);
+        const query = try alloc.create(indexes_openapi.GraphMatchQuery);
+        var nodes = std.json.ArrayHashMap(indexes_openapi.GraphMatchNode){};
+        const edge_count: usize = @intCast(hops);
+        const edges = try alloc.alloc(indexes_openapi.GraphMatchEdge, edge_count);
+        for (0..edge_count + 1) |i| {
+            const alias = try queryBuilderPatternAlias(alloc, i);
+            const filter = if (i == 0)
+                try graphNodeSelectorFilterValue(alloc, start_nodes)
+            else if (i == edge_count and target_nodes != null)
+                try graphNodeSelectorFilterValue(alloc, target_nodes.?)
+            else
+                null;
+            try nodes.map.put(alloc, alias, .{ .filter = filter });
+            if (i > 0) {
+                edges[i - 1] = .{
+                    .from = try queryBuilderPatternAlias(alloc, i - 1),
+                    .to = alias,
+                    .types = edge_types,
+                    .direction = .out,
+                    .min_hops = 1,
+                    .max_hops = 1,
+                };
+            }
+        }
+        const return_alias = try queryBuilderPatternAlias(alloc, edge_count);
+        query.* = .{
+            .index = try alloc.dupe(u8, std.mem.trim(u8, index, " \t\r\n")),
+            .match = .{ .nodes = nodes, .edges = edges },
+            .@"return" = .{ .bindings = try alloc.dupe([]const u8, &[_][]const u8{return_alias}) },
+        };
+        try graph_queries.map.put(alloc, "graph_search", .{ .graph_match_query = query });
+        return graph_queries;
+    }
+    if (graph_mode.query_type != .traverse and graph_mode.query_type != .neighbors) return null;
+    const query = try alloc.create(indexes_openapi.GraphTraverseQuery);
+    query.* = .{
+        .index = try alloc.dupe(u8, std.mem.trim(u8, index, " \t\r\n")),
+        .traverse = .{
+            .start = start_nodes,
+            .edge_types = edge_types,
+            .max_depth = queryBuilderConstraintInteger(request.constraints, "graph_max_depth") orelse graph_mode.max_depth,
+            .limit = queryBuilderConstraintInteger(request.constraints, "graph_max_results") orelse queryBuilderConstraintLimit(request.constraints),
+            .deduplicate_nodes = true,
+            .include_paths = graph_mode.include_paths,
+        },
+    };
+    try graph_queries.map.put(alloc, "graph_search", .{ .graph_traverse_query = query });
+    return graph_queries;
 }
 
+fn graphNodeSelectorSingleKey(selector: indexes_openapi.GraphNodeSelector) ?[]const u8 {
+    const keys = selector.keys orelse return null;
+    return if (keys.len == 1) keys[0] else null;
+}
+
+fn graphNodeSelectorFilterValue(
+    alloc: std.mem.Allocator,
+    selector: indexes_openapi.GraphNodeSelector,
+) !?std.json.Value {
+    const keys = selector.keys orelse return null;
+    if (keys.len == 0) return null;
+    var ids = std.json.Array.init(alloc);
+    for (keys) |key| try ids.append(.{ .string = key });
+    var object = std.json.ObjectMap.empty;
+    try object.put(alloc, "ids", .{ .array = ids });
+    return .{ .object = object };
+}
+
+const QueryBuilderGraphType = enum { traverse, neighbors, shortest_path, k_shortest_paths, pattern };
+
 const QueryBuilderGraphMode = struct {
-    query_type: indexes_openapi.GraphQueryType,
+    query_type: QueryBuilderGraphType,
     max_depth: ?i64 = null,
     include_paths: ?bool = null,
     include_edges: ?bool = null,
@@ -4967,62 +4953,6 @@ fn queryBuilderGraphEdgeTypes(
 ) !?[]const []const u8 {
     if (try queryBuilderConstraintStringSliceOrNull(alloc, request.constraints, "graph_edge_types")) |edge_types| return edge_types;
     return try queryBuilderInferredGraphEdgeTypes(alloc, request.intent);
-}
-
-fn queryBuilderGraphQueryParams(
-    request: metadata_openapi.QueryBuilderRequest,
-    graph_mode: QueryBuilderGraphMode,
-    edge_types: ?[]const []const u8,
-) ?indexes_openapi.GraphQueryParams {
-    return if (graph_mode.query_type == .pattern)
-        .{
-            .max_results = queryBuilderConstraintInteger(request.constraints, "graph_max_results") orelse
-                queryBuilderConstraintLimit(request.constraints),
-            .deduplicate_nodes = true,
-        }
-    else
-        .{
-            .edge_types = edge_types,
-            .max_depth = queryBuilderConstraintInteger(request.constraints, "graph_max_depth") orelse graph_mode.max_depth,
-            .max_results = queryBuilderConstraintInteger(request.constraints, "graph_max_results") orelse
-                queryBuilderConstraintLimit(request.constraints),
-            .deduplicate_nodes = true,
-            .include_paths = graph_mode.include_paths,
-        };
-}
-
-fn queryBuilderGraphPatternSteps(
-    alloc: std.mem.Allocator,
-    graph_mode: QueryBuilderGraphMode,
-    edge_types: ?[]const []const u8,
-) !?[]const indexes_openapi.PatternStep {
-    const hops = graph_mode.pattern_hops orelse return null;
-    if (hops < 1 or hops > 3) return null;
-
-    const step_count: usize = @intCast(hops + 1);
-    const steps = try alloc.alloc(indexes_openapi.PatternStep, step_count);
-    for (steps, 0..) |*step, i| {
-        step.* = .{
-            .alias = try queryBuilderPatternAlias(alloc, i),
-            .edge = if (i == 0) null else .{
-                .types = edge_types,
-                .direction = .out,
-                .min_hops = 1,
-                .max_hops = 1,
-            },
-        };
-    }
-    return steps;
-}
-
-fn queryBuilderGraphReturnAliases(
-    alloc: std.mem.Allocator,
-    graph_mode: QueryBuilderGraphMode,
-) !?[]const []const u8 {
-    const hops = graph_mode.pattern_hops orelse return null;
-    if (hops < 1 or hops > 3) return null;
-    const alias = try queryBuilderPatternAlias(alloc, @intCast(hops));
-    return try alloc.dupe([]const u8, &[_][]const u8{alias});
 }
 
 fn queryBuilderPatternAlias(
@@ -5489,7 +5419,7 @@ fn validateRequiredExecutableQueryBuilderRequest(
         if (std.ascii.eqlIgnoreCase(mode, "tree") and (retrieval_query_request == null or retrieval_query_request.?.tree_search == null)) {
             return error.InvalidQueryBuilderRequest;
         }
-        if (std.ascii.eqlIgnoreCase(mode, "graph") and query_request.graph_searches == null) {
+        if (std.ascii.eqlIgnoreCase(mode, "graph") and query_request.graph_queries == null) {
             return error.InvalidQueryBuilderRequest;
         }
     }
@@ -5871,7 +5801,7 @@ fn buildQueryBuilderClarificationQuestion(
     if (graph_mode and !queryBuilderHasConstraintGraphSearches(request.constraints) and queryBuilderGraphIndex(request, graph_indexes) == null) {
         if (graph_indexes.len == 0) {
             const options = try alloc.dupe([]const u8, &[_][]const u8{"constraints.graph_index"});
-            const affects = try alloc.dupe([]const u8, &[_][]const u8{ "query_request.graph_searches", "specialist" });
+            const affects = try alloc.dupe([]const u8, &[_][]const u8{ "query_request.graph_queries", "specialist" });
             return .{
                 .id = "select_graph_index",
                 .kind = .free_text,
@@ -5884,7 +5814,7 @@ fn buildQueryBuilderClarificationQuestion(
         }
         if (graph_indexes.len > 1) {
             const options = try cloneStringSlice(alloc, graph_indexes);
-            const affects = try alloc.dupe([]const u8, &[_][]const u8{ "query_request.graph_searches", "specialist" });
+            const affects = try alloc.dupe([]const u8, &[_][]const u8{ "query_request.graph_queries", "specialist" });
             return .{
                 .id = "select_graph_index",
                 .kind = .single_choice,
@@ -6008,14 +5938,14 @@ fn pickQueryBuilderSpecialist(
 ) []const u8 {
     if (mode) |value| {
         if (std.ascii.eqlIgnoreCase(value, "tree") and has_retrieval_query_request) return "tree";
-        if (std.ascii.eqlIgnoreCase(value, "graph") and query_request.graph_searches != null) return "graph";
+        if (std.ascii.eqlIgnoreCase(value, "graph") and query_request.graph_queries != null) return "graph";
         if (std.ascii.eqlIgnoreCase(value, "full_text")) return "full_text";
         if (std.ascii.eqlIgnoreCase(value, "filter") and built.query_kind == .status_only) return "filter";
         if (std.ascii.eqlIgnoreCase(value, "semantic") and built.query_kind == .semantic) return "semantic";
         if (std.ascii.eqlIgnoreCase(value, "hybrid") and built.query_kind == .hybrid) return "hybrid";
     }
     if (has_retrieval_query_request) return "tree";
-    if (query_request.graph_searches != null) return "graph";
+    if (query_request.graph_queries != null) return "graph";
     return switch (built.query_kind) {
         .status_only => "filter",
         .semantic => "semantic",
@@ -6072,7 +6002,7 @@ fn buildQueryBuilderExplanation(
     fields: []const []const u8,
     built: BuiltQueryBuilderQuery,
 ) ![]const u8 {
-    if (built.graph_searches != null) {
+    if (built.graph_queries != null) {
         if (built.llm_explanation) |explanation| return explanation;
     }
     return switch (built.query_kind) {
@@ -6904,14 +6834,10 @@ test "query builder metadata validator rejects generated full text fields outsid
 test "query builder metadata validator accepts executable graph node filters" {
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
         \\{
-        \\  "graph_searches": {
+        \\  "graph_queries": {
         \\    "graph_search": {
-        \\      "type": "neighbors",
-        \\      "index_name": "doc_graph",
-        \\      "start_nodes": {"keys": ["doc:a"]},
-        \\      "params": {
-        \\        "node_filter": {"filter_prefix": "doc:"}
-        \\      }
+        \\      "index": "doc_graph",
+        \\      "traverse": {"start": {"keys": ["doc:a"]}, "filter": {"prefix":"doc:","field":"_id"}}
         \\    }
         \\  }
         \\}
@@ -6930,11 +6856,10 @@ test "query builder metadata validator accepts executable graph node filters" {
 test "query builder metadata validator rejects graph result refs without seed results" {
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
         \\{
-        \\  "graph_searches": {
+        \\  "graph_queries": {
         \\    "graph_search": {
-        \\      "type": "neighbors",
-        \\      "index_name": "doc_graph",
-        \\      "start_nodes": {"result_ref": "$full_text_results"}
+        \\      "index": "doc_graph",
+        \\      "traverse": {"start": {"result_ref": "$full_text_results"}, "max_depth": 1}
         \\    }
         \\  }
         \\}
@@ -7537,11 +7462,10 @@ test "query builder preflight plan mode summarizes bound indexes and result refs
         \\      "field": "status"
         \\    }
         \\  },
-        \\  "graph_searches": {
+        \\  "graph_queries": {
         \\    "related": {
-        \\      "type": "neighbors",
-        \\      "index_name": "doc_graph",
-        \\      "start_nodes": {"result_ref": "$fused_results", "limit": 3}
+        \\      "index": "doc_graph",
+        \\      "traverse": {"start": {"result_ref": "$fused_results", "limit": 3}, "max_depth": 1}
         \\    }
         \\  }
         \\}
@@ -8405,7 +8329,7 @@ test "query builder uses generated graph specialist when runner is provided" {
             try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "related raft documents") != null);
             return .{
                 .content = try alloc.dupe(u8,
-                    \\{"graph_searches":{"related":{"type":"neighbors","index_name":"doc_graph","start_nodes":{"result_ref":"$full_text_results","limit":5},"params":{"edge_types":["references"],"max_depth":1},"fields":["title"]}},"explanation":"Expands from lexical matches through reference edges.","confidence":0.87,"warnings":["used table graph index"]}
+                    \\{"graph_queries":{"related":{"index":"doc_graph","traverse":{"start":{"result_ref":"$full_text_results","limit":5},"edge_types":["references"],"max_depth":1}}},"explanation":"Expands from lexical matches through reference edges.","confidence":0.87,"warnings":["used table graph index"]}
                 ),
                 .allocator = alloc,
             };
@@ -8439,12 +8363,10 @@ test "query builder uses generated graph specialist when runner is provided" {
     try std.testing.expectEqualStrings("graph", result.specialist.?);
     try std.testing.expectEqualStrings("Expands from lexical matches through reference edges.", result.explanation.?);
     try std.testing.expectEqual(@as(f64, 0.87), result.confidence.?);
-    const graph_query = result.query_request.?.graph_searches.?.map.get("related").?;
-    try std.testing.expectEqual(indexes_openapi.GraphQueryType.neighbors, graph_query.type);
-    try std.testing.expectEqualStrings("doc_graph", graph_query.index_name);
-    try std.testing.expectEqualStrings("$full_text_results", graph_query.start_nodes.?.result_ref.?);
-    try std.testing.expectEqualStrings("references", graph_query.params.?.edge_types.?[0]);
-    try std.testing.expectEqualStrings("title", graph_query.fields.?[0]);
+    const graph_query = result.query_request.?.graph_queries.?.map.get("related").?;
+    try std.testing.expectEqualStrings("doc_graph", graph_query.graph_traverse_query.index);
+    try std.testing.expectEqualStrings("$full_text_results", graph_query.graph_traverse_query.traverse.start.result_ref.?);
+    try std.testing.expectEqualStrings("references", graph_query.graph_traverse_query.traverse.edge_types.?[0]);
     try std.testing.expectEqualStrings("used table graph index", result.warnings.?[0]);
 }
 
@@ -8471,7 +8393,7 @@ test "query builder repairs invalid generated graph plan once" {
                 try std.testing.expectEqual(@as(usize, 2), messages.len);
                 return .{
                     .content = try alloc.dupe(u8,
-                        \\{"graph_searches":{"bad":{"type":"neighbors","index_name":"missing_graph","start_nodes":{"result_ref":"$full_text_results"}}},"explanation":"bad index","confidence":0.99}
+                        \\{"graph_queries":{"bad":{"index":"missing_graph","traverse":{"start":{"result_ref":"$full_text_results"},"max_depth":1}}},"explanation":"bad index","confidence":0.99}
                     ),
                     .allocator = alloc,
                 };
@@ -8482,7 +8404,7 @@ test "query builder repairs invalid generated graph plan once" {
             try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[2]), "Regenerate a valid response") != null);
             return .{
                 .content = try alloc.dupe(u8,
-                    \\{"graph_searches":{"repaired":{"type":"neighbors","index_name":"doc_graph","start_nodes":{"result_ref":"$full_text_results","limit":3},"params":{"edge_types":["references"],"max_depth":1}}},"explanation":"Repaired to use the table graph index.","confidence":0.72}
+                    \\{"graph_queries":{"repaired":{"index":"doc_graph","traverse":{"start":{"result_ref":"$full_text_results","limit":3},"edge_types":["references"],"max_depth":1}}},"explanation":"Repaired to use the table graph index.","confidence":0.72}
                 ),
                 .allocator = alloc,
             };
@@ -8509,10 +8431,10 @@ test "query builder repairs invalid generated graph plan once" {
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     try std.testing.expectEqualStrings("graph", result.specialist.?);
     try std.testing.expectEqualStrings("Repaired to use the table graph index.", result.explanation.?);
-    const graph_query = result.query_request.?.graph_searches.?.map.get("repaired").?;
-    try std.testing.expectEqualStrings("doc_graph", graph_query.index_name);
-    try std.testing.expectEqualStrings("$full_text_results", graph_query.start_nodes.?.result_ref.?);
-    try std.testing.expectEqualStrings("references", graph_query.params.?.edge_types.?[0]);
+    const graph_query = result.query_request.?.graph_queries.?.map.get("repaired").?;
+    try std.testing.expectEqualStrings("doc_graph", graph_query.graph_traverse_query.index);
+    try std.testing.expectEqualStrings("$full_text_results", graph_query.graph_traverse_query.traverse.start.result_ref.?);
+    try std.testing.expectEqualStrings("references", graph_query.graph_traverse_query.traverse.edge_types.?[0]);
     if (result.warnings) |warnings| {
         for (warnings) |warning| {
             try std.testing.expect(std.mem.indexOf(u8, warning, "Generator-backed graph query building failed") == null);
@@ -8543,7 +8465,7 @@ test "query builder repairs generated graph plan with unavailable seed ref" {
                 try std.testing.expectEqual(@as(usize, 2), messages.len);
                 return .{
                     .content = try alloc.dupe(u8,
-                        \\{"graph_searches":{"bad_seed":{"type":"neighbors","index_name":"doc_graph","start_nodes":{"result_ref":"$embeddings_results"},"params":{"edge_types":["references"],"max_depth":1}}},"explanation":"bad seed","confidence":0.99}
+                        \\{"graph_queries":{"bad_seed":{"index":"doc_graph","traverse":{"start":{"result_ref":"$embeddings_results"},"edge_types":["references"],"max_depth":1}}},"explanation":"bad seed","confidence":0.99}
                     ),
                     .allocator = alloc,
                 };
@@ -8554,7 +8476,7 @@ test "query builder repairs generated graph plan with unavailable seed ref" {
             try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[2]), "$embeddings_results") != null);
             return .{
                 .content = try alloc.dupe(u8,
-                    \\{"graph_searches":{"related":{"type":"neighbors","index_name":"doc_graph","start_nodes":{"result_ref":"$full_text_results","limit":3},"params":{"edge_types":["references"],"max_depth":1}}},"explanation":"Repaired to use the available lexical seed.","confidence":0.76}
+                    \\{"graph_queries":{"related":{"index":"doc_graph","traverse":{"start":{"result_ref":"$full_text_results","limit":3},"edge_types":["references"],"max_depth":1}}},"explanation":"Repaired to use the available lexical seed.","confidence":0.76}
                 ),
                 .allocator = alloc,
             };
@@ -8581,8 +8503,8 @@ test "query builder repairs generated graph plan with unavailable seed ref" {
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     try std.testing.expectEqualStrings("graph", result.specialist.?);
     try std.testing.expectEqualStrings("Repaired to use the available lexical seed.", result.explanation.?);
-    const graph_query = result.query_request.?.graph_searches.?.map.get("related").?;
-    try std.testing.expectEqualStrings("$full_text_results", graph_query.start_nodes.?.result_ref.?);
+    const graph_query = result.query_request.?.graph_queries.?.map.get("related").?;
+    try std.testing.expectEqualStrings("$full_text_results", graph_query.graph_traverse_query.traverse.start.result_ref.?);
 }
 
 test "query builder accepts generated graph result dependencies" {
@@ -8603,7 +8525,7 @@ test "query builder accepts generated graph result dependencies" {
             try std.testing.expectEqual(@as(usize, 2), messages.len);
             return .{
                 .content = try alloc.dupe(u8,
-                    \\{"graph_searches":{"seed":{"type":"neighbors","index_name":"doc_graph","start_nodes":{"result_ref":"$full_text_results","limit":4},"params":{"edge_types":["references"],"max_depth":1}},"expand_seed":{"type":"traverse","index_name":"doc_graph","start_nodes":{"result_ref":"$graph_results.seed","limit":6},"params":{"edge_types":["links"],"max_depth":2}}},"explanation":"Chains graph expansion from a generated seed set.","confidence":0.78}
+                    \\{"graph_queries":{"seed":{"index":"doc_graph","traverse":{"start":{"result_ref":"$full_text_results","limit":4},"edge_types":["references"],"max_depth":1}},"expand_seed":{"index":"doc_graph","traverse":{"start":{"result_ref":"$graph_results.seed","limit":6},"edge_types":["links"],"max_depth":2}}},"explanation":"Chains graph expansion from a generated seed set.","confidence":0.78}
                 ),
                 .allocator = alloc,
             };
@@ -8628,11 +8550,11 @@ test "query builder accepts generated graph result dependencies" {
 
     try std.testing.expectEqualStrings("graph", result.specialist.?);
     try std.testing.expectEqualStrings("Chains graph expansion from a generated seed set.", result.explanation.?);
-    const graph_searches = result.query_request.?.graph_searches.?;
-    try std.testing.expect(graph_searches.map.get("seed") != null);
-    const dependent = graph_searches.map.get("expand_seed").?;
-    try std.testing.expectEqualStrings("$graph_results.seed", dependent.start_nodes.?.result_ref.?);
-    try std.testing.expectEqualStrings("links", dependent.params.?.edge_types.?[0]);
+    const graph_queries = result.query_request.?.graph_queries.?;
+    try std.testing.expect(graph_queries.map.get("seed") != null);
+    const dependent = graph_queries.map.get("expand_seed").?;
+    try std.testing.expectEqualStrings("$graph_results.seed", dependent.graph_traverse_query.traverse.start.result_ref.?);
+    try std.testing.expectEqualStrings("links", dependent.graph_traverse_query.traverse.edge_types.?[0]);
 }
 
 test "query builder repairs generated graph plan from validator feedback" {
@@ -8658,7 +8580,7 @@ test "query builder repairs generated graph plan from validator feedback" {
                 try std.testing.expectEqual(@as(usize, 2), messages.len);
                 return .{
                     .content = try alloc.dupe(u8,
-                        \\{"graph_searches":{"related":{"type":"neighbors","index_name":"doc_graph","start_nodes":{"result_ref":"$full_text_results"},"params":{"edge_types":["missing_edge"],"max_depth":1}}},"explanation":"Uses an unavailable edge type.","confidence":0.8}
+                        \\{"graph_queries":{"related":{"index":"doc_graph","traverse":{"start":{"result_ref":"$full_text_results"},"edge_types":["missing_edge"],"max_depth":1}}},"explanation":"Uses an unavailable edge type.","confidence":0.8}
                     ),
                     .allocator = alloc,
                 };
@@ -8669,7 +8591,7 @@ test "query builder repairs generated graph plan from validator feedback" {
             try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[2]), "missing_edge") != null);
             return .{
                 .content = try alloc.dupe(u8,
-                    \\{"graph_searches":{"related":{"type":"neighbors","index_name":"doc_graph","start_nodes":{"result_ref":"$full_text_results"},"params":{"edge_types":["references"],"max_depth":1}}},"explanation":"Uses the available reference edge type.","confidence":0.84}
+                    \\{"graph_queries":{"related":{"index":"doc_graph","traverse":{"start":{"result_ref":"$full_text_results"},"edge_types":["references"],"max_depth":1}}},"explanation":"Uses the available reference edge type.","confidence":0.84}
                 ),
                 .allocator = alloc,
             };
@@ -8705,8 +8627,8 @@ test "query builder repairs generated graph plan from validator feedback" {
 
     try std.testing.expectEqual(@as(usize, 2), fake_generation.calls);
     try std.testing.expectEqualStrings("Uses the available reference edge type.", result.explanation.?);
-    const graph_query = result.query_request.?.graph_searches.?.map.get("related").?;
-    try std.testing.expectEqualStrings("references", graph_query.params.?.edge_types.?[0]);
+    const graph_query = result.query_request.?.graph_queries.?.map.get("related").?;
+    try std.testing.expectEqualStrings("references", graph_query.graph_traverse_query.traverse.edge_types.?[0]);
 }
 
 test "query builder appends final plan validator feedback" {
@@ -8801,7 +8723,7 @@ test "query builder rejects generated graph missing result dependency" {
         ) !generating.GenerateResult {
             return .{
                 .content = try alloc.dupe(u8,
-                    \\{"graph_searches":{"expand_missing":{"type":"traverse","index_name":"doc_graph","start_nodes":{"result_ref":"$graph_results.missing"},"params":{"edge_types":["links"],"max_depth":2}}},"explanation":"bad dependency","confidence":0.99}
+                    \\{"graph_queries":{"expand_missing":{"index":"doc_graph","traverse":{"start":{"result_ref":"$graph_results.missing"},"edge_types":["links"],"max_depth":2}}},"explanation":"bad dependency","confidence":0.99}
                 ),
                 .allocator = alloc,
             };
@@ -8825,7 +8747,7 @@ test "query builder rejects generated graph missing result dependency" {
     }, FakeGeneration.iface());
 
     try std.testing.expectEqualStrings("graph", result.specialist.?);
-    try std.testing.expect(result.query_request.?.graph_searches.?.map.get("graph_search") != null);
+    try std.testing.expect(result.query_request.?.graph_queries.?.map.get("graph_search") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.warnings.?[0], "Generator-backed graph query building failed") != null);
 }
 
@@ -8846,7 +8768,7 @@ test "query builder rejects generated graph cyclic result dependencies" {
         ) !generating.GenerateResult {
             return .{
                 .content = try alloc.dupe(u8,
-                    \\{"graph_searches":{"a":{"type":"traverse","index_name":"doc_graph","start_nodes":{"result_ref":"$graph_results.b"},"params":{"max_depth":1}},"b":{"type":"traverse","index_name":"doc_graph","start_nodes":{"result_ref":"$graph_results.a"},"params":{"max_depth":1}}},"explanation":"bad cycle","confidence":0.99}
+                    \\{"graph_queries":{"a":{"index":"doc_graph","traverse":{"start":{"result_ref":"$graph_results.b"},"max_depth":1}},"b":{"index":"doc_graph","traverse":{"start":{"result_ref":"$graph_results.a"},"max_depth":1}}},"explanation":"bad cycle","confidence":0.99}
                 ),
                 .allocator = alloc,
             };
@@ -8870,7 +8792,7 @@ test "query builder rejects generated graph cyclic result dependencies" {
     }, FakeGeneration.iface());
 
     try std.testing.expectEqualStrings("graph", result.specialist.?);
-    try std.testing.expect(result.query_request.?.graph_searches.?.map.get("graph_search") != null);
+    try std.testing.expect(result.query_request.?.graph_queries.?.map.get("graph_search") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.warnings.?[0], "Generator-backed graph query building failed") != null);
 }
 
@@ -8891,7 +8813,7 @@ test "query builder rejects generated graph indexes outside context and falls ba
         ) !generating.GenerateResult {
             return .{
                 .content = try alloc.dupe(u8,
-                    \\{"graph_searches":{"bad":{"type":"neighbors","index_name":"missing_graph","start_nodes":{"result_ref":"$full_text_results"}}},"explanation":"bad index","confidence":0.99}
+                    \\{"graph_queries":{"bad":{"index":"missing_graph","traverse":{"start":{"result_ref":"$full_text_results"},"max_depth":1}}},"explanation":"bad index","confidence":0.99}
                 ),
                 .allocator = alloc,
             };
@@ -8915,8 +8837,8 @@ test "query builder rejects generated graph indexes outside context and falls ba
     }, FakeGeneration.iface());
 
     try std.testing.expectEqualStrings("graph", result.specialist.?);
-    const graph_query = result.query_request.?.graph_searches.?.map.get("graph_search").?;
-    try std.testing.expectEqualStrings("doc_graph", graph_query.index_name);
+    const graph_query = result.query_request.?.graph_queries.?.map.get("graph_search").?;
+    try std.testing.expectEqualStrings("doc_graph", graph_query.graph_traverse_query.index);
     try std.testing.expect(result.warnings != null);
     try std.testing.expect(std.mem.indexOf(u8, result.warnings.?[0], "Generator-backed graph query building failed") != null);
 }
@@ -8938,7 +8860,7 @@ test "query builder rejects generated graph unsupported result refs" {
         ) !generating.GenerateResult {
             return .{
                 .content = try alloc.dupe(u8,
-                    \\{"graph_searches":{"bad":{"type":"neighbors","index_name":"doc_graph","start_nodes":{"result_ref":"$unknown_results"}}},"explanation":"bad ref","confidence":0.99}
+                    \\{"graph_queries":{"bad":{"index":"doc_graph","traverse":{"start":{"result_ref":"$unknown_results"},"max_depth":1}}},"explanation":"bad ref","confidence":0.99}
                 ),
                 .allocator = alloc,
             };
@@ -8962,7 +8884,7 @@ test "query builder rejects generated graph unsupported result refs" {
     }, FakeGeneration.iface());
 
     try std.testing.expectEqualStrings("graph", result.specialist.?);
-    try std.testing.expect(result.query_request.?.graph_searches.?.map.get("graph_search") != null);
+    try std.testing.expect(result.query_request.?.graph_queries.?.map.get("graph_search") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.warnings.?[0], "Generator-backed graph query building failed") != null);
 }
 
@@ -8983,7 +8905,7 @@ test "query builder rejects generated graph malformed patterns" {
         ) !generating.GenerateResult {
             return .{
                 .content = try alloc.dupe(u8,
-                    \\{"graph_searches":{"bad":{"type":"pattern","index_name":"doc_graph","start_nodes":{"keys":["doc:a"]},"pattern":[{"alias":"a"},{"alias":"a","edge":{"types":["links"],"min_hops":2,"max_hops":1}}],"return_aliases":["missing"]}},"explanation":"bad pattern","confidence":0.99}
+                    \\{"graph_queries":{"bad":{"index":"doc_graph","match":{"nodes":{"a":{},"b":{}},"edges":[{"from":"a","to":"b","types":["links"],"min_hops":2,"max_hops":1}]},"return":{"bindings":["missing"]}}},"explanation":"bad pattern","confidence":0.99}
                 ),
                 .allocator = alloc,
             };
@@ -9007,8 +8929,8 @@ test "query builder rejects generated graph malformed patterns" {
     }, FakeGeneration.iface());
 
     try std.testing.expectEqualStrings("graph", result.specialist.?);
-    const graph_query = result.query_request.?.graph_searches.?.map.get("graph_search").?;
-    try std.testing.expectEqual(indexes_openapi.GraphQueryType.pattern, graph_query.type);
+    const graph_query = result.query_request.?.graph_queries.?.map.get("graph_search").?;
+    try std.testing.expect(graph_query == .graph_match_query);
     try std.testing.expect(std.mem.indexOf(u8, result.warnings.?[0], "Generator-backed graph query building failed") != null);
 }
 
@@ -9662,7 +9584,7 @@ test "query builder applies search cursor only when sort is present" {
 
 test "query builder maps graph searches from constraints" {
     var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"graph_searches":{"related":{"type":"neighbors","index_name":"doc_graph","start_nodes":{"keys":["doc-1"]},"params":{"edge_types":["references"],"max_depth":1},"include_edges":true}},"expand_strategy":"union"}
+        \\{"graph_queries":{"related":{"index":"doc_graph","traverse":{"start":{"keys":["doc-1"]},"edge_types":["references"],"max_depth":1}}},"expand_strategy":"union"}
     , .{});
     defer constraints_tree.deinit();
 
@@ -9677,14 +9599,12 @@ test "query builder maps graph searches from constraints" {
 
     const query_request = result.query_request.?;
     try std.testing.expectEqualStrings("union", query_request.expand_strategy.?);
-    try std.testing.expect(query_request.graph_searches != null);
-    try std.testing.expectEqual(@as(usize, 1), query_request.graph_searches.?.map.count());
-    const graph_query = query_request.graph_searches.?.map.get("related").?;
-    try std.testing.expectEqual(indexes_openapi.GraphQueryType.neighbors, graph_query.type);
-    try std.testing.expectEqualStrings("doc_graph", graph_query.index_name);
-    try std.testing.expectEqualStrings("doc-1", graph_query.start_nodes.?.keys.?[0]);
-    try std.testing.expectEqualStrings("references", graph_query.params.?.edge_types.?[0]);
-    try std.testing.expectEqual(true, graph_query.include_edges.?);
+    try std.testing.expect(query_request.graph_queries != null);
+    try std.testing.expectEqual(@as(usize, 1), query_request.graph_queries.?.map.count());
+    const graph_query = query_request.graph_queries.?.map.get("related").?;
+    try std.testing.expectEqualStrings("doc_graph", graph_query.graph_traverse_query.index);
+    try std.testing.expectEqualStrings("doc-1", graph_query.graph_traverse_query.traverse.start.keys.?[0]);
+    try std.testing.expectEqualStrings("references", graph_query.graph_traverse_query.traverse.edge_types.?[0]);
 }
 
 test "query builder infers graph search from table context" {
@@ -9700,12 +9620,10 @@ test "query builder infers graph search from table context" {
     }, null);
 
     try std.testing.expectEqualStrings("graph", result.specialist.?);
-    const graph_query = result.query_request.?.graph_searches.?.map.get("graph_search").?;
-    try std.testing.expectEqual(indexes_openapi.GraphQueryType.traverse, graph_query.type);
-    try std.testing.expectEqualStrings("doc_graph", graph_query.index_name);
-    try std.testing.expectEqualStrings("$full_text_results", graph_query.start_nodes.?.result_ref.?);
-    try std.testing.expectEqual(@as(i64, 2), graph_query.params.?.max_depth.?);
-    try std.testing.expect(graph_query.include_edges == null);
+    const graph_query = result.query_request.?.graph_queries.?.map.get("graph_search").?;
+    try std.testing.expectEqualStrings("doc_graph", graph_query.graph_traverse_query.index);
+    try std.testing.expectEqualStrings("$full_text_results", graph_query.graph_traverse_query.traverse.start.result_ref.?);
+    try std.testing.expectEqual(@as(i64, 2), graph_query.graph_traverse_query.traverse.max_depth.?);
 }
 
 test "query builder infers dense graph seed from semantic results" {
@@ -9729,8 +9647,8 @@ test "query builder infers dense graph seed from semantic results" {
 
     try std.testing.expectEqualStrings("semantic", result.specialist.?);
     try std.testing.expect(result.query_request.?.semantic_search != null);
-    const graph_query = result.query_request.?.graph_searches.?.map.get("graph_search").?;
-    try std.testing.expectEqualStrings("$embeddings_results", graph_query.start_nodes.?.result_ref.?);
+    const graph_query = result.query_request.?.graph_queries.?.map.get("graph_search").?;
+    try std.testing.expectEqualStrings("$embeddings_results", graph_query.graph_traverse_query.traverse.start.result_ref.?);
 }
 
 test "query builder preserves legacy flat graph indexes without structured metadata" {
@@ -9746,8 +9664,8 @@ test "query builder preserves legacy flat graph indexes without structured metad
     }, null);
 
     try std.testing.expectEqualStrings("graph", result.specialist.?);
-    const graph_query = result.query_request.?.graph_searches.?.map.get("graph_search").?;
-    try std.testing.expectEqualStrings("legacy_graph", graph_query.index_name);
+    const graph_query = result.query_request.?.graph_queries.?.map.get("graph_search").?;
+    try std.testing.expectEqualStrings("legacy_graph", graph_query.graph_traverse_query.index);
 }
 
 test "query builder maps graph shorthand constraints" {
@@ -9766,13 +9684,12 @@ test "query builder maps graph shorthand constraints" {
     }, null);
 
     try std.testing.expectEqualStrings("graph", result.specialist.?);
-    const graph_query = result.query_request.?.graph_searches.?.map.get("graph_search").?;
-    try std.testing.expectEqual(indexes_openapi.GraphQueryType.neighbors, graph_query.type);
-    try std.testing.expectEqualStrings("doc_graph", graph_query.index_name);
-    try std.testing.expectEqualStrings("doc:a", graph_query.start_nodes.?.keys.?[0]);
-    try std.testing.expectEqualStrings("doc:b", graph_query.start_nodes.?.keys.?[1]);
-    try std.testing.expectEqualStrings("references", graph_query.params.?.edge_types.?[0]);
-    try std.testing.expectEqual(@as(i64, 1), graph_query.params.?.max_depth.?);
+    const graph_query = result.query_request.?.graph_queries.?.map.get("graph_search").?;
+    try std.testing.expectEqualStrings("doc_graph", graph_query.graph_traverse_query.index);
+    try std.testing.expectEqualStrings("doc:a", graph_query.graph_traverse_query.traverse.start.keys.?[0]);
+    try std.testing.expectEqualStrings("doc:b", graph_query.graph_traverse_query.traverse.start.keys.?[1]);
+    try std.testing.expectEqualStrings("references", graph_query.graph_traverse_query.traverse.edge_types.?[0]);
+    try std.testing.expectEqual(@as(i64, 1), graph_query.graph_traverse_query.traverse.max_depth.?);
 }
 
 test "query builder infers graph path nodes and edge type from intent" {
@@ -9788,12 +9705,10 @@ test "query builder infers graph path nodes and edge type from intent" {
     }, null);
 
     try std.testing.expectEqualStrings("graph", result.specialist.?);
-    const graph_query = result.query_request.?.graph_searches.?.map.get("graph_search").?;
-    try std.testing.expectEqual(indexes_openapi.GraphQueryType.shortest_path, graph_query.type);
-    try std.testing.expectEqualStrings("doc:a", graph_query.start_nodes.?.keys.?[0]);
-    try std.testing.expectEqualStrings("doc:b", graph_query.target_nodes.?.keys.?[0]);
-    try std.testing.expectEqualStrings("references", graph_query.params.?.edge_types.?[0]);
-    try std.testing.expectEqual(true, graph_query.params.?.include_paths.?);
+    const graph_query = result.query_request.?.graph_queries.?.map.get("graph_search").?;
+    try std.testing.expectEqualStrings("doc:a", graph_query.graph_shortest_path_query.shortest_path.from.key);
+    try std.testing.expectEqualStrings("doc:b", graph_query.graph_shortest_path_query.shortest_path.to.key);
+    try std.testing.expectEqualStrings("references", graph_query.graph_shortest_path_query.shortest_path.edge_types.?[0]);
 }
 
 test "query builder infers graph between nodes and dependency edge type" {
@@ -9808,11 +9723,10 @@ test "query builder infers graph between nodes and dependency edge type" {
         .graph_index_metadata = &.{.{ .name = "service_graph" }},
     }, null);
 
-    const graph_query = result.query_request.?.graph_searches.?.map.get("graph_search").?;
-    try std.testing.expectEqual(indexes_openapi.GraphQueryType.shortest_path, graph_query.type);
-    try std.testing.expectEqualStrings("service:a", graph_query.start_nodes.?.keys.?[0]);
-    try std.testing.expectEqualStrings("service:b", graph_query.target_nodes.?.keys.?[0]);
-    try std.testing.expectEqualStrings("depends_on", graph_query.params.?.edge_types.?[0]);
+    const graph_query = result.query_request.?.graph_queries.?.map.get("graph_search").?;
+    try std.testing.expectEqualStrings("service:a", graph_query.graph_shortest_path_query.shortest_path.from.key);
+    try std.testing.expectEqualStrings("service:b", graph_query.graph_shortest_path_query.shortest_path.to.key);
+    try std.testing.expectEqualStrings("depends_on", graph_query.graph_shortest_path_query.shortest_path.edge_types.?[0]);
 }
 
 test "query builder infers graph multi hop pattern from intent" {
@@ -9833,20 +9747,18 @@ test "query builder infers graph multi hop pattern from intent" {
     }, null);
 
     try std.testing.expectEqualStrings("graph", result.specialist.?);
-    const graph_query = result.query_request.?.graph_searches.?.map.get("graph_search").?;
-    try std.testing.expectEqual(indexes_openapi.GraphQueryType.pattern, graph_query.type);
-    try std.testing.expectEqualStrings("doc:a", graph_query.start_nodes.?.keys.?[0]);
-    try std.testing.expectEqualStrings("doc:z", graph_query.target_nodes.?.keys.?[0]);
-    try std.testing.expectEqual(@as(usize, 3), graph_query.pattern.?.len);
-    try std.testing.expectEqualStrings("a", graph_query.pattern.?[0].alias.?);
-    try std.testing.expect(graph_query.pattern.?[0].edge == null);
-    try std.testing.expectEqualStrings("b", graph_query.pattern.?[1].alias.?);
-    try std.testing.expectEqualStrings("links", graph_query.pattern.?[1].edge.?.types.?[0]);
-    try std.testing.expectEqual(@as(i64, 1), graph_query.pattern.?[1].edge.?.min_hops.?);
-    try std.testing.expectEqual(@as(i64, 1), graph_query.pattern.?[1].edge.?.max_hops.?);
-    try std.testing.expectEqualStrings("c", graph_query.pattern.?[2].alias.?);
-    try std.testing.expectEqualStrings("links", graph_query.pattern.?[2].edge.?.types.?[0]);
-    try std.testing.expectEqualStrings("c", graph_query.return_aliases.?[0]);
+    const graph_query = result.query_request.?.graph_queries.?.map.get("graph_search").?;
+    const match_query = graph_query.graph_match_query;
+    try std.testing.expectEqual(@as(usize, 3), match_query.match.nodes.map.count());
+    try std.testing.expectEqual(@as(usize, 2), match_query.match.edges.len);
+    try std.testing.expectEqualStrings("a", match_query.match.edges[0].from);
+    try std.testing.expectEqualStrings("b", match_query.match.edges[0].to);
+    try std.testing.expectEqualStrings("links", match_query.match.edges[0].types.?[0]);
+    try std.testing.expectEqual(@as(i64, 1), match_query.match.edges[0].min_hops.?);
+    try std.testing.expectEqual(@as(i64, 1), match_query.match.edges[0].max_hops.?);
+    try std.testing.expectEqualStrings("b", match_query.match.edges[1].from);
+    try std.testing.expectEqualStrings("c", match_query.match.edges[1].to);
+    try std.testing.expectEqualStrings("c", match_query.@"return".bindings.?[0]);
 }
 
 test "query builder maps tree search into retrieval query request" {
@@ -10026,7 +9938,7 @@ test "query builder asks for graph index when table has multiple graph indexes" 
     try std.testing.expectEqualStrings("select_graph_index", result.questions.?[0].id);
     try std.testing.expectEqualStrings("doc_hierarchy", result.questions.?[0].options.?[0]);
     try std.testing.expectEqualStrings("topic_graph", result.questions.?[0].options.?[1]);
-    try std.testing.expect(result.query_request.?.graph_searches == null);
+    try std.testing.expect(result.query_request.?.graph_queries == null);
 }
 
 test "query builder uses graph index decision answer" {
@@ -10049,8 +9961,8 @@ test "query builder uses graph index decision answer" {
 
     try std.testing.expectEqual(AgentStatus.completed, result.status.?);
     try std.testing.expect(result.questions == null);
-    const graph_query = result.query_request.?.graph_searches.?.map.get("graph_search").?;
-    try std.testing.expectEqualStrings("topic_graph", graph_query.index_name);
+    const graph_query = result.query_request.?.graph_queries.?.map.get("graph_search").?;
+    try std.testing.expectEqualStrings("topic_graph", graph_query.graph_traverse_query.index);
 }
 
 test "query builder require executable rejects missing semantic index without clarification" {

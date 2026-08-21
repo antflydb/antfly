@@ -2039,17 +2039,14 @@ func graphVisualizationQuery(searchText string) map[string]any {
 			"query": searchText,
 		},
 		"limit": 8,
-		"graph_searches": map[string]any{
+		"graph_queries": map[string]any{
 			"relations": map[string]any{
-				"type":              "traverse",
-				"index_name":        DefaultAutographIndex,
-				"start_nodes":       map[string]any{"result_ref": "$full_text_results", "limit": 8},
-				"include_documents": true,
-				"fields":            []string{"title", "url", "metadata"},
-				"params": map[string]any{
+				"index": DefaultAutographIndex,
+				"traverse": map[string]any{
+					"start":         map[string]any{"result_ref": "$full_text_results", "limit": 8},
 					"direction":     "both",
 					"max_depth":     1,
-					"max_results":   80,
+					"limit":         80,
 					"include_paths": true,
 				},
 			},
@@ -2063,17 +2060,14 @@ func graphVisualizationSampleQuery() map[string]any {
 			"match_all": map[string]any{},
 		},
 		"limit": 8,
-		"graph_searches": map[string]any{
+		"graph_queries": map[string]any{
 			"relations": map[string]any{
-				"type":              "traverse",
-				"index_name":        DefaultAutographIndex,
-				"start_nodes":       map[string]any{"result_ref": "$fused_results", "limit": 8},
-				"include_documents": true,
-				"fields":            []string{"title", "url", "metadata"},
-				"params": map[string]any{
+				"index": DefaultAutographIndex,
+				"traverse": map[string]any{
+					"start":         map[string]any{"result_ref": "$fused_results", "limit": 8},
 					"direction":     "both",
 					"max_depth":     1,
-					"max_results":   80,
+					"limit":         80,
 					"include_paths": true,
 				},
 			},

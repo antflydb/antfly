@@ -13,6 +13,8 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
+const metadata_test_openapi = @import("antfly_metadata_openapi");
 const db_mod = @import("../storage/db/mod.zig");
 const db_query_search = @import("../storage/db/query/search_exec.zig");
 const hierarchy_navigation = @import("../storage/hierarchy_navigation.zig");
@@ -135,7 +137,7 @@ fn mergeGenericSearchResultsWithRuntimeSchema(
         }
 
         const graph_results = if (has_graph_results)
-            try mergeGraphSearchResults(alloc, results)
+            try mergeGraphSearchResults(alloc, req.graph_queries, results)
         else
             @constCast((&[_]db_mod.types.GraphSearchResult{})[0..]);
         errdefer {
@@ -218,7 +220,7 @@ fn mergeGenericSearchResultsWithRuntimeSchema(
     }
 
     const graph_results = if (has_graph_results)
-        try mergeGraphSearchResults(alloc, results)
+        try mergeGraphSearchResults(alloc, req.graph_queries, results)
     else
         @constCast((&[_]db_mod.types.GraphSearchResult{})[0..]);
     errdefer {
@@ -412,7 +414,7 @@ fn mergeHierarchyUnitSearchResults(
         }
     }
     if (has_graph_results) {
-        const graph_results = try mergeGraphSearchResults(alloc, results);
+        const graph_results = try mergeGraphSearchResults(alloc, req.graph_queries, results);
         errdefer {
             for (graph_results) |*graph_result| graph_result.deinit(alloc);
             if (graph_results.len > 0) alloc.free(graph_results);
@@ -874,6 +876,7 @@ const GraphSearchResultBuilder = struct {
     nodes: std.ArrayListUnmanaged(graph_query_mod.GraphResultNode) = .empty,
     paths: std.ArrayListUnmanaged(db_mod.types.GraphPath) = .empty,
     matches: std.ArrayListUnmanaged(db_mod.types.GraphPatternMatch) = .empty,
+    aggregates: std.ArrayListUnmanaged(db_mod.types.GraphAggregateResult) = .empty,
     hits: std.ArrayListUnmanaged(db_mod.types.SearchHit) = .empty,
     total_hits: u32 = 0,
 
@@ -885,6 +888,8 @@ const GraphSearchResultBuilder = struct {
         self.paths.deinit(alloc);
         for (self.matches.items) |*match| match.deinit(alloc);
         self.matches.deinit(alloc);
+        for (self.aggregates.items) |*aggregate| aggregate.deinit(alloc);
+        self.aggregates.deinit(alloc);
         for (self.hits.items) |*hit| hit.deinit(alloc);
         self.hits.deinit(alloc);
         self.* = undefined;
@@ -906,6 +911,11 @@ const GraphSearchResultBuilder = struct {
             for (matches) |*match| match.deinit(alloc);
             if (matches.len > 0) alloc.free(matches);
         }
+        const aggregates = try self.aggregates.toOwnedSlice(alloc);
+        errdefer {
+            for (aggregates) |*aggregate| aggregate.deinit(alloc);
+            if (aggregates.len > 0) alloc.free(aggregates);
+        }
         const hits = try self.hits.toOwnedSlice(alloc);
         errdefer {
             for (hits) |*hit| hit.deinit(alloc);
@@ -919,6 +929,7 @@ const GraphSearchResultBuilder = struct {
             .nodes = nodes,
             .paths = paths,
             .matches = matches,
+            .aggregates = aggregates,
             .hits = hits,
             .total_hits = self.total_hits,
         };
@@ -927,6 +938,7 @@ const GraphSearchResultBuilder = struct {
 
 fn mergeGraphSearchResults(
     alloc: std.mem.Allocator,
+    queries: []const db_mod.types.NamedGraphQuery,
     results: []const db_mod.types.SearchResult,
 ) ![]db_mod.types.GraphSearchResult {
     var builders = std.ArrayListUnmanaged(GraphSearchResultBuilder).empty;
@@ -972,6 +984,32 @@ fn mergeGraphSearchResults(
                     return err;
                 };
             }
+            for (graph_result.aggregates) |aggregate| {
+                var found = false;
+                for (builder.aggregates.items) |*existing| {
+                    if (!std.mem.eql(u8, existing.name, aggregate.name)) continue;
+                    existing.value = std.math.add(u128, existing.value, aggregate.value) catch return error.Overflow;
+                    existing.exact = existing.exact and aggregate.exact;
+                    if (graphAggregateIsDistinct(queries, graph_result.name, aggregate.name)) {
+                        // A shard-local distinct count cannot be summed exactly when
+                        // the same binding may occur on more than one shard.
+                        existing.exact = false;
+                    }
+                    found = true;
+                    break;
+                }
+                if (!found) {
+                    const name = try alloc.dupe(u8, aggregate.name);
+                    builder.aggregates.append(alloc, .{
+                        .name = name,
+                        .value = aggregate.value,
+                        .exact = aggregate.exact,
+                    }) catch |err| {
+                        alloc.free(name);
+                        return err;
+                    };
+                }
+            }
             for (graph_result.hits) |hit| {
                 var owned = try hit.clone(alloc);
                 builder.hits.append(alloc, owned) catch |err| {
@@ -993,6 +1031,21 @@ fn mergeGraphSearchResults(
         initialized += 1;
     }
     return merged;
+}
+
+fn graphAggregateIsDistinct(
+    queries: []const db_mod.types.NamedGraphQuery,
+    query_name: []const u8,
+    aggregate_name: []const u8,
+) bool {
+    for (queries) |named| {
+        if (!std.mem.eql(u8, named.name, query_name)) continue;
+        for (named.query.aggregates) |aggregate| {
+            if (std.mem.eql(u8, aggregate.name, aggregate_name)) return aggregate.distinct;
+        }
+        return false;
+    }
+    return false;
 }
 
 fn cloneGraphSearchResult(
@@ -1045,11 +1098,27 @@ fn cloneGraphSearchResult(
         initialized_matches += 1;
     }
 
+    const aggregates = try alloc.alloc(db_mod.types.GraphAggregateResult, source.aggregates.len);
+    var initialized_aggregates: usize = 0;
+    errdefer {
+        for (aggregates[0..initialized_aggregates]) |*aggregate| aggregate.deinit(alloc);
+        if (source.aggregates.len > 0) alloc.free(aggregates);
+    }
+    for (source.aggregates, 0..) |aggregate, i| {
+        aggregates[i] = .{
+            .name = try alloc.dupe(u8, aggregate.name),
+            .value = aggregate.value,
+            .exact = aggregate.exact,
+        };
+        initialized_aggregates += 1;
+    }
+
     return .{
         .name = try alloc.dupe(u8, source.name),
         .nodes = nodes,
         .paths = paths,
         .matches = matches,
+        .aggregates = aggregates,
         .hits = hits,
         .total_hits = source.total_hits,
     };
@@ -1089,9 +1158,21 @@ fn cloneGraphPatternMatch(
         initialized_path += 1;
     }
 
+    const null_aliases = try alloc.alloc([]u8, source.null_aliases.len);
+    var initialized_null_aliases: usize = 0;
+    errdefer {
+        for (null_aliases[0..initialized_null_aliases]) |alias| alloc.free(alias);
+        if (source.null_aliases.len > 0) alloc.free(null_aliases);
+    }
+    for (source.null_aliases, 0..) |alias, i| {
+        null_aliases[i] = try alloc.dupe(u8, alias);
+        initialized_null_aliases += 1;
+    }
+
     return .{
         .bindings = bindings,
         .path = path,
+        .null_aliases = null_aliases,
     };
 }
 
@@ -1659,14 +1740,14 @@ test "query parser keeps stored documents for dense reranking without fields" {
 
 test "query parser accepts graph searches" {
     var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"graph_searches":{"neighbors":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]},"params":{"edge_types":["links"]}}},"limit":10}
+        \\{"graph_queries":{"neighbors":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]},"edge_types":["links"],"max_depth":1}}},"limit":10}
     );
     defer owned.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries.len);
     try std.testing.expectEqualStrings("neighbors", owned.req.graph_queries[0].name);
     try std.testing.expectEqualStrings("graph_idx", owned.req.graph_queries[0].query.index_name);
-    try std.testing.expect(owned.req.graph_queries[0].query.query_type == .neighbors);
+    try std.testing.expect(owned.req.graph_queries[0].query.query_type == .traverse);
     switch (owned.req.graph_queries[0].query.start_nodes) {
         .keys => |keys| try std.testing.expectEqualStrings("doc:a", keys[0]),
         else => return error.TestUnexpectedResult,
@@ -1675,28 +1756,27 @@ test "query parser accepts graph searches" {
 
 test "query parser accepts graph pattern searches" {
     var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"graph_searches":{"pattern_walk":{"type":"pattern","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]},"pattern":[{"alias":"a"},{"alias":"b","edge":{"types":["links"],"direction":"out","min_hops":1,"max_hops":2}}],"return_aliases":["b"],"include_documents":true}},"limit":10}
+        \\{"graph_queries":{"pattern_walk":{"index":"graph_idx","match":{"nodes":{"a":{"filter":{"ids":["doc:a"]}},"b":{}},"edges":[{"from":"a","to":"b","types":["links"],"max_hops":2}]},"return":{"bindings":["b"],"limit":10}}},"limit":10}
     );
     defer owned.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries.len);
     try std.testing.expect(owned.req.graph_queries[0].query.query_type == .pattern);
-    try std.testing.expectEqual(@as(usize, 2), owned.req.graph_queries[0].query.pattern.len);
+    try std.testing.expectEqual(@as(usize, 2), owned.req.graph_queries[0].query.match_pattern.?.nodes.len);
     try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries[0].query.return_aliases.len);
-    try std.testing.expect(owned.req.graph_queries[0].query.include_documents);
-    try std.testing.expect(owned.req.graph_queries[0].query.include_all_fields);
+    try std.testing.expectEqual(@as(u32, 10), owned.req.graph_queries[0].query.params.max_results);
 }
 
-test "query parser treats explicit graph document fields as a projection" {
+test "query parser accepts exact graph count aggregates" {
     var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"graph_searches":{"pattern_walk":{"type":"pattern","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]},"pattern":[{"alias":"a"}],"include_documents":true,"fields":["title"]}},"limit":10}
+        \\{"graph_queries":{"pattern_count":{"index":"graph_idx","match":{"nodes":{"a":{}},"edges":[]},"return":{"aggregates":{"count":{"type":"count","of":"*"}}}}},"limit":10}
     );
     defer owned.deinit(std.testing.allocator);
 
     const graph_query = owned.req.graph_queries[0].query;
-    try std.testing.expect(!graph_query.include_all_fields);
-    try std.testing.expectEqual(@as(usize, 1), graph_query.fields.len);
-    try std.testing.expectEqualStrings("title", graph_query.fields[0]);
+    try std.testing.expectEqual(@as(usize, 1), graph_query.aggregates.len);
+    try std.testing.expectEqualStrings("count", graph_query.aggregates[0].name);
+    try std.testing.expectEqualStrings("*", graph_query.aggregates[0].of);
 }
 
 test "query parser rejects semantic search offsets" {
@@ -1985,10 +2065,17 @@ test "query encoder emits graph results" {
         },
     }, .{ .took_ms = 4 }, result);
     defer encoded.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"graph_results\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"neighbors\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"type\":\"neighbors\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"document\":{\"title\":\"beta\"}") != null);
+    var parsed = try ant_json.parseFromSlice(metadata_test_openapi.QueryResponses, alloc, encoded.json, .{});
+    defer parsed.deinit();
+    const responses = parsed.value.responses orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), responses.len);
+    const decoded_graph_results = responses[0].graph_results orelse return error.TestUnexpectedResult;
+    const neighbors = decoded_graph_results.map.get("neighbors") orelse return error.TestUnexpectedResult;
+    const nodes = neighbors.nodes orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), nodes.len);
+    try std.testing.expectEqualStrings("doc:b", nodes[0].key);
+    const document = nodes[0].document orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("beta", document.object.get("title").?.string);
 }
 
 test "query merge applies global score ordering and offset" {

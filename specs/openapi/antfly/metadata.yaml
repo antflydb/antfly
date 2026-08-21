@@ -6596,7 +6596,7 @@ components:
                   - required: [reranker]
                   - required: [analyses]
                   - required: [aggregations]
-                  - required: [graph_searches]
+                  - required: [graph_queries]
                   - required: [expand_strategy]
                   - required: [document_renderer]
                   - required: [pruner]
@@ -6969,13 +6969,13 @@ components:
             ```
         analyses:
           $ref: "#/components/schemas/Analyses"
-        graph_searches:
+        graph_queries:
           type: object
           additionalProperties:
             $ref: "indexes.yaml#/components/schemas/GraphQuery"
           description: |
-            Declarative graph queries to execute after full-text/vector searches.
-            Results can reference search results using node selectors like $full_text_results.
+            Declarative graph matching, traversal, and path queries. A nested node
+            `filter` uses the same canonical query DSL as document search.
         expand_strategy:
           type: string
           enum:
@@ -7115,7 +7115,7 @@ components:
             product catalogs, etc.) without ingesting that data into Antfly.
 
             **Supported operations on foreign tables:** filter_query, field selection, limit/offset.
-            **Not supported:** full_text_search, semantic_search, graph_searches, aggregations, reranker.
+            **Not supported:** full_text_search, semantic_search, graph_queries, aggregations, reranker.
 
             **Example - Join Antfly products with Postgres customers:**
             ```json

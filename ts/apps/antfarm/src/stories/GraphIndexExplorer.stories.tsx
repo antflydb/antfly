@@ -60,8 +60,6 @@ const graphIndex = {
 } as unknown as IndexStatus;
 
 const traversalResult: GraphQueryResult = {
-  type: "traverse",
-  total: 5,
   nodes: [
     {
       key: "paper:vector-db",
@@ -126,8 +124,6 @@ const traversalResult: GraphQueryResult = {
 };
 
 const shortestPathResult: GraphQueryResult = {
-  type: "shortest_path",
-  total: 1,
   paths: [
     {
       nodes: ["paper:graph-rag", "paper:agent-memory", "paper:entity-links"],
@@ -146,15 +142,15 @@ const shortestPathResult: GraphQueryResult = {
 };
 
 function graphResultFor(request: QueryRequest): GraphQueryResult {
-  const query = request.graph_searches?.explorer;
-  if (query?.type === "shortest_path") return shortestPathResult;
+  const query = request.graph_queries?.explorer;
+  if (query && "shortest_path" in query) return shortestPathResult;
   return traversalResult;
 }
 
 const fakeClient = {
   tables: {
     query: async (_tableName: string, request: QueryRequest) => {
-      if (!request.graph_searches) {
+      if (!request.graph_queries) {
         return {
           responses: [
             {

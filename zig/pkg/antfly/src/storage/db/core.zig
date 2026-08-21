@@ -1163,6 +1163,18 @@ pub const DBCore = struct {
         return try graph_pattern_mod.matchPattern(alloc, &entry.index, start_keys, pattern, opts);
     }
 
+    pub fn graphMatchConjunctivePattern(
+        self: *DBCore,
+        alloc: Allocator,
+        index_name: []const u8,
+        start_keys: []const []const u8,
+        pattern: graph_pattern_mod.ConjunctivePattern,
+        opts: graph_pattern_mod.MatchOptions,
+    ) ![]graph_pattern_mod.PatternMatch {
+        const entry = self.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try graph_pattern_mod.matchConjunctivePattern(alloc, &entry.index, start_keys, pattern, opts);
+    }
+
     pub fn documentRangeLowerAlloc(self: *DBCore, raw_key: []const u8) ![]u8 {
         return try internal_keys.documentRangeLowerAlloc(self.alloc, raw_key);
     }

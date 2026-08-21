@@ -272,6 +272,10 @@ from .get_current_user_response_200_metadata_type_0 import GetCurrentUserRespons
 from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDetail
 from .google_embedder_config import GoogleEmbedderConfig
 from .google_generator_config import GoogleGeneratorConfig
+from .graph_aggregate_value import GraphAggregateValue
+from .graph_alias_operand import GraphAliasOperand
+from .graph_count_aggregate import GraphCountAggregate
+from .graph_count_aggregate_type import GraphCountAggregateType
 from .graph_index_config import GraphIndexConfig
 from .graph_index_stats import GraphIndexStats
 from .graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
@@ -283,15 +287,37 @@ from .graph_index_stats_promotion import GraphIndexStatsPromotion
 from .graph_index_stats_resolution import GraphIndexStatsResolution
 from .graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
 from .graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
+from .graph_k_shortest_paths import GraphKShortestPaths
+from .graph_k_shortest_paths_query import GraphKShortestPathsQuery
+from .graph_match import GraphMatch
+from .graph_match_edge import GraphMatchEdge
+from .graph_match_node import GraphMatchNode
+from .graph_match_node_filter import GraphMatchNodeFilter
+from .graph_match_nodes import GraphMatchNodes
+from .graph_match_query import GraphMatchQuery
 from .graph_node_selector import GraphNodeSelector
-from .graph_query import GraphQuery
-from .graph_query_params import GraphQueryParams
-from .graph_query_params_algorithm_params import GraphQueryParamsAlgorithmParams
+from .graph_not_equal_predicate import GraphNotEqualPredicate
+from .graph_not_exists_pattern import GraphNotExistsPattern
+from .graph_optional_match import GraphOptionalMatch
+from .graph_optional_match_nodes import GraphOptionalMatchNodes
+from .graph_path_endpoint import GraphPathEndpoint
+from .graph_query_page import GraphQueryPage
 from .graph_query_result import GraphQueryResult
-from .graph_query_type import GraphQueryType
+from .graph_query_result_aggregates import GraphQueryResultAggregates
+from .graph_query_result_rows_item import GraphQueryResultRowsItem
+from .graph_query_stats import GraphQueryStats
 from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
+from .graph_shortest_path import GraphShortestPath
+from .graph_shortest_path_filter import GraphShortestPathFilter
+from .graph_shortest_path_query import GraphShortestPathQuery
+from .graph_traversal import GraphTraversal
+from .graph_traversal_filter import GraphTraversalFilter
+from .graph_traverse_query import GraphTraverseQuery
+from .graph_where_and import GraphWhereAnd
+from .graph_where_not_equal import GraphWhereNotEqual
+from .graph_where_not_exists import GraphWhereNotExists
 from .ground_truth import GroundTruth
 from .hierarchy_ancestor import HierarchyAncestor
 from .hierarchy_ancestor_document import HierarchyAncestorDocument
@@ -556,10 +582,6 @@ from .path_find_request import PathFindRequest
 from .path_find_result import PathFindResult
 from .path_find_weight_mode import PathFindWeightMode
 from .path_weight_mode import PathWeightMode
-from .pattern_edge_step import PatternEdgeStep
-from .pattern_match import PatternMatch
-from .pattern_match_bindings import PatternMatchBindings
-from .pattern_step import PatternStep
 from .permission import Permission
 from .permission_type import PermissionType
 from .phrase_query import PhraseQuery
@@ -589,7 +611,7 @@ from .query_request_aggregations import QueryRequestAggregations
 from .query_request_embeddings import QueryRequestEmbeddings
 from .query_request_expand_strategy import QueryRequestExpandStrategy
 from .query_request_foreign_sources import QueryRequestForeignSources
-from .query_request_graph_searches import QueryRequestGraphSearches
+from .query_request_graph_queries import QueryRequestGraphQueries
 from .query_request_query import QueryRequestQuery
 from .query_responses import QueryResponses
 from .query_result import QueryResult
@@ -1034,6 +1056,10 @@ __all__ = (
     "GetDocumentArtifactManifestDetail",
     "GoogleEmbedderConfig",
     "GoogleGeneratorConfig",
+    "GraphAggregateValue",
+    "GraphAliasOperand",
+    "GraphCountAggregate",
+    "GraphCountAggregateType",
     "GraphIndexConfig",
     "GraphIndexStats",
     "GraphIndexStatsAlgebraicGraph",
@@ -1045,15 +1071,37 @@ __all__ = (
     "GraphIndexStatsResolution",
     "GraphIndexStatsResolverReplay",
     "GraphIndexStatsSourceArtifact",
+    "GraphKShortestPaths",
+    "GraphKShortestPathsQuery",
+    "GraphMatch",
+    "GraphMatchEdge",
+    "GraphMatchNode",
+    "GraphMatchNodeFilter",
+    "GraphMatchNodes",
+    "GraphMatchQuery",
     "GraphNodeSelector",
-    "GraphQuery",
-    "GraphQueryParams",
-    "GraphQueryParamsAlgorithmParams",
+    "GraphNotEqualPredicate",
+    "GraphNotExistsPattern",
+    "GraphOptionalMatch",
+    "GraphOptionalMatchNodes",
+    "GraphPathEndpoint",
+    "GraphQueryPage",
     "GraphQueryResult",
-    "GraphQueryType",
+    "GraphQueryResultAggregates",
+    "GraphQueryResultRowsItem",
+    "GraphQueryStats",
     "GraphResultNode",
     "GraphResultNodeDocument",
     "GraphResultNodeEvidence",
+    "GraphShortestPath",
+    "GraphShortestPathFilter",
+    "GraphShortestPathQuery",
+    "GraphTraversal",
+    "GraphTraversalFilter",
+    "GraphTraverseQuery",
+    "GraphWhereAnd",
+    "GraphWhereNotEqual",
+    "GraphWhereNotExists",
     "GroundTruth",
     "HierarchyAncestor",
     "HierarchyAncestorDocument",
@@ -1316,10 +1364,6 @@ __all__ = (
     "PathFindResult",
     "PathFindWeightMode",
     "PathWeightMode",
-    "PatternEdgeStep",
-    "PatternMatch",
-    "PatternMatchBindings",
-    "PatternStep",
     "Permission",
     "PermissionType",
     "PhraseQuery",
@@ -1349,7 +1393,7 @@ __all__ = (
     "QueryRequestEmbeddings",
     "QueryRequestExpandStrategy",
     "QueryRequestForeignSources",
-    "QueryRequestGraphSearches",
+    "QueryRequestGraphQueries",
     "QueryRequestQuery",
     "QueryResponses",
     "QueryResult",

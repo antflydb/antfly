@@ -7,17 +7,17 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 if TYPE_CHECKING:
-    from ..models.graph_result_node import GraphResultNode
+    from ..models.graph_aggregate_value import GraphAggregateValue
 
 
-T = TypeVar("T", bound="PatternMatchBindings")
+T = TypeVar("T", bound="GraphQueryResultAggregates")
 
 
 @_attrs_define
-class PatternMatchBindings:
-    """Map of alias to matched node"""
+class GraphQueryResultAggregates:
+    """ """
 
-    additional_properties: dict[str, GraphResultNode] = _attrs_field(init=False, factory=dict)
+    additional_properties: dict[str, GraphAggregateValue] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
 
@@ -29,28 +29,28 @@ class PatternMatchBindings:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.graph_result_node import GraphResultNode
+        from ..models.graph_aggregate_value import GraphAggregateValue
 
         d = dict(src_dict)
-        pattern_match_bindings = cls()
+        graph_query_result_aggregates = cls()
 
         additional_properties = {}
         for prop_name, prop_dict in d.items():
-            additional_property = GraphResultNode.from_dict(prop_dict)
+            additional_property = GraphAggregateValue.from_dict(prop_dict)
 
             additional_properties[prop_name] = additional_property
 
-        pattern_match_bindings.additional_properties = additional_properties
-        return pattern_match_bindings
+        graph_query_result_aggregates.additional_properties = additional_properties
+        return graph_query_result_aggregates
 
     @property
     def additional_keys(self) -> list[str]:
         return list(self.additional_properties.keys())
 
-    def __getitem__(self, key: str) -> GraphResultNode:
+    def __getitem__(self, key: str) -> GraphAggregateValue:
         return self.additional_properties[key]
 
-    def __setitem__(self, key: str, value: GraphResultNode) -> None:
+    def __setitem__(self, key: str, value: GraphAggregateValue) -> None:
         self.additional_properties[key] = value
 
     def __delitem__(self, key: str) -> None:

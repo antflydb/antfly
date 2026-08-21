@@ -2002,6 +2002,7 @@ pub const GraphSearchResult = struct {
     nodes: []graph_query_mod.GraphResultNode = &.{},
     paths: []GraphPath = &.{},
     matches: []GraphPatternMatch = &.{},
+    aggregates: []GraphAggregateResult = &.{},
     hits: []SearchHit,
     total_hits: u32,
 
@@ -2013,8 +2014,21 @@ pub const GraphSearchResult = struct {
         if (self.paths.len > 0) alloc.free(self.paths);
         for (self.matches) |*match| match.deinit(alloc);
         if (self.matches.len > 0) alloc.free(self.matches);
+        for (self.aggregates) |*aggregate| aggregate.deinit(alloc);
+        if (self.aggregates.len > 0) alloc.free(self.aggregates);
         for (self.hits) |*hit| hit.deinit(alloc);
         if (self.hits.len > 0) alloc.free(self.hits);
+        self.* = undefined;
+    }
+};
+
+pub const GraphAggregateResult = struct {
+    name: []u8,
+    value: u128,
+    exact: bool = true,
+
+    pub fn deinit(self: *GraphAggregateResult, alloc: Allocator) void {
+        alloc.free(self.name);
         self.* = undefined;
     }
 };
@@ -2033,6 +2047,7 @@ pub const GraphPatternBinding = struct {
 pub const GraphPatternMatch = struct {
     bindings: []GraphPatternBinding,
     path: []graph_query_mod.PathEdgeInfo,
+    null_aliases: [][]u8 = &.{},
 
     pub fn deinit(self: *GraphPatternMatch, alloc: Allocator) void {
         for (self.bindings) |*binding| binding.deinit(alloc);
@@ -2044,6 +2059,8 @@ pub const GraphPatternMatch = struct {
             if (edge.metadata.len > 0) alloc.free(edge.metadata);
         }
         if (self.path.len > 0) alloc.free(self.path);
+        for (self.null_aliases) |alias| alloc.free(alias);
+        if (self.null_aliases.len > 0) alloc.free(self.null_aliases);
         self.* = undefined;
     }
 };

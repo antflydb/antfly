@@ -108,7 +108,7 @@ const query_request_description_json =
     \\      "Structured filter_query.geo_bbox accepts field, min_lat, min_lon, max_lat, and max_lon; min_lon greater than max_lon represents an antimeridian-wrapped box."
     \\    ]
     \\  },
-    \\  "top_level_fields": ["query", "full_text_search", "semantic_search", "embedding_template", "indexes", "filter_prefix", "filter_query", "exclusion_query", "aggregations", "embeddings", "search_effort", "fields", "hierarchy", "limit", "offset", "timeout_ms", "order_by", "search_after", "search_before", "distance_under", "distance_over", "merge_config", "count", "profile", "reranker", "analyses", "graph_searches", "expand_strategy", "document_renderer", "pruner", "join", "foreign_sources"],
+    \\  "top_level_fields": ["query", "full_text_search", "semantic_search", "embedding_template", "indexes", "filter_prefix", "filter_query", "exclusion_query", "aggregations", "embeddings", "search_effort", "fields", "hierarchy", "limit", "offset", "timeout_ms", "order_by", "search_after", "search_before", "distance_under", "distance_over", "merge_config", "count", "profile", "reranker", "analyses", "graph_queries", "expand_strategy", "document_renderer", "pruner", "join", "foreign_sources"],
     \\  "examples": {
     \\    "fielded_full_text": {"full_text_search":{"match":"hello","field":"body"},"fields":["title","body"],"limit":5,"timeout_ms":5000},
     \\    "match_retrieval": {"semantic_search":"How does Antfly index documents?","indexes":["document_vectors"],"hierarchy":{"ancestors":{"source":{"fields":["title","url"]}}},"fields":["text"],"limit":5},

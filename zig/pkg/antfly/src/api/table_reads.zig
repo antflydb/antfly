@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const ant_json = @import("antfly-json");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const scraping = @import("antfly_scraping");
@@ -16593,7 +16594,7 @@ fn appendGraphQueriesField(
     first: *bool,
     graph_queries: []const db_mod.types.NamedGraphQuery,
 ) !void {
-    try appendJsonFieldName(alloc, out, first, "graph_searches");
+    try appendJsonFieldName(alloc, out, first, "graph_queries");
     try out.append(alloc, '{');
     for (graph_queries, 0..) |graph_query, i| {
         if (i > 0) try out.append(alloc, ',');
@@ -17562,8 +17563,8 @@ fn parseRemoteGraphResults(
         else
             ParsedRemoteGraphNodes{};
         errdefer parsed_nodes.deinit(alloc);
-        const parsed_matches = if (result_value.matches) |matches_value|
-            try parseRemoteGraphMatches(alloc, matches_value)
+        const parsed_matches = if (result_value.rows) |rows_value|
+            try parseRemoteGraphRows(alloc, rows_value)
         else
             ParsedRemoteGraphMatches{};
         errdefer parsed_matches.deinit(alloc);
@@ -17575,19 +17576,51 @@ fn parseRemoteGraphResults(
             for (paths) |path| graph_paths.freePath(alloc, path);
             if (paths.len > 0) alloc.free(paths);
         }
+        const aggregates = if (result_value.aggregates) |aggregates_value|
+            try parseRemoteGraphAggregates(alloc, aggregates_value)
+        else
+            @constCast((&[_]db_mod.types.GraphAggregateResult{})[0..]);
+        errdefer {
+            for (aggregates) |*aggregate| aggregate.deinit(alloc);
+            if (aggregates.len > 0) alloc.free(aggregates);
+        }
 
         results[initialized] = .{
             .name = try alloc.dupe(u8, entry.key_ptr.*),
             .nodes = parsed_nodes.nodes,
             .paths = paths,
             .matches = parsed_matches.matches,
+            .aggregates = aggregates,
             .hits = try concatGraphResultHits(alloc, parsed_nodes.hits, parsed_matches.hits),
-            .total_hits = @intCast(result_value.total),
+            .total_hits = @intCast(@max(parsed_nodes.nodes.len, @max(paths.len, parsed_matches.matches.len))),
         };
         initialized += 1;
     }
 
     return results;
+}
+
+fn parseRemoteGraphAggregates(
+    alloc: std.mem.Allocator,
+    value: std.json.ArrayHashMap(indexes_openapi.GraphAggregateValue),
+) ![]db_mod.types.GraphAggregateResult {
+    const aggregates = try alloc.alloc(db_mod.types.GraphAggregateResult, value.map.count());
+    var initialized: usize = 0;
+    errdefer {
+        for (aggregates[0..initialized]) |*aggregate| aggregate.deinit(alloc);
+        alloc.free(aggregates);
+    }
+    var it = value.map.iterator();
+    while (it.next()) |entry| {
+        const parsed_value = std.fmt.parseInt(u128, entry.value_ptr.value, 10) catch return error.InvalidRemoteResponse;
+        aggregates[initialized] = .{
+            .name = try alloc.dupe(u8, entry.key_ptr.*),
+            .value = parsed_value,
+            .exact = entry.value_ptr.exact,
+        };
+        initialized += 1;
+    }
+    return aggregates;
 }
 
 const ParsedRemoteGraphNodes = struct {
@@ -17669,61 +17702,48 @@ fn parseRemoteGraphNodeWithKey(
     };
 }
 
-fn parseRemoteGraphMatches(
+fn parseRemoteGraphRows(
     alloc: std.mem.Allocator,
-    value: []const indexes_openapi.PatternMatch,
+    value: []const std.json.Value,
 ) !ParsedRemoteGraphMatches {
     const matches = try alloc.alloc(db_mod.types.GraphPatternMatch, value.len);
     var initialized_matches: usize = 0;
     errdefer {
         for (matches[0..initialized_matches]) |*match| match.deinit(alloc);
-        alloc.free(matches);
+        if (matches.len > 0) alloc.free(matches);
     }
-    var hits = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
-    errdefer {
-        for (hits.items) |*hit| hit.deinit(alloc);
-        hits.deinit(alloc);
-    }
-
-    for (value, 0..) |item, i| {
-        const bindings_value = item.bindings orelse return error.InvalidQueryRequest;
-
-        const bindings = try alloc.alloc(db_mod.types.GraphPatternBinding, bindings_value.map.count());
-        var initialized_bindings: usize = 0;
+    for (value, 0..) |row, i| {
+        if (row != .object) return error.InvalidQueryRequest;
+        var bindings = std.ArrayListUnmanaged(db_mod.types.GraphPatternBinding).empty;
         errdefer {
-            for (bindings[0..initialized_bindings]) |*binding| binding.deinit(alloc);
-            if (bindings.len > 0) alloc.free(bindings);
+            for (bindings.items) |*binding| binding.deinit(alloc);
+            bindings.deinit(alloc);
         }
-
-        var binding_it = bindings_value.map.iterator();
-        while (binding_it.next()) |binding_entry| {
-            const node_value = binding_entry.value_ptr.*;
-            const node = try parseRemoteGraphNodeWithKey(alloc, node_value.key, node_value);
-            bindings[initialized_bindings] = .{
-                .alias = try alloc.dupe(u8, binding_entry.key_ptr.*),
-                .node = node,
-            };
-            if (node_value.document) |document| {
-                try hits.append(alloc, .{
-                    .id = try alloc.dupe(u8, node_value.key),
-                    .score = null,
-                    .stored_data = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(document, .{})}),
-                });
+        var null_aliases = std.ArrayListUnmanaged([]u8).empty;
+        errdefer {
+            for (null_aliases.items) |alias| alloc.free(alias);
+            null_aliases.deinit(alloc);
+        }
+        var it = row.object.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* == .null) {
+                try null_aliases.append(alloc, try alloc.dupe(u8, entry.key_ptr.*));
+                continue;
             }
-            initialized_bindings += 1;
+            const node_value = try std.json.parseFromValueLeaky(indexes_openapi.GraphResultNode, alloc, entry.value_ptr.*, .{});
+            try bindings.append(alloc, .{
+                .alias = try alloc.dupe(u8, entry.key_ptr.*),
+                .node = try parseRemoteGraphNodeWithKey(alloc, node_value.key, node_value),
+            });
         }
-
         matches[i] = .{
-            .bindings = bindings,
-            .path = if (item.path) |path_value| try cloneRemoteGraphNodePathEdges(alloc, path_value) else @constCast((&[_]graph_query_mod.PathEdgeInfo{})[0..]),
+            .bindings = try bindings.toOwnedSlice(alloc),
+            .path = &.{},
+            .null_aliases = try null_aliases.toOwnedSlice(alloc),
         };
         initialized_matches += 1;
     }
-
-    return .{
-        .matches = matches,
-        .hits = try hits.toOwnedSlice(alloc),
-    };
+    return .{ .matches = matches, .hits = &.{} };
 }
 
 fn concatGraphResultHits(
@@ -17965,7 +17985,7 @@ fn appendScanProjectedFields(
 }
 
 fn parseJsonTestBody(comptime T: type, alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(T) {
-    return try std.json.parseFromSlice(T, alloc, body, .{});
+    return try ant_json.parseFromSlice(T, alloc, body, .{});
 }
 
 test "scan ndjson keeps _id reserved for server document identity" {

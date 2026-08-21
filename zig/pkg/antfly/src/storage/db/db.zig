@@ -15497,6 +15497,28 @@ pub const DB = struct {
         });
     }
 
+    fn matchConjunctivePatternWithNodeAdmission(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        start_keys: []const []const u8,
+        pattern: graph_pattern_mod.ConjunctivePattern,
+        max_results: u32,
+        return_aliases: []const []const u8,
+        node_admission: ?NodeAdmission,
+    ) ![]graph_pattern_mod.PatternMatch {
+        if (start_keys.len == 0) return try alloc.alloc(graph_pattern_mod.PatternMatch, 0);
+        var filter_ctx = PatternNodeFilterContext.init(self, alloc);
+        defer filter_ctx.deinit();
+        return try self.core.graphMatchConjunctivePattern(alloc, index_name, start_keys, pattern, .{
+            .max_results = max_results,
+            .return_aliases = return_aliases,
+            .include_paths = false,
+            .evaluator = .{ .ctx = &filter_ctx, .func = patternNodeFilterEvaluator },
+            .node_admission = node_admission,
+        });
+    }
+
     const PatternNodeFilterContext = struct {
         db: *DB,
         cache: db_query_graph.PreparedPatternFilterCache,
@@ -24798,6 +24820,10 @@ pub const DB = struct {
                 executePatternMatchWithAdmissionCallback
             else
                 executePatternMatchCallback,
+            .match_conjunctive = if (predicate_aware)
+                executeConjunctiveMatchWithAdmissionCallback
+            else
+                executeConjunctiveMatchCallback,
             .load_projected_document = loadPatternProjectedDocumentCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsForGraphCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
@@ -25135,6 +25161,42 @@ pub const DB = struct {
             target_nodes,
             named.query.target_nodes != null,
             named.query.params.include_paths,
+            execution.admission.iface(),
+        );
+    }
+
+    fn executeConjunctiveMatchCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        named: *const types.NamedGraphQuery,
+        start_key_refs: []const []const u8,
+    ) anyerror![]graph_pattern_mod.PatternMatch {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.matchConjunctivePatternWithNodeAdmission(
+            alloc,
+            named.query.index_name,
+            start_key_refs,
+            named.query.match_pattern orelse return error.InvalidArgument,
+            named.query.params.max_results,
+            named.query.return_aliases,
+            null,
+        );
+    }
+
+    fn executeConjunctiveMatchWithAdmissionCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        named: *const types.NamedGraphQuery,
+        start_key_refs: []const []const u8,
+    ) anyerror![]graph_pattern_mod.PatternMatch {
+        const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try execution.db.matchConjunctivePatternWithNodeAdmission(
+            alloc,
+            named.query.index_name,
+            start_key_refs,
+            named.query.match_pattern orelse return error.InvalidArgument,
+            named.query.params.max_results,
+            named.query.return_aliases,
             execution.admission.iface(),
         );
     }

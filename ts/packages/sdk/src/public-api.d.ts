@@ -6551,10 +6551,10 @@ export interface components {
             reranker?: components["schemas"]["RerankerConfig"];
             analyses?: components["schemas"]["Analyses"];
             /**
-             * @description Declarative graph queries to execute after full-text/vector searches.
-             *     Results can reference search results using node selectors like $full_text_results.
+             * @description Declarative graph matching, traversal, and path queries. A nested node
+             *     `filter` uses the same canonical query DSL as document search.
              */
-            graph_searches?: {
+            graph_queries?: {
                 [key: string]: components["schemas"]["GraphQuery"];
             };
             /**
@@ -6690,7 +6690,7 @@ export interface components {
              *     product catalogs, etc.) without ingesting that data into Antfly.
              *
              *     **Supported operations on foreign tables:** filter_query, field selection, limit/offset.
-             *     **Not supported:** full_text_search, semantic_search, graph_searches, aggregations, reranker.
+             *     **Not supported:** full_text_search, semantic_search, graph_queries, aggregations, reranker.
              *
              *     **Example - Join Antfly products with Postgres customers:**
              *     ```json
@@ -11323,11 +11323,84 @@ export interface components {
             /** @description Handlebars template to render document text for reranking. */
             template?: string;
         } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["OllamaRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
-        /**
-         * @description Type of graph query to execute
-         * @enum {string}
-         */
-        GraphQueryType: "traverse" | "neighbors" | "shortest_path" | "k_shortest_paths" | "pattern";
+        GraphMatchNode: {
+            /** @description Canonical Antfly document-query expression evaluated for this alias. */
+            filter?: {
+                [key: string]: unknown;
+            };
+        };
+        GraphMatchEdge: {
+            from: string;
+            to: string;
+            /** @description Empty or omitted matches every edge type. */
+            types?: string[];
+            direction?: components["schemas"]["EdgeDirection"];
+            /** @default 1 */
+            min_hops?: number;
+            /** @default 1 */
+            max_hops?: number;
+            /** Format: double */
+            min_weight?: number;
+            /** Format: double */
+            max_weight?: number;
+        };
+        GraphWhereAnd: {
+            and: components["schemas"]["GraphWhereExpression"][];
+        };
+        GraphAliasOperand: {
+            alias: string;
+        };
+        GraphNotEqualPredicate: {
+            left: components["schemas"]["GraphAliasOperand"];
+            right: components["schemas"]["GraphAliasOperand"];
+        };
+        GraphWhereNotEqual: {
+            not_equal: components["schemas"]["GraphNotEqualPredicate"];
+        };
+        GraphNotExistsPattern: {
+            edges: components["schemas"]["GraphMatchEdge"][];
+        };
+        GraphWhereNotExists: {
+            not_exists: components["schemas"]["GraphNotExistsPattern"];
+        };
+        GraphWhereExpression: components["schemas"]["GraphWhereAnd"] | components["schemas"]["GraphWhereNotEqual"] | components["schemas"]["GraphWhereNotExists"];
+        GraphOptionalMatch: {
+            nodes?: {
+                [key: string]: components["schemas"]["GraphMatchNode"];
+            };
+            edges: components["schemas"]["GraphMatchEdge"][];
+            where?: components["schemas"]["GraphWhereExpression"];
+        };
+        GraphMatch: {
+            nodes: {
+                [key: string]: components["schemas"]["GraphMatchNode"];
+            };
+            edges: components["schemas"]["GraphMatchEdge"][];
+            where?: components["schemas"]["GraphWhereExpression"];
+            optional?: components["schemas"]["GraphOptionalMatch"][];
+        };
+        GraphCountAggregate: {
+            /** @enum {string} */
+            type: "count";
+            /** @description Use `*` to count rows, or an alias to count non-null bindings. */
+            of: string;
+            /** @default false */
+            distinct?: boolean;
+        };
+        /** @description Return bindings or exact aggregates. Bindings and aggregates are mutually exclusive. */
+        GraphReturn: {
+            bindings?: string[];
+            /** @default 100 */
+            limit?: number;
+            aggregates?: {
+                [key: string]: components["schemas"]["GraphCountAggregate"];
+            };
+        } & (unknown | unknown);
+        GraphMatchQuery: {
+            index: string;
+            match: components["schemas"]["GraphMatch"];
+            return: components["schemas"]["GraphReturn"];
+        };
         /** @description Filter nodes during graph traversal using existing query primitives */
         NodeFilter: {
             /** @description Antfly query to filter nodes (same syntax as search filter_query) */
@@ -11352,6 +11425,41 @@ export interface components {
             /** @description Filter which nodes to use as start/target */
             node_filter?: components["schemas"]["NodeFilter"];
         };
+        GraphTraversal: {
+            start: components["schemas"]["GraphNodeSelector"];
+            edge_types?: string[];
+            direction?: components["schemas"]["EdgeDirection"];
+            /** @default 3 */
+            max_depth?: number;
+            /** Format: double */
+            min_weight?: number;
+            /** Format: double */
+            max_weight?: number;
+            /** @default 100 */
+            limit?: number;
+            /** @default true */
+            deduplicate_nodes?: boolean;
+            /** @default false */
+            include_paths?: boolean;
+            /**
+             * @description Include each result node's stored document.
+             * @default false
+             */
+            include_documents?: boolean;
+            /** @description Document fields to include when include_documents is true. Omit to include all fields. */
+            fields?: string[];
+            /** @description Canonical Antfly document-query AST (the same shape accepted by QueryRequest.filter_query). */
+            filter?: {
+                [key: string]: unknown;
+            };
+        };
+        GraphTraverseQuery: {
+            index: string;
+            traverse: components["schemas"]["GraphTraversal"];
+        };
+        GraphPathEndpoint: {
+            key: string;
+        };
         /**
          * @description Path weighting algorithm for pathfinding:
          *     - min_hops: Minimize number of edges
@@ -11360,98 +11468,42 @@ export interface components {
          * @enum {string}
          */
         PathWeightMode: "min_hops" | "min_weight" | "max_weight";
-        /** @description Parameters for graph traversal and pathfinding */
-        GraphQueryParams: {
-            /** @description Filter by edge types */
+        GraphShortestPath: {
+            from: components["schemas"]["GraphPathEndpoint"];
+            to: components["schemas"]["GraphPathEndpoint"];
             edge_types?: string[];
             direction?: components["schemas"]["EdgeDirection"];
-            /** @description Maximum traversal depth */
+            /** @default 10 */
             max_depth?: number;
-            /**
-             * Format: double
-             * @description Minimum edge weight
-             */
+            /** Format: double */
             min_weight?: number;
-            /**
-             * Format: double
-             * @description Maximum edge weight
-             */
+            /** Format: double */
             max_weight?: number;
-            /** @description Maximum number of results (traversal) */
-            max_results?: number;
-            /** @description Remove duplicate nodes (traversal) */
-            deduplicate_nodes?: boolean;
-            /** @description Include path information (traversal) */
-            include_paths?: boolean;
             weight_mode?: components["schemas"]["PathWeightMode"];
-            /** @description Number of paths to find (k-shortest-paths) */
-            k?: number;
-            /** @description Filter which nodes to visit during traversal */
-            node_filter?: components["schemas"]["NodeFilter"];
-            /** @description Graph algorithm to run (e.g., 'pagerank', 'betweenness') */
-            algorithm?: string;
-            /** @description Parameters for the graph algorithm */
-            algorithm_params?: {
+            /** @description Canonical Antfly document-query AST. */
+            filter?: {
                 [key: string]: unknown;
             };
-        };
-        /** @description Edge constraints in a pattern step */
-        PatternEdgeStep: {
-            /** @description Edge types to traverse (empty = any) */
-            types?: string[];
-            direction?: components["schemas"]["EdgeDirection"];
             /**
-             * @description Minimum number of hops (1 = direct edge)
-             * @default 1
+             * @description Include stored documents on nodes returned with the path.
+             * @default false
              */
-            min_hops?: number;
-            /**
-             * @description Maximum number of hops (>1 = variable-length path)
-             * @default 1
-             */
-            max_hops?: number;
-            /**
-             * Format: double
-             * @description Minimum edge weight filter
-             */
-            min_weight?: number;
-            /**
-             * Format: double
-             * @description Maximum edge weight filter
-             */
-            max_weight?: number;
-        };
-        /** @description A step in a graph pattern query */
-        PatternStep: {
-            /** @description Name for this node (reuse alias for cycle detection) */
-            alias?: string;
-            /** @description Filter constraints for nodes at this step */
-            node_filter?: components["schemas"]["NodeFilter"];
-            /** @description Edge to traverse to reach this step (null for first step) */
-            edge?: components["schemas"]["PatternEdgeStep"];
-        };
-        /** @description Declarative graph query to execute after full-text/vector searches */
-        GraphQuery: {
-            type: components["schemas"]["GraphQueryType"];
-            /** @description Graph index name (must be graph type) */
-            index_name: string;
-            /** @description Starting node(s) for the query */
-            start_nodes?: components["schemas"]["GraphNodeSelector"];
-            /** @description Exact target nodes for pathfinding or the final binding of a pattern query. When a pattern endpoint is known, prefer this selector over an exact node_filter.filter_prefix so Antfly can use an exact edge-probe plan. */
-            target_nodes?: components["schemas"]["GraphNodeSelector"];
-            /** @description Traversal/pathfinding parameters */
-            params?: components["schemas"]["GraphQueryParams"];
-            /** @description Pattern steps for pattern query type */
-            pattern?: components["schemas"]["PatternStep"][];
-            /** @description Which aliases to return from pattern query (empty = all) */
-            return_aliases?: string[];
-            /** @description Fetch full documents for graph results */
             include_documents?: boolean;
-            /** @description Include edge details for each node */
-            include_edges?: boolean;
-            /** @description Which fields to return from documents */
+            /** @description Document fields to include when include_documents is true. Omit to include all fields. */
             fields?: string[];
         };
+        GraphShortestPathQuery: {
+            index: string;
+            shortest_path: components["schemas"]["GraphShortestPath"];
+        };
+        GraphKShortestPaths: components["schemas"]["GraphShortestPath"] & {
+            k: number;
+        };
+        GraphKShortestPathsQuery: {
+            index: string;
+            k_shortest_paths: components["schemas"]["GraphKShortestPaths"];
+        };
+        GraphQuery: components["schemas"]["GraphMatchQuery"] | components["schemas"]["GraphTraverseQuery"] | components["schemas"]["GraphShortestPathQuery"] | components["schemas"]["GraphKShortestPathsQuery"];
         /**
          * @description Configuration for pruning search results based on score quality.
          *     Helps filter out low-relevance results in RAG pipelines by detecting
@@ -11525,29 +11577,36 @@ export interface components {
             evidence?: {
                 [key: string]: unknown;
             };
-            /** @description Connected edges (when include_edges=true) */
+            /** @description Connected edges when supplied by the graph executor. */
             edges?: components["schemas"]["Edge"][];
         };
-        /** @description A single match from a pattern query */
-        PatternMatch: {
-            /** @description Map of alias to matched node */
-            bindings?: {
-                [key: string]: components["schemas"]["GraphResultNode"];
-            };
-            /** @description Edges traversed in this match */
-            path?: components["schemas"]["PathEdge"][];
+        GraphAggregateValue: {
+            /** @description Decimal string so counts remain lossless in JavaScript. */
+            value: string;
+            exact: boolean;
+        };
+        GraphQueryPage: {
+            next_cursor?: string;
+        };
+        GraphQueryStats: {
+            /** Format: uint64 */
+            returned_rows: number;
+            truncated: boolean;
         };
         /** @description Results of a graph query */
         GraphQueryResult: {
-            type: components["schemas"]["GraphQueryType"];
             /** @description Result nodes */
             nodes?: components["schemas"]["GraphResultNode"][];
             /** @description Result paths (for pathfinding queries) */
             paths?: components["schemas"]["Path"][];
-            /** @description Pattern matches (for pattern queries) */
-            matches?: components["schemas"]["PatternMatch"][];
-            /** @description Total number of results */
-            total: number;
+            rows?: {
+                [key: string]: unknown;
+            }[];
+            aggregates?: {
+                [key: string]: components["schemas"]["GraphAggregateValue"];
+            };
+            page?: components["schemas"]["GraphQueryPage"];
+            stats?: components["schemas"]["GraphQueryStats"];
             /**
              * Format: int64
              * @description Query execution time

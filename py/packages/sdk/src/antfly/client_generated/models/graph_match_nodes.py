@@ -7,20 +7,17 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 if TYPE_CHECKING:
-    from ..models.graph_query import GraphQuery
+    from ..models.graph_match_node import GraphMatchNode
 
 
-T = TypeVar("T", bound="QueryRequestGraphSearches")
+T = TypeVar("T", bound="GraphMatchNodes")
 
 
 @_attrs_define
-class QueryRequestGraphSearches:
-    """Declarative graph queries to execute after full-text/vector searches.
-    Results can reference search results using node selectors like $full_text_results.
+class GraphMatchNodes:
+    """ """
 
-    """
-
-    additional_properties: dict[str, GraphQuery] = _attrs_field(init=False, factory=dict)
+    additional_properties: dict[str, GraphMatchNode] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
 
@@ -32,28 +29,28 @@ class QueryRequestGraphSearches:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.graph_query import GraphQuery
+        from ..models.graph_match_node import GraphMatchNode
 
         d = dict(src_dict)
-        query_request_graph_searches = cls()
+        graph_match_nodes = cls()
 
         additional_properties = {}
         for prop_name, prop_dict in d.items():
-            additional_property = GraphQuery.from_dict(prop_dict)
+            additional_property = GraphMatchNode.from_dict(prop_dict)
 
             additional_properties[prop_name] = additional_property
 
-        query_request_graph_searches.additional_properties = additional_properties
-        return query_request_graph_searches
+        graph_match_nodes.additional_properties = additional_properties
+        return graph_match_nodes
 
     @property
     def additional_keys(self) -> list[str]:
         return list(self.additional_properties.keys())
 
-    def __getitem__(self, key: str) -> GraphQuery:
+    def __getitem__(self, key: str) -> GraphMatchNode:
         return self.additional_properties[key]
 
-    def __setitem__(self, key: str, value: GraphQuery) -> None:
+    def __setitem__(self, key: str, value: GraphMatchNode) -> None:
         self.additional_properties[key] = value
 
     def __delitem__(self, key: str) -> None:

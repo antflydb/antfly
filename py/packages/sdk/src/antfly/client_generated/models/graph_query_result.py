@@ -6,13 +6,15 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.graph_query_type import GraphQueryType
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.graph_query_page import GraphQueryPage
+    from ..models.graph_query_result_aggregates import GraphQueryResultAggregates
+    from ..models.graph_query_result_rows_item import GraphQueryResultRowsItem
+    from ..models.graph_query_stats import GraphQueryStats
     from ..models.graph_result_node import GraphResultNode
     from ..models.path import Path
-    from ..models.pattern_match import PatternMatch
 
 
 T = TypeVar("T", bound="GraphQueryResult")
@@ -23,27 +25,25 @@ class GraphQueryResult:
     """Results of a graph query
 
     Attributes:
-        type_ (GraphQueryType): Type of graph query to execute
-        total (int): Total number of results
         nodes (list[GraphResultNode] | Unset): Result nodes
         paths (list[Path] | Unset): Result paths (for pathfinding queries)
-        matches (list[PatternMatch] | Unset): Pattern matches (for pattern queries)
+        rows (list[GraphQueryResultRowsItem] | Unset):
+        aggregates (GraphQueryResultAggregates | Unset):
+        page (GraphQueryPage | Unset):
+        stats (GraphQueryStats | Unset):
         took (int | Unset): Query execution time
     """
 
-    type_: GraphQueryType
-    total: int
     nodes: list[GraphResultNode] | Unset = UNSET
     paths: list[Path] | Unset = UNSET
-    matches: list[PatternMatch] | Unset = UNSET
+    rows: list[GraphQueryResultRowsItem] | Unset = UNSET
+    aggregates: GraphQueryResultAggregates | Unset = UNSET
+    page: GraphQueryPage | Unset = UNSET
+    stats: GraphQueryStats | Unset = UNSET
     took: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        type_ = self.type_.value
-
-        total = self.total
-
         nodes: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.nodes, Unset):
             nodes = []
@@ -58,29 +58,42 @@ class GraphQueryResult:
                 paths_item = paths_item_data.to_dict()
                 paths.append(paths_item)
 
-        matches: list[dict[str, Any]] | Unset = UNSET
-        if not isinstance(self.matches, Unset):
-            matches = []
-            for matches_item_data in self.matches:
-                matches_item = matches_item_data.to_dict()
-                matches.append(matches_item)
+        rows: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.rows, Unset):
+            rows = []
+            for rows_item_data in self.rows:
+                rows_item = rows_item_data.to_dict()
+                rows.append(rows_item)
+
+        aggregates: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.aggregates, Unset):
+            aggregates = self.aggregates.to_dict()
+
+        page: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.page, Unset):
+            page = self.page.to_dict()
+
+        stats: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.stats, Unset):
+            stats = self.stats.to_dict()
 
         took = self.took
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update(
-            {
-                "type": type_,
-                "total": total,
-            }
-        )
+        field_dict.update({})
         if nodes is not UNSET:
             field_dict["nodes"] = nodes
         if paths is not UNSET:
             field_dict["paths"] = paths
-        if matches is not UNSET:
-            field_dict["matches"] = matches
+        if rows is not UNSET:
+            field_dict["rows"] = rows
+        if aggregates is not UNSET:
+            field_dict["aggregates"] = aggregates
+        if page is not UNSET:
+            field_dict["page"] = page
+        if stats is not UNSET:
+            field_dict["stats"] = stats
         if took is not UNSET:
             field_dict["took"] = took
 
@@ -88,15 +101,14 @@ class GraphQueryResult:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.graph_query_page import GraphQueryPage
+        from ..models.graph_query_result_aggregates import GraphQueryResultAggregates
+        from ..models.graph_query_result_rows_item import GraphQueryResultRowsItem
+        from ..models.graph_query_stats import GraphQueryStats
         from ..models.graph_result_node import GraphResultNode
         from ..models.path import Path
-        from ..models.pattern_match import PatternMatch
 
         d = dict(src_dict)
-        type_ = GraphQueryType(d.pop("type"))
-
-        total = d.pop("total")
-
         _nodes = d.pop("nodes", UNSET)
         nodes: list[GraphResultNode] | Unset = UNSET
         if _nodes is not UNSET:
@@ -115,23 +127,45 @@ class GraphQueryResult:
 
                 paths.append(paths_item)
 
-        _matches = d.pop("matches", UNSET)
-        matches: list[PatternMatch] | Unset = UNSET
-        if _matches is not UNSET:
-            matches = []
-            for matches_item_data in _matches:
-                matches_item = PatternMatch.from_dict(matches_item_data)
+        _rows = d.pop("rows", UNSET)
+        rows: list[GraphQueryResultRowsItem] | Unset = UNSET
+        if _rows is not UNSET:
+            rows = []
+            for rows_item_data in _rows:
+                rows_item = GraphQueryResultRowsItem.from_dict(rows_item_data)
 
-                matches.append(matches_item)
+                rows.append(rows_item)
+
+        _aggregates = d.pop("aggregates", UNSET)
+        aggregates: GraphQueryResultAggregates | Unset
+        if isinstance(_aggregates, Unset):
+            aggregates = UNSET
+        else:
+            aggregates = GraphQueryResultAggregates.from_dict(_aggregates)
+
+        _page = d.pop("page", UNSET)
+        page: GraphQueryPage | Unset
+        if isinstance(_page, Unset):
+            page = UNSET
+        else:
+            page = GraphQueryPage.from_dict(_page)
+
+        _stats = d.pop("stats", UNSET)
+        stats: GraphQueryStats | Unset
+        if isinstance(_stats, Unset):
+            stats = UNSET
+        else:
+            stats = GraphQueryStats.from_dict(_stats)
 
         took = d.pop("took", UNSET)
 
         graph_query_result = cls(
-            type_=type_,
-            total=total,
             nodes=nodes,
             paths=paths,
-            matches=matches,
+            rows=rows,
+            aggregates=aggregates,
+            page=page,
+            stats=stats,
             took=took,
         )
 

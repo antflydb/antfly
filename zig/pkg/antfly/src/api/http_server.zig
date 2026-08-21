@@ -8271,7 +8271,7 @@ pub const ApiHttpServer = struct {
         if (request.merge_config != null) return error.UnsupportedQueryRequest;
         if (request.reranker != null) return error.UnsupportedQueryRequest;
         if (request.analyses != null) return error.UnsupportedQueryRequest;
-        if (request.graph_searches != null) return error.UnsupportedQueryRequest;
+        if (request.graph_queries != null) return error.UnsupportedQueryRequest;
         if (request.expand_strategy != null) return error.UnsupportedQueryRequest;
         if (request.document_renderer != null) return error.UnsupportedQueryRequest;
         if (request.pruner != null) return error.UnsupportedQueryRequest;
@@ -24499,7 +24499,7 @@ test "api http server query builder handles tree graph indexes" {
     var graph_inferred = try std.json.parseFromSlice(metadata_openapi.QueryBuilderResult, alloc, graph_inferred_resp.body, .{});
     defer graph_inferred.deinit();
     try std.testing.expectEqualStrings("graph", graph_inferred.value.specialist.?);
-    const graph_query = graph_inferred.value.query_request.?.graph_searches.?.map.get("graph_search").?;
+    const graph_query = graph_inferred.value.query_request.?.graph_queries.?.map.get("graph_search").?;
     try std.testing.expectEqualStrings("doc_hierarchy", graph_query.index_name);
     try std.testing.expectEqualStrings("$full_text_results", graph_query.start_nodes.?.result_ref.?);
 
@@ -24549,7 +24549,7 @@ test "api http server query builder handles tree graph indexes" {
     var graph_answer = try std.json.parseFromSlice(metadata_openapi.QueryBuilderResult, alloc, graph_answer_resp.body, .{});
     defer graph_answer.deinit();
     try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, graph_answer.value.status.?);
-    const graph_answer_query = graph_answer.value.query_request.?.graph_searches.?.map.get("graph_search").?;
+    const graph_answer_query = graph_answer.value.query_request.?.graph_queries.?.map.get("graph_search").?;
     try std.testing.expectEqualStrings("topic_graph", graph_answer_query.index_name);
 }
 

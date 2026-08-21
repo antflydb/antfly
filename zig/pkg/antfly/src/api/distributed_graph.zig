@@ -1581,9 +1581,16 @@ fn convertPatternMatches(
             path_init += 1;
         }
 
+        const null_aliases = try cloneOwnedStrings(alloc, raw_match.null_aliases);
+        errdefer {
+            for (null_aliases) |alias| alloc.free(alias);
+            if (null_aliases.len > 0) alloc.free(null_aliases);
+        }
+
         matches[i] = .{
             .bindings = bindings,
             .path = path,
+            .null_aliases = null_aliases,
         };
         initialized += 1;
     }
@@ -5060,11 +5067,21 @@ pub fn cloneGraphSearchResult(
         alloc.free(matches);
     };
 
+    const aggregates = if (src.aggregates.len > 0)
+        try cloneGraphAggregates(alloc, src.aggregates)
+    else
+        @constCast((&[_]db_mod.types.GraphAggregateResult{})[0..]);
+    errdefer if (aggregates.len > 0) {
+        for (aggregates) |*aggregate| aggregate.deinit(alloc);
+        alloc.free(aggregates);
+    };
+
     return .{
         .name = try alloc.dupe(u8, src.name),
         .nodes = nodes,
         .paths = paths,
         .matches = matches,
+        .aggregates = aggregates,
         .hits = hits,
         .total_hits = src.total_hits,
     };
@@ -6323,6 +6340,27 @@ fn cloneGraphPatternMatches(
     return out;
 }
 
+fn cloneGraphAggregates(
+    alloc: std.mem.Allocator,
+    aggregates: []const db_mod.types.GraphAggregateResult,
+) ![]db_mod.types.GraphAggregateResult {
+    const out = try alloc.alloc(db_mod.types.GraphAggregateResult, aggregates.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*aggregate| aggregate.deinit(alloc);
+        alloc.free(out);
+    }
+    for (aggregates, 0..) |aggregate, i| {
+        out[i] = .{
+            .name = try alloc.dupe(u8, aggregate.name),
+            .value = aggregate.value,
+            .exact = aggregate.exact,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
 fn cloneGraphPatternMatch(
     alloc: std.mem.Allocator,
     match: db_mod.types.GraphPatternMatch,
@@ -6341,9 +6379,16 @@ fn cloneGraphPatternMatch(
     const path = try dupPathEdges(alloc, match.path);
     errdefer freePathEdges(alloc, path);
 
+    const null_aliases = try cloneOwnedStrings(alloc, match.null_aliases);
+    errdefer {
+        for (null_aliases) |alias| alloc.free(alias);
+        if (null_aliases.len > 0) alloc.free(null_aliases);
+    }
+
     return .{
         .bindings = bindings,
         .path = path,
+        .null_aliases = null_aliases,
     };
 }
 
@@ -6408,6 +6453,20 @@ fn dupPath(alloc: std.mem.Allocator, path: []const []const u8) ![][]const u8 {
         alloc.free(out);
     }
     for (path, 0..) |item, i| {
+        out[i] = try alloc.dupe(u8, item);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneOwnedStrings(alloc: std.mem.Allocator, items: []const []const u8) ![][]u8 {
+    const out = try alloc.alloc([]u8, items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |item| alloc.free(item);
+        alloc.free(out);
+    }
+    for (items, 0..) |item, i| {
         out[i] = try alloc.dupe(u8, item);
         initialized += 1;
     }
