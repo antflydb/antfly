@@ -940,6 +940,7 @@ pub const GraphMetricOrder = struct {
     nulls: ?[]const u8 = null,
 };
 
+/// Reads a published graph metric. Score-bearing graph metric queries on multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required instead of merging mathematically incompatible shard-local scores.
 pub const GraphMetricQuery = struct {
     /// Optional result key. Defaults to the metric name.
     name: ?[]const u8 = null,
@@ -947,12 +948,13 @@ pub const GraphMetricQuery = struct {
     index: []const u8,
     /// Graph metric to read.
     metric: []const u8,
-    /// Maximum globally ranked metric scores to return after shard fan-in.
+    /// Maximum ranked metric scores to return. Multi-shard tables require a globally coordinated metric snapshot.
     top_k: ?i32 = null,
     /// Whether the latest published generation may be stale or must match the graph edge generation.
     metric_freshness: ?[]const u8 = null,
 };
 
+/// Blends a published graph metric into hit scores. Multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required.
 pub const GraphMetricRerank = struct {
     /// Graph index that owns the published metric.
     index: []const u8,
@@ -1034,8 +1036,8 @@ pub const GraphMetricStatus = struct {
     edge_filter: ?GraphMetricEdgeFilterStatus = null,
     /// Version of the published graph metric metadata schema.
     metadata_version: ?i64 = null,
-    /// Deterministic fingerprint of the configuration that produced the published metric snapshot.
-    config_fingerprint: ?i64 = null,
+    /// Deterministic configuration fingerprint encoded as fixed-width hexadecimal so every SDK preserves all 64 bits.
+    config_fingerprint: ?[]const u8 = null,
     maintenance_paused: ?bool = null,
     /// Whether a local or distributed build is queued after the currently published or building generation.
     build_queued: bool,

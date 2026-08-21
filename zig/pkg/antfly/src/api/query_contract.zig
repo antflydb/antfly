@@ -5156,7 +5156,7 @@ fn toOpenApiGraphMetricBuildPages(
     return out;
 }
 
-fn toOpenApiGraphMetricStatus(
+pub fn toOpenApiGraphMetricStatus(
     alloc: std.mem.Allocator,
     status: db_mod.types.GraphMetricStatus,
 ) !indexes_openapi.GraphMetricStatus {
@@ -5170,7 +5170,7 @@ fn toOpenApiGraphMetricStatus(
         .phase = graphMetricPhaseName(status.phase),
         .edge_filter = .{ .mode = @tagName(status.edge_filter.mode), .types = if (status.edge_filter.types.len > 0) status.edge_filter.types else null },
         .metadata_version = @intCast(status.metadata_version),
-        .config_fingerprint = saturatingI64(status.config_fingerprint),
+        .config_fingerprint = try std.fmt.allocPrint(alloc, "{x:0>16}", .{status.config_fingerprint}),
         .maintenance_paused = status.maintenance_paused,
         .build_queued = status.build_queued,
         .published_generation = saturatingI64(status.published_generation),
@@ -14294,6 +14294,16 @@ test "api query contract bounds graph metric top k" {
     try std.testing.expectError(error.InvalidQueryRequest, parseGraphMetricQueriesAlloc(alloc,
         \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","top_k":10001}}
     ));
+}
+
+test "api query contract preserves graph metric fingerprint precision" {
+    const alloc = std.testing.allocator;
+    const converted = try toOpenApiGraphMetricStatus(alloc, .{
+        .name = @constCast("pagerank"),
+        .config_fingerprint = std.math.maxInt(u64),
+    });
+    defer alloc.free(converted.config_fingerprint.?);
+    try std.testing.expectEqualStrings("ffffffffffffffff", converted.config_fingerprint.?);
 }
 
 test "api query contract treats nullable graph metric extensions as absent" {

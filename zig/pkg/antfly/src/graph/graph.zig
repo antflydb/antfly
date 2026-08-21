@@ -370,6 +370,11 @@ pub const GraphMetricConfig = struct {
     edge_filter: GraphMetricEdgeFilter = .{},
 };
 
+/// Iterative graph metrics are intentionally bounded even when configuration
+/// is supplied by an internal caller. This keeps a malformed index definition
+/// from creating effectively unbounded foreground or background work.
+pub const graph_metric_max_iterations: u32 = 1_000;
+
 pub fn freeGraphMetricConfigs(alloc: Allocator, configs: []GraphMetricConfig) void {
     for (configs) |*cfg| {
         alloc.free(cfg.name);
@@ -384,6 +389,9 @@ pub const GraphMetricValidationError = error{
     DuplicateGraphMetricName,
     InvalidGraphMetricEdgeFilter,
     DuplicateGraphMetricEdgeType,
+    InvalidGraphMetricIterations,
+    InvalidGraphMetricHitsPair,
+    AmbiguousGraphMetricHitsPair,
 };
 
 pub fn validateGraphMetricEdgeFilters(
@@ -392,6 +400,9 @@ pub fn validateGraphMetricEdgeFilters(
 ) GraphMetricValidationError!void {
     for (metric_configs, 0..) |metric_cfg, i| {
         if (metric_cfg.name.len == 0) return error.InvalidGraphMetricName;
+        if (metric_cfg.max_iterations == 0 or metric_cfg.max_iterations > graph_metric_max_iterations) {
+            return error.InvalidGraphMetricIterations;
+        }
         for (metric_configs[0..i]) |prior| {
             if (std.mem.eql(u8, prior.name, metric_cfg.name)) return error.DuplicateGraphMetricName;
         }
@@ -407,7 +418,37 @@ pub fn validateGraphMetricEdgeFilters(
                 if (edge_type_configs.len > 0 and !hasConfiguredEdgeType(edge_type_configs, edge_type)) return error.UnknownGraphMetricEdgeType;
             }
         }
+
+        const opposite_kind = graphMetricOppositeHitsKind(metric_cfg.kind) orelse continue;
+        var pair_count: usize = 0;
+        var pair_refresh: GraphMetricRefreshMode = undefined;
+        for (metric_configs) |candidate| {
+            if (candidate.kind != opposite_kind) continue;
+            if (candidate.max_iterations != metric_cfg.max_iterations) continue;
+            if (candidate.tolerance != metric_cfg.tolerance) continue;
+            if (!candidate.edge_filter.equivalent(metric_cfg.edge_filter)) continue;
+            pair_count += 1;
+            pair_refresh = candidate.refresh;
+        }
+        if (pair_count > 1) return error.AmbiguousGraphMetricHitsPair;
+        if (pair_count == 1 and pair_refresh != metric_cfg.refresh) return error.InvalidGraphMetricHitsPair;
     }
+}
+
+pub fn graphMetricOppositeHitsKind(kind: GraphMetricKind) ?GraphMetricKind {
+    return switch (kind) {
+        .hits_authority => .hits_hub,
+        .hits_hub => .hits_authority,
+        else => null,
+    };
+}
+
+pub fn graphMetricHitsPairCompatible(a: GraphMetricConfig, b: GraphMetricConfig) bool {
+    return graphMetricOppositeHitsKind(a.kind) == b.kind and
+        a.refresh == b.refresh and
+        a.max_iterations == b.max_iterations and
+        a.tolerance == b.tolerance and
+        a.edge_filter.equivalent(b.edge_filter);
 }
 
 fn hasConfiguredEdgeType(edge_type_configs: []const EdgeTypeConfig, edge_type: []const u8) bool {
@@ -503,6 +544,28 @@ test "graph metric edge filter validation uses configured edge type metadata" {
         .name = "pagerank",
         .edge_filter = .{ .mode = .all, .types = &valid_filter_types },
     }};
+    const zero_iteration_metrics = [_]GraphMetricConfig{.{ .name = "pagerank", .max_iterations = 0 }};
+    const excessive_iteration_metrics = [_]GraphMetricConfig{.{
+        .name = "pagerank",
+        .max_iterations = graph_metric_max_iterations + 1,
+    }};
+    const mismatched_hits_refresh = [_]GraphMetricConfig{
+        .{ .name = "authority", .kind = .hits_authority, .refresh = .background },
+        .{ .name = "hub", .kind = .hits_hub, .refresh = .manual },
+    };
+    const ambiguous_hits = [_]GraphMetricConfig{
+        .{ .name = "authority-a", .kind = .hits_authority },
+        .{ .name = "authority-b", .kind = .hits_authority },
+        .{ .name = "hub", .kind = .hits_hub },
+    };
+    const cites_only = [_][]const u8{"cites"};
+    const mentions_only = [_][]const u8{"mentions"};
+    const distinct_hits_pairs = [_]GraphMetricConfig{
+        .{ .name = "authority-cites", .kind = .hits_authority, .edge_filter = .{ .mode = .types, .types = &cites_only } },
+        .{ .name = "hub-cites", .kind = .hits_hub, .edge_filter = .{ .mode = .types, .types = &cites_only } },
+        .{ .name = "authority-mentions", .kind = .hits_authority, .edge_filter = .{ .mode = .types, .types = &mentions_only } },
+        .{ .name = "hub-mentions", .kind = .hits_hub, .edge_filter = .{ .mode = .types, .types = &mentions_only } },
+    };
 
     try validateGraphMetricEdgeFilters(&edge_types, &valid_metrics);
     try validateGraphMetricEdgeFilters(&.{}, &invalid_metrics);
@@ -513,6 +576,11 @@ test "graph metric edge filter validation uses configured edge type metadata" {
     try std.testing.expectError(error.InvalidGraphMetricEdgeFilter, validateGraphMetricEdgeFilters(&edge_types, &blank_filter_metrics));
     try std.testing.expectError(error.DuplicateGraphMetricEdgeType, validateGraphMetricEdgeFilters(&edge_types, &duplicate_filter_metrics));
     try std.testing.expectError(error.InvalidGraphMetricEdgeFilter, validateGraphMetricEdgeFilters(&edge_types, &all_with_types_metrics));
+    try std.testing.expectError(error.InvalidGraphMetricIterations, validateGraphMetricEdgeFilters(&edge_types, &zero_iteration_metrics));
+    try std.testing.expectError(error.InvalidGraphMetricIterations, validateGraphMetricEdgeFilters(&edge_types, &excessive_iteration_metrics));
+    try std.testing.expectError(error.InvalidGraphMetricHitsPair, validateGraphMetricEdgeFilters(&edge_types, &mismatched_hits_refresh));
+    try std.testing.expectError(error.AmbiguousGraphMetricHitsPair, validateGraphMetricEdgeFilters(&edge_types, &ambiguous_hits));
+    try validateGraphMetricEdgeFilters(&edge_types, &distinct_hits_pairs);
 }
 
 const reverse_rebuild_batch_size: usize = 1024;
@@ -9224,8 +9292,6 @@ pub const GraphIndex = struct {
         var batch = try self.beginWriteReverseBatch();
         errdefer batch.abort();
         const active_job_id = if (try self.metricBuildJob(&batch, metric_name)) |job| job.job_id else 0;
-        const prior_published = try self.metricPublishedGeneration(&batch, metric_name);
-        if (prior_published != 0) try self.enqueueRetiredScoreGenerationInBatch(&batch, metric_name, prior_published);
         // A durable tombstone distinguishes an operator-requested delete from
         // an uninitialized background metric. Explicit refresh/rebuild/resume
         // clears it; autonomous maintenance must leave the metric deleted.
@@ -9242,6 +9308,13 @@ pub const GraphIndex = struct {
             try self.graphMetricMaintenancePausedKeyAlloc(metric_name),
             try self.graphMetricBuildLeaseKeyAlloc(metric_name),
             try self.graphMetricBuildJobKeyAlloc(metric_name),
+            // Full materialization cleanup subsumes generation retirement.
+            // Dropping these control records makes operator deletion immune to
+            // a saturated two-slot retirement queue.
+            try self.graphMetricRetiredScoreGenerationKeyAlloc(metric_name),
+            try self.graphMetricNextRetiredScoreGenerationKeyAlloc(metric_name),
+            try self.graphMetricRetiredScoreCleanupPhaseKeyAlloc(metric_name),
+            try self.graphMetricRetiredScoreCleanupCursorKeyAlloc(metric_name),
         }) |key| {
             defer self.alloc.free(key);
             batch.delete(key) catch |err| switch (err) {
@@ -9616,22 +9689,10 @@ pub const GraphIndex = struct {
         try putU64(batch, config_fingerprint_key, meta.config_fingerprint);
     }
 
-    fn oppositeHitsKind(kind: GraphMetricKind) ?GraphMetricKind {
-        return switch (kind) {
-            .hits_authority => .hits_hub,
-            .hits_hub => .hits_authority,
-            else => null,
-        };
-    }
-
     fn pairedHitsMetricConfig(self: *const GraphIndex, cfg: GraphMetricConfig) ?GraphMetricConfig {
-        const opposite_kind = oppositeHitsKind(cfg.kind) orelse return null;
         for (self.metric_configs) |candidate| {
-            if (candidate.kind != opposite_kind) continue;
             if (std.mem.eql(u8, candidate.name, cfg.name)) continue;
-            if (candidate.max_iterations != cfg.max_iterations) continue;
-            if (candidate.tolerance != cfg.tolerance) continue;
-            if (!graphMetricEdgeFiltersEqual(candidate.edge_filter, cfg.edge_filter)) continue;
+            if (!graphMetricHitsPairCompatible(cfg, candidate)) continue;
             return candidate;
         }
         return null;
@@ -19370,6 +19431,26 @@ test "graph metric materialization deletion clears scores and allows rebuild" {
     try std.testing.expectEqual(@as(usize, 1), legacy_top.len);
     try std.testing.expectEqualStrings("doc-b", legacy_top[0].node);
 
+    // Deletion is an operator control-plane action and must remain available
+    // even when asynchronous generation retirement has fallen behind.
+    {
+        var backlog_batch = try graph.beginWriteReverseBatch();
+        errdefer backlog_batch.abort();
+        const retired_key = try graph.graphMetricRetiredScoreGenerationKeyAlloc("degree");
+        defer alloc.free(retired_key);
+        const next_retired_key = try graph.graphMetricNextRetiredScoreGenerationKeyAlloc("degree");
+        defer alloc.free(next_retired_key);
+        const retirement_phase_key = try graph.graphMetricRetiredScoreCleanupPhaseKeyAlloc("degree");
+        defer alloc.free(retirement_phase_key);
+        const retirement_cursor_key = try graph.graphMetricRetiredScoreCleanupCursorKeyAlloc("degree");
+        defer alloc.free(retirement_cursor_key);
+        try GraphIndex.putU64(&backlog_batch, retired_key, 101);
+        try GraphIndex.putU64(&backlog_batch, next_retired_key, 102);
+        try GraphIndex.putU64(&backlog_batch, retirement_phase_key, 1);
+        try backlog_batch.put(retirement_cursor_key, "resume-here");
+        try backlog_batch.commit();
+    }
+
     try graph.deleteGraphMetricMaterialization("degree");
     var deleted_status = try graph.graphMetricStatus("degree");
     defer deleted_status.deinit(alloc);
@@ -19378,6 +19459,7 @@ test "graph metric materialization deletion clears scores and allows rebuild" {
     try std.testing.expectEqual(@as(u64, 0), deleted_status.published_generation);
     try std.testing.expectError(error.MetricNotReady, graph.graphMetricTopK("degree", 1));
     try std.testing.expectError(error.GraphMetricDisabled, graph.runGraphMetric("degree"));
+    try std.testing.expect(!(try graph.cleanupRetiredGraphMetricScoreGenerationPage("degree")));
     const stale_scores = [_]GraphIndex.GraphMetricScore{.{ .node = "doc-a", .score = 99.0 }};
     try std.testing.expectError(error.GraphMetricDisabled, graph.publishGraphMetricScores(
         "degree",
@@ -19415,7 +19497,7 @@ test "graph metric materialization deletion clears scores and allows rebuild" {
     var rebuilt = try graph.runGraphMetric("degree");
     defer rebuilt.deinit(alloc);
     try std.testing.expectEqual(GraphIndex.GraphMetricState.fresh, rebuilt.state);
-    try std.testing.expectEqual(published_generation, rebuilt.published_generation);
+    try std.testing.expect(rebuilt.published_generation > published_generation);
     try std.testing.expect(rebuilt.recent_events.len >= 1);
     try std.testing.expectEqual(GraphIndex.GraphMetricEventKind.publish, rebuilt.recent_events[0].kind);
     const rebuilt_top = try graph.graphMetricTopK("degree", 3);

@@ -10316,11 +10316,8 @@ export interface components {
              * @description Version of the published graph metric metadata schema.
              */
             metadata_version?: number;
-            /**
-             * Format: int64
-             * @description Deterministic fingerprint of the configuration that produced the published metric snapshot.
-             */
-            config_fingerprint?: number;
+            /** @description Deterministic configuration fingerprint encoded as fixed-width hexadecimal so every SDK preserves all 64 bits. */
+            config_fingerprint?: string;
             maintenance_paused?: boolean;
             /** @description Whether a local or distributed build is queued after the currently published or building generation. */
             build_queued: boolean;
@@ -11608,6 +11605,7 @@ export interface components {
             /** @description Handlebars template to render document text for reranking. */
             template?: string;
         } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["OllamaRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
+        /** @description Reads a published graph metric. Score-bearing graph metric queries on multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required instead of merging mathematically incompatible shard-local scores. */
         GraphMetricQuery: {
             /** @description Optional result key. Defaults to the metric name. */
             name?: string;
@@ -11617,7 +11615,7 @@ export interface components {
             metric: string;
             /**
              * Format: int32
-             * @description Maximum globally ranked metric scores to return after shard fan-in.
+             * @description Maximum ranked metric scores to return. Multi-shard tables require a globally coordinated metric snapshot.
              * @default 10
              */
             top_k?: number;
@@ -11628,6 +11626,7 @@ export interface components {
              */
             metric_freshness?: "published" | "fresh";
         };
+        /** @description Blends a published graph metric into hit scores. Multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required. */
         GraphMetricRerank: {
             /** @description Graph index that owns the published metric. */
             index: string;

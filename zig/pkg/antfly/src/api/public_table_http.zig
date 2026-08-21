@@ -106,6 +106,7 @@ pub const TableApi = struct {
         IndexRebuilding,
         ModelNotFound,
         UnsupportedExactSort,
+        GraphMetricGlobalMaterializationRequired,
         QueryCandidateBudgetExceeded,
         HierarchyCursorStale,
         QueryEmbeddingInputTooLarge,
@@ -751,6 +752,78 @@ fn unsupportedExactSortBody(alloc: std.mem.Allocator) ![]u8 {
     }, .{});
 }
 
+pub fn graphMetricGlobalMaterializationRequiredBody(alloc: std.mem.Allocator) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .code = "graph_metric_global_materialization_required",
+        .message = "graph metric scoring is unavailable for multi-shard tables until a globally coordinated metric snapshot is published",
+        .retryable = false,
+    }, .{});
+}
+
+test "multi-shard graph metric rejection is actionable and non-retryable" {
+    const encoded = try graphMetricGlobalMaterializationRequiredBody(std.testing.allocator);
+    defer std.testing.allocator.free(encoded);
+    const parsed = try std.json.parseFromSlice(struct {
+        code: []const u8,
+        message: []const u8,
+        retryable: bool,
+    }, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("graph_metric_global_materialization_required", parsed.value.code);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.message, "globally coordinated metric snapshot") != null);
+    try std.testing.expect(!parsed.value.retryable);
+}
+
+test "public table query maps multi-shard graph metric rejection" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .request = .{},
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+            _: operation.RequestContext,
+        ) TableApi.ExecuteQueryError![]u8 {
+            return error.GraphMetricGlobalMaterializationRequired;
+        }
+    };
+
+    var response = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"graph_metric":{"index":"graph_idx","metric":"pagerank"}}
+    , null, Backend.iface());
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 422), response.status);
+    try std.testing.expect(response.json);
+
+    const parsed = try std.json.parseFromSlice(struct {
+        code: []const u8,
+        message: []const u8,
+        retryable: bool,
+    }, std.testing.allocator, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("graph_metric_global_materialization_required", parsed.value.code);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.message, "globally coordinated metric snapshot") != null);
+    try std.testing.expect(!parsed.value.retryable);
+}
+
 fn queryCandidateBudgetExceededBody(alloc: std.mem.Allocator) ![]u8 {
     const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse db_mod.SortRejectionDiagnostic{
         .reason = "candidate_budget_exceeded",
@@ -965,6 +1038,10 @@ pub fn handleTableQueryRequest(
             error.UnsupportedExactSort => {
                 std.log.warn("public table query unsupported exact sort table={s} err={}", .{ table_name, err });
                 return .{ .status = 422, .body = try unsupportedExactSortBody(alloc) };
+            },
+            error.GraphMetricGlobalMaterializationRequired => {
+                std.log.info("public table query requires global graph metric materialization table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphMetricGlobalMaterializationRequiredBody(alloc), .json = true };
             },
             error.Canceled => return error.Canceled,
             error.DeadlineExceeded => return error.DeadlineExceeded,

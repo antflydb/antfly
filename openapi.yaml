@@ -19685,10 +19685,10 @@ components:
           format: int64
           description: Version of the published graph metric metadata schema.
         config_fingerprint:
-          type: integer
-          format: int64
-          description: Deterministic fingerprint of the configuration that produced the published metric
-            snapshot.
+          type: string
+          pattern: ^[0-9a-f]{16}$
+          description: Deterministic configuration fingerprint encoded as fixed-width hexadecimal so every
+            SDK preserves all 64 bits.
         maintenance_paused:
           type: boolean
         build_queued:
@@ -21707,6 +21707,9 @@ components:
         field: content
     GraphMetricQuery:
       type: object
+      description: Reads a published graph metric. Score-bearing graph metric queries on multi-shard tables
+        require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required
+        instead of merging mathematically incompatible shard-local scores.
       required:
         - index
         - metric
@@ -21729,7 +21732,8 @@ components:
           minimum: 1
           maximum: 10000
           default: 10
-          description: Maximum globally ranked metric scores to return after shard fan-in.
+          description: Maximum ranked metric scores to return. Multi-shard tables require a globally coordinated
+            metric snapshot.
         metric_freshness:
           type: string
           enum:
@@ -21740,6 +21744,8 @@ components:
             generation.
     GraphMetricRerank:
       type: object
+      description: Blends a published graph metric into hit scores. Multi-shard tables require a globally
+        coordinated metric snapshot and otherwise return graph_metric_global_materialization_required.
       required:
         - index
         - metric

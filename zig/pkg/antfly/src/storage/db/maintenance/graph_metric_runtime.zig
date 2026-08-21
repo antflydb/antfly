@@ -12578,7 +12578,9 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, false, 0, 0, 0, 1);
+    // Incompatible HITS definitions are independent local-fallback metrics;
+    // neither side may suppress the other as though they shared one lifecycle.
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, false, 0, 0, 0, 2);
 
     try db.runUntilIdle();
 

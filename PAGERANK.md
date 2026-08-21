@@ -51,6 +51,13 @@ Graph metrics should live under graph index configuration:
 }
 ```
 
+`max_iterations` must be between 1 and 1,000. The bound applies at both the
+configuration parser and graph runtime boundary so malformed internal config
+cannot create unbounded foreground or background work. HITS authority and hub
+metrics form a pair only when their iteration limit, tolerance, refresh mode,
+and edge filter match; ambiguous aliases and mixed manual/background pairs are
+rejected during index validation.
+
 The internal representation should keep the surface generic:
 
 ```zig

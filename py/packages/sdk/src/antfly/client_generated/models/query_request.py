@@ -276,8 +276,12 @@ class QueryRequest:
             Has minor performance overhead — not recommended for production traffic.
         reranker (RerankerConfig | Unset): A unified configuration for a reranking provider. Example: {'provider':
             'ollama', 'model': 'dengcao/Qwen3-Reranker-0.6B:F16', 'field': 'content'}.
-        graph_metric (GraphMetricQuery | Unset):
-        graph_metric_rerank (GraphMetricRerank | Unset):
+        graph_metric (GraphMetricQuery | Unset): Reads a published graph metric. Score-bearing graph metric queries on
+            multi-shard tables require a globally coordinated metric snapshot and otherwise return
+            graph_metric_global_materialization_required instead of merging mathematically incompatible shard-local scores.
+        graph_metric_rerank (GraphMetricRerank | Unset): Blends a published graph metric into hit scores. Multi-shard
+            tables require a globally coordinated metric snapshot and otherwise return
+            graph_metric_global_materialization_required.
         analyses (Analyses | Unset):
         graph_searches (QueryRequestGraphSearches | Unset): Declarative graph queries to execute after full-text/vector
             searches.

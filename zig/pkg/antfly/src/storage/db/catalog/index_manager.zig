@@ -4257,7 +4257,7 @@ pub const IndexManager = struct {
     fn graphMetricBackgroundStartCanonical(configs: []const graph_mod.GraphMetricConfig, cfg: graph_mod.GraphMetricConfig) bool {
         if (cfg.kind != .hits_hub) return true;
         for (configs) |candidate| {
-            if (candidate.kind == .hits_authority and candidate.refresh == .background) return false;
+            if (candidate.refresh == .background and graph_mod.graphMetricHitsPairCompatible(cfg, candidate)) return false;
         }
         return true;
     }
@@ -19199,7 +19199,7 @@ fn parseGraphMetricConfigs(alloc: Allocator, root: std.json.Value) ![]graph_mod.
         if (tolerance <= 0.0) return error.InvalidIndexConfig;
         const max_iterations = if (metric_obj.get("max_iterations")) |value| blk: {
             const raw = try jsonNumberAsU32(value);
-            if (raw == 0) return error.InvalidIndexConfig;
+            if (raw == 0 or raw > graph_mod.graph_metric_max_iterations) return error.InvalidIndexConfig;
             break :blk raw;
         } else 50;
 
@@ -19510,6 +19510,35 @@ test "graph config declares algebraic provenance semiring traversal law" {
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"algebraic_planning":{"bounded_traversal":{"law":"min_plus_semiring"}}}
     ));
+}
+
+test "graph config bounds iterative metric work" {
+    const alloc = std.testing.allocator;
+    var bounded = try parseGraphConfig(alloc,
+        \\{"metrics":{"pagerank":{"max_iterations":1000}}}
+    );
+    defer bounded.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.graph_metric_max_iterations, bounded.metric_configs[0].max_iterations);
+
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"metrics":{"pagerank":{"max_iterations":1001}}}
+    ));
+}
+
+test "background HITS scheduling suppresses only the compatible hub" {
+    const cites = [_][]const u8{"cites"};
+    const mentions = [_][]const u8{"mentions"};
+    const compatible = [_]graph_mod.GraphMetricConfig{
+        .{ .name = "authority", .kind = .hits_authority, .edge_filter = .{ .mode = .types, .types = &cites } },
+        .{ .name = "hub", .kind = .hits_hub, .edge_filter = .{ .mode = .types, .types = &cites } },
+    };
+    try std.testing.expect(!IndexManager.graphMetricBackgroundStartCanonical(&compatible, compatible[1]));
+
+    const unrelated = [_]graph_mod.GraphMetricConfig{
+        .{ .name = "authority", .kind = .hits_authority, .edge_filter = .{ .mode = .types, .types = &mentions } },
+        .{ .name = "hub", .kind = .hits_hub, .edge_filter = .{ .mode = .types, .types = &cites } },
+    };
+    try std.testing.expect(IndexManager.graphMetricBackgroundStartCanonical(&unrelated, unrelated[1]));
 }
 
 test "graph config parses artifact source and shorthand asset enrichment" {

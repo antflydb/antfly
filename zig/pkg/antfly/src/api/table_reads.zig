@@ -77,7 +77,7 @@ fn graphSearchQueryNeedsInternalMetricStatus(query: graph_query_mod.GraphQuery) 
 fn rejectNonGlobalGraphMetricFanout(group_count: usize, req: db_mod.types.SearchRequest) !void {
     if (group_count <= 1) return;
     if (req.graph_metric_queries.len > 0 or req.graph_metric_rerank != null) {
-        return error.UnsupportedQueryRequest;
+        return error.GraphMetricGlobalMaterializationRequired;
     }
     for (req.graph_queries) |named| {
         if (graphSearchQueryNeedsInternalMetricStatus(named.query)) {
@@ -86,7 +86,7 @@ fn rejectNonGlobalGraphMetricFanout(group_count: usize, req: db_mod.types.Search
             // snapshot identity. Merging them would return plausible but
             // mathematically invalid results. Fail closed until a coordinator
             // supplies one globally materialized metric snapshot.
-            return error.UnsupportedQueryRequest;
+            return error.GraphMetricGlobalMaterializationRequired;
         }
     }
 }
@@ -99,7 +99,7 @@ test "multi-shard reads fail closed for shard-local graph metric scores" {
         }},
     };
     try rejectNonGlobalGraphMetricFanout(1, metric_req);
-    try std.testing.expectError(error.UnsupportedQueryRequest, rejectNonGlobalGraphMetricFanout(2, metric_req));
+    try std.testing.expectError(error.GraphMetricGlobalMaterializationRequired, rejectNonGlobalGraphMetricFanout(2, metric_req));
 
     const traversal_only = db_mod.types.SearchRequest{ .graph_queries = &.{.{
         .name = "neighbors",
@@ -17868,7 +17868,7 @@ fn parseRemoteGraphMetricStatusValue(
         .phase = graphMetricPhaseFromName(status.phase) orelse return error.InvalidQueryResponse,
         .edge_filter = edge_filter,
         .metadata_version = try remoteOptionalU32(status.metadata_version),
-        .config_fingerprint = try remoteOptionalU64(status.config_fingerprint),
+        .config_fingerprint = try remoteOptionalConfigFingerprint(status.config_fingerprint),
         .maintenance_paused = status.maintenance_paused orelse false,
         .build_queued = status.build_queued,
         .published_generation = try remoteU64(status.published_generation),
@@ -18039,6 +18039,23 @@ fn remoteU64(value: i64) !u64 {
 
 fn remoteOptionalU64(value: ?i64) !u64 {
     return remoteU64(value orelse 0);
+}
+
+fn remoteOptionalConfigFingerprint(value: ?[]const u8) !u64 {
+    const encoded = value orelse return 0;
+    if (encoded.len != 16) return error.InvalidQueryResponse;
+    for (encoded) |char| {
+        if (!std.ascii.isDigit(char) and !(char >= 'a' and char <= 'f')) return error.InvalidQueryResponse;
+    }
+    return std.fmt.parseInt(u64, encoded, 16) catch error.InvalidQueryResponse;
+}
+
+test "remote graph metric fingerprints require exact lowercase hex" {
+    try std.testing.expectEqual(std.math.maxInt(u64), try remoteOptionalConfigFingerprint("ffffffffffffffff"));
+    try std.testing.expectEqual(@as(u64, 0), try remoteOptionalConfigFingerprint(null));
+    try std.testing.expectError(error.InvalidQueryResponse, remoteOptionalConfigFingerprint("fffffffffffffff"));
+    try std.testing.expectError(error.InvalidQueryResponse, remoteOptionalConfigFingerprint("FFFFFFFFFFFFFFFF"));
+    try std.testing.expectError(error.InvalidQueryResponse, remoteOptionalConfigFingerprint("gggggggggggggggg"));
 }
 
 fn remoteU32(value: i64) !u32 {
@@ -27461,7 +27478,7 @@ test "encode query request includes graph metric read rerank and traversal statu
 test "remote query parser preserves graph metric fan-in provenance and durable status" {
     const alloc = std.testing.allocator;
     var parsed = try parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":1,"relation":"exact"},"hits":[{"_id":"doc:a","_score":2.25,"_score_details":{"graph_metric_rerank":{"index_name":"graph_idx","metric_name":"pagerank","base_score":1.0,"base_weight":0.5,"metric_score":0.7,"metric_score_used":0.7,"metric_weight":2.5,"missing_score_used":false,"final_score":2.25,"published_generation":7}}}]},"graph_results":{"related":{"type":"traverse","nodes":[{"key":"doc:a","depth":0,"distance":0,"metrics":{"pagerank":0.7,"degree":null}}],"total":1,"metric_status":{"pagerank":{"state":"fresh","phase":"complete","edge_filter":{"mode":"types","types":["references"]},"metadata_version":2,"maintenance_paused":false,"build_queued":false,"published_generation":7,"edge_generation":7,"target_edge_generation":7,"queued_generation":0,"building_generation":0,"build_job_id":12345,"build_started_at_ms":1780000000123,"build_iteration":2,"build_lease_expires_at_ms":0,"build_worker_id":"worker-a","build_cursor":"edge:42","build_completed_units":42,"build_total_units":100,"build_pages":[{"phase":"scan_edges_and_out_degree","iteration":2,"page_id":9,"state":"leased","range_kind":"reverse_edges","worker_id":"worker-a","lease_expires_at_ms":1780000001123,"attempt":1,"cursor":"edge:42","completed_units":42,"total_units":100}],"build_pages_truncated":false,"retry_count":0,"progress":1.0,"converged":true,"iterations_completed":12,"delta":0.0,"computed_at_ms":1780000000000,"last_event":{"sequence":3,"kind":"publish","at_ms":1780000000000,"target_edge_generation":7,"published_generation":7,"score_count":100}}}}},"graph_metric_results":{"central":{"index_name":"graph_idx","metric":"pagerank","scores":[{"node":"doc:a","score":0.7}],"status":{"state":"fresh","phase":"complete","build_queued":false,"published_generation":7,"edge_generation":7,"target_edge_generation":7,"progress":1.0,"converged":true,"iterations_completed":12,"delta":0.0,"computed_at_ms":1780000000000}}},"profile":{"graph_metrics":[{"query_name":"graph_metric_rerank","source":"graph_metric_rerank","index_name":"graph_idx","metric_name":"pagerank","freshness":"published","status":{"state":"fresh","phase":"complete","build_queued":false,"published_generation":7,"edge_generation":7,"target_edge_generation":7,"progress":1.0,"converged":true,"iterations_completed":12,"delta":0.0,"computed_at_ms":1780000000000}}]},"took":1,"status":200}]}
+        \\{"responses":[{"hits":{"total":{"value":1,"relation":"exact"},"hits":[{"_id":"doc:a","_score":2.25,"_score_details":{"graph_metric_rerank":{"index_name":"graph_idx","metric_name":"pagerank","base_score":1.0,"base_weight":0.5,"metric_score":0.7,"metric_score_used":0.7,"metric_weight":2.5,"missing_score_used":false,"final_score":2.25,"published_generation":7}}}]},"graph_results":{"related":{"type":"traverse","nodes":[{"key":"doc:a","depth":0,"distance":0,"metrics":{"pagerank":0.7,"degree":null}}],"total":1,"metric_status":{"pagerank":{"state":"fresh","phase":"complete","edge_filter":{"mode":"types","types":["references"]},"metadata_version":2,"config_fingerprint":"ffffffffffffffff","maintenance_paused":false,"build_queued":false,"published_generation":7,"edge_generation":7,"target_edge_generation":7,"queued_generation":0,"building_generation":0,"build_job_id":12345,"build_started_at_ms":1780000000123,"build_iteration":2,"build_lease_expires_at_ms":0,"build_worker_id":"worker-a","build_cursor":"edge:42","build_completed_units":42,"build_total_units":100,"build_pages":[{"phase":"scan_edges_and_out_degree","iteration":2,"page_id":9,"state":"leased","range_kind":"reverse_edges","worker_id":"worker-a","lease_expires_at_ms":1780000001123,"attempt":1,"cursor":"edge:42","completed_units":42,"total_units":100}],"build_pages_truncated":false,"retry_count":0,"progress":1.0,"converged":true,"iterations_completed":12,"delta":0.0,"computed_at_ms":1780000000000,"last_event":{"sequence":3,"kind":"publish","at_ms":1780000000000,"target_edge_generation":7,"published_generation":7,"score_count":100}}}}},"graph_metric_results":{"central":{"index_name":"graph_idx","metric":"pagerank","scores":[{"node":"doc:a","score":0.7}],"status":{"state":"fresh","phase":"complete","build_queued":false,"published_generation":7,"edge_generation":7,"target_edge_generation":7,"progress":1.0,"converged":true,"iterations_completed":12,"delta":0.0,"computed_at_ms":1780000000000}}},"profile":{"graph_metrics":[{"query_name":"graph_metric_rerank","source":"graph_metric_rerank","index_name":"graph_idx","metric_name":"pagerank","freshness":"published","status":{"state":"fresh","phase":"complete","build_queued":false,"published_generation":7,"edge_generation":7,"target_edge_generation":7,"progress":1.0,"converged":true,"iterations_completed":12,"delta":0.0,"computed_at_ms":1780000000000}}]},"took":1,"status":200}]}
     );
     defer parsed.deinit();
 
@@ -27474,6 +27491,7 @@ test "remote query parser preserves graph metric fan-in provenance and durable s
     try std.testing.expect(parsed.graph_results[0].nodes[0].metrics[1].score == null);
     const status = parsed.graph_results[0].metric_status[0];
     try std.testing.expectEqual(@as(u32, 2), status.metadata_version);
+    try std.testing.expectEqual(std.math.maxInt(u64), status.config_fingerprint);
     try std.testing.expectEqual(@as(usize, 1), status.build_pages.len);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPageState.leased, status.build_pages[0].state);
     try std.testing.expectEqualStrings("edge:42", status.build_cursor);

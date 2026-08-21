@@ -26,12 +26,16 @@ const managed_embedder = @import("../inference/managed_embedder.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const enrichment_config_validation = @import("../storage/db/enrichment/config_validation.zig");
+const query_contract = @import("query_contract.zig");
 
 pub fn encodeGraphMetricStatusResponse(
     alloc: std.mem.Allocator,
     status: db_mod.types.GraphMetricStatus,
 ) ![]u8 {
-    return try std.json.Stringify.valueAlloc(alloc, .{ .status = status }, .{ .emit_null_optional_fields = false });
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const public_status = try query_contract.toOpenApiGraphMetricStatus(arena.allocator(), status);
+    return try std.json.Stringify.valueAlloc(alloc, .{ .status = public_status }, .{ .emit_null_optional_fields = false });
 }
 
 pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
@@ -6122,6 +6126,7 @@ test "graph metric status encoder exposes active build pages" {
         .name = @constCast("pagerank"),
         .state = .building,
         .phase = .scan_edges_and_out_degree,
+        .config_fingerprint = std.math.maxInt(u64),
         .build_job_id = 9,
         .build_worker_id = "coordinator",
         .build_cursor = "phase:scan",
@@ -6144,4 +6149,8 @@ test "graph metric status encoder exposes active build pages" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"total_units\":11") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"last_error\":\"boom\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"build_pages_truncated\":true") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    const status_object = parsed.value.object.get("status").?.object;
+    try std.testing.expectEqualStrings("ffffffffffffffff", status_object.get("config_fingerprint").?.string);
 }

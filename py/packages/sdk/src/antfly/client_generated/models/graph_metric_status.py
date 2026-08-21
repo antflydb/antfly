@@ -36,8 +36,8 @@ class GraphMetricStatus:
         computed_at_ms (int):
         edge_filter (GraphMetricEdgeFilterStatus | Unset):
         metadata_version (int | Unset): Version of the published graph metric metadata schema.
-        config_fingerprint (int | Unset): Deterministic fingerprint of the configuration that produced the published
-            metric snapshot.
+        config_fingerprint (str | Unset): Deterministic configuration fingerprint encoded as fixed-width hexadecimal so
+            every SDK preserves all 64 bits.
         maintenance_paused (bool | Unset):
         queued_generation (int | Unset): Pending edge generation waiting to build, or 0 when no build is queued.
         building_generation (int | Unset): Edge generation currently held by an active build lease, or 0 when idle.
@@ -78,7 +78,7 @@ class GraphMetricStatus:
     computed_at_ms: int
     edge_filter: GraphMetricEdgeFilterStatus | Unset = UNSET
     metadata_version: int | Unset = UNSET
-    config_fingerprint: int | Unset = UNSET
+    config_fingerprint: str | Unset = UNSET
     maintenance_paused: bool | Unset = UNSET
     queued_generation: int | Unset = UNSET
     building_generation: int | Unset = UNSET

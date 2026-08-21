@@ -14,14 +14,18 @@ T = TypeVar("T", bound="GraphMetricQuery")
 
 @_attrs_define
 class GraphMetricQuery:
-    """
-    Attributes:
-        index (str): Graph index that owns the published metric.
-        metric (str): Graph metric to read.
-        name (str | Unset): Optional result key. Defaults to the metric name.
-        top_k (int | Unset): Maximum globally ranked metric scores to return after shard fan-in. Default: 10.
-        metric_freshness (GraphMetricQueryMetricFreshness | Unset): Whether the latest published generation may be stale
-            or must match the graph edge generation. Default: GraphMetricQueryMetricFreshness.PUBLISHED.
+    """Reads a published graph metric. Score-bearing graph metric queries on multi-shard tables require a globally
+    coordinated metric snapshot and otherwise return graph_metric_global_materialization_required instead of merging
+    mathematically incompatible shard-local scores.
+
+        Attributes:
+            index (str): Graph index that owns the published metric.
+            metric (str): Graph metric to read.
+            name (str | Unset): Optional result key. Defaults to the metric name.
+            top_k (int | Unset): Maximum ranked metric scores to return. Multi-shard tables require a globally coordinated
+                metric snapshot. Default: 10.
+            metric_freshness (GraphMetricQueryMetricFreshness | Unset): Whether the latest published generation may be stale
+                or must match the graph edge generation. Default: GraphMetricQueryMetricFreshness.PUBLISHED.
     """
 
     index: str

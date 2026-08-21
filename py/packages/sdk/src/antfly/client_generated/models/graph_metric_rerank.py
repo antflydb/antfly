@@ -14,18 +14,20 @@ T = TypeVar("T", bound="GraphMetricRerank")
 
 @_attrs_define
 class GraphMetricRerank:
-    """
-    Attributes:
-        index (str): Graph index that owns the published metric.
-        metric (str): Graph metric name to blend into the search hit score.
-        base_weight (float | Unset): Multiplier applied to the existing hit score before adding the graph metric
-            feature. Default: 1.0.
-        weight (float | Unset): Multiplier applied to the graph metric score before it is added to the existing hit
-            score. Default: 1.0.
-        missing_score (float | Unset): Metric feature value to use for hits that do not have a score in the published
-            metric generation. Default: 0.0.
-        metric_freshness (GraphMetricRerankMetricFreshness | Unset): Whether stale published generations are acceptable
-            or the metric must be fresh. Default: GraphMetricRerankMetricFreshness.PUBLISHED.
+    """Blends a published graph metric into hit scores. Multi-shard tables require a globally coordinated metric snapshot
+    and otherwise return graph_metric_global_materialization_required.
+
+        Attributes:
+            index (str): Graph index that owns the published metric.
+            metric (str): Graph metric name to blend into the search hit score.
+            base_weight (float | Unset): Multiplier applied to the existing hit score before adding the graph metric
+                feature. Default: 1.0.
+            weight (float | Unset): Multiplier applied to the graph metric score before it is added to the existing hit
+                score. Default: 1.0.
+            missing_score (float | Unset): Metric feature value to use for hits that do not have a score in the published
+                metric generation. Default: 0.0.
+            metric_freshness (GraphMetricRerankMetricFreshness | Unset): Whether stale published generations are acceptable
+                or the metric must be fresh. Default: GraphMetricRerankMetricFreshness.PUBLISHED.
     """
 
     index: str
