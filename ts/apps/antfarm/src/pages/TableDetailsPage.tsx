@@ -83,9 +83,10 @@ import {
   type SearchableField,
 } from "../utils/fieldUtils";
 import {
-  artifactRetrievalDefaults,
+  builderArtifactRetrievalDefaults,
   buildTableQueryRequest,
   parseTableQueryRequest,
+  requestArtifactRetrievalDefaults,
   type TableQueryMetadataState,
   tableQueryBuilderConversionBlocker,
   tableQueryErrorMessage,
@@ -245,6 +246,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   activeTableName.current = tableName;
   const indexesRequestSequence = useRef(0);
   const tableMetadataRequestSequence = useRef(0);
+  const queryAbortController = useRef<AbortController | null>(null);
   const navigate = useNavigate();
   const [indexes, setIndexes] = useState<IndexStatus[]>([]);
   const [indexesMetadataState, setIndexesMetadataState] =
@@ -284,8 +286,8 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   const [queryMode, setQueryMode] = useState<"builder" | "json">("builder");
 
   const artifactRetrieval = useMemo(
-    () => artifactRetrievalDefaults(indexes, hasSemanticQuery ? queryIndexes : [], tableStatus),
-    [indexes, hasSemanticQuery, queryIndexes, tableStatus]
+    () => builderArtifactRetrievalDefaults(indexes, query, queryIndexes, tableStatus),
+    [indexes, query, queryIndexes, tableStatus]
   );
   const artifactSelectionError = hasSemanticQuery ? artifactRetrieval?.selectionError : undefined;
   const queryMetadataBlocker = tableQueryMetadataBlocker(indexesMetadataState, tableMetadataState);
@@ -319,12 +321,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   const [queryJsonString, setQueryJsonString] = useState(semanticQueryRequestString);
   const parsedJsonQuery = useMemo(() => parseTableQueryRequest(queryJsonString), [queryJsonString]);
   const isJsonQueryValid = parsedJsonQuery !== null;
-  const jsonArtifactRetrieval = useMemo(() => {
-    const requestedIndexes = Array.isArray(parsedJsonQuery?.indexes)
-      ? parsedJsonQuery.indexes.filter((index): index is string => typeof index === "string")
-      : [];
-    return artifactRetrievalDefaults(indexes, requestedIndexes, tableStatus);
-  }, [indexes, parsedJsonQuery, tableStatus]);
+  const jsonArtifactRetrieval = useMemo(
+    () => requestArtifactRetrievalDefaults(indexes, parsedJsonQuery, tableStatus),
+    [indexes, parsedJsonQuery, tableStatus]
+  );
   const jsonQuerySafetyBlocker = tableQueryJsonSafetyBlocker(
     queryMetadataBlocker,
     jsonArtifactRetrieval !== null,
@@ -344,9 +344,9 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         const nextSelectedFields = Array.isArray(queryRequest.fields)
           ? queryRequest.fields.filter((field): field is string => typeof field === "string")
           : [];
-        const nextArtifactRetrieval = artifactRetrievalDefaults(
+        const nextArtifactRetrieval = requestArtifactRetrievalDefaults(
           indexes,
-          nextQueryIndexes,
+          queryRequest,
           tableStatus
         );
         const nextQuery = tableQueryInput(queryRequest, nextArtifactRetrieval?.searchFields);
@@ -502,6 +502,8 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   // Reset table-specific editor state when switching tables.
   useEffect(() => {
     if (!tableName) return;
+    queryAbortController.current?.abort();
+    queryAbortController.current = null;
     setIsEditingSchema(false);
     setIndexes([]);
     setIndexesMetadataState("loading");
@@ -516,6 +518,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     setIncludeProfile(false);
     setQueryMode("builder");
     setError(null);
+    return () => queryAbortController.current?.abort();
   }, [tableName]);
 
   const handleOpenCreateDialog = () => {
@@ -563,6 +566,9 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
 
   const handleRunQuery = useCallback(async () => {
     if (!tableName) return;
+    queryAbortController.current?.abort();
+    const controller = new AbortController();
+    queryAbortController.current = controller;
     setError(null);
     try {
       if (queryMode === "builder" && queryMetadataBlocker) {
@@ -582,13 +588,29 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         setError("The query editor must contain one JSON object.");
         return;
       }
-      const response = await api.tables.query(tableName, queryRequest);
-      if (activeTableName.current !== tableName) return;
+      const response = await api.tables.query(tableName, queryRequest, {
+        signal: controller.signal,
+      });
+      if (
+        controller.signal.aborted ||
+        queryAbortController.current !== controller ||
+        activeTableName.current !== tableName
+      )
+        return;
       setQueryResult(response?.responses?.[0] || null);
     } catch (e) {
-      if (activeTableName.current !== tableName) return;
+      if (
+        controller.signal.aborted ||
+        queryAbortController.current !== controller ||
+        activeTableName.current !== tableName
+      )
+        return;
       setError(tableQueryErrorMessage(e, `Failed to run query on table ${tableName}.`));
       console.error(e);
+    } finally {
+      if (queryAbortController.current === controller) {
+        queryAbortController.current = null;
+      }
     }
   }, [
     tableName,

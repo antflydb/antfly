@@ -2,8 +2,10 @@ import type { IndexStatus, TableStatus } from "@antfly/sdk";
 import { describe, expect, it } from "vitest";
 import {
   artifactRetrievalDefaults,
+  builderArtifactRetrievalDefaults,
   buildTableQueryRequest,
   parseTableQueryRequest,
+  requestArtifactRetrievalDefaults,
   tableQueryBuilderConversionBlocker,
   tableQueryErrorMessage,
   tableQueryInput,
@@ -252,6 +254,92 @@ describe("table query builder UX", () => {
     );
     expect(tableQueryJsonSafetyBlocker(null, true, { fields: ["text"], limit: 3 })).toBeNull();
     expect(tableQueryJsonSafetyBlocker(null, false, { limit: 3 })).toBeNull();
+  });
+
+  it("applies artifact defaults only to requests that retrieve search artifacts", () => {
+    const indexes = [
+      {
+        config: { name: "full_text_index_v0", type: "full_text" },
+        shard_status: {},
+        status: { index_type: "full_text" },
+      },
+    ] as IndexStatus[];
+    const tableStatus = {
+      name: "docs",
+      indexes: {
+        full_text_index_v0: { name: "full_text_index_v0", type: "full_text" },
+      },
+      shards: {},
+      storage_status: {},
+      artifact_enrichments: [
+        {
+          name: "document_chunks_v1",
+          kind: "chunk",
+          field: "text",
+          full_text_index: true,
+        },
+      ],
+    } as TableStatus;
+
+    expect(builderArtifactRetrievalDefaults(indexes, "", [], tableStatus)).toBeNull();
+    expect(builderArtifactRetrievalDefaults(indexes, "singularity", [], tableStatus)).toEqual({
+      searchFields: ["text"],
+      projectionFields: ["text"],
+      returnMatches: true,
+    });
+    expect(
+      requestArtifactRetrievalDefaults(
+        indexes,
+        { semantic_search: "singularity", limit: 3 },
+        tableStatus
+      )
+    ).toBeNull();
+    expect(requestArtifactRetrievalDefaults(indexes, { limit: 10 }, tableStatus)).toBeNull();
+    expect(
+      requestArtifactRetrievalDefaults(
+        indexes,
+        { filter_query: { match: "singularity", field: "text" }, limit: 10 },
+        tableStatus
+      )
+    ).toBeNull();
+    expect(
+      requestArtifactRetrievalDefaults(
+        indexes,
+        { full_text_search: { query: "singularity" }, limit: 3 },
+        tableStatus
+      )
+    ).toEqual({
+      searchFields: ["text"],
+      projectionFields: ["text"],
+      returnMatches: true,
+    });
+    const hybridIndexes = [
+      ...indexes,
+      {
+        config: { name: "document_vectors", type: "embeddings" },
+        shard_status: {},
+        status: { index_type: "embeddings" },
+      },
+    ] as IndexStatus[];
+    expect(
+      requestArtifactRetrievalDefaults(
+        hybridIndexes,
+        {
+          semantic_search: "singularity",
+          indexes: ["document_vectors"],
+          full_text_search: { query: "singularity" },
+          limit: 3,
+        },
+        tableStatus
+      )
+    ).toEqual({
+      searchFields: ["text"],
+      projectionFields: ["text"],
+      returnMatches: true,
+    });
+    expect(
+      requestArtifactRetrievalDefaults(indexes, { hierarchy: {}, limit: 3 }, tableStatus)
+    ).not.toBeNull();
   });
 
   it("detects artifact-backed full-text and vector indexes", () => {

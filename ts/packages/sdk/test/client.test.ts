@@ -146,6 +146,22 @@ describe("AntflyClient", () => {
       });
     });
 
+    it("forwards global query cancellation", async () => {
+      mockPost.mockResolvedValueOnce({
+        data: { responses: [] },
+        error: undefined,
+      });
+      const controller = new AbortController();
+      const request: QueryRequest = { limit: 3 };
+
+      await client.query(request, { signal: controller.signal });
+
+      expect(mockPost).toHaveBeenCalledWith("/db/v1/query", {
+        body: request,
+        signal: controller.signal,
+      });
+    });
+
     it("should handle query with Bleve full_text_search", async () => {
       const mockResponse = {
         responses: [
@@ -287,6 +303,23 @@ describe("AntflyClient", () => {
       expect(mockPost).toHaveBeenCalledWith("/db/v1/tables/{tableName}/query", {
         params: { path: { tableName: "products" } },
         body: request,
+      });
+    });
+
+    it("forwards table query cancellation", async () => {
+      mockPost.mockResolvedValueOnce({
+        data: { responses: [] },
+        error: undefined,
+      });
+      const controller = new AbortController();
+      const request: QueryRequest = { limit: 3 };
+
+      await client.tables.query("products", request, { signal: controller.signal });
+
+      expect(mockPost).toHaveBeenCalledWith("/db/v1/tables/{tableName}/query", {
+        params: { path: { tableName: "products" } },
+        body: request,
+        signal: controller.signal,
       });
     });
 

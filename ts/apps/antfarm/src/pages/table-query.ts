@@ -79,6 +79,56 @@ export interface ArtifactRetrievalDefaults {
   selectionError?: string;
 }
 
+export function builderArtifactRetrievalDefaults(
+  indexes: IndexStatus[],
+  query: string,
+  selectedVectorIndexes: string[],
+  tableStatus?: TableStatus | null
+): ArtifactRetrievalDefaults | null {
+  if (!query.trim()) return null;
+  return artifactRetrievalDefaults(indexes, selectedVectorIndexes, tableStatus);
+}
+
+export function requestArtifactRetrievalDefaults(
+  indexes: IndexStatus[],
+  request: QueryRequest | null,
+  tableStatus?: TableStatus | null
+): ArtifactRetrievalDefaults | null {
+  if (!request) return null;
+
+  const activeDefaults: ArtifactRetrievalDefaults[] = [];
+  if (typeof request.semantic_search === "string" && request.semantic_search.trim()) {
+    const requestedIndexes = Array.isArray(request.indexes)
+      ? request.indexes.filter((index): index is string => typeof index === "string")
+      : [];
+    const vectorIndexes =
+      requestedIndexes.length > 0
+        ? requestedIndexes
+        : indexes
+            .filter((index) => index.config.type === "embeddings")
+            .map((index) => index.config.name);
+    if (vectorIndexes.length > 0) {
+      const defaults = artifactRetrievalDefaults(indexes, vectorIndexes, tableStatus);
+      if (defaults) activeDefaults.push(defaults);
+    }
+  }
+
+  if (request.full_text_search !== undefined || request.hierarchy !== undefined) {
+    const defaults = artifactRetrievalDefaults(indexes, [], tableStatus);
+    if (defaults) activeDefaults.push(defaults);
+  }
+
+  if (activeDefaults.length === 0) return null;
+  const merged: ArtifactRetrievalDefaults = {
+    searchFields: [...new Set(activeDefaults.flatMap((defaults) => defaults.searchFields))],
+    projectionFields: [...new Set(activeDefaults.flatMap((defaults) => defaults.projectionFields))],
+    returnMatches: activeDefaults.some((defaults) => defaults.returnMatches),
+  };
+  const selectionError = activeDefaults.find((defaults) => defaults.selectionError)?.selectionError;
+  if (selectionError) merged.selectionError = selectionError;
+  return merged;
+}
+
 export function artifactRetrievalDefaults(
   indexes: IndexStatus[],
   selectedVectorIndexes: string[],
