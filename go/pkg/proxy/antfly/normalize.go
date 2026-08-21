@@ -70,14 +70,20 @@ func normalizeSuccessfulResponse(resp *http.Response, req RequestContext) ([]byt
 	if resp == nil || resp.Body == nil {
 		return nil, false, nil
 	}
+	// Unknown response kinds require no public-shape transformation. Classify
+	// before reading so ordinary table queries and writes remain streaming and do
+	// not materialize potentially large bodies in the proxy.
+	kind := classifyResponseKind(req.BackendPath)
+	if kind == responseKindUnknown {
+		return nil, false, nil
+	}
 
 	body, err := readAndReplaceBody(resp)
 	if err != nil {
 		return nil, false, err
 	}
 
-	kind := classifyResponseKind(req.BackendPath)
-	if kind == responseKindUnknown || !isJSONResponse(resp, body) {
+	if !isJSONResponse(resp, body) {
 		return body, false, nil
 	}
 
