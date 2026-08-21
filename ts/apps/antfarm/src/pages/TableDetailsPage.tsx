@@ -87,6 +87,7 @@ import {
   buildTableQueryRequest,
   parseTableQueryRequest,
   type TableQueryMetadataState,
+  tableQueryBuilderConversionBlocker,
   tableQueryErrorMessage,
   tableQueryInput,
   tableQueryJsonSafetyBlocker,
@@ -297,8 +298,8 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       semanticQuery,
       filterQuery,
       includeProfile,
-      artifactSearchField: artifactRetrieval?.field,
-      artifactProjectionFields: artifactRetrieval?.fields,
+      artifactSearchFields: artifactRetrieval?.searchFields,
+      artifactProjectionFields: artifactRetrieval?.projectionFields,
       returnArtifactMatches: artifactRetrieval?.returnMatches,
     });
   }, [
@@ -337,25 +338,20 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     } else if (mode === "builder") {
       const queryRequest = parseTableQueryRequest(queryJsonString);
       if (queryRequest) {
-        setQueryIndexes(queryRequest.indexes || []);
-        setSelectedFields(queryRequest.fields || []);
-        setIncludeProfile(queryRequest.profile === true);
-        setFieldInput(""); // Clear field input when switching from JSON mode
-
-        // Set query content (search mode is auto-detected from content)
+        const nextQueryIndexes = Array.isArray(queryRequest.indexes)
+          ? queryRequest.indexes.filter((index): index is string => typeof index === "string")
+          : [];
+        const nextSelectedFields = Array.isArray(queryRequest.fields)
+          ? queryRequest.fields.filter((field): field is string => typeof field === "string")
+          : [];
         const nextArtifactRetrieval = artifactRetrievalDefaults(
           indexes,
-          queryRequest.indexes || [],
+          nextQueryIndexes,
           tableStatus
         );
-        setQuery(tableQueryInput(queryRequest, nextArtifactRetrieval?.fields));
+        const nextQuery = tableQueryInput(queryRequest, nextArtifactRetrieval?.searchFields);
 
-        // Set filter query content
-        if (queryRequest.filter_query) {
-          setFilterQuery(JSON.stringify(queryRequest.filter_query, null, 2));
-        } else {
-          setFilterQuery(JSON.stringify({}, null, 2));
-        }
+        const nextFilterQuery = JSON.stringify(queryRequest.filter_query || {}, null, 2);
         const { aggregations, limit, offset } = queryRequest;
         const semanticPart: {
           aggregations?: unknown;
@@ -365,7 +361,31 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         if (aggregations) semanticPart.aggregations = aggregations;
         if (limit !== undefined) semanticPart.limit = limit;
         if (offset !== undefined) semanticPart.offset = offset;
-        setSemanticQuery(JSON.stringify(semanticPart, null, 2));
+        const nextSemanticQuery = JSON.stringify(semanticPart, null, 2);
+        const rebuilt = buildTableQueryRequest({
+          query: nextQuery,
+          queryIndexes: nextQueryIndexes,
+          selectedFields: nextSelectedFields,
+          semanticQuery: nextSemanticQuery,
+          filterQuery: nextFilterQuery,
+          includeProfile: queryRequest.profile === true,
+          artifactSearchFields: nextArtifactRetrieval?.searchFields,
+          artifactProjectionFields: nextArtifactRetrieval?.projectionFields,
+          returnArtifactMatches: nextArtifactRetrieval?.returnMatches,
+        });
+        const conversionBlocker = tableQueryBuilderConversionBlocker(queryRequest, rebuilt);
+        if (conversionBlocker) {
+          setError(conversionBlocker);
+          return;
+        }
+
+        setQueryIndexes(nextQueryIndexes);
+        setSelectedFields(nextSelectedFields);
+        setIncludeProfile(queryRequest.profile === true);
+        setFieldInput("");
+        setQuery(nextQuery);
+        setFilterQuery(nextFilterQuery);
+        setSemanticQuery(nextSemanticQuery);
         setError(null);
       } else {
         setError("The query editor must contain one JSON object.");
@@ -1085,10 +1105,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                       <AccordionContent className="pb-3 pt-1 space-y-2.5">
                         {artifactRetrieval && selectedFields.length === 0 && (
                           <p className="text-xs text-muted-foreground">
-                            Artifact retrieval defaults to the {artifactRetrieval.fields.join(", ")}{" "}
-                            {artifactRetrieval.fields.length === 1 ? "field" : "fields"} so source
-                            files and inline URLs are not returned. Select fields here to override
-                            that projection.
+                            {artifactRetrieval.projectionFields.length > 0
+                              ? `Artifact retrieval defaults to the ${artifactRetrieval.projectionFields.join(", ")} ${artifactRetrieval.projectionFields.length === 1 ? "field" : "fields"} so source files and inline URLs are not returned.`
+                              : "Generated asset output fields are not declared, so artifact retrieval defaults to identity-only results."}{" "}
+                            Select fields here to override that projection.
                           </p>
                         )}
                         <Input

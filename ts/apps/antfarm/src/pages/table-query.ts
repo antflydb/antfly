@@ -7,7 +7,7 @@ export interface TableQueryBuilderState {
   semanticQuery: string;
   filterQuery: string;
   includeProfile: boolean;
-  artifactSearchField?: string;
+  artifactSearchFields?: string[];
   artifactProjectionFields?: string[];
   returnArtifactMatches?: boolean;
 }
@@ -42,6 +42,27 @@ export function tableQueryJsonSafetyBlocker(
   return 'Query metadata is not ready. Add an explicit "fields" array before running this JSON query; use "fields": [] for identity-only results.';
 }
 
+export function tableQueryBuilderConversionBlocker(
+  source: QueryRequest,
+  rebuilt: QueryRequest
+): string | null {
+  if (JSON.stringify(canonicalJsonValue(source)) === JSON.stringify(canonicalJsonValue(rebuilt))) {
+    return null;
+  }
+  return "The Builder cannot represent this JSON query without changing it. Keep using JSON, or remove unsupported controls before switching to Builder.";
+}
+
+function canonicalJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJsonValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => [key, canonicalJsonValue(item)])
+  );
+}
+
 type ArtifactAwareIndexConfig = IndexStatus["config"] & {
   artifact_name?: string;
   embedding_name?: string;
@@ -52,8 +73,8 @@ type ArtifactAwareIndexConfig = IndexStatus["config"] & {
 type ArtifactEnrichment = NonNullable<TableStatus["artifact_enrichments"]>[number];
 
 export interface ArtifactRetrievalDefaults {
-  field: string;
-  fields: string[];
+  searchFields: string[];
+  projectionFields: string[];
   returnMatches: boolean;
   selectionError?: string;
 }
@@ -72,7 +93,9 @@ export function artifactRetrievalDefaults(
       : [...configs].filter(([, config]) => config.type === "full_text").map(([name]) => name);
 
   const tableEnrichments = tableStatus?.artifact_enrichments ?? [];
-  const artifactFields = new Set<string>();
+  const artifactSearchFields = new Set<string>();
+  const artifactProjectionFields = new Set<string>();
+  let hasSchemaUnknownAsset = false;
   let artifactIndexCount = 0;
   let ordinaryIndexCount = 0;
 
@@ -89,7 +112,9 @@ export function artifactRetrievalDefaults(
         continue;
       }
       const sourceEnrichment = findEmbeddingSourceEnrichment(config, enrichments, tableEnrichments);
-      artifactFields.add(sourceEnrichment?.field?.trim() || "text");
+      const field = sourceEnrichment?.field?.trim() || "text";
+      artifactSearchFields.add(field);
+      artifactProjectionFields.add(field);
       artifactIndexCount++;
       continue;
     }
@@ -108,11 +133,23 @@ export function artifactRetrievalDefaults(
 
     if (artifactEnrichments.length > 0) {
       for (const enrichment of artifactEnrichments) {
-        artifactFields.add(enrichment.field?.trim() || config.field?.trim() || "text");
+        if (enrichment.kind === "asset") {
+          // Asset `field` identifies the source-document input, while the full-text
+          // runtime indexes the produced artifact JSON directly. Its output fields
+          // are not inferable without an output schema, so search `_all` and keep
+          // the implicit projection identity-only.
+          hasSchemaUnknownAsset = true;
+          continue;
+        }
+        const field = enrichment.field?.trim() || config.field?.trim() || "text";
+        artifactSearchFields.add(field);
+        artifactProjectionFields.add(field);
       }
       artifactIndexCount++;
     } else if (config.artifact_name) {
-      artifactFields.add(config.field?.trim() || "text");
+      const field = config.field?.trim() || "text";
+      artifactSearchFields.add(field);
+      artifactProjectionFields.add(field);
       artifactIndexCount++;
     } else {
       ordinaryIndexCount++;
@@ -120,10 +157,10 @@ export function artifactRetrievalDefaults(
   }
 
   if (artifactIndexCount === 0) return null;
-  const fields = [...artifactFields];
+  const searchFields = hasSchemaUnknownAsset ? ["_all"] : [...artifactSearchFields];
   const defaults: ArtifactRetrievalDefaults = {
-    field: fields[0] ?? "text",
-    fields,
+    searchFields: searchFields.length > 0 ? searchFields : ["text"],
+    projectionFields: [...artifactProjectionFields],
     returnMatches: true,
   };
   if (selectedVectorIndexes.length > 0 && ordinaryIndexCount > 0) {
@@ -174,16 +211,13 @@ export function parseTableQueryRequest(source: string): QueryRequest | null {
   return parseJsonObject(source) as QueryRequest | null;
 }
 
-export function tableQueryInput(
-  request: QueryRequest,
-  artifactSearchFields?: string | string[]
-): string {
+export function tableQueryInput(request: QueryRequest, artifactSearchFields?: string[]): string {
   if (typeof request.semantic_search === "string") {
     return request.semantic_search;
   }
   const artifactFields = [
     ...new Set(
-      (Array.isArray(artifactSearchFields) ? artifactSearchFields : [artifactSearchFields])
+      (artifactSearchFields ?? [])
         .filter((field): field is string => typeof field === "string")
         .map((field) => field.trim())
         .filter(Boolean)
@@ -284,21 +318,20 @@ function artifactFullTextQuery(fields: string[], query: string): QueryRequest["f
   }
   const field = fields[0] ?? "text";
   const reservedOperator = ["AND", "OR", "NOT"].includes(query.toUpperCase());
-  if (!reservedOperator && /^[\p{L}\p{N}_]+$/u.test(query)) {
+  if (field !== "_all" && !reservedOperator && /^[\p{L}\p{N}_]+$/u.test(query)) {
     return { query: `${field}:${query}` };
   }
   return { match: query, field };
 }
 
-function normalizedArtifactFields(primaryField: string, projectionFields?: string[]): string[] {
-  const fields = Array.from(
-    new Set(
-      (projectionFields?.length ? projectionFields : [primaryField])
-        .map((field) => field.trim())
-        .filter(Boolean)
-    )
-  );
-  return fields.length > 0 ? fields : [primaryField.trim() || "text"];
+function normalizedArtifactFields(fields: string[], fallback: string[]): string[] {
+  const normalized = Array.from(new Set(fields.map((field) => field.trim()).filter(Boolean)));
+  return normalized.length > 0 ? normalized : fallback;
+}
+
+function normalizedProjectionFields(projectionFields?: string[]): string[] {
+  if (projectionFields === undefined) return [];
+  return Array.from(new Set(projectionFields.map((field) => field.trim()).filter(Boolean)));
 }
 
 export function buildTableQueryRequest({
@@ -308,31 +341,32 @@ export function buildTableQueryRequest({
   semanticQuery,
   filterQuery,
   includeProfile,
-  artifactSearchField,
+  artifactSearchFields,
   artifactProjectionFields,
   returnArtifactMatches = false,
 }: TableQueryBuilderState): QueryRequest {
   const request: QueryRequest = {};
   const trimmedQuery = query.trim();
   const hasSemanticQuery = trimmedQuery.length > 0 && queryIndexes.length > 0;
-  const artifactFields = artifactSearchField
-    ? normalizedArtifactFields(artifactSearchField, artifactProjectionFields)
+  const normalizedSearchFields = artifactSearchFields
+    ? normalizedArtifactFields(artifactSearchFields, ["text"])
     : [];
+  const normalizedProjection = normalizedProjectionFields(artifactProjectionFields);
 
   if (hasSemanticQuery) {
     request.indexes = queryIndexes;
     request.semantic_search = trimmedQuery;
   } else if (trimmedQuery.length > 0) {
-    if (artifactSearchField) {
-      request.full_text_search = artifactFullTextQuery(artifactFields, trimmedQuery);
+    if (normalizedSearchFields.length > 0) {
+      request.full_text_search = artifactFullTextQuery(normalizedSearchFields, trimmedQuery);
     } else {
       request.full_text_search = { query: trimmedQuery };
     }
   }
   if (selectedFields.length > 0) {
     request.fields = selectedFields;
-  } else if (returnArtifactMatches && artifactSearchField) {
-    request.fields = artifactFields;
+  } else if (returnArtifactMatches) {
+    request.fields = normalizedProjection;
   }
   if (returnArtifactMatches) {
     request.hierarchy = {};

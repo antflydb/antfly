@@ -4,6 +4,7 @@ import {
   artifactRetrievalDefaults,
   buildTableQueryRequest,
   parseTableQueryRequest,
+  tableQueryBuilderConversionBlocker,
   tableQueryErrorMessage,
   tableQueryInput,
   tableQueryJsonSafetyBlocker,
@@ -68,7 +69,8 @@ describe("buildTableQueryRequest", () => {
         semanticQuery: "{}",
         filterQuery: "{}",
         includeProfile: false,
-        artifactSearchField: "text",
+        artifactSearchFields: ["text"],
+        artifactProjectionFields: ["text"],
         returnArtifactMatches: true,
       })
     ).toEqual({
@@ -88,7 +90,7 @@ describe("buildTableQueryRequest", () => {
         semanticQuery: "{}",
         filterQuery: "{}",
         includeProfile: false,
-        artifactSearchField: "text",
+        artifactSearchFields: ["text"],
         artifactProjectionFields: ["text", "caption", "text"],
         returnArtifactMatches: true,
       })
@@ -110,7 +112,7 @@ describe("buildTableQueryRequest", () => {
         semanticQuery: "{}",
         filterQuery: "{}",
         includeProfile: false,
-        artifactSearchField: "text",
+        artifactSearchFields: ["text"],
         returnArtifactMatches: true,
       })
     ).toMatchObject({
@@ -128,7 +130,7 @@ describe("buildTableQueryRequest", () => {
         semanticQuery: "{}",
         filterQuery: "{}",
         includeProfile: false,
-        artifactSearchField: "text",
+        artifactSearchFields: ["text", "caption"],
         artifactProjectionFields: ["text", "caption", "text"],
         returnArtifactMatches: true,
       })
@@ -140,6 +142,27 @@ describe("buildTableQueryRequest", () => {
         ],
       },
       fields: ["text", "caption"],
+      hierarchy: {},
+      limit: 3,
+    });
+  });
+
+  it("searches schema-unknown asset output without returning source payloads", () => {
+    expect(
+      buildTableQueryRequest({
+        query: "crimson harbor",
+        queryIndexes: [],
+        selectedFields: [],
+        semanticQuery: "{}",
+        filterQuery: "{}",
+        includeProfile: false,
+        artifactSearchFields: ["_all"],
+        artifactProjectionFields: [],
+        returnArtifactMatches: true,
+      })
+    ).toEqual({
+      full_text_search: { field: "_all", match: "crimson harbor" },
+      fields: [],
       hierarchy: {},
       limit: 3,
     });
@@ -296,13 +319,13 @@ describe("table query builder UX", () => {
     } as TableStatus;
 
     expect(artifactRetrievalDefaults(indexes, [], tableStatus)).toEqual({
-      field: "text",
-      fields: ["text"],
+      searchFields: ["text"],
+      projectionFields: ["text"],
       returnMatches: true,
     });
     expect(artifactRetrievalDefaults(indexes, ["document_vectors"], tableStatus)).toEqual({
-      field: "text",
-      fields: ["text"],
+      searchFields: ["text"],
+      projectionFields: ["text"],
       returnMatches: true,
     });
   });
@@ -333,13 +356,13 @@ describe("table query builder UX", () => {
     } as TableStatus;
 
     expect(artifactRetrievalDefaults(indexes, [], tableStatus)).toEqual({
-      field: "text",
-      fields: ["text"],
+      searchFields: ["text"],
+      projectionFields: ["text"],
       returnMatches: true,
     });
   });
 
-  it("collects every separately registered artifact field routed to full-text search", () => {
+  it("uses all-fields search when generated asset output has no declared schema", () => {
     const indexes = [
       {
         config: { name: "full_text_index_v0", type: "full_text" },
@@ -371,8 +394,40 @@ describe("table query builder UX", () => {
     } as TableStatus;
 
     expect(artifactRetrievalDefaults(indexes, [], tableStatus)).toEqual({
-      field: "text",
-      fields: ["text", "caption"],
+      searchFields: ["_all"],
+      projectionFields: ["text"],
+      returnMatches: true,
+    });
+  });
+
+  it("keeps asset-only retrieval identity-only by default", () => {
+    const indexes = [
+      {
+        config: { name: "full_text_index_v0", type: "full_text" },
+        shard_status: {},
+        status: { index_type: "full_text" },
+      },
+    ] as IndexStatus[];
+    const tableStatus = {
+      name: "docs",
+      indexes: {
+        full_text_index_v0: { name: "full_text_index_v0", type: "full_text" },
+      },
+      shards: {},
+      storage_status: {},
+      artifact_enrichments: [
+        {
+          name: "image_captions_v1",
+          kind: "asset",
+          field: "inline_url",
+          full_text_index: true,
+        },
+      ],
+    } as TableStatus;
+
+    expect(artifactRetrievalDefaults(indexes, [], tableStatus)).toEqual({
+      searchFields: ["_all"],
+      projectionFields: [],
       returnMatches: true,
     });
   });
@@ -417,8 +472,8 @@ describe("table query builder UX", () => {
     } as unknown as TableStatus;
 
     expect(artifactRetrievalDefaults(indexes, [], tableStatus)).toEqual({
-      field: "text",
-      fields: ["text"],
+      searchFields: ["text"],
+      projectionFields: ["text"],
       returnMatches: true,
     });
   });
@@ -546,15 +601,15 @@ describe("table query builder UX", () => {
     expect(
       artifactRetrievalDefaults(indexes, ["text_vectors", "caption_vectors"], tableStatus)
     ).toEqual({
-      field: "text",
-      fields: ["text", "caption"],
+      searchFields: ["text", "caption"],
+      projectionFields: ["text", "caption"],
       returnMatches: true,
     });
     expect(
       artifactRetrievalDefaults(indexes, ["text_vectors", "product_vectors"], tableStatus)
     ).toEqual({
-      field: "text",
-      fields: ["text"],
+      searchFields: ["text"],
+      projectionFields: ["text"],
       returnMatches: true,
       selectionError:
         "Artifact-backed and document-backed vector indexes cannot be searched together. Select indexes that return the same result type.",
@@ -574,14 +629,14 @@ describe("table query builder UX", () => {
   });
 
   it("round-trips field-scoped artifact text into the builder", () => {
-    expect(tableQueryInput({ full_text_search: { query: "text:singularity" } }, "text")).toBe(
+    expect(tableQueryInput({ full_text_search: { query: "text:singularity" } }, ["text"])).toBe(
       "singularity"
     );
-    expect(tableQueryInput({ full_text_search: { query: 'text:"event horizon"' } }, "text")).toBe(
+    expect(tableQueryInput({ full_text_search: { query: 'text:"event horizon"' } }, ["text"])).toBe(
       "event horizon"
     );
     expect(
-      tableQueryInput({ full_text_search: { match: "event horizon", field: "text" } }, "text")
+      tableQueryInput({ full_text_search: { match: "event horizon", field: "text" } }, ["text"])
     ).toBe("event horizon");
   });
 
@@ -593,7 +648,7 @@ describe("table query builder UX", () => {
       semanticQuery: "{}",
       filterQuery: "{}",
       includeProfile: false,
-      artifactSearchField: "text",
+      artifactSearchFields: ["text", "caption"],
       artifactProjectionFields: ["text", "caption"],
       returnArtifactMatches: true,
     });
@@ -628,6 +683,43 @@ describe("table query builder UX", () => {
         ["text", "caption"]
       )
     ).toBe("");
+  });
+
+  it("allows JSON-to-Builder conversion only when the request is lossless", () => {
+    const source = {
+      hierarchy: {},
+      fields: ["text"],
+      full_text_search: { field: "text", match: "event horizon" },
+      limit: 3,
+    };
+    const reordered = {
+      limit: 3,
+      full_text_search: { match: "event horizon", field: "text" },
+      fields: ["text"],
+      hierarchy: {},
+    };
+
+    expect(tableQueryBuilderConversionBlocker(source, reordered)).toBeNull();
+    expect(
+      tableQueryBuilderConversionBlocker(
+        {
+          ...source,
+          full_text_search: {
+            disjuncts: [
+              { field: "text", match: "event horizon" },
+              { field: "caption", match: "singularity" },
+            ],
+          },
+        },
+        reordered
+      )
+    ).toContain("without changing it");
+    expect(
+      tableQueryBuilderConversionBlocker(
+        { ...source, order_by: [{ field: "created_at", direction: "desc" }] } as typeof source,
+        reordered
+      )
+    ).toContain("without changing it");
   });
 
   it("shows Problem Details and Error messages instead of undefined", () => {
