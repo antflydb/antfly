@@ -70,6 +70,34 @@ pub fn isWriteOnlyConfigField(field: []const u8) bool {
     return std.ascii.eqlIgnoreCase(field, "producer_json");
 }
 
+/// Fields intentionally exposed by CreatedProviderConfig. Provider request
+/// objects are extensible and may acquire new credentials without this API
+/// layer knowing their names, so public responses must use a positive contract
+/// rather than reflecting every field that does not look secret.
+pub fn isAllowedCreatedProviderField(field: []const u8) bool {
+    return std.mem.eql(u8, field, "provider") or
+        std.mem.eql(u8, field, "model") or
+        std.mem.eql(u8, field, "models") or
+        std.mem.eql(u8, field, "project_id") or
+        std.mem.eql(u8, field, "location") or
+        std.mem.eql(u8, field, "region") or
+        std.mem.eql(u8, field, "url") or
+        std.mem.eql(u8, field, "api_url") or
+        std.mem.eql(u8, field, "dimension") or
+        std.mem.eql(u8, field, "dimensions") or
+        std.mem.eql(u8, field, "input_type") or
+        std.mem.eql(u8, field, "truncate") or
+        std.mem.eql(u8, field, "strip_new_lines") or
+        std.mem.eql(u8, field, "batch_size") or
+        std.mem.eql(u8, field, "temperature") or
+        std.mem.eql(u8, field, "max_tokens") or
+        std.mem.eql(u8, field, "top_p") or
+        std.mem.eql(u8, field, "top_k") or
+        std.mem.eql(u8, field, "frequency_penalty") or
+        std.mem.eql(u8, field, "presence_penalty") or
+        std.mem.eql(u8, field, "timeout");
+}
+
 fn isCommonField(field: []const u8) bool {
     return std.mem.eql(u8, field, "name") or
         std.mem.eql(u8, field, "type") or

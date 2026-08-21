@@ -1081,6 +1081,14 @@ fn appendPublicConfigValue(
             var first = true;
             var it = object.iterator();
             while (it.next()) |entry| {
+                if (field_name) |parent_field| {
+                    if ((std.mem.eql(u8, parent_field, "embedder") or
+                        std.mem.eql(u8, parent_field, "summarizer")) and
+                        !public_index_contract.isAllowedCreatedProviderField(entry.key_ptr.*))
+                    {
+                        continue;
+                    }
+                }
                 // Asset producers are intentionally opaque and may gain new
                 // provider-specific credential fields at any time. A
                 // deny-list cannot safely project them into a public response,
@@ -3884,9 +3892,17 @@ test "public index config encoders redact coverage incarnation" {
     );
 }
 
+test "created provider response allowlist covers the generated schema" {
+    inline for (@typeInfo(indexes_openapi.CreatedProviderConfig).@"struct".fields) |field| {
+        try std.testing.expect(public_index_contract.isAllowedCreatedProviderField(field.name));
+    }
+    try std.testing.expect(!public_index_contract.isAllowedCreatedProviderField("client_value"));
+    try std.testing.expect(!public_index_contract.isAllowedCreatedProviderField("settings"));
+}
+
 test "public index config encoders redact nested credentials" {
     const indexes_json =
-        \\{"embed_idx":{"type":"embeddings","dimension":384,"embedder":{"provider":"openai","model":"text-embedding-3-small","api_key":"sk-private","secret_key":"private-secret-key","url":"https://alice:private-password@example.com/v1","endpoint":"https://example.com/v1?auth=private-endpoint-auth","base_url":"https://example.com/oauth/callback#access_token=private-fragment-token"},"summarizer":{"provider":"gemini","model":"gemini-2.5-flash","api_key":"${secret:gemini_key}","api_url":"https://example.com/v1?access%5Fkey%5Fid=private-url-key"},"enrichments":[{"name":"asset_v1","kind":"asset","producer_json":"{\"provider\":\"s3\",\"secret_access_key\":\"unknown-provider-secret\",\"access_token\":\"private-token\",\"headers\":{\"Authorization\":\"Bearer private-auth\",\"X-Auth\":\"future-private-header\",\"Accept\":\"text/html\"},\"format\":\"html\"}"}]}}
+        \\{"embed_idx":{"type":"embeddings","dimension":384,"embedder":{"provider":"openai","model":"text-embedding-3-small","api_key":"sk-private","secret_key":"private-secret-key","url":"https://alice:private-password@example.com/v1","endpoint":"https://example.com/v1?auth=private-endpoint-auth","base_url":"https://example.com/oauth/callback#access_token=private-fragment-token","client_value":"private-unknown-field","settings":{"opaque":"private-nested-value"}},"summarizer":{"provider":"gemini","model":"gemini-2.5-flash","api_key":"${secret:gemini_key}","api_url":"https://example.com/v1?access%5Fkey%5Fid=private-url-key"},"enrichments":[{"name":"asset_v1","kind":"asset","producer_json":"{\"provider\":\"s3\",\"secret_access_key\":\"unknown-provider-secret\",\"access_token\":\"private-token\",\"headers\":{\"Authorization\":\"Bearer private-auth\",\"X-Auth\":\"future-private-header\",\"Accept\":\"text/html\"},\"format\":\"html\"}"}]}}
     ;
 
     const encoded_single = (try encodeSingleIndexConfig(std.testing.allocator, indexes_json, "embed_idx")).?;
@@ -3914,7 +3930,7 @@ test "public index config encoders retain credential-free provider urls" {
     defer std.testing.allocator.free(created);
     try ant_json.testing.expectEqualJsonText(
         std.testing.allocator,
-        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":384,\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\",\"url\":\"https://api.example.com/v1?api-version=2026-08-01#documentation\",\"endpoint\":\"https://gateway.example.com/v1?region=us-west-2\"}}",
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":384,\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\",\"url\":\"https://api.example.com/v1?api-version=2026-08-01#documentation\"}}",
         created,
     );
 }

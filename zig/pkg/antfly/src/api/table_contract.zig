@@ -845,6 +845,23 @@ test "table contract preserves embeddings create request fields" {
     );
 }
 
+test "table contract public response omits unknown nested provider fields" {
+    const config_json = try parseCreateIndexRequest(
+        std.testing.allocator,
+        "embed_idx",
+        "{\"type\":\"embeddings\",\"dimension\":384,\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\",\"client_value\":\"private-unknown-field\",\"settings\":{\"opaque\":\"private-nested-value\"}}}",
+    );
+    defer std.testing.allocator.free(config_json);
+
+    const response = try indexes_api.encodeCreatedIndexConfig(std.testing.allocator, "embed_idx", config_json);
+    defer std.testing.allocator.free(response);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":384,\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\"}}",
+        response,
+    );
+}
+
 test "table contract canonicalizes generated optional null fields" {
     var request = try parseCreateTableRequest(
         std.testing.allocator,
