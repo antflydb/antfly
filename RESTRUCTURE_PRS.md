@@ -230,43 +230,41 @@ work is reviewed and published as one PR. The older
 - Exclude: lake manifests and scanners.
 - Gates: object-store tests for memory, filesystem, S3, and GCS adapters.
 
-### R1: Relational schema and row-codec core
+### R1: Relational core and authoritative base rows
 
 - Branch: `feature/relational-core`
 - Worktree: `.worktrees/feature-relational-core`
 - Base: `origin/main`
+- PR: #502.
 - Historical anchors: PR #143 commits `0fb025e`, `f4345d7`, and `2d66400`.
 - Scope: relational storage mode, closed schemas, JSON column type, typed
   column catalog/capability, and only the generated schema artifacts implied by
   those changes; document-to-typed-cell projection; required/type validation;
-  order-preserving scalar encoding; and the versioned packed row codec.
-- Exclude: DB keyspace changes, read-path materialization, public row APIs, and
-  indexes, SQL, and constraints.
-- Gates: deterministic OpenAPI regeneration and 11 focused relational schema,
-  projection, ordering, codec round-trip, escaping, and corruption tests.
+  order-preserving scalar encoding; the versioned packed row codec; runtime
+  schema derivation; a dedicated relational base-row keyspace and storage
+  facade; authoritative packed-row writes and strict point/scan
+  materialization; normal transaction commit and orphaned-intent recovery;
+  split/merge cleanup; and hydration for existing derived-index, enrichment,
+  resolution, identity, filter, and rebuild consumers.
+- Exclude: relational secondary indexes and constraint lifecycle, distributed
+  foreign keys, typed row APIs, SQL binding/lowering, catalog routing, and
+  DB-aware portable relational backup/restore. Generic portable backup fails
+  closed for relational schemas and rows until the DB-aware path lands.
+- Gates: 44 focused relational schema, projection, codec, runtime lifecycle,
+  replay, mode-transition, and backup-boundary tests; the complete DB suite;
+  formatting; and generated checks.
 
-The schema/contract and projection/codec changes are the branch's two logical
-AJ-authored commits and are reviewed and published as one PR. The existing
-`feature/relational-base-rows` worktree is only a development checkpoint; it
-does not represent another PR in this extraction. Any future authoritative
-base-row keyspace work begins only after R1 and is outside the current split.
-
-### R2: Authoritative relational base rows
-
-- Branch: `feature/relational-base-rows`
-- Worktree: `.worktrees/feature-relational-base-rows`
-- Parent: R1
-- Scope: dedicated base-row keyspace, typed row codec, scans, transactions,
-  replay, split/merge behavior, and derived-index hydration from base rows.
-- Exclude: public row APIs, SQL, and foreign keys.
-- Gates: DB tests, split/merge tests, replay tests, and relational storage
-  benchmarks as non-blocking evidence.
+The current surgical state of the mega branch's minimal usable relational
+storage path is reviewed and published as one PR. The former R2 base-row slice
+is folded into R1 rather than published as a second branch. The existing
+`feature/relational-base-rows` worktree is only a development checkpoint and
+does not represent another PR in this extraction.
 
 ### R3: Relational index and constraint lifecycle
 
 - Branch: `feature/relational-indexes`
 - Worktree: `.worktrees/feature-relational-indexes`
-- Parent: R2
+- Parent: R1
 - Scope: primary/unique/covering indexes, generation records, rebuild/repair,
   and schema mutation lifecycle.
 - Exclude: distributed foreign-key execution.
@@ -285,7 +283,7 @@ base-row keyspace work begins only after R1 and is outside the current split.
 
 - Branch: `feature/rows-read-api`
 - Worktree: `.worktrees/feature-rows-read-api`
-- Parent: R2
+- Parent: R1
 - Scope: row execution contract plus get/query/aggregate/window/join/lateral
   read plans and endpoints.
 - Exclude: writes, conflict actions, SQL, and lake routing.
