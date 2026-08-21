@@ -275,9 +275,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   const [queryMode, setQueryMode] = useState<"builder" | "json">("builder");
 
   const artifactRetrieval = useMemo(
-    () => artifactRetrievalDefaults(indexes, queryIndexes, tableStatus),
-    [indexes, queryIndexes, tableStatus]
+    () => artifactRetrievalDefaults(indexes, hasSemanticQuery ? queryIndexes : [], tableStatus),
+    [indexes, hasSemanticQuery, queryIndexes, tableStatus]
   );
+  const artifactSelectionError = hasSemanticQuery ? artifactRetrieval?.selectionError : undefined;
 
   const semanticQueryRequest = useMemo(() => {
     return buildTableQueryRequest({
@@ -288,6 +289,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       filterQuery,
       includeProfile,
       artifactSearchField: artifactRetrieval?.field,
+      artifactProjectionFields: artifactRetrieval?.fields,
       returnArtifactMatches: artifactRetrieval?.returnMatches,
     });
   }, [
@@ -358,7 +360,14 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     try {
       const response = await api.indexes.list(tableName);
       if (activeTableName.current !== tableName) return;
-      setIndexes(response as IndexStatus[]);
+      const nextIndexes = (response ?? []) as IndexStatus[];
+      const liveVectorIndexes = new Set(
+        nextIndexes
+          .filter((index) => index.config.type === "embeddings")
+          .map((index) => index.config.name)
+      );
+      setIndexes(nextIndexes);
+      setQueryIndexes((current) => current.filter((name) => liveVectorIndexes.has(name)));
     } catch (e) {
       if (activeTableName.current !== tableName) return;
       setError(`Failed to fetch indexes for table ${tableName}.`);
@@ -444,7 +453,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   };
 
   const handleIndexCreated = () => {
-    fetchIndexes();
+    void Promise.all([fetchIndexes(), fetchTableSchema()]);
   };
 
   const handleOpenDropDialog = (index: IndexStatus) => {
@@ -459,8 +468,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   const handleDropIndex = async () => {
     if (!tableName || !selectedIndex) return;
     try {
-      await api.indexes.drop(tableName, selectedIndex.config.name);
-      fetchIndexes();
+      const droppedIndexName = selectedIndex.config.name;
+      await api.indexes.drop(tableName, droppedIndexName);
+      setQueryIndexes((current) => current.filter((name) => name !== droppedIndexName));
+      await Promise.all([fetchIndexes(), fetchTableSchema()]);
       handleCloseDropDialog();
     } catch (e) {
       setError(`Failed to drop index ${selectedIndex.config.name}.`);
@@ -480,6 +491,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     if (!tableName) return;
     setError(null);
     try {
+      if (queryMode === "builder" && artifactSelectionError) {
+        setError(artifactSelectionError);
+        return;
+      }
       const queryRequest = queryMode === "json" ? parsedJsonQuery : semanticQueryRequest;
       if (!queryRequest) {
         setError("The query editor must contain one JSON object.");
@@ -493,7 +508,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       setError(tableQueryErrorMessage(e, `Failed to run query on table ${tableName}.`));
       console.error(e);
     }
-  }, [tableName, queryMode, parsedJsonQuery, semanticQueryRequest]);
+  }, [tableName, queryMode, parsedJsonQuery, semanticQueryRequest, artifactSelectionError]);
 
   // Global Ctrl+Enter handler for search section
   useEffect(() => {
@@ -1000,9 +1015,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                       <AccordionContent className="pb-3 pt-1 space-y-2.5">
                         {artifactRetrieval && selectedFields.length === 0 && (
                           <p className="text-xs text-muted-foreground">
-                            Artifact retrieval defaults to the {artifactRetrieval.field} field so
-                            source files and inline URLs are not returned. Select fields here to
-                            override that projection.
+                            Artifact retrieval defaults to the {artifactRetrieval.fields.join(", ")}{" "}
+                            {artifactRetrieval.fields.length === 1 ? "field" : "fields"} so source
+                            files and inline URLs are not returned. Select fields here to override
+                            that projection.
                           </p>
                         )}
                         <Input
@@ -1092,6 +1108,13 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                                 >
                                   Learn more about RRF ranking
                                 </a>
+                              </AlertDescription>
+                            </Alert>
+                          )}
+                          {artifactSelectionError && (
+                            <Alert variant="destructive" className="py-1.5 px-3">
+                              <AlertDescription className="text-xs">
+                                {artifactSelectionError}
                               </AlertDescription>
                             </Alert>
                           )}
@@ -1208,7 +1231,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
             <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
               <Button
                 onClick={handleRunQuery}
-                disabled={queryMode === "json" && !isJsonQueryValid}
+                disabled={
+                  (queryMode === "json" && !isJsonQueryValid) ||
+                  (queryMode === "builder" && Boolean(artifactSelectionError))
+                }
                 size="lg"
               >
                 Run Query

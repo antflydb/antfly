@@ -8,6 +8,7 @@ export interface TableQueryBuilderState {
   filterQuery: string;
   includeProfile: boolean;
   artifactSearchField?: string;
+  artifactProjectionFields?: string[];
   returnArtifactMatches?: boolean;
 }
 
@@ -25,7 +26,9 @@ type ArtifactEnrichment = NonNullable<TableStatus["artifact_enrichments"]>[numbe
 
 export interface ArtifactRetrievalDefaults {
   field: string;
+  fields: string[];
   returnMatches: boolean;
+  selectionError?: string;
 }
 
 export function artifactRetrievalDefaults(
@@ -33,30 +36,40 @@ export function artifactRetrievalDefaults(
   selectedVectorIndexes: string[],
   tableStatus?: TableStatus | null
 ): ArtifactRetrievalDefaults | null {
+  // The list endpoint owns membership. Table status supplies richer enrichment
+  // metadata, but may briefly lag a create/drop operation.
   const configs = new Map(indexes.map((index) => [index.config.name, index.config]));
-  for (const [name, config] of Object.entries(tableStatus?.indexes ?? {})) {
-    configs.set(name, config);
-  }
   const candidateNames =
     selectedVectorIndexes.length > 0
       ? selectedVectorIndexes.filter((name) => configs.get(name)?.type === "embeddings")
       : [...configs].filter(([, config]) => config.type === "full_text").map(([name]) => name);
 
   const tableEnrichments = tableStatus?.artifact_enrichments ?? [];
+  const artifactFields = new Set<string>();
+  let artifactIndexCount = 0;
+  let ordinaryIndexCount = 0;
 
   for (const name of candidateNames) {
     const config = configs.get(name) as ArtifactAwareIndexConfig | undefined;
     if (!config) continue;
 
-    const enrichments = structuredEnrichments(config.enrichments);
-    if (config.type === "embeddings" && config.source_artifact_name) {
+    const enrichments = structuredEnrichments(
+      tableStatus?.indexes?.[name]?.enrichments ?? config.enrichments
+    );
+    if (config.type === "embeddings") {
+      if (!config.source_artifact_name) {
+        ordinaryIndexCount++;
+        continue;
+      }
       const sourceEnrichment = findEmbeddingSourceEnrichment(config, enrichments, tableEnrichments);
-      return {
-        field: sourceEnrichment?.field?.trim() || "text",
-        returnMatches: true,
-      };
+      artifactFields.add(sourceEnrichment?.field?.trim() || "text");
+      artifactIndexCount++;
+      continue;
     }
 
+    // A table-level full-text artifact enrichment is relevant to full-text
+    // candidates, but must never turn an unrelated vector index into an
+    // artifact-backed index.
     const allEnrichments = [...enrichments, ...tableEnrichments];
     const artifactEnrichment =
       allEnrichments.find(
@@ -71,13 +84,25 @@ export function artifactRetrievalDefaults(
       );
 
     if (artifactEnrichment || config.artifact_name) {
-      return {
-        field: artifactEnrichment?.field?.trim() || config.field?.trim() || "text",
-        returnMatches: true,
-      };
+      artifactFields.add(artifactEnrichment?.field?.trim() || config.field?.trim() || "text");
+      artifactIndexCount++;
+    } else {
+      ordinaryIndexCount++;
     }
   }
-  return null;
+
+  if (artifactIndexCount === 0) return null;
+  const fields = [...artifactFields];
+  const defaults: ArtifactRetrievalDefaults = {
+    field: fields[0] ?? "text",
+    fields,
+    returnMatches: true,
+  };
+  if (selectedVectorIndexes.length > 0 && ordinaryIndexCount > 0) {
+    defaults.selectionError =
+      "Artifact-backed and document-backed vector indexes cannot be searched together. Select indexes that return the same result type.";
+  }
+  return defaults;
 }
 
 function structuredEnrichments(enrichments: unknown): ArtifactEnrichment[] {
@@ -187,6 +212,7 @@ export function buildTableQueryRequest({
   filterQuery,
   includeProfile,
   artifactSearchField,
+  artifactProjectionFields,
   returnArtifactMatches = false,
 }: TableQueryBuilderState): QueryRequest {
   const request: QueryRequest = {};
@@ -204,7 +230,14 @@ export function buildTableQueryRequest({
   if (selectedFields.length > 0) {
     request.fields = selectedFields;
   } else if (returnArtifactMatches && artifactSearchField) {
-    request.fields = [artifactSearchField];
+    request.fields = Array.from(
+      new Set(
+        (artifactProjectionFields?.length
+          ? artifactProjectionFields
+          : [artifactSearchField]
+        ).filter((field) => field.trim().length > 0)
+      )
+    );
   }
   if (returnArtifactMatches) {
     request.hierarchy = {};

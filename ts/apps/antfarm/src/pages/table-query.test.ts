@@ -87,12 +87,13 @@ describe("buildTableQueryRequest", () => {
         filterQuery: "{}",
         includeProfile: false,
         artifactSearchField: "text",
+        artifactProjectionFields: ["text", "caption", "text"],
         returnArtifactMatches: true,
       })
     ).toEqual({
       indexes: ["document_vectors"],
       semantic_search: "singularity",
-      fields: ["text"],
+      fields: ["text", "caption"],
       hierarchy: {},
       limit: 3,
     });
@@ -226,10 +227,12 @@ describe("table query builder UX", () => {
 
     expect(artifactRetrievalDefaults(indexes, [], tableStatus)).toEqual({
       field: "text",
+      fields: ["text"],
       returnMatches: true,
     });
     expect(artifactRetrievalDefaults(indexes, ["document_vectors"], tableStatus)).toEqual({
       field: "text",
+      fields: ["text"],
       returnMatches: true,
     });
   });
@@ -261,7 +264,146 @@ describe("table query builder UX", () => {
 
     expect(artifactRetrievalDefaults(indexes, [], tableStatus)).toEqual({
       field: "text",
+      fields: ["text"],
       returnMatches: true,
+    });
+  });
+
+  it("does not treat an ordinary vector index as artifact-backed because of table enrichments", () => {
+    const indexes = [
+      {
+        config: { name: "product_vectors", type: "embeddings", field: "embedding" },
+        shard_status: {},
+        status: { index_type: "embeddings" },
+      },
+    ] as IndexStatus[];
+    const tableStatus = {
+      name: "products",
+      indexes: {
+        product_vectors: {
+          name: "product_vectors",
+          type: "embeddings",
+          field: "embedding",
+          embedding_name: "stale_dense_v1",
+          source_artifact_name: "document_chunks_v1",
+          enrichments: [
+            {
+              name: "stale_dense_v1",
+              kind: "embedding",
+              field: "text",
+              source_artifact_name: "document_chunks_v1",
+            },
+          ],
+        },
+      },
+      shards: {},
+      storage_status: {},
+      artifact_enrichments: [
+        {
+          name: "document_chunks_v1",
+          kind: "chunk",
+          field: "text",
+          full_text_index: true,
+        },
+      ],
+    } as TableStatus;
+
+    expect(artifactRetrievalDefaults(indexes, ["product_vectors"], tableStatus)).toBeNull();
+  });
+
+  it("uses live index membership instead of stale table details", () => {
+    const tableStatus = {
+      name: "docs",
+      indexes: {
+        removed_vectors: {
+          name: "removed_vectors",
+          type: "embeddings",
+          source_artifact_name: "document_chunks_v1",
+        },
+      },
+      shards: {},
+      storage_status: {},
+    } as TableStatus;
+
+    expect(artifactRetrievalDefaults([], ["removed_vectors"], tableStatus)).toBeNull();
+  });
+
+  it("projects every artifact field and rejects mixed vector result types", () => {
+    const indexes = [
+      {
+        config: {
+          name: "text_vectors",
+          type: "embeddings",
+          source_artifact_name: "text_chunks_v1",
+        },
+        shard_status: {},
+        status: { index_type: "embeddings" },
+      },
+      {
+        config: {
+          name: "caption_vectors",
+          type: "embeddings",
+          source_artifact_name: "image_assets_v1",
+        },
+        shard_status: {},
+        status: { index_type: "embeddings" },
+      },
+      {
+        config: { name: "product_vectors", type: "embeddings", field: "embedding" },
+        shard_status: {},
+        status: { index_type: "embeddings" },
+      },
+    ] as IndexStatus[];
+    const tableStatus = {
+      name: "docs",
+      indexes: {
+        text_vectors: {
+          name: "text_vectors",
+          type: "embeddings",
+          embedding_name: "text_dense_v1",
+          source_artifact_name: "text_chunks_v1",
+        },
+        caption_vectors: {
+          name: "caption_vectors",
+          type: "embeddings",
+          embedding_name: "caption_dense_v1",
+          source_artifact_name: "image_assets_v1",
+        },
+        product_vectors: { name: "product_vectors", type: "embeddings", field: "embedding" },
+      },
+      shards: {},
+      storage_status: {},
+      artifact_enrichments: [
+        {
+          name: "text_dense_v1",
+          kind: "embedding",
+          field: "text",
+          source_artifact_name: "text_chunks_v1",
+        },
+        {
+          name: "caption_dense_v1",
+          kind: "embedding",
+          field: "caption",
+          source_artifact_name: "image_assets_v1",
+        },
+      ],
+    } as TableStatus;
+
+    expect(
+      artifactRetrievalDefaults(indexes, ["text_vectors", "caption_vectors"], tableStatus)
+    ).toEqual({
+      field: "text",
+      fields: ["text", "caption"],
+      returnMatches: true,
+    });
+    expect(
+      artifactRetrievalDefaults(indexes, ["text_vectors", "product_vectors"], tableStatus)
+    ).toEqual({
+      field: "text",
+      fields: ["text"],
+      returnMatches: true,
+      selectionError:
+        "Artifact-backed and document-backed vector indexes cannot be searched together. Select indexes that return the same result type.",
     });
   });
 
