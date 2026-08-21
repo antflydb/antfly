@@ -29,6 +29,7 @@ const lake_sidecar_selection = @import("lake_sidecar_selection.zig");
 const range_io = @import("lake_range_io.zig");
 const sidecar_manifest = @import("../segment/sidecar_manifest.zig");
 const rowsource = @import("../../storage/rowsource/types.zig");
+const rowsource_external = @import("../../storage/rowsource/external.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
 const snappy = @import("../../encoding/snappy.zig");
 pub const ObjectRangeCacheDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
@@ -916,11 +917,12 @@ fn buildPlainI64RowGroupBatchAlloc(
     if (row_group_ordinal >= file.row_groups.len) return error.ExternalSourceRowOutOfBounds;
     const row_group = file.row_groups[row_group_ordinal];
     const row_count: usize = std.math.cast(usize, row_group.row_count) orelse return error.InvalidParquetRowGroupBatch;
+    const binding = rowsource_bridge.bindingFromValidatedInventory(inventory);
 
     const row_refs = try alloc.alloc(rowsource.RowRef, row_count);
     errdefer alloc.free(row_refs);
     for (row_refs, 0..) |*row_ref, idx| {
-        row_ref.* = try rowsource_bridge.rowRefForInventoryRow(inventory, file_id, row_group_ordinal, idx);
+        row_ref.* = try rowsource_external.makeRowRef(binding, file_id, row_group_ordinal, idx);
     }
 
     const columns = try alloc.alloc(rowsource.ColumnVector, projected_chunks.len);
@@ -1163,13 +1165,12 @@ fn buildPlainI64RowGroupBatchAlloc(
         };
     }
 
-    const binding = try rowsource_bridge.bindingFromInventory(inventory);
     const batch = rowsource.ColumnBatch{
         .snapshot = binding.snapshot(),
         .row_refs = row_refs,
         .columns = columns,
     };
-    try rowsource_bridge.validateBatchAgainstInventory(inventory, batch);
+    try rowsource_bridge.validateBatchAgainstInventoryAlloc(alloc, inventory, batch);
 
     return .{
         .batch = batch,

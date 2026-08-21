@@ -38,10 +38,27 @@ pub const SnapshotReadRequest = struct {
     metadata_uri: []const u8,
     requested_snapshot_id: ?[]const u8 = null,
     cache: ?*lake_parquet_rowgroup.ObjectRangeCache = null,
+    limits: ReadLimits = .{},
 
     pub fn validate(self: SnapshotReadRequest) !void {
         if (self.source_id.len == 0) return error.InvalidIcebergSnapshotRead;
         if (self.metadata_uri.len == 0) return error.InvalidIcebergSnapshotRead;
+        try self.limits.validate();
+    }
+};
+
+pub const ReadLimits = struct {
+    metadata_object_bytes: u64 = 64 * 1024 * 1024,
+    manifest_list_object_bytes: u64 = 128 * 1024 * 1024,
+    manifest_object_bytes: u64 = 256 * 1024 * 1024,
+
+    pub fn validate(self: ReadLimits) !void {
+        if (self.metadata_object_bytes == 0 or
+            self.manifest_list_object_bytes == 0 or
+            self.manifest_object_bytes == 0)
+        {
+            return error.InvalidIcebergSnapshotRead;
+        }
     }
 };
 
@@ -160,7 +177,7 @@ pub fn readSnapshotInventoryAlloc(
     var client = request.client;
     client.allocator = alloc;
 
-    const metadata_bytes = try readFullObjectAlloc(alloc, &client, request.cache, request.metadata_uri, .iceberg_metadata, null);
+    const metadata_bytes = try readFullObjectAlloc(alloc, &client, request.cache, request.metadata_uri, .iceberg_metadata, null, request.limits.metadata_object_bytes);
     defer alloc.free(metadata_bytes);
     var metadata_plan = try iceberg_metadata.parseMetadataPlanAlloc(
         alloc,
@@ -171,7 +188,7 @@ pub fn readSnapshotInventoryAlloc(
     defer metadata_plan.deinit(alloc);
 
     const current_snapshot = metadata_plan.currentSnapshot();
-    const manifest_list_bytes = try readFullObjectAlloc(alloc, &client, request.cache, current_snapshot.manifest_list_uri, .iceberg_metadata, null);
+    const manifest_list_bytes = try readFullObjectAlloc(alloc, &client, request.cache, current_snapshot.manifest_list_uri, .iceberg_metadata, null, request.limits.manifest_list_object_bytes);
     defer alloc.free(manifest_list_bytes);
     var manifest_list = try iceberg_avro.parseManifestListAlloc(alloc, manifest_list_bytes);
     defer manifest_list.deinit(alloc);
@@ -195,6 +212,7 @@ pub fn readSnapshotInventoryAlloc(
                     manifest_entry.manifest_path,
                     .iceberg_metadata,
                     manifest_entry.manifest_length,
+                    request.limits.manifest_object_bytes,
                 );
                 defer alloc.free(manifest_bytes);
                 decoded_manifests[initialized] = .{
@@ -209,6 +227,7 @@ pub fn readSnapshotInventoryAlloc(
                     &client,
                     request.cache,
                     manifest_entry,
+                    request.limits.manifest_object_bytes,
                 );
                 if (active_deletes) return error.UnsupportedIcebergDeletes;
             },
@@ -231,7 +250,7 @@ pub fn readSnapshotInventoryAndDeletePlanAlloc(
     var client = request.client;
     client.allocator = alloc;
 
-    const metadata_bytes = try readFullObjectAlloc(alloc, &client, request.cache, request.metadata_uri, .iceberg_metadata, null);
+    const metadata_bytes = try readFullObjectAlloc(alloc, &client, request.cache, request.metadata_uri, .iceberg_metadata, null, request.limits.metadata_object_bytes);
     defer alloc.free(metadata_bytes);
     var metadata_plan = try iceberg_metadata.parseMetadataPlanAlloc(
         alloc,
@@ -242,7 +261,7 @@ pub fn readSnapshotInventoryAndDeletePlanAlloc(
     defer metadata_plan.deinit(alloc);
 
     const current_snapshot = metadata_plan.currentSnapshot();
-    const manifest_list_bytes = try readFullObjectAlloc(alloc, &client, request.cache, current_snapshot.manifest_list_uri, .iceberg_metadata, null);
+    const manifest_list_bytes = try readFullObjectAlloc(alloc, &client, request.cache, current_snapshot.manifest_list_uri, .iceberg_metadata, null, request.limits.manifest_list_object_bytes);
     defer alloc.free(manifest_list_bytes);
     var manifest_list = try iceberg_avro.parseManifestListAlloc(alloc, manifest_list_bytes);
     defer manifest_list.deinit(alloc);
@@ -270,6 +289,7 @@ pub fn readSnapshotInventoryAndDeletePlanAlloc(
                     manifest_entry.manifest_path,
                     .iceberg_metadata,
                     manifest_entry.manifest_length,
+                    request.limits.manifest_object_bytes,
                 );
                 defer alloc.free(manifest_bytes);
                 decoded_manifests[initialized] = .{
@@ -286,6 +306,7 @@ pub fn readSnapshotInventoryAndDeletePlanAlloc(
                     manifest_entry.manifest_path,
                     .iceberg_delete_metadata,
                     manifest_entry.manifest_length,
+                    request.limits.manifest_object_bytes,
                 );
                 defer alloc.free(manifest_bytes);
 
@@ -324,7 +345,7 @@ pub fn readSnapshotDeletePlanAlloc(
     var client = request.client;
     client.allocator = alloc;
 
-    const metadata_bytes = try readFullObjectAlloc(alloc, &client, request.cache, request.metadata_uri, .iceberg_metadata, null);
+    const metadata_bytes = try readFullObjectAlloc(alloc, &client, request.cache, request.metadata_uri, .iceberg_metadata, null, request.limits.metadata_object_bytes);
     defer alloc.free(metadata_bytes);
     var metadata_plan = try iceberg_metadata.parseMetadataPlanAlloc(
         alloc,
@@ -335,7 +356,7 @@ pub fn readSnapshotDeletePlanAlloc(
     defer metadata_plan.deinit(alloc);
 
     const current_snapshot = metadata_plan.currentSnapshot();
-    const manifest_list_bytes = try readFullObjectAlloc(alloc, &client, request.cache, current_snapshot.manifest_list_uri, .iceberg_metadata, null);
+    const manifest_list_bytes = try readFullObjectAlloc(alloc, &client, request.cache, current_snapshot.manifest_list_uri, .iceberg_metadata, null, request.limits.manifest_list_object_bytes);
     defer alloc.free(manifest_list_bytes);
     var manifest_list = try iceberg_avro.parseManifestListAlloc(alloc, manifest_list_bytes);
     defer manifest_list.deinit(alloc);
@@ -353,6 +374,7 @@ pub fn readSnapshotDeletePlanAlloc(
             manifest_entry.manifest_path,
             .iceberg_delete_metadata,
             manifest_entry.manifest_length,
+            request.limits.manifest_object_bytes,
         );
         defer alloc.free(manifest_bytes);
 
@@ -851,6 +873,7 @@ fn readDeleteManifestHasActiveDeletesAlloc(
     client: *object_storage.ObjectStorage,
     cache: ?*lake_parquet_rowgroup.ObjectRangeCache,
     manifest_entry: iceberg_avro.ManifestListEntry,
+    max_object_bytes: u64,
 ) !bool {
     const manifest_bytes = try readFullObjectAlloc(
         alloc,
@@ -859,6 +882,7 @@ fn readDeleteManifestHasActiveDeletesAlloc(
         manifest_entry.manifest_path,
         .iceberg_delete_metadata,
         manifest_entry.manifest_length,
+        max_object_bytes,
     );
     defer alloc.free(manifest_bytes);
 
@@ -1035,10 +1059,14 @@ fn readFullObjectAlloc(
     uri: []const u8,
     purpose: lake_range_io.RangePurpose,
     expected_byte_len: ?u64,
+    max_object_bytes: u64,
 ) ![]u8 {
     const location = try lake_range_io.objectLocationForUri(uri);
     var meta = try client.statObject(location.bucket, location.key);
     defer meta.deinit(alloc);
+    if (meta.content_length == 0 or meta.content_length > max_object_bytes) {
+        return error.IcebergMetadataObjectTooLarge;
+    }
     if (expected_byte_len) |expected| {
         if (meta.content_length != expected) return error.IcebergManifestLengthMismatch;
     }
@@ -1160,6 +1188,23 @@ test "iceberg snapshot reader plans inventory from object storage metadata and m
     try std.testing.expectEqual(@as(usize, 2), inventory.files.len);
     try std.testing.expectEqualStrings("s3://bucket/t/data/a.parquet", inventory.files[0].file_id);
     try std.testing.expectEqualStrings("s3://bucket/t/data/b.parquet", inventory.files[1].file_id);
+}
+
+test "iceberg snapshot reader rejects oversized metadata before fetching it" {
+    const alloc = std.testing.allocator;
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put = try client.putObject("bucket", "t/metadata/v1.metadata.json", "oversized", .{});
+    defer put.deinit(alloc);
+
+    try std.testing.expectError(error.IcebergMetadataObjectTooLarge, readSnapshotInventoryAlloc(alloc, .{
+        .client = client,
+        .source_id = "events",
+        .metadata_uri = "s3://bucket/t/metadata/v1.metadata.json",
+        .limits = .{ .metadata_object_bytes = 4 },
+    }));
 }
 
 test "iceberg snapshot reader reuses cached metadata and manifest ranges" {

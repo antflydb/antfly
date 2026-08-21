@@ -95,6 +95,9 @@ pub const ResolverOptions = struct {
     file_bucket: []const u8 = "antfly",
     object_uri_base: ?[]const u8 = null,
     footer_probe_bytes: u64 = 64 * 1024,
+    max_listing_pages: u32 = external_source.defaultMaxObjectListingPages,
+    max_listing_objects: usize = external_source.defaultMaxObjectListingObjects,
+    iceberg_read_limits: lake_iceberg_snapshot.ReadLimits = .{},
 };
 
 pub const Resolver = struct {
@@ -177,6 +180,8 @@ fn inventoryForBindingAlloc(
                 .source_uri = binding.source_uri,
                 .object_uri_base = source_options.object_uri_base,
                 .schema_fingerprint = binding.schema_fingerprint,
+                .max_pages = source_options.max_listing_pages,
+                .max_objects = source_options.max_listing_objects,
             });
             errdefer inventory.deinit(alloc);
             const enriched = try enrichInventoryWithObjectFootersAlloc(
@@ -196,6 +201,8 @@ fn inventoryForBindingAlloc(
                 opened_store.prefix,
                 binding.source_uri,
                 source_options.object_uri_base,
+                source_options.max_listing_pages,
+                source_options.max_listing_objects,
             );
             defer alloc.free(metadata_uri);
             var inventory = try lake_iceberg_snapshot.readSnapshotInventoryAlloc(alloc, .{
@@ -203,6 +210,7 @@ fn inventoryForBindingAlloc(
                 .source_id = binding.table_id,
                 .metadata_uri = metadata_uri,
                 .requested_snapshot_id = binding.snapshot_mode.pinnedSnapshotId(),
+                .limits = source_options.iceberg_read_limits,
             });
             errdefer inventory.deinit(alloc);
             try lake_iceberg_snapshot.pinInventoryDataFileObjectVersions(
@@ -278,6 +286,8 @@ fn icebergMetadataUriForOpenedStoreAlloc(
     prefix: []const u8,
     source_uri: []const u8,
     object_uri_base: ?[]const u8,
+    max_listing_pages: u32,
+    max_listing_objects: usize,
 ) ![]u8 {
     if (std.mem.endsWith(u8, source_uri, ".metadata.json")) return try alloc.dupe(u8, source_uri);
 
@@ -292,16 +302,22 @@ fn icebergMetadataUriForOpenedStoreAlloc(
 
     var best_key: ?[]u8 = null;
     defer if (best_key) |key| alloc.free(key);
-    var next_token: ?[]u8 = null;
-    defer if (next_token) |token| alloc.free(token);
+    if (max_listing_pages == 0 or max_listing_objects == 0) return error.InvalidExternalSourceSnapshot;
+    var pagination = external_source.ObjectListingPaginationGuard.init(max_listing_pages);
+    defer pagination.deinit(alloc);
+    var listed_entry_count: usize = 0;
     while (true) {
         var page = try storage_client.listObjects(bucket, .{
             .prefix = metadata_prefix,
             .recursive = true,
-            .continuation_token = next_token,
+            .continuation_token = pagination.currentToken(),
             .max_keys = 1000,
         });
         defer page.deinit(alloc);
+
+        listed_entry_count = std.math.add(usize, listed_entry_count, page.entries.len) catch
+            return error.ExternalSourceSnapshotTooLarge;
+        if (listed_entry_count > max_listing_objects) return error.ExternalSourceSnapshotTooLarge;
 
         for (page.entries) |entry| {
             if (!std.mem.endsWith(u8, entry.key, ".metadata.json")) continue;
@@ -312,11 +328,7 @@ fn icebergMetadataUriForOpenedStoreAlloc(
             }
         }
 
-        if (!try external_source.advanceObjectListingContinuationTokenAlloc(
-            alloc,
-            &next_token,
-            page.next_continuation_token,
-        )) break;
+        if (!try pagination.advanceAlloc(alloc, page.next_continuation_token)) break;
     }
 
     const key = best_key orelse return error.ExternalLakeSnapshotMismatch;

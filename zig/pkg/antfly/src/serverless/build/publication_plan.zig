@@ -440,7 +440,7 @@ test "table definition snapshot owns pinned external base source" {
 test "publication plan derives pinned external lake base source from schema" {
     const alloc = std.testing.allocator;
     var descriptor = (try pinnedExternalBaseSourceFromSchemaJsonAlloc(alloc,
-        \\{"version":5,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"iceberg","uri":"s3://bucket/warehouse/events","credentials":{"ref":"prod-lake-read","scope":"events"},"snapshot":{"mode":"snapshot_id","id":"iceberg-123"},"schema_fingerprint":"schema-v5","write_policy":"read_only"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":5,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"iceberg","uri":"s3://bucket/warehouse/events","credentials":{"ref":"prod-lake-read","scope":"warehouse/events"},"snapshot":{"mode":"snapshot_id","id":"iceberg-123"},"schema_fingerprint":"schema-v5","write_policy":"read_only"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     )).?;
     defer manifest_base_source.freeOwnedDescriptor(alloc, &descriptor);
 

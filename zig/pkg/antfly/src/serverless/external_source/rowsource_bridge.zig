@@ -22,6 +22,13 @@ const rowsource = @import("../../storage/rowsource/types.zig");
 
 pub fn bindingFromInventory(inventory: external_source.Inventory) !rowsource_external.Binding {
     try inventory.validate();
+    return bindingFromValidatedInventory(inventory);
+}
+
+/// Build a binding after the caller has validated the inventory once. Batch
+/// readers use this to avoid repeating the inventory-wide validation for every
+/// row reference they materialize.
+pub fn bindingFromValidatedInventory(inventory: external_source.Inventory) rowsource_external.Binding {
     return .{
         .format = switch (inventory.format) {
             .parquet => .parquet,
@@ -52,14 +59,30 @@ pub fn validateBatchAgainstInventory(
     inventory: external_source.Inventory,
     batch: rowsource.ColumnBatch,
 ) !void {
-    const binding = try bindingFromInventory(inventory);
+    return try validateBatchAgainstInventoryAlloc(std.heap.page_allocator, inventory, batch);
+}
+
+pub fn validateBatchAgainstInventoryAlloc(
+    alloc: std.mem.Allocator,
+    inventory: external_source.Inventory,
+    batch: rowsource.ColumnBatch,
+) !void {
+    try inventory.validateAlloc(alloc);
+    const binding = bindingFromValidatedInventory(inventory);
     try rowsource_external.validateExternalBatch(binding, batch);
+
+    var files_by_id = std.StringHashMapUnmanaged(*const external_source.FileEntry).empty;
+    defer files_by_id.deinit(alloc);
+    const file_capacity = std.math.cast(u32, inventory.files.len) orelse return error.InvalidExternalSourceInventory;
+    try files_by_id.ensureTotalCapacity(alloc, file_capacity);
+    for (inventory.files) |*file| files_by_id.putAssumeCapacity(file.file_id, file);
+
     for (batch.row_refs) |row_ref| {
         const external = switch (row_ref) {
             .external => |external| external,
             else => return error.InvalidExternalRowSource,
         };
-        const file = inventory.fileById(external.file_id) orelse return error.ExternalSourceFileNotFound;
+        const file = files_by_id.get(external.file_id) orelse return error.ExternalSourceFileNotFound;
         if (external.row_group_ordinal >= file.row_groups.len) return error.ExternalSourceRowOutOfBounds;
         if (external.row_ordinal >= file.row_groups[external.row_group_ordinal].row_count) {
             return error.ExternalSourceRowOutOfBounds;

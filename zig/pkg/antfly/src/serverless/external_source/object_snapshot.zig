@@ -25,6 +25,9 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const external_source = @import("types.zig");
 const object_storage = @import("../../storage/object_storage.zig");
 
+pub const default_max_listing_pages: u32 = 10_000;
+pub const default_max_listing_objects: usize = 1_000_000;
+
 pub const ListedObject = struct {
     key: []const u8,
     byte_len: u64,
@@ -47,6 +50,8 @@ pub const ObjectStorageSnapshotRequest = struct {
     object_uri_base: ?[]const u8 = null,
     schema_fingerprint: []const u8,
     max_keys: u32 = 1000,
+    max_pages: u32 = default_max_listing_pages,
+    max_objects: usize = default_max_listing_objects,
 
     pub fn validate(self: ObjectStorageSnapshotRequest) !void {
         if (self.bucket.len == 0) return error.InvalidExternalSourceSnapshot;
@@ -54,6 +59,8 @@ pub const ObjectStorageSnapshotRequest = struct {
         if (self.source_uri.len == 0) return error.InvalidExternalSourceSnapshot;
         if (self.schema_fingerprint.len == 0) return error.InvalidExternalSourceSnapshot;
         if (self.max_keys == 0) return error.InvalidExternalSourceSnapshot;
+        if (self.max_pages == 0 or self.max_objects == 0) return error.InvalidExternalSourceSnapshot;
+        if (self.max_keys > self.max_objects) return error.InvalidExternalSourceSnapshot;
     }
 };
 
@@ -82,17 +89,22 @@ pub fn planParquetPrefixInventoryFromObjectStorageAlloc(
 
     var client = request.client;
     client.allocator = alloc;
-    var next_token: ?[]u8 = null;
-    defer if (next_token) |token| alloc.free(token);
+    var pagination = PaginationGuard.init(request.max_pages);
+    defer pagination.deinit(alloc);
+    var listed_entry_count: usize = 0;
 
     while (true) {
         var page = try client.listObjects(request.bucket, .{
             .prefix = list_prefix,
             .recursive = true,
-            .continuation_token = next_token,
+            .continuation_token = pagination.currentToken(),
             .max_keys = request.max_keys,
         });
         defer page.deinit(alloc);
+
+        listed_entry_count = std.math.add(usize, listed_entry_count, page.entries.len) catch
+            return error.ExternalSourceSnapshotTooLarge;
+        if (listed_entry_count > request.max_objects) return error.ExternalSourceSnapshotTooLarge;
 
         for (page.entries) |entry| {
             if (!isParquetDataObject(entry.key)) continue;
@@ -113,7 +125,7 @@ pub fn planParquetPrefixInventoryFromObjectStorageAlloc(
             });
         }
 
-        if (!try advanceContinuationTokenAlloc(alloc, &next_token, page.next_continuation_token)) break;
+        if (!try pagination.advanceAlloc(alloc, page.next_continuation_token)) break;
     }
 
     return try planParquetPrefixInventoryWithObjectUriBaseAlloc(
@@ -130,26 +142,50 @@ pub fn planParquetPrefixInventoryFromObjectStorageAlloc(
 /// forward progress. Object-store implementations occasionally surface empty
 /// or repeated tokens on malformed pagination responses; accepting either
 /// would turn snapshot resolution into an unbounded loop.
-pub fn advanceContinuationTokenAlloc(
-    alloc: Allocator,
-    current: *?[]u8,
-    received: ?[]const u8,
-) !bool {
-    const token = received orelse {
-        if (current.*) |old| alloc.free(old);
-        current.* = null;
-        return false;
-    };
-    if (token.len == 0) return error.InvalidContinuationToken;
-    if (current.*) |old| {
-        if (std.mem.eql(u8, old, token)) return error.InvalidContinuationToken;
+pub const PaginationGuard = struct {
+    max_pages: u32,
+    pages_seen: u32 = 0,
+    current: ?[]const u8 = null,
+    seen: std.StringHashMapUnmanaged(void) = .empty,
+
+    pub fn init(max_pages: u32) PaginationGuard {
+        return .{ .max_pages = max_pages };
     }
 
-    const owned = try alloc.dupe(u8, token);
-    if (current.*) |old| alloc.free(old);
-    current.* = owned;
-    return true;
-}
+    pub fn deinit(self: *PaginationGuard, alloc: Allocator) void {
+        var keys = self.seen.keyIterator();
+        while (keys.next()) |key| alloc.free(@constCast(key.*));
+        self.seen.deinit(alloc);
+        self.* = undefined;
+    }
+
+    pub fn currentToken(self: PaginationGuard) ?[]const u8 {
+        return self.current;
+    }
+
+    /// Record one listing response, rejecting empty/repeated/cyclic tokens and
+    /// responses that would require more than the admitted page budget.
+    pub fn advanceAlloc(self: *PaginationGuard, alloc: Allocator, received: ?[]const u8) !bool {
+        if (self.max_pages == 0) return error.InvalidExternalSourceSnapshot;
+        self.pages_seen = std.math.add(u32, self.pages_seen, 1) catch
+            return error.ExternalSourceSnapshotTooLarge;
+        if (self.pages_seen > self.max_pages) return error.ExternalSourceSnapshotTooLarge;
+
+        const token = received orelse {
+            self.current = null;
+            return false;
+        };
+        if (token.len == 0) return error.InvalidContinuationToken;
+        if (self.pages_seen == self.max_pages) return error.ExternalSourceSnapshotTooLarge;
+
+        const owned = try alloc.dupe(u8, token);
+        errdefer alloc.free(owned);
+        const result = try self.seen.getOrPut(alloc, owned);
+        if (result.found_existing) return error.InvalidContinuationToken;
+        self.current = owned;
+        return true;
+    }
+};
 
 pub fn planParquetPrefixInventoryAlloc(
     alloc: Allocator,
@@ -420,15 +456,22 @@ test "raw parquet prefix snapshot changes with object version identity" {
 
 test "raw parquet prefix pagination requires advancing continuation tokens" {
     const alloc = std.testing.allocator;
-    var token: ?[]u8 = null;
-    defer if (token) |value| alloc.free(value);
+    var pagination = PaginationGuard.init(4);
+    defer pagination.deinit(alloc);
 
-    try std.testing.expect(try advanceContinuationTokenAlloc(alloc, &token, "page-2"));
-    try std.testing.expectEqualStrings("page-2", token.?);
-    try std.testing.expectError(error.InvalidContinuationToken, advanceContinuationTokenAlloc(alloc, &token, "page-2"));
-    try std.testing.expectError(error.InvalidContinuationToken, advanceContinuationTokenAlloc(alloc, &token, ""));
-    try std.testing.expect(!try advanceContinuationTokenAlloc(alloc, &token, null));
-    try std.testing.expect(token == null);
+    try std.testing.expect(try pagination.advanceAlloc(alloc, "page-2"));
+    try std.testing.expectEqualStrings("page-2", pagination.currentToken().?);
+    try std.testing.expect(try pagination.advanceAlloc(alloc, "page-3"));
+    try std.testing.expectError(error.InvalidContinuationToken, pagination.advanceAlloc(alloc, "page-2"));
+}
+
+test "raw parquet prefix pagination enforces its global page budget" {
+    const alloc = std.testing.allocator;
+    var pagination = PaginationGuard.init(2);
+    defer pagination.deinit(alloc);
+
+    try std.testing.expect(try pagination.advanceAlloc(alloc, "page-2"));
+    try std.testing.expectError(error.ExternalSourceSnapshotTooLarge, pagination.advanceAlloc(alloc, "page-3"));
 }
 
 test "raw parquet prefix snapshot rejects empty and unversioned listings" {

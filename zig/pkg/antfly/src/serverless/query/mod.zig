@@ -152,6 +152,7 @@ pub const LakeParquetPlainI64ObjectRangeRowGroupSource = lake_parquet_rowgroup.O
 pub const LakeScanPlanRequest = lake_scan_plan.Request;
 pub const LakeScanPlan = lake_scan_plan.Plan;
 pub const LakeIcebergSnapshotReadRequest = lake_iceberg_snapshot.SnapshotReadRequest;
+pub const LakeIcebergReadLimits = lake_iceberg_snapshot.ReadLimits;
 pub const LakeIcebergDeleteFile = lake_iceberg_snapshot.IcebergDeleteFile;
 pub const LakeIcebergDeletePlan = lake_iceberg_snapshot.IcebergDeletePlan;
 pub const LakeIcebergSnapshotWithDeletePlan = lake_iceberg_snapshot.SnapshotWithDeletePlan;
@@ -382,6 +383,7 @@ test "serverless query module compiles" {
     _ = LakeScanPlanRequest;
     _ = LakeScanPlan;
     _ = LakeIcebergSnapshotReadRequest;
+    _ = LakeIcebergReadLimits;
     _ = LakeIcebergDeleteFile;
     _ = LakeIcebergDeletePlan;
     _ = LakeIcebergSnapshotWithDeletePlan;

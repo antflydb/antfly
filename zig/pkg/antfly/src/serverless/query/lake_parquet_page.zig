@@ -25,6 +25,9 @@ const snappy = @import("../../encoding/snappy.zig");
 /// writers while preventing an external page header or compressed payload from
 /// requesting process-scale allocations.
 pub const max_uncompressed_page_bytes: usize = 64 * 1024 * 1024;
+/// A compact RLE level stream can claim billions of values while remaining a
+/// few bytes long. Bound decoded vectors independently from payload bytes.
+pub const max_values_per_page: usize = max_uncompressed_page_bytes / @sizeOf(i64);
 
 const CompactType = enum(u4) {
     stop = 0,
@@ -80,16 +83,19 @@ pub const Header = struct {
     data_is_compressed: bool = true,
 
     pub fn validatePlainDictionary(self: Header) !void {
+        try self.validateResourceLimits();
         if (self.page_type != .dictionary_page) return error.UnsupportedParquetPage;
         if (self.encoding != .plain) return error.UnsupportedParquetPage;
     }
 
     pub fn validatePlainRequired(self: Header) !void {
+        try self.validateResourceLimits();
         if (self.page_type != .data_page and self.page_type != .data_page_v2) return error.UnsupportedParquetPage;
         if (self.encoding != .plain) return error.UnsupportedParquetPage;
     }
 
     pub fn validateDictionaryRequired(self: Header) !void {
+        try self.validateResourceLimits();
         if (self.page_type != .data_page and self.page_type != .data_page_v2) return error.UnsupportedParquetPage;
         if (self.encoding != .rle_dictionary and self.encoding != .plain_dictionary) return error.UnsupportedParquetPage;
     }
@@ -102,6 +108,10 @@ pub const Header = struct {
     pub fn validateUncompressedDictionaryRequired(self: Header) !void {
         try self.validateDictionaryRequired();
         if (self.compressed_page_size != self.uncompressed_page_size) return error.UnsupportedParquetPage;
+    }
+
+    pub fn validateResourceLimits(self: Header) !void {
+        if (self.value_count > max_values_per_page) return error.ParquetPageTooLarge;
     }
 };
 
@@ -165,6 +175,7 @@ pub const NullableByteArrayValues = struct {
 pub fn parsePageHeader(bytes: []const u8) !ParsedHeader {
     var reader = Reader{ .bytes = bytes };
     const header = try parseHeaderStruct(&reader);
+    try header.validateResourceLimits();
     return .{ .header = header, .header_len = reader.cursor };
 }
 
@@ -951,6 +962,7 @@ pub fn decodeHybridLevelsAlloc(
     bit_width: u4,
     expected_count: usize,
 ) ![]u8 {
+    if (expected_count > max_values_per_page) return error.ParquetPageTooLarge;
     if (expected_count == 0) return try alloc.alloc(u8, 0);
     if (bit_width > 8) return error.UnsupportedParquetPage;
     const levels = try alloc.alloc(u8, expected_count);
@@ -994,6 +1006,7 @@ pub fn decodeHybridIndexesAlloc(
     bit_width: u6,
     expected_count: usize,
 ) ![]u32 {
+    if (expected_count > max_values_per_page) return error.ParquetPageTooLarge;
     if (expected_count == 0) return try alloc.alloc(u32, 0);
     if (bit_width > 32) return error.UnsupportedParquetPage;
     const indexes = try alloc.alloc(u32, expected_count);
@@ -3061,6 +3074,17 @@ test "parquet page parser decodes plain i64 data page values" {
     const values = try decodePlainI64Alloc(alloc, parsed.header, &payload);
     defer alloc.free(values);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, -1 }, values);
+}
+
+test "parquet page parser rejects value counts above the decoded-vector budget" {
+    const alloc = std.testing.allocator;
+    var header_bytes = try buildDataPageHeaderFixture(alloc, max_values_per_page + 1, 1);
+    defer header_bytes.deinit(alloc);
+    try std.testing.expectError(error.ParquetPageTooLarge, parsePageHeader(header_bytes.items));
+    try std.testing.expectError(
+        error.ParquetPageTooLarge,
+        decodeHybridLevelsAlloc(alloc, &[_]u8{ 2, 0 }, 1, max_values_per_page + 1),
+    );
 }
 
 test "parquet page parser decodes plain byte array values" {

@@ -216,14 +216,9 @@ fn ensureBucketAllowed(bucket: []const u8, allowed_buckets: []const []const u8) 
 }
 
 fn ensurePrefixAllowed(prefix: []const u8, allowed_prefix: []const u8) !void {
-    const allowed = std.mem.trimEnd(u8, allowed_prefix, "/");
-    const requested = std.mem.trimEnd(u8, prefix, "/");
-    if (allowed.len == 0) return;
-    if (std.mem.eql(u8, requested, allowed)) return;
-    if (requested.len > allowed.len and
-        std.mem.startsWith(u8, requested, allowed) and
-        requested[allowed.len] == '/') return;
-    return error.ExternalLakeCredentialScopeMismatch;
+    if (!catalog_binding.isPrefixWithinCredentialScope(prefix, allowed_prefix)) {
+        return error.ExternalLakeCredentialScopeMismatch;
+    }
 }
 
 fn resolveFilesystemSourcePathAlloc(

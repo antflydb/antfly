@@ -28,6 +28,8 @@ pub const CredentialRef = struct {
     /// Name of an Antfly-managed credential. Raw cloud keys must not be stored
     /// in catalog bindings.
     ref_id: []const u8,
+    /// Object-prefix path, relative to the bucket (or filesystem connection
+    /// root), within which this binding's source must remain.
     scope: []const u8 = &.{},
 
     pub fn validate(self: CredentialRef) !void {
@@ -113,7 +115,15 @@ pub const Binding = struct {
         if (self.table_id.len == 0) return error.InvalidExternalTableBinding;
         if (self.source_uri.len == 0) return error.InvalidExternalTableBinding;
         if (self.schema_fingerprint.len == 0) return error.InvalidExternalTableBinding;
-        if (self.credential_ref) |credential| try credential.validate();
+        if (self.credential_ref) |credential| {
+            try credential.validate();
+            if (credential.scope.len != 0) {
+                const source_prefix = sourcePrefix(self.source_uri) orelse return error.InvalidExternalTableBinding;
+                if (!isPrefixWithinCredentialScope(source_prefix, credential.scope)) {
+                    return error.ExternalLakeCredentialScopeMismatch;
+                }
+            }
+        }
         try self.snapshot_mode.validate();
     }
 
@@ -157,6 +167,28 @@ pub const Binding = struct {
         return descriptor;
     }
 };
+
+fn sourcePrefix(uri: []const u8) ?[]const u8 {
+    const rest = if (std.mem.startsWith(u8, uri, "s3://"))
+        uri["s3://".len..]
+    else if (std.mem.startsWith(u8, uri, "gs://"))
+        uri["gs://".len..]
+    else if (std.mem.startsWith(u8, uri, "file://"))
+        return std.mem.trim(u8, uri["file://".len..], "/")
+    else
+        return null;
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return "";
+    return std.mem.trim(u8, rest[slash + 1 ..], "/");
+}
+
+pub fn isPrefixWithinCredentialScope(prefix: []const u8, scope: []const u8) bool {
+    const requested = std.mem.trimEnd(u8, prefix, "/");
+    const allowed = std.mem.trimEnd(u8, scope, "/");
+    if (allowed.len == 0 or std.mem.eql(u8, requested, allowed)) return true;
+    return requested.len > allowed.len and
+        std.mem.startsWith(u8, requested, allowed) and
+        requested[allowed.len] == '/';
+}
 
 pub fn sourceKindForFormat(format: external_source.Format) rowsource.SourceKind {
     return switch (format) {
@@ -219,7 +251,7 @@ test "external table binding validates read-only iceberg source" {
         .table_id = "events",
         .format = .iceberg,
         .source_uri = "s3://bucket/warehouse/events",
-        .credential_ref = .{ .ref_id = "prod-lake-read", .scope = "events" },
+        .credential_ref = .{ .ref_id = "prod-lake-read", .scope = "warehouse/events" },
         .snapshot_mode = .{ .snapshot_id = "iceberg-123" },
         .schema_fingerprint = "schema-v2",
     };
@@ -233,6 +265,16 @@ test "external table binding validates read-only iceberg source" {
     const descriptor = try binding.toManifestBaseSource("iceberg-123", "files-0001");
     try descriptor.validate();
     try std.testing.expectEqualStrings("files-0001", descriptor.external_iceberg.file_inventory_artifact.?);
+}
+
+test "external source catalog admission rejects credential scope outside source prefix" {
+    try std.testing.expectError(error.ExternalLakeCredentialScopeMismatch, (Binding{
+        .table_id = "events",
+        .format = .iceberg,
+        .source_uri = "s3://bucket/warehouse/events",
+        .credential_ref = .{ .ref_id = "prod-lake-read", .scope = "events" },
+        .schema_fingerprint = "schema-v1",
+    }).validate());
 }
 
 test "external table binding supports raw parquet object-version snapshots" {
@@ -284,7 +326,7 @@ test "external table binding converts from runtime schema base source" {
         .table_id = "events",
         .format = .iceberg,
         .source_uri = "s3://bucket/warehouse/events",
-        .credential_ref = .{ .ref_id = "prod-lake-read", .scope = "events" },
+        .credential_ref = .{ .ref_id = "prod-lake-read", .scope = "warehouse/events" },
         .snapshot_mode = .{ .snapshot_id = "iceberg-123" },
         .schema_fingerprint = "schema-v5",
     };
@@ -296,7 +338,7 @@ test "external table binding converts from runtime schema base source" {
     try std.testing.expectEqualStrings("s3://bucket/warehouse/events", binding.source_uri);
     try std.testing.expect(binding.credential_ref != null);
     try std.testing.expectEqualStrings("prod-lake-read", binding.credential_ref.?.ref_id);
-    try std.testing.expectEqualStrings("events", binding.credential_ref.?.scope);
+    try std.testing.expectEqualStrings("warehouse/events", binding.credential_ref.?.scope);
     try std.testing.expectEqualStrings("iceberg-123", binding.snapshot_mode.snapshot_id);
     try std.testing.expectEqualStrings("schema-v5", binding.schema_fingerprint);
 }

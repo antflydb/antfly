@@ -19,6 +19,40 @@ const external_source = @import("types.zig");
 const magic = "AFXS";
 const version: u32 = 13;
 
+pub const DecodeLimits = struct {
+    max_artifact_bytes: usize = 256 * 1024 * 1024,
+    max_struct_allocation_bytes: usize = 256 * 1024 * 1024,
+
+    pub fn validate(self: DecodeLimits) !void {
+        if (self.max_artifact_bytes == 0 or self.max_struct_allocation_bytes == 0) {
+            return error.InvalidExternalSourceInventory;
+        }
+    }
+};
+
+const DecodeBudget = struct {
+    remaining_struct_bytes: usize,
+
+    fn admitCount(
+        self: *DecodeBudget,
+        comptime T: type,
+        bytes: []const u8,
+        cursor: usize,
+        raw_count: u32,
+    ) !usize {
+        if (cursor > bytes.len) return error.InvalidExternalSourceInventory;
+        const count: usize = @intCast(raw_count);
+        // Every encoded record consumes at least one byte. This cheap check
+        // rejects forged counts before asking the allocator for a large slice.
+        if (count > bytes.len - cursor) return error.InvalidExternalSourceInventory;
+        const allocation_bytes = std.math.mul(usize, count, @sizeOf(T)) catch
+            return error.ExternalSourceInventoryTooLarge;
+        if (allocation_bytes > self.remaining_struct_bytes) return error.ExternalSourceInventoryTooLarge;
+        self.remaining_struct_bytes -= allocation_bytes;
+        return count;
+    }
+};
+
 pub fn encodeAlloc(alloc: Allocator, inventory: external_source.Inventory) ![]u8 {
     try inventory.validate();
 
@@ -84,6 +118,17 @@ pub fn encodeAlloc(alloc: Allocator, inventory: external_source.Inventory) ![]u8
 }
 
 pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !external_source.Inventory {
+    return try decodeAllocWithLimits(alloc, bytes, .{});
+}
+
+pub fn decodeAllocWithLimits(
+    alloc: Allocator,
+    bytes: []const u8,
+    limits: DecodeLimits,
+) !external_source.Inventory {
+    try limits.validate();
+    if (bytes.len > limits.max_artifact_bytes) return error.ExternalSourceInventoryTooLarge;
+    var budget = DecodeBudget{ .remaining_struct_bytes = limits.max_struct_allocation_bytes };
     var cursor: usize = 0;
     if (bytes.len < magic.len + 4) return error.InvalidExternalSourceInventory;
     if (!std.mem.eql(u8, bytes[0..magic.len], magic)) return error.InvalidExternalSourceInventoryMagic;
@@ -102,7 +147,8 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !external_source.Invento
     errdefer alloc.free(snapshot_id);
     const schema_fingerprint = try readBytesAlloc(alloc, bytes, &cursor);
     errdefer alloc.free(schema_fingerprint);
-    const file_count = try readU32(bytes, &cursor);
+    const raw_file_count = try readU32(bytes, &cursor);
+    const file_count = try budget.admitCount(external_source.FileEntry, bytes, cursor, raw_file_count);
 
     const files = try alloc.alloc(external_source.FileEntry, file_count);
     errdefer alloc.free(files);
@@ -124,7 +170,10 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !external_source.Invento
         const byte_len = try readU64(bytes, &cursor);
         const row_count = try readU64(bytes, &cursor);
         const data_sequence_number: ?i64 = if (got_version >= 13) try readOptionalI64(bytes, &cursor) else null;
-        const partition_count = if (got_version >= 8) try readU32(bytes, &cursor) else 0;
+        const partition_count = if (got_version >= 8) blk: {
+            const raw_count = try readU32(bytes, &cursor);
+            break :blk try budget.admitCount(external_source.PartitionValue, bytes, cursor, raw_count);
+        } else 0;
         const partition_values = try alloc.alloc(external_source.PartitionValue, partition_count);
         var initialized_partitions: usize = 0;
         errdefer if (!keep_file) {
@@ -144,7 +193,8 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !external_source.Invento
             keep_partition = true;
             initialized_partitions += 1;
         }
-        const row_group_count = try readU32(bytes, &cursor);
+        const raw_row_group_count = try readU32(bytes, &cursor);
+        const row_group_count = try budget.admitCount(external_source.RowGroup, bytes, cursor, raw_row_group_count);
         const row_groups = try alloc.alloc(external_source.RowGroup, row_group_count);
         var initialized_row_groups: usize = 0;
         errdefer if (!keep_file) {
@@ -157,7 +207,8 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !external_source.Invento
             const row_group_rows = try readU64(bytes, &cursor);
             const file_offset = try readU64(bytes, &cursor);
             const total_byte_len = try readU64(bytes, &cursor);
-            const column_chunk_count = try readU32(bytes, &cursor);
+            const raw_column_chunk_count = try readU32(bytes, &cursor);
+            const column_chunk_count = try budget.admitCount(external_source.ColumnChunk, bytes, cursor, raw_column_chunk_count);
             const column_chunks = try alloc.alloc(external_source.ColumnChunk, column_chunk_count);
             var initialized_chunks: usize = 0;
             errdefer if (!keep_row_group) {
@@ -282,7 +333,7 @@ fn appendBytes(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), bytes: []cons
 
 fn readBytesAlloc(alloc: Allocator, bytes: []const u8, cursor: *usize) ![]u8 {
     const len = try readU32(bytes, cursor);
-    if (cursor.* + len > bytes.len) return error.InvalidExternalSourceInventory;
+    if (cursor.* > bytes.len or len > bytes.len - cursor.*) return error.InvalidExternalSourceInventory;
     const out = try alloc.dupe(u8, bytes[cursor.* .. cursor.* + len]);
     cursor.* += len;
     return out;
@@ -534,4 +585,20 @@ test "external source inventory codec round-trips file inventory" {
     try std.testing.expectEqual(@as(?f64, 1.25), decoded.files[0].row_groups[0].column_chunks[0].stats_min_f64);
     try std.testing.expectEqual(@as(?f64, 2.5), decoded.files[0].row_groups[0].column_chunks[0].stats_max_f64);
     try std.testing.expect(decoded.files[0].row_groups[0].column_chunks[0].nullable);
+}
+
+test "external source inventory codec rejects forged counts before allocation" {
+    const alloc = std.testing.allocator;
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+    try encoded.appendSlice(alloc, magic);
+    try appendU32(alloc, &encoded, version);
+    try encoded.append(alloc, @intFromEnum(external_source.Format.parquet));
+    try appendBytes(alloc, &encoded, "source");
+    try appendBytes(alloc, &encoded, "s3://bucket/source");
+    try appendBytes(alloc, &encoded, "snapshot");
+    try appendBytes(alloc, &encoded, "schema");
+    try appendU32(alloc, &encoded, std.math.maxInt(u32));
+
+    try std.testing.expectError(error.InvalidExternalSourceInventory, decodeAlloc(alloc, encoded.items));
 }
