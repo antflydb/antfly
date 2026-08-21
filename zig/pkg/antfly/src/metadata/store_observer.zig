@@ -243,10 +243,23 @@ fn observationLacksAuthoritativeCommittedRepairIdentity(
             const same_materialization = std.mem.eql(u8, prior_index.kind, next_index.kind) and
                 prior_index.coverage_generation == next_index.coverage_generation and
                 prior_index.coverage_config_hash == next_index.coverage_config_hash;
-            if (!same_materialization and !next_index.coverage_identity_ready) return true;
+            if (!same_materialization and
+                (!next_index.coverage_identity_ready or
+                    !runtimeObservationCausallySupersedes(prior_runtime, next_runtime))) return true;
         }
     }
     return false;
+}
+
+fn runtimeObservationCausallySupersedes(
+    prior: table_manager.RuntimeGroupStatusReport,
+    next: table_manager.RuntimeGroupStatusReport,
+) bool {
+    // Cross-process runtime reports publish Unix time. A generation alone is
+    // insufficient because it restarts with the producer process, so ambiguous,
+    // missing, equal, or regressed timestamps fail closed. A later full report
+    // (or protocol activation) releases the transition without extra I/O.
+    return prior.updated_at_ns != 0 and next.updated_at_ns > prior.updated_at_ns;
 }
 
 fn groupStatusesEqual(
@@ -671,6 +684,8 @@ test "store observer preserves committed repair facts while capability is unknow
         .group_id = 2,
         .store_id = 3,
         .node_id = 4,
+        .updated_at_ns = 200 * std.time.ns_per_ms,
+        .status_generation = 10,
         .source = "runtime",
         .freshness = "fresh",
         .indexes = existing_indexes[0..],
@@ -749,9 +764,52 @@ test "store observer preserves committed repair facts while capability is unknow
     );
     try std.testing.expect(records[0].runtime_statuses[0].indexes[0].repair_active_generation_serviceable);
 
-    // Once the producer supplies a complete replacement identity, it must not
-    // inherit repair state from the retired materialization.
+    // Missing causal metadata on either side is ambiguous and must fail closed.
     observed_indexes[0].coverage_identity_ready = true;
+    observed_runtime[0].updated_at_ns = 0;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try applyObservationsOwnedWithRepairStatus(std.testing.allocator, &records, &.{observation}, false),
+    );
+    try std.testing.expectEqual(@as(u64, 11), records[0].runtime_statuses[0].indexes[0].doc_count);
+    try std.testing.expectEqual(
+        table_manager.IndexRepairStatus.rebuilding,
+        records[0].runtime_statuses[0].indexes[0].repair_status.?,
+    );
+
+    observed_runtime[0].updated_at_ns = 300 * std.time.ns_per_ms;
+    records[0].runtime_statuses[0].updated_at_ns = 0;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try applyObservationsOwnedWithRepairStatus(std.testing.allocator, &records, &.{observation}, false),
+    );
+    try std.testing.expectEqual(@as(u64, 11), records[0].runtime_statuses[0].indexes[0].doc_count);
+    try std.testing.expectEqual(
+        table_manager.IndexRepairStatus.rebuilding,
+        records[0].runtime_statuses[0].indexes[0].repair_status.?,
+    );
+    records[0].runtime_statuses[0].updated_at_ns = 200 * std.time.ns_per_ms;
+
+    // A complete but older cached identity still has no deletion authority.
+    // Producer generations can reset, so even a larger generation does not
+    // override a regressed cross-process timestamp.
+    observed_runtime[0].updated_at_ns = 100 * std.time.ns_per_ms;
+    observed_runtime[0].status_generation = 99;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try applyObservationsOwnedWithRepairStatus(std.testing.allocator, &records, &.{observation}, false),
+    );
+    try std.testing.expectEqual(@as(u64, 11), records[0].runtime_statuses[0].indexes[0].doc_count);
+    try std.testing.expectEqual(
+        table_manager.IndexRepairStatus.rebuilding,
+        records[0].runtime_statuses[0].indexes[0].repair_status.?,
+    );
+
+    // Once the producer supplies a complete, newer replacement identity, it
+    // must not inherit repair state from the retired materialization. A lower
+    // process-local generation remains valid after a producer restart.
+    observed_runtime[0].updated_at_ns = 300 * std.time.ns_per_ms;
+    observed_runtime[0].status_generation = 1;
     try std.testing.expectEqual(
         @as(usize, 1),
         try applyObservationsOwnedWithRepairStatus(std.testing.allocator, &records, &.{observation}, false),

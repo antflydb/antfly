@@ -6544,6 +6544,8 @@ test "metadata service status reporting never proposes deletion of committed rep
         .group_id = 2,
         .store_id = 3,
         .node_id = 4,
+        .updated_at_ns = 200 * std.time.ns_per_ms,
+        .status_generation = 10,
         .indexes = existing_indexes[0..],
     }};
     var projected = [_]metadata_table_manager.StoreRecord{try metadata_table_manager.cloneStore(std.testing.allocator, .{
@@ -6648,10 +6650,24 @@ test "metadata service status reporting never proposes deletion of committed rep
     try std.testing.expect(storeHasRuntimeRepairStatus(projected[0]));
     try std.testing.expectEqual(@as(u64, 7), projected[0].runtime_statuses[0].indexes[0].coverage_generation);
 
-    // A replacement with a complete identity does not inherit stale repair
-    // state and may continue publishing its legacy-compatible heartbeat.
+    // A complete but older cached identity still cannot delete newer repair
+    // state, even if its process-local generation is numerically larger.
     observed_indexes[0].doc_count = 15;
     observed_indexes[0].coverage_identity_ready = true;
+    observed_runtime[0].updated_at_ns = 100 * std.time.ns_per_ms;
+    observed_runtime[0].status_generation = 99;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try reportStoreStatusesWithProjected(&service, &projected, &reports),
+    );
+    try std.testing.expectEqual(@as(usize, 0), service.upserts);
+    try std.testing.expect(storeHasRuntimeRepairStatus(projected[0]));
+    try std.testing.expectEqual(@as(u64, 7), projected[0].runtime_statuses[0].indexes[0].coverage_generation);
+
+    // A complete, newer identity is authoritative. A lower generation is valid
+    // because the producer may have restarted between the observations.
+    observed_runtime[0].updated_at_ns = 300 * std.time.ns_per_ms;
+    observed_runtime[0].status_generation = 1;
     try std.testing.expectEqual(
         @as(usize, 1),
         try reportStoreStatusesWithProjected(&service, &projected, &reports),
