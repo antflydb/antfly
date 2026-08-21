@@ -593,8 +593,8 @@ maintenance state, and RaBitQ checkpoints into one checksummed immutable file.
 It publishes that file, an empty next-generation WAL, and a checksummed
 `CURRENT` pointer in crash-safe order. Activation requires exact upstream
 source-sequence coverage. Any ordinary write disables the sidecar before its
-transaction starts, so this experiment cannot serve stale derived state while
-transaction-aware WAL capture is still absent.
+transaction starts, so the initial checkpoint experiment cannot serve stale
+derived state.
 
 On the internal public-ingest-shaped 5K x 1,536-dimensional workload, the
 segment was 2.10 MB versus 33.74 MB written by the HBC LSM build and took about
@@ -630,6 +630,41 @@ and non-fsync derived appends reduce that to 35 ms, and that an O(1)
 posting-kind latest-value index is necessary on the query path. They also show
 that a 37 MB tail is already too deep for this 2.1 MB segment: recovery and
 warm tail latency both regress substantially.
+
+The next prototype captures the posting ids touched by one authoritative HBC
+transaction, waits for that transaction to commit, then snapshots only those
+committed postings into one derived-WAL batch. Kind-specific tombstones prevent
+a missing posting-maintenance or quantized value from falling back to an older
+checkpoint value. Any failure before source commit cancels capture; any failure
+after source commit leaves the source journal authoritative, and exact sequence
+admission rejects the incomplete sidecar until replay repairs it.
+
+A three-sample qualification applied 1,000 real vector updates in ten batches
+after checkpointing. Each isolated sample produced 499 WAL records and an
+8.52 MB tail. Median total mutation time was 733.35 ms: 673.00 ms in the
+authoritative HBC apply and 58.56 ms capturing/appending the derived WAL. Full
+posting snapshots therefore added about 8.7% over the apply time and made the
+tail four times larger than the 2.10 MB checkpoint. This validates transaction
+capture but rejects full snapshots as the final steady-state encoding; use
+posting-local deltas and/or checkpoint much sooner.
+
+Query latency is part of the same qualification, not a separate microbenchmark.
+Freshly reopened LSM and freshly reopened segment-plus-WAL reads produced the
+same result digest and recall in every sample:
+
+| Reopened query path | Cold first query (median) | Warm p50 / p95 / p99 (median) | Warm QPS (median) | Recall@10 |
+| --- | ---: | ---: | ---: | ---: |
+| Authoritative HBC LSM | 9.72 ms | 0.194 / 0.542 / 1.348 ms | 3,717 | 0.444 |
+| Immutable segment + 8.52 MB WAL | 1.78 ms | 0.193 / 0.533 / 1.339 ms | 3,716 | 0.444 |
+
+The sidecar preserved ranked results and warm latency while cutting the cold
+query by about 82%. Activation of the oversized tail still took 37.00 ms
+median, reinforcing the shallow-tail checkpoint policy. Separately, the same
+fixed workload measured 0.696 recall before updates and 0.444 after updates on
+both the LSM and sidecar. The sidecar is not the cause, but online replacement
+quality is now a product-level follow-up: a storage-format win is not qualified
+until the authoritative HBC update path preserves recall as well as load and
+query latency.
 
 The efficient product design is therefore a packed immutable checkpoint plus
 a shallow, buffered derived WAL, not another general-purpose LSM. The primary
@@ -683,10 +718,12 @@ published.
    41.65 seconds with a 38.72--43.14 second range, but the single follow-up 1M
    lifecycle remains diagnostic because compaction scheduling produced
    materially different curves on the same host.
-5. Wire transaction-aware touched-posting capture to the authoritative replay
-   sequence, buffer derived WAL writes, and checkpoint before the tail harms
-   activation or p95. Preserve fallback to source replay across every crash
-   boundary and measure live, cold, and warm query latency plus recall.
+5. Replace the transaction-capture prototype's full posting snapshots with
+   posting-local deltas, wire its sequence to authoritative replay, and
+   checkpoint before the tail harms activation or p95. Preserve fallback to
+   source replay across every crash boundary. Diagnose the reproducible
+   0.696-to-0.444 recall loss after 1,000 vector replacements independently of
+   the sidecar.
 6. Compare eager single-read segment admission with mmap and footer/index-first
    range admission at 50K and 1M. Include page-cache/RSS accounting; do not
    trade a lower startup timer for unbounded mapped or decoded residency.

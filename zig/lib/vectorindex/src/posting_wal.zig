@@ -26,7 +26,7 @@ const posting_segment = @import("posting_segment.zig");
 pub const PostingId = posting_segment.PostingId;
 
 const magic: u32 = 0x41465057; // AFPW
-const version: u16 = 2;
+const version: u16 = 3;
 const min_supported_version: u16 = 1;
 const frame_header_len: usize = 48;
 const checksum_offset: usize = 12;
@@ -40,6 +40,9 @@ pub const RecordKind = enum(u8) {
     quantized_checkpoint = 4,
     tombstone = 5,
     posting_state = 6,
+    base_tombstone = 7,
+    quantized_checkpoint_tombstone = 8,
+    posting_state_tombstone = 9,
     commit = 255,
 };
 
@@ -93,6 +96,7 @@ pub const Writer = struct {
         payload: []const u8,
     ) !void {
         if (kind == .commit) return error.InvalidPostingWalRecord;
+        if (isTombstone(kind) and payload.len != 0) return error.InvalidPostingWalRecord;
         const starts_batch = self.open_batch == null;
         if (self.open_batch) |open_batch| {
             if (batch_id != open_batch) return error.InterleavedPostingWalBatch;
@@ -184,6 +188,7 @@ pub const Replay = struct {
                 open_batch_records = 0;
                 open_batch_max_sequence = 0;
             } else {
+                if (isTombstone(record.kind) and record.payload.len != 0) return error.InvalidPostingWalRecord;
                 if (open_batch) |batch_id| {
                     if (record.batch_id != batch_id) return error.InterleavedPostingWalBatch;
                     if (record.source_sequence < open_batch_max_sequence) return error.OutOfOrderPostingWalSequence;
@@ -253,6 +258,8 @@ pub const Replay = struct {
                 inline for (lookup_record_kinds) |kind| {
                     try self.latest_by_kind.put(self.alloc, postingKindKey(record.posting_id, kind), .tombstone);
                 }
+            } else if (tombstoneTarget(record.kind)) |target| {
+                try self.latest_by_kind.put(self.alloc, postingKindKey(record.posting_id, target), .tombstone);
             } else {
                 try self.latest_by_kind.put(
                     self.alloc,
@@ -290,6 +297,19 @@ const lookup_record_kinds = [_]RecordKind{
 
 fn postingKindKey(posting_id: PostingId, kind: RecordKind) u128 {
     return (@as(u128, posting_id) << 8) | @intFromEnum(kind);
+}
+
+fn tombstoneTarget(kind: RecordKind) ?RecordKind {
+    return switch (kind) {
+        .base_tombstone => .base,
+        .quantized_checkpoint_tombstone => .quantized_checkpoint,
+        .posting_state_tombstone => .posting_state,
+        else => null,
+    };
+}
+
+fn isTombstone(kind: RecordKind) bool {
+    return kind == .tombstone or tombstoneTarget(kind) != null;
 }
 
 pub const PostingIterator = struct {
@@ -360,6 +380,9 @@ fn decodeFrame(bytes: []const u8) !?DecodedFrame {
         @intFromEnum(RecordKind.quantized_checkpoint) => .quantized_checkpoint,
         @intFromEnum(RecordKind.tombstone) => .tombstone,
         @intFromEnum(RecordKind.posting_state) => .posting_state,
+        @intFromEnum(RecordKind.base_tombstone) => .base_tombstone,
+        @intFromEnum(RecordKind.quantized_checkpoint_tombstone) => .quantized_checkpoint_tombstone,
+        @intFromEnum(RecordKind.posting_state_tombstone) => .posting_state_tombstone,
         @intFromEnum(RecordKind.commit) => .commit,
         else => return error.InvalidPostingWalRecord,
     };
@@ -574,4 +597,19 @@ test "posting WAL distinguishes tombstones from missing overrides" {
     try std.testing.expectEqualStrings("state-v1", replay.resolve(7, .posting_state).value.payload);
     try std.testing.expect(replay.resolve(8, .posting_state) == .tombstone);
     try std.testing.expect(replay.resolve(9, .posting_state) == .missing);
+}
+
+test "posting WAL kind tombstones mask only their target" {
+    const alloc = std.testing.allocator;
+    var writer = Writer.init(alloc);
+    defer writer.deinit();
+    try writer.append(.base, 1, 7, 100, "base-v2");
+    try writer.append(.quantized_checkpoint_tombstone, 1, 7, 100, &.{});
+    try writer.commit(1, 100);
+
+    var replay = try Replay.parse(alloc, writer.bytes());
+    defer replay.deinit();
+    try std.testing.expectEqualStrings("base-v2", replay.resolve(7, .base).value.payload);
+    try std.testing.expect(replay.resolve(7, .quantized_checkpoint) == .tombstone);
+    try std.testing.expect(replay.resolve(7, .posting_state) == .missing);
 }
