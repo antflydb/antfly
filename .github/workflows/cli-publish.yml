@@ -55,6 +55,7 @@ jobs:
             "antfly_${version}_Linux_x86_64.tar.gz"
           do
             curl -fsSL \
+              --max-redirs 0 \
               -H "X-Antfly-Download-Channel: release-automation" \
               -H "X-Antfly-Audience: ci" \
               "${base}/${archive}" \

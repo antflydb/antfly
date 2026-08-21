@@ -29,7 +29,8 @@ require() {
 download_archive() {
     case "${ANTFLY_DOWNLOAD_CLASS:-}" in
         employee|ci)
-            curl -A "antfly-installer/1" -H "X-Antfly-Audience: ${ANTFLY_DOWNLOAD_CLASS}" "$@"
+            curl -A "antfly-installer/1" -H "X-Antfly-Audience: ${ANTFLY_DOWNLOAD_CLASS}" \
+                --max-redirs 0 "$@"
             ;;
         ""|external)
             curl -A "antfly-installer/1" "$@"
@@ -225,6 +226,8 @@ Environment:
   unset, external, and invalid values are measured as external traffic. Values
   are caller-asserted and can be omitted or forged. They are not authentication
   credentials and must not be treated as proof of employee or CI identity.
+  Labeled requests reject redirects so their metric headers stay on the
+  versioned releases.antfly.io request.
 
   By default, it installs to:
     - /usr/local/bin (if running as root)

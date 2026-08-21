@@ -77,10 +77,14 @@ employee_arguments="$(printf '%s\n' "$employee_files" | sed -n '1p')"
 assert_line "-A" "$employee_arguments"
 assert_line "antfly-installer/1" "$employee_arguments"
 assert_line "X-Antfly-Audience: employee" "$employee_arguments"
+assert_line "--max-redirs" "$employee_arguments"
+assert_line "0" "$employee_arguments"
 
 ci_files="$(run_case ci)"
 ci_arguments="$(printf '%s\n' "$ci_files" | sed -n '1p')"
 assert_line "X-Antfly-Audience: ci" "$ci_arguments"
+assert_line "--max-redirs" "$ci_arguments"
+assert_line "0" "$ci_arguments"
 
 external_files="$(run_case external)"
 external_arguments="$(printf '%s\n' "$external_files" | sed -n '1p')"
@@ -92,5 +96,17 @@ invalid_arguments="$(printf '%s\n' "$invalid_files" | sed -n '1p')"
 invalid_stderr="$(printf '%s\n' "$invalid_files" | sed -n '2p')"
 assert_no_audience_header "$invalid_arguments"
 grep -Fq "Ignoring invalid ANTFLY_DOWNLOAD_CLASS" "$invalid_stderr"
+
+publish_workflow="$repo_root/.github/workflows/cli-publish.yml"
+for expected in \
+  '--max-redirs 0' \
+  'X-Antfly-Download-Channel: release-automation' \
+  'X-Antfly-Audience: ci'
+do
+  grep -Fq -- "$expected" "$publish_workflow" || {
+    echo "missing release automation marker '$expected' in $publish_workflow" >&2
+    exit 1
+  }
+done
 
 echo "install download marker tests passed"
