@@ -17,7 +17,7 @@ const Allocator = std.mem.Allocator;
 const external_source = @import("types.zig");
 
 const magic = "AFXS";
-const version: u32 = 14;
+const version: u32 = 15;
 
 pub const DecodeLimits = struct {
     max_artifact_bytes: usize = 256 * 1024 * 1024,
@@ -120,6 +120,14 @@ pub fn encodeAlloc(alloc: Allocator, inventory: external_source.Inventory) ![]u8
         }
     }
 
+    try appendU32(alloc, &out, @intCast(inventory.deleted_row_groups.len));
+    for (inventory.deleted_row_groups) |group| {
+        try appendBytes(alloc, &out, group.file_id);
+        try appendU32(alloc, &out, group.row_group_ordinal);
+        try appendU32(alloc, &out, @intCast(group.row_ordinals.len));
+        for (group.row_ordinals) |ordinal| try appendU64(alloc, &out, ordinal);
+    }
+
     return try out.toOwnedSlice(alloc);
 }
 
@@ -140,7 +148,7 @@ pub fn decodeAllocWithLimits(
     if (!std.mem.eql(u8, bytes[0..magic.len], magic)) return error.InvalidExternalSourceInventoryMagic;
     cursor += magic.len;
     const got_version = try readU32(bytes, &cursor);
-    if (got_version != 2 and got_version != 3 and got_version != 4 and got_version != 5 and got_version != 6 and got_version != 7 and got_version != 8 and got_version != 9 and got_version != 10 and got_version != 11 and got_version != 12 and got_version != 13 and got_version != version) return error.UnsupportedExternalSourceInventoryVersion;
+    if (got_version != 2 and got_version != 3 and got_version != 4 and got_version != 5 and got_version != 6 and got_version != 7 and got_version != 8 and got_version != 9 and got_version != 10 and got_version != 11 and got_version != 12 and got_version != 13 and got_version != 14 and got_version != version) return error.UnsupportedExternalSourceInventoryVersion;
     if (cursor >= bytes.len) return error.InvalidExternalSourceInventory;
     const format = try decodeFormat(bytes[cursor]);
     cursor += 1;
@@ -312,6 +320,33 @@ pub fn decodeAllocWithLimits(
         initialized_files += 1;
     }
 
+    const deleted_row_group_count = if (got_version >= 15) blk: {
+        const raw_count = try readU32(bytes, &cursor);
+        break :blk try budget.admitCount(external_source.DeletedRowGroup, bytes, cursor, raw_count);
+    } else 0;
+    const deleted_row_groups = try alloc.alloc(external_source.DeletedRowGroup, deleted_row_group_count);
+    var initialized_deleted_groups: usize = 0;
+    errdefer {
+        for (deleted_row_groups[0..initialized_deleted_groups]) |*group| group.deinit(alloc);
+        if (deleted_row_groups.len > 0) alloc.free(deleted_row_groups);
+    }
+    for (deleted_row_groups) |*group| {
+        const file_id = try readBytesAlloc(alloc, bytes, &cursor);
+        errdefer alloc.free(file_id);
+        const row_group_ordinal = try readU32(bytes, &cursor);
+        const raw_ordinal_count = try readU32(bytes, &cursor);
+        const ordinal_count = try budget.admitCount(u64, bytes, cursor, raw_ordinal_count);
+        const row_ordinals = try alloc.alloc(u64, ordinal_count);
+        errdefer alloc.free(row_ordinals);
+        for (row_ordinals) |*ordinal| ordinal.* = try readU64(bytes, &cursor);
+        group.* = .{
+            .file_id = file_id,
+            .row_group_ordinal = row_group_ordinal,
+            .row_ordinals = row_ordinals,
+        };
+        initialized_deleted_groups += 1;
+    }
+
     if (cursor != bytes.len) return error.InvalidExternalSourceInventory;
 
     var inventory = external_source.Inventory{
@@ -321,6 +356,7 @@ pub fn decodeAllocWithLimits(
         .snapshot_id = snapshot_id,
         .schema_fingerprint = schema_fingerprint,
         .files = files,
+        .deleted_row_groups = deleted_row_groups,
     };
     errdefer inventory.deinit(alloc);
     try inventory.validate();
@@ -511,6 +547,7 @@ test "external source inventory codec round-trips file inventory" {
         .snapshot_id = try alloc.dupe(u8, "iceberg-123"),
         .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
         .files = try alloc.alloc(external_source.FileEntry, 1),
+        .deleted_row_groups = try alloc.alloc(external_source.DeletedRowGroup, 1),
     };
     defer inventory.deinit(alloc);
     inventory.files[0] = .{
@@ -559,6 +596,11 @@ test "external source inventory codec round-trips file inventory" {
             },
         }),
     };
+    inventory.deleted_row_groups[0] = .{
+        .file_id = try alloc.dupe(u8, "file-a.parquet"),
+        .row_group_ordinal = 0,
+        .row_ordinals = try alloc.dupe(u64, &.{ 0, 1 }),
+    };
 
     const encoded = try encodeAlloc(alloc, inventory);
     defer alloc.free(encoded);
@@ -599,6 +641,25 @@ test "external source inventory codec round-trips file inventory" {
     try std.testing.expectEqual(@as(?f64, 1.25), decoded.files[0].row_groups[0].column_chunks[0].stats_min_f64);
     try std.testing.expectEqual(@as(?f64, 2.5), decoded.files[0].row_groups[0].column_chunks[0].stats_max_f64);
     try std.testing.expect(decoded.files[0].row_groups[0].column_chunks[0].nullable);
+    try std.testing.expectEqual(@as(usize, 1), decoded.deleted_row_groups.len);
+    try std.testing.expectEqualStrings("file-a.parquet", decoded.deleted_row_groups[0].file_id);
+    try std.testing.expectEqualSlices(u64, &.{ 0, 1 }, decoded.deleted_row_groups[0].row_ordinals);
+    try std.testing.expect(decoded.isDeleted("file-a.parquet", 0, 1));
+
+    const owned_deleted_groups = inventory.deleted_row_groups;
+    inventory.deleted_row_groups = &.{};
+    defer inventory.deleted_row_groups = owned_deleted_groups;
+    const current_without_deletes = try encodeAlloc(alloc, inventory);
+    defer alloc.free(current_without_deletes);
+    // Version 14 ended immediately after the file inventory. Prove durable
+    // artifacts published before delete sets were introduced remain readable.
+    const legacy = try alloc.dupe(u8, current_without_deletes[0 .. current_without_deletes.len - @sizeOf(u32)]);
+    defer alloc.free(legacy);
+    std.mem.writeInt(u32, legacy[magic.len..][0..4], 14, .little);
+    var decoded_legacy = try decodeAlloc(alloc, legacy);
+    defer decoded_legacy.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), decoded_legacy.deleted_row_groups.len);
+    try std.testing.expectEqual(@as(usize, 1), decoded_legacy.files.len);
 }
 
 test "external source inventory codec rejects forged counts before allocation" {

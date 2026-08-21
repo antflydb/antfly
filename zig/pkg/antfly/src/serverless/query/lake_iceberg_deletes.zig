@@ -77,24 +77,29 @@ pub fn positionDeleteRowsToRowRefsAlloc(
 
     for (deletes) |delete_row| {
         try delete_row.validate();
-        const file = inventoryFileForDeletePath(inventory, delete_row.data_file_path) orelse {
-            return error.IcebergPositionDeleteDataFileNotFound;
-        };
-        if (file.row_groups.len == 0) return error.MissingIcebergPositionDeleteRowGroupMetadata;
-
-        const mapped = rowGroupPositionForFilePosition(file, delete_row.row_position) orelse {
-            return error.IcebergPositionDeleteRowOutOfBounds;
-        };
-        const row_ref = try rowsource_bridge.rowRefForInventoryRow(
-            inventory,
-            file.file_id,
-            mapped.row_group_ordinal,
-            mapped.row_ordinal,
-        );
+        const row_ref = try positionDeleteRowToRowRef(inventory, delete_row);
         if (!containsRowRef(out.items, row_ref)) try out.append(alloc, row_ref);
     }
 
     return try out.toOwnedSlice(alloc);
+}
+
+pub fn positionDeleteRowToRowRef(
+    inventory: external_source.Inventory,
+    delete_row: PositionDeleteRow,
+) !rowsource.RowRef {
+    try delete_row.validate();
+    const file = fileForDeletePath(inventory, delete_row.data_file_path) orelse
+        return error.IcebergPositionDeleteDataFileNotFound;
+    if (file.row_groups.len == 0) return error.MissingIcebergPositionDeleteRowGroupMetadata;
+    const mapped = rowGroupPositionForFilePosition(file, delete_row.row_position) orelse
+        return error.IcebergPositionDeleteRowOutOfBounds;
+    return try rowsource_bridge.rowRefForInventoryRow(
+        inventory,
+        file.file_id,
+        mapped.row_group_ordinal,
+        mapped.row_ordinal,
+    );
 }
 
 pub fn equalityDeleteScanResultsToRowRefsAlloc(
@@ -204,6 +209,60 @@ pub fn equalityKeyAlloc(
     return try out.toOwnedSlice(alloc);
 }
 
+pub fn equalityKeyFromBatchRowAlloc(
+    alloc: Allocator,
+    batch: rowsource.ColumnBatch,
+    row_idx: usize,
+    equality_columns: []const []const u8,
+) ![]u8 {
+    try validateEqualityColumns(equality_columns);
+    try batch.validate();
+    if (row_idx >= batch.rowCount()) return error.ExternalSourceRowOutOfBounds;
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    for (equality_columns) |column_name| {
+        const column = batch.findColumn(column_name) orelse return error.IcebergEqualityDeleteColumnNotFound;
+        if (column.nulls.isNull(row_idx)) {
+            try out.append(alloc, 0);
+            continue;
+        }
+        switch (column.values) {
+            .bytes => |values| try appendBytesEqualityKeyPart(alloc, &out, values[row_idx]),
+            .json, .vector_f32 => return error.UnsupportedIcebergEqualityDeleteColumn,
+            .i64 => |values| {
+                try out.append(alloc, 2);
+                var bytes: [8]u8 = undefined;
+                std.mem.writeInt(i64, &bytes, values[row_idx], .little);
+                try out.appendSlice(alloc, &bytes);
+            },
+            .f64 => |values| try appendF64EqualityKeyPart(alloc, &out, values[row_idx]),
+            .bool => |values| {
+                try out.append(alloc, 4);
+                try out.append(alloc, @intFromBool(values[row_idx]));
+            },
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendBytesEqualityKeyPart(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    try out.append(alloc, 1);
+    const len = std.math.cast(u64, value.len) orelse return error.IcebergEqualityDeleteSetTooLarge;
+    var len_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len_bytes, len, .little);
+    try out.appendSlice(alloc, &len_bytes);
+    try out.appendSlice(alloc, value);
+}
+
+fn appendF64EqualityKeyPart(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), number: f64) !void {
+    if (std.math.isNan(number)) return error.UnsupportedIcebergEqualityDeleteColumn;
+    try out.append(alloc, 3);
+    const canonical: f64 = if (number == 0) 0 else number;
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, @bitCast(canonical), .little);
+    try out.appendSlice(alloc, &bytes);
+}
+
 fn validateEqualityColumns(columns: []const []const u8) !void {
     if (columns.len == 0) return error.InvalidIcebergEqualityDeleteColumns;
     for (columns, 0..) |column, idx| {
@@ -242,7 +301,7 @@ const RowGroupPosition = struct {
     row_ordinal: u64,
 };
 
-fn inventoryFileForDeletePath(
+pub fn fileForDeletePath(
     inventory: external_source.Inventory,
     data_file_path: []const u8,
 ) ?external_source.FileEntry {

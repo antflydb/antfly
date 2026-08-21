@@ -74,6 +74,7 @@ pub fn planInventoryFromDataFilesAlloc(
     for (request.data_files) |file| {
         try file.validate();
         if (file.content != .data) return error.UnsupportedIcebergDeletes;
+        try validateResolvedManifestEntry(file);
         if (file.status != .deleted) active_count += 1;
     }
     if (active_count == 0) return error.EmptyIcebergInventory;
@@ -92,9 +93,9 @@ pub fn planInventoryFromDataFilesAlloc(
             const right = ctx[right_idx];
             const path_order = std.mem.order(u8, left.file_path, right.file_path);
             if (path_order != .eq) return path_order == .lt;
-            if (left.snapshot_id != right.snapshot_id) return left.snapshot_id < right.snapshot_id;
-            if (left.data_sequence_number != right.data_sequence_number) return left.data_sequence_number < right.data_sequence_number;
-            return left.file_sequence_number < right.file_sequence_number;
+            if (left.snapshot_id.? != right.snapshot_id.?) return left.snapshot_id.? < right.snapshot_id.?;
+            if (left.data_sequence_number.? != right.data_sequence_number.?) return left.data_sequence_number.? < right.data_sequence_number.?;
+            return left.file_sequence_number.? < right.file_sequence_number.?;
         }
     }.lessThan);
 
@@ -185,7 +186,7 @@ pub fn planInventoryFromSnapshotManifestsAlloc(
         if (manifest_entry.content != .data) continue;
         const decoded = try decodedManifestForPath(request.data_manifests, manifest_entry.manifest_path);
         for (decoded.manifest.entries) |entry| {
-            data_files[next_file] = entry;
+            data_files[next_file] = try resolveManifestEntry(entry, manifest_entry, request.metadata_plan.format_version);
             data_files[next_file].partition_spec_id = manifest_entry.partition_spec_id;
             next_file += 1;
         }
@@ -198,6 +199,118 @@ pub fn planInventoryFromSnapshotManifestsAlloc(
         .schema_fingerprint = request.metadata_plan.schema_fingerprint,
         .data_files = data_files,
     });
+}
+
+/// Resolve Iceberg manifest-entry inheritance while the owning manifest-list
+/// row and table format version are still available. Keeping nullable values
+/// through Avro decoding is essential: zero is a real sequence number for v1,
+/// not a safe stand-in for an inherited v2 value.
+pub fn resolveManifestEntry(
+    entry: iceberg_avro.DataFileEntry,
+    manifest_entry: iceberg_avro.ManifestListEntry,
+    format_version: u8,
+) !iceberg_avro.DataFileEntry {
+    if (format_version != 1 and format_version != 2) return error.UnsupportedIcebergMetadataVersion;
+    var resolved = entry;
+    if (format_version == 1) {
+        // snapshot_id is required in the v1 manifest-entry schema. Missing it
+        // is corruption, not an inheritance opportunity.
+        resolved.snapshot_id = entry.snapshot_id orelse return error.InvalidIcebergDataManifest;
+        resolved.data_sequence_number = 0;
+        resolved.file_sequence_number = 0;
+    } else {
+        // Unlike sequence numbers, snapshot_id is inherited whenever null.
+        resolved.snapshot_id = entry.snapshot_id orelse manifest_entry.added_snapshot_id orelse
+            return error.InvalidIcebergDataManifest;
+        const manifest_sequence = manifest_entry.sequence_number orelse
+            return error.InvalidIcebergDataManifest;
+        switch (entry.status) {
+            .added => {
+                resolved.data_sequence_number = entry.data_sequence_number orelse manifest_sequence;
+                resolved.file_sequence_number = entry.file_sequence_number orelse manifest_sequence;
+            },
+            .existing, .deleted => {
+                // A v2 table may still reference v1 manifests after upgrade.
+                // Their sequence columns are absent and the v2 manifest-list
+                // sequence is the initial sequence number (zero).
+                if (manifest_sequence == 0) {
+                    resolved.data_sequence_number = entry.data_sequence_number orelse 0;
+                    resolved.file_sequence_number = entry.file_sequence_number orelse 0;
+                } else if (entry.data_sequence_number == null or entry.file_sequence_number == null) {
+                    return error.InvalidIcebergDataManifest;
+                }
+            },
+        }
+    }
+    try validateResolvedManifestEntry(resolved);
+    return resolved;
+}
+
+test "iceberg v2 added entries inherit nullable manifest sequence fields" {
+    const manifest = iceberg_avro.ManifestListEntry{
+        .manifest_path = @constCast("metadata/m.avro"),
+        .manifest_length = 1,
+        .sequence_number = 42,
+        .added_snapshot_id = 12,
+    };
+    const entry = iceberg_avro.DataFileEntry{
+        .status = .added,
+        .file_path = @constCast("data/a.parquet"),
+        .file_format = @constCast("PARQUET"),
+        .record_count = 1,
+        .file_size_in_bytes = 1,
+    };
+
+    const resolved = try resolveManifestEntry(entry, manifest, 2);
+    try std.testing.expectEqual(@as(?i64, 12), resolved.snapshot_id);
+    try std.testing.expectEqual(@as(?i64, 42), resolved.data_sequence_number);
+    try std.testing.expectEqual(@as(?i64, 42), resolved.file_sequence_number);
+}
+
+test "iceberg v2 existing entries fail closed instead of inheriting sequence fields" {
+    const manifest = iceberg_avro.ManifestListEntry{
+        .manifest_path = @constCast("metadata/m.avro"),
+        .manifest_length = 1,
+        .sequence_number = 42,
+        .added_snapshot_id = 12,
+    };
+    const entry = iceberg_avro.DataFileEntry{
+        .status = .existing,
+        .file_path = @constCast("data/a.parquet"),
+        .file_format = @constCast("PARQUET"),
+        .record_count = 1,
+        .file_size_in_bytes = 1,
+    };
+
+    try std.testing.expectError(error.InvalidIcebergDataManifest, resolveManifestEntry(entry, manifest, 2));
+}
+
+test "iceberg v2 existing entries inherit snapshot id and upgraded v1 sequence zero" {
+    const manifest = iceberg_avro.ManifestListEntry{
+        .manifest_path = @constCast("metadata/m.avro"),
+        .manifest_length = 1,
+        .sequence_number = 0,
+        .added_snapshot_id = 12,
+    };
+    const entry = iceberg_avro.DataFileEntry{
+        .status = .existing,
+        .file_path = @constCast("data/a.parquet"),
+        .file_format = @constCast("PARQUET"),
+        .record_count = 1,
+        .file_size_in_bytes = 1,
+    };
+
+    const resolved = try resolveManifestEntry(entry, manifest, 2);
+    try std.testing.expectEqual(@as(?i64, 12), resolved.snapshot_id);
+    try std.testing.expectEqual(@as(?i64, 0), resolved.data_sequence_number);
+    try std.testing.expectEqual(@as(?i64, 0), resolved.file_sequence_number);
+}
+
+fn validateResolvedManifestEntry(entry: iceberg_avro.DataFileEntry) !void {
+    const snapshot_id = entry.snapshot_id orelse return error.InvalidIcebergDataManifest;
+    const data_sequence = entry.data_sequence_number orelse return error.InvalidIcebergDataManifest;
+    const file_sequence = entry.file_sequence_number orelse return error.InvalidIcebergDataManifest;
+    if (snapshot_id < 0 or data_sequence < 0 or file_sequence < 0) return error.InvalidIcebergDataManifest;
 }
 
 fn clonePartitionValuesAlloc(
@@ -298,10 +411,10 @@ fn syntheticVersionIdAlloc(
         "iceberg:v1:snapshot={s}:entry_snapshot={d}:status={s}:data_seq={d}:file_seq={d}",
         .{
             pinned_snapshot_id,
-            file.snapshot_id,
+            file.snapshot_id.?,
             @tagName(file.status),
-            file.data_sequence_number,
-            file.file_sequence_number,
+            file.data_sequence_number.?,
+            file.file_sequence_number.?,
         },
     );
 }
@@ -548,6 +661,7 @@ fn testMetadataPlanAlloc(alloc: Allocator) !iceberg_metadata.Plan {
     };
     errdefer snapshots[0].deinit(alloc);
     return .{
+        .format_version = 2,
         .metadata_uri = try alloc.dupe(u8, "s3://bucket/t/metadata/v1.metadata.json"),
         .table_uuid = try alloc.dupe(u8, "uuid-events"),
         .location = try alloc.dupe(u8, "s3://bucket/t"),

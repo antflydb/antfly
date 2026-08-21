@@ -25,6 +25,7 @@ pub const Format = types.Format;
 pub const ColumnChunk = types.ColumnChunk;
 pub const RowGroup = types.RowGroup;
 pub const FileEntry = types.FileEntry;
+pub const DeletedRowGroup = types.DeletedRowGroup;
 pub const Inventory = types.Inventory;
 pub const ExternalCredentialRef = catalog_binding.CredentialRef;
 pub const ExternalSnapshotMode = catalog_binding.SnapshotMode;

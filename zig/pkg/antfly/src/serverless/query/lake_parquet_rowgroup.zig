@@ -598,6 +598,8 @@ pub const ObjectRangeRowsQueryRequest = struct {
     predicate: ?lake_rows.Predicate = null,
     limit: ?usize = null,
     deleted_row_refs: []const rowsource.RowRef = &.{},
+    scan_limits: lake_rows.ScanLimits = .{},
+    materialization_limits: MaterializationLimits = .{},
     coalesce_options: range_io.CoalesceOptions = .{},
     sidecars: []const sidecar_manifest.DeclaredArtifact = &.{},
     desired_sidecars: []const lake_sidecar_selection.DesiredSidecar = &.{},
@@ -611,6 +613,7 @@ pub const ObjectRangeExpressionAggregateRequest = struct {
     cache: ?*ObjectRangeCache = null,
     inventory: external_source.Inventory,
     aggregate: lake_rows.ExpressionAggregateRequest,
+    materialization_limits: MaterializationLimits = .{},
     coalesce_options: range_io.CoalesceOptions = .{},
 };
 
@@ -1605,12 +1608,15 @@ pub fn querySupportedI64ObjectRangeRowsAlloc(
             request.coalesce_options,
         );
     defer source.deinit(alloc);
+    source.materialization_limits = request.materialization_limits;
 
     const scan_request: lake_rows.ScanRequest = .{
         .projected_columns = request.projected_columns,
         .predicate = request.predicate,
         .limit = request.limit,
         .deleted_row_refs = request.deleted_row_refs,
+        .deleted_row_filter = inventoryDeletedRowFilter(&request.inventory),
+        .limits = request.scan_limits,
     };
     if (maybe_binding) |binding| {
         const base_source = try binding.toManifestBaseSource(request.inventory.snapshot_id, null);
@@ -1663,7 +1669,9 @@ pub fn executeSupportedI64ObjectRangeExpressionAggregatesAlloc(
             .ctx = &dummy,
             .next_batch = EmptySource.next,
         };
-        return try lake_rows.executeExpressionAggregatesAlloc(alloc, source, request.aggregate, null);
+        var aggregate = request.aggregate;
+        aggregate.deleted_row_filter = inventoryDeletedRowFilter(&request.inventory);
+        return try lake_rows.executeExpressionAggregatesAlloc(alloc, source, aggregate, null);
     }
 
     var source = if (request.cache) |cache|
@@ -1683,7 +1691,26 @@ pub fn executeSupportedI64ObjectRangeExpressionAggregatesAlloc(
         );
     defer source.deinit(alloc);
 
-    return try lake_rows.executeExpressionAggregatesAlloc(alloc, source.rowSource(), request.aggregate, null);
+    source.materialization_limits = request.materialization_limits;
+    var aggregate = request.aggregate;
+    aggregate.deleted_row_filter = inventoryDeletedRowFilter(&request.inventory);
+    return try lake_rows.executeExpressionAggregatesAlloc(alloc, source.rowSource(), aggregate, null);
+}
+
+fn inventoryDeletedRowFilter(inventory: *const external_source.Inventory) ?lake_rows.DeletedRowFilter {
+    if (inventory.deleted_row_groups.len == 0) return null;
+    return .{ .ctx = inventory, .contains_fn = inventoryContainsDeletedRow };
+}
+
+fn inventoryContainsDeletedRow(ctx: *const anyopaque, row_ref: rowsource.RowRef) bool {
+    const inventory: *const external_source.Inventory = @ptrCast(@alignCast(ctx));
+    const external = switch (row_ref) {
+        .external => |value| value,
+        else => return false,
+    };
+    if (!std.mem.eql(u8, external.source_id, inventory.source_id) or
+        !std.mem.eql(u8, external.snapshot_id, inventory.snapshot_id)) return false;
+    return inventory.isDeleted(external.file_id, external.row_group_ordinal, external.row_ordinal);
 }
 
 fn rowsQueryScanColumnsAlloc(

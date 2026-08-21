@@ -233,6 +233,7 @@ pub const hydrateLakeRowsAlloc = lake_rows.hydrateRowsAlloc;
 pub const hydrateLakeRowsExcludingDeletedAlloc = lake_rows.hydrateRowsExcludingDeletedAlloc;
 pub const hydrateLakeRowsForBindingAlloc = lake_rows.hydrateRowsForBindingAlloc;
 pub const hydrateLakeRowsForBindingExcludingDeletedAlloc = lake_rows.hydrateRowsForBindingExcludingDeletedAlloc;
+pub const hydrateLakeRowsForBindingExcludingDeletedWithFilterAlloc = lake_rows.hydrateRowsForBindingExcludingDeletedWithFilterAlloc;
 pub const scanLakeRowsAlloc = lake_rows.scanRowsAlloc;
 pub const scanLakeRowsWithSidecarsAlloc = lake_rows.scanRowsWithSidecarsAlloc;
 pub const scanLakeRowsWithAutomaticSidecarsAlloc = lake_rows.scanRowsWithAutomaticSidecarsAlloc;

@@ -50,6 +50,7 @@ pub const SchemaField = struct {
 };
 
 pub const Plan = struct {
+    format_version: u8,
     metadata_uri: []u8,
     table_uuid: []u8,
     location: []u8,
@@ -84,6 +85,7 @@ pub const Plan = struct {
     }
 
     pub fn validate(self: Plan) !void {
+        if (self.format_version != 1 and self.format_version != 2) return error.UnsupportedIcebergMetadataVersion;
         if (self.metadata_uri.len == 0) return error.InvalidIcebergMetadata;
         if (self.table_uuid.len == 0) return error.InvalidIcebergMetadata;
         if (self.location.len == 0) return error.InvalidIcebergMetadata;
@@ -124,8 +126,9 @@ pub fn parseMetadataPlanAlloc(
         else => return error.InvalidIcebergMetadata,
     };
 
-    const format_version = try requiredI64(root, "format-version");
-    if (format_version != 1 and format_version != 2) return error.UnsupportedIcebergMetadataVersion;
+    const format_version_i64 = try requiredI64(root, "format-version");
+    if (format_version_i64 != 1 and format_version_i64 != 2) return error.UnsupportedIcebergMetadataVersion;
+    const format_version: u8 = @intCast(format_version_i64);
 
     const table_uuid = try requiredString(root, "table-uuid");
     const location = try requiredString(root, "location");
@@ -215,6 +218,7 @@ pub fn parseMetadataPlanAlloc(
     target_snapshot_id = null;
 
     var plan = Plan{
+        .format_version = format_version,
         .metadata_uri = metadata_uri_copy,
         .table_uuid = table_uuid_copy,
         .location = location_copy,

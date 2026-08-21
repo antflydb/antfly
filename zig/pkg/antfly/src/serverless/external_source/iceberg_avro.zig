@@ -38,9 +38,9 @@ pub const ManifestListEntry = struct {
     manifest_length: u64,
     partition_spec_id: i32 = 0,
     content: ManifestContent = .data,
-    sequence_number: i64 = 0,
-    min_sequence_number: i64 = 0,
-    added_snapshot_id: i64 = 0,
+    sequence_number: ?i64 = null,
+    min_sequence_number: ?i64 = null,
+    added_snapshot_id: ?i64 = null,
     added_files_count: u32 = 0,
     existing_files_count: u32 = 0,
     deleted_files_count: u32 = 0,
@@ -88,9 +88,9 @@ pub const DataFileContent = enum(u8) {
 
 pub const DataFileEntry = struct {
     status: ManifestEntryStatus,
-    snapshot_id: i64 = 0,
-    data_sequence_number: i64 = 0,
-    file_sequence_number: i64 = 0,
+    snapshot_id: ?i64 = null,
+    data_sequence_number: ?i64 = null,
+    file_sequence_number: ?i64 = null,
     content: DataFileContent = .data,
     file_path: []u8,
     file_format: []u8,
@@ -596,9 +596,9 @@ const EntryScratch = struct {
     manifest_length: u64 = 0,
     partition_spec_id: i32 = 0,
     content: ManifestContent = .data,
-    sequence_number: i64 = 0,
-    min_sequence_number: i64 = 0,
-    added_snapshot_id: i64 = 0,
+    sequence_number: ?i64 = null,
+    min_sequence_number: ?i64 = null,
+    added_snapshot_id: ?i64 = null,
     added_files_count: u32 = 0,
     existing_files_count: u32 = 0,
     deleted_files_count: u32 = 0,
@@ -714,9 +714,9 @@ fn nonNegativeU64(value: i64) !u64 {
 
 const DataManifestScratch = struct {
     status: ?ManifestEntryStatus = null,
-    snapshot_id: i64 = 0,
-    data_sequence_number: i64 = 0,
-    file_sequence_number: i64 = 0,
+    snapshot_id: ?i64 = null,
+    data_sequence_number: ?i64 = null,
+    file_sequence_number: ?i64 = null,
     data_file: ?DataFileScratch = null,
 
     fn deinit(self: *DataManifestScratch, alloc: Allocator) void {
@@ -757,11 +757,11 @@ fn readDataManifestEntryAlloc(alloc: Allocator, reader: *Reader, schema: std.jso
         if (std.mem.eql(u8, name, "status")) {
             scratch.status = try dataManifestStatus(try readJsonAvroInt(reader, field_type));
         } else if (std.mem.eql(u8, name, "snapshot_id")) {
-            if (try readJsonAvroLongNullable(reader, field_type)) |value| scratch.snapshot_id = value;
+            scratch.snapshot_id = try readJsonAvroLongNullable(reader, field_type);
         } else if (std.mem.eql(u8, name, "data_sequence_number")) {
-            if (try readJsonAvroLongNullable(reader, field_type)) |value| scratch.data_sequence_number = value;
+            scratch.data_sequence_number = try readJsonAvroLongNullable(reader, field_type);
         } else if (std.mem.eql(u8, name, "file_sequence_number")) {
-            if (try readJsonAvroLongNullable(reader, field_type)) |value| scratch.file_sequence_number = value;
+            scratch.file_sequence_number = try readJsonAvroLongNullable(reader, field_type);
         } else if (std.mem.eql(u8, name, "data_file")) {
             if (scratch.data_file != null) return error.InvalidIcebergDataManifest;
             scratch.data_file = try readDataFileRecordAlloc(alloc, reader, field_type);
@@ -1126,13 +1126,13 @@ test "iceberg avro manifest-list decoder reads data and delete manifests" {
     try std.testing.expectEqual(@as(u64, 111), list.entries[0].manifest_length);
     try std.testing.expectEqual(@as(i32, 3), list.entries[0].partition_spec_id);
     try std.testing.expectEqual(ManifestContent.data, list.entries[0].content);
-    try std.testing.expectEqual(@as(i64, 42), list.entries[0].sequence_number);
+    try std.testing.expectEqual(@as(?i64, 42), list.entries[0].sequence_number);
     try std.testing.expectEqual(@as(u32, 2), list.entries[0].added_files_count);
     try std.testing.expectEqual(@as(u64, 1000), list.entries[0].added_rows_count);
 
     try std.testing.expectEqualStrings("s3://bucket/t/metadata/d0.avro", list.entries[1].manifest_path);
     try std.testing.expectEqual(ManifestContent.deletes, list.entries[1].content);
-    try std.testing.expectEqual(@as(i64, 43), list.entries[1].sequence_number);
+    try std.testing.expectEqual(@as(?i64, 43), list.entries[1].sequence_number);
     try std.testing.expectEqual(@as(u64, 3), list.entries[1].deleted_rows_count);
 }
 
@@ -1211,9 +1211,9 @@ test "iceberg avro data-manifest decoder reads parquet data files" {
 
     try std.testing.expectEqual(@as(usize, 2), manifest.entries.len);
     try std.testing.expectEqual(ManifestEntryStatus.added, manifest.entries[0].status);
-    try std.testing.expectEqual(@as(i64, 123), manifest.entries[0].snapshot_id);
-    try std.testing.expectEqual(@as(i64, 44), manifest.entries[0].data_sequence_number);
-    try std.testing.expectEqual(@as(i64, 45), manifest.entries[0].file_sequence_number);
+    try std.testing.expectEqual(@as(?i64, 123), manifest.entries[0].snapshot_id);
+    try std.testing.expectEqual(@as(?i64, 44), manifest.entries[0].data_sequence_number);
+    try std.testing.expectEqual(@as(?i64, 45), manifest.entries[0].file_sequence_number);
     try std.testing.expectEqual(DataFileContent.data, manifest.entries[0].content);
     try std.testing.expectEqualStrings("s3://bucket/t/data/a.parquet", manifest.entries[0].file_path);
     try std.testing.expectEqualStrings("PARQUET", manifest.entries[0].file_format);

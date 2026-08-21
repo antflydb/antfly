@@ -180,6 +180,32 @@ pub const PartitionValue = struct {
     }
 };
 
+/// Compact durable deletion set for one data-file row group. Ordinals are
+/// strictly increasing so serving can use binary search without allocating a
+/// per-request hash table.
+pub const DeletedRowGroup = struct {
+    file_id: []u8,
+    row_group_ordinal: u32,
+    row_ordinals: []u64,
+
+    pub fn deinit(self: *DeletedRowGroup, alloc: Allocator) void {
+        alloc.free(self.file_id);
+        alloc.free(self.row_ordinals);
+        self.* = undefined;
+    }
+
+    pub fn validate(self: DeletedRowGroup, inventory: Inventory) !void {
+        if (self.file_id.len == 0 or self.row_ordinals.len == 0) return error.InvalidExternalSourceInventory;
+        const file = inventory.fileById(self.file_id) orelse return error.InvalidExternalSourceInventory;
+        if (self.row_group_ordinal >= file.row_groups.len) return error.InvalidExternalSourceInventory;
+        const row_count = file.row_groups[self.row_group_ordinal].row_count;
+        for (self.row_ordinals, 0..) |ordinal, idx| {
+            if (ordinal >= row_count) return error.InvalidExternalSourceInventory;
+            if (idx != 0 and ordinal <= self.row_ordinals[idx - 1]) return error.InvalidExternalSourceInventory;
+        }
+    }
+};
+
 pub const Inventory = struct {
     format: Format,
     source_id: []u8,
@@ -187,6 +213,7 @@ pub const Inventory = struct {
     snapshot_id: []u8,
     schema_fingerprint: []u8,
     files: []FileEntry,
+    deleted_row_groups: []DeletedRowGroup = &.{},
 
     pub fn deinit(self: *Inventory, alloc: Allocator) void {
         alloc.free(self.source_id);
@@ -195,6 +222,8 @@ pub const Inventory = struct {
         alloc.free(self.schema_fingerprint);
         for (self.files) |*file| file.deinit(alloc);
         alloc.free(self.files);
+        for (self.deleted_row_groups) |*group| group.deinit(alloc);
+        if (self.deleted_row_groups.len > 0) alloc.free(self.deleted_row_groups);
         self.* = undefined;
     }
 
@@ -217,6 +246,17 @@ pub const Inventory = struct {
             const entry = try file_ids.getOrPut(alloc, file.file_id);
             if (entry.found_existing) return error.InvalidExternalSourceInventory;
         }
+        if (self.deleted_row_groups.len != 0 and self.format != .iceberg) return error.InvalidExternalSourceInventory;
+        for (self.deleted_row_groups, 0..) |group, idx| {
+            try group.validate(self);
+            if (idx == 0) continue;
+            const previous = self.deleted_row_groups[idx - 1];
+            const file_order = std.mem.order(u8, previous.file_id, group.file_id);
+            if (file_order == .gt) return error.InvalidExternalSourceInventory;
+            if (file_order == .eq and previous.row_group_ordinal >= group.row_group_ordinal) {
+                return error.InvalidExternalSourceInventory;
+            }
+        }
     }
 
     pub fn fileById(self: Inventory, file_id: []const u8) ?FileEntry {
@@ -224,6 +264,29 @@ pub const Inventory = struct {
             if (std.mem.eql(u8, file.file_id, file_id)) return file;
         }
         return null;
+    }
+
+    pub fn isDeleted(self: Inventory, file_id: []const u8, row_group_ordinal: u32, row_ordinal: u64) bool {
+        var low: usize = 0;
+        var high = self.deleted_row_groups.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            const group = self.deleted_row_groups[mid];
+            const file_order = std.mem.order(u8, group.file_id, file_id);
+            if (file_order == .lt or (file_order == .eq and group.row_group_ordinal < row_group_ordinal)) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        if (low >= self.deleted_row_groups.len) return false;
+        const group = self.deleted_row_groups[low];
+        if (!std.mem.eql(u8, group.file_id, file_id) or group.row_group_ordinal != row_group_ordinal) return false;
+        return std.sort.binarySearch(u64, group.row_ordinals, row_ordinal, struct {
+            fn compare(key: u64, candidate: u64) std.math.Order {
+                return std.math.order(key, candidate);
+            }
+        }.compare) != null;
     }
 };
 
@@ -240,6 +303,7 @@ test "external source inventory validates files and row groups" {
         .snapshot_id = try alloc.dupe(u8, "iceberg-123"),
         .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
         .files = try alloc.alloc(FileEntry, 1),
+        .deleted_row_groups = try alloc.alloc(DeletedRowGroup, 1),
     };
     defer inventory.deinit(alloc);
     inventory.files[0] = .{
@@ -266,10 +330,44 @@ test "external source inventory validates files and row groups" {
             .{ .ordinal = 1, .row_count = 2, .file_offset = 104, .total_byte_len = 120 },
         }),
     };
+    inventory.deleted_row_groups[0] = .{
+        .file_id = try alloc.dupe(u8, "file-a.parquet"),
+        .row_group_ordinal = 1,
+        .row_ordinals = try alloc.dupe(u64, &.{0}),
+    };
 
     try inventory.validate();
     try std.testing.expect(inventory.fileById("file-a.parquet") != null);
     try std.testing.expect(inventory.fileById("missing.parquet") == null);
+    try std.testing.expect(inventory.isDeleted("file-a.parquet", 1, 0));
+    try std.testing.expect(!inventory.isDeleted("file-a.parquet", 1, 1));
+    try std.testing.expect(!inventory.isDeleted("missing.parquet", 1, 0));
+}
+
+test "external source inventory rejects malformed durable delete sets" {
+    const file = FileEntry{
+        .file_id = @constCast("file-a.parquet"),
+        .object_uri = @constCast("s3://bucket/file-a.parquet"),
+        .etag = @constCast("etag"),
+        .byte_len = 1,
+        .row_count = 3,
+        .row_groups = @constCast(&[_]RowGroup{.{ .ordinal = 0, .row_count = 3 }}),
+    };
+    var ordinals = [_]u64{ 1, 1 };
+    const inventory = Inventory{
+        .format = .iceberg,
+        .source_id = @constCast("events"),
+        .source_uri = @constCast("s3://bucket/events"),
+        .snapshot_id = @constCast("1"),
+        .schema_fingerprint = @constCast("schema"),
+        .files = @constCast(&[_]FileEntry{file}),
+        .deleted_row_groups = @constCast(&[_]DeletedRowGroup{.{
+            .file_id = @constCast("file-a.parquet"),
+            .row_group_ordinal = 0,
+            .row_ordinals = &ordinals,
+        }}),
+    };
+    try std.testing.expectError(error.InvalidExternalSourceInventory, inventory.validateAlloc(std.testing.allocator));
 }
 
 test "external source inventory rejects duplicate file ids with allocator-backed validation" {

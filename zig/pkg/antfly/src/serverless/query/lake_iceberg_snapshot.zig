@@ -22,7 +22,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const external_source = @import("../external_source/types.zig");
 const iceberg_avro = @import("../external_source/iceberg_avro.zig");
-const external_binding = @import("../external_source/catalog_binding.zig");
 const iceberg_inventory = @import("../external_source/iceberg_inventory.zig");
 const iceberg_metadata = @import("../external_source/iceberg_metadata.zig");
 const lake_iceberg_deletes = @import("lake_iceberg_deletes.zig");
@@ -98,6 +97,9 @@ pub const IcebergDeleteFile = struct {
         if (!std.ascii.eqlIgnoreCase(self.file_format, "PARQUET")) return error.UnsupportedIcebergDataFileFormat;
         if (self.record_count == 0) return error.InvalidIcebergDeleteManifest;
         if (self.file_size_in_bytes == 0) return error.InvalidIcebergDeleteManifest;
+        if (self.snapshot_id < 0 or self.data_sequence_number < 0 or self.file_sequence_number < 0) {
+            return error.InvalidIcebergDeleteManifest;
+        }
         if (self.partition_spec_id < 0) return error.InvalidIcebergDeleteManifest;
         if (self.partition_values.len > self.partition_field_count) return error.InvalidIcebergDeleteManifest;
         for (self.partition_values, 0..) |partition, idx| {
@@ -178,6 +180,39 @@ pub const PositionDeleteRowRefsReadRequest = struct {
     delete_plan: IcebergDeletePlan,
     coalesce_options: lake_range_io.CoalesceOptions = .{},
     footer_probe_bytes: u64 = 64 * 1024,
+    materialization_limits: lake_parquet_rowgroup.MaterializationLimits = .{},
+    application_limits: DeleteApplicationLimits = .{},
+};
+
+pub const DeleteApplicationLimits = struct {
+    max_batches: usize = 1_000_000,
+    max_scanned_rows: u64 = 100_000_000,
+    max_deleted_rows: usize = 10_000_000,
+
+    pub fn validate(self: DeleteApplicationLimits) !void {
+        if (self.max_batches == 0 or self.max_scanned_rows == 0 or self.max_deleted_rows == 0) {
+            return error.InvalidIcebergDeleteApplicationLimits;
+        }
+    }
+};
+
+const DeleteApplicationBudget = struct {
+    limits: DeleteApplicationLimits,
+    batches: usize = 0,
+    scanned_rows: u64 = 0,
+    deleted_rows: usize = 0,
+
+    fn admitBatch(self: *DeleteApplicationBudget, row_count: usize) !void {
+        self.batches = std.math.add(usize, self.batches, 1) catch return error.IcebergDeleteApplicationTooLarge;
+        if (self.batches > self.limits.max_batches) return error.IcebergDeleteApplicationTooLarge;
+        self.scanned_rows = std.math.add(u64, self.scanned_rows, row_count) catch return error.IcebergDeleteApplicationTooLarge;
+        if (self.scanned_rows > self.limits.max_scanned_rows) return error.IcebergDeleteApplicationTooLarge;
+    }
+
+    fn admitDeletedRow(self: *DeleteApplicationBudget) !void {
+        self.deleted_rows = std.math.add(usize, self.deleted_rows, 1) catch return error.IcebergDeleteApplicationTooLarge;
+        if (self.deleted_rows > self.limits.max_deleted_rows) return error.IcebergDeleteApplicationTooLarge;
+    }
 };
 
 pub const DeleteRowRefsReadRequest = PositionDeleteRowRefsReadRequest;
@@ -410,46 +445,76 @@ pub fn readPositionDeleteRowRefsAlloc(
     try request.data_inventory.validate();
     if (request.data_inventory.format != .iceberg) return error.InvalidIcebergPositionDeleteInventory;
     try request.delete_plan.validate();
+    try request.application_limits.validate();
+    try request.materialization_limits.validate();
     if (request.delete_plan.activePositionDeleteFileCount() == 0) return try alloc.alloc(rowsource.RowRef, 0);
 
-    var delete_inventory = try positionDeleteFilesInventoryAlloc(alloc, request.data_inventory, request.delete_plan, request.client);
-    defer delete_inventory.deinit(alloc);
-
     const columns = [_][]const u8{ "file_path", "pos" };
-    var discovered = if (request.cache) |cache|
-        try lake_parquet_rowgroup.discoverSupportedI64ObjectRangeRowGroupsFromCachedFootersAlloc(
+    var budget = DeleteApplicationBudget{ .limits = request.application_limits };
+    var out = std.ArrayListUnmanaged(rowsource.RowRef).empty;
+    errdefer out.deinit(alloc);
+
+    for (request.delete_plan.files) |delete_file| {
+        if (delete_file.content != .position_deletes) continue;
+        var delete_inventory = try singleDeleteFileInventoryAlloc(
             alloc,
-            request.reader,
-            cache,
-            delete_inventory,
-            &columns,
-            request.footer_probe_bytes,
-        )
-    else
-        try lake_parquet_rowgroup.discoverSupportedI64ObjectRangeRowGroupsFromFootersAlloc(
-            alloc,
-            request.reader,
-            delete_inventory,
-            &columns,
-            request.footer_probe_bytes,
+            request.data_inventory,
+            delete_file,
+            request.client,
+            "iceberg-position-delete",
         );
-    defer discovered.deinit(alloc);
+        defer delete_inventory.deinit(alloc);
+        var discovered = if (request.cache) |cache|
+            try lake_parquet_rowgroup.discoverSupportedI64ObjectRangeRowGroupsFromCachedFootersAlloc(
+                alloc,
+                request.reader,
+                cache,
+                delete_inventory,
+                &columns,
+                request.footer_probe_bytes,
+            )
+        else
+            try lake_parquet_rowgroup.discoverSupportedI64ObjectRangeRowGroupsFromFootersAlloc(
+                alloc,
+                request.reader,
+                delete_inventory,
+                &columns,
+                request.footer_probe_bytes,
+            );
+        defer discovered.deinit(alloc);
 
-    var delete_rows = try lake_parquet_rowgroup.querySupportedI64ObjectRangeRowsAlloc(alloc, .{
-        .reader = request.reader,
-        .cache = request.cache,
-        .inventory = discovered.inventory,
-        .projected_columns = &columns,
-        .coalesce_options = request.coalesce_options,
-    });
-    defer delete_rows.deinit(alloc);
-
-    return try lake_iceberg_deletes.positionDeleteScanResultToRowRefsAlloc(
-        alloc,
-        request.data_inventory,
-        delete_rows,
-        .{},
-    );
+        var source = if (request.cache) |cache|
+            try lake_parquet_rowgroup.ObjectRangeRowGroupSource.initWithCacheAndCoalesceOptions(
+                request.reader,
+                cache,
+                discovered.inventory,
+                discovered.row_group_plan.row_groups,
+                request.coalesce_options,
+            )
+        else
+            try lake_parquet_rowgroup.ObjectRangeRowGroupSource.initWithCoalesceOptions(
+                request.reader,
+                discovered.inventory,
+                discovered.row_group_plan.row_groups,
+                request.coalesce_options,
+            );
+        defer source.deinit(alloc);
+        source.materialization_limits = request.materialization_limits;
+        const row_source = source.rowSource();
+        while (try row_source.next(alloc)) |batch| {
+            try budget.admitBatch(batch.rowCount());
+            for (0..batch.rowCount()) |row_idx| {
+                const delete_row = try positionDeleteRowFromBatch(batch, row_idx);
+                const data_file = lake_iceberg_deletes.fileForDeletePath(request.data_inventory, delete_row.data_file_path) orelse continue;
+                if (!try positionDeleteAppliesToFile(data_file, delete_file)) continue;
+                const row_ref = try lake_iceberg_deletes.positionDeleteRowToRowRef(request.data_inventory, delete_row);
+                try budget.admitDeletedRow();
+                try out.append(alloc, row_ref);
+            }
+        }
+    }
+    out.shrinkRetainingCapacity(sortAndDeduplicateExternalRowRefs(out.items));
+    return try out.toOwnedSlice(alloc);
 }
 
 pub fn readDeleteRowRefsAlloc(
@@ -465,16 +530,13 @@ pub fn readDeleteRowRefsAlloc(
 
     const position_refs = try readPositionDeleteRowRefsAlloc(alloc, request);
     defer alloc.free(position_refs);
-    for (position_refs) |row_ref| {
-        if (!rowRefsContain(out.items, row_ref)) try out.append(alloc, row_ref);
-    }
+    try out.appendSlice(alloc, position_refs);
 
     const equality_refs = try readEqualityDeleteRowRefsAlloc(alloc, request);
     defer alloc.free(equality_refs);
-    for (equality_refs) |row_ref| {
-        if (!rowRefsContain(out.items, row_ref)) try out.append(alloc, row_ref);
-    }
+    try out.appendSlice(alloc, equality_refs);
 
+    out.shrinkRetainingCapacity(sortAndDeduplicateExternalRowRefs(out.items));
     return try out.toOwnedSlice(alloc);
 }
 
@@ -483,12 +545,15 @@ fn readEqualityDeleteRowRefsAlloc(
     request: DeleteRowRefsReadRequest,
 ) ![]rowsource.RowRef {
     if (request.delete_plan.activeEqualityDeleteFileCount() == 0) return try alloc.alloc(rowsource.RowRef, 0);
+    try request.application_limits.validate();
+    try request.materialization_limits.validate();
 
     var out = std.ArrayListUnmanaged(rowsource.RowRef).empty;
     errdefer out.deinit(alloc);
     const processed = try alloc.alloc(bool, request.delete_plan.files.len);
     defer alloc.free(processed);
     @memset(processed, false);
+    var budget = DeleteApplicationBudget{ .limits = request.application_limits };
 
     for (request.delete_plan.files, 0..) |group_file, group_idx| {
         if (processed[group_idx] or group_file.content != .equality_deletes) continue;
@@ -533,45 +598,57 @@ fn readEqualityDeleteRowRefsAlloc(
                     request.footer_probe_bytes,
                 );
             defer discovered_delete.deinit(alloc);
-            var delete_rows = try lake_parquet_rowgroup.querySupportedI64ObjectRangeRowsAlloc(alloc, .{
-                .reader = request.reader,
-                .cache = request.cache,
-                .inventory = discovered_delete.inventory,
-                .projected_columns = equality_columns,
-                .coalesce_options = request.coalesce_options,
-            });
-            defer delete_rows.deinit(alloc);
-
-            for (delete_rows.rows) |delete_row| {
-                const key = try lake_iceberg_deletes.equalityKeyAlloc(alloc, delete_row, equality_columns);
-                if (delete_keys.getPtr(key)) |file_indexes| {
-                    alloc.free(key);
-                    if (file_indexes.items.len == 0 or file_indexes.items[file_indexes.items.len - 1] != delete_idx) {
-                        stored_key_bytes = try lake_iceberg_deletes.admitEqualityDeleteStorage(
-                            stored_key_bytes,
-                            @sizeOf(usize),
-                        );
-                        try file_indexes.append(alloc, delete_idx);
+            var delete_source = if (request.cache) |cache|
+                try lake_parquet_rowgroup.ObjectRangeRowGroupSource.initWithCacheAndCoalesceOptions(
+                    request.reader,
+                    cache,
+                    discovered_delete.inventory,
+                    discovered_delete.row_group_plan.row_groups,
+                    request.coalesce_options,
+                )
+            else
+                try lake_parquet_rowgroup.ObjectRangeRowGroupSource.initWithCoalesceOptions(
+                    request.reader,
+                    discovered_delete.inventory,
+                    discovered_delete.row_group_plan.row_groups,
+                    request.coalesce_options,
+                );
+            defer delete_source.deinit(alloc);
+            delete_source.materialization_limits = request.materialization_limits;
+            const delete_row_source = delete_source.rowSource();
+            while (try delete_row_source.next(alloc)) |batch| {
+                try budget.admitBatch(batch.rowCount());
+                for (0..batch.rowCount()) |row_idx| {
+                    const key = try lake_iceberg_deletes.equalityKeyFromBatchRowAlloc(alloc, batch, row_idx, equality_columns);
+                    if (delete_keys.getPtr(key)) |file_indexes| {
+                        alloc.free(key);
+                        if (file_indexes.items.len == 0 or file_indexes.items[file_indexes.items.len - 1] != delete_idx) {
+                            stored_key_bytes = try lake_iceberg_deletes.admitEqualityDeleteStorage(
+                                stored_key_bytes,
+                                @sizeOf(usize),
+                            );
+                            try file_indexes.append(alloc, delete_idx);
+                        }
+                        continue;
                     }
-                    continue;
-                }
 
-                const next_storage = lake_iceberg_deletes.admitEqualityDeleteKeyStorage(
-                    stored_key_bytes,
-                    key.len,
-                    1,
-                ) catch |err| {
-                    alloc.free(key);
-                    return err;
-                };
-                const entry = delete_keys.getOrPut(alloc, key) catch |err| {
-                    alloc.free(key);
-                    return err;
-                };
-                std.debug.assert(!entry.found_existing);
-                entry.value_ptr.* = .empty;
-                stored_key_bytes = next_storage;
-                try entry.value_ptr.append(alloc, delete_idx);
+                    const next_storage = lake_iceberg_deletes.admitEqualityDeleteKeyStorage(
+                        stored_key_bytes,
+                        key.len,
+                        1,
+                    ) catch |err| {
+                        alloc.free(key);
+                        return err;
+                    };
+                    const entry = delete_keys.getOrPut(alloc, key) catch |err| {
+                        alloc.free(key);
+                        return err;
+                    };
+                    std.debug.assert(!entry.found_existing);
+                    entry.value_ptr.* = .empty;
+                    stored_key_bytes = next_storage;
+                    try entry.value_ptr.append(alloc, delete_idx);
+                }
             }
         }
         if (delete_keys.count() == 0) continue;
@@ -599,33 +676,52 @@ fn readEqualityDeleteRowRefsAlloc(
         }
         const data_inventory = if (discovered_data) |discovered| discovered.inventory else request.data_inventory;
 
-        var data_rows = try lake_parquet_rowgroup.querySupportedI64ObjectRangeRowsAlloc(alloc, .{
-            .binding = bindingForPinnedIcebergInventory(data_inventory),
-            .reader = request.reader,
-            .cache = request.cache,
-            .inventory = data_inventory,
-            .projected_columns = equality_columns,
-            .coalesce_options = request.coalesce_options,
-        });
-        defer data_rows.deinit(alloc);
-
-        for (data_rows.rows) |data_row| {
-            const key = try lake_iceberg_deletes.equalityKeyAlloc(alloc, data_row, equality_columns);
-            defer alloc.free(key);
-            const file_indexes = delete_keys.get(key) orelse continue;
-            const stable_ref = try rebindRowRefToInventory(request.data_inventory, data_row.row_ref);
-            for (file_indexes.items) |delete_idx| {
-                if (!try equalityDeleteAppliesToRowRef(
-                    request.data_inventory,
-                    request.delete_plan.files[delete_idx],
-                    stable_ref,
-                )) continue;
-                if (!rowRefsContain(out.items, stable_ref)) try out.append(alloc, stable_ref);
-                break;
+        var data_row_group_plan = try lake_parquet_rowgroup.planSupportedI64ObjectRangeRowGroupsAlloc(
+            alloc,
+            data_inventory,
+            equality_columns,
+        );
+        defer data_row_group_plan.deinit(alloc);
+        var data_source = if (request.cache) |cache|
+            try lake_parquet_rowgroup.ObjectRangeRowGroupSource.initWithCacheAndCoalesceOptions(
+                request.reader,
+                cache,
+                data_inventory,
+                data_row_group_plan.row_groups,
+                request.coalesce_options,
+            )
+        else
+            try lake_parquet_rowgroup.ObjectRangeRowGroupSource.initWithCoalesceOptions(
+                request.reader,
+                data_inventory,
+                data_row_group_plan.row_groups,
+                request.coalesce_options,
+            );
+        defer data_source.deinit(alloc);
+        data_source.materialization_limits = request.materialization_limits;
+        const data_row_source = data_source.rowSource();
+        while (try data_row_source.next(alloc)) |batch| {
+            try budget.admitBatch(batch.rowCount());
+            for (0..batch.rowCount()) |row_idx| {
+                const key = try lake_iceberg_deletes.equalityKeyFromBatchRowAlloc(alloc, batch, row_idx, equality_columns);
+                defer alloc.free(key);
+                const file_indexes = delete_keys.get(key) orelse continue;
+                const stable_ref = try rebindRowRefToInventory(request.data_inventory, batch.row_refs[row_idx]);
+                for (file_indexes.items) |delete_idx| {
+                    if (!try equalityDeleteAppliesToRowRef(
+                        request.data_inventory,
+                        request.delete_plan.files[delete_idx],
+                        stable_ref,
+                    )) continue;
+                    try budget.admitDeletedRow();
+                    try out.append(alloc, stable_ref);
+                    break;
+                }
             }
         }
     }
 
+    out.shrinkRetainingCapacity(sortAndDeduplicateExternalRowRefs(out.items));
     return try out.toOwnedSlice(alloc);
 }
 
@@ -660,7 +756,7 @@ fn planInventoryFromDecodedDataManifestsAllowingDeletesAlloc(
         if (manifest_entry.content != .data) continue;
         const decoded = try decodedManifestForPath(data_manifests, manifest_entry.manifest_path);
         for (decoded.manifest.entries) |entry| {
-            data_files[next_file] = entry;
+            data_files[next_file] = try iceberg_inventory.resolveManifestEntry(entry, manifest_entry, metadata_plan.format_version);
             data_files[next_file].partition_spec_id = manifest_entry.partition_spec_id;
             next_file += 1;
         }
@@ -726,53 +822,34 @@ fn validateDataManifestSummary(
     if (deleted_rows != manifest_entry.deleted_rows_count) return error.IcebergManifestSummaryMismatch;
 }
 
-fn positionDeleteFilesInventoryAlloc(
-    alloc: Allocator,
-    data_inventory: external_source.Inventory,
-    delete_plan: IcebergDeletePlan,
-    maybe_client: ?object_storage.ObjectStorage,
-) !external_source.Inventory {
-    const file_count = delete_plan.activePositionDeleteFileCount();
-    if (file_count == 0) return error.InvalidIcebergDeleteManifest;
-
-    const files = try alloc.alloc(external_source.FileEntry, file_count);
-    errdefer alloc.free(files);
-    var initialized: usize = 0;
-    errdefer {
-        for (files[0..initialized]) |*file| file.deinit(alloc);
-    }
-
-    for (delete_plan.files) |delete_file| {
-        if (delete_file.content != .position_deletes) continue;
-        files[initialized] = try positionDeleteFileEntryAlloc(alloc, data_inventory, delete_file, maybe_client);
-        initialized += 1;
-    }
-
-    var inventory = external_source.Inventory{
-        .format = .parquet,
-        .source_id = try alloc.dupe(u8, data_inventory.source_id),
-        .source_uri = try alloc.dupe(u8, data_inventory.source_uri),
-        .snapshot_id = try alloc.dupe(u8, data_inventory.snapshot_id),
-        .schema_fingerprint = try alloc.dupe(u8, "iceberg-position-delete:v1:file_path-pos"),
-        .files = files,
-    };
-    errdefer inventory.deinit(alloc);
-    try inventory.validate();
-    return inventory;
-}
-
 fn equalityDeleteFileInventoryAlloc(
     alloc: Allocator,
     data_inventory: external_source.Inventory,
     delete_file: IcebergDeleteFile,
     maybe_client: ?object_storage.ObjectStorage,
 ) !external_source.Inventory {
+    return try singleDeleteFileInventoryAlloc(
+        alloc,
+        data_inventory,
+        delete_file,
+        maybe_client,
+        "iceberg-equality-delete",
+    );
+}
+
+fn singleDeleteFileInventoryAlloc(
+    alloc: Allocator,
+    data_inventory: external_source.Inventory,
+    delete_file: IcebergDeleteFile,
+    maybe_client: ?object_storage.ObjectStorage,
+    kind: []const u8,
+) !external_source.Inventory {
     const files = try alloc.alloc(external_source.FileEntry, 1);
     errdefer alloc.free(files);
     var initialized = false;
     errdefer if (initialized) files[0].deinit(alloc);
 
-    files[0] = try deleteFileEntryAlloc(alloc, data_inventory, delete_file, maybe_client, "iceberg-equality-delete");
+    files[0] = try deleteFileEntryAlloc(alloc, data_inventory, delete_file, maybe_client, kind);
     initialized = true;
 
     var inventory = external_source.Inventory{
@@ -780,21 +857,15 @@ fn equalityDeleteFileInventoryAlloc(
         .source_id = try alloc.dupe(u8, data_inventory.source_id),
         .source_uri = try alloc.dupe(u8, data_inventory.source_uri),
         .snapshot_id = try alloc.dupe(u8, data_inventory.snapshot_id),
-        .schema_fingerprint = try equalityDeleteSchemaFingerprintAlloc(alloc, delete_file.equality_columns),
+        .schema_fingerprint = if (delete_file.content == .equality_deletes)
+            try equalityDeleteSchemaFingerprintAlloc(alloc, delete_file.equality_columns)
+        else
+            try alloc.dupe(u8, "iceberg-position-delete:v1:file_path-pos"),
         .files = files,
     };
     errdefer inventory.deinit(alloc);
     try inventory.validate();
     return inventory;
-}
-
-fn positionDeleteFileEntryAlloc(
-    alloc: Allocator,
-    data_inventory: external_source.Inventory,
-    delete_file: IcebergDeleteFile,
-    maybe_client: ?object_storage.ObjectStorage,
-) !external_source.FileEntry {
-    return try deleteFileEntryAlloc(alloc, data_inventory, delete_file, maybe_client, "iceberg-position-delete");
 }
 
 fn deleteFileEntryAlloc(
@@ -859,17 +930,6 @@ fn equalityDeleteSchemaFingerprintAlloc(alloc: Allocator, columns: []const []con
     return try out.toOwnedSlice(alloc);
 }
 
-fn bindingForPinnedIcebergInventory(inventory: external_source.Inventory) external_binding.Binding {
-    return .{
-        .table_id = inventory.source_id,
-        .format = .iceberg,
-        .source_uri = inventory.source_uri,
-        .snapshot_mode = .{ .snapshot_id = inventory.snapshot_id },
-        .schema_fingerprint = inventory.schema_fingerprint,
-        .write_policy = .read_only,
-    };
-}
-
 fn inventoryHasRowGroupMetadata(inventory: external_source.Inventory) bool {
     for (inventory.files) |file| {
         if (file.row_groups.len != 0) return true;
@@ -921,6 +981,69 @@ fn equalityDeleteAppliesToRowRef(
     return partitionValuesEqual(file.partition_values, delete_file.partition_values);
 }
 
+fn positionDeleteRowFromBatch(batch: rowsource.ColumnBatch, row_idx: usize) !lake_iceberg_deletes.PositionDeleteRow {
+    if (row_idx >= batch.rowCount()) return error.ExternalSourceRowOutOfBounds;
+    const path_column = batch.findColumn("file_path") orelse return error.IcebergPositionDeleteColumnNotFound;
+    const position_column = batch.findColumn("pos") orelse return error.IcebergPositionDeleteColumnNotFound;
+    if (path_column.nulls.isNull(row_idx) or position_column.nulls.isNull(row_idx)) return error.InvalidIcebergPositionDelete;
+    const path = switch (path_column.values) {
+        .bytes => |values| values[row_idx],
+        else => return error.UnsupportedIcebergPositionDeleteColumn,
+    };
+    const position = switch (position_column.values) {
+        .i64 => |values| values[row_idx],
+        else => return error.UnsupportedIcebergPositionDeleteColumn,
+    };
+    if (position < 0) return error.InvalidIcebergPositionDelete;
+    return .{ .data_file_path = path, .row_position = @intCast(position) };
+}
+
+fn positionDeleteAppliesToFile(file: external_source.FileEntry, delete_file: IcebergDeleteFile) !bool {
+    const data_sequence = file.data_sequence_number orelse return error.UnsupportedIcebergDeletes;
+    if (data_sequence > delete_file.data_sequence_number) return false;
+    const data_spec_id = file.partition_spec_id orelse return error.UnsupportedIcebergPartitionDeleteScope;
+    if (data_spec_id != delete_file.partition_spec_id) return false;
+    if (file.partition_field_count != delete_file.partition_field_count) return false;
+    if (file.partition_field_count == 0) return true;
+    if (file.partition_values.len != file.partition_field_count or
+        delete_file.partition_values.len != delete_file.partition_field_count)
+    {
+        return error.UnsupportedIcebergPartitionDeleteScope;
+    }
+    return partitionValuesEqual(file.partition_values, delete_file.partition_values);
+}
+
+fn sortAndDeduplicateExternalRowRefs(refs: []rowsource.RowRef) usize {
+    std.mem.sort(rowsource.RowRef, refs, {}, externalRowRefLessThan);
+    if (refs.len == 0) return 0;
+    var out: usize = 1;
+    for (refs[1..]) |row_ref| {
+        if (rowRefsEqual(refs[out - 1], row_ref)) continue;
+        refs[out] = row_ref;
+        out += 1;
+    }
+    return out;
+}
+
+fn externalRowRefLessThan(_: void, left_ref: rowsource.RowRef, right_ref: rowsource.RowRef) bool {
+    const left = switch (left_ref) {
+        .external => |value| value,
+        else => return false,
+    };
+    const right = switch (right_ref) {
+        .external => |value| value,
+        else => return false,
+    };
+    const source_order = std.mem.order(u8, left.source_id, right.source_id);
+    if (source_order != .eq) return source_order == .lt;
+    const snapshot_order = std.mem.order(u8, left.snapshot_id, right.snapshot_id);
+    if (snapshot_order != .eq) return snapshot_order == .lt;
+    const file_order = std.mem.order(u8, left.file_id, right.file_id);
+    if (file_order != .eq) return file_order == .lt;
+    if (left.row_group_ordinal != right.row_group_ordinal) return left.row_group_ordinal < right.row_group_ordinal;
+    return left.row_ordinal < right.row_ordinal;
+}
+
 fn partitionValuesEqual(
     left: []const external_source.PartitionValue,
     right: []const external_source.PartitionValue,
@@ -947,13 +1070,6 @@ fn icebergDataSequenceFromFileVersion(version_id: []const u8) !i64 {
     while (value_end < version_id.len and version_id[value_end] != ':') : (value_end += 1) {}
     if (value_end == value_start) return error.UnsupportedIcebergDeletes;
     return try std.fmt.parseInt(i64, version_id[value_start..value_end], 10);
-}
-
-fn rowRefsContain(haystack: []const rowsource.RowRef, needle: rowsource.RowRef) bool {
-    for (haystack) |candidate| {
-        if (rowRefsEqual(candidate, needle)) return true;
-    }
-    return false;
 }
 
 fn rowRefsEqual(a: rowsource.RowRef, b: rowsource.RowRef) bool {
@@ -1015,6 +1131,7 @@ fn appendActiveDeleteFilesFromManifestAlloc(
     var deleted_rows: u64 = 0;
 
     for (manifest.entries) |entry| {
+        const resolved_entry = try iceberg_inventory.resolveManifestEntry(entry, manifest_entry, metadata_plan.format_version);
         switch (entry.content) {
             .data => return error.InvalidIcebergDeleteManifest,
             .position_deletes, .equality_deletes => {},
@@ -1023,12 +1140,12 @@ fn appendActiveDeleteFilesFromManifestAlloc(
             .added => {
                 added_files += 1;
                 added_rows += entry.record_count;
-                try appendDeleteFileFromEntryAlloc(alloc, out, manifest_entry.partition_spec_id, entry, metadata_plan);
+                try appendDeleteFileFromEntryAlloc(alloc, out, manifest_entry.partition_spec_id, resolved_entry, metadata_plan);
             },
             .existing => {
                 existing_files += 1;
                 existing_rows += entry.record_count;
-                try appendDeleteFileFromEntryAlloc(alloc, out, manifest_entry.partition_spec_id, entry, metadata_plan);
+                try appendDeleteFileFromEntryAlloc(alloc, out, manifest_entry.partition_spec_id, resolved_entry, metadata_plan);
             },
             .deleted => {
                 deleted_files += 1;
@@ -1068,9 +1185,9 @@ fn appendDeleteFileFromEntryAlloc(
         .content = entry.content,
         .file_path = file_path,
         .file_format = file_format,
-        .snapshot_id = entry.snapshot_id,
-        .data_sequence_number = entry.data_sequence_number,
-        .file_sequence_number = entry.file_sequence_number,
+        .snapshot_id = entry.snapshot_id.?,
+        .data_sequence_number = entry.data_sequence_number.?,
+        .file_sequence_number = entry.file_sequence_number.?,
         .partition_spec_id = partition_spec_id,
         .partition_field_count = entry.partition_field_count,
         .partition_values = partition_values,
@@ -1668,6 +1785,8 @@ test "iceberg snapshot reader scans position delete parquet files into row refs"
         .version_id = try alloc.dupe(u8, "iceberg:v1:snapshot=12"),
         .byte_len = 4096,
         .row_count = 3,
+        .data_sequence_number = 5,
+        .partition_spec_id = 0,
         .row_groups = try alloc.dupe(external_source.RowGroup, &[_]external_source.RowGroup{
             .{ .ordinal = 0, .row_count = 2 },
             .{ .ordinal = 1, .row_count = 1 },
@@ -1688,6 +1807,13 @@ test "iceberg snapshot reader scans position delete parquet files into row refs"
     };
 
     var range_reader = lake_object_reader.ObjectStorageRangeReader.init(client);
+    try std.testing.expectError(error.IcebergDeleteApplicationTooLarge, readPositionDeleteRowRefsAlloc(alloc, .{
+        .reader = range_reader.parquetReader(),
+        .client = client,
+        .data_inventory = inventory,
+        .delete_plan = plan,
+        .application_limits = .{ .max_deleted_rows = 1 },
+    }));
     const refs = try readPositionDeleteRowRefsAlloc(alloc, .{
         .reader = range_reader.parquetReader(),
         .client = client,
@@ -1704,6 +1830,46 @@ test "iceberg snapshot reader scans position delete parquet files into row refs"
     try std.testing.expectEqual(@as(u64, 0), refs[0].external.row_ordinal);
     try std.testing.expectEqual(@as(u32, 1), refs[1].external.row_group_ordinal);
     try std.testing.expectEqual(@as(u64, 0), refs[1].external.row_ordinal);
+}
+
+test "iceberg position deletes enforce sequence and partition scope" {
+    const partition_values = [_]external_source.PartitionValue{.{
+        .column_id = @constCast("region"),
+        .string_value = @constCast("west"),
+    }};
+    var file = external_source.FileEntry{
+        .file_id = @constCast("data.parquet"),
+        .object_uri = @constCast("s3://bucket/data.parquet"),
+        .etag = @constCast("etag"),
+        .byte_len = 1,
+        .row_count = 1,
+        .data_sequence_number = 7,
+        .partition_spec_id = 3,
+        .partition_field_count = 1,
+        .partition_values = @constCast(&partition_values),
+        .row_groups = @constCast(&[_]external_source.RowGroup{.{ .ordinal = 0, .row_count = 1 }}),
+    };
+    var delete_file = IcebergDeleteFile{
+        .content = .position_deletes,
+        .file_path = @constCast("delete.parquet"),
+        .file_format = @constCast("PARQUET"),
+        .snapshot_id = 1,
+        .data_sequence_number = 6,
+        .file_sequence_number = 7,
+        .partition_spec_id = 3,
+        .partition_field_count = 1,
+        .partition_values = @constCast(&partition_values),
+        .record_count = 1,
+        .file_size_in_bytes = 1,
+    };
+    try std.testing.expect(!try positionDeleteAppliesToFile(file, delete_file));
+    delete_file.data_sequence_number = 7;
+    try std.testing.expect(try positionDeleteAppliesToFile(file, delete_file));
+    delete_file.partition_spec_id = 4;
+    try std.testing.expect(!try positionDeleteAppliesToFile(file, delete_file));
+    delete_file.partition_spec_id = 3;
+    file.partition_spec_id = null;
+    try std.testing.expectError(error.UnsupportedIcebergPartitionDeleteScope, positionDeleteAppliesToFile(file, delete_file));
 }
 
 test "iceberg snapshot reader discovers data footers for equality deletes" {

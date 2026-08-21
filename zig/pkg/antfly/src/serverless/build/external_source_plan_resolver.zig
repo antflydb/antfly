@@ -29,6 +29,7 @@ const external_source_publish = @import("external_source_publish.zig");
 const object_store_support = @import("../object_store_support.zig");
 const object_storage = @import("../../storage/object_storage.zig");
 const resolver_api = @import("external_source_plan_resolver_api.zig");
+const rowsource = @import("../../storage/rowsource/types.zig");
 const lake_iceberg_snapshot = @import("../query/lake_iceberg_snapshot.zig");
 const lake_object_reader = @import("../query/lake_object_reader.zig");
 const lake_parquet_footer = @import("../query/lake_parquet_footer.zig");
@@ -98,6 +99,8 @@ pub const ResolverOptions = struct {
     max_listing_pages: u32 = external_source.defaultMaxObjectListingPages,
     max_listing_objects: usize = external_source.defaultMaxObjectListingObjects,
     iceberg_read_limits: lake_iceberg_snapshot.ReadLimits = .{},
+    iceberg_delete_application_limits: lake_iceberg_snapshot.DeleteApplicationLimits = .{},
+    parquet_materialization_limits: lake_parquet_rowgroup.MaterializationLimits = .{},
 };
 
 pub const Resolver = struct {
@@ -205,30 +208,97 @@ fn inventoryForBindingAlloc(
                 source_options.max_listing_objects,
             );
             defer alloc.free(metadata_uri);
-            var inventory = try lake_iceberg_snapshot.readSnapshotInventoryAlloc(alloc, .{
+            var snapshot = try lake_iceberg_snapshot.readSnapshotInventoryAndDeletePlanAlloc(alloc, .{
                 .client = opened_store.client,
                 .source_id = binding.table_id,
                 .metadata_uri = metadata_uri,
                 .requested_snapshot_id = binding.snapshot_mode.pinnedSnapshotId(),
                 .limits = source_options.iceberg_read_limits,
             });
-            errdefer inventory.deinit(alloc);
+            defer snapshot.deinit(alloc);
             try lake_iceberg_snapshot.pinInventoryDataFileObjectVersions(
                 alloc,
                 opened_store.client,
-                &inventory,
+                &snapshot.inventory,
             );
-            const enriched = try enrichInventoryWithObjectFootersAlloc(
+            var enriched = try enrichInventoryWithObjectFootersAlloc(
                 alloc,
                 opened_store.client,
-                inventory,
+                snapshot.inventory,
                 source_options.footer_probe_bytes,
             );
-            inventory.deinit(alloc);
+            errdefer enriched.deinit(alloc);
+            if (snapshot.delete_plan.activeFileCount() != 0) {
+                var object_reader = lake_object_reader.ObjectStorageRangeReader.init(opened_store.client);
+                const deleted_refs = try lake_iceberg_snapshot.readDeleteRowRefsAlloc(alloc, .{
+                    .reader = object_reader.parquetReader(),
+                    .client = opened_store.client,
+                    .data_inventory = enriched,
+                    .delete_plan = snapshot.delete_plan,
+                    .footer_probe_bytes = source_options.footer_probe_bytes,
+                    .application_limits = source_options.iceberg_delete_application_limits,
+                    .materialization_limits = source_options.parquet_materialization_limits,
+                });
+                defer alloc.free(deleted_refs);
+                enriched.deleted_row_groups = try deletedRowGroupsFromRefsAlloc(alloc, enriched, deleted_refs);
+                try enriched.validate();
+            }
             break :blk enriched;
         },
         .lance => error.UnsupportedRowsQuery,
     };
+}
+
+fn deletedRowGroupsFromRefsAlloc(
+    alloc: Allocator,
+    inventory: external_source.Inventory,
+    refs: []const rowsource.RowRef,
+) ![]external_source.DeletedRowGroup {
+    if (refs.len == 0) return &.{};
+    var group_count: usize = 0;
+    var previous_file: []const u8 = &.{};
+    var previous_group: u32 = 0;
+    for (refs, 0..) |row_ref, idx| {
+        const external = switch (row_ref) {
+            .external => |value| value,
+            else => return error.InvalidIcebergPositionDeleteInventory,
+        };
+        if (!std.mem.eql(u8, external.source_id, inventory.source_id) or
+            !std.mem.eql(u8, external.snapshot_id, inventory.snapshot_id))
+        {
+            return error.InvalidIcebergPositionDeleteInventory;
+        }
+        if (idx == 0 or !std.mem.eql(u8, previous_file, external.file_id) or previous_group != external.row_group_ordinal) {
+            group_count += 1;
+            previous_file = external.file_id;
+            previous_group = external.row_group_ordinal;
+        }
+    }
+
+    const groups = try alloc.alloc(external_source.DeletedRowGroup, group_count);
+    errdefer alloc.free(groups);
+    var initialized: usize = 0;
+    errdefer for (groups[0..initialized]) |*group| group.deinit(alloc);
+    var ref_start: usize = 0;
+    while (ref_start < refs.len) {
+        const first = refs[ref_start].external;
+        var ref_end = ref_start + 1;
+        while (ref_end < refs.len) : (ref_end += 1) {
+            const next = refs[ref_end].external;
+            if (!std.mem.eql(u8, first.file_id, next.file_id) or first.row_group_ordinal != next.row_group_ordinal) break;
+        }
+        const ordinals = try alloc.alloc(u64, ref_end - ref_start);
+        errdefer alloc.free(ordinals);
+        for (refs[ref_start..ref_end], ordinals) |row_ref, *ordinal| ordinal.* = row_ref.external.row_ordinal;
+        groups[initialized] = .{
+            .file_id = try alloc.dupe(u8, first.file_id),
+            .row_group_ordinal = first.row_group_ordinal,
+            .row_ordinals = ordinals,
+        };
+        initialized += 1;
+        ref_start = ref_end;
+    }
+    return groups;
 }
 
 fn enrichInventoryWithObjectFootersAlloc(
@@ -299,42 +369,13 @@ fn icebergMetadataUriForOpenedStoreAlloc(
     if (try icebergMetadataUriFromVersionHintAlloc(alloc, &storage_client, bucket, prefix, metadata_prefix, source_uri, object_uri_base)) |metadata_uri| {
         return metadata_uri;
     }
-
-    var best_key: ?[]u8 = null;
-    defer if (best_key) |key| alloc.free(key);
-    if (max_listing_pages == 0 or max_listing_objects == 0) return error.InvalidExternalSourceSnapshot;
-    var pagination = external_source.ObjectListingPaginationGuard.init(max_listing_pages);
-    defer pagination.deinit(alloc);
-    var listed_entry_count: usize = 0;
-    while (true) {
-        var page = try storage_client.listObjects(bucket, .{
-            .prefix = metadata_prefix,
-            .recursive = true,
-            .continuation_token = pagination.currentToken(),
-            .max_keys = 1000,
-        });
-        defer page.deinit(alloc);
-
-        listed_entry_count = std.math.add(usize, listed_entry_count, page.entries.len) catch
-            return error.ExternalSourceSnapshotTooLarge;
-        if (listed_entry_count > max_listing_objects) return error.ExternalSourceSnapshotTooLarge;
-
-        for (page.entries) |entry| {
-            if (!std.mem.endsWith(u8, entry.key, ".metadata.json")) continue;
-            if (best_key == null or std.mem.order(u8, best_key.?, entry.key) == .lt) {
-                const next_best = try alloc.dupe(u8, entry.key);
-                if (best_key) |old| alloc.free(old);
-                best_key = next_best;
-            }
-        }
-
-        if (!try pagination.advanceAlloc(alloc, page.next_continuation_token)) break;
-    }
-
-    const key = best_key orelse return error.ExternalLakeSnapshotMismatch;
-    const relative_key = relativeObjectKeyForPrefix(prefix, key);
-    const base_uri = object_uri_base orelse source_uri;
-    return try objectUriForRelativeKeyAlloc(alloc, base_uri, relative_key);
+    _ = max_listing_pages;
+    _ = max_listing_objects;
+    // Object listings are not an Iceberg commit protocol. A failed writer may
+    // leave a lexicographically newer metadata file behind without advancing
+    // the catalog pointer. Require an authoritative pointer rather than ever
+    // publishing an uncommitted snapshot.
+    return error.IcebergMetadataAuthorityRequired;
 }
 
 fn icebergMetadataUriFromVersionHintAlloc(
@@ -394,6 +435,64 @@ fn objectUriForRelativeKeyAlloc(alloc: Allocator, base_uri: []const u8, relative
 fn objectStoreUriBaseAlloc(alloc: Allocator, bucket: []const u8, prefix: []const u8) ![]u8 {
     if (prefix.len == 0) return try std.fmt.allocPrint(alloc, "object://{s}", .{bucket});
     return try std.fmt.allocPrint(alloc, "object://{s}/{s}", .{ bucket, prefix });
+}
+
+test "iceberg publication requires an authoritative metadata pointer" {
+    const alloc = std.testing.allocator;
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var orphan = try client.putObject("bucket", "events/metadata/v999.metadata.json", "{}", .{});
+    defer orphan.deinit(alloc);
+
+    try std.testing.expectError(error.IcebergMetadataAuthorityRequired, icebergMetadataUriForOpenedStoreAlloc(
+        alloc,
+        client,
+        "bucket",
+        "events",
+        "s3://bucket/events",
+        null,
+        1,
+        1,
+    ));
+}
+
+test "iceberg publication compacts sorted delete refs by file and row group" {
+    const alloc = std.testing.allocator;
+    const files = [_]external_source.FileEntry{.{
+        .file_id = @constCast("data.parquet"),
+        .object_uri = @constCast("s3://bucket/data.parquet"),
+        .etag = @constCast("etag"),
+        .byte_len = 1,
+        .row_count = 3,
+        .row_groups = @constCast(&[_]external_source.RowGroup{
+            .{ .ordinal = 0, .row_count = 2 },
+            .{ .ordinal = 1, .row_count = 1 },
+        }),
+    }};
+    const inventory = external_source.Inventory{
+        .format = .iceberg,
+        .source_id = @constCast("events"),
+        .source_uri = @constCast("s3://bucket/events"),
+        .snapshot_id = @constCast("12"),
+        .schema_fingerprint = @constCast("schema"),
+        .files = @constCast(&files),
+    };
+    const refs = [_]rowsource.RowRef{
+        .{ .external = .{ .source_id = "events", .snapshot_id = "12", .file_id = "data.parquet", .row_group_ordinal = 0, .row_ordinal = 0 } },
+        .{ .external = .{ .source_id = "events", .snapshot_id = "12", .file_id = "data.parquet", .row_group_ordinal = 0, .row_ordinal = 1 } },
+        .{ .external = .{ .source_id = "events", .snapshot_id = "12", .file_id = "data.parquet", .row_group_ordinal = 1, .row_ordinal = 0 } },
+    };
+
+    const groups = try deletedRowGroupsFromRefsAlloc(alloc, inventory, &refs);
+    defer {
+        for (groups) |*group| group.deinit(alloc);
+        alloc.free(groups);
+    }
+    try std.testing.expectEqual(@as(usize, 2), groups.len);
+    try std.testing.expectEqualSlices(u64, &.{ 0, 1 }, groups[0].row_ordinals);
+    try std.testing.expectEqualSlices(u64, &.{0}, groups[1].row_ordinals);
 }
 
 test "remote uri publication resolver pins parquet inventory into artifact store" {

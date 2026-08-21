@@ -32,12 +32,23 @@ pub const GroupByRequest = struct {
     op: algebraic_segment.AggregateOp,
     materialized_source: ?MaterializedSourceRef = null,
     deleted_row_refs: []const rowsource.RowRef = &.{},
+    deleted_row_filter: ?DeletedRowFilter = null,
 };
 
 pub const ExpressionAggregateRequest = struct {
     expressions: []const algebraic_segment.ExpressionSpec,
     materialized_source: ?MaterializedSourceRef = null,
     deleted_row_refs: []const rowsource.RowRef = &.{},
+    deleted_row_filter: ?DeletedRowFilter = null,
+};
+
+pub const DeletedRowFilter = struct {
+    ctx: *const anyopaque,
+    contains_fn: *const fn (ctx: *const anyopaque, row_ref: rowsource.RowRef) bool,
+
+    pub fn contains(self: DeletedRowFilter, row_ref: rowsource.RowRef) bool {
+        return self.contains_fn(self.ctx, row_ref);
+    }
 };
 
 pub const MaterializedSourceRef = struct {
@@ -160,6 +171,27 @@ pub const ProjectedRow = struct {
         }
         return null;
     }
+
+    pub fn allocatedBytes(self: ProjectedRow) usize {
+        var total = std.math.add(
+            usize,
+            @sizeOf(ProjectedRow),
+            std.math.mul(usize, self.cells.len, @sizeOf(ProjectedCell)) catch return std.math.maxInt(usize),
+        ) catch return std.math.maxInt(usize);
+        for (self.cells) |cell| {
+            total = std.math.add(usize, total, cell.name.len) catch return std.math.maxInt(usize);
+            if (cell.value) |value| {
+                const payload_bytes = switch (value) {
+                    .bytes => |bytes| bytes.len,
+                    .json => |bytes| bytes.len,
+                    .vector_f32 => |values| std.math.mul(usize, values.len, @sizeOf(f32)) catch return std.math.maxInt(usize),
+                    .i64, .f64, .bool => 0,
+                };
+                total = std.math.add(usize, total, payload_bytes) catch return std.math.maxInt(usize);
+            }
+        }
+        return total;
+    }
 };
 
 pub const HydrateResult = struct {
@@ -194,6 +226,25 @@ pub const ScanRequest = struct {
     predicate: ?Predicate = null,
     limit: ?usize = null,
     deleted_row_refs: []const rowsource.RowRef = &.{},
+    deleted_row_filter: ?DeletedRowFilter = null,
+    limits: ScanLimits = .{},
+};
+
+pub const ScanLimits = struct {
+    max_batches: usize = 100_000,
+    max_rows_examined: u64 = 100_000_000,
+    max_matching_rows: u64 = std.math.maxInt(u32),
+    max_materialized_rows: usize = 1_000_000,
+    max_materialized_bytes: usize = 256 * 1024 * 1024,
+
+    pub fn validate(self: ScanLimits) !void {
+        if (self.max_batches == 0 or self.max_rows_examined == 0 or self.max_matching_rows == 0 or
+            self.max_materialized_rows == 0 or self.max_materialized_bytes == 0 or
+            self.max_matching_rows > std.math.maxInt(u32))
+        {
+            return error.InvalidLakeRowsScanLimits;
+        }
+    }
 };
 
 pub const ScanResult = HydrateResult;
@@ -244,7 +295,7 @@ pub fn executeGroupByAlloc(
         if (required.kind != source.kind) return error.LakeRowsMaterializedSourceMismatch;
     }
     if (materialized) |reader| {
-        if (request.deleted_row_refs.len == 0 and materializedMatches(reader.*, request)) {
+        if (request.deleted_row_refs.len == 0 and request.deleted_row_filter == null and materializedMatches(reader.*, request)) {
             return try resultFromAlgebraicAlloc(alloc, reader.*);
         }
     }
@@ -265,7 +316,7 @@ pub fn executeExpressionAggregatesAlloc(
         if (required.kind != source.kind) return error.LakeRowsMaterializedSourceMismatch;
     }
     if (materialized) |reader| {
-        if (request.deleted_row_refs.len == 0 and materializedExpressionMatches(reader.*, request)) {
+        if (request.deleted_row_refs.len == 0 and request.deleted_row_filter == null and materializedExpressionMatches(reader.*, request)) {
             return try expressionResultFromAlgebraicAlloc(alloc, reader.*, request.expressions);
         }
     }
@@ -290,20 +341,35 @@ pub fn scanRowsAlloc(
     }
 
     var total: u32 = 0;
+    var batches_seen: usize = 0;
+    var rows_examined: u64 = 0;
+    var materialized_bytes: usize = 0;
     while (try source.next(alloc)) |batch| {
+        batches_seen = std.math.add(usize, batches_seen, 1) catch return error.LakeRowsScanBudgetExceeded;
+        if (batches_seen > request.limits.max_batches) return error.LakeRowsScanBudgetExceeded;
         const predicate_column = if (request.predicate) |predicate|
             batch.findColumn(predicate.column) orelse return error.RowSourceColumnNotFound
         else
             null;
 
         for (0..batch.rowCount()) |row_idx| {
-            if (containsRowRef(request.deleted_row_refs, batch.row_refs[row_idx])) continue;
+            rows_examined = std.math.add(u64, rows_examined, 1) catch return error.LakeRowsScanBudgetExceeded;
+            if (rows_examined > request.limits.max_rows_examined) return error.LakeRowsScanBudgetExceeded;
+            if (rowIsDeleted(request.deleted_row_refs, request.deleted_row_filter, batch.row_refs[row_idx])) continue;
             if (request.predicate) |predicate| {
                 if (!try predicateMatches(predicate, predicate_column.?, row_idx)) continue;
             }
-            total += 1;
+            total = std.math.add(u32, total, 1) catch return error.LakeRowsScanBudgetExceeded;
+            if (total > request.limits.max_matching_rows) return error.LakeRowsScanBudgetExceeded;
             if (!limitReached(rows.items.len, request.limit)) {
-                try rows.append(alloc, try projectRowAlloc(alloc, batch, row_idx, request.projected_columns));
+                if (rows.items.len >= request.limits.max_materialized_rows) return error.LakeRowsScanBudgetExceeded;
+                var projected = try projectRowAlloc(alloc, batch, row_idx, request.projected_columns);
+                errdefer projected.deinit(alloc);
+                const row_bytes = projected.allocatedBytes();
+                materialized_bytes = std.math.add(usize, materialized_bytes, row_bytes) catch
+                    return error.LakeRowsScanBudgetExceeded;
+                if (materialized_bytes > request.limits.max_materialized_bytes) return error.LakeRowsScanBudgetExceeded;
+                try rows.append(alloc, projected);
             }
         }
     }
@@ -335,14 +401,20 @@ pub fn scanRowsWithSidecarsAlloc(
 
     if (try usableCandidateRefsAlloc(alloc, request.sidecars, selection, request.candidates)) |usable| {
         defer alloc.free(usable.row_refs);
-        const live_refs = try rowRefsExcludingDeletedAlloc(alloc, usable.row_refs, request.scan.deleted_row_refs);
+        const live_refs = try rowRefsExcludingDeletedAlloc(
+            alloc,
+            usable.row_refs,
+            request.scan.deleted_row_refs,
+            request.scan.deleted_row_filter,
+        );
         defer alloc.free(live_refs);
-        var hydrated = try hydrateRowsForBindingExcludingDeletedAlloc(
+        var hydrated = try hydrateRowsForBindingExcludingDeletedWithFilterAlloc(
             alloc,
             source,
             usable.binding,
             usable.row_refs,
             request.scan.deleted_row_refs,
+            request.scan.deleted_row_filter,
             request.scan.projected_columns,
         );
         errdefer hydrated.deinit(alloc);
@@ -418,7 +490,7 @@ pub fn hydrateRowsAlloc(
     wanted_refs: []const rowsource.RowRef,
     projected_columns: []const []const u8,
 ) !HydrateResult {
-    return try hydrateRowsInternalAlloc(alloc, source, null, wanted_refs, &.{}, projected_columns);
+    return try hydrateRowsInternalAlloc(alloc, source, null, wanted_refs, &.{}, null, projected_columns);
 }
 
 pub fn hydrateRowsExcludingDeletedAlloc(
@@ -428,7 +500,7 @@ pub fn hydrateRowsExcludingDeletedAlloc(
     deleted_row_refs: []const rowsource.RowRef,
     projected_columns: []const []const u8,
 ) !HydrateResult {
-    return try hydrateRowsInternalAlloc(alloc, source, null, wanted_refs, deleted_row_refs, projected_columns);
+    return try hydrateRowsInternalAlloc(alloc, source, null, wanted_refs, deleted_row_refs, null, projected_columns);
 }
 
 pub fn hydrateRowsForBindingAlloc(
@@ -439,7 +511,7 @@ pub fn hydrateRowsForBindingAlloc(
     projected_columns: []const []const u8,
 ) !HydrateResult {
     try source_binding.validateCandidateRowRefsAgainstBinding(binding, wanted_refs);
-    return try hydrateRowsInternalAlloc(alloc, source, binding, wanted_refs, &.{}, projected_columns);
+    return try hydrateRowsInternalAlloc(alloc, source, binding, wanted_refs, &.{}, null, projected_columns);
 }
 
 pub fn hydrateRowsForBindingExcludingDeletedAlloc(
@@ -450,8 +522,28 @@ pub fn hydrateRowsForBindingExcludingDeletedAlloc(
     deleted_row_refs: []const rowsource.RowRef,
     projected_columns: []const []const u8,
 ) !HydrateResult {
+    return try hydrateRowsForBindingExcludingDeletedWithFilterAlloc(
+        alloc,
+        source,
+        binding,
+        wanted_refs,
+        deleted_row_refs,
+        null,
+        projected_columns,
+    );
+}
+
+pub fn hydrateRowsForBindingExcludingDeletedWithFilterAlloc(
+    alloc: Allocator,
+    source: rowsource.Source,
+    binding: source_binding.Binding,
+    wanted_refs: []const rowsource.RowRef,
+    deleted_row_refs: []const rowsource.RowRef,
+    deleted_row_filter: ?DeletedRowFilter,
+    projected_columns: []const []const u8,
+) !HydrateResult {
     try source_binding.validateCandidateRowRefsAgainstBinding(binding, wanted_refs);
-    return try hydrateRowsInternalAlloc(alloc, source, binding, wanted_refs, deleted_row_refs, projected_columns);
+    return try hydrateRowsInternalAlloc(alloc, source, binding, wanted_refs, deleted_row_refs, deleted_row_filter, projected_columns);
 }
 
 fn hydrateRowsInternalAlloc(
@@ -460,6 +552,7 @@ fn hydrateRowsInternalAlloc(
     binding: ?source_binding.Binding,
     wanted_refs: []const rowsource.RowRef,
     deleted_row_refs: []const rowsource.RowRef,
+    deleted_row_filter: ?DeletedRowFilter,
     projected_columns: []const []const u8,
 ) !HydrateResult {
     if (wanted_refs.len == 0) return .{ .rows = try alloc.alloc(ProjectedRow, 0), .total = 0 };
@@ -476,7 +569,7 @@ fn hydrateRowsInternalAlloc(
             try source_binding.validateBatchSnapshotAgainstBinding(sidecar_binding, batch);
         }
         for (batch.row_refs, 0..) |row_ref, row_idx| {
-            if (containsRowRef(deleted_row_refs, row_ref)) continue;
+            if (rowIsDeleted(deleted_row_refs, deleted_row_filter, row_ref)) continue;
             if (!containsRowRef(wanted_refs, row_ref)) continue;
             try rows.append(alloc, try projectRowAlloc(alloc, batch, row_idx, projected_columns));
             if (rows.items.len == wanted_refs.len) break;
@@ -484,6 +577,7 @@ fn hydrateRowsInternalAlloc(
         if (rows.items.len == wanted_refs.len) break;
     }
 
+    if (rows.items.len > std.math.maxInt(u32)) return error.LakeRowsHydrationBudgetExceeded;
     const total: u32 = @intCast(rows.items.len);
     return .{ .rows = try rows.toOwnedSlice(alloc), .total = total };
 }
@@ -497,12 +591,13 @@ fn rowRefsExcludingDeletedAlloc(
     alloc: Allocator,
     row_refs: []const rowsource.RowRef,
     deleted_row_refs: []const rowsource.RowRef,
+    deleted_row_filter: ?DeletedRowFilter,
 ) ![]rowsource.RowRef {
     if (row_refs.len == 0) return try alloc.alloc(rowsource.RowRef, 0);
     var out = std.ArrayListUnmanaged(rowsource.RowRef).empty;
     errdefer out.deinit(alloc);
     for (row_refs) |row_ref| {
-        if (!containsRowRef(deleted_row_refs, row_ref)) try out.append(alloc, row_ref);
+        if (!rowIsDeleted(deleted_row_refs, deleted_row_filter, row_ref)) try out.append(alloc, row_ref);
     }
     return try out.toOwnedSlice(alloc);
 }
@@ -526,12 +621,16 @@ fn validateExpressionAggregateRequest(request: ExpressionAggregateRequest) !void
 }
 
 fn validateScanRequest(request: ScanRequest) !void {
+    try request.limits.validate();
     if (request.projected_columns.len == 0) return error.InvalidLakeRowsQuery;
     for (request.projected_columns) |column| {
         if (column.len == 0) return error.InvalidLakeRowsQuery;
     }
     if (request.predicate) |predicate| {
         if (predicate.column.len == 0) return error.InvalidLakeRowsQuery;
+    }
+    if (request.limit) |limit| {
+        if (limit > request.limits.max_materialized_rows) return error.InvalidLakeRowsScanLimits;
     }
 }
 
@@ -764,7 +863,7 @@ fn resultFromSourceAlloc(
         }
 
         for (0..batch.rowCount()) |row_idx| {
-            if (containsRowRef(request.deleted_row_refs, batch.row_refs[row_idx])) continue;
+            if (rowIsDeleted(request.deleted_row_refs, request.deleted_row_filter, batch.row_refs[row_idx])) continue;
             if (group_column.nulls.isNull(row_idx)) continue;
             const key = group_column.values.bytes[row_idx];
             if (key.len == 0) continue;
@@ -825,7 +924,7 @@ fn expressionResultFromSourceAlloc(
                 if (column.kind() != .i64) return error.UnsupportedLakeRowsValueColumnKind;
             }
             for (0..batch.rowCount()) |row_idx| {
-                if (containsRowRef(request.deleted_row_refs, batch.row_refs[row_idx])) continue;
+                if (rowIsDeleted(request.deleted_row_refs, request.deleted_row_filter, batch.row_refs[row_idx])) continue;
                 const next_value = rowAggregateValue(accumulator.spec.op, value_column, row_idx) orelse continue;
                 if (!accumulator.initialized) {
                     accumulator.value = next_value;
@@ -948,6 +1047,15 @@ fn containsRowRef(haystack: []const rowsource.RowRef, needle: rowsource.RowRef) 
         if (rowRefsEqual(candidate, needle)) return true;
     }
     return false;
+}
+
+fn rowIsDeleted(
+    deleted_row_refs: []const rowsource.RowRef,
+    deleted_row_filter: ?DeletedRowFilter,
+    row_ref: rowsource.RowRef,
+) bool {
+    if (containsRowRef(deleted_row_refs, row_ref)) return true;
+    return if (deleted_row_filter) |filter| filter.contains(row_ref) else false;
 }
 
 fn rowRefsEqual(a: rowsource.RowRef, b: rowsource.RowRef) bool {
@@ -1570,6 +1678,54 @@ test "lake rows scans exclude deleted row refs before predicates and limits" {
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
     try std.testing.expect(rowRefsEqual(row_refs[1], result.rows[0].row_ref));
     try std.testing.expectEqual(@as(i64, 20), result.rows[0].find("amount").?.value.?.i64);
+}
+
+test "lake rows enforce global scan budgets and callback deletion filters" {
+    const alloc = std.testing.allocator;
+    const local = @import("../../storage/rowsource/local.zig");
+
+    const row_refs = [_]rowsource.RowRef{
+        .{ .relational_key = "row:a" },
+        .{ .relational_key = "row:b" },
+        .{ .relational_key = "row:c" },
+    };
+    const amounts = [_]i64{ 10, 20, 30 };
+    const columns = [_]rowsource.ColumnVector{.{ .name = "amount", .values = .{ .i64 = &amounts } }};
+    const batches = [_]rowsource.ColumnBatch{.{
+        .snapshot = .{ .table_id = "orders", .snapshot_id = "1" },
+        .row_refs = &row_refs,
+        .columns = &columns,
+    }};
+    const Filter = struct {
+        deleted: rowsource.RowRef,
+
+        fn contains(ctx: *const anyopaque, row_ref: rowsource.RowRef) bool {
+            const self: *const @This() = @ptrCast(@alignCast(ctx));
+            return rowRefsEqual(self.deleted, row_ref);
+        }
+    };
+    const filter_ctx = Filter{ .deleted = row_refs[1] };
+    const projection = [_][]const u8{"amount"};
+    var filtered_source = try local.relationalStoreSource(&batches);
+    var filtered = try scanRowsAlloc(alloc, filtered_source.rowSource(), .{
+        .projected_columns = &projection,
+        .deleted_row_filter = .{ .ctx = &filter_ctx, .contains_fn = Filter.contains },
+    });
+    defer filtered.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), filtered.total);
+    try std.testing.expectEqual(@as(usize, 2), filtered.rows.len);
+
+    var bounded_source = try local.relationalStoreSource(&batches);
+    try std.testing.expectError(error.LakeRowsScanBudgetExceeded, scanRowsAlloc(alloc, bounded_source.rowSource(), .{
+        .projected_columns = &projection,
+        .limits = .{ .max_rows_examined = 2 },
+    }));
+
+    var byte_bounded_source = try local.relationalStoreSource(&batches);
+    try std.testing.expectError(error.LakeRowsScanBudgetExceeded, scanRowsAlloc(alloc, byte_bounded_source.rowSource(), .{
+        .projected_columns = &projection,
+        .limits = .{ .max_materialized_bytes = 1 },
+    }));
 }
 
 test "lake rows hydrates projected cells by row ref" {

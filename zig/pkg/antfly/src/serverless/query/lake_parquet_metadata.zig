@@ -170,6 +170,8 @@ pub fn enrichInventoryFilesWithFootersAlloc(
     errdefer alloc.free(snapshot_id);
     const schema_fingerprint = try alloc.dupe(u8, inventory.schema_fingerprint);
     errdefer alloc.free(schema_fingerprint);
+    const deleted_row_groups = try cloneDeletedRowGroupsAlloc(alloc, inventory.deleted_row_groups);
+    errdefer deinitDeletedRowGroups(alloc, deleted_row_groups);
 
     var out = external_source.Inventory{
         .format = inventory.format,
@@ -178,6 +180,7 @@ pub fn enrichInventoryFilesWithFootersAlloc(
         .snapshot_id = snapshot_id,
         .schema_fingerprint = schema_fingerprint,
         .files = files,
+        .deleted_row_groups = deleted_row_groups,
     };
     errdefer out.deinit(alloc);
     try out.validate();
@@ -222,6 +225,8 @@ pub fn enrichInventoryFileWithFooterAlloc(
     errdefer alloc.free(snapshot_id);
     const schema_fingerprint = try alloc.dupe(u8, inventory.schema_fingerprint);
     errdefer alloc.free(schema_fingerprint);
+    const deleted_row_groups = try cloneDeletedRowGroupsAlloc(alloc, inventory.deleted_row_groups);
+    errdefer deinitDeletedRowGroups(alloc, deleted_row_groups);
 
     var out = external_source.Inventory{
         .format = inventory.format,
@@ -230,10 +235,40 @@ pub fn enrichInventoryFileWithFooterAlloc(
         .snapshot_id = snapshot_id,
         .schema_fingerprint = schema_fingerprint,
         .files = files,
+        .deleted_row_groups = deleted_row_groups,
     };
     errdefer out.deinit(alloc);
     try out.validate();
     return out;
+}
+
+fn cloneDeletedRowGroupsAlloc(
+    alloc: Allocator,
+    groups: []const external_source.DeletedRowGroup,
+) ![]external_source.DeletedRowGroup {
+    if (groups.len == 0) return &.{};
+    const out = try alloc.alloc(external_source.DeletedRowGroup, groups.len);
+    errdefer alloc.free(out);
+    var initialized: usize = 0;
+    errdefer for (out[0..initialized]) |*group| group.deinit(alloc);
+    for (groups, out) |group, *cloned| {
+        const file_id = try alloc.dupe(u8, group.file_id);
+        errdefer alloc.free(file_id);
+        const row_ordinals = try alloc.dupe(u64, group.row_ordinals);
+        errdefer alloc.free(row_ordinals);
+        cloned.* = .{
+            .file_id = file_id,
+            .row_group_ordinal = group.row_group_ordinal,
+            .row_ordinals = row_ordinals,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn deinitDeletedRowGroups(alloc: Allocator, groups: []external_source.DeletedRowGroup) void {
+    for (groups) |*group| group.deinit(alloc);
+    if (groups.len > 0) alloc.free(groups);
 }
 
 fn footerForFile(footers: []const FileFooter, file_id: []const u8) ?struct { idx: usize, footer: ParsedFooter } {
