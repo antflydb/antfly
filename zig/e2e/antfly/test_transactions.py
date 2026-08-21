@@ -27,6 +27,9 @@ import requests
 from helpers import wait_until
 
 
+pytestmark = pytest.mark.reuse_antfly_process
+
+
 NUM_SHARDS = 4
 
 

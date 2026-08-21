@@ -26,6 +26,9 @@ from helpers import wait_until
 from helpers import json_doc, upsert
 
 
+pytestmark = pytest.mark.reuse_antfly_process
+
+
 def _raise_thread_errors(errors: list[Exception]) -> None:
     if errors:
         raise AssertionError("\n\n".join(str(err) for err in errors))
@@ -397,8 +400,15 @@ def test_serverless_table_transforms_follow_latest_then_published(serverless_api
     assert published_before["table_name"] == table_name
     assert published_before["view"] == "published"
     published_before_docs = _docs_by_id(published_before)
-    assert "status" not in published_before_docs["doc-a"]
-    assert published_before_docs["doc-a"]["version"] == 1
+    published_before_doc = published_before_docs["doc-a"]
+    # Automatic publication may win the race with this observation. Both the
+    # previous snapshot and the fully transformed snapshot are valid here;
+    # partial transform visibility is not.
+    if "status" in published_before_doc:
+        assert published_before_doc["status"] == "updated"
+        assert published_before_doc["version"] == 3
+    else:
+        assert published_before_doc["version"] == 1
 
     try:
         serverless_api.build_table(table_name)

@@ -17,9 +17,14 @@
 from __future__ import annotations
 
 import time
+
+import pytest
 import requests
 
 from helpers import json_doc, query_hits_total_value, upsert, wait_until
+
+
+pytestmark = pytest.mark.reuse_antfly_process
 
 
 def _create_index(api, table_name: str, index_name: str, payload: dict) -> dict:

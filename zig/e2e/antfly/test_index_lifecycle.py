@@ -28,6 +28,9 @@ from conftest import ready_index_status
 from helpers import json_doc, upsert, wait_until
 
 
+pytestmark = pytest.mark.reuse_antfly_process
+
+
 def _table_name(created: dict) -> str:
     return created.get("name") or created.get("table_name") or ""
 
@@ -344,6 +347,7 @@ def test_stateful_table_accepts_public_full_text_create_index(stateful_api):
     assert detail["config"]["type"] == "full_text"
 
 
+@pytest.mark.fresh_antfly_process
 def test_stateful_managed_algebraic_generation_rebuild_catches_up_and_reopens(stateful_api):
     table_name = f"managed_algebraic_generation_{time.time_ns()}"
     index_name = "analytics_idx"
@@ -1199,6 +1203,7 @@ def test_stateful_managed_embeddings_backfill_recovers_after_rate_limited_enrich
     assert _response_hit_ids(alpha_query)[0] == "doc:a"
 
 
+@pytest.mark.fresh_antfly_process
 def test_stateful_managed_embeddings_backfill_resumes_after_process_restart(
     single_item_enrichment_batches,
     stateful_api,
@@ -1587,6 +1592,7 @@ def test_stateful_managed_embeddings_provider_pacing_is_shared_across_tables(
     assert stats["rate_limited_requests"] <= 1
 
 
+@pytest.mark.fresh_antfly_process
 def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_artifact(
     stateful_api,
     openai_embedder,
@@ -1837,14 +1843,18 @@ def test_table_chunker_full_text_index_routes_template_chunks(table_api, openai_
         if table_api.backend == "serverless":
             assert table_api.publish_table(table_name) is not None
 
-        hits = wait_until(
-            lambda: (
-                current
-                if ((current := query_ids(table_name)) and full_text_enabled)
-                else None
-            ),
-            timeout_s=30.0,
-            interval_s=0.5,
+        # `full_index` is the positive completion barrier for stateful tables;
+        # serverless tables additionally complete publication above. Do not
+        # poll for an absent hit when full text is disabled: that predicate can
+        # never succeed and previously consumed the entire 30-second timeout.
+        hits = (
+            wait_until(
+                lambda: current if (current := query_ids(table_name)) else None,
+                timeout_s=30.0,
+                interval_s=0.5,
+            )
+            if full_text_enabled
+            else None
         )
         return table_name, {"hits": hits or []}
 
@@ -2313,21 +2323,17 @@ def test_serverless_named_embedding_indexes_report_publication_actions(serverles
     )
     assert serverless_api.delete_index(table_name, "semantic_a") == {}
 
-    planned = wait_until(
-        lambda: (
-            current
-            if (
-                (current := serverless_api.table_build_status(table_name)).get("head_republish_recommended") is True
-                and _named_action(current, "vector_index_actions", "semantic_b") == "reuse"
-                and _named_action(current, "sparse_index_actions", "sparse_a") == "reuse"
-                and _named_action(current, "sparse_index_actions", "sparse_b") == "rebuild"
-            )
-            else None
-        ),
-        timeout_s=30.0,
-        interval_s=0.5,
-    )
-    if planned is not None:
+    # The pre-build plan is a transient diagnostic snapshot: the test's
+    # required contract is the post-build action set below. Inspect it when it
+    # is already observable, but do not spend 30 seconds waiting for an
+    # optional intermediate state.
+    planned = serverless_api.table_build_status(table_name)
+    if (
+        planned.get("head_republish_recommended") is True
+        and _named_action(planned, "vector_index_actions", "semantic_b") == "reuse"
+        and _named_action(planned, "sparse_index_actions", "sparse_a") == "reuse"
+        and _named_action(planned, "sparse_index_actions", "sparse_b") == "rebuild"
+    ):
         assert _named_action(planned, "vector_index_actions", "semantic_a") == "drop"
         assert planned["artifact_actions"]["dense_vector"] == "reuse"
         assert planned["artifact_actions"]["sparse_vector"] == "rebuild"
