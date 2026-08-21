@@ -3197,6 +3197,14 @@ const HAStandbyReplicationErrorCode = enum(u8) {
     BrokenPipe,
     EndOfStream,
     NoAddressReturned,
+    Timeout,
+    ConnectionTimedOut,
+    NetworkUnreachable,
+    HostUnreachable,
+    NetworkDown,
+    AddressUnavailable,
+    TemporaryNameServerFailure,
+    NameServerFailure,
     InvalidInternalReplicationRequest,
     InternalReplicationEndpointNotFound,
     UnsupportedOperation,
@@ -3243,6 +3251,14 @@ fn haStandbyReplicationErrorCode(err: anyerror) HAStandbyReplicationErrorCode {
         error.BrokenPipe => .BrokenPipe,
         error.EndOfStream => .EndOfStream,
         error.NoAddressReturned => .NoAddressReturned,
+        error.Timeout => .Timeout,
+        error.ConnectionTimedOut => .ConnectionTimedOut,
+        error.NetworkUnreachable => .NetworkUnreachable,
+        error.HostUnreachable => .HostUnreachable,
+        error.NetworkDown => .NetworkDown,
+        error.AddressUnavailable => .AddressUnavailable,
+        error.TemporaryNameServerFailure => .TemporaryNameServerFailure,
+        error.NameServerFailure => .NameServerFailure,
         error.InvalidInternalReplicationRequest => .InvalidInternalReplicationRequest,
         error.InternalReplicationEndpointNotFound => .InternalReplicationEndpointNotFound,
         error.UnsupportedOperation => .UnsupportedOperation,
@@ -3291,6 +3307,14 @@ fn haStandbyReplicationErrorName(code: HAStandbyReplicationErrorCode) ?[]const u
         .BrokenPipe => "BrokenPipe",
         .EndOfStream => "EndOfStream",
         .NoAddressReturned => "NoAddressReturned",
+        .Timeout => "Timeout",
+        .ConnectionTimedOut => "ConnectionTimedOut",
+        .NetworkUnreachable => "NetworkUnreachable",
+        .HostUnreachable => "HostUnreachable",
+        .NetworkDown => "NetworkDown",
+        .AddressUnavailable => "AddressUnavailable",
+        .TemporaryNameServerFailure => "TemporaryNameServerFailure",
+        .NameServerFailure => "NameServerFailure",
         .InvalidInternalReplicationRequest => "InvalidInternalReplicationRequest",
         .InternalReplicationEndpointNotFound => "InternalReplicationEndpointNotFound",
         .UnsupportedOperation => "UnsupportedOperation",
@@ -3330,7 +3354,33 @@ fn haStandbyReplicationErrorName(code: HAStandbyReplicationErrorCode) ?[]const u
     };
 }
 
+fn isHAStandbyUpstreamTransportError(err: anyerror) bool {
+    return switch (haStandbyReplicationErrorCode(err)) {
+        .HttpConnectionClosing,
+        .ConnectionResetByPeer,
+        .ConnectionRefused,
+        .BrokenPipe,
+        .EndOfStream,
+        .NoAddressReturned,
+        .Timeout,
+        .ConnectionTimedOut,
+        .NetworkUnreachable,
+        .HostUnreachable,
+        .NetworkDown,
+        .AddressUnavailable,
+        .TemporaryNameServerFailure,
+        .NameServerFailure,
+        .NotListening,
+        => true,
+        else => false,
+    };
+}
+
 fn isNonFatalHAStandbyReplicationError(err: anyerror) bool {
+    // Losing the upstream transport is expected during primary failure. Keep
+    // the standby control plane alive so it can expose its durable safe-read
+    // boundary and complete the separately fenced promotion protocol.
+    if (isHAStandbyUpstreamTransportError(err)) return true;
     return switch (err) {
         // Promotion is durably committed before the runtime adopts the
         // standby's resources. Keep the process available and fail closed so
@@ -3347,12 +3397,6 @@ fn isNonFatalHAStandbyReplicationError(err: anyerror) bool {
         error.WriterLocked,
         error.InvalidPromotionHandoff,
         error.MissingPromotionSwitch,
-        error.HttpConnectionClosing,
-        error.ConnectionResetByPeer,
-        error.ConnectionRefused,
-        error.NoAddressReturned,
-        error.BrokenPipe,
-        error.EndOfStream,
         // Upstream route/resource availability and protocol negotiation are
         // operational degradation, not local process integrity failures. Keep
         // stale reads and promotion controls available while reporting the
@@ -3364,7 +3408,6 @@ fn isNonFatalHAStandbyReplicationError(err: anyerror) bool {
         error.InternalReplicationEndpointNotReady,
         error.SlotNotFound,
         error.UnexpectedHttpStatus,
-        error.NotListening,
         error.UnsupportedReplicationFormat,
         error.InternalReplicationDidNotAdvance,
         error.ReplicationResponseLsnMismatch,
@@ -3420,6 +3463,29 @@ fn isSupersededHAStandbyReplicationRound(err: anyerror) bool {
 
 test "data server keeps upstream replication availability failures nonfatal" {
     inline for (.{
+        error.HttpConnectionClosing,
+        error.ConnectionResetByPeer,
+        error.ConnectionRefused,
+        error.BrokenPipe,
+        error.EndOfStream,
+        error.NoAddressReturned,
+        error.Timeout,
+        error.ConnectionTimedOut,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        error.NetworkDown,
+        error.AddressUnavailable,
+        error.TemporaryNameServerFailure,
+        error.NameServerFailure,
+        error.NotListening,
+    }) |err| {
+        try std.testing.expect(isHAStandbyUpstreamTransportError(err));
+        try std.testing.expect(isNonFatalHAStandbyReplicationError(err));
+        const code = haStandbyReplicationErrorCode(err);
+        try std.testing.expect(code != .Other);
+        try std.testing.expectEqualStrings(@errorName(err), haStandbyReplicationErrorName(code).?);
+    }
+    inline for (.{
         error.InvalidInternalReplicationRequest,
         error.InternalReplicationEndpointNotFound,
         error.UnsupportedOperation,
@@ -3427,6 +3493,7 @@ test "data server keeps upstream replication availability failures nonfatal" {
         error.InternalReplicationEndpointNotReady,
         error.SlotNotFound,
     }) |err| {
+        try std.testing.expect(!isHAStandbyUpstreamTransportError(err));
         try std.testing.expect(isNonFatalHAStandbyReplicationError(err));
         try std.testing.expect(haStandbyReplicationErrorCode(err) != .Other);
     }
@@ -27034,7 +27101,7 @@ test "storage.ha data server rejects writes and owner jobs after primary promoti
         .uri = antfly.admin.routes.ha_fence,
         .authorization = "Bearer runtime-secret-token",
         .content_type = "application/json",
-        .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"force\":false,\"reason\":\"data-server-test\"}",
+        .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"generation\":1,\"required_lsn\":1,\"observed_lsn\":1,\"force\":false,\"reason\":\"data-server-test\"}",
     });
     defer fence_response.deinit(server.http_server.?.alloc);
     try std.testing.expectEqual(@as(u16, 200), fence_response.status);

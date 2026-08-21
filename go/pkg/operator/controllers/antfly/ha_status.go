@@ -3721,8 +3721,29 @@ func standbyPromotionEligible(standby antflyv1.HAStandbyStatus) bool {
 	if !standby.CaughtUpToReceived || !standby.CanServeSafeReads {
 		return false
 	}
+	if standbyUpstreamTransportUnavailable(errName) {
+		return true
+	}
+	return false
+}
+
+func standbyUpstreamTransportUnavailable(errName string) bool {
 	switch errName {
-	case "ConnectionRefused", "ConnectionResetByPeer", "BrokenPipe", "EndOfStream", "HttpConnectionClosing", "NoAddressReturned", "NotListening":
+	case "HttpConnectionClosing",
+		"ConnectionResetByPeer",
+		"ConnectionRefused",
+		"BrokenPipe",
+		"EndOfStream",
+		"NoAddressReturned",
+		"Timeout",
+		"ConnectionTimedOut",
+		"NetworkUnreachable",
+		"HostUnreachable",
+		"NetworkDown",
+		"AddressUnavailable",
+		"TemporaryNameServerFailure",
+		"NameServerFailure",
+		"NotListening":
 		return true
 	default:
 		return false
