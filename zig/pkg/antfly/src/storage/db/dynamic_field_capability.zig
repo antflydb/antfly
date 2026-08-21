@@ -16,6 +16,8 @@
 
 const std = @import("std");
 const schema_mod = @import("../schema.zig");
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const platform_time = @import("antfly_platform").time;
 
 pub const CoverageReadMode = enum(u8) {
     /// Return only coverage summaries that have already been validated. This
@@ -35,6 +37,8 @@ pub const ObservationQuery = struct {
     /// physical sort fields so unrelated columns remain cold.
     fields: []const []const u8 = &.{},
     coverage_read_mode: CoverageReadMode = .cached_only,
+    execution_deadline_ns: ?u64 = null,
+    cancellation: ?CancellationToken = null,
 
     pub fn includesField(self: ObservationQuery, field: []const u8) bool {
         if (self.fields.len == 0) return true;
@@ -42,6 +46,13 @@ pub const ObservationQuery = struct {
             if (std.mem.eql(u8, selected, field)) return true;
         }
         return false;
+    }
+
+    pub fn checkActive(self: ObservationQuery) !void {
+        if (self.cancellation) |token| try token.check();
+        if (self.execution_deadline_ns) |deadline_ns| {
+            if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        }
     }
 };
 

@@ -37,6 +37,67 @@ pub const LookupResponse = struct {
     }
 };
 
+test "table read source distinguishes unavailable physical capability observation" {
+    const Observer = struct {
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_types.LookupOptions,
+            _: read_gate.ReadConsistency,
+        ) anyerror!?LookupResponse {
+            return null;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_types.ScanOptions,
+            _: read_gate.ReadConsistency,
+        ) anyerror!?ScanResponse {
+            return null;
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_types.SearchRequest,
+            _: read_gate.ReadConsistency,
+        ) anyerror!?query_api.QueryResponse {
+            return null;
+        }
+
+        fn observe(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: DynamicFieldObservationQuery,
+        ) !?[]ObservedDynamicFieldCapabilitySet {
+            return &.{};
+        }
+    };
+
+    const unavailable = TableReadSource{ .ptr = undefined, .vtable = &.{
+        .lookup = Observer.lookup,
+        .scan = Observer.scan,
+        .query = Observer.query,
+    } };
+    try std.testing.expect(!unavailable.supportsObservedDynamicFieldCapabilitySets());
+
+    const available = TableReadSource{ .ptr = undefined, .vtable = &.{
+        .lookup = Observer.lookup,
+        .scan = Observer.scan,
+        .query = Observer.query,
+        .observed_dynamic_field_capability_sets = Observer.observe,
+    } };
+    try std.testing.expect(available.supportsObservedDynamicFieldCapabilitySets());
+}
+
 pub const ScanResponse = struct {
     ndjson: []u8,
 
@@ -674,5 +735,12 @@ pub const TableReadSource = struct {
     ) !?[]ObservedDynamicFieldCapabilitySet {
         const fn_ptr = self.vtable.observed_dynamic_field_capability_sets orelse return null;
         return try BoundaryAbi.call("observed_dynamic_field_capability_sets", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, observation });
+    }
+
+    /// Whether this source can authoritatively observe physical typed-column
+    /// coverage. Routed metadata gateways intentionally do not: the owning
+    /// shard validates coverage again before executing an exact sort.
+    pub fn supportsObservedDynamicFieldCapabilitySets(self: TableReadSource) bool {
+        return self.vtable.observed_dynamic_field_capability_sets != null;
     }
 };

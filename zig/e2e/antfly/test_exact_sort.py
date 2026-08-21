@@ -22,19 +22,19 @@ DOCUMENTS = {
     "a": {
         "title": "alpha note",
         "label": "alpha",
-        "size": 10,
+        "size": -9007199254740993,
         "modified_at": "2026-05-05T12:43:00Z",
     },
     "b": {
         "title": "bravo note",
         "label": "bravo",
-        "size": 20,
+        "size": 10.5,
         "modified_at": "2026-06-05T12:43:00Z",
     },
     "c": {
         "title": "charlie note",
         "label": "charlie",
-        "size": 30,
+        "size": 18446744073709551615,
         "modified_at": "2026-07-05T12:43:00Z",
     },
 }
@@ -221,6 +221,27 @@ def test_public_exact_sort_declares_native_coverage_and_shorthand_fields_are_act
             "queryable",
             "accelerated",
         }
+
+    first_numeric_page = stateful_api.query_table(
+        sortable_table,
+        {
+            "query": {"match_all": {}},
+            "limit": 1,
+            "order_by": [{"field": "size"}],
+        },
+    )
+    first_numeric_hit = first_numeric_page["responses"][0]["hits"]["hits"][0]
+    assert first_numeric_hit["_id"] == "a"
+    second_numeric_page = stateful_api.query_table(
+        sortable_table,
+        {
+            "query": {"match_all": {}},
+            "limit": 2,
+            "order_by": [{"field": "size"}],
+            "search_after": first_numeric_hit["_sort"],
+        },
+    )
+    assert _hit_ids(second_numeric_page) == ["b", "c"]
 
     if stateful_api.supports_restart:
         stateful_api.restart_server()

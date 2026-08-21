@@ -4842,8 +4842,14 @@ pub const DB = struct {
         alloc: Allocator,
         observation: index_manager_mod.IndexManager.DynamicFieldObservationQuery,
     ) ![]index_manager_mod.IndexManager.ObservedDynamicFieldCapabilitySet {
-        lockApplyShared(self);
+        try observation.checkActive();
+        if (observation.execution_deadline_ns != null or observation.cancellation != null) {
+            if (!self.core.tryLockApplyShared()) return error.StorageReadTemporarilyUnavailable;
+        } else {
+            lockApplyShared(self);
+        }
         defer self.core.unlockApplyShared();
+        try observation.checkActive();
         return try self.core.index_manager.observedDynamicFieldCapabilitySetsAlloc(alloc, observation);
     }
 

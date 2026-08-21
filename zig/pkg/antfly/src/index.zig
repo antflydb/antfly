@@ -36,6 +36,7 @@ const query_mod = @import("search/query.zig");
 const distributed_stats_mod = @import("search/distributed_stats.zig");
 const platform_time = @import("antfly_platform").time;
 const resource_manager_mod = @import("storage/resource_manager.zig");
+const CancellationToken = @import("common/cancellation.zig").CancellationToken;
 
 const mapped_residency_cold: u8 = 0;
 const mapped_residency_resident: u8 = 1;
@@ -177,6 +178,12 @@ pub const SegmentShared = struct {
         }
     }
 
+    fn tryLockDeletionShared(self: *SegmentShared) bool {
+        const state = self.deletion_lock.load(.acquire);
+        if ((state & deletion_writer_bit) != 0 or state >= deletion_writer_bit - 1) return false;
+        return self.deletion_lock.cmpxchgStrong(state, state + 1, .acquire, .monotonic) == null;
+    }
+
     pub fn unlockDeletionShared(self: *SegmentShared) void {
         const previous = self.deletion_lock.fetchSub(1, .release);
         std.debug.assert((previous & ~deletion_writer_bit) > 0);
@@ -238,6 +245,18 @@ pub const TypedDocValuesFieldCoverage = struct {
     }
 };
 
+pub const CoverageValidation = struct {
+    execution_deadline_ns: ?u64 = null,
+    cancellation: ?CancellationToken = null,
+
+    fn checkActive(self: @This()) !void {
+        if (self.cancellation) |token| try token.check();
+        if (self.execution_deadline_ns) |deadline_ns| {
+            if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        }
+    }
+};
+
 fn freeTypedDocValuesCoverage(alloc: Allocator, coverage: []TypedDocValuesFieldCoverage) void {
     for (coverage) |*field| field.deinit();
     if (coverage.len > 0) alloc.free(coverage);
@@ -294,32 +313,46 @@ fn initializeTypedDocValuesFieldCoverage(
     shared: *SegmentShared,
     reader: *const segment_mod.SegmentReader,
     coverage: *TypedDocValuesFieldCoverage,
+    validation: ?CoverageValidation,
 ) !void {
     if (coverage.initialized.load(.acquire)) return;
-    coverage.lockInitialization();
+    if (validation) |active| {
+        try active.checkActive();
+        // Admission retries this transient condition. A request with a short
+        // deadline must never park behind another request's cold O(docs)
+        // validation scan.
+        if (!coverage.initialization_mutex.tryLock()) return error.StorageReadTemporarilyUnavailable;
+    } else {
+        coverage.lockInitialization();
+    }
     defer coverage.unlockInitialization();
     if (coverage.initialized.load(.acquire)) return;
+    if (validation) |active| try active.checkActive();
 
     const section_data = reader.getSection(coverage.field, .typed_doc_values) catch {
+        if (validation) |active| try active.checkActive();
         coverage.physical_status = .malformed_doc_values_section;
         coverage.initialized.store(true, .release);
         return;
     } orelse {
+        if (validation) |active| try active.checkActive();
         coverage.physical_status = .missing_doc_values_section;
         coverage.initialized.store(true, .release);
         return;
     };
     const typed_reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch {
+        if (validation) |active| try active.checkActive();
         coverage.physical_status = .malformed_doc_values_section;
         coverage.initialized.store(true, .release);
         return;
     };
-    coverage.value_type = typed_reader.value_type;
+    const value_type = typed_reader.value_type;
 
     var present = try std.DynamicBitSetUnmanaged.initEmpty(alloc, reader.doc_count);
     defer present.deinit(alloc);
     var structural_status: TypedDocValuesCoverageStatus = .covered;
     chunks: for (0..typed_reader.num_chunks) |chunk_idx| {
+        if (validation) |active| try active.checkActive();
         const doc_ids = typed_reader.readValidatedChunkDocIds(@intCast(chunk_idx)) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => {
@@ -328,7 +361,8 @@ fn initializeTypedDocValuesFieldCoverage(
             },
         };
         defer alloc.free(doc_ids);
-        for (doc_ids) |doc_id| {
+        for (doc_ids, 0..) |doc_id, doc_idx| {
+            if ((doc_idx & 1023) == 0) if (validation) |active| try active.checkActive();
             if (doc_id >= reader.doc_count) {
                 structural_status = .invalid_doc_value_doc_id;
                 break :chunks;
@@ -341,6 +375,8 @@ fn initializeTypedDocValuesFieldCoverage(
         }
     }
     if (structural_status != .covered) {
+        if (validation) |active| try active.checkActive();
+        coverage.value_type = value_type;
         coverage.physical_status = structural_status;
         coverage.initialized.store(true, .release);
         return;
@@ -349,6 +385,8 @@ fn initializeTypedDocValuesFieldCoverage(
     const present_count: u32 = @intCast(present.count());
     const missing_count = reader.doc_count - present_count;
     if (missing_count == 0) {
+        if (validation) |active| try active.checkActive();
+        coverage.value_type = value_type;
         coverage.physical_status = .covered;
         coverage.initialized.store(true, .release);
         return;
@@ -358,13 +396,20 @@ fn initializeTypedDocValuesFieldCoverage(
     var membership = roaring.RoaringBitmap.init(alloc);
     errdefer membership.deinit();
     for (0..reader.doc_count) |doc_id| {
+        if ((doc_id & 1023) == 0) if (validation) |active| try active.checkActive();
         if (present.isSet(doc_id) != retain_missing) try membership.add(@intCast(doc_id));
     }
     // Decoding immutable segment bytes must not block deletes. Synchronize
     // only the small publication window: a deletion that completed during the
     // scan is included in the initial count, while one that starts afterward
     // observes initialized=true and updates the published membership.
-    shared.lockDeletionShared();
+    if (validation) |active| try active.checkActive();
+    if (validation != null) {
+        if (!shared.tryLockDeletionShared()) return error.StorageReadTemporarilyUnavailable;
+    } else {
+        shared.lockDeletionShared();
+    }
+    coverage.value_type = value_type;
     coverage.membership_doc_ids = membership;
     coverage.membership_is_missing = retain_missing;
     coverage.physical_status = .sparse_live_doc_values;
@@ -549,6 +594,14 @@ pub const SegmentEntry = struct {
     /// subsequent calls read only the cached summary. Missing columns are
     /// represented by null.
     pub fn typedDocValuesCoverage(self: *const SegmentEntry, field: []const u8) !?TypedDocValuesCoverage {
+        return self.typedDocValuesCoverageWithValidation(field, null);
+    }
+
+    pub fn typedDocValuesCoverageWithValidation(
+        self: *const SegmentEntry,
+        field: []const u8,
+        validation: ?CoverageValidation,
+    ) !?TypedDocValuesCoverage {
         var low: usize = 0;
         var high = self.shared.typed_doc_values_coverage.len;
         while (low < high) {
@@ -564,7 +617,7 @@ pub const SegmentEntry = struct {
                         // query reader while the first-use scan runs.
                         self.beginAccess();
                         defer self.endAccess();
-                        try initializeTypedDocValuesFieldCoverage(self.reader.alloc, self.shared, &self.reader, coverage);
+                        try initializeTypedDocValuesFieldCoverage(self.reader.alloc, self.shared, &self.reader, coverage, validation);
                     }
                     return .{ .status = coverage.status(), .value_type = coverage.value_type };
                 },
@@ -2330,6 +2383,34 @@ test "typed doc values coverage is lazy and retains compact sparse membership" {
     try std.testing.expectEqual(@as(u32, 62), cached.missing_live_count.load(.acquire));
     try std.testing.expect(try writer.deleteById("doc:0"));
     try std.testing.expectEqual(@as(u32, 62), cached.missing_live_count.load(.acquire));
+}
+
+test "typed doc values coverage admission honors cancellation deadline and contention" {
+    const alloc = std.testing.allocator;
+    const segment_bytes = try buildSparseTypedDocValuesTestSegment(alloc, 64);
+    defer alloc.free(segment_bytes);
+
+    var writer = try IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(segment_bytes);
+    const segment = &writer.snapshot().segments[0];
+    const cached = &segment.shared.typed_doc_values_coverage[0];
+
+    try std.testing.expectError(error.Timeout, segment.typedDocValuesCoverageWithValidation("rank", .{
+        .execution_deadline_ns = 0,
+    }));
+    try std.testing.expect(!cached.initialized.load(.acquire));
+
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, segment.typedDocValuesCoverageWithValidation("rank", .{
+        .cancellation = CancellationToken.fromAtomic(&canceled),
+    }));
+    try std.testing.expect(!cached.initialized.load(.acquire));
+
+    try std.testing.expect(cached.initialization_mutex.tryLock());
+    defer cached.unlockInitialization();
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, segment.typedDocValuesCoverageWithValidation("rank", .{}));
+    try std.testing.expect(!cached.initialized.load(.acquire));
 }
 
 test "concurrent typed doc values coverage initialization publishes one stable summary" {

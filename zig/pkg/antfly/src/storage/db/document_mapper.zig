@@ -1836,16 +1836,16 @@ fn typedDocValueForMappedFieldAlloc(
             else => null,
         },
         .numeric => switch (value) {
-            .integer => |number| .{ .i64_val = number },
-            .float => |number| if (std.math.isFinite(number)) .{ .f64_val = number } else null,
+            .integer => |number| .{ .numeric_val = .{ .i64_val = number } },
+            .float => |number| if (std.math.isFinite(number)) .{ .numeric_val = .{ .f64_val = number } } else null,
             .number_string => |number| blk: {
                 if (std.mem.indexOfAny(u8, number, ".eE") == null) {
-                    if (std.fmt.parseInt(i64, number, 10)) |parsed| break :blk .{ .i64_val = parsed } else |_| {}
-                    if (std.fmt.parseUnsigned(u64, number, 10)) |parsed| break :blk .{ .u64_val = parsed } else |_| {}
+                    if (std.fmt.parseInt(i64, number, 10)) |parsed| break :blk .{ .numeric_val = .{ .i64_val = parsed } } else |_| {}
+                    if (std.fmt.parseUnsigned(u64, number, 10)) |parsed| break :blk .{ .numeric_val = .{ .u64_val = parsed } } else |_| {}
                 }
                 const parsed = std.fmt.parseFloat(f64, number) catch return null;
                 if (!std.math.isFinite(parsed)) return null;
-                break :blk .{ .f64_val = parsed };
+                break :blk .{ .numeric_val = .{ .f64_val = parsed } };
             },
             else => null,
         },
@@ -1904,6 +1904,7 @@ fn typedValueType(value: typed_dv.TypedValue) typed_dv.ValueType {
         .bytes_val => .bytes_val,
         .geo_point => .geo_point,
         .bool_val => .bool_val,
+        .numeric_val => .numeric_val,
     };
 }
 
@@ -3704,9 +3705,9 @@ test "document mapper preserves integer numeric doc values as i64" {
 
     const section = (try reader.getSection("rank", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
-    try std.testing.expectEqual(typed_dv.ValueType.i64_val, values.value_type);
-    try std.testing.expectEqual(@as(?i64, -9007199254740993), try values.getI64(0));
-    try std.testing.expectEqual(@as(?i64, 42), try values.getI64(1));
+    try std.testing.expectEqual(typed_dv.ValueType.numeric_val, values.value_type);
+    try std.testing.expectEqual(typed_dv.NumericValue{ .i64_val = -9007199254740993 }, (try values.getNumeric(0)).?);
+    try std.testing.expectEqual(typed_dv.NumericValue{ .i64_val = 42 }, (try values.getNumeric(1)).?);
 }
 
 test "document mapper preserves unsigned numeric doc values beyond i64 as u64" {
@@ -3737,11 +3738,11 @@ test "document mapper preserves unsigned numeric doc values beyond i64 as u64" {
 
     const section = (try reader.getSection("rank", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
-    try std.testing.expectEqual(typed_dv.ValueType.u64_val, values.value_type);
-    try std.testing.expectEqual(@as(?u64, 9223372036854775808), try values.getU64(0));
+    try std.testing.expectEqual(typed_dv.ValueType.numeric_val, values.value_type);
+    try std.testing.expectEqual(typed_dv.NumericValue{ .u64_val = 9223372036854775808 }, (try values.getNumeric(0)).?);
 }
 
-test "document mapper omits mixed numeric typed doc value domains" {
+test "document mapper preserves mixed numeric typed doc value domains" {
     const alloc = std.testing.allocator;
     const text_analysis = introducer_mod.TextAnalysisConfig{};
     const templates = [_]runtime_schema.DynamicTemplate{
@@ -3760,7 +3761,8 @@ test "document mapper omits mixed numeric typed doc value domains" {
     };
 
     const segment = (try buildTextSegmentFromDocuments(alloc, &.{
-        .{ .key = "doc:integer", .value = "{\"rank\":10}" },
+        .{ .key = "doc:negative", .value = "{\"rank\":-9007199254740993}" },
+        .{ .key = "doc:unsigned", .value = "{\"rank\":18446744073709551615}" },
         .{ .key = "doc:float", .value = "{\"rank\":10.5}" },
     }, text_analysis, schema)).?;
     defer alloc.free(segment);
@@ -3768,7 +3770,12 @@ test "document mapper omits mixed numeric typed doc value domains" {
     var reader = try segment_mod.SegmentReader.init(alloc, segment);
     defer reader.deinit();
 
-    try std.testing.expect((try reader.getSection("rank", .typed_doc_values)) == null);
+    const section = (try reader.getSection("rank", .typed_doc_values)) orelse return error.TestExpectedEqual;
+    var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
+    try std.testing.expectEqual(typed_dv.ValueType.numeric_val, values.value_type);
+    try std.testing.expectEqual(typed_dv.NumericValue{ .i64_val = -9007199254740993 }, (try values.getNumeric(0)).?);
+    try std.testing.expectEqual(typed_dv.NumericValue{ .u64_val = std.math.maxInt(u64) }, (try values.getNumeric(1)).?);
+    try std.testing.expectEqual(typed_dv.NumericValue{ .f64_val = 10.5 }, (try values.getNumeric(2)).?);
 }
 
 test "document mapper omits non-finite numeric doc values" {
@@ -4044,9 +4051,9 @@ test "document mapper flushes schema index_sort segments in physical sort order"
 
     const section = (try reader.getSection("price", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
-    try std.testing.expectEqual(typed_dv.ValueType.i64_val, values.value_type);
-    try std.testing.expectEqual(@as(?i64, 1), try values.getI64(0));
-    try std.testing.expectEqual(@as(?i64, 2), try values.getI64(1));
+    try std.testing.expectEqual(typed_dv.ValueType.numeric_val, values.value_type);
+    try std.testing.expectEqual(typed_dv.NumericValue{ .i64_val = 1 }, (try values.getNumeric(0)).?);
+    try std.testing.expectEqual(typed_dv.NumericValue{ .i64_val = 2 }, (try values.getNumeric(1)).?);
 }
 
 test "document mapper accepts match-mapping-type dynamic template index_sort field" {
@@ -4100,7 +4107,7 @@ test "document mapper accepts match-mapping-type dynamic template index_sort fie
     try std.testing.expect((try values.getU64(0)).? > (try values.getU64(1)).?);
 }
 
-test "document mapper rejects mixed native value types for index_sort field" {
+test "document mapper orders mixed numeric domains for index_sort field" {
     const alloc = std.testing.allocator;
     const text_analysis = introducer_mod.TextAnalysisConfig{};
     const templates = [_]runtime_schema.DynamicTemplate{
@@ -4123,10 +4130,18 @@ test "document mapper rejects mixed native value types for index_sort field" {
         .index_sort = &index_sort,
     };
 
-    try std.testing.expectError(error.InvalidSegment, buildTextSegmentFromDocumentsWithMetadata(alloc, &.{
-        .{ .key = "doc:a", .value = "{\"price\":1}" },
-        .{ .key = "doc:b", .value = "{\"price\":1.5}" },
-    }, text_analysis, schema));
+    var result = try buildTextSegmentFromDocumentsWithMetadata(alloc, &.{
+        .{ .key = "doc:large", .value = "{\"price\":9007199254740993}" },
+        .{ .key = "doc:decimal", .value = "{\"price\":1.5}" },
+        .{ .key = "doc:negative", .value = "{\"price\":-2}" },
+    }, text_analysis, schema);
+    defer result.deinit(alloc);
+    const segment = result.segment orelse return error.TestExpectedEqual;
+    var reader = try segment_mod.SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+    try std.testing.expectEqualStrings("doc:negative", (try reader.storedDoc(0)).?.id);
+    try std.testing.expectEqualStrings("doc:decimal", (try reader.storedDoc(1)).?.id);
+    try std.testing.expectEqualStrings("doc:large", (try reader.storedDoc(2)).?.id);
 }
 
 test "document mapper validates schema index_sort field capabilities" {

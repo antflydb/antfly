@@ -6486,7 +6486,7 @@ pub const IndexManager = struct {
             if (!observation.includesField(item.field_name)) continue;
             var capability = schema_mod.observedDynamicFieldCapability(entry.runtime_schema, item.field_name, item.mapping());
             if (schema_mod.mappingHasNativeDocValues(item.mapping())) {
-                if (try observedDynamicFieldTypedDocValueCoverageStatus(entry, item.field_name, item.mapping(), observation.coverage_read_mode)) |coverage| {
+                if (try observedDynamicFieldTypedDocValueCoverageStatus(entry, item.field_name, item.mapping(), observation)) |coverage| {
                     if (coverage == .covered) {
                         capability.doc_value_coverage = "covered";
                         capability.queryability_state = "queryable";
@@ -6509,7 +6509,7 @@ pub const IndexManager = struct {
                 if (!schema_mod.mappingHasNativeDocValues(template.mapping)) continue;
                 if (!observation.includesField(field)) continue;
                 var capability = schema_mod.dynamicTemplateFieldCapability(schema, template);
-                if (try observedDynamicFieldTypedDocValueCoverageStatus(entry, field, template.mapping, observation.coverage_read_mode)) |coverage| {
+                if (try observedDynamicFieldTypedDocValueCoverageStatus(entry, field, template.mapping, observation)) |coverage| {
                     if (coverage == .covered) {
                         capability.doc_value_coverage = "covered";
                         capability.queryability_state = "queryable";
@@ -6549,8 +6549,9 @@ pub const IndexManager = struct {
         entry: *IndexManager.TextIndex,
         field: []const u8,
         mapping: schema_mod.FieldMapping,
-        read_mode: dynamic_field_capability.CoverageReadMode,
+        observation: dynamic_field_capability.ObservationQuery,
     ) !?typed_dv_coverage.Status {
+        try observation.checkActive();
         if (!schema_mod.mappingHasNativeDocValues(mapping)) return .missing_doc_values_section;
         const snapshot = entry.persistent.snapshot();
         if (snapshot.liveDocCount() == 0) return .covered;
@@ -6558,8 +6559,11 @@ pub const IndexManager = struct {
         var has_uninitialized_coverage = false;
         for (snapshot.segments) |*segment| {
             if (segment.liveDocCount() == 0) continue;
-            const coverage = switch (read_mode) {
-                .validate => (try segment.typedDocValuesCoverage(field)) orelse return .missing_doc_values_section,
+            const coverage = switch (observation.coverage_read_mode) {
+                .validate => (try segment.typedDocValuesCoverageWithValidation(field, .{
+                    .execution_deadline_ns = observation.execution_deadline_ns,
+                    .cancellation = observation.cancellation,
+                })) orelse return .missing_doc_values_section,
                 .cached_only => switch (segment.cachedTypedDocValuesCoverage(field)) {
                     .missing => return .missing_doc_values_section,
                     .uninitialized => {
@@ -6580,7 +6584,7 @@ pub const IndexManager = struct {
         return switch (mapping.field_type) {
             .datetime => value_type == .u64_val,
             .numeric => switch (value_type) {
-                .u64_val, .i64_val, .f64_val => true,
+                .u64_val, .i64_val, .f64_val, .numeric_val => true,
                 else => false,
             },
             .boolean => value_type == .bool_val,
@@ -6595,25 +6599,40 @@ pub const IndexManager = struct {
         alloc: Allocator,
         observation: dynamic_field_capability.ObservationQuery,
     ) ![]ObservedDynamicFieldCapabilitySet {
+        try observation.checkActive();
+        const locked_entries = try alloc.alloc(*TextIndex, self.text_indexes.items.len);
+        defer alloc.free(locked_entries);
+        var locked_count: usize = 0;
+        var cleanup_partial_locks = true;
+        errdefer if (cleanup_partial_locks) {
+            while (locked_count > 0) {
+                locked_count -= 1;
+                locked_entries[locked_count].analysis_mutex.unlockShared();
+            }
+        };
         for (self.text_indexes.items) |*entry| {
             if (observation.index_name) |name| {
                 if (!std.mem.eql(u8, entry.config.name, name)) continue;
             }
-            entry.analysis_mutex.lockShared();
+            if (observation.execution_deadline_ns != null or observation.cancellation != null) {
+                if (!entry.analysis_mutex.tryLockShared()) return error.StorageReadTemporarilyUnavailable;
+            } else {
+                entry.analysis_mutex.lockShared();
+            }
+            locked_entries[locked_count] = entry;
+            locked_count += 1;
         }
+        cleanup_partial_locks = false;
         defer {
-            var i = self.text_indexes.items.len;
-            while (i > 0) {
-                i -= 1;
-                const entry = &self.text_indexes.items[i];
-                if (observation.index_name) |name| {
-                    if (!std.mem.eql(u8, entry.config.name, name)) continue;
-                }
-                entry.analysis_mutex.unlockShared();
+            while (locked_count > 0) {
+                locked_count -= 1;
+                locked_entries[locked_count].analysis_mutex.unlockShared();
             }
         }
+        try observation.checkActive();
         var set_count: usize = 0;
         for (self.text_indexes.items) |*entry| {
+            try observation.checkActive();
             if (observation.index_name) |name| {
                 if (!std.mem.eql(u8, entry.config.name, name)) continue;
             }

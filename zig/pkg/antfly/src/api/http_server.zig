@@ -5120,16 +5120,27 @@ pub const ApiHttpServer = struct {
 
         const physical_sort_fields = try publicPhysicalSortFieldsAlloc(self.alloc, query_req.order_by);
         defer if (physical_sort_fields.len > 0) self.alloc.free(physical_sort_fields);
-        const observed_dynamic_capability_sets: []table_reads.ObservedDynamicFieldCapabilitySet = if (physical_sort_fields.len == 0)
+        const can_observe_physical_coverage = if (self.table_reads) |source|
+            source.supportsObservedDynamicFieldCapabilitySets()
+        else
+            false;
+        const observed_dynamic_capability_sets: []table_reads.ObservedDynamicFieldCapabilitySet = if (physical_sort_fields.len == 0 or !can_observe_physical_coverage)
             &.{}
         else
             try self.queryObservedDynamicFieldCapabilitySets(table_name, query_req, .{
                 .index_name = query_req.primary_text_index_name orelse query_req.index_name,
                 .fields = physical_sort_fields,
                 .coverage_read_mode = .validate,
+                .execution_deadline_ns = query_req.execution_deadline_ns,
+                .cancellation = query_req.cancellation,
             });
         defer self.freeObservedDynamicFieldCapabilitySets(observed_dynamic_capability_sets);
-        try validatePublicQuerySortCapabilitiesAgainstRuntime(query_req, runtime_schema, observed_dynamic_capability_sets);
+        try validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(
+            query_req,
+            runtime_schema,
+            observed_dynamic_capability_sets,
+            can_observe_physical_coverage,
+        );
     }
 
     fn queryObservedDynamicFieldCapabilitySets(
@@ -12319,6 +12330,20 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntime(
     runtime_schema: storage_schema.TableSchema,
     observed_dynamic_capability_sets: []const table_reads.ObservedDynamicFieldCapabilitySet,
 ) !void {
+    return validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(
+        query_req,
+        runtime_schema,
+        observed_dynamic_capability_sets,
+        true,
+    );
+}
+
+fn validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(
+    query_req: db_mod.types.SearchRequest,
+    runtime_schema: storage_schema.TableSchema,
+    observed_dynamic_capability_sets: []const table_reads.ObservedDynamicFieldCapabilitySet,
+    physical_evidence_available: bool,
+) !void {
     if (try validatePublicQuerySortRequestContract(query_req)) return;
     const cursor = if (query_req.search_after.len > 0) query_req.search_after else query_req.search_before;
     for (query_req.order_by, 0..) |field, i| {
@@ -12333,7 +12358,7 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntime(
                 field.field,
                 mapping.field_type,
             ) == null) {
-                try validatePublicMappedSortCoverage(field.field, mapping);
+                if (physical_evidence_available) try validatePublicMappedSortCoverage(field.field, mapping);
             }
             if (cursor.len > 0) try validatePublicMappedSortCursor(field.field, mapping.field_type, cursor[i]);
             continue;
@@ -12349,8 +12374,13 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntime(
             continue;
         }
 
-        recordPublicSortCapabilityRejection(field.field, "unmapped_sort_field", "unmapped_field");
-        return error.UnsupportedExactSort;
+        // A routed gateway cannot see shard-local wildcard/dynamic mappings.
+        // Defer only the physical question; every owning shard still performs
+        // the same fail-closed native-sort planning before reading results.
+        if (physical_evidence_available) {
+            recordPublicSortCapabilityRejection(field.field, "unmapped_sort_field", "unmapped_field");
+            return error.UnsupportedExactSort;
+        }
     }
 }
 
@@ -17604,6 +17634,23 @@ test "api http public sort capability gate validates mapped sortable fields" {
     };
 
     const created_order = [_]db_mod.types.SortField{.{ .field = "created_at", .desc = true }};
+    // Routed gateways validate the declaration and cursor shape, then defer
+    // physical coverage to the fail-closed shard executor because they do not
+    // own a local text-index catalog.
+    try validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(.{
+        .order_by = &created_order,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{}, false);
+    const routed_bad_cursor = [_]std.json.Value{ .{ .string = "not-a-date" }, .{ .string = "doc:1" } };
+    const routed_effective_order = [_]db_mod.types.SortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id" },
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(.{
+        .order_by = &routed_effective_order,
+        .search_after = &routed_bad_cursor,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{}, false));
     try validatePublicQuerySortCapabilitiesAgainstRuntime(.{
         .order_by = &created_order,
         .primary_text_index_name = "full_text_index_v0",
