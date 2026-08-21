@@ -69,11 +69,15 @@ const IndexEntry = struct {
     checksum: u32,
 
     fn value(self: IndexEntry, data: []const u8) ![]const u8 {
-        const end = std.math.add(usize, self.offset, self.len) catch return error.CorruptedPostingSegment;
-        if (end > data.len) return error.CorruptedPostingSegment;
-        const bytes = data[self.offset..end];
+        const bytes = try self.rawValue(data);
         if (std.hash.Crc32.hash(bytes) != self.checksum) return error.PostingSegmentChecksumMismatch;
         return bytes;
+    }
+
+    fn rawValue(self: IndexEntry, data: []const u8) ![]const u8 {
+        const end = std.math.add(usize, self.offset, self.len) catch return error.CorruptedPostingSegment;
+        if (end > data.len) return error.CorruptedPostingSegment;
+        return data[self.offset..end];
     }
 };
 
@@ -309,15 +313,20 @@ pub const Reader = struct {
     }
 
     fn getLatest(self: Reader, posting_id: PostingId, kind: EntryKind) !?SequencedValue {
+        const index = (try self.latestIndex(posting_id, kind)) orelse return null;
+        const found = try self.indexEntry(index);
+        return .{ .sequence = found.sequence, .value = try found.value(self.data) };
+    }
+
+    fn latestIndex(self: Reader, posting_id: PostingId, kind: EntryKind) !?usize {
         var index = self.lowerBound(posting_id, kind, 0);
-        var latest: ?IndexEntry = null;
+        var latest: ?usize = null;
         while (index < self.entry_count) : (index += 1) {
             const entry = try self.indexEntry(index);
             if (entry.posting_id != posting_id or entry.kind != kind) break;
-            latest = entry;
+            latest = index;
         }
-        const found = latest orelse return null;
-        return .{ .sequence = found.sequence, .value = try found.value(self.data) };
+        return latest;
     }
 
     fn lowerBound(self: Reader, posting_id: PostingId, kind: EntryKind, sequence: u64) usize {
@@ -376,6 +385,60 @@ pub const Reader = struct {
             }
             previous = entry;
         }
+    }
+};
+
+pub const VerifiedReader = struct {
+    const Verification = std.atomic.Value(u8);
+    const unknown: u8 = 0;
+    const valid: u8 = 1;
+    const corrupt: u8 = 2;
+
+    alloc: Allocator,
+    reader: Reader,
+    verification: []Verification,
+
+    pub fn init(alloc: Allocator, data: []const u8) !VerifiedReader {
+        const reader = try Reader.init(data);
+        const verification = try alloc.alloc(Verification, reader.entry_count);
+        for (verification) |*state| state.* = Verification.init(unknown);
+        return .{ .alloc = alloc, .reader = reader, .verification = verification };
+    }
+
+    pub fn deinit(self: *VerifiedReader) void {
+        self.alloc.free(self.verification);
+        self.* = undefined;
+    }
+
+    pub fn getBase(self: *VerifiedReader, posting_id: PostingId) !?[]const u8 {
+        const result = try self.getLatest(posting_id, .base);
+        return if (result) |found| found.value else null;
+    }
+
+    pub fn getQuantizedCheckpoint(self: *VerifiedReader, posting_id: PostingId) !?[]const u8 {
+        const result = try self.getLatest(posting_id, .quantized_checkpoint);
+        return if (result) |found| found.value else null;
+    }
+
+    fn getLatest(self: *VerifiedReader, posting_id: PostingId, kind: EntryKind) !?SequencedValue {
+        const index = (try self.reader.latestIndex(posting_id, kind)) orelse return null;
+        const entry = try self.reader.indexEntry(index);
+        return .{ .sequence = entry.sequence, .value = try self.verifiedValue(index, entry) };
+    }
+
+    fn verifiedValue(self: *VerifiedReader, index: usize, entry: IndexEntry) ![]const u8 {
+        const bytes = try entry.rawValue(self.reader.data);
+        switch (self.verification[index].load(.acquire)) {
+            valid => return bytes,
+            corrupt => return error.PostingSegmentChecksumMismatch,
+            else => {},
+        }
+        if (std.hash.Crc32.hash(bytes) != entry.checksum) {
+            self.verification[index].store(corrupt, .release);
+            return error.PostingSegmentChecksumMismatch;
+        }
+        self.verification[index].store(valid, .release);
+        return bytes;
     }
 };
 
@@ -549,6 +612,32 @@ pub fn testValidatesIndexAndPayloadChecksums() !void {
     try std.testing.expectError(error.PostingSegmentChecksumMismatch, reader.getBase(1));
 }
 
+pub fn testVerifiedReaderMemoizesPayloadStatus() !void {
+    const alloc = std.testing.allocator;
+    var writer = Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendBase(1, "payload");
+    const bytes = try writer.build();
+    defer alloc.free(bytes);
+
+    var verified = try VerifiedReader.init(alloc, bytes);
+    defer verified.deinit();
+    try std.testing.expectEqualSlices(u8, "payload", (try verified.getBase(1)).?);
+    try std.testing.expectEqualSlices(u8, "payload", (try verified.getBase(1)).?);
+    const base_index = (try verified.reader.latestIndex(1, .base)).?;
+    try std.testing.expectEqual(VerifiedReader.valid, verified.verification[base_index].load(.acquire));
+
+    var corrupt_bytes = try alloc.dupe(u8, bytes);
+    defer alloc.free(corrupt_bytes);
+    corrupt_bytes[0] ^= 1;
+    var corrupt_reader = try VerifiedReader.init(alloc, corrupt_bytes);
+    defer corrupt_reader.deinit();
+    try std.testing.expectError(error.PostingSegmentChecksumMismatch, corrupt_reader.getBase(1));
+    try std.testing.expectError(error.PostingSegmentChecksumMismatch, corrupt_reader.getBase(1));
+    const corrupt_index = (try corrupt_reader.reader.latestIndex(1, .base)).?;
+    try std.testing.expectEqual(VerifiedReader.corrupt, corrupt_reader.verification[corrupt_index].load(.acquire));
+}
+
 test "posting segment stores base centroid and ordered delta values" {
     try testStoresPointAndOrderedDeltaValues();
 }
@@ -563,4 +652,8 @@ test "posting segment validates footer and version" {
 
 test "posting segment validates index and payload checksums" {
     try testValidatesIndexAndPayloadChecksums();
+}
+
+test "posting segment verified reader memoizes payload status" {
+    try testVerifiedReaderMemoizesPayloadStatus();
 }

@@ -73,6 +73,8 @@ Current status:
   posting-local sorted index. The v2 format checks the footer and index at
   admission, validates strict key ordering and value bounds, and lazily checks
   each payload on access so opening a large segment is not O(file size).
+  A concurrent-safe verified reader memoizes both successful and failed
+  per-entry verification, avoiding a full payload CRC on every query.
 - A framed posting WAL codec now makes whole batches query-visible with an
   explicit commit record. Its CRC covers routing metadata and payload, replay
   ignores incomplete or uncommitted tails, and a checksummed checkpoint records

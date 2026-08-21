@@ -21,6 +21,7 @@ const lsm_backend = antfly.lsm_backend;
 const platform_time = antfly.platform_time;
 const vec = antfly.vector;
 const recall_common = @import("recall_common.zig");
+const posting_segment = antfly.vectorindex.posting_segment;
 
 const Config = struct {
     samples: usize = 3,
@@ -45,6 +46,7 @@ const Config = struct {
     flat_centroid_block_size: usize = 8192,
     flat_centroid_probe_count: usize = 0,
     reopen_before_query: bool = true,
+    shadow_segment_checkpoint: bool = false,
 };
 
 const StorageSelection = enum {
@@ -462,6 +464,9 @@ pub fn main(init: std.process.Init) !void {
                 const after_build_storage = scenario.storage_harness.snapshotCounters();
                 try printBuildResult(out, &scenario, build_elapsed, before_build_storage, after_build_storage);
                 try stdout_writer.flush();
+                if (cfg.shadow_segment_checkpoint) {
+                    try benchShadowSegmentCheckpoint(out, &stdout_writer, &scenario);
+                }
                 try benchQueries(out, &stdout_writer, &scenario, "post_ingest_query_no_metadata", queries, cfg.queries, .{
                     .query = queries[0..cfg.dims],
                     .k = cfg.k,
@@ -496,6 +501,90 @@ pub fn main(init: std.process.Init) !void {
             }
         }
     }
+    try stdout_writer.flush();
+}
+
+fn benchShadowSegmentCheckpoint(writer: anytype, stdout_writer: anytype, scenario: *Scenario) !void {
+    var segment_writer = posting_segment.Writer.init(scenario.allocator);
+    defer segment_writer.deinit();
+    var live_ids = std.ArrayListUnmanaged(u64).empty;
+    defer live_ids.deinit(scenario.allocator);
+
+    var txn = try scenario.index.beginRuntimeReadTxn();
+    defer txn.abort();
+    const checkpoint_start = nanotime();
+    var node_id: u64 = 1;
+    while (node_id <= scenario.index.metadata.node_count) : (node_id += 1) {
+        var key_buf: [12]u8 = undefined;
+        const packed_value = scenario.index.getNamespaced(&txn, .nodes, antfly.vectorindex.encodeNodeKey(&key_buf, node_id, .packed_node)) catch |err| switch (err) {
+            error.NotFound => continue,
+            else => return err,
+        };
+        try segment_writer.appendBase(node_id, packed_value);
+        try live_ids.append(scenario.allocator, node_id);
+
+        var quant_key_buf: [10]u8 = undefined;
+        if (scenario.index.getNamespaced(&txn, .quant, antfly.vectorindex.encodeQuantKey(&quant_key_buf, node_id))) |quantized| {
+            try segment_writer.appendQuantizedCheckpoint(node_id, quantized);
+        } else |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        }
+    }
+    const segment_bytes = try segment_writer.build();
+    defer scenario.allocator.free(segment_bytes);
+    const checkpoint_ns = nanotime() - checkpoint_start;
+
+    const open_start = nanotime();
+    var reader = try posting_segment.VerifiedReader.init(scenario.allocator, segment_bytes);
+    defer reader.deinit();
+    const open_ns = nanotime() - open_start;
+    const verification_latencies = try scenario.allocator.alloc(u64, live_ids.items.len);
+    defer scenario.allocator.free(verification_latencies);
+    for (live_ids.items, 0..) |lookup_id, index| {
+        const lookup_start = nanotime();
+        _ = (try reader.getBase(lookup_id)).?;
+        _ = try reader.getQuantizedCheckpoint(lookup_id);
+        verification_latencies[index] = nanotime() - lookup_start;
+    }
+    std.mem.sort(u64, verification_latencies, {}, std.sort.asc(u64));
+    const lookup_count = @max(scenario.cfg.queries, 1000);
+    const latencies = try scenario.allocator.alloc(u64, lookup_count);
+    defer scenario.allocator.free(latencies);
+    var bytes_touched: usize = 0;
+    for (0..lookup_count) |index| {
+        const lookup_id = live_ids.items[(index * 9973) % live_ids.items.len];
+        const lookup_start = nanotime();
+        const base = (try reader.getBase(lookup_id)).?;
+        const quantized = try reader.getQuantizedCheckpoint(lookup_id);
+        latencies[index] = nanotime() - lookup_start;
+        bytes_touched +%= base.len;
+        if (quantized) |value| bytes_touched +%= value.len;
+    }
+    std.mem.doNotOptimizeAway(bytes_touched);
+    std.mem.sort(u64, latencies, {}, std.sort.asc(u64));
+    try writer.print(
+        "{{\"scenario\":\"{s}_{s}_shadow_segment_checkpoint\",\"storage\":\"{s}\",\"build\":\"{s}\",\"sample\":{d},\"workload\":\"shadow_segment_checkpoint\",\"live_postings\":{d},\"segment_bytes\":{d},\"checkpoint_ns\":{d},\"open_ns\":{d},\"verification_p50_ns\":{d},\"verification_p95_ns\":{d},\"verification_max_ns\":{d},\"lookups\":{d},\"lookup_p50_ns\":{d},\"lookup_p95_ns\":{d},\"lookup_p99_ns\":{d},\"lookup_max_ns\":{d}}}\n",
+        .{
+            @tagName(scenario.storage_kind),
+            @tagName(scenario.build_kind),
+            @tagName(scenario.storage_kind),
+            @tagName(scenario.build_kind),
+            scenario.sample_index,
+            live_ids.items.len,
+            segment_bytes.len,
+            checkpoint_ns,
+            open_ns,
+            percentile(verification_latencies, 50),
+            percentile(verification_latencies, 95),
+            verification_latencies[verification_latencies.len - 1],
+            lookup_count,
+            percentile(latencies, 50),
+            percentile(latencies, 95),
+            percentile(latencies, 99),
+            latencies[latencies.len - 1],
+        },
+    );
     try stdout_writer.flush();
 }
 
@@ -863,6 +952,8 @@ fn parseArgs(proc_args: std.process.Args) !Config {
             cfg.use_quantization = false;
         } else if (std.mem.eql(u8, arg, "--no-reopen")) {
             cfg.reopen_before_query = false;
+        } else if (std.mem.eql(u8, arg, "--shadow-segment-checkpoint")) {
+            cfg.shadow_segment_checkpoint = true;
         } else if (std.mem.eql(u8, arg, "--random-ortho")) {
             cfg.use_random_ortho_trans = true;
         } else {

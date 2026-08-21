@@ -77,6 +77,7 @@ pub const PostingBacklogStats = posting.PostingBacklogStats;
 pub const PostingStore = posting.PostingStore;
 pub const PostingSegmentWriter = posting_segment.Writer;
 pub const PostingSegmentReader = posting_segment.Reader;
+pub const VerifiedPostingSegmentReader = posting_segment.VerifiedReader;
 pub const PostingSegmentEntryKind = posting_segment.EntryKind;
 pub const PostingWalWriter = posting_wal.Writer;
 pub const PostingWalReplay = posting_wal.Replay;
@@ -128,6 +129,10 @@ test "posting segment validates footer and version" {
 
 test "posting segment validates index and payload checksums" {
     try posting_segment.testValidatesIndexAndPayloadChecksums();
+}
+
+test "posting segment verified reader memoizes payload status" {
+    try posting_segment.testVerifiedReaderMemoizesPayloadStatus();
 }
 
 test "posting wal replays committed batches in order" {

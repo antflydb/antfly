@@ -435,6 +435,25 @@ query p50 averaged 0.340 ms, p95 1.405 ms, p99 1.756 ms, and throughput about
 This is the matched internal gate for future storage arms; public HTTP E2E
 latency and the real VectorDBBench corpus remain required before promotion.
 
+The first current-main shadow checkpoint experiment exported the final packed
+node and RaBitQ values after that same 5K public-ingest build. Fifty-six live
+postings occupied a 2.098 MB immutable segment, versus 33.741 MB written while
+building through the LSM (about 16.1x less final live payload than cumulative
+write traffic). Three checkpoints took 9.69--10.13 ms and segment admission
+took 7 microseconds. This does not yet measure the cost of appending/fsyncing a
+WAL or replace the LSM at runtime, but it confirms that checkpoint generation
+is small relative to the roughly 230--245 ms build.
+
+The first reader recomputed CRC32 on every point access and measured about 52
+microseconds p50, which would be unacceptable across many postings per query.
+The format reader now keeps atomic per-entry verification state: the first
+base-plus-RaBitQ verification was about 58 microseconds p50 in a follow-up,
+while already-verified point lookups were below the benchmark clock's
+1-microsecond resolution at p95 and 1 microsecond at p99. Verification failures
+are memoized as well as successes. The runtime design should either preverify
+hot/pinned postings or let their first cache admission pay this cost once; it
+must never checksum an unchanged payload on every query.
+
 | Run | Insert | Ready/load | Notes |
 | --- | ---: | ---: | --- |
 | 50K OpenAI, batch 100, four workers, original public path | 46.39 s | 48.42 s | Default full-text index present |
