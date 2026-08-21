@@ -16,15 +16,18 @@
 
 from __future__ import annotations
 
-import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 import requests
 
-from helpers import assert_created_index, create_index_payload, wait_until
-
+from helpers import (
+    assert_created_index,
+    create_index_payload,
+    start_http_server,
+    wait_until,
+)
 
 pytestmark = pytest.mark.reuse_antfly_process
 
@@ -110,8 +113,7 @@ class _TextServer:
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         host, port = self._server.server_address
         self.url = f"http://{host}:{port}"
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._thread.start()
+        self._thread = start_http_server(self._server)
 
     def stop(self) -> None:
         self._server.shutdown()

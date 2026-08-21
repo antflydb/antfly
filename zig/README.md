@@ -115,9 +115,13 @@ needed. From the repository root, use `make zig-test` or `make zig-unit-test`.
 The Python e2e suites are split by product:
 
 ```sh
-uv run --project e2e/antfly pytest -q e2e/antfly
+scripts/ci/zig-antfly-e2e-pytest.sh e2e/antfly
 uv run --project e2e/inference pytest -q e2e/inference
 ```
+
+The Antfly runner uses up to four pytest workers and keeps each module on one
+worker so module-scoped process reuse remains intact. Set
+`ANTFLY_E2E_WORKERS=1` for a sequential comparison or debugging run.
 
 Some e2e tests start local binaries from `zig-out/bin`; build the relevant
 binary first when running those tests directly:

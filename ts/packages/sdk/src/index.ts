@@ -40,6 +40,7 @@ export {
   DEFAULT_WRITE_MAX_RESPONSE_BYTES,
   HierarchyCursorStaleError,
   QUERY_TEMPORARILY_UNAVAILABLE_CODES,
+  type QueryExecutionOptions,
   type QueryTemporarilyUnavailableCode,
   QueryTemporarilyUnavailableError,
   type IndexOperations,

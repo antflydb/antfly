@@ -58,6 +58,10 @@ export interface RestoreOptions {
   idempotencyKey?: string;
 }
 
+export interface QueryExecutionOptions {
+  signal?: AbortSignal;
+}
+
 export interface RestoreJobListOptions {
   limit?: number;
   cursor?: string;
@@ -528,18 +532,21 @@ export class AntflyClient {
   private async performQuery(
     path: "/db/v1/query" | "/db/v1/tables/{tableName}/query",
     request: QueryRequest,
-    tableName?: string
+    tableName?: string,
+    options?: QueryExecutionOptions
   ): Promise<QueryResponses | undefined> {
     if (path === "/db/v1/tables/{tableName}/query" && tableName) {
       const { data, error, response } = await this.client.POST("/db/v1/tables/{tableName}/query", {
         params: { path: { tableName } },
         body: request,
+        ...(options?.signal ? { signal: options.signal } : {}),
       });
       if (error) throw queryError("Table query failed", error, response);
       return data;
     } else {
       const { data, error, response } = await this.client.POST("/db/v1/query", {
         body: request,
+        ...(options?.signal ? { signal: options.signal } : {}),
       });
       if (error) throw queryError("Query failed", error, response);
       return data;
@@ -581,8 +588,11 @@ export class AntflyClient {
   /**
    * Global query operations
    */
-  async query(request: QueryRequest): Promise<QueryResult | undefined> {
-    const data = await this.performQuery("/db/v1/query", request);
+  async query(
+    request: QueryRequest,
+    options?: QueryExecutionOptions
+  ): Promise<QueryResult | undefined> {
+    const data = await this.performQuery("/db/v1/query", request, undefined, options);
     // The global query returns QueryResponses, extract the first result
     return data?.responses?.[0];
   }
@@ -966,7 +976,7 @@ export class AntflyClient {
       const { data, error } = await this.client.GET("/db/v1/tables/{tableName}", {
         params: { path: { tableName } },
       });
-      if (error) throw new Error(`Failed to get table: ${error.error}`);
+      if (error) throw new Error(`Failed to get table: ${apiErrorMessage(error)}`);
       return data;
     },
 
@@ -1010,8 +1020,8 @@ export class AntflyClient {
     /**
      * Query a specific table
      */
-    query: async (tableName: string, request: QueryRequest) => {
-      return this.performQuery("/db/v1/tables/{tableName}/query", request, tableName);
+    query: async (tableName: string, request: QueryRequest, options?: QueryExecutionOptions) => {
+      return this.performQuery("/db/v1/tables/{tableName}/query", request, tableName, options);
     },
 
     /**

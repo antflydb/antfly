@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "ts/**"
+      - "zig/pkg/antfly/antfarm/**"
       - "openapi.yaml"
       - "specs/openapi/**"
       - ".github/workflows/ts-ci.yml"
@@ -12,6 +13,7 @@ on:
     branches: [main]
     paths:
       - "ts/**"
+      - "zig/pkg/antfly/antfarm/**"
       - "openapi.yaml"
       - "specs/openapi/**"
       - ".github/workflows/ts-ci.yml"
@@ -66,6 +68,10 @@ jobs:
 
       - name: Build
         run: pnpm build
+
+      - name: Verify embedded Antfarm bundle
+        working-directory: .
+        run: diff -qr ts/apps/antfarm/dist zig/pkg/antfly/antfarm
 
       - name: Run tests
         run: pnpm test
