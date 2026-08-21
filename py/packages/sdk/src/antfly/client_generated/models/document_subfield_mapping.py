@@ -24,7 +24,7 @@ class DocumentSubfieldMapping:
                 date/timestamp to datetime, geo_point to geopoint, and geo_shape to
                 geoshape.
             analyzer (str | Unset): Analyzer name for text-oriented mappings.
-            index (bool | Unset): Whether to index the field (default true) Default: True.
+            index (bool | Unset): Whether to index the field. Omit to use the server default of true.
             store (bool | Unset): Whether to store the field value (default false) Default: False.
             include_in_all (bool | Unset): Whether to include in the _all field for cross-field search Default: False.
             sortable (bool | Unset): Whether this exact scalar subfield can be used in order_by. Antfly derives the required
@@ -36,7 +36,7 @@ class DocumentSubfieldMapping:
 
     type_: FieldMappingType | Unset = UNSET
     analyzer: str | Unset = UNSET
-    index: bool | Unset = True
+    index: bool | Unset = UNSET
     store: bool | Unset = False
     include_in_all: bool | Unset = False
     sortable: bool | Unset = False

@@ -9169,10 +9169,7 @@ export interface components {
             type?: components["schemas"]["FieldMappingType"];
             /** @description Analyzer name for text-oriented mappings. */
             analyzer?: string;
-            /**
-             * @description Whether to index the field (default true)
-             * @default true
-             */
+            /** @description Whether to index the field. Omit to use the server default of true. */
             index?: boolean;
             /**
              * @description Whether to store the field value (default false)
@@ -9201,10 +9198,7 @@ export interface components {
             type?: components["schemas"]["FieldMappingType"];
             /** @description Analyzer name for text-oriented mappings. */
             analyzer?: string;
-            /**
-             * @description Whether to index the field (default true)
-             * @default true
-             */
+            /** @description Whether to index the field. Omit to use the server default of true. */
             index?: boolean;
             /**
              * @description Whether to store the field value (default false)
@@ -9258,10 +9252,7 @@ export interface components {
              *     Used for text fields to control tokenization and normalization.
              */
             analyzer?: string;
-            /**
-             * @description Whether to index the field (default true)
-             * @default true
-             */
+            /** @description Whether to index the field. Omit to use the server default of true. */
             index?: boolean;
             /**
              * @description Whether to store the field value (default false)

@@ -2318,7 +2318,7 @@ pub const DocumentFieldMapping = struct {
     type: ?FieldMappingType = null,
     /// Analyzer name for text-oriented mappings.
     analyzer: ?[]const u8 = null,
-    /// Whether to index the field (default true)
+    /// Whether to index the field. Omit to use the server default of true.
     index: ?bool = null,
     /// Whether to store the field value (default false)
     store: ?bool = null,
@@ -2345,7 +2345,7 @@ pub const DocumentSubfieldMapping = struct {
     type: ?FieldMappingType = null,
     /// Analyzer name for text-oriented mappings.
     analyzer: ?[]const u8 = null,
-    /// Whether to index the field (default true)
+    /// Whether to index the field. Omit to use the server default of true.
     index: ?bool = null,
     /// Whether to store the field value (default false)
     store: ?bool = null,
@@ -8524,7 +8524,7 @@ pub const TemplateFieldMapping = struct {
     type: ?FieldMappingType = null,
     /// Analyzer name (e.g., "standard", "keyword", "en", "html_analyzer"). Used for text fields to control tokenization and normalization.
     analyzer: ?[]const u8 = null,
-    /// Whether to index the field (default true)
+    /// Whether to index the field. Omit to use the server default of true.
     index: ?bool = null,
     /// Whether to store the field value (default false)
     store: ?bool = null,

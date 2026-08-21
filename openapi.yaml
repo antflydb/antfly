@@ -17870,8 +17870,8 @@ components:
           description: Analyzer name for text-oriented mappings.
         index:
           type: boolean
-          default: true
-          description: Whether to index the field (default true)
+          x-go-type-skip-optional-pointer: false
+          description: Whether to index the field. Omit to use the server default of true.
         store:
           type: boolean
           default: false
@@ -17908,8 +17908,8 @@ components:
           description: Analyzer name for text-oriented mappings.
         index:
           type: boolean
-          default: true
-          description: Whether to index the field (default true)
+          x-go-type-skip-optional-pointer: false
+          description: Whether to index the field. Omit to use the server default of true.
         store:
           type: boolean
           default: false
@@ -17981,8 +17981,8 @@ components:
             Used for text fields to control tokenization and normalization.
         index:
           type: boolean
-          default: true
-          description: Whether to index the field (default true)
+          x-go-type-skip-optional-pointer: false
+          description: Whether to index the field. Omit to use the server default of true.
         store:
           type: boolean
           default: false
