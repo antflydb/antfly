@@ -26,6 +26,9 @@ const rowsource_bridge = @import("../external_source/rowsource_bridge.zig");
 const rowsource = @import("../../storage/rowsource/types.zig");
 const lake_rows = @import("lake_rows.zig");
 
+pub const max_equality_delete_key_storage_bytes: usize = 256 * 1024 * 1024;
+pub const equality_delete_key_entry_overhead_bytes: usize = 32;
+
 pub const PositionDeleteRow = struct {
     data_file_path: []const u8,
     row_position: u64,
@@ -102,18 +105,102 @@ pub fn equalityDeleteScanResultsToRowRefsAlloc(
 ) ![]rowsource.RowRef {
     try validateEqualityColumns(equality_columns);
 
+    var delete_keys = std.StringHashMapUnmanaged(void).empty;
+    defer {
+        var iter = delete_keys.keyIterator();
+        while (iter.next()) |key| alloc.free(key.*);
+        delete_keys.deinit(alloc);
+    }
+    var stored_key_bytes: usize = 0;
+    for (delete_rows.rows) |delete_row| {
+        const key = try equalityKeyAlloc(alloc, delete_row, equality_columns);
+        errdefer alloc.free(key);
+        const entry = try delete_keys.getOrPut(alloc, key);
+        if (entry.found_existing) {
+            alloc.free(key);
+        } else {
+            const next_storage = try admitEqualityDeleteKeyStorage(stored_key_bytes, key.len, 0);
+            entry.value_ptr.* = {};
+            stored_key_bytes = next_storage;
+        }
+    }
+
     var out = std.ArrayListUnmanaged(rowsource.RowRef).empty;
     errdefer out.deinit(alloc);
 
     for (data_rows.rows) |data_row| {
-        for (delete_rows.rows) |delete_row| {
-            if (try projectedRowsEqualOnColumns(data_row, delete_row, equality_columns)) {
-                if (!containsRowRef(out.items, data_row.row_ref)) try out.append(alloc, data_row.row_ref);
-                break;
-            }
-        }
+        const key = try equalityKeyAlloc(alloc, data_row, equality_columns);
+        defer alloc.free(key);
+        if (delete_keys.contains(key)) try out.append(alloc, data_row.row_ref);
     }
 
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn admitEqualityDeleteKeyStorage(
+    current: usize,
+    key_bytes: usize,
+    file_index_count: usize,
+) !usize {
+    var additional = std.math.add(usize, key_bytes, equality_delete_key_entry_overhead_bytes) catch
+        return error.IcebergEqualityDeleteSetTooLarge;
+    const file_index_bytes = std.math.mul(usize, file_index_count, @sizeOf(usize)) catch
+        return error.IcebergEqualityDeleteSetTooLarge;
+    additional = std.math.add(usize, additional, file_index_bytes) catch
+        return error.IcebergEqualityDeleteSetTooLarge;
+    return admitEqualityDeleteStorage(current, additional);
+}
+
+pub fn admitEqualityDeleteStorage(current: usize, additional: usize) !usize {
+    const next = std.math.add(usize, current, additional) catch
+        return error.IcebergEqualityDeleteSetTooLarge;
+    if (next > max_equality_delete_key_storage_bytes) return error.IcebergEqualityDeleteSetTooLarge;
+    return next;
+}
+
+pub fn equalityKeyAlloc(
+    alloc: Allocator,
+    row: lake_rows.ProjectedRow,
+    equality_columns: []const []const u8,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    for (equality_columns) |column| {
+        const cell = row.find(column) orelse return error.IcebergEqualityDeleteColumnNotFound;
+        const value = cell.value orelse {
+            try out.append(alloc, 0);
+            continue;
+        };
+        switch (value) {
+            .bytes => |bytes| {
+                try out.append(alloc, 1);
+                const len = std.math.cast(u64, bytes.len) orelse return error.IcebergEqualityDeleteSetTooLarge;
+                var len_bytes: [8]u8 = undefined;
+                std.mem.writeInt(u64, &len_bytes, len, .little);
+                try out.appendSlice(alloc, &len_bytes);
+                try out.appendSlice(alloc, bytes);
+            },
+            .i64 => |number| {
+                try out.append(alloc, 2);
+                var bytes: [8]u8 = undefined;
+                std.mem.writeInt(i64, &bytes, number, .little);
+                try out.appendSlice(alloc, &bytes);
+            },
+            .f64 => |number| {
+                if (std.math.isNan(number)) return error.UnsupportedIcebergEqualityDeleteColumn;
+                try out.append(alloc, 3);
+                const canonical: f64 = if (number == 0) 0 else number;
+                var bytes: [8]u8 = undefined;
+                std.mem.writeInt(u64, &bytes, @bitCast(canonical), .little);
+                try out.appendSlice(alloc, &bytes);
+            },
+            .bool => |boolean| {
+                try out.append(alloc, 4);
+                try out.append(alloc, @intFromBool(boolean));
+            },
+            .json, .vector_f32 => return error.UnsupportedIcebergEqualityDeleteColumn,
+        }
+    }
     return try out.toOwnedSlice(alloc);
 }
 
@@ -125,43 +212,6 @@ fn validateEqualityColumns(columns: []const []const u8) !void {
             if (std.mem.eql(u8, previous, column)) return error.InvalidIcebergEqualityDeleteColumns;
         }
     }
-}
-
-fn projectedRowsEqualOnColumns(
-    data_row: lake_rows.ProjectedRow,
-    delete_row: lake_rows.ProjectedRow,
-    equality_columns: []const []const u8,
-) !bool {
-    for (equality_columns) |column| {
-        const data_cell = data_row.find(column) orelse return error.IcebergEqualityDeleteColumnNotFound;
-        const delete_cell = delete_row.find(column) orelse return error.IcebergEqualityDeleteColumnNotFound;
-        if (!try projectedCellValuesEqual(data_cell.value, delete_cell.value)) return false;
-    }
-    return true;
-}
-
-fn projectedCellValuesEqual(left: ?lake_rows.CellValue, right: ?lake_rows.CellValue) !bool {
-    if (left == null and right == null) return true;
-    if (left == null or right == null) return false;
-    return switch (left.?) {
-        .bytes => |left_value| switch (right.?) {
-            .bytes => |right_value| std.mem.eql(u8, left_value, right_value),
-            else => error.UnsupportedIcebergEqualityDeleteColumn,
-        },
-        .i64 => |left_value| switch (right.?) {
-            .i64 => |right_value| left_value == right_value,
-            else => error.UnsupportedIcebergEqualityDeleteColumn,
-        },
-        .f64 => |left_value| switch (right.?) {
-            .f64 => |right_value| left_value == right_value,
-            else => error.UnsupportedIcebergEqualityDeleteColumn,
-        },
-        .bool => |left_value| switch (right.?) {
-            .bool => |right_value| left_value == right_value,
-            else => error.UnsupportedIcebergEqualityDeleteColumn,
-        },
-        .json, .vector_f32 => error.UnsupportedIcebergEqualityDeleteColumn,
-    };
 }
 
 fn positionDeleteRowFromProjectedRow(
@@ -522,6 +572,38 @@ test "iceberg equality delete scan result treats matching nulls as equal" {
 
     try std.testing.expectEqual(@as(usize, 1), refs.len);
     try std.testing.expectEqualStrings("data:0", refs[0].relational_key);
+}
+
+test "iceberg equality delete hash keys preserve column boundaries" {
+    const alloc = std.testing.allocator;
+    const makeRow = struct {
+        fn make(a: Allocator, key: []const u8, first: []const u8, second: []const u8) !lake_rows.ProjectedRow {
+            const cells = try a.alloc(lake_rows.ProjectedCell, 2);
+            var initialized: usize = 0;
+            errdefer {
+                for (cells[0..initialized]) |*cell| cell.deinit(a);
+                a.free(cells);
+            }
+            cells[0] = .{ .name = try a.dupe(u8, "a"), .value = .{ .bytes = try a.dupe(u8, first) } };
+            initialized += 1;
+            cells[1] = .{ .name = try a.dupe(u8, "b"), .value = .{ .bytes = try a.dupe(u8, second) } };
+            initialized += 1;
+            return .{ .row_ref = .{ .relational_key = key }, .cells = cells };
+        }
+    }.make;
+
+    var data = lake_rows.ScanResult{ .rows = try alloc.alloc(lake_rows.ProjectedRow, 2), .total = 2 };
+    data.rows[0] = try makeRow(alloc, "match", "a", "bc");
+    data.rows[1] = try makeRow(alloc, "not-match", "ab", "c");
+    defer data.deinit(alloc);
+    var deletes = lake_rows.ScanResult{ .rows = try alloc.alloc(lake_rows.ProjectedRow, 1), .total = 1 };
+    deletes.rows[0] = try makeRow(alloc, "delete", "a", "bc");
+    defer deletes.deinit(alloc);
+
+    const refs = try equalityDeleteScanResultsToRowRefsAlloc(alloc, data, deletes, &.{ "a", "b" });
+    defer alloc.free(refs);
+    try std.testing.expectEqual(@as(usize, 1), refs.len);
+    try std.testing.expectEqualStrings("match", refs[0].relational_key);
 }
 
 fn testPositionDeleteProjectedRowAlloc(

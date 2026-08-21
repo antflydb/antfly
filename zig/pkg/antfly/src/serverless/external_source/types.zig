@@ -118,6 +118,8 @@ pub const FileEntry = struct {
     byte_len: u64,
     row_count: u64,
     data_sequence_number: ?i64 = null,
+    partition_spec_id: ?i32 = null,
+    partition_field_count: u32 = 0,
     partition_values: []PartitionValue = &.{},
     row_groups: []RowGroup,
 
@@ -140,6 +142,12 @@ pub const FileEntry = struct {
         if (self.byte_len == 0) return error.InvalidExternalSourceInventory;
         if (self.data_sequence_number) |sequence| {
             if (sequence < 0) return error.InvalidExternalSourceInventory;
+        }
+        if (self.partition_spec_id) |spec_id| {
+            if (spec_id < 0) return error.InvalidExternalSourceInventory;
+        }
+        if (self.partition_field_count != 0 and self.partition_values.len > self.partition_field_count) {
+            return error.InvalidExternalSourceInventory;
         }
         for (self.partition_values, 0..) |partition, idx| {
             try partition.validate();

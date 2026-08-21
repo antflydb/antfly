@@ -28,6 +28,7 @@ pub const max_uncompressed_page_bytes: usize = 64 * 1024 * 1024;
 /// A compact RLE level stream can claim billions of values while remaining a
 /// few bytes long. Bound decoded vectors independently from payload bytes.
 pub const max_values_per_page: usize = max_uncompressed_page_bytes / @sizeOf(i64);
+pub const max_pages_per_column_chunk: usize = 1_000_000;
 
 const CompactType = enum(u4) {
     stop = 0,
@@ -112,6 +113,7 @@ pub const Header = struct {
 
     pub fn validateResourceLimits(self: Header) !void {
         if (self.value_count > max_values_per_page) return error.ParquetPageTooLarge;
+        if (self.uncompressed_page_size > max_uncompressed_page_bytes) return error.ParquetPageTooLarge;
     }
 };
 
@@ -119,6 +121,42 @@ pub const ParsedHeader = struct {
     header: Header,
     header_len: usize,
 };
+
+pub const ColumnChunkResourceUsage = struct {
+    data_value_count: u64 = 0,
+    uncompressed_bytes: usize = 0,
+    page_count: usize = 0,
+};
+
+/// Validate every page boundary and compute cumulative decode work before any
+/// page payload is decompressed or any output vector is allocated.
+pub fn inspectColumnChunkResourceUsage(column_chunk_bytes: []const u8) !ColumnChunkResourceUsage {
+    if (column_chunk_bytes.len == 0) return error.InvalidParquetPage;
+    var usage = ColumnChunkResourceUsage{};
+    var cursor: usize = 0;
+    while (cursor < column_chunk_bytes.len) {
+        if (usage.page_count == max_pages_per_column_chunk) return error.ParquetPageTooLarge;
+        const parsed = try parsePageHeader(column_chunk_bytes[cursor..]);
+        cursor = std.math.add(usize, cursor, parsed.header_len) catch return error.InvalidParquetPage;
+        if (parsed.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+        cursor += parsed.header.compressed_page_size;
+        usage.uncompressed_bytes = std.math.add(
+            usize,
+            usage.uncompressed_bytes,
+            parsed.header.uncompressed_page_size,
+        ) catch return error.ParquetColumnChunkTooLarge;
+        switch (parsed.header.page_type) {
+            .data_page, .data_page_v2 => usage.data_value_count = std.math.add(
+                u64,
+                usage.data_value_count,
+                parsed.header.value_count,
+            ) catch return error.ParquetColumnChunkTooLarge,
+            .dictionary_page, .index_page => {},
+        }
+        usage.page_count += 1;
+    }
+    return usage;
+}
 
 const PagePayload = struct {
     bytes: []u8,

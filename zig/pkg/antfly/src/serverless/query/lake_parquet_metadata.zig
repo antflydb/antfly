@@ -254,6 +254,8 @@ fn cloneFileAlloc(alloc: Allocator, file: external_source.FileEntry) !external_s
     errdefer if (version_id.len > 0) alloc.free(version_id);
     const row_groups = try cloneRowGroupsAlloc(alloc, file.row_groups);
     errdefer freeMaybeOwnedRowGroups(alloc, row_groups);
+    const partition_values = try clonePartitionValuesAlloc(alloc, file.partition_values);
+    errdefer freeMaybeOwnedPartitionValues(alloc, partition_values);
 
     return .{
         .file_id = file_id,
@@ -263,6 +265,9 @@ fn cloneFileAlloc(alloc: Allocator, file: external_source.FileEntry) !external_s
         .byte_len = file.byte_len,
         .row_count = file.row_count,
         .data_sequence_number = file.data_sequence_number,
+        .partition_spec_id = file.partition_spec_id,
+        .partition_field_count = file.partition_field_count,
+        .partition_values = partition_values,
         .row_groups = row_groups,
     };
 }
@@ -282,6 +287,8 @@ fn cloneFileWithFooterAlloc(
     errdefer if (version_id.len > 0) alloc.free(version_id);
     const row_groups = try cloneRowGroupsAlloc(alloc, footer.row_groups);
     errdefer freeMaybeOwnedRowGroups(alloc, row_groups);
+    const partition_values = try clonePartitionValuesAlloc(alloc, file.partition_values);
+    errdefer freeMaybeOwnedPartitionValues(alloc, partition_values);
 
     return .{
         .file_id = file_id,
@@ -291,8 +298,37 @@ fn cloneFileWithFooterAlloc(
         .byte_len = file.byte_len,
         .row_count = footer.row_count,
         .data_sequence_number = file.data_sequence_number,
+        .partition_spec_id = file.partition_spec_id,
+        .partition_field_count = file.partition_field_count,
+        .partition_values = partition_values,
         .row_groups = row_groups,
     };
+}
+
+fn clonePartitionValuesAlloc(
+    alloc: Allocator,
+    values: []const external_source.PartitionValue,
+) ![]external_source.PartitionValue {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc(external_source.PartitionValue, values.len);
+    errdefer alloc.free(out);
+    var initialized: usize = 0;
+    errdefer for (out[0..initialized]) |*value| value.deinit(alloc);
+    for (values, 0..) |value, idx| {
+        const column_id = try alloc.dupe(u8, value.column_id);
+        errdefer alloc.free(column_id);
+        out[idx] = .{
+            .column_id = column_id,
+            .string_value = try alloc.dupe(u8, value.string_value),
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeMaybeOwnedPartitionValues(alloc: Allocator, values: []external_source.PartitionValue) void {
+    for (values) |*value| value.deinit(alloc);
+    if (values.len > 0) alloc.free(values);
 }
 
 fn freeMaybeOwnedRowGroups(alloc: Allocator, row_groups: []external_source.RowGroup) void {
@@ -1561,6 +1597,12 @@ test "parquet metadata parser enriches raw inventory for projected scan planning
         .etag = try alloc.dupe(u8, "etag-a"),
         .byte_len = 1024,
         .row_count = 0,
+        .partition_spec_id = 7,
+        .partition_field_count = 1,
+        .partition_values = try alloc.dupe(external_source.PartitionValue, &.{.{
+            .column_id = try alloc.dupe(u8, "region"),
+            .string_value = try alloc.dupe(u8, "west"),
+        }}),
         .row_groups = &.{},
     };
     try raw.validate();
@@ -1572,6 +1614,11 @@ test "parquet metadata parser enriches raw inventory for projected scan planning
     try std.testing.expectEqualStrings("amount", enriched.files[0].row_groups[0].column_chunks[0].column_id);
     try std.testing.expectEqual(@as(?i64, 10), enriched.files[0].row_groups[0].column_chunks[0].stats_min_i64);
     try std.testing.expectEqual(@as(?i64, 20), enriched.files[0].row_groups[0].column_chunks[0].stats_max_i64);
+    try std.testing.expectEqual(@as(?i32, 7), enriched.files[0].partition_spec_id);
+    try std.testing.expectEqual(@as(u32, 1), enriched.files[0].partition_field_count);
+    try std.testing.expectEqual(@as(usize, 1), enriched.files[0].partition_values.len);
+    try std.testing.expectEqualStrings("region", enriched.files[0].partition_values[0].column_id);
+    try std.testing.expectEqualStrings("west", enriched.files[0].partition_values[0].string_value);
 
     const binding = external_binding.Binding{
         .table_id = "events",

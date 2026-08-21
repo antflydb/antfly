@@ -98,12 +98,13 @@ pub fn planInventoryFromDataFilesAlloc(
         }
     }.lessThan);
 
+    var inventory_owns_allocations = false;
     const files = try alloc.alloc(external_source.FileEntry, active_count);
-    errdefer alloc.free(files);
+    errdefer if (!inventory_owns_allocations) alloc.free(files);
     var initialized: usize = 0;
-    errdefer {
+    errdefer if (!inventory_owns_allocations) {
         for (files[0..initialized]) |*file| file.deinit(alloc);
-    }
+    };
 
     for (sorted_indexes, 0..) |source_idx, out_idx| {
         const data_file = request.data_files[source_idx];
@@ -125,6 +126,11 @@ pub fn planInventoryFromDataFilesAlloc(
             .byte_len = data_file.file_size_in_bytes,
             .row_count = data_file.record_count,
             .data_sequence_number = data_file.data_sequence_number,
+            .partition_spec_id = data_file.partition_spec_id,
+            .partition_field_count = if (data_file.partition_field_count != 0)
+                data_file.partition_field_count
+            else
+                @intCast(data_file.partition_values.len),
             .partition_values = partition_values,
             .row_groups = &.{},
         };
@@ -132,13 +138,13 @@ pub fn planInventoryFromDataFilesAlloc(
     }
 
     const source_id = try alloc.dupe(u8, request.source_id);
-    errdefer alloc.free(source_id);
+    errdefer if (!inventory_owns_allocations) alloc.free(source_id);
     const source_uri = try alloc.dupe(u8, request.source_uri);
-    errdefer alloc.free(source_uri);
+    errdefer if (!inventory_owns_allocations) alloc.free(source_uri);
     const snapshot_id = try alloc.dupe(u8, request.snapshot_id);
-    errdefer alloc.free(snapshot_id);
+    errdefer if (!inventory_owns_allocations) alloc.free(snapshot_id);
     const schema_fingerprint = try alloc.dupe(u8, request.schema_fingerprint);
-    errdefer alloc.free(schema_fingerprint);
+    errdefer if (!inventory_owns_allocations) alloc.free(schema_fingerprint);
 
     var inventory = external_source.Inventory{
         .format = .iceberg,
@@ -148,6 +154,7 @@ pub fn planInventoryFromDataFilesAlloc(
         .schema_fingerprint = schema_fingerprint,
         .files = files,
     };
+    inventory_owns_allocations = true;
     errdefer inventory.deinit(alloc);
     try inventory.validate();
     return inventory;
@@ -179,6 +186,7 @@ pub fn planInventoryFromSnapshotManifestsAlloc(
         const decoded = try decodedManifestForPath(request.data_manifests, manifest_entry.manifest_path);
         for (decoded.manifest.entries) |entry| {
             data_files[next_file] = entry;
+            data_files[next_file].partition_spec_id = manifest_entry.partition_spec_id;
             next_file += 1;
         }
     }
@@ -400,7 +408,9 @@ test "iceberg inventory planner expands snapshot manifests into pinned inventory
     try std.testing.expectEqualStrings("iceberg-schema:7", inventory.schema_fingerprint);
     try std.testing.expectEqual(@as(usize, 2), inventory.files.len);
     try std.testing.expectEqualStrings("s3://bucket/t/data/a.parquet", inventory.files[0].file_id);
+    try std.testing.expectEqual(@as(?i32, 7), inventory.files[0].partition_spec_id);
     try std.testing.expectEqualStrings("s3://bucket/t/data/b.parquet", inventory.files[1].file_id);
+    try std.testing.expectEqual(@as(?i32, 8), inventory.files[1].partition_spec_id);
 }
 
 test "iceberg inventory planner rejects missing decoded manifests" {
@@ -554,6 +564,7 @@ fn testManifestListAlloc(alloc: Allocator) !iceberg_avro.ManifestList {
     entries[0] = .{
         .manifest_path = try alloc.dupe(u8, "s3://bucket/t/metadata/m-a.avro"),
         .manifest_length = 512,
+        .partition_spec_id = 7,
         .content = .data,
         .sequence_number = 42,
         .added_files_count = 1,
@@ -565,6 +576,7 @@ fn testManifestListAlloc(alloc: Allocator) !iceberg_avro.ManifestList {
     entries[1] = .{
         .manifest_path = try alloc.dupe(u8, "s3://bucket/t/metadata/m-b.avro"),
         .manifest_length = 256,
+        .partition_spec_id = 8,
         .content = .data,
         .sequence_number = 42,
         .existing_files_count = 1,

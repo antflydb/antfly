@@ -56,6 +56,7 @@ pub const ManifestListEntry = struct {
     pub fn validate(self: ManifestListEntry) !void {
         if (self.manifest_path.len == 0) return error.InvalidIcebergManifestList;
         if (self.manifest_length == 0) return error.InvalidIcebergManifestList;
+        if (self.partition_spec_id < 0) return error.InvalidIcebergManifestList;
     }
 };
 
@@ -93,6 +94,13 @@ pub const DataFileEntry = struct {
     content: DataFileContent = .data,
     file_path: []u8,
     file_format: []u8,
+    /// Supplied by the manifest-list entry that owns this data-file row.
+    partition_spec_id: i32 = 0,
+    /// Number of fields in the manifest's partition record schema. This stays
+    /// non-zero when a field is null or has a type this reader cannot compare,
+    /// allowing delete planning to fail closed instead of treating it as an
+    /// unpartitioned/global delete.
+    partition_field_count: u32 = 0,
     partition_values: []PartitionValue = &.{},
     equality_ids: []i32 = &.{},
     record_count: u64,
@@ -113,6 +121,10 @@ pub const DataFileEntry = struct {
         if (!std.ascii.eqlIgnoreCase(self.file_format, "PARQUET")) return error.UnsupportedIcebergDataFileFormat;
         if (self.record_count == 0) return error.InvalidIcebergDataManifest;
         if (self.file_size_in_bytes == 0) return error.InvalidIcebergDataManifest;
+        if (self.partition_spec_id < 0) return error.InvalidIcebergDataManifest;
+        if (self.partition_field_count != 0 and self.partition_values.len > self.partition_field_count) {
+            return error.InvalidIcebergDataManifest;
+        }
         if (self.content == .equality_deletes and self.equality_ids.len == 0) return error.InvalidIcebergDataManifest;
         for (self.equality_ids, 0..) |field_id, idx| {
             if (field_id < 0) return error.InvalidIcebergDataManifest;
@@ -717,6 +729,7 @@ const DataFileScratch = struct {
     content: ?DataFileContent = null,
     file_path: ?[]u8 = null,
     file_format: ?[]u8 = null,
+    partition_field_count: u32 = 0,
     partition_values: []PartitionValue = &.{},
     equality_ids: []i32 = &.{},
     record_count: u64 = 0,
@@ -779,6 +792,7 @@ fn readDataManifestEntryAlloc(alloc: Allocator, reader: *Reader, schema: std.jso
         .content = content,
         .file_path = file_path,
         .file_format = file_format,
+        .partition_field_count = data_file.partition_field_count,
         .partition_values = partition_values,
         .equality_ids = equality_ids,
         .record_count = data_file.record_count,
@@ -808,8 +822,10 @@ fn readDataFileRecordAlloc(alloc: Allocator, reader: *Reader, schema: std.json.V
             if (scratch.file_format != null) return error.InvalidIcebergDataManifest;
             scratch.file_format = try readJsonAvroStringAlloc(alloc, reader, field_type);
         } else if (std.mem.eql(u8, name, "partition")) {
-            if (scratch.partition_values.len != 0) return error.InvalidIcebergDataManifest;
-            scratch.partition_values = try readPartitionRecordAlloc(alloc, reader, field_type);
+            if (scratch.partition_field_count != 0 or scratch.partition_values.len != 0) return error.InvalidIcebergDataManifest;
+            const partition = try readPartitionRecordAlloc(alloc, reader, field_type);
+            scratch.partition_field_count = partition.field_count;
+            scratch.partition_values = partition.values;
         } else if (std.mem.eql(u8, name, "equality_ids")) {
             if (scratch.equality_ids.len != 0) return error.InvalidIcebergDataManifest;
             scratch.equality_ids = try readJsonAvroIntArrayAlloc(alloc, reader, field_type);
@@ -825,9 +841,15 @@ fn readDataFileRecordAlloc(alloc: Allocator, reader: *Reader, schema: std.json.V
     return scratch;
 }
 
-fn readPartitionRecordAlloc(alloc: Allocator, reader: *Reader, schema: std.json.Value) ![]PartitionValue {
-    const value_schema = try readJsonUnionTagForValue(reader, schema) orelse return &.{};
+const PartitionRecord = struct {
+    field_count: u32,
+    values: []PartitionValue,
+};
+
+fn readPartitionRecordAlloc(alloc: Allocator, reader: *Reader, schema: std.json.Value) !PartitionRecord {
+    const value_schema = try readJsonUnionTagForValue(reader, schema) orelse return .{ .field_count = 0, .values = &.{} };
     const fields = try recordFields(value_schema);
+    const field_count = std.math.cast(u32, fields.items.len) orelse return error.InvalidIcebergDataManifest;
     var partitions = std.ArrayListUnmanaged(PartitionValue).empty;
     errdefer {
         for (partitions.items) |*partition| partition.deinit(alloc);
@@ -851,7 +873,10 @@ fn readPartitionRecordAlloc(alloc: Allocator, reader: *Reader, schema: std.json.
         }
     }
 
-    return try partitions.toOwnedSlice(alloc);
+    return .{
+        .field_count = field_count,
+        .values = try partitions.toOwnedSlice(alloc),
+    };
 }
 
 fn readJsonAvroIntArrayAlloc(alloc: Allocator, reader: *Reader, schema: std.json.Value) ![]i32 {
@@ -1192,6 +1217,7 @@ test "iceberg avro data-manifest decoder reads parquet data files" {
     try std.testing.expectEqual(DataFileContent.data, manifest.entries[0].content);
     try std.testing.expectEqualStrings("s3://bucket/t/data/a.parquet", manifest.entries[0].file_path);
     try std.testing.expectEqualStrings("PARQUET", manifest.entries[0].file_format);
+    try std.testing.expectEqual(@as(u32, 1), manifest.entries[0].partition_field_count);
     try std.testing.expectEqual(@as(usize, 1), manifest.entries[0].partition_values.len);
     try std.testing.expectEqualStrings("region", manifest.entries[0].partition_values[0].column_id);
     try std.testing.expectEqualStrings("us-west", manifest.entries[0].partition_values[0].string_value);

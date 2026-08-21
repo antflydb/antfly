@@ -291,6 +291,12 @@ fn canCoalesce(a: RangeRead, b: RangeRead, max_gap_bytes: u64) bool {
     if (!sameObjectVersion(a.object, b.object)) return false;
     if (a.purpose != b.purpose) return false;
     if (!std.mem.eql(u8, a.compression_codec, b.compression_codec)) return false;
+    switch (a.purpose) {
+        .decoded_column_page, .projected_row_batch => {
+            if (!std.mem.eql(u8, a.decoded_column_id, b.decoded_column_id)) return false;
+        },
+        else => {},
+    }
     if (b.range.offset < a.range.offset) return false;
     const a_end = a.range.end();
     if (b.range.offset > a_end and b.range.offset - a_end > max_gap_bytes) return false;
@@ -550,6 +556,34 @@ test "lake range planner validates cache lanes and decoded column keys" {
         .purpose = .decoded_column_page,
     };
     try std.testing.expectError(error.InvalidLakeRangeRead, invalid.validate());
+}
+
+test "lake range planner does not coalesce distinct decoded column identities" {
+    const alloc = std.testing.allocator;
+    const object = ObjectRef{
+        .bucket = "warehouse",
+        .key = "events/part-0.parquet",
+        .byte_len = 4096,
+        .version = .{ .version_id = "v1" },
+    };
+    const reads = [_]RangeRead{
+        .{
+            .object = object,
+            .range = .{ .offset = 0, .len = 128 },
+            .purpose = .decoded_column_page,
+            .decoded_column_id = "amount",
+        },
+        .{
+            .object = object,
+            .range = .{ .offset = 128, .len = 128 },
+            .purpose = .decoded_column_page,
+            .decoded_column_id = "tenant_id",
+        },
+    };
+    const physical = try coalescePhysicalReadsAlloc(alloc, &reads, .{});
+    defer alloc.free(physical);
+    try std.testing.expectEqual(@as(usize, 2), physical.len);
+    for (physical) |read| try read.validate();
 }
 
 test "lake range planner creates column chunk reads from external inventory metadata" {

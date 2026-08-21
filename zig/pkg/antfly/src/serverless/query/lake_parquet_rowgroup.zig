@@ -38,9 +38,18 @@ pub const MaterializationLimits = struct {
     max_rows: usize = 1_000_000,
     max_projected_cells: usize = 8_000_000,
     max_struct_allocation_bytes: usize = 256 * 1024 * 1024,
+    max_input_bytes: usize = 256 * 1024 * 1024,
+    max_decoded_bytes: usize = 256 * 1024 * 1024,
+    max_physical_reads: usize = 4096,
 
     pub fn validate(self: MaterializationLimits) !void {
-        if (self.max_rows == 0 or self.max_projected_cells == 0 or self.max_struct_allocation_bytes == 0) {
+        if (self.max_rows == 0 or
+            self.max_projected_cells == 0 or
+            self.max_struct_allocation_bytes == 0 or
+            self.max_input_bytes == 0 or
+            self.max_decoded_bytes == 0 or
+            self.max_physical_reads == 0)
+        {
             return error.InvalidParquetMaterializationLimits;
         }
     }
@@ -150,7 +159,6 @@ pub const ObjectRangeCachePolicy = struct {
     pub fn lakeServingDefaults(max_total_bytes: usize) ObjectRangeCachePolicy {
         var policy = ObjectRangeCachePolicy{};
         policy.setTotalLimit(max_total_bytes);
-        policy.setFetchLimit(@min(max_total_bytes, range_io.max_physical_range_read_bytes));
         policy.protectLane(.metadata);
         policy.protectLane(.serving_sidecar);
         policy.setLaneLimit(.broad_scan_scratch, max_total_bytes / 8);
@@ -970,6 +978,39 @@ fn admitMaterialization(
     return row_count;
 }
 
+fn preflightColumnChunks(
+    projected_chunks: []const ColumnChunkInput,
+    expected_row_count: usize,
+    limits: MaterializationLimits,
+) !void {
+    var input_bytes: usize = 0;
+    var decoded_bytes: usize = 0;
+    for (projected_chunks) |input| {
+        try input.validate();
+        input_bytes = std.math.add(usize, input_bytes, input.bytes.len) catch
+            return error.ParquetRowGroupTooLarge;
+        if (input_bytes > limits.max_input_bytes) return error.ParquetRowGroupTooLarge;
+        const usage = try parquet_page.inspectColumnChunkResourceUsage(input.bytes);
+        if (usage.data_value_count != expected_row_count) return error.ParquetRowGroupRowCountMismatch;
+        decoded_bytes = std.math.add(usize, decoded_bytes, usage.uncompressed_bytes) catch
+            return error.ParquetRowGroupTooLarge;
+        if (decoded_bytes > limits.max_decoded_bytes) return error.ParquetRowGroupTooLarge;
+    }
+}
+
+fn admitPhysicalReads(
+    physical_reads: []const range_io.RangeRead,
+    limits: MaterializationLimits,
+) !void {
+    if (physical_reads.len > limits.max_physical_reads) return error.ParquetRowGroupTooLarge;
+    var total_bytes: usize = 0;
+    for (physical_reads) |read| {
+        const len = std.math.cast(usize, read.range.len) orelse return error.ParquetRowGroupTooLarge;
+        total_bytes = std.math.add(usize, total_bytes, len) catch return error.ParquetRowGroupTooLarge;
+        if (total_bytes > limits.max_input_bytes) return error.ParquetRowGroupTooLarge;
+    }
+}
+
 fn buildPlainI64RowGroupBatchAlloc(
     alloc: Allocator,
     inventory: external_source.Inventory,
@@ -985,6 +1026,7 @@ fn buildPlainI64RowGroupBatchAlloc(
     if (row_group_ordinal >= file.row_groups.len) return error.ExternalSourceRowOutOfBounds;
     const row_group = file.row_groups[row_group_ordinal];
     const row_count = try admitMaterialization(row_group.row_count, projected_chunks.len, limits);
+    try preflightColumnChunks(projected_chunks, row_count, limits);
     const binding = rowsource_bridge.bindingFromValidatedInventory(inventory);
 
     const row_refs = try alloc.alloc(rowsource.RowRef, row_count);
@@ -1442,6 +1484,7 @@ fn buildPlainI64RowGroupBatchFromObjectRangeReaderAlloc(
 
     const physical_reads = try range_io.coalescePhysicalReadsAlloc(alloc, logical_reads, coalesce_options);
     defer alloc.free(physical_reads);
+    try admitPhysicalReads(physical_reads, limits);
     const physical_bytes = try alloc.alloc([]u8, physical_reads.len);
     defer alloc.free(physical_bytes);
     var initialized_physical: usize = 0;
@@ -5703,6 +5746,45 @@ test "parquet object range cache enforces fetch admission before reader invocati
     try std.testing.expectEqual(@as(usize, 0), reader_impl.calls);
 }
 
+test "parquet serving cache capacity does not reject larger safe reads" {
+    const alloc = std.testing.allocator;
+    const Reader = struct {
+        fn readRangeAlloc(
+            ctx: *anyopaque,
+            a: Allocator,
+            bucket: []const u8,
+            key: []const u8,
+            offset: u64,
+            len: usize,
+        ) ![]u8 {
+            _ = ctx;
+            _ = bucket;
+            _ = key;
+            _ = offset;
+            return try a.alloc(u8, len);
+        }
+    };
+    var unused: u8 = 0;
+    const reader = ObjectRangeReader{ .ctx = &unused, .read_range_alloc = Reader.readRangeAlloc };
+    var cache = ObjectRangeCache.initWithLakeServingDefaults(1);
+    defer cache.deinit(alloc);
+    const read = range_io.RangeRead{
+        .object = .{
+            .bucket = "bucket",
+            .key = "object",
+            .byte_len = 2,
+            .version = .{ .etag = "etag" },
+        },
+        .range = .{ .offset = 0, .len = 2 },
+        .purpose = .parquet_column_chunk,
+    };
+    const bytes = try cache.readAlloc(alloc, reader, read);
+    defer alloc.free(bytes);
+    try std.testing.expectEqual(@as(usize, 2), bytes.len);
+    try std.testing.expectEqual(@as(usize, 0), cache.statsSnapshot().stored_bytes);
+    try std.testing.expectEqual(@as(usize, 2), cache.statsSnapshot().rejected_bytes);
+}
+
 test "parquet object range cache rejects corrupted cached range checksums" {
     const alloc = std.testing.allocator;
     var cache = ObjectRangeCache{};
@@ -7938,4 +8020,110 @@ test "parquet row group materialization rejects oversized batches before decodin
         &.{.{ .column_id = "amount", .bytes = "x" }},
         .{ .max_rows = 10 },
     ));
+}
+
+test "parquet row group preflight bounds cumulative decoded page bytes" {
+    const alloc = std.testing.allocator;
+    var chunk = std.ArrayListUnmanaged(u8).empty;
+    defer chunk.deinit(alloc);
+    try appendPlainI64DataPage(&chunk, alloc, &.{1});
+    try appendPlainI64DataPage(&chunk, alloc, &.{2});
+
+    var inventory = external_source.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "sha256:objects"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source.FileEntry, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-a"),
+        .byte_len = chunk.items.len,
+        .row_count = 2,
+        .row_groups = try alloc.dupe(external_source.RowGroup, &.{.{
+            .ordinal = 0,
+            .row_count = 2,
+            .file_offset = 0,
+            .total_byte_len = chunk.items.len,
+            .column_chunks = try alloc.dupe(external_source.ColumnChunk, &.{.{
+                .column_id = try alloc.dupe(u8, "amount"),
+                .file_offset = 0,
+                .compressed_len = chunk.items.len,
+            }}),
+        }}),
+    };
+
+    try std.testing.expectError(error.ParquetRowGroupTooLarge, buildSupportedI64RowGroupBatchAllocWithLimits(
+        alloc,
+        inventory,
+        "part-a.parquet",
+        0,
+        &.{.{ .column_id = "amount", .bytes = chunk.items }},
+        .{ .max_decoded_bytes = 8 },
+    ));
+}
+
+test "parquet row group rejects cumulative object input before reads" {
+    const alloc = std.testing.allocator;
+    const CountingReader = struct {
+        calls: usize = 0,
+        fn readRangeAlloc(
+            ctx: *anyopaque,
+            a: Allocator,
+            bucket: []const u8,
+            key: []const u8,
+            offset: u64,
+            len: usize,
+        ) ![]u8 {
+            _ = bucket;
+            _ = key;
+            _ = offset;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return try a.alloc(u8, len);
+        }
+    };
+    var reader_impl = CountingReader{};
+    const reader = ObjectRangeReader{ .ctx = &reader_impl, .read_range_alloc = CountingReader.readRangeAlloc };
+    var inventory = external_source.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "sha256:objects"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source.FileEntry, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-a"),
+        .byte_len = 2,
+        .row_count = 1,
+        .row_groups = try alloc.dupe(external_source.RowGroup, &.{.{
+            .ordinal = 0,
+            .row_count = 1,
+            .file_offset = 0,
+            .total_byte_len = 2,
+            .column_chunks = try alloc.dupe(external_source.ColumnChunk, &.{
+                .{ .column_id = try alloc.dupe(u8, "a"), .file_offset = 0, .compressed_len = 1 },
+                .{ .column_id = try alloc.dupe(u8, "b"), .file_offset = 1, .compressed_len = 1 },
+            }),
+        }}),
+    };
+
+    try std.testing.expectError(error.ParquetRowGroupTooLarge, buildSupportedI64RowGroupBatchFromObjectRangeReaderAllocWithLimits(
+        alloc,
+        reader,
+        inventory,
+        "part-a.parquet",
+        0,
+        &.{ "a", "b" },
+        .{ .max_input_bytes = 1 },
+    ));
+    try std.testing.expectEqual(@as(usize, 0), reader_impl.calls);
 }
