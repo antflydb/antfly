@@ -133,9 +133,11 @@ fn buildAlgebraicGroupBySidecarBoundedAlloc(
     var segment = try groupMapToSegmentAlloc(alloc, &folds, binding, options);
     defer algebraic_segment.freeSegment(alloc, &segment);
 
+    const encoded_size = try algebraic_segment.encodedSize(segment);
+    try budget.checkOutputBytes(encoded_size);
     const payload = try algebraic_segment.encodeAlloc(alloc, segment);
     errdefer alloc.free(payload);
-    try budget.checkOutputBytes(payload.len);
+    std.debug.assert(payload.len == encoded_size);
 
     var declaration = try declaredArtifactAlloc(alloc, binding, options, payload.len);
     errdefer freeOwnedDeclaration(alloc, declaration);
@@ -211,9 +213,11 @@ fn buildAlgebraicExpressionSidecarBoundedAlloc(
     var materialization = try accumulatorsToExpressionMaterializationAlloc(alloc, accumulators, binding, options);
     defer algebraic_segment.freeExpressionMaterialization(alloc, &materialization);
 
+    const encoded_size = try algebraic_segment.encodedExpressionSize(materialization);
+    try budget.checkOutputBytes(encoded_size);
     const payload = try algebraic_segment.encodeExpressionAlloc(alloc, materialization);
     errdefer alloc.free(payload);
-    try budget.checkOutputBytes(payload.len);
+    std.debug.assert(payload.len == encoded_size);
 
     var declaration = try declaredArtifactForNameAlloc(
         alloc,

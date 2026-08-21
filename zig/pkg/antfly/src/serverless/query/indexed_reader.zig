@@ -689,7 +689,7 @@ fn searchVectorSegmentAlloc(
 
     var candidates = std.ArrayListUnmanaged(ApproxCandidate).empty;
     defer candidates.deinit(alloc);
-    const needed = req.offset + req.limit;
+    const needed = boundedRequestedCount(vector_segment.entries.len, req.offset, req.limit);
     for (clusters[0..probes], 0..) |cluster_hit, probe_rank| {
         const cluster = vector_segment.clusters[cluster_hit.cluster_index];
         const start: usize = cluster.start_index;
@@ -855,7 +855,7 @@ fn searchVectorArtifactAlloc(
 
     var candidates = std.ArrayListUnmanaged(ApproxCandidate).empty;
     defer candidates.deinit(alloc);
-    const needed = req.offset + req.limit;
+    const needed = boundedRequestedCount(@intCast(header.entry_count), req.offset, req.limit);
     for (ranked_clusters[0..probes], 0..) |cluster_hit, probe_rank| {
         try session.checkCancellation();
         const cluster = clusters[cluster_hit.cluster_index];
@@ -1238,11 +1238,23 @@ fn similarityForQuery(
 
 fn vectorShortlistCount(candidate_count: usize, probes: usize, limit: usize, offset: usize, shortlist_multiplier: u32) usize {
     if (candidate_count == 0) return 0;
-    const needed = offset + limit;
+    const needed = boundedRequestedCount(candidate_count, offset, limit);
     const multiplier: usize = @max(@as(usize, 2), shortlist_multiplier);
-    const probe_budget = @max(probes * multiplier, probes + needed);
-    const shortlist = @max(needed + 4, @max(needed * multiplier, probe_budget));
+    const probe_budget = @max(saturatingMul(probes, multiplier), saturatingAdd(probes, needed));
+    const shortlist = @max(saturatingAdd(needed, 4), @max(saturatingMul(needed, multiplier), probe_budget));
     return @min(candidate_count, shortlist);
+}
+
+fn boundedRequestedCount(candidate_count: usize, offset: usize, limit: usize) usize {
+    return @min(candidate_count, saturatingAdd(offset, limit));
+}
+
+fn saturatingAdd(a: usize, b: usize) usize {
+    return std.math.add(usize, a, b) catch std.math.maxInt(usize);
+}
+
+fn saturatingMul(a: usize, b: usize) usize {
+    return std.math.mul(usize, a, b) catch std.math.maxInt(usize);
 }
 
 fn clusterCandidateCap(
@@ -1254,9 +1266,9 @@ fn clusterCandidateCap(
 ) usize {
     if (candidates.len == 0) return 0;
     const base_needed = @max(@as(usize, 1), needed);
-    const base = std.math.divCeil(usize, base_needed * 2, @max(@as(usize, 1), probes)) catch base_needed;
+    const base = std.math.divCeil(usize, saturatingMul(base_needed, 2), @max(@as(usize, 1), probes)) catch base_needed;
     const rank_bonus: usize = if (probe_rank < 2) 4 else if (probe_rank < 4) 2 else 0;
-    var cap = @min(candidates.len, @max(@as(usize, 4), base + rank_bonus));
+    var cap = @min(candidates.len, @max(@as(usize, 4), saturatingAdd(base, rank_bonus)));
     if (cap >= candidates.len) return candidates.len;
 
     const best_distance = optimisticDistance(candidates[0]);
@@ -1269,7 +1281,7 @@ fn clusterCandidateCap(
     const avg_distance_bias = @max(@as(f32, 0), cluster.routing_distance_avg - cluster.routing_distance_min);
 
     if (spread_ratio < 0.25 or cluster_spread < 0.08 or avg_distance_bias < 0.05) {
-        cap += @max(@as(usize, 2), cap / 2);
+        cap = saturatingAdd(cap, @max(@as(usize, 2), cap / 2));
     } else if ((spread_ratio > 0.75 or avg_distance_bias > 0.25) and cap > 4) {
         cap -= @max(@as(usize, 1), cap / 4);
     }
@@ -1288,7 +1300,7 @@ fn effectiveProbeCount(req: query_request.QueryRequest, minimum_hint: u32, ranke
     const requested = resolveRequestedProbeCount(req, cluster_count);
     var probes = if (requested == 0) hinted else @max(@as(usize, requested), hinted);
     probes = @min(cluster_count, @max(@as(usize, 1), probes));
-    const max_probe_budget = @min(cluster_count, @max(probes, probes * 2));
+    const max_probe_budget = @min(cluster_count, @max(probes, saturatingMul(probes, 2)));
     while (probes < max_probe_budget) : (probes += 1) {
         const prev = ranked_clusters[probes - 1].score;
         const next = ranked_clusters[probes].score;

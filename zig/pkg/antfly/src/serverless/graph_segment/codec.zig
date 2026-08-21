@@ -15,23 +15,25 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const graph_types = @import("types.zig");
+const bounded_decode = @import("../bounded_decode.zig");
+
+pub const DecodeLimits = bounded_decode.Limits;
 
 pub const wire_magic = "AFSG";
 pub const wire_version: u16 = 1;
 
 const header_len = 4 + 2 + 4;
 
-fn edgeEncodedSize(edge: graph_types.Edge) usize {
-    return 4 + 4 + 4 + edge.neighbor_id.len + edge.edge_type.len;
+fn edgeEncodedSize(edge: graph_types.Edge) !usize {
+    _ = std.math.cast(u32, edge.neighbor_id.len) orelse return error.GraphSegmentTooLarge;
+    _ = std.math.cast(u32, edge.edge_type.len) orelse return error.GraphSegmentTooLarge;
+    var size: usize = 12;
+    size = std.math.add(usize, size, edge.neighbor_id.len) catch return error.GraphSegmentTooLarge;
+    return std.math.add(usize, size, edge.edge_type.len) catch error.GraphSegmentTooLarge;
 }
 
 pub fn encodeAlloc(alloc: Allocator, segment: graph_types.Segment) ![]u8 {
-    var size: usize = header_len;
-    for (segment.adjacencies) |adjacency| {
-        size += 4 + 4 + 4 + adjacency.node_id.len;
-        for (adjacency.out_edges) |edge| size += edgeEncodedSize(edge);
-        for (adjacency.in_edges) |edge| size += edgeEncodedSize(edge);
-    }
+    const size = try encodedSize(segment);
 
     const buf = try alloc.alloc(u8, size);
     errdefer alloc.free(buf);
@@ -61,7 +63,43 @@ pub fn encodeAlloc(alloc: Allocator, segment: graph_types.Segment) ![]u8 {
     return buf;
 }
 
+pub fn encodedSize(segment: graph_types.Segment) !usize {
+    _ = std.math.cast(u32, segment.adjacencies.len) orelse return error.GraphSegmentTooLarge;
+    var size: usize = header_len;
+    for (segment.adjacencies) |adjacency| {
+        _ = std.math.cast(u32, adjacency.node_id.len) orelse return error.GraphSegmentTooLarge;
+        _ = std.math.cast(u32, adjacency.out_edges.len) orelse return error.GraphSegmentTooLarge;
+        _ = std.math.cast(u32, adjacency.in_edges.len) orelse return error.GraphSegmentTooLarge;
+        size = std.math.add(usize, size, 12) catch return error.GraphSegmentTooLarge;
+        size = std.math.add(usize, size, adjacency.node_id.len) catch return error.GraphSegmentTooLarge;
+        for (adjacency.out_edges) |edge| size = std.math.add(usize, size, try edgeEncodedSize(edge)) catch return error.GraphSegmentTooLarge;
+        for (adjacency.in_edges) |edge| size = std.math.add(usize, size, try edgeEncodedSize(edge)) catch return error.GraphSegmentTooLarge;
+    }
+    return size;
+}
+
+test "lake graph segment codec rejects forged adjacency counts before allocation" {
+    var payload = [_]u8{0} ** header_len;
+    @memcpy(payload[0..4], wire_magic);
+    std.mem.writeInt(u16, payload[4..6], wire_version, .little);
+    std.mem.writeInt(u32, payload[6..10], std.math.maxInt(u32), .little);
+    try std.testing.expectError(error.InvalidGraphSegment, decodeAlloc(std.testing.allocator, &payload));
+}
+
 pub fn decodeAlloc(alloc: Allocator, data: []const u8) !graph_types.Segment {
+    return try decodeAllocWithLimits(alloc, data, .{});
+}
+
+pub fn decodeAllocWithLimits(alloc: Allocator, data: []const u8, limits: DecodeLimits) !graph_types.Segment {
+    var budget = try bounded_decode.Budget.init(data.len, limits);
+    var limiter = try bounded_decode.AllocationLimiter.init(alloc, limits.max_allocation_bytes);
+    return decodeBoundedAlloc(limiter.allocator(), data, &budget) catch |err| {
+        if (err == error.OutOfMemory and limiter.limit_exceeded) return error.DecodedArtifactTooLarge;
+        return err;
+    };
+}
+
+fn decodeBoundedAlloc(alloc: Allocator, data: []const u8, budget: *bounded_decode.Budget) !graph_types.Segment {
     if (data.len < header_len) return error.InvalidGraphSegment;
     var pos: usize = 0;
     if (!std.mem.eql(u8, data[pos..][0..4], wire_magic)) return error.InvalidGraphSegment;
@@ -71,6 +109,8 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !graph_types.Segment {
     if (version != wire_version) return error.UnsupportedGraphSegmentVersion;
     const adjacency_count = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += 4;
+    if (@as(usize, adjacency_count) > (data.len - pos) / 12) return error.InvalidGraphSegment;
+    _ = try budget.admitCount(graph_types.Adjacency, adjacency_count, data.len - pos, 12);
 
     const adjacencies = try alloc.alloc(graph_types.Adjacency, adjacency_count);
     errdefer alloc.free(adjacencies);
@@ -87,17 +127,18 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !graph_types.Segment {
         pos += 4;
         const in_count = std.mem.readInt(u32, data[pos..][0..4], .little);
         pos += 4;
-        if (pos + node_id_len > data.len) return error.InvalidGraphSegment;
+        if (node_id_len > data.len - pos) return error.InvalidGraphSegment;
+        try budget.admitBytes(node_id_len);
         const node_id = try alloc.dupe(u8, data[pos .. pos + node_id_len]);
         pos += node_id_len;
         errdefer alloc.free(node_id);
 
-        const out_edges = try decodeEdgesAlloc(alloc, data, &pos, out_count);
+        const out_edges = try decodeEdgesAlloc(alloc, data, &pos, out_count, budget);
         errdefer {
             for (out_edges) |*edge| edge.deinit(alloc);
             alloc.free(out_edges);
         }
-        const in_edges = try decodeEdgesAlloc(alloc, data, &pos, in_count);
+        const in_edges = try decodeEdgesAlloc(alloc, data, &pos, in_count, budget);
         errdefer {
             for (in_edges) |*edge| edge.deinit(alloc);
             alloc.free(in_edges);
@@ -130,7 +171,15 @@ fn encodeEdge(buf: []u8, edge: graph_types.Edge) usize {
     return pos;
 }
 
-fn decodeEdgesAlloc(alloc: Allocator, data: []const u8, pos: *usize, edge_count: u32) ![]graph_types.Edge {
+fn decodeEdgesAlloc(
+    alloc: Allocator,
+    data: []const u8,
+    pos: *usize,
+    edge_count: u32,
+    budget: *bounded_decode.Budget,
+) ![]graph_types.Edge {
+    if (pos.* > data.len or @as(usize, edge_count) > (data.len - pos.*) / 12) return error.InvalidGraphSegment;
+    _ = try budget.admitCount(graph_types.Edge, edge_count, data.len - pos.*, 12);
     const edges = try alloc.alloc(graph_types.Edge, edge_count);
     errdefer alloc.free(edges);
     var initialized: usize = 0;
@@ -146,7 +195,9 @@ fn decodeEdgesAlloc(alloc: Allocator, data: []const u8, pos: *usize, edge_count:
         pos.* += 4;
         const weight_bits = std.mem.readInt(u32, data[pos.*..][0..4], .little);
         pos.* += 4;
-        if (pos.* + neighbor_id_len + edge_type_len > data.len) return error.InvalidGraphSegment;
+        const names_len = std.math.add(usize, neighbor_id_len, edge_type_len) catch return error.InvalidGraphSegment;
+        if (pos.* > data.len or names_len > data.len - pos.*) return error.InvalidGraphSegment;
+        try budget.admitBytes(names_len);
         const neighbor_id = try alloc.dupe(u8, data[pos.* .. pos.* + neighbor_id_len]);
         pos.* += neighbor_id_len;
         errdefer alloc.free(neighbor_id);

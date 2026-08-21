@@ -105,9 +105,11 @@ fn buildGraphSidecarBoundedAlloc(
     var segment = try nodeMapToSegmentAlloc(alloc, &node_map);
     defer graph_segment.freeSegment(alloc, &segment);
 
+    const encoded_size = try graph_segment.encodedSize(segment);
+    try budget.checkOutputBytes(encoded_size);
     const payload = try graph_segment.encodeAlloc(alloc, segment);
     errdefer alloc.free(payload);
-    try budget.checkOutputBytes(payload.len);
+    std.debug.assert(payload.len == encoded_size);
 
     var declaration = try declaredArtifactAlloc(alloc, binding, options, payload.len);
     errdefer freeOwnedDeclaration(alloc, declaration);

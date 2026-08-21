@@ -15,6 +15,7 @@
 //! Shared allocation-amplification guards for durable binary artifacts.
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 
 pub const Limits = struct {
     max_artifact_bytes: usize = 256 * 1024 * 1024,
@@ -85,10 +86,85 @@ pub const Budget = struct {
     }
 };
 
+/// Hard live-allocation admission for decoders whose wire format may contain
+/// nested or variable-sized allocations. A forged count can make an allocator
+/// request large, but it cannot reach the backing allocator once this limit is
+/// exceeded. `limit_exceeded` lets callers distinguish configured admission
+/// from a genuine backing-allocator failure.
+pub const AllocationLimiter = struct {
+    backing: Allocator,
+    live_bytes: usize = 0,
+    max_live_bytes: usize,
+    limit_exceeded: bool = false,
+
+    pub fn init(backing: Allocator, max_live_bytes: usize) !AllocationLimiter {
+        if (max_live_bytes == 0) return error.InvalidDecodeLimits;
+        return .{ .backing = backing, .max_live_bytes = max_live_bytes };
+    }
+
+    pub fn allocator(self: *AllocationLimiter) Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn permitsGrowth(self: *AllocationLimiter, additional_bytes: usize) bool {
+        if (additional_bytes <= self.max_live_bytes -| self.live_bytes) return true;
+        self.limit_exceeded = true;
+        return false;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *AllocationLimiter = @ptrCast(@alignCast(ctx));
+        if (!self.permitsGrowth(len)) return null;
+        const memory = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.live_bytes += len;
+        return memory;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *AllocationLimiter = @ptrCast(@alignCast(ctx));
+        const growth = new_len -| memory.len;
+        if (growth > 0 and !self.permitsGrowth(growth)) return false;
+        if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        self.live_bytes = self.live_bytes -| memory.len +| new_len;
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *AllocationLimiter = @ptrCast(@alignCast(ctx));
+        const growth = new_len -| memory.len;
+        if (growth > 0 and !self.permitsGrowth(growth)) return null;
+        const remapped = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        self.live_bytes = self.live_bytes -| memory.len +| new_len;
+        return remapped;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *AllocationLimiter = @ptrCast(@alignCast(ctx));
+        self.backing.rawFree(memory, alignment, ret_addr);
+        self.live_bytes -|= memory.len;
+    }
+
+    const vtable = Allocator.VTable{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+};
+
 test "lake bounded decode rejects count amplification before allocation" {
     var budget = try Budget.init(16, .{ .max_artifact_bytes = 16, .max_allocation_bytes = 64, .max_elements = 8 });
     try std.testing.expectError(error.InvalidEncodedCount, budget.admitCount(u64, 4, 3, 1));
 
     var allocation_budget = try Budget.init(16, .{ .max_artifact_bytes = 16, .max_allocation_bytes = 16, .max_elements = 8 });
     try std.testing.expectError(error.DecodedArtifactTooLarge, allocation_budget.admitCount(u64, 3, 16, 1));
+}
+
+test "lake bounded decode allocator rejects live allocation amplification" {
+    var limiter = try AllocationLimiter.init(std.testing.allocator, 16);
+    const alloc = limiter.allocator();
+    const bytes = try alloc.alloc(u8, 16);
+    defer alloc.free(bytes);
+    try std.testing.expectError(error.OutOfMemory, alloc.alloc(u8, 1));
+    try std.testing.expect(limiter.limit_exceeded);
 }

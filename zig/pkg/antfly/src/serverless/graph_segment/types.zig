@@ -52,6 +52,38 @@ pub const Segment = struct {
     }
 };
 
+/// Immutable lookup built over a decoded Segment. Keys borrow `node_id` storage
+/// from the segment, so the index must be deinitialized before the segment.
+pub const AdjacencyIndex = struct {
+    const Map = std.StringHashMapUnmanaged(usize);
+
+    by_node_id: Map = .empty,
+
+    pub fn init(alloc: Allocator, segment: Segment) !AdjacencyIndex {
+        var self = AdjacencyIndex{};
+        errdefer self.deinit(alloc);
+        const capacity = std.math.cast(Map.Size, segment.adjacencies.len) orelse
+            return error.InvalidGraphSegment;
+        try self.by_node_id.ensureTotalCapacity(alloc, capacity);
+        for (segment.adjacencies, 0..) |adjacency, idx| {
+            const gop = self.by_node_id.getOrPutAssumeCapacity(adjacency.node_id);
+            if (gop.found_existing) return error.InvalidGraphSegment;
+            gop.value_ptr.* = idx;
+        }
+        return self;
+    }
+
+    pub fn deinit(self: *AdjacencyIndex, alloc: Allocator) void {
+        self.by_node_id.deinit(alloc);
+        self.* = .{};
+    }
+
+    pub fn find(self: AdjacencyIndex, segment: Segment, node_id: []const u8) ?Adjacency {
+        const idx = self.by_node_id.get(node_id) orelse return null;
+        return segment.adjacencies[idx];
+    }
+};
+
 pub fn freeSegment(alloc: Allocator, segment: *Segment) void {
     segment.deinit(alloc);
 }
@@ -72,4 +104,28 @@ test "graph segment types free owned storage" {
         .weight = 1.0,
     };
     freeSegment(alloc, &segment);
+}
+
+test "lake graph adjacency index provides constant-time lookup and rejects duplicate nodes" {
+    const alloc = std.testing.allocator;
+    var segment = Segment{ .adjacencies = try alloc.alloc(Adjacency, 2) };
+    defer freeSegment(alloc, &segment);
+    for (segment.adjacencies, 0..) |*adjacency, idx| {
+        adjacency.* = .{
+            .node_id = try alloc.dupe(u8, if (idx == 0) "doc-b" else "doc-a"),
+            .out_edges = try alloc.alloc(Edge, 0),
+            .in_edges = try alloc.alloc(Edge, 0),
+        };
+    }
+
+    {
+        var index = try AdjacencyIndex.init(alloc, segment);
+        defer index.deinit(alloc);
+        try std.testing.expectEqualStrings("doc-a", index.find(segment, "doc-a").?.node_id);
+        try std.testing.expect(index.find(segment, "missing") == null);
+    }
+
+    alloc.free(segment.adjacencies[1].node_id);
+    segment.adjacencies[1].node_id = try alloc.dupe(u8, "doc-b");
+    try std.testing.expectError(error.InvalidGraphSegment, AdjacencyIndex.init(alloc, segment));
 }

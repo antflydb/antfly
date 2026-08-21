@@ -15,6 +15,39 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+pub const sha256_checksum_len: usize = std.crypto.hash.sha2.Sha256.digest_length * 2;
+pub const sha256_artifact_id_prefix = "sha256:";
+
+/// Returns the checksum portion of a canonical content-addressed artifact ID.
+/// Artifact stores use this before any filesystem or object-store access so a
+/// malformed ID cannot select an arbitrary cache key or silently weaken
+/// payload verification.
+pub fn sha256ChecksumFromArtifactId(artifact_id: []const u8) ![]const u8 {
+    if (!std.mem.startsWith(u8, artifact_id, sha256_artifact_id_prefix)) {
+        return error.InvalidArtifactId;
+    }
+    const checksum = artifact_id[sha256_artifact_id_prefix.len..];
+    try validateSha256Checksum(checksum);
+    return checksum;
+}
+
+pub fn validateSha256Checksum(checksum: []const u8) !void {
+    if (checksum.len != sha256_checksum_len) return error.InvalidArtifactId;
+    for (checksum) |byte| {
+        if (!isLowerHex(byte)) return error.InvalidArtifactId;
+    }
+}
+
+pub fn validateSha256ArtifactIdentity(artifact_id: []const u8, checksum: []const u8) !void {
+    try validateSha256Checksum(checksum);
+    const id_checksum = try sha256ChecksumFromArtifactId(artifact_id);
+    if (!std.mem.eql(u8, id_checksum, checksum)) return error.InvalidArtifactId;
+}
+
+fn isLowerHex(byte: u8) bool {
+    return (byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f');
+}
+
 pub const ArtifactMetadata = struct {
     artifact_id: []u8,
     byte_len: u64,
@@ -66,3 +99,23 @@ pub const ArtifactStore = struct {
         try self.vtable.delete(self.ptr, artifact_id);
     }
 };
+
+test "artifact identities require canonical matching sha256 values" {
+    const checksum = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const artifact_id = sha256_artifact_id_prefix ++ checksum;
+    try validateSha256ArtifactIdentity(artifact_id, checksum);
+    try std.testing.expectEqualStrings(checksum, try sha256ChecksumFromArtifactId(artifact_id));
+
+    try std.testing.expectError(error.InvalidArtifactId, sha256ChecksumFromArtifactId("sha256:abcd"));
+    try std.testing.expectError(
+        error.InvalidArtifactId,
+        sha256ChecksumFromArtifactId("sha256:0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef"),
+    );
+    try std.testing.expectError(
+        error.InvalidArtifactId,
+        validateSha256ArtifactIdentity(
+            artifact_id,
+            "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ),
+    );
+}

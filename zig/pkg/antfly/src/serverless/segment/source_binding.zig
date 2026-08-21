@@ -31,6 +31,63 @@ pub const RowRefKind = enum(u8) {
     external = 3,
 };
 
+/// Hash/equality semantics for RowRef values. Maps using this context borrow the
+/// byte slices stored in their keys; callers must keep those slices alive until
+/// the map is deinitialized.
+pub const RowRefContext = struct {
+    pub fn hash(_: RowRefContext, row_ref: rowsource.RowRef) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        const tag: u8 = @intFromEnum(std.meta.activeTag(row_ref));
+        hasher.update(std.mem.asBytes(&tag));
+        switch (row_ref) {
+            .relational_key => |key| hashBytes(&hasher, key),
+            .serverless => |value| {
+                hashBytes(&hasher, value.fragment_id);
+                hasher.update(std.mem.asBytes(&value.row_ordinal));
+            },
+            .external => |value| {
+                hashBytes(&hasher, value.source_id);
+                hashBytes(&hasher, value.snapshot_id);
+                hashBytes(&hasher, value.file_id);
+                hasher.update(std.mem.asBytes(&value.row_group_ordinal));
+                hasher.update(std.mem.asBytes(&value.row_ordinal));
+            },
+        }
+        return hasher.final();
+    }
+
+    pub fn eql(_: RowRefContext, lhs: rowsource.RowRef, rhs: rowsource.RowRef) bool {
+        return rowRefsEqual(lhs, rhs);
+    }
+};
+
+pub const RowRefSetMap = std.HashMapUnmanaged(
+    rowsource.RowRef,
+    void,
+    RowRefContext,
+    std.hash_map.default_max_load_percentage,
+);
+
+pub fn rowRefsEqual(lhs: rowsource.RowRef, rhs: rowsource.RowRef) bool {
+    if (std.meta.activeTag(lhs) != std.meta.activeTag(rhs)) return false;
+    return switch (lhs) {
+        .relational_key => |lhs_key| std.mem.eql(u8, lhs_key, rhs.relational_key),
+        .serverless => |lhs_ref| std.mem.eql(u8, lhs_ref.fragment_id, rhs.serverless.fragment_id) and
+            lhs_ref.row_ordinal == rhs.serverless.row_ordinal,
+        .external => |lhs_ref| std.mem.eql(u8, lhs_ref.source_id, rhs.external.source_id) and
+            std.mem.eql(u8, lhs_ref.snapshot_id, rhs.external.snapshot_id) and
+            std.mem.eql(u8, lhs_ref.file_id, rhs.external.file_id) and
+            lhs_ref.row_group_ordinal == rhs.external.row_group_ordinal and
+            lhs_ref.row_ordinal == rhs.external.row_ordinal,
+    };
+}
+
+fn hashBytes(hasher: *std.hash.Wyhash, value: []const u8) void {
+    const len = value.len;
+    hasher.update(std.mem.asBytes(&len));
+    hasher.update(value);
+}
+
 pub const Binding = struct {
     sidecar_kind: SidecarKind,
     source_kind: rowsource.SourceKind,
@@ -254,16 +311,18 @@ pub fn rowRefKeyAlloc(alloc: std.mem.Allocator, row_ref: rowsource.RowRef) ![]u8
 }
 
 pub fn rowRefFromKeyAlloc(alloc: std.mem.Allocator, key: []const u8) !rowsource.RowRef {
+    return try cloneRowRefAlloc(alloc, try rowRefFromKey(key));
+}
+
+fn rowRefFromKey(key: []const u8) !rowsource.RowRef {
     var parser = RowRefKeyParser.init(key);
     if (parser.consumePrefix("rel:")) {
-        const relational_key = try parser.readLengthPrefixedAlloc(alloc);
-        errdefer alloc.free(relational_key);
+        const relational_key = try parser.readLengthPrefixed();
         try parser.expectEof();
         return .{ .relational_key = relational_key };
     }
     if (parser.consumePrefix("srv:")) {
-        const fragment_id = try parser.readLengthPrefixedAlloc(alloc);
-        errdefer alloc.free(fragment_id);
+        const fragment_id = try parser.readLengthPrefixed();
         try parser.expectByte(':');
         const row_ordinal = try parser.readU64ToEnd();
         return .{ .serverless = .{
@@ -272,14 +331,11 @@ pub fn rowRefFromKeyAlloc(alloc: std.mem.Allocator, key: []const u8) !rowsource.
         } };
     }
     if (parser.consumePrefix("ext:")) {
-        const source_id = try parser.readLengthPrefixedAlloc(alloc);
-        errdefer alloc.free(source_id);
+        const source_id = try parser.readLengthPrefixed();
         try parser.expectByte(':');
-        const snapshot_id = try parser.readLengthPrefixedAlloc(alloc);
-        errdefer alloc.free(snapshot_id);
+        const snapshot_id = try parser.readLengthPrefixed();
         try parser.expectByte(':');
-        const file_id = try parser.readLengthPrefixedAlloc(alloc);
-        errdefer alloc.free(file_id);
+        const file_id = try parser.readLengthPrefixed();
         try parser.expectByte(':');
         const row_group_ordinal_u64 = try parser.readU64Field();
         const row_group_ordinal = std.math.cast(u32, row_group_ordinal_u64) orelse return error.InvalidSidecarRowRefKey;
@@ -295,6 +351,35 @@ pub fn rowRefFromKeyAlloc(alloc: std.mem.Allocator, key: []const u8) !rowsource.
     return error.InvalidSidecarRowRefKey;
 }
 
+/// Return the exact number of bytes retained by an owned row-ref result,
+/// including the tagged-union slice. Keys are fully parsed and checked against
+/// the declaration binding before the caller performs any output allocation.
+pub fn rowRefsOwnedAllocationBytesFromKeys(
+    binding: Binding,
+    keys: []const []const u8,
+) !usize {
+    var total = std.math.mul(usize, keys.len, @sizeOf(rowsource.RowRef)) catch
+        return error.InvalidSidecarRowRefKey;
+    for (keys) |key| {
+        const row_ref = try rowRefFromKey(key);
+        try validateRowRefAgainstBinding(binding, row_ref);
+        const retained_bytes = switch (row_ref) {
+            .relational_key => |value| value.len,
+            .serverless => |value| value.fragment_id.len,
+            .external => |value| blk: {
+                var bytes = std.math.add(usize, value.source_id.len, value.snapshot_id.len) catch
+                    return error.InvalidSidecarRowRefKey;
+                bytes = std.math.add(usize, bytes, value.file_id.len) catch
+                    return error.InvalidSidecarRowRefKey;
+                break :blk bytes;
+            },
+        };
+        total = std.math.add(usize, total, retained_bytes) catch
+            return error.InvalidSidecarRowRefKey;
+    }
+    return total;
+}
+
 pub fn rowRefsFromKeysAlloc(
     alloc: std.mem.Allocator,
     binding: Binding,
@@ -302,7 +387,10 @@ pub fn rowRefsFromKeysAlloc(
 ) ![]rowsource.RowRef {
     const refs = try alloc.alloc(rowsource.RowRef, keys.len);
     var initialized: usize = 0;
-    errdefer freeOwnedRowRefs(alloc, refs[0..initialized]);
+    errdefer {
+        for (refs[0..initialized]) |row_ref| freeOwnedRowRef(alloc, row_ref);
+        alloc.free(refs);
+    }
     for (keys, 0..) |key, idx| {
         refs[idx] = try rowRefFromKeyAlloc(alloc, key);
         initialized += 1;
@@ -374,14 +462,14 @@ const RowRefKeyParser = struct {
         if (self.pos != self.input.len) return error.InvalidSidecarRowRefKey;
     }
 
-    fn readLengthPrefixedAlloc(self: *RowRefKeyParser, alloc: std.mem.Allocator) ![]u8 {
+    fn readLengthPrefixed(self: *RowRefKeyParser) ![]const u8 {
         const len = try self.readU64Field();
         const value_len = std.math.cast(usize, len) orelse return error.InvalidSidecarRowRefKey;
         if (value_len == 0) return error.InvalidSidecarRowRefKey;
         if (self.pos > self.input.len or value_len > self.input.len - self.pos) return error.InvalidSidecarRowRefKey;
         const value = self.input[self.pos..][0..value_len];
         self.pos += value_len;
-        return try alloc.dupe(u8, value);
+        return value;
     }
 
     fn readU64Field(self: *RowRefKeyParser) !u64 {
@@ -478,6 +566,37 @@ test "sidecar row-ref cloning owns every string and is allocation-failure safe" 
         }
     };
     try std.testing.checkAllAllocationFailures(alloc, AllocationRunner.run, .{original});
+}
+
+test "sidecar row-ref list decoding frees the original allocation on every failure" {
+    const alloc = std.testing.allocator;
+    const binding = Binding{
+        .sidecar_kind = .text,
+        .source_kind = .external_iceberg,
+        .row_ref_kind = .external,
+        .source_id = "events",
+        .snapshot_id = "iceberg-123",
+        .schema_fingerprint = "schema-v1",
+        .index_config_hash = "sha256:text:v1",
+    };
+    const keys = [_][]const u8{
+        "ext:6:events:11:iceberg-123:14:part-a.parquet:7:42",
+        "ext:6:events:11:iceberg-123:14:part-b.parquet:8:43",
+    };
+
+    const AllocationRunner = struct {
+        fn run(a: std.mem.Allocator, source_binding: Binding, encoded: []const []const u8) !void {
+            const refs = try rowRefsFromKeysAlloc(a, source_binding, encoded);
+            defer freeOwnedRowRefs(a, refs);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, AllocationRunner.run, .{ binding, keys[0..] });
+
+    const invalid_keys = [_][]const u8{ keys[0], "not-a-row-ref" };
+    try std.testing.expectError(
+        error.InvalidSidecarRowRefKey,
+        rowRefsFromKeysAlloc(alloc, binding, invalid_keys[0..]),
+    );
 }
 
 test "sidecar source binding validates batches and creates stable row-ref keys" {

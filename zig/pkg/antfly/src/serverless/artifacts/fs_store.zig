@@ -66,8 +66,7 @@ pub const FsStore = struct {
     }
 
     pub fn getAlloc(self: *FsStore, alloc: Allocator, artifact_id: []const u8) ![]u8 {
-        const checksum = try checksumFromArtifactIdAlloc(alloc, artifact_id);
-        defer alloc.free(checksum);
+        const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         const path = try pathForArtifactAlloc(alloc, self.root_dir, checksum);
         defer alloc.free(path);
         return try readFileAlloc(alloc, path);
@@ -84,7 +83,8 @@ pub const FsStore = struct {
     }
 
     pub fn stat(self: *FsStore, alloc: Allocator, artifact_id: []const u8) !artifact_store.ArtifactMetadata {
-        const checksum = try checksumFromArtifactIdAlloc(alloc, artifact_id);
+        const checksum_value = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
+        const checksum = try alloc.dupe(u8, checksum_value);
         errdefer alloc.free(checksum);
         const artifact_id_copy = try alloc.dupe(u8, artifact_id);
         errdefer alloc.free(artifact_id_copy);
@@ -103,8 +103,7 @@ pub const FsStore = struct {
     }
 
     pub fn delete(self: *FsStore, artifact_id: []const u8) !void {
-        const checksum = try checksumFromArtifactIdAlloc(self.alloc, artifact_id);
-        defer self.alloc.free(checksum);
+        const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         const path = try pathForArtifactAlloc(self.alloc, self.root_dir, checksum);
         defer self.alloc.free(path);
         try deleteFile(path);
@@ -227,14 +226,8 @@ fn makeArtifactIdAlloc(alloc: Allocator, checksum: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "sha256:{s}", .{checksum});
 }
 
-fn checksumFromArtifactIdAlloc(alloc: Allocator, artifact_id: []const u8) ![]u8 {
-    const prefix = "sha256:";
-    if (!std.mem.startsWith(u8, artifact_id, prefix)) return error.InvalidArtifactId;
-    return try alloc.dupe(u8, artifact_id[prefix.len..]);
-}
-
 fn pathForArtifactAlloc(alloc: Allocator, root_dir: []const u8, checksum: []const u8) ![]u8 {
-    if (checksum.len < 4) return error.InvalidArtifactId;
+    try artifact_store.validateSha256Checksum(checksum);
     return try std.fs.path.join(alloc, &.{ root_dir, "sha256", checksum[0..2], checksum[2..] });
 }
 
@@ -307,6 +300,16 @@ test "fs artifact store getRangeAlloc returns requested slice" {
     const mid = try store.getRangeAlloc(std.testing.allocator, meta.artifact_id, 2, 3);
     defer std.testing.allocator.free(mid);
     try std.testing.expectEqualStrings("cde", mid);
+}
+
+test "fs artifact store rejects malformed content addresses before lookup" {
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "invalid-id");
+    defer cleanupTmp(path);
+
+    var store = try FsStore.init(std.testing.allocator, std.mem.span(path));
+    defer store.deinit();
+    try std.testing.expectError(error.InvalidArtifactId, store.getAlloc(std.testing.allocator, "sha256:abcd"));
 }
 
 test "fs artifact store erased interface works" {

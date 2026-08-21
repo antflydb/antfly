@@ -112,23 +112,28 @@ fn buildSparseSidecarBoundedAlloc(
         try budget.checkRetainedItems(total_retained_items);
     }
 
+    var entries_owned_by_segment = false;
     const doc_entries = try docs.toOwnedSlice(alloc);
-    errdefer {
+    errdefer if (!entries_owned_by_segment) {
         freeDocumentEntries(alloc, doc_entries);
         alloc.free(doc_entries);
-    }
+    };
 
     const term_entries = try alloc.alloc(sparse_segment.TermEntry, term_map.count());
-    errdefer alloc.free(term_entries);
+    errdefer if (!entries_owned_by_segment) alloc.free(term_entries);
     var terms_initialized: usize = 0;
-    errdefer {
+    errdefer if (!entries_owned_by_segment) {
         for (term_entries[0..terms_initialized]) |*term| term.deinit(alloc);
-    }
+    };
 
     for (term_map.keys(), 0..) |term, idx| {
+        const owned_term = try alloc.dupe(u8, term);
+        errdefer alloc.free(owned_term);
+        const owned_postings = try term_map.values()[idx].toOwnedSlice(alloc);
+        errdefer alloc.free(owned_postings);
         term_entries[idx] = .{
-            .term = try alloc.dupe(u8, term),
-            .postings = try term_map.values()[idx].toOwnedSlice(alloc),
+            .term = owned_term,
+            .postings = owned_postings,
         };
         terms_initialized += 1;
     }
@@ -138,11 +143,14 @@ fn buildSparseSidecarBoundedAlloc(
         .docs = doc_entries,
         .terms = term_entries,
     };
+    entries_owned_by_segment = true;
     defer segment.deinit(alloc);
 
+    const encoded_size = try sparse_segment.encodedSize(segment);
+    try budget.checkOutputBytes(encoded_size);
     const payload = try sparse_segment.encodeAlloc(alloc, segment);
     errdefer alloc.free(payload);
-    try budget.checkOutputBytes(payload.len);
+    std.debug.assert(payload.len == encoded_size);
 
     var declaration = try declaredArtifactAlloc(alloc, binding, options, payload.len);
     errdefer freeOwnedDeclaration(alloc, declaration);
@@ -310,6 +318,8 @@ fn appendFeature(
     feature_count: *u32,
 ) !void {
     const normalized_term = try indexed_reader.normalizeAlloc(alloc, term);
+    var normalized_term_owned = true;
+    errdefer if (normalized_term_owned) alloc.free(normalized_term);
     if (normalized_term.len == 0) {
         alloc.free(normalized_term);
         return;
@@ -317,8 +327,10 @@ fn appendFeature(
     const gop = try term_map.getOrPut(alloc, normalized_term);
     if (!gop.found_existing) {
         gop.value_ptr.* = .empty;
+        normalized_term_owned = false;
     } else {
         alloc.free(normalized_term);
+        normalized_term_owned = false;
     }
     try gop.value_ptr.append(alloc, .{
         .doc_index = doc_index,
@@ -589,6 +601,58 @@ test "lake sparse sidecar builder consumes external row source batches" {
     try std.testing.expectEqual(@as(usize, 2), beta.postings.len);
     try std.testing.expectEqual(@as(f32, 0.5), beta.postings[0].weight);
     try std.testing.expectEqual(@as(f32, 2.0), beta.postings[1].weight);
+}
+
+test "lake sparse sidecar builder releases every partial OOM allocation" {
+    const external_binding = external_rowsource.Binding{
+        .format = .iceberg,
+        .source_id = "events",
+        .source_uri = "s3://bucket/warehouse/events",
+        .snapshot_id = "iceberg-sparse-oom",
+        .schema_fingerprint = "schema-v1",
+    };
+    const row_refs = [_]rowsource.RowRef{
+        try external_rowsource.makeRowRef(external_binding, "file-a.parquet", 0, 0),
+    };
+    const sparse_values = [_][]const u8{"{\"alpha\":1.0,\"beta\":0.5}"};
+    const columns = [_]rowsource.ColumnVector{
+        .{ .name = "sparse_embedding", .values = .{ .json = &sparse_values } },
+    };
+    const batches = [_]rowsource.ColumnBatch{.{
+        .snapshot = external_binding.snapshot(),
+        .row_refs = &row_refs,
+        .columns = &columns,
+    }};
+    const binding = source_binding.bindingFromSnapshot(
+        .sparse,
+        .external_iceberg,
+        external_binding.snapshot(),
+        external_binding.schema_fingerprint,
+        &[_][]const u8{"sparse_embedding"},
+        "sha256:sparse:v1",
+    );
+
+    var reached_success = false;
+    for (0..256) |fail_index| {
+        var batch_source = try external_rowsource.BatchSource.init(external_binding, &batches);
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        const failing_alloc = failing.allocator();
+        const result = buildSparseSidecarFromRowSourceAlloc(failing_alloc, batch_source.rowSource(), binding, .{
+            .name = "events.sparse",
+            .sparse_column = "sparse_embedding",
+        });
+        if (result) |value| {
+            var built = value;
+            built.deinit(failing_alloc);
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            reached_success = true;
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        }
+    }
+    try std.testing.expect(reached_success);
 }
 
 test "lake sparse sidecar publisher writes artifact store metadata into declaration" {

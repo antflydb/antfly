@@ -36,6 +36,7 @@ pub const external_source_catalog_binding = @import("serverless/external_source/
 pub const external_source_object_snapshot = @import("serverless/external_source/object_snapshot.zig");
 pub const external_source_iceberg_metadata = @import("serverless/external_source/iceberg_metadata.zig");
 pub const lake_rows_query = @import("serverless/query/lake_rows.zig");
+pub const lake_sidecar_candidates = @import("serverless/query/lake_sidecar_candidates.zig");
 pub const lake_explain_query = @import("serverless/query/lake_explain.zig");
 pub const lake_cache_query = @import("serverless/query/lake_cache.zig");
 pub const lake_range_io = @import("serverless/query/lake_range_io.zig");
@@ -75,6 +76,7 @@ test {
     _ = external_source_object_snapshot;
     _ = external_source_iceberg_metadata;
     _ = lake_rows_query;
+    _ = lake_sidecar_candidates;
     _ = lake_explain_query;
     _ = lake_cache_query;
     _ = lake_range_io;

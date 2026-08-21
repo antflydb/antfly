@@ -167,8 +167,7 @@ pub const ObjectStore = struct {
     }
 
     pub fn getAlloc(self: *ObjectStore, alloc: std.mem.Allocator, artifact_id: []const u8) ![]u8 {
-        const checksum = try checksumFromArtifactIdAlloc(alloc, artifact_id);
-        defer alloc.free(checksum);
+        const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         const key = try keyForChecksumAlloc(alloc, self.prefix, checksum);
         defer alloc.free(key);
         var result = try self.client.getObject(self.bucket, key, .{});
@@ -177,8 +176,7 @@ pub const ObjectStore = struct {
     }
 
     pub fn getRangeAlloc(self: *ObjectStore, alloc: std.mem.Allocator, artifact_id: []const u8, offset: u64, len: usize) ![]u8 {
-        const checksum = try checksumFromArtifactIdAlloc(alloc, artifact_id);
-        defer alloc.free(checksum);
+        const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         const key = try keyForChecksumAlloc(alloc, self.prefix, checksum);
         defer alloc.free(key);
         var result = try self.client.getObject(self.bucket, key, .{
@@ -189,7 +187,8 @@ pub const ObjectStore = struct {
     }
 
     pub fn stat(self: *ObjectStore, alloc: std.mem.Allocator, artifact_id: []const u8) !artifact_store.ArtifactMetadata {
-        const checksum = try checksumFromArtifactIdAlloc(alloc, artifact_id);
+        const checksum_value = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
+        const checksum = try alloc.dupe(u8, checksum_value);
         errdefer alloc.free(checksum);
         const key = try keyForChecksumAlloc(alloc, self.prefix, checksum);
         defer alloc.free(key);
@@ -203,8 +202,7 @@ pub const ObjectStore = struct {
     }
 
     pub fn delete(self: *ObjectStore, artifact_id: []const u8) !void {
-        const checksum = try checksumFromArtifactIdAlloc(self.alloc, artifact_id);
-        defer self.alloc.free(checksum);
+        const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         const key = try keyForChecksumAlloc(self.alloc, self.prefix, checksum);
         defer self.alloc.free(key);
         try self.client.deleteObject(self.bucket, key, .{});
@@ -266,14 +264,8 @@ fn makeArtifactIdAlloc(alloc: std.mem.Allocator, checksum: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "sha256:{s}", .{checksum});
 }
 
-fn checksumFromArtifactIdAlloc(alloc: std.mem.Allocator, artifact_id: []const u8) ![]u8 {
-    const prefix = "sha256:";
-    if (!std.mem.startsWith(u8, artifact_id, prefix)) return error.InvalidArtifactId;
-    return try alloc.dupe(u8, artifact_id[prefix.len..]);
-}
-
 fn keyForChecksumAlloc(alloc: std.mem.Allocator, prefix: []const u8, checksum: []const u8) ![]u8 {
-    if (checksum.len < 4) return error.InvalidArtifactId;
+    try artifact_store.validateSha256Checksum(checksum);
     if (prefix.len == 0) return try std.fmt.allocPrint(alloc, "sha256/{s}/{s}", .{ checksum[0..2], checksum[2..] });
     return try std.fmt.allocPrint(alloc, "{s}/sha256/{s}/{s}", .{ prefix, checksum[0..2], checksum[2..] });
 }
@@ -299,6 +291,17 @@ test "objectstore-backed artifacts store round-trips over file uri" {
     const got = try store.getAlloc(meta.artifact_id);
     defer std.testing.allocator.free(got);
     try std.testing.expectEqualStrings("payload", got);
+}
+
+test "objectstore-backed artifacts reject malformed content addresses before I/O" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var impl = try ObjectStore.initWithClient(alloc, memory.client(), "bucket", "tenant/a");
+    var store = impl.artifactStore();
+    defer store.deinit();
+
+    try std.testing.expectError(error.InvalidArtifactId, store.getAlloc("sha256:abcd"));
 }
 
 test "objectstore-backed artifacts store opens gs uri through parser with injected client" {

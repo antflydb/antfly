@@ -18,6 +18,9 @@ pub const remote_store = @import("remote_store.zig");
 
 pub const ArtifactMetadata = store.ArtifactMetadata;
 pub const ArtifactStore = store.ArtifactStore;
+pub const sha256ChecksumFromArtifactId = store.sha256ChecksumFromArtifactId;
+pub const validateSha256ArtifactIdentity = store.validateSha256ArtifactIdentity;
+pub const validateSha256Checksum = store.validateSha256Checksum;
 pub const FsStore = fs_store.FsStore;
 pub const RemoteStore = remote_store.RemoteStore;
 
@@ -27,6 +30,9 @@ test "serverless artifacts module compiles" {
     _ = remote_store;
     _ = ArtifactMetadata;
     _ = ArtifactStore;
+    _ = sha256ChecksumFromArtifactId;
+    _ = validateSha256ArtifactIdentity;
+    _ = validateSha256Checksum;
     _ = FsStore;
     _ = RemoteStore;
 }

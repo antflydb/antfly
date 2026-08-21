@@ -121,9 +121,11 @@ fn buildVectorSidecarBoundedAlloc(
     );
     defer vector_segment.freeSegment(alloc, &segment);
 
+    const encoded_size = try vector_segment.encodedSize(segment);
+    try budget.checkOutputBytes(encoded_size);
     const payload = try vector_segment.encodeAlloc(alloc, segment);
     errdefer alloc.free(payload);
-    try budget.checkOutputBytes(payload.len);
+    std.debug.assert(payload.len == encoded_size);
 
     var declaration = try declaredArtifactAlloc(alloc, binding, options, payload.len);
     errdefer freeOwnedDeclaration(alloc, declaration);

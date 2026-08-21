@@ -25,9 +25,11 @@ pub const DecodeLimits = bounded_decode.Limits;
 
 pub fn encodeAlloc(alloc: Allocator, segment: algebraic_segment.Segment) ![]u8 {
     try segment.validate();
+    const size = try encodedSize(segment);
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
+    try out.ensureTotalCapacityPrecise(alloc, size);
 
     try out.appendSlice(alloc, magic);
     try appendU32(alloc, &out, version);
@@ -47,6 +49,24 @@ pub fn encodeAlloc(alloc: Allocator, segment: algebraic_segment.Segment) ![]u8 {
     }
 
     return try out.toOwnedSlice(alloc);
+}
+
+pub fn encodedSize(segment: algebraic_segment.Segment) !usize {
+    try segment.validate();
+    _ = std.math.cast(u32, segment.aggregate.groups.len) orelse return error.AlgebraicSegmentTooLarge;
+    var size: usize = magic.len + 4 + 1;
+    size = try addEncodedSize(size, try lengthPrefixedSize(segment.source.snapshot_id.len));
+    size = try addEncodedSize(size, try lengthPrefixedSize(segment.source.schema_fingerprint.len));
+    size = try addEncodedSize(size, try lengthPrefixedSize(segment.source.source_id.len));
+    size = try addEncodedSize(size, 1);
+    size = try addEncodedSize(size, try lengthPrefixedSize(segment.aggregate.group_column.len));
+    size = try addEncodedSize(size, try lengthPrefixedSize(segment.aggregate.value_column.len));
+    size = try addEncodedSize(size, 4);
+    for (segment.aggregate.groups) |group| {
+        size = try addEncodedSize(size, try lengthPrefixedSize(group.key.len));
+        size = try addEncodedSize(size, try aggregateValueEncodedSize(segment.aggregate.op, group.value));
+    }
+    return size;
 }
 
 pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !algebraic_segment.Segment {
@@ -124,9 +144,11 @@ pub fn decodeAllocWithLimits(alloc: Allocator, bytes: []const u8, limits: Decode
 
 pub fn encodeExpressionAlloc(alloc: Allocator, materialization: algebraic_segment.ExpressionMaterialization) ![]u8 {
     try materialization.validate();
+    const size = try encodedExpressionSize(materialization);
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
+    try out.ensureTotalCapacityPrecise(alloc, size);
 
     try out.appendSlice(alloc, expression_magic);
     try appendU32(alloc, &out, version);
@@ -143,6 +165,43 @@ pub fn encodeExpressionAlloc(alloc: Allocator, materialization: algebraic_segmen
     }
 
     return try out.toOwnedSlice(alloc);
+}
+
+pub fn encodedExpressionSize(materialization: algebraic_segment.ExpressionMaterialization) !usize {
+    try materialization.validate();
+    _ = std.math.cast(u32, materialization.expressions.len) orelse return error.AlgebraicSegmentTooLarge;
+    var size: usize = expression_magic.len + 4 + 1;
+    size = try addEncodedSize(size, try lengthPrefixedSize(materialization.source.snapshot_id.len));
+    size = try addEncodedSize(size, try lengthPrefixedSize(materialization.source.schema_fingerprint.len));
+    size = try addEncodedSize(size, try lengthPrefixedSize(materialization.source.source_id.len));
+    size = try addEncodedSize(size, 4);
+    for (materialization.expressions) |expression| {
+        size = try addEncodedSize(size, try lengthPrefixedSize(expression.name.len));
+        size = try addEncodedSize(size, 1);
+        size = try addEncodedSize(size, try lengthPrefixedSize(expression.value_column.len));
+        size = try addEncodedSize(size, try aggregateValueEncodedSize(expression.op, expression.value));
+    }
+    return size;
+}
+
+fn aggregateValueEncodedSize(
+    op: algebraic_segment.AggregateOp,
+    value: algebraic_segment.AggregateValue,
+) !usize {
+    if (std.meta.activeTag(value) != op) return error.InvalidAlgebraicSegment;
+    return switch (value) {
+        .count, .sum_i64, .min_i64, .max_i64 => 8,
+        .avg_i64 => 16,
+    };
+}
+
+fn lengthPrefixedSize(len: usize) !usize {
+    _ = std.math.cast(u32, len) orelse return error.AlgebraicSegmentTooLarge;
+    return std.math.add(usize, 4, len) catch error.AlgebraicSegmentTooLarge;
+}
+
+fn addEncodedSize(a: usize, b: usize) !usize {
+    return std.math.add(usize, a, b) catch error.AlgebraicSegmentTooLarge;
 }
 
 pub fn decodeExpressionAlloc(alloc: Allocator, bytes: []const u8) !algebraic_segment.ExpressionMaterialization {

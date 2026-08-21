@@ -16,6 +16,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const vector_types = @import("types.zig");
 const shared_vector = @import("antfly_vector").vector;
+const bounded_decode = @import("../bounded_decode.zig");
+
+pub const DecodeLimits = bounded_decode.Limits;
 
 pub const Header = struct {
     metric: shared_vector.DistanceMetric,
@@ -51,12 +54,8 @@ pub fn decodeHeader(payload: []const u8) !Header {
 }
 
 pub fn encodeAlloc(alloc: Allocator, segment: vector_types.Segment) ![]u8 {
-    const metadata_len = clusterRecordLen(segment.dims) * segment.clusters.len;
-    var total_len: usize = header_len + metadata_len;
-    for (segment.clusters) |cluster| {
-        total_len += cluster.quantized_set.len;
-        total_len += cluster.exact_entries.len;
-    }
+    const total_len = try encodedSize(segment);
+    const metadata_len = std.math.mul(usize, clusterRecordLen(segment.dims), segment.clusters.len) catch unreachable;
 
     const buf = try alloc.alloc(u8, total_len);
     var pos: usize = 0;
@@ -116,32 +115,105 @@ pub fn encodeAlloc(alloc: Allocator, segment: vector_types.Segment) ![]u8 {
     return buf;
 }
 
+pub fn encodedSize(segment: vector_types.Segment) !usize {
+    _ = std.math.cast(u32, segment.clusters.len) orelse return error.VectorSegmentTooLarge;
+    _ = std.math.cast(u32, segment.entries.len) orelse return error.VectorSegmentTooLarge;
+    const dim_count: usize = @intCast(segment.dims);
+    const metadata_len = std.math.mul(usize, clusterRecordLen(segment.dims), segment.clusters.len) catch
+        return error.VectorSegmentTooLarge;
+    var total_len = std.math.add(usize, header_len, metadata_len) catch return error.VectorSegmentTooLarge;
+    var covered_entries: usize = 0;
+    for (segment.clusters) |cluster| {
+        if (cluster.centroid.len != dim_count or cluster.start_index != covered_entries) {
+            return error.InvalidVectorSegment;
+        }
+        covered_entries = std.math.add(usize, covered_entries, cluster.entry_count) catch
+            return error.VectorSegmentTooLarge;
+        if (covered_entries > segment.entries.len) return error.InvalidVectorSegment;
+        _ = std.math.cast(u32, cluster.quantized_set.len) orelse return error.VectorSegmentTooLarge;
+        _ = std.math.cast(u32, cluster.exact_entries.len) orelse return error.VectorSegmentTooLarge;
+        total_len = std.math.add(usize, total_len, cluster.quantized_set.len) catch return error.VectorSegmentTooLarge;
+        total_len = std.math.add(usize, total_len, cluster.exact_entries.len) catch return error.VectorSegmentTooLarge;
+    }
+    if (covered_entries != segment.entries.len) return error.InvalidVectorSegment;
+    _ = std.math.cast(u32, total_len) orelse return error.VectorSegmentTooLarge;
+    return total_len;
+}
+
+test "lake vector segment codec rejects forged entry counts before allocation" {
+    var payload = [_]u8{0} ** header_len;
+    std.mem.writeInt(u32, payload[0..4], @intFromEnum(shared_vector.DistanceMetric.l2_squared), .little);
+    std.mem.writeInt(u32, payload[4..8], 2, .little);
+    std.mem.writeInt(u32, payload[12..16], std.math.maxInt(u32), .little);
+    try std.testing.expectError(error.DecodedArtifactTooLarge, decodeAlloc(std.testing.allocator, &payload));
+}
+
 pub fn decodeAlloc(alloc: Allocator, payload: []const u8) !vector_types.Segment {
+    return try decodeAllocWithLimits(alloc, payload, .{});
+}
+
+pub fn decodeAllocWithLimits(alloc: Allocator, payload: []const u8, limits: DecodeLimits) !vector_types.Segment {
+    var budget = try bounded_decode.Budget.init(payload.len, limits);
+    var limiter = try bounded_decode.AllocationLimiter.init(alloc, limits.max_allocation_bytes);
+    return decodeBoundedAlloc(limiter.allocator(), payload, &budget) catch |err| {
+        if (err == error.OutOfMemory and limiter.limit_exceeded) return error.DecodedArtifactTooLarge;
+        return err;
+    };
+}
+
+fn decodeBoundedAlloc(alloc: Allocator, payload: []const u8, budget: *bounded_decode.Budget) !vector_types.Segment {
     const header = try decodeHeader(payload);
-    const table_len = clusterRecordLen(header.dims) * @as(usize, @intCast(header.cluster_count));
-    if (payload.len < header_len + table_len) return error.InvalidVectorSegmentPayload;
-    const table = payload[header_len .. header_len + table_len];
+    const table_len = std.math.mul(usize, clusterRecordLen(header.dims), @intCast(header.cluster_count)) catch
+        return error.InvalidVectorSegmentPayload;
+    const table_end = std.math.add(usize, header_len, table_len) catch return error.InvalidVectorSegmentPayload;
+    if (payload.len < table_end) return error.InvalidVectorSegmentPayload;
+    _ = try budget.admitCount(vector_types.Cluster, header.cluster_count, payload.len - header_len, clusterRecordLen(header.dims));
+    const min_entry_len = std.math.add(
+        usize,
+        4,
+        std.math.mul(usize, @intCast(header.dims), 2) catch return error.InvalidVectorSegmentPayload,
+    ) catch return error.InvalidVectorSegmentPayload;
+    _ = try budget.admitCount(vector_types.Entry, header.entry_count, payload.len - table_end, min_entry_len);
+    const table = payload[header_len..table_end];
     const clusters = try decodeClusterTableAlloc(alloc, header.dims, header.cluster_count, table);
     errdefer {
         for (clusters) |*cluster| cluster.deinit(alloc);
         alloc.free(clusters);
     }
 
-    var entries_start: usize = header_len + table_len;
-    for (clusters) |*cluster| {
+    var expected_payload_offset: usize = table_end;
+    var covered_entries: usize = 0;
+    for (clusters) |cluster| {
+        if (cluster.start_index != covered_entries or cluster.quantized_offset != expected_payload_offset) {
+            return error.InvalidVectorSegmentPayload;
+        }
+        covered_entries = std.math.add(usize, covered_entries, cluster.entry_count) catch
+            return error.InvalidVectorSegmentPayload;
+        if (covered_entries > header.entry_count) return error.InvalidVectorSegmentPayload;
         const quantized_start = cluster.quantized_offset;
+        const quantized_end = std.math.add(usize, quantized_start, cluster.quantized_len) catch return error.InvalidVectorSegmentPayload;
+        if (quantized_end > payload.len or cluster.exact_entries_offset != quantized_end) return error.InvalidVectorSegmentPayload;
+        const exact_start = cluster.exact_entries_offset;
+        const exact_end = std.math.add(usize, exact_start, cluster.exact_entries_len) catch return error.InvalidVectorSegmentPayload;
+        if (exact_end > payload.len) return error.InvalidVectorSegmentPayload;
+        const minimum_exact_len = std.math.mul(usize, cluster.entry_count, min_entry_len) catch
+            return error.InvalidVectorSegmentPayload;
+        if (cluster.exact_entries_len < minimum_exact_len) return error.InvalidVectorSegmentPayload;
+        expected_payload_offset = exact_end;
+    }
+    if (expected_payload_offset != payload.len or covered_entries != header.entry_count) {
+        return error.InvalidVectorSegmentPayload;
+    }
+
+    for (clusters) |*cluster| {
+        const quantized_start: usize = cluster.quantized_offset;
         const quantized_end = quantized_start + cluster.quantized_len;
-        if (quantized_end > payload.len) return error.InvalidVectorSegmentPayload;
         alloc.free(cluster.quantized_set);
         cluster.quantized_set = try alloc.dupe(u8, payload[quantized_start..quantized_end]);
-
-        const exact_start = cluster.exact_entries_offset;
+        const exact_start: usize = cluster.exact_entries_offset;
         const exact_end = exact_start + cluster.exact_entries_len;
-        if (exact_end > payload.len) return error.InvalidVectorSegmentPayload;
         alloc.free(cluster.exact_entries);
         cluster.exact_entries = try alloc.dupe(u8, payload[exact_start..exact_end]);
-
-        entries_start = @max(entries_start, exact_end);
     }
 
     const entries = try alloc.alloc(vector_types.Entry, @intCast(header.entry_count));
@@ -150,8 +222,6 @@ pub fn decodeAlloc(alloc: Allocator, payload: []const u8) !vector_types.Segment 
     errdefer {
         for (entries[0..initialized]) |*entry| entry.deinit(alloc);
     }
-    if (entries_start != payload.len) return error.InvalidVectorSegmentPayload;
-
     for (clusters) |cluster| {
         const block = try decodeExactEntriesAlloc(
             alloc,
@@ -159,18 +229,12 @@ pub fn decodeAlloc(alloc: Allocator, payload: []const u8) !vector_types.Segment 
             @intCast(cluster.entry_count),
             cluster.exact_entries,
         );
-        defer {
-            for (block) |*entry| entry.deinit(alloc);
-            alloc.free(block);
-        }
+        defer alloc.free(block);
         const start: usize = cluster.start_index;
-        const end: usize = start + cluster.entry_count;
-        if (end > entries.len or block.len != end - start) return error.InvalidVectorSegmentPayload;
+        const end = start + cluster.entry_count;
+        std.debug.assert(end <= entries.len and block.len == end - start);
         for (block, start..) |entry, idx| {
-            entries[idx] = .{
-                .doc_id = try alloc.dupe(u8, entry.doc_id),
-                .vector = try alloc.dupe(f32, entry.vector),
-            };
+            entries[idx] = entry;
             initialized += 1;
         }
     }
@@ -194,7 +258,8 @@ pub fn decodeClusterTableAlloc(
 ) ![]vector_types.Cluster {
     const dim_count: usize = @intCast(dims);
     const record_len = clusterRecordLen(dims);
-    if (payload.len < record_len * @as(usize, @intCast(cluster_count))) return error.InvalidVectorSegmentPayload;
+    const required_len = std.math.mul(usize, record_len, @intCast(cluster_count)) catch return error.InvalidVectorSegmentPayload;
+    if (payload.len < required_len) return error.InvalidVectorSegmentPayload;
 
     const clusters = try alloc.alloc(vector_types.Cluster, @intCast(cluster_count));
     errdefer alloc.free(clusters);
@@ -355,7 +420,9 @@ pub fn decodeExactEntriesAlloc(
         if (pos + 4 > payload.len) return error.InvalidVectorSegmentPayload;
         const doc_id_len = std.mem.readInt(u32, payload[pos..][0..4], .little);
         pos += 4;
-        if (pos + doc_id_len + (dim_count * 2) > payload.len) return error.InvalidVectorSegmentPayload;
+        const vector_bytes = std.math.mul(usize, dim_count, 2) catch return error.InvalidVectorSegmentPayload;
+        const entry_bytes = std.math.add(usize, doc_id_len, vector_bytes) catch return error.InvalidVectorSegmentPayload;
+        if (pos > payload.len or entry_bytes > payload.len - pos) return error.InvalidVectorSegmentPayload;
         const doc_id = try alloc.dupe(u8, payload[pos .. pos + doc_id_len]);
         pos += doc_id_len;
         errdefer alloc.free(doc_id);
@@ -373,6 +440,7 @@ pub fn decodeExactEntriesAlloc(
         };
         initialized += 1;
     }
+    if (pos != payload.len) return error.InvalidVectorSegmentPayload;
     return entries;
 }
 

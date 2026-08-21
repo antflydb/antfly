@@ -459,27 +459,14 @@ pub fn scanRowsWithSidecarsAlloc(
         request.scan.limits.max_lookup_row_refs,
     )) |usable| {
         defer alloc.free(usable.row_refs);
-        const expected_live_count = try uniqueLiveRowRefCountAlloc(
-            alloc,
-            usable.row_refs,
-            request.scan.deleted_row_refs,
-            request.scan.deleted_row_filter,
-            request.scan.limits.max_lookup_row_refs,
-        );
-        var hydrated = try hydrateRowsForBindingExcludingDeletedWithFilterAndLimitsAlloc(
+        var hydrated = try hydrateRowsForBindingForScanAlloc(
             alloc,
             source,
             usable.binding,
             usable.row_refs,
-            request.scan.deleted_row_refs,
-            request.scan.deleted_row_filter,
-            request.scan.projected_columns,
-            request.scan.limits,
+            request.scan,
         );
         errdefer hydrated.deinit(alloc);
-        if (@as(usize, @intCast(hydrated.total)) != expected_live_count) {
-            return error.LakeSidecarCandidateHydrationMismatch;
-        }
         return .{
             .rows = hydrated.rows,
             .total = hydrated.total,
@@ -559,7 +546,7 @@ pub fn hydrateRowsWithLimitsAlloc(
     projected_columns: []const []const u8,
     limits: ScanLimits,
 ) !HydrateResult {
-    return try hydrateRowsInternalAlloc(alloc, source, null, wanted_refs, &.{}, null, projected_columns, limits);
+    return try hydrateRowsInternalAlloc(alloc, source, null, wanted_refs, &.{}, null, projected_columns, null, null, limits, false);
 }
 
 pub fn hydrateRowsExcludingDeletedAlloc(
@@ -580,7 +567,7 @@ pub fn hydrateRowsExcludingDeletedWithLimitsAlloc(
     projected_columns: []const []const u8,
     limits: ScanLimits,
 ) !HydrateResult {
-    return try hydrateRowsInternalAlloc(alloc, source, null, wanted_refs, deleted_row_refs, null, projected_columns, limits);
+    return try hydrateRowsInternalAlloc(alloc, source, null, wanted_refs, deleted_row_refs, null, projected_columns, null, null, limits, false);
 }
 
 pub fn hydrateRowsForBindingAlloc(
@@ -591,7 +578,7 @@ pub fn hydrateRowsForBindingAlloc(
     projected_columns: []const []const u8,
 ) !HydrateResult {
     try source_binding.validateCandidateRowRefsAgainstBinding(binding, wanted_refs);
-    return try hydrateRowsInternalAlloc(alloc, source, binding, wanted_refs, &.{}, null, projected_columns, .{});
+    return try hydrateRowsInternalAlloc(alloc, source, binding, wanted_refs, &.{}, null, projected_columns, null, null, .{}, false);
 }
 
 pub fn hydrateRowsForBindingExcludingDeletedAlloc(
@@ -645,7 +632,42 @@ pub fn hydrateRowsForBindingExcludingDeletedWithFilterAndLimitsAlloc(
     limits: ScanLimits,
 ) !HydrateResult {
     try source_binding.validateCandidateRowRefsAgainstBinding(binding, wanted_refs);
-    return try hydrateRowsInternalAlloc(alloc, source, binding, wanted_refs, deleted_row_refs, deleted_row_filter, projected_columns, limits);
+    return try hydrateRowsInternalAlloc(
+        alloc,
+        source,
+        binding,
+        wanted_refs,
+        deleted_row_refs,
+        deleted_row_filter,
+        projected_columns,
+        null,
+        null,
+        limits,
+        false,
+    );
+}
+
+fn hydrateRowsForBindingForScanAlloc(
+    alloc: Allocator,
+    source: rowsource.Source,
+    binding: source_binding.Binding,
+    wanted_refs: []const rowsource.RowRef,
+    request: ScanRequest,
+) !HydrateResult {
+    try source_binding.validateCandidateRowRefsAgainstBinding(binding, wanted_refs);
+    return try hydrateRowsInternalAlloc(
+        alloc,
+        source,
+        binding,
+        wanted_refs,
+        request.deleted_row_refs,
+        request.deleted_row_filter,
+        request.projected_columns,
+        request.predicate,
+        request.limit,
+        request.limits,
+        true,
+    );
 }
 
 fn hydrateRowsInternalAlloc(
@@ -656,7 +678,10 @@ fn hydrateRowsInternalAlloc(
     deleted_row_refs: []const rowsource.RowRef,
     deleted_row_filter: ?DeletedRowFilter,
     projected_columns: []const []const u8,
+    predicate: ?Predicate,
+    limit: ?usize,
     limits: ScanLimits,
+    require_all_wanted: bool,
 ) !HydrateResult {
     try limits.validate();
     if (wanted_refs.len == 0) return .{ .rows = try alloc.alloc(ProjectedRow, 0), .total = 0 };
@@ -668,7 +693,6 @@ fn hydrateRowsInternalAlloc(
 
     var wanted = try RowRefMatchMap.init(alloc, wanted_refs, limits.max_lookup_row_refs);
     defer wanted.deinit(alloc);
-    if (wanted.map.count() > limits.max_materialized_rows) return error.LakeRowsHydrationBudgetExceeded;
     var deleted_lookup = try RowRefLookup.init(alloc, deleted_row_refs, limits.max_lookup_row_refs);
     defer deleted_lookup.deinit(alloc);
     var wanted_live_count: usize = 0;
@@ -686,18 +710,33 @@ fn hydrateRowsInternalAlloc(
     var batches_seen: usize = 0;
     var rows_examined: u64 = 0;
     var materialized_bytes: usize = 0;
+    var matching_count: u32 = 0;
+    var found_live_count: usize = 0;
     while (try source.next(alloc)) |batch| {
         batches_seen = std.math.add(usize, batches_seen, 1) catch return error.LakeRowsHydrationBudgetExceeded;
         if (batches_seen > limits.max_batches) return error.LakeRowsHydrationBudgetExceeded;
         if (binding) |sidecar_binding| {
             try source_binding.validateBatchSnapshotAgainstBinding(sidecar_binding, batch);
         }
+        const predicate_column = if (predicate) |value|
+            batch.findColumn(value.column) orelse return error.RowSourceColumnNotFound
+        else
+            null;
         for (batch.row_refs, 0..) |row_ref, row_idx| {
             rows_examined = std.math.add(u64, rows_examined, 1) catch return error.LakeRowsHydrationBudgetExceeded;
             if (rows_examined > limits.max_rows_examined) return error.LakeRowsHydrationBudgetExceeded;
             if (rowIsDeletedLookup(deleted_lookup, deleted_row_filter, row_ref)) continue;
             const matched = wanted.map.getPtr(row_ref) orelse continue;
             if (matched.*) continue;
+            matched.* = true;
+            found_live_count += 1;
+            if (predicate) |value| {
+                if (!try predicateMatches(value, predicate_column.?, row_idx)) continue;
+            }
+            matching_count = std.math.add(u32, matching_count, 1) catch return error.LakeRowsHydrationBudgetExceeded;
+            if (matching_count > limits.max_matching_rows) return error.LakeRowsHydrationBudgetExceeded;
+            if (limitReached(rows.items.len, limit)) continue;
+            if (rows.items.len >= limits.max_materialized_rows) return error.LakeRowsHydrationBudgetExceeded;
             const row_bytes = try projectedRowAllocatedBytes(batch, row_idx, projected_columns);
             materialized_bytes = std.math.add(usize, materialized_bytes, row_bytes) catch
                 return error.LakeRowsHydrationBudgetExceeded;
@@ -706,41 +745,21 @@ fn hydrateRowsInternalAlloc(
             errdefer projected.deinit(alloc);
             std.debug.assert(projected.allocatedBytes() == row_bytes);
             try rows.append(alloc, projected);
-            matched.* = true;
-            if (rows.items.len == wanted_live_count) break;
+            if (found_live_count == wanted_live_count) break;
         }
-        if (rows.items.len == wanted_live_count) break;
+        if (found_live_count == wanted_live_count) break;
     }
 
-    if (rows.items.len > std.math.maxInt(u32)) return error.LakeRowsHydrationBudgetExceeded;
-    const total: u32 = @intCast(rows.items.len);
-    return .{ .rows = try rows.toOwnedSlice(alloc), .total = total };
+    if (require_all_wanted and found_live_count != wanted_live_count) {
+        return error.LakeSidecarCandidateHydrationMismatch;
+    }
+    return .{ .rows = try rows.toOwnedSlice(alloc), .total = matching_count };
 }
 
 const UsableCandidateRefs = struct {
     binding: source_binding.Binding,
     row_refs: []rowsource.RowRef,
 };
-
-fn uniqueLiveRowRefCountAlloc(
-    alloc: Allocator,
-    row_refs: []const rowsource.RowRef,
-    deleted_row_refs: []const rowsource.RowRef,
-    deleted_row_filter: ?DeletedRowFilter,
-    max_refs: usize,
-) !usize {
-    if (row_refs.len > max_refs or deleted_row_refs.len > max_refs) return error.LakeRowsScanBudgetExceeded;
-    var wanted = try RowRefMatchMap.init(alloc, row_refs, max_refs);
-    defer wanted.deinit(alloc);
-    var deleted = try RowRefLookup.init(alloc, deleted_row_refs, max_refs);
-    defer deleted.deinit(alloc);
-    var count: usize = 0;
-    var iterator = wanted.map.keyIterator();
-    while (iterator.next()) |row_ref| {
-        if (!rowIsDeletedLookup(deleted, deleted_row_filter, row_ref.*)) count += 1;
-    }
-    return count;
-}
 
 fn validateRequest(request: GroupByRequest) !void {
     try request.limits.validate();
@@ -1233,50 +1252,12 @@ fn cloneCellValueAlloc(
     };
 }
 
-const RowRefContext = struct {
-    pub fn hash(_: RowRefContext, row_ref: rowsource.RowRef) u64 {
-        var hasher = std.hash.Wyhash.init(0);
-        const tag: u8 = @intFromEnum(std.meta.activeTag(row_ref));
-        hasher.update(std.mem.asBytes(&tag));
-        switch (row_ref) {
-            .relational_key => |key| hashBytes(&hasher, key),
-            .serverless => |value| {
-                hashBytes(&hasher, value.fragment_id);
-                hasher.update(std.mem.asBytes(&value.row_ordinal));
-            },
-            .external => |value| {
-                hashBytes(&hasher, value.source_id);
-                hashBytes(&hasher, value.snapshot_id);
-                hashBytes(&hasher, value.file_id);
-                hasher.update(std.mem.asBytes(&value.row_group_ordinal));
-                hasher.update(std.mem.asBytes(&value.row_ordinal));
-            },
-        }
-        return hasher.final();
-    }
-
-    pub fn eql(_: RowRefContext, left: rowsource.RowRef, right: rowsource.RowRef) bool {
-        return rowRefsEqual(left, right);
-    }
-};
-
-fn hashBytes(hasher: *std.hash.Wyhash, value: []const u8) void {
-    const len = value.len;
-    hasher.update(std.mem.asBytes(&len));
-    hasher.update(value);
-}
-
-const RowRefSetMap = std.HashMapUnmanaged(
-    rowsource.RowRef,
-    void,
-    RowRefContext,
-    std.hash_map.default_max_load_percentage,
-);
+const RowRefSetMap = source_binding.RowRefSetMap;
 
 const RowRefMatchSetMap = std.HashMapUnmanaged(
     rowsource.RowRef,
     bool,
-    RowRefContext,
+    source_binding.RowRefContext,
     std.hash_map.default_max_load_percentage,
 );
 
@@ -1330,23 +1311,7 @@ fn rowIsDeletedLookup(
 }
 
 fn rowRefsEqual(a: rowsource.RowRef, b: rowsource.RowRef) bool {
-    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
-    return switch (a) {
-        .relational_key => |key| std.mem.eql(u8, key, b.relational_key),
-        .serverless => |value| blk: {
-            const other = b.serverless;
-            break :blk std.mem.eql(u8, value.fragment_id, other.fragment_id) and
-                value.row_ordinal == other.row_ordinal;
-        },
-        .external => |value| blk: {
-            const other = b.external;
-            break :blk std.mem.eql(u8, value.source_id, other.source_id) and
-                std.mem.eql(u8, value.snapshot_id, other.snapshot_id) and
-                std.mem.eql(u8, value.file_id, other.file_id) and
-                value.row_group_ordinal == other.row_group_ordinal and
-                value.row_ordinal == other.row_ordinal;
-        },
-    };
+    return source_binding.rowRefsEqual(a, b);
 }
 
 test "lake rows group-by scans RowSource batches" {
@@ -2327,8 +2292,10 @@ test "lake rows sidecar scan hydrates selected external candidates" {
         try external.makeRowRef(external_binding, "file-b.parquet", 1, 0),
     };
     const amounts = [_]i64{ 10, 20, 30 };
+    const tenants = [_][]const u8{ "t1", "t2", "t2" };
     const columns = [_]rowsource.ColumnVector{
         .{ .name = "amount", .values = .{ .i64 = &amounts } },
+        .{ .name = "tenant", .values = .{ .bytes = &tenants } },
     };
     const batches = [_]rowsource.ColumnBatch{.{
         .snapshot = external_binding.snapshot(),
@@ -2386,6 +2353,31 @@ test "lake rows sidecar scan hydrates selected external candidates" {
     try std.testing.expect(rowRefsEqual(row_refs[2], result.rows[1].row_ref));
     try std.testing.expectEqual(@as(i64, 20), result.rows[0].find("amount").?.value.?.i64);
     try std.testing.expectEqual(@as(i64, 30), result.rows[1].find("amount").?.value.?.i64);
+
+    var filtered_source = try external.BatchSource.init(external_binding, &batches);
+    var filtered = try scanRowsWithSidecarsAlloc(alloc, filtered_source.rowSource(), .{
+        .scan = .{
+            .projected_columns = &projection,
+            .predicate = .{ .column = "tenant", .op = .eq_bytes, .bytes_value = "t2" },
+            .limit = 1,
+        },
+        .base_source = .{ .external_iceberg = .{
+            .format = .iceberg,
+            .source_uri = "s3://bucket/warehouse/events",
+            .snapshot_id = "iceberg-9",
+            .schema_fingerprint = "schema-v2",
+        } },
+        .sidecars = &[_]sidecar_manifest.DeclaredArtifact{declaration},
+        .desired_sidecars = &[_]lake_sidecar_selection.DesiredSidecar{.{ .kind = .vector }},
+        .sidecar_policy = .{ .require_requested = true },
+        .candidates = &candidates,
+    });
+    defer filtered.deinit(alloc);
+
+    try std.testing.expectEqual(SidecarScanSource.sidecar_hydration, filtered.source);
+    try std.testing.expectEqual(@as(u32, 2), filtered.total);
+    try std.testing.expectEqual(@as(usize, 1), filtered.rows.len);
+    try std.testing.expect(rowRefsEqual(row_refs[1], filtered.rows[0].row_ref));
 }
 
 test "lake rows sidecar scan excludes deleted candidate refs" {
