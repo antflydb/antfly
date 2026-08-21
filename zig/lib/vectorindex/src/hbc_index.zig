@@ -5672,12 +5672,17 @@ pub fn batchApplyOptions(
     try batchDeleteTxn(self, &batch, deletes);
 
     var insert_options = options;
+    const caller_assumed_absent = insert_options.assume_absent_ids;
     if (!insert_options.assume_absent_ids and
         try batchWritesAreUniqueAndCoveredByDeletes(self.alloc, writes, deletes))
     {
         insert_options.assume_absent_ids = true;
     }
-    const grouped = if (writes.len > 1 and insert_options.assume_absent_ids and insert_options.coalesce_leaf_writes)
+    // A replacement is absent only because this transaction deleted it. Keep
+    // the cheap per-item absent lookup, but do not bulk-route all replacements
+    // against the pre-insert topology; sequential routing preserves materially
+    // better ANN quality after large replacement batches.
+    const grouped = if (writes.len > 1 and caller_assumed_absent and insert_options.coalesce_leaf_writes)
         try batchInsertAssumeAbsentGroupedTxnOptions(self, &batch, writes, insert_options, now_fn, elapsed_fn)
     else
         false;

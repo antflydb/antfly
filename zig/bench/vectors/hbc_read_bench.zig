@@ -41,6 +41,8 @@ const Config = struct {
     kmeans_backend: hbc.HBCConfig.KmeansBackend = .auto,
     kmeans_update_strategy: hbc.HBCConfig.KmeansUpdateStrategy = .auto,
     use_quantization: bool = true,
+    rerank_policy: hbc.HBCConfig.RerankPolicy = .boundary,
+    rerank_factor: usize = 0,
     use_random_ortho_trans: bool = false,
     centroid_directory_mode: hbc.HBCConfig.CentroidDirectoryMode = .hbc,
     flat_centroid_block_size: usize = 8192,
@@ -50,6 +52,8 @@ const Config = struct {
     segment_store_reads: bool = false,
     segment_wal_shadow_batches: usize = 0,
     segment_wal_mutation_batches: usize = 0,
+    prebuild_mutation_batches: usize = 0,
+    mutation_rebuild_quantized: bool = false,
     segment_wal_sync_each_batch: bool = false,
 };
 
@@ -416,7 +420,7 @@ pub fn main(init: std.process.Init) !void {
     const out = &stdout_writer.interface;
 
     try out.print(
-        "hbc read bench samples={d} vectors={d} dims={d} queries={d} k={d} batch_size={d} leaf_size={d} branching_factor={d} storage={s} build={s} kmeans_backend={s} kmeans_update_strategy={s} centroid_directory={s} flat_centroid_block_size={d} flat_centroid_probe_count={d} reopen_before_query={any} segment_store_reads={any} segment_wal_shadow_batches={d} segment_wal_mutation_batches={d} segment_wal_sync_each_batch={any}\n",
+        "hbc read bench samples={d} vectors={d} dims={d} queries={d} k={d} batch_size={d} leaf_size={d} branching_factor={d} storage={s} build={s} kmeans_backend={s} kmeans_update_strategy={s} rerank_policy={s} rerank_factor={d} centroid_directory={s} flat_centroid_block_size={d} flat_centroid_probe_count={d} reopen_before_query={any} segment_store_reads={any} segment_wal_shadow_batches={d} segment_wal_mutation_batches={d} prebuild_mutation_batches={d} mutation_rebuild_quantized={any} segment_wal_sync_each_batch={any}\n",
         .{
             cfg.samples,
             cfg.vectors,
@@ -430,6 +434,8 @@ pub fn main(init: std.process.Init) !void {
             @tagName(cfg.build_mode),
             @tagName(cfg.kmeans_backend),
             @tagName(cfg.kmeans_update_strategy),
+            @tagName(cfg.rerank_policy),
+            cfg.rerank_factor,
             @tagName(cfg.centroid_directory_mode),
             cfg.flat_centroid_block_size,
             cfg.flat_centroid_probe_count,
@@ -437,6 +443,8 @@ pub fn main(init: std.process.Init) !void {
             cfg.segment_store_reads,
             cfg.segment_wal_shadow_batches,
             cfg.segment_wal_mutation_batches,
+            cfg.prebuild_mutation_batches,
+            cfg.mutation_rebuild_quantized,
             cfg.segment_wal_sync_each_batch,
         },
     );
@@ -460,6 +468,7 @@ pub fn main(init: std.process.Init) !void {
             for (0..cfg.samples) |sample_index| {
                 const sample_dataset = try allocator.dupe(f32, dataset);
                 defer allocator.free(sample_dataset);
+                applyDatasetMutations(sample_dataset, cfg, cfg.prebuild_mutation_batches);
                 const sample_items = try makeItems(allocator, cfg, sample_dataset);
                 defer freeItems(allocator, sample_items);
                 var scenario = try Scenario.init(allocator, cfg, sample_index, storage_mode, build_mode);
@@ -537,6 +546,7 @@ pub fn main(init: std.process.Init) !void {
                         const mutation_start = nanotime();
                         var apply_ns: u64 = 0;
                         var wal_capture_ns: u64 = 0;
+                        var quantized_rebuild_ns: u64 = 0;
                         var wal_bytes: u64 = 0;
                         var wal_records: u64 = 0;
                         const item_batch_slots = (sample_items.len - 1) / cfg.batch_size + 1;
@@ -548,21 +558,23 @@ pub fn main(init: std.process.Init) !void {
                             defer allocator.free(mutation_vectors);
                             const mutation_items = try allocator.alloc(hbc.BatchInsertItem, mutation_count);
                             defer allocator.free(mutation_items);
+                            const mutation_deletes = try allocator.alloc(u64, mutation_count);
+                            defer allocator.free(mutation_deletes);
                             for (mutation_items, 0..) |*item, item_index| {
                                 const source = sample_items[offset + item_index];
                                 const vector = mutation_vectors[item_index * cfg.dims ..][0..cfg.dims];
                                 @memcpy(vector, source.vector);
-                                vector[batch_index % cfg.dims] += 0.05;
-                                _ = vec.normalize(vector);
+                                applyVectorMutation(vector, batch_index);
                                 item.* = .{
                                     .vector_id = source.vector_id,
                                     .vector = vector,
                                     .metadata = source.metadata,
                                 };
+                                mutation_deletes[item_index] = source.vector_id;
                             }
                             const apply_start = nanotime();
                             try scenario.index.beginExperimentalPostingMutationCapture();
-                            scenario.index.batchInsertWithMetadataOptions(mutation_items, .{
+                            scenario.index.batchApplyOptions(mutation_items, mutation_deletes, .{
                                 .assume_absent_ids = false,
                                 .coalesce_leaf_writes = true,
                                 .skip_vector_store = true,
@@ -586,11 +598,30 @@ pub fn main(init: std.process.Init) !void {
                             wal_bytes = wal_stats.wal_committed_bytes;
                             wal_records += wal_stats.record_count;
                         }
+                        if (cfg.mutation_rebuild_quantized) {
+                            const rebuild_start = nanotime();
+                            try scenario.index.beginExperimentalPostingMutationCapture();
+                            scenario.index.rebuildAllQuantizedForExperiment() catch |err| {
+                                scenario.index.cancelExperimentalPostingMutationCapture();
+                                return err;
+                            };
+                            quantized_rebuild_ns = nanotime() - rebuild_start;
+                            posting_source_sequence += 1;
+                            const wal_capture_start = nanotime();
+                            const wal_stats = try scenario.index.finishExperimentalPostingMutationCapture(
+                                @intCast(cfg.segment_wal_mutation_batches + 1),
+                                posting_source_sequence,
+                                .{ .sync = cfg.segment_wal_sync_each_batch },
+                            );
+                            wal_capture_ns += nanotime() - wal_capture_start;
+                            wal_bytes = wal_stats.wal_committed_bytes;
+                            wal_records += wal_stats.record_count;
+                        }
                         const mutation_ns = nanotime() - mutation_start;
                         const mutation_storage_after = scenario.storage_harness.snapshotCounters();
                         const mutation_storage = StorageCounters.delta(mutation_storage_after, mutation_storage_before);
                         try out.print(
-                            "{{\"scenario\":\"{s}_{s}_posting_wal_mutation\",\"storage\":\"{s}\",\"build\":\"{s}\",\"sample\":{d},\"workload\":\"posting_wal_mutation\",\"batches\":{d},\"batch_size\":{d},\"records\":{d},\"wal_bytes\":{d},\"sync_each_batch\":{any},\"ns\":{d},\"apply_ns\":{d},\"wal_capture_ns\":{d},\"storage_write_file\":{d},\"storage_write_bytes\":{d}}}\n",
+                            "{{\"scenario\":\"{s}_{s}_posting_wal_mutation\",\"storage\":\"{s}\",\"build\":\"{s}\",\"sample\":{d},\"workload\":\"posting_wal_mutation\",\"batches\":{d},\"batch_size\":{d},\"records\":{d},\"wal_bytes\":{d},\"sync_each_batch\":{any},\"ns\":{d},\"apply_ns\":{d},\"quantized_rebuild_ns\":{d},\"wal_capture_ns\":{d},\"storage_write_file\":{d},\"storage_write_bytes\":{d}}}\n",
                             .{
                                 @tagName(scenario.storage_kind),
                                 @tagName(scenario.build_kind),
@@ -604,6 +635,7 @@ pub fn main(init: std.process.Init) !void {
                                 cfg.segment_wal_sync_each_batch,
                                 mutation_ns,
                                 apply_ns,
+                                quantized_rebuild_ns,
                                 wal_capture_ns,
                                 mutation_storage.write_file,
                                 mutation_storage.write_bytes,
@@ -866,6 +898,7 @@ fn benchQueries(
     for (0..query_count) |i| {
         var req = request_template;
         req.query = queries[(i % scenario.cfg.queries) * scenario.cfg.dims ..][0..scenario.cfg.dims];
+        if (scenario.cfg.rerank_factor != 0) req.rerank_factor = scenario.cfg.rerank_factor;
         const query_start = nanotime();
         var profiled = try scenario.index.searchProfiledRequest(req);
         latencies[i] = nanotime() - query_start;
@@ -1018,7 +1051,7 @@ fn hbcConfig(cfg: Config) hbc.HBCConfig {
         .search_width = cfg.branching_factor,
         .epsilon = 7,
         .use_quantization = cfg.use_quantization,
-        .rerank_policy = .boundary,
+        .rerank_policy = cfg.rerank_policy,
         .quantizer_seed = cfg.seed,
         .use_random_ortho_trans = cfg.use_random_ortho_trans,
         .bulk_build_algo = cfg.bulk_build_algo,
@@ -1059,6 +1092,23 @@ fn makeQueries(allocator: Allocator, cfg: Config, dataset: []const f32) ![]f32 {
         _ = vec.normalize(queries[i * cfg.dims ..][0..cfg.dims]);
     }
     return queries;
+}
+
+fn applyVectorMutation(vector: []f32, batch_index: usize) void {
+    vector[batch_index % vector.len] += 0.05;
+    _ = vec.normalize(vector);
+}
+
+fn applyDatasetMutations(dataset: []f32, cfg: Config, batches: usize) void {
+    if (batches == 0) return;
+    const batch_slots = (cfg.vectors - 1) / cfg.batch_size + 1;
+    for (0..batches) |batch_index| {
+        const offset = (batch_index % batch_slots) * cfg.batch_size;
+        const end = @min(offset + cfg.batch_size, cfg.vectors);
+        for (offset..end) |vector_index| {
+            applyVectorMutation(dataset[vector_index * cfg.dims ..][0..cfg.dims], batch_index);
+        }
+    }
 }
 
 fn makeItems(allocator: Allocator, cfg: Config, dataset: []const f32) ![]hbc.BatchInsertItem {
@@ -1138,6 +1188,18 @@ fn parseArgs(proc_args: std.process.Args) !Config {
             cfg.flat_centroid_probe_count = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--no-quantization")) {
             cfg.use_quantization = false;
+        } else if (std.mem.eql(u8, arg, "--rerank-policy")) {
+            const value = args.next() orelse return error.MissingArgument;
+            cfg.rerank_policy = if (std.mem.eql(u8, value, "always"))
+                .always
+            else if (std.mem.eql(u8, value, "boundary"))
+                .boundary
+            else if (std.mem.eql(u8, value, "never"))
+                .never
+            else
+                return error.InvalidArgument;
+        } else if (std.mem.eql(u8, arg, "--rerank-factor")) {
+            cfg.rerank_factor = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--no-reopen")) {
             cfg.reopen_before_query = false;
         } else if (std.mem.eql(u8, arg, "--shadow-segment-checkpoint")) {
@@ -1148,6 +1210,10 @@ fn parseArgs(proc_args: std.process.Args) !Config {
             cfg.segment_wal_shadow_batches = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--segment-wal-mutation-batches")) {
             cfg.segment_wal_mutation_batches = try parseNextUsize(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--prebuild-mutation-batches")) {
+            cfg.prebuild_mutation_batches = try parseNextUsize(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--mutation-rebuild-quantized")) {
+            cfg.mutation_rebuild_quantized = true;
         } else if (std.mem.eql(u8, arg, "--segment-wal-sync-each-batch")) {
             cfg.segment_wal_sync_each_batch = true;
         } else if (std.mem.eql(u8, arg, "--random-ortho")) {
@@ -1159,6 +1225,8 @@ fn parseArgs(proc_args: std.process.Args) !Config {
     if (cfg.samples == 0 or cfg.vectors == 0 or cfg.dims == 0 or cfg.queries == 0 or cfg.recall_queries == 0 or cfg.k == 0 or cfg.batch_size == 0) return error.InvalidArgument;
     if ((cfg.segment_wal_shadow_batches > 0 or cfg.segment_wal_mutation_batches > 0) and !cfg.segment_store_reads) return error.InvalidArgument;
     if (cfg.segment_wal_shadow_batches > 0 and cfg.segment_wal_mutation_batches > 0) return error.InvalidArgument;
+    if (cfg.prebuild_mutation_batches > 0 and cfg.segment_wal_mutation_batches > 0) return error.InvalidArgument;
+    if (cfg.mutation_rebuild_quantized and cfg.segment_wal_mutation_batches == 0) return error.InvalidArgument;
     return cfg;
 }
 

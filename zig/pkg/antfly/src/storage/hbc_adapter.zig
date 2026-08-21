@@ -4372,6 +4372,13 @@ pub const HBCIndex = struct {
         try vectorindex_hbc_index.rebuildAllQuantized(self, txn);
     }
 
+    pub fn rebuildAllQuantizedForExperiment(self: *HBCIndex) !void {
+        var txn = try self.beginRuntimeWriteTxn();
+        errdefer txn.abort();
+        try self.rebuildAllQuantized(&txn);
+        try self.finishWriteTxn(&txn);
+    }
+
     fn rebuildQuantizedSubtree(self: *HBCIndex, txn: anytype, node_id: u64) !void {
         var node = try self.loadNode(txn, node_id);
         defer node.deinit(self.alloc);
@@ -10564,6 +10571,46 @@ test "bulk replay recomputes same-leaf existing members once per leaf" {
     const members = try idx.debugLeafMembers(alloc, idx.metadata.root_node);
     defer alloc.free(members);
     try std.testing.expectEqual(@as(usize, 2), members.len);
+}
+
+test "atomic replacements do not take the grouped new-id routing path" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 8,
+        .branching_factor = 2,
+        .use_quantization = false,
+    });
+    defer idx.close();
+
+    const initial = [_]BatchInsertItem{
+        .{ .vector_id = 1, .vector = &[_]f32{ 1.0, 0.0 }, .metadata = "doc:1" },
+        .{ .vector_id = 2, .vector = &[_]f32{ 0.0, 1.0 }, .metadata = "doc:2" },
+        .{ .vector_id = 3, .vector = &[_]f32{ -1.0, 0.0 }, .metadata = "doc:3" },
+        .{ .vector_id = 4, .vector = &[_]f32{ 0.0, -1.0 }, .metadata = "doc:4" },
+    };
+    try idx.batchInsertWithMetadataOptions(&initial, .{
+        .assume_absent_ids = true,
+        .coalesce_leaf_writes = true,
+    });
+
+    idx.resetWriteProfile();
+    const replacements = [_]BatchInsertItem{
+        .{ .vector_id = 1, .vector = &[_]f32{ 0.8, 0.2 }, .metadata = "doc:1" },
+        .{ .vector_id = 2, .vector = &[_]f32{ 0.2, 0.8 }, .metadata = "doc:2" },
+    };
+    try idx.batchApplyOptions(&replacements, &.{ 1, 2 }, .{
+        .assume_absent_ids = false,
+        .coalesce_leaf_writes = true,
+    });
+
+    const profile = idx.getWriteProfile();
+    try std.testing.expectEqual(@as(u64, 0), profile.grouped_items);
+    try std.testing.expectEqual(@as(u64, 4), idx.stats().active_count);
 }
 
 test "deferred quantized rebuild uses current batch vectors before external loader" {

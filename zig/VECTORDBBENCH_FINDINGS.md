@@ -639,14 +639,25 @@ checkpoint value. Any failure before source commit cancels capture; any failure
 after source commit leaves the source journal authoritative, and exact sequence
 admission rejects the incomplete sidecar until replay repairs it.
 
-A three-sample qualification applied 1,000 real vector updates in ten batches
-after checkpointing. Each isolated sample produced 499 WAL records and an
-8.52 MB tail. Median total mutation time was 733.35 ms: 673.00 ms in the
-authoritative HBC apply and 58.56 ms capturing/appending the derived WAL. Full
-posting snapshots therefore added about 8.7% over the apply time and made the
-tail four times larger than the 2.10 MB checkpoint. This validates transaction
-capture but rejects full snapshots as the final steady-state encoding; use
-posting-local deltas and/or checkpoint much sooner.
+A first three-sample qualification applied 1,000 direct existing-ID reinserts
+in ten batches after checkpointing. Each isolated sample produced 499 WAL
+records and an 8.52 MB tail. Median total mutation time was 733.35 ms:
+673.00 ms in the authoritative HBC apply and 58.56 ms capturing/appending the
+derived WAL. Full posting snapshots therefore added about 8.7% over the apply
+time and made the tail four times larger than the 2.10 MB checkpoint. This
+validates transaction capture but rejects full snapshots as the final
+steady-state encoding; use posting-local deltas and/or checkpoint much sooner.
+
+The direct-reinsert workload is supported internally but is not the public
+table replacement contract. The public path atomically deletes the old
+assignment and inserts the replacement. That exposed an independent fast-path
+quality problem: treating transaction-local deletes as proof that all writes
+were new let grouped insertion route the complete replacement batch against
+one pre-insert topology. A single diagnostic sample measured 0.566 recall and
+318.7 ms for this path. Restricting grouped routing to callers that knew the
+ids were absent before the transaction raised recall to 0.632 at 328.5 ms. The
+covered-by-delete proof still skips redundant existence lookups; it no longer
+selects the topology-sensitive grouped algorithm.
 
 Query latency is part of the same qualification, not a separate microbenchmark.
 Freshly reopened LSM and freshly reopened segment-plus-WAL reads produced the
@@ -654,17 +665,25 @@ same result digest and recall in every sample:
 
 | Reopened query path | Cold first query (median) | Warm p50 / p95 / p99 (median) | Warm QPS (median) | Recall@10 |
 | --- | ---: | ---: | ---: | ---: |
-| Authoritative HBC LSM | 9.72 ms | 0.194 / 0.542 / 1.348 ms | 3,717 | 0.444 |
-| Immutable segment + 8.52 MB WAL | 1.78 ms | 0.193 / 0.533 / 1.339 ms | 3,716 | 0.444 |
+| Authoritative HBC LSM | about 12.7 ms | 0.269 / 0.582 / 1.138 ms | about 3,064 | 0.632 |
+| Immutable segment + 7.86 MB WAL | about 2.5 ms | 0.268 / 0.551 / 1.008 ms | about 3,086 | 0.632 |
 
-The sidecar preserved ranked results and warm latency while cutting the cold
-query by about 82%. Activation of the oversized tail still took 37.00 ms
-median, reinforcing the shallow-tail checkpoint policy. Separately, the same
-fixed workload measured 0.696 recall before updates and 0.444 after updates on
-both the LSM and sidecar. The sidecar is not the cause, but online replacement
-quality is now a product-level follow-up: a storage-format win is not qualified
-until the authoritative HBC update path preserves recall as well as load and
-query latency.
+The sidecar preserved the exact ranked-result digest—not merely recall within
+a tolerance—in every paired LSM/sidecar run. Warm latency remained neutral and
+the cold query improved by roughly 80%. Activation of the oversized tail took
+about 35 ms, reinforcing the shallow-tail checkpoint policy.
+
+Online-update quality is a separate unresolved issue. With the final corpus
+built from scratch, the default boundary-rerank policy reached 0.702 recall;
+public atomic replacement reached 0.632 after the grouped-routing fix. Turning
+quantization off made the updated topology better than the rebuilt topology
+(0.872 versus 0.800), localizing the remaining gap to incremental quantized
+state rather than tree layout. A full quantized refresh cost about 80 ms and
+raised default recall to 0.660. With exact reranking and a factor-10 candidate
+window, refreshed online recall was 0.754 versus 0.774 for a fresh build of the
+same corpus. That two-point gap is much closer but still outside a one-point
+qualification bar; widening to factor 16 reached 0.822 but roughly doubled
+reopened p95, so it is not an acceptable unconditional shortcut.
 
 The efficient product design is therefore a packed immutable checkpoint plus
 a shallow, buffered derived WAL, not another general-purpose LSM. The primary
@@ -721,9 +740,9 @@ published.
 5. Replace the transaction-capture prototype's full posting snapshots with
    posting-local deltas, wire its sequence to authoritative replay, and
    checkpoint before the tail harms activation or p95. Preserve fallback to
-   source replay across every crash boundary. Diagnose the reproducible
-   0.696-to-0.444 recall loss after 1,000 vector replacements independently of
-   the sidecar.
+   source replay across every crash boundary. Bring refreshed online
+   quantization within one recall point of a same-corpus rebuild without the
+   factor-16 p95 cost; LSM and sidecar ranked results must remain identical.
 6. Compare eager single-read segment admission with mmap and footer/index-first
    range admission at 50K and 1M. Include page-cache/RSS accounting; do not
    trade a lower startup timer for unbounded mapped or decoded residency.
