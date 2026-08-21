@@ -89,6 +89,7 @@ jobs:
 
           if git diff --quiet "$base" "${{ github.sha }}" -- \
             ':(glob)zig/**' \
+            ':(exclude,glob)zig/pkg/antfly/antfarm/**' \
             ':(glob)scripts/ci/**' \
             scripts/test-backup-s3-integration.sh \
             Makefile \
@@ -102,6 +103,7 @@ jobs:
 
           if git diff --quiet "$base" "${{ github.sha }}" -- \
             ':(glob)zig/**' \
+            ':(exclude,glob)zig/pkg/antfly/antfarm/**' \
             ':(glob)scripts/ci/**' \
             scripts/test-backup-s3-integration.sh \
             Makefile \
