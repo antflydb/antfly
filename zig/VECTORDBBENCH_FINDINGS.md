@@ -395,6 +395,36 @@ preserves liveness without changing the general default.
 Unless a row explicitly reports a mean and range, the times below are
 one-machine diagnostics rather than publication-grade means.
 
+### Posting segment/WAL query gate
+
+The earlier `spfresh-v2` diagnostic established that write throughput alone is
+not a valid acceptance criterion. On a synthetic 5K-by-1536 public-shaped
+workload, the first lazy segment implementation improved ingest from 377.6 ms
+to 244.8 ms and reduced measured writes from 671.6 MB to 303.1 MB, but query
+p50 regressed from about 0.32 ms to 6.65 ms and recall changed. Publishing a
+coherent posting base, centroid directory, and RaBitQ checkpoint removed the
+tail replay and restored query behavior (p50 0.309 ms, p95 0.422 ms, recall
+0.188 versus 0.190), but also gave back nearly all of the write gain (368.9 ms
+and 660.4 MB). The next design therefore uses an immutable packed checkpoint
+plus a bounded committed WAL overlay; an unbounded lazy base/delta tail is
+rejected even when its load number is attractive.
+
+The current-main internal HBC reference now measures the same read invariants
+before and after reopen. For 5,000 synthetic 1,536-dimensional vectors loaded
+in batches of 100, one sample reported:
+
+| Phase | p50 | p95 | p99 | QPS | sampled recall@10 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| immediately after ingest | 0.305 ms | 1.548 ms | 2.718 ms | 1,887 | 0.680 |
+| after close/reopen, warm | 0.444 ms | 3.082 ms | 4.070 ms | 1,052 | 0.680 |
+
+The internal online-coalesced build took 1.495 seconds (3,343 vectors/s) and
+reported 222.9 MB written. This is not the public HTTP VectorDBBench load path
+and must not be compared directly with the 50K lifecycle times below; it is a
+fast query/recall regression gate for storage-format experiments. The cold
+first query after reopen was 14.7 ms, which is tracked separately from the
+warm distribution rather than hidden in an average.
+
 | Run | Insert | Ready/load | Notes |
 | --- | ---: | ---: | --- |
 | 50K OpenAI, batch 100, four workers, original public path | 46.39 s | 48.42 s | Default full-text index present |

@@ -28,14 +28,16 @@ const posting = @import("posting.zig");
 pub const PostingId = posting.PostingId;
 
 const magic: [4]u8 = "AFPS".*;
-const version: u16 = 1;
-const index_entry_size: usize = 8 + 1 + 8 + 8 + 8;
-const footer_size: usize = 8 + 8 + 2 + 4;
+const version: u16 = 2;
+const index_entry_size: usize = 8 + 1 + 8 + 8 + 8 + 4;
+const footer_size: usize = 8 + 8 + 4 + 2 + 2 + 4 + 4;
 
 pub const EntryKind = enum(u8) {
     base = 1,
     delta = 2,
     centroid_directory = 3,
+    quantized_checkpoint = 4,
+    tombstone = 5,
 };
 
 pub const DeltaValue = struct {
@@ -50,23 +52,33 @@ const PendingEntry = struct {
     value: []u8,
 };
 
+const EntryKey = struct {
+    posting_id: PostingId,
+    kind: EntryKind,
+    sequence: u64,
+};
+
 const IndexEntry = struct {
     posting_id: PostingId,
     kind: EntryKind,
     sequence: u64,
     offset: usize,
     len: usize,
+    checksum: u32,
 
     fn value(self: IndexEntry, data: []const u8) ![]const u8 {
         const end = std.math.add(usize, self.offset, self.len) catch return error.CorruptedPostingSegment;
         if (end > data.len) return error.CorruptedPostingSegment;
-        return data[self.offset..end];
+        const bytes = data[self.offset..end];
+        if (std.hash.Crc32.hash(bytes) != self.checksum) return error.PostingSegmentChecksumMismatch;
+        return bytes;
     }
 };
 
 pub const Writer = struct {
     alloc: Allocator,
     entries: std.ArrayListUnmanaged(PendingEntry) = .empty,
+    finished: bool = false,
 
     pub fn init(alloc: Allocator) Writer {
         return .{ .alloc = alloc };
@@ -86,12 +98,46 @@ pub const Writer = struct {
         }, value);
     }
 
+    /// Transfers ownership of `value`, including on error.
+    pub fn appendBaseOwned(self: *Writer, posting_id: PostingId, value: []u8) !void {
+        try self.appendEntryOwned(.{
+            .posting_id = posting_id,
+            .kind = .base,
+            .sequence = 0,
+        }, value);
+    }
+
     pub fn appendCentroidDirectory(self: *Writer, posting_id: PostingId, value: []const u8) !void {
         try self.appendEntry(.{
             .posting_id = posting_id,
             .kind = .centroid_directory,
             .sequence = 0,
         }, value);
+    }
+
+    pub fn appendQuantizedCheckpoint(self: *Writer, posting_id: PostingId, value: []const u8) !void {
+        try self.appendEntry(.{
+            .posting_id = posting_id,
+            .kind = .quantized_checkpoint,
+            .sequence = 0,
+        }, value);
+    }
+
+    /// Transfers ownership of `value`, including on error.
+    pub fn appendQuantizedCheckpointOwned(self: *Writer, posting_id: PostingId, value: []u8) !void {
+        try self.appendEntryOwned(.{
+            .posting_id = posting_id,
+            .kind = .quantized_checkpoint,
+            .sequence = 0,
+        }, value);
+    }
+
+    pub fn appendTombstone(self: *Writer, posting_id: PostingId, sequence: u64) !void {
+        try self.appendEntry(.{
+            .posting_id = posting_id,
+            .kind = .tombstone,
+            .sequence = sequence,
+        }, &.{});
     }
 
     pub fn appendDelta(self: *Writer, posting_id: PostingId, sequence: u64, value: []const u8) !void {
@@ -102,13 +148,14 @@ pub const Writer = struct {
         }, value);
     }
 
-    fn appendEntry(self: *Writer, key: struct {
-        posting_id: PostingId,
-        kind: EntryKind,
-        sequence: u64,
-    }, value: []const u8) !void {
+    fn appendEntry(self: *Writer, key: EntryKey, value: []const u8) !void {
         const owned = try self.alloc.dupe(u8, value);
+        try self.appendEntryOwned(key, owned);
+    }
+
+    fn appendEntryOwned(self: *Writer, key: EntryKey, owned: []u8) !void {
         errdefer self.alloc.free(owned);
+        if (self.finished) return error.PostingSegmentWriterFinished;
         try self.entries.append(self.alloc, .{
             .posting_id = key.posting_id,
             .kind = key.kind,
@@ -118,6 +165,7 @@ pub const Writer = struct {
     }
 
     pub fn build(self: *Writer) ![]u8 {
+        if (self.finished) return error.PostingSegmentWriterFinished;
         std.mem.sort(PendingEntry, self.entries.items, {}, pendingEntryLessThan);
         try rejectDuplicateEntries(self.entries.items);
 
@@ -126,24 +174,47 @@ pub const Writer = struct {
         var index_entries = try std.ArrayListUnmanaged(IndexEntry).initCapacity(self.alloc, self.entries.items.len);
         defer index_entries.deinit(self.alloc);
 
+        var output_len = footer_size;
+        output_len = std.math.add(usize, output_len, std.math.mul(usize, self.entries.items.len, index_entry_size) catch return error.PostingSegmentTooLarge) catch return error.PostingSegmentTooLarge;
         for (self.entries.items) |entry| {
+            output_len = std.math.add(usize, output_len, entry.value.len) catch return error.PostingSegmentTooLarge;
+        }
+        try out.ensureTotalCapacity(self.alloc, output_len);
+        self.finished = true;
+
+        // Consume each owned value after copying it into the final allocation.
+        // With exact capacity reserved above, checkpoint construction retains
+        // roughly one payload copy instead of holding complete input and output
+        // payloads concurrently.
+        for (self.entries.items) |*entry| {
             const offset = out.items.len;
             try out.appendSlice(self.alloc, entry.value);
+            const value_len = entry.value.len;
+            const checksum = std.hash.Crc32.hash(entry.value);
+            self.alloc.free(entry.value);
+            entry.value = &.{};
             index_entries.appendAssumeCapacity(.{
                 .posting_id = entry.posting_id,
                 .kind = entry.kind,
                 .sequence = entry.sequence,
                 .offset = offset,
-                .len = entry.value.len,
+                .len = value_len,
+                .checksum = checksum,
             });
         }
 
         const index_offset = out.items.len;
         for (index_entries.items) |entry| try appendIndexEntry(self.alloc, &out, entry);
+        const index_bytes = out.items[index_offset..];
         try appendU64(self.alloc, &out, @intCast(index_offset));
         try appendU64(self.alloc, &out, @intCast(index_entries.items.len));
+        try appendU32(self.alloc, &out, std.hash.Crc32.hash(index_bytes));
         try appendU16(self.alloc, &out, version);
+        try appendU16(self.alloc, &out, 0);
+        const footer_without_checksum = out.items[out.items.len - 24 ..];
+        try appendU32(self.alloc, &out, std.hash.Crc32.hash(footer_without_checksum));
         try out.appendSlice(self.alloc, &magic);
+        std.debug.assert(out.items.len == output_len);
         return try out.toOwnedSlice(self.alloc);
     }
 };
@@ -157,8 +228,10 @@ pub const Reader = struct {
         if (data.len < footer_size) return error.CorruptedPostingSegment;
         const footer = data[data.len - footer_size ..];
         if (!std.mem.eql(u8, footer[footer_size - magic.len ..], &magic)) return error.BadPostingSegmentMagic;
-        const segment_version = readU16(footer[16..18]);
+        const segment_version = readU16(footer[20..22]);
         if (segment_version != version) return error.UnsupportedPostingSegmentVersion;
+        if (readU16(footer[22..24]) != 0) return error.UnsupportedPostingSegmentFlags;
+        if (readU32(footer[24..28]) != std.hash.Crc32.hash(footer[0..24])) return error.PostingSegmentChecksumMismatch;
         const index_offset_u64 = readU64(footer[0..8]);
         const entry_count_u64 = readU64(footer[8..16]);
         const index_offset = std.math.cast(usize, index_offset_u64) orelse return error.CorruptedPostingSegment;
@@ -166,11 +239,14 @@ pub const Reader = struct {
         const index_bytes = std.math.mul(usize, entry_count, index_entry_size) catch return error.CorruptedPostingSegment;
         const index_end = std.math.add(usize, index_offset, index_bytes) catch return error.CorruptedPostingSegment;
         if (index_offset > data.len - footer_size or index_end != data.len - footer_size) return error.CorruptedPostingSegment;
-        return .{
+        if (readU32(footer[16..20]) != std.hash.Crc32.hash(data[index_offset..index_end])) return error.PostingSegmentChecksumMismatch;
+        const reader: Reader = .{
             .data = data,
             .index_offset = index_offset,
             .entry_count = entry_count,
         };
+        try reader.validateIndex();
+        return reader;
     }
 
     pub fn getBase(self: Reader, posting_id: PostingId) !?[]const u8 {
@@ -179,6 +255,10 @@ pub const Reader = struct {
 
     pub fn getCentroidDirectory(self: Reader, posting_id: PostingId) !?[]const u8 {
         return try self.getExact(posting_id, .centroid_directory, 0);
+    }
+
+    pub fn getQuantizedCheckpoint(self: Reader, posting_id: PostingId) !?[]const u8 {
+        return try self.getExact(posting_id, .quantized_checkpoint, 0);
     }
 
     pub fn deltas(self: Reader, posting_id: PostingId) DeltaIterator {
@@ -223,6 +303,8 @@ pub const Reader = struct {
             @intFromEnum(EntryKind.base) => .base,
             @intFromEnum(EntryKind.delta) => .delta,
             @intFromEnum(EntryKind.centroid_directory) => .centroid_directory,
+            @intFromEnum(EntryKind.quantized_checkpoint) => .quantized_checkpoint,
+            @intFromEnum(EntryKind.tombstone) => .tombstone,
             else => return error.CorruptedPostingSegment,
         };
         const offset = std.math.cast(usize, readU64(raw[17..25])) orelse return error.CorruptedPostingSegment;
@@ -233,7 +315,24 @@ pub const Reader = struct {
             .sequence = readU64(raw[9..17]),
             .offset = offset,
             .len = len,
+            .checksum = readU32(raw[33..37]),
         };
+    }
+
+    fn validateIndex(self: Reader) !void {
+        var previous: ?IndexEntry = null;
+        var index: usize = 0;
+        while (index < self.entry_count) : (index += 1) {
+            const entry = try self.indexEntry(index);
+            const end = std.math.add(usize, entry.offset, entry.len) catch return error.CorruptedPostingSegment;
+            if (end > self.index_offset) return error.CorruptedPostingSegment;
+            if (previous) |prev| {
+                if (compareEntryKey(prev.posting_id, prev.kind, prev.sequence, entry.posting_id, entry.kind, entry.sequence) != .lt) {
+                    return error.CorruptedPostingSegment;
+                }
+            }
+            previous = entry;
+        }
     }
 };
 
@@ -260,6 +359,7 @@ fn appendIndexEntry(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), entry: I
     try appendU64(alloc, out, entry.sequence);
     try appendU64(alloc, out, @intCast(entry.offset));
     try appendU64(alloc, out, @intCast(entry.len));
+    try appendU32(alloc, out, entry.checksum);
 }
 
 fn rejectDuplicateEntries(entries: []const PendingEntry) !void {
@@ -294,6 +394,12 @@ fn appendU16(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u16) !vo
     try out.appendSlice(alloc, &buf);
 }
 
+fn appendU32(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u32) !void {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, value, .big);
+    try out.appendSlice(alloc, &buf);
+}
+
 fn appendU64(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u64) !void {
     var buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &buf, value, .big);
@@ -302,6 +408,10 @@ fn appendU64(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u64) !vo
 
 fn readU16(bytes: *const [2]u8) u16 {
     return std.mem.readInt(u16, bytes, .big);
+}
+
+fn readU32(bytes: *const [4]u8) u32 {
+    return std.mem.readInt(u32, bytes, .big);
 }
 
 fn readU64(bytes: *const [8]u8) u64 {
@@ -314,12 +424,14 @@ pub fn testStoresPointAndOrderedDeltaValues() !void {
     const delta_4 = "insert:40";
     const delta_5 = "delete:20";
     const centroid = "centroid-directory-v1";
+    const quantized = "rabitq-checkpoint-v1";
 
     var writer = Writer.init(alloc);
     defer writer.deinit();
     try writer.appendDelta(7, 5, delta_5);
     try writer.appendCentroidDirectory(7, centroid);
     try writer.appendBase(7, base);
+    try writer.appendQuantizedCheckpoint(7, quantized);
     try writer.appendDelta(7, 4, delta_4);
 
     const bytes = try writer.build();
@@ -328,6 +440,7 @@ pub fn testStoresPointAndOrderedDeltaValues() !void {
     const reader = try Reader.init(bytes);
     try std.testing.expectEqualSlices(u8, base, (try reader.getBase(7)).?);
     try std.testing.expectEqualSlices(u8, centroid, (try reader.getCentroidDirectory(7)).?);
+    try std.testing.expectEqualSlices(u8, quantized, (try reader.getQuantizedCheckpoint(7)).?);
     try std.testing.expect(try reader.getBase(8) == null);
 
     var iter = reader.deltas(7);
@@ -364,8 +477,29 @@ pub fn testValidatesFooterAndVersion() !void {
 
     var bad_version = try alloc.dupe(u8, bytes);
     defer alloc.free(bad_version);
-    bad_version[bad_version.len - magic.len - 1] = 2;
+    bad_version[bad_version.len - magic.len - 7] = 1;
     try std.testing.expectError(error.UnsupportedPostingSegmentVersion, Reader.init(bad_version));
+}
+
+pub fn testValidatesIndexAndPayloadChecksums() !void {
+    const alloc = std.testing.allocator;
+    var writer = Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendBase(1, "payload");
+    const bytes = try writer.build();
+    defer alloc.free(bytes);
+
+    var bad_index = try alloc.dupe(u8, bytes);
+    defer alloc.free(bad_index);
+    const index_offset: usize = @intCast(readU64(bad_index[bad_index.len - footer_size ..][0..8]));
+    bad_index[index_offset] ^= 1;
+    try std.testing.expectError(error.PostingSegmentChecksumMismatch, Reader.init(bad_index));
+
+    var bad_payload = try alloc.dupe(u8, bytes);
+    defer alloc.free(bad_payload);
+    bad_payload[0] ^= 1;
+    const reader = try Reader.init(bad_payload);
+    try std.testing.expectError(error.PostingSegmentChecksumMismatch, reader.getBase(1));
 }
 
 test "posting segment stores base centroid and ordered delta values" {
@@ -378,4 +512,8 @@ test "posting segment rejects duplicate logical entries" {
 
 test "posting segment validates footer and version" {
     try testValidatesFooterAndVersion();
+}
+
+test "posting segment validates index and payload checksums" {
+    try testValidatesIndexAndPayloadChecksums();
 }

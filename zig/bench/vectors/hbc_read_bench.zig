@@ -20,12 +20,14 @@ const hbc = antfly.hbc;
 const lsm_backend = antfly.lsm_backend;
 const platform_time = antfly.platform_time;
 const vec = antfly.vector;
+const recall_common = @import("recall_common.zig");
 
 const Config = struct {
     samples: usize = 3,
     vectors: usize = 10_000,
     dims: usize = 128,
     queries: usize = 200,
+    recall_queries: usize = 20,
     k: usize = 10,
     batch_size: usize = 1_000,
     seed: u64 = 42,
@@ -92,6 +94,7 @@ const StorageCounters = struct {
 
 const StorageHarness = struct {
     const CountingStorage = struct {
+        allocator: Allocator,
         backing: lsm_backend.Storage,
         counters: StorageCounters = .{},
 
@@ -141,6 +144,23 @@ const StorageHarness = struct {
             return self.backing.writeFileAbsolute(path, contents);
         }
 
+        fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.counters.write_file += 1;
+            self.counters.write_bytes += contents.len;
+            return self.backing.appendFileAbsolute(self.allocator, path, contents, sync);
+        }
+
+        fn syncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.syncFileContentsAbsolute(path);
+        }
+
+        fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.syncParentAbsolute(path);
+        }
+
         fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.counters.rename += 1;
@@ -172,10 +192,14 @@ const StorageHarness = struct {
         .file_size = CountingStorage.fileSize,
         .read_file_trailer_alloc = CountingStorage.readFileTrailerAlloc,
         .write_file_absolute = CountingStorage.writeFileAbsolute,
+        .append_file_absolute = CountingStorage.appendFileAbsolute,
+        .sync_contents_absolute = CountingStorage.syncFileContentsAbsolute,
+        .sync_parent_absolute = CountingStorage.syncParentAbsolute,
         .rename_absolute = CountingStorage.renameAbsolute,
         .delete_file_absolute = CountingStorage.deleteFileAbsolute,
         .delete_tree = CountingStorage.deleteTree,
         .now_ns = CountingStorage.nowNs,
+        .rename_is_atomic = true,
     };
 
     allocator: Allocator,
@@ -196,7 +220,7 @@ const StorageHarness = struct {
                 if (mode == .host) {
                     const ctx = try allocator.create(CountingStorage);
                     errdefer allocator.destroy(ctx);
-                    ctx.* = .{ .backing = backing.storage() };
+                    ctx.* = .{ .allocator = allocator, .backing = backing.storage() };
                     harness.counting_ctx = ctx;
                 }
             },
@@ -209,7 +233,7 @@ const StorageHarness = struct {
 
                 const ctx = try allocator.create(CountingStorage);
                 errdefer allocator.destroy(ctx);
-                ctx.* = .{ .backing = backing.storage() };
+                ctx.* = .{ .allocator = allocator, .backing = backing.storage() };
                 harness.counting_ctx = ctx;
             },
             .both => unreachable,
@@ -416,34 +440,82 @@ pub fn main(init: std.process.Init) !void {
             for (0..cfg.samples) |sample_index| {
                 var scenario = try Scenario.init(allocator, cfg, sample_index, storage_mode, build_mode);
                 defer scenario.deinit();
+                const before_build_storage = scenario.storage_harness.snapshotCounters();
+                scenario.index.resetWriteProfile();
+                const build_start = nanotime();
                 try buildIndex(&scenario, items);
+                const build_elapsed = nanotime() - build_start;
+                const after_build_storage = scenario.storage_harness.snapshotCounters();
+                try printBuildResult(out, &scenario, build_elapsed, before_build_storage, after_build_storage);
+                try stdout_writer.flush();
+                try benchQueries(out, &stdout_writer, &scenario, "post_ingest_query_no_metadata", queries, cfg.queries, .{
+                    .query = queries[0..cfg.dims],
+                    .k = cfg.k,
+                    .load_metadata = false,
+                }, dataset, true);
                 if (cfg.reopen_before_query) try scenario.reopen();
 
                 try benchQueries(out, &stdout_writer, &scenario, "cold_first_query_no_metadata", queries, 1, .{
                     .query = queries[0..cfg.dims],
                     .k = cfg.k,
                     .load_metadata = false,
-                });
+                }, dataset, false);
                 try benchQueries(out, &stdout_writer, &scenario, "warm_query_no_metadata", queries, cfg.queries, .{
                     .query = queries[0..cfg.dims],
                     .k = cfg.k,
                     .load_metadata = false,
-                });
+                }, dataset, true);
                 try benchQueries(out, &stdout_writer, &scenario, "warm_query_metadata", queries, cfg.queries, .{
                     .query = queries[0..cfg.dims],
                     .k = cfg.k,
                     .load_metadata = true,
-                });
+                }, dataset, false);
                 try benchQueries(out, &stdout_writer, &scenario, "warm_query_filter_prefix", queries, cfg.queries, .{
                     .query = queries[0..cfg.dims],
                     .k = cfg.k,
                     .load_metadata = false,
                     .filter_prefix = "doc:0000",
-                });
+                }, dataset, false);
             }
         }
     }
     try stdout_writer.flush();
+}
+
+fn printBuildResult(
+    writer: anytype,
+    scenario: *const Scenario,
+    elapsed_ns: u64,
+    before_storage: StorageCounters,
+    after_storage: StorageCounters,
+) !void {
+    const storage_delta = StorageCounters.delta(after_storage, before_storage);
+    const profile = scenario.index.getWriteProfile();
+    try writer.print(
+        "{{\"scenario\":\"{s}_{s}_build\",\"storage\":\"{s}\",\"build\":\"{s}\",\"sample\":{d},\"workload\":\"build\",\"vectors\":{d},\"dims\":{d},\"ns\":{d},\"ns_per_vector\":{d:.2},\"vectors_per_second\":{d:.2},\"storage_write_file\":{d},\"storage_write_bytes\":{d},\"storage_manifest_write_file\":{d},\"storage_manifest_write_bytes\":{d},\"insert_calls\":{d},\"save_node_calls\":{d},\"split_leaf_calls\":{d},\"refresh_quantized_ns\":{d},\"quantized_store_ns\":{d},\"quantized_put_ns\":{d}}}\n",
+        .{
+            @tagName(scenario.storage_kind),
+            @tagName(scenario.build_kind),
+            @tagName(scenario.storage_kind),
+            @tagName(scenario.build_kind),
+            scenario.sample_index,
+            scenario.cfg.vectors,
+            scenario.cfg.dims,
+            elapsed_ns,
+            @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(scenario.cfg.vectors)),
+            @as(f64, @floatFromInt(scenario.cfg.vectors)) * 1_000_000_000.0 / @as(f64, @floatFromInt(@max(elapsed_ns, 1))),
+            storage_delta.write_file,
+            storage_delta.write_bytes,
+            storage_delta.manifest_write_file,
+            storage_delta.manifest_write_bytes,
+            profile.insert_calls,
+            profile.save_node_calls,
+            profile.split_leaf_calls,
+            profile.refresh_quantized_ns,
+            profile.quantized_store_ns,
+            profile.quantized_put_ns,
+        },
+    );
 }
 
 fn buildIndex(scenario: *Scenario, items: []const hbc.BatchInsertItem) !void {
@@ -472,20 +544,62 @@ fn benchQueries(
     queries: []const f32,
     query_count: usize,
     request_template: hbc.SearchRequest,
+    dataset: []const f32,
+    measure_recall: bool,
 ) !void {
     const before_storage = scenario.storage_harness.snapshotCounters();
     var totals: ProfileTotals = .{};
+    const latencies = try scenario.allocator.alloc(u64, query_count);
+    defer scenario.allocator.free(latencies);
+    const predictions = try scenario.allocator.alloc(u64, query_count * scenario.cfg.k);
+    defer scenario.allocator.free(predictions);
+    @memset(predictions, 0);
+    const prediction_counts = try scenario.allocator.alloc(usize, query_count);
+    defer scenario.allocator.free(prediction_counts);
     const start = nanotime();
     for (0..query_count) |i| {
         var req = request_template;
         req.query = queries[(i % scenario.cfg.queries) * scenario.cfg.dims ..][0..scenario.cfg.dims];
+        const query_start = nanotime();
         var profiled = try scenario.index.searchProfiledRequest(req);
+        latencies[i] = nanotime() - query_start;
         totals.add(&profiled);
+        const hits = profiled.results.getHits();
+        prediction_counts[i] = @min(hits.len, scenario.cfg.k);
+        for (hits[0..prediction_counts[i]], 0..) |hit, hit_index| {
+            predictions[i * scenario.cfg.k + hit_index] = hit.vector_id;
+        }
         profiled.results.deinit();
     }
     const elapsed = nanotime() - start;
     const after_storage = scenario.storage_harness.snapshotCounters();
-    try printResult(writer, scenario, workload, query_count, elapsed, before_storage, after_storage, totals);
+    std.mem.sort(u64, latencies, {}, std.sort.asc(u64));
+
+    var recall_sum: f64 = 0;
+    const recall_queries = if (measure_recall) @min(query_count, scenario.cfg.recall_queries) else 0;
+    for (0..recall_queries) |i| {
+        const query = queries[(i % scenario.cfg.queries) * scenario.cfg.dims ..][0..scenario.cfg.dims];
+        const truth = try recall_common.calculateTruth(
+            scenario.allocator,
+            @min(scenario.cfg.k, scenario.cfg.vectors),
+            .cosine,
+            query,
+            .{ .dims = scenario.cfg.dims, .count = scenario.cfg.vectors, .data = @constCast(dataset) },
+        );
+        defer scenario.allocator.free(truth);
+        var hits: usize = 0;
+        for (truth) |truth_offset| {
+            for (predictions[i * scenario.cfg.k ..][0..prediction_counts[i]]) |prediction| {
+                if (prediction == truth_offset + 1) {
+                    hits += 1;
+                    break;
+                }
+            }
+        }
+        recall_sum += @as(f64, @floatFromInt(hits)) / @as(f64, @floatFromInt(truth.len));
+    }
+    const recall = if (recall_queries > 0) recall_sum / @as(f64, @floatFromInt(recall_queries)) else 0;
+    try printResult(writer, scenario, workload, query_count, elapsed, before_storage, after_storage, totals, latencies, recall_queries, recall);
     try stdout_writer.flush();
 }
 
@@ -498,11 +612,14 @@ fn printResult(
     before_storage: StorageCounters,
     after_storage: StorageCounters,
     totals: ProfileTotals,
+    sorted_latencies: []const u64,
+    recall_queries: usize,
+    recall: f64,
 ) !void {
     const storage_delta = StorageCounters.delta(after_storage, before_storage);
     const ns_per_query = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(@max(queries, 1)));
     try writer.print(
-        "{{\"scenario\":\"{s}_{s}_{s}\",\"storage\":\"{s}\",\"build\":\"{s}\",\"sample\":{d},\"workload\":\"{s}\",\"vectors\":{d},\"dims\":{d},\"queries\":{d},\"k\":{d},\"ns\":{d},\"ns_per_query\":{d:.2}",
+        "{{\"scenario\":\"{s}_{s}_{s}\",\"storage\":\"{s}\",\"build\":\"{s}\",\"sample\":{d},\"workload\":\"{s}\",\"vectors\":{d},\"dims\":{d},\"queries\":{d},\"k\":{d},\"ns\":{d},\"ns_per_query\":{d:.2},\"qps\":{d:.2},\"latency_p50_ns\":{d},\"latency_p95_ns\":{d},\"latency_p99_ns\":{d},\"latency_max_ns\":{d},\"recall_queries\":{d},\"recall_at_k\":{d:.6}",
         .{
             @tagName(scenario.storage_kind),
             @tagName(scenario.build_kind),
@@ -517,6 +634,13 @@ fn printResult(
             scenario.cfg.k,
             ns,
             ns_per_query,
+            @as(f64, @floatFromInt(queries)) * 1_000_000_000.0 / @as(f64, @floatFromInt(@max(ns, 1))),
+            percentile(sorted_latencies, 50),
+            percentile(sorted_latencies, 95),
+            percentile(sorted_latencies, 99),
+            sorted_latencies[sorted_latencies.len - 1],
+            recall_queries,
+            recall,
         },
     );
     try writer.print(
@@ -564,6 +688,12 @@ fn printResult(
             totals.result_count,
         },
     );
+}
+
+fn percentile(sorted: []const u64, percent: usize) u64 {
+    std.debug.assert(sorted.len > 0);
+    const rank = @max(@as(usize, 1), (sorted.len * percent + 99) / 100);
+    return sorted[@min(rank - 1, sorted.len - 1)];
 }
 
 fn hbcConfig(cfg: Config) hbc.HBCConfig {
@@ -656,6 +786,8 @@ fn parseArgs(proc_args: std.process.Args) !Config {
             cfg.dims = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--queries")) {
             cfg.queries = try parseNextUsize(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--recall-queries")) {
+            cfg.recall_queries = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--k")) {
             cfg.k = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--batch-size")) {
@@ -703,7 +835,7 @@ fn parseArgs(proc_args: std.process.Args) !Config {
             return error.InvalidArgument;
         }
     }
-    if (cfg.samples == 0 or cfg.vectors == 0 or cfg.dims == 0 or cfg.queries == 0 or cfg.k == 0 or cfg.batch_size == 0) return error.InvalidArgument;
+    if (cfg.samples == 0 or cfg.vectors == 0 or cfg.dims == 0 or cfg.queries == 0 or cfg.recall_queries == 0 or cfg.k == 0 or cfg.batch_size == 0) return error.InvalidArgument;
     return cfg;
 }
 
