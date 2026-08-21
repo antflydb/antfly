@@ -288,6 +288,11 @@ pub const NodeRecord = struct {
 pub const StoreRecord = struct {
     store_id: u64,
     node_id: u64,
+    /// Random non-zero process incarnation established by store registration.
+    /// Status generations are comparable only within this incarnation.
+    reporter_incarnation: u64 = 0,
+    /// Highest status snapshot generation accepted for `reporter_incarnation`.
+    status_generation: u64 = 0,
     api_url: []const u8 = "",
     raft_url: []const u8 = "",
     role: []const u8 = "data",
@@ -633,6 +638,11 @@ pub fn voterSetFingerprint(node_ids: []const u64, required_node_id: ?u64) VoterS
 
 pub const StoreStatusReport = struct {
     store_id: u64,
+    /// Must match the incarnation established by store registration. Zero is
+    /// reserved for rolling-upgrade compatibility with legacy reporters.
+    reporter_incarnation: u64 = 0,
+    /// Monotonic snapshot generation within `reporter_incarnation`.
+    status_generation: u64 = 0,
     live: bool = true,
     health_class: []const u8 = "healthy",
     capacity_bytes: u64 = 0,
@@ -1939,6 +1949,8 @@ pub fn cloneStore(alloc: std.mem.Allocator, record: StoreRecord) !StoreRecord {
     return .{
         .store_id = record.store_id,
         .node_id = record.node_id,
+        .reporter_incarnation = record.reporter_incarnation,
+        .status_generation = record.status_generation,
         .api_url = api_url,
         .raft_url = raft_url,
         .role = role,

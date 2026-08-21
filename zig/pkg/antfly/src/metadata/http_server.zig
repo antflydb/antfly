@@ -2323,6 +2323,8 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
     const Parsed = struct {
         store_id: u64,
         node_id: u64,
+        reporter_incarnation: ?u64 = null,
+        status_generation: ?u64 = null,
         api_url: ?[]const u8 = null,
         raft_url: ?[]const u8 = null,
         role: ?[]const u8 = null,
@@ -2351,6 +2353,8 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
     return .{
         .store_id = parsed.value.store_id,
         .node_id = parsed.value.node_id,
+        .reporter_incarnation = parsed.value.reporter_incarnation orelse 0,
+        .status_generation = parsed.value.status_generation orelse 0,
         .api_url = try alloc.dupe(u8, parsed.value.api_url orelse ""),
         .raft_url = try alloc.dupe(u8, parsed.value.raft_url orelse ""),
         .role = try alloc.dupe(u8, parsed.value.role orelse "data"),
@@ -2440,6 +2444,8 @@ fn parseStoreStatusReport(alloc: std.mem.Allocator, body: []const u8) !metadata_
 fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []const u8, default_store_id: ?u64) !metadata_table_manager.StoreStatusReport {
     const Parsed = struct {
         store_id: ?u64 = null,
+        reporter_incarnation: ?u64 = null,
+        status_generation: ?u64 = null,
         live: ?bool = null,
         health_class: ?[]const u8 = null,
         capacity_bytes: ?u64 = null,
@@ -2463,6 +2469,8 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
     if (store_id == 0) return error.InvalidNodeID;
     return .{
         .store_id = store_id,
+        .reporter_incarnation = parsed.value.reporter_incarnation orelse 0,
+        .status_generation = parsed.value.status_generation orelse 0,
         .live = parsed.value.live orelse true,
         .health_class = try alloc.dupe(u8, parsed.value.health_class orelse "healthy"),
         .capacity_bytes = parsed.value.capacity_bytes orelse 0,

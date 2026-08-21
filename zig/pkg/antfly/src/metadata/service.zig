@@ -579,7 +579,7 @@ fn runtimeStatusProtocolCompatible(
     return peer_status.metadata_group_id == metadata_group_id and
         peer_status.metadata_raft_local_node_id == node_id and
         std.mem.eql(u8, &peer_incarnation, &incarnation) and
-        peer_status.runtime_status_record_version >= metadata_runtime_status_protocol.repair_status_record_version;
+        peer_status.runtime_status_record_version >= metadata_runtime_status_protocol.current_record_version;
 }
 
 const RuntimeStatusMembershipFingerprint = [std.crypto.hash.sha2.Sha256.digest_length]u8;
@@ -683,6 +683,11 @@ fn stripRuntimeRepairStatus(record: *metadata_table_manager.StoreRecord) void {
     }
 }
 
+fn stripRuntimeReporterFence(record: *metadata_table_manager.StoreRecord) void {
+    record.reporter_incarnation = 0;
+    record.status_generation = 0;
+}
+
 fn runtimeStatusProtocolSafeCommand(
     service: anytype,
     command: metadata_storage.TransitionCommand,
@@ -690,16 +695,20 @@ fn runtimeStatusProtocolSafeCommand(
 ) !metadata_storage.TransitionCommand {
     switch (command) {
         .upsert_store => |record| {
-            if (!storeHasRuntimeRepairStatus(record) or service.runtimeStatusRepairProtocolReady()) return command;
+            const needs_current_protocol = storeHasRuntimeRepairStatus(record) or record.reporter_incarnation != 0;
+            if (!needs_current_protocol or service.runtimeStatusRepairProtocolReady()) return command;
             var legacy_record = try metadata_table_manager.cloneStore(service.alloc, record);
             stripRuntimeRepairStatus(&legacy_record);
+            stripRuntimeReporterFence(&legacy_record);
             owned_legacy_store.* = legacy_record;
             return .{ .upsert_store = legacy_record };
         },
         .register_store => |record| {
-            if (!storeHasRuntimeRepairStatus(record) or service.runtimeStatusRepairProtocolReady()) return command;
+            const needs_current_protocol = storeHasRuntimeRepairStatus(record) or record.reporter_incarnation != 0;
+            if (!needs_current_protocol or service.runtimeStatusRepairProtocolReady()) return command;
             var legacy_record = try metadata_table_manager.cloneStore(service.alloc, record);
             stripRuntimeRepairStatus(&legacy_record);
+            stripRuntimeReporterFence(&legacy_record);
             owned_legacy_store.* = legacy_record;
             return .{ .register_store = legacy_record };
         },
@@ -3866,7 +3875,7 @@ pub const MetadataHttpService = struct {
 
     fn runtimeStatusRepairProtocolReady(self: *MetadataHttpService) bool {
         if (self.runtimeStatusProtocolActivationVersion() >=
-            metadata_runtime_status_protocol.repair_status_record_version) return true;
+            metadata_runtime_status_protocol.current_record_version) return true;
         const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse return false;
         const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
         if (std.mem.indexOfScalar(u64, raft_status.conf_state.voters, local_node_id) == null and
@@ -4948,8 +4957,13 @@ pub const MetadataHttpService = struct {
         snapshot: *MetadataStatus,
     ) void {
         snapshot.runtime_status_protocol_activated_version = self.runtimeStatusProtocolActivationVersion();
+        snapshot.runtime_status_protocol_ready_version =
+            if (self.runtimeStatusRepairProtocolReady())
+                metadata_runtime_status_protocol.current_record_version
+            else
+                snapshot.runtime_status_protocol_activated_version;
         if (snapshot.runtime_status_protocol_activated_version >=
-            metadata_runtime_status_protocol.repair_status_record_version)
+            metadata_runtime_status_protocol.current_record_version)
         {
             snapshot.runtime_status_protocol_probe_in_flight = false;
             snapshot.runtime_status_protocol_probe_failures = 0;
@@ -6487,6 +6501,7 @@ test "metadata transition commands downgrade runtime repair status until protoco
     const store = metadata_table_manager.StoreRecord{
         .store_id = 1,
         .node_id = 2,
+        .reporter_incarnation = 77,
         .runtime_statuses = runtime_statuses[0..],
     };
 
@@ -6499,6 +6514,7 @@ test "metadata transition commands downgrade runtime repair status until protoco
         &owned_legacy_store,
     );
     try std.testing.expect(!storeHasRuntimeRepairStatus(safe_command.register_store));
+    try std.testing.expectEqual(@as(u64, 0), safe_command.register_store.reporter_incarnation);
     try std.testing.expect(storeHasRuntimeRepairStatus(store));
 
     var current_service = FakeService{ .alloc = std.testing.allocator, .ready = true };
@@ -6510,6 +6526,7 @@ test "metadata transition commands downgrade runtime repair status until protoco
     );
     try std.testing.expect(unexpectedly_owned == null);
     try std.testing.expect(storeHasRuntimeRepairStatus(current_command.upsert_store));
+    try std.testing.expectEqual(@as(u64, 77), current_command.upsert_store.reporter_incarnation);
 }
 
 test "metadata service status reporting never proposes deletion of committed repair facts while activation is unknown" {

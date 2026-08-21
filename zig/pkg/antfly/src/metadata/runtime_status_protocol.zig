@@ -17,5 +17,7 @@
 /// metadata replica that can apply the transition advertises support for the
 /// current version.
 pub const legacy_record_version: u16 = 12;
+/// V13 is the first (unreleased) format carrying both compact repair state and
+/// the store reporter-incarnation fence.
 pub const repair_status_record_version: u16 = 13;
 pub const current_record_version: u16 = repair_status_record_version;

@@ -70,6 +70,7 @@ pub const NodeRecord = table_manager.NodeRecord;
 pub const StoreRecord = table_manager.StoreRecord;
 pub const GroupStatusReport = table_manager.GroupStatusReport;
 pub const StoreStatusReport = table_manager.StoreStatusReport;
+pub const runtime_status_protocol = @import("runtime_status_protocol.zig");
 pub const RuntimeGroupStatusReport = table_manager.RuntimeGroupStatusReport;
 pub const RuntimeEnrichmentStatusReport = table_manager.RuntimeEnrichmentStatusReport;
 pub const RuntimeDocIdentityStatusReport = table_manager.RuntimeDocIdentityStatusReport;

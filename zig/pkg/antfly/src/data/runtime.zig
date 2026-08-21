@@ -2534,6 +2534,8 @@ const CachedSplitKey = union(enum) {
 };
 
 const StoreStatusHeartbeatCache = struct {
+    reporter_incarnation: u64 = 0,
+    status_generation: u64 = 0,
     live: bool = true,
     health_class: []const u8 = "healthy",
     owns_health_class: bool = false,
@@ -4332,6 +4334,9 @@ pub const DataServer = struct {
     metadata_local_providers_registered: bool = false,
     store_registration: ?StoreRegistrationConfig = null,
     store_registration_confirmed: bool = false,
+    reporter_incarnation_mutex: std.atomic.Mutex = .unlocked,
+    reporter_incarnation: u64 = 0,
+    store_status_generation: std.atomic.Value(u64) = .init(1),
     metadata_bootstrap_retry_mutex: std.atomic.Mutex = .unlocked,
     metadata_bootstrap_retry_attempts: u32 = 0,
     next_metadata_bootstrap_retry_at_ms: u64 = 0,
@@ -10320,6 +10325,27 @@ pub const DataServer = struct {
         self.invalidateLocalGroupStatusCache();
     }
 
+    fn reporterIncarnation(self: *DataServer) !u64 {
+        lockAtomic(&self.reporter_incarnation_mutex);
+        if (self.reporter_incarnation != 0) {
+            const reporter_incarnation = self.reporter_incarnation;
+            self.reporter_incarnation_mutex.unlock();
+            return reporter_incarnation;
+        }
+        self.reporter_incarnation_mutex.unlock();
+
+        const runtime = try self.ensureBackendRuntime();
+        const io_impl = runtime.apiIoImpl() orelse return error.BackendRuntimeUnavailable;
+        lockAtomic(&self.reporter_incarnation_mutex);
+        defer self.reporter_incarnation_mutex.unlock();
+        if (self.reporter_incarnation == 0) {
+            while (self.reporter_incarnation == 0) {
+                try io_impl.io().randomSecure(std.mem.asBytes(&self.reporter_incarnation));
+            }
+        }
+        return self.reporter_incarnation;
+    }
+
     pub fn registerNodeIfConfigured(self: *DataServer) !void {
         const remote_metadata = self.remote_metadata orelse return;
         const registration = self.store_registration orelse return;
@@ -10335,6 +10361,7 @@ pub const DataServer = struct {
         const record: antfly.metadata.table_manager.StoreRecord = .{
             .store_id = registration.store_id,
             .node_id = registration.node_id,
+            .reporter_incarnation = try self.reporterIncarnation(),
             .api_url = api_url,
             .raft_url = raft_url,
             .role = registration.role,
@@ -10924,8 +10951,25 @@ pub const DataServer = struct {
         // round; clearing at the end would lose that notification.
         _ = self.store_status_dirty.swap(false, .acq_rel);
         errdefer self.store_status_dirty.store(true, .release);
+        const status_generation = self.store_status_generation.fetchAdd(1, .monotonic);
         var snapshot = try remote_metadata.fetchSnapshot();
         defer freeAdminSnapshotOwned(self.alloc, &snapshot);
+        const reporter_incarnation = try self.reporterIncarnation();
+        if (snapshot.status.runtime_status_protocol_ready_version >=
+            antfly.metadata.runtime_status_protocol.current_record_version and
+            !storeReporterIncarnationVisible(
+                snapshot.stores,
+                registration.store_id,
+                reporter_incarnation,
+            ))
+        {
+            // A process that registered while v13 was still rolling out has a
+            // legacy zero-incarnation record. Re-register once activation is
+            // durable so it gains causal authority without churning status
+            // records throughout the mixed-version window.
+            self.store_registration_confirmed = false;
+            try self.registerNodeIfConfigured();
+        }
         try self.syncDataRaftFromSnapshot(&snapshot);
         const report_generation = self.local_group_status_generation.load(.acquire);
 
@@ -10996,6 +11040,8 @@ pub const DataServer = struct {
 
         const report: antfly.metadata.table_manager.StoreStatusReport = .{
             .store_id = registration.store_id,
+            .reporter_incarnation = reporter_incarnation,
+            .status_generation = status_generation,
             .live = true,
             .health_class = "healthy",
             .capacity_bytes = capacity.capacity_bytes,
@@ -11377,6 +11423,8 @@ pub const DataServer = struct {
         if (cache.group_statuses.len == 0 and cache.runtime_statuses.len == 0) return null;
         return .{
             .store_id = store_id,
+            .reporter_incarnation = cache.reporter_incarnation,
+            .status_generation = cache.status_generation,
             .live = cache.live,
             .health_class = try self.alloc.dupe(u8, cache.health_class),
             .capacity_bytes = cache.capacity_bytes,
@@ -11399,6 +11447,8 @@ pub const DataServer = struct {
         defer self.store_status_cache_mutex.unlock();
         self.store_status_heartbeat_cache.clear(self.alloc);
         self.store_status_heartbeat_cache = .{
+            .reporter_incarnation = report.reporter_incarnation,
+            .status_generation = report.status_generation,
             .live = report.live,
             .health_class = try self.alloc.dupe(u8, report.health_class),
             .owns_health_class = true,
@@ -16197,7 +16247,23 @@ fn storeRegistrationVisible(
         if (!std.mem.eql(u8, store.role, record.role)) continue;
         if (!std.mem.eql(u8, store.api_url, record.api_url)) continue;
         if (!std.mem.eql(u8, store.raft_url, record.raft_url)) continue;
+        // A zero committed incarnation is a legacy rolling-upgrade record.
+        // Once v13 is active, registration visibility requires the exact
+        // process incarnation and stale processes lose report authority.
+        if (store.reporter_incarnation != 0 and
+            store.reporter_incarnation != record.reporter_incarnation) continue;
         return true;
+    }
+    return false;
+}
+
+fn storeReporterIncarnationVisible(
+    stores: []const antfly.metadata.table_manager.StoreRecord,
+    store_id: u64,
+    reporter_incarnation: u64,
+) bool {
+    for (stores) |store| {
+        if (store.store_id == store_id) return store.reporter_incarnation == reporter_incarnation;
     }
     return false;
 }

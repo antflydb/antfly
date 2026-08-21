@@ -37,6 +37,11 @@ pub fn applyObservation(
     observation: StoreObservation,
 ) table_manager.StoreRecord {
     var updated = existing;
+    if (existing.reporter_incarnation != 0 and
+        observation.reporter_incarnation == existing.reporter_incarnation)
+    {
+        updated.status_generation = observation.status_generation;
+    }
     updated.live = observation.live;
     updated.health_class = observation.health_class;
     updated.capacity_bytes = observation.capacity_bytes;
@@ -87,6 +92,11 @@ pub fn applyObservationsOwnedWithRepairStatus(
         }
         alloc.free(records[index].health_class);
         records[index].health_class = try alloc.dupe(u8, observation.health_class);
+        if (records[index].reporter_incarnation != 0 and
+            observation.reporter_incarnation == records[index].reporter_incarnation)
+        {
+            records[index].status_generation = observation.status_generation;
+        }
         records[index].live = observation.live;
         records[index].capacity_bytes = observation.capacity_bytes;
         records[index].available_bytes = observation.available_bytes;
@@ -183,6 +193,24 @@ pub fn observationChangesRecordWithRepairStatus(
     observation: StoreObservation,
     include_repair_status: bool,
 ) bool {
+    const repair_facts_equal = !include_repair_status or
+        runtimeRepairFactsEqual(existing.runtime_statuses, observation.runtime_statuses);
+    // Once registration establishes an incarnation, reports from a prior
+    // process can never mutate the store projection. Generations order full
+    // snapshots within the active process; equal generations remain useful
+    // for cheap heartbeats that overlay live Raft facts.
+    if (existing.reporter_incarnation != 0) {
+        if (observation.reporter_incarnation != existing.reporter_incarnation) return false;
+        if (observation.status_generation < existing.status_generation) return false;
+        if (include_repair_status and
+            observation.status_generation == existing.status_generation and
+            !repair_facts_equal) return false;
+    } else if (!repair_facts_equal and
+        !legacyRepairTransitionCausallySupersedes(existing.runtime_statuses, observation.runtime_statuses))
+    {
+        return false;
+    }
+
     // Until the v13 codec is activated, absence or an incomplete replacement
     // identity is not authoritative for an already-committed repair identity.
     // A legacy or transient heartbeat can omit an index (or its whole runtime
@@ -190,13 +218,12 @@ pub fn observationChangesRecordWithRepairStatus(
     // only admission-safety fact. Treat the heartbeat as unchanged so callers
     // neither replace the projection nor propose the deletion. A same-name
     // index with a complete new materialization identity remains authoritative.
-    if (!include_repair_status and observationLacksAuthoritativeCommittedRepairIdentity(
-        existing.runtime_statuses,
-        observation.runtime_statuses,
-    )) return false;
+    if (observationLacksAuthoritativeCommittedRepairIdentity(existing, observation)) return false;
 
     return existing.live != observation.live or
         !std.mem.eql(u8, existing.health_class, observation.health_class) or
+        (existing.reporter_incarnation != 0 and
+            existing.status_generation != observation.status_generation) or
         existing.capacity_bytes != observation.capacity_bytes or
         existing.available_bytes != observation.available_bytes or
         existing.lease_pressure != observation.lease_pressure or
@@ -209,10 +236,10 @@ pub fn observationChangesRecordWithRepairStatus(
 }
 
 fn observationLacksAuthoritativeCommittedRepairIdentity(
-    existing: []const table_manager.RuntimeGroupStatusReport,
-    next: []const table_manager.RuntimeGroupStatusReport,
+    existing: table_manager.StoreRecord,
+    observation: StoreObservation,
 ) bool {
-    for (existing) |prior_runtime| {
+    for (existing.runtime_statuses) |prior_runtime| {
         var has_committed_repair = false;
         for (prior_runtime.indexes) |prior_index| {
             if (prior_index.repair_status != null) {
@@ -224,7 +251,10 @@ fn observationLacksAuthoritativeCommittedRepairIdentity(
         // keep the common repair-free store path linear in its own index count.
         if (!has_committed_repair) continue;
 
-        const next_runtime = findRuntimeRepairIdentity(next, prior_runtime) orelse return true;
+        const next_runtime = findRuntimeRepairIdentity(observation.runtime_statuses, prior_runtime) orelse {
+            if (!storeObservationCausallySupersedes(existing, observation, null, null)) return true;
+            continue;
+        };
         for (prior_runtime.indexes) |prior_index| {
             if (prior_index.repair_status == null) continue;
             var replacement: ?table_manager.RuntimeIndexStatusReport = null;
@@ -234,7 +264,10 @@ fn observationLacksAuthoritativeCommittedRepairIdentity(
                     break;
                 }
             }
-            const next_index = replacement orelse return true;
+            const next_index = replacement orelse {
+                if (!storeObservationCausallySupersedes(existing, observation, prior_runtime, next_runtime)) return true;
+                continue;
+            };
             // A kind change is only an explicit catalog replacement once the
             // producer supplies a complete identity. Legacy reports may omit
             // kind entirely, and startup/degraded snapshots deliberately
@@ -245,21 +278,92 @@ fn observationLacksAuthoritativeCommittedRepairIdentity(
                 prior_index.coverage_config_hash == next_index.coverage_config_hash;
             if (!same_materialization and
                 (!next_index.coverage_identity_ready or
-                    !runtimeObservationCausallySupersedes(prior_runtime, next_runtime))) return true;
+                    !storeObservationCausallySupersedes(existing, observation, prior_runtime, next_runtime))) return true;
         }
     }
     return false;
 }
 
-fn runtimeObservationCausallySupersedes(
-    prior: table_manager.RuntimeGroupStatusReport,
-    next: table_manager.RuntimeGroupStatusReport,
+fn storeObservationCausallySupersedes(
+    existing: table_manager.StoreRecord,
+    observation: StoreObservation,
+    prior_runtime: ?table_manager.RuntimeGroupStatusReport,
+    next_runtime: ?table_manager.RuntimeGroupStatusReport,
 ) bool {
-    // Cross-process runtime reports publish Unix time. A generation alone is
-    // insufficient because it restarts with the producer process, so ambiguous,
-    // missing, equal, or regressed timestamps fail closed. A later full report
-    // (or protocol activation) releases the transition without extra I/O.
+    if (existing.reporter_incarnation != 0) {
+        return observation.reporter_incarnation == existing.reporter_incarnation and
+            observation.status_generation > existing.status_generation;
+    }
+    // Legacy rolling-upgrade reporters have no process authority. Retain the
+    // conservative realtime fallback only when both corresponding runtime
+    // observations exist; absence can never prove a deletion.
+    const prior = prior_runtime orelse return false;
+    const next = next_runtime orelse return false;
     return prior.updated_at_ns != 0 and next.updated_at_ns > prior.updated_at_ns;
+}
+
+fn runtimeRepairFactsEqual(
+    lhs: []const table_manager.RuntimeGroupStatusReport,
+    rhs: []const table_manager.RuntimeGroupStatusReport,
+) bool {
+    return runtimeRepairFactsContained(lhs, rhs) and runtimeRepairFactsContained(rhs, lhs);
+}
+
+fn runtimeRepairFactsContained(
+    expected: []const table_manager.RuntimeGroupStatusReport,
+    actual: []const table_manager.RuntimeGroupStatusReport,
+) bool {
+    for (expected) |expected_runtime| {
+        for (expected_runtime.indexes) |expected_index| {
+            const expected_status = expected_index.repair_status orelse continue;
+            const actual_runtime = findRuntimeRepairIdentity(actual, expected_runtime) orelse return false;
+            const actual_index = findRuntimeIndexRepairIdentity(actual_runtime.indexes, expected_index) orelse return false;
+            if (actual_index.repair_status != expected_status or
+                actual_index.repair_active_generation_serviceable !=
+                    expected_index.repair_active_generation_serviceable) return false;
+        }
+    }
+    return true;
+}
+
+fn runtimeRepairFactsForGroupEqual(
+    lhs: table_manager.RuntimeGroupStatusReport,
+    rhs: table_manager.RuntimeGroupStatusReport,
+) bool {
+    return runtimeRepairFactsForGroupContained(lhs, rhs) and
+        runtimeRepairFactsForGroupContained(rhs, lhs);
+}
+
+fn runtimeRepairFactsForGroupContained(
+    expected: table_manager.RuntimeGroupStatusReport,
+    actual: table_manager.RuntimeGroupStatusReport,
+) bool {
+    for (expected.indexes) |expected_index| {
+        const expected_status = expected_index.repair_status orelse continue;
+        const actual_index = findRuntimeIndexRepairIdentity(actual.indexes, expected_index) orelse return false;
+        if (actual_index.repair_status != expected_status or
+            actual_index.repair_active_generation_serviceable !=
+                expected_index.repair_active_generation_serviceable) return false;
+    }
+    return true;
+}
+
+fn legacyRepairTransitionCausallySupersedes(
+    existing: []const table_manager.RuntimeGroupStatusReport,
+    observation: []const table_manager.RuntimeGroupStatusReport,
+) bool {
+    for (existing) |prior_runtime| {
+        const next_runtime = findRuntimeRepairIdentity(observation, prior_runtime) orelse {
+            for (prior_runtime.indexes) |index| if (index.repair_status != null) return false;
+            continue;
+        };
+        if (runtimeRepairFactsForGroupEqual(prior_runtime, next_runtime)) continue;
+        if (prior_runtime.updated_at_ns == 0 or
+            next_runtime.updated_at_ns <= prior_runtime.updated_at_ns) return false;
+    }
+    // A genuinely new runtime group has no committed predecessor to protect.
+    // Matching groups, including null-to-repair publication, were fenced above.
+    return true;
 }
 
 fn groupStatusesEqual(
@@ -665,6 +769,71 @@ test "store observer can ignore unactivated repair fields without hiding other c
     try std.testing.expect(!observationChangesRecordWithRepairStatus(existing, observation, false));
     observed_indexes[0].doc_count += 1;
     try std.testing.expect(observationChangesRecordWithRepairStatus(existing, observation, false));
+}
+
+test "store observer fences repair transitions by registered reporter incarnation and generation" {
+    var existing_indexes = [_]table_manager.RuntimeIndexStatusReport{.{
+        .name = "visual_idx",
+        .kind = "dense_vector",
+        .coverage_generation = 7,
+        .coverage_config_hash = 8,
+        .coverage_identity_ready = true,
+        .repair_status = .rebuilding,
+        .repair_active_generation_serviceable = true,
+    }};
+    var next_indexes = existing_indexes;
+    next_indexes[0].repair_status = .failed;
+    next_indexes[0].repair_active_generation_serviceable = false;
+    var existing_runtime = [_]table_manager.RuntimeGroupStatusReport{.{
+        .table_id = 1,
+        .group_id = 2,
+        .store_id = 3,
+        .node_id = 4,
+        .updated_at_ns = 500,
+        .indexes = existing_indexes[0..],
+    }};
+    var next_runtime = existing_runtime;
+    next_runtime[0].updated_at_ns = 1;
+    next_runtime[0].indexes = next_indexes[0..];
+    const existing: table_manager.StoreRecord = .{
+        .store_id = 3,
+        .node_id = 4,
+        .reporter_incarnation = 0x1111,
+        .status_generation = 8,
+        .runtime_statuses = existing_runtime[0..],
+    };
+
+    var observation: StoreObservation = .{
+        .store_id = 3,
+        .reporter_incarnation = 0x2222,
+        .status_generation = 100,
+        .runtime_statuses = next_runtime[0..],
+    };
+    try std.testing.expect(!observationChangesRecordWithRepairStatus(existing, observation, true));
+
+    observation.reporter_incarnation = existing.reporter_incarnation;
+    observation.status_generation = existing.status_generation - 1;
+    try std.testing.expect(!observationChangesRecordWithRepairStatus(existing, observation, true));
+
+    observation.status_generation = existing.status_generation;
+    try std.testing.expect(!observationChangesRecordWithRepairStatus(existing, observation, true));
+
+    // Generation, rather than incomparable wall time, authorizes the active
+    // process to publish the transition and to delete an omitted repair fact.
+    observation.status_generation = existing.status_generation + 1;
+    try std.testing.expect(observationChangesRecordWithRepairStatus(existing, observation, true));
+    observation.runtime_statuses = &.{};
+    try std.testing.expect(observationChangesRecordWithRepairStatus(existing, observation, true));
+
+    var legacy_existing = existing;
+    legacy_existing.reporter_incarnation = 0;
+    legacy_existing.status_generation = 0;
+    observation.reporter_incarnation = 0;
+    observation.status_generation = 0;
+    observation.runtime_statuses = next_runtime[0..];
+    try std.testing.expect(!observationChangesRecordWithRepairStatus(legacy_existing, observation, true));
+    next_runtime[0].updated_at_ns = existing_runtime[0].updated_at_ns + 1;
+    try std.testing.expect(observationChangesRecordWithRepairStatus(legacy_existing, observation, true));
 }
 
 test "store observer preserves committed repair facts while capability is unknown" {
