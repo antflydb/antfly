@@ -1338,7 +1338,7 @@ def test_stateful_graph_pattern_max_results_limit(backup_api):
         lambda: (
             result
             if (result := _query_graph_result(backup_api, table_name, query_payload, "counts")) is not None
-            and result.get("aggregates", {}).get("rows", {}).get("value") == "4"
+            and result.get("aggregates", {}).get("rows", {}).get("value") == "5"
             else None
         ),
         timeout_s=120.0,
@@ -1346,6 +1346,6 @@ def test_stateful_graph_pattern_max_results_limit(backup_api):
     )
     assert counts is not None
     assert counts["aggregates"] == {
-        "rows": {"value": "4", "exact": True},
-        "neighbors": {"value": "4", "exact": True},
+        "rows": {"value": "5", "exact": True},
+        "neighbors": {"value": "5", "exact": True},
     }

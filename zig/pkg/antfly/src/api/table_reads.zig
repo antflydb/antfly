@@ -3119,6 +3119,21 @@ pub const ProvisionedTableReadSource = struct {
             };
             try checkQueryDeadline(base_req);
             defer merged.deinit();
+            var match_anchor_result: ?db_mod.types.SearchResult = null;
+            defer if (match_anchor_result) |*result| result.deinit();
+            if (distributed_graph.requiresCompleteMatchAnchors(req)) {
+                const required_generations = try distributedIdentityGenerationsForGroupsAlloc(alloc, group_ids, merged);
+                defer alloc.free(required_generations);
+                match_anchor_result = try queryProvisionedAcrossGroupsAtGenerations(
+                    self,
+                    alloc,
+                    group_ids,
+                    completeGraphMatchAnchorRequest(req),
+                    table_name,
+                    .stale,
+                    required_generations,
+                );
+            }
             const graph_req = requestWithResultIdentityGeneration(req, merged);
 
             // Distributed graph execution can cross table boundaries. Do not
@@ -3131,7 +3146,16 @@ pub const ProvisionedTableReadSource = struct {
 
             var worker_ctx = ProvisionedGraphWorkerContext.init(self);
             const worker = worker_ctx.worker();
-            const graph_results = try distributed_graph.executeCrossRange(alloc, self.catalog, worker, table_name, graph_req, merged, consistency);
+            const graph_results = try distributed_graph.executeCrossRangeWithMatchAnchors(
+                alloc,
+                self.catalog,
+                worker,
+                table_name,
+                graph_req,
+                merged,
+                match_anchor_result,
+                consistency,
+            );
             merged.graph_results = graph_results;
 
             // Aggregation may return to the source table after graph fanout.
@@ -4136,10 +4160,34 @@ pub const HostedProvisionedTableReadSource = struct {
             var merged = try queryHostedAcrossGroups(self, alloc, group_ids, base_req, table_name, consistency);
             try checkQueryDeadline(base_req);
             defer merged.deinit();
+            var match_anchor_result: ?db_mod.types.SearchResult = null;
+            defer if (match_anchor_result) |*result| result.deinit();
+            if (distributed_graph.requiresCompleteMatchAnchors(req)) {
+                const required_generations = try distributedIdentityGenerationsForGroupsAlloc(alloc, group_ids, merged);
+                defer alloc.free(required_generations);
+                match_anchor_result = try queryHostedAcrossGroupsAtGenerations(
+                    self,
+                    alloc,
+                    group_ids,
+                    completeGraphMatchAnchorRequest(req),
+                    table_name,
+                    consistency,
+                    required_generations,
+                );
+            }
             const graph_req = requestWithResultIdentityGeneration(req, merged);
 
             const worker = hostedGraphWorker(self);
-            const graph_results = try distributed_graph.executeCrossRange(alloc, self.catalog, worker, table_name, graph_req, merged, consistency);
+            const graph_results = try distributed_graph.executeCrossRangeWithMatchAnchors(
+                alloc,
+                self.catalog,
+                worker,
+                table_name,
+                graph_req,
+                merged,
+                match_anchor_result,
+                consistency,
+            );
             merged.graph_results = graph_results;
 
             var meta: query_api.QueryResponseMeta = .{
@@ -5012,6 +5060,99 @@ fn distributedSearchShardLimit(req: db_mod.types.SearchRequest) u32 {
     if (req.search_after.len > 0 or req.search_before.len > 0) return req.limit;
     const shard_limit = req.limit +| req.offset;
     return if (shard_limit == 0) req.limit else shard_limit;
+}
+
+/// Canonical MATCH is a graph relation over the authorized source-table
+/// universe, not over the public retrieval page. Build a bounded identity-only
+/// match-all request while retaining every request-scoped admission predicate.
+fn completeGraphMatchAnchorRequest(req: db_mod.types.SearchRequest) db_mod.types.SearchRequest {
+    return .{
+        .index_name = req.index_name,
+        .primary_text_index_name = req.primary_text_index_name,
+        .filter_text = req.filter_text,
+        .exclusion_text = req.exclusion_text,
+        .filter_query_json = req.filter_query_json,
+        .exclusion_query_json = req.exclusion_query_json,
+        .doc_filter_bindings = req.doc_filter_bindings,
+        .include_all_fields = false,
+        .include_stored = false,
+        .limit = distributed_graph.complete_match_anchor_limit,
+        .filter_prefix = req.filter_prefix,
+        .filter_ids = req.filter_ids,
+        .exclude_ids = req.exclude_ids,
+        .filter_doc_ids = req.filter_doc_ids,
+        .filter_doc_ids_positive = req.filter_doc_ids_positive,
+        .exclude_doc_ids = req.exclude_doc_ids,
+        .resolved_doc_filter = req.resolved_doc_filter,
+        .resolved_text_doc_filter = req.resolved_text_doc_filter,
+        .resolved_doc_filter_wire_context = req.resolved_doc_filter_wire_context,
+        .graph_table_read_authorizer = req.graph_table_read_authorizer,
+        .execution_deadline_ns = req.execution_deadline_ns,
+        .cancellation = req.cancellation,
+        .require_algebraic_filter_resolution = req.require_algebraic_filter_resolution,
+    };
+}
+
+test "complete graph match anchors retain admission and discard retrieval shaping" {
+    const filter_ids = [_]u64{ 3, 7 };
+    const excluded_ids = [_]u64{11};
+    const filter_doc_ids = [_][]const u8{"visible"};
+    const excluded_doc_ids = [_][]const u8{"hidden"};
+    const order_by = [_]db_mod.types.SortField{.{ .field = "rank", .desc = true }};
+    const cursor = [_]std.json.Value{.{ .integer = 42 }};
+
+    const anchors = completeGraphMatchAnchorRequest(.{
+        .index_name = "content",
+        .primary_text_index_name = "body",
+        .aggregations_json = "{\"count\":{}}",
+        .count_only = true,
+        .profile = true,
+        .full_text = .match_all,
+        .filter_text = .match_all,
+        .exclusion_text = .match_none,
+        .filter_query_json = "{\"term\":{\"tenant\":\"one\"}}",
+        .exclusion_query_json = "{\"term\":{\"deleted\":true}}",
+        .order_by = &order_by,
+        .search_after = &cursor,
+        .include_all_fields = true,
+        .include_stored = true,
+        .offset = 80,
+        .limit = 20,
+        .filter_prefix = "tenant-one:",
+        .filter_ids = &filter_ids,
+        .exclude_ids = &excluded_ids,
+        .filter_doc_ids = &filter_doc_ids,
+        .filter_doc_ids_positive = true,
+        .exclude_doc_ids = &excluded_doc_ids,
+        .execution_deadline_ns = 1234,
+        .require_algebraic_filter_resolution = true,
+    });
+
+    try std.testing.expectEqual(std.meta.Tag(db_mod.types.Query).match_all, std.meta.activeTag(anchors.query));
+    try std.testing.expect(anchors.full_text == null);
+    try std.testing.expectEqual(@as(usize, 0), anchors.graph_queries.len);
+    try std.testing.expectEqual(@as(usize, 0), anchors.order_by.len);
+    try std.testing.expectEqual(@as(usize, 0), anchors.search_after.len);
+    try std.testing.expectEqual(@as(u32, 0), anchors.offset);
+    try std.testing.expectEqual(distributed_graph.complete_match_anchor_limit, anchors.limit);
+    try std.testing.expect(!anchors.include_all_fields);
+    try std.testing.expect(!anchors.include_stored);
+    try std.testing.expectEqualStrings("", anchors.aggregations_json);
+    try std.testing.expect(!anchors.count_only);
+    try std.testing.expect(!anchors.profile);
+
+    try std.testing.expectEqual(std.meta.Tag(db_mod.types.TextQuery).match_all, std.meta.activeTag(anchors.filter_text.?));
+    try std.testing.expectEqual(std.meta.Tag(db_mod.types.TextQuery).match_none, std.meta.activeTag(anchors.exclusion_text.?));
+    try std.testing.expectEqualStrings("{\"term\":{\"tenant\":\"one\"}}", anchors.filter_query_json);
+    try std.testing.expectEqualStrings("{\"term\":{\"deleted\":true}}", anchors.exclusion_query_json);
+    try std.testing.expectEqualStrings("tenant-one:", anchors.filter_prefix);
+    try std.testing.expectEqualSlices(u64, &filter_ids, anchors.filter_ids);
+    try std.testing.expectEqualSlices(u64, &excluded_ids, anchors.exclude_ids);
+    try std.testing.expectEqualStrings("visible", anchors.filter_doc_ids[0]);
+    try std.testing.expect(anchors.filter_doc_ids_positive);
+    try std.testing.expectEqualStrings("hidden", anchors.exclude_doc_ids[0]);
+    try std.testing.expectEqual(@as(?u64, 1234), anchors.execution_deadline_ns);
+    try std.testing.expect(anchors.require_algebraic_filter_resolution);
 }
 
 fn distributedSearchShardRequest(

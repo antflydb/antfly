@@ -723,6 +723,15 @@ pub fn supportsCrossRange(req: db_mod.types.SearchRequest) bool {
     return true;
 }
 
+pub fn requiresCompleteMatchAnchors(req: db_mod.types.SearchRequest) bool {
+    for (req.graph_queries) |graph_query| {
+        if (graph_query.query.match_pattern != null) return true;
+    }
+    return false;
+}
+
+pub const complete_match_anchor_limit: u32 = graph_pattern_mod.default_max_intermediate_states + 1;
+
 fn resultHasIdentitySnapshot(
     req: db_mod.types.SearchRequest,
     base_result: db_mod.types.SearchResult,
@@ -801,6 +810,28 @@ fn validateSourceSnapshotGroupSet(
     }
 }
 
+fn validateMatchingSourceSnapshots(
+    base_result: db_mod.types.SearchResult,
+    match_anchor_result: db_mod.types.SearchResult,
+) !void {
+    const base_tokens = base_result.shard_identity_read_generations;
+    const anchor_tokens = match_anchor_result.shard_identity_read_generations;
+    if (base_tokens.len > 0 or anchor_tokens.len > 0) {
+        if (base_tokens.len != anchor_tokens.len) return error.TopologyChanged;
+        for (base_tokens) |base_token| {
+            const anchor_generation = try identityReadGenerationForGroup(
+                null,
+                anchor_tokens,
+                base_token.group_id,
+            );
+            if (anchor_generation.? != base_token.generation) return error.TopologyChanged;
+        }
+        return;
+    }
+    if (base_result.identity_read_generation != match_anchor_result.identity_read_generation)
+        return error.TopologyChanged;
+}
+
 pub fn executeCrossRange(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
@@ -810,9 +841,42 @@ pub fn executeCrossRange(
     base_result: db_mod.types.SearchResult,
     consistency: raft_mod.ReadConsistency,
 ) ![]db_mod.types.GraphSearchResult {
+    return try executeCrossRangeWithMatchAnchors(
+        alloc,
+        catalog,
+        worker,
+        table_name,
+        req,
+        base_result,
+        if (requiresCompleteMatchAnchors(req)) base_result else null,
+        consistency,
+    );
+}
+
+pub fn executeCrossRangeWithMatchAnchors(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    worker: Worker,
+    table_name: []const u8,
+    req: db_mod.types.SearchRequest,
+    base_result: db_mod.types.SearchResult,
+    match_anchor_result: ?db_mod.types.SearchResult,
+    consistency: raft_mod.ReadConsistency,
+) ![]db_mod.types.GraphSearchResult {
     if (!supportsCrossRange(req)) return error.UnsupportedQueryRequest;
     try requireStampedCrossRangeRequest(req, base_result);
     try rejectUnstampedResultRefs(req, base_result);
+    if (requiresCompleteMatchAnchors(req) and match_anchor_result == null)
+        return error.UnsupportedQueryRequest;
+    if (match_anchor_result) |anchors| {
+        if (anchors.total_hits_relation != .exact or
+            @as(u64, anchors.total_hits) > anchors.hits.len or
+            anchors.hits.len > graph_pattern_mod.default_max_intermediate_states)
+            return error.QueryCandidateBudgetExceeded;
+        if (@as(u64, anchors.total_hits) < anchors.hits.len)
+            return error.InvalidQueryResult;
+        try validateMatchingSourceSnapshots(base_result, anchors);
+    }
 
     var request_worker = worker;
     request_worker.execution_deadline_ns = req.execution_deadline_ns;
@@ -822,7 +886,7 @@ pub fn executeCrossRange(
     var attempts: u32 = 0;
     while (true) : (attempts += 1) {
         try request_worker.ensureActive();
-        return executeCrossRangeOnce(alloc, catalog, request_worker, table_name, req, base_result, consistency) catch |err| switch (err) {
+        return executeCrossRangeOnce(alloc, catalog, request_worker, table_name, req, base_result, match_anchor_result, consistency) catch |err| switch (err) {
             error.TopologyChanged, error.UnknownGroup => {
                 if (attempts == 0) continue;
                 return err;
@@ -839,11 +903,14 @@ fn executeCrossRangeOnce(
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
     base_result: db_mod.types.SearchResult,
+    match_anchor_result: ?db_mod.types.SearchResult,
     consistency: raft_mod.ReadConsistency,
 ) ![]db_mod.types.GraphSearchResult {
     if (!supportsCrossRange(req)) return error.UnsupportedQueryRequest;
     try table_catalog.validateDocIdentityReadyForTableStrict(alloc, catalog, table_name);
     try validateSourceSnapshotGroupSet(alloc, catalog, table_name, base_result);
+    if (match_anchor_result) |anchors|
+        try validateSourceSnapshotGroupSet(alloc, catalog, table_name, anchors);
 
     const results = try alloc.alloc(db_mod.types.GraphSearchResult, req.graph_queries.len);
     var initialized: usize = 0;
@@ -860,6 +927,7 @@ fn executeCrossRangeOnce(
             table_name,
             req,
             base_result,
+            match_anchor_result,
             results[0..initialized],
             graph_query,
             consistency,
@@ -1305,6 +1373,7 @@ fn executeSingleCrossRange(
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
     base_result: db_mod.types.SearchResult,
+    match_anchor_result: ?db_mod.types.SearchResult,
     prior_results: []const db_mod.types.GraphSearchResult,
     graph_query: db_mod.types.NamedGraphQuery,
     consistency: raft_mod.ReadConsistency,
@@ -1367,6 +1436,7 @@ fn executeSingleCrossRange(
             table_name,
             req,
             base_result,
+            match_anchor_result,
             prior_results,
             graph_query,
             consistency,
@@ -1447,6 +1517,7 @@ fn executeDistributedPattern(
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
     base_result: db_mod.types.SearchResult,
+    match_anchor_result: ?db_mod.types.SearchResult,
     prior_results: []const db_mod.types.GraphSearchResult,
     graph_query: db_mod.types.NamedGraphQuery,
     consistency: raft_mod.ReadConsistency,
@@ -1455,7 +1526,14 @@ fn executeDistributedPattern(
     // Resolve start keys.
     var state = QueryState{ .name = try alloc.dupe(u8, graph_query.name) };
     errdefer state.deinit(alloc);
-    const frontier = try resolveStartFrontier(alloc, &state, req, base_result, prior_results, graph_query.query.start_nodes, false);
+    const canonical_match = graph_query.query.match_pattern != null;
+    const selector_result = if (canonical_match)
+        match_anchor_result orelse return error.UnsupportedQueryRequest
+    else
+        base_result;
+    var selector_req = req;
+    if (canonical_match) selector_req.limit = 0;
+    const frontier = try resolveStartFrontier(alloc, &state, selector_req, selector_result, prior_results, graph_query.query.start_nodes, false);
     defer freeFrontier(alloc, frontier);
 
     const start_nodes = try alloc.alloc(graph_node_identity.Ref, frontier.len);
@@ -4102,6 +4180,43 @@ test "distributed graph target refs are table exact while raw keys remain wildca
     defer wildcard.deinit(alloc);
     try std.testing.expect(wildcard.contains(null, "shared"));
     try std.testing.expect(wildcard.contains("entities", "shared"));
+}
+
+test "distributed graph complete anchors require the source snapshot" {
+    const source_tokens = [_]db_mod.types.ShardIdentityReadGeneration{
+        .{ .group_id = 11, .generation = 101 },
+        .{ .group_id = 22, .generation = 202 },
+    };
+    const same_tokens_reordered = [_]db_mod.types.ShardIdentityReadGeneration{
+        .{ .group_id = 22, .generation = 202 },
+        .{ .group_id = 11, .generation = 101 },
+    };
+    const stale_tokens = [_]db_mod.types.ShardIdentityReadGeneration{
+        .{ .group_id = 11, .generation = 100 },
+        .{ .group_id = 22, .generation = 202 },
+    };
+    const empty_hits = @constCast((&[_]db_mod.types.SearchHit{})[0..]);
+    const source = db_mod.types.SearchResult{
+        .alloc = std.testing.allocator,
+        .hits = empty_hits,
+        .total_hits = 0,
+        .shard_identity_read_generations = @constCast(source_tokens[0..]),
+    };
+    const same_snapshot = db_mod.types.SearchResult{
+        .alloc = std.testing.allocator,
+        .hits = empty_hits,
+        .total_hits = 0,
+        .shard_identity_read_generations = @constCast(same_tokens_reordered[0..]),
+    };
+    try validateMatchingSourceSnapshots(source, same_snapshot);
+
+    const stale_snapshot = db_mod.types.SearchResult{
+        .alloc = std.testing.allocator,
+        .hits = empty_hits,
+        .total_hits = 0,
+        .shard_identity_read_generations = @constCast(stale_tokens[0..]),
+    };
+    try std.testing.expectError(error.TopologyChanged, validateMatchingSourceSnapshots(source, stale_snapshot));
 }
 
 fn edgeCost(_: FrontierState, node: graph_query_mod.GraphResultNode, mode: graph_paths_mod.PathWeightMode) f64 {

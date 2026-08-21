@@ -826,13 +826,16 @@ fn findReachableNodes(
                 for (edges, 0..) |graph_edge, edge_index| {
                     if (!edgeMatches(graph_edge, edge)) continue;
                     const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
-                    if (std.mem.eql(u8, target_key, frontier.key)) continue;
                     const target_table = edgeTargetTable(
                         frontier.table,
                         graph_edge,
                         target_key,
                     );
-                    if (visited.contains(.{ .table = target_table, .key = target_key })) continue;
+                    const closes_required_target = target_required and
+                        targetNodeMatches(.{ .table = target_table, .key = target_key }, target_nodes, true);
+                    if ((std.mem.eql(u8, target_key, frontier.key) or
+                        visited.contains(.{ .table = target_table, .key = target_key })) and
+                        !closes_required_target) continue;
                     candidate_indexes.appendAssumeCapacity(edge_index);
                     candidate_nodes.appendAssumeCapacity(.{
                         .key = target_key,
@@ -857,7 +860,12 @@ fn findReachableNodes(
                     if (!mask[edge_index]) continue;
                 } else {
                     if (!edgeMatches(graph_edge, edge)) continue;
-                    if (std.mem.eql(u8, target_key, frontier.key)) continue;
+                    const candidate_table = edgeTargetTable(frontier.table, graph_edge, target_key);
+                    const closes_required_target = target_required and
+                        targetNodeMatches(.{ .table = candidate_table, .key = target_key }, target_nodes, true);
+                    if ((std.mem.eql(u8, target_key, frontier.key) or
+                        visited.contains(.{ .table = candidate_table, .key = target_key })) and
+                        !closes_required_target) continue;
                 }
                 const new_hops = frontier.hops + 1;
                 const target_table = edgeTargetTable(
@@ -1096,8 +1104,14 @@ fn buildConjunctiveStates(
 
     var current = std.ArrayListUnmanaged(ConjunctiveState).empty;
     errdefer freeConjunctiveStates(alloc, &current);
-    for (start_keys) |key| {
+    const admitted_starts = if (opts.node_admission) |admission|
+        try admission.filterLocalKeysAlloc(alloc, start_keys)
+    else
+        null;
+    defer if (admitted_starts) |mask| alloc.free(mask);
+    for (start_keys, 0..) |key, start_index| {
         try work_budget.consumeNode();
+        if (admitted_starts) |mask| if (!mask[start_index]) continue;
         if (!(try passesNodeFilter(.{ .table = null, .key = key }, anchor_node.filter, opts.evaluator))) continue;
         const bindings = try alloc.alloc(PatternBinding, 1);
         bindings[0] = initPatternBinding(alloc, anchor_alias, key, null, 0) catch |err| {
@@ -2030,6 +2044,82 @@ test "exact conjunctive aggregate does not inherit row expansion window" {
         alloc.free(aggregates);
     }
     try std.testing.expectEqual(@as(u128, targets.len), aggregates[0].value);
+}
+
+test "conjunctive matcher admits anchors before alias evaluation" {
+    const Reader = struct {
+        pub fn getEdges(_: @This(), a: Allocator, _: ?[]const u8, _: []const u8, _: []const []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            return try a.alloc(graph_mod.Edge, 0);
+        }
+
+        pub fn freeEdges(_: @This(), a: Allocator, edges: []graph_mod.Edge) void {
+            a.free(edges);
+        }
+    };
+    const Admission = struct {
+        fn filter(_: ?*anyopaque, alloc: Allocator, nodes: []const NodeRef) anyerror![]bool {
+            const mask = try alloc.alloc(bool, nodes.len);
+            for (nodes, 0..) |node, i| mask[i] = std.mem.eql(u8, node.key, "allowed");
+            return mask;
+        }
+    };
+    const nodes = [_]MatchNode{.{ .alias = "a" }};
+    const matches = try matchConjunctivePatternWithEdgeReader(
+        std.testing.allocator,
+        Reader{},
+        &.{ "denied", "allowed" },
+        .{ .nodes = &nodes, .edges = &.{} },
+        .{ .node_admission = .{ .ctx = null, .filter_many = Admission.filter } },
+    );
+    defer freeMatches(std.testing.allocator, matches);
+
+    try std.testing.expectEqual(@as(usize, 1), matches.len);
+    try std.testing.expectEqualStrings("allowed", matches[0].bindings[0].key);
+}
+
+test "conjunctive cycle closure survives node admission deduplication" {
+    const Reader = struct {
+        const edges = [_]graph_mod.Edge{
+            .{ .source = "a", .target = "b", .edge_type = "links", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
+            .{ .source = "b", .target = "c", .edge_type = "links", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
+            .{ .source = "c", .target = "a", .edge_type = "links", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
+        };
+
+        pub fn getEdges(_: @This(), a: Allocator, _: ?[]const u8, key: []const u8, _: []const []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            var out = std.ArrayListUnmanaged(graph_mod.Edge).empty;
+            errdefer out.deinit(a);
+            for (edges) |edge| if (std.mem.eql(u8, edge.source, key)) try out.append(a, edge);
+            return try out.toOwnedSlice(a);
+        }
+
+        pub fn freeEdges(_: @This(), a: Allocator, edges_value: []graph_mod.Edge) void {
+            if (edges_value.len > 0) a.free(edges_value);
+        }
+    };
+    const Admission = struct {
+        fn filter(_: ?*anyopaque, alloc: Allocator, nodes_value: []const NodeRef) anyerror![]bool {
+            const mask = try alloc.alloc(bool, nodes_value.len);
+            @memset(mask, true);
+            return mask;
+        }
+    };
+    const nodes = [_]MatchNode{.{ .alias = "x" }};
+    const edges = [_]MatchEdge{.{
+        .from = "x",
+        .to = "x",
+        .step = .{ .types = &.{"links"}, .min_hops = 3, .max_hops = 3 },
+    }};
+    const matches = try matchConjunctivePatternWithEdgeReader(
+        std.testing.allocator,
+        Reader{},
+        &.{"a"},
+        .{ .nodes = &nodes, .edges = &edges },
+        .{ .node_admission = .{ .ctx = null, .filter_many = Admission.filter } },
+    );
+    defer freeMatches(std.testing.allocator, matches);
+
+    try std.testing.expectEqual(@as(usize, 1), matches.len);
+    try std.testing.expectEqualStrings("a", matches[0].bindings[0].key);
 }
 
 test "exact two-edge pattern uses typed batch probes without paths" {
