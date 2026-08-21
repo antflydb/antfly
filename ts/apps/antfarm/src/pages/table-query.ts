@@ -1,4 +1,4 @@
-import type { IndexStatus, QueryRequest } from "@antfly/sdk";
+import type { IndexStatus, QueryRequest, TableStatus } from "@antfly/sdk";
 
 export interface TableQueryBuilderState {
   query: string;
@@ -11,13 +11,17 @@ export interface TableQueryBuilderState {
   returnArtifactMatches?: boolean;
 }
 
-export const DEFAULT_TABLE_QUERY_LIMIT = 3;
+export const DEFAULT_TABLE_QUERY_LIMIT = 10;
+export const DEFAULT_ARTIFACT_QUERY_LIMIT = 3;
 
 type ArtifactAwareIndexConfig = IndexStatus["config"] & {
   artifact_name?: string;
+  embedding_name?: string;
   field?: string;
   source_artifact_name?: string;
 };
+
+type ArtifactEnrichment = NonNullable<TableStatus["artifact_enrichments"]>[number];
 
 export interface ArtifactRetrievalDefaults {
   field: string;
@@ -26,28 +30,47 @@ export interface ArtifactRetrievalDefaults {
 
 export function artifactRetrievalDefaults(
   indexes: IndexStatus[],
-  selectedVectorIndexes: string[]
+  selectedVectorIndexes: string[],
+  tableStatus?: TableStatus | null
 ): ArtifactRetrievalDefaults | null {
-  const candidates =
+  const configs = new Map(indexes.map((index) => [index.config.name, index.config]));
+  for (const [name, config] of Object.entries(tableStatus?.indexes ?? {})) {
+    configs.set(name, config);
+  }
+  const candidateNames =
     selectedVectorIndexes.length > 0
-      ? indexes.filter(
-          (index) =>
-            index.config.type === "embeddings" && selectedVectorIndexes.includes(index.config.name)
-        )
-      : indexes.filter((index) => index.config.type === "full_text");
+      ? selectedVectorIndexes.filter((name) => configs.get(name)?.type === "embeddings")
+      : [...configs].filter(([, config]) => config.type === "full_text").map(([name]) => name);
 
-  for (const index of candidates) {
-    const config = index.config as ArtifactAwareIndexConfig;
-    const artifactEnrichment = config.enrichments?.find(
-      (enrichment) =>
-        (enrichment.kind === "chunk" || enrichment.kind === "asset") &&
-        enrichment.full_text_index === true
-    );
-    const consumesArtifact =
-      Boolean(config.artifact_name || config.source_artifact_name) ||
-      config.enrichments?.some((enrichment) => Boolean(enrichment.source_artifact_name));
+  const tableEnrichments = tableStatus?.artifact_enrichments ?? [];
 
-    if (artifactEnrichment || consumesArtifact) {
+  for (const name of candidateNames) {
+    const config = configs.get(name) as ArtifactAwareIndexConfig | undefined;
+    if (!config) continue;
+
+    const enrichments = structuredEnrichments(config.enrichments);
+    if (config.type === "embeddings" && config.source_artifact_name) {
+      const sourceEnrichment = findEmbeddingSourceEnrichment(config, enrichments, tableEnrichments);
+      return {
+        field: sourceEnrichment?.field?.trim() || "text",
+        returnMatches: true,
+      };
+    }
+
+    const allEnrichments = [...enrichments, ...tableEnrichments];
+    const artifactEnrichment =
+      allEnrichments.find(
+        (enrichment) =>
+          (enrichment.kind === "chunk" || enrichment.kind === "asset") &&
+          enrichment.name === config.artifact_name
+      ) ??
+      allEnrichments.find(
+        (enrichment) =>
+          (enrichment.kind === "chunk" || enrichment.kind === "asset") &&
+          enrichment.full_text_index === true
+      );
+
+    if (artifactEnrichment || config.artifact_name) {
       return {
         field: artifactEnrichment?.field?.trim() || config.field?.trim() || "text",
         returnMatches: true,
@@ -55,6 +78,32 @@ export function artifactRetrievalDefaults(
     }
   }
   return null;
+}
+
+function structuredEnrichments(enrichments: unknown): ArtifactEnrichment[] {
+  if (!Array.isArray(enrichments)) return [];
+  return enrichments.filter(
+    (enrichment): enrichment is ArtifactEnrichment =>
+      typeof enrichment === "object" && enrichment !== null
+  );
+}
+
+function findEmbeddingSourceEnrichment(
+  config: ArtifactAwareIndexConfig,
+  indexEnrichments: ArtifactEnrichment[],
+  tableEnrichments: ArtifactEnrichment[]
+): ArtifactEnrichment | undefined {
+  const enrichments = [...indexEnrichments, ...tableEnrichments];
+  return (
+    enrichments.find(
+      (enrichment) => enrichment.kind === "embedding" && enrichment.name === config.embedding_name
+    ) ??
+    enrichments.find(
+      (enrichment) =>
+        enrichment.kind === "embedding" &&
+        enrichment.source_artifact_name === config.source_artifact_name
+    )
+  );
 }
 
 function parseJsonObject(source: string): Record<string, unknown> | null {
@@ -76,7 +125,17 @@ export function tableQueryInput(request: QueryRequest, artifactSearchField?: str
   if (typeof request.semantic_search === "string") {
     return request.semantic_search;
   }
-  const raw = request.full_text_search as { query?: unknown } | undefined;
+  const raw = request.full_text_search as
+    | { field?: unknown; match?: unknown; query?: unknown }
+    | undefined;
+  if (
+    typeof raw?.match === "string" &&
+    (artifactSearchField === undefined ||
+      raw.field === undefined ||
+      raw.field === artifactSearchField)
+  ) {
+    return raw.match;
+  }
   if (typeof raw?.query !== "string") {
     return "";
   }
@@ -112,13 +171,12 @@ export function tableQueryErrorMessage(error: unknown, fallback: string): string
   return fallback;
 }
 
-function fieldScopedTextQuery(field: string, query: string): string {
+function artifactFullTextQuery(field: string, query: string): QueryRequest["full_text_search"] {
   const reservedOperator = ["AND", "OR", "NOT"].includes(query.toUpperCase());
   if (!reservedOperator && /^[\p{L}\p{N}_]+$/u.test(query)) {
-    return `${field}:${query}`;
+    return { query: `${field}:${query}` };
   }
-  const quoted = query.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-  return `${field}:"${quoted}"`;
+  return { match: query, field };
 }
 
 export function buildTableQueryRequest({
@@ -139,11 +197,9 @@ export function buildTableQueryRequest({
     request.indexes = queryIndexes;
     request.semantic_search = trimmedQuery;
   } else if (trimmedQuery.length > 0) {
-    request.full_text_search = {
-      query: artifactSearchField
-        ? fieldScopedTextQuery(artifactSearchField, trimmedQuery)
-        : trimmedQuery,
-    };
+    request.full_text_search = artifactSearchField
+      ? artifactFullTextQuery(artifactSearchField, trimmedQuery)
+      : { query: trimmedQuery };
   }
   if (selectedFields.length > 0) {
     request.fields = selectedFields;
@@ -158,7 +214,12 @@ export function buildTableQueryRequest({
   if (options?.aggregations !== undefined) {
     request.aggregations = options.aggregations as QueryRequest["aggregations"];
   }
-  request.limit = typeof options?.limit === "number" ? options.limit : DEFAULT_TABLE_QUERY_LIMIT;
+  request.limit =
+    typeof options?.limit === "number"
+      ? options.limit
+      : returnArtifactMatches
+        ? DEFAULT_ARTIFACT_QUERY_LIMIT
+        : DEFAULT_TABLE_QUERY_LIMIT;
   if (!hasSemanticQuery && typeof options?.offset === "number") {
     request.offset = options.offset;
   }

@@ -58,7 +58,7 @@ import type {
 import { queryResultTotalHits } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import type React from "react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, type TableSchema } from "../api";
 import AggregationResults from "../components/AggregationResults";
@@ -237,8 +237,11 @@ interface TableDetailsPageProps {
 const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "overview" }) => {
   const theme = localStorage.getItem("theme") || "light";
   const { tableName } = useParams<{ tableName: string }>();
+  const activeTableName = useRef(tableName);
+  activeTableName.current = tableName;
   const navigate = useNavigate();
   const [indexes, setIndexes] = useState<IndexStatus[]>([]);
+  const [tableStatus, setTableStatus] = useState<TableStatus | null>(null);
   const [tableSchema, setTableSchema] = useState<TableSchema | null>(null);
   const [storageStatus, setStorageStatus] = useState<TableStatus["storage_status"] | null>(null);
   const [documentCount, setDocumentCount] = useState<number | null>(null);
@@ -272,8 +275,8 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   const [queryMode, setQueryMode] = useState<"builder" | "json">("builder");
 
   const artifactRetrieval = useMemo(
-    () => artifactRetrievalDefaults(indexes, queryIndexes),
-    [indexes, queryIndexes]
+    () => artifactRetrievalDefaults(indexes, queryIndexes, tableStatus),
+    [indexes, queryIndexes, tableStatus]
   );
 
   const semanticQueryRequest = useMemo(() => {
@@ -320,7 +323,8 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         // Set query content (search mode is auto-detected from content)
         const nextArtifactRetrieval = artifactRetrievalDefaults(
           indexes,
-          queryRequest.indexes || []
+          queryRequest.indexes || [],
+          tableStatus
         );
         setQuery(tableQueryInput(queryRequest, nextArtifactRetrieval?.field));
 
@@ -353,8 +357,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     if (!tableName) return;
     try {
       const response = await api.indexes.list(tableName);
+      if (activeTableName.current !== tableName) return;
       setIndexes(response as IndexStatus[]);
     } catch (e) {
+      if (activeTableName.current !== tableName) return;
       setError(`Failed to fetch indexes for table ${tableName}.`);
       console.error(e);
     }
@@ -364,6 +370,8 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     if (!tableName) return;
     try {
       const response = await api.tables.get(tableName);
+      if (activeTableName.current !== tableName) return;
+      setTableStatus((response as TableStatus | undefined) ?? null);
       if (response?.schema && Object.keys(response.schema).length > 0) {
         setTableSchema(response.schema as TableSchema);
       } else {
@@ -372,8 +380,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       setStorageStatus((response as TableStatus | undefined)?.storage_status ?? null);
       setMigration(response?.migration);
     } catch {
+      if (activeTableName.current !== tableName) return;
       // This is a 404, so we can ignore it.
       setTableSchema(null);
+      setTableStatus(null);
       setStorageStatus(null);
       setMigration(undefined);
     }
@@ -391,8 +401,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         count: true,
         limit: 0,
       } as QueryRequest);
+      if (activeTableName.current !== tableName) return;
       setDocumentCount(queryResultTotalHits(response?.responses?.[0]) ?? null);
     } catch {
+      if (activeTableName.current !== tableName) return;
       setDocumentCount(null);
     }
   }, [storageStatus?.empty, tableName]);
@@ -410,6 +422,8 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   useEffect(() => {
     if (!tableName) return;
     setIsEditingSchema(false);
+    setIndexes([]);
+    setTableStatus(null);
     setQuery("");
     setQueryResult(null);
     setQueryIndexes([]);
@@ -472,8 +486,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         return;
       }
       const response = await api.tables.query(tableName, queryRequest);
+      if (activeTableName.current !== tableName) return;
       setQueryResult(response?.responses?.[0] || null);
     } catch (e) {
+      if (activeTableName.current !== tableName) return;
       setError(tableQueryErrorMessage(e, `Failed to run query on table ${tableName}.`));
       console.error(e);
     }

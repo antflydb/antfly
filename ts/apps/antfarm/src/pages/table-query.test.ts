@@ -1,4 +1,4 @@
-import type { IndexStatus } from "@antfly/sdk";
+import type { IndexStatus, TableStatus } from "@antfly/sdk";
 import { describe, expect, it } from "vitest";
 import {
   artifactRetrievalDefaults,
@@ -20,7 +20,7 @@ describe("buildTableQueryRequest", () => {
         includeProfile: true,
       })
     ).toEqual({
-      limit: 3,
+      limit: 10,
       profile: true,
     });
   });
@@ -53,7 +53,7 @@ describe("buildTableQueryRequest", () => {
       })
     ).toEqual({
       full_text_search: { query: "singularity" },
-      limit: 3,
+      limit: 10,
     });
   });
 
@@ -98,7 +98,7 @@ describe("buildTableQueryRequest", () => {
     });
   });
 
-  it("quotes multi-word artifact queries without exposing query syntax", () => {
+  it("uses a structured match for natural multi-word artifact queries", () => {
     expect(
       buildTableQueryRequest({
         query: '  event horizon "image"  ',
@@ -111,7 +111,7 @@ describe("buildTableQueryRequest", () => {
         returnArtifactMatches: true,
       })
     ).toMatchObject({
-      full_text_search: { query: 'text:"event horizon \\"image\\""' },
+      full_text_search: { field: "text", match: 'event horizon "image"' },
       fields: ["text", "title"],
     });
   });
@@ -154,7 +154,7 @@ describe("buildTableQueryRequest", () => {
         includeProfile: false,
       })
     ).toEqual({
-      limit: 3,
+      limit: 10,
     });
   });
 });
@@ -164,6 +164,32 @@ describe("table query builder UX", () => {
     const indexes = [
       {
         config: {
+          name: "document_text",
+          type: "full_text",
+          artifact_name: "document_chunks_v1",
+          enrichments: ["document_units_v1", "document_chunks_v1"],
+        },
+        shard_status: {},
+        status: { index_type: "full_text" },
+      },
+      {
+        config: {
+          name: "document_vectors",
+          type: "embeddings",
+          field: "embedding",
+          embedding_name: "document_chunk_dense_v1",
+          source_artifact_name: "document_chunks_v1",
+          enrichments: ["document_chunk_dense_v1"],
+        },
+        shard_status: {},
+        status: { index_type: "embeddings" },
+      },
+    ] as unknown as IndexStatus[];
+
+    const tableStatus = {
+      name: "docs",
+      indexes: {
+        document_text: {
           name: "document_text",
           type: "full_text",
           field: "text",
@@ -178,26 +204,62 @@ describe("table query builder UX", () => {
             },
           ],
         },
-        shard_status: {},
-        status: { index_type: "full_text" },
-      },
-      {
-        config: {
+        document_vectors: {
           name: "document_vectors",
           type: "embeddings",
-          field: "text",
+          field: "embedding",
+          embedding_name: "document_chunk_dense_v1",
           source_artifact_name: "document_chunks_v1",
+          enrichments: [
+            {
+              name: "document_chunk_dense_v1",
+              kind: "embedding",
+              field: "text",
+              source_artifact_name: "document_chunks_v1",
+            },
+          ],
         },
-        shard_status: {},
-        status: { index_type: "embeddings" },
       },
-    ] as IndexStatus[];
+      shards: {},
+      storage_status: {},
+    } as TableStatus;
 
-    expect(artifactRetrievalDefaults(indexes, [])).toEqual({
+    expect(artifactRetrievalDefaults(indexes, [], tableStatus)).toEqual({
       field: "text",
       returnMatches: true,
     });
-    expect(artifactRetrievalDefaults(indexes, ["document_vectors"])).toEqual({
+    expect(artifactRetrievalDefaults(indexes, ["document_vectors"], tableStatus)).toEqual({
+      field: "text",
+      returnMatches: true,
+    });
+  });
+
+  it("detects separately registered chunk enrichments routed to full-text search", () => {
+    const indexes = [
+      {
+        config: { name: "full_text_index_v0", type: "full_text" },
+        shard_status: {},
+        status: { index_type: "full_text" },
+      },
+    ] as IndexStatus[];
+    const tableStatus = {
+      name: "docs",
+      indexes: {
+        full_text_index_v0: { name: "full_text_index_v0", type: "full_text" },
+      },
+      shards: {},
+      storage_status: {},
+      artifact_enrichments: [
+        {
+          name: "document_chunks_v1",
+          kind: "chunk",
+          field: "text",
+          full_text_index: true,
+        },
+      ],
+    } as TableStatus;
+
+    expect(artifactRetrievalDefaults(indexes, [], tableStatus)).toEqual({
       field: "text",
       returnMatches: true,
     });
@@ -222,6 +284,9 @@ describe("table query builder UX", () => {
     expect(tableQueryInput({ full_text_search: { query: 'text:"event horizon"' } }, "text")).toBe(
       "event horizon"
     );
+    expect(
+      tableQueryInput({ full_text_search: { match: "event horizon", field: "text" } }, "text")
+    ).toBe("event horizon");
   });
 
   it("shows Problem Details and Error messages instead of undefined", () => {
