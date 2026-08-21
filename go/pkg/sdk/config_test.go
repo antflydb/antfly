@@ -104,13 +104,16 @@ func TestNewCreateIndexRequestConvertsNamedIndexConfig(t *testing.T) {
 	}
 }
 
-func TestNewCreateIndexRequestPreservesLegacyVariantPayload(t *testing.T) {
+func TestNewCreateIndexRequestPreservesSupportedGraphMappingPayload(t *testing.T) {
 	var legacy IndexConfig
 	if err := json.Unmarshal([]byte(`{
 		"name":"relationships",
 		"type":"graph",
 		"source":{"kind":"artifact","artifact":"relations"},
-		"future_option":{"enabled":true}
+		"nodes":{"model":"document","target":"{{ _item.target.text }}"},
+		"edge":{"weight":"{{ _item.score }}","metadata":{"source":"extractor"}},
+		"context":{"doc_fields":["title"]},
+		"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring"}}
 	}`), &legacy); err != nil {
 		t.Fatalf("unmarshal index config: %v", err)
 	}
@@ -130,9 +133,84 @@ func TestNewCreateIndexRequestPreservesLegacyVariantPayload(t *testing.T) {
 	if _, exists := body["name"]; exists {
 		t.Fatalf("request must not duplicate path-owned name: %s", data)
 	}
-	future, ok := body["future_option"].(map[string]any)
-	if !ok || future["enabled"] != true {
-		t.Fatalf("converted request lost variant payload: %s", data)
+	nodes, ok := body["nodes"].(map[string]any)
+	if !ok || nodes["target"] != "{{ _item.target.text }}" {
+		t.Fatalf("converted request lost node mapping: %s", data)
+	}
+	edge, ok := body["edge"].(map[string]any)
+	if !ok || edge["weight"] != "{{ _item.score }}" {
+		t.Fatalf("converted request lost edge mapping: %s", data)
+	}
+	planning, ok := body["algebraic_planning"].(map[string]any)
+	if !ok {
+		t.Fatalf("converted request lost algebraic planning: %s", data)
+	}
+	bounded, ok := planning["bounded_traversal"].(map[string]any)
+	if !ok || bounded["law"] != "provenance_semiring" {
+		t.Fatalf("converted request lost traversal law: %s", data)
+	}
+}
+
+func TestNewCreateIndexRequestSupportsTypedGraphMapping(t *testing.T) {
+	var source, target, edgeType, weight GraphTemplateValue
+	if err := source.FromGraphTemplateValue0("{{ _doc.key }}"); err != nil {
+		t.Fatalf("set source template: %v", err)
+	}
+	if err := target.FromGraphTemplateValue0("{{ _item.target.text }}"); err != nil {
+		t.Fatalf("set target template: %v", err)
+	}
+	if err := edgeType.FromGraphTemplateValue0("{{ _item.type }}"); err != nil {
+		t.Fatalf("set edge type template: %v", err)
+	}
+	if err := weight.FromGraphTemplateValue1(0.75); err != nil {
+		t.Fatalf("set edge weight: %v", err)
+	}
+
+	request, err := NewCreateIndexRequest(GraphIndexConfig{
+		Source: GraphArtifactSourceConfig{
+			Kind:     GraphArtifactSourceConfigKindArtifact,
+			Artifact: "relations_v1",
+		},
+		Nodes: GraphArtifactNodeMappingConfig{
+			Model:  GraphArtifactNodeMappingConfigModelDocument,
+			Source: source,
+			Target: target,
+		},
+		Edge: GraphArtifactEdgeMappingConfig{
+			Type:     edgeType,
+			Weight:   weight,
+			Metadata: map[string]any{"source": "extractor"},
+		},
+		Context: GraphArtifactContextConfig{DocFields: []string{"title", "body"}},
+		AlgebraicPlanning: GraphAlgebraicPlanningConfig{
+			BoundedTraversal: GraphBoundedTraversalConfig{
+				Law:     GraphBoundedTraversalConfigLawProvenanceSemiring,
+				Enabled: true,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewCreateIndexRequest failed: %v", err)
+	}
+	data, err := json.Marshal(request)
+	if err != nil {
+		t.Fatalf("marshal create index request: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatalf("unmarshal create index request: %v", err)
+	}
+	if body["type"] != "graph" {
+		t.Fatalf("type = %v, want graph: %s", body["type"], data)
+	}
+	edge := body["edge"].(map[string]any)
+	if edge["weight"] != 0.75 {
+		t.Fatalf("edge weight = %v, want 0.75: %s", edge["weight"], data)
+	}
+	planning := body["algebraic_planning"].(map[string]any)
+	bounded := planning["bounded_traversal"].(map[string]any)
+	if bounded["law"] != "provenance_semiring" {
+		t.Fatalf("traversal law = %v: %s", bounded["law"], data)
 	}
 }
 

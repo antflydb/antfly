@@ -266,13 +266,26 @@ type (
 	ReplicationRoute       = oapi.ReplicationRoute
 
 	// Graph index types
-	GraphIndexConfig       = oapi.GraphIndexConfig
-	GraphIndexStats        = oapi.GraphIndexStats
-	EdgeTypeConfig         = oapi.EdgeTypeConfig
-	EdgeTypeConfigTopology = oapi.EdgeTypeConfigTopology
-	EdgeDirection          = oapi.EdgeDirection
-	Edge                   = oapi.Edge
-	EdgesResponse          = oapi.EdgesResponse
+	GraphIndexConfig                    = oapi.GraphIndexConfig
+	GraphIndexStats                     = oapi.GraphIndexStats
+	GraphArtifactSourceConfig           = oapi.GraphArtifactSourceConfig
+	GraphArtifactSourceConfigKind       = oapi.GraphArtifactSourceConfigKind
+	GraphArtifactProducerConfig         = oapi.GraphArtifactProducerConfig
+	GraphArtifactNodeMappingConfig      = oapi.GraphArtifactNodeMappingConfig
+	GraphArtifactNodeMappingConfigModel = oapi.GraphArtifactNodeMappingConfigModel
+	GraphArtifactEdgeMappingConfig      = oapi.GraphArtifactEdgeMappingConfig
+	GraphArtifactContextConfig          = oapi.GraphArtifactContextConfig
+	GraphAlgebraicPlanningConfig        = oapi.GraphAlgebraicPlanningConfig
+	GraphBoundedTraversalConfig         = oapi.GraphBoundedTraversalConfig
+	GraphBoundedTraversalConfigLaw      = oapi.GraphBoundedTraversalConfigLaw
+	GraphTemplateValue                  = oapi.GraphTemplateValue
+	GraphTemplateValue0                 = oapi.GraphTemplateValue0
+	GraphTemplateValue1                 = oapi.GraphTemplateValue1
+	EdgeTypeConfig                      = oapi.EdgeTypeConfig
+	EdgeTypeConfigTopology              = oapi.EdgeTypeConfigTopology
+	EdgeDirection                       = oapi.EdgeDirection
+	Edge                                = oapi.Edge
+	EdgesResponse                       = oapi.EdgesResponse
 
 	// Graph query types
 	GraphQuery        = oapi.GraphQuery
@@ -726,6 +739,12 @@ const (
 	// EdgeTypeConfigTopology values
 	EdgeTypeConfigTopologyGraph = oapi.EdgeTypeConfigTopologyGraph
 	EdgeTypeConfigTopologyTree  = oapi.EdgeTypeConfigTopologyTree
+
+	// Graph artifact mapping values
+	GraphArtifactSourceConfigKindArtifact            = oapi.GraphArtifactSourceConfigKindArtifact
+	GraphArtifactNodeMappingConfigModelDocument      = oapi.GraphArtifactNodeMappingConfigModelDocument
+	GraphArtifactNodeMappingConfigModelExternal      = oapi.GraphArtifactNodeMappingConfigModelExternal
+	GraphBoundedTraversalConfigLawProvenanceSemiring = oapi.GraphBoundedTraversalConfigLawProvenanceSemiring
 
 	// GraphQueryType values
 	GraphQueryTypeKShortestPaths = oapi.GraphQueryTypeKShortestPaths

@@ -35,6 +35,11 @@ pub const CreatedObjectShape = enum {
     enrichment,
     graph_source,
     graph_artifact,
+    graph_nodes,
+    graph_edge,
+    graph_context,
+    graph_algebraic_planning,
+    graph_bounded_traversal,
     edge_types,
     edge_type,
     graph_resolvers,
@@ -83,6 +88,10 @@ pub fn isAllowedConfigField(kind: Kind, field: []const u8) bool {
             std.mem.eql(u8, field, "max_edges_per_document") or
             std.mem.eql(u8, field, "source") or
             std.mem.eql(u8, field, "artifact") or
+            std.mem.eql(u8, field, "nodes") or
+            std.mem.eql(u8, field, "edge") or
+            std.mem.eql(u8, field, "context") or
+            std.mem.eql(u8, field, "algebraic_planning") or
             std.mem.eql(u8, field, "resolvers"),
         .algebraic => std.mem.eql(u8, field, "derive_from_schema"),
     };
@@ -136,6 +145,14 @@ pub fn createdObjectShapeForRootField(kind: Kind, field: []const u8) CreatedObje
             .graph_source
         else if (std.mem.eql(u8, field, "artifact"))
             .graph_artifact
+        else if (std.mem.eql(u8, field, "nodes"))
+            .graph_nodes
+        else if (std.mem.eql(u8, field, "edge"))
+            .graph_edge
+        else if (std.mem.eql(u8, field, "context"))
+            .graph_context
+        else if (std.mem.eql(u8, field, "algebraic_planning"))
+            .graph_algebraic_planning
         else if (std.mem.eql(u8, field, "edge_types"))
             .edge_types
         else if (std.mem.eql(u8, field, "resolvers"))
@@ -170,7 +187,8 @@ fn createdObjectHasRequiredFields(shape: CreatedObjectShape, object: std.json.Ob
         .graph_source => &.{ "kind", "artifact" },
         .edge_type => &.{"name"},
         .graph_resolver => &.{ "name", "table", "source_artifact", "resolution_artifact", "key_template" },
-        .unrestricted, .enrichments, .edge_types, .graph_resolvers, .chunker_text, .chunker_audio, .index_execution, .execution_policy => &.{},
+        .graph_bounded_traversal => &.{"law"},
+        .unrestricted, .enrichments, .edge_types, .graph_resolvers, .graph_nodes, .graph_edge, .graph_context, .graph_algebraic_planning, .chunker_text, .chunker_audio, .index_execution, .execution_policy => &.{},
     };
     for (required_fields) |field| {
         const value = object.get(field) orelse return false;
@@ -189,6 +207,7 @@ pub fn createdObjectShapeForChild(parent: CreatedObjectShape, field: []const u8)
         else
             .unrestricted,
         .index_execution => if (isAllowedIndexExecutionField(field)) .execution_policy else .unrestricted,
+        .graph_algebraic_planning => if (std.mem.eql(u8, field, "bounded_traversal")) .graph_bounded_traversal else .unrestricted,
         else => .unrestricted,
     };
 }
@@ -201,6 +220,11 @@ pub fn isAllowedCreatedObjectField(shape: CreatedObjectShape, field: []const u8)
         .enrichment => isAllowedCreatedEnrichmentField(field),
         .graph_source => isAllowedGraphArtifactSourceField(field),
         .graph_artifact => isAllowedCreatedGraphArtifactField(field),
+        .graph_nodes => isAllowedGraphNodeMappingField(field),
+        .graph_edge => isAllowedGraphEdgeMappingField(field),
+        .graph_context => isAllowedGraphContextField(field),
+        .graph_algebraic_planning => std.mem.eql(u8, field, "bounded_traversal"),
+        .graph_bounded_traversal => std.mem.eql(u8, field, "law") or std.mem.eql(u8, field, "enabled"),
         .edge_type => isAllowedEdgeTypeField(field),
         .graph_resolver => isAllowedGraphResolverField(field),
         .chunker => isAllowedChunkerField(field),
@@ -249,7 +273,11 @@ pub fn rootFieldValueMatches(kind: Kind, field: []const u8, value: std.json.Valu
             value == .array
         else if (std.mem.eql(u8, field, "summarizer") or
             std.mem.eql(u8, field, "source") or
-            std.mem.eql(u8, field, "artifact"))
+            std.mem.eql(u8, field, "artifact") or
+            std.mem.eql(u8, field, "nodes") or
+            std.mem.eql(u8, field, "edge") or
+            std.mem.eql(u8, field, "context") or
+            std.mem.eql(u8, field, "algebraic_planning"))
             value == .object
         else
             isString(value),
@@ -266,6 +294,14 @@ pub fn createdFieldValueMatches(shape: CreatedObjectShape, field: []const u8, va
         .provider => providerFieldValueMatches(field, value),
         .enrichment => enrichmentFieldValueMatches(field, value),
         .graph_source, .graph_artifact => isString(value),
+        .graph_nodes => graphNodeMappingFieldValueMatches(field, value),
+        .graph_edge => graphEdgeMappingFieldValueMatches(field, value),
+        .graph_context => isNonEmptyStringArray(value),
+        .graph_algebraic_planning => value == .object,
+        .graph_bounded_traversal => if (std.mem.eql(u8, field, "enabled"))
+            isBool(value)
+        else
+            value == .string and std.mem.eql(u8, value.string, "provenance_semiring"),
         .edge_type => edgeTypeFieldValueMatches(field, value),
         .graph_resolver => graphResolverFieldValueMatches(field, value),
         .chunker => chunkerFieldValueMatches(field, value),
@@ -319,6 +355,19 @@ fn graphResolverFieldValueMatches(field: []const u8, value: std.json.Value) bool
     return isString(value);
 }
 
+fn graphNodeMappingFieldValueMatches(field: []const u8, value: std.json.Value) bool {
+    if (std.mem.eql(u8, field, "model")) {
+        return value == .string and
+            (std.mem.eql(u8, value.string, "document") or std.mem.eql(u8, value.string, "external"));
+    }
+    return isString(value) or isNumber(value);
+}
+
+fn graphEdgeMappingFieldValueMatches(field: []const u8, value: std.json.Value) bool {
+    if (std.mem.eql(u8, field, "metadata")) return value == .object;
+    return isString(value) or isNumber(value);
+}
+
 fn chunkerFieldValueMatches(field: []const u8, value: std.json.Value) bool {
     if (std.mem.eql(u8, field, "store_chunks")) return isBool(value);
     if (std.mem.eql(u8, field, "full_text_index") or
@@ -349,6 +398,14 @@ fn isStringArray(value: std.json.Value) bool {
     if (value != .array) return false;
     for (value.array.items) |item| {
         if (item != .string) return false;
+    }
+    return true;
+}
+
+fn isNonEmptyStringArray(value: std.json.Value) bool {
+    if (value != .array) return false;
+    for (value.array.items) |item| {
+        if (item != .string or item.string.len == 0) return false;
     }
     return true;
 }
@@ -392,6 +449,22 @@ pub fn isAllowedGraphArtifactSourceField(field: []const u8) bool {
         std.mem.eql(u8, field, "path") or
         std.mem.eql(u8, field, "format") or
         std.mem.eql(u8, field, "mention_edge_type");
+}
+
+pub fn isAllowedGraphNodeMappingField(field: []const u8) bool {
+    return std.mem.eql(u8, field, "model") or
+        std.mem.eql(u8, field, "source") or
+        std.mem.eql(u8, field, "target");
+}
+
+pub fn isAllowedGraphEdgeMappingField(field: []const u8) bool {
+    return std.mem.eql(u8, field, "type") or
+        std.mem.eql(u8, field, "weight") or
+        std.mem.eql(u8, field, "metadata");
+}
+
+pub fn isAllowedGraphContextField(field: []const u8) bool {
+    return std.mem.eql(u8, field, "doc_fields");
 }
 
 pub fn isAllowedGraphArtifactRequestField(field: []const u8) bool {

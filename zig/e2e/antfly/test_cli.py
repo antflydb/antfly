@@ -28,7 +28,6 @@ import time
 from pathlib import Path
 
 import pytest
-import requests
 
 from conftest import (
     DEFAULT_ANTFLY_BIN,
@@ -36,7 +35,6 @@ from conftest import (
     InferenceGeneratorServer,
     StandaloneAntflyServer,
     resolve_binary_path,
-    wait_for_server,
 )
 from helpers import wait_until
 from port_reservations import find_free_port
@@ -310,6 +308,26 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         assert "warning:" not in image_query.stderr.lower()
         image_hits = parse_json(image_query.stdout)["responses"][0]["hits"]["hits"]
         assert image_hits[0]["_id"] == "doc:alpha"
+
+        # Creating another derived index can briefly advance the table's
+        # catalog generation before every shard has republished sibling
+        # coverage. Re-establish the documented readiness precondition before
+        # exercising retrieval so the advisory remains meaningful and the
+        # pipeline is deterministic across runners.
+        text_wait_after_index_create = cli(
+            "index",
+            "wait",
+            "--table",
+            table,
+            "--index",
+            "title_body",
+            "--timeout",
+            "20s",
+            "--poll-interval",
+            "25ms",
+            timeout_s=30.0,
+        )
+        assert "title_body\tembeddings\tready" in text_wait_after_index_create.stdout
 
         rag = cli(
             "agents",

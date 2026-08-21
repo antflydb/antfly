@@ -3924,6 +3924,11 @@ test "created nested response allowlists cover generated schemas" {
     try expectCreatedObjectAllowlistCovers(indexes_openapi.CreatedEnrichmentConfig, .enrichment);
     try expectCreatedObjectAllowlistCovers(indexes_openapi.GraphArtifactSourceConfig, .graph_source);
     try expectCreatedObjectAllowlistCovers(indexes_openapi.CreatedGraphArtifactProducerConfig, .graph_artifact);
+    try expectCreatedObjectAllowlistCovers(indexes_openapi.GraphArtifactNodeMappingConfig, .graph_nodes);
+    try expectCreatedObjectAllowlistCovers(indexes_openapi.GraphArtifactEdgeMappingConfig, .graph_edge);
+    try expectCreatedObjectAllowlistCovers(indexes_openapi.GraphArtifactContextConfig, .graph_context);
+    try expectCreatedObjectAllowlistCovers(indexes_openapi.GraphAlgebraicPlanningConfig, .graph_algebraic_planning);
+    try expectCreatedObjectAllowlistCovers(indexes_openapi.GraphBoundedTraversalConfig, .graph_bounded_traversal);
     try expectCreatedObjectAllowlistCovers(indexes_openapi.EdgeTypeConfig, .edge_type);
     try expectCreatedObjectAllowlistCovers(indexes_openapi.GraphResolverConfig, .graph_resolver);
     try expectCreatedObjectAllowlistCovers(chunking_openapi.ChunkerConfig, .chunker);
@@ -3944,6 +3949,11 @@ test "created nested response allowlists cover generated schemas" {
         .enrichment,
         .graph_source,
         .graph_artifact,
+        .graph_nodes,
+        .graph_edge,
+        .graph_context,
+        .graph_algebraic_planning,
+        .graph_bounded_traversal,
         .edge_type,
         .graph_resolver,
         .chunker,
@@ -4007,10 +4017,10 @@ test "public index config encoders omit root write-only producer documents" {
 
 test "created graph index response projects closed nested schemas" {
     const config =
-        \\{"type":"graph","template":{"client_value":"private-root-value"},"source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":{"client_value":"private-format-value"},"client_value":"private-source-value","settings":{"opaque":"private-source-settings"}},"artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":{"client_value":"private-content-type"},"producer_json":{"provider":"private","api_key":"private-key"},"client_value":"private-artifact-value","settings":{"opaque":"private-artifact-settings"}},"edge_types":[{"name":"mentions","field":"relations","topology":"graph","max_weight":0.9,"min_weight":0,"allow_self_loops":false,"required_metadata":["source","confidence"],"client_value":"private-edge-value"},{"name":"malformed","required_metadata":{"client_value":"private-metadata-value"}},{"name":{"client_value":"private-required-value"}}],"resolvers":["private-malformed-resolver",{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_search":"prefix","candidate_limit":{"client_value":"private-limit-value"},"client_value":"private-resolver-value","settings":{"opaque":"private-resolver-settings"}}]}
+        \\{"type":"graph","template":{"client_value":"private-root-value"},"source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":{"client_value":"private-format-value"},"client_value":"private-source-value","settings":{"opaque":"private-source-settings"}},"artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":{"client_value":"private-content-type"},"producer_json":{"provider":"private","api_key":"private-key"},"client_value":"private-artifact-value","settings":{"opaque":"private-artifact-settings"}},"nodes":{"model":"document","source":"{{ _doc.key }}","target":"{{ _item.target.text }}","client_value":"private-node-value"},"edge":{"type":"{{ _item.predicate }}","weight":0.75,"metadata":{"source":"extractor","api_key":"private-metadata-key","nested":{"label":"public","authorization":"private-authorization"}},"client_value":"private-edge-mapping-value"},"context":{"doc_fields":["title","body"],"client_value":"private-context-value"},"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring","enabled":true,"client_value":"private-bounded-value"},"client_value":"private-planning-value"},"edge_types":[{"name":"mentions","field":"relations","topology":"graph","max_weight":0.9,"min_weight":0,"allow_self_loops":false,"required_metadata":["source","confidence"],"client_value":"private-edge-value"},{"name":"malformed","required_metadata":{"client_value":"private-metadata-value"}},{"name":{"client_value":"private-required-value"}}],"resolvers":["private-malformed-resolver",{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_search":"prefix","candidate_limit":{"client_value":"private-limit-value"},"client_value":"private-resolver-value","settings":{"opaque":"private-resolver-settings"}}]}
     ;
     const expected =
-        \\{"name":"relations_graph","type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]"},"artifact":{"name":"relations_v1","kind":"asset","field":"relations"},"edge_types":[{"name":"mentions","field":"relations","topology":"graph","max_weight":0.9,"min_weight":0,"allow_self_loops":false,"required_metadata":["source","confidence"]},{"name":"malformed"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_search":"prefix"}]}
+        \\{"name":"relations_graph","type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]"},"artifact":{"name":"relations_v1","kind":"asset","field":"relations"},"nodes":{"model":"document","source":"{{ _doc.key }}","target":"{{ _item.target.text }}"},"edge":{"type":"{{ _item.predicate }}","weight":0.75,"metadata":{"source":"extractor","nested":{"label":"public"}}},"context":{"doc_fields":["title","body"]},"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring","enabled":true}},"edge_types":[{"name":"mentions","field":"relations","topology":"graph","max_weight":0.9,"min_weight":0,"allow_self_loops":false,"required_metadata":["source","confidence"]},{"name":"malformed"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_search":"prefix"}]}
     ;
     const created = try encodeCreatedIndexConfig(std.testing.allocator, "relations_graph", config);
     defer std.testing.allocator.free(created);

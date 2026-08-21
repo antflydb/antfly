@@ -1908,6 +1908,10 @@ pub const CreateGraphIndexRequest = struct {
     max_edges_per_document: ?i64 = null,
     source: ?GraphArtifactSourceConfig = null,
     artifact: ?GraphArtifactProducerConfig = null,
+    nodes: ?GraphArtifactNodeMappingConfig = null,
+    edge: ?GraphArtifactEdgeMappingConfig = null,
+    context: ?GraphArtifactContextConfig = null,
+    algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
     type: []const u8,
 };
@@ -2114,6 +2118,10 @@ pub const CreatedGraphIndex = struct {
     max_edges_per_document: ?i64 = null,
     source: ?GraphArtifactSourceConfig = null,
     artifact: ?CreatedGraphArtifactProducerConfig = null,
+    nodes: ?GraphArtifactNodeMappingConfig = null,
+    edge: ?GraphArtifactEdgeMappingConfig = null,
+    context: ?GraphArtifactContextConfig = null,
+    algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
     type: []const u8,
 };
@@ -2126,6 +2134,10 @@ pub const CreatedGraphIndexConfig = struct {
     max_edges_per_document: ?i64 = null,
     source: ?GraphArtifactSourceConfig = null,
     artifact: ?CreatedGraphArtifactProducerConfig = null,
+    nodes: ?GraphArtifactNodeMappingConfig = null,
+    edge: ?GraphArtifactEdgeMappingConfig = null,
+    context: ?GraphArtifactContextConfig = null,
+    algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
 };
 
@@ -4251,6 +4263,31 @@ pub const GoogleGeneratorConfig = struct {
     url: ?[]const u8 = null,
 };
 
+/// Optional algebraic planning features for graph traversal.
+pub const GraphAlgebraicPlanningConfig = struct {
+    bounded_traversal: ?GraphBoundedTraversalConfig = null,
+};
+
+/// Document fields made available to graph mapping templates through `_doc.value`.
+pub const GraphArtifactContextConfig = struct {
+    doc_fields: ?[]const []const u8 = null,
+};
+
+/// Maps each artifact item to an edge type, weight, and public metadata.
+pub const GraphArtifactEdgeMappingConfig = struct {
+    type: ?GraphTemplateValue = null,
+    weight: ?GraphTemplateValue = null,
+    /// JSON metadata template copied onto each materialized edge. Sensitive keys are omitted from create responses.
+    metadata: ?std.json.Value = null,
+};
+
+/// Maps each artifact item to graph node identifiers.
+pub const GraphArtifactNodeMappingConfig = struct {
+    model: ?[]const u8 = null,
+    source: ?GraphTemplateValue = null,
+    target: ?GraphTemplateValue = null,
+};
+
 /// Asset producer used by an artifact-backed graph index.
 pub const GraphArtifactProducerConfig = struct {
     name: []const u8,
@@ -4270,6 +4307,12 @@ pub const GraphArtifactSourceConfig = struct {
     mention_edge_type: ?[]const u8 = null,
 };
 
+/// Algebraic law used to combine bounded graph traversal provenance.
+pub const GraphBoundedTraversalConfig = struct {
+    law: []const u8,
+    enabled: ?bool = null,
+};
+
 /// Configuration for graph index type
 pub const GraphIndexConfig = struct {
     /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
@@ -4282,6 +4325,10 @@ pub const GraphIndexConfig = struct {
     max_edges_per_document: ?i64 = null,
     source: ?GraphArtifactSourceConfig = null,
     artifact: ?GraphArtifactProducerConfig = null,
+    nodes: ?GraphArtifactNodeMappingConfig = null,
+    edge: ?GraphArtifactEdgeMappingConfig = null,
+    context: ?GraphArtifactContextConfig = null,
+    algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
 };
 
@@ -4541,6 +4588,9 @@ pub const GraphResultNode = struct {
     edges: ?[]const Edge = null,
 };
 
+/// A literal numeric value or a Handlebars template evaluated for each materialized graph item.
+pub const GraphTemplateValue = std.json.Value;
+
 /// Ground truth data for evaluation
 pub const GroundTruth = struct {
     /// Document IDs known to be relevant (for retrieval metrics)
@@ -4736,6 +4786,10 @@ pub const IndexConfig = struct {
     max_edges_per_document: ?i64 = null,
     source: ?GraphArtifactSourceConfig = null,
     artifact: ?GraphArtifactProducerConfig = null,
+    nodes: ?GraphArtifactNodeMappingConfig = null,
+    edge: ?GraphArtifactEdgeMappingConfig = null,
+    context: ?GraphArtifactContextConfig = null,
+    algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
     /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
     derive_from_schema: ?bool = null,
@@ -4844,6 +4898,22 @@ pub const IndexConfig = struct {
         }
         if (self.artifact) |value| {
             try jw.objectField("artifact");
+            try jw.write(value);
+        }
+        if (self.nodes) |value| {
+            try jw.objectField("nodes");
+            try jw.write(value);
+        }
+        if (self.edge) |value| {
+            try jw.objectField("edge");
+            try jw.write(value);
+        }
+        if (self.context) |value| {
+            try jw.objectField("context");
+            try jw.write(value);
+        }
+        if (self.algebraic_planning) |value| {
+            try jw.objectField("algebraic_planning");
             try jw.write(value);
         }
         if (self.resolvers) |value| {

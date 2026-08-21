@@ -424,6 +424,19 @@ fn validatePublicNestedIndexFields(object: anytype, index_type: public_index_con
         if (value != .null) try validatePublicGraphArtifact(value);
     }
 
+    const graph_shapes = .{
+        .{ "nodes", public_index_contract.CreatedObjectShape.graph_nodes },
+        .{ "edge", public_index_contract.CreatedObjectShape.graph_edge },
+        .{ "context", public_index_contract.CreatedObjectShape.graph_context },
+        .{ "algebraic_planning", public_index_contract.CreatedObjectShape.graph_algebraic_planning },
+    };
+    inline for (graph_shapes) |field_shape| {
+        const value = if (@hasField(Object, "map")) object.map.get(field_shape[0]) else object.get(field_shape[0]);
+        if (value) |nested| {
+            if (nested != .null) try validatePublicCreatedShape(nested, field_shape[1]);
+        }
+    }
+
     const edge_types = if (@hasField(Object, "map")) object.map.get("edge_types") else object.get("edge_types");
     if (edge_types) |value| {
         if (value != .null) try validatePublicCreatedShape(value, .edge_types);
@@ -951,13 +964,13 @@ test "table contract canonicalizes generated optional null fields" {
 
 test "table contract preserves typed artifact-backed graph configuration" {
     const body =
-        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions"},"artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json","producer_json":{"type":"document_extraction","api_key":"write-only"}},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}]}
+        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions"},"artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json","producer_json":{"type":"document_extraction","api_key":"write-only"}},"nodes":{"model":"document","source":"{{ _doc.key }}","target":"{{ _item.target.text }}"},"edge":{"type":"{{ _item.predicate }}","weight":0.75,"metadata":{"source":"{{ _item.source }}"}},"context":{"doc_fields":["title","body"]},"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring","enabled":true}},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}]}
     ;
     const config_json = try parseCreateIndexRequest(std.testing.allocator, "relations_graph", body);
     defer std.testing.allocator.free(config_json);
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
-        "{\"name\":\"relations_graph\",\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\"},\"resolvers\":[{\"name\":\"kg\",\"candidate_search\":\"prefix\"}]}",
+        "{\"name\":\"relations_graph\",\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\"},\"nodes\":{\"model\":\"document\",\"target\":\"{{ _item.target.text }}\"},\"edge\":{\"weight\":0.75},\"context\":{\"doc_fields\":[\"title\",\"body\"]},\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}},\"resolvers\":[{\"name\":\"kg\",\"candidate_search\":\"prefix\"}]}",
         config_json,
     );
 
@@ -968,7 +981,7 @@ test "table contract preserves typed artifact-backed graph configuration" {
     defer table_req.deinit(std.testing.allocator);
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
-        "{\"relations_graph\":{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\"},\"resolvers\":[{\"name\":\"kg\"}]}}",
+        "{\"relations_graph\":{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\"},\"nodes\":{\"model\":\"document\"},\"edge\":{\"weight\":0.75},\"context\":{\"doc_fields\":[\"title\",\"body\"]},\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}},\"resolvers\":[{\"name\":\"kg\"}]}}",
         table_req.indexes_json.?,
     );
 }
@@ -990,6 +1003,18 @@ test "table contract rejects unknown fields in closed nested index objects" {
         \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":{"client_value":"private"}}}
         ,
         \\{"type":"graph","resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_limit":{"client_value":"private"}}]}
+        ,
+        \\{"type":"graph","nodes":{"model":"document","client_value":"private"}}
+        ,
+        \\{"type":"graph","nodes":{"model":"unsupported"}}
+        ,
+        \\{"type":"graph","edge":{"weight":{"client_value":"private"}}}
+        ,
+        \\{"type":"graph","context":{"doc_fields":["title",""]}}
+        ,
+        \\{"type":"graph","algebraic_planning":{"bounded_traversal":{"law":"min_plus_semiring"}}}
+        ,
+        \\{"type":"graph","algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring","client_value":"private"}}}
         ,
         \\{"type":"embeddings","dimension":384,"chunker":{"provider":"antfly","model":"fixed","client_value":"private"}}
         ,
@@ -1020,7 +1045,7 @@ test "table contract treats nullable nested index fields as omitted" {
     const config_json = try parseCreateIndexRequest(
         std.testing.allocator,
         "relations_graph",
-        "{\"type\":\"graph\",\"source\":null,\"artifact\":null,\"edge_types\":null,\"resolvers\":null}",
+        "{\"type\":\"graph\",\"source\":null,\"artifact\":null,\"nodes\":null,\"edge\":null,\"context\":null,\"algebraic_planning\":null,\"edge_types\":null,\"resolvers\":null}",
     );
     defer std.testing.allocator.free(config_json);
     try ant_json.testing.expectEqualJsonText(

@@ -143,6 +143,61 @@ components:
           additionalProperties: true
           writeOnly: true
           description: "Write-only producer configuration; it may contain credentials and is never returned."
+    GraphTemplateValue:
+      description: "A literal numeric value or a Handlebars template evaluated for each materialized graph item."
+      anyOf:
+        - type: string
+        - type: number
+          format: double
+    GraphArtifactNodeMappingConfig:
+      type: object
+      additionalProperties: false
+      description: "Maps each artifact item to graph node identifiers."
+      properties:
+        model:
+          type: string
+          enum: [document, external]
+          default: document
+        source: { $ref: "#/components/schemas/GraphTemplateValue" }
+        target: { $ref: "#/components/schemas/GraphTemplateValue" }
+    GraphArtifactEdgeMappingConfig:
+      type: object
+      additionalProperties: false
+      description: "Maps each artifact item to an edge type, weight, and public metadata."
+      properties:
+        type: { $ref: "#/components/schemas/GraphTemplateValue" }
+        weight: { $ref: "#/components/schemas/GraphTemplateValue" }
+        metadata:
+          type: object
+          additionalProperties: true
+          description: "JSON metadata template copied onto each materialized edge. Sensitive keys are omitted from create responses."
+    GraphArtifactContextConfig:
+      type: object
+      additionalProperties: false
+      description: "Document fields made available to graph mapping templates through `_doc.value`."
+      properties:
+        doc_fields:
+          type: array
+          items: { type: string, minLength: 1 }
+    GraphBoundedTraversalConfig:
+      type: object
+      additionalProperties: false
+      required: [law]
+      description: "Algebraic law used to combine bounded graph traversal provenance."
+      properties:
+        law:
+          type: string
+          enum: [provenance_semiring]
+        enabled:
+          type: boolean
+          default: true
+    GraphAlgebraicPlanningConfig:
+      type: object
+      additionalProperties: false
+      description: "Optional algebraic planning features for graph traversal."
+      properties:
+        bounded_traversal:
+          $ref: "#/components/schemas/GraphBoundedTraversalConfig"
     CreatedGraphArtifactProducerConfig:
       type: object
       additionalProperties: false
@@ -316,6 +371,10 @@ components:
         max_edges_per_document: { type: integer }
         source: { $ref: "#/components/schemas/GraphArtifactSourceConfig" }
         artifact: { $ref: "#/components/schemas/CreatedGraphArtifactProducerConfig" }
+        nodes: { $ref: "#/components/schemas/GraphArtifactNodeMappingConfig" }
+        edge: { $ref: "#/components/schemas/GraphArtifactEdgeMappingConfig" }
+        context: { $ref: "#/components/schemas/GraphArtifactContextConfig" }
+        algebraic_planning: { $ref: "#/components/schemas/GraphAlgebraicPlanningConfig" }
         resolvers:
           type: array
           items: { $ref: "#/components/schemas/GraphResolverConfig" }
@@ -1748,6 +1807,14 @@ components:
           $ref: "#/components/schemas/GraphArtifactSourceConfig"
         artifact:
           $ref: "#/components/schemas/GraphArtifactProducerConfig"
+        nodes:
+          $ref: "#/components/schemas/GraphArtifactNodeMappingConfig"
+        edge:
+          $ref: "#/components/schemas/GraphArtifactEdgeMappingConfig"
+        context:
+          $ref: "#/components/schemas/GraphArtifactContextConfig"
+        algebraic_planning:
+          $ref: "#/components/schemas/GraphAlgebraicPlanningConfig"
         resolvers:
           type: array
           items:

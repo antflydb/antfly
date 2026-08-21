@@ -9299,6 +9299,42 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** @description A literal numeric value or a Handlebars template evaluated for each materialized graph item. */
+        GraphTemplateValue: string | number;
+        /** @description Maps each artifact item to graph node identifiers. */
+        GraphArtifactNodeMappingConfig: {
+            /**
+             * @default document
+             * @enum {string}
+             */
+            model?: "document" | "external";
+            source?: components["schemas"]["GraphTemplateValue"];
+            target?: components["schemas"]["GraphTemplateValue"];
+        };
+        /** @description Maps each artifact item to an edge type, weight, and public metadata. */
+        GraphArtifactEdgeMappingConfig: {
+            type?: components["schemas"]["GraphTemplateValue"];
+            weight?: components["schemas"]["GraphTemplateValue"];
+            /** @description JSON metadata template copied onto each materialized edge. Sensitive keys are omitted from create responses. */
+            metadata?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description Document fields made available to graph mapping templates through `_doc.value`. */
+        GraphArtifactContextConfig: {
+            doc_fields?: string[];
+        };
+        /** @description Algebraic law used to combine bounded graph traversal provenance. */
+        GraphBoundedTraversalConfig: {
+            /** @enum {string} */
+            law: "provenance_semiring";
+            /** @default true */
+            enabled?: boolean;
+        };
+        /** @description Optional algebraic planning features for graph traversal. */
+        GraphAlgebraicPlanningConfig: {
+            bounded_traversal?: components["schemas"]["GraphBoundedTraversalConfig"];
+        };
         /** @description Versioned entity resolver attached to an artifact-backed graph index. */
         GraphResolverConfig: {
             name: string;
@@ -9351,6 +9387,10 @@ export interface components {
             max_edges_per_document?: number;
             source?: components["schemas"]["GraphArtifactSourceConfig"];
             artifact?: components["schemas"]["GraphArtifactProducerConfig"];
+            nodes?: components["schemas"]["GraphArtifactNodeMappingConfig"];
+            edge?: components["schemas"]["GraphArtifactEdgeMappingConfig"];
+            context?: components["schemas"]["GraphArtifactContextConfig"];
+            algebraic_planning?: components["schemas"]["GraphAlgebraicPlanningConfig"];
             resolvers?: components["schemas"]["GraphResolverConfig"][];
         };
         /** @description Create a graph index. */
@@ -11968,6 +12008,10 @@ export interface components {
             max_edges_per_document?: number;
             source?: components["schemas"]["GraphArtifactSourceConfig"];
             artifact?: components["schemas"]["CreatedGraphArtifactProducerConfig"];
+            nodes?: components["schemas"]["GraphArtifactNodeMappingConfig"];
+            edge?: components["schemas"]["GraphArtifactEdgeMappingConfig"];
+            context?: components["schemas"]["GraphArtifactContextConfig"];
+            algebraic_planning?: components["schemas"]["GraphAlgebraicPlanningConfig"];
             resolvers?: components["schemas"]["GraphResolverConfig"][];
         };
         /** @description Normalized effective graph index configuration returned after creation. */

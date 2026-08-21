@@ -116,6 +116,36 @@ describe("Antfly Query Type Integration", () => {
       const invalid: CreateIndexRequest = { type: "full_text", dimension: 512 };
       expect(invalid.type).toBe("full_text");
     });
+
+    it("types artifact graph mappings and algebraic planning", () => {
+      const graph: CreateIndexRequest = {
+        type: "graph",
+        source: {
+          kind: "artifact",
+          artifact: "relations_v1",
+        },
+        nodes: {
+          model: "document",
+          source: "{{ _doc.key }}",
+          target: "{{ _item.target.text }}",
+        },
+        edge: {
+          type: "{{ _item.type }}",
+          weight: 0.75,
+          metadata: { source: "extractor" },
+        },
+        context: { doc_fields: ["title", "body"] },
+        algebraic_planning: {
+          bounded_traversal: {
+            law: "provenance_semiring",
+            enabled: true,
+          },
+        },
+      };
+
+      expect(graph.edge?.weight).toBe(0.75);
+      expect(graph.algebraic_planning?.bounded_traversal?.law).toBe("provenance_semiring");
+    });
   });
 
   describe("Batch transform types", () => {
