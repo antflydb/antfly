@@ -1519,6 +1519,76 @@ fn validateFieldMappingObject(mapping: std.json.Value, allow_fields: bool) !void
     }
 }
 
+fn validateFieldMappingSchemaCompatibility(
+    schema_type: ?[]const u8,
+    mapping: ?DynamicTemplate,
+) !void {
+    const resolved_schema_type = schema_type orelse return;
+    const resolved_mapping = mapping orelse return;
+    if (!fieldMappingAcceptsSchemaType(resolved_mapping.field_type orelse "text", resolved_schema_type)) {
+        return error.InvalidSchemaUpdateRequest;
+    }
+    for (resolved_mapping.fields) |subfield| {
+        try validateFieldMappingSchemaCompatibility(resolved_schema_type, subfield);
+    }
+}
+
+fn fieldMappingAcceptsSchemaType(mapping_type: []const u8, schema_type: []const u8) bool {
+    if (std.mem.eql(u8, mapping_type, "text") or
+        std.mem.eql(u8, mapping_type, "keyword") or
+        std.mem.eql(u8, mapping_type, "link") or
+        std.mem.eql(u8, mapping_type, "blob") or
+        std.mem.eql(u8, mapping_type, "html") or
+        std.mem.eql(u8, mapping_type, "search_as_you_type"))
+    {
+        return schemaTypeIsString(schema_type);
+    }
+    if (std.mem.eql(u8, mapping_type, "numeric") or
+        std.mem.eql(u8, mapping_type, "number") or
+        std.mem.eql(u8, mapping_type, "integer"))
+    {
+        return schemaTypeIsNumeric(schema_type);
+    }
+    if (std.mem.eql(u8, mapping_type, "boolean") or std.mem.eql(u8, mapping_type, "bool")) {
+        return std.mem.eql(u8, schema_type, "boolean");
+    }
+    if (std.mem.eql(u8, mapping_type, "datetime") or
+        std.mem.eql(u8, mapping_type, "date") or
+        std.mem.eql(u8, mapping_type, "timestamp"))
+    {
+        return std.mem.eql(u8, schema_type, "datetime") or
+            std.mem.eql(u8, schema_type, "integer") or
+            schemaTypeIsString(schema_type);
+    }
+    if (std.mem.eql(u8, mapping_type, "geopoint") or
+        std.mem.eql(u8, mapping_type, "geo_point") or
+        std.mem.eql(u8, mapping_type, "geoshape") or
+        std.mem.eql(u8, mapping_type, "geo_shape"))
+    {
+        return std.mem.eql(u8, schema_type, "object");
+    }
+    if (std.mem.eql(u8, mapping_type, "embedding")) {
+        return std.mem.eql(u8, schema_type, "array");
+    }
+    return false;
+}
+
+fn schemaTypeIsString(schema_type: []const u8) bool {
+    return std.mem.eql(u8, schema_type, "string") or
+        std.mem.eql(u8, schema_type, "text") or
+        std.mem.eql(u8, schema_type, "keyword") or
+        std.mem.eql(u8, schema_type, "link") or
+        std.mem.eql(u8, schema_type, "blob") or
+        std.mem.eql(u8, schema_type, "html") or
+        std.mem.eql(u8, schema_type, "search_as_you_type");
+}
+
+fn schemaTypeIsNumeric(schema_type: []const u8) bool {
+    return std.mem.eql(u8, schema_type, "number") or
+        std.mem.eql(u8, schema_type, "integer") or
+        std.mem.eql(u8, schema_type, "numeric");
+}
+
 fn isKnownFieldMappingKey(key: []const u8, allow_fields: bool) bool {
     return std.mem.eql(u8, key, "type") or
         std.mem.eql(u8, key, "analyzer") or
@@ -2195,7 +2265,7 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         alloc.destroy(owned);
     };
 
-    if (schemaShapeIsArrayLike(
+    const array_like = schemaShapeIsArrayLike(
         field_type,
         min_items,
         max_items,
@@ -2208,7 +2278,8 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         min_contains,
         max_contains,
         unique_items,
-    )) {
+    );
+    if (array_like) {
         if (fieldMappingContainsSortable(antfly_field)) return error.InvalidSchemaUpdateRequest;
         if (documentPropertiesContainSortableMapping(prefix_items)) return error.InvalidSchemaUpdateRequest;
         if (item) |array_item| {
@@ -2220,6 +2291,10 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         if (unevaluated_items_schema) |unevaluated_item| {
             if (documentPropertyContainsSortableMapping(unevaluated_item.*)) return error.InvalidSchemaUpdateRequest;
         }
+    }
+
+    if (!array_like and (antfly_index orelse true)) {
+        try validateFieldMappingSchemaCompatibility(field_type, antfly_field);
     }
 
     property.* = .{
@@ -4117,6 +4192,31 @@ test "parse accepts sortable without public doc values and rejects unsupported s
             "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"patternProperties\":{\"^_.*$\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"text\",\"fields\":{\"keyword\":{\"type\":\"keyword\",\"sortable\":true}}}}}}}}}",
         ),
     );
+}
+
+test "parse rejects document field mappings incompatible with their schema value domain" {
+    const incompatible_schemas = [_][]const u8{
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"price\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"number\",\"sortable\":true}}}}}}}",
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"price\":{\"type\":\"number\",\"x-antfly-field\":{\"type\":\"keyword\",\"sortable\":true}}}}}}}",
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"active\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"boolean\",\"sortable\":true}}}}}}}",
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"text\",\"fields\":{\"numeric\":{\"type\":\"number\",\"sortable\":true}}}}}}}}}",
+    };
+    for (incompatible_schemas) |schema_json| {
+        try std.testing.expectError(
+            error.InvalidSchemaUpdateRequest,
+            parseSchema(std.testing.allocator, schema_json),
+        );
+    }
+
+    const compatible_schemas = [_][]const u8{
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"price\":{\"type\":\"integer\",\"x-antfly-field\":{\"type\":\"numeric\",\"sortable\":true}}}}}}}",
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"created_at\":{\"type\":\"string\",\"format\":\"date-time\",\"x-antfly-field\":{\"type\":\"date\",\"sortable\":true}}}}}}}",
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"text\",\"fields\":{\"keyword\":{\"type\":\"keyword\",\"sortable\":true}}}}}}}}}",
+    };
+    for (compatible_schemas) |schema_json| {
+        var parsed = try parseSchema(std.testing.allocator, schema_json);
+        parsed.deinit(std.testing.allocator);
+    }
 }
 
 test "parse explicit field analyzer override" {

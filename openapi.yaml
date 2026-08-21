@@ -203,7 +203,13 @@ tags:
 
       the internal typed doc values; `doc_values` is intentionally not a public
 
-      setting.
+      setting. The mapping type must accept the property's JSON Schema value
+
+      type. Explicit property mappings take precedence over dynamic templates.
+
+      When multiple document types declare the same dotted field path, their
+
+      normalized physical mappings must be identical.
 
 
       ```json
@@ -17868,7 +17874,9 @@ components:
       type: object
       additionalProperties: false
       description: Field mapping used by a dynamic template or a document property's `x-antfly-field`
-        annotation.
+        annotation. A property mapping must accept the JSON Schema value type. Explicit property mappings
+        take precedence over dynamic templates, and declarations for the same dotted path across document
+        types must normalize to an identical physical mapping.
       properties:
         type:
           $ref: '#/components/schemas/FieldMappingType'

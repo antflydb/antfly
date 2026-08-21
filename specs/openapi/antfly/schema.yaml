@@ -147,7 +147,12 @@ components:
     TemplateFieldMapping:
       type: object
       additionalProperties: false
-      description: Field mapping used by a dynamic template or a document property's `x-antfly-field` annotation.
+      description: >-
+        Field mapping used by a dynamic template or a document property's
+        `x-antfly-field` annotation. A property mapping must accept the JSON
+        Schema value type. Explicit property mappings take precedence over
+        dynamic templates, and declarations for the same dotted path across
+        document types must normalize to an identical physical mapping.
       properties:
         type:
           $ref: "#/components/schemas/FieldMappingType"

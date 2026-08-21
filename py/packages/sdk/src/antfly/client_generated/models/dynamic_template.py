@@ -31,7 +31,9 @@ class DynamicTemplate:
             path_unmatch (str | Unset): Path exclusion pattern. If it matches the full path, the template is skipped.
             match_mapping_type (DynamicTemplateMatchMappingType | Unset): Filter by detected JSON type
             mapping (TemplateFieldMapping | Unset): Field mapping used by a dynamic template or a document property's
-                `x-antfly-field` annotation.
+                `x-antfly-field` annotation. A property mapping must accept the JSON Schema value type. Explicit property
+                mappings take precedence over dynamic templates, and declarations for the same dotted path across document types
+                must normalize to an identical physical mapping.
     """
 
     name: str | Unset = UNSET

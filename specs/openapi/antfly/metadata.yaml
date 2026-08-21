@@ -195,7 +195,10 @@ tags:
       Set `sortable: true` on a keyword, numeric/number/integer,
       boolean/bool, datetime/date/timestamp, or link mapping. Antfly derives
       the internal typed doc values; `doc_values` is intentionally not a public
-      setting.
+      setting. The mapping type must accept the property's JSON Schema value
+      type. Explicit property mappings take precedence over dynamic templates.
+      When multiple document types declare the same dotted field path, their
+      normalized physical mappings must be identical.
 
       ```json
       {

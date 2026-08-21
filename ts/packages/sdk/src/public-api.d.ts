@@ -9176,7 +9176,7 @@ export interface components {
          * @enum {string}
          */
         FieldMappingType: "text" | "html" | "keyword" | "numeric" | "number" | "integer" | "boolean" | "bool" | "datetime" | "date" | "timestamp" | "geopoint" | "geo_point" | "geoshape" | "geo_shape" | "embedding" | "blob" | "link" | "search_as_you_type";
-        /** @description Field mapping used by a dynamic template or a document property's `x-antfly-field` annotation. */
+        /** @description Field mapping used by a dynamic template or a document property's `x-antfly-field` annotation. A property mapping must accept the JSON Schema value type. Explicit property mappings take precedence over dynamic templates, and declarations for the same dotted path across document types must normalize to an identical physical mapping. */
         TemplateFieldMapping: {
             type?: components["schemas"]["FieldMappingType"];
             /**

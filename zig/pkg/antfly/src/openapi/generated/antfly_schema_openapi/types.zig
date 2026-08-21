@@ -179,7 +179,7 @@ pub const TableSchema = struct {
     dynamic_templates: ?[]const DynamicTemplate = null,
 };
 
-/// Field mapping used by a dynamic template or a document property's `x-antfly-field` annotation.
+/// Field mapping used by a dynamic template or a document property's `x-antfly-field` annotation. A property mapping must accept the JSON Schema value type. Explicit property mappings take precedence over dynamic templates, and declarations for the same dotted path across document types must normalize to an identical physical mapping.
 pub const TemplateFieldMapping = struct {
     type: ?FieldMappingType = null,
     /// Analyzer name (e.g., "standard", "keyword", "en", "html_analyzer"). Used for text fields to control tokenization and normalization.
