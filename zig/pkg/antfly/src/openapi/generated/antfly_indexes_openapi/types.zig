@@ -1064,12 +1064,35 @@ pub const GraphQueryPage = struct {
     next_cursor: ?[]const u8 = null,
 };
 
+/// Deprecated graph_searches traversal and path parameters.
+pub const GraphQueryParams = struct {
+    edge_types: ?[]const []const u8 = null,
+    direction: ?EdgeDirection = null,
+    max_depth: ?i64 = null,
+    min_weight: ?f64 = null,
+    max_weight: ?f64 = null,
+    max_results: ?i64 = null,
+    deduplicate_nodes: ?bool = null,
+    include_paths: ?bool = null,
+    weight_mode: ?PathWeightMode = null,
+    k: ?i64 = null,
+    node_filter: ?NodeFilter = null,
+    algorithm: ?[]const u8 = null,
+    algorithm_params: ?std.json.Value = null,
+};
+
 /// Results of a graph query
 pub const GraphQueryResult = struct {
+    /// Deprecated graph_searches query discriminator; omitted for graph_queries.
+    type: ?GraphQueryType = null,
     /// Result nodes
     nodes: ?[]const GraphResultNode = null,
     /// Result paths (for pathfinding queries)
     paths: ?[]const Path = null,
+    /// Deprecated graph_searches pattern results; use rows for graph_queries.
+    matches: ?[]const PatternMatch = null,
+    /// Deprecated graph_searches result count; use stats or a named count aggregate.
+    total: ?i64 = null,
     rows: ?[]const std.json.Value = null,
     aggregates: ?std.json.ArrayHashMap(GraphAggregateValue) = null,
     page: ?GraphQueryPage = null,
@@ -1081,6 +1104,41 @@ pub const GraphQueryResult = struct {
 pub const GraphQueryStats = struct {
     returned_rows: i64,
     truncated: bool,
+};
+
+/// Deprecated discriminator used by LegacyGraphQuery.
+pub const GraphQueryType = enum {
+    traverse,
+    neighbors,
+    shortest_path,
+    k_shortest_paths,
+    pattern,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .traverse => "traverse",
+            .neighbors => "neighbors",
+            .shortest_path => "shortest_path",
+            .k_shortest_paths => "k_shortest_paths",
+            .pattern => "pattern",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "traverse", .traverse },
+            .{ "neighbors", .neighbors },
+            .{ "shortest_path", .shortest_path },
+            .{ "k_shortest_paths", .k_shortest_paths },
+            .{ "pattern", .pattern },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// A node in graph query results
@@ -1489,6 +1547,20 @@ pub const IndexType = enum {
     }
 };
 
+/// Deprecated graph_searches request. Use the operation-keyed GraphQuery DSL.
+pub const LegacyGraphQuery = struct {
+    type: GraphQueryType,
+    index_name: []const u8,
+    start_nodes: ?GraphNodeSelector = null,
+    target_nodes: ?GraphNodeSelector = null,
+    params: ?GraphQueryParams = null,
+    pattern: ?[]const PatternStep = null,
+    return_aliases: ?[]const []const u8 = null,
+    include_documents: ?bool = null,
+    include_edges: ?bool = null,
+    fields: ?[]const []const u8 = null,
+};
+
 /// Configuration for result fusion when combining multiple search indexes.
 pub const MergeConfig = struct {
     strategy: ?MergeStrategy = null,
@@ -1633,6 +1705,29 @@ pub const PathWeightMode = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+/// Deprecated linear graph_searches pattern edge.
+pub const PatternEdgeStep = struct {
+    types: ?[]const []const u8 = null,
+    direction: ?EdgeDirection = null,
+    min_hops: ?i64 = null,
+    max_hops: ?i64 = null,
+    min_weight: ?f64 = null,
+    max_weight: ?f64 = null,
+};
+
+/// Deprecated graph_searches pattern response row.
+pub const PatternMatch = struct {
+    bindings: ?std.json.ArrayHashMap(GraphResultNode) = null,
+    path: ?[]const PathEdge = null,
+};
+
+/// Deprecated linear graph_searches pattern step.
+pub const PatternStep = struct {
+    alias: ?[]const u8 = null,
+    node_filter: ?NodeFilter = null,
+    edge: ?PatternEdgeStep = null,
 };
 
 /// Configuration for pruning search results based on score quality. Helps filter out low-relevance results in RAG pipelines by detecting score gaps or deviations from top results.

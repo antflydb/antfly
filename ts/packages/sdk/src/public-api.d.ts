@@ -6558,6 +6558,14 @@ export interface components {
                 [key: string]: components["schemas"]["GraphQuery"];
             };
             /**
+             * @deprecated
+             * @description Deprecated compatibility alias for the v0.2 graph query contract.
+             *     Use `graph_queries`; requests containing both fields are rejected.
+             */
+            graph_searches?: {
+                [key: string]: components["schemas"]["LegacyGraphQuery"];
+            };
+            /**
              * @description Strategy for merging graph results with search results:
              *     - union: Include nodes from both search and graph results
              *     - intersection: Only include nodes appearing in both
@@ -11505,6 +11513,75 @@ export interface components {
         };
         GraphQuery: components["schemas"]["GraphMatchQuery"] | components["schemas"]["GraphTraverseQuery"] | components["schemas"]["GraphShortestPathQuery"] | components["schemas"]["GraphKShortestPathsQuery"];
         /**
+         * @description Deprecated discriminator used by LegacyGraphQuery.
+         * @enum {string}
+         */
+        GraphQueryType: "traverse" | "neighbors" | "shortest_path" | "k_shortest_paths" | "pattern";
+        /**
+         * @deprecated
+         * @description Deprecated graph_searches traversal and path parameters.
+         */
+        GraphQueryParams: {
+            edge_types?: string[];
+            direction?: components["schemas"]["EdgeDirection"];
+            max_depth?: number;
+            /** Format: double */
+            min_weight?: number;
+            /** Format: double */
+            max_weight?: number;
+            max_results?: number;
+            deduplicate_nodes?: boolean;
+            include_paths?: boolean;
+            weight_mode?: components["schemas"]["PathWeightMode"];
+            k?: number;
+            node_filter?: components["schemas"]["NodeFilter"];
+            algorithm?: string;
+            algorithm_params?: {
+                [key: string]: unknown;
+            };
+        };
+        /**
+         * @deprecated
+         * @description Deprecated linear graph_searches pattern edge.
+         */
+        PatternEdgeStep: {
+            types?: string[];
+            direction?: components["schemas"]["EdgeDirection"];
+            /** @default 1 */
+            min_hops?: number;
+            /** @default 1 */
+            max_hops?: number;
+            /** Format: double */
+            min_weight?: number;
+            /** Format: double */
+            max_weight?: number;
+        };
+        /**
+         * @deprecated
+         * @description Deprecated linear graph_searches pattern step.
+         */
+        PatternStep: {
+            alias?: string;
+            node_filter?: components["schemas"]["NodeFilter"];
+            edge?: components["schemas"]["PatternEdgeStep"];
+        };
+        /**
+         * @deprecated
+         * @description Deprecated graph_searches request. Use the operation-keyed GraphQuery DSL.
+         */
+        LegacyGraphQuery: {
+            type: components["schemas"]["GraphQueryType"];
+            index_name: string;
+            start_nodes?: components["schemas"]["GraphNodeSelector"];
+            target_nodes?: components["schemas"]["GraphNodeSelector"];
+            params?: components["schemas"]["GraphQueryParams"];
+            pattern?: components["schemas"]["PatternStep"][];
+            return_aliases?: string[];
+            include_documents?: boolean;
+            include_edges?: boolean;
+            fields?: string[];
+        };
+        /**
          * @description Configuration for pruning search results based on score quality.
          *     Helps filter out low-relevance results in RAG pipelines by detecting
          *     score gaps or deviations from top results.
@@ -11580,6 +11657,16 @@ export interface components {
             /** @description Connected edges when supplied by the graph executor. */
             edges?: components["schemas"]["Edge"][];
         };
+        /**
+         * @deprecated
+         * @description Deprecated graph_searches pattern response row.
+         */
+        PatternMatch: {
+            bindings?: {
+                [key: string]: components["schemas"]["GraphResultNode"];
+            };
+            path?: components["schemas"]["PathEdge"][];
+        };
         GraphAggregateValue: {
             /** @description Decimal string so counts remain lossless in JavaScript. */
             value: string;
@@ -11595,10 +11682,25 @@ export interface components {
         };
         /** @description Results of a graph query */
         GraphQueryResult: {
+            /**
+             * @deprecated
+             * @description Deprecated graph_searches query discriminator; omitted for graph_queries.
+             */
+            type?: components["schemas"]["GraphQueryType"];
             /** @description Result nodes */
             nodes?: components["schemas"]["GraphResultNode"][];
             /** @description Result paths (for pathfinding queries) */
             paths?: components["schemas"]["Path"][];
+            /**
+             * @deprecated
+             * @description Deprecated graph_searches pattern results; use rows for graph_queries.
+             */
+            matches?: components["schemas"]["PatternMatch"][];
+            /**
+             * @deprecated
+             * @description Deprecated graph_searches result count; use stats or a named count aggregate.
+             */
+            total?: number;
             rows?: {
                 [key: string]: unknown;
             }[];

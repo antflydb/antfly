@@ -48,21 +48,38 @@ pub fn parseSupportedGraphQueriesAlloc(
     alloc: std.mem.Allocator,
     request: metadata_openapi.QueryRequest,
 ) ![]const db_mod.types.NamedGraphQuery {
-    const graph_queries = request.graph_queries orelse return &.{};
+    if (request.graph_queries != null and request.graph_searches != null)
+        return error.InvalidQueryRequest;
 
     var items = std.ArrayListUnmanaged(db_mod.types.NamedGraphQuery).empty;
     errdefer freeNamedGraphQueries(alloc, items.items);
 
-    var it = graph_queries.map.iterator();
-    while (it.next()) |entry| {
-        const name = try alloc.dupe(u8, entry.key_ptr.*);
-        errdefer alloc.free(name);
-        const query = try parseSupportedGraphQuery(alloc, entry.value_ptr.*);
-        errdefer freeGraphQuery(alloc, query);
-        try items.append(alloc, .{
-            .name = name,
-            .query = query,
-        });
+    if (request.graph_queries) |graph_queries| {
+        var it = graph_queries.map.iterator();
+        while (it.next()) |entry| {
+            const name = try alloc.dupe(u8, entry.key_ptr.*);
+            var name_owned = true;
+            errdefer if (name_owned) alloc.free(name);
+            const query = try parseSupportedGraphQuery(alloc, entry.value_ptr.*);
+            var query_owned = true;
+            errdefer if (query_owned) freeGraphQuery(alloc, query);
+            try items.append(alloc, .{ .name = name, .query = query });
+            name_owned = false;
+            query_owned = false;
+        }
+    } else if (request.graph_searches) |graph_searches| {
+        var it = graph_searches.map.iterator();
+        while (it.next()) |entry| {
+            const name = try alloc.dupe(u8, entry.key_ptr.*);
+            var name_owned = true;
+            errdefer if (name_owned) alloc.free(name);
+            const query = try query_contract.parseLegacyGraphQuery(alloc, entry.value_ptr.*);
+            var query_owned = true;
+            errdefer if (query_owned) freeGraphQuery(alloc, query);
+            try items.append(alloc, .{ .name = name, .query = query });
+            name_owned = false;
+            query_owned = false;
+        }
     }
     return try items.toOwnedSlice(alloc);
 }
@@ -308,6 +325,36 @@ test "parse supported graph queries alloc clones edge types and keys" {
         "{\"term\":{\"path\":\"tenant\",\"term\":\"visible\"}}",
         items[0].query.params.node_filter.filter_query_json.?,
     );
+}
+
+test "parse supported graph queries accepts deprecated graph searches" {
+    const alloc = std.testing.allocator;
+    var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
+        \\{"graph_searches":{"neighbors":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]},"params":{"edge_types":["cites"],"max_results":7}}}}
+    , .{});
+    defer parsed.deinit();
+
+    const items = try parseSupportedGraphQueriesAlloc(alloc, parsed.value);
+    defer freeNamedGraphQueries(alloc, items);
+
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    try std.testing.expect(items[0].query.legacy_response);
+    try std.testing.expectEqual(graph_query_mod.QueryType.neighbors, items[0].query.query_type);
+    try std.testing.expectEqualStrings("graph_idx", items[0].query.index_name);
+    try std.testing.expectEqual(@as(u32, 7), items[0].query.params.max_results);
+}
+
+test "parse supported graph queries rejects canonical and legacy fields together" {
+    const alloc = std.testing.allocator;
+    var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
+        \\{
+        \\  "graph_queries":{"canonical":{"index":"graph_idx","traverse":{"start":{"keys":["doc-a"]}}}},
+        \\  "graph_searches":{"legacy":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]}}}
+        \\}
+    , .{});
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.InvalidQueryRequest, parseSupportedGraphQueriesAlloc(alloc, parsed.value));
 }
 
 test "parse supported graph queries reject unbounded traversal limits" {

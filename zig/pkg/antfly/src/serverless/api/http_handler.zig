@@ -1442,7 +1442,7 @@ pub const HttpHandler = struct {
         if (request.merge_config != null) return error.UnsupportedQueryRequest;
         if (request.reranker != null) return error.UnsupportedQueryRequest;
         if (request.analyses != null) return error.UnsupportedQueryRequest;
-        if (request.graph_queries != null) return error.UnsupportedQueryRequest;
+        if (request.graph_queries != null or request.graph_searches != null) return error.UnsupportedQueryRequest;
         if (request.expand_strategy != null) return error.UnsupportedQueryRequest;
         if (request.document_renderer != null) return error.UnsupportedQueryRequest;
         if (request.pruner != null) return error.UnsupportedQueryRequest;
@@ -2612,7 +2612,10 @@ pub const HttpHandler = struct {
         };
         var raw_request = ant_json.parseFromSlice(std.json.Value, self.alloc, body, .{}) catch return null;
         defer raw_request.deinit();
-        if (raw_request.value == .object and raw_request.value.object.get("graph_queries") != null) {
+        if (raw_request.value == .object and
+            (raw_request.value.object.get("graph_queries") != null or
+                raw_request.value.object.get("graph_searches") != null))
+        {
             const unsupported_controls = [_][]const u8{
                 "aggregations",
                 "analyses",
@@ -2639,7 +2642,7 @@ pub const HttpHandler = struct {
         }) catch return null;
         defer parsed_request.deinit();
         const request = parsed_request.value;
-        if (request.graph_queries == null) return null;
+        if (request.graph_queries == null and request.graph_searches == null) return null;
 
         if (request.aggregations != null or
             request.analyses != null or

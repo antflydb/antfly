@@ -97,6 +97,9 @@ pub const GraphQuery = struct {
     query_type: QueryType,
     index_name: []const u8,
     start_nodes: NodeSelector,
+    /// Preserve the v0.2 `graph_searches` response envelope while that request
+    /// field remains available as a deprecated compatibility adapter.
+    legacy_response: bool = false,
     params: QueryParams = .{},
     target_nodes: ?NodeSelector = null,
     k: u32 = 1,

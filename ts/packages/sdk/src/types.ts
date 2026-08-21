@@ -182,6 +182,16 @@ export type EdgesResponse = components["schemas"]["EdgesResponse"];
 export type TraversalRules = components["schemas"]["TraversalRules"];
 export type TraversalResult = components["schemas"]["TraversalResult"];
 export type GraphQuery = components["schemas"]["GraphQuery"];
+/** @deprecated Use GraphQuery through QueryRequest.graph_queries. */
+export type LegacyGraphQuery = components["schemas"]["LegacyGraphQuery"];
+/** @deprecated Compatibility type for LegacyGraphQuery. */
+export type GraphQueryType = components["schemas"]["GraphQueryType"];
+/** @deprecated Compatibility type for LegacyGraphQuery. */
+export type GraphQueryParams = components["schemas"]["GraphQueryParams"];
+/** @deprecated Compatibility type for LegacyGraphQuery. */
+export type PatternStep = components["schemas"]["PatternStep"];
+/** @deprecated Compatibility type for legacy graph result matches. */
+export type PatternMatch = components["schemas"]["PatternMatch"];
 export type GraphQueryResult = components["schemas"]["GraphQueryResult"];
 export type GraphResultNode = components["schemas"]["GraphResultNode"];
 export type GraphNodeSelector = components["schemas"]["GraphNodeSelector"];

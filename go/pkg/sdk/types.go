@@ -261,6 +261,12 @@ type (
 
 	// Graph query types
 	GraphQuery               = oapi.GraphQuery
+	LegacyGraphQuery         = oapi.LegacyGraphQuery
+	GraphQueryType           = oapi.GraphQueryType
+	GraphQueryParams         = oapi.GraphQueryParams
+	PatternStep              = oapi.PatternStep
+	PatternEdgeStep          = oapi.PatternEdgeStep
+	PatternMatch             = oapi.PatternMatch
 	GraphQueryResult         = oapi.GraphQueryResult
 	GraphNodeSelector        = oapi.GraphNodeSelector
 	GraphResultNode          = oapi.GraphResultNode

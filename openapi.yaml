@@ -13410,6 +13410,10 @@ components:
       type: object
       not:
         anyOf:
+          - description: Use graph_queries or deprecated graph_searches, never both.
+            required:
+              - graph_queries
+              - graph_searches
           - description: Hierarchy grouping requires an explicit top-level field projection.
             allOf:
               - required:
@@ -13554,6 +13558,8 @@ components:
                       - aggregations
                   - required:
                       - graph_queries
+                  - required:
+                      - graph_searches
                   - required:
                       - expand_strategy
                   - required:
@@ -14100,6 +14106,15 @@ components:
             Declarative graph matching, traversal, and path queries. A nested node
 
             `filter` uses the same canonical query DSL as document search.
+        graph_searches:
+          deprecated: true
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/LegacyGraphQuery'
+          description: >
+            Deprecated compatibility alias for the v0.2 graph query contract.
+
+            Use `graph_queries`; requests containing both fields are rejected.
         expand_strategy:
           type: string
           enum:
@@ -21698,6 +21713,154 @@ components:
         - $ref: '#/components/schemas/GraphTraverseQuery'
         - $ref: '#/components/schemas/GraphShortestPathQuery'
         - $ref: '#/components/schemas/GraphKShortestPathsQuery'
+    GraphQueryType:
+      x-go-type-skip-optional-pointer: true
+      type: string
+      enum:
+        - traverse
+        - neighbors
+        - shortest_path
+        - k_shortest_paths
+        - pattern
+      description: Deprecated discriminator used by LegacyGraphQuery.
+    GraphQueryParams:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      deprecated: true
+      description: Deprecated graph_searches traversal and path parameters.
+      properties:
+        edge_types:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+        direction:
+          $ref: '#/components/schemas/EdgeDirection'
+        max_depth:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          maximum: 64
+        min_weight:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+        max_weight:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+        max_results:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          maximum: 10000
+        deduplicate_nodes:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        include_paths:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        weight_mode:
+          $ref: '#/components/schemas/PathWeightMode'
+        k:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          maximum: 100
+        node_filter:
+          $ref: '#/components/schemas/NodeFilter'
+        algorithm:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        algorithm_params:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+    PatternEdgeStep:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      deprecated: true
+      description: Deprecated linear graph_searches pattern edge.
+      properties:
+        types:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+        direction:
+          $ref: '#/components/schemas/EdgeDirection'
+        min_hops:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          default: 1
+          minimum: 1
+        max_hops:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          default: 1
+          minimum: 1
+        min_weight:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+        max_weight:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+    PatternStep:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      deprecated: true
+      description: Deprecated linear graph_searches pattern step.
+      properties:
+        alias:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        node_filter:
+          $ref: '#/components/schemas/NodeFilter'
+        edge:
+          $ref: '#/components/schemas/PatternEdgeStep'
+    LegacyGraphQuery:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      deprecated: true
+      description: Deprecated graph_searches request. Use the operation-keyed GraphQuery DSL.
+      required:
+        - type
+        - index_name
+      properties:
+        type:
+          $ref: '#/components/schemas/GraphQueryType'
+        index_name:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        start_nodes:
+          $ref: '#/components/schemas/GraphNodeSelector'
+        target_nodes:
+          $ref: '#/components/schemas/GraphNodeSelector'
+        params:
+          $ref: '#/components/schemas/GraphQueryParams'
+        pattern:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            $ref: '#/components/schemas/PatternStep'
+        return_aliases:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+        include_documents:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        include_edges:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        fields:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
     Pruner:
       type: object
       description: >
@@ -21820,6 +21983,22 @@ components:
           items:
             $ref: '#/components/schemas/Edge'
           description: Connected edges when supplied by the graph executor.
+    PatternMatch:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      deprecated: true
+      description: Deprecated graph_searches pattern response row.
+      properties:
+        bindings:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/GraphResultNode'
+        path:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            $ref: '#/components/schemas/PathEdge'
     GraphAggregateValue:
       type: object
       required:
@@ -21853,6 +22032,10 @@ components:
       type: object
       description: Results of a graph query
       properties:
+        type:
+          deprecated: true
+          description: Deprecated graph_searches query discriminator; omitted for graph_queries.
+          $ref: '#/components/schemas/GraphQueryType'
         nodes:
           x-go-type-skip-optional-pointer: true
           type: array
@@ -21865,6 +22048,18 @@ components:
           items:
             $ref: '#/components/schemas/Path'
           description: Result paths (for pathfinding queries)
+        matches:
+          deprecated: true
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            $ref: '#/components/schemas/PatternMatch'
+          description: Deprecated graph_searches pattern results; use rows for graph_queries.
+        total:
+          deprecated: true
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          description: Deprecated graph_searches result count; use stats or a named count aggregate.
         rows:
           type: array
           items:

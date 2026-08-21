@@ -6502,6 +6502,8 @@ components:
       type: object
       not:
         anyOf:
+          - description: Use graph_queries or deprecated graph_searches, never both.
+            required: [graph_queries, graph_searches]
           - description: Hierarchy grouping requires an explicit top-level field projection.
             allOf:
               - required: [hierarchy]
@@ -6597,6 +6599,7 @@ components:
                   - required: [analyses]
                   - required: [aggregations]
                   - required: [graph_queries]
+                  - required: [graph_searches]
                   - required: [expand_strategy]
                   - required: [document_renderer]
                   - required: [pruner]
@@ -6976,6 +6979,14 @@ components:
           description: |
             Declarative graph matching, traversal, and path queries. A nested node
             `filter` uses the same canonical query DSL as document search.
+        graph_searches:
+          deprecated: true
+          type: object
+          additionalProperties:
+            $ref: "indexes.yaml#/components/schemas/LegacyGraphQuery"
+          description: |
+            Deprecated compatibility alias for the v0.2 graph query contract.
+            Use `graph_queries`; requests containing both fields are rejected.
         expand_strategy:
           type: string
           enum:

@@ -4098,12 +4098,35 @@ pub const GraphQueryPage = struct {
     next_cursor: ?[]const u8 = null,
 };
 
+/// Deprecated graph_searches traversal and path parameters.
+pub const GraphQueryParams = struct {
+    edge_types: ?[]const []const u8 = null,
+    direction: ?EdgeDirection = null,
+    max_depth: ?i64 = null,
+    min_weight: ?f64 = null,
+    max_weight: ?f64 = null,
+    max_results: ?i64 = null,
+    deduplicate_nodes: ?bool = null,
+    include_paths: ?bool = null,
+    weight_mode: ?PathWeightMode = null,
+    k: ?i64 = null,
+    node_filter: ?NodeFilter = null,
+    algorithm: ?[]const u8 = null,
+    algorithm_params: ?std.json.Value = null,
+};
+
 /// Results of a graph query
 pub const GraphQueryResult = struct {
+    /// Deprecated graph_searches query discriminator; omitted for graph_queries.
+    type: ?GraphQueryType = null,
     /// Result nodes
     nodes: ?[]const GraphResultNode = null,
     /// Result paths (for pathfinding queries)
     paths: ?[]const Path = null,
+    /// Deprecated graph_searches pattern results; use rows for graph_queries.
+    matches: ?[]const PatternMatch = null,
+    /// Deprecated graph_searches result count; use stats or a named count aggregate.
+    total: ?i64 = null,
     rows: ?[]const std.json.Value = null,
     aggregates: ?std.json.ArrayHashMap(GraphAggregateValue) = null,
     page: ?GraphQueryPage = null,
@@ -4115,6 +4138,41 @@ pub const GraphQueryResult = struct {
 pub const GraphQueryStats = struct {
     returned_rows: i64,
     truncated: bool,
+};
+
+/// Deprecated discriminator used by LegacyGraphQuery.
+pub const GraphQueryType = enum {
+    traverse,
+    neighbors,
+    shortest_path,
+    k_shortest_paths,
+    pattern,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .traverse => "traverse",
+            .neighbors => "neighbors",
+            .shortest_path => "shortest_path",
+            .k_shortest_paths => "k_shortest_paths",
+            .pattern => "pattern",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "traverse", .traverse },
+            .{ "neighbors", .neighbors },
+            .{ "shortest_path", .shortest_path },
+            .{ "k_shortest_paths", .k_shortest_paths },
+            .{ "pattern", .pattern },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// A node in graph query results
@@ -6185,6 +6243,20 @@ pub const KeyRange = struct {
     to: ?[]const u8 = null,
 };
 
+/// Deprecated graph_searches request. Use the operation-keyed GraphQuery DSL.
+pub const LegacyGraphQuery = struct {
+    type: GraphQueryType,
+    index_name: []const u8,
+    start_nodes: ?GraphNodeSelector = null,
+    target_nodes: ?GraphNodeSelector = null,
+    params: ?GraphQueryParams = null,
+    pattern: ?[]const PatternStep = null,
+    return_aliases: ?[]const []const u8 = null,
+    include_documents: ?bool = null,
+    include_edges: ?bool = null,
+    fields: ?[]const []const u8 = null,
+};
+
 /// Status of a linear merge page operation: - "success": All records in batch processed successfully - "partial": Processing stopped at shard boundary, client should retry with next_cursor - "error": Fatal error occurred, no records processed successfully
 pub const LinearMergePageStatus = enum {
     success,
@@ -6771,6 +6843,29 @@ pub const PathWeightMode = enum {
     }
 };
 
+/// Deprecated linear graph_searches pattern edge.
+pub const PatternEdgeStep = struct {
+    types: ?[]const []const u8 = null,
+    direction: ?EdgeDirection = null,
+    min_hops: ?i64 = null,
+    max_hops: ?i64 = null,
+    min_weight: ?f64 = null,
+    max_weight: ?f64 = null,
+};
+
+/// Deprecated graph_searches pattern response row.
+pub const PatternMatch = struct {
+    bindings: ?std.json.ArrayHashMap(GraphResultNode) = null,
+    path: ?[]const PathEdge = null,
+};
+
+/// Deprecated linear graph_searches pattern step.
+pub const PatternStep = struct {
+    alias: ?[]const u8 = null,
+    node_filter: ?NodeFilter = null,
+    edge: ?PatternEdgeStep = null,
+};
+
 pub const Permission = struct {
     /// Resource name (e.g., table name, target username, or '*' for all inference operations or a global grant).
     resource: []const u8,
@@ -7325,6 +7420,8 @@ pub const QueryRequest = struct {
     analyses: ?Analyses = null,
     /// Declarative graph matching, traversal, and path queries. A nested node `filter` uses the same canonical query DSL as document search.
     graph_queries: ?std.json.ArrayHashMap(GraphQuery) = null,
+    /// Deprecated compatibility alias for the v0.2 graph query contract. Use `graph_queries`; requests containing both fields are rejected.
+    graph_searches: ?std.json.ArrayHashMap(LegacyGraphQuery) = null,
     /// Strategy for merging graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
     expand_strategy: ?[]const u8 = null,
     /// Optional Handlebars template string for rendering document content in RAG queries. Template has access to document fields via `{{this.fields.fieldName}}`. **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction: ```handlebars {{encodeToon this.fields}} ``` **Available Helpers**: - `encodeToon` - Renders fields in compact TOON format with configurable options: - `lengthMarker` (bool): Add # prefix to array counts (default: true) - `indent` (int): Indentation spacing (default: 2) - `delimiter` (string): Field separator for tabular arrays - `scrubHtml` - Removes HTML tags and extracts text - `media` - Wraps data URIs for GenKit multimodal support - `eq` - Equality comparison for conditionals **Examples**: - Basic TOON: `{{encodeToon this.fields}}` - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}` - Tabular data: `{{encodeToon this.fields delimiter="\t"}}` - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}` - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}` TOON format produces compact, LLM-optimized output like: ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml ``` **References**: - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon
@@ -7880,6 +7977,8 @@ pub const RetrievalQueryRequest = struct {
     analyses: ?Analyses = null,
     /// Declarative graph matching, traversal, and path queries. A nested node `filter` uses the same canonical query DSL as document search.
     graph_queries: ?std.json.ArrayHashMap(GraphQuery) = null,
+    /// Deprecated compatibility alias for the v0.2 graph query contract. Use `graph_queries`; requests containing both fields are rejected.
+    graph_searches: ?std.json.ArrayHashMap(LegacyGraphQuery) = null,
     /// Strategy for merging graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
     expand_strategy: ?[]const u8 = null,
     /// Optional Handlebars template string for rendering document content in RAG queries. Template has access to document fields via `{{this.fields.fieldName}}`. **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction: ```handlebars {{encodeToon this.fields}} ``` **Available Helpers**: - `encodeToon` - Renders fields in compact TOON format with configurable options: - `lengthMarker` (bool): Add # prefix to array counts (default: true) - `indent` (int): Indentation spacing (default: 2) - `delimiter` (string): Field separator for tabular arrays - `scrubHtml` - Removes HTML tags and extracts text - `media` - Wraps data URIs for GenKit multimodal support - `eq` - Equality comparison for conditionals **Examples**: - Basic TOON: `{{encodeToon this.fields}}` - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}` - Tabular data: `{{encodeToon this.fields delimiter="\t"}}` - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}` - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}` TOON format produces compact, LLM-optimized output like: ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml ``` **References**: - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon

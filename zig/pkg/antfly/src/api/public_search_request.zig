@@ -79,6 +79,7 @@ pub fn looksLikePublicSearchRequest(value: std.json.Value) bool {
         hasNonNullField(obj, "reranker") or
         hasNonNullField(obj, "hierarchy") or
         hasNonNullField(obj, "graph_queries") or
+        hasNonNullField(obj, "graph_searches") or
         hasNonNullField(obj, "expand_strategy") or
         hasNonNullField(obj, "distance_over") or
         hasNonNullField(obj, "distance_under");

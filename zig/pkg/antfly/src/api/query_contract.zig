@@ -5123,6 +5123,20 @@ fn toOpenApiGraphQueryResult(
     meta: QueryResponseMeta,
     graph_result: db_mod.types.GraphSearchResult,
 ) !indexes_openapi.GraphQueryResult {
+    if (query.legacy_response) {
+        return .{
+            .type = legacyGraphQueryType(query.query_type),
+            .nodes = try toOpenApiGraphNodes(alloc, graph_result),
+            .paths = try toOpenApiPaths(alloc, graph_result.paths),
+            .matches = try toOpenApiLegacyPatternMatches(
+                alloc,
+                graph_result,
+                query.params.include_paths,
+            ),
+            .total = @intCast(graph_result.total_hits),
+            .took = meta.took_ms,
+        };
+    }
     const rows = if (query.match_pattern != null and query.aggregates.len == 0)
         try toOpenApiGraphRows(alloc, graph_result)
     else
@@ -5142,6 +5156,53 @@ fn toOpenApiGraphQueryResult(
         },
         .took = meta.took_ms,
     };
+}
+
+fn legacyGraphQueryType(query_type: graph_query_mod.QueryType) indexes_openapi.GraphQueryType {
+    return switch (query_type) {
+        .traverse => .traverse,
+        .neighbors => .neighbors,
+        .shortest_path => .shortest_path,
+        .k_shortest_paths => .k_shortest_paths,
+        .pattern => .pattern,
+    };
+}
+
+fn toOpenApiLegacyPatternMatches(
+    alloc: std.mem.Allocator,
+    graph_result: db_mod.types.GraphSearchResult,
+    include_paths: bool,
+) !?[]const indexes_openapi.PatternMatch {
+    if (graph_result.matches.len == 0) return null;
+    const out = try alloc.alloc(indexes_openapi.PatternMatch, graph_result.matches.len);
+    for (graph_result.matches, 0..) |match, i| {
+        var bindings: std.json.ArrayHashMap(indexes_openapi.GraphResultNode) = .{};
+        errdefer bindings.deinit(alloc);
+        for (match.bindings) |binding| {
+            try bindings.map.put(alloc, binding.alias, .{
+                .key = binding.node.key,
+                .table = binding.node.table,
+                .depth = @intCast(binding.node.depth),
+                .distance = binding.node.distance,
+                .document = findGraphDocument(
+                    alloc,
+                    graph_result.hits,
+                    binding.node.key,
+                    binding.node.table,
+                ),
+                .path = binding.node.path,
+                .path_edges = try toOpenApiOptionalPathEdges(alloc, binding.node.path_edges),
+                .provenance = binding.node.provenance,
+                .evidence = try graphNodeEvidenceJsonValue(alloc, binding.node),
+                .edges = null,
+            });
+        }
+        out[i] = .{
+            .bindings = bindings,
+            .path = if (include_paths) try toOpenApiPathEdges(alloc, match.path) else null,
+        };
+    }
+    return out;
 }
 
 fn toOpenApiGraphRows(
@@ -5305,6 +5366,33 @@ test "graph aggregate response preserves exact decimal counts" {
     try std.testing.expectEqualStrings("9384729384729384", count.value);
     try std.testing.expect(count.exact);
     try std.testing.expect(result.rows == null);
+}
+
+test "deprecated graph search preserves its response envelope" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const result = try toOpenApiGraphQueryResult(
+        alloc,
+        .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .legacy_response = true,
+        },
+        .{ .took_ms = 3 },
+        .{
+            .name = @constCast("neighbors"),
+            .hits = &.{},
+            .total_hits = 12,
+        },
+    );
+
+    try std.testing.expectEqual(indexes_openapi.GraphQueryType.neighbors, result.type.?);
+    try std.testing.expectEqual(@as(i64, 12), result.total.?);
+    try std.testing.expect(result.rows == null);
+    try std.testing.expect(result.aggregates == null);
+    try std.testing.expect(result.stats == null);
 }
 
 fn toOpenApiGraphNodes(
@@ -8337,7 +8425,8 @@ fn buildGraphQueries(
     alloc: std.mem.Allocator,
     request: metadata_openapi.QueryRequest,
 ) ![]const db_mod.types.NamedGraphQuery {
-    const graph_queries = request.graph_queries orelse return &.{};
+    if (request.graph_queries != null and request.graph_searches != null)
+        return error.InvalidQueryRequest;
 
     var items = std.ArrayListUnmanaged(db_mod.types.NamedGraphQuery).empty;
     errdefer {
@@ -8348,20 +8437,32 @@ fn buildGraphQueries(
         items.deinit(alloc);
     }
 
-    var it = graph_queries.map.iterator();
-    while (it.next()) |entry| {
-        const name = try alloc.dupe(u8, entry.key_ptr.*);
-        var name_owned = true;
-        errdefer if (name_owned) alloc.free(name);
-        const query = try parseGraphQuery(alloc, entry.value_ptr.*);
-        var query_owned = true;
-        errdefer if (query_owned) freeGraphQuery(alloc, query);
-        try items.append(alloc, .{
-            .name = name,
-            .query = query,
-        });
-        name_owned = false;
-        query_owned = false;
+    if (request.graph_queries) |graph_queries| {
+        var it = graph_queries.map.iterator();
+        while (it.next()) |entry| {
+            const name = try alloc.dupe(u8, entry.key_ptr.*);
+            var name_owned = true;
+            errdefer if (name_owned) alloc.free(name);
+            const query = try parseGraphQuery(alloc, entry.value_ptr.*);
+            var query_owned = true;
+            errdefer if (query_owned) freeGraphQuery(alloc, query);
+            try items.append(alloc, .{ .name = name, .query = query });
+            name_owned = false;
+            query_owned = false;
+        }
+    } else if (request.graph_searches) |graph_searches| {
+        var it = graph_searches.map.iterator();
+        while (it.next()) |entry| {
+            const name = try alloc.dupe(u8, entry.key_ptr.*);
+            var name_owned = true;
+            errdefer if (name_owned) alloc.free(name);
+            const query = try parseLegacyGraphQuery(alloc, entry.value_ptr.*);
+            var query_owned = true;
+            errdefer if (query_owned) freeGraphQuery(alloc, query);
+            try items.append(alloc, .{ .name = name, .query = query });
+            name_owned = false;
+            query_owned = false;
+        }
     }
     return try items.toOwnedSlice(alloc);
 }
@@ -8381,6 +8482,175 @@ pub fn parseGraphQuery(
             std.math.cast(u32, value.k_shortest_paths.k) orelse return error.InvalidQueryRequest,
             .k_shortest_paths,
         ),
+    };
+}
+
+pub fn parseLegacyGraphQuery(
+    alloc: std.mem.Allocator,
+    query: indexes_openapi.LegacyGraphQuery,
+) !graph_query_mod.GraphQuery {
+    const params = try parseLegacyGraphQueryParams(alloc, query.params);
+    errdefer freeGraphQueryParams(alloc, params);
+    const index_name = try alloc.dupe(u8, query.index_name);
+    errdefer alloc.free(index_name);
+    const start_nodes = try parseGraphNodeSelector(alloc, query.start_nodes orelse return error.UnsupportedQueryRequest);
+    errdefer freeGraphNodeSelector(alloc, start_nodes);
+    const target_nodes = if (query.target_nodes) |selector|
+        try parseGraphNodeSelector(alloc, selector)
+    else
+        null;
+    errdefer if (target_nodes) |selector| freeGraphNodeSelector(alloc, selector);
+    const pattern = if (query.pattern) |steps|
+        try parseLegacyPatternSteps(alloc, steps)
+    else
+        @constCast((&[_]graph_pattern_mod.PatternStep{})[0..]);
+    errdefer freePatternSteps(alloc, pattern);
+    const return_aliases = if (query.return_aliases) |aliases|
+        try cloneFields(alloc, aliases)
+    else
+        @constCast((&[_][]const u8{})[0..]);
+    errdefer freeOwnedStringSlice(alloc, return_aliases);
+    if (query.include_edges == true) return error.UnsupportedQueryRequest;
+    const fields = if (query.fields) |requested_fields|
+        try cloneFields(alloc, requested_fields)
+    else
+        @constCast((&[_][]const u8{})[0..]);
+    errdefer freeOwnedStringSlice(alloc, fields);
+
+    if (query.type == .pattern) {
+        if (pattern.len == 0) return error.UnsupportedQueryRequest;
+    } else if (pattern.len > 0 or return_aliases.len > 0) {
+        return error.UnsupportedQueryRequest;
+    }
+
+    const k: u32 = if (query.params) |graph_params|
+        if (graph_params.k) |raw| blk: {
+            const value = std.math.cast(u32, raw) orelse return error.InvalidQueryRequest;
+            if (value < 1 or value > 100) return error.InvalidQueryRequest;
+            break :blk value;
+        } else 1
+    else
+        1;
+
+    return .{
+        .query_type = switch (query.type) {
+            .traverse => .traverse,
+            .neighbors => .neighbors,
+            .shortest_path => .shortest_path,
+            .k_shortest_paths => .k_shortest_paths,
+            .pattern => .pattern,
+        },
+        .index_name = index_name,
+        .start_nodes = start_nodes,
+        .legacy_response = true,
+        .params = params,
+        .target_nodes = target_nodes,
+        .k = k,
+        .pattern = pattern,
+        .return_aliases = return_aliases,
+        .include_documents = query.include_documents orelse false,
+        .fields = fields,
+        .include_all_fields = query.fields == null,
+    };
+}
+
+fn parseLegacyPatternSteps(
+    alloc: std.mem.Allocator,
+    value: []const indexes_openapi.PatternStep,
+) ![]const graph_pattern_mod.PatternStep {
+    if (value.len == 0 or value.len > graph_pattern_mod.max_pattern_steps)
+        return error.InvalidQueryRequest;
+    const steps = try alloc.alloc(graph_pattern_mod.PatternStep, value.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (steps[0..initialized]) |step| {
+            alloc.free(step.alias);
+            freePatternNodeFilter(alloc, step.node_filter);
+            freeOwnedStringSlice(alloc, step.edge.types);
+        }
+        alloc.free(steps);
+    }
+
+    for (value, 0..) |step, i| {
+        const edge_types = if (step.edge) |edge|
+            if (edge.types) |types| try cloneFields(alloc, types) else &.{}
+        else
+            &.{};
+        errdefer freeOwnedStringSlice(alloc, edge_types);
+        steps[i] = .{
+            .alias = try alloc.dupe(u8, step.alias orelse ""),
+            .node_filter = try parseLegacyPatternNodeFilter(alloc, step.node_filter),
+            .edge = if (step.edge) |edge| .{
+                .direction = if (edge.direction) |direction| switch (direction) {
+                    .out => .out,
+                    .in => .in,
+                    .both => .both,
+                } else .out,
+                .min_hops = if (edge.min_hops) |raw| std.math.cast(u32, raw) orelse return error.InvalidQueryRequest else 1,
+                .max_hops = if (edge.max_hops) |raw| std.math.cast(u32, raw) orelse return error.InvalidQueryRequest else 1,
+                .min_weight = edge.min_weight orelse 0,
+                .max_weight = edge.max_weight orelse 0,
+                .types = edge_types,
+            } else .{ .types = edge_types },
+        };
+        if (step.edge != null and (steps[i].edge.min_hops == 0 or
+            steps[i].edge.max_hops == 0 or
+            steps[i].edge.min_hops > steps[i].edge.max_hops or
+            steps[i].edge.max_hops > graph_pattern_mod.max_pattern_hops))
+            return error.InvalidQueryRequest;
+        initialized += 1;
+    }
+    return steps;
+}
+
+fn parseLegacyPatternNodeFilter(
+    alloc: std.mem.Allocator,
+    filter: ?indexes_openapi.NodeFilter,
+) !graph_pattern_mod.NodeFilter {
+    const value = filter orelse return .{};
+    var out: graph_pattern_mod.NodeFilter = .{};
+    errdefer freePatternNodeFilter(alloc, out);
+    if (value.filter_prefix) |prefix| out.filter_prefix = try alloc.dupe(u8, prefix);
+    if (value.filter_query) |filter_query| {
+        const parsed = try parseSupportedFullTextQuery(alloc, filter_query, 10);
+        defer freeTextQuery(alloc, parsed);
+        out.filter_query_json = try encodePatternFilterQuery(alloc, parsed);
+    }
+    return out;
+}
+
+fn parseLegacyGraphQueryParams(
+    alloc: std.mem.Allocator,
+    params: ?indexes_openapi.GraphQueryParams,
+) !graph_query_mod.QueryParams {
+    const value = params orelse return .{};
+    if (value.algorithm != null or value.algorithm_params != null) return error.UnsupportedQueryRequest;
+    const max_depth = if (value.max_depth) |raw| std.math.cast(u32, raw) orelse return error.InvalidQueryRequest else 3;
+    const max_results = if (value.max_results) |raw| std.math.cast(u32, raw) orelse return error.InvalidQueryRequest else 100;
+    if (max_depth < 1 or max_depth > 64 or max_results < 1 or max_results > 10_000)
+        return error.InvalidQueryRequest;
+    const node_filter = try parseLegacyPatternNodeFilter(alloc, value.node_filter);
+    errdefer freePatternNodeFilter(alloc, node_filter);
+    const edge_types = if (value.edge_types) |types| try cloneFields(alloc, types) else &.{};
+    return .{
+        .edge_types = edge_types,
+        .direction = if (value.direction) |direction| switch (direction) {
+            .out => .out,
+            .in => .in,
+            .both => .both,
+        } else .out,
+        .max_depth = max_depth,
+        .max_results = max_results,
+        .min_weight = value.min_weight orelse 0,
+        .max_weight = value.max_weight orelse 0,
+        .deduplicate = value.deduplicate_nodes orelse true,
+        .include_paths = value.include_paths orelse false,
+        .weight_mode = if (value.weight_mode) |mode| switch (mode) {
+            .min_hops => .min_hops,
+            .min_weight => .min_weight,
+            .max_weight => .max_weight,
+        } else .min_hops,
+        .node_filter = node_filter,
     };
 }
 

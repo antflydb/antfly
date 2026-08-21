@@ -1738,7 +1738,7 @@ test "query parser keeps stored documents for dense reranking without fields" {
     try std.testing.expect(owned.req.include_stored);
 }
 
-test "query parser accepts graph searches" {
+test "query parser accepts graph queries" {
     var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
         \\{"graph_queries":{"neighbors":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]},"edge_types":["links"],"max_depth":1}}},"limit":10}
     );
@@ -1752,6 +1752,24 @@ test "query parser accepts graph searches" {
         .keys => |keys| try std.testing.expectEqualStrings("doc:a", keys[0]),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "query parser adapts deprecated graph searches" {
+    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+        \\{"graph_searches":{"neighbors":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]},"params":{"edge_types":["links"],"max_depth":1}}},"limit":10}
+    );
+    defer owned.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries.len);
+    try std.testing.expectEqualStrings("neighbors", owned.req.graph_queries[0].name);
+    try std.testing.expect(owned.req.graph_queries[0].query.query_type == .neighbors);
+    try std.testing.expect(owned.req.graph_queries[0].query.legacy_response);
+}
+
+test "query parser rejects graph queries and graph searches together" {
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
+        \\{"graph_queries":{"new":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]}}}},"graph_searches":{"old":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]}}}}
+    ));
 }
 
 test "query parser accepts graph pattern searches" {

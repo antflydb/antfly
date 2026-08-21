@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from ..models.query_request_embeddings import QueryRequestEmbeddings
     from ..models.query_request_foreign_sources import QueryRequestForeignSources
     from ..models.query_request_graph_queries import QueryRequestGraphQueries
+    from ..models.query_request_graph_searches import QueryRequestGraphSearches
     from ..models.query_request_query import QueryRequestQuery
     from ..models.query_string_query import QueryStringQuery
     from ..models.regexp_query import RegexpQuery
@@ -286,6 +287,9 @@ class RetrievalQueryRequest:
             graph_queries (QueryRequestGraphQueries | Unset): Declarative graph matching, traversal, and path queries. A
                 nested node
                 `filter` uses the same canonical query DSL as document search.
+            graph_searches (QueryRequestGraphSearches | Unset): Deprecated compatibility alias for the v0.2 graph query
+                contract.
+                Use `graph_queries`; requests containing both fields are rejected.
             expand_strategy (QueryRequestExpandStrategy | Unset): Strategy for merging graph results with search results:
                 - union: Include nodes from both search and graph results
                 - intersection: Only include nodes appearing in both
@@ -476,6 +480,7 @@ class RetrievalQueryRequest:
     reranker: RerankerConfig | Unset = UNSET
     analyses: Analyses | Unset = UNSET
     graph_queries: QueryRequestGraphQueries | Unset = UNSET
+    graph_searches: QueryRequestGraphSearches | Unset = UNSET
     expand_strategy: QueryRequestExpandStrategy | Unset = UNSET
     document_renderer: str | Unset = UNSET
     pruner: Pruner | Unset = UNSET
@@ -758,6 +763,10 @@ class RetrievalQueryRequest:
         if not isinstance(self.graph_queries, Unset):
             graph_queries = self.graph_queries.to_dict()
 
+        graph_searches: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.graph_searches, Unset):
+            graph_searches = self.graph_searches.to_dict()
+
         expand_strategy: str | Unset = UNSET
         if not isinstance(self.expand_strategy, Unset):
             expand_strategy = self.expand_strategy.value
@@ -839,6 +848,8 @@ class RetrievalQueryRequest:
             field_dict["analyses"] = analyses
         if graph_queries is not UNSET:
             field_dict["graph_queries"] = graph_queries
+        if graph_searches is not UNSET:
+            field_dict["graph_searches"] = graph_searches
         if expand_strategy is not UNSET:
             field_dict["expand_strategy"] = expand_strategy
         if document_renderer is not UNSET:
@@ -886,6 +897,7 @@ class RetrievalQueryRequest:
         from ..models.query_request_embeddings import QueryRequestEmbeddings
         from ..models.query_request_foreign_sources import QueryRequestForeignSources
         from ..models.query_request_graph_queries import QueryRequestGraphQueries
+        from ..models.query_request_graph_searches import QueryRequestGraphSearches
         from ..models.query_request_query import QueryRequestQuery
         from ..models.query_string_query import QueryStringQuery
         from ..models.regexp_query import RegexpQuery
@@ -1717,6 +1729,13 @@ class RetrievalQueryRequest:
         else:
             graph_queries = QueryRequestGraphQueries.from_dict(_graph_queries)
 
+        _graph_searches = d.pop("graph_searches", UNSET)
+        graph_searches: QueryRequestGraphSearches | Unset
+        if isinstance(_graph_searches, Unset):
+            graph_searches = UNSET
+        else:
+            graph_searches = QueryRequestGraphSearches.from_dict(_graph_searches)
+
         _expand_strategy = d.pop("expand_strategy", UNSET)
         expand_strategy: QueryRequestExpandStrategy | Unset
         if isinstance(_expand_strategy, Unset):
@@ -1783,6 +1802,7 @@ class RetrievalQueryRequest:
             reranker=reranker,
             analyses=analyses,
             graph_queries=graph_queries,
+            graph_searches=graph_searches,
             expand_strategy=expand_strategy,
             document_renderer=document_renderer,
             pruner=pruner,

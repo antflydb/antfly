@@ -2291,8 +2291,13 @@ fn hasAggregationRetrievalFields(retrieval_query: RetrievalQueryRequest) bool {
 }
 
 fn hasGraphRetrievalFields(retrieval_query: RetrievalQueryRequest) bool {
-    const graph_queries = retrieval_query.graph_queries orelse return false;
-    return graph_queries.map.count() > 0;
+    if (retrieval_query.graph_queries) |graph_queries| {
+        if (graph_queries.map.count() > 0) return true;
+    }
+    if (retrieval_query.graph_searches) |graph_searches| {
+        if (graph_searches.map.count() > 0) return true;
+    }
+    return false;
 }
 
 fn buildToolModeStepDetails(
@@ -5471,7 +5476,8 @@ fn encodeQueryValueForRetrievalQuery(
     query_request.filter_query = mandatory_predicates.filter_query;
     query_request.exclusion_query = mandatory_predicates.exclusion_query;
     if (retrieval_query.tree_search) |tree_search| {
-        if (query_request.graph_queries != null) return error.UnsupportedRetrievalAgentRequest;
+        if (query_request.graph_queries != null or query_request.graph_searches != null)
+            return error.UnsupportedRetrievalAgentRequest;
         query_request.graph_queries = try buildTreeGraphSearches(
             arena,
             runner,
@@ -6300,6 +6306,14 @@ test "retrieval agent requires every tool used by a combined retrieval query" {
     try std.testing.expectError(
         error.UnsupportedRetrievalAgentRequest,
         executeJson(std.testing.allocator, ValidationOnlyRunner.iface(), null, semantic_graph_body),
+    );
+
+    const semantic_legacy_graph_body =
+        \\{"query":"find related alpha docs","stream":false,"tools":{"enabled_tools":["semantic_search"]},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"graph_searches":{"related":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]}}},"limit":5}]}
+    ;
+    try std.testing.expectError(
+        error.UnsupportedRetrievalAgentRequest,
+        executeJson(std.testing.allocator, ValidationOnlyRunner.iface(), null, semantic_legacy_graph_body),
     );
 
     const tree_seed_body =

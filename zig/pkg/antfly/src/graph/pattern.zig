@@ -1136,13 +1136,47 @@ fn validateConjunctivePattern(pattern: ConjunctivePattern) !void {
     }
     for (pattern.edges) |edge| try validateMatchEdge(pattern.nodes, edge);
     for (pattern.predicates) |predicate| try validateMatchPredicate(pattern.nodes, predicate);
-    for (pattern.optional) |optional_pattern| {
+    for (pattern.optional, 0..) |optional_pattern, optional_index| {
+        for (optional_pattern.nodes, 0..) |node, node_index| {
+            if (node.alias.len == 0 or findMatchNode(pattern.nodes, node.alias) != null)
+                return error.InvalidArgument;
+            for (optional_pattern.nodes[0..node_index]) |prior| {
+                if (std.mem.eql(u8, prior.alias, node.alias)) return error.InvalidArgument;
+            }
+            for (pattern.optional[0..optional_index]) |prior_group| {
+                if (findMatchNode(prior_group.nodes, node.alias) != null) return error.InvalidArgument;
+            }
+        }
         for (optional_pattern.edges) |edge| {
-            if (findMatchNode(pattern.nodes, edge.from) == null and findMatchNode(optional_pattern.nodes, edge.from) == null) return error.InvalidArgument;
-            if (findMatchNode(pattern.nodes, edge.to) == null and findMatchNode(optional_pattern.nodes, edge.to) == null) return error.InvalidArgument;
+            if (!optionalAliasVisible(pattern, optional_index, edge.from) or
+                !optionalAliasVisible(pattern, optional_index, edge.to))
+                return error.InvalidArgument;
             try validateEdgeHops(edge);
         }
+        for (optional_pattern.predicates) |predicate| switch (predicate) {
+            .not_equal => |neq| {
+                if (!optionalAliasVisible(pattern, optional_index, neq.left) or
+                    !optionalAliasVisible(pattern, optional_index, neq.right))
+                    return error.InvalidArgument;
+            },
+            .not_exists => |edges| for (edges) |edge| {
+                if (!optionalAliasVisible(pattern, optional_index, edge.from) or
+                    !optionalAliasVisible(pattern, optional_index, edge.to))
+                    return error.InvalidArgument;
+                try validateEdgeHops(edge);
+            },
+        };
     }
+}
+
+fn optionalAliasVisible(pattern: ConjunctivePattern, optional_index: usize, alias: []const u8) bool {
+    if (findMatchNode(pattern.nodes, alias) != null or
+        findMatchNode(pattern.optional[optional_index].nodes, alias) != null)
+        return true;
+    for (pattern.optional[0..optional_index]) |prior_group| {
+        if (findMatchNode(prior_group.nodes, alias) != null) return true;
+    }
+    return false;
 }
 
 fn validateMatchEdge(nodes: []const MatchNode, edge: MatchEdge) !void {
@@ -1634,6 +1668,7 @@ test "conjunctive match supports branches anti joins inequality and optional nul
             .{ .source = "a", .target = "b", .edge_type = "KNOWS", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
             .{ .source = "a", .target = "c", .edge_type = "KNOWS", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
             .{ .source = "d", .target = "a", .edge_type = "LIKES", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
+            .{ .source = "e", .target = "d", .edge_type = "FOLLOWS", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
             .{ .source = "x", .target = "y", .edge_type = "KNOWS", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
             .{ .source = "x", .target = "z", .edge_type = "KNOWS", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
         };
@@ -1671,7 +1706,12 @@ test "conjunctive match supports branches anti joins inequality and optional nul
     };
     const optional_nodes = [_]MatchNode{.{ .alias = "liker" }};
     const optional_edges = [_]MatchEdge{.{ .from = "liker", .to = "root", .step = .{ .types = &.{"LIKES"} } }};
-    const optional = [_]OptionalPattern{.{ .nodes = &optional_nodes, .edges = &optional_edges }};
+    const follower_nodes = [_]MatchNode{.{ .alias = "follower" }};
+    const follower_edges = [_]MatchEdge{.{ .from = "follower", .to = "liker", .step = .{ .types = &.{"FOLLOWS"} } }};
+    const optional = [_]OptionalPattern{
+        .{ .nodes = &optional_nodes, .edges = &optional_edges },
+        .{ .nodes = &follower_nodes, .edges = &follower_edges },
+    };
 
     const matches = try matchConjunctivePatternWithEdgeReader(
         alloc,
@@ -1684,13 +1724,34 @@ test "conjunctive match supports branches anti joins inequality and optional nul
 
     try std.testing.expectEqual(@as(usize, 4), matches.len);
     var saw_liker = false;
+    var saw_follower = false;
     var saw_null = false;
     for (matches) |match| {
         saw_liker = saw_liker or findBinding(match.bindings, "liker") != null;
+        saw_follower = saw_follower or findBinding(match.bindings, "follower") != null;
         saw_null = saw_null or containsString(match.null_aliases, "liker");
     }
     try std.testing.expect(saw_liker);
+    try std.testing.expect(saw_follower);
     try std.testing.expect(saw_null);
+}
+
+test "conjunctive optional predicates reject aliases outside their ordered scope" {
+    const base_nodes = [_]MatchNode{.{ .alias = "root" }};
+    const optional_nodes = [_]MatchNode{.{ .alias = "related" }};
+    const optional_edges = [_]MatchEdge{.{ .from = "root", .to = "related" }};
+    const predicates = [_]MatchPredicate{.{ .not_equal = .{ .left = "related", .right = "later" } }};
+    const optional = [_]OptionalPattern{.{
+        .nodes = &optional_nodes,
+        .edges = &optional_edges,
+        .predicates = &predicates,
+    }};
+
+    try std.testing.expectError(error.InvalidArgument, validateConjunctivePattern(.{
+        .nodes = &base_nodes,
+        .edges = &.{},
+        .optional = &optional,
+    }));
 }
 
 test "exact two-edge pattern uses typed batch probes without paths" {

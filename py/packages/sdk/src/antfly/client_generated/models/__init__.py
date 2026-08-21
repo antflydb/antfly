@@ -302,10 +302,13 @@ from .graph_optional_match import GraphOptionalMatch
 from .graph_optional_match_nodes import GraphOptionalMatchNodes
 from .graph_path_endpoint import GraphPathEndpoint
 from .graph_query_page import GraphQueryPage
+from .graph_query_params import GraphQueryParams
+from .graph_query_params_algorithm_params import GraphQueryParamsAlgorithmParams
 from .graph_query_result import GraphQueryResult
 from .graph_query_result_aggregates import GraphQueryResultAggregates
 from .graph_query_result_rows_item import GraphQueryResultRowsItem
 from .graph_query_stats import GraphQueryStats
+from .graph_query_type import GraphQueryType
 from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
@@ -524,6 +527,7 @@ from .join_profile import JoinProfile
 from .join_strategy import JoinStrategy
 from .join_type import JoinType
 from .key_range import KeyRange
+from .legacy_graph_query import LegacyGraphQuery
 from .linear_merge_page_status import LinearMergePageStatus
 from .linear_merge_request import LinearMergeRequest
 from .linear_merge_request_records import LinearMergeRequestRecords
@@ -582,6 +586,10 @@ from .path_find_request import PathFindRequest
 from .path_find_result import PathFindResult
 from .path_find_weight_mode import PathFindWeightMode
 from .path_weight_mode import PathWeightMode
+from .pattern_edge_step import PatternEdgeStep
+from .pattern_match import PatternMatch
+from .pattern_match_bindings import PatternMatchBindings
+from .pattern_step import PatternStep
 from .permission import Permission
 from .permission_type import PermissionType
 from .phrase_query import PhraseQuery
@@ -612,6 +620,7 @@ from .query_request_embeddings import QueryRequestEmbeddings
 from .query_request_expand_strategy import QueryRequestExpandStrategy
 from .query_request_foreign_sources import QueryRequestForeignSources
 from .query_request_graph_queries import QueryRequestGraphQueries
+from .query_request_graph_searches import QueryRequestGraphSearches
 from .query_request_query import QueryRequestQuery
 from .query_responses import QueryResponses
 from .query_result import QueryResult
@@ -1086,10 +1095,13 @@ __all__ = (
     "GraphOptionalMatchNodes",
     "GraphPathEndpoint",
     "GraphQueryPage",
+    "GraphQueryParams",
+    "GraphQueryParamsAlgorithmParams",
     "GraphQueryResult",
     "GraphQueryResultAggregates",
     "GraphQueryResultRowsItem",
     "GraphQueryStats",
+    "GraphQueryType",
     "GraphResultNode",
     "GraphResultNodeDocument",
     "GraphResultNodeEvidence",
@@ -1306,6 +1318,7 @@ __all__ = (
     "JoinStrategy",
     "JoinType",
     "KeyRange",
+    "LegacyGraphQuery",
     "LinearMergePageStatus",
     "LinearMergeRequest",
     "LinearMergeRequestRecords",
@@ -1364,6 +1377,10 @@ __all__ = (
     "PathFindResult",
     "PathFindWeightMode",
     "PathWeightMode",
+    "PatternEdgeStep",
+    "PatternMatch",
+    "PatternMatchBindings",
+    "PatternStep",
     "Permission",
     "PermissionType",
     "PhraseQuery",
@@ -1394,6 +1411,7 @@ __all__ = (
     "QueryRequestExpandStrategy",
     "QueryRequestForeignSources",
     "QueryRequestGraphQueries",
+    "QueryRequestGraphSearches",
     "QueryRequestQuery",
     "QueryResponses",
     "QueryResult",

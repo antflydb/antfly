@@ -8271,7 +8271,7 @@ pub const ApiHttpServer = struct {
         if (request.merge_config != null) return error.UnsupportedQueryRequest;
         if (request.reranker != null) return error.UnsupportedQueryRequest;
         if (request.analyses != null) return error.UnsupportedQueryRequest;
-        if (request.graph_queries != null) return error.UnsupportedQueryRequest;
+        if (request.graph_queries != null or request.graph_searches != null) return error.UnsupportedQueryRequest;
         if (request.expand_strategy != null) return error.UnsupportedQueryRequest;
         if (request.document_renderer != null) return error.UnsupportedQueryRequest;
         if (request.pruner != null) return error.UnsupportedQueryRequest;
