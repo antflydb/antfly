@@ -234,6 +234,29 @@ fn addRuntimeSkipTestFilters(run: *std.Build.Step.Run, filters: []const []const 
     }
 }
 
+fn configureUnitStorageTestRun(
+    b: *std.Build,
+    run: *std.Build.Step.Run,
+    runtime_filters: []const []const u8,
+    allow_empty_filter: bool,
+    unit_skip_filters: []const []const u8,
+    root_skip_filters: []const []const u8,
+    extra_skip_filters: []const []const u8,
+    is_ha_shard: bool,
+) void {
+    addRuntimeTestFilters(b, run, runtime_filters);
+    if (allow_empty_filter) run.addArg("--allow-empty-test-filter");
+    addRuntimeSkipTestFilters(run, unit_skip_filters);
+    for (root_skip_filters) |filter| {
+        // `storage.ha` keeps the HA suite out of broad root-module test runs.
+        // Applying it to the dedicated shard would select zero tests.
+        if (is_ha_shard and std.mem.eql(u8, filter, "storage.ha")) continue;
+        run.addArgs(&.{ "--skip-test-filter", filter });
+    }
+    addRuntimeSkipTestFilters(run, extra_skip_filters);
+    addRuntimeSkipTestFilters(run, &release_scale_test_filters);
+}
+
 fn compileFiltersWithAnchors(
     b: *std.Build,
     anchors: []const []const u8,
@@ -3858,20 +3881,7 @@ pub fn build(b: *std.Build) void {
     const lite_cmd_test_step = b.step("lite-cmd-test", "Run command tests owned by Antfly Lite profiles");
     lite_cmd_test_step.dependOn(&run_lite_cmd_tests.step);
 
-    const lib_recall_default_filters = [_][]const u8{
-        "HBC recall",
-    };
-    const lib_recall_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_recall_default_filters),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_recall_tests = addFilteredTestRunArtifact(b, lib_recall_tests);
     const recall_test_step = b.step("recall-test", "Run HBC vector recall quality tests");
-    recall_test_step.dependOn(&run_lib_recall_tests.step);
 
     const raft_unit_default_filters = [_][]const u8{"raft."};
     const raft_unit_tests = b.addTest(.{
@@ -6815,12 +6825,16 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(delegated_inference_steps.inference_test);
     unit_test_step.dependOn(delegated_inference_steps.inference_finetune_test);
     unit_test_step.dependOn(lib_standalone_runtime_test_step);
-    unit_test_step.dependOn(ha_test_step);
+    // The aggregate's storage HA shard owns the library tests. Keep only the
+    // command-root coverage that the shard cannot discover; `ha-test` remains
+    // available as the convenient focused target containing both artifacts.
+    unit_test_step.dependOn(&run_ha_cli_tests.step);
     unit_test_step.dependOn(&run_raft_unit_tests.step);
     unit_test_step.dependOn(&run_raft_runtime_tests.step);
     unit_test_step.dependOn(&run_raft_restore_tests.step);
-    unit_test_step.dependOn(&run_raft_ready_continuation_tests.step);
-    unit_test_step.dependOn(&run_raft_transport_tests.step);
+    // The standalone Raft library and Antfly-rooted Raft artifacts already
+    // contain the ready-continuation and transport selections, respectively.
+    // Preserve their focused targets without executing them twice in `unit-test`.
 
     // Progress mode uses one union-filtered root artifact too. Storage and
     // metadata module paths overlap, while raft-transport is a strict subset
@@ -7502,6 +7516,19 @@ pub fn build(b: *std.Build) void {
         5 * 1024 * 1024 * 1024,
         5 * 1024 * 1024 * 1024,
     };
+    // Recent CI timings put these DB categories at 279 seconds and the
+    // complement at 297 seconds. Run the two halves from one compiled DB-core
+    // artifact so the dominant shard gets parallel runtime without duplicating
+    // its expensive semantic analysis and code generation.
+    const unit_storage_db_core_lane_filters = [_][]const u8{
+        "db restore",
+        "db explicit doc-id",
+        "db artifact repair",
+        "db document",
+        "db dense",
+        "db split",
+    };
+    const unit_storage_recall_filters = [_][]const u8{"HBC recall"};
     const unit_storage_sharded_test_step = b.step(
         "unit-storage-test",
         "Run the storage portion of the default unit-test target in bounded codegen shards",
@@ -7517,6 +7544,11 @@ pub fn build(b: *std.Build) void {
             unit_storage_shard_audit.addArgs(&.{ "--filter", shard_filter });
         }
     }
+    unit_storage_shard_audit.addArg("--runtime-partition-source");
+    unit_storage_shard_audit.addFileArg(b.path("pkg/antfly/src/storage/db/db.zig"));
+    for (unit_storage_db_core_lane_filters) |lane_filter| {
+        unit_storage_shard_audit.addArgs(&.{ "--runtime-partition-filter", lane_filter });
+    }
     const unit_storage_shard_audit_step = b.step(
         "unit-storage-test-audit",
         "Verify every test-bearing storage module belongs to a bounded codegen shard",
@@ -7525,16 +7557,28 @@ pub fn build(b: *std.Build) void {
     const storage_runtime_filter_is_default =
         lib_storage_runtime_filters.len == 1 and
         std.mem.eql(u8, lib_storage_runtime_filters[0], "storage.");
-    var unit_storage_tail: ?*std.Build.Step = null;
+    // Keep the largest DB artifact on one lane and serialize the remaining
+    // storage shards on the other. The patched build runner still enforces
+    // every artifact's max_rss claim, while the second lane prevents the DB
+    // runtime from leaving the other CPU cores idle for several minutes.
+    const unit_storage_shard_lanes = [_]usize{ 1, 1, 1, 0, 1, 1, 1 };
+    var unit_storage_tails = [_]?*std.Build.Step{ null, null };
+    var recall_test_artifact: ?*std.Build.Step.Compile = null;
     for (
         unit_storage_shard_filters,
         unit_storage_shard_names,
         unit_storage_shard_max_rss,
-    ) |shard_filters, shard_name, shard_max_rss| {
+        unit_storage_shard_lanes,
+    ) |shard_filters, shard_name, shard_max_rss, lane| {
+        const is_utility_shard = std.mem.eql(u8, shard_name, "storage-utility-tests");
+        const compile_filters = if (is_utility_shard)
+            compileFiltersWithAnchors(b, shard_filters, &unit_storage_recall_filters)
+        else
+            shard_filters;
         const unit_storage_tests = b.addTest(.{
             .name = shard_name,
             .root_module = lib_test_mod,
-            .filters = shard_filters,
+            .filters = compile_filters,
             .test_runner = .{
                 .path = b.path("pkg/antfly/src/test_runner.zig"),
                 .mode = .simple,
@@ -7542,26 +7586,81 @@ pub fn build(b: *std.Build) void {
             .max_rss = shard_max_rss,
         });
         unit_storage_tests.step.dependOn(&unit_storage_shard_audit.step);
-        if (unit_storage_tail) |previous| unit_storage_tests.step.dependOn(previous);
-        const run_unit_storage_tests = b.addRunArtifact(unit_storage_tests);
-        addRuntimeTestFilters(b, run_unit_storage_tests, lib_storage_runtime_filters);
-        if (!storage_runtime_filter_is_default) {
-            run_unit_storage_tests.addArg("--allow-empty-test-filter");
+        const lane_previous = unit_storage_tails[lane];
+        // Keep the reusable recall artifact free of unit-run dependencies so
+        // `zig build recall-test` does not execute the rest of storage first.
+        // Its ordinary unit Run step is still ordered on the lane below.
+        if (!is_utility_shard) {
+            if (lane_previous) |previous| unit_storage_tests.step.dependOn(previous);
         }
-        addRuntimeSkipTestFilters(run_unit_storage_tests, lib_unit_filters);
+        if (is_utility_shard) recall_test_artifact = unit_storage_tests;
         const is_ha_shard = std.mem.eql(u8, shard_name, "storage-ha-tests");
-        for (root_test_skip_filters) |filter| {
-            // `storage.ha` keeps the HA suite out of broad root-module test
-            // runs. Applying that same exclusion to its dedicated shard makes
-            // the shard select zero tests and fail before exercising anything.
-            if (is_ha_shard and std.mem.eql(u8, filter, "storage.ha")) continue;
-            run_unit_storage_tests.addArgs(&.{ "--skip-test-filter", filter });
+        const is_db_core_shard = std.mem.eql(u8, shard_name, "storage-db-core-tests");
+        if (is_db_core_shard and storage_runtime_filter_is_default) {
+            // Zig serializes independent checked Run steps for one artifact.
+            // Use one scheduler-visible step that launches both filtered
+            // processes, preserving one compile while realizing the overlap.
+            const run_db_core_partitioned_tests = b.addSystemCommand(&.{"python3"});
+            run_db_core_partitioned_tests.setName("run test storage-db-core-tests partitioned");
+            run_db_core_partitioned_tests.addFileArg(b.path("tools/run_test_partitions.py"));
+            run_db_core_partitioned_tests.addArg("--executable");
+            run_db_core_partitioned_tests.addArtifactArg(unit_storage_tests);
+            for (unit_storage_db_core_lane_filters) |lane_filter| {
+                run_db_core_partitioned_tests.addArgs(&.{ "--partition-filter", lane_filter });
+            }
+            for (lib_unit_filters) |filter| {
+                run_db_core_partitioned_tests.addArgs(&.{ "--common-skip-filter", filter });
+            }
+            for (root_test_skip_filters) |filter| {
+                run_db_core_partitioned_tests.addArgs(&.{ "--common-skip-filter", filter });
+            }
+            for (release_scale_test_filters) |filter| {
+                run_db_core_partitioned_tests.addArgs(&.{ "--common-skip-filter", filter });
+            }
+            if (b.args) |runtime_args| {
+                if (runtime_args.len != 0) {
+                    run_db_core_partitioned_tests.addArg("--");
+                    run_db_core_partitioned_tests.addArgs(runtime_args);
+                }
+            }
+            run_db_core_partitioned_tests.stdio = .inherit;
+            run_db_core_partitioned_tests.step.max_rss = 12 * 1024 * 1024 * 1024;
+            unit_test_step.dependOn(&run_db_core_partitioned_tests.step);
+            unit_storage_sharded_test_step.dependOn(&run_db_core_partitioned_tests.step);
+            unit_storage_tails[lane] = &run_db_core_partitioned_tests.step;
+            continue;
         }
-        addRuntimeSkipTestFilters(run_unit_storage_tests, &release_scale_test_filters);
+
+        const run_unit_storage_tests = b.addRunArtifact(unit_storage_tests);
+        configureUnitStorageTestRun(
+            b,
+            run_unit_storage_tests,
+            lib_storage_runtime_filters,
+            !storage_runtime_filter_is_default,
+            lib_unit_filters,
+            &root_test_skip_filters,
+            &.{},
+            is_ha_shard,
+        );
+        if (is_utility_shard) {
+            if (lane_previous) |previous| run_unit_storage_tests.step.dependOn(previous);
+        }
         unit_test_step.dependOn(&run_unit_storage_tests.step);
         unit_storage_sharded_test_step.dependOn(&run_unit_storage_tests.step);
-        unit_storage_tail = &run_unit_storage_tests.step;
+        unit_storage_tails[lane] = &run_unit_storage_tests.step;
     }
+
+    // Reuse the storage utility executable instead of compiling another copy
+    // of the broad Antfly root solely for the two corpus recall tests. Its
+    // ordinary unit run selects `storage.` and therefore never executes these
+    // additional compile-time tests.
+    const compiled_recall_tests = recall_test_artifact orelse @panic("storage utility test artifact missing");
+    const run_compiled_recall_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        compiled_recall_tests,
+        &unit_storage_recall_filters,
+    );
+    recall_test_step.dependOn(&run_compiled_recall_tests.step);
 
     // The complete metadata namespace pulls in the simulation harness and a
     // large amount of control-plane code even though the default unit target
@@ -7645,15 +7744,18 @@ pub fn build(b: *std.Build) void {
     const metadata_runtime_filter_is_default =
         lib_metadata_runtime_filters.len == 1 and
         std.mem.eql(u8, lib_metadata_runtime_filters[0], "metadata.");
-    var unit_metadata_compile_tail: ?*std.Build.Step = null;
-    var unit_metadata_aggregate_run_tail: ?*std.Build.Step = null;
-    var unit_metadata_focused_run_tail: ?*std.Build.Step = null;
+    const unit_metadata_shard_lanes = [_]usize{ 0, 1, 0, 1, 0, 1, 0, 1, 0 };
+    var unit_metadata_compile_tails = [_]?*std.Build.Step{ null, null };
+    var unit_metadata_aggregate_run_tails = [_]?*std.Build.Step{ null, null };
+    var unit_metadata_focused_run_tails = [_]?*std.Build.Step{ null, null };
     for (
         unit_metadata_shard_filters,
         unit_metadata_shard_names,
         metadata_unit_test_mods,
         unit_metadata_shard_max_rss,
-    ) |shard_filters, shard_name, test_mod, shard_max_rss| {
+        unit_metadata_shard_lanes,
+    ) |shard_filters, shard_name, test_mod, shard_max_rss, lane| {
+        const is_runtime_exclusive = std.mem.eql(u8, shard_name, "metadata-replication-backfill-tests");
         const unit_metadata_tests = b.addTest(.{
             .name = shard_name,
             .root_module = test_mod,
@@ -7664,8 +7766,8 @@ pub fn build(b: *std.Build) void {
             },
             .max_rss = shard_max_rss,
         });
-        if (unit_metadata_compile_tail) |previous| unit_metadata_tests.step.dependOn(previous);
-        unit_metadata_compile_tail = &unit_metadata_tests.step;
+        if (unit_metadata_compile_tails[lane]) |previous| unit_metadata_tests.step.dependOn(previous);
+        unit_metadata_compile_tails[lane] = &unit_metadata_tests.step;
         const run_unit_metadata_tests = b.addRunArtifact(unit_metadata_tests);
         const runtime_filters = if (metadata_runtime_filter_is_default)
             shard_filters
@@ -7683,11 +7785,19 @@ pub fn build(b: *std.Build) void {
         for (root_test_skip_filters) |filter| {
             run_unit_metadata_tests.addArgs(&.{ "--skip-test-filter", filter });
         }
-        if (unit_metadata_aggregate_run_tail) |previous| {
+        if (is_runtime_exclusive) {
+            for (unit_metadata_aggregate_run_tails) |previous| {
+                if (previous) |previous_step| run_unit_metadata_tests.step.dependOn(previous_step);
+            }
+        } else if (unit_metadata_aggregate_run_tails[lane]) |previous| {
             run_unit_metadata_tests.step.dependOn(previous);
         }
         unit_test_step.dependOn(&run_unit_metadata_tests.step);
-        unit_metadata_aggregate_run_tail = &run_unit_metadata_tests.step;
+        if (is_runtime_exclusive) {
+            unit_metadata_aggregate_run_tails = .{ &run_unit_metadata_tests.step, &run_unit_metadata_tests.step };
+        } else {
+            unit_metadata_aggregate_run_tails[lane] = &run_unit_metadata_tests.step;
+        }
 
         // The standalone metadata step owns its selected metadata tests. Use a
         // separate run policy so a caller filter is not mistaken for the root
@@ -7700,12 +7810,20 @@ pub fn build(b: *std.Build) void {
         for (root_test_skip_filters) |filter| {
             run_focused_metadata_tests.addArgs(&.{ "--skip-test-filter", filter });
         }
-        if (unit_metadata_focused_run_tail) |previous| {
+        if (is_runtime_exclusive) {
+            for (unit_metadata_focused_run_tails) |previous| {
+                if (previous) |previous_step| run_focused_metadata_tests.step.dependOn(previous_step);
+            }
+        } else if (unit_metadata_focused_run_tails[lane]) |previous| {
             run_focused_metadata_tests.step.dependOn(previous);
         }
         unit_metadata_sharded_test_step.dependOn(&run_focused_metadata_tests.step);
         lib_metadata_test_step.dependOn(&run_focused_metadata_tests.step);
-        unit_metadata_focused_run_tail = &run_focused_metadata_tests.step;
+        if (is_runtime_exclusive) {
+            unit_metadata_focused_run_tails = .{ &run_focused_metadata_tests.step, &run_focused_metadata_tests.step };
+        } else {
+            unit_metadata_focused_run_tails[lane] = &run_focused_metadata_tests.step;
+        }
     }
 
     // Default Antfly unit coverage is hermetic: no network fetchers, no
@@ -9483,6 +9601,29 @@ pub fn build(b: *std.Build) void {
     const recall_harness_step = b.step("recall-harness", "Run Zig recall suites against exported vector datasets");
     recall_harness_step.dependOn(&run_recall_harness.step);
 
+    // Allow full CI to compile this ReleaseFast executable alongside the
+    // release-scale regressions, then reuse the cached artifact for the recall
+    // phase instead of paying its compile cost on the recall critical path.
+    const recall_harness_build_step = b.step("recall-harness-build", "Build the recall harness without running it");
+    recall_harness_build_step.dependOn(&recall_harness.step);
+
+    const run_recall_checks = b.addSystemCommand(&.{"python3"});
+    run_recall_checks.setName("run storage and per-metric recall checks concurrently");
+    run_recall_checks.addFileArg(b.path("tools/run_recall_checks.py"));
+    run_recall_checks.addArg("--test-executable");
+    run_recall_checks.addArtifactArg(compiled_recall_tests);
+    run_recall_checks.addArg("--harness-executable");
+    run_recall_checks.addArtifactArg(recall_harness);
+    run_recall_checks.addArg("--dataset-dir");
+    run_recall_checks.addDirectoryArg(b.path("testdata/vectorsets"));
+    run_recall_checks.stdio = .inherit;
+    run_recall_checks.step.max_rss = 12 * 1024 * 1024 * 1024;
+    const recall_ci_test_step = b.step(
+        "recall-ci-test",
+        "Run storage-backed and per-metric recall checks concurrently",
+    );
+    recall_ci_test_step.dependOn(&run_recall_checks.step);
+
     const antfly_main_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/main.zig"),
         .target = target,
@@ -9813,18 +9954,11 @@ pub fn build(b: *std.Build) void {
     lite_dev_step.dependOn(&run_capi_tests.step);
     lite_dev_step.dependOn(&run_antfly_embedded_pkg_tests.step);
 
-    const run_recall_harness_default = b.addRunArtifact(recall_harness);
-    run_recall_harness_default.stdio = .inherit;
-    run_recall_harness_default.addArgs(&.{
-        "--dataset-dir",
-        "testdata/vectorsets",
-    });
     dependOnAll(antfly_test_step, &.{
         unit_test_step,
         sim_test_step,
         integration_test_step,
-        recall_test_step,
-        &run_recall_harness_default.step,
+        recall_ci_test_step,
         chaos_test_step,
     });
 
