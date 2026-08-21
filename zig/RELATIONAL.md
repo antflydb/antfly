@@ -5,10 +5,10 @@ zstd-compressed JSON blob, and every index (`full_text`, `embeddings`,
 `graph`, `algebraic`) is *derived* from that blob. Schema is optional and
 soft.
 
-**Relational mode** is the target second table profile on the same engine. This
-document describes the contract and phased runtime integration; the core work
-initially establishes schema validation, column planning, projection, and the
-packed-row codec. It keeps
+**Relational mode** is the second table profile on the same engine. This
+document describes the contract and runtime integration. The current runtime
+establishes schema validation, column planning, projection, an authoritative
+packed-row codec, and the complete base-row lifecycle. It keeps
 every piece of the existing machinery — shards, Raft, indexes, enrichers, the
 join planner, and the algebraic fold runtime — but changes two things:
 
@@ -24,10 +24,11 @@ indexed exactly the way documents are indexed today (path-fact projection plus
 dynamic templates over that subtree). That gives relational tables typed
 columns *and* the schemaless document behaviour where it is wanted.
 
-Relational mode is **not** a separate store. Internally it is represented by a
-`storage_mode` on the parsed `TableSchema`. It is not exposed by the public
-OpenAPI schema until the runtime write/read lifecycle honors that mode
-end-to-end. A document-mode table behaves exactly as before.
+Relational mode is **not** a separate engine. Internally it is represented by a
+`storage_mode` on the parsed `TableSchema`, and relational rows occupy a
+dedicated internal key kind so packed values can never be mistaken for JSON.
+Schema mutations admit `storage_mode: "relational"`; document-mode tables keep
+their existing key and value format.
 
 ## Why this fits
 
@@ -54,30 +55,24 @@ Relational mode is therefore mostly *wiring and a required-schema contract*
 over things that are already built, plus one genuinely new query operator
 (the columnar table scan).
 
-## The pivotal decision: authoritative columns
+## The pivotal decision: authoritative packed rows
 
-There are two storage layouts, and relational mode is designed so the first is
-a strict subset of the second:
+The base store uses one self-describing packed row per document. Declared
+scalars are stored in their physical typed representation; nullable absence and
+explicit null remain distinct; `json` columns retain their exact JSON subtree
+bytes. The legacy zstd whole-document blob is not double-written.
 
-- **Phase A — guaranteed-complete secondary columns.** The zstd JSON blob stays
-  the source of truth, but relational mode *guarantees* every declared scalar
-  column is populated into typed columns at write time. Reads still reconstruct
-  documents from the blob; predicate pushdown and aggregation are served from
-  columns. Low risk, reuses everything, double-writes.
-- **Phase B — authoritative columns.** Typed columns become the store. Non-JSON
-  columns no longer keep a blob; documents are *reconstructed* from columns on
-  read via `ColumnarReader.readDoc(projection)`. Only `json` columns keep a
-  byte payload. Smaller storage, true columnar scans, no double-write.
-
-Ship Phase A first. Phase B is an internal storage swap behind the same
-contract and query surface.
+Segment-level typed columns remain a derived acceleration structure. They can
+be added for scans, predicates, sorts, and aggregations without changing point
+lookup, transaction, backup, or recovery semantics because the packed base row
+is already the durable authority.
 
 ## Contract rollout
 
-The parsed schema has an internal `storage_mode`, but public create and update
-requests reject `relational` until column persistence and reads are wired
-atomically. This prevents a caller from selecting a storage contract that the
-runtime would silently execute as ordinary document storage.
+Public create and update requests admit `relational` only after the schema has
+passed the closed-row and physical-encoding checks below. Base-row writes,
+reads, transactions, replay, recovery, TTL cleanup, split handoff, indexing,
+and portable backup all preserve the packed-row contract end-to-end.
 
 In `relational` mode the following are implied/enforced:
 
@@ -151,6 +146,13 @@ First-cut physical mapping:
 
 ### Write path
 
+The authoritative base value is one self-describing `AROW` payload per
+document. It stores each present column's path, physical type, null state, and
+typed value. Point reads reconstruct canonical JSON without a schema lookup;
+metadata and derived-artifact keyspaces are never passed through the row
+decoder. Portable backup format v2 retains the packed payload and row key kind
+exactly, including timestamps and relational schema metadata.
+
 `schema_capability.projectRelationalRowJsonAlloc` parses and turns a document into one typed
 cell per declared column (`RelationalRow` / `RelationalCell` / `ColumnValue`),
 ready to hand to `section/typed_doc_values.zig` at segment-build time:
@@ -190,7 +192,7 @@ the canonical decimal domain without a floating-point tolerance.
 Round-trip through the real `TypedDocValuesWriter`/`TypedDocValuesReader` is
 covered by unit tests.
 
-**Remaining integration seam:** `TypedDocValuesWriter` is a segment-level
+**Remaining columnar-index integration seam:** `TypedDocValuesWriter` is a segment-level
 accumulator (all docs in a segment → one `build()`), not a per-document store,
 so populating columns belongs in the segment builder that owns the write batch,
 not in the per-document `writeDocFacts`. The seam is: add
@@ -224,22 +226,22 @@ physical representation and backfill plan are compatible.
 
 ## Phased plan
 
-- **Phase 1 — internal contract + catalog (this change).**
-  Internal `storage_mode` parsing, raw-schema `json` columns, and
-  `relationalColumnPlanAlloc` producing the typed-column catalog with tests.
-  Public schema mutations remain gated, and there is no behaviour change for
-  document-mode tables.
-- **Phase 2 — write path (projection done).** `projectRelationalRowJsonAlloc`
-  produces order-preserving typed cells per column, enforces required presence
-  and non-null schemas, and captures `json` subtrees, verified end-to-end
-  against the real `typed_doc_values` writer/reader. Remaining: wire per-column
+- **Phase 1 — contract + catalog (complete).** `storage_mode` parsing,
+  raw-schema `json` columns, and `relationalColumnPlanAlloc` produce the static
+  typed-column catalog.
+- **Phase 2A — authoritative packed base rows (complete).** Writes,
+  transactions, recovery, replay, scans, indexing, TTL, split handoff, and
+  portable backup operate on dedicated packed-row keys while returning logical
+  JSON at API boundaries.
+- **Phase 2B — segment typed-column persistence (pending).** Wire per-column
   `TypedDocValuesWriter` accumulation into the segment builder and persist the
-  sections (see "Remaining integration seam" above).
+  sections (see "Remaining columnar-index integration seam" above).
 - **Phase 3 — columnar scan + predicate pushdown.** Table-scan operator over
   `typed_doc_values`; route typed-column predicates to it; columnar projection
   on read.
-- **Phase 4 — authoritative columns (Phase B).** Drop the JSON blob for
-  non-`json` columns; reconstruct documents from columns on read.
+- **Phase 4 — unified columnar reads.** Serve projections from segment columns
+  when available and fall back to the authoritative packed base row. There is
+  no retained whole-document JSON blob for relational rows today.
 
 ## Related docs
 

@@ -7971,7 +7971,7 @@ pub const DB = struct {
         const store_key = try encodeStoreLookupKeyAlloc(self, alloc, key);
         defer alloc.free(store_key);
         const raw = try self.core.getStoreValue(alloc, store_key) orelse return null;
-        return try materializeOwnedStoredDocumentValueAlloc(self, alloc, raw);
+        return try relational_store.materializeOwnedStoredValueAlloc(alloc, store_key, raw);
     }
 
     pub fn getGroupCreatedAtMillis(self: *DB, alloc: Allocator, group_id: u64) !?u64 {
@@ -15088,6 +15088,7 @@ pub const DB = struct {
 
         lockApply(self);
         defer self.core.unlockApply();
+        try self.validateRelationalTransactionIntentsLocked(intents);
         try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
         try self.core.writeIntents(txn_id, intents, predicates);
     }
@@ -15138,8 +15139,50 @@ pub const DB = struct {
             if (intent.value == null or isMetadataKey(intent.key)) continue;
             try identity_upsert_keys.append(self.alloc, intent.key);
         }
+        try self.validateRelationalTransactionWritesLocked(effective_ops.writes);
         try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
         try self.core.writeIntents(txn_id, intents.items, predicates.items);
+    }
+
+    fn validateRelationalTransactionIntentsLocked(
+        self: *DB,
+        intents: []const transactions_mod.WriteIntent,
+    ) !void {
+        if (relationalColumns(self) == null) return;
+        var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        defer writes.deinit(self.alloc);
+        for (intents) |intent| {
+            const value = intent.value orelse continue;
+            if (isMetadataKey(intent.key)) continue;
+            try writes.append(self.alloc, .{ .key = intent.key, .value = value });
+        }
+        try self.validateRelationalTransactionWritesLocked(writes.items);
+    }
+
+    fn validateRelationalTransactionWritesLocked(self: *DB, writes: anytype) !void {
+        const columns = relationalColumns(self) orelse return;
+        if (writes.len == 0) return;
+
+        // Production tables retain the authoritative JSON schema alongside the
+        // compiled runtime schema. Revalidate at the DB intent boundary so all
+        // callers—including replicated and low-level prepare paths—share the
+        // same constraints instead of relying on API-layer preflight alone.
+        if (try self.core.getStoreValue(self.alloc, public_schema_json_key)) |schema_json| {
+            defer self.alloc.free(schema_json);
+            var parsed = try public_table_schema.parseValidatedTableSchema(self.alloc, schema_json);
+            defer parsed.deinit(self.alloc);
+            try public_table_schema.validateWritesAgainstTableSchema(self.alloc, parsed, writes);
+            return;
+        }
+
+        // Embedders and tests may install only a compiled schema. Preserve a
+        // strict closed-row contract in that case, including required fields,
+        // nullability, physical numeric domains, and unknown-field rejection.
+        for (writes) |write| {
+            if (isMetadataKey(write.key)) continue;
+            const encoded = try relational_store.encodeValueAlloc(self.alloc, write.value, columns);
+            self.alloc.free(encoded);
+        }
     }
 
     // resolveTransactionTransforms, removePendingTransactionWrite, and freeTransactionWritesOwned
@@ -22277,7 +22320,7 @@ pub const DB = struct {
         defer alloc.free(source_key);
         const maybe_raw_source = try self.core.getStoreValue(alloc, source_key);
         const maybe_stored_source = if (maybe_raw_source) |raw_source|
-            try materializeOwnedStoredDocumentValueAlloc(self, alloc, raw_source)
+            try relational_store.materializeOwnedStoredValueAlloc(alloc, source_key, raw_source)
         else
             null;
         if (maybe_stored_source == null) {
@@ -25400,7 +25443,7 @@ pub const DB = struct {
             else => return err,
         };
         const owned = try alloc.dupe(u8, raw);
-        return try materializeOwnedStoredDocumentValueAlloc(self, alloc, owned);
+        return try relational_store.materializeOwnedStoredValueAlloc(alloc, store_key, owned);
     }
 
     fn loadProjectedSearchDocumentMany(
@@ -26030,7 +26073,7 @@ fn loadStoredSearchDocumentsMany(self: *DB, alloc: Allocator, keys: []const []co
     for (pending.items, 0..) |item, i| {
         const value = read_values[i] orelse continue;
         const owned = try alloc.dupe(u8, value);
-        loaded[item.original_index] = try materializeOwnedStoredDocumentValueAlloc(self, alloc, owned);
+        loaded[item.original_index] = try relational_store.materializeOwnedStoredValueAlloc(alloc, item.store_key, owned);
     }
     if (bench_profile) dupe_ns = platform_time.monotonicNs() - dupe_start_ns;
     if (bench_profile) {
@@ -26186,12 +26229,6 @@ fn encodeStoreLookupKeyAlloc(self: *const DB, alloc: Allocator, key: []const u8)
     }
     if (relationalColumns(self) != null) return try relational_store.keyAlloc(alloc, key);
     return try internal_keys.documentKeyAlloc(alloc, key);
-}
-
-fn materializeOwnedStoredDocumentValueAlloc(self: *const DB, alloc: Allocator, raw: []u8) ![]u8 {
-    if (relationalColumns(self) == null) return raw;
-    defer alloc.free(raw);
-    return try relational_store.decodeValueAlloc(alloc, raw);
 }
 
 fn documentRangeLowerAlloc(alloc: Allocator, raw_key: []const u8) ![]u8 {
@@ -45921,23 +45958,20 @@ test "db default primary backend survives reopen" {
 
 test "db relational mode stores authoritative packed rows across reopen scan and delete" {
     const alloc = std.testing.allocator;
-    const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"count":{"type":"integer"},"status":{"type":"keyword"},"title":{"type":"text"},"payload":{"type":"json"}},"required":["id","count","status","title"],"additionalProperties":false}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"count":{"type":"integer"},"status":{"type":"keyword","enum":["active"]},"title":{"type":"text"},"payload":{"type":"json"}},"required":["id","count","status","title"],"additionalProperties":false}}}}
     ;
     {
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
         defer db.close();
-        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
-        defer parsed_schema.deinit(alloc);
-        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
-        defer schema_mod.freeSchema(alloc, runtime_schema);
-        try db.setSchema(runtime_schema);
+        try db.setSchemaJson(alloc, schema_json);
+        try std.testing.expectEqual(@as(u64, 1234), try db.ensureGroupCreatedAtMillis(alloc, 7, 1234));
+        try std.testing.expectEqual(@as(?u64, 1234), try db.getGroupCreatedAtMillis(alloc, 7));
         try db.addIndex(.{ .name = "ft_rows", .kind = .full_text, .config_json = "{}" });
 
         try db.batch(.{ .writes = &.{.{
@@ -45960,6 +45994,7 @@ test "db relational mode stores authoritative packed rows across reopen scan and
         defer db.close();
         const raw = (try db.get(alloc, "row:a")) orelse return error.TestExpectedEqual;
         defer alloc.free(raw);
+        try std.testing.expectEqual(@as(?u64, 1234), try db.getGroupCreatedAtMillis(alloc, 7));
         try std.testing.expectEqualStrings(
             "{\"id\":\"a\",\"count\":9007199254740993,\"status\":\"active\",\"title\":\"replayed relational row\",\"payload\":{\"n\":0.10000000000000001}}",
             raw,
@@ -45982,6 +46017,22 @@ test "db relational mode stores authoritative packed rows across reopen scan and
         try std.testing.expectEqual(@as(usize, 1), scanned.documents.len);
         try std.testing.expectEqualStrings("row:a", scanned.documents[0].id);
         try std.testing.expectEqualStrings(raw, scanned.documents[0].json);
+
+        const rejected_txn = try db.beginTransaction(1_900);
+        try std.testing.expectError(error.InvalidBatchRequest, db.writeTransaction(rejected_txn, .{ .writes = &.{.{
+            .key = "row:invalid",
+            .value = "{\"id\":\"invalid\",\"count\":1,\"status\":\"inactive\",\"title\":\"bad\"}",
+        }} }));
+        try db.resolveTransactionIntents(rejected_txn, .aborted, 1_901);
+        try std.testing.expect((try db.get(alloc, "row:invalid")) == null);
+
+        const rejected_unknown_txn = try db.beginTransaction(1_910);
+        try std.testing.expectError(error.InvalidBatchRequest, db.writeIntents(rejected_unknown_txn, &.{.{
+            .key = "row:unknown",
+            .value = "{\"id\":\"unknown\",\"count\":1,\"status\":\"active\",\"title\":\"bad\",\"unknown\":true}",
+        }}, &.{}));
+        try db.resolveTransactionIntents(rejected_unknown_txn, .aborted, 1_911);
+        try std.testing.expect((try db.get(alloc, "row:unknown")) == null);
 
         const txn_id = try db.beginTransaction(2_000);
         try db.writeIntents(txn_id, &.{.{

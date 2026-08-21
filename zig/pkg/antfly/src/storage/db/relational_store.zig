@@ -39,6 +39,11 @@ pub fn decodeValueAlloc(alloc: Allocator, packed_row: []const u8) ![]u8 {
     return try document_mapper.materializeRelationalRowValueAlloc(alloc, packed_row);
 }
 
+pub fn validateValue(packed_row: []const u8) !void {
+    if (!document_mapper.isRelationalRowValue(packed_row)) return error.InvalidFormat;
+    try document_mapper.validateRelationalRowValue(packed_row);
+}
+
 /// Materialize a logical document encountered during a mixed internal-key scan.
 /// The keyspace, rather than value sniffing, selects strict packed-row decoding.
 pub fn materializeStoredValueAlloc(
@@ -48,6 +53,18 @@ pub fn materializeStoredValueAlloc(
 ) ![]u8 {
     if (internal_keys.isRelationalRowKey(store_key)) return try decodeValueAlloc(alloc, stored_value);
     return try alloc.dupe(u8, stored_value);
+}
+
+/// Materialize an owned store value without copying document-mode metadata or
+/// artifact payloads. Only the relational-row keyspace selects packed decoding.
+pub fn materializeOwnedStoredValueAlloc(
+    alloc: Allocator,
+    store_key: []const u8,
+    stored_value: []u8,
+) ![]u8 {
+    if (!internal_keys.isRelationalRowKey(store_key)) return stored_value;
+    defer alloc.free(stored_value);
+    return try decodeValueAlloc(alloc, stored_value);
 }
 
 test "relational store facade round trips an authoritative row" {

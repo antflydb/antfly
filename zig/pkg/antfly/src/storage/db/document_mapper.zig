@@ -3125,11 +3125,13 @@ pub fn buildRelationalRowValueAlloc(
         owned.deinit(alloc);
     }
 
+    var found_columns: usize = 0;
     for (columns) |column| {
         const found = parsed.value.object.get(column.name) orelse {
             if (column.required) return error.InvalidBatchRequest;
             continue;
         };
+        found_columns += 1;
         const value_type = relationalValueType(column.column_type);
         if (found == .null) {
             if (!column.allows_null) return error.InvalidBatchRequest;
@@ -3165,6 +3167,10 @@ pub fn buildRelationalRowValueAlloc(
             .value = value,
         });
     }
+    // A relational row is closed. Checking the count after the column walk is
+    // allocation-free and rejects every unknown field without building a
+    // second name index for each write.
+    if (found_columns != parsed.value.object.count()) return error.InvalidBatchRequest;
     return try relational_row_codec.serialize(alloc, cells.items);
 }
 
@@ -3174,6 +3180,10 @@ pub fn materializeRelationalRowValueAlloc(alloc: Allocator, value: []const u8) !
 
 pub fn isRelationalRowValue(value: []const u8) bool {
     return relational_row_codec.looksLikeRow(value);
+}
+
+pub fn validateRelationalRowValue(value: []const u8) !void {
+    try relational_row_codec.validate(value);
 }
 
 fn relationalValueType(column_type: runtime_schema.RelationalColumnType) typed_dv.ValueType {

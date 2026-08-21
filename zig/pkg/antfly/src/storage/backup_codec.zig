@@ -20,8 +20,9 @@ const ArrayList = std.ArrayList;
 /// AFB file magic bytes: "ANTFLYB\n"
 pub const magic = [8]u8{ 'A', 'N', 'T', 'F', 'L', 'Y', 'B', '\n' };
 
-/// Current format version.
-pub const format_version: u32 = 1;
+/// Current format version. Version 2 adds self-describing relational-row
+/// document entries; readers still accept version-1 document backups.
+pub const format_version: u32 = 2;
 
 /// Fixed size of the file header in bytes.
 pub const header_size: usize = 64;
@@ -58,8 +59,10 @@ pub const BlockType = enum(u8) {
 
 pub const block_flag_compressed: u8 = 1 << 0;
 
-/// Document value flag: value is zstd-compressed JSON.
-pub const doc_value_flag_compressed: u8 = 1;
+/// Document value flags.
+pub const doc_value_flag_compressed: u8 = 1 << 0;
+pub const doc_value_flag_relational_row: u8 = 1 << 1;
+pub const doc_value_known_flags: u8 = doc_value_flag_compressed | doc_value_flag_relational_row;
 
 // --- File Header ---
 
@@ -929,6 +932,7 @@ test "document batch round-trip" {
     const entries = [_]DocumentEntry{
         .{ .key = "doc1", .value_flags = 0, .value = "{\"title\":\"Hello\"}", .timestamp_ns = 0 },
         .{ .key = "doc2", .value_flags = doc_value_flag_compressed, .value = &.{ 0x28, 0xb5, 0x2f, 0xfd }, .timestamp_ns = 1234567890 },
+        .{ .key = "row3", .value_flags = doc_value_flag_relational_row, .value = "AROW-payload", .timestamp_ns = 42 },
     };
 
     const encoded = try encodeDocumentBatch(alloc, &entries);
@@ -943,7 +947,7 @@ test "document batch round-trip" {
         alloc.free(decoded);
     }
 
-    try std.testing.expectEqual(@as(usize, 2), decoded.len);
+    try std.testing.expectEqual(@as(usize, 3), decoded.len);
     try std.testing.expectEqualStrings("doc1", decoded[0].key);
     try std.testing.expectEqual(@as(u8, 0), decoded[0].value_flags);
     try std.testing.expectEqualStrings("{\"title\":\"Hello\"}", decoded[0].value);
@@ -953,7 +957,12 @@ test "document batch round-trip" {
     try std.testing.expectEqual(doc_value_flag_compressed, decoded[1].value_flags);
     try std.testing.expectEqual(@as(u64, 1234567890), decoded[1].timestamp_ns);
 
-    try std.testing.expectEqual(@as(u32, 2), try documentBatchEntryCount(encoded));
+    try std.testing.expectEqualStrings("row3", decoded[2].key);
+    try std.testing.expectEqual(doc_value_flag_relational_row, decoded[2].value_flags);
+    try std.testing.expectEqualStrings("AROW-payload", decoded[2].value);
+    try std.testing.expectEqual(@as(u64, 42), decoded[2].timestamp_ns);
+
+    try std.testing.expectEqual(@as(u32, 3), try documentBatchEntryCount(encoded));
     try std.testing.expectError(error.Truncated, documentBatchEntryCount(encoded[0 .. encoded.len - 1]));
     const with_trailing = try alloc.alloc(u8, encoded.len + 1);
     defer alloc.free(with_trailing);
