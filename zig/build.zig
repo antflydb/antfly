@@ -7277,6 +7277,8 @@ pub fn build(b: *std.Build) void {
         "graph degree large-build summary counts filtered materialization without coordinator scan",
         "graph degree planned build honors edge filter during scan page execution",
         "graph pagerank planned build publishes scores matching local runner",
+        "graph pagerank coordinator publish failure preserves prior published generation after reopen",
+        "graph hits coordinator publish failure preserves prior published pair after reopen",
     };
     const graph_metric_unit_tests = b.addTest(.{
         .root_module = db_test_mod,

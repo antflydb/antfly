@@ -5984,6 +5984,20 @@ pub const GraphIndex = struct {
         return decodeF64(raw) orelse error.InvalidGraphMetricScore;
     }
 
+    /// Reads a materialized score that must exist before publication. Missing
+    /// accumulator inputs legitimately mean zero while a build is in flight;
+    /// a missing final rank instead means the generation is incomplete and
+    /// must never be made visible to readers.
+    fn readRequiredFiniteF64(txn: anytype, key: []const u8) !f64 {
+        const raw = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return error.InvalidGraphMetricScore,
+            else => return err,
+        };
+        const value = decodeF64(raw) orelse return error.InvalidGraphMetricScore;
+        if (!std.math.isFinite(value)) return error.InvalidGraphMetricScore;
+        return value;
+    }
+
     fn metricConfig(self: *const GraphIndex, metric_name: []const u8) ?GraphMetricConfig {
         for (self.metric_configs) |cfg| {
             if (std.mem.eql(u8, cfg.name, metric_name)) return cfg;
@@ -9107,15 +9121,13 @@ pub const GraphIndex = struct {
                     .degree => return error.UnsupportedGraphMetricBuildPhase,
                 };
                 defer self.alloc.free(primary_rank_key);
-                const primary_rank = try readF64OrZero(&txn, primary_rank_key);
-                if (!std.math.isFinite(primary_rank)) return error.InvalidGraphMetricScore;
+                const primary_rank = try readRequiredFiniteF64(&txn, primary_rank_key);
                 try primary_scores.append(self.alloc, .{ .node = node, .score = primary_rank });
 
                 if (pair_cfg) |pair| {
                     const pair_rank_key = try self.graphMetricBuildHitsRankKeyAlloc(metric_name, job.job_id, hitsVectorName(pair.kind), rank_iteration, node);
                     defer self.alloc.free(pair_rank_key);
-                    const pair_rank = try readF64OrZero(&txn, pair_rank_key);
-                    if (!std.math.isFinite(pair_rank)) return error.InvalidGraphMetricScore;
+                    const pair_rank = try readRequiredFiniteF64(&txn, pair_rank_key);
                     try pair_scores.append(self.alloc, .{ .node = node, .score = pair_rank });
                 }
             }
@@ -15099,6 +15111,37 @@ test "graph pagerank coordinator publish failure preserves prior published gener
         try std.testing.expectEqual(active_job.job_id, job.job_id);
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.publish_generation, job.phase);
         _ = try graph.verifyGraphMetricBuildPublishReady("pagerank", active_job.job_id);
+    }
+    const missing_rank_key = try graph.graphMetricBuildPageRankKeyAlloc("pagerank", active_job.job_id, active_job.iteration + 1, "doc-a");
+    defer alloc.free(missing_rank_key);
+    const missing_rank_value = blk: {
+        var txn = try graph.beginReadReverseTxn();
+        defer txn.abort();
+        break :blk try GraphIndex.readRequiredFiniteF64(&txn, missing_rank_key);
+    };
+    {
+        var batch = try graph.beginWriteReverseBatch();
+        errdefer batch.abort();
+        try batch.delete(missing_rank_key);
+        try batch.commit();
+    }
+    const rejected_materialization = try graph.runGraphMetricPlannedWorkerPageStepForMetric("pagerank", "worker-missing-final-rank");
+    try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.publish_generation, rejected_materialization.phase);
+    try std.testing.expect(rejected_materialization.claimed_page);
+    try std.testing.expect(!rejected_materialization.completed_page);
+    {
+        var txn = try graph.beginReadReverseTxn();
+        defer txn.abort();
+        const failed_page = try graph.metricBuildPage(&txn, "pagerank", active_job.job_id, .publish_generation, active_job.iteration, rejected_materialization.page_id) orelse return error.TestExpectedGraphMetricBuildPage;
+        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.failed, failed_page.state);
+        try std.testing.expectEqualStrings("InvalidGraphMetricScore", failed_page.last_error);
+        try std.testing.expectEqual(@as(usize, 0), try graph.countGraphMetricScoreGeneration("pagerank", active_job.score_generation));
+    }
+    {
+        var batch = try graph.beginWriteReverseBatch();
+        errdefer batch.abort();
+        try GraphIndex.putF64(&batch, missing_rank_key, missing_rank_value);
+        try batch.commit();
     }
     _ = try materializeGraphMetricPublishPagesForTest(&graph, "pagerank", "worker-publish-materialize");
 
@@ -24448,6 +24491,38 @@ test "graph hits coordinator publish failure preserves prior published pair afte
         try std.testing.expectEqual(active_job.job_id, job.job_id);
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.publish_generation, job.phase);
         _ = try graph.verifyGraphMetricBuildPublishReady("hits_authority", active_job.job_id);
+    }
+    const missing_pair_rank_key = try graph.graphMetricBuildHitsRankKeyAlloc("hits_authority", active_job.job_id, "hub", active_job.iteration + 1, "doc-hub-a");
+    defer alloc.free(missing_pair_rank_key);
+    const missing_pair_rank_value = blk: {
+        var txn = try graph.beginReadReverseTxn();
+        defer txn.abort();
+        break :blk try GraphIndex.readRequiredFiniteF64(&txn, missing_pair_rank_key);
+    };
+    {
+        var batch = try graph.beginWriteReverseBatch();
+        errdefer batch.abort();
+        try batch.delete(missing_pair_rank_key);
+        try batch.commit();
+    }
+    const rejected_pair_materialization = try graph.runGraphMetricPlannedWorkerPageStepForMetric("hits_authority", "worker-missing-pair-rank");
+    try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.publish_generation, rejected_pair_materialization.phase);
+    try std.testing.expect(rejected_pair_materialization.claimed_page);
+    try std.testing.expect(!rejected_pair_materialization.completed_page);
+    {
+        var txn = try graph.beginReadReverseTxn();
+        defer txn.abort();
+        const failed_page = try graph.metricBuildPage(&txn, "hits_authority", active_job.job_id, .publish_generation, active_job.iteration, rejected_pair_materialization.page_id) orelse return error.TestExpectedGraphMetricBuildPage;
+        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.failed, failed_page.state);
+        try std.testing.expectEqualStrings("InvalidGraphMetricScore", failed_page.last_error);
+        try std.testing.expectEqual(@as(usize, 0), try graph.countGraphMetricScoreGeneration("hits_authority", active_job.score_generation));
+        try std.testing.expectEqual(@as(usize, 0), try graph.countGraphMetricScoreGeneration("hits_hub", active_job.score_generation));
+    }
+    {
+        var batch = try graph.beginWriteReverseBatch();
+        errdefer batch.abort();
+        try GraphIndex.putF64(&batch, missing_pair_rank_key, missing_pair_rank_value);
+        try batch.commit();
     }
     _ = try materializeGraphMetricPublishPagesForTest(&graph, "hits_authority", "worker-publish-materialize");
 
