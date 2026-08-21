@@ -55,7 +55,6 @@ pub fn isImportTargetEmpty(allocator: Allocator, db: *db_mod.DB) !bool {
 }
 
 pub fn finalizeRestoredLiteDb(allocator: Allocator, db: *db_mod.DB) !void {
-    try db.core.loadIndexes();
     _ = try db.rebuildDenseIndexesForTargetCoverage(allocator);
     _ = try db.rebuildSparseIndexesForTargetCoverage(allocator);
     try db.rebuildGraphIndexesForTargetCoverage(allocator);
@@ -66,13 +65,7 @@ pub fn finalizeRestoredLiteDb(allocator: Allocator, db: *db_mod.DB) !void {
 }
 
 pub fn importPortableIntoLiteDb(allocator: Allocator, db: *db_mod.DB, backup: []const u8) !void {
-    try portable_backup.validatePortable(allocator, backup);
-    try portable_backup.importPortable(allocator, db.core.store, backup);
-    try db.reloadSchemaForInternalRestore();
-    // Portable archives carry source identity rows for consistency checks,
-    // but the restore target owns its namespace. Rebuild canonical mappings
-    // before indexes or queries can observe the imported documents.
-    try db.reassignIdentityNamespaceForInternalTransition(connection.embeddedRootIdentity());
+    try db.importPortableIntoEmpty(allocator, backup, connection.embeddedRootIdentity());
     try finalizeRestoredLiteDb(allocator, db);
 }
 

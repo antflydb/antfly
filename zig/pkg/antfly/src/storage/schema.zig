@@ -953,13 +953,30 @@ pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
 
 /// Save a schema to DocStore. Returns whether durable state changed.
 pub fn saveSchema(store: anytype, alloc: Allocator, schema: TableSchema) !bool {
+    return try saveSchemaWithMetadata(store, alloc, schema, &.{}, &.{});
+}
+
+/// Save the runtime schema and caller-owned metadata in one store transaction.
+///
+/// The extra writes/deletes are deliberately part of the same transaction as
+/// the active and versioned runtime schema keys. Public schema validators and
+/// other schema-generation metadata must never become observable from a
+/// different durable generation than the physical schema they describe.
+pub fn saveSchemaWithMetadata(
+    store: anytype,
+    alloc: Allocator,
+    schema: TableSchema,
+    metadata_writes: []const docstore.KVPair,
+    metadata_deletes: []const []const u8,
+) !bool {
     const data = try serializeSchema(alloc, schema);
     defer alloc.free(data);
-    if (try activeSchemaDataMatches(store, alloc, data)) return false;
+    const schema_changed = !(try activeSchemaDataMatches(store, alloc, data));
+    if (!schema_changed and metadata_writes.len == 0 and metadata_deletes.len == 0) return false;
 
     const versioned_key = try schemaVersionKeyAlloc(alloc, schema.version);
     defer alloc.free(versioned_key);
-    const previous_schema = try loadSchema(store, alloc);
+    const previous_schema = if (schema_changed) try loadSchema(store, alloc) else null;
     defer if (previous_schema) |loaded| freeSchema(alloc, loaded);
 
     const previous_versioned_data = blk: {
@@ -976,17 +993,24 @@ pub fn saveSchema(store: anytype, alloc: Allocator, schema: TableSchema) !bool {
     defer runtime.deinit();
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
-    if (previous_schema) |loaded| {
-        if (previous_versioned_data) |encoded| {
-            const previous_versioned_key = try schemaVersionKeyAlloc(alloc, loaded.version);
-            defer alloc.free(previous_versioned_key);
-            try txn.put(previous_versioned_key, encoded);
+    if (schema_changed) {
+        if (previous_schema) |loaded| {
+            if (previous_versioned_data) |encoded| {
+                const previous_versioned_key = try schemaVersionKeyAlloc(alloc, loaded.version);
+                defer alloc.free(previous_versioned_key);
+                try txn.put(previous_versioned_key, encoded);
+            }
         }
+        try txn.put(schema_key, data);
+        try txn.put(versioned_key, data);
     }
-    try txn.put(schema_key, data);
-    try txn.put(versioned_key, data);
+    for (metadata_writes) |write| try txn.put(write.key, write.value);
+    for (metadata_deletes) |key| txn.delete(key) catch |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    };
     try txn.commit();
-    return true;
+    return schema_changed;
 }
 
 fn activeSchemaDataMatches(store: anytype, alloc: Allocator, expected: []const u8) !bool {
@@ -2399,6 +2423,37 @@ test "schema save/load via DocStore" {
     const loaded_v7 = (try loadSchemaVersion(&store, alloc, 7)).?;
     defer freeSchema(alloc, loaded_v7);
     try std.testing.expectEqual(@as(u32, 7), loaded_v7.version);
+}
+
+test "schema and generation metadata commit in one transaction" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "schema-metadata-atomic");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    defer cleanupTestDir(path);
+
+    const public_key = "\x00\x00__metadata__:schema_json_test";
+    const public_json = "{\"version\":9}";
+    try std.testing.expect(try saveSchemaWithMetadata(
+        &store,
+        alloc,
+        .{ .version = 9, .default_type = "row", .storage_mode = .relational },
+        &.{.{ .key = public_key, .value = public_json }},
+        &.{},
+    ));
+
+    const loaded = (try loadSchema(&store, alloc)).?;
+    defer freeSchema(alloc, loaded);
+    try std.testing.expectEqual(@as(u32, 9), loaded.version);
+    try std.testing.expectEqual(StorageMode.relational, loaded.storage_mode);
+    const stored_public = try store.get(alloc, public_key);
+    defer alloc.free(stored_public);
+    try std.testing.expectEqualStrings(public_json, stored_public);
+
+    try std.testing.expect(!try saveSchemaWithMetadata(&store, alloc, loaded, &.{}, &.{public_key}));
+    try std.testing.expectError(error.NotFound, store.get(alloc, public_key));
 }
 
 test "schema preserves versioned history in DocStore" {

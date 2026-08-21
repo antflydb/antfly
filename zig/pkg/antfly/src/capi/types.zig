@@ -271,6 +271,7 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.UnsupportedVersion,
         error.BlockCrcMismatch,
         error.InvalidBackupRequest,
+        error.LiteImportTargetNotEmpty,
         => .invalid_argument,
         error.FileNotFound => .not_found,
         error.WouldBlock,

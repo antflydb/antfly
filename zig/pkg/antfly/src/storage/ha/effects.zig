@@ -56,9 +56,10 @@ pub const MetadataMutationKind = enum {
 };
 
 pub const MetadataMutationPayload = struct {
-    schema_version: u32 = 1,
+    schema_version: u32 = 2,
     kind: MetadataMutationKind,
     schema_bytes: []const u8,
+    public_schema_json: ?[]const u8 = null,
 };
 
 pub fn encodeBatchMutationRequestAlloc(
@@ -115,12 +116,14 @@ pub fn decodeBatchMutationRequest(
 pub fn encodeSchemaMetadataMutationAlloc(
     alloc: Allocator,
     schema: schema_mod.TableSchema,
+    public_schema_json: ?[]const u8,
 ) ![]u8 {
     const schema_bytes = try schema_mod.serializeSchema(alloc, schema);
     defer alloc.free(schema_bytes);
     return try std.json.Stringify.valueAlloc(alloc, MetadataMutationPayload{
         .kind = .schema,
         .schema_bytes = schema_bytes,
+        .public_schema_json = public_schema_json,
     }, .{});
 }
 
@@ -128,9 +131,10 @@ pub fn appendSchemaMetadataMutation(
     alloc: Allocator,
     primary: *primary_mod.Primary,
     schema: schema_mod.TableSchema,
+    public_schema_json: ?[]const u8,
     options: AppendMetadataMutationOptions,
 ) !u64 {
-    const payload = try encodeSchemaMetadataMutationAlloc(alloc, schema);
+    const payload = try encodeSchemaMetadataMutationAlloc(alloc, schema, public_schema_json);
     defer alloc.free(payload);
 
     return try primary.append(.{
@@ -154,18 +158,40 @@ pub fn decodeMetadataMutation(
         .allocate = .alloc_always,
     });
     errdefer parsed.deinit();
-    if (parsed.value.schema_version != 1) return error.UnsupportedMetadataMutationPayloadVersion;
+    if (parsed.value.schema_version != 1 and parsed.value.schema_version != 2) return error.UnsupportedMetadataMutationPayloadVersion;
     return parsed;
 }
+
+pub const DecodedSchemaMetadataMutation = struct {
+    alloc: Allocator,
+    schema: schema_mod.TableSchema,
+    public_schema_json: ?[]u8,
+
+    pub fn deinit(self: *DecodedSchemaMetadataMutation) void {
+        schema_mod.freeSchema(self.alloc, self.schema);
+        if (self.public_schema_json) |value| self.alloc.free(value);
+        self.* = undefined;
+    }
+};
 
 pub fn decodeSchemaMetadataMutation(
     alloc: Allocator,
     record: replication_record.RecordView,
-) !schema_mod.TableSchema {
+) !DecodedSchemaMetadataMutation {
     var parsed = try decodeMetadataMutation(alloc, record);
     defer parsed.deinit();
     if (parsed.value.kind != .schema) return error.UnsupportedMetadataMutationKind;
-    return try schema_mod.deserializeSchema(alloc, parsed.value.schema_bytes);
+    const schema = try schema_mod.deserializeSchema(alloc, parsed.value.schema_bytes);
+    errdefer schema_mod.freeSchema(alloc, schema);
+    const public_schema_json = if (parsed.value.schema_version >= 2)
+        if (parsed.value.public_schema_json) |value| try alloc.dupe(u8, value) else null
+    else
+        null;
+    return .{
+        .alloc = alloc,
+        .schema = schema,
+        .public_schema_json = public_schema_json,
+    };
 }
 
 pub fn appendDerivedChangeRecord(
@@ -331,7 +357,7 @@ test "storage.ha effects appends schema metadata payload as HA metadata mutation
         .default_type = "doc",
         .ttl_duration_ns = 123,
         .ttl_field = "expires_at",
-    }, .{ .commit_timestamp_ns = 9012 });
+    }, "{\"version\":7}", .{ .commit_timestamp_ns = 9012 });
     try std.testing.expectEqual(@as(u64, 1), lsn);
 
     var entry = (try primary.log.entryAt(alloc, lsn)) orelse return error.TestExpectedEqual;
@@ -343,12 +369,39 @@ test "storage.ha effects appends schema metadata payload as HA metadata mutation
     try std.testing.expectEqual(@as(u64, 13), entry.record.table_id);
     try std.testing.expectEqual(@as(i64, 9012), entry.record.commit_timestamp_ns);
 
-    const decoded = try decodeSchemaMetadataMutation(alloc, entry.record);
-    defer schema_mod.freeSchema(alloc, decoded);
-    try std.testing.expectEqual(@as(u32, 7), decoded.version);
-    try std.testing.expectEqualStrings("doc", decoded.default_type);
-    try std.testing.expectEqual(@as(u64, 123), decoded.ttl_duration_ns);
-    try std.testing.expectEqualStrings("expires_at", decoded.ttl_field);
+    var decoded = try decodeSchemaMetadataMutation(alloc, entry.record);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u32, 7), decoded.schema.version);
+    try std.testing.expectEqualStrings("doc", decoded.schema.default_type);
+    try std.testing.expectEqual(@as(u64, 123), decoded.schema.ttl_duration_ns);
+    try std.testing.expectEqualStrings("expires_at", decoded.schema.ttl_field);
+    try std.testing.expectEqualStrings("{\"version\":7}", decoded.public_schema_json.?);
+
+    const legacy_schema_bytes = try schema_mod.serializeSchema(alloc, .{
+        .version = 6,
+        .default_type = "legacy",
+    });
+    defer alloc.free(legacy_schema_bytes);
+    const LegacyPayload = struct {
+        schema_version: u32 = 1,
+        kind: MetadataMutationKind = .schema,
+        schema_bytes: []const u8,
+    };
+    const legacy_payload = try std.json.Stringify.valueAlloc(alloc, LegacyPayload{
+        .schema_bytes = legacy_schema_bytes,
+    }, .{});
+    defer alloc.free(legacy_payload);
+    const legacy_lsn = try primary.append(.{
+        .kind = .metadata_mutation,
+        .payload_codec = .json,
+        .payload = legacy_payload,
+    });
+    var legacy_entry = (try primary.log.entryAt(alloc, legacy_lsn)) orelse return error.TestExpectedEqual;
+    defer legacy_entry.deinit(alloc);
+    var legacy_decoded = try decodeSchemaMetadataMutation(alloc, legacy_entry.record);
+    defer legacy_decoded.deinit();
+    try std.testing.expectEqual(@as(u32, 6), legacy_decoded.schema.version);
+    try std.testing.expectEqual(@as(?[]u8, null), legacy_decoded.public_schema_json);
 }
 
 test "storage.ha effects rejects non-derived HA records when decoding derived payloads" {
@@ -454,7 +507,7 @@ test "storage.ha effects rejects unsupported metadata mutation payloads" {
         .epoch = 1,
         .lsn = 1,
         .previous_lsn = 0,
-        .payload = "{\"schema_version\":2,\"kind\":\"schema\",\"schema_bytes\":\"\"}",
+        .payload = "{\"schema_version\":3,\"kind\":\"schema\",\"schema_bytes\":\"\"}",
     };
     try std.testing.expectError(
         error.UnsupportedMetadataMutationPayloadVersion,

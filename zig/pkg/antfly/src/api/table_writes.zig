@@ -23046,6 +23046,12 @@ fn validateTableBatchAgainstLocalSchema(
     transforms: []const db_mod.types.DocumentTransform,
 ) !void {
     if (writes.len == 0 and deletes.len == 0 and transforms.len == 0) return;
+    // Relational writes are validated authoritatively by DB.batch after its
+    // final transform resolution and while holding the schema generation's
+    // apply lock. Repeating the API-level load/parse/transform pass doubles
+    // CPU and allocation cost without improving error timing: both paths are
+    // synchronous and return InvalidBatchRequest before any durable mutation.
+    if (db.usesRelationalStorage()) return;
     const schema_json = (try loadLocalTableSchemaJson(alloc, db)) orelse return;
     defer alloc.free(schema_json);
     if (schema_json.len == 0) return;

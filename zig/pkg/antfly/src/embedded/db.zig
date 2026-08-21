@@ -290,11 +290,8 @@ pub const DB = struct {
             try lite_restore_staging.importPortableIntoLiteDb(alloc, &self.inner, backup);
             return;
         }
-        try support.portable_backup.validatePortable(alloc, backup);
-        try support.portable_backup.importPortable(alloc, self.inner.core.store, backup);
-        try self.inner.reloadSchemaForInternalRestore();
         const target_identity = self.inner.core.identity_namespace;
-        try self.inner.reassignIdentityNamespaceForInternalTransition(target_identity);
+        try self.inner.importPortableIntoEmpty(alloc, backup, target_identity);
     }
 
     pub fn checkLite(self: *DB) !LiteCheckReport {

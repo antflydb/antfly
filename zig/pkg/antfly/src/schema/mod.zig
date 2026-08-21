@@ -48,10 +48,62 @@ pub fn validateWritesAgainstTableSchema(
     schema: ParsedTableSchema,
     writes: anytype,
 ) !void {
-    const physical_fields = try derivePhysicalFieldValidations(alloc, schema);
-    defer freePhysicalFieldValidations(alloc, physical_fields);
-    try impl.validateWritesAgainstSchemaWithPhysicalFields(alloc, schema, writes, physical_fields);
+    var compiled = try CompiledTableValidator.initParsed(alloc, schema);
+    defer compiled.deinitPhysicalFields(alloc);
+    try compiled.validateWrites(alloc, writes);
 }
+
+/// Immutable, generation-scoped public-schema validator.
+///
+/// Physical field mappings are derived once when a schema is installed rather
+/// than rebuilt for every batch while the DB apply lock is held. `schema` is
+/// owned when constructed with `init`; `initParsed` borrows it so compatibility
+/// callers can retain their existing ownership convention.
+pub const CompiledTableValidator = struct {
+    schema: ParsedTableSchema,
+    physical_fields: []impl.PhysicalFieldValidation,
+    owns_schema: bool,
+
+    pub fn init(alloc: std.mem.Allocator, schema_json: []const u8) !CompiledTableValidator {
+        var schema = try parseValidatedTableSchema(alloc, schema_json);
+        errdefer schema.deinit(alloc);
+        const physical_fields = try derivePhysicalFieldValidations(alloc, schema);
+        return .{
+            .schema = schema,
+            .physical_fields = physical_fields,
+            .owns_schema = true,
+        };
+    }
+
+    pub fn initParsed(alloc: std.mem.Allocator, schema: ParsedTableSchema) !CompiledTableValidator {
+        return .{
+            .schema = schema,
+            .physical_fields = try derivePhysicalFieldValidations(alloc, schema),
+            .owns_schema = false,
+        };
+    }
+
+    pub fn takeParsed(alloc: std.mem.Allocator, schema: ParsedTableSchema) !CompiledTableValidator {
+        var compiled = try initParsed(alloc, schema);
+        compiled.owns_schema = true;
+        return compiled;
+    }
+
+    pub fn deinit(self: *CompiledTableValidator, alloc: std.mem.Allocator) void {
+        self.deinitPhysicalFields(alloc);
+        if (self.owns_schema) self.schema.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn deinitPhysicalFields(self: *CompiledTableValidator, alloc: std.mem.Allocator) void {
+        freePhysicalFieldValidations(alloc, self.physical_fields);
+        self.physical_fields = &.{};
+    }
+
+    pub fn validateWrites(self: CompiledTableValidator, alloc: std.mem.Allocator, writes: anytype) !void {
+        try impl.validateWritesAgainstSchemaWithPhysicalFields(alloc, self.schema, writes, self.physical_fields);
+    }
+};
 
 fn derivePhysicalFieldValidations(
     alloc: std.mem.Allocator,

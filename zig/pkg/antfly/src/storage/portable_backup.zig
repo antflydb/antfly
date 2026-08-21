@@ -17,8 +17,10 @@ const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 
 const backup_codec = @import("backup_codec.zig");
+const backend_erased = @import("backend_erased.zig");
 const internal_keys = @import("internal_keys.zig");
 const docstore_mod = @import("docstore.zig");
+const mem_backend = @import("mem_backend.zig");
 const doc_identity = @import("db/doc_identity.zig");
 const relational_store = @import("db/relational_store.zig");
 const storage_schema = @import("schema.zig");
@@ -889,6 +891,63 @@ pub fn importPortable(alloc: Allocator, store: *DocStore, data: []const u8) !voi
 pub fn validatePortable(alloc: Allocator, data: []const u8) !void {
     try validatePortableImportBlocks(alloc, data, .{});
 }
+
+/// Fully validated portable import held outside the live target generation.
+/// Publishing streams the staged keys through one target write transaction,
+/// so memory/backend failures abort without exposing a prefix of the archive.
+pub const PortableImportStage = struct {
+    alloc: Allocator,
+    backend: *mem_backend.Backend,
+    runtime_store: backend_erased.Store,
+    store: DocStore,
+
+    pub fn init(alloc: Allocator, data: []const u8, opts: ImportOptions) !PortableImportStage {
+        const backend = try alloc.create(mem_backend.Backend);
+        errdefer alloc.destroy(backend);
+        backend.* = mem_backend.Backend.init(alloc, .{});
+        errdefer backend.close();
+        var runtime_store = try backend.runtimeStore(alloc, .{ .name = "portable-restore-stage" });
+        errdefer runtime_store.deinit();
+        var store = try DocStore.openRuntime(alloc, &runtime_store);
+        errdefer store.close();
+        try importPortableWithOptions(alloc, &store, data, opts);
+        return .{
+            .alloc = alloc,
+            .backend = backend,
+            .runtime_store = runtime_store,
+            .store = store,
+        };
+    }
+
+    pub fn deinit(self: *PortableImportStage) void {
+        self.store.close();
+        self.runtime_store.deinit();
+        self.backend.close();
+        self.alloc.destroy(self.backend);
+        self.* = undefined;
+    }
+
+    pub fn reassignIdentityNamespace(self: *PortableImportStage, alloc: Allocator, namespace: doc_identity.Namespace) !void {
+        try doc_identity.reassignNamespaceAlloc(alloc, &self.store, namespace);
+    }
+
+    pub fn publish(self: *PortableImportStage, target: *DocStore) !void {
+        var write_txn = try target.beginWriteTxn();
+        errdefer write_txn.abort();
+        const Publish = struct {
+            txn: *DocStore.Txn,
+
+            fn copy(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!DocStore.ScanAction {
+                const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                try state.txn.put(key, value);
+                return .@"continue";
+            }
+        };
+        var state = Publish{ .txn = &write_txn };
+        try self.store.scanWithContext("", "", .{}, &state, Publish.copy);
+        try write_txn.commit();
+    }
+};
 
 pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []const u8, opts: ImportOptions) !void {
     var validation_reader = backup_codec.SliceReader.init(data);

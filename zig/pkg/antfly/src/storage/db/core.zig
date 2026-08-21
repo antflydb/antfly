@@ -926,13 +926,13 @@ pub const DBCore = struct {
         alloc: Allocator,
         config: transaction_runtime_mod.Config,
     ) !types.TransactionRecoveryStats {
-        var identity_ctx = TransactionRecoveryIdentityContext{
-            .store = self.store,
-            .identity_namespace = self.identity_namespace,
-            .alloc = alloc,
-            .relational_base_rows = if (self.schema) |schema| schema.storage_mode == .relational else false,
-            .relational_columns = if (self.schema) |schema| schema.relational_columns else &.{},
-        };
+        var identity_ctx = try TransactionRecoveryIdentityContext.init(
+            alloc,
+            self.store,
+            self.identity_namespace,
+            if (self.schema) |schema| if (schema.storage_mode == .relational) schema.relational_columns else null else null,
+        );
+        defer identity_ctx.deinit();
         var effective_config = config;
         effective_config.resolution_extra_hooks = transactionRecoveryIdentityHooks(&identity_ctx);
         return try transaction_runtime_mod.recoverOnce(alloc, self.store, effective_config);
@@ -994,19 +994,42 @@ pub const DBCore = struct {
     }
 
     pub fn setSchema(self: *DBCore, table_schema: schema_mod.TableSchema) !void {
-        const changed = try schema_mod.saveSchema(self.store, self.alloc, table_schema);
+        _ = try self.commitSchemaMetadata(table_schema, &.{}, &.{});
         // Refresh even when the durable value is unchanged. An index may have
         // been provisioned between the original schema commit and this
         // idempotent retry, and empty generations still need the mapping.
-        if (!changed) {
-            try self.index_manager.refreshEmptyTextIndexSchemas(self.store);
-            return;
-        }
-        const next_schema = try schema_mod.loadSchema(self.store, self.alloc);
-        errdefer if (next_schema) |schema| schema_mod.freeSchema(self.alloc, schema);
         try self.index_manager.refreshEmptyTextIndexSchemas(self.store);
+    }
+
+    /// Atomically commit the physical schema and its generation metadata, then
+    /// publish a fully-owned in-memory schema without any post-commit
+    /// allocation. Callers may safely install their prepared validator before
+    /// running fallible index refresh work.
+    pub fn commitSchemaMetadata(
+        self: *DBCore,
+        table_schema: schema_mod.TableSchema,
+        metadata_writes: []const docstore_mod.KVPair,
+        metadata_deletes: []const []const u8,
+    ) !bool {
+        const encoded = try schema_mod.serializeSchema(self.alloc, table_schema);
+        defer self.alloc.free(encoded);
+        const next_schema = try schema_mod.deserializeSchema(self.alloc, encoded);
+        errdefer schema_mod.freeSchema(self.alloc, next_schema);
+
+        const changed = try schema_mod.saveSchemaWithMetadata(
+            self.store,
+            self.alloc,
+            table_schema,
+            metadata_writes,
+            metadata_deletes,
+        );
         if (self.schema) |existing| schema_mod.freeSchema(self.alloc, existing);
         self.schema = next_schema;
+        return changed;
+    }
+
+    pub fn refreshSchemaIndexes(self: *DBCore) !void {
+        try self.index_manager.refreshEmptyTextIndexSchemas(self.store);
     }
 
     /// Replace the in-memory schema from already-restored durable metadata.
@@ -1015,6 +1038,10 @@ pub const DBCore = struct {
     pub fn reloadSchemaFromStore(self: *DBCore) !void {
         const next_schema = try schema_mod.loadSchema(self.store, self.alloc);
         errdefer if (next_schema) |schema| schema_mod.freeSchema(self.alloc, schema);
+        self.replaceSchemaOwned(next_schema);
+    }
+
+    pub fn replaceSchemaOwned(self: *DBCore, next_schema: ?schema_mod.TableSchema) void {
         if (self.schema) |existing| schema_mod.freeSchema(self.alloc, existing);
         self.schema = next_schema;
     }
@@ -1465,13 +1492,13 @@ pub const DBCore = struct {
     pub fn recoverTransactions(self: *DBCore, cutoff_timestamp: u64, resolution_timestamp: u64) !transactions_mod.RecoveryStats {
         var manager = try self.initTxnManager();
         defer manager.deinit();
-        var identity_ctx = TransactionRecoveryIdentityContext{
-            .store = self.store,
-            .identity_namespace = self.identity_namespace,
-            .alloc = self.alloc,
-            .relational_base_rows = if (self.schema) |schema| schema.storage_mode == .relational else false,
-            .relational_columns = if (self.schema) |schema| schema.relational_columns else &.{},
-        };
+        var identity_ctx = try TransactionRecoveryIdentityContext.init(
+            self.alloc,
+            self.store,
+            self.identity_namespace,
+            if (self.schema) |schema| if (schema.storage_mode == .relational) schema.relational_columns else null else null,
+        );
+        defer identity_ctx.deinit();
         return try manager.recoverTransactionsWithExtraBatchHooks(
             cutoff_timestamp,
             resolution_timestamp,
@@ -1484,9 +1511,107 @@ pub const TransactionRecoveryIdentityContext = struct {
     store: *docstore_mod.DocStore,
     identity_namespace: doc_identity.Namespace,
     alloc: Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
     relational_base_rows: bool = false,
     relational_columns: []const schema_mod.RelationalColumn = &.{},
+
+    pub fn init(
+        alloc: Allocator,
+        store: *docstore_mod.DocStore,
+        identity_namespace: doc_identity.Namespace,
+        relational_columns: ?[]const schema_mod.RelationalColumn,
+    ) !TransactionRecoveryIdentityContext {
+        const owned_columns = if (relational_columns) |columns|
+            try cloneRelationalColumns(alloc, columns)
+        else
+            &[_]schema_mod.RelationalColumn{};
+        return .{
+            .store = store,
+            .identity_namespace = identity_namespace,
+            .alloc = alloc,
+            .relational_base_rows = relational_columns != null,
+            .relational_columns = owned_columns,
+        };
+    }
+
+    pub fn deinit(self: *TransactionRecoveryIdentityContext) void {
+        freeRelationalColumns(self.alloc, self.relational_columns);
+        self.* = undefined;
+    }
+
+    pub fn updateRelationalColumns(self: *TransactionRecoveryIdentityContext, columns: ?[]const schema_mod.RelationalColumn) !void {
+        var prepared = try PreparedRecoveryRelationalState.init(self.alloc, columns);
+        defer prepared.deinit();
+        self.installPreparedRelationalState(&prepared);
+    }
+
+    pub fn installPreparedRelationalState(self: *TransactionRecoveryIdentityContext, prepared: *PreparedRecoveryRelationalState) void {
+        std.debug.assert(prepared.alloc.ptr == self.alloc.ptr and prepared.alloc.vtable == self.alloc.vtable);
+        lockAtomic(&self.mutex);
+        const previous = self.relational_columns;
+        self.relational_columns = prepared.columns;
+        self.relational_base_rows = prepared.enabled;
+        prepared.columns = &.{};
+        self.mutex.unlock();
+        freeRelationalColumns(self.alloc, previous);
+    }
+
+    pub fn updateIdentityNamespace(self: *TransactionRecoveryIdentityContext, namespace: doc_identity.Namespace) void {
+        lockAtomic(&self.mutex);
+        self.identity_namespace = namespace;
+        self.mutex.unlock();
+    }
 };
+
+pub const PreparedRecoveryRelationalState = struct {
+    alloc: Allocator,
+    enabled: bool,
+    columns: []const schema_mod.RelationalColumn,
+
+    pub fn init(alloc: Allocator, columns: ?[]const schema_mod.RelationalColumn) !PreparedRecoveryRelationalState {
+        return .{
+            .alloc = alloc,
+            .enabled = columns != null,
+            .columns = if (columns) |items| try cloneRelationalColumns(alloc, items) else &.{},
+        };
+    }
+
+    pub fn deinit(self: *PreparedRecoveryRelationalState) void {
+        freeRelationalColumns(self.alloc, self.columns);
+        self.* = undefined;
+    }
+};
+
+fn cloneRelationalColumns(alloc: Allocator, columns: []const schema_mod.RelationalColumn) ![]schema_mod.RelationalColumn {
+    if (columns.len == 0) return &.{};
+    const out = try alloc.alloc(schema_mod.RelationalColumn, columns.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |column| {
+            alloc.free(column.name);
+            alloc.free(column.path);
+        }
+        alloc.free(out);
+    }
+    for (columns) |column| {
+        const name = try alloc.dupe(u8, column.name);
+        errdefer alloc.free(name);
+        const path = try alloc.dupe(u8, column.path);
+        out[initialized] = column;
+        out[initialized].name = name;
+        out[initialized].path = path;
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeRelationalColumns(alloc: Allocator, columns: []const schema_mod.RelationalColumn) void {
+    for (columns) |column| {
+        alloc.free(column.name);
+        alloc.free(column.path);
+    }
+    if (columns.len > 0) alloc.free(columns);
+}
 
 pub fn transactionRecoveryIdentityHooks(ctx: *TransactionRecoveryIdentityContext) transactions_mod.TxnManager.RecoveryExtraBatchHooks {
     return .{
@@ -1512,6 +1637,8 @@ fn buildTransactionRecoveryIdentityExtraBatch(
 ) anyerror!transactions_mod.ResolutionExtraBatch {
     if (status != .committed) return .{};
     const identity_ctx: *TransactionRecoveryIdentityContext = @ptrCast(@alignCast(ctx.?));
+    lockAtomic(&identity_ctx.mutex);
+    defer identity_ctx.mutex.unlock();
     const alloc = identity_ctx.alloc;
 
     var raw_upserts = std.ArrayListUnmanaged([]const u8).empty;
