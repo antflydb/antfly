@@ -26,6 +26,9 @@ from helpers import wait_until
 from helpers import json_doc, upsert
 
 
+pytestmark = pytest.mark.reuse_antfly_process
+
+
 def _raise_thread_errors(errors: list[Exception]) -> None:
     if errors:
         raise AssertionError("\n\n".join(str(err) for err in errors))

@@ -146,6 +146,22 @@ describe("AntflyClient", () => {
       });
     });
 
+    it("forwards global query cancellation", async () => {
+      mockPost.mockResolvedValueOnce({
+        data: { responses: [] },
+        error: undefined,
+      });
+      const controller = new AbortController();
+      const request: QueryRequest = { limit: 3 };
+
+      await client.query(request, { signal: controller.signal });
+
+      expect(mockPost).toHaveBeenCalledWith("/db/v1/query", {
+        body: request,
+        signal: controller.signal,
+      });
+    });
+
     it("should handle query with Bleve full_text_search", async () => {
       const mockResponse = {
         responses: [
@@ -214,6 +230,23 @@ describe("AntflyClient", () => {
       });
     });
 
+    it("formats table metadata Problem Details errors", async () => {
+      mockGet.mockResolvedValueOnce({
+        data: undefined,
+        error: {
+          type: "about:blank",
+          title: "Bad Gateway",
+          status: 502,
+          detail: "upstream table metadata request failed",
+        },
+        response: new Response(undefined, { status: 502 }),
+      });
+
+      await expect(client.tables.get("products")).rejects.toThrow(
+        "Failed to get table: upstream table metadata request failed"
+      );
+    });
+
     it("should create a table", async () => {
       const mockTable = { name: "new_table", indexes: {}, shards: {} };
 
@@ -271,6 +304,40 @@ describe("AntflyClient", () => {
         params: { path: { tableName: "products" } },
         body: request,
       });
+    });
+
+    it("forwards table query cancellation", async () => {
+      mockPost.mockResolvedValueOnce({
+        data: { responses: [] },
+        error: undefined,
+      });
+      const controller = new AbortController();
+      const request: QueryRequest = { limit: 3 };
+
+      await client.tables.query("products", request, { signal: controller.signal });
+
+      expect(mockPost).toHaveBeenCalledWith("/db/v1/tables/{tableName}/query", {
+        params: { path: { tableName: "products" } },
+        body: request,
+        signal: controller.signal,
+      });
+    });
+
+    it("formats table query Problem Details errors", async () => {
+      mockPost.mockResolvedValueOnce({
+        data: undefined,
+        error: {
+          type: "about:blank",
+          title: "Bad Gateway",
+          status: 502,
+          detail: "upstream query response ended unexpectedly",
+        },
+        response: new Response(undefined, { status: 502 }),
+      });
+
+      await expect(client.tables.query("products", { limit: 3 })).rejects.toThrow(
+        "Table query failed: upstream query response ended unexpectedly"
+      );
     });
 
     it("should return the durable table restore job", async () => {
