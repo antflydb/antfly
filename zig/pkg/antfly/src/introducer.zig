@@ -977,6 +977,7 @@ const TextIndexSortValue = union(enum) {
     bool_val: bool,
     bytes_val: []u8,
     id: []const u8,
+    numeric_val: typed_dv.NumericValue,
 
     fn deinit(self: *TextIndexSortValue, alloc: Allocator) void {
         switch (self.*) {
@@ -1088,6 +1089,11 @@ fn textIndexSortBoundValueAlloc(alloc: Allocator, value: TextIndexSortValue) !se
         .bool_val => |v| .{ .bool_val = v },
         .bytes_val => |v| .{ .bytes_val = try alloc.dupe(u8, v) },
         .id => |v| .{ .id = try alloc.dupe(u8, v) },
+        .numeric_val => |v| switch (v) {
+            .u64_val => |number| .{ .u64_val = number },
+            .i64_val => |number| .{ .i64_val = number },
+            .f64_val => |number| .{ .f64_val = number },
+        },
     };
 }
 
@@ -1136,6 +1142,7 @@ fn textIndexSortValueFromTypedValueAlloc(alloc: Allocator, value: typed_dv.Typed
         .bool_val => |v| .{ .bool_val = v },
         .bytes_val => |v| .{ .bytes_val = try alloc.dupe(u8, v) },
         .geo_point => error.UnsupportedTypedDocValues,
+        .numeric_val => |v| .{ .numeric_val = v },
     };
 }
 
@@ -1173,6 +1180,10 @@ fn compareTextIndexSortValues(a: TextIndexSortValue, b: TextIndexSortValue) std.
         },
         .id => |av| switch (b) {
             .id => |bv| std.mem.order(u8, av, bv),
+            else => .lt,
+        },
+        .numeric_val => |av| switch (b) {
+            .numeric_val => |bv| typed_dv.compareNumericValues(av, bv),
             else => .lt,
         },
     };
@@ -1513,6 +1524,7 @@ fn cloneTypedValue(alloc: Allocator, value: typed_dv.TypedValue) !typed_dv.Typed
         .f64_val => |number| .{ .f64_val = number },
         .geo_point => |point| .{ .geo_point = point },
         .bool_val => |boolean| .{ .bool_val = boolean },
+        .numeric_val => |number| .{ .numeric_val = number },
     };
 }
 

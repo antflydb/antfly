@@ -13,19 +13,9 @@
 // limitations.
 
 const std = @import("std");
-const Allocator = std.mem.Allocator;
 const index_mod = @import("../../index.zig");
-const typed_dv = @import("../../section/typed_doc_values.zig");
 
-pub const Status = enum {
-    covered,
-    missing_doc_values_section,
-    malformed_doc_values_section,
-    doc_values_kind_mismatch,
-    sparse_live_doc_values,
-    invalid_doc_value_doc_id,
-    duplicate_doc_value_doc_id,
-};
+pub const Status = index_mod.TypedDocValuesCoverageStatus;
 
 pub fn statusName(status: Status) []const u8 {
     return switch (status) {
@@ -37,44 +27,6 @@ pub fn statusName(status: Status) []const u8 {
         .invalid_doc_value_doc_id => "invalid_doc_value_doc_id",
         .duplicate_doc_value_doc_id => "duplicate_doc_value_doc_id",
     };
-}
-
-pub fn readerCoversLiveDocsAlloc(
-    alloc: Allocator,
-    segment: *const index_mod.SegmentEntry,
-    reader: *const typed_dv.TypedDocValuesReader,
-) !Status {
-    const doc_count = segment.reader.doc_count;
-    if (doc_count == 0) return .covered;
-
-    var present = try std.DynamicBitSetUnmanaged.initEmpty(alloc, doc_count);
-    defer present.deinit(alloc);
-
-    for (0..reader.num_chunks) |chunk_idx| {
-        const doc_ids = reader.readValidatedChunkDocIds(@intCast(chunk_idx)) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return .malformed_doc_values_section,
-        };
-        defer alloc.free(doc_ids);
-        for (doc_ids) |doc_id| {
-            if (doc_id >= doc_count) return .invalid_doc_value_doc_id;
-            if (present.isSet(doc_id)) return .duplicate_doc_value_doc_id;
-            present.set(doc_id);
-        }
-    }
-
-    {
-        segment.shared.lockDeletionShared();
-        defer segment.shared.unlockDeletionShared();
-        for (0..doc_count) |local_doc_id| {
-            const local_doc_u32: u32 = @intCast(local_doc_id);
-            if (segment.shared.deleted) |deleted| {
-                if (deleted.contains(local_doc_u32)) continue;
-            }
-            if (!present.isSet(local_doc_id)) return .sparse_live_doc_values;
-        }
-    }
-    return .covered;
 }
 
 test "typed doc values coverage status names are stable" {
