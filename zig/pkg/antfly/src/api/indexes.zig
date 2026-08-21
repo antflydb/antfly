@@ -26,6 +26,8 @@ const json_helpers = @import("json_helpers.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
+const chunking_openapi = @import("antfly_chunking_openapi");
+const chunking_api_openapi = @import("antfly_chunking_api_openapi");
 const enrichment_config_validation = @import("../storage/db/enrichment/config_validation.zig");
 const public_index_contract = @import("public_index_contract.zig");
 const index_repair_status = @import("../common/index_repair_status.zig");
@@ -912,6 +914,7 @@ fn appendPublicIndexConfig(
         if (public_index_contract.isWriteOnlyConfigField(entry.key_ptr.*)) continue;
         if (isSensitivePublicConfigField(entry.key_ptr.*)) continue;
         if (isSensitivePublicConfigValue(entry.key_ptr.*, entry.value_ptr.*)) continue;
+        if (!public_index_contract.rootFieldValueMatches(index_type, entry.key_ptr.*, entry.value_ptr.*)) continue;
         const object_shape = public_index_contract.createdObjectShapeForRootField(index_type, entry.key_ptr.*);
         if (!public_index_contract.createdValueMatchesShape(object_shape, entry.value_ptr.*)) continue;
         try out.append(alloc, ',');
@@ -1099,6 +1102,7 @@ fn appendPublicConfigValue(
                 if (public_index_contract.isWriteOnlyConfigField(entry.key_ptr.*)) continue;
                 if (isSensitivePublicConfigField(entry.key_ptr.*)) continue;
                 if (isSensitivePublicConfigValue(entry.key_ptr.*, entry.value_ptr.*)) continue;
+                if (!public_index_contract.createdFieldValueMatches(object_shape, entry.key_ptr.*, entry.value_ptr.*)) continue;
                 const child_shape = public_index_contract.createdObjectShapeForChild(object_shape, entry.key_ptr.*);
                 if (!public_index_contract.createdValueMatchesShape(child_shape, entry.value_ptr.*)) continue;
                 if (!first) try out.append(alloc, ',');
@@ -3920,7 +3924,11 @@ test "created nested response allowlists cover generated schemas" {
     try expectCreatedObjectAllowlistCovers(indexes_openapi.CreatedEnrichmentConfig, .enrichment);
     try expectCreatedObjectAllowlistCovers(indexes_openapi.GraphArtifactSourceConfig, .graph_source);
     try expectCreatedObjectAllowlistCovers(indexes_openapi.CreatedGraphArtifactProducerConfig, .graph_artifact);
+    try expectCreatedObjectAllowlistCovers(indexes_openapi.EdgeTypeConfig, .edge_type);
     try expectCreatedObjectAllowlistCovers(indexes_openapi.GraphResolverConfig, .graph_resolver);
+    try expectCreatedObjectAllowlistCovers(chunking_openapi.ChunkerConfig, .chunker);
+    try expectCreatedObjectAllowlistCovers(chunking_api_openapi.TextChunkOptions, .chunker_text);
+    try expectCreatedObjectAllowlistCovers(chunking_api_openapi.AudioChunkOptions, .chunker_audio);
     try expectCreatedObjectAllowlistCovers(indexes_openapi.IndexExecutionConfig, .index_execution);
     try expectCreatedObjectAllowlistCovers(indexes_openapi.ExecutionPolicy, .execution_policy);
 
@@ -3936,7 +3944,11 @@ test "created nested response allowlists cover generated schemas" {
         .enrichment,
         .graph_source,
         .graph_artifact,
+        .edge_type,
         .graph_resolver,
+        .chunker,
+        .chunker_text,
+        .chunker_audio,
         .index_execution,
         .execution_policy,
     }) |shape| {
@@ -3947,14 +3959,14 @@ test "created nested response allowlists cover generated schemas" {
 
 test "public index config encoders redact nested credentials" {
     const indexes_json =
-        \\{"embed_idx":{"type":"embeddings","dimension":384,"embedder":{"provider":"openai","model":"text-embedding-3-small","api_key":"sk-private","secret_key":"private-secret-key","url":"https://alice:private-password@example.com/v1","endpoint":"https://example.com/v1?auth=private-endpoint-auth","base_url":"https://example.com/oauth/callback#access_token=private-fragment-token","client_value":"private-unknown-field","settings":{"opaque":"private-nested-value"}},"summarizer":{"provider":"gemini","model":"gemini-2.5-flash","api_key":"${secret:gemini_key}","api_url":"https://example.com/v1?access%5Fkey%5Fid=private-url-key"},"execution":{"embedding":{"batch_items":32,"client_value":"private-execution-value"},"chunking":"private-malformed-policy","settings":{"opaque":"private-execution-settings"}},"enrichments":[{"name":"asset_v1","kind":"asset","client_value":"private-enrichment-value","producer_json":"{\"provider\":\"s3\",\"secret_access_key\":\"unknown-provider-secret\",\"access_token\":\"private-token\",\"headers\":{\"Authorization\":\"Bearer private-auth\",\"X-Auth\":\"future-private-header\",\"Accept\":\"text/html\"},\"format\":\"html\"}","execution":{"batch_items":4,"settings":{"opaque":"private-policy-settings"}}}]}}
+        \\{"embed_idx":{"type":"embeddings","dimension":384,"source_artifact_name":{"client_value":"private-root-value"},"embedder":{"provider":"openai","model":"text-embedding-3-small","models":{"client_value":"private-models-value"},"api_key":"sk-private","secret_key":"private-secret-key","url":"https://alice:private-password@example.com/v1","endpoint":"https://example.com/v1?auth=private-endpoint-auth","base_url":"https://example.com/oauth/callback#access_token=private-fragment-token","client_value":"private-unknown-field","settings":{"opaque":"private-nested-value"}},"summarizer":{"provider":"gemini","model":"gemini-2.5-flash","api_key":"${secret:gemini_key}","api_url":"https://example.com/v1?access%5Fkey%5Fid=private-url-key"},"chunker":{"provider":"antfly","model":"fixed","api_url":"https://chunker.example.com","store_chunks":true,"max_chunks":50,"threshold":0.75,"client_value":"private-chunker-value","text":{"target_tokens":500,"overlap_tokens":50,"separator":"---","client_value":"private-text-value"},"audio":{"window_duration_ms":30000,"overlap_duration_ms":500,"client_value":"private-audio-value"},"full_text_index":{"analyzer":"standard"}},"execution":{"embedding":{"batch_items":32,"batch_bytes":{"client_value":"private-batch-value"},"client_value":"private-execution-value"},"chunking":"private-malformed-policy","settings":{"opaque":"private-execution-settings"}},"enrichments":[{"name":"asset_v1","kind":"asset","content_type":{"client_value":"private-content-type"},"client_value":"private-enrichment-value","producer_json":"{\"provider\":\"s3\",\"secret_access_key\":\"unknown-provider-secret\",\"access_token\":\"private-token\",\"headers\":{\"Authorization\":\"Bearer private-auth\",\"X-Auth\":\"future-private-header\",\"Accept\":\"text/html\"},\"format\":\"html\"}","execution":{"batch_items":4,"settings":{"opaque":"private-policy-settings"}}}]}}
     ;
 
     const encoded_single = (try encodeSingleIndexConfig(std.testing.allocator, indexes_json, "embed_idx")).?;
     defer std.testing.allocator.free(encoded_single);
     try ant_json.testing.expectEqualJsonText(
         std.testing.allocator,
-        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":384,\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\"},\"summarizer\":{\"provider\":\"gemini\",\"model\":\"gemini-2.5-flash\"},\"execution\":{\"embedding\":{\"batch_items\":32}},\"enrichments\":[\"asset_v1\"]}",
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":384,\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\"},\"summarizer\":{\"provider\":\"gemini\",\"model\":\"gemini-2.5-flash\"},\"chunker\":{\"provider\":\"antfly\",\"model\":\"fixed\",\"api_url\":\"https://chunker.example.com\",\"store_chunks\":true,\"max_chunks\":50,\"threshold\":0.75,\"text\":{\"target_tokens\":500,\"overlap_tokens\":50,\"separator\":\"---\"},\"audio\":{\"window_duration_ms\":30000,\"overlap_duration_ms\":500},\"full_text_index\":{\"analyzer\":\"standard\"}},\"execution\":{\"embedding\":{\"batch_items\":32}},\"enrichments\":[\"asset_v1\"]}",
         encoded_single,
     );
 
@@ -3962,7 +3974,7 @@ test "public index config encoders redact nested credentials" {
     defer std.testing.allocator.free(created);
     try ant_json.testing.expectEqualJsonText(
         std.testing.allocator,
-        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":384,\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\"},\"summarizer\":{\"provider\":\"gemini\",\"model\":\"gemini-2.5-flash\"},\"execution\":{\"embedding\":{\"batch_items\":32}},\"enrichments\":[{\"name\":\"asset_v1\",\"kind\":\"asset\",\"execution\":{\"batch_items\":4}}]}",
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":384,\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\"},\"summarizer\":{\"provider\":\"gemini\",\"model\":\"gemini-2.5-flash\"},\"chunker\":{\"provider\":\"antfly\",\"model\":\"fixed\",\"api_url\":\"https://chunker.example.com\",\"store_chunks\":true,\"max_chunks\":50,\"threshold\":0.75,\"text\":{\"target_tokens\":500,\"overlap_tokens\":50,\"separator\":\"---\"},\"audio\":{\"window_duration_ms\":30000,\"overlap_duration_ms\":500},\"full_text_index\":{\"analyzer\":\"standard\"}},\"execution\":{\"embedding\":{\"batch_items\":32}},\"enrichments\":[{\"name\":\"asset_v1\",\"kind\":\"asset\",\"execution\":{\"batch_items\":4}}]}",
         created,
     );
 }
@@ -3995,10 +4007,10 @@ test "public index config encoders omit root write-only producer documents" {
 
 test "created graph index response projects closed nested schemas" {
     const config =
-        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","client_value":"private-source-value","settings":{"opaque":"private-source-settings"}},"artifact":{"name":"relations_v1","kind":"asset","field":"relations","producer_json":{"provider":"private","api_key":"private-key"},"client_value":"private-artifact-value","settings":{"opaque":"private-artifact-settings"}},"edge_types":[{"name":"mentions"}],"resolvers":["private-malformed-resolver",{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_search":"prefix","client_value":"private-resolver-value","settings":{"opaque":"private-resolver-settings"}}]}
+        \\{"type":"graph","template":{"client_value":"private-root-value"},"source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":{"client_value":"private-format-value"},"client_value":"private-source-value","settings":{"opaque":"private-source-settings"}},"artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":{"client_value":"private-content-type"},"producer_json":{"provider":"private","api_key":"private-key"},"client_value":"private-artifact-value","settings":{"opaque":"private-artifact-settings"}},"edge_types":[{"name":"mentions","field":"relations","topology":"graph","max_weight":1.0,"min_weight":0,"allow_self_loops":false,"required_metadata":["source","confidence"],"client_value":"private-edge-value"},{"name":"malformed","required_metadata":{"client_value":"private-metadata-value"}},{"name":{"client_value":"private-required-value"}}],"resolvers":["private-malformed-resolver",{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_search":"prefix","candidate_limit":{"client_value":"private-limit-value"},"client_value":"private-resolver-value","settings":{"opaque":"private-resolver-settings"}}]}
     ;
     const expected =
-        \\{"name":"relations_graph","type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]"},"artifact":{"name":"relations_v1","kind":"asset","field":"relations"},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_search":"prefix"}]}
+        \\{"name":"relations_graph","type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]"},"artifact":{"name":"relations_v1","kind":"asset","field":"relations"},"edge_types":[{"name":"mentions","field":"relations","topology":"graph","max_weight":1.0,"min_weight":0,"allow_self_loops":false,"required_metadata":["source","confidence"]},{"name":"malformed"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_search":"prefix"}]}
     ;
     const created = try encodeCreatedIndexConfig(std.testing.allocator, "relations_graph", config);
     defer std.testing.allocator.free(created);

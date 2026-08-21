@@ -402,9 +402,13 @@ fn validatePublicIndexObject(object: anytype) !void {
 fn validatePublicNestedIndexFields(object: anytype, index_type: public_index_contract.Kind) !void {
     const Object = @TypeOf(object);
     if (index_type == .embeddings) {
+        const chunker = if (@hasField(Object, "map")) object.map.get("chunker") else object.get("chunker");
+        if (chunker) |value| {
+            if (value != .null) try validatePublicCreatedShape(value, .chunker);
+        }
         const execution = if (@hasField(Object, "map")) object.map.get("execution") else object.get("execution");
         if (execution) |value| {
-            if (value != .null) try validatePublicIndexExecution(value);
+            if (value != .null) try validatePublicCreatedShape(value, .index_execution);
         }
         return;
     }
@@ -412,38 +416,66 @@ fn validatePublicNestedIndexFields(object: anytype, index_type: public_index_con
 
     const source = if (@hasField(Object, "map")) object.map.get("source") else object.get("source");
     if (source) |value| {
-        if (value != .null) try validateClosedObjectFields(value, public_index_contract.isAllowedGraphArtifactSourceField);
+        if (value != .null) try validatePublicCreatedShape(value, .graph_source);
     }
 
     const artifact = if (@hasField(Object, "map")) object.map.get("artifact") else object.get("artifact");
     if (artifact) |value| {
-        if (value != .null) try validateClosedObjectFields(value, public_index_contract.isAllowedGraphArtifactRequestField);
+        if (value != .null) try validatePublicGraphArtifact(value);
+    }
+
+    const edge_types = if (@hasField(Object, "map")) object.map.get("edge_types") else object.get("edge_types");
+    if (edge_types) |value| {
+        if (value != .null) try validatePublicCreatedShape(value, .edge_types);
     }
 
     const resolvers = if (@hasField(Object, "map")) object.map.get("resolvers") else object.get("resolvers");
     if (resolvers) |value| {
-        if (value == .null) return;
-        if (value != .array) return error.InvalidCreateIndexRequest;
-        for (value.array.items) |item| {
-            try validateClosedObjectFields(item, public_index_contract.isAllowedGraphResolverField);
+        if (value != .null) try validatePublicCreatedShape(value, .graph_resolvers);
+    }
+}
+
+fn validatePublicCreatedShape(value: std.json.Value, shape: public_index_contract.CreatedObjectShape) !void {
+    if (!public_index_contract.createdValueMatchesShape(shape, value)) return error.InvalidCreateIndexRequest;
+    switch (value) {
+        .object => |object| {
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (!public_index_contract.isAllowedCreatedObjectField(shape, entry.key_ptr.*))
+                    return error.InvalidCreateIndexRequest;
+                // Generated SDKs use null for absent optional members. The
+                // canonicalizer drops them, so admission must treat them as
+                // omission before applying the non-null wire type contract.
+                if (entry.value_ptr.* == .null) continue;
+                if (!public_index_contract.createdFieldValueMatches(shape, entry.key_ptr.*, entry.value_ptr.*))
+                    return error.InvalidCreateIndexRequest;
+                if (shape == .execution_policy and entry.value_ptr.integer <= 0)
+                    return error.InvalidCreateIndexRequest;
+                const child_shape = public_index_contract.createdObjectShapeForChild(shape, entry.key_ptr.*);
+                if (child_shape != .unrestricted) try validatePublicCreatedShape(entry.value_ptr.*, child_shape);
+            }
+        },
+        .array => |array| {
+            const item_shape = public_index_contract.createdObjectShapeForArrayItem(shape);
+            for (array.items) |item| try validatePublicCreatedShape(item, item_shape);
+        },
+        else => unreachable,
+    }
+}
+
+fn validatePublicGraphArtifact(value: std.json.Value) !void {
+    if (!public_index_contract.createdValueMatchesShape(.graph_artifact, value))
+        return error.InvalidCreateIndexRequest;
+    var it = value.object.iterator();
+    while (it.next()) |entry| {
+        if (!public_index_contract.isAllowedGraphArtifactRequestField(entry.key_ptr.*))
+            return error.InvalidCreateIndexRequest;
+        if (entry.value_ptr.* == .null) continue;
+        if (std.mem.eql(u8, entry.key_ptr.*, "producer_json")) {
+            if (entry.value_ptr.* != .object) return error.InvalidCreateIndexRequest;
+        } else if (!public_index_contract.createdFieldValueMatches(.graph_artifact, entry.key_ptr.*, entry.value_ptr.*)) {
+            return error.InvalidCreateIndexRequest;
         }
-    }
-}
-
-fn validatePublicIndexExecution(value: std.json.Value) !void {
-    if (value != .object) return error.InvalidCreateIndexRequest;
-    var it = value.object.iterator();
-    while (it.next()) |entry| {
-        if (!public_index_contract.isAllowedIndexExecutionField(entry.key_ptr.*)) return error.InvalidCreateIndexRequest;
-        try validateClosedObjectFields(entry.value_ptr.*, public_index_contract.isAllowedExecutionPolicyField);
-    }
-}
-
-fn validateClosedObjectFields(value: std.json.Value, comptime is_allowed: fn ([]const u8) bool) !void {
-    if (value != .object) return error.InvalidCreateIndexRequest;
-    var it = value.object.iterator();
-    while (it.next()) |entry| {
-        if (!is_allowed(entry.key_ptr.*)) return error.InvalidCreateIndexRequest;
     }
 }
 
@@ -457,6 +489,8 @@ fn validatePublicInlineArtifactEnrichments(object: anytype) !void {
     if (value == .null) return;
     if (value != .array) return error.InvalidCreateIndexRequest;
     for (value.array.items) |item| {
+        if (!public_index_contract.createdValueMatchesShape(.enrichment, item))
+            return error.InvalidCreateIndexRequest;
         if (item != .object) return error.InvalidCreateIndexRequest;
         validatePublicArtifactEnrichmentObject(item.object) catch
             return error.InvalidCreateIndexRequest;
@@ -511,31 +545,27 @@ fn validatePublicArtifactEnrichmentObject(object: anytype) !void {
     if (@hasField(Object, "map")) {
         var it = object.map.iterator();
         while (it.next()) |entry| {
-            if (!public_index_contract.isAllowedEnrichmentRequestField(entry.key_ptr.*)) return error.InvalidArtifactEnrichmentRequest;
+            try validatePublicArtifactEnrichmentField(entry.key_ptr.*, entry.value_ptr.*);
         }
     } else {
         var it = object.iterator();
         while (it.next()) |entry| {
-            if (!public_index_contract.isAllowedEnrichmentRequestField(entry.key_ptr.*)) return error.InvalidArtifactEnrichmentRequest;
+            try validatePublicArtifactEnrichmentField(entry.key_ptr.*, entry.value_ptr.*);
         }
     }
-
-    const execution = if (@hasField(Object, "map"))
-        object.map.get("execution")
-    else
-        object.get("execution");
-    if (execution) |value| try validatePublicEnrichmentExecution(value);
 }
 
-fn validatePublicEnrichmentExecution(value: std.json.Value) !void {
-    if (value != .object) return error.InvalidArtifactEnrichmentRequest;
-    var it = value.object.iterator();
-    while (it.next()) |entry| {
-        if (!public_index_contract.isAllowedExecutionPolicyField(entry.key_ptr.*)) {
-            return error.InvalidArtifactEnrichmentRequest;
-        }
-        if (entry.value_ptr.* != .integer or entry.value_ptr.integer <= 0)
-            return error.InvalidArtifactEnrichmentRequest;
+fn validatePublicArtifactEnrichmentField(field: []const u8, value: std.json.Value) !void {
+    if (!public_index_contract.isAllowedEnrichmentRequestField(field)) return error.InvalidArtifactEnrichmentRequest;
+    if (value == .null) return;
+    if (std.mem.eql(u8, field, "producer_json")) {
+        if (value != .string) return error.InvalidArtifactEnrichmentRequest;
+        return;
+    }
+    if (!public_index_contract.createdFieldValueMatches(.enrichment, field, value))
+        return error.InvalidArtifactEnrichmentRequest;
+    if (std.mem.eql(u8, field, "execution")) {
+        validatePublicCreatedShape(value, .execution_policy) catch return error.InvalidArtifactEnrichmentRequest;
     }
 }
 
@@ -561,6 +591,9 @@ fn validatePublicIndexFields(object: anytype, index_type: public_index_contract.
         var it = object.map.iterator();
         while (it.next()) |entry| {
             if (!public_index_contract.isAllowedConfigField(index_type, entry.key_ptr.*)) return error.InvalidCreateIndexRequest;
+            if (entry.value_ptr.* != .null and
+                !public_index_contract.rootFieldValueMatches(index_type, entry.key_ptr.*, entry.value_ptr.*))
+                return error.InvalidCreateIndexRequest;
         }
         return;
     }
@@ -568,6 +601,9 @@ fn validatePublicIndexFields(object: anytype, index_type: public_index_contract.
     var it = object.iterator();
     while (it.next()) |entry| {
         if (!public_index_contract.isAllowedConfigField(index_type, entry.key_ptr.*)) return error.InvalidCreateIndexRequest;
+        if (entry.value_ptr.* != .null and
+            !public_index_contract.rootFieldValueMatches(index_type, entry.key_ptr.*, entry.value_ptr.*))
+            return error.InvalidCreateIndexRequest;
     }
 }
 
@@ -945,9 +981,31 @@ test "table contract rejects unknown fields in closed nested index objects" {
         ,
         \\{"type":"graph","resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","client_value":"private"}]}
         ,
+        \\{"type":"graph","edge_types":[{"name":"mentions","client_value":"private"}]}
+        ,
+        \\{"type":"graph","edge_types":[{"name":"mentions","required_metadata":{"client_value":"private"}}]}
+        ,
+        \\{"type":"graph","edge_types":[{"topology":"graph"}]}
+        ,
+        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":{"client_value":"private"}}}
+        ,
+        \\{"type":"graph","resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_limit":{"client_value":"private"}}]}
+        ,
+        \\{"type":"embeddings","dimension":384,"chunker":{"provider":"antfly","model":"fixed","client_value":"private"}}
+        ,
+        \\{"type":"embeddings","dimension":384,"chunker":{"provider":"antfly","model":"fixed","text":{"target_tokens":500,"client_value":"private"}}}
+        ,
+        \\{"type":"embeddings","dimension":384,"chunker":{"provider":"antfly","model":{"client_value":"private"}}}
+        ,
+        \\{"type":"embeddings","dimension":384,"chunker":{"model":"fixed"}}
+        ,
         \\{"type":"embeddings","dimension":384,"execution":{"embedding":{"batch_items":32,"client_value":"private"}}}
         ,
+        \\{"type":"embeddings","dimension":384,"execution":{"embedding":{"batch_items":{"client_value":"private"}}}}
+        ,
         \\{"type":"embeddings","dimension":384,"execution":{"client_value":{"batch_items":32}}}
+        ,
+        \\{"type":"embeddings","dimension":384,"template":{"client_value":"private"}}
         ,
     };
     for (invalid_requests) |request| {
@@ -962,13 +1020,25 @@ test "table contract treats nullable nested index fields as omitted" {
     const config_json = try parseCreateIndexRequest(
         std.testing.allocator,
         "relations_graph",
-        "{\"type\":\"graph\",\"source\":null,\"artifact\":null,\"resolvers\":null}",
+        "{\"type\":\"graph\",\"source\":null,\"artifact\":null,\"edge_types\":null,\"resolvers\":null}",
     );
     defer std.testing.allocator.free(config_json);
     try ant_json.testing.expectEqualJsonText(
         std.testing.allocator,
         "{\"name\":\"relations_graph\",\"type\":\"graph\"}",
         config_json,
+    );
+
+    const embedding_json = try parseCreateIndexRequest(
+        std.testing.allocator,
+        "semantic_chunks",
+        "{\"type\":\"embeddings\",\"dimension\":384,\"chunker\":{\"provider\":\"antfly\",\"model\":\"fixed\",\"text\":null,\"audio\":null},\"execution\":null}",
+    );
+    defer std.testing.allocator.free(embedding_json);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"name\":\"semantic_chunks\",\"type\":\"embeddings\",\"dimension\":384,\"chunker\":{\"provider\":\"antfly\",\"model\":\"fixed\"}}",
+        embedding_json,
     );
 }
 

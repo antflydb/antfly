@@ -326,14 +326,6 @@ fn runtimeRepairFactsContained(
     return true;
 }
 
-fn runtimeRepairFactsForGroupEqual(
-    lhs: table_manager.RuntimeGroupStatusReport,
-    rhs: table_manager.RuntimeGroupStatusReport,
-) bool {
-    return runtimeRepairFactsForGroupContained(lhs, rhs) and
-        runtimeRepairFactsForGroupContained(rhs, lhs);
-}
-
 fn runtimeRepairFactsForGroupContained(
     expected: table_manager.RuntimeGroupStatusReport,
     actual: table_manager.RuntimeGroupStatusReport,
@@ -357,12 +349,16 @@ fn legacyRepairTransitionCausallySupersedes(
             for (prior_runtime.indexes) |index| if (index.repair_status != null) return false;
             continue;
         };
-        if (runtimeRepairFactsForGroupEqual(prior_runtime, next_runtime)) continue;
+        // Publishing an additional repair fact cannot erase or rewrite any
+        // committed admission-safety fact, so legacy reporters do not need a
+        // timestamp proof for that monotonic transition. Removal or mutation
+        // still requires a causally newer complete observation below.
+        if (runtimeRepairFactsForGroupContained(prior_runtime, next_runtime)) continue;
         if (prior_runtime.updated_at_ns == 0 or
             next_runtime.updated_at_ns <= prior_runtime.updated_at_ns) return false;
     }
-    // A genuinely new runtime group has no committed predecessor to protect.
-    // Matching groups, including null-to-repair publication, were fenced above.
+    // A genuinely new runtime group has no committed predecessor to protect;
+    // monotonic publications on matching groups were accepted above.
     return true;
 }
 
