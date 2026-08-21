@@ -2513,6 +2513,7 @@ pub const LoadedModel = struct {
             &self.text_projection,
             &self.text_projection_resource_lease,
         );
+        _ = platform.allocator.reclaimUnusedProcessMemory();
     }
 
     /// Admit the reusable text/image sidecars transactionally. A failed
@@ -2577,6 +2578,11 @@ pub const LoadedModel = struct {
             &self.audio_session,
             &self.audio_resource_lease,
         );
+        // Audio sidecars are intentionally request-phased rather than cached.
+        // Their backend allocations can be large and differently shaped from
+        // the persistent vision/text sessions, so complete the physical
+        // release at this explicit cold boundary before admitting later work.
+        _ = platform.allocator.reclaimUnusedProcessMemory();
     }
 
     pub fn embeddingPipeline(self: *LoadedModel, allocator: std.mem.Allocator) EmbeddingPipeline {
@@ -4160,6 +4166,7 @@ pub const ModelManager = struct {
         std.debug.assert(model.retired);
         model.deinit();
         self.allocator.destroy(model);
+        _ = platform.allocator.reclaimUnusedProcessMemory();
     }
 
     fn destroyEvictedModel(self: *ModelManager, evicted: EvictedModel) void {
@@ -4170,6 +4177,7 @@ pub const ModelManager = struct {
         evicted.model.deinit();
         self.allocator.destroy(evicted.model);
         self.allocator.free(evicted.key);
+        _ = platform.allocator.reclaimUnusedProcessMemory();
     }
 
     fn takeLruWhisperAssetsLocked(
@@ -4227,6 +4235,7 @@ pub const ModelManager = struct {
     ) void {
         evicted.assets.deinit();
         self.allocator.destroy(evicted.assets);
+        _ = platform.allocator.reclaimUnusedProcessMemory();
     }
 
     fn admissionAmountsPresent(amounts: runtime.tier.memory.AdmissionAmounts) bool {
@@ -4392,6 +4401,11 @@ pub const ModelManager = struct {
                 @tagName(pressure),
             },
         );
+        // Cache storage is physically destroyed before its aggregate credit is
+        // observed by the next admission probe. On glibc, also return unused
+        // arena pages so the cgroup working set reflects that destruction
+        // rather than the allocator's historical high-water mark.
+        _ = platform.allocator.reclaimUnusedProcessMemory();
         return true;
     }
 
@@ -5139,6 +5153,7 @@ pub const ModelManager = struct {
             self.resource_domain = null;
             lifetime.release();
         }
+        _ = platform.allocator.reclaimUnusedProcessMemory();
     }
 
     pub fn attachIo(self: *ModelManager, io: std.Io) void {
@@ -5436,6 +5451,7 @@ pub const ModelManager = struct {
         errdefer if (assets_owned) {
             assets.deinit();
             self.allocator.destroy(assets);
+            _ = platform.allocator.reclaimUnusedProcessMemory();
         };
         spinLock(&self.eviction_lock);
         defer self.eviction_lock.unlock();
@@ -5446,6 +5462,7 @@ pub const ModelManager = struct {
                 self.unlockLoadedModels();
                 assets.deinit();
                 self.allocator.destroy(assets);
+                _ = platform.allocator.reclaimUnusedProcessMemory();
                 assets_owned = false;
                 return .{ .manager = self, .assets = existing };
             }
@@ -6053,6 +6070,7 @@ pub const ModelManager = struct {
         errdefer if (model_owned) {
             model.deinit();
             self.allocator.destroy(model);
+            _ = platform.allocator.reclaimUnusedProcessMemory();
         };
 
         const variant_key = try backendVariantCacheKey(
@@ -6091,6 +6109,7 @@ pub const ModelManager = struct {
 
                 model.deinit();
                 self.allocator.destroy(model);
+                _ = platform.allocator.reclaimUnusedProcessMemory();
                 model_owned = false;
                 return .{ .manager = self, .model = existing };
             }

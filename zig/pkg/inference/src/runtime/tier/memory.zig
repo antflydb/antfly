@@ -1214,8 +1214,9 @@ pub const AdmissionController = struct {
                 if (info) |memory_info| {
                     const available = memory_info.available_bytes orelse 0;
                     const reserve = liveHostAdmissionReserve(memory_info);
+                    const process_memory = platform.process_memory.pressureSnapshot();
                     std.log.warn(
-                        "inference live-memory admission denied requested_bytes={d} pending_bytes={d} available_bytes={d} reserve_bytes={d} capacity_bytes={d} basis={s} policy={s}",
+                        "inference live-memory admission denied requested_bytes={d} pending_bytes={d} available_bytes={d} reserve_bytes={d} capacity_bytes={d} basis={s} policy={s} process_rss_bytes={d} process_anonymous_bytes={d} process_private_dirty_bytes={d}",
                         .{
                             incremental_bytes,
                             self.live_pending_bytes,
@@ -1224,6 +1225,9 @@ pub const AdmissionController = struct {
                             available -| reserve,
                             @tagName(memory_info.availability_basis),
                             @tagName(memory_info.live_admission_policy),
+                            process_memory.resident_bytes,
+                            process_memory.anonymous_bytes,
+                            process_memory.private_dirty_bytes,
                         },
                     );
                 } else {

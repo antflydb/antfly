@@ -256,6 +256,19 @@ anonymous, dirty, writeback, and still-shared pages remain charged. This keeps
 sequential model churn from pinning recently active weight pages inside the
 process envelope without weakening admission accounting for live memory.
 
+Physical teardown also has an allocator boundary. A long-lived glibc process
+may retain freed pages in malloc arenas after a model, ephemeral audio sidecar,
+or cold native cache has been destroyed. That retained high-water mark is still
+anonymous cgroup working set even though ModelManager has released the matching
+lease. After those coarse teardown events, the platform allocator performs a
+best-effort `malloc_trim(0)` on GNU/Linux; unsupported allocators and platforms
+make it a no-op. This purge never runs on ordinary request completion or
+individual frees, preserving allocator reuse on hot paths. Admission is still
+authoritative and re-probes the cgroup after reclamation rather than assuming
+that a successful hint released a particular number of bytes. Denial logs
+include process RSS, anonymous RSS, and private-dirty bytes so operators can
+distinguish allocator residency from active file cache or sibling processes.
+
 Resolved bytes and provenance travel together through direct `NodeConfig` and
 the standalone inference ABI. Only an effective `explicit` source selects the
 fixed-reserve policy; cgroup, host, unavailable, and explicit-input-clamped-by-
