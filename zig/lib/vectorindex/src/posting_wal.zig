@@ -26,7 +26,8 @@ const posting_segment = @import("posting_segment.zig");
 pub const PostingId = posting_segment.PostingId;
 
 const magic: u32 = 0x41465057; // AFPW
-const version: u16 = 1;
+const version: u16 = 2;
+const min_supported_version: u16 = 1;
 const frame_header_len: usize = 48;
 const checksum_offset: usize = 12;
 const checksum_body_offset: usize = 16;
@@ -38,6 +39,7 @@ pub const RecordKind = enum(u8) {
     centroid_directory = 3,
     quantized_checkpoint = 4,
     tombstone = 5,
+    posting_state = 6,
     commit = 255,
 };
 
@@ -134,9 +136,21 @@ pub const Writer = struct {
 };
 
 pub const Replay = struct {
+    pub const Resolution = union(enum) {
+        missing,
+        tombstone,
+        value: Record,
+    };
+
+    const Latest = union(enum) {
+        tombstone,
+        record_index: usize,
+    };
+
     alloc: Allocator,
     records: std.ArrayListUnmanaged(Record) = .empty,
     posting_order: std.ArrayListUnmanaged(usize) = .empty,
+    latest_by_kind: std.AutoHashMapUnmanaged(u128, Latest) = .empty,
     valid_bytes: usize = 0,
     committed_bytes: usize = 0,
     last_committed_batch: ?u64 = null,
@@ -196,6 +210,7 @@ pub const Replay = struct {
     }
 
     pub fn deinit(self: *Replay) void {
+        self.latest_by_kind.deinit(self.alloc);
         self.posting_order.deinit(self.alloc);
         self.records.deinit(self.alloc);
         self.* = undefined;
@@ -211,24 +226,41 @@ pub const Replay = struct {
     }
 
     /// Returns the newest committed value for a posting and kind. A newer
-    /// posting tombstone masks an older value. Work is proportional only to
-    /// this posting's bounded tail, not the whole WAL.
+    /// posting tombstone masks an older value. Replay builds a direct latest
+    /// value table so query work does not grow with WAL-tail depth.
     pub fn latest(self: *const Replay, posting_id: PostingId, kind: RecordKind) ?Record {
-        const start = self.postingLowerBound(posting_id);
-        var end = start;
-        while (end < self.posting_order.items.len and self.records.items[self.posting_order.items[end]].posting_id == posting_id) : (end += 1) {}
-        while (end > start) {
-            end -= 1;
-            const record = self.records.items[self.posting_order.items[end]];
-            if (record.kind == .tombstone) return null;
-            if (record.kind == kind) return record;
-        }
-        return null;
+        return switch (self.resolve(posting_id, kind)) {
+            .value => |record| record,
+            .missing, .tombstone => null,
+        };
+    }
+
+    /// Distinguishes an absent WAL override from a tombstone, allowing callers
+    /// to fall back to the immutable segment only in the former case.
+    pub fn resolve(self: *const Replay, posting_id: PostingId, kind: RecordKind) Resolution {
+        const resolved = self.latest_by_kind.get(postingKindKey(posting_id, kind)) orelse return .missing;
+        return switch (resolved) {
+            .tombstone => .tombstone,
+            .record_index => |index| .{ .value = self.records.items[index] },
+        };
     }
 
     fn buildPostingIndex(self: *Replay) !void {
         try self.posting_order.ensureTotalCapacity(self.alloc, self.records.items.len);
-        for (0..self.records.items.len) |index| self.posting_order.appendAssumeCapacity(index);
+        for (self.records.items, 0..) |record, index| {
+            self.posting_order.appendAssumeCapacity(index);
+            if (record.kind == .tombstone) {
+                inline for (lookup_record_kinds) |kind| {
+                    try self.latest_by_kind.put(self.alloc, postingKindKey(record.posting_id, kind), .tombstone);
+                }
+            } else {
+                try self.latest_by_kind.put(
+                    self.alloc,
+                    postingKindKey(record.posting_id, record.kind),
+                    .{ .record_index = index },
+                );
+            }
+        }
         std.mem.sort(usize, self.posting_order.items, self, replayPostingLessThan);
     }
 
@@ -247,6 +279,18 @@ pub const Replay = struct {
         return lo;
     }
 };
+
+const lookup_record_kinds = [_]RecordKind{
+    .base,
+    .mutation,
+    .centroid_directory,
+    .quantized_checkpoint,
+    .posting_state,
+};
+
+fn postingKindKey(posting_id: PostingId, kind: RecordKind) u128 {
+    return (@as(u128, posting_id) << 8) | @intFromEnum(kind);
+}
 
 pub const PostingIterator = struct {
     replay: *const Replay,
@@ -297,7 +341,8 @@ fn appendFrame(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), record: Recor
 fn decodeFrame(bytes: []const u8) !?DecodedFrame {
     if (bytes.len < checksum_body_offset) return null;
     if (std.mem.readInt(u32, bytes[0..4], .big) != magic) return error.BadPostingWalMagic;
-    if (std.mem.readInt(u16, bytes[4..6], .big) != version) return error.UnsupportedPostingWalVersion;
+    const frame_version = std.mem.readInt(u16, bytes[4..6], .big);
+    if (frame_version < min_supported_version or frame_version > version) return error.UnsupportedPostingWalVersion;
     if (std.mem.readInt(u16, bytes[6..8], .big) != frame_header_len) return error.UnsupportedPostingWalHeader;
     const total_len: usize = @intCast(std.mem.readInt(u32, bytes[8..12], .big));
     if (total_len < frame_header_len) return error.CorruptedPostingWal;
@@ -314,6 +359,7 @@ fn decodeFrame(bytes: []const u8) !?DecodedFrame {
         @intFromEnum(RecordKind.centroid_directory) => .centroid_directory,
         @intFromEnum(RecordKind.quantized_checkpoint) => .quantized_checkpoint,
         @intFromEnum(RecordKind.tombstone) => .tombstone,
+        @intFromEnum(RecordKind.posting_state) => .posting_state,
         @intFromEnum(RecordKind.commit) => .commit,
         else => return error.InvalidPostingWalRecord,
     };
@@ -512,4 +558,20 @@ test "posting checkpoint round trips with checksum" {
 
 test "posting segment checkpoint and wal tail compose" {
     try testSegmentCheckpointAndWalTailCompose();
+}
+
+test "posting WAL distinguishes tombstones from missing overrides" {
+    const alloc = std.testing.allocator;
+    var writer = Writer.init(alloc);
+    defer writer.deinit();
+    try writer.append(.posting_state, 1, 7, 100, "state-v1");
+    try writer.commit(1, 100);
+    try writer.append(.tombstone, 2, 8, 101, &.{});
+    try writer.commit(2, 101);
+
+    var replay = try Replay.parse(alloc, writer.bytes());
+    defer replay.deinit();
+    try std.testing.expectEqualStrings("state-v1", replay.resolve(7, .posting_state).value.payload);
+    try std.testing.expect(replay.resolve(8, .posting_state) == .tombstone);
+    try std.testing.expect(replay.resolve(9, .posting_state) == .missing);
 }

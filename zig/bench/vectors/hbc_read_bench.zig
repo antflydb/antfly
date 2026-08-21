@@ -47,6 +47,9 @@ const Config = struct {
     flat_centroid_probe_count: usize = 0,
     reopen_before_query: bool = true,
     shadow_segment_checkpoint: bool = false,
+    segment_store_reads: bool = false,
+    segment_wal_shadow_batches: usize = 0,
+    segment_wal_sync_each_batch: bool = false,
 };
 
 const StorageSelection = enum {
@@ -414,7 +417,7 @@ pub fn main(init: std.process.Init) !void {
     const out = &stdout_writer.interface;
 
     try out.print(
-        "hbc read bench samples={d} vectors={d} dims={d} queries={d} k={d} batch_size={d} leaf_size={d} branching_factor={d} storage={s} build={s} kmeans_backend={s} kmeans_update_strategy={s} centroid_directory={s} flat_centroid_block_size={d} flat_centroid_probe_count={d} reopen_before_query={any}\n",
+        "hbc read bench samples={d} vectors={d} dims={d} queries={d} k={d} batch_size={d} leaf_size={d} branching_factor={d} storage={s} build={s} kmeans_backend={s} kmeans_update_strategy={s} centroid_directory={s} flat_centroid_block_size={d} flat_centroid_probe_count={d} reopen_before_query={any} segment_store_reads={any} segment_wal_shadow_batches={d} segment_wal_sync_each_batch={any}\n",
         .{
             cfg.samples,
             cfg.vectors,
@@ -432,6 +435,9 @@ pub fn main(init: std.process.Init) !void {
             cfg.flat_centroid_block_size,
             cfg.flat_centroid_probe_count,
             cfg.reopen_before_query,
+            cfg.segment_store_reads,
+            cfg.segment_wal_shadow_batches,
+            cfg.segment_wal_sync_each_batch,
         },
     );
     try stdout_writer.flush();
@@ -467,12 +473,94 @@ pub fn main(init: std.process.Init) !void {
                 if (cfg.shadow_segment_checkpoint) {
                     try benchShadowSegmentCheckpoint(out, &stdout_writer, &scenario);
                 }
+                if (cfg.segment_store_reads) {
+                    const checkpoint_start = nanotime();
+                    const checkpoint = try scenario.index.publishExperimentalPostingCheckpoint(@intCast(cfg.vectors));
+                    const checkpoint_ns = nanotime() - checkpoint_start;
+                    try out.print(
+                        "{{\"scenario\":\"{s}_{s}_posting_store_publish\",\"storage\":\"{s}\",\"build\":\"{s}\",\"sample\":{d},\"workload\":\"posting_store_publish\",\"generation\":{d},\"covered_source_sequence\":{d},\"live_postings\":{d},\"segment_bytes\":{d},\"checkpoint_ns\":{d}}}\n",
+                        .{
+                            @tagName(scenario.storage_kind),
+                            @tagName(scenario.build_kind),
+                            @tagName(scenario.storage_kind),
+                            @tagName(scenario.build_kind),
+                            scenario.sample_index,
+                            checkpoint.generation,
+                            checkpoint.covered_source_sequence,
+                            checkpoint.posting_count,
+                            checkpoint.segment_bytes,
+                            checkpoint_ns,
+                        },
+                    );
+                    try stdout_writer.flush();
+                    if (cfg.segment_wal_shadow_batches > 0) {
+                        const wal_start = nanotime();
+                        var wal_bytes: u64 = 0;
+                        var wal_records: u64 = 0;
+                        var wal_sequence: u64 = @intCast(cfg.vectors);
+                        for (0..cfg.segment_wal_shadow_batches) |batch_index| {
+                            wal_sequence += 1;
+                            const posting_id = @as(u64, @intCast(batch_index % @as(usize, @intCast(checkpoint.posting_count)))) + 1;
+                            const wal_stats = try scenario.index.appendExperimentalPostingWalSnapshotBatchWithOptions(
+                                @intCast(batch_index + 1),
+                                wal_sequence,
+                                &.{posting_id},
+                                .{ .sync = cfg.segment_wal_sync_each_batch },
+                            );
+                            wal_bytes = wal_stats.wal_committed_bytes;
+                            wal_records += wal_stats.record_count;
+                        }
+                        const wal_ns = nanotime() - wal_start;
+                        try out.print(
+                            "{{\"scenario\":\"{s}_{s}_posting_wal_shadow\",\"storage\":\"{s}\",\"build\":\"{s}\",\"sample\":{d},\"workload\":\"posting_wal_shadow\",\"batches\":{d},\"records\":{d},\"wal_bytes\":{d},\"sync_each_batch\":{any},\"ns\":{d}}}\n",
+                            .{
+                                @tagName(scenario.storage_kind),
+                                @tagName(scenario.build_kind),
+                                @tagName(scenario.storage_kind),
+                                @tagName(scenario.build_kind),
+                                scenario.sample_index,
+                                cfg.segment_wal_shadow_batches,
+                                wal_records,
+                                wal_bytes,
+                                cfg.segment_wal_sync_each_batch,
+                                wal_ns,
+                            },
+                        );
+                        try stdout_writer.flush();
+                    }
+                }
                 try benchQueries(out, &stdout_writer, &scenario, "post_ingest_query_no_metadata", queries, cfg.queries, .{
                     .query = queries[0..cfg.dims],
                     .k = cfg.k,
                     .load_metadata = false,
                 }, dataset, true);
-                if (cfg.reopen_before_query) {
+                var reopened = false;
+                if (cfg.segment_store_reads) {
+                    const reopen_start = nanotime();
+                    try scenario.reopen();
+                    const reopen_ns = nanotime() - reopen_start;
+                    if (build_mode == .public_ingest) scenario.index.setExternalVectorLoader(&external_loader_ctx, ExternalVectorLoaderContext.load);
+                    const activate_start = nanotime();
+                    try scenario.index.activateExperimentalPostingReads(
+                        @as(u64, @intCast(cfg.vectors)) + @as(u64, @intCast(cfg.segment_wal_shadow_batches)),
+                    );
+                    const activate_ns = nanotime() - activate_start;
+                    try out.print(
+                        "{{\"scenario\":\"{s}_{s}_posting_store_activate\",\"storage\":\"{s}\",\"build\":\"{s}\",\"sample\":{d},\"workload\":\"posting_store_activate\",\"reopen_ns\":{d},\"activate_ns\":{d}}}\n",
+                        .{
+                            @tagName(scenario.storage_kind),
+                            @tagName(scenario.build_kind),
+                            @tagName(scenario.storage_kind),
+                            @tagName(scenario.build_kind),
+                            scenario.sample_index,
+                            reopen_ns,
+                            activate_ns,
+                        },
+                    );
+                    try stdout_writer.flush();
+                    reopened = true;
+                }
+                if (cfg.reopen_before_query and !reopened) {
                     try scenario.reopen();
                     if (build_mode == .public_ingest) scenario.index.setExternalVectorLoader(&external_loader_ctx, ExternalVectorLoaderContext.load);
                 }
@@ -954,6 +1042,12 @@ fn parseArgs(proc_args: std.process.Args) !Config {
             cfg.reopen_before_query = false;
         } else if (std.mem.eql(u8, arg, "--shadow-segment-checkpoint")) {
             cfg.shadow_segment_checkpoint = true;
+        } else if (std.mem.eql(u8, arg, "--segment-store-reads")) {
+            cfg.segment_store_reads = true;
+        } else if (std.mem.eql(u8, arg, "--segment-wal-shadow-batches")) {
+            cfg.segment_wal_shadow_batches = try parseNextUsize(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--segment-wal-sync-each-batch")) {
+            cfg.segment_wal_sync_each_batch = true;
         } else if (std.mem.eql(u8, arg, "--random-ortho")) {
             cfg.use_random_ortho_trans = true;
         } else {
@@ -961,6 +1055,7 @@ fn parseArgs(proc_args: std.process.Args) !Config {
         }
     }
     if (cfg.samples == 0 or cfg.vectors == 0 or cfg.dims == 0 or cfg.queries == 0 or cfg.recall_queries == 0 or cfg.k == 0 or cfg.batch_size == 0) return error.InvalidArgument;
+    if (cfg.segment_wal_shadow_batches > 0 and !cfg.segment_store_reads) return error.InvalidArgument;
     return cfg;
 }
 

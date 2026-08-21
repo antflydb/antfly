@@ -586,6 +586,61 @@ visibility variants differed by only about 3%. The large run-to-run wall-time
 spread therefore remains a compaction scheduling/rewrite-amplification finding,
 not a reason to weaken replay correctness or redefine the target upward.
 
+## Immutable posting segment and WAL experiment
+
+The first read-serving prototype now snapshots packed HBC nodes, posting
+maintenance state, and RaBitQ checkpoints into one checksummed immutable file.
+It publishes that file, an empty next-generation WAL, and a checksummed
+`CURRENT` pointer in crash-safe order. Activation requires exact upstream
+source-sequence coverage. Any ordinary write disables the sidecar before its
+transaction starts, so this experiment cannot serve stale derived state while
+transaction-aware WAL capture is still absent.
+
+On the internal public-ingest-shaped 5K x 1,536-dimensional workload, the
+segment was 2.10 MB versus 33.74 MB written by the HBC LSM build and took about
+19 ms to publish. Across matched 500-query samples, recall@10 remained 0.696.
+Warm no-metadata latency was neutral: median p50/p95/p99 was
+0.278/0.968/1.601 ms with the segment and 0.277/0.972/1.614 ms with the LSM,
+while median throughput was 2,492 versus 2,484 QPS. The median cold first query
+fell from 12.41 ms to 6.63 ms, with storage reads falling from 246 to 79 and
+bytes from 5.33 MB to 0.49 MB. The remaining reads are source-document metadata
+needed by the external vector loader, not HBC node or quantized payloads.
+
+Startup initially read and checksummed the segment twice. Retaining the bytes
+from store admission cut median activation from 8.24 ms to 4.18 ms. A later
+three-sample run measured about 12.1 ms from the start of HBC reopen through
+the first completed sidecar query, less than the LSM control's 12.41 ms query
+alone. A mapped or range-backed reader remains worth exploring at larger
+segments, but eager single-read admission is already small enough for the 5K
+prototype and preserves lazy per-payload checksum verification.
+
+Synthetic committed WAL tails make the next trade-off explicit:
+
+| Tail | WAL bytes | Append time | Activation | Cold query | Warm p50 / p95 / p99 | Warm QPS |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 batches | 0 | -- | 4.18 ms median | 6.63 ms median | 0.278 / 0.968 / 1.601 ms median | 2,492 median |
+| 100 batches | 3.83 MB | 35.3 ms | 19.3 ms | 2.66 ms | 0.294 / 1.010 / 1.628 ms | 2,415 |
+| 1,000 batches | 37.63 MB | 2.15 s | 163.5 ms | 3.19 ms | 0.322 / 1.411 / 2.154 ms | 2,013 |
+
+The tail rows are single diagnostic samples and rewrite one full posting
+snapshot per synthetic batch; they are not claimed as public VectorDBBench
+throughput. They do show that reopening and validating the segment for every
+append was wrong (100 batches originally took 878 ms), that a retained writer
+and non-fsync derived appends reduce that to 35 ms, and that an O(1)
+posting-kind latest-value index is necessary on the query path. They also show
+that a 37 MB tail is already too deep for this 2.1 MB segment: recovery and
+warm tail latency both regress substantially.
+
+The efficient product design is therefore a packed immutable checkpoint plus
+a shallow, buffered derived WAL, not another general-purpose LSM. The primary
+source journal remains the durability authority. Derived WAL frames can be
+grouped without fsync on every source batch; after a crash, exact source
+coverage admission rejects a short tail and normal replay repairs it. Trigger
+a new immutable checkpoint by WAL bytes relative to segment bytes and by an
+absolute recovery-time budget. Production wiring must capture only postings
+touched by a successfully committed source transaction and should encode
+posting-local deltas rather than repeatedly writing full snapshots.
+
 ## Memory methodology
 
 Use Circus's native `footprint_sampler.py` against the Antfly server process
@@ -628,3 +683,10 @@ published.
    41.65 seconds with a 38.72--43.14 second range, but the single follow-up 1M
    lifecycle remains diagnostic because compaction scheduling produced
    materially different curves on the same host.
+5. Wire transaction-aware touched-posting capture to the authoritative replay
+   sequence, buffer derived WAL writes, and checkpoint before the tail harms
+   activation or p95. Preserve fallback to source replay across every crash
+   boundary and measure live, cold, and warm query latency plus recall.
+6. Compare eager single-read segment admission with mmap and footer/index-first
+   range admission at 50K and 1M. Include page-cache/RSS accounting; do not
+   trade a lower startup timer for unbounded mapped or decoded residency.

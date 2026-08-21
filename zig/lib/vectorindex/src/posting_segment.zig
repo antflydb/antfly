@@ -28,7 +28,8 @@ const posting = @import("posting.zig");
 pub const PostingId = posting.PostingId;
 
 const magic: [4]u8 = "AFPS".*;
-const version: u16 = 2;
+const version: u16 = 3;
+const min_supported_version: u16 = 2;
 const index_entry_size: usize = 8 + 1 + 8 + 8 + 8 + 4;
 const footer_size: usize = 8 + 8 + 4 + 2 + 2 + 4 + 4;
 
@@ -38,6 +39,7 @@ pub const EntryKind = enum(u8) {
     centroid_directory = 3,
     quantized_checkpoint = 4,
     tombstone = 5,
+    posting_state = 6,
 };
 
 pub const DeltaValue = struct {
@@ -160,6 +162,14 @@ pub const Writer = struct {
         }, value);
     }
 
+    pub fn appendPostingStateAt(self: *Writer, posting_id: PostingId, sequence: u64, value: []const u8) !void {
+        try self.appendEntry(.{
+            .posting_id = posting_id,
+            .kind = .posting_state,
+            .sequence = sequence,
+        }, value);
+    }
+
     pub fn appendTombstone(self: *Writer, posting_id: PostingId, sequence: u64) !void {
         try self.appendEntry(.{
             .posting_id = posting_id,
@@ -257,7 +267,7 @@ pub const Reader = struct {
         const footer = data[data.len - footer_size ..];
         if (!std.mem.eql(u8, footer[footer_size - magic.len ..], &magic)) return error.BadPostingSegmentMagic;
         const segment_version = readU16(footer[20..22]);
-        if (segment_version != version) return error.UnsupportedPostingSegmentVersion;
+        if (segment_version < min_supported_version or segment_version > version) return error.UnsupportedPostingSegmentVersion;
         if (readU16(footer[22..24]) != 0) return error.UnsupportedPostingSegmentFlags;
         if (readU32(footer[24..28]) != std.hash.Crc32.hash(footer[0..24])) return error.PostingSegmentChecksumMismatch;
         const index_offset_u64 = readU64(footer[0..8]);
@@ -302,6 +312,11 @@ pub const Reader = struct {
 
     pub fn getQuantizedCheckpointValue(self: Reader, posting_id: PostingId) !?SequencedValue {
         return try self.getLatest(posting_id, .quantized_checkpoint);
+    }
+
+    pub fn getPostingState(self: Reader, posting_id: PostingId) !?[]const u8 {
+        const result = try self.getLatest(posting_id, .posting_state);
+        return if (result) |found| found.value else null;
     }
 
     pub fn deltas(self: Reader, posting_id: PostingId) DeltaIterator {
@@ -357,6 +372,7 @@ pub const Reader = struct {
             @intFromEnum(EntryKind.centroid_directory) => .centroid_directory,
             @intFromEnum(EntryKind.quantized_checkpoint) => .quantized_checkpoint,
             @intFromEnum(EntryKind.tombstone) => .tombstone,
+            @intFromEnum(EntryKind.posting_state) => .posting_state,
             else => return error.CorruptedPostingSegment,
         };
         const offset = std.math.cast(usize, readU64(raw[17..25])) orelse return error.CorruptedPostingSegment;
@@ -417,6 +433,11 @@ pub const VerifiedReader = struct {
 
     pub fn getQuantizedCheckpoint(self: *VerifiedReader, posting_id: PostingId) !?[]const u8 {
         const result = try self.getLatest(posting_id, .quantized_checkpoint);
+        return if (result) |found| found.value else null;
+    }
+
+    pub fn getPostingState(self: *VerifiedReader, posting_id: PostingId) !?[]const u8 {
+        const result = try self.getLatest(posting_id, .posting_state);
         return if (result) |found| found.value else null;
     }
 
@@ -532,6 +553,7 @@ pub fn testStoresPointAndOrderedDeltaValues() !void {
     const delta_5 = "delete:20";
     const centroid = "centroid-directory-v1";
     const quantized = "rabitq-checkpoint-v1";
+    const posting_state = "posting-state-v1";
 
     var writer = Writer.init(alloc);
     defer writer.deinit();
@@ -540,6 +562,7 @@ pub fn testStoresPointAndOrderedDeltaValues() !void {
     try writer.appendBaseAt(7, 10, base);
     try writer.appendBaseAt(7, 12, base_v2);
     try writer.appendQuantizedCheckpoint(7, quantized);
+    try writer.appendPostingStateAt(7, 12, posting_state);
     try writer.appendDelta(7, 4, delta_4);
 
     const bytes = try writer.build();
@@ -551,6 +574,7 @@ pub fn testStoresPointAndOrderedDeltaValues() !void {
     try std.testing.expectEqual(@as(u64, 12), latest_base.sequence);
     try std.testing.expectEqualSlices(u8, centroid, (try reader.getCentroidDirectory(7)).?);
     try std.testing.expectEqualSlices(u8, quantized, (try reader.getQuantizedCheckpoint(7)).?);
+    try std.testing.expectEqualSlices(u8, posting_state, (try reader.getPostingState(7)).?);
     try std.testing.expect(try reader.getBase(8) == null);
 
     var iter = reader.deltas(7);

@@ -36,6 +36,7 @@ const AtomicU64 = platform.atomic.Value(u64);
 const backend_erased = @import("backend_erased.zig");
 const backend_types = @import("backend_types.zig");
 const hbc_backend = @import("hbc_backend.zig");
+const posting_segment_store_mod = @import("posting_segment_store.zig");
 const resource_manager_mod = @import("resource_manager.zig");
 const apply_rw_lock_mod = @import("db/apply_rw_lock.zig");
 const supports_lmdb = builtin.os.tag != .freestanding and build_options.lmdb_enabled;
@@ -60,6 +61,8 @@ const vectorindex_hbc_runtime = @import("antfly_vectorindex").hbc_runtime;
 const vectorindex_hbc = @import("antfly_vectorindex").hbc;
 const vectorindex_hbc_index = @import("antfly_vectorindex").hbc_index;
 const vectorindex_posting = @import("antfly_vectorindex").posting;
+const vectorindex_posting_segment = @import("antfly_vectorindex").posting_segment;
+const vectorindex_posting_wal = @import("antfly_vectorindex").posting_wal;
 const vectorindex_spfresh_index = @import("antfly_vectorindex").spfresh_index;
 const vectorindex_hbc_transfer = @import("antfly_vectorindex").hbc_transfer;
 const vectorindex_hbc_debug = @import("antfly_vectorindex").hbc_debug;
@@ -1405,6 +1408,52 @@ fn claimLocalClockSlot(clock_keys: []u64, start_slot: usize, key: u64) ?usize {
 // HBC Index
 // ============================================================================
 
+const ExperimentalPostingReadState = struct {
+    alloc: Allocator,
+    segment_bytes: []u8,
+    segment: vectorindex_posting_segment.VerifiedReader,
+    wal: posting_segment_store_mod.RecoveredWal,
+
+    fn deinit(self: *ExperimentalPostingReadState) void {
+        self.segment.deinit();
+        self.alloc.free(self.segment_bytes);
+        self.wal.deinit();
+        self.* = undefined;
+    }
+
+    fn value(self: *ExperimentalPostingReadState, posting_id: u64, kind: vectorindex_posting_wal.RecordKind) !?[]const u8 {
+        switch (self.wal.replay.resolve(posting_id, kind)) {
+            .value => |record| return record.payload,
+            .tombstone => return error.NotFound,
+            .missing => {},
+        }
+        return switch (kind) {
+            .base => try self.segment.getBase(posting_id),
+            .quantized_checkpoint => try self.segment.getQuantizedCheckpoint(posting_id),
+            .posting_state => try self.segment.getPostingState(posting_id),
+            else => null,
+        };
+    }
+};
+
+pub const PostingCheckpointStats = struct {
+    generation: u64,
+    covered_source_sequence: u64,
+    posting_count: u64,
+    segment_bytes: u64,
+};
+
+pub const PostingWalAppendStats = struct {
+    batch_id: u64,
+    covered_source_sequence: u64,
+    record_count: u64,
+    wal_committed_bytes: u64,
+};
+
+pub const ExperimentalPostingWalAppendOptions = struct {
+    sync: bool = true,
+};
+
 pub const HBCIndex = struct {
     alloc: Allocator,
     env_owner: EnvOwner,
@@ -1415,6 +1464,9 @@ pub const HBCIndex = struct {
     published_active_count: AtomicU64,
     published_node_count: AtomicU64,
     published_generation: AtomicU64,
+    experimental_posting_reads_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    experimental_posting_read_state: ?*ExperimentalPostingReadState = null,
+    experimental_posting_write_store: ?posting_segment_store_mod.Store = null,
     rng: go_rand.GoPcg,
     // Set when a write path observes a tree-link inconsistency (stale parent
     // pointer, dangling node reference); background maintenance runs a
@@ -1777,6 +1829,7 @@ pub const HBCIndex = struct {
         if (self.write_session_depth != 0 and self.write_session_kind != kind) {
             return error.MixedWriteSessionKinds;
         }
+        self.disableExperimentalPostingReads();
         switch (self.env_owner) {
             .lsm => |handle| handle.backend.beginBulkIngestSession() catch |err| {
                 return err;
@@ -2676,6 +2729,16 @@ pub const HBCIndex = struct {
     }
 
     fn deinitWithBackendDisposition(self: *HBCIndex, abandon_after_crash: bool) void {
+        self.experimental_posting_reads_enabled.store(false, .release);
+        if (self.experimental_posting_read_state) |state| {
+            state.deinit();
+            self.alloc.destroy(state);
+            self.experimental_posting_read_state = null;
+        }
+        if (self.experimental_posting_write_store) |*store| {
+            store.deinit();
+            self.experimental_posting_write_store = null;
+        }
         if (self.shared_cache == null) {
             self.clearNodeCache();
             self.clearQuantizedCache();
@@ -2737,6 +2800,249 @@ pub const HBCIndex = struct {
 
     pub fn syncReplayState(self: *HBCIndex) !void {
         try self.env_owner.syncReplayState();
+    }
+
+    fn disableExperimentalPostingReads(self: *HBCIndex) void {
+        self.experimental_posting_reads_enabled.store(false, .release);
+    }
+
+    fn openExperimentalPostingStore(self: *HBCIndex) !posting_segment_store_mod.Store {
+        const handle = switch (self.env_owner) {
+            .lsm => |handle| handle,
+            .lmdb => return error.UnsupportedStorageBackend,
+        };
+        const storage = handle.backend.storage orelse return error.MissingStorageBackend;
+        const root_dir = handle.backend.root_dir orelse return error.MissingStorageRoot;
+        const posting_root = try std.fs.path.join(self.alloc, &.{ root_dir, "posting-segments" });
+        defer self.alloc.free(posting_root);
+        return try posting_segment_store_mod.Store.open(self.alloc, storage, posting_root);
+    }
+
+    fn openExperimentalPostingStoreWithSegment(self: *HBCIndex) !posting_segment_store_mod.OpenedWithSegment {
+        const handle = switch (self.env_owner) {
+            .lsm => |handle| handle,
+            .lmdb => return error.UnsupportedStorageBackend,
+        };
+        const storage = handle.backend.storage orelse return error.MissingStorageBackend;
+        const root_dir = handle.backend.root_dir orelse return error.MissingStorageRoot;
+        const posting_root = try std.fs.path.join(self.alloc, &.{ root_dir, "posting-segments" });
+        defer self.alloc.free(posting_root);
+        return try posting_segment_store_mod.Store.openWithSegmentAlloc(self.alloc, storage, posting_root);
+    }
+
+    pub fn closeExperimentalPostingWalWriter(self: *HBCIndex) void {
+        if (self.experimental_posting_write_store) |*store| {
+            store.deinit();
+            self.experimental_posting_write_store = null;
+        }
+    }
+
+    /// Materializes the currently committed packed HBC node and RaBitQ values
+    /// into a durable immutable generation. The caller supplies the upstream
+    /// source sequence whose complete effects are represented by this state.
+    /// This method does not switch reads; activation is a separate explicit
+    /// step so publication cannot expose a checkpoint prematurely.
+    pub fn publishExperimentalPostingCheckpoint(
+        self: *HBCIndex,
+        covered_source_sequence: u64,
+    ) !PostingCheckpointStats {
+        if (self.write_session_depth != 0) return error.ActiveWriteSession;
+        self.closeExperimentalPostingWalWriter();
+        var posting_store = try self.openExperimentalPostingStore();
+        defer posting_store.deinit();
+
+        const generation = if (posting_store.checkpoint) |checkpoint|
+            std.math.add(u64, checkpoint.segment_generation, 1) catch return error.PostingSegmentGenerationOverflow
+        else
+            1;
+        var writer = vectorindex_posting_segment.Writer.init(self.alloc);
+        defer writer.deinit();
+        var posting_count: u64 = 0;
+
+        var txn = try self.store.beginRead();
+        defer txn.abort();
+        var node_id: u64 = 1;
+        while (node_id <= self.metadata.node_count) : (node_id = std.math.add(u64, node_id, 1) catch break) {
+            var node_key_buf: [12]u8 = undefined;
+            const packed_node = txn.get(.nodes, encodeNodeKey(&node_key_buf, node_id, .packed_node)) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            try writer.appendBaseAt(node_id, covered_source_sequence, packed_node);
+            posting_count += 1;
+
+            var posting_key_buf: [12]u8 = undefined;
+            if (txn.get(.nodes, encodeNodeKey(&posting_key_buf, node_id, .posting))) |posting_state| {
+                try writer.appendPostingStateAt(node_id, covered_source_sequence, posting_state);
+            } else |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            }
+
+            var quant_key_buf: [10]u8 = undefined;
+            if (txn.get(.quant, encodeQuantKey(&quant_key_buf, node_id))) |quantized| {
+                try writer.appendQuantizedCheckpointAt(node_id, covered_source_sequence, quantized);
+            } else |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            }
+        }
+        const segment_bytes = try writer.build();
+        defer self.alloc.free(segment_bytes);
+        try posting_store.publishCheckpoint(generation, covered_source_sequence, segment_bytes);
+        return .{
+            .generation = generation,
+            .covered_source_sequence = covered_source_sequence,
+            .posting_count = posting_count,
+            .segment_bytes = @intCast(segment_bytes.len),
+        };
+    }
+
+    /// Appends full committed snapshots for selected postings to the sidecar
+    /// WAL. This is an experimental measurement hook: production mutation
+    /// wiring must derive posting ids and source sequence from the transaction
+    /// that has already committed to the authoritative source journal.
+    pub fn appendExperimentalPostingWalSnapshotBatch(
+        self: *HBCIndex,
+        batch_id: u64,
+        covered_source_sequence: u64,
+        posting_ids: []const u64,
+    ) !PostingWalAppendStats {
+        return try self.appendExperimentalPostingWalSnapshotBatchWithOptions(
+            batch_id,
+            covered_source_sequence,
+            posting_ids,
+            .{},
+        );
+    }
+
+    pub fn appendExperimentalPostingWalSnapshotBatchWithOptions(
+        self: *HBCIndex,
+        batch_id: u64,
+        covered_source_sequence: u64,
+        posting_ids: []const u64,
+        options: ExperimentalPostingWalAppendOptions,
+    ) !PostingWalAppendStats {
+        if (self.write_session_depth != 0) return error.ActiveWriteSession;
+        if (posting_ids.len == 0) return error.EmptyPostingWalBatch;
+        if (self.experimental_posting_write_store == null) {
+            self.experimental_posting_write_store = try self.openExperimentalPostingStore();
+        }
+        const posting_store = &self.experimental_posting_write_store.?;
+
+        var records = std.ArrayListUnmanaged(posting_segment_store_mod.BatchRecord).empty;
+        defer records.deinit(self.alloc);
+        var owned_payloads = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_payloads.items) |payload| self.alloc.free(payload);
+            owned_payloads.deinit(self.alloc);
+        }
+        const max_records = std.math.mul(usize, posting_ids.len, 3) catch return error.PostingWalTooLarge;
+        try records.ensureTotalCapacity(self.alloc, max_records);
+        try owned_payloads.ensureTotalCapacity(self.alloc, max_records);
+
+        var txn = try self.store.beginRead();
+        defer txn.abort();
+        for (posting_ids) |posting_id| {
+            if (posting_id == 0) return error.InvalidPostingId;
+            var node_key_buf: [12]u8 = undefined;
+            const packed_node = txn.get(.nodes, encodeNodeKey(&node_key_buf, posting_id, .packed_node)) catch |err| switch (err) {
+                error.NotFound => {
+                    records.appendAssumeCapacity(.{
+                        .kind = .tombstone,
+                        .posting_id = posting_id,
+                        .source_sequence = covered_source_sequence,
+                        .payload = &.{},
+                    });
+                    continue;
+                },
+                else => return err,
+            };
+            const owned_packed = try self.alloc.dupe(u8, packed_node);
+            owned_payloads.appendAssumeCapacity(owned_packed);
+            records.appendAssumeCapacity(.{
+                .kind = .base,
+                .posting_id = posting_id,
+                .source_sequence = covered_source_sequence,
+                .payload = owned_packed,
+            });
+
+            var posting_key_buf: [12]u8 = undefined;
+            if (txn.get(.nodes, encodeNodeKey(&posting_key_buf, posting_id, .posting))) |posting_state| {
+                const owned_state = try self.alloc.dupe(u8, posting_state);
+                owned_payloads.appendAssumeCapacity(owned_state);
+                records.appendAssumeCapacity(.{
+                    .kind = .posting_state,
+                    .posting_id = posting_id,
+                    .source_sequence = covered_source_sequence,
+                    .payload = owned_state,
+                });
+            } else |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            }
+
+            var quant_key_buf: [10]u8 = undefined;
+            if (txn.get(.quant, encodeQuantKey(&quant_key_buf, posting_id))) |quantized| {
+                const owned_quantized = try self.alloc.dupe(u8, quantized);
+                owned_payloads.appendAssumeCapacity(owned_quantized);
+                records.appendAssumeCapacity(.{
+                    .kind = .quantized_checkpoint,
+                    .posting_id = posting_id,
+                    .source_sequence = covered_source_sequence,
+                    .payload = owned_quantized,
+                });
+            } else |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            }
+        }
+        try posting_store.appendBatchWithOptions(batch_id, records.items, covered_source_sequence, .{ .sync = options.sync });
+        return .{
+            .batch_id = batch_id,
+            .covered_source_sequence = covered_source_sequence,
+            .record_count = @intCast(records.items.len),
+            .wal_committed_bytes = posting_store.wal_committed_bytes,
+        };
+    }
+
+    /// Activates a previously published segment plus its committed WAL tail
+    /// only when it exactly covers the caller's authoritative source sequence.
+    /// Any later write disables the sidecar before opening its transaction and
+    /// falls back to the LSM, so stale posting bytes are never served.
+    pub fn activateExperimentalPostingReads(self: *HBCIndex, expected_source_sequence: u64) !void {
+        if (self.experimental_posting_read_state != null) return error.ExperimentalPostingReadsAlreadyLoaded;
+        var opened = try self.openExperimentalPostingStoreWithSegment();
+        defer opened.store.deinit();
+        errdefer self.alloc.free(opened.segment_bytes);
+        if (opened.store.checkpoint == null) return error.MissingPostingCheckpoint;
+        if (opened.store.covered_source_sequence != expected_source_sequence) {
+            return error.PostingCheckpointSequenceMismatch;
+        }
+
+        const segment_bytes = opened.segment_bytes;
+        var segment = try vectorindex_posting_segment.VerifiedReader.init(self.alloc, segment_bytes);
+        errdefer segment.deinit();
+        var wal = try opened.store.recoverWal();
+        errdefer wal.deinit();
+        for (wal.replay.records.items) |record| switch (record.kind) {
+            .base, .quantized_checkpoint, .posting_state, .tombstone => {},
+            .mutation, .centroid_directory, .commit => return error.UnsupportedExperimentalPostingWalRecord,
+        };
+
+        const state = try self.alloc.create(ExperimentalPostingReadState);
+        state.* = .{
+            .alloc = self.alloc,
+            .segment_bytes = segment_bytes,
+            .segment = segment,
+            .wal = wal,
+        };
+        self.experimental_posting_read_state = state;
+        self.experimental_posting_reads_enabled.store(true, .release);
+    }
+
+    pub fn experimentalPostingReadsEnabled(self: *const HBCIndex) bool {
+        return self.experimental_posting_reads_enabled.load(.acquire);
     }
 
     fn txnLikeChild(comptime T: type) type {
@@ -2858,12 +3164,38 @@ pub const HBCIndex = struct {
         return true;
     }
 
+    fn decodeQuantizedNodeId(key: []const u8) ?u64 {
+        if (key.len != 10 or key[0] != 'q' or key[1] != ':') return null;
+        return std.mem.readInt(u64, key[2..10], .big);
+    }
+
+    fn experimentalPostingValue(self: *HBCIndex, namespace: Namespace, key: []const u8) !?[]const u8 {
+        if (!self.experimental_posting_reads_enabled.load(.acquire)) return null;
+        const state = self.experimental_posting_read_state orelse return error.Corrupted;
+        return switch (namespace) {
+            .nodes => blk: {
+                const decoded = decodeNodeKey(key) orelse break :blk null;
+                break :blk switch (decoded.suffix) {
+                    .packed_node => try state.value(decoded.id, .base),
+                    .posting => try state.value(decoded.id, .posting_state),
+                    else => null,
+                };
+            },
+            .quant => blk: {
+                const node_id = decodeQuantizedNodeId(key) orelse break :blk null;
+                break :blk try state.value(node_id, .quantized_checkpoint);
+            },
+            .meta, .vecs => null,
+        };
+    }
+
     pub fn getNamespaced(self: *HBCIndex, txn: anytype, comptime namespace: Namespace, key: []const u8) ![]const u8 {
         if (namespace == .nodes) {
             if (self.stagedNodeKey(key)) |staged| {
                 return staged.value orelse error.NotFound;
             }
         }
+        if (try self.experimentalPostingValue(namespace, key)) |value| return value;
         const Child = comptime txnLikeChild(@TypeOf(txn));
         switch (Child) {
             vectorindex_store.NamespaceReadTxn,
@@ -2875,7 +3207,7 @@ pub const HBCIndex = struct {
     }
 
     fn getNamespacedCommitted(self: *HBCIndex, txn: anytype, comptime namespace: Namespace, key: []const u8) ![]const u8 {
-        _ = self;
+        if (try self.experimentalPostingValue(namespace, key)) |value| return value;
         const Child = comptime txnLikeChild(@TypeOf(txn));
         switch (Child) {
             vectorindex_store.NamespaceReadTxn,
@@ -3032,6 +3364,7 @@ pub const HBCIndex = struct {
     }
 
     pub fn beginRuntimeWriteTxn(self: *HBCIndex) !vectorindex_store.NamespaceWriteTxn {
+        self.disableExperimentalPostingReads();
         if (self.crossBatchPublicationActive()) self.bulk_publication_may_have_mutated = true;
         if (!self.crossBatchPublicationActive()) {
             self.deferred_quantized_nodes.clearRetainingCapacity();
@@ -3043,6 +3376,7 @@ pub const HBCIndex = struct {
     }
 
     pub fn beginRuntimeBatchTxn(self: *HBCIndex) !vectorindex_store.NamespaceBatch {
+        self.disableExperimentalPostingReads();
         if (self.crossBatchPublicationActive()) self.bulk_publication_may_have_mutated = true;
         if (!self.crossBatchPublicationActive()) {
             self.deferred_quantized_nodes.clearRetainingCapacity();
@@ -3054,6 +3388,7 @@ pub const HBCIndex = struct {
     }
 
     pub fn beginRuntimeBatchTxnOptions(self: *HBCIndex, options: BatchInsertOptions) !vectorindex_store.NamespaceBatch {
+        self.disableExperimentalPostingReads();
         if (self.crossBatchPublicationActive()) self.bulk_publication_may_have_mutated = true;
         if (!self.shouldDeferQuantizedRebuildToBulkFinish(options)) {
             self.deferred_quantized_nodes.clearRetainingCapacity();
@@ -7096,6 +7431,56 @@ test "insert and search" {
     try std.testing.expect(hits.len > 0);
     // First result should be vector 1 (distance ~0.01)
     try std.testing.expectEqual(@as(u64, 1), hits[0].vector_id);
+}
+
+test "experimental posting checkpoint reopens safely and a write disables it" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    {
+        var idx = try HBCIndex.open(alloc, path, .{
+            .dims = 2,
+            .leaf_size = 8,
+            .branching_factor = 2,
+            .search_width = 8,
+            .use_quantization = true,
+            .storage_backend = .lsm,
+        });
+        defer idx.close();
+        try idx.insertWithMetadata(1, &[_]f32{ 1.0, 0.0 }, "doc:1");
+        try idx.insertWithMetadata(2, &[_]f32{ 0.0, 1.0 }, "doc:2");
+        const checkpoint = try idx.publishExperimentalPostingCheckpoint(2);
+        try std.testing.expectEqual(@as(u64, 2), checkpoint.covered_source_sequence);
+        try std.testing.expect(checkpoint.posting_count > 0);
+        const wal = try idx.appendExperimentalPostingWalSnapshotBatch(1, 3, &.{1});
+        try std.testing.expect(wal.record_count > 0);
+        try std.testing.expectEqual(@as(u64, 3), wal.covered_source_sequence);
+    }
+
+    var reopened = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 8,
+        .branching_factor = 2,
+        .search_width = 8,
+        .use_quantization = true,
+        .storage_backend = .lsm,
+    });
+    defer reopened.close();
+    try std.testing.expectError(error.PostingCheckpointSequenceMismatch, reopened.activateExperimentalPostingReads(4));
+    try reopened.activateExperimentalPostingReads(3);
+    try std.testing.expect(reopened.experimentalPostingReadsEnabled());
+
+    var results = try reopened.search(&[_]f32{ 1.0, 0.0 }, 1);
+    defer results.deinit();
+    try std.testing.expectEqual(@as(u64, 1), results.items.items[0].vector_id);
+
+    try reopened.insertWithMetadata(3, &[_]f32{ 0.5, 0.5 }, "doc:3");
+    try std.testing.expect(!reopened.experimentalPostingReadsEnabled());
+    var after_write = try reopened.search(&[_]f32{ 0.5, 0.5 }, 3);
+    defer after_write.deinit();
+    try std.testing.expectEqual(@as(usize, 3), after_write.items.items.len);
 }
 
 test "flat rabitq centroid directory searches leaf postings" {

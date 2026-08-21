@@ -30,6 +30,10 @@ pub const BatchRecord = struct {
     payload: []const u8,
 };
 
+pub const AppendOptions = struct {
+    sync: bool = true,
+};
+
 pub const RecoveredWal = struct {
     alloc: Allocator,
     bytes: []u8,
@@ -54,9 +58,34 @@ pub const Store = struct {
     poisoned: bool,
 
     pub fn open(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8) !Store {
+        return try openInternal(alloc, storage, root_dir, null);
+    }
+
+    /// Opens and validates the store while retaining the already-read segment
+    /// bytes for a read-serving caller. The caller owns both returned fields.
+    /// This avoids reading and checksumming a large immutable segment twice on
+    /// process startup.
+    pub fn openWithSegmentAlloc(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8) !OpenedWithSegment {
+        var retained_segment: ?[]u8 = null;
+        var store = try openInternal(alloc, storage, root_dir, &retained_segment);
+        errdefer store.deinit();
+        return .{
+            .store = store,
+            .segment_bytes = retained_segment orelse return error.MissingPostingCheckpoint,
+        };
+    }
+
+    fn openInternal(
+        alloc: Allocator,
+        storage: lsm_backend.Storage,
+        root_dir: []const u8,
+        retained_segment: ?*?[]u8,
+    ) !Store {
         const owned_root = try alloc.dupe(u8, root_dir);
-        errdefer alloc.free(owned_root);
-        try storage.createDirPath(owned_root);
+        storage.createDirPath(owned_root) catch |err| {
+            alloc.free(owned_root);
+            return err;
+        };
 
         var store: Store = .{
             .alloc = alloc,
@@ -73,7 +102,10 @@ pub const Store = struct {
 
         const current_path = try store.currentPathAlloc();
         defer alloc.free(current_path);
-        const current = storage.readFileAlloc(alloc, current_path, max_control_bytes) catch |err| switch (err) {
+        // std.Io's limited read treats reaching the limit as StreamTooLong;
+        // reserve one byte beyond the accepted payload so an exactly sized
+        // file can reach EOF and still be admitted by the codec below.
+        const current = storage.readFileAlloc(alloc, current_path, max_control_bytes + 1) catch |err| switch (err) {
             error.FileNotFound => {
                 try store.replaceWal(&.{});
                 return store;
@@ -86,7 +118,9 @@ pub const Store = struct {
         store.wal_generation = checkpoint.wal_generation;
         store.covered_source_sequence = checkpoint.covered_source_sequence;
 
-        try store.validateSegment(checkpoint);
+        const segment_bytes = try store.readSegmentAllocFor(checkpoint);
+        var segment_owned = true;
+        defer if (segment_owned) alloc.free(segment_bytes);
         var recovered = try store.recoverWal();
         defer recovered.deinit();
         if (recovered.replay.committed_bytes < checkpoint.wal_committed_bytes) {
@@ -109,6 +143,10 @@ pub const Store = struct {
             checkpoint.covered_source_sequence,
             recovered.replay.covered_source_sequence,
         );
+        if (retained_segment) |out| {
+            out.* = segment_bytes;
+            segment_owned = false;
+        }
         return store;
     }
 
@@ -118,6 +156,16 @@ pub const Store = struct {
     }
 
     pub fn appendBatch(self: *Store, batch_id: u64, records: []const BatchRecord, covered_source_sequence: u64) !void {
+        return try self.appendBatchWithOptions(batch_id, records, covered_source_sequence, .{});
+    }
+
+    pub fn appendBatchWithOptions(
+        self: *Store,
+        batch_id: u64,
+        records: []const BatchRecord,
+        covered_source_sequence: u64,
+        options: AppendOptions,
+    ) !void {
         if (self.poisoned) return error.PostingStoreRequiresReopen;
         if (self.checkpoint == null) return error.MissingPostingCheckpoint;
         if (records.len == 0) return error.EmptyPostingWalBatch;
@@ -141,7 +189,7 @@ pub const Store = struct {
 
         const wal_path = try self.walPathAlloc(self.wal_generation);
         defer self.alloc.free(wal_path);
-        self.storage.appendFileAbsolute(self.alloc, wal_path, writer.bytes(), true) catch |err| {
+        self.storage.appendFileAbsolute(self.alloc, wal_path, writer.bytes(), options.sync) catch |err| {
             // The storage error may be ambiguous (for example fsync failed
             // after the append reached the page cache). Refuse retries on this
             // handle; reopen reparses the durable prefix without risking a
@@ -210,7 +258,7 @@ pub const Store = struct {
     pub fn recoverWal(self: *Store) !RecoveredWal {
         const wal_path = try self.walPathAlloc(self.wal_generation);
         defer self.alloc.free(wal_path);
-        const bytes = self.storage.readFileAlloc(self.alloc, wal_path, max_wal_bytes) catch |err| switch (err) {
+        const bytes = self.storage.readFileAlloc(self.alloc, wal_path, max_wal_bytes + 1) catch |err| switch (err) {
             error.FileNotFound => if (self.wal_committed_bytes == 0)
                 try self.alloc.alloc(u8, 0)
             else
@@ -229,22 +277,17 @@ pub const Store = struct {
         const checkpoint = self.checkpoint orelse return error.MissingPostingCheckpoint;
         const path = try self.segmentPathAlloc(checkpoint.segment_generation);
         defer self.alloc.free(path);
-        const bytes = try self.storage.readFileAlloc(self.alloc, path, max_segment_bytes);
+        const bytes = try self.storage.readFileAlloc(self.alloc, path, boundedReadLimit(max_segment_bytes));
         errdefer self.alloc.free(bytes);
         if (std.hash.Crc32.hash(bytes) != checkpoint.segment_checksum) return error.PostingSegmentChecksumMismatch;
         _ = try posting_segment.Reader.init(bytes);
         return bytes;
     }
 
-    fn validateSegment(self: *Store, checkpoint: posting_wal.Checkpoint) !void {
-        const bytes = try self.readSegmentAllocFor(checkpoint);
-        defer self.alloc.free(bytes);
-    }
-
     fn readSegmentAllocFor(self: *Store, checkpoint: posting_wal.Checkpoint) ![]u8 {
         const path = try self.segmentPathAlloc(checkpoint.segment_generation);
         defer self.alloc.free(path);
-        const bytes = self.storage.readFileAlloc(self.alloc, path, max_segment_bytes) catch |err| switch (err) {
+        const bytes = self.storage.readFileAlloc(self.alloc, path, boundedReadLimit(max_segment_bytes)) catch |err| switch (err) {
             error.FileNotFound => return error.MissingPostingSegment,
             else => return err,
         };
@@ -277,6 +320,22 @@ pub const Store = struct {
         return try std.fs.path.join(self.alloc, &.{ self.root_dir, name });
     }
 };
+
+pub const OpenedWithSegment = struct {
+    store: Store,
+    segment_bytes: []u8,
+
+    pub fn deinit(self: *OpenedWithSegment) void {
+        const alloc = self.store.alloc;
+        self.store.deinit();
+        alloc.free(self.segment_bytes);
+        self.* = undefined;
+    }
+};
+
+fn boundedReadLimit(max_bytes: usize) usize {
+    return std.math.add(usize, max_bytes, 1) catch std.math.maxInt(usize);
+}
 
 fn atomicReplace(alloc: Allocator, storage: lsm_backend.Storage, path: []const u8, contents: []const u8) !void {
     var sink = try storage.beginAtomicWrite(alloc, path);
