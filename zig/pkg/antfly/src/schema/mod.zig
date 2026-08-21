@@ -489,7 +489,45 @@ fn deriveRuntimeDeclaredDocumentFields(
             try appendRuntimeDeclaredDocumentFields(alloc, &out, property.name, property);
         }
     }
+    // JSON object order and x-antfly-types order are not schema semantics.
+    // Keep capability-only declarations canonical so a presentation-only
+    // reorder cannot perturb runtime schema equality or create a new physical
+    // index generation. Multiple document types may contribute the same
+    // shorthand declaration, so collapse exact duplicates at the same time.
+    std.mem.sort(storage_schema.DeclaredField, out.items, {}, declaredFieldLessThan);
+    var write_index: usize = 0;
+    for (out.items) |field| {
+        if (write_index > 0 and declaredFieldsEqual(out.items[write_index - 1], field)) {
+            alloc.free(field.field);
+            alloc.free(field.mapping.analyzer);
+            continue;
+        }
+        out.items[write_index] = field;
+        write_index += 1;
+    }
+    out.items.len = write_index;
     return try out.toOwnedSlice(alloc);
+}
+
+fn declaredFieldLessThan(_: void, a: storage_schema.DeclaredField, b: storage_schema.DeclaredField) bool {
+    const field_order = std.mem.order(u8, a.field, b.field);
+    if (field_order != .eq) return field_order == .lt;
+    if (a.mapping.field_type != b.mapping.field_type) {
+        return @intFromEnum(a.mapping.field_type) < @intFromEnum(b.mapping.field_type);
+    }
+    if (a.mapping.do_index != b.mapping.do_index) return !a.mapping.do_index;
+    if (a.mapping.store != b.mapping.store) return !a.mapping.store;
+    if (a.mapping.doc_values != b.mapping.doc_values) return !a.mapping.doc_values;
+    if (a.mapping.sortable != b.mapping.sortable) return !a.mapping.sortable;
+    if (a.mapping.missing_null_policy != b.mapping.missing_null_policy) {
+        return @intFromEnum(a.mapping.missing_null_policy) < @intFromEnum(b.mapping.missing_null_policy);
+    }
+    if (a.mapping.include_in_all != b.mapping.include_in_all) return !a.mapping.include_in_all;
+    return std.mem.order(u8, a.mapping.analyzer, b.mapping.analyzer) == .lt;
+}
+
+fn declaredFieldsEqual(a: storage_schema.DeclaredField, b: storage_schema.DeclaredField) bool {
+    return std.mem.eql(u8, a.field, b.field) and runtimeFieldMappingsEqual(a.mapping, b.mapping);
 }
 
 fn appendRuntimeDeclaredDocumentFields(

@@ -3588,6 +3588,7 @@ pub fn build(b: *std.Build) void {
         "write validation enforces table-wide exact mappings across document types",
         "composed schemas lower only unconditional equivalent exact mappings",
         "runtime schema retains shorthand exact scalar declarations as non-sortable capabilities",
+        "metadata.schema update ignores shorthand capability declaration order",
         "schema rejects sortable non-scalar document field mappings",
         "parse rejects document field mappings incompatible with their schema value domain",
         "write validation rejects values that cannot populate explicit physical mappings",

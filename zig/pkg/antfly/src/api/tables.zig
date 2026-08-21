@@ -4689,6 +4689,40 @@ test "metadata.schema update avoids a generation for semantically identical JSON
     try std.testing.expectEqualStrings(table.indexes_json, updated.indexes_json);
 }
 
+test "metadata.schema update ignores shorthand capability declaration order" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json =
+        \\{"version":2,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{
+        \\  "title":{"type":"string","x-antfly-types":["text","keyword"]},
+        \\  "label":{"type":"string","x-antfly-types":["keyword"]},
+        \\  "size":{"type":"number","x-antfly-types":["numeric"]}
+        \\}}}}}
+        ,
+        .read_schema_json = "{\"version\":1}",
+        .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"},\"full_text_index_v2\":{\"type\":\"full_text\"}}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    const updated = try applySchemaUpdateRecord(
+        std.testing.allocator,
+        &table,
+        \\{"version":999,"default_type":"doc","document_schemas":{"doc":{"schema":{"properties":{
+        \\  "size":{"x-antfly-types":["numeric"],"type":"number"},
+        \\  "label":{"x-antfly-types":["keyword"],"type":"string"},
+        \\  "title":{"x-antfly-types":["keyword","text"],"type":"string"}
+        \\},"type":"object"}}}}
+        ,
+    );
+    defer metadata_table_manager.freeTable(std.testing.allocator, updated);
+
+    try std.testing.expect(std.mem.indexOf(u8, updated.schema_json, "\"version\":2") != null);
+    try std.testing.expectEqualStrings(table.read_schema_json, updated.read_schema_json);
+    try std.testing.expectEqualStrings(table.indexes_json, updated.indexes_json);
+}
+
 test "metadata.schema update avoids a generation for explicit runtime defaults" {
     const table: metadata_table_manager.TableRecord = .{
         .table_id = 7,
