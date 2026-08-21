@@ -662,6 +662,7 @@ test "store observer preserves committed repair facts while capability is unknow
         .doc_count = 10,
         .coverage_generation = 7,
         .coverage_config_hash = 8,
+        .coverage_identity_ready = true,
         .repair_status = .rebuilding,
         .repair_active_generation_serviceable = true,
     }};
@@ -704,13 +705,31 @@ test "store observer preserves committed repair facts while capability is unknow
     );
     try std.testing.expect(records[0].runtime_statuses[0].indexes[0].repair_active_generation_serviceable);
 
-    // A different materialization identity must not inherit stale repair state.
+    // A different but incomplete materialization identity has no authority to
+    // erase the committed repair fact.
     observed_indexes[0].doc_count = 12;
     observed_indexes[0].coverage_generation = 9;
+    observed_indexes[0].coverage_config_hash = 0;
+    observed_indexes[0].coverage_identity_ready = false;
     try std.testing.expectEqual(
         @as(usize, 1),
         try applyObservationsOwnedWithRepairStatus(std.testing.allocator, &records, &.{observation}, false),
     );
+    try std.testing.expectEqual(@as(u64, 11), records[0].runtime_statuses[0].indexes[0].doc_count);
+    try std.testing.expectEqual(
+        table_manager.IndexRepairStatus.rebuilding,
+        records[0].runtime_statuses[0].indexes[0].repair_status.?,
+    );
+    try std.testing.expect(records[0].runtime_statuses[0].indexes[0].repair_active_generation_serviceable);
+
+    // Once the producer supplies a complete replacement identity, it must not
+    // inherit repair state from the retired materialization.
+    observed_indexes[0].coverage_identity_ready = true;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try applyObservationsOwnedWithRepairStatus(std.testing.allocator, &records, &.{observation}, false),
+    );
+    try std.testing.expectEqual(@as(u64, 12), records[0].runtime_statuses[0].indexes[0].doc_count);
     try std.testing.expect(records[0].runtime_statuses[0].indexes[0].repair_status == null);
     try std.testing.expect(!records[0].runtime_statuses[0].indexes[0].repair_active_generation_serviceable);
 }
