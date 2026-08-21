@@ -38,7 +38,8 @@ class GraphIndexConfig:
         edge_types (list[EdgeTypeConfig] | Unset): List of edge types with their configurations
         max_edges_per_document (int | Unset): Maximum number of edges per document (0 = unlimited)
         source (GraphArtifactSourceConfig | Unset): Artifact stream materialized into graph edges.
-        artifact (GraphArtifactProducerConfig | Unset): Asset producer used by an artifact-backed graph index.
+        artifact (GraphArtifactProducerConfig | Unset): Asset producer used by an artifact-backed graph index. At least
+            one non-empty field or template source is required.
         nodes (GraphArtifactNodeMappingConfig | Unset): Maps each artifact item to graph node identifiers.
         edge (GraphArtifactEdgeMappingConfig | Unset): Maps each artifact item to an edge type, weight, and public
             metadata.

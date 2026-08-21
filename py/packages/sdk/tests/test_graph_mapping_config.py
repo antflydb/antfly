@@ -1,3 +1,6 @@
+from antfly.client_generated.models.created_graph_artifact_producer_config import (
+    CreatedGraphArtifactProducerConfig,
+)
 from antfly.client_generated.models.created_graph_index import CreatedGraphIndex
 from antfly.client_generated.models.graph_algebraic_planning_config import (
     GraphAlgebraicPlanningConfig,
@@ -29,10 +32,15 @@ def test_created_graph_index_exposes_artifact_mapping_and_planning() -> None:
                 "metadata": {"source": "extractor"},
             },
             "context": {"doc_fields": ["title", "body"]},
+            "artifact": {
+                "name": "relations_v1",
+                "kind": "asset",
+                "template": "{{ body }}",
+                "execution": {"batch_items": 8},
+            },
             "algebraic_planning": {
                 "bounded_traversal": {
                     "law": "provenance_semiring",
-                    "enabled": True,
                 }
             },
         }
@@ -43,6 +51,7 @@ def test_created_graph_index_exposes_artifact_mapping_and_planning() -> None:
     assert isinstance(created.edge, GraphArtifactEdgeMappingConfig)
     assert created.edge.weight == 0.75
     assert isinstance(created.algebraic_planning, GraphAlgebraicPlanningConfig)
-    assert created.to_dict()["algebraic_planning"]["bounded_traversal"]["law"] == (
-        "provenance_semiring"
-    )
+    assert isinstance(created.artifact, CreatedGraphArtifactProducerConfig)
+    assert created.artifact.template == "{{ body }}"
+    assert created.artifact.execution.batch_items == 8
+    assert created.to_dict()["algebraic_planning"]["bounded_traversal"]["law"] == ("provenance_semiring")

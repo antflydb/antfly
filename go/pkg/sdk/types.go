@@ -70,6 +70,7 @@ type (
 	EmbeddingsIndexStats  = oapi.EmbeddingsIndexStats
 	EnrichmentConfig      = oapi.EnrichmentConfig
 	EnrichmentKind        = oapi.EnrichmentKind
+	ExecutionPolicy       = oapi.ExecutionPolicy
 	FullTextIndexConfig   = oapi.FullTextIndexConfig
 	AlgebraicIndexConfig  = oapi.AlgebraicIndexConfig
 	FullTextIndexStats    = oapi.FullTextIndexStats
@@ -269,8 +270,10 @@ type (
 	GraphIndexConfig                    = oapi.GraphIndexConfig
 	GraphIndexStats                     = oapi.GraphIndexStats
 	GraphArtifactSourceConfig           = oapi.GraphArtifactSourceConfig
+	GraphArtifactSourceConfigFormat     = oapi.GraphArtifactSourceConfigFormat
 	GraphArtifactSourceConfigKind       = oapi.GraphArtifactSourceConfigKind
 	GraphArtifactProducerConfig         = oapi.GraphArtifactProducerConfig
+	GraphArtifactProducerConfigKind     = oapi.GraphArtifactProducerConfigKind
 	GraphArtifactNodeMappingConfig      = oapi.GraphArtifactNodeMappingConfig
 	GraphArtifactNodeMappingConfigModel = oapi.GraphArtifactNodeMappingConfigModel
 	GraphArtifactEdgeMappingConfig      = oapi.GraphArtifactEdgeMappingConfig
@@ -311,6 +314,9 @@ type (
 	PathFindWeightMode = oapi.PathFindWeightMode
 	PathWeightMode     = oapi.PathWeightMode
 )
+
+type CreatedGraphArtifactProducerConfig = oapi.CreatedGraphArtifactProducerConfig
+type CreatedGraphArtifactProducerConfigKind = oapi.CreatedGraphArtifactProducerConfigKind
 
 // CreatedIndex is a validated discriminated create-index response.
 // Accessors reject the wrong variant instead of decoding the same payload into
@@ -741,10 +747,14 @@ const (
 	EdgeTypeConfigTopologyTree  = oapi.EdgeTypeConfigTopologyTree
 
 	// Graph artifact mapping values
-	GraphArtifactSourceConfigKindArtifact            = oapi.GraphArtifactSourceConfigKindArtifact
-	GraphArtifactNodeMappingConfigModelDocument      = oapi.GraphArtifactNodeMappingConfigModelDocument
-	GraphArtifactNodeMappingConfigModelExternal      = oapi.GraphArtifactNodeMappingConfigModelExternal
-	GraphBoundedTraversalConfigLawProvenanceSemiring = oapi.GraphBoundedTraversalConfigLawProvenanceSemiring
+	GraphArtifactSourceConfigKindArtifact             = oapi.GraphArtifactSourceConfigKindArtifact
+	GraphArtifactSourceConfigFormatExtractionGraph    = oapi.GraphArtifactSourceConfigFormatExtractionGraph
+	GraphArtifactSourceConfigFormatExtractionRelation = oapi.GraphArtifactSourceConfigFormatExtractionRelation
+	GraphArtifactProducerConfigKindAsset              = oapi.GraphArtifactProducerConfigKindAsset
+	CreatedGraphArtifactProducerConfigKindAsset       = oapi.CreatedGraphArtifactProducerConfigKindAsset
+	GraphArtifactNodeMappingConfigModelDocument       = oapi.GraphArtifactNodeMappingConfigModelDocument
+	GraphArtifactNodeMappingConfigModelExternal       = oapi.GraphArtifactNodeMappingConfigModelExternal
+	GraphBoundedTraversalConfigLawProvenanceSemiring  = oapi.GraphBoundedTraversalConfigLawProvenanceSemiring
 
 	// GraphQueryType values
 	GraphQueryTypeKShortestPaths = oapi.GraphQueryTypeKShortestPaths

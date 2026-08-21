@@ -5,6 +5,7 @@ from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 
+from ..models.graph_artifact_source_config_format import GraphArtifactSourceConfigFormat
 from ..models.graph_artifact_source_config_kind import GraphArtifactSourceConfigKind
 from ..types import UNSET, Unset
 
@@ -19,14 +20,15 @@ class GraphArtifactSourceConfig:
         kind (GraphArtifactSourceConfigKind):
         artifact (str):
         path (str | Unset):
-        format_ (str | Unset):  Default: 'extraction_relation'.
+        format_ (GraphArtifactSourceConfigFormat | Unset):  Default:
+            GraphArtifactSourceConfigFormat.EXTRACTION_RELATION.
         mention_edge_type (str | Unset):
     """
 
     kind: GraphArtifactSourceConfigKind
     artifact: str
     path: str | Unset = UNSET
-    format_: str | Unset = "extraction_relation"
+    format_: GraphArtifactSourceConfigFormat | Unset = GraphArtifactSourceConfigFormat.EXTRACTION_RELATION
     mention_edge_type: str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
@@ -36,7 +38,9 @@ class GraphArtifactSourceConfig:
 
         path = self.path
 
-        format_ = self.format_
+        format_: str | Unset = UNSET
+        if not isinstance(self.format_, Unset):
+            format_ = self.format_.value
 
         mention_edge_type = self.mention_edge_type
 
@@ -66,7 +70,12 @@ class GraphArtifactSourceConfig:
 
         path = d.pop("path", UNSET)
 
-        format_ = d.pop("format", UNSET)
+        _format_ = d.pop("format", UNSET)
+        format_: GraphArtifactSourceConfigFormat | Unset
+        if isinstance(_format_, Unset):
+            format_ = UNSET
+        else:
+            format_ = GraphArtifactSourceConfigFormat(_format_)
 
         mention_edge_type = d.pop("mention_edge_type", UNSET)
 

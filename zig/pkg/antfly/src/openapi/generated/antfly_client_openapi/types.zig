@@ -2094,12 +2094,14 @@ pub const CreatedFullTextIndex = struct {
     type: []const u8,
 };
 
-/// Credential-free graph artifact producer configuration returned after creation.
+/// Credential-free graph artifact producer configuration returned after creation. At least one non-empty field or template source is present.
 pub const CreatedGraphArtifactProducerConfig = struct {
     name: []const u8,
-    kind: EnrichmentKind,
+    kind: []const u8,
     field: ?[]const u8 = null,
+    template: ?[]const u8 = null,
     content_type: ?[]const u8 = null,
+    execution: ?ExecutionPolicy = null,
 };
 
 /// Normalized effective graph index configuration returned after creation.
@@ -4288,12 +4290,14 @@ pub const GraphArtifactNodeMappingConfig = struct {
     target: ?GraphTemplateValue = null,
 };
 
-/// Asset producer used by an artifact-backed graph index.
+/// Asset producer used by an artifact-backed graph index. At least one non-empty field or template source is required.
 pub const GraphArtifactProducerConfig = struct {
     name: []const u8,
-    kind: EnrichmentKind,
+    kind: []const u8,
     field: ?[]const u8 = null,
+    template: ?[]const u8 = null,
     content_type: ?[]const u8 = null,
+    execution: ?ExecutionPolicy = null,
     /// Write-only producer configuration; it may contain credentials and is never returned.
     producer_json: ?std.json.Value = null,
 };
@@ -4310,7 +4314,6 @@ pub const GraphArtifactSourceConfig = struct {
 /// Algebraic law used to combine bounded graph traversal provenance.
 pub const GraphBoundedTraversalConfig = struct {
     law: []const u8,
-    enabled: ?bool = null,
 };
 
 /// Configuration for graph index type

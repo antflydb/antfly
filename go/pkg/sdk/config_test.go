@@ -170,6 +170,15 @@ func TestNewCreateIndexRequestSupportsTypedGraphMapping(t *testing.T) {
 		Source: GraphArtifactSourceConfig{
 			Kind:     GraphArtifactSourceConfigKindArtifact,
 			Artifact: "relations_v1",
+			Format:   GraphArtifactSourceConfigFormatExtractionGraph,
+		},
+		Artifact: GraphArtifactProducerConfig{
+			Name:     "relations_v1",
+			Kind:     GraphArtifactProducerConfigKindAsset,
+			Template: "{{ body }}",
+			Execution: ExecutionPolicy{
+				BatchItems: 8,
+			},
 		},
 		Nodes: GraphArtifactNodeMappingConfig{
 			Model:  GraphArtifactNodeMappingConfigModelDocument,
@@ -184,8 +193,7 @@ func TestNewCreateIndexRequestSupportsTypedGraphMapping(t *testing.T) {
 		Context: GraphArtifactContextConfig{DocFields: []string{"title", "body"}},
 		AlgebraicPlanning: GraphAlgebraicPlanningConfig{
 			BoundedTraversal: GraphBoundedTraversalConfig{
-				Law:     GraphBoundedTraversalConfigLawProvenanceSemiring,
-				Enabled: true,
+				Law: GraphBoundedTraversalConfigLawProvenanceSemiring,
 			},
 		},
 	})
@@ -211,6 +219,17 @@ func TestNewCreateIndexRequestSupportsTypedGraphMapping(t *testing.T) {
 	bounded := planning["bounded_traversal"].(map[string]any)
 	if bounded["law"] != "provenance_semiring" {
 		t.Fatalf("traversal law = %v: %s", bounded["law"], data)
+	}
+	if _, exists := bounded["enabled"]; exists {
+		t.Fatalf("bounded traversal must use presence semantics without enabled: %s", data)
+	}
+	artifact := body["artifact"].(map[string]any)
+	if artifact["template"] != "{{ body }}" {
+		t.Fatalf("artifact template = %v: %s", artifact["template"], data)
+	}
+	execution := artifact["execution"].(map[string]any)
+	if execution["batch_items"] != float64(8) {
+		t.Fatalf("artifact batch_items = %v: %s", execution["batch_items"], data)
 	}
 }
 

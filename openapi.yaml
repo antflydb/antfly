@@ -18094,10 +18094,14 @@ components:
             - artifact
         artifact:
           type: string
+          minLength: 1
         path:
           type: string
         format:
           type: string
+          enum:
+            - extraction_relation
+            - extraction_graph
           default: extraction_relation
         mention_edge_type:
           type: string
@@ -18107,16 +18111,26 @@ components:
       required:
         - name
         - kind
-      description: Asset producer used by an artifact-backed graph index.
+      description: Asset producer used by an artifact-backed graph index. At least one non-empty field
+        or template source is required.
       properties:
         name:
           type: string
+          minLength: 1
         kind:
-          $ref: '#/components/schemas/EnrichmentKind'
+          type: string
+          enum:
+            - asset
         field:
           type: string
+          minLength: 1
+        template:
+          type: string
+          minLength: 1
         content_type:
           type: string
+        execution:
+          $ref: '#/components/schemas/ExecutionPolicy'
         producer_json:
           type: object
           additionalProperties: true
@@ -18179,9 +18193,6 @@ components:
           type: string
           enum:
             - provenance_semiring
-        enabled:
-          type: boolean
-          default: true
     GraphAlgebraicPlanningConfig:
       type: object
       additionalProperties: false
@@ -22532,16 +22543,26 @@ components:
       required:
         - name
         - kind
-      description: Credential-free graph artifact producer configuration returned after creation.
+      description: Credential-free graph artifact producer configuration returned after creation. At least
+        one non-empty field or template source is present.
       properties:
         name:
           type: string
+          minLength: 1
         kind:
-          $ref: '#/components/schemas/EnrichmentKind'
+          type: string
+          enum:
+            - asset
         field:
           type: string
+          minLength: 1
+        template:
+          type: string
+          minLength: 1
         content_type:
           type: string
+        execution:
+          $ref: '#/components/schemas/ExecutionPolicy'
     CreatedGraphIndexConfig:
       type: object
       description: Credential-free normalized graph configuration returned after creation.

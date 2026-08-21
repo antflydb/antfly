@@ -139,6 +139,7 @@ from .created_enrichment_config import CreatedEnrichmentConfig
 from .created_full_text_index import CreatedFullTextIndex
 from .created_full_text_index_type import CreatedFullTextIndexType
 from .created_graph_artifact_producer_config import CreatedGraphArtifactProducerConfig
+from .created_graph_artifact_producer_config_kind import CreatedGraphArtifactProducerConfigKind
 from .created_graph_index import CreatedGraphIndex
 from .created_graph_index_config import CreatedGraphIndexConfig
 from .created_graph_index_type import CreatedGraphIndexType
@@ -306,8 +307,10 @@ from .graph_artifact_edge_mapping_config_metadata import GraphArtifactEdgeMappin
 from .graph_artifact_node_mapping_config import GraphArtifactNodeMappingConfig
 from .graph_artifact_node_mapping_config_model import GraphArtifactNodeMappingConfigModel
 from .graph_artifact_producer_config import GraphArtifactProducerConfig
+from .graph_artifact_producer_config_kind import GraphArtifactProducerConfigKind
 from .graph_artifact_producer_config_producer_json import GraphArtifactProducerConfigProducerJson
 from .graph_artifact_source_config import GraphArtifactSourceConfig
+from .graph_artifact_source_config_format import GraphArtifactSourceConfigFormat
 from .graph_artifact_source_config_kind import GraphArtifactSourceConfigKind
 from .graph_bounded_traversal_config import GraphBoundedTraversalConfig
 from .graph_bounded_traversal_config_law import GraphBoundedTraversalConfigLaw
@@ -950,6 +953,7 @@ __all__ = (
     "CreatedFullTextIndex",
     "CreatedFullTextIndexType",
     "CreatedGraphArtifactProducerConfig",
+    "CreatedGraphArtifactProducerConfigKind",
     "CreatedGraphIndex",
     "CreatedGraphIndexConfig",
     "CreatedGraphIndexType",
@@ -1126,8 +1130,10 @@ __all__ = (
     "GraphArtifactNodeMappingConfig",
     "GraphArtifactNodeMappingConfigModel",
     "GraphArtifactProducerConfig",
+    "GraphArtifactProducerConfigKind",
     "GraphArtifactProducerConfigProducerJson",
     "GraphArtifactSourceConfig",
+    "GraphArtifactSourceConfigFormat",
     "GraphArtifactSourceConfigKind",
     "GraphBoundedTraversalConfig",
     "GraphBoundedTraversalConfigLaw",

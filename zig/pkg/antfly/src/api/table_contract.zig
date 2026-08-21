@@ -489,6 +489,8 @@ fn validatePublicGraphArtifact(value: std.json.Value) !void {
         } else if (!public_index_contract.createdFieldValueMatches(.graph_artifact, entry.key_ptr.*, entry.value_ptr.*)) {
             return error.InvalidCreateIndexRequest;
         }
+        const child_shape = public_index_contract.createdObjectShapeForChild(.graph_artifact, entry.key_ptr.*);
+        if (child_shape != .unrestricted) try validatePublicCreatedShape(entry.value_ptr.*, child_shape);
     }
 }
 
@@ -964,13 +966,13 @@ test "table contract canonicalizes generated optional null fields" {
 
 test "table contract preserves typed artifact-backed graph configuration" {
     const body =
-        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions"},"artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json","producer_json":{"type":"document_extraction","api_key":"write-only"}},"nodes":{"model":"document","source":"{{ _doc.key }}","target":"{{ _item.target.text }}"},"edge":{"type":"{{ _item.predicate }}","weight":0.75,"metadata":{"source":"{{ _item.source }}"}},"context":{"doc_fields":["title","body"]},"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring","enabled":true}},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}]}
+        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions"},"artifact":{"name":"relations_v1","kind":"asset","template":"{{ body }}","content_type":"application/json","producer_json":{"type":"document_extraction","api_key":"write-only"},"execution":{"batch_items":8,"batch_bytes":262144}},"nodes":{"model":"document","source":"{{ _doc.key }}","target":"{{ _item.target.text }}"},"edge":{"type":"{{ _item.predicate }}","weight":0.75,"metadata":{"source":"{{ _item.source }}"}},"context":{"doc_fields":["title","body"]},"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring"}},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}]}
     ;
     const config_json = try parseCreateIndexRequest(std.testing.allocator, "relations_graph", body);
     defer std.testing.allocator.free(config_json);
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
-        "{\"name\":\"relations_graph\",\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\"},\"nodes\":{\"model\":\"document\",\"target\":\"{{ _item.target.text }}\"},\"edge\":{\"weight\":0.75},\"context\":{\"doc_fields\":[\"title\",\"body\"]},\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}},\"resolvers\":[{\"name\":\"kg\",\"candidate_search\":\"prefix\"}]}",
+        "{\"name\":\"relations_graph\",\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"template\":\"{{ body }}\",\"execution\":{\"batch_items\":8,\"batch_bytes\":262144}},\"nodes\":{\"model\":\"document\",\"target\":\"{{ _item.target.text }}\"},\"edge\":{\"weight\":0.75},\"context\":{\"doc_fields\":[\"title\",\"body\"]},\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}},\"resolvers\":[{\"name\":\"kg\",\"candidate_search\":\"prefix\"}]}",
         config_json,
     );
 
@@ -991,6 +993,22 @@ test "table contract rejects unknown fields in closed nested index objects" {
         \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","client_value":"private"}}
         ,
         \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","client_value":"private"}}
+        ,
+        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset"}}
+        ,
+        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"chunk","field":"relations"}}
+        ,
+        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","field":""}}
+        ,
+        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","field":"relations","template":""}}
+        ,
+        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","template":42}}
+        ,
+        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","field":"relations","execution":{"batch_items":0}}}
+        ,
+        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","format":"unsupported"}}
+        ,
+        \\{"type":"graph","source":{"kind":"document_field","artifact":"relations_v1"}}
         ,
         \\{"type":"graph","resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","client_value":"private"}]}
         ,
@@ -1015,6 +1033,8 @@ test "table contract rejects unknown fields in closed nested index objects" {
         \\{"type":"graph","algebraic_planning":{"bounded_traversal":{"law":"min_plus_semiring"}}}
         ,
         \\{"type":"graph","algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring","client_value":"private"}}}
+        ,
+        \\{"type":"graph","algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring","enabled":false}}}
         ,
         \\{"type":"embeddings","dimension":384,"chunker":{"provider":"antfly","model":"fixed","client_value":"private"}}
         ,

@@ -9284,16 +9284,22 @@ export interface components {
             kind: "artifact";
             artifact: string;
             path?: string;
-            /** @default extraction_relation */
-            format?: string;
+            /**
+             * @default extraction_relation
+             * @enum {string}
+             */
+            format?: "extraction_relation" | "extraction_graph";
             mention_edge_type?: string;
         };
-        /** @description Asset producer used by an artifact-backed graph index. */
+        /** @description Asset producer used by an artifact-backed graph index. At least one non-empty field or template source is required. */
         GraphArtifactProducerConfig: {
             name: string;
-            kind: components["schemas"]["EnrichmentKind"];
+            /** @enum {string} */
+            kind: "asset";
             field?: string;
+            template?: string;
             content_type?: string;
+            execution?: components["schemas"]["ExecutionPolicy"];
             /** @description Write-only producer configuration; it may contain credentials and is never returned. */
             producer_json?: {
                 [key: string]: unknown;
@@ -9328,8 +9334,6 @@ export interface components {
         GraphBoundedTraversalConfig: {
             /** @enum {string} */
             law: "provenance_semiring";
-            /** @default true */
-            enabled?: boolean;
         };
         /** @description Optional algebraic planning features for graph traversal. */
         GraphAlgebraicPlanningConfig: {
@@ -11993,12 +11997,15 @@ export interface components {
              */
             type: "embeddings";
         };
-        /** @description Credential-free graph artifact producer configuration returned after creation. */
+        /** @description Credential-free graph artifact producer configuration returned after creation. At least one non-empty field or template source is present. */
         CreatedGraphArtifactProducerConfig: {
             name: string;
-            kind: components["schemas"]["EnrichmentKind"];
+            /** @enum {string} */
+            kind: "asset";
             field?: string;
+            template?: string;
             content_type?: string;
+            execution?: components["schemas"]["ExecutionPolicy"];
         };
         /** @description Credential-free normalized graph configuration returned after creation. */
         CreatedGraphIndexConfig: {

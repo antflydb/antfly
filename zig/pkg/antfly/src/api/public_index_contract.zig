@@ -194,6 +194,11 @@ fn createdObjectHasRequiredFields(shape: CreatedObjectShape, object: std.json.Ob
         const value = object.get(field) orelse return false;
         if (value == .null or !createdFieldValueMatches(shape, field, value)) return false;
     }
+    if (shape == .graph_artifact) {
+        const has_field = objectHasNonEmptyString(object, "field");
+        const has_template = objectHasNonEmptyString(object, "template");
+        if (!has_field and !has_template) return false;
+    }
     return true;
 }
 
@@ -207,6 +212,7 @@ pub fn createdObjectShapeForChild(parent: CreatedObjectShape, field: []const u8)
         else
             .unrestricted,
         .index_execution => if (isAllowedIndexExecutionField(field)) .execution_policy else .unrestricted,
+        .graph_artifact => if (std.mem.eql(u8, field, "execution")) .execution_policy else .unrestricted,
         .graph_algebraic_planning => if (std.mem.eql(u8, field, "bounded_traversal")) .graph_bounded_traversal else .unrestricted,
         else => .unrestricted,
     };
@@ -224,7 +230,7 @@ pub fn isAllowedCreatedObjectField(shape: CreatedObjectShape, field: []const u8)
         .graph_edge => isAllowedGraphEdgeMappingField(field),
         .graph_context => isAllowedGraphContextField(field),
         .graph_algebraic_planning => std.mem.eql(u8, field, "bounded_traversal"),
-        .graph_bounded_traversal => std.mem.eql(u8, field, "law") or std.mem.eql(u8, field, "enabled"),
+        .graph_bounded_traversal => std.mem.eql(u8, field, "law"),
         .edge_type => isAllowedEdgeTypeField(field),
         .graph_resolver => isAllowedGraphResolverField(field),
         .chunker => isAllowedChunkerField(field),
@@ -293,15 +299,13 @@ pub fn createdFieldValueMatches(shape: CreatedObjectShape, field: []const u8, va
         .enrichments, .edge_types, .graph_resolvers => false,
         .provider => providerFieldValueMatches(field, value),
         .enrichment => enrichmentFieldValueMatches(field, value),
-        .graph_source, .graph_artifact => isString(value),
+        .graph_source => graphArtifactSourceFieldValueMatches(field, value),
+        .graph_artifact => graphArtifactFieldValueMatches(field, value),
         .graph_nodes => graphNodeMappingFieldValueMatches(field, value),
         .graph_edge => graphEdgeMappingFieldValueMatches(field, value),
         .graph_context => isNonEmptyStringArray(value),
         .graph_algebraic_planning => value == .object,
-        .graph_bounded_traversal => if (std.mem.eql(u8, field, "enabled"))
-            isBool(value)
-        else
-            value == .string and std.mem.eql(u8, value.string, "provenance_semiring"),
+        .graph_bounded_traversal => value == .string and std.mem.eql(u8, value.string, "provenance_semiring"),
         .edge_type => edgeTypeFieldValueMatches(field, value),
         .graph_resolver => graphResolverFieldValueMatches(field, value),
         .chunker => chunkerFieldValueMatches(field, value),
@@ -368,6 +372,32 @@ fn graphEdgeMappingFieldValueMatches(field: []const u8, value: std.json.Value) b
     return isString(value) or isNumber(value);
 }
 
+fn graphArtifactSourceFieldValueMatches(field: []const u8, value: std.json.Value) bool {
+    if (std.mem.eql(u8, field, "kind"))
+        return value == .string and std.mem.eql(u8, value.string, "artifact");
+    if (std.mem.eql(u8, field, "format"))
+        return value == .string and
+            (std.mem.eql(u8, value.string, "extraction_relation") or
+                std.mem.eql(u8, value.string, "extraction_graph"));
+    if (std.mem.eql(u8, field, "artifact")) return isNonEmptyString(value);
+    return isString(value);
+}
+
+fn graphArtifactFieldValueMatches(field: []const u8, value: std.json.Value) bool {
+    if (std.mem.eql(u8, field, "kind"))
+        return value == .string and std.mem.eql(u8, value.string, "asset");
+    if (std.mem.eql(u8, field, "name")) return isNonEmptyString(value);
+    if (std.mem.eql(u8, field, "field") or std.mem.eql(u8, field, "template"))
+        return isNonEmptyString(value);
+    if (std.mem.eql(u8, field, "execution")) return value == .object;
+    return isString(value);
+}
+
+fn objectHasNonEmptyString(object: std.json.ObjectMap, field: []const u8) bool {
+    const value = object.get(field) orelse return false;
+    return isNonEmptyString(value);
+}
+
 fn chunkerFieldValueMatches(field: []const u8, value: std.json.Value) bool {
     if (std.mem.eql(u8, field, "store_chunks")) return isBool(value);
     if (std.mem.eql(u8, field, "full_text_index") or
@@ -380,6 +410,10 @@ fn chunkerFieldValueMatches(field: []const u8, value: std.json.Value) bool {
 
 fn isString(value: std.json.Value) bool {
     return value == .string;
+}
+
+fn isNonEmptyString(value: std.json.Value) bool {
+    return value == .string and value.string.len > 0;
 }
 
 fn isInteger(value: std.json.Value) bool {
@@ -475,7 +509,9 @@ pub fn isAllowedCreatedGraphArtifactField(field: []const u8) bool {
     return std.mem.eql(u8, field, "name") or
         std.mem.eql(u8, field, "kind") or
         std.mem.eql(u8, field, "field") or
-        std.mem.eql(u8, field, "content_type");
+        std.mem.eql(u8, field, "template") or
+        std.mem.eql(u8, field, "content_type") or
+        std.mem.eql(u8, field, "execution");
 }
 
 pub fn isAllowedGraphResolverField(field: []const u8) bool {

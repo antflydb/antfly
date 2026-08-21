@@ -123,6 +123,13 @@ describe("Antfly Query Type Integration", () => {
         source: {
           kind: "artifact",
           artifact: "relations_v1",
+          format: "extraction_graph",
+        },
+        artifact: {
+          name: "relations_v1",
+          kind: "asset",
+          template: "{{ body }}",
+          execution: { batch_items: 8 },
         },
         nodes: {
           model: "document",
@@ -138,12 +145,12 @@ describe("Antfly Query Type Integration", () => {
         algebraic_planning: {
           bounded_traversal: {
             law: "provenance_semiring",
-            enabled: true,
           },
         },
       };
 
       expect(graph.edge?.weight).toBe(0.75);
+      expect(graph.artifact?.execution?.batch_items).toBe(8);
       expect(graph.algebraic_planning?.bounded_traversal?.law).toBe("provenance_semiring");
     });
   });
