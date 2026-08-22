@@ -13,3 +13,7 @@
 // limitations.
 
 pub const sim_runtime = @import("storage/sim_runtime.zig");
+
+test {
+    _ = sim_runtime;
+}

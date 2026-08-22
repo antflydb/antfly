@@ -7136,6 +7136,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    storage_sim_runtime_test_mod.addImport("antfly_platform", platform_mod);
     const storage_sim_runtime_tests = b.addTest(.{
         .root_module = storage_sim_runtime_test_mod,
     });

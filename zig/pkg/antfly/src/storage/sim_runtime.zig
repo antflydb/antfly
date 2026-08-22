@@ -293,24 +293,38 @@ pub const ModeledDevice = struct {
     durable_directories: std.StringHashMapUnmanaged(void) = .empty,
     dirty_directories: std.StringHashMapUnmanaged(DirtyDirectory) = .empty,
     tick: u64 = 1,
+    fail_next_read: bool = false,
     fail_next_write: bool = false,
     fail_next_sync: bool = false,
+    fail_next_truncate: bool = false,
+    fail_next_rename: bool = false,
+    fail_next_delete: bool = false,
     drop_next_sync: bool = false,
     partial_next_write_bytes: ?usize = null,
     partial_write_faults_consumed: u64 = 0,
     dropped_syncs_consumed: u64 = 0,
+    device_full_faults_consumed: u64 = 0,
+    fail_next_read_path_contains: ?[]u8 = null,
     fail_next_write_path_contains: ?[]u8 = null,
     fail_next_sync_path_contains: ?[]u8 = null,
+    fail_next_truncate_path_contains: ?[]u8 = null,
+    fail_next_rename_path_contains: ?[]u8 = null,
     fail_next_delete_path_contains: ?[]u8 = null,
+    capacity_bytes: ?usize = null,
 
     pub fn init(alloc: Allocator) ModeledDevice {
         return .{ .alloc = alloc };
     }
 
     pub fn deinit(self: *ModeledDevice) void {
-        if (self.fail_next_write_path_contains) |needle| self.alloc.free(needle);
-        if (self.fail_next_sync_path_contains) |needle| self.alloc.free(needle);
-        if (self.fail_next_delete_path_contains) |needle| self.alloc.free(needle);
+        inline for (&.{
+            &self.fail_next_read_path_contains,
+            &self.fail_next_write_path_contains,
+            &self.fail_next_sync_path_contains,
+            &self.fail_next_truncate_path_contains,
+            &self.fail_next_rename_path_contains,
+            &self.fail_next_delete_path_contains,
+        }) |slot| if (slot.*) |needle| self.alloc.free(needle);
         var it = self.files.iterator();
         while (it.next()) |entry| {
             self.alloc.free(entry.key_ptr.*);
@@ -367,6 +381,18 @@ pub const ModeledDevice = struct {
         self.fail_next_write = true;
     }
 
+    pub fn injectReadFailure(self: *ModeledDevice) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.fail_next_read = true;
+    }
+
+    pub fn injectReadFailureForPathContains(self: *ModeledDevice, needle: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.replaceFaultNeedle(&self.fail_next_read_path_contains, needle);
+    }
+
     pub fn injectWriteFailureForPathContains(self: *ModeledDevice, needle: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -377,6 +403,36 @@ pub const ModeledDevice = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.fail_next_sync = true;
+    }
+
+    pub fn injectTruncateFailure(self: *ModeledDevice) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.fail_next_truncate = true;
+    }
+
+    pub fn injectTruncateFailureForPathContains(self: *ModeledDevice, needle: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.replaceFaultNeedle(&self.fail_next_truncate_path_contains, needle);
+    }
+
+    pub fn injectRenameFailure(self: *ModeledDevice) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.fail_next_rename = true;
+    }
+
+    pub fn injectRenameFailureForPathContains(self: *ModeledDevice, needle: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.replaceFaultNeedle(&self.fail_next_rename_path_contains, needle);
+    }
+
+    pub fn injectDeleteFailure(self: *ModeledDevice) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.fail_next_delete = true;
     }
 
     /// The next write persists at most `bytes_written` volatile bytes and then
@@ -418,6 +474,43 @@ pub const ModeledDevice = struct {
         return self.dropped_syncs_consumed;
     }
 
+    pub fn setCapacityBytes(self: *ModeledDevice, capacity: ?usize) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.capacity_bytes = capacity;
+    }
+
+    pub fn usedBytes(self: *ModeledDevice) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.usedBytesLocked();
+    }
+
+    pub fn deviceFullFaultsConsumed(self: *ModeledDevice) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.device_full_faults_consumed;
+    }
+
+    pub fn corruptVolatileByte(self: *ModeledDevice, path: []const u8, offset: usize, xor_mask: u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (xor_mask == 0) return error.InvalidCorruptionMask;
+        const file = self.files.getPtr(path) orelse return error.FileNotFound;
+        if (offset >= file.volatile_bytes.len) return error.CorruptionOffsetOutOfBounds;
+        file.volatile_bytes[offset] ^= xor_mask;
+    }
+
+    pub fn corruptDurableByte(self: *ModeledDevice, path: []const u8, offset: usize, xor_mask: u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (xor_mask == 0) return error.InvalidCorruptionMask;
+        const file = self.files.getPtr(path) orelse return error.FileNotFound;
+        const durable = file.durable_bytes orelse return error.FileNotDurable;
+        if (offset >= durable.bytes.len) return error.CorruptionOffsetOutOfBounds;
+        durable.bytes[offset] ^= xor_mask;
+    }
+
     pub fn fileSize(self: *ModeledDevice, path: []const u8) !usize {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -429,6 +522,7 @@ pub const ModeledDevice = struct {
         const self: *ModeledDevice = @ptrCast(@alignCast(ptr));
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (self.consumeReadFaultLocked(path)) return error.InjectedReadFault;
         const file = self.files.get(path) orelse return error.FileNotFound;
         if (offset > file.volatile_bytes.len) return error.EndOfFile;
         const end = @min(file.volatile_bytes.len, offset + len);
@@ -443,16 +537,18 @@ pub const ModeledDevice = struct {
             self.fail_next_write = false;
             return error.InjectedWriteFault;
         }
+        const end = offset + bytes.len;
+        const old_len = if (self.files.get(path)) |file| file.volatile_bytes.len else 0;
+        try self.ensureCapacityLocked(path, @max(old_len, end));
         const file = try self.ensureFile(path);
         if (self.takePartialWriteLimit()) |limit| {
             const written = @min(limit, bytes.len);
             const partial_end = offset + written;
-            try resizeBuffer(self.alloc, &file.volatile_bytes, partial_end);
+            try resizeBuffer(self.alloc, &file.volatile_bytes, @max(file.volatile_bytes.len, partial_end));
             @memcpy(file.volatile_bytes[offset..partial_end], bytes[0..written]);
             return error.InjectedPartialWriteFault;
         }
-        const end = offset + bytes.len;
-        try resizeBuffer(self.alloc, &file.volatile_bytes, end);
+        try resizeBuffer(self.alloc, &file.volatile_bytes, @max(file.volatile_bytes.len, end));
         @memcpy(file.volatile_bytes[offset..end], bytes);
     }
 
@@ -578,6 +674,11 @@ pub const ModeledDevice = struct {
         const self: *ModeledDevice = @ptrCast(@alignCast(ptr));
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (self.fail_next_truncate or self.consumeFaultNeedle(&self.fail_next_truncate_path_contains, path)) {
+            self.fail_next_truncate = false;
+            return error.InjectedTruncateFault;
+        }
+        try self.ensureCapacityLocked(path, len);
         const file = try self.ensureFile(path);
         try resizeBuffer(self.alloc, &file.volatile_bytes, len);
     }
@@ -586,6 +687,13 @@ pub const ModeledDevice = struct {
         const self: *ModeledDevice = @ptrCast(@alignCast(ptr));
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (self.fail_next_rename or
+            self.consumeFaultNeedle(&self.fail_next_rename_path_contains, old_path) or
+            self.consumeFaultNeedle(&self.fail_next_rename_path_contains, new_path))
+        {
+            self.fail_next_rename = false;
+            return error.InjectedRenameFault;
+        }
         if (!self.files.contains(old_path)) return error.FileNotFound;
         try self.markNamespaceDirtyLocked(old_path);
         try self.markNamespaceDirtyLocked(new_path);
@@ -606,7 +714,10 @@ pub const ModeledDevice = struct {
         const self: *ModeledDevice = @ptrCast(@alignCast(ptr));
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (self.consumeFaultNeedle(&self.fail_next_delete_path_contains, path)) return error.InjectedDeleteFault;
+        if (self.fail_next_delete or self.consumeFaultNeedle(&self.fail_next_delete_path_contains, path)) {
+            self.fail_next_delete = false;
+            return error.InjectedDeleteFault;
+        }
         if (!self.files.contains(path)) return;
         try self.markNamespaceDirtyLocked(path);
         const removed = self.files.fetchRemove(path) orelse return;
@@ -755,6 +866,29 @@ pub const ModeledDevice = struct {
         if (limit != null) self.partial_write_faults_consumed +|= 1;
         return limit;
     }
+
+    fn consumeReadFaultLocked(self: *ModeledDevice, path: []const u8) bool {
+        if (!self.fail_next_read and !self.consumeFaultNeedle(&self.fail_next_read_path_contains, path)) return false;
+        self.fail_next_read = false;
+        return true;
+    }
+
+    fn usedBytesLocked(self: *const ModeledDevice) usize {
+        var total: usize = 0;
+        var it = self.files.valueIterator();
+        while (it.next()) |file| total +|= file.volatile_bytes.len;
+        return total;
+    }
+
+    fn ensureCapacityLocked(self: *ModeledDevice, path: []const u8, new_len: usize) !void {
+        const capacity = self.capacity_bytes orelse return;
+        const old_len = if (self.files.get(path)) |file| file.volatile_bytes.len else 0;
+        const used = self.usedBytesLocked();
+        const proposed = used -| old_len +| new_len;
+        if (proposed <= capacity) return;
+        self.device_full_faults_consumed +|= 1;
+        return error.InjectedDeviceFull;
+    }
 };
 
 const modeled_storage_vtable: lsm_storage.Storage.VTable = .{
@@ -794,6 +928,7 @@ fn modeledReadFileAlloc(ptr: *anyopaque, alloc: Allocator, path: []const u8, max
     const self: *ModeledDevice = @ptrCast(@alignCast(ptr));
     self.mutex.lock();
     defer self.mutex.unlock();
+    if (self.consumeReadFaultLocked(path)) return error.InjectedReadFault;
     const file = self.files.get(path) orelse return error.FileNotFound;
     if (file.volatile_bytes.len > max_bytes) return error.FileTooBig;
     return try alloc.dupe(u8, file.volatile_bytes);
@@ -803,6 +938,7 @@ fn modeledReadFileRangeAlloc(ptr: *anyopaque, alloc: Allocator, path: []const u8
     const self: *ModeledDevice = @ptrCast(@alignCast(ptr));
     self.mutex.lock();
     defer self.mutex.unlock();
+    if (self.consumeReadFaultLocked(path)) return error.InjectedReadFault;
     const file = self.files.get(path) orelse return error.FileNotFound;
     const start: usize = @intCast(offset);
     if (start > file.volatile_bytes.len or file.volatile_bytes.len - start < len) return error.EndOfStream;
@@ -818,6 +954,7 @@ fn modeledReadFileTrailerAlloc(ptr: *anyopaque, alloc: Allocator, path: []const 
     const self: *ModeledDevice = @ptrCast(@alignCast(ptr));
     self.mutex.lock();
     defer self.mutex.unlock();
+    if (self.consumeReadFaultLocked(path)) return error.InjectedReadFault;
     const file = self.files.get(path) orelse return error.FileNotFound;
     if (file.volatile_bytes.len < len) return error.EndOfStream;
     return .{
@@ -834,6 +971,7 @@ fn modeledWriteFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const
         self.fail_next_write = false;
         return error.InjectedWriteFault;
     }
+    try self.ensureCapacityLocked(path, contents.len);
     const file = try self.ensureFile(path);
     if (self.takePartialWriteLimit()) |limit| {
         const written = @min(limit, contents.len);
@@ -853,8 +991,9 @@ fn modeledAppendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []cons
         self.fail_next_write = false;
         return error.InjectedWriteFault;
     }
+    const old_len = if (self.files.get(path)) |file| file.volatile_bytes.len else 0;
+    try self.ensureCapacityLocked(path, old_len + contents.len);
     const file = try self.ensureFile(path);
-    const old_len = file.volatile_bytes.len;
     if (self.takePartialWriteLimit()) |limit| {
         const written = @min(limit, contents.len);
         try resizeBuffer(self.alloc, &file.volatile_bytes, old_len + written);
@@ -893,7 +1032,10 @@ fn modeledDeleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
     const self: *ModeledDevice = @ptrCast(@alignCast(ptr));
     self.mutex.lock();
     defer self.mutex.unlock();
-    if (self.consumeFaultNeedle(&self.fail_next_delete_path_contains, path)) return error.InjectedDeleteFault;
+    if (self.fail_next_delete or self.consumeFaultNeedle(&self.fail_next_delete_path_contains, path)) {
+        self.fail_next_delete = false;
+        return error.InjectedDeleteFault;
+    }
     if (!self.files.contains(path)) return error.FileNotFound;
     try self.markNamespaceDirtyLocked(path);
     const removed = self.files.fetchRemove(path) orelse return error.FileNotFound;
@@ -906,6 +1048,10 @@ fn modeledDeleteTree(ptr: *anyopaque, path: []const u8) !void {
     const self: *ModeledDevice = @ptrCast(@alignCast(ptr));
     self.mutex.lock();
     defer self.mutex.unlock();
+    if (self.fail_next_delete or self.consumeFaultNeedle(&self.fail_next_delete_path_contains, path)) {
+        self.fail_next_delete = false;
+        return error.InjectedDeleteFault;
+    }
     var doomed = std.ArrayListUnmanaged([]const u8).empty;
     defer doomed.deinit(self.alloc);
 
@@ -1109,6 +1255,62 @@ test "modeled device exposes torn writes and acknowledged dropped syncs" {
     const dropped = try device.readAlloc(std.testing.allocator, "wal", 0, 16);
     defer std.testing.allocator.free(dropped);
     try std.testing.expectEqualStrings("abcWX", dropped);
+}
+
+test "modeled device exposes typed operation capacity and corruption faults" {
+    var device_model = ModeledDevice.init(std.testing.allocator);
+    defer device_model.deinit();
+    const device = device_model.device();
+
+    try device_model.storage().createDirPath("/root");
+    try device.write("/root/value", 0, "abcdef");
+    try device.sync("/root/value");
+
+    device_model.injectReadFailure();
+    try std.testing.expectError(error.InjectedReadFault, device.readAlloc(std.testing.allocator, "/root/value", 0, 6));
+    device_model.injectTruncateFailure();
+    try std.testing.expectError(error.InjectedTruncateFault, device.truncate("/root/value", 2));
+    device_model.injectRenameFailure();
+    try std.testing.expectError(error.InjectedRenameFault, device.rename("/root/value", "/root/renamed"));
+    device_model.injectDeleteFailure();
+    try std.testing.expectError(error.InjectedDeleteFault, device.remove("/root/value"));
+
+    try std.testing.expectEqual(@as(usize, 6), device_model.usedBytes());
+    device_model.setCapacityBytes(6);
+    try std.testing.expectError(error.InjectedDeviceFull, device.write("/root/value", 6, "g"));
+    try std.testing.expectEqual(@as(u64, 1), device_model.deviceFullFaultsConsumed());
+    try device.write("/root/value", 1, "B");
+    device_model.setCapacityBytes(null);
+
+    try device_model.corruptVolatileByte("/root/value", 2, 0x20);
+    const volatile_corrupt = try device.readAlloc(std.testing.allocator, "/root/value", 0, 6);
+    defer std.testing.allocator.free(volatile_corrupt);
+    try std.testing.expectEqualStrings("aBCdef", volatile_corrupt);
+    try device.crash();
+    const restored = try device.readAlloc(std.testing.allocator, "/root/value", 0, 6);
+    defer std.testing.allocator.free(restored);
+    try std.testing.expectEqualStrings("abcdef", restored);
+
+    try device_model.corruptDurableByte("/root/value", 0, 0x20);
+    try device.crash();
+    const durable_corrupt = try device.readAlloc(std.testing.allocator, "/root/value", 0, 6);
+    defer std.testing.allocator.free(durable_corrupt);
+    try std.testing.expectEqualStrings("Abcdef", durable_corrupt);
+}
+
+test "modeled storage consumes path-targeted read rename and delete faults" {
+    var device_model = ModeledDevice.init(std.testing.allocator);
+    defer device_model.deinit();
+    const storage = device_model.storage();
+
+    try storage.createDirPath("/root");
+    try storage.writeFileAbsolute("/root/a", "abc");
+    try device_model.injectReadFailureForPathContains("/root/a");
+    try std.testing.expectError(error.InjectedReadFault, storage.readFileAlloc(std.testing.allocator, "/root/a", 16));
+    try device_model.injectRenameFailureForPathContains("/root/a");
+    try std.testing.expectError(error.InjectedRenameFault, storage.renameAbsolute("/root/a", "/root/b"));
+    try device_model.injectDeleteFailureForPathContains("/root");
+    try std.testing.expectError(error.InjectedDeleteFault, storage.deleteTree("/root"));
 }
 
 test "modeled storage requires a directory sync for a newly created file" {
