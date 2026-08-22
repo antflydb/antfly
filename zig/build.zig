@@ -6762,6 +6762,12 @@ pub fn build(b: *std.Build) void {
     const sim_promote_step = b.step("sim-promote", "Promote a reviewed reduced VOPR failure fixture");
     sim_promote_step.dependOn(&promote_sim_cli.step);
 
+    const migrate_sim_cli = b.addRunArtifact(sim_cli);
+    migrate_sim_cli.addArg("migrate");
+    if (b.args) |args| migrate_sim_cli.addArgs(args);
+    const sim_migrate_step = b.step("sim-migrate", "Migrate a VOPR artifact after proving equivalent replay outcomes");
+    sim_migrate_step.dependOn(&migrate_sim_cli.step);
+
     const tla_sim_cli = b.addRunArtifact(sim_cli);
     tla_sim_cli.addArg("tla");
     if (b.args) |args| tla_sim_cli.addArgs(args);

@@ -1,8 +1,9 @@
 # Metadata Simulation Determinism Audit
 
-This is the Phase 0 inventory for the first metadata world:
+This is the preserved Phase 0 baseline inventory for the first metadata world:
 `metadata/sim_harness.zig`, including its `raft/sim_harness.zig` transport.
-It records replay risks; it does not claim the metadata adapter is complete.
+The table records the risks as originally audited; the resolution summary below
+states the current adapter status.
 
 | Input class | Current use | Phase 0 classification | Adapter requirement |
 |---|---|---|---|
@@ -17,7 +18,12 @@ It records replay risks; it does not claim the metadata adapter is complete.
 | Iteration/order | Enabled VOPR actions are currently selected by integer ranges and local control flow; several maps/catalogs may have implementation-defined iteration order. | Not yet proven canonical. | Scenario adapters must emit explicit transition descriptors and call `List.canonicalize`; observations must use `Builder.canonicalize`. |
 | Process/environment | Temp roots, target, optimize mode, and source revision can differ. | Diagnostic only unless they alter behavior. | Record them in the header, but determine replay compatibility from simulator ABI plus scenario version. |
 
-Phase 0 establishes the contracts that enforce the right edge of this table.
-Phase 1 must close the real-clock path, turn campaign PRNG calls into choices,
-and add construction-time capability checks before claiming exact replay for the
-metadata world.
+Phase 0 established the contracts that enforce the right edge of this table.
+The metadata adapter now records structured choices and canonical enabled sets,
+selects individual virtual messages/node rounds/time advances, requires virtual
+synchronous transport for the replayable world, and stamps simulated group
+status from the cluster's injected manual clock rather than host realtime.
+Debug and ReleaseSafe each pass the dedicated 100-consecutive exact-replay
+gate. Wall-clock delay executors, real listeners, and physical filesystem
+behavior remain confined to explicitly identified integration tests; they are
+not silently admitted into the in-process metadata replay kernel.

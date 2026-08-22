@@ -1,11 +1,42 @@
 # VOPR: Deterministic Autonomous Simulation for Antfly
 
-Status: all phased exit conditions are implemented. The Phase 4 scenario has
-generated/replayable plan choices and split-to-merge composition; finer-grained
-control inside its real DataServer/HTTP integration remains an explicitly
-bounded production-seam expansion, not a replay-kernel dependency.
+Status (2026-08-22): Phases 0 through 5 and their stated exit conditions are
+implemented. The Phase 4 scenario has generated/replayable plan choices and
+split-to-merge composition. Finer-grained control inside its real
+DataServer/HTTP integration remains an explicitly bounded production-seam
+expansion, not a replay-kernel dependency; the simulator must not counterfeit
+that control by opening a second writer or weakening production lease
+ownership.
 
 Scope: Zig Antfly simulation, VOPR, modeled-storage, and chaos tests
+
+## Implementation Conformance Snapshot
+
+This table is the requirement-to-evidence index for the implemented design. It
+is deliberately more conservative than a list of source files: “implemented”
+means the behavior has an executable test or command path.
+
+| Requirement | Implementation evidence | Verification path |
+| --- | --- | --- |
+| Stable structured choices and exact clean-world replay | `lib/vopr/src/choice.zig`, `runner.zig`, `replay.zig`, and canonical `vopr-trace-v1` parsing | `zig build vopr-test` |
+| One-transition scheduling, typed outcomes, and blocked/budget termination | `scheduler.zig`, `scenario.zig`, and `outcome.zig` | `zig build vopr-test` |
+| Narrow application runtime with scheduler-only control | `runtime.zig` and `sim_runtime.zig`; Antfly `DurableJobLane` adapter | `zig build vopr-runtime-test` |
+| Explicit clocks, timers, and storage completions | `time.zig`, `sim_runtime.zig`, and selected completion APIs in `storage/sim_runtime.zig` | `zig build vopr-test storage-sim-runtime-test` |
+| Independent lifecycle faults with budgets | `fault.zig` plus metadata link, node, pause, crash, route, queue, and transport faults | `zig build vopr-test lib-metadata-vopr-test` |
+| Typed state-aware workload vocabulary | `command.zig`; scenario-specific adapters retain domain execution | `zig build vopr-test` |
+| Semantic properties, observations, coverage, corpus, and guided search | `property.zig`, `observation.zig`, `coverage.zig`, `corpus.zig`, and `explorer.zig` | `zig build vopr-test vopr-benchmark` |
+| Exact-replay-before-retention campaigns and deterministic reporting | Antfly `sim/cli.zig` with persistent corpus mutation/splicing and first/smallest failure reporting | `zig build sim-campaign -- --scenario metadata --histories 3 --transitions 2 --workers 2 --artifact-dir /tmp/antfly-vopr-smoke` |
+| Same-fingerprint reduction, including context-backed scenarios | `reducer.zig`, metadata configuration shrinking, and distributed-data context dispatch | `zig build vopr-test sim-meta-test` |
+| Replay-proven fixture promotion and explicit migration | `fixture.zig` plus `sim-promote` and `sim-migrate` | `zig build vopr-test sim-meta-test` |
+| Formal sidecars and causal triage | transaction/Raft `sim-tla` dispatch and `causal.zig`/`sim-explain` | `zig build transaction-vopr-test sim-meta-test` |
+| Metadata replay stability across build modes | A dedicated 100-consecutive-replay acceptance test | `zig build metadata-vopr-replay-stability-test` and the same command with `-Doptimize=ReleaseSafe` |
+| Distributed acknowledged-data durability | Real public API, split, partition/restart, modeled device crash/recovery, merge, and reference model | `zig build lib-metadata-vopr-data-test` |
+
+The reusable package is Antfly-independent. The physical distributed-data
+shell is intentionally an integration differential: its generated plan is
+replayable, while its real HTTP/DataServer phase remains a single atomic
+transition until production exposes safe borrowed-lease and request-executor
+suspension points.
 
 ## Executive Summary
 
@@ -1263,11 +1294,18 @@ can be modeled without weakening production parity.
 
 ### Raft Runtime
 
+Status: planned migration; the metadata adapter already exposes selected Raft
+HTTP messages and node rounds, but a reusable per-group Raft scenario remains.
+
 Expose atomic host rounds, per-group scheduler choices, message deliveries,
 snapshot operations, persistence/apply completions, and backpressure. Reuse the
 existing differential trace corpus and compare selected histories with etcd.
 
 ### Modeled Storage
+
+Status: partially implemented. WAL uses the common runner; LMDB, persistent
+index, DB split, index manager, and LSM retain their focused simulators pending
+adapter-by-adapter replay parity.
 
 Adapt WAL, LMDB, persistent index, DB split, index manager, and LSM campaigns to
 the common trace/property interface. Preserve their focused reference models
@@ -1278,11 +1316,18 @@ one enormous distributed scenario before focused replay parity is proven.
 
 ### Data Plane
 
+Status: first distributed durability vertical slice implemented; broader
+document, enrichment, index, compaction, and repair command decomposition is
+planned.
+
 Add public document traffic, table routing, range transitions, snapshots,
 enrichment, index lifecycle, compaction, and repair. The client history and
 final-state oracle become essential here.
 
 ### HA
+
+Status: planned migration. Existing HA and chaos suites remain required gates
+and seed material; they are not replaced or de-scoped by the metadata slice.
 
 Convert crash-phase, standby, fencing, reseed, timeline, retention, and
 promotion tests into commands and properties. Node and storage faults then use
@@ -1317,15 +1362,19 @@ lib/vopr/
   src/
     root.zig
     choice.zig
+    command.zig
     transition.zig
     runner.zig
     event.zig
+    outcome.zig
     trace.zig
     replay.zig
     property.zig
     observation.zig
     runtime.zig
     sim_runtime.zig
+    time.zig
+    fault.zig
     vopr-trace-v1.schema.json
     scheduler.zig
     coverage.zig
@@ -1341,20 +1390,29 @@ lib/vopr/
 pkg/antfly/src/sim/
   DETERMINISM_AUDIT.md
   cli.zig
-  scenarios/
+  cli_runner.zig
+  fixtures/
+    metadata/
+    distributed-data/
+    transaction/
+    raft/              # planned migration namespace
+    wal/               # planned promoted-fixture namespace
+    lmdb/              # planned promoted-fixture namespace
+    lsm/               # planned migration namespace
+    ha/                # planned migration namespace
+  scenarios/           # planned registry/consolidation; adapters may stay by domain
     metadata.zig
     raft.zig
     wal.zig
+    lmdb.zig
     lsm.zig
     ha.zig
-  fixtures/
-    metadata/
-    raft/
-    wal/
-    lsm/
-    ha/
 
+pkg/antfly/src/metadata/
+  sim_harness.zig # metadata and distributed-data scenario adapters
 pkg/antfly/src/storage/
+  wal_vopr.zig
+  transaction_vopr.zig
   vopr_durable_job_lane.zig # Antfly Job -> generic VOPR Executor adapter
 ```
 
@@ -1366,14 +1424,24 @@ cleaner dependency direction. The stable rule is:
 - production code only depends on narrow runtime, clock, entropy, transport,
   and storage interfaces, never on the explorer or `SchedulerPort`
 
-The CLI should be a standalone executable rather than additional behavior in
-the unit-test runner. The current custom test runner has a deliberately small
-argument surface and fail-fast `std.testing` semantics; campaigns need budgets,
-artifacts, replay modes, and property aggregation.
+The Raft, LMDB, LSM, and HA entries are forward migration targets, not removed
+scope. WAL is the first modeled-storage adapter; the remaining focused suites
+keep their existing runners and oracles until they reach exact replay parity,
+then join the same scenario registry and fixture policy incrementally.
+
+The CLI is a standalone command surface, not additional behavior in Antfly's
+ordinary unit-test runner. Its scenario implementations intentionally use
+test-only resources such as `std.testing.tmpDir`, allocator leak checking, and
+the test I/O instance. The build therefore emits a runnable test-mode artifact
+with a dedicated `cli_runner.zig` that dispatches only the VOPR command
+entrypoint. This preserves the harness-only contract while supporting budgets,
+artifacts, replay modes, and property aggregation through normal `zig build
+sim-* -- ...` commands. It must not be installed or represented as a production
+Antfly binary.
 
 ## CLI and Build Integration
 
-Proposed commands:
+Implemented commands:
 
 ```sh
 # Run one deterministic generated history.
@@ -1396,6 +1464,12 @@ zig build sim-reduce -- \
 zig build sim-promote -- \
   --trace /tmp/metadata-reduced.simtrace \
   --name split-leader-restart-before-finalize
+
+# Rewrite only after source replay, migration, target replay, and semantic
+# outcome equivalence all succeed.
+zig build sim-migrate -- \
+  --trace /tmp/metadata-reduced.simtrace \
+  --out /tmp/metadata-migrated.simtrace
 
 # Exact-replay an eligible artifact and export its formal Raft event stream.
 zig build sim-tla -- \
@@ -1456,6 +1530,17 @@ and campaign must remain distinct operations.
 - more workers and larger history budgets
 - stress fault budgets
 - existing legacy chaos tests until coverage is superseded
+
+The cross-mode replay acceptance lane is intentionally opt-in because it
+reconstructs a real three-node metadata world 100 times:
+
+```sh
+zig build metadata-vopr-replay-stability-test
+zig build metadata-vopr-replay-stability-test -Doptimize=ReleaseSafe
+```
+
+Both commands must pass without divergence or leaks before changing the
+metadata replay ABI.
 
 Nightly/manual:
 
@@ -1670,6 +1755,22 @@ and the top-level build exposes `vopr-test` while preserving
 determinism audit remains in `pkg/antfly/src/sim/`, ready to guide the Phase 1
 adapter.
 
+The completed package also owns the Antfly-independent command registry,
+transition outcomes, fault lifecycle controller and budgets, node clock model,
+fixture migration proof, campaign accounting, and context-aware reducer. These
+belong in `lib/vopr`, not `lib/sim`: each has a replay/campaign semantic
+contract. A general modeled component should move below VOPR only when it is
+useful without exploration semantics, as the modeled storage device already
+is.
+
+The `std.Io` decision is equally explicit. VOPR adopts the handle/vtable shape
+for narrow `Executor`, `Clock`, `Timers`, `Runtime`, and `SchedulerPort`
+capabilities, but does not implement a simulated `std.Io.VTable`. The latter
+would falsely promise deterministic files, sockets, futexes, processes, and
+arbitrary blocking callbacks. A full backend remains conditional on a concrete
+production dependency and a reviewed capability matrix with no real-I/O
+fallbacks.
+
 ### Phase 1: Traceable Metadata Campaign
 
 - extract current metadata VOPR actions from test-local PRNG execution
@@ -1729,6 +1830,15 @@ whose selected transition changes during selection. `choice.Mutating` now
 provides clean-world prefix replay, a structured branch at one decision, and a
 seeded suffix.
 
+`outcome.zig` gives every transition an explicit applied, rejected,
+injected-error, property, target, process-crash/panic, harness-error, or
+replay-divergence result. `fault.zig` owns reusable lifecycle identity,
+start/end/one-shot semantics, and node/link/delay/storage/quorum/quiet budgets.
+`time.zig` separates global monotonic time, per-node monotonic domains,
+realtime jumps and drift, pause/resume state, and Raft logical ticks. These are
+independent engine contracts even where the first metadata adapter uses only a
+subset of their fault and clock vocabulary.
+
 The Antfly metadata adapter now exposes individual node rounds, virtual-time
 advancement, and selected queued-message delivery, drop, duplication, delay,
 and release. The virtual network provides a side-effect-free canonical message
@@ -1747,10 +1857,11 @@ the aggregate heal action is independently selectable. Node pause and resume
 are lifecycle transitions: pausing suppresses only that node's scheduler round
 while preserving its memory, durable state, and network fault state. Active
 link, node, pause, route, queue, and total fault counts are semantic
-observations, and the metadata replay ABI is version 5 after these enabled-set
-changes. The remaining Phase 2 follow-on was to move a
-shared production background-service seam onto `SimRuntime` instead of leaving
-all such work in manual domain runtimes.
+observations. Version 6 additionally distinguishes graceful stop from a crash
+interval, destroys the crashed process state, restarts from its durable
+dependencies, and records matching start/end fault IDs. The remaining Phase 2
+follow-on was to move a shared production background-service seam onto
+`SimRuntime` instead of leaving all such work in manual domain runtimes.
 
 That production seam is now implemented for the shared durable-job surface.
 `storage/vopr_durable_job_lane.zig` adapts Antfly's existing
@@ -1813,6 +1924,23 @@ budget and then performs same-fingerprint structured scheduling/fault
 substitution, exact-replaying every accepted result. Promotion refuses
 non-failing or non-replaying traces, validates fixture names, and avoids
 overwriting by default.
+
+Every generated or mutated campaign artifact is now exact-replayed before it
+can affect coverage, corpus retention, or failure reporting. The deterministic
+summary separates clean histories, property failures, replay divergences, and
+harness errors; reports transitions, unique semantic states and transition
+IDs, reached faults/workloads, productive corpus parents, and splice outcomes;
+lists every observed property as pass/fail/not-reached; and prints the first
+and smallest artifact plus replay/reduction commands for each stable failure
+fingerprint. Retained children credit their selected mutation/splice parents,
+so corpus energy reflects measured productivity rather than only novelty.
+
+The generic reducer accepts an optional scenario context and uses it for the
+original proof, every candidate, and every exact-replay check. The CLI keeps
+metadata's domain shrinker and dispatches generic transaction and
+context-backed distributed-data reductions by the artifact scenario. Context
+values that affect replay remain serialized in the artifact; the pointer is
+only the clean-world construction mechanism.
 
 The `sim-meta-test` gate closes the Phase 3 exit condition. It enables a
 test-only named metadata oracle bug that is reachable only while two directed
@@ -1971,6 +2099,14 @@ runtime test declaration and supplies its platform dependency. This corrected
 a prior zero-test gate: it now executes the complete imported storage suite
 (168 tests at this checkpoint), including the typed fault, capacity, namespace
 durability, and corruption cases.
+
+Modeled completion scheduling is externally selectable rather than implicitly
+FIFO-only. The runtime exposes a canonical pending-completion snapshot, can
+delay or complete one selected stable completion ID, and can advance virtual
+time without draining unrelated work. Tests prove that two operations due at
+the same time can complete in either selected order without changing their
+identity. This is the storage analogue of selected network delivery and is the
+seam future LMDB/LSM adapters should consume.
 
 Eligible metadata VOPR artifacts can also be exact-replayed with a formal Raft
 sidecar through `zig build sim-tla -- --trace ... --domain raft --out ...`.
@@ -2193,8 +2329,9 @@ work uncovers a concrete contradiction:
    an optimization.
 7. Use non-fatal named properties and a deterministic quiet suffix.
 8. Preserve the same failure fingerprint during reduction.
-9. Use a standalone campaign executable and keep unit-test runner behavior
-   simple.
+9. Use a standalone VOPR command surface compiled as a harness-only test
+   artifact; keep the ordinary unit-test runner behavior simple and never ship
+   the VOPR shell as a production binary.
 10. Migrate existing suites incrementally and preserve their focused oracles.
 11. Keep real HTTP, threaded, and process chaos tests as complementary layers.
 12. Require explicit human review before fixture promotion.
@@ -2221,6 +2358,10 @@ Implementation resolved the Phase 0 design questions as follows:
   allocate workers and wall-clock budgets but does not select transitions
 - compiler coverage remains optional secondary feedback because the current
   Zig/LLVM instrumentation surface is not stable enough to join the replay ABI
+- VOPR command steps compile in test mode through a dedicated runner because
+  Antfly scenarios use test-only allocators, I/O, and temporary directories;
+  this is a command boundary, not permission for production code to import
+  `std.testing`
 
 One bounded expansion remains outside the phased exit conditions. The
 distributed public-data scenario generates and replays its transport and fault

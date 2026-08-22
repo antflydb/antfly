@@ -672,7 +672,7 @@ fn reportRuntimeDocIdentityForActiveReplicas(
             defer db.close();
             const stats = try db.runtimeStatusStatsConsistent(alloc);
             defer db_mod.types.freeDBStats(alloc, stats);
-            const now_ms = currentGroupStatusTimestampMs();
+            const now_ms = cluster.manual_clock.clock().nowRealtimeMs();
             const reported_doc_count = if (metrics_override) |metrics| metrics.doc_count else stats.doc_count;
             const reported_disk_bytes = if (metrics_override) |metrics| metrics.disk_bytes else 1;
             const raft_status = cluster.cluster.node(i).raftStatus(group_id) orelse continue;
@@ -2309,13 +2309,14 @@ fn makeGroupStatus(
     group_id: u64,
     doc_count: u64,
     disk_bytes: u64,
+    now_ms: u64,
 ) metadata_table_manager.GroupStatusReport {
     return .{
         .group_id = group_id,
         .doc_count = doc_count,
         .disk_bytes = disk_bytes,
         .empty = false,
-        .updated_at_millis = currentGroupStatusTimestampMs(),
+        .updated_at_millis = now_ms,
     };
 }
 
@@ -2613,8 +2614,9 @@ fn reportSplitCandidateStatus(
     median_key: ?[]const u8,
 ) !void {
     _ = median_key;
+    const now_ms = node.cluster.manual_clock.clock().nowRealtimeMs();
     const group_statuses = [_]metadata_table_manager.GroupStatusReport{
-        makeGroupStatus(group_id, doc_count, disk_bytes),
+        makeGroupStatus(group_id, doc_count, disk_bytes, now_ms),
     };
     try reportHealthyStoreStatuses(node, group_statuses[0..]);
 }
@@ -2628,9 +2630,10 @@ fn reportMergeCandidateStatuses(
     donor_doc_count: u64,
     donor_disk_bytes: u64,
 ) !void {
+    const now_ms = node.cluster.manual_clock.clock().nowRealtimeMs();
     const group_statuses = [_]metadata_table_manager.GroupStatusReport{
-        makeGroupStatus(receiver_group_id, receiver_doc_count, receiver_disk_bytes),
-        makeGroupStatus(donor_group_id, donor_doc_count, donor_disk_bytes),
+        makeGroupStatus(receiver_group_id, receiver_doc_count, receiver_disk_bytes, now_ms),
+        makeGroupStatus(donor_group_id, donor_doc_count, donor_disk_bytes, now_ms),
     };
     try reportHealthyStoreStatuses(node, group_statuses[0..]);
 }
@@ -4980,10 +4983,6 @@ fn bootstrapDesiredLoop(
 ) !void {
     try loop.stateRef().syncProjected(node);
     try loop.stateRef().seedDesiredFromProjected();
-}
-
-fn currentGroupStatusTimestampMs() u64 {
-    return platform_clock.Clock.real().nowRealtimeMs();
 }
 
 fn metadataBlackholeEndpoints() []const peer_resolver.PeerEndpoint {
