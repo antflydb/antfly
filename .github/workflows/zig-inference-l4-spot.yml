@@ -246,6 +246,14 @@ jobs:
             run_case env \
               ANTFLY_INFERENCE_PREFERRED_BACKEND=cuda \
               ANTFLY_INFERENCE_REQUIRE_SELECTED_BACKEND=cuda \
+              ANTFLY_INFERENCE_FLORENCE_DEBUG_STATS=1 \
+              uv run --project e2e/inference pytest -q -s \
+              e2e/inference/test_read.py::test_read_florence_model_answers_text
+            run_case env \
+              ANTFLY_INFERENCE_PREFERRED_BACKEND=cuda \
+              ANTFLY_INFERENCE_REQUIRE_SELECTED_BACKEND=cuda \
+              ANTFLY_INFERENCE_FLORENCE_DEBUG_STATS=1 \
+              ANTFLY_INFERENCE_FLORENCE_DISABLE_KV_CACHE=1 \
               uv run --project e2e/inference pytest -q -s \
               e2e/inference/test_read.py::test_read_florence_model_answers_text
             exit "$failures"

@@ -260,6 +260,7 @@ def test_read_florence_model_answers_text(api):
         max_tokens=64,
         require_runtime_support=True,
     )
+    print(f"florence_response={resp!r}")
     results = resp["data"]
     assert len(results) == 1
     _assert_read_result_shape(results[0])
