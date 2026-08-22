@@ -23,6 +23,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
+from .conftest import FIRST_USE_REQUEST_TIMEOUT
 from .helpers import TINY_PNG_URI, make_wav_b64
 from .models import (
     default_generator_model_name,
@@ -175,6 +176,9 @@ def test_generate_response_format_json_object(api):
         max_tokens=4,
         chat_template_kwargs={"enable_thinking": False},
         response_format={"type": "json_object"},
+        # The first generator request imports the model and initializes the
+        # native backend. Keep that bounded separately from steady requests.
+        request_timeout=FIRST_USE_REQUEST_TIMEOUT,
     )
 
     choice = _first_choice(resp)
@@ -388,16 +392,16 @@ def test_multimodal_generation(api):
         ],
     }]
 
-    r = api.post("/generate", json={
-        "model": model,
-        "messages": messages,
+    resp = api.generate(
+        messages,
+        model=model,
         # Projector execution and the first decoded content are the contract.
-        # Keep the CPU-only release smoke below the request deadline.
-        "max_tokens": 2,
-        "chat_template_kwargs": {"enable_thinking": False},
-    })
-    r.raise_for_status()
-    resp = r.json()
+        max_tokens=2,
+        chat_template_kwargs={"enable_thinking": False},
+        # Vision/projector initialization is another first-use path. It may be
+        # slower than a warm decode but must still finish within a hard bound.
+        request_timeout=FIRST_USE_REQUEST_TIMEOUT,
+    )
     content = _message_content(resp)
     assert content, f"No multimodal generated content in response: {resp}"
 
@@ -424,19 +428,18 @@ def test_multimodal_audio_generation(api):
         ],
     }]
 
-    response = api.post("/generate", json={
-        "model": model,
-        "messages": messages,
-        "max_tokens": 8,
-        "chat_template_kwargs": {"enable_thinking": False},
-    })
-    assert response.status_code == 200, (
-        "shipped Gemma decoder/projector failed audio inference: "
-        f"{response.status_code} {response.text[:2000]}"
+    response = api.generate(
+        messages,
+        model=model,
+        max_tokens=8,
+        chat_template_kwargs={"enable_thinking": False},
+        # Audio initializes a distinct projector path after vision. Keep the
+        # single request bounded without timing out and overlapping its work.
+        request_timeout=FIRST_USE_REQUEST_TIMEOUT,
     )
-    resp = response.json()
-    content = _message_content(resp)
-    assert content, f"No audio-conditioned generated content in response: {resp}"
+    assert _message_content(response), (
+        f"No multimodal audio content in response: {response}"
+    )
 
 
 def test_generate_rejects_tool_choice_without_tools(api):

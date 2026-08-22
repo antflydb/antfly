@@ -21,7 +21,7 @@ import time
 import pytest
 import requests
 
-from helpers import json_doc, query_hits_total_value, upsert, wait_until
+from helpers import assert_created_index, json_doc, query_hits_total_value, upsert, wait_until
 
 
 pytestmark = pytest.mark.reuse_antfly_process
@@ -466,7 +466,7 @@ def test_stateful_graph_neighbors_traverse_and_shortest_path(backup_api):
     created = _create_stateful_table(backup_api, table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         _create_index(
             backup_api,
             table_name,
@@ -479,8 +479,9 @@ def test_stateful_graph_neighbors_traverse_and_shortest_path(backup_api):
                     {"name": "related"},
                 ],
             },
-        )
-        == {}
+        ),
+        "graph_idx",
+        'graph',
     )
 
     batch = _batch_write_stateful(
@@ -698,7 +699,7 @@ def test_serverless_graph_pattern_two_hop_and_documents(serverless_api):
 def test_multi_batch_graph_push_preserves_boundary_error_and_existing_edges(backup_api):
     table_name = f"graph_transform_boundary_{time.time_ns()}"
     _create_stateful_table(backup_api, table_name, num_shards=1)
-    assert (
+    assert_created_index(
         _create_index(
             backup_api,
             table_name,
@@ -708,8 +709,9 @@ def test_multi_batch_graph_push_preserves_boundary_error_and_existing_edges(back
                 "type": "graph",
                 "edge_types": [{"name": "knows"}],
             },
-        )
-        == {}
+        ),
+        "graph_idx",
+        'graph',
     )
     seeded = _batch_write_stateful(
         backup_api,
@@ -808,7 +810,7 @@ def test_stateful_graph_field_edges_extract_and_update(backup_api):
     created = _create_stateful_table(backup_api, table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         _create_index(
             backup_api,
             table_name,
@@ -824,8 +826,9 @@ def test_stateful_graph_field_edges_extract_and_update(backup_api):
                     }
                 ],
             },
-        )
-        == {}
+        ),
+        "hierarchy",
+        'graph',
     )
 
     batch = _batch_write_stateful(
@@ -910,7 +913,7 @@ def test_stateful_graph_pattern_two_hop_and_documents(backup_api):
     created = _create_stateful_table(backup_api, table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         _create_index(
             backup_api,
             table_name,
@@ -920,8 +923,9 @@ def test_stateful_graph_pattern_two_hop_and_documents(backup_api):
                 "type": "graph",
                 "edge_types": [{"name": "knows"}],
             },
-        )
-        == {}
+        ),
+        "graph_idx",
+        'graph',
     )
 
     batch = _batch_write_stateful(
@@ -1004,7 +1008,7 @@ def test_stateful_graph_pattern_variable_length_and_cycle(backup_api):
     created = _create_stateful_table(backup_api, table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         _create_index(
             backup_api,
             table_name,
@@ -1014,8 +1018,9 @@ def test_stateful_graph_pattern_variable_length_and_cycle(backup_api):
                 "type": "graph",
                 "edge_types": [{"name": "knows"}],
             },
-        )
-        == {}
+        ),
+        "graph_idx",
+        'graph',
     )
 
     batch = backup_api.batch_write(
@@ -1109,7 +1114,7 @@ def test_stateful_graph_pattern_diamond_and_edge_type_filter(backup_api):
     created = _create_stateful_table(backup_api, table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         _create_index(
             backup_api,
             table_name,
@@ -1119,8 +1124,9 @@ def test_stateful_graph_pattern_diamond_and_edge_type_filter(backup_api):
                 "type": "graph",
                 "edge_types": [{"name": "knows"}, {"name": "follows"}],
             },
-        )
-        == {}
+        ),
+        "graph_idx",
+        'graph',
     )
 
     batch = wait_until(
@@ -1248,7 +1254,7 @@ def test_stateful_graph_pattern_max_results_limit(backup_api):
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         _create_index(
             backup_api,
             table_name,
@@ -1258,8 +1264,9 @@ def test_stateful_graph_pattern_max_results_limit(backup_api):
                 "type": "graph",
                 "edge_types": [{"name": "knows"}],
             },
-        )
-        == {}
+        ),
+        "graph_idx",
+        'graph',
     )
 
     batch = _batch_write_stateful(

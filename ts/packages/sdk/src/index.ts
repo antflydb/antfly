@@ -43,8 +43,10 @@ export {
   type QueryExecutionOptions,
   type QueryTemporarilyUnavailableCode,
   QueryTemporarilyUnavailableError,
+  type IndexOperations,
   type RestoreOptions,
   StorageReadTemporarilyUnavailableError,
+  StorageResourceExhaustedError,
 } from "./client.js";
 export {
   InferenceAPIError,
@@ -218,6 +220,12 @@ export type {
   GraphQueryType,
   GraphResultNode,
   // Index types
+  CreateIndexRequest,
+  CreateFullTextIndexRequest,
+  CreateEmbeddingsIndexRequest,
+  CreateGraphIndexRequest,
+  CreateAlgebraicIndexRequest,
+  CreatedIndex,
   IndexConfig,
   IndexStatus,
   IndexType,

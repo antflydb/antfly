@@ -33,6 +33,346 @@ pub const Stats = struct {
     malloc_zone_bytes: u64 = 0,
 };
 
+pub const EnvelopeSource = enum {
+    cgroup_v2,
+    cgroup_v1,
+    host,
+    unavailable,
+};
+
+pub const Envelope = struct {
+    limit_bytes: u64 = 0,
+    source: EnvelopeSource = .unavailable,
+};
+
+const CgroupVersion = enum { v1, v2 };
+
+const CgroupPaths = struct {
+    v2: ?[]const u8 = null,
+    v1_memory: ?[]const u8 = null,
+};
+
+const CgroupMount = struct {
+    root_storage: [std.fs.max_path_bytes]u8 = undefined,
+    root_len: usize = 0,
+    mount_point_storage: [std.fs.max_path_bytes]u8 = undefined,
+    mount_point_len: usize = 0,
+
+    fn root(self: *const CgroupMount) []const u8 {
+        return self.root_storage[0..self.root_len];
+    }
+
+    fn mountPoint(self: *const CgroupMount) []const u8 {
+        return self.mount_point_storage[0..self.mount_point_len];
+    }
+
+    fn valid(self: *const CgroupMount) bool {
+        return self.root_len != 0 and self.mount_point_len != 0;
+    }
+};
+
+const CgroupMounts = struct {
+    v2: CgroupMount = .{},
+    v1_memory: CgroupMount = .{},
+};
+
+/// Resolve the finite physical envelope visible to this process. Linux walks
+/// the process's actual cgroup leaf and every ancestor, including noncanonical
+/// and subtree mounts; a host fallback is used only when no finite controller
+/// limit is visible.
+pub fn systemEnvelope() Envelope {
+    if (builtin.os.tag == .linux) {
+        if (linuxCgroupEnvelope()) |envelope| return envelope;
+    }
+    const total = std.process.totalSystemMemory() catch return .{};
+    if (total == 0) return .{};
+    return .{ .limit_bytes = total, .source = .host };
+}
+
+fn linuxCgroupEnvelope() ?Envelope {
+    var cgroup_buffer: [4096]u8 = undefined;
+    const cgroup_bytes = readSmallLinuxFile("/proc/self/cgroup", &cgroup_buffer) orelse
+        return null;
+    const paths = parseCgroupPaths(cgroup_bytes);
+
+    if (paths.v2) |path| {
+        const probe = readCgroupHierarchyLimit(
+            "/sys/fs/cgroup",
+            "/",
+            path,
+            "memory.max",
+            .v2,
+        );
+        if (probe.leaf_present) {
+            if (probe.limit_bytes) |limit|
+                return .{ .limit_bytes = limit, .source = .cgroup_v2 };
+            return null;
+        }
+    }
+    if (paths.v1_memory) |path| {
+        const probe = readCgroupHierarchyLimit(
+            "/sys/fs/cgroup/memory",
+            "/",
+            path,
+            "memory.limit_in_bytes",
+            .v1,
+        );
+        if (probe.leaf_present) {
+            if (probe.limit_bytes) |limit|
+                return .{ .limit_bytes = limit, .source = .cgroup_v1 };
+            return null;
+        }
+    }
+    return probeCgroupMountLimits(paths);
+}
+
+fn controllerListContains(controllers: []const u8, expected: []const u8) bool {
+    var it = std.mem.splitScalar(u8, controllers, ',');
+    while (it.next()) |controller| {
+        if (std.mem.eql(u8, controller, expected)) return true;
+    }
+    return false;
+}
+
+fn isSafeAbsoluteCgroupPath(path: []const u8) bool {
+    if (path.len == 0 or path[0] != '/' or std.mem.indexOfScalar(u8, path, 0) != null)
+        return false;
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| {
+        if (std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, ".."))
+            return false;
+    }
+    return true;
+}
+
+fn parseCgroupPaths(bytes: []const u8) CgroupPaths {
+    var result = CgroupPaths{};
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        const first = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const second = std.mem.indexOfScalarPos(u8, line, first + 1, ':') orelse continue;
+        const hierarchy = line[0..first];
+        const controllers = line[first + 1 .. second];
+        const path = line[second + 1 ..];
+        if (!isSafeAbsoluteCgroupPath(path)) continue;
+        if (std.mem.eql(u8, hierarchy, "0") and controllers.len == 0) {
+            result.v2 = path;
+        } else if (controllerListContains(controllers, "memory")) {
+            result.v1_memory = path;
+        }
+    }
+    return result;
+}
+
+const LinuxLimit = struct {
+    present: bool = false,
+    finite_bytes: ?u64 = null,
+};
+
+fn readLinuxLimit(path: []const u8, version: CgroupVersion) LinuxLimit {
+    var buffer: [128]u8 = undefined;
+    const bytes = readSmallLinuxFile(path, &buffer) orelse return .{};
+    const raw = std.mem.trim(u8, bytes, " \t\r\n");
+    if (raw.len == 0 or std.mem.eql(u8, raw, "max")) return .{ .present = true };
+    const value = std.fmt.parseUnsigned(u64, raw, 10) catch return .{ .present = true };
+    if (value == 0) return .{ .present = true };
+    if (version == .v1 and value >= std.math.maxInt(u64) / 2)
+        return .{ .present = true };
+    return .{ .present = true, .finite_bytes = value };
+}
+
+fn decodeMountInfoPath(destination: []u8, encoded: []const u8) ?usize {
+    if (encoded.len == 0 or encoded[0] != '/') return null;
+    var source_index: usize = 0;
+    var destination_index: usize = 0;
+    while (source_index < encoded.len) {
+        if (destination_index == destination.len) return null;
+        if (encoded[source_index] == '\\' and source_index + 3 < encoded.len) {
+            const digits = encoded[source_index + 1 .. source_index + 4];
+            if (digits[0] >= '0' and digits[0] <= '7' and
+                digits[1] >= '0' and digits[1] <= '7' and
+                digits[2] >= '0' and digits[2] <= '7')
+            {
+                destination[destination_index] = @intCast(
+                    @as(u16, digits[0] - '0') * 64 +
+                        @as(u16, digits[1] - '0') * 8 +
+                        @as(u16, digits[2] - '0'),
+                );
+                source_index += 4;
+                destination_index += 1;
+                continue;
+            }
+        }
+        destination[destination_index] = encoded[source_index];
+        source_index += 1;
+        destination_index += 1;
+    }
+    const decoded = destination[0..destination_index];
+    var components = std.mem.splitScalar(u8, decoded, '/');
+    while (components.next()) |component| {
+        if (std.mem.eql(u8, component, "..")) return null;
+    }
+    return destination_index;
+}
+
+fn parseCgroupMountInfoLine(line: []const u8, mounts: *CgroupMounts) void {
+    const separator = std.mem.indexOf(u8, line, " - ") orelse return;
+    var before = std.mem.tokenizeScalar(u8, line[0..separator], ' ');
+    _ = before.next() orelse return;
+    _ = before.next() orelse return;
+    _ = before.next() orelse return;
+    const encoded_root = before.next() orelse return;
+    const encoded_mount_point = before.next() orelse return;
+
+    var after = std.mem.tokenizeScalar(u8, line[separator + 3 ..], ' ');
+    const filesystem_type = after.next() orelse return;
+    _ = after.next() orelse return;
+    const super_options = after.next() orelse "";
+    const is_v2 = std.mem.eql(u8, filesystem_type, "cgroup2");
+    const is_v1_memory = std.mem.eql(u8, filesystem_type, "cgroup") and
+        controllerListContains(super_options, "memory");
+    if (!is_v2 and !is_v1_memory) return;
+
+    const mount = if (is_v2) &mounts.v2 else &mounts.v1_memory;
+    mount.root_len = decodeMountInfoPath(&mount.root_storage, encoded_root) orelse return;
+    mount.mount_point_len = decodeMountInfoPath(
+        &mount.mount_point_storage,
+        encoded_mount_point,
+    ) orelse return;
+}
+
+fn cgroupPathRelativeToMount(process_path: []const u8, mount_root: []const u8) ?[]const u8 {
+    if (!isSafeAbsoluteCgroupPath(process_path) or !isSafeAbsoluteCgroupPath(mount_root))
+        return null;
+    if (std.mem.eql(u8, process_path, "/")) return process_path;
+    if (std.mem.eql(u8, mount_root, "/")) return process_path;
+    if (std.mem.eql(u8, process_path, mount_root)) return "/";
+    if (std.mem.startsWith(u8, process_path, mount_root) and
+        process_path.len > mount_root.len and process_path[mount_root.len] == '/')
+        return process_path[mount_root.len..];
+    return process_path;
+}
+
+fn cgroupDirectoryPath(buffer: []u8, mount_point: []const u8, relative: []const u8) ?[]u8 {
+    if (!isSafeAbsoluteCgroupPath(mount_point) or !isSafeAbsoluteCgroupPath(relative))
+        return null;
+    const trimmed_mount = std.mem.trimEnd(u8, mount_point, "/");
+    if (trimmed_mount.len == 0) return std.fmt.bufPrint(buffer, "{s}", .{relative}) catch null;
+    return if (std.mem.eql(u8, relative, "/"))
+        std.fmt.bufPrint(buffer, "{s}", .{trimmed_mount}) catch null
+    else
+        std.fmt.bufPrint(buffer, "{s}{s}", .{ trimmed_mount, relative }) catch null;
+}
+
+const CgroupLimitProbe = struct {
+    limit_bytes: ?u64 = null,
+    leaf_present: bool = false,
+};
+
+fn readCgroupHierarchyLimit(
+    mount_point: []const u8,
+    mount_root: []const u8,
+    process_path: []const u8,
+    limit_filename: []const u8,
+    version: CgroupVersion,
+) CgroupLimitProbe {
+    const relative = cgroupPathRelativeToMount(process_path, mount_root) orelse return .{};
+    var directory_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var directory = cgroupDirectoryPath(&directory_buffer, mount_point, relative) orelse return .{};
+    const leaf_len = directory.len;
+    const hierarchy_root_len = @max(@as(usize, 1), std.mem.trimEnd(u8, mount_point, "/").len);
+    var result = CgroupLimitProbe{};
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    while (directory.len >= hierarchy_root_len) {
+        const path = std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ directory, limit_filename }) catch break;
+        const limit = readLinuxLimit(path, version);
+        if (directory.len == leaf_len) result.leaf_present = limit.present;
+        if (limit.finite_bytes) |value| {
+            result.limit_bytes = if (result.limit_bytes) |existing| @min(existing, value) else value;
+        }
+        if (directory.len == hierarchy_root_len) break;
+        const parent = std.fs.path.dirname(directory) orelse break;
+        if (parent.len < hierarchy_root_len) break;
+        directory = directory_buffer[0..parent.len];
+    }
+    return result;
+}
+
+fn probeCgroupMountInfoLine(line: []const u8, paths: CgroupPaths, best: *?Envelope) void {
+    var mounts = CgroupMounts{};
+    parseCgroupMountInfoLine(line, &mounts);
+    if (paths.v2) |path| {
+        if (mounts.v2.valid()) {
+            const probe = readCgroupHierarchyLimit(
+                mounts.v2.mountPoint(),
+                mounts.v2.root(),
+                path,
+                "memory.max",
+                .v2,
+            );
+            if (probe.leaf_present) if (probe.limit_bytes) |limit| {
+                if (best.* == null or limit < best.*.?.limit_bytes)
+                    best.* = .{ .limit_bytes = limit, .source = .cgroup_v2 };
+            };
+        }
+    }
+    if (paths.v1_memory) |path| {
+        if (mounts.v1_memory.valid()) {
+            const probe = readCgroupHierarchyLimit(
+                mounts.v1_memory.mountPoint(),
+                mounts.v1_memory.root(),
+                path,
+                "memory.limit_in_bytes",
+                .v1,
+            );
+            if (probe.leaf_present) if (probe.limit_bytes) |limit| {
+                if (best.* == null or limit < best.*.?.limit_bytes)
+                    best.* = .{ .limit_bytes = limit, .source = .cgroup_v1 };
+            };
+        }
+    }
+}
+
+fn probeCgroupMountLimits(paths: CgroupPaths) ?Envelope {
+    if (builtin.os.tag != .linux) return null;
+    const fd = std.posix.openat(
+        std.posix.AT.FDCWD,
+        "/proc/self/mountinfo",
+        .{ .ACCMODE = .RDONLY, .CLOEXEC = true },
+        0,
+    ) catch return null;
+    defer _ = std.posix.system.close(fd);
+
+    var best: ?Envelope = null;
+    var read_buffer: [4096]u8 = undefined;
+    var line_buffer: [8192]u8 = undefined;
+    var line_len: usize = 0;
+    var discard_line = false;
+    while (true) {
+        const count = std.posix.read(fd, &read_buffer) catch return best;
+        if (count == 0) break;
+        for (read_buffer[0..count]) |byte| {
+            if (byte == '\n') {
+                if (!discard_line and line_len != 0)
+                    probeCgroupMountInfoLine(line_buffer[0..line_len], paths, &best);
+                line_len = 0;
+                discard_line = false;
+            } else if (!discard_line) {
+                if (line_len == line_buffer.len) {
+                    line_len = 0;
+                    discard_line = true;
+                } else {
+                    line_buffer[line_len] = byte;
+                    line_len += 1;
+                }
+            }
+        }
+    }
+    if (!discard_line and line_len != 0)
+        probeCgroupMountInfoLine(line_buffer[0..line_len], paths, &best);
+    return best;
+}
+
 /// Memory that contributes to process pressure rather than clean file-backed
 /// mappings. RSS is still reported separately for diagnostics, but durable
 /// stores can map large files whose resident clean pages are reclaimable.
@@ -145,6 +485,26 @@ fn linuxStatusValueBytes(path: []const u8, key: []const u8) ?u64 {
     var buf: [64 * 1024]u8 = undefined;
     const contents = readProcFile(path, &buf) orelse return null;
     return parseProcStatusBytes(contents, key);
+}
+
+fn readSmallLinuxFile(path: []const u8, buffer: []u8) ?[]const u8 {
+    if (builtin.os.tag != .linux or buffer.len == 0) return null;
+    const fd = std.posix.openat(
+        std.posix.AT.FDCWD,
+        path,
+        .{ .ACCMODE = .RDONLY, .CLOEXEC = true },
+        0,
+    ) catch return null;
+    defer _ = std.posix.system.close(fd);
+
+    var used: usize = 0;
+    while (used < buffer.len) {
+        const count = std.posix.read(fd, buffer[used..]) catch return null;
+        if (count == 0) break;
+        used += count;
+    }
+    if (used == 0) return null;
+    return buffer[0..used];
 }
 
 fn readProcFile(path: []const u8, buf: []u8) ?[]const u8 {
@@ -279,3 +639,49 @@ const darwin = if (builtin.os.tag == .macos) struct {
     extern "c" fn malloc_default_zone() ?*anyopaque;
     extern "c" fn malloc_zone_statistics(zone: *anyopaque, stats: *malloc_statistics_t) void;
 } else struct {};
+
+test "cgroup paths reject traversal while preserving dotted names" {
+    const paths = parseCgroupPaths(
+        \\0::/system.slice/antfly.service
+        \\7:cpu,cpuacct:/system.slice/antfly.service
+        \\6:memory:/production/antfly
+        \\
+    );
+    try std.testing.expectEqualStrings("/system.slice/antfly.service", paths.v2.?);
+    try std.testing.expectEqualStrings("/production/antfly", paths.v1_memory.?);
+    try std.testing.expectEqualStrings(
+        "/system.slice/worker..scope",
+        parseCgroupPaths("0::/system.slice/worker..scope\n").v2.?,
+    );
+    try std.testing.expect(parseCgroupPaths("0::/safe/../escape\n").v2 == null);
+}
+
+test "cgroup mountinfo resolves roots and escaped paths" {
+    var mounts = CgroupMounts{};
+    parseCgroupMountInfoLine(
+        "36 29 0:32 /kubepods.slice /run/antfly\\040cg rw,nosuid,nodev - cgroup2 cgroup rw",
+        &mounts,
+    );
+    parseCgroupMountInfoLine(
+        "44 29 0:40 /production /run/cgroup/memory rw - cgroup memory rw,memory",
+        &mounts,
+    );
+
+    try std.testing.expect(mounts.v2.valid());
+    try std.testing.expectEqualStrings("/kubepods.slice", mounts.v2.root());
+    try std.testing.expectEqualStrings("/run/antfly cg", mounts.v2.mountPoint());
+    try std.testing.expect(mounts.v1_memory.valid());
+    try std.testing.expectEqualStrings("/production", mounts.v1_memory.root());
+    try std.testing.expectEqualStrings("/run/cgroup/memory", mounts.v1_memory.mountPoint());
+    try std.testing.expectEqualStrings(
+        "/pod-a/container-b",
+        cgroupPathRelativeToMount(
+            "/kubepods.slice/pod-a/container-b",
+            mounts.v2.root(),
+        ).?,
+    );
+    try std.testing.expectEqualStrings(
+        "/",
+        cgroupPathRelativeToMount("/", mounts.v2.root()).?,
+    );
+}

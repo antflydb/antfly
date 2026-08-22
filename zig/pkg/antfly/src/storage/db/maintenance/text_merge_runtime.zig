@@ -58,6 +58,10 @@ pub var test_finish_admission_failures_remaining: std.atomic.Value(u32) = .init(
 pub var test_wait_for_fd_admission: std.atomic.Value(bool) = .init(false);
 pub var test_fd_admission_entered: std.atomic.Value(bool) = .init(false);
 pub var test_fd_admission_canceled: std.atomic.Value(bool) = .init(false);
+pub var test_wait_for_producer_shutdown: std.atomic.Value(bool) = .init(false);
+pub var test_producer_shutdown_wait_entered: std.atomic.Value(bool) = .init(false);
+/// Test-only outcome: 1 means shutdown wake, 2 means ordinary deadline.
+pub var test_producer_shutdown_wait_outcome: std.atomic.Value(u8) = .init(0);
 
 pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     config: Config,
@@ -492,6 +496,23 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         segment_count: u64,
         byte_count: u64,
     ) !ProducerPermit {
+        if (builtin.is_test and test_wait_for_producer_shutdown.swap(false, .acq_rel)) {
+            test_producer_shutdown_wait_entered.store(true, .release);
+            const shutdown_wait_started_ns = self.backpressureNowNs();
+            while (!self.isAdmissionClosed()) {
+                const wait_epoch = self.producer_wait_epoch.load(.acquire);
+                if (!try self.waitForProducerAdmissionChange(wait_epoch, shutdown_wait_started_ns)) {
+                    if (self.isAdmissionClosed()) {
+                        test_producer_shutdown_wait_outcome.store(1, .release);
+                        return error.TextMergeRuntimeShutdown;
+                    }
+                    test_producer_shutdown_wait_outcome.store(2, .release);
+                    return error.TextMergeBackpressureTimeout;
+                }
+            }
+            test_producer_shutdown_wait_outcome.store(1, .release);
+            return error.TextMergeRuntimeShutdown;
+        }
         if ((segment_count == 0 and byte_count == 0) or !self.config.enabled or
             (self.config.max_pending_segments == 0 and self.config.max_pending_bytes == 0))
         {

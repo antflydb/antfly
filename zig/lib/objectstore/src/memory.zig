@@ -33,9 +33,25 @@ const StoredObject = struct {
 pub const MemoryClient = struct {
     alloc: Allocator,
     buckets: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(StoredObject)) = .empty,
+    operation_count: std.atomic.Value(u64) = .init(0),
 
     pub fn init(alloc: Allocator) MemoryClient {
         return .{ .alloc = alloc };
+    }
+
+    /// Test-visible transport operation count. Counting at the client boundary
+    /// includes failed conditional requests and makes cleanup budget assertions
+    /// verify actual backend work rather than only local arithmetic.
+    pub fn operationCount(self: *const MemoryClient) u64 {
+        return self.operation_count.load(.monotonic);
+    }
+
+    pub fn resetOperationCount(self: *MemoryClient) void {
+        self.operation_count.store(0, .monotonic);
+    }
+
+    fn recordOperation(self: *MemoryClient) void {
+        _ = self.operation_count.fetchAdd(1, .monotonic);
     }
 
     pub fn deinit(self: *MemoryClient) void {
@@ -63,10 +79,12 @@ pub const MemoryClient = struct {
     }
 
     fn bucketExists(self: *MemoryClient, bucket: []const u8) bool {
+        self.recordOperation();
         return self.buckets.contains(bucket);
     }
 
     fn makeBucket(self: *MemoryClient, bucket: []const u8) !void {
+        self.recordOperation();
         _ = try self.ensureBucket(bucket);
     }
 
@@ -79,6 +97,7 @@ pub const MemoryClient = struct {
     }
 
     fn putObject(self: *MemoryClient, alloc: Allocator, bucket: []const u8, key: []const u8, body: []const u8, opts: types.PutOptions) !types.PutResult {
+        self.recordOperation();
         var object_map = try self.ensureBucket(bucket);
 
         const existing = object_map.getPtr(key);
@@ -121,6 +140,7 @@ pub const MemoryClient = struct {
     }
 
     fn getObject(self: *MemoryClient, alloc: Allocator, bucket: []const u8, key: []const u8, opts: types.GetOptions) !types.GetResult {
+        self.recordOperation();
         _ = opts.version_id;
         const object_map = self.buckets.getPtr(bucket) orelse return error.FileNotFound;
         const object = object_map.getPtr(key) orelse return error.FileNotFound;
@@ -159,6 +179,7 @@ pub const MemoryClient = struct {
     }
 
     fn getObjectAttributes(self: *MemoryClient, alloc: Allocator, bucket: []const u8, key: []const u8) !types.ObjectAttributes {
+        self.recordOperation();
         const object_map = self.buckets.getPtr(bucket) orelse return error.FileNotFound;
         const object = object_map.getPtr(key) orelse return error.FileNotFound;
         const parts = try alloc.alloc(types.ObjectPart, 1);
@@ -177,6 +198,7 @@ pub const MemoryClient = struct {
     }
 
     fn statObject(self: *MemoryClient, alloc: Allocator, bucket: []const u8, key: []const u8) !types.ObjectMetadata {
+        self.recordOperation();
         const object_map = self.buckets.getPtr(bucket) orelse return error.FileNotFound;
         const object = object_map.getPtr(key) orelse return error.FileNotFound;
         return .{
@@ -193,6 +215,7 @@ pub const MemoryClient = struct {
     }
 
     fn deleteObject(self: *MemoryClient, bucket: []const u8, key: []const u8, opts: types.DeleteOptions) !void {
+        self.recordOperation();
         _ = opts.version_id;
         const object_map = self.buckets.getPtr(bucket) orelse return error.FileNotFound;
         const object = object_map.getPtr(key) orelse return error.FileNotFound;
@@ -205,6 +228,7 @@ pub const MemoryClient = struct {
     }
 
     fn listObjects(self: *MemoryClient, alloc: Allocator, bucket: []const u8, opts: types.ListOptions) !types.ListResult {
+        self.recordOperation();
         const object_map = self.buckets.getPtr(bucket) orelse {
             return .{
                 .entries = try alloc.alloc(types.ListEntry, 0),

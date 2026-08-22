@@ -1,0 +1,66 @@
+name: Rust SDK CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rs/crates/sdk/**"
+      - "rs/Cargo.toml"
+      - "rs/Cargo.lock"
+      - "openapi.yaml"
+      - "specs/openapi/**"
+      - ".github/workflows/rust-sdk.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "rs/crates/sdk/**"
+      - "rs/Cargo.toml"
+      - "rs/Cargo.lock"
+      - "openapi.yaml"
+      - "specs/openapi/**"
+      - ".github/workflows/rust-sdk.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  rust-sdk:
+    runs-on: arc-antfly-standard
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: rs
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install native build dependencies
+        shell: bash
+        run: |
+          if command -v cc >/dev/null 2>&1 && command -v cmake >/dev/null 2>&1 && command -v pkg-config >/dev/null 2>&1; then
+            exit 0
+          fi
+          sudo_cmd=""
+          if command -v sudo >/dev/null 2>&1; then
+            sudo_cmd="sudo"
+          fi
+          $sudo_cmd apt-get update
+          $sudo_cmd apt-get install --yes --no-install-recommends build-essential cmake pkg-config
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Build and test SDK
+        run: cargo test --locked --package antfly-sdk

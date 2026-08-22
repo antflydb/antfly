@@ -129,6 +129,7 @@ const indexInfo = await client.indexes.get('products', 'price_index');
 
 // Create an index
 await client.indexes.create('products', 'embeddings_index', {
+  type: 'embeddings',
   field: 'description',
   dimension: 768,
   embedder: {

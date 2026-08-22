@@ -19,6 +19,7 @@ const db_types = @import("../storage/db/types.zig");
 const algebraic = @import("../storage/db/algebraic/mod.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const coverage_policy_mod = @import("coverage_policy.zig");
+const index_manager = @import("../storage/db/catalog/index_manager.zig");
 
 pub fn parseIndexKind(value: std.json.Value) !db_types.IndexKind {
     if (value != .object) return .full_text;
@@ -82,6 +83,37 @@ pub fn validateIndexConfigWithOptions(
         }) catch return error.InvalidCreateTableRequest;
         defer parsed.deinit();
         algebraic.index.validateConfig(parsed.value) catch return error.InvalidCreateTableRequest;
+    } else if (cfg.kind == .graph) {
+        try validateGraphConfig(alloc, cfg.config_json);
+    }
+}
+
+fn validateGraphConfig(alloc: std.mem.Allocator, config_json: []const u8) !void {
+    index_manager.validateGraphConfig(alloc, config_json) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidCreateTableRequest,
+    };
+}
+
+/// Validate the runtime semantics of every graph index in a table definition.
+/// This is intentionally graph-only: managed embedding normalization may need
+/// provider I/O and algebraic validation needs the expanded table schema, while
+/// graph parsing is pure and must complete before any catalog mutation.
+pub fn validateGraphIndexesJson(alloc: std.mem.Allocator, indexes_json: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer parsed.deinit();
+    const indexes = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidCreateTableRequest,
+    };
+
+    var it = indexes.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) return error.InvalidCreateTableRequest;
+        if (try parseIndexKind(entry.value_ptr.*) != .graph) continue;
+        const config_json = try extractIndexConfigJson(alloc, entry.key_ptr.*, entry.value_ptr.*);
+        defer alloc.free(config_json);
+        try validateGraphConfig(alloc, config_json);
     }
 }
 
@@ -181,4 +213,42 @@ pub fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u
     const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
     defer alloc.free(escaped);
     try out.appendSlice(alloc, escaped);
+}
+
+test "graph index validation runs the runtime parser before catalog admission" {
+    const alloc = std.testing.allocator;
+
+    try validateIndexConfig(
+        alloc,
+        "relations_graph",
+        "{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"relations\"}}}",
+    );
+
+    const invalid_configs = [_][]const u8{
+        "{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}",
+        "{\"type\":\"graph\",\"edge_types\":[{\"name\":\"mentions\",\"topology\":\"dag\"}]}",
+        "{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"nodes\":{\"source\":\"{{ _doc.value.tenant }}\"}}",
+        "{\"type\":\"graph\",\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"source\":{\"type\":\"document\",\"value\":\"relations\"}}}",
+    };
+    for (invalid_configs) |config| {
+        try std.testing.expectError(
+            error.InvalidCreateTableRequest,
+            validateIndexConfig(alloc, "relations_graph", config),
+        );
+    }
+}
+
+test "table graph validation rejects runtime-invalid configs before catalog admission" {
+    const alloc = std.testing.allocator;
+    try validateGraphIndexesJson(
+        alloc,
+        "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"relations_graph\":{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\"}}}",
+    );
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        validateGraphIndexesJson(
+            alloc,
+            "{\"relations_graph\":{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}}",
+        ),
+    );
 }

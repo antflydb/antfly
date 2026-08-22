@@ -560,6 +560,14 @@ pub const AuthSubject = struct {
     kind: []const u8,
 };
 
+pub const BackupAlreadyExistsConflict = struct {
+    code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+};
+
 pub const BackupInfo = struct {
     /// The backup identifier
     backup_id: []const u8,
@@ -580,6 +588,52 @@ pub const BackupListResponse = struct {
     backups: []const BackupInfo,
     /// Opaque continuation cursor. Omitted when no additional backups remain.
     next_cursor: ?[]const u8 = null,
+};
+
+/// A retryable metadata-availability failure reported before backup side effects begin.
+pub const BackupMetadataUnavailableError = union(enum) {
+    metadata_capability_unavailable_error: MetadataCapabilityUnavailableError,
+    metadata_leader_unavailable_error: MetadataLeaderUnavailableError,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("code") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "metadata_capability_unavailable")) {
+            return .{ .metadata_capability_unavailable_error = try std.json.parseFromValueLeaky(MetadataCapabilityUnavailableError, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "metadata_leader_unavailable")) {
+            return .{ .metadata_leader_unavailable_error = try std.json.parseFromValueLeaky(MetadataLeaderUnavailableError, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .metadata_capability_unavailable_error => |v| try jw.write(v),
+            .metadata_leader_unavailable_error => |v| try jw.write(v),
+        }
+    }
+};
+
+pub const BackupOutcomeAmbiguousConflict = struct {
+    code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+    /// Logical backup ID whose outcome must be inspected before retrying.
+    backup_id: []const u8,
+    /// Opaque artifact generation retained by an ambiguous attempt. This is for reconciliation, not as a replacement logical backup ID.
+    artifact_backup_id: ?[]const u8 = null,
 };
 
 pub const BackupRequest = struct {
@@ -1058,8 +1112,8 @@ pub const CreateTableRequest = struct {
     num_shards: ?i64 = null,
     /// Optional human-readable description of the table and its purpose. Useful for documentation and team collaboration.
     description: ?[]const u8 = null,
-    /// Map of index name to index configuration. Indexes enable different query capabilities: - Full-text indexes for BM25 search - Vector indexes for semantic similarity - Multimodal indexes for images/audio/video You can add multiple indexes to support different query patterns.
-    indexes: ?std.json.ArrayHashMap(antfly_indexes_openapi.IndexConfig) = null,
+    /// Map of index name to create-index configuration. The map key owns the index name; do not repeat `name` inside the configuration. Indexes enable different query capabilities: - Full-text indexes for BM25 search - Vector indexes for semantic similarity - Multimodal indexes for images/audio/video You can add multiple indexes to support different query patterns.
+    indexes: ?std.json.ArrayHashMap(antfly_indexes_openapi.CreateIndexRequest) = null,
     /// Optional schema definition specifying field types, primary key, and TTL configuration. While optional, defining a schema provides type safety, optimized indexing, and better search performance. **Schema Features:** - **Field Types**: Define document structure using JSON Schema with `x-antfly-types` extensions - **Document TTL**: Configure automatic expiration via `ttl_duration` and optional `ttl_field` - **Primary Keys**: Specify unique identifier fields - **Validation**: Enforce schema constraints on writes **TTL Example:** ```json { "ttl_duration": "7d", "ttl_field": "_timestamp", "document_schemas": {...} } ``` See the Table Management documentation for comprehensive TTL configuration and use cases.
     schema: ?antfly_schema_openapi.TableSchema = null,
     /// PostgreSQL CDC replication sources. Streams INSERT/UPDATE/DELETE changes from PostgreSQL tables into this Antfly table via logical replication. Multiple sources can feed into a single table (e.g., `users` + `scores` → Antfly `users`). Each source uses `on_update`/`on_delete` transforms to control how PG events map to Antfly document operations. Requires `wal_level=logical` on the PostgreSQL source.
@@ -1369,7 +1423,16 @@ pub const EdgesResponse = struct {
 pub const Embedding = std.json.Value;
 
 pub const Error = struct {
+    /// Optional stable machine-readable error code for programmatic handling.
+    code: ?[]const u8 = null,
+    /// Legacy human-readable error text.
     @"error": []const u8,
+    /// Human-readable error description when supplied by the endpoint.
+    message: ?[]const u8 = null,
+    /// Whether retrying the operation may succeed without changing the request.
+    retryable: ?bool = null,
+    /// Suggested minimum retry delay in milliseconds.
+    retry_after_ms: ?i32 = null,
 };
 
 pub const ExactSortError = struct {
@@ -2049,6 +2112,27 @@ pub const MergeProfile = struct {
     semantic_hits: ?i64 = null,
     /// Time spent merging results in milliseconds.
     duration_ms: ?i64 = null,
+};
+
+/// The metadata service does not yet provide the consistency capability required by backup.
+pub const MetadataCapabilityUnavailableError = struct {
+    code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
+    @"error": []const u8,
+    message: []const u8,
+    required_capability: []const u8,
+    retryable: bool,
+    retry_after_ms: i32,
+};
+
+/// The request could not establish authority with the current metadata leader.
+pub const MetadataLeaderUnavailableError = struct {
+    code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+    retry_after_ms: i32,
 };
 
 /// Cross-table batch operations in a single atomic transaction. Groups batch operations by table name. All operations across all tables are committed atomically using distributed 2-phase commit (2PC). **Atomicity**: Either all operations across all tables succeed, or none do. This enables use cases like transferring a record from one table to another, or maintaining referential integrity across tables.
@@ -3180,6 +3264,15 @@ pub const StorageMaintenanceCapabilities = struct {
     asynchronous: bool,
 };
 
+/// Actionable retry contract for temporary storage descriptor exhaustion.
+pub const StorageResourceExhaustedError = struct {
+    code: []const u8,
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+    retry_after_ms: i64,
+};
+
 pub const StorageRuntimeStatus = struct {
     engine: []const u8,
     format: ?[]const u8 = null,
@@ -3256,13 +3349,68 @@ pub const TableArtifactEnrichmentList = struct {
     artifacts: []const antfly_indexes_openapi.EnrichmentConfig,
 };
 
+/// A non-retryable table-backup conflict. Ambiguous outcomes include the logical backup ID and, when available, the opaque artifact generation retained for reconciliation.
+pub const TableBackupConflictError = union(enum) {
+    backup_already_exists_conflict: BackupAlreadyExistsConflict,
+    table_catalog_changed_conflict: TableCatalogChangedConflict,
+    backup_outcome_ambiguous_conflict: BackupOutcomeAmbiguousConflict,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("code") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "backup_already_exists")) {
+            return .{ .backup_already_exists_conflict = try std.json.parseFromValueLeaky(BackupAlreadyExistsConflict, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "table_catalog_changed")) {
+            return .{ .table_catalog_changed_conflict = try std.json.parseFromValueLeaky(TableCatalogChangedConflict, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "backup_outcome_ambiguous")) {
+            return .{ .backup_outcome_ambiguous_conflict = try std.json.parseFromValueLeaky(BackupOutcomeAmbiguousConflict, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .backup_already_exists_conflict => |v| try jw.write(v),
+            .table_catalog_changed_conflict => |v| try jw.write(v),
+            .backup_outcome_ambiguous_conflict => |v| try jw.write(v),
+        }
+    }
+};
+
+/// Outcome for one table in a cluster backup. `successful` is the legacy spelling emitted by pre-Zig coordinators; new coordinators emit `completed`. An `ambiguous` outcome includes `error`, `code`, `retryable: false`, `backup_id`, and `artifact_backup_id` so callers can reconcile the retained generation without retrying blindly. Failed and skipped outcomes may include `error`; other fields are omitted when they do not apply.
 pub const TableBackupStatus = struct {
     /// Table name
     name: []const u8,
-    /// Backup status for this table
     status: []const u8,
-    /// Error message if backup failed
+    /// Human-readable failure, skip reason, or reconciliation guidance.
     @"error": ?[]const u8 = null,
+    /// Stable machine-readable code for an ambiguous outcome.
+    code: ?[]const u8 = null,
+    /// False for an ambiguous outcome; inspect the retained attempt before retrying.
+    retryable: ?bool = null,
+    /// Logical per-table backup ID retained by an ambiguous cluster attempt.
+    backup_id: ?[]const u8 = null,
+    /// Opaque artifact generation retained by an ambiguous cluster attempt.
+    artifact_backup_id: ?[]const u8 = null,
+};
+
+pub const TableCatalogChangedConflict = struct {
+    code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
 };
 
 /// Describes an in-progress schema migration. The table serves reads from read_schema while rebuilding full-text indexes for the new schema.

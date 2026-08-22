@@ -345,13 +345,13 @@ def test_unsupported_transform_is_rejected_without_partial_mutation(stateful_api
 
 
 def test_serverless_table_transforms_follow_latest_then_published(serverless_api):
-    def initial_publication() -> dict | None:
+    def initial_snapshot_published() -> dict | None:
         try:
             published = serverless_api.query_published(table_name)
         except requests.HTTPError:
             return None
         doc = _docs_by_id(published).get("doc-a")
-        if doc is None or doc.get("version") != 1:
+        if doc is None or doc.get("version") != 1 or "status" in doc:
             return None
         return published
 
@@ -388,7 +388,11 @@ def test_serverless_table_transforms_follow_latest_then_published(serverless_api
     # the truthful per-request `published` result and assert the user-visible
     # publication outcome instead of requiring this caller to win the race.
     assert isinstance(initial_build.get("published"), bool), initial_build
-    initial_published = wait_until(initial_publication, timeout_s=10.0, interval_s=0.1)
+    initial_published = wait_until(
+        initial_snapshot_published,
+        timeout_s=10.0,
+        interval_s=0.1,
+    )
     assert initial_published is not None, (
         f"initial publication did not become queryable; build_result={initial_build}; "
         f"build_status={serverless_api.table_build_status(table_name)}"

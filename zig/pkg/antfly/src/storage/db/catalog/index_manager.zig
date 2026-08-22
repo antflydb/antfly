@@ -3261,7 +3261,11 @@ pub const IndexManager = struct {
     fn releaseFullTextPendingBytes(self: *IndexManager) void {
         if (self.full_text_pending_bytes_accounted == 0) return;
         if (self.resource_manager) |manager| {
-            manager.releaseBytes(.full_text_pending_segments, self.full_text_pending_bytes_accounted);
+            manager.adjustUsage(
+                .full_text_pending_segments,
+                &self.full_text_pending_bytes_accounted,
+                0,
+            ) catch {};
         }
         self.full_text_pending_bytes_accounted = 0;
     }
@@ -12049,6 +12053,7 @@ pub const IndexManager = struct {
             defer self.alloc.free(planned);
             var reservation = self.reserveTextMergeBuffers(&entry.persistent, snap, planned, .strict) catch |err| switch (err) {
                 error.ResourceBudgetExceeded => if (options.mode == .best_effort) return false else return err,
+                else => return err,
             };
             defer if (reservation) |*active| active.release();
 
@@ -18408,6 +18413,11 @@ fn parseGeneratorChunkerJson(alloc: Allocator, object: std.json.ObjectMap) ![]u8
     return try chunking_types.stringifyAlloc(alloc, cfg);
 }
 
+pub fn validateGraphConfig(alloc: Allocator, raw: []const u8) !void {
+    var config = try parseGraphConfig(alloc, raw);
+    defer config.deinit(alloc);
+}
+
 fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
@@ -18652,15 +18662,22 @@ fn parseGraphShorthandAsset(alloc: Allocator, root: std.json.Value) !?enrichment
     const kind = artifact.object.get("kind") orelse return error.InvalidIndexConfig;
     if (kind != .string or !std.mem.eql(u8, kind.string, "asset")) return error.InvalidIndexConfig;
 
-    const field = if (artifact.object.get("field")) |value| blk: {
-        if (value != .string) return error.InvalidIndexConfig;
-        break :blk value.string;
-    } else "";
-    const template = if (artifact.object.get("template")) |value| blk: {
-        if (value != .string) return error.InvalidIndexConfig;
-        break :blk value.string;
-    } else "";
-    if (field.len == 0 and template.len == 0) return error.InvalidIndexConfig;
+    const source = artifact.object.get("source") orelse return error.InvalidIndexConfig;
+    if (source != .object) return error.InvalidIndexConfig;
+    const source_type = source.object.get("type") orelse return error.InvalidIndexConfig;
+    const source_value = source.object.get("value") orelse return error.InvalidIndexConfig;
+    if (source_type != .string or source_value != .string or source_value.string.len == 0)
+        return error.InvalidIndexConfig;
+
+    var field: []const u8 = "";
+    var template: []const u8 = "";
+    if (std.mem.eql(u8, source_type.string, "field")) {
+        field = source_value.string;
+    } else if (std.mem.eql(u8, source_type.string, "template")) {
+        template = source_value.string;
+    } else {
+        return error.InvalidIndexConfig;
+    }
     const content_type = if (artifact.object.get("content_type")) |value| blk: {
         if (value != .string) return error.InvalidIndexConfig;
         break :blk value.string;
@@ -18723,7 +18740,7 @@ test "graph config parses artifact source and shorthand asset enrichment" {
     var cfg = try parseGraphConfig(alloc,
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"body","content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"antfly"}},"execution":{"batch_items":8,"batch_bytes":262144}}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"body"},"content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"antfly"}},"execution":{"batch_items":8,"batch_bytes":262144}}
         \\}
     );
     defer cfg.deinit(alloc);
@@ -18757,13 +18774,25 @@ test "graph shorthand asset uses artifact execution only" {
     var cfg = try parseGraphConfig(alloc,
         \\{
         \\  "source":{"kind":"artifact","artifact":"pages_v1","path":"$.pages[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"pages_v1","kind":"asset","field":"image","producer_json":{"type":"reader","config":{"provider":"antfly"}},"execution":{"batch_items":3}}
+        \\  "artifact":{"name":"pages_v1","kind":"asset","source":{"type":"field","value":"image"},"producer_json":{"type":"reader","config":{"provider":"antfly"}},"execution":{"batch_items":3}}
         \\}
     );
     defer cfg.deinit(alloc);
 
     try std.testing.expect(cfg.shorthand_asset != null);
     try std.testing.expect(std.mem.indexOf(u8, cfg.shorthand_asset.?.execution_json, "\"batch_items\":3") != null);
+}
+
+test "graph shorthand asset maps template source without field ambiguity" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseGraphConfig(alloc,
+        \\{"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"template","value":"{{ title }} {{ body }}"}}}
+    );
+    defer cfg.deinit(alloc);
+
+    const asset = cfg.shorthand_asset orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("", asset.source_field);
+    try std.testing.expectEqualStrings("{{ title }} {{ body }}", asset.source_template);
 }
 
 test "graph config parses artifact mapping templates and context fields" {

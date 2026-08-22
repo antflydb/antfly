@@ -53,6 +53,19 @@ def assert_single_top_hit(payload: dict, doc_id: str) -> None:
     assert hits[0]["doc_id"] == doc_id
 
 
+def assert_created_index(created: dict, name: str, index_type: str) -> None:
+    assert created["name"] == name
+    assert created["type"] == index_type
+
+
+def create_index_payload(payload: dict, index_name: str) -> dict:
+    """Return the path-owned create payload without mutating the caller's value."""
+    body = payload.copy()
+    repeated_name = body.pop("name", index_name)
+    assert repeated_name == index_name, "index payload name must match the path name"
+    return body
+
+
 def query_hits_total_value(hits: dict) -> int:
     total = hits["total"]
     assert isinstance(total, dict), (

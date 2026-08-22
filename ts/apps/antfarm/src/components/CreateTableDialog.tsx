@@ -12,6 +12,7 @@ import { useEffect, useState } from "react";
 import type { TableSchema } from "../api";
 import { useApi } from "../hooks/use-api-config";
 import { useTable } from "../hooks/use-table";
+import { createIndexArguments } from "../lib/create-index";
 import { buildCreateTableRequest, createTableErrorMessage } from "../lib/create-table";
 import TableSchemaForm from "./schema-builder/TableSchemaForm";
 
@@ -49,7 +50,8 @@ const CreateTableDialog: React.FC<CreateTableDialogProps> = ({
       const requestBody = buildCreateTableRequest(data.num_shards, data.schema);
       await api.tables.create(data.name, requestBody);
       for (const index of data.indexes) {
-        await api.indexes.create(data.name, index);
+        const { indexName, request } = createIndexArguments(index);
+        await api.indexes.create(data.name, indexName, request);
       }
       setSelectedTable(data.name);
       await refreshTables();

@@ -47,6 +47,7 @@ components:
           default: 3072
         api_key:
           type: string
+          writeOnly: true
           description: "The Google API key. Can also be set via GEMINI_API_KEY environment variable."
         url:
           type: string
@@ -85,6 +86,7 @@ components:
           default: "us-central1"
         credentials_path:
           type: string
+          writeOnly: true
           description: "Path to service account JSON key file. Alternative to ADC for non-GCP environments."
         dimension:
           type: integer
@@ -152,6 +154,7 @@ components:
           example: "https://api.openai.com"
         api_key:
           type: string
+          writeOnly: true
           description: "The OpenAI API key. Can also be set via OPENAI_API_KEY environment variable."
         dimensions:
           type: integer
@@ -227,6 +230,7 @@ components:
           example: "embed-english-v3.0"
         api_key:
           type: string
+          writeOnly: true
           description: "The Cohere API key. Can also be set via COHERE_API_KEY environment variable."
         input_type:
           type: string
@@ -272,6 +276,7 @@ components:
           example: "openai/text-embedding-3-small"
         api_key:
           type: string
+          writeOnly: true
           description: "The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable."
         dimensions:
           type: integer

@@ -20,7 +20,7 @@ const error_abi = @import("../runtime_error_abi.zig");
 const http_abi = @import("../runtime_http_abi.zig");
 const native_abi = @import("../runtime_native_abi.zig");
 
-pub const abi_version: u32 = 11;
+pub const abi_version: u32 = 16;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -65,6 +65,15 @@ pub const WarmModel = extern struct {
     quantization: OptionalString = .{},
 };
 
+pub const ProcessMemoryLimitProvenance = enum(u8) {
+    automatic = 0,
+    explicit = 1,
+    cgroup_v2 = 2,
+    cgroup_v1 = 3,
+    host = 4,
+    unavailable = 5,
+};
+
 pub const CreateContext = extern struct {
     abi_version: u32,
     struct_size: u32 = @sizeOf(@This()),
@@ -77,6 +86,8 @@ pub const CreateContext = extern struct {
     combined_limit_bytes: usize,
     kv_limit_bytes: usize,
     scratch_limit_bytes: usize,
+    process_memory_limit_bytes: usize,
+    process_memory_limit_provenance: ProcessMemoryLimitProvenance = .automatic,
     preload_ptr: ?[*]const WarmModel,
     preload_len: usize,
     keep_alive: OptionalString,
@@ -110,11 +121,15 @@ pub const ResourceBudget = extern struct {
     abi_version: u32,
     struct_size: u32 = @sizeOf(@This()),
     context: *anyopaque,
-    reserve_admission: *const fn (*anyopaque, *const AdmissionAmounts) callconv(.c) Status,
-    release_admission: *const fn (*anyopaque, *const AdmissionAmounts) callconv(.c) void,
-    observe_prompt_cache: *const fn (*anyopaque, u64, u64) callconv(.c) void,
-    reserve_tokenizer_cache: *const fn (*anyopaque, usize) callconv(.c) u8,
-    release_tokenizer_cache: *const fn (*anyopaque, usize) callconv(.c) void,
+    /// Retain/release the host-owned context across inference component
+    /// lifetimes. Configure fails when the owner is already shutting down.
+    retain_context: *const fn (*anyopaque) callconv(.c) u8,
+    release_context: *const fn (*anyopaque) callconv(.c) void,
+    reserve_admission: *const fn (*anyopaque, *const AdmissionAmounts, *usize) callconv(.c) Status,
+    retain_admission: *const fn (*anyopaque, usize, *const AdmissionAmounts) callconv(.c) Status,
+    release_admission: *const fn (*anyopaque, usize) callconv(.c) void,
+    observe_prompt_cache: *const fn (*anyopaque, usize, u64, u64) callconv(.c) u8,
+    observe_tokenizer_cache: *const fn (*anyopaque, usize, u64, u64) callconv(.c) u8,
 };
 
 /// Stable operation identifiers for the embedded inference service. Requests
@@ -249,6 +264,12 @@ pub extern fn antfly_standalone_inference_get_function_table() callconv(.c) *con
 
 test "linked inference ABI rejects mismatched context and function-table prefixes" {
     const std = @import("std");
+    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(ProcessMemoryLimitProvenance.automatic));
+    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(ProcessMemoryLimitProvenance.explicit));
+    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(ProcessMemoryLimitProvenance.cgroup_v2));
+    try std.testing.expectEqual(@as(u8, 3), @intFromEnum(ProcessMemoryLimitProvenance.cgroup_v1));
+    try std.testing.expectEqual(@as(u8, 4), @intFromEnum(ProcessMemoryLimitProvenance.host));
+    try std.testing.expectEqual(@as(u8, 5), @intFromEnum(ProcessMemoryLimitProvenance.unavailable));
     try std.testing.expect(validContext(RouteManifestContext, abi_version, @sizeOf(RouteManifestContext)));
     try std.testing.expect(!validContext(RouteManifestContext, abi_version - 1, @sizeOf(RouteManifestContext)));
     try std.testing.expect(!validContext(RouteManifestContext, abi_version, @sizeOf(RouteManifestContext) - 1));

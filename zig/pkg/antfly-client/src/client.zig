@@ -122,11 +122,16 @@ pub const AntflyClient = struct {
     // --- Index operations ---
 
     pub const IndexConfig = @TypeOf(@as(openapi.types.IndexStatus, undefined).config);
+    pub const CreateIndexRequest = openapi.types.CreateIndexRequest;
+    pub const CreatedIndex = openapi.types.CreatedIndex;
 
-    pub fn createIndex(self: *AntflyClient, table_name: []const u8, index_name: []const u8, body: IndexConfig) !void {
+    pub fn createIndex(self: *AntflyClient, table_name: []const u8, index_name: []const u8, body: CreateIndexRequest) !openapi.ApiResponse(CreatedIndex) {
         var resp = try self.inner.createIndex(table_name, index_name, body);
-        defer resp.deinit();
-        if (resp.status_code >= 300) return self.apiErrorFromResponse(&resp);
+        if (resp.status_code >= 300) {
+            defer resp.deinit();
+            return self.apiErrorFromResponse(&resp);
+        }
+        return resp;
     }
 
     pub fn dropIndex(self: *AntflyClient, table_name: []const u8, index_name: []const u8) !void {
@@ -136,12 +141,49 @@ pub const AntflyClient = struct {
     }
 
     pub fn getIndex(self: *AntflyClient, table_name: []const u8, index_name: []const u8) !openapi.ApiResponse(openapi.types.IndexStatus) {
-        var resp = try self.inner.getIndex(table_name, index_name);
+        var resp = try self.getIndexResponse(table_name, index_name);
         if (resp.status_code >= 300) {
             defer resp.deinit();
             return self.apiErrorFromResponse(&resp);
         }
         return resp;
+    }
+
+    /// Returns the typed HTTP response without converting non-2xx statuses to
+    /// `error.ApiError`. Long-running readiness commands use this to classify
+    /// retryable status codes without weakening normal one-shot API behavior.
+    pub fn getIndexResponse(self: *AntflyClient, table_name: []const u8, index_name: []const u8) !openapi.ApiResponse(openapi.types.IndexStatus) {
+        return self.inner.getIndex(table_name, index_name);
+    }
+
+    /// Equivalent to `getIndexResponse`, but bounds the complete HTTP request.
+    /// Polling callers should pass their remaining operation budget so a
+    /// socket-level timeout cannot outlive the user-visible deadline.
+    pub fn getIndexResponseWithTimeout(
+        self: *AntflyClient,
+        table_name: []const u8,
+        index_name: []const u8,
+        timeout_ms: u64,
+    ) !openapi.ApiResponse(openapi.types.IndexStatus) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
+        defer self.allocator.free(encoded_index_name);
+        const url = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/db/v1/tables/{s}/indexes/{s}",
+            .{ self.inner.base_url, encoded_table_name, encoded_index_name },
+        );
+        defer self.allocator.free(url);
+        const headers: ?[]const [2][]const u8 = if (self.inner.auth_header) |*header|
+            @as(*const [1][2][]const u8, header)
+        else
+            null;
+        var resp = try self.inner.http.get(url, .{
+            .headers = headers,
+            .timeout_ms = @max(timeout_ms, 1),
+        });
+        return openapi.ApiResponse(openapi.types.IndexStatus).fromResponse(self.allocator, &resp);
     }
 
     pub fn listIndexes(self: *AntflyClient, table_name: []const u8) !openapi.ApiResponse([]const openapi.types.IndexStatus) {
@@ -151,6 +193,33 @@ pub const AntflyClient = struct {
             return self.apiErrorFromResponse(&resp);
         }
         return resp;
+    }
+
+    /// Returns index statuses without converting non-2xx responses while
+    /// bounding the complete request. This is intended for best-effort CLI
+    /// diagnostics that must never dominate the latency of the real action.
+    pub fn listIndexesResponseWithTimeout(
+        self: *AntflyClient,
+        table_name: []const u8,
+        timeout_ms: u64,
+    ) !openapi.ApiResponse([]const openapi.types.IndexStatus) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/db/v1/tables/{s}/indexes",
+            .{ self.inner.base_url, encoded_table_name },
+        );
+        defer self.allocator.free(url);
+        const headers: ?[]const [2][]const u8 = if (self.inner.auth_header) |*header|
+            @as(*const [1][2][]const u8, header)
+        else
+            null;
+        var resp = try self.inner.http.get(url, .{
+            .headers = headers,
+            .timeout_ms = @max(timeout_ms, 1),
+        });
+        return openapi.ApiResponse([]const openapi.types.IndexStatus).fromResponse(self.allocator, &resp);
     }
 
     // --- Query operations ---
