@@ -9,6 +9,8 @@ const corpus_mod = @import("corpus.zig");
 const coverage_mod = @import("coverage.zig");
 const replay = @import("replay.zig");
 const runner = @import("runner.zig");
+const ids = @import("id.zig");
+const property = @import("property.zig");
 const snapshot = @import("snapshot.zig");
 const splice = @import("splice.zig");
 const trace = @import("trace.zig");
@@ -22,6 +24,8 @@ pub const Config = struct {
     splice_percent: u8 = 20,
     checkpoint_percent: u8 = 10,
     targets: []const coverage_mod.Target = &.{},
+    replay_command: []const u8 = "vopr replay --trace <artifact>",
+    reduction_command: []const u8 = "vopr reduce --trace <artifact> --out <reduced-artifact>",
 
     pub fn validate(self: Config) !void {
         if (self.histories == 0) return error.InvalidHistoryBudget;
@@ -55,7 +59,40 @@ pub const Report = struct {
     replay_divergences: u64 = 0,
     exact_replay_checks: u64 = 0,
     semantic_features: usize = 0,
+    transitions_executed: u64 = 0,
+    unique_semantic_states: usize = 0,
+    unique_transitions: usize = 0,
+    reached_faults: usize = 0,
+    reached_workloads: usize = 0,
+    productive_corpus_inputs: usize = 0,
+    distinct_failure_fingerprints: usize = 0,
     target_hits: u64 = 0,
+};
+
+pub const PropertyCatalogStatus = struct {
+    id: ids.StableId,
+    name: []const u8,
+    kind: property.Kind,
+    evaluations: u64 = 0,
+    ever_true: bool = false,
+    ever_false: bool = false,
+    failed: bool = false,
+
+    pub const Result = enum { pass, fail, not_reached };
+
+    pub fn result(self: PropertyCatalogStatus) Result {
+        if (self.failed) return .fail;
+        if (self.evaluations == 0) return .not_reached;
+        return .pass;
+    }
+};
+
+pub const FailureExample = struct {
+    fingerprint: u64,
+    first_history: u64,
+    first_trace_digest: u64,
+    smallest_transitions: u64,
+    smallest_trace_digest: u64,
 };
 
 pub fn Campaign(comptime Scenario: type) type {
@@ -66,12 +103,25 @@ pub fn Campaign(comptime Scenario: type) type {
         coverage: coverage_mod.Tracker,
         corpus: corpus_mod.Corpus,
         checkpoints: snapshot.Store,
+        semantic_states: std.AutoHashMapUnmanaged(u64, void) = .empty,
+        transition_ids: std.AutoHashMapUnmanaged(u64, void) = .empty,
+        fault_ids: std.AutoHashMapUnmanaged(u64, void) = .empty,
+        workload_ids: std.AutoHashMapUnmanaged(u64, void) = .empty,
+        failure_examples: std.AutoHashMapUnmanaged(u64, FailureExample) = .empty,
+        property_catalog: []PropertyCatalogStatus,
         report: Report = .{},
 
         const Self = @This();
 
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
             try config.validate();
+            const property_catalog = try allocator.alloc(PropertyCatalogStatus, Scenario.properties.len);
+            errdefer allocator.free(property_catalog);
+            for (Scenario.properties, property_catalog) |declaration, *status| status.* = .{
+                .id = declaration.id,
+                .name = declaration.name,
+                .kind = declaration.kind,
+            };
             return .{
                 .allocator = allocator,
                 .config = config,
@@ -79,11 +129,18 @@ pub fn Campaign(comptime Scenario: type) type {
                 .coverage = coverage_mod.Tracker.init(allocator),
                 .corpus = corpus_mod.Corpus.init(allocator),
                 .checkpoints = snapshot.Store.init(allocator),
+                .property_catalog = property_catalog,
             };
         }
 
         pub fn deinit(self: *Self) void {
             self.checkpoints.deinit();
+            self.semantic_states.deinit(self.allocator);
+            self.transition_ids.deinit(self.allocator);
+            self.fault_ids.deinit(self.allocator);
+            self.workload_ids.deinit(self.allocator);
+            self.failure_examples.deinit(self.allocator);
+            self.allocator.free(self.property_catalog);
             self.corpus.deinit();
             self.coverage.deinit();
             self.* = undefined;
@@ -112,6 +169,12 @@ pub fn Campaign(comptime Scenario: type) type {
                 self.report.histories += 1;
             }
             self.report.semantic_features = self.coverage.hits.count();
+            self.report.unique_semantic_states = self.semantic_states.count();
+            self.report.unique_transitions = self.transition_ids.count();
+            self.report.reached_faults = self.fault_ids.count();
+            self.report.reached_workloads = self.workload_ids.count();
+            self.report.distinct_failure_fingerprints = self.failure_examples.count();
+            for (self.corpus.entries.items) |entry| self.report.productive_corpus_inputs += @intFromBool(entry.productive_children > 0);
         }
 
         fn runSplice(self: *Self, left_index: usize, right_index: usize) !bool {
@@ -291,6 +354,41 @@ pub fn Campaign(comptime Scenario: type) type {
             parent_index: ?usize,
             exact_replay_before_retention: bool,
         ) !void {
+            self.report.transitions_executed +|= artifact.summary.?.transitions;
+            for (artifact.observations.items) |record| try self.semantic_states.put(self.allocator, record.digest, {});
+            for (artifact.transitions.items) |record| {
+                try self.transition_ids.put(self.allocator, record.id, {});
+                if (record.kind == .workload) try self.workload_ids.put(self.allocator, record.id, {});
+            }
+            for (artifact.faults.items) |record| try self.fault_ids.put(self.allocator, record.id, {});
+            for (artifact.properties.items) |record| {
+                const status = self.propertyStatus(record.property_id) orelse return error.UnknownCampaignProperty;
+                status.evaluations +|= 1;
+                status.ever_true = status.ever_true or record.condition;
+                status.ever_false = status.ever_false or !record.condition;
+            }
+            const artifact_digest = try traceDigest(self.allocator, artifact);
+            for (artifact.failures.items) |failure| {
+                if (failure.property_id) |property_id| {
+                    const status = self.propertyStatus(property_id) orelse return error.UnknownCampaignProperty;
+                    status.failed = true;
+                }
+                const gop = try self.failure_examples.getOrPut(self.allocator, failure.fingerprint);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = .{
+                        .fingerprint = failure.fingerprint,
+                        .first_history = self.report.histories,
+                        .first_trace_digest = artifact_digest,
+                        .smallest_transitions = artifact.summary.?.transitions,
+                        .smallest_trace_digest = artifact_digest,
+                    };
+                } else if (artifact.summary.?.transitions < gop.value_ptr.smallest_transitions or
+                    (artifact.summary.?.transitions == gop.value_ptr.smallest_transitions and artifact_digest < gop.value_ptr.smallest_trace_digest))
+                {
+                    gop.value_ptr.smallest_transitions = artifact.summary.?.transitions;
+                    gop.value_ptr.smallest_trace_digest = artifact_digest;
+                }
+            }
             var novelty = if (exact_replay_before_retention)
                 try self.coverage.preview(artifact)
             else
@@ -330,7 +428,18 @@ pub fn Campaign(comptime Scenario: type) type {
                 if (parent_index) |index| try self.corpus.markProductive(index);
             }
         }
+
+        fn propertyStatus(self: *Self, property_id: ids.StableId) ?*PropertyCatalogStatus {
+            for (self.property_catalog) |*status| if (status.id == property_id) return status;
+            return null;
+        }
     };
+}
+
+fn traceDigest(allocator: std.mem.Allocator, artifact: *const trace.Trace) !u64 {
+    const bytes = try artifact.renderAlloc(allocator);
+    defer allocator.free(bytes);
+    return ids.digest(bytes);
 }
 
 test "campaign generates, mutates, and retains semantic histories" {
@@ -350,6 +459,11 @@ test "campaign generates, mutates, and retains semantic histories" {
     try std.testing.expect(campaign.report.mutated >= 1);
     try std.testing.expect(campaign.report.retained >= 1);
     try std.testing.expect(campaign.report.semantic_features > 0);
+    try std.testing.expect(campaign.report.transitions_executed >= campaign.report.histories);
+    try std.testing.expect(campaign.report.unique_semantic_states > 0);
+    try std.testing.expect(campaign.report.unique_transitions > 0);
+    try std.testing.expect(campaign.report.reached_workloads > 0);
+    try std.testing.expectEqual(@as(usize, ToyScenario.properties.len), campaign.property_catalog.len);
     try std.testing.expectEqual(campaign.report.histories, campaign.report.clean_histories + campaign.report.property_failure_histories + campaign.report.non_property_failure_histories);
     try std.testing.expectEqual(@as(u64, 0), campaign.report.harness_errors);
     try std.testing.expectEqual(@as(u64, 0), campaign.report.replay_divergences);
