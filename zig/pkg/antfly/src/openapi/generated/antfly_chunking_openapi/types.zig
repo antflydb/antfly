@@ -8,8 +8,8 @@ const antfly_chunking_api_openapi = @import("antfly_chunking_api_openapi");
 pub const AntflyChunkerConfig = struct {
     /// The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
-    /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
-    model: []const u8,
+    /// The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other values select a model from models/chunkers/{name}/. Successful create responses include the effective model.
+    model: ?[]const u8 = null,
 };
 
 pub const Chunk = antfly_chunking_api_openapi.Chunk;
@@ -20,13 +20,17 @@ pub const ChunkOptions = antfly_chunking_api_openapi.ChunkOptions;
 pub const ChunkerConfig = struct {
     /// The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
-    /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
+    /// The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other values select a model from models/chunkers/{name}/. Successful create responses include the effective model.
     model: ?[]const u8 = null,
     provider: ChunkerProvider,
     /// Controls whether chunk data is persisted to storage. When false (default), chunks are generated in memory and only embeddings are stored. When true, both chunks and embeddings are stored.
     store_chunks: ?bool = null,
     /// Configuration for full-text indexing of chunks in Bleve. When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's _chunks field. When absent, chunks use :c: suffix and are only used for vector embeddings.
     full_text_index: ?std.json.Value = null,
+    max_chunks: ?i64 = null,
+    threshold: ?f32 = null,
+    text: ?antfly_chunking_api_openapi.TextChunkOptions = null,
+    audio: ?antfly_chunking_api_openapi.AudioChunkOptions = null,
 };
 
 /// The chunking provider to use.

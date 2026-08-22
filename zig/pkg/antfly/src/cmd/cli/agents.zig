@@ -15,6 +15,7 @@
 const std = @import("std");
 const antfly_client = @import("antfly-client");
 const cli = @import("mod.zig");
+const index_readiness = @import("index_readiness.zig");
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const subcommand = args.next() orelse {
@@ -25,6 +26,16 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
     if (std.mem.eql(u8, subcommand, "query-builder")) return queryBuilder(allocator, io, client, args);
 
     cli.fatal("unknown agents subcommand: {s}", .{subcommand});
+}
+
+fn takeUniqueValue(args: *std.process.Args.Iterator, slot: *?[]const u8, flag: []const u8) void {
+    if (slot.* != null) cli.fatal("{s} may only be provided once", .{flag});
+    slot.* = args.next() orelse cli.fatal("{s} requires a value", .{flag});
+}
+
+fn takeUniqueSwitch(seen: *bool, flag: []const u8) void {
+    if (seen.*) cli.fatal("{s} may only be provided once", .{flag});
+    seen.* = true;
 }
 
 fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
@@ -44,43 +55,61 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
     var followup = false;
     var confidence = false;
     var max_context_tokens: ?i64 = null;
+    var limit_set = false;
+    var streaming_set = false;
+    var classify_set = false;
+    var reasoning_set = false;
+    var generate_set = false;
+    var followup_set = false;
+    var confidence_set = false;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
-            table_name = args.next();
+            takeUniqueValue(args, &table_name, arg);
         } else if (std.mem.eql(u8, arg, "--generator")) {
-            generator_json = args.next();
+            takeUniqueValue(args, &generator_json, arg);
         } else if (std.mem.eql(u8, arg, "--semantic-search")) {
-            semantic_search = args.next();
+            takeUniqueValue(args, &semantic_search, arg);
         } else if (std.mem.eql(u8, arg, "--full-text-search")) {
-            full_text_search = args.next();
+            takeUniqueValue(args, &full_text_search, arg);
         } else if (std.mem.eql(u8, arg, "--indexes") or std.mem.eql(u8, arg, "-i")) {
-            indexes_str = args.next();
+            takeUniqueValue(args, &indexes_str, arg);
         } else if (std.mem.eql(u8, arg, "--fields")) {
-            fields_str = args.next();
+            takeUniqueValue(args, &fields_str, arg);
         } else if (std.mem.eql(u8, arg, "--limit")) {
-            if (args.next()) |s| limit = std.fmt.parseInt(i64, s, 10) catch limit;
+            takeUniqueSwitch(&limit_set, arg);
+            const raw = args.next() orelse cli.fatal("--limit requires a value", .{});
+            limit = std.fmt.parseInt(i64, raw, 10) catch cli.fatal("invalid --limit value: {s}", .{raw});
+            if (limit <= 0) cli.fatal("--limit must be greater than zero", .{});
         } else if (std.mem.eql(u8, arg, "--prompt")) {
-            prompt = args.next();
+            takeUniqueValue(args, &prompt, arg);
         } else if (std.mem.eql(u8, arg, "--system-prompt")) {
-            system_prompt = args.next();
+            takeUniqueValue(args, &system_prompt, arg);
         } else if (std.mem.eql(u8, arg, "--max-context-tokens")) {
-            if (args.next()) |s| max_context_tokens = std.fmt.parseInt(i64, s, 10) catch |err| {
-                cli.fatal("invalid --max-context-tokens: {}", .{err});
-            };
+            if (max_context_tokens != null) cli.fatal("--max-context-tokens may only be provided once", .{});
+            const raw = args.next() orelse cli.fatal("--max-context-tokens requires a value", .{});
+            max_context_tokens = std.fmt.parseInt(i64, raw, 10) catch cli.fatal("invalid --max-context-tokens value: {s}", .{raw});
+            if (max_context_tokens.? <= 0) cli.fatal("--max-context-tokens must be greater than zero", .{});
         } else if (std.mem.eql(u8, arg, "--streaming")) {
+            takeUniqueSwitch(&streaming_set, arg);
             streaming = true;
         } else if (std.mem.eql(u8, arg, "--no-streaming")) {
+            takeUniqueSwitch(&streaming_set, arg);
             streaming = false;
         } else if (std.mem.eql(u8, arg, "--classify")) {
+            takeUniqueSwitch(&classify_set, arg);
             classify = true;
         } else if (std.mem.eql(u8, arg, "--reasoning")) {
+            takeUniqueSwitch(&reasoning_set, arg);
             reasoning = true;
         } else if (std.mem.eql(u8, arg, "--generate")) {
+            takeUniqueSwitch(&generate_set, arg);
             generate = true;
         } else if (std.mem.eql(u8, arg, "--followup")) {
+            takeUniqueSwitch(&followup_set, arg);
             followup = true;
         } else if (std.mem.eql(u8, arg, "--confidence")) {
+            takeUniqueSwitch(&confidence_set, arg);
             confidence = true;
         } else {
             cli.fatal("unknown agents retrieval flag: {s}", .{arg});
@@ -145,6 +174,7 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
         .steps = steps,
     };
 
+    if (semantic_search != null) index_readiness.warnIfSelectedSemanticIndexesAreNotReadyForRetrieval(client, table, indexes);
     var resp = try client.retrievalAgent(body);
     defer resp.deinit();
     if (resp.body) |response_body| {
@@ -160,11 +190,13 @@ fn queryBuilder(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--intent")) {
-            intent = args.next();
+            takeUniqueValue(args, &intent, arg);
         } else if (std.mem.eql(u8, arg, "--table")) {
-            table_name = args.next();
+            takeUniqueValue(args, &table_name, arg);
         } else if (std.mem.eql(u8, arg, "--generator")) {
-            generator_json = args.next();
+            takeUniqueValue(args, &generator_json, arg);
+        } else {
+            cli.fatal("unknown agents query-builder flag: {s}", .{arg});
         }
     }
 

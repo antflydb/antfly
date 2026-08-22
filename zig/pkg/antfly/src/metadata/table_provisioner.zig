@@ -2197,7 +2197,7 @@ test "table provisioner registers a resolver declared in the table index config"
         \\{
         \\  "relations_graph":{"type":"graph",
         \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}},
+        \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
         \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}
@@ -2254,7 +2254,7 @@ test "table provisioner registers a resolver declared in the table index config"
         \\{
         \\  "relations_graph":{"type":"graph",
         \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}},
+        \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
         \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":2}
@@ -2300,7 +2300,7 @@ test "table provisioner registers a resolver declared in the table index config"
         \\{
         \\  "relations_graph":{"type":"graph",
         \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}},
+        \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}},
         \\  "resolvers":[]
         \\}
     ;
@@ -2355,7 +2355,7 @@ test "table provisioner can admit resolver backfill without draining corpus work
         \\{
         \\  "relations_graph":{"type":"graph",
         \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}}
+        \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}}
         \\}
     ;
     _ = try reconcileDbIndexesWithOptions(alloc, &db, graph_only, .{});
@@ -2374,7 +2374,7 @@ test "table provisioner can admit resolver backfill without draining corpus work
         \\{
         \\  "relations_graph":{"type":"graph",
         \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}},
+        \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
         \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}

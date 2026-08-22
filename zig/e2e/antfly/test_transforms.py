@@ -345,6 +345,16 @@ def test_unsupported_transform_is_rejected_without_partial_mutation(stateful_api
 
 
 def test_serverless_table_transforms_follow_latest_then_published(serverless_api):
+    def initial_snapshot_published() -> dict | None:
+        try:
+            published = serverless_api.query_published(table_name)
+        except requests.HTTPError:
+            return None
+        doc = _docs_by_id(published).get("doc-a")
+        if doc is None or doc.get("version") != 1 or "status" in doc:
+            return None
+        return published
+
     def published_after_transform() -> dict | None:
         try:
             published = serverless_api.query_published(table_name)
@@ -373,8 +383,13 @@ def test_serverless_table_transforms_follow_latest_then_published(serverless_api
         ],
     )
 
-    initial_build = serverless_api.build_table(table_name)
-    assert initial_build["published"] is True
+    serverless_api.build_table(table_name)
+    initial_published = wait_until(
+        initial_snapshot_published,
+        timeout_s=10.0,
+        interval_s=0.1,
+    )
+    assert initial_published is not None
 
     transformed = serverless_api.batch_table(
         table_name,

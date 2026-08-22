@@ -277,6 +277,7 @@ components:
           description: "Top-k sampling parameter."
         api_key:
           type: string
+          writeOnly: true
           description: "The Google API key."
         url:
           type: string
@@ -304,6 +305,7 @@ components:
           default: "us-central1"
         credentials_path:
           type: string
+          writeOnly: true
           description: "Path to service account JSON key file."
         temperature:
           type: number
@@ -418,6 +420,7 @@ components:
           description: "The URL of the OpenAI API endpoint."
         api_key:
           type: string
+          writeOnly: true
           description: "The OpenAI API key."
         temperature:
           type: number
@@ -494,6 +497,7 @@ components:
           example: "claude-sonnet-4-5-20250929"
         api_key:
           type: string
+          writeOnly: true
           description: "The Anthropic API key."
         url:
           type: string
@@ -532,6 +536,7 @@ components:
           example: "command-r-plus"
         api_key:
           type: string
+          writeOnly: true
           description: "The Cohere API key."
         temperature:
           type: number
@@ -583,6 +588,7 @@ components:
             Array of model identifiers for fallback routing. Either model or models must be provided.
         api_key:
           type: string
+          writeOnly: true
           description: "The OpenRouter API key."
         temperature:
           type: number

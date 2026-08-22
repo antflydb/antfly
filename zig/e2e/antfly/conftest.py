@@ -54,7 +54,7 @@ from typing import Any, Callable
 import pytest
 import requests
 
-from helpers import start_http_server
+from helpers import create_index_payload, start_http_server
 from port_reservations import LoopbackPortReservations, find_free_port
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -129,9 +129,15 @@ def prefixed_api_path(root: str, path: str) -> str:
     return f"{normalized_root}{normalized_path}"
 
 
-def antfly_public_api_url(base_url: str, *, binary: str | None = None, root: str | None = None) -> str:
+def antfly_public_api_url(
+    base_url: str, *, binary: str | None = None, root: str | None = None
+) -> str:
     if root is None:
-        root = default_antfly_api_root(binary) if binary is not None else ANTFLY_PUBLIC_API_ROOT
+        root = (
+            default_antfly_api_root(binary)
+            if binary is not None
+            else ANTFLY_PUBLIC_API_ROOT
+        )
     return with_api_root(base_url, root)
 
 
@@ -195,7 +201,9 @@ def wait_for_listener(url: str, timeout: float = 5.0) -> bool:
     return False
 
 
-def _start_stateful_server_with_retry(binary: str, port: int) -> PublicAntflyServer | StandaloneAntflyServer:
+def _start_stateful_server_with_retry(
+    binary: str, port: int
+) -> PublicAntflyServer | StandaloneAntflyServer:
     if Path(binary).name != "antfly":
         return PublicAntflyServer(binary, "127.0.0.1", port)
 
@@ -245,9 +253,13 @@ def _cleanup_created_tables(api: Any, table_names: set[str]) -> list[str]:
     cleanup_errors: list[str] = []
     for table_name in reversed(sorted(table_names)):
         try:
-            response = api.s.delete(f"{api.url}/tables/{quote(table_name, safe='')}", timeout=30)
+            response = api.s.delete(
+                f"{api.url}/tables/{quote(table_name, safe='')}", timeout=30
+            )
             if response.status_code not in (200, 202, 204, 404):
-                cleanup_errors.append(f"{table_name}: HTTP {response.status_code} {response.text[:500]}")
+                cleanup_errors.append(
+                    f"{table_name}: HTTP {response.status_code} {response.text[:500]}"
+                )
         except requests.RequestException as err:
             cleanup_errors.append(f"{table_name}: {err}")
     return cleanup_errors
@@ -260,7 +272,9 @@ def _created_table_from_path(path: str) -> str | None:
     return unquote(parts[1])
 
 
-def ready_index_status(index_info: dict[str, Any], *, require_query_fresh: bool = False) -> dict[str, Any] | None:
+def ready_index_status(
+    index_info: dict[str, Any], *, require_query_fresh: bool = False
+) -> dict[str, Any] | None:
     status = index_info.get("status")
     if status is None:
         return None
@@ -345,15 +359,17 @@ def ready_serverless_build_status(status: dict[str, Any]) -> dict[str, Any] | No
     if status.get("head_version", 0) < 1 or status.get("published_wal_end_lsn", 0) < 1:
         return None
     pending_families = status.get("pending_materialization_families")
-    full_text_pending = isinstance(pending_families, dict) and pending_families.get("full_text", False)
-    chunk_preview_pending = isinstance(pending_families, dict) and pending_families.get("chunk_preview", False)
+    full_text_pending = isinstance(pending_families, dict) and pending_families.get(
+        "full_text", False
+    )
+    chunk_preview_pending = isinstance(pending_families, dict) and pending_families.get(
+        "chunk_preview", False
+    )
     if full_text_pending:
         return None
     if status.get("next_publish_reason") is not None:
         return None
-    for field in (
-        "full_text_index_actions",
-    ):
+    for field in ("full_text_index_actions",):
         actions = status.get(field)
         if not isinstance(actions, list):
             continue
@@ -367,10 +383,14 @@ def ready_serverless_build_status(status: dict[str, Any]) -> dict[str, Any] | No
     return status
 
 
-def _wait_for_restore_job(get_job: Callable[[str], Any], accepted: dict[str, Any], *, timeout_s: float = 120.0) -> dict[str, Any]:
+def _wait_for_restore_job(
+    get_job: Callable[[str], Any], accepted: dict[str, Any], *, timeout_s: float = 120.0
+) -> dict[str, Any]:
     job_id = accepted.get("job_id")
     if not isinstance(job_id, str) or not job_id:
-        raise AssertionError(f"restore admission did not return an opaque job id: {accepted}")
+        raise AssertionError(
+            f"restore admission did not return an opaque job id: {accepted}"
+        )
     deadline = time.monotonic() + timeout_s
     while True:
         job = get_job(f"/restore/jobs/{job_id}")
@@ -379,15 +399,25 @@ def _wait_for_restore_job(get_job: Callable[[str], Any], accepted: dict[str, Any
             result = job.get("result")
             return result if isinstance(result, dict) else job
         if phase in {"failed", "cancelled"}:
-            raise AssertionError(f"restore job {job_id} ended in {phase}: {job.get('error')}")
+            raise AssertionError(
+                f"restore job {job_id} ended in {phase}: {job.get('error')}"
+            )
         if time.monotonic() >= deadline:
-            raise AssertionError(f"restore job {job_id} did not complete within {timeout_s}s: {job}")
+            raise AssertionError(
+                f"restore job {job_id} did not complete within {timeout_s}s: {job}"
+            )
         time.sleep(0.1)
 
 
 def raise_request_error_with_logs(
     err: requests.RequestException,
-    server_ref: AntflyServer | PublicAntflyServer | StandaloneAntflyServer | StatefulAntflyServer | None,
+    server_ref: (
+        AntflyServer
+        | PublicAntflyServer
+        | StandaloneAntflyServer
+        | StatefulAntflyServer
+        | None
+    ),
 ) -> None:
     logs = ""
     proc_statuses: list[str] = []
@@ -419,7 +449,9 @@ def raise_if_server_process_exited(server_ref: Any) -> None:
     raise RuntimeError(message)
 
 
-def _dead_process_statuses(processes: list[tuple[str, subprocess.Popen[Any]]] | None) -> list[str]:
+def _dead_process_statuses(
+    processes: list[tuple[str, subprocess.Popen[Any]]] | None,
+) -> list[str]:
     statuses: list[str] = []
     for name, proc in processes or []:
         status = proc.poll()
@@ -498,7 +530,9 @@ class AntflyServer:
                     "ANTFLY_SERVERLESS_QUERY_CACHE_DIR": str(root / "cache"),
                 }
             )
-            command = _serverless_combined_command(binary, host=host, port=port, root=root)
+            command = _serverless_combined_command(
+                binary, host=host, port=port, root=root
+            )
             self.proc: subprocess.Popen[str] | None = None
             setup.pop_all()
         try:
@@ -574,7 +608,9 @@ class PublicAntflyServer:
         if not wait_for_server(self.url):
             self.stop()
             out = _read_log_tail(self.log_path)
-            raise RuntimeError(f"Public API server failed to start at {self.url}\n{out}")
+            raise RuntimeError(
+                f"Public API server failed to start at {self.url}\n{out}"
+            )
 
     def debug_logs(self) -> str:
         self.log_file.flush()
@@ -595,7 +631,9 @@ class PublicAntflyServer:
         self.port_reservations.ensure_reserved(self.port)
 
     def resume(self) -> None:
-        command = _legacy_stateful_command(self.binary, host=self.host, port=self.port, root=self.root)
+        command = _legacy_stateful_command(
+            self.binary, host=self.host, port=self.port, root=self.root
+        )
         self.proc = self.port_reservations.handoff_to(
             (self.port,),
             lambda: subprocess.Popen(
@@ -608,7 +646,9 @@ class PublicAntflyServer:
         if not wait_for_server(self.url):
             out = _read_log_tail(self.log_path)
             self.stop()
-            raise RuntimeError(f"Public API server failed to resume at {self.url}\n{out}")
+            raise RuntimeError(
+                f"Public API server failed to resume at {self.url}\n{out}"
+            )
 
     def stop(self, *, test_failed: bool = False) -> None:
         self._stop_process()
@@ -618,7 +658,9 @@ class PublicAntflyServer:
             self.tempdir.cleanup()
 
 
-def _serverless_combined_command(binary: str, *, host: str, port: int, root: Path) -> list[str]:
+def _serverless_combined_command(
+    binary: str, *, host: str, port: int, root: Path
+) -> list[str]:
     basename = Path(binary).name
     if basename == "antfly":
         return [
@@ -651,7 +693,9 @@ def _serverless_combined_command(binary: str, *, host: str, port: int, root: Pat
     ]
 
 
-def _legacy_stateful_command(binary: str, *, host: str, port: int, root: Path) -> list[str]:
+def _legacy_stateful_command(
+    binary: str, *, host: str, port: int, root: Path
+) -> list[str]:
     return [
         binary,
         "--host",
@@ -669,7 +713,9 @@ def _legacy_stateful_command(binary: str, *, host: str, port: int, root: Path) -
     ]
 
 
-def _standalone_stateful_command(binary: str, *, host: str, port: int, root: Path) -> list[str]:
+def _standalone_stateful_command(
+    binary: str, *, host: str, port: int, root: Path
+) -> list[str]:
     return [
         binary,
         "standalone",
@@ -694,7 +740,9 @@ def _standalone_stateful_command(binary: str, *, host: str, port: int, root: Pat
     ]
 
 
-def _metadata_command(binary: str, *, host: str, raft_port: int, admin_port: int, root: Path) -> list[str]:
+def _metadata_command(
+    binary: str, *, host: str, raft_port: int, admin_port: int, root: Path
+) -> list[str]:
     return [
         binary,
         "metadata",
@@ -769,7 +817,9 @@ def _data_command(
 
 
 class StatefulAntflyServer:
-    def __init__(self, binary: str, host: str, port: int, *, auth_enabled: bool = False):
+    def __init__(
+        self, binary: str, host: str, port: int, *, auth_enabled: bool = False
+    ):
         self.binary = binary
         self.host = host
         self.auth_enabled = auth_enabled
@@ -783,13 +833,17 @@ class StatefulAntflyServer:
             self.port = port
             self.url = f"http://{host}:{port}"
             self.api_url = antfly_public_api_url(self.url, binary=binary)
-            self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-stateful-e2e-")
+            self.tempdir = tempfile.TemporaryDirectory(
+                prefix="antfly-zig-stateful-e2e-"
+            )
             setup.callback(self.tempdir.cleanup)
             self.root = Path(self.tempdir.name)
             self.replica_root = self.root / "data-replicas"
             self.metadata_log_path = self.root / "metadata.log"
             self.data_log_path = self.root / "data.log"
-            self.metadata_log_file = setup.enter_context(self.metadata_log_path.open("w"))
+            self.metadata_log_file = setup.enter_context(
+                self.metadata_log_path.open("w")
+            )
             self.data_log_file = setup.enter_context(self.data_log_path.open("w"))
             (
                 self.metadata_port,
@@ -837,7 +891,9 @@ class StatefulAntflyServer:
             self.metadata_log_file.flush()
             metadata_out = _read_log_tail(self.metadata_log_path)
             self.stop()
-            raise RuntimeError(f"Metadata server failed to start at {self.metadata_admin_url}\n{metadata_out}")
+            raise RuntimeError(
+                f"Metadata server failed to start at {self.metadata_admin_url}\n{metadata_out}"
+            )
 
         data_command = _data_command(
             self.binary,
@@ -860,7 +916,10 @@ class StatefulAntflyServer:
         if not wait_for_server(
             self.api_url,
             allow_unauthorized=self.auth_enabled,
-            processes=[("metadata_proc", self.metadata_proc), ("data_proc", self.data_proc)],
+            processes=[
+                ("metadata_proc", self.metadata_proc),
+                ("data_proc", self.data_proc),
+            ],
         ):
             self.metadata_log_file.flush()
             self.data_log_file.flush()
@@ -938,7 +997,9 @@ class StandaloneAntflyServer:
             self.port = port
             self.url = f"http://{host}:{port}"
             self.api_url = antfly_public_api_url(self.url, binary=binary)
-            self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-standalone-e2e-")
+            self.tempdir = tempfile.TemporaryDirectory(
+                prefix="antfly-zig-standalone-e2e-"
+            )
             setup.callback(self.tempdir.cleanup)
             self.root = Path(self.tempdir.name)
             self.replica_root = self.root / "replicas"
@@ -956,7 +1017,9 @@ class StandaloneAntflyServer:
     def _start_process(self, *, truncate_logs: bool) -> None:
         if truncate_logs:
             self.log_file = self.log_path.open("w")
-        command = _standalone_stateful_command(self.binary, host=self.host, port=self.port, root=self.root)
+        command = _standalone_stateful_command(
+            self.binary, host=self.host, port=self.port, root=self.root
+        )
         self.proc = self.port_reservations.handoff_to(
             (self.port,),
             lambda: subprocess.Popen(
@@ -969,7 +1032,9 @@ class StandaloneAntflyServer:
         if not wait_for_server(self.api_url):
             self.stop()
             out = _read_log_tail(self.log_path)
-            raise RuntimeError(f"Standalone API server failed to start at {self.api_url}\n{out}")
+            raise RuntimeError(
+                f"Standalone API server failed to start at {self.api_url}\n{out}"
+            )
         self.metadata_admin_url = self._poll_metadata_admin_url()
 
     def _poll_metadata_admin_url(self) -> str:
@@ -977,7 +1042,9 @@ class StandaloneAntflyServer:
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
             logs = _read_log_tail(self.log_path)
-            matches = re.findall(r"(?:standalone )?metadata admin api listening on (http://[^\s]+)", logs)
+            matches = re.findall(
+                r"(?:standalone )?metadata admin api listening on (http://[^\s]+)", logs
+            )
             if matches:
                 return matches[-1].rstrip("/")
             if "standalone local metadata enabled (raft disabled)" in logs:
@@ -1062,7 +1129,9 @@ class InferenceRerankerServer:
         self._server = ThreadingHTTPServer((host, port), Handler)
         self._thread = start_http_server(self._server)
         if not wait_for_listener(self.url):
-            raise RuntimeError(f"Inference reranker server failed to start at {self.url}")
+            raise RuntimeError(
+                f"Inference reranker server failed to start at {self.url}"
+            )
 
     def stop(self) -> None:
         self._server.shutdown()
@@ -1096,8 +1165,7 @@ class InferenceGeneratorServer:
                         "Selected tree branches:" in prompt
                         and "doc:root" in prompt
                         and "doc:child" in prompt
-                        and
-                        "Tree hierarchy context:" in prompt
+                        and "Tree hierarchy context:" in prompt
                         and "Tree roots=1, tree_hits=1" in prompt
                         and "Root doc:root" in prompt
                     ):
@@ -1109,7 +1177,9 @@ class InferenceGeneratorServer:
                 else:
                     content = "Generated answer"
 
-                body = json.dumps({"choices": [{"message": {"content": content}}]}).encode("utf-8")
+                body = json.dumps(
+                    {"choices": [{"message": {"content": content}}]}
+                ).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -1124,7 +1194,9 @@ class InferenceGeneratorServer:
         self._server = ThreadingHTTPServer((host, port), Handler)
         self._thread = start_http_server(self._server)
         if not wait_for_listener(self.url):
-            raise RuntimeError(f"Inference generator server failed to start at {self.url}")
+            raise RuntimeError(
+                f"Inference generator server failed to start at {self.url}"
+            )
 
     def stop(self) -> None:
         self._server.shutdown()
@@ -1425,7 +1497,9 @@ class RateLimitedOpenAiEmbeddingServer:
                 model = payload.get("model", "text-embedding-3-small")
                 with outer._lock:
                     outer.total_requests += 1
-                    allow_success = outer._successful_requests < outer._allowed_successes
+                    allow_success = (
+                        outer._successful_requests < outer._allowed_successes
+                    )
                     if allow_success:
                         outer._successful_requests += 1
                     else:
@@ -1483,7 +1557,9 @@ class RateLimitedOpenAiEmbeddingServer:
         self._server = ThreadingHTTPServer((host, port), Handler)
         self._thread = start_http_server(self._server)
         if not wait_for_listener(self.url):
-            raise RuntimeError(f"Rate-limited OpenAI embedding server failed to start at {self.url}")
+            raise RuntimeError(
+                f"Rate-limited OpenAI embedding server failed to start at {self.url}"
+            )
 
     def allow_all_requests(self) -> None:
         with self._lock:
@@ -1537,7 +1613,10 @@ class PacingSensitiveOpenAiEmbeddingServer:
                 now = time.monotonic()
                 with outer._lock:
                     outer.total_requests += 1
-                    allowed = outer._last_success_at == 0.0 or (now - outer._last_success_at) >= outer.min_interval_s
+                    allowed = (
+                        outer._last_success_at == 0.0
+                        or (now - outer._last_success_at) >= outer.min_interval_s
+                    )
                     if allowed:
                         outer._last_success_at = now
                         outer.successful_requests += 1
@@ -1596,7 +1675,9 @@ class PacingSensitiveOpenAiEmbeddingServer:
         self._server = ThreadingHTTPServer((host, port), Handler)
         self._thread = start_http_server(self._server)
         if not wait_for_listener(self.url):
-            raise RuntimeError(f"Pacing-sensitive OpenAI embedding server failed to start at {self.url}")
+            raise RuntimeError(
+                f"Pacing-sensitive OpenAI embedding server failed to start at {self.url}"
+            )
 
     def stats(self) -> dict[str, int]:
         with self._lock:
@@ -1626,7 +1707,11 @@ class InferenceEmbeddingServer:
                 raw = self.rfile.read(content_length)
                 payload = json.loads(raw.decode("utf-8") or "{}")
 
-                if self.path in ("/chunk", "/api/chunk", f"{INFERENCE_PUBLIC_API_ROOT}/chunk"):
+                if self.path in (
+                    "/chunk",
+                    "/api/chunk",
+                    f"{INFERENCE_PUBLIC_API_ROOT}/chunk",
+                ):
                     model = payload.get("config", {}).get("model")
                     if model != "antfly-chunker-v1":
                         self.send_error(400)
@@ -1668,7 +1753,9 @@ class InferenceEmbeddingServer:
                             },
                         ]
 
-                    body = json.dumps({"object": "list", "data": chunks}).encode("utf-8")
+                    body = json.dumps({"object": "list", "data": chunks}).encode(
+                        "utf-8"
+                    )
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(body)))
@@ -1686,7 +1773,10 @@ class InferenceEmbeddingServer:
                     model = payload.get("model", "")
                     input_value = payload.get("input", [])
                     if isinstance(input_value, list):
-                        values = [outer._vector_for_text(json.dumps(item)) for item in input_value]
+                        values = [
+                            outer._vector_for_text(json.dumps(item))
+                            for item in input_value
+                        ]
                     else:
                         values = [outer._vector_for_text(str(input_value))]
 
@@ -1741,7 +1831,9 @@ class InferenceEmbeddingServer:
         self._server = ThreadingHTTPServer((host, port), Handler)
         self._thread = start_http_server(self._server)
         if not wait_for_listener(self.url):
-            raise RuntimeError(f"Inference embedding server failed to start at {self.url}")
+            raise RuntimeError(
+                f"Inference embedding server failed to start at {self.url}"
+            )
 
     @staticmethod
     def _vector_for_text(text: str) -> list[float]:
@@ -1762,7 +1854,11 @@ class InferenceEmbeddingServer:
 
 def _models_dir() -> Path:
     home = os.environ.get("HOME")
-    return Path(home).expanduser() / ".antfly" / "inference" / "models" if home else Path("./models")
+    return (
+        Path(home).expanduser() / ".antfly" / "inference" / "models"
+        if home
+        else Path("./models")
+    )
 
 
 def _clipclap_model_dir() -> Path:
@@ -1770,7 +1866,9 @@ def _clipclap_model_dir() -> Path:
 
 
 def _clipclap_gguf_available(model_dir: Path) -> bool:
-    return model_dir.exists() and all((model_dir / name).exists() for name in CLIPCLAP_GGUF_FILES)
+    return model_dir.exists() and all(
+        (model_dir / name).exists() for name in CLIPCLAP_GGUF_FILES
+    )
 
 
 def _env_truthy(name: str) -> bool:
@@ -1805,7 +1903,12 @@ def serverless_api(serverless_runtime):
     base_url, server = serverless_runtime
 
     class Api:
-        def __init__(self, session: requests.Session, base_url: str, server_ref: AntflyServer | None):
+        def __init__(
+            self,
+            session: requests.Session,
+            base_url: str,
+            server_ref: AntflyServer | None,
+        ):
             self.s = session
             self.url = base_url.rstrip("/")
             self._server = server_ref
@@ -1828,10 +1931,14 @@ def serverless_api(serverless_runtime):
             return self._check(self.s.get(f"{self.url}{path}", timeout=10))
 
         def post(self, path: str, payload: dict) -> dict:
-            return self._check(self.s.post(f"{self.url}{path}", json=payload, timeout=10))
+            return self._check(
+                self.s.post(f"{self.url}{path}", json=payload, timeout=10)
+            )
 
         def put(self, path: str, payload: dict) -> dict:
-            return self._check(self.s.put(f"{self.url}{path}", json=payload, timeout=10))
+            return self._check(
+                self.s.put(f"{self.url}{path}", json=payload, timeout=10)
+            )
 
         def status(self) -> dict:
             return self.get("/status")
@@ -1842,7 +1949,9 @@ def serverless_api(serverless_runtime):
         def update_table(self, table_name: str, payload: dict) -> dict:
             return self.put(f"/tables/{table_name}", payload)
 
-        def ingest_table(self, table_name: str, timestamp_ns: int, mutations: list[dict]) -> dict:
+        def ingest_table(
+            self, table_name: str, timestamp_ns: int, mutations: list[dict]
+        ) -> dict:
             return self.put(
                 f"/tables/{table_name}/ingest-batch",
                 {"timestamp_ns": timestamp_ns, "mutations": mutations},
@@ -1855,7 +1964,10 @@ def serverless_api(serverless_runtime):
             return self.get(f"/tables/{table_name}/indexes/{index_name}")
 
         def create_index(self, table_name: str, index_name: str, payload: dict) -> dict:
-            created = self.post(f"/tables/{table_name}/indexes/{index_name}", payload)
+            created = self.post(
+                f"/tables/{table_name}/indexes/{index_name}",
+                create_index_payload(payload, index_name),
+            )
             deadline = time.monotonic() + 10.0
             while True:
                 try:
@@ -1884,7 +1996,9 @@ def serverless_api(serverless_runtime):
             while True:
                 try:
                     last_info = self.get(f"/tables/{table_name}/indexes/{index_name}")
-                    ready = ready_index_status(last_info, require_query_fresh=require_query_fresh)
+                    ready = ready_index_status(
+                        last_info, require_query_fresh=require_query_fresh
+                    )
                     if ready is not None:
                         return ready
                 except requests.RequestException as exc:
@@ -1903,20 +2017,34 @@ def serverless_api(serverless_runtime):
                 time.sleep(interval_s)
 
         def delete_index(self, table_name: str, index_name: str) -> dict:
-            return self._check(self.s.delete(f"{self.url}/tables/{table_name}/indexes/{index_name}", timeout=10))
+            return self._check(
+                self.s.delete(
+                    f"{self.url}/tables/{table_name}/indexes/{index_name}", timeout=10
+                )
+            )
 
-        def build_table(self, table_name: str, *, timeout_s: float = 10.0, interval_s: float = 0.1) -> dict:
+        def build_table(
+            self, table_name: str, *, timeout_s: float = 10.0, interval_s: float = 0.1
+        ) -> dict:
             deadline = time.monotonic() + timeout_s
             while True:
                 try:
-                    return self.post(antfly_internal_api_path(f"/tables/{table_name}/build"), {})
+                    return self.post(
+                        antfly_internal_api_path(f"/tables/{table_name}/build"), {}
+                    )
                 except requests.HTTPError as exc:
-                    if exc.response is None or exc.response.status_code != 409 or time.monotonic() >= deadline:
+                    if (
+                        exc.response is None
+                        or exc.response.status_code != 409
+                        or time.monotonic() >= deadline
+                    ):
                         raise
                     time.sleep(interval_s)
 
         def table_build_status(self, table_name: str) -> dict:
-            return self.get(antfly_internal_api_path(f"/tables/{table_name}/build-status"))
+            return self.get(
+                antfly_internal_api_path(f"/tables/{table_name}/build-status")
+            )
 
         def batch_table(
             self,
@@ -1936,8 +2064,16 @@ def serverless_api(serverless_runtime):
                 payload["transforms"] = transforms
             if sync_level is not None:
                 payload["sync_level"] = sync_level
-            timeout = 60 if sync_level in {"full_text", "enrichments", "full_index"} else 10
-            return self._check(self.s.post(f"{self.url}/tables/{table_name}/batch", json=payload, timeout=timeout))
+            timeout = (
+                60 if sync_level in {"full_text", "enrichments", "full_index"} else 10
+            )
+            return self._check(
+                self.s.post(
+                    f"{self.url}/tables/{table_name}/batch",
+                    json=payload,
+                    timeout=timeout,
+                )
+            )
 
         def query_published(self, table_name: str) -> dict:
             return self.get(f"/tables/{table_name}/query/published")
@@ -1961,7 +2097,11 @@ def serverless_api(serverless_runtime):
             return self.post(f"/tables/{table_name}/query/graph/shortest-path", payload)
 
         def query_head_artifact(self, namespace: str, artifact_index: int) -> dict:
-            return self.get(antfly_internal_api_path(f"/namespaces/{namespace}/query/head/artifacts/{artifact_index}"))
+            return self.get(
+                antfly_internal_api_path(
+                    f"/namespaces/{namespace}/query/head/artifacts/{artifact_index}"
+                )
+            )
 
     yield Api(session, base_url, server)
     session.close()
@@ -2050,12 +2190,21 @@ def clipclap_model_available():
         pytest.skip(f"Antfly binary not found for model download: {binary}")
 
     subprocess.run(
-        [binary, "inference", "pull", "hf:antflydb/clipclap:gguf:Q4_K", "--tasks", "embed"],
+        [
+            binary,
+            "inference",
+            "pull",
+            "hf:antflydb/clipclap:gguf:Q4_K",
+            "--tasks",
+            "embed",
+        ],
         cwd=REPO_ROOT,
         check=True,
     )
     if not model_dir.exists():
-        raise RuntimeError(f"antfly inference pull finished but did not create {model_dir}")
+        raise RuntimeError(
+            f"antfly inference pull finished but did not create {model_dir}"
+        )
     if not _clipclap_gguf_available(model_dir):
         raise RuntimeError(f"ClipClap GGUF files are missing from {model_dir}")
     return model_dir
@@ -2082,7 +2231,9 @@ def _reusable_stateful_runtime():
 @pytest.fixture(scope="function")
 def stateful_api(request: pytest.FixtureRequest):
     base_url = os.environ.get("ANTFLY_STATEFUL_URL")
-    server: PublicAntflyServer | StandaloneAntflyServer | StatefulAntflyServer | None = None
+    server: (
+        PublicAntflyServer | StandaloneAntflyServer | StatefulAntflyServer | None
+    ) = None
     reusable_runtime: ReusableAntflyRuntime | None = None
     default_root = os.environ.get("ANTFLY_STATEFUL_API_ROOT")
     if not base_url:
@@ -2093,7 +2244,9 @@ def stateful_api(request: pytest.FixtureRequest):
             if default_root is None:
                 default_root = reusable_runtime.default_api_root
         else:
-            binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+            binary = resolve_binary_path(
+                os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))
+            )
             if not Path(binary).exists():
                 pytest.skip(f"Public API binary not found: {binary}")
             server = _start_stateful_server_with_retry(binary, find_free_port())
@@ -2101,7 +2254,9 @@ def stateful_api(request: pytest.FixtureRequest):
         if default_root is None and Path(binary).name == "antfly":
             default_root = ANTFLY_PUBLIC_API_ROOT
 
-    base = antfly_public_api_url(base_url, root=default_root if default_root is not None else "")
+    base = antfly_public_api_url(
+        base_url, root=default_root if default_root is not None else ""
+    )
 
     if reusable_runtime is None and not wait_for_server(base, timeout=10):
         pytest.skip(f"Public API at {base} is not reachable")
@@ -2115,7 +2270,12 @@ def stateful_api(request: pytest.FixtureRequest):
             self,
             session: requests.Session,
             base_url: str,
-            server_ref: PublicAntflyServer | StandaloneAntflyServer | StatefulAntflyServer | None,
+            server_ref: (
+                PublicAntflyServer
+                | StandaloneAntflyServer
+                | StatefulAntflyServer
+                | None
+            ),
         ):
             self.s = session
             self.url = base_url.rstrip("/")
@@ -2165,19 +2325,25 @@ def stateful_api(request: pytest.FixtureRequest):
         @property
         def supports_restart(self) -> bool:
             """Whether this fixture owns a server with a restart lifecycle."""
-            return self._server is not None and callable(getattr(self._server, "restart", None))
+            return self._server is not None and callable(
+                getattr(self._server, "restart", None)
+            )
 
         def restart_server(self) -> None:
             server = self._server
             if not self.supports_restart:
-                raise RuntimeError("restart is only available for locally managed stateful servers")
+                raise RuntimeError(
+                    "restart is only available for locally managed stateful servers"
+                )
             assert server is not None
             with self._request_lock:
                 self.s.close()
                 server.restart()
                 if not wait_for_server(self.url, timeout=20):
                     logs = server.debug_logs().strip()
-                    raise RuntimeError(f"stateful server failed to restart at {self.url}\n{logs}")
+                    raise RuntimeError(
+                        f"stateful server failed to restart at {self.url}\n{logs}"
+                    )
                 new_session = requests.Session()
                 new_session.headers["Content-Type"] = "application/json"
                 new_session.headers["Connection"] = "close"
@@ -2186,7 +2352,9 @@ def stateful_api(request: pytest.FixtureRequest):
         def pause_server(self) -> None:
             server = self._server
             if server is None or not hasattr(server, "pause"):
-                raise AssertionError("pause is only available for locally managed stateful servers")
+                raise AssertionError(
+                    "pause is only available for locally managed stateful servers"
+                )
             with self._request_lock:
                 self.s.close()
                 server.pause()
@@ -2194,21 +2362,29 @@ def stateful_api(request: pytest.FixtureRequest):
         def resume_server(self) -> None:
             server = self._server
             if server is None or not hasattr(server, "resume"):
-                raise AssertionError("resume is only available for locally managed stateful servers")
+                raise AssertionError(
+                    "resume is only available for locally managed stateful servers"
+                )
             with self._request_lock:
                 server.resume()
                 if not wait_for_server(self.url, timeout=20):
                     logs = server.debug_logs().strip()
-                    raise AssertionError(f"stateful server failed to resume at {self.url}\n{logs}")
+                    raise AssertionError(
+                        f"stateful server failed to resume at {self.url}\n{logs}"
+                    )
                 new_session = requests.Session()
                 new_session.headers["Content-Type"] = "application/json"
                 new_session.headers["Connection"] = "close"
                 self.s = new_session
 
-        def corrupt_embedding_artifact(self, table_name: str, doc_key: str, index_name: str) -> None:
+        def corrupt_embedding_artifact(
+            self, table_name: str, doc_key: str, index_name: str
+        ) -> None:
             server = self._server
             if server is None:
-                raise AssertionError("artifact corruption is only available for locally managed stateful servers")
+                raise AssertionError(
+                    "artifact corruption is only available for locally managed stateful servers"
+                )
             internal_url = f"{server.url}{antfly_internal_api_path(f'/tables/{table_name}/corrupt-embedding-artifact')}"
             try:
                 with self._request_lock:
@@ -2236,7 +2412,9 @@ def stateful_api(request: pytest.FixtureRequest):
         def post(self, path: str, payload: dict) -> Any:
             try:
                 with self._request_lock:
-                    result = self._check(self.s.post(f"{self.url}{path}", json=payload, timeout=30))
+                    result = self._check(
+                        self.s.post(f"{self.url}{path}", json=payload, timeout=30)
+                    )
                 if table_name := _created_table_from_path(path):
                     self._created_tables.add(table_name)
                 return result
@@ -2246,14 +2424,20 @@ def stateful_api(request: pytest.FixtureRequest):
         def put(self, path: str, payload: dict) -> Any:
             try:
                 with self._request_lock:
-                    return self._check(self.s.put(f"{self.url}{path}", json=payload, timeout=30))
+                    return self._check(
+                        self.s.put(f"{self.url}{path}", json=payload, timeout=30)
+                    )
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
-        def _request(self, method: str, path: str, payload: dict | None = None) -> requests.Response:
+        def _request(
+            self, method: str, path: str, payload: dict | None = None
+        ) -> requests.Response:
             try:
                 with self._request_lock:
-                    return self.s.request(method, f"{self.url}{path}", json=payload, timeout=30)
+                    return self.s.request(
+                        method, f"{self.url}{path}", json=payload, timeout=30
+                    )
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
@@ -2264,15 +2448,26 @@ def stateful_api(request: pytest.FixtureRequest):
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
-        def create_table(self, table_name: str, *, num_shards: int = 1, description: str | None = None) -> dict:
+        def create_table(
+            self,
+            table_name: str,
+            *,
+            num_shards: int = 1,
+            description: str | None = None,
+            indexes: dict[str, dict] | None = None,
+        ) -> dict:
             payload: dict[str, object] = {"num_shards": num_shards}
             if description is not None:
                 payload["description"] = description
+            if indexes is not None:
+                payload["indexes"] = indexes
             deadline = time.monotonic() + 5.0
             while True:
                 try:
                     with self._request_lock:
-                        response = self.s.post(f"{self.url}/tables/{table_name}", json=payload, timeout=30)
+                        response = self.s.post(
+                            f"{self.url}/tables/{table_name}", json=payload, timeout=30
+                        )
                 except requests.RequestException as err:
                     if time.monotonic() >= deadline:
                         self._raise_request_error(err)
@@ -2298,7 +2493,9 @@ def stateful_api(request: pytest.FixtureRequest):
         def query_table(self, table_name: str, payload: dict) -> dict:
             return self.post(f"/tables/{table_name}/query", payload)
 
-        def inference_embed(self, model: str, text: str, *, timeout_s: float = 120.0) -> dict:
+        def inference_embed(
+            self, model: str, text: str, *, timeout_s: float = 120.0
+        ) -> dict:
             base_url = self.url.removesuffix(ANTFLY_PUBLIC_API_ROOT)
             try:
                 with self._request_lock:
@@ -2349,7 +2546,9 @@ def stateful_api(request: pytest.FixtureRequest):
                 payload["sync_level"] = sync_level
             return self.post(f"/tables/{table_name}/merge", payload)
 
-        def backup_table(self, table_name: str, *, backup_id: str, location: str) -> dict:
+        def backup_table(
+            self, table_name: str, *, backup_id: str, location: str
+        ) -> dict:
             try:
                 with self._request_lock:
                     response = self.s.post(
@@ -2365,7 +2564,9 @@ def stateful_api(request: pytest.FixtureRequest):
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
-        def restore_table(self, table_name: str, *, backup_id: str, location: str) -> dict:
+        def restore_table(
+            self, table_name: str, *, backup_id: str, location: str
+        ) -> dict:
             try:
                 with self._request_lock:
                     response = self.s.post(
@@ -2382,7 +2583,9 @@ def stateful_api(request: pytest.FixtureRequest):
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
-        def cluster_backup(self, *, backup_id: str, location: str, table_names: list[str] | None = None) -> dict:
+        def cluster_backup(
+            self, *, backup_id: str, location: str, table_names: list[str] | None = None
+        ) -> dict:
             payload: dict[str, object] = {
                 "backup_id": backup_id,
                 "location": location,
@@ -2392,7 +2595,9 @@ def stateful_api(request: pytest.FixtureRequest):
                 payload["table_names"] = table_names
             try:
                 with self._request_lock:
-                    return self._check(self.s.post(f"{self.url}/backup", json=payload, timeout=120))
+                    return self._check(
+                        self.s.post(f"{self.url}/backup", json=payload, timeout=120)
+                    )
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
@@ -2415,13 +2620,18 @@ def stateful_api(request: pytest.FixtureRequest):
                 payload["restore_mode"] = restore_mode
             try:
                 with self._request_lock:
-                    accepted = self._check(self.s.post(f"{self.url}/restore", json=payload, timeout=120))
+                    accepted = self._check(
+                        self.s.post(f"{self.url}/restore", json=payload, timeout=120)
+                    )
                 return _wait_for_restore_job(self.get, accepted)
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
         def list_backups(self, *, location: str) -> dict:
-            response = self.s.get(f"{self.url}/backups?location={location}&connection={E2E_BACKUP_CONNECTION}", timeout=30)
+            response = self.s.get(
+                f"{self.url}/backups?location={location}&connection={E2E_BACKUP_CONNECTION}",
+                timeout=30,
+            )
             return self._check(response)
 
         def batch_write_with_timeout(
@@ -2451,7 +2661,9 @@ def stateful_api(request: pytest.FixtureRequest):
                 )
             return self._check(response)
 
-        def multi_batch(self, tables: dict[str, dict], *, sync_level: str | None = None) -> dict:
+        def multi_batch(
+            self, tables: dict[str, dict], *, sync_level: str | None = None
+        ) -> dict:
             payload: dict[str, object] = {"tables": tables}
             if sync_level is not None:
                 payload["sync_level"] = sync_level
@@ -2470,12 +2682,12 @@ def stateful_api(request: pytest.FixtureRequest):
             if not response.content:
                 return []
             return [
-                json.loads(line)
-                for line in response.text.splitlines()
-                if line.strip()
+                json.loads(line) for line in response.text.splitlines() if line.strip()
             ]
 
-        def lookup_key_with_version(self, table_name: str, key: str) -> tuple[dict, str | None]:
+        def lookup_key_with_version(
+            self, table_name: str, key: str
+        ) -> tuple[dict, str | None]:
             response = self._request("GET", lookup_key_path(table_name, key))
             body = self._check(response)
             return body, response.headers.get("X-Antfly-Version")
@@ -2536,7 +2748,9 @@ def stateful_api(request: pytest.FixtureRequest):
                 "key": key,
                 "version": str(version),
             }
-            response = self._request("POST", f"/transactions/{transaction_id}/read", payload)
+            response = self._request(
+                "POST", f"/transactions/{transaction_id}/read", payload
+            )
             if response.status_code not in (200, 409):
                 response.raise_for_status()
             return response.status_code, self._decode(response)
@@ -2556,7 +2770,9 @@ def stateful_api(request: pytest.FixtureRequest):
             }
             return self.post(f"/transactions/{transaction_id}/write", payload)
 
-        def stage_transaction_delete(self, transaction_id: str, *, table_name: str, key: str) -> dict:
+        def stage_transaction_delete(
+            self, transaction_id: str, *, table_name: str, key: str
+        ) -> dict:
             payload = {
                 "table": table_name,
                 "key": key,
@@ -2566,8 +2782,12 @@ def stateful_api(request: pytest.FixtureRequest):
         def create_transaction_savepoint(self, transaction_id: str) -> dict:
             return self.post(f"/transactions/{transaction_id}/savepoints", {})
 
-        def rollback_transaction_savepoint(self, transaction_id: str, savepoint_id: int) -> dict:
-            return self.post(f"/transactions/{transaction_id}/savepoints/{savepoint_id}/rollback", {})
+        def rollback_transaction_savepoint(
+            self, transaction_id: str, savepoint_id: int
+        ) -> dict:
+            return self.post(
+                f"/transactions/{transaction_id}/savepoints/{savepoint_id}/rollback", {}
+            )
 
         def commit_transaction_session(
             self,
@@ -2584,7 +2804,9 @@ def stateful_api(request: pytest.FixtureRequest):
                 payload["tables"] = tables
             if sync_level is not None:
                 payload["sync_level"] = sync_level
-            response = self._request("POST", f"/transactions/{transaction_id}/commit", payload or None)
+            response = self._request(
+                "POST", f"/transactions/{transaction_id}/commit", payload or None
+            )
             if response.status_code not in (200, 409):
                 response.raise_for_status()
             return response.status_code, self._decode(response)
@@ -2599,7 +2821,10 @@ def stateful_api(request: pytest.FixtureRequest):
             return self.get(f"/tables/{table_name}/indexes/{index_name}")
 
         def create_index(self, table_name: str, index_name: str, payload: dict) -> dict:
-            created = self.post(f"/tables/{table_name}/indexes/{index_name}", payload)
+            created = self.post(
+                f"/tables/{table_name}/indexes/{index_name}",
+                create_index_payload(payload, index_name),
+            )
             deadline = time.monotonic() + 10.0
             while True:
                 try:
@@ -2625,12 +2850,20 @@ def stateful_api(request: pytest.FixtureRequest):
     yield api
     report = getattr(request.node, "rep_call", None)
     test_failed = bool(report and report.failed)
-    cleanup_errors = _cleanup_created_tables(api, api._created_tables) if reusable_runtime is not None else []
+    cleanup_errors = (
+        _cleanup_created_tables(api, api._created_tables)
+        if reusable_runtime is not None
+        else []
+    )
     session.close()
     if reusable_runtime is not None:
-        reusable_runtime.test_failed = reusable_runtime.test_failed or test_failed or bool(cleanup_errors)
+        reusable_runtime.test_failed = (
+            reusable_runtime.test_failed or test_failed or bool(cleanup_errors)
+        )
         if cleanup_errors:
-            message = "failed to clean reusable Antfly test tables:\n" + "\n".join(cleanup_errors)
+            message = "failed to clean reusable Antfly test tables:\n" + "\n".join(
+                cleanup_errors
+            )
             if test_failed:
                 print(message)
             else:
@@ -2662,7 +2895,9 @@ def backup_api(request: pytest.FixtureRequest):
         server = reusable_runtime.server
         binary = server.binary
     else:
-        binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+        binary = resolve_binary_path(
+            os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))
+        )
         if not Path(binary).exists():
             pytest.skip(f"Public API binary not found: {binary}")
         if Path(binary).name == "antfly":
@@ -2685,7 +2920,12 @@ def backup_api(request: pytest.FixtureRequest):
             self,
             session: requests.Session,
             base_url: str,
-            server_ref: PublicAntflyServer | StandaloneAntflyServer | StatefulAntflyServer | None,
+            server_ref: (
+                PublicAntflyServer
+                | StandaloneAntflyServer
+                | StatefulAntflyServer
+                | None
+            ),
         ):
             self.s = session
             self.url = base_url.rstrip("/")
@@ -2732,7 +2972,9 @@ def backup_api(request: pytest.FixtureRequest):
         def post(self, path: str, payload: dict) -> Any:
             try:
                 with self._request_lock:
-                    result = self._check(self.s.post(f"{self.url}{path}", json=payload, timeout=30))
+                    result = self._check(
+                        self.s.post(f"{self.url}{path}", json=payload, timeout=30)
+                    )
                 if table_name := _created_table_from_path(path):
                     self._created_tables.add(table_name)
                 return result
@@ -2742,14 +2984,20 @@ def backup_api(request: pytest.FixtureRequest):
         def put(self, path: str, payload: dict) -> Any:
             try:
                 with self._request_lock:
-                    return self._check(self.s.put(f"{self.url}{path}", json=payload, timeout=30))
+                    return self._check(
+                        self.s.put(f"{self.url}{path}", json=payload, timeout=30)
+                    )
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
-        def _request(self, method: str, path: str, payload: dict | None = None) -> requests.Response:
+        def _request(
+            self, method: str, path: str, payload: dict | None = None
+        ) -> requests.Response:
             try:
                 with self._request_lock:
-                    return self.s.request(method, f"{self.url}{path}", json=payload, timeout=30)
+                    return self.s.request(
+                        method, f"{self.url}{path}", json=payload, timeout=30
+                    )
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
@@ -2760,15 +3008,26 @@ def backup_api(request: pytest.FixtureRequest):
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
-        def create_table(self, table_name: str, *, num_shards: int = 1, description: str | None = None) -> dict:
+        def create_table(
+            self,
+            table_name: str,
+            *,
+            num_shards: int = 1,
+            description: str | None = None,
+            indexes: dict[str, dict] | None = None,
+        ) -> dict:
             payload: dict[str, object] = {"num_shards": num_shards}
             if description is not None:
                 payload["description"] = description
+            if indexes is not None:
+                payload["indexes"] = indexes
             deadline = time.monotonic() + 5.0
             while True:
                 try:
                     with self._request_lock:
-                        response = self.s.post(f"{self.url}/tables/{table_name}", json=payload, timeout=30)
+                        response = self.s.post(
+                            f"{self.url}/tables/{table_name}", json=payload, timeout=30
+                        )
                 except requests.RequestException as err:
                     if time.monotonic() >= deadline:
                         self._raise_request_error(err)
@@ -2794,7 +3053,9 @@ def backup_api(request: pytest.FixtureRequest):
         def query_table(self, table_name: str, payload: dict) -> dict:
             return self.post(f"/tables/{table_name}/query", payload)
 
-        def inference_embed(self, model: str, text: str, *, timeout_s: float = 120.0) -> dict:
+        def inference_embed(
+            self, model: str, text: str, *, timeout_s: float = 120.0
+        ) -> dict:
             base_url = self.url.removesuffix(ANTFLY_PUBLIC_API_ROOT)
             try:
                 with self._request_lock:
@@ -2837,9 +3098,7 @@ def backup_api(request: pytest.FixtureRequest):
             if not response.content:
                 return []
             return [
-                json.loads(line)
-                for line in response.text.splitlines()
-                if line.strip()
+                json.loads(line) for line in response.text.splitlines() if line.strip()
             ]
 
         def list_indexes(self, table_name: str) -> dict:
@@ -2849,7 +3108,10 @@ def backup_api(request: pytest.FixtureRequest):
             return self.get(f"/tables/{table_name}/indexes/{index_name}")
 
         def create_index(self, table_name: str, index_name: str, payload: dict) -> dict:
-            created = self.post(f"/tables/{table_name}/indexes/{index_name}", payload)
+            created = self.post(
+                f"/tables/{table_name}/indexes/{index_name}",
+                create_index_payload(payload, index_name),
+            )
             deadline = time.monotonic() + 10.0
             while True:
                 try:
@@ -2878,7 +3140,9 @@ def backup_api(request: pytest.FixtureRequest):
             while True:
                 try:
                     last_info = self.get(f"/tables/{table_name}/indexes/{index_name}")
-                    ready = ready_index_status(last_info, require_query_fresh=require_query_fresh)
+                    ready = ready_index_status(
+                        last_info, require_query_fresh=require_query_fresh
+                    )
                     if ready is not None:
                         return ready
                 except requests.RequestException as exc:
@@ -2899,7 +3163,9 @@ def backup_api(request: pytest.FixtureRequest):
         def delete_index(self, table_name: str, index_name: str) -> dict:
             return self.delete(f"/tables/{table_name}/indexes/{index_name}")
 
-        def backup_table(self, table_name: str, *, backup_id: str, location: str) -> dict:
+        def backup_table(
+            self, table_name: str, *, backup_id: str, location: str
+        ) -> dict:
             try:
                 with self._request_lock:
                     response = self.s.post(
@@ -2915,7 +3181,9 @@ def backup_api(request: pytest.FixtureRequest):
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
-        def restore_table(self, table_name: str, *, backup_id: str, location: str) -> dict:
+        def restore_table(
+            self, table_name: str, *, backup_id: str, location: str
+        ) -> dict:
             try:
                 with self._request_lock:
                     response = self.s.post(
@@ -2932,7 +3200,9 @@ def backup_api(request: pytest.FixtureRequest):
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
-        def cluster_backup(self, *, backup_id: str, location: str, table_names: list[str] | None = None) -> dict:
+        def cluster_backup(
+            self, *, backup_id: str, location: str, table_names: list[str] | None = None
+        ) -> dict:
             payload: dict[str, object] = {
                 "backup_id": backup_id,
                 "location": location,
@@ -2942,7 +3212,9 @@ def backup_api(request: pytest.FixtureRequest):
                 payload["table_names"] = table_names
             try:
                 with self._request_lock:
-                    return self._check(self.s.post(f"{self.url}/backup", json=payload, timeout=120))
+                    return self._check(
+                        self.s.post(f"{self.url}/backup", json=payload, timeout=120)
+                    )
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
@@ -2965,25 +3237,38 @@ def backup_api(request: pytest.FixtureRequest):
                 payload["restore_mode"] = restore_mode
             try:
                 with self._request_lock:
-                    accepted = self._check(self.s.post(f"{self.url}/restore", json=payload, timeout=120))
+                    accepted = self._check(
+                        self.s.post(f"{self.url}/restore", json=payload, timeout=120)
+                    )
                 return _wait_for_restore_job(self.get, accepted)
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
         def list_backups(self, *, location: str) -> dict:
-            response = self.s.get(f"{self.url}/backups?location={location}&connection={E2E_BACKUP_CONNECTION}", timeout=30)
+            response = self.s.get(
+                f"{self.url}/backups?location={location}&connection={E2E_BACKUP_CONNECTION}",
+                timeout=30,
+            )
             return self._check(response)
 
     api = PublicApi(session, base, server)
     yield api
     report = getattr(request.node, "rep_call", None)
     test_failed = bool(report and report.failed)
-    cleanup_errors = _cleanup_created_tables(api, api._created_tables) if reusable_runtime is not None else []
+    cleanup_errors = (
+        _cleanup_created_tables(api, api._created_tables)
+        if reusable_runtime is not None
+        else []
+    )
     session.close()
     if reusable_runtime is not None:
-        reusable_runtime.test_failed = reusable_runtime.test_failed or test_failed or bool(cleanup_errors)
+        reusable_runtime.test_failed = (
+            reusable_runtime.test_failed or test_failed or bool(cleanup_errors)
+        )
         if cleanup_errors:
-            message = "failed to clean reusable Antfly test tables:\n" + "\n".join(cleanup_errors)
+            message = "failed to clean reusable Antfly test tables:\n" + "\n".join(
+                cleanup_errors
+            )
             if test_failed:
                 print(message)
             else:
@@ -2992,7 +3277,9 @@ def backup_api(request: pytest.FixtureRequest):
         server.stop(test_failed=test_failed)
 
 
-@pytest.fixture(scope="function", params=["stateful", "serverless"], ids=["stateful", "serverless"])
+@pytest.fixture(
+    scope="function", params=["stateful", "serverless"], ids=["stateful", "serverless"]
+)
 def table_api(request):
     backend = request.param
     raw = request.getfixturevalue(f"{backend}_api")
@@ -3039,7 +3326,9 @@ def table_api(request):
                 sync_level=sync_level,
             )
 
-        def publish_table(self, table_name: str, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> dict | None:
+        def publish_table(
+            self, table_name: str, *, timeout_s: float = 30.0, interval_s: float = 0.5
+        ) -> dict | None:
             if self.backend == "stateful":
                 return None
             deadline = time.monotonic() + timeout_s
@@ -3070,7 +3359,9 @@ def table_api(request):
                     message = str(exc)
                     if logs:
                         message += f"\n[logs]\n{logs}"
-                    raise requests.ConnectionError(message, request=getattr(exc, "request", None)) from exc
+                    raise requests.ConnectionError(
+                        message, request=getattr(exc, "request", None)
+                    ) from exc
             return self.raw.query_table(table_name, payload)
 
         def list_indexes(self, table_name: str) -> dict:
@@ -3097,7 +3388,9 @@ def table_api(request):
             while True:
                 try:
                     last_info = self.get_index(table_name, index_name)
-                    ready = ready_index_status(last_info, require_query_fresh=require_query_fresh)
+                    ready = ready_index_status(
+                        last_info, require_query_fresh=require_query_fresh
+                    )
                     if ready is not None:
                         return ready
                 except requests.RequestException as exc:

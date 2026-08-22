@@ -791,6 +791,7 @@ const LocalStandaloneMetadata = struct {
                 .status = status,
                 .admin_snapshot = catalogAdminSnapshot,
                 .cached_admin_snapshot = cachedAdminSnapshot,
+                .linearizable_snapshot = linearizableSnapshot,
                 .free_admin_snapshot = catalogFreeAdminSnapshot,
                 .create_table = createTable,
                 .replace_table_definition = replaceTableDefinition,
@@ -838,6 +839,21 @@ const LocalStandaloneMetadata = struct {
 
     fn cachedAdminSnapshot(ptr: *anyopaque) !?antfly.metadata_api.AdminSnapshot {
         return try catalogAdminSnapshot(ptr);
+    }
+
+    fn linearizableSnapshot(
+        ptr: *anyopaque,
+        request: antfly.public_api.operation.RequestContext,
+    ) !?antfly.metadata_api.AdminSnapshot {
+        // Standalone catalog mutations and snapshots share the same mutex, so
+        // the locked clone itself is the linearization point. Preserve the
+        // request lifecycle contract on both sides of the potentially large
+        // allocation just like the Raft-backed coherent snapshot path does.
+        try request.ensureActive();
+        var snapshot = try catalogAdminSnapshot(ptr);
+        errdefer catalogFreeAdminSnapshot(ptr, &snapshot);
+        try request.ensureActive();
+        return snapshot;
     }
 
     fn catalogAdminSnapshot(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
@@ -6925,6 +6941,34 @@ test "standalone metadata rolls back an undurable catalog mutation" {
     }
     try std.testing.expectEqual(@as(u64, 1), metadata.epoch);
     try std.testing.expect(metadata.findTableByNameLocked("docs") == null);
+}
+
+test "standalone metadata advertises a linearizable owned snapshot" {
+    const alloc = std.testing.allocator;
+    var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var metadata = LocalStandaloneMetadata{
+        .alloc = alloc,
+        .manager = antfly.metadata.TableManager.init(alloc),
+        .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
+        .local_node_id = 1,
+        .store_id = 1,
+        .api_url = try alloc.dupe(u8, "http://127.0.0.1:8080"),
+        .replica_root_dir = try alloc.dupe(u8, "."),
+        .catalog_path = try alloc.dupe(u8, ".zig-cache/unused-linearizable-snapshot-catalog"),
+        .catalog_store = null,
+        .backend_runtime = backend_runtime.ptr(),
+    };
+    defer metadata.deinit();
+    try metadata.manager.upsertTable(.{ .table_id = 7, .name = "docs" });
+    metadata.epoch = 9;
+
+    const source = metadata.statusSource();
+    var snapshot = (try source.linearizableSnapshot(.{})) orelse return error.TestUnexpectedResult;
+    defer source.freeAdminSnapshot(&snapshot);
+    try std.testing.expectEqual(@as(u64, 9), snapshot.status.metadata_epoch);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.tables.len);
+    try std.testing.expectEqualStrings("docs", snapshot.tables[0].name);
 }
 
 test "standalone metadata rejects corrupt catalog without double-freeing owned paths" {
