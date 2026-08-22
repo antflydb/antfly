@@ -2130,6 +2130,27 @@ pub fn replayDistributedDataVoprCampaign(
     return try vopr.replay.exactWithContext(DistributedDataVoprScenario, alloc, recorded, &context);
 }
 
+pub fn reduceDistributedDataVoprCampaign(
+    alloc: std.mem.Allocator,
+    recorded: *const vopr.trace.Trace,
+    max_attempts: u64,
+) !vopr.reducer.Result {
+    const target = if (recorded.failures.items.len > 0)
+        recorded.failures.items[0].fingerprint
+    else
+        return error.FailingTraceRequired;
+    const config = try DistributedDataVoprCampaignConfig.fromTrace(recorded);
+    var context = DistributedDataVoprContext{ .config = config };
+    return vopr.reducer.reduceWithContext(
+        DistributedDataVoprScenario,
+        alloc,
+        recorded,
+        target,
+        .{ .max_attempts = max_attempts },
+        &context,
+    );
+}
+
 fn runAutomaticMergePublicTrafficScenario(cfg: AutomaticMergePublicTrafficScenario) !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7734,6 +7755,23 @@ test "metadata VOPR seeded smoke campaign" {
         .split_group_id = 6103,
         .split_transition_id = 6104,
     });
+}
+
+test "metadata VOPR trace exactly replays 100 consecutive times" {
+    var recorded = try recordMetadataVoprCampaign(std.testing.allocator, .{
+        .seed = 0xA17F_0100,
+        .operation_count = 1,
+        .metadata_group_id = 6120,
+        .table_id = 6121,
+        .range_group_id = 6122,
+        .split_group_id = 6123,
+        .split_transition_id = 6124,
+    });
+    defer recorded.deinit();
+    for (0..100) |_| {
+        var replayed = try replayMetadataVoprCampaign(std.testing.allocator, &recorded);
+        replayed.deinit();
+    }
 }
 
 test "metadata VOPR records crash interval and durable-state restart lifecycle" {

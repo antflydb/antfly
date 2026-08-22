@@ -42,11 +42,25 @@ pub fn reduce(
     target_fingerprint: u64,
     config: Config,
 ) !Result {
+    return reduceWithContext(Scenario, allocator, original, target_fingerprint, config, null);
+}
+
+/// Reduce a scenario whose clean-world construction requires an application
+/// context. The context is diagnostic/runtime configuration only; every
+/// replay-relevant value must still be present in the canonical artifact.
+pub fn reduceWithContext(
+    comptime Scenario: type,
+    allocator: std.mem.Allocator,
+    original: *const trace.Trace,
+    target_fingerprint: u64,
+    config: Config,
+    scenario_context: ?*anyopaque,
+) !Result {
     if (config.max_attempts == 0) return error.InvalidReductionAttemptBudget;
     if (!hasFingerprint(original, target_fingerprint)) return error.TargetFingerprintMissing;
 
     // Prove the input itself is an exact replay before treating it as a bug.
-    var replayed = try replay.exact(Scenario, allocator, original);
+    var replayed = try replay.exactWithContext(Scenario, allocator, original, scenario_context);
     replayed.deinit();
     var current = try cloneTrace(allocator, original);
     errdefer current.deinit();
@@ -73,12 +87,12 @@ pub fn reduce(
                 report.attempts += 1;
                 report.deletion_attempts += 1;
                 var source = try choice.Deleting.init(current.choices.items, start, end, config.suffix_seed +% report.attempts);
-                var candidate = runner.run(Scenario, allocator, source.source(), runnerConfig(&current)) catch continue;
+                var candidate = runner.run(Scenario, allocator, source.source(), runnerConfig(&current, scenario_context)) catch continue;
                 defer candidate.deinit();
                 if (!hasFingerprint(&candidate, target_fingerprint)) continue;
                 if (!try strictlySimpler(allocator, &candidate, &current)) continue;
 
-                var exact = replay.exact(Scenario, allocator, &candidate) catch continue;
+                var exact = replay.exactWithContext(Scenario, allocator, &candidate, scenario_context) catch continue;
                 exact.deinit();
                 report.replay_checks += 1;
                 const replacement = try cloneTrace(allocator, &candidate);
@@ -101,12 +115,12 @@ pub fn reduce(
                 if (alternative == record.selected_id or report.attempts == config.max_attempts) continue;
                 report.attempts += 1;
                 var source = choice.Mutating.init(current.choices.items, choice_index, alternative, config.suffix_seed +% report.attempts);
-                var candidate = runner.run(Scenario, allocator, source.source(), runnerConfig(&current)) catch continue;
+                var candidate = runner.run(Scenario, allocator, source.source(), runnerConfig(&current, scenario_context)) catch continue;
                 defer candidate.deinit();
                 if (!hasFingerprint(&candidate, target_fingerprint)) continue;
                 if (!try strictlySimpler(allocator, &candidate, &current)) continue;
 
-                var exact = replay.exact(Scenario, allocator, &candidate) catch continue;
+                var exact = replay.exactWithContext(Scenario, allocator, &candidate, scenario_context) catch continue;
                 exact.deinit();
                 report.replay_checks += 1;
                 const replacement = try cloneTrace(allocator, &candidate);
@@ -124,7 +138,7 @@ pub fn reduce(
     return .{ .artifact = current, .report = report };
 }
 
-fn runnerConfig(artifact: *const trace.Trace) runner.Config {
+fn runnerConfig(artifact: *const trace.Trace, scenario_context: ?*anyopaque) runner.Config {
     return .{
         .system = artifact.header.system,
         .seed = artifact.config.seed,
@@ -137,6 +151,7 @@ fn runnerConfig(artifact: *const trace.Trace) runner.Config {
         .source_revision = artifact.header.source_revision,
         .target = artifact.header.target,
         .optimize = artifact.header.optimize,
+        .scenario_context = scenario_context,
     };
 }
 
@@ -215,5 +230,67 @@ test "reducer shortens a history while preserving its failure fingerprint" {
     try std.testing.expect(result.report.accepted > 0);
     try std.testing.expect(result.report.deletion_attempts > 0);
     try std.testing.expect(result.report.deletions_accepted > 0);
+    try std.testing.expect(hasFingerprint(&result.artifact, fingerprint));
+}
+
+test "reducer preserves a required scenario context" {
+    const event = @import("event.zig");
+    const ids = @import("id.zig");
+    const observation = @import("observation.zig");
+    const outcome = @import("outcome.zig");
+    const property = @import("property.zig");
+    const transition = @import("transition.zig");
+    const Context = struct { failure_at: u64 };
+    const ContextScenario = struct {
+        pub const name: []const u8 = "context-reducer-test";
+        pub const version: u32 = 1;
+        const failure_id = ids.stable("property", "context-reducer.failure");
+        const step_id = ids.stable("transition", "context-reducer.step");
+        pub const properties = &[_]property.Declaration{.{ .id = failure_id, .name = "context-reducer.failure", .kind = .always }};
+        pub const World = struct { context: *Context, steps: u64 = 0 };
+        pub fn init(_: std.mem.Allocator) !World {
+            return error.ContextRequired;
+        }
+        pub fn initWithContext(_: std.mem.Allocator, context_ptr: ?*anyopaque) !World {
+            return .{ .context = @ptrCast(@alignCast(context_ptr orelse return error.ContextRequired)) };
+        }
+        pub fn deinit(_: *World, _: std.mem.Allocator) void {}
+        pub fn enumerate(_: *World, list: *transition.List, allocator_: std.mem.Allocator) !void {
+            try list.append(allocator_, .{ .id = step_id, .name = "context-reducer.step", .kind = .workload });
+        }
+        pub fn execute(world: *World, _: transition.Transition, _: *event.Sink, _: std.mem.Allocator) !outcome.TransitionOutcome {
+            world.steps += 1;
+            return outcome.TransitionOutcome.applied();
+        }
+        pub fn observe(world: *World, builder: *observation.Builder, allocator_: std.mem.Allocator) !void {
+            try builder.addNamed(allocator_, "context-reducer.steps", @intCast(world.steps));
+        }
+        pub fn evaluate(world: *World, sink: *property.Sink, allocator_: std.mem.Allocator) !void {
+            try sink.check(allocator_, failure_id, world.steps < world.context.failure_at);
+        }
+        pub fn done(world: *World) bool {
+            return world.steps >= 3;
+        }
+    };
+
+    var context = Context{ .failure_at = 2 };
+    var seeded = choice.Seeded.init(1);
+    var original = try runner.run(ContextScenario, std.testing.allocator, seeded.source(), .{
+        .transition_budget = 3,
+        .scenario_context = &context,
+    });
+    defer original.deinit();
+    const fingerprint = original.failures.items[0].fingerprint;
+    var result = try reduceWithContext(
+        ContextScenario,
+        std.testing.allocator,
+        &original,
+        fingerprint,
+        .{ .max_attempts = 8 },
+        &context,
+    );
+    defer result.deinit();
+    var replayed = try replay.exactWithContext(ContextScenario, std.testing.allocator, &result.artifact, &context);
+    replayed.deinit();
     try std.testing.expect(hasFingerprint(&result.artifact, fingerprint));
 }

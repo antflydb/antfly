@@ -318,15 +318,78 @@ fn reduceCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8)
     defer alloc.free(encoded);
     var recorded = try vopr.trace.parseAlloc(alloc, encoded);
     defer recorded.deinit();
-    var reduced = try antfly.metadata_sim_harness.reduceMetadataVoprCampaign(alloc, &recorded, attempts);
-    defer reduced.deinit();
-    const reduced_bytes = try reduced.artifact.renderAlloc(alloc);
+    if (std.mem.eql(u8, recorded.header.scenario, "metadata-vopr")) {
+        var reduced = try antfly.metadata_sim_harness.reduceMetadataVoprCampaign(alloc, &recorded, attempts);
+        defer reduced.deinit();
+        return writeReducedArtifact(
+            alloc,
+            io,
+            output,
+            &reduced.artifact,
+            reduced.original_transitions,
+            reduced.reduced_transitions,
+            reduced.attempts,
+            reduced.target_fingerprint,
+        );
+    }
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.transaction_vopr.Scenario.name)) {
+        const target = if (recorded.failures.items.len > 0)
+            recorded.failures.items[0].fingerprint
+        else
+            return error.FailingTraceRequired;
+        var reduced = try vopr.reducer.reduce(
+            antfly.transaction_vopr.Scenario,
+            alloc,
+            &recorded,
+            target,
+            .{ .max_attempts = attempts },
+        );
+        defer reduced.deinit();
+        return writeReducedArtifact(
+            alloc,
+            io,
+            output,
+            &reduced.artifact,
+            reduced.report.original_transitions,
+            reduced.report.reduced_transitions,
+            reduced.report.attempts,
+            reduced.report.target_fingerprint,
+        );
+    }
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.metadata_sim_harness.DistributedDataVoprScenario.name)) {
+        var reduced = try antfly.metadata_sim_harness.reduceDistributedDataVoprCampaign(alloc, &recorded, attempts);
+        defer reduced.deinit();
+        return writeReducedArtifact(
+            alloc,
+            io,
+            output,
+            &reduced.artifact,
+            reduced.report.original_transitions,
+            reduced.report.reduced_transitions,
+            reduced.report.attempts,
+            reduced.report.target_fingerprint,
+        );
+    }
+    return error.UnsupportedScenario;
+}
+
+fn writeReducedArtifact(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    output: []const u8,
+    artifact: *const vopr.trace.Trace,
+    original_transitions: u64,
+    reduced_transitions: u64,
+    attempts: u64,
+    target_fingerprint: u64,
+) !void {
+    const reduced_bytes = try artifact.renderAlloc(alloc);
     defer alloc.free(reduced_bytes);
     if (std.fs.path.dirname(output)) |parent| try ensureDir(io, parent);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output, .data = reduced_bytes });
     std.debug.print(
         "VOPR reduced transitions={d}->{d} attempts={d} fingerprint={x} trace={s}\n",
-        .{ reduced.original_transitions, reduced.reduced_transitions, reduced.attempts, reduced.target_fingerprint, output },
+        .{ original_transitions, reduced_transitions, attempts, target_fingerprint, output },
     );
 }
 

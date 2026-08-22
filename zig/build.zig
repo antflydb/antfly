@@ -4912,6 +4912,21 @@ pub fn build(b: *std.Build) void {
     const lib_metadata_vopr_test_step = b.step("lib-metadata-vopr-test", "Run seeded metadata virtual-operation campaign tests");
     lib_metadata_vopr_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
 
+    const lib_metadata_vopr_replay_stability_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"metadata VOPR trace exactly replays 100 consecutive times"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_metadata_vopr_replay_stability_tests = addFilteredTestRunArtifact(b, lib_metadata_vopr_replay_stability_tests);
+    const lib_metadata_vopr_replay_stability_step = b.step(
+        "metadata-vopr-replay-stability-test",
+        "Exact-replay one metadata VOPR trace 100 consecutive times",
+    );
+    lib_metadata_vopr_replay_stability_step.dependOn(&run_lib_metadata_vopr_replay_stability_tests.step);
+
     const lib_metadata_vopr_data_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"metadata VOPR distributed data survives split partition node restart and modeled storage crash"},
