@@ -93,7 +93,7 @@ pub const PropertyRecord = struct {
     details: []const u8,
 };
 
-pub const FailureClass = enum { property, harness, panic, process, allocator, differential, replay_divergence };
+pub const FailureClass = enum { property, liveness, harness, panic, process, allocator, differential, replay_divergence };
 pub const FailureRecord = struct {
     index: u64,
     class: FailureClass,

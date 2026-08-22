@@ -37,6 +37,8 @@ const PropertyFailure = struct {
     transition_index: u64,
 };
 
+const StepResult = enum { executed, stopped };
+
 pub fn run(
     comptime Scenario: type,
     allocator: std.mem.Allocator,
@@ -83,7 +85,8 @@ pub fn captureCheckpoint(
     var replay_source = choice.Replay{ .records = artifact.choices.items };
     var transition_index: u64 = 0;
     while (transition_index < prefix_len) {
-        try executeStep(Scenario, allocator, replay_source.source(), config.transition_budget, &world, &tracker, &actual, &transition_index, &last_digest);
+        if (try executeStep(Scenario, allocator, replay_source.source(), config.transition_budget, &world, &tracker, &actual, &transition_index, &last_digest) == .stopped)
+            return error.SnapshotPrefixPastScenarioEnd;
     }
     actual.summary = .{
         .transitions = transition_index,
@@ -168,7 +171,8 @@ fn continueRun(
     var last_digest = starting_digest;
     var transition_index = starting_transition_index;
     while (!Scenario.done(world)) {
-        try executeStep(Scenario, allocator, choice_source, transition_budget, world, tracker, result, &transition_index, &last_digest);
+        if (try executeStep(Scenario, allocator, choice_source, transition_budget, world, tracker, result, &transition_index, &last_digest) == .stopped)
+            break;
     }
     try choice_source.finish();
     tracker.finish(transition_index);
@@ -219,13 +223,34 @@ fn executeStep(
     result: *trace.Trace,
     transition_index: *u64,
     last_digest: *u64,
-) !void {
+) !StepResult {
     if (Scenario.done(world)) return error.SnapshotPrefixPastScenarioEnd;
-    if (transition_index.* == transition_budget) return error.TransitionBudgetExceeded;
+    if (transition_index.* == transition_budget) return .stopped;
 
     var enabled = try scheduler.enumerateCanonical(Scenario, world, allocator);
     defer enabled.deinit(allocator);
-    if (enabled.items.items.len == 0) return error.ScenarioDeadlock;
+    if (enabled.items.items.len == 0) {
+        const classification: scenario_contract.NoTransition = if (@hasDecl(Scenario, "classifyNoTransition"))
+            Scenario.classifyNoTransition(world)
+        else
+            .{ .harness_deadlock = "vopr.scenario_deadlock" };
+        switch (classification) {
+            .clean_quiescence, .expected_blocked => return .stopped,
+            .liveness_failure => |identity| {
+                if (identity.len == 0) return error.EmptyLivenessFailureIdentity;
+                try result.addFailure(.{
+                    .index = transition_index.*,
+                    .class = .liveness,
+                    .property_id = null,
+                    .identity = identity,
+                    .fingerprint = ids.derive("failure.liveness", ids.stable("failure", identity), Scenario.version),
+                    .observation_digest = last_digest.*,
+                });
+                return .stopped;
+            },
+            .harness_deadlock => return error.ScenarioDeadlock,
+        }
+    }
 
     const occurrence = transition_index.*;
     const selected_id = try choice_source.choose(.{
@@ -343,6 +368,7 @@ fn executeStep(
             .observation_digest = last_digest.*,
         });
     }
+    return .executed;
 }
 
 fn initTrace(comptime Scenario: type, allocator: std.mem.Allocator, config: Config) !trace.Trace {

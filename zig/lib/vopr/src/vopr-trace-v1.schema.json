@@ -159,7 +159,7 @@
       "properties": {
         "type": { "const": "failure" },
         "index": { "$ref": "#/$defs/u64" },
-        "class": { "enum": ["property", "harness", "panic", "process", "allocator", "differential", "replay_divergence"] },
+        "class": { "enum": ["property", "liveness", "harness", "panic", "process", "allocator", "differential", "replay_divergence"] },
         "property_id": { "oneOf": [{ "$ref": "#/$defs/u64" }, { "type": "null" }] },
         "identity": { "type": "string", "minLength": 1 },
         "fingerprint": { "$ref": "#/$defs/u64" },

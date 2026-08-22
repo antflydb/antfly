@@ -64,6 +64,63 @@ const FailingScenario = struct {
     }
 };
 
+fn NoTransitionScenario(comptime classification: ?scenario.NoTransition) type {
+    return struct {
+        pub const name: []const u8 = if (classification == null) "blocked-default" else switch (classification.?) {
+            .clean_quiescence => "blocked-clean",
+            .expected_blocked => "blocked-expected",
+            .liveness_failure => "blocked-liveness",
+            .harness_deadlock => "blocked-harness",
+        };
+        pub const version: u32 = 1;
+        pub const properties = &[_]property.Declaration{};
+        pub const World = struct {};
+        pub fn init(_: std.mem.Allocator) !World {
+            return .{};
+        }
+        pub fn deinit(_: *World, _: std.mem.Allocator) void {}
+        pub fn enumerate(_: *World, _: *transition.List, _: std.mem.Allocator) !void {}
+        pub fn execute(_: *World, _: transition.Transition, _: *event.Sink, _: std.mem.Allocator) !outcome.TransitionOutcome {
+            return error.UnreachableTransition;
+        }
+        pub fn observe(_: *World, _: *observation.Builder, _: std.mem.Allocator) !void {}
+        pub fn evaluate(_: *World, _: *property.Sink, _: std.mem.Allocator) !void {}
+        pub fn done(_: *World) bool {
+            return false;
+        }
+        pub fn classifyNoTransition(_: *World) scenario.NoTransition {
+            if (classification) |value| return value;
+            unreachable;
+        }
+    };
+}
+
+const BudgetScenario = struct {
+    pub const name: []const u8 = "budget-terminated";
+    pub const version: u32 = 1;
+    const step_id = id.stable("transition", "budget.step");
+    pub const properties = &[_]property.Declaration{};
+    pub const World = struct { steps: u64 = 0 };
+    pub fn init(_: std.mem.Allocator) !World {
+        return .{};
+    }
+    pub fn deinit(_: *World, _: std.mem.Allocator) void {}
+    pub fn enumerate(_: *World, list: *transition.List, allocator: std.mem.Allocator) !void {
+        try list.append(allocator, .{ .id = step_id, .name = "budget.step", .kind = .workload });
+    }
+    pub fn execute(world: *World, _: transition.Transition, _: *event.Sink, _: std.mem.Allocator) !outcome.TransitionOutcome {
+        world.steps += 1;
+        return outcome.TransitionOutcome.applied();
+    }
+    pub fn observe(world: *World, builder: *observation.Builder, allocator: std.mem.Allocator) !void {
+        try builder.addNamed(allocator, "budget.steps", @intCast(world.steps));
+    }
+    pub fn evaluate(_: *World, _: *property.Sink, _: std.mem.Allocator) !void {}
+    pub fn done(_: *World) bool {
+        return false;
+    }
+};
+
 test "toy scenario records, parses, and exactly replays" {
     var seeded = choice.Seeded.init(0xa17f_0001);
     var recorded = try runner.run(ToyScenario, std.testing.allocator, seeded.source(), .{
@@ -142,6 +199,34 @@ test "property violations are recorded with stable failure fingerprints" {
 
     var replayed = try replay.exact(FailingScenario, std.testing.allocator, &recorded);
     replayed.deinit();
+}
+
+test "bounded histories stop cleanly at their transition budget" {
+    var seeded = choice.Seeded.init(4);
+    var recorded = try runner.run(BudgetScenario, std.testing.allocator, seeded.source(), .{ .seed = 4, .transition_budget = 2 });
+    defer recorded.deinit();
+    try std.testing.expectEqual(@as(u64, 2), recorded.summary.?.transitions);
+    try std.testing.expectEqual(@as(usize, 0), recorded.failures.items.len);
+    var replayed = try replay.exact(BudgetScenario, std.testing.allocator, &recorded);
+    replayed.deinit();
+}
+
+test "no-transition states distinguish clean liveness and harness outcomes" {
+    const Clean = NoTransitionScenario(.clean_quiescence);
+    var seeded = choice.Seeded.init(5);
+    var clean = try runner.run(Clean, std.testing.allocator, seeded.source(), .{ .seed = 5, .transition_budget = 1 });
+    defer clean.deinit();
+    try std.testing.expectEqual(@as(u64, 0), clean.summary.?.transitions);
+    try std.testing.expectEqual(@as(usize, 0), clean.failures.items.len);
+
+    const Liveness = NoTransitionScenario(.{ .liveness_failure = "test.recovery_stalled" });
+    var liveness = try runner.run(Liveness, std.testing.allocator, seeded.source(), .{ .seed = 5, .transition_budget = 1 });
+    defer liveness.deinit();
+    try std.testing.expectEqual(@as(usize, 1), liveness.failures.items.len);
+    try std.testing.expectEqual(trace.FailureClass.liveness, liveness.failures.items[0].class);
+
+    const Harness = NoTransitionScenario(.{ .harness_deadlock = "test.scheduler_deadlock" });
+    try std.testing.expectError(error.ScenarioDeadlock, runner.run(Harness, std.testing.allocator, seeded.source(), .{ .seed = 5, .transition_budget = 1 }));
 }
 
 test "record and replay paths are allocation-failure safe" {

@@ -3,6 +3,13 @@
 
 const outcome = @import("outcome.zig");
 
+pub const NoTransition = union(enum) {
+    clean_quiescence,
+    expected_blocked,
+    liveness_failure: []const u8,
+    harness_deadlock: []const u8,
+};
+
 pub fn assertContract(comptime Scenario: type) void {
     const required_declarations = .{ "World", "name", "version", "properties", "init", "deinit", "enumerate", "execute", "observe", "evaluate", "done" };
     inline for (required_declarations) |declaration| {
