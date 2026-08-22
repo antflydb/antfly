@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
 from .conftest import FIRST_USE_REQUEST_TIMEOUT
-from .helpers import TINY_PNG_URI, make_text_png_uri, make_wav_b64
+from .helpers import make_text_png_uri, make_wav_b64
 from .models import (
     default_generator_model_name,
     find_multimodal_generator_model_name,
