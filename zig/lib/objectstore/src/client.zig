@@ -35,6 +35,7 @@ pub const Client = struct {
         get_object: *const fn (*anyopaque, Allocator, []const u8, []const u8, types.GetOptions) anyerror!types.GetResult,
         get_object_attributes: *const fn (*anyopaque, Allocator, []const u8, []const u8) anyerror!types.ObjectAttributes,
         stat_object: *const fn (*anyopaque, Allocator, []const u8, []const u8) anyerror!types.ObjectMetadata,
+        stat_object_with_options: ?*const fn (*anyopaque, Allocator, []const u8, []const u8, types.StatOptions) anyerror!types.ObjectMetadata = null,
         delete_object: *const fn (*anyopaque, []const u8, []const u8, types.DeleteOptions) anyerror!void,
         list_objects: *const fn (*anyopaque, Allocator, []const u8, types.ListOptions) anyerror!types.ListResult,
     };
@@ -77,7 +78,11 @@ pub const Client = struct {
     }
 
     pub fn getObject(self: *Client, bucket: []const u8, key: []const u8, opts: types.GetOptions) !types.GetResult {
-        return try self.vtable.get_object(self.ptr, self.allocator, bucket, key, opts);
+        if (opts.cancellation) |token| try token.check();
+        var result = try self.vtable.get_object(self.ptr, self.allocator, bucket, key, opts);
+        errdefer result.deinit(self.allocator);
+        if (opts.cancellation) |token| try token.check();
+        return result;
     }
 
     pub fn getFile(self: *Client, bucket: []const u8, key: []const u8, dest_path: []const u8, opts: types.GetOptions) !void {
@@ -144,7 +149,18 @@ pub const Client = struct {
     }
 
     pub fn statObject(self: *Client, bucket: []const u8, key: []const u8) !types.ObjectMetadata {
-        return try self.vtable.stat_object(self.ptr, self.allocator, bucket, key);
+        return try self.statObjectWithOptions(bucket, key, .{});
+    }
+
+    pub fn statObjectWithOptions(self: *Client, bucket: []const u8, key: []const u8, opts: types.StatOptions) !types.ObjectMetadata {
+        if (opts.cancellation) |token| try token.check();
+        var metadata = if (self.vtable.stat_object_with_options) |stat_with_options|
+            try stat_with_options(self.ptr, self.allocator, bucket, key, opts)
+        else
+            try self.vtable.stat_object(self.ptr, self.allocator, bucket, key);
+        errdefer metadata.deinit(self.allocator);
+        if (opts.cancellation) |token| try token.check();
+        return metadata;
     }
 
     pub fn deleteObject(self: *Client, bucket: []const u8, key: []const u8, opts: types.DeleteOptions) !void {

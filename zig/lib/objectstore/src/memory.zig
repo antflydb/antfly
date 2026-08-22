@@ -140,6 +140,7 @@ pub const MemoryClient = struct {
     }
 
     fn getObject(self: *MemoryClient, alloc: Allocator, bucket: []const u8, key: []const u8, opts: types.GetOptions) !types.GetResult {
+        if (opts.cancellation) |token| try token.check();
         self.recordOperation();
         _ = opts.version_id;
         const object_map = self.buckets.getPtr(bucket) orelse return error.FileNotFound;
@@ -160,7 +161,17 @@ pub const MemoryClient = struct {
         if (opts.max_response_bytes) |limit| {
             if (selected.len > limit) return error.ResponseTooLarge;
         }
-        const body = try alloc.dupe(u8, selected);
+        const body = try alloc.alloc(u8, selected.len);
+        errdefer alloc.free(body);
+        const cancellation_chunk_bytes = 1024 * 1024;
+        var copied: usize = 0;
+        while (copied < selected.len) {
+            if (opts.cancellation) |token| try token.check();
+            const chunk_len = @min(cancellation_chunk_bytes, selected.len - copied);
+            @memcpy(body[copied..][0..chunk_len], selected[copied..][0..chunk_len]);
+            copied += chunk_len;
+        }
+        if (opts.cancellation) |token| try token.check();
 
         return .{
             .body = body,

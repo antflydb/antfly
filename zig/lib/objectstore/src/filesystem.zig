@@ -204,6 +204,7 @@ pub const FilesystemClient = struct {
     }
 
     fn getObject(self: *FilesystemClient, alloc: Allocator, bucket: []const u8, key: []const u8, opts: types.GetOptions) !types.GetResult {
+        if (opts.cancellation) |token| try token.check();
         if (opts.version_id != null) return error.VersioningUnsupported;
         if (opts.range != null and opts.part_number != null) return error.AmbiguousRange;
         var meta = try self.statObject(alloc, bucket, key);
@@ -230,7 +231,15 @@ pub const FilesystemClient = struct {
         if (opts.max_response_bytes) |limit| {
             if (requested.end - requested.start > limit) return error.ResponseTooLarge;
         }
-        const body = try readObjectRangeAlloc(self.io, alloc, object_path, requested.start, requested.end, meta.etag.?);
+        const body = try readObjectRangeAlloc(
+            self.io,
+            alloc,
+            object_path,
+            requested.start,
+            requested.end,
+            meta.etag.?,
+            opts.cancellation,
+        );
 
         meta.content_length = @intCast(body.len);
         return .{
@@ -794,7 +803,16 @@ fn resolveRange(total_len: u64, offset: u64, maybe_len: ?u64) !ObjectRange {
     return .{ .start = @intCast(offset), .end = @intCast(end_u64) };
 }
 
-fn readObjectRangeAlloc(io: std.Io, alloc: Allocator, path: []const u8, start: usize, end: usize, expected_etag: []const u8) ![]u8 {
+fn readObjectRangeAlloc(
+    io: std.Io,
+    alloc: Allocator,
+    path: []const u8,
+    start: usize,
+    end: usize,
+    expected_etag: []const u8,
+    cancellation: ?types.CancellationToken,
+) ![]u8 {
+    if (cancellation) |token| try token.check();
     if (end < start) return error.InvalidRange;
     const file = try openFilePath(io, path);
     defer file.close(io);
@@ -807,7 +825,16 @@ fn readObjectRangeAlloc(io: std.Io, alloc: Allocator, path: []const u8, start: u
     const body = try alloc.alloc(u8, end - start);
     errdefer alloc.free(body);
     const file_offset = std.math.add(u64, header.data_offset, start) catch return error.InvalidRange;
-    if (body.len > 0 and try file.readPositionalAll(io, body, file_offset) != body.len) return error.CorruptObject;
+    const cancellation_chunk_bytes = 1024 * 1024;
+    var copied: usize = 0;
+    while (copied < body.len) {
+        if (cancellation) |token| try token.check();
+        const chunk_len = @min(cancellation_chunk_bytes, body.len - copied);
+        const chunk = body[copied..][0..chunk_len];
+        if (try file.readPositionalAll(io, chunk, file_offset + copied) != chunk.len) return error.CorruptObject;
+        copied += chunk.len;
+    }
+    if (cancellation) |token| try token.check();
     return body;
 }
 

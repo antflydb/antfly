@@ -129,7 +129,7 @@ pub const TransportResponse = struct {
     }
 };
 
-const RequestFn = *const fn (?*anyopaque, Allocator, HttpMethod, []const u8, []const HeaderPair, ?[]const u8, ?[]const u8, ?usize) anyerror!TransportResponse;
+const RequestFn = *const fn (?*anyopaque, Allocator, HttpMethod, []const u8, []const HeaderPair, ?[]const u8, ?[]const u8, ?usize, ?types.CancellationToken) anyerror!TransportResponse;
 
 const HttpxTransport = struct {
     alloc: Allocator,
@@ -179,6 +179,7 @@ const HttpxTransport = struct {
         body: ?[]const u8,
         content_type: ?[]const u8,
         max_response_size: ?usize,
+        cancellation: ?types.CancellationToken,
     ) !TransportResponse {
         const self: *HttpxTransport = @ptrCast(@alignCast(ctx.?));
 
@@ -189,11 +190,15 @@ const HttpxTransport = struct {
             try request_headers.append(alloc, .{ "Content-Type", value });
         }
 
-        var response = try self.client.request(method.toHttpx(), url, .{
+        var response = self.client.request(method.toHttpx(), url, .{
             .headers = request_headers.items,
             .body = body,
             .max_response_size = max_response_size,
-        });
+            .cancellation = if (cancellation) |token|
+                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+            else
+                null,
+        }) catch |err| return if (err == error.Cancelled) error.Canceled else err;
         defer response.deinit();
 
         return .{
@@ -454,7 +459,7 @@ pub const JsonApiClient = struct {
                 .key = owned_key,
                 .content_length = 0,
             };
-        } else try self.statObjectVersion(alloc, bucket, key, opts.version_id);
+        } else try self.statObjectVersion(alloc, bucket, key, opts.version_id, opts.cancellation);
         errdefer meta.deinit(alloc);
 
         const effective_generation: ?[]const u8 = if (opts.version_id) |value|
@@ -486,13 +491,14 @@ pub const JsonApiClient = struct {
             }
         }
 
-        var response = try self.performWithResponseLimit(
+        var response = try self.performWithResponseLimitAndCancellation(
             .GET,
             url,
             headers.items,
             null,
             null,
             opts.max_response_bytes,
+            opts.cancellation,
         );
         errdefer response.deinit(alloc);
 
@@ -545,14 +551,25 @@ pub const JsonApiClient = struct {
     }
 
     fn statObject(self: *JsonApiClient, alloc: Allocator, bucket: []const u8, key: []const u8) !types.ObjectMetadata {
-        return self.statObjectVersion(alloc, bucket, key, null);
+        return self.statObjectVersion(alloc, bucket, key, null, null);
     }
 
-    fn statObjectVersion(self: *JsonApiClient, alloc: Allocator, bucket: []const u8, key: []const u8, generation: ?[]const u8) !types.ObjectMetadata {
+    fn statObjectWithOptions(self: *JsonApiClient, alloc: Allocator, bucket: []const u8, key: []const u8, opts: types.StatOptions) !types.ObjectMetadata {
+        return self.statObjectVersion(alloc, bucket, key, null, opts.cancellation);
+    }
+
+    fn statObjectVersion(
+        self: *JsonApiClient,
+        alloc: Allocator,
+        bucket: []const u8,
+        key: []const u8,
+        generation: ?[]const u8,
+        cancellation: ?types.CancellationToken,
+    ) !types.ObjectMetadata {
         const url = try objectMetadataUrlWithGenerationAlloc(alloc, self.cfg, bucket, key, generation);
         defer alloc.free(url);
 
-        var response = try self.perform(.GET, url, &.{}, null, null);
+        var response = try self.performWithResponseLimitAndCancellation(.GET, url, &.{}, null, null, null, cancellation);
         defer response.deinit(alloc);
 
         switch (response.status) {
@@ -630,6 +647,20 @@ pub const JsonApiClient = struct {
         content_type: ?[]const u8,
         max_response_size: ?usize,
     ) !TransportResponse {
+        return try self.performWithResponseLimitAndCancellation(method, url, headers, body, content_type, max_response_size, null);
+    }
+
+    fn performWithResponseLimitAndCancellation(
+        self: *JsonApiClient,
+        method: HttpMethod,
+        url: []const u8,
+        headers: []const HeaderPair,
+        body: ?[]const u8,
+        content_type: ?[]const u8,
+        max_response_size: ?usize,
+        cancellation: ?types.CancellationToken,
+    ) !TransportResponse {
+        if (cancellation) |token| try token.check();
         var merged = std.ArrayListUnmanaged(HeaderPair).empty;
         defer merged.deinit(self.alloc);
         try merged.appendSlice(self.alloc, headers);
@@ -647,6 +678,7 @@ pub const JsonApiClient = struct {
             body,
             content_type,
             max_response_size,
+            cancellation,
         );
     }
 
@@ -659,6 +691,7 @@ pub const JsonApiClient = struct {
         .get_object = erasedGetObject,
         .get_object_attributes = erasedGetObjectAttributes,
         .stat_object = erasedStatObject,
+        .stat_object_with_options = erasedStatObjectWithOptions,
         .delete_object = erasedDeleteObject,
         .list_objects = erasedListObjects,
     };
@@ -701,6 +734,11 @@ pub const JsonApiClient = struct {
     fn erasedStatObject(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8) !types.ObjectMetadata {
         const self: *JsonApiClient = @ptrCast(@alignCast(ptr));
         return try self.statObject(alloc, bucket, key);
+    }
+
+    fn erasedStatObjectWithOptions(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, opts: types.StatOptions) !types.ObjectMetadata {
+        const self: *JsonApiClient = @ptrCast(@alignCast(ptr));
+        return try self.statObjectWithOptions(alloc, bucket, key, opts);
     }
 
     fn erasedDeleteObject(ptr: *anyopaque, bucket: []const u8, key: []const u8, opts: types.DeleteOptions) !void {
@@ -1301,7 +1339,7 @@ test "gcs file upload completes a resumable lifecycle with bounded chunks" {
     const State = struct {
         calls: usize = 0,
 
-        fn request(ctx: ?*anyopaque, request_alloc: Allocator, method: HttpMethod, url: []const u8, _: []const HeaderPair, body: ?[]const u8, _: ?[]const u8, _: ?usize) !TransportResponse {
+        fn request(ctx: ?*anyopaque, request_alloc: Allocator, method: HttpMethod, url: []const u8, _: []const HeaderPair, body: ?[]const u8, _: ?[]const u8, _: ?usize, _: ?types.CancellationToken) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             defer self.calls += 1;
             return switch (self.calls) {
@@ -1361,6 +1399,7 @@ test "json api client pins media reads to the generation returned by metadata" {
             body: ?[]const u8,
             content_type: ?[]const u8,
             max_response_size: ?usize,
+            _: ?types.CancellationToken,
         ) !TransportResponse {
             _ = body;
             _ = content_type;
@@ -1461,6 +1500,60 @@ test "json api metadata falls back to the always-available crc32c checksum" {
     try std.testing.expectEqual(types.ObjectChecksumType.full_object, meta.checksum.?.checksum_type);
 }
 
+test "gcs read cancellation reaches active media and metadata requests" {
+    const alloc = std.testing.allocator;
+    const State = struct {
+        signal: *std.atomic.Value(bool),
+        calls: usize = 0,
+
+        fn request(
+            ptr: ?*anyopaque,
+            _: Allocator,
+            method: HttpMethod,
+            _: []const u8,
+            _: []const HeaderPair,
+            _: ?[]const u8,
+            _: ?[]const u8,
+            _: ?usize,
+            cancellation: ?types.CancellationToken,
+        ) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.calls += 1;
+            try std.testing.expectEqual(HttpMethod.GET, method);
+            self.signal.store(true, .release);
+            try cancellation.?.check();
+            return error.TestExpectedCancellation;
+        }
+    };
+
+    var signal = std.atomic.Value(bool).init(false);
+    var state = State{ .signal = &signal };
+    const cfg = try jsonApiClientConfigAlloc(alloc);
+    var json_client = JsonApiClient.initWithRequestFn(alloc, cfg, &state, State.request);
+    var client = json_client.client();
+    defer client.deinit();
+
+    try std.testing.expectError(
+        error.Canceled,
+        client.getObject("bucket", "object", .{
+            .range = .{ .offset = 0, .length = 1 },
+            .skip_metadata_probe = true,
+            .max_response_bytes = 1,
+            .cancellation = types.CancellationToken.fromAtomic(&signal),
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
+
+    signal.store(false, .release);
+    try std.testing.expectError(
+        error.Canceled,
+        client.statObjectWithOptions("bucket", "object", .{
+            .cancellation = types.CancellationToken.fromAtomic(&signal),
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 2), state.calls);
+}
+
 test "json api client put object encodes upload url and returns etag" {
     const alloc = std.testing.allocator;
     const State = struct {
@@ -1473,6 +1566,7 @@ test "json api client put object encodes upload url and returns etag" {
             body: ?[]const u8,
             content_type: ?[]const u8,
             _: ?usize,
+            _: ?types.CancellationToken,
         ) !TransportResponse {
             try std.testing.expectEqual(HttpMethod.POST, method);
             try std.testing.expectEqualStrings("https://storage.googleapis.com/upload/storage/v1/b/bucket/o?uploadType=media&name=folder%2Fdoc.txt&ifGenerationMatch=0", url);
@@ -1513,6 +1607,7 @@ test "json api client lists objects and prefixes" {
             body: ?[]const u8,
             content_type: ?[]const u8,
             _: ?usize,
+            _: ?types.CancellationToken,
         ) !TransportResponse {
             _ = headers;
             _ = body;
@@ -1562,6 +1657,7 @@ test "json api client make bucket requires project id" {
             _: ?[]const u8,
             _: ?[]const u8,
             _: ?usize,
+            _: ?types.CancellationToken,
         ) !TransportResponse {
             return error.Unreachable;
         }

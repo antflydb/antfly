@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 
 pub const sha256_checksum_len: usize = std.crypto.hash.sha2.Sha256.digest_length * 2;
 pub const sha256_artifact_id_prefix = "sha256:";
@@ -70,7 +71,9 @@ pub const ArtifactStore = struct {
         put: *const fn (*anyopaque, Allocator, []const u8) anyerror!ArtifactMetadata,
         get_alloc: *const fn (*anyopaque, Allocator, []const u8) anyerror![]u8,
         get_range_alloc: *const fn (*anyopaque, Allocator, []const u8, u64, usize) anyerror![]u8,
+        get_range_alloc_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, u64, usize, CancellationToken) anyerror![]u8 = null,
         stat: *const fn (*anyopaque, Allocator, []const u8) anyerror!ArtifactMetadata,
+        stat_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, CancellationToken) anyerror!ArtifactMetadata = null,
         delete: *const fn (*anyopaque, []const u8) anyerror!void,
     };
 
@@ -88,11 +91,39 @@ pub const ArtifactStore = struct {
     }
 
     pub fn getRangeAlloc(self: *ArtifactStore, artifact_id: []const u8, offset: u64, len: usize) ![]u8 {
-        return try self.vtable.get_range_alloc(self.ptr, self.allocator, artifact_id, offset, len);
+        return try self.getRangeAllocWithCancellation(artifact_id, offset, len, .none);
+    }
+
+    pub fn getRangeAllocWithCancellation(
+        self: *ArtifactStore,
+        artifact_id: []const u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        try cancellation.check();
+        const payload = if (self.vtable.get_range_alloc_with_cancellation) |get_with_cancellation|
+            try get_with_cancellation(self.ptr, self.allocator, artifact_id, offset, len, cancellation)
+        else
+            try self.vtable.get_range_alloc(self.ptr, self.allocator, artifact_id, offset, len);
+        errdefer self.allocator.free(payload);
+        try cancellation.check();
+        return payload;
     }
 
     pub fn stat(self: *ArtifactStore, artifact_id: []const u8) !ArtifactMetadata {
-        return try self.vtable.stat(self.ptr, self.allocator, artifact_id);
+        return try self.statWithCancellation(artifact_id, .none);
+    }
+
+    pub fn statWithCancellation(self: *ArtifactStore, artifact_id: []const u8, cancellation: CancellationToken) !ArtifactMetadata {
+        try cancellation.check();
+        var metadata = if (self.vtable.stat_with_cancellation) |stat_with_cancellation|
+            try stat_with_cancellation(self.ptr, self.allocator, artifact_id, cancellation)
+        else
+            try self.vtable.stat(self.ptr, self.allocator, artifact_id);
+        errdefer metadata.deinit(self.allocator);
+        try cancellation.check();
+        return metadata;
     }
 
     pub fn delete(self: *ArtifactStore, artifact_id: []const u8) !void {

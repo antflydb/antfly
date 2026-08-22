@@ -1133,7 +1133,10 @@ fn loadVerifiedArtifactAlloc(
     // Check at each transport boundary: cancellation may arrive while local
     // validation or a preceding artifact is being processed.
     try budget.checkCancellation();
-    var metadata = try artifacts.stat(declaration.artifact.artifact_id);
+    var metadata = try artifacts.statWithCancellation(
+        declaration.artifact.artifact_id,
+        budget.cancellation,
+    );
     defer metadata.deinit(artifacts.allocator);
     if (!std.mem.eql(u8, metadata.artifact_id, declaration.artifact.artifact_id) or
         metadata.byte_len != declaration.artifact.byte_len or
@@ -1146,7 +1149,12 @@ fn loadVerifiedArtifactAlloc(
 
     // Fetch exactly the admitted range so remote implementations can enforce
     // the bound at the transport layer as well as after download.
-    const payload = try artifacts.getRangeAlloc(declaration.artifact.artifact_id, 0, admitted_len);
+    const payload = try artifacts.getRangeAllocWithCancellation(
+        declaration.artifact.artifact_id,
+        0,
+        admitted_len,
+        budget.cancellation,
+    );
     errdefer artifacts.allocator.free(payload);
     try validatePayloadAgainstDeclarationWithCancellation(payload, declaration, budget.limits, budget.cancellation);
     return payload;
@@ -1607,7 +1615,7 @@ test "lake graph sidecar candidate admission bounds filters, edge work, and canc
     );
 }
 
-test "lake sidecar cancellation after metadata stat prevents artifact range fetch" {
+test "lake sidecar cancellation reaches metadata and active artifact range operations" {
     const alloc = std.testing.allocator;
     const checksum = "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881";
     const artifact_id = "sha256:" ++ checksum;
@@ -1615,6 +1623,7 @@ test "lake sidecar cancellation after metadata stat prevents artifact range fetc
     const CancellationStore = struct {
         const State = struct {
             cancelled: *std.atomic.Value(bool),
+            cancel_on_stat: bool = true,
             stat_calls: usize = 0,
             range_calls: usize = 0,
         };
@@ -1641,10 +1650,25 @@ test "lake sidecar cancellation after metadata stat prevents artifact range fetc
             return try allocator.dupe(u8, "x");
         }
 
+        fn getRangeAllocWithCancellation(
+            ptr: *anyopaque,
+            _: Allocator,
+            _: []const u8,
+            _: u64,
+            _: usize,
+            cancellation: CancellationToken,
+        ) ![]u8 {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            state.range_calls += 1;
+            state.cancelled.store(true, .release);
+            try cancellation.check();
+            return error.TestExpectedCancellation;
+        }
+
         fn stat(ptr: *anyopaque, allocator: Allocator, _: []const u8) !artifacts_mod.ArtifactMetadata {
             const state: *State = @ptrCast(@alignCast(ptr));
             state.stat_calls += 1;
-            state.cancelled.store(true, .release);
+            if (state.cancel_on_stat) state.cancelled.store(true, .release);
             const owned_id = try allocator.dupe(u8, artifact_id);
             errdefer allocator.free(owned_id);
             return .{
@@ -1663,6 +1687,7 @@ test "lake sidecar cancellation after metadata stat prevents artifact range fetc
             .put = put,
             .get_alloc = getAlloc,
             .get_range_alloc = getRangeAlloc,
+            .get_range_alloc_with_cancellation = getRangeAllocWithCancellation,
             .stat = stat,
             .delete = delete,
         };
@@ -1710,6 +1735,21 @@ test "lake sidecar cancellation after metadata stat prevents artifact range fetc
     );
     try std.testing.expectEqual(@as(usize, 1), state.stat_calls);
     try std.testing.expectEqual(@as(usize, 0), state.range_calls);
+
+    cancelled.store(false, .release);
+    state.cancel_on_stat = false;
+    try std.testing.expectError(
+        error.Canceled,
+        textCandidateSetsFromArtifactStoreWithOptionsAlloc(
+            alloc,
+            &store,
+            &.{declaration},
+            .{ .request = .{ .text = "query" }, .sidecar_names = &names },
+            .{ .cancellation = CancellationToken.fromAtomic(&cancelled) },
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 2), state.stat_calls);
+    try std.testing.expectEqual(@as(usize, 1), state.range_calls);
 }
 
 fn testCandidateDeclaration(

@@ -423,14 +423,12 @@ fn searchTextSegmentSpecAlloc(
 
     var scored = std.ArrayListUnmanaged(ScoredDoc).empty;
     defer scored.deinit(alloc);
+    errdefer freeOwnedScoredDocItems(alloc, scored.items);
     for (scores, 0..) |score, doc_index| {
         if (doc_index % 64 == 0) try cancellation.check();
         if (score == 0) continue;
         if (operator == .all_terms and matched_terms[doc_index] != @as(u16, @intCast(query_terms.len))) continue;
-        try scored.append(alloc, .{
-            .doc_id = try alloc.dupe(u8, text_segment.docs[doc_index].doc_id),
-            .score = score,
-        });
+        try appendOwnedScoredDocAlloc(alloc, &scored, text_segment.docs[doc_index].doc_id, score, null);
     }
 
     try cancellation.check();
@@ -614,13 +612,17 @@ fn searchSparseSegmentSpecAlloc(
 
     var scored = std.ArrayListUnmanaged(ScoredDoc).empty;
     defer scored.deinit(alloc);
+    errdefer freeOwnedScoredDocItems(alloc, scored.items);
     for (scores, 0..) |score, doc_index| {
         if (doc_index % 64 == 0) try cancellation.check();
         if (score <= 0) continue;
-        try scored.append(alloc, .{
-            .doc_id = try alloc.dupe(u8, sparse_segment.docs[doc_index].doc_id),
-            .score = @intFromFloat(score * 1000.0),
-        });
+        try appendOwnedScoredDocAlloc(
+            alloc,
+            &scored,
+            sparse_segment.docs[doc_index].doc_id,
+            @intFromFloat(score * 1000.0),
+            null,
+        );
     }
     try cancellation.check();
     std.mem.sort(ScoredDoc, scored.items, {}, lessScoredDoc);
@@ -699,13 +701,17 @@ fn searchSparseArtifactAlloc(
 
     var scored = std.ArrayListUnmanaged(ScoredDoc).empty;
     defer scored.deinit(alloc);
+    errdefer freeOwnedScoredDocItems(alloc, scored.items);
     for (scores, 0..) |score, doc_index| {
         if (doc_index % 64 == 0) try session.checkCancellation();
         if (score <= 0) continue;
-        try scored.append(alloc, .{
-            .doc_id = try alloc.dupe(u8, docs[doc_index].doc_id),
-            .score = @intFromFloat(score * 1000.0),
-        });
+        try appendOwnedScoredDocAlloc(
+            alloc,
+            &scored,
+            docs[doc_index].doc_id,
+            @intFromFloat(score * 1000.0),
+            null,
+        );
     }
     std.mem.sort(ScoredDoc, scored.items, {}, lessScoredDoc);
     return try clipScoredDocsAlloc(alloc, scored.items, req.offset, req.limit, req.min_score);
@@ -763,7 +769,13 @@ fn searchVectorSegmentAlloc(
             const error_bounds = try alloc.alloc(f32, count);
             defer alloc.free(error_bounds);
             try cancellation.check();
-            try quantizer.estimateDistances(&quantized, effective_query, distances, error_bounds);
+            try quantizer.estimateDistancesCancellable(
+                &quantized,
+                effective_query,
+                distances,
+                error_bounds,
+                vectorQuantizerCancellation(cancellation),
+            );
             try cancellation.check();
             var local_candidates = std.ArrayListUnmanaged(ApproxCandidate).empty;
             defer local_candidates.deinit(alloc);
@@ -810,6 +822,7 @@ fn searchVectorSegmentAlloc(
 
     var scored = std.ArrayListUnmanaged(ScoredDoc).empty;
     defer scored.deinit(alloc);
+    errdefer freeOwnedScoredDocItems(alloc, scored.items);
     var exact_blocks = try alloc.alloc(?[]vector_segment_mod.Entry, vector_segment.clusters.len);
     defer {
         for (exact_blocks) |maybe_block| {
@@ -840,11 +853,13 @@ fn searchVectorSegmentAlloc(
         if (similarity <= 0) continue;
         const distance = vector_types.distanceToQuery(effective_query, query_measure, entry.vector, vector_segment.metric);
         stats.exact_rerank_count += 1;
-        try scored.append(alloc, .{
-            .doc_id = try alloc.dupe(u8, entry.doc_id),
-            .score = @intFromFloat(similarity * 1000.0),
-            .distance = distance,
-        });
+        try appendOwnedScoredDocAlloc(
+            alloc,
+            &scored,
+            entry.doc_id,
+            @intFromFloat(similarity * 1000.0),
+            distance,
+        );
         std.mem.sort(ScoredDoc, scored.items, {}, lessScoredDoc);
         trimScoredDocsToNeeded(alloc, &scored, needed);
     }
@@ -1074,11 +1089,13 @@ fn searchVectorArtifactAlloc(
         if (similarity <= 0) continue;
         const distance = vector_types.distanceToQuery(effective_query, query_measure, entry.vector, header.metric);
         stats.exact_rerank_count += 1;
-        try scored.append(alloc, .{
-            .doc_id = try alloc.dupe(u8, entry.doc_id),
-            .score = @intFromFloat(similarity * 1000.0),
-            .distance = distance,
-        });
+        try appendOwnedScoredDocAlloc(
+            alloc,
+            &scored,
+            entry.doc_id,
+            @intFromFloat(similarity * 1000.0),
+            distance,
+        );
         std.mem.sort(ScoredDoc, scored.items, {}, lessScoredDoc);
         trimScoredDocsToNeeded(alloc, &scored, needed);
     }
@@ -1585,8 +1602,31 @@ fn clipScoredDocsAlloc(alloc: Allocator, scored: []ScoredDoc, offset: usize, lim
     return out;
 }
 
-pub fn freeScoredDocs(alloc: Allocator, hits: []ScoredDoc) void {
+/// Append one owned hit without creating an allocation that can be orphaned if
+/// growing the list fails. Callers retain ownership of every item in `scored`
+/// until clipping transfers selected IDs to the returned slice.
+fn appendOwnedScoredDocAlloc(
+    alloc: Allocator,
+    scored: *std.ArrayListUnmanaged(ScoredDoc),
+    doc_id: []const u8,
+    score: u32,
+    distance: ?f32,
+) !void {
+    try scored.ensureUnusedCapacity(alloc, 1);
+    const owned_doc_id = try alloc.dupe(u8, doc_id);
+    scored.appendAssumeCapacity(.{
+        .doc_id = owned_doc_id,
+        .score = score,
+        .distance = distance,
+    });
+}
+
+fn freeOwnedScoredDocItems(alloc: Allocator, hits: []const ScoredDoc) void {
     for (hits) |hit| alloc.free(hit.doc_id);
+}
+
+pub fn freeScoredDocs(alloc: Allocator, hits: []ScoredDoc) void {
+    freeOwnedScoredDocItems(alloc, hits);
     alloc.free(hits);
 }
 
@@ -1701,10 +1741,14 @@ fn accumulatePrefixAnyTerms(
     }
 }
 
-fn quantizerCancellation(session: *const runtime_mod.QuerySession) ?vector_quantizer.CancellationToken {
-    const ptr = session.cancellation.ptr orelse return null;
-    const is_cancelled_fn = session.cancellation.is_cancelled_fn orelse return null;
+fn vectorQuantizerCancellation(cancellation: CancellationToken) ?vector_quantizer.CancellationToken {
+    const ptr = cancellation.ptr orelse return null;
+    const is_cancelled_fn = cancellation.is_cancelled_fn orelse return null;
     return .{ .ptr = ptr, .is_cancelled_fn = is_cancelled_fn };
+}
+
+fn quantizerCancellation(session: *const runtime_mod.QuerySession) ?vector_quantizer.CancellationToken {
+    return vectorQuantizerCancellation(session.cancellation);
 }
 
 fn findTerm(terms: []const text_segment_mod.TermEntry, needle: []const u8) ?text_segment_mod.TermEntry {
@@ -1827,6 +1871,59 @@ test "serverless text postings scan stops at an inner-loop cancellation checkpoi
     );
     try std.testing.expectEqual(@as(usize, 3), state.checks);
     try std.testing.expectEqual(@as(u32, 64), scores[0]);
+}
+
+test "serverless text cancellation releases partially constructed owned hits" {
+    const State = struct {
+        checks: usize = 0,
+
+        fn cancelled(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            // Checks 1-4 cover setup and posting accumulation, check 5 starts
+            // materialization, and check 6 interrupts after 64 owned IDs.
+            return self.checks >= 6;
+        }
+    };
+
+    var docs: [65]text_segment_mod.DocumentEntry = undefined;
+    var postings: [65]text_segment_mod.Posting = undefined;
+    for (&docs, &postings, 0..) |*doc, *posting, idx| {
+        doc.* = .{
+            .doc_id = @constCast("same-doc-id"),
+            .normalized_text = @constCast("term"),
+            .token_count = 1,
+        };
+        posting.* = .{ .doc_index = @intCast(idx), .term_freq = 1 };
+    }
+    var terms = [_]text_segment_mod.TermEntry{.{
+        .term = @constCast("term"),
+        .postings = &postings,
+    }};
+    const segment = text_segment_mod.Segment{ .docs = &docs, .terms = &terms };
+    var state = State{};
+    const cancellation = CancellationToken{ .ptr = &state, .is_cancelled_fn = State.cancelled };
+
+    try std.testing.expectError(
+        error.Canceled,
+        searchTextSegmentDocIdsWithCancellationAlloc(
+            std.testing.allocator,
+            segment,
+            "term",
+            .any_terms,
+            0,
+            docs.len,
+            0,
+            cancellation,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 6), state.checks);
+}
+
+test "serverless vector quantizer cancellation adapter preserves callback semantics" {
+    var cancelled = std.atomic.Value(bool).init(true);
+    const adapted = vectorQuantizerCancellation(CancellationToken.fromAtomic(&cancelled)).?;
+    try std.testing.expectError(error.Canceled, adapted.check());
 }
 
 test "indexed reader uses text postings for all-term and prefix search" {

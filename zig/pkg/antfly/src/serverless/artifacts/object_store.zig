@@ -17,6 +17,7 @@ const objectstore = @import("objectstore");
 const artifact_store = @import("store.zig");
 const remote_uri = @import("../remote_uri.zig");
 const object_store_support = @import("../object_store_support.zig");
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 
 pub const ObjectStore = struct {
     alloc: std.mem.Allocator,
@@ -176,24 +177,53 @@ pub const ObjectStore = struct {
     }
 
     pub fn getRangeAlloc(self: *ObjectStore, alloc: std.mem.Allocator, artifact_id: []const u8, offset: u64, len: usize) ![]u8 {
+        return try self.getRangeAllocWithCancellation(alloc, artifact_id, offset, len, .none);
+    }
+
+    pub fn getRangeAllocWithCancellation(
+        self: *ObjectStore,
+        alloc: std.mem.Allocator,
+        artifact_id: []const u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        try cancellation.check();
         const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         const key = try keyForChecksumAlloc(alloc, self.prefix, checksum);
         defer alloc.free(key);
-        var result = try self.client.getObject(self.bucket, key, .{
+        var result = self.client.getObject(self.bucket, key, .{
             .range = .{ .offset = offset, .length = len },
-        });
+            .skip_metadata_probe = true,
+            .max_response_bytes = len,
+            .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
+        }) catch |err| return normalizeCancellationError(err);
         defer result.deinit(alloc);
+        try cancellation.check();
         return try alloc.dupe(u8, result.body);
     }
 
     pub fn stat(self: *ObjectStore, alloc: std.mem.Allocator, artifact_id: []const u8) !artifact_store.ArtifactMetadata {
+        return try self.statWithCancellation(alloc, artifact_id, .none);
+    }
+
+    pub fn statWithCancellation(
+        self: *ObjectStore,
+        alloc: std.mem.Allocator,
+        artifact_id: []const u8,
+        cancellation: CancellationToken,
+    ) !artifact_store.ArtifactMetadata {
+        try cancellation.check();
         const checksum_value = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         const checksum = try alloc.dupe(u8, checksum_value);
         errdefer alloc.free(checksum);
         const key = try keyForChecksumAlloc(alloc, self.prefix, checksum);
         defer alloc.free(key);
-        var meta = try self.client.statObject(self.bucket, key);
+        var meta = self.client.statObjectWithOptions(self.bucket, key, .{
+            .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
+        }) catch |err| return normalizeCancellationError(err);
         defer meta.deinit(alloc);
+        try cancellation.check();
         return .{
             .artifact_id = try alloc.dupe(u8, artifact_id),
             .byte_len = meta.content_length,
@@ -213,7 +243,9 @@ pub const ObjectStore = struct {
         .put = erasedPut,
         .get_alloc = erasedGetAlloc,
         .get_range_alloc = erasedGetRangeAlloc,
+        .get_range_alloc_with_cancellation = erasedGetRangeAllocWithCancellation,
         .stat = erasedStat,
+        .stat_with_cancellation = erasedStatWithCancellation,
         .delete = erasedDelete,
     };
 
@@ -237,9 +269,19 @@ pub const ObjectStore = struct {
         return try self.getRangeAlloc(alloc, artifact_id, offset, len);
     }
 
+    fn erasedGetRangeAllocWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, artifact_id: []const u8, offset: u64, len: usize, cancellation: CancellationToken) ![]u8 {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return try self.getRangeAllocWithCancellation(alloc, artifact_id, offset, len, cancellation);
+    }
+
     fn erasedStat(ptr: *anyopaque, alloc: std.mem.Allocator, artifact_id: []const u8) !artifact_store.ArtifactMetadata {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         return try self.stat(alloc, artifact_id);
+    }
+
+    fn erasedStatWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, artifact_id: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return try self.statWithCancellation(alloc, artifact_id, cancellation);
     }
 
     fn erasedDelete(ptr: *anyopaque, artifact_id: []const u8) !void {
@@ -247,6 +289,10 @@ pub const ObjectStore = struct {
         try self.delete(artifact_id);
     }
 };
+
+fn normalizeCancellationError(err: anyerror) anyerror {
+    return if (err == error.Cancelled) error.Canceled else err;
+}
 
 fn sha256StringAlloc(alloc: std.mem.Allocator, contents: []const u8) ![]u8 {
     var digest: [32]u8 = undefined;
