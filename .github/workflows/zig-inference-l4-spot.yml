@@ -67,9 +67,10 @@ jobs:
 
       - name: Verify CUDA is compiled in
         run: |
-          version="$(zig/zig-out/bin/antfly inference version)"
-          printf '%s\n' "$version"
-          grep -q 'cuda=true' <<<"$version"
+          identity="$(zig/zig-out/bin/antfly inference cuda-info --artifact-identity 2>&1)"
+          printf '%s\n' "$identity"
+          grep -q '^cuda_artifact_identity_schema: antfly.cuda_artifact_identity.v1$' <<<"$identity"
+          grep -q '^cuda_artifact_mode: fatbin$' <<<"$identity"
 
       - name: Package E2E executable
         run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-cuda.tar.gz" zig-out/bin/antfly
@@ -156,9 +157,6 @@ jobs:
           nvidia-smi --query-gpu=name,uuid,driver_version,compute_cap,memory.total --format=csv,noheader | tee "${RUNNER_TEMP}/gpu-before.csv"
           grep -q 'NVIDIA L4' "${RUNNER_TEMP}/gpu-before.csv"
           grep -q '8.9' "${RUNNER_TEMP}/gpu-before.csv"
-          version="$(./zig-out/bin/antfly inference version)"
-          printf '%s\n' "$version"
-          grep -q 'cuda=true' <<<"$version"
           ./zig-out/bin/antfly inference cuda-info --smoke
 
       - name: Run CUDA inference validation
