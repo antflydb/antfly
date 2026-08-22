@@ -43,8 +43,25 @@ pub const Seeded = struct {
 
     fn choose(ptr: *anyopaque, request: Request) !ids.StableId {
         const self: *Seeded = @ptrCast(@alignCast(ptr));
-        const index = self.prng.random().intRangeLessThan(usize, 0, request.enabled.len);
-        return request.enabled[index].id;
+        var weighted = false;
+        var total: u64 = 0;
+        for (request.enabled) |alternative| {
+            if (alternative.weight == 0) return error.InvalidTransitionWeight;
+            weighted = weighted or alternative.weight != 1;
+            total = std.math.add(u64, total, alternative.weight) catch return error.ChoiceWeightOverflow;
+        }
+        // Preserve the original uniform seeded stream byte-for-byte for the
+        // overwhelmingly common all-ones case and existing replay fixtures.
+        if (!weighted) {
+            const index = self.prng.random().intRangeLessThan(usize, 0, request.enabled.len);
+            return request.enabled[index].id;
+        }
+        var ordinal = self.prng.random().uintLessThan(u64, total);
+        for (request.enabled) |alternative| {
+            if (ordinal < alternative.weight) return alternative.id;
+            ordinal -= alternative.weight;
+        }
+        unreachable;
     }
 
     fn finish(_: *anyopaque) !void {}
@@ -68,6 +85,90 @@ pub const Scripted = struct {
     fn finish(ptr: *anyopaque) !void {
         const self: *Scripted = @ptrCast(@alignCast(ptr));
         if (self.cursor != self.selections.len) return error.UnusedScriptChoices;
+    }
+};
+
+/// Deterministic depth-first enumeration of a dynamic choice tree.
+///
+/// Call `beginHistory` before each clean-world execution, run the scenario
+/// through `source`, then call `advance` after a successful `finish`. The
+/// enumerator stores ordinals rather than transition IDs because each history
+/// supplies and validates its canonical enabled set. When an earlier branch
+/// changes, its stale suffix is discarded. This keeps memory proportional to
+/// history depth and never snapshots scenario state.
+pub const Enumerating = struct {
+    allocator: std.mem.Allocator,
+    ordinals: std.ArrayListUnmanaged(usize) = .empty,
+    radices: std.ArrayListUnmanaged(usize) = .empty,
+    cursor: usize = 0,
+    history_open: bool = false,
+    exhausted: bool = false,
+
+    pub fn init(allocator: std.mem.Allocator) Enumerating {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *Enumerating) void {
+        self.ordinals.deinit(self.allocator);
+        self.radices.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn beginHistory(self: *Enumerating) !void {
+        if (self.history_open) return error.EnumerationHistoryAlreadyOpen;
+        if (self.exhausted) return error.EnumerationExhausted;
+        self.cursor = 0;
+        self.radices.clearRetainingCapacity();
+        self.history_open = true;
+    }
+
+    pub fn source(self: *Enumerating) Source {
+        return .{ .ptr = self, .choose_fn = choose, .finish_fn = finish };
+    }
+
+    /// Advances to the next depth-first history. Returns false exactly once
+    /// the complete reachable tree has been enumerated.
+    pub fn advance(self: *Enumerating) !bool {
+        if (self.history_open) return error.EnumerationHistoryStillOpen;
+        if (self.exhausted) return false;
+        if (self.ordinals.items.len != self.radices.items.len) return error.InvalidEnumerationState;
+        var index = self.ordinals.items.len;
+        while (index > 0) {
+            index -= 1;
+            if (self.ordinals.items[index] + 1 < self.radices.items[index]) {
+                self.ordinals.items[index] += 1;
+                self.ordinals.shrinkRetainingCapacity(index + 1);
+                return true;
+            }
+        }
+        self.exhausted = true;
+        return false;
+    }
+
+    fn choose(ptr: *anyopaque, request: Request) !ids.StableId {
+        const self: *Enumerating = @ptrCast(@alignCast(ptr));
+        if (!self.history_open) return error.EnumerationHistoryNotOpen;
+        const index = self.cursor;
+        self.cursor += 1;
+        const ordinal = if (index < self.ordinals.items.len)
+            self.ordinals.items[index]
+        else blk: {
+            try self.ordinals.append(self.allocator, 0);
+            break :blk 0;
+        };
+        if (ordinal >= request.enabled.len) return error.EnumerationEnabledSetDiverged;
+        try self.radices.append(self.allocator, request.enabled.len);
+        return request.enabled[ordinal].id;
+    }
+
+    fn finish(ptr: *anyopaque) !void {
+        const self: *Enumerating = @ptrCast(@alignCast(ptr));
+        if (!self.history_open) return error.EnumerationHistoryNotOpen;
+        self.history_open = false;
+        // A branch may terminate before a suffix inherited from its parent.
+        // Only decisions actually reached belong to the new path.
+        self.ordinals.shrinkRetainingCapacity(self.cursor);
+        if (self.cursor == 0) self.exhausted = true;
     }
 };
 
@@ -199,4 +300,65 @@ test "mutating choice source replays a prefix and branches" {
     try std.testing.expectEqual(@as(u64, 1), try source.choose(.{ .site_id = 7, .site_name = "site", .occurrence = 0, .enabled = &enabled }));
     try std.testing.expectEqual(@as(u64, 2), try source.choose(.{ .site_id = 7, .site_name = "site", .occurrence = 1, .enabled = &enabled }));
     try source.finish();
+}
+
+test "seeded source honors weights while preserving enabled membership" {
+    const enabled = [_]transition.Transition{
+        .{ .id = 1, .name = "rare", .kind = .workload, .weight = 1 },
+        .{ .id = 2, .name = "common", .kind = .workload, .weight = 7 },
+    };
+    var rare: usize = 0;
+    var common: usize = 0;
+    var seeded = Seeded.init(0x51e1_9a7e);
+    const source = seeded.source();
+    for (0..8_000) |occurrence| {
+        switch (try source.choose(.{
+            .site_id = 9,
+            .site_name = "weighted",
+            .occurrence = occurrence,
+            .enabled = &enabled,
+        })) {
+            1 => rare += 1,
+            2 => common += 1,
+            else => return error.InvalidWeightedSelection,
+        }
+    }
+    try source.finish();
+    try std.testing.expect(common > rare * 5);
+    try std.testing.expect(common < rare * 9);
+}
+
+test "enumerating source visits a dynamic choice tree exactly once" {
+    const root = [_]transition.Transition{
+        .{ .id = 10, .name = "short", .kind = .workload },
+        .{ .id = 20, .name = "long", .kind = .workload },
+    };
+    const suffix = [_]transition.Transition{
+        .{ .id = 21, .name = "left", .kind = .workload },
+        .{ .id = 22, .name = "middle", .kind = .workload },
+        .{ .id = 23, .name = "right", .kind = .workload },
+    };
+    var enumerating = Enumerating.init(std.testing.allocator);
+    defer enumerating.deinit();
+    var histories: usize = 0;
+    var seen_short = false;
+    var seen_suffix = [_]bool{ false, false, false };
+    while (true) {
+        try enumerating.beginHistory();
+        const source = enumerating.source();
+        const first = try source.choose(.{ .site_id = 1, .site_name = "root", .occurrence = 0, .enabled = &root });
+        if (first == 10) {
+            seen_short = true;
+        } else {
+            const second = try source.choose(.{ .site_id = 2, .site_name = "suffix", .occurrence = 1, .enabled = &suffix });
+            seen_suffix[@intCast(second - 21)] = true;
+        }
+        try source.finish();
+        histories += 1;
+        if (!try enumerating.advance()) break;
+    }
+    try std.testing.expectEqual(@as(usize, 4), histories);
+    try std.testing.expect(seen_short);
+    try std.testing.expectEqual([_]bool{ true, true, true }, seen_suffix);
+    try std.testing.expectError(error.EnumerationExhausted, enumerating.beginHistory());
 }

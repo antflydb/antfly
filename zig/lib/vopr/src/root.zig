@@ -11,6 +11,7 @@ pub const corpus = @import("corpus.zig");
 pub const event = @import("event.zig");
 pub const explorer = @import("explorer.zig");
 pub const id = @import("id.zig");
+pub const meta_test = @import("meta_test.zig");
 pub const observation = @import("observation.zig");
 pub const property = @import("property.zig");
 pub const replay = @import("replay.zig");

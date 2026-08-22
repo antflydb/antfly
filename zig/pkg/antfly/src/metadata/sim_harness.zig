@@ -1160,6 +1160,7 @@ const AutomaticSplitPublicTrafficScenario = struct {
     ensure_source_group_text_index_before_transition: bool = false,
     modeled_storage: bool = false,
     failure_mode: AutomaticSplitPublicTrafficFailureMode = .none,
+    storage_crash_after_split: bool = false,
     verify: SplitPublicVerificationConfig,
     compose_merge: ?ComposedMergePublicTrafficConfig = null,
 };
@@ -1191,6 +1192,208 @@ const ComposedMergePublicTrafficConfig = struct {
     post_failure_leader_wait_rounds: usize = 0,
     failure_mode: AutomaticMergePublicTrafficFailureMode = .none,
     verify: MergePublicVerificationConfig,
+};
+
+pub const DistributedDataVoprCampaignConfig = struct {
+    seed: u64,
+    table_id: u64 = 4553,
+
+    pub fn validate(self: @This()) !void {
+        if (self.table_id == 0 or self.table_id > std.math.maxInt(i64) / 10_000) return error.InvalidDistributedDataVoprTableId;
+    }
+
+    pub fn fromTrace(artifact: *const vopr.trace.Trace) !@This() {
+        if (!std.mem.eql(u8, artifact.header.system, "antfly") or
+            !std.mem.eql(u8, artifact.header.scenario, DistributedDataVoprScenario.name) or
+            artifact.header.scenario_version != DistributedDataVoprScenario.version)
+            return error.IncompatibleDistributedDataVoprTrace;
+        const table_parameter_id = vopr.id.stable("parameter", "distributed_data.table_id");
+        const table_id = for (artifact.config.scenario_parameters) |parameter| {
+            if (parameter.id != table_parameter_id) continue;
+            if (parameter.value <= 0) return error.InvalidDistributedDataVoprTableId;
+            break @as(u64, @intCast(parameter.value));
+        } else return error.DistributedDataVoprParameterMissing;
+        const config: @This() = .{
+            .seed = artifact.config.seed orelse return error.DistributedDataVoprSeedMissing,
+            .table_id = table_id,
+        };
+        try config.validate();
+        return config;
+    }
+};
+
+const DistributedDataVoprContext = struct {
+    config: DistributedDataVoprCampaignConfig,
+};
+
+pub const DistributedDataVoprScenario = struct {
+    pub const name: []const u8 = "distributed-data-vopr";
+    pub const version: u32 = 1;
+
+    const completed_property = vopr.id.stable("property", "distributed_data.split_merge_completed");
+    const acknowledged_property = vopr.id.stable("property", "distributed_data.acknowledged_data_survives");
+    pub const properties = &[_]vopr.property.Declaration{
+        .{ .id = completed_property, .name = "distributed_data.split_merge_completed", .kind = .reachable },
+        .{ .id = acknowledged_property, .name = "distributed_data.acknowledged_data_survives", .kind = .always },
+    };
+
+    const Stage = enum { transport, split_fault, merge_fault, execute, done };
+    const delayed_off_id = vopr.id.stable("transition", "distributed_data.transport.immediate");
+    const delayed_on_id = vopr.id.stable("transition", "distributed_data.transport.delayed");
+    const split_restart_metadata_id = vopr.id.stable("transition", "distributed_data.split.restart_metadata_leader");
+    const split_restart_source_id = vopr.id.stable("transition", "distributed_data.split.restart_source_leader");
+    const split_partition_metadata_id = vopr.id.stable("transition", "distributed_data.split.partition_metadata_leader");
+    const merge_none_id = vopr.id.stable("transition", "distributed_data.merge.no_additional_fault");
+    const merge_restart_metadata_id = vopr.id.stable("transition", "distributed_data.merge.restart_metadata_leader");
+    const merge_restart_donor_id = vopr.id.stable("transition", "distributed_data.merge.restart_donor_leader");
+    const merge_partition_metadata_id = vopr.id.stable("transition", "distributed_data.merge.partition_metadata_leader");
+    const execute_id = vopr.id.stable("transition", "distributed_data.execute_split_merge_history");
+
+    pub const World = struct {
+        context: *DistributedDataVoprContext,
+        stage: Stage = .transport,
+        delayed_transport: bool = false,
+        split_failure: AutomaticSplitPublicTrafficFailureMode = .partition_metadata_leader,
+        merge_failure: AutomaticMergePublicTrafficFailureMode = .none,
+        completed: bool = false,
+    };
+
+    pub fn init(_: std.mem.Allocator) !World {
+        return error.DistributedDataVoprContextRequired;
+    }
+
+    pub fn initWithContext(_: std.mem.Allocator, context_ptr: ?*anyopaque) !World {
+        const context: *DistributedDataVoprContext = @ptrCast(@alignCast(context_ptr orelse return error.DistributedDataVoprContextRequired));
+        try context.config.validate();
+        return .{ .context = context };
+    }
+
+    pub fn deinit(_: *World, _: std.mem.Allocator) void {}
+
+    pub fn enumerate(world: *World, list: *vopr.transition.List, alloc: std.mem.Allocator) !void {
+        switch (world.stage) {
+            .transport => {
+                try list.append(alloc, .{ .id = delayed_off_id, .name = "distributed_data.transport.immediate", .kind = .scheduler });
+                try list.append(alloc, .{ .id = delayed_on_id, .name = "distributed_data.transport.delayed", .kind = .scheduler, .weight = 3 });
+            },
+            .split_fault => {
+                try list.append(alloc, .{ .id = split_restart_metadata_id, .name = "distributed_data.split.restart_metadata_leader", .kind = .fault });
+                try list.append(alloc, .{ .id = split_restart_source_id, .name = "distributed_data.split.restart_source_leader", .kind = .fault });
+                try list.append(alloc, .{ .id = split_partition_metadata_id, .name = "distributed_data.split.partition_metadata_leader", .kind = .fault, .weight = 2 });
+            },
+            .merge_fault => {
+                try list.append(alloc, .{ .id = merge_none_id, .name = "distributed_data.merge.no_additional_fault", .kind = .fault, .weight = 3 });
+                try list.append(alloc, .{ .id = merge_restart_metadata_id, .name = "distributed_data.merge.restart_metadata_leader", .kind = .fault });
+                try list.append(alloc, .{ .id = merge_restart_donor_id, .name = "distributed_data.merge.restart_donor_leader", .kind = .fault });
+                try list.append(alloc, .{ .id = merge_partition_metadata_id, .name = "distributed_data.merge.partition_metadata_leader", .kind = .fault });
+            },
+            .execute => try list.append(alloc, .{ .id = execute_id, .name = "distributed_data.execute_split_merge_history", .kind = .workload }),
+            .done => {},
+        }
+    }
+
+    pub fn execute(world: *World, selected: vopr.transition.Transition, events: *vopr.event.Sink, alloc: std.mem.Allocator) !void {
+        switch (world.stage) {
+            .transport => {
+                world.delayed_transport = selected.id == delayed_on_id;
+                if (!world.delayed_transport and selected.id != delayed_off_id) return error.InvalidDistributedDataTransportChoice;
+                world.stage = .split_fault;
+            },
+            .split_fault => {
+                world.split_failure = if (selected.id == split_restart_metadata_id)
+                    .restart_metadata_leader
+                else if (selected.id == split_restart_source_id)
+                    .restart_source_group_leader
+                else if (selected.id == split_partition_metadata_id)
+                    .partition_metadata_leader
+                else
+                    return error.InvalidDistributedDataSplitFaultChoice;
+                world.stage = .merge_fault;
+            },
+            .merge_fault => {
+                world.merge_failure = if (selected.id == merge_none_id)
+                    .none
+                else if (selected.id == merge_restart_metadata_id)
+                    .restart_metadata_leader
+                else if (selected.id == merge_restart_donor_id)
+                    .restart_donor_group_leader
+                else if (selected.id == merge_partition_metadata_id)
+                    .partition_metadata_leader
+                else
+                    return error.InvalidDistributedDataMergeFaultChoice;
+                world.stage = .execute;
+            },
+            .execute => {
+                if (selected.id != execute_id) return error.InvalidDistributedDataExecuteChoice;
+                const table_id = world.context.config.table_id;
+                try runAutomaticSplitPublicTrafficScenario(.{
+                    .table_id = table_id,
+                    .path_prefix = "metadata-vopr-distributed-generated",
+                    .description = "generated VOPR distributed data durability docs",
+                    .delayed_transport = world.delayed_transport,
+                    .bootstrap_rounds = 48,
+                    .range_create_rounds = 64,
+                    .projected_index_rounds = 96,
+                    .finalize_rounds = 160,
+                    .post_failure_leader_wait_rounds = 96,
+                    .ensure_source_group_text_index_before_transition = true,
+                    .modeled_storage = true,
+                    .failure_mode = world.split_failure,
+                    .storage_crash_after_split = true,
+                    .verify = .{
+                        .route_rounds = 96,
+                        .active_rounds = 96,
+                        .leader_rounds = 192,
+                        .lookup_rounds = 192,
+                        .count_profile_rounds = 192,
+                    },
+                    .compose_merge = .{
+                        .transition_id = table_id * 10_000 + 2,
+                        .finalize_rounds = 192,
+                        .post_failure_leader_wait_rounds = 96,
+                        .failure_mode = world.merge_failure,
+                        .verify = .{
+                            .active_rounds = 128,
+                            .absent_rounds = 128,
+                            .route_rounds = 128,
+                            .leader_rounds = 192,
+                            .lookup_rounds = 192,
+                            .expect_profile = true,
+                        },
+                    },
+                });
+                world.completed = true;
+                world.stage = .done;
+            },
+            .done => return error.DistributedDataVoprAlreadyDone,
+        }
+        try events.emit(alloc, .{
+            .id = vopr.id.stable("event", "distributed_data.phase_completed"),
+            .name = "distributed_data.phase_completed",
+            .kind = if (world.completed) .client_response else .state_change,
+            .payload_digest = @intFromEnum(world.stage),
+        });
+    }
+
+    pub fn observe(world: *World, builder: *vopr.observation.Builder, alloc: std.mem.Allocator) !void {
+        try builder.addNamed(alloc, "distributed_data.stage", @intFromEnum(world.stage));
+        try builder.addNamed(alloc, "distributed_data.transport_delayed", @intFromBool(world.delayed_transport));
+        try builder.addNamed(alloc, "distributed_data.split_fault", @intFromEnum(world.split_failure));
+        try builder.addNamed(alloc, "distributed_data.merge_fault", @intFromEnum(world.merge_failure));
+        try builder.addNamed(alloc, "distributed_data.storage_crash_required", 1);
+        try builder.addNamed(alloc, "distributed_data.acknowledged_documents", if (world.completed) 5 else 0);
+    }
+
+    pub fn evaluate(world: *World, sink: *vopr.property.Sink, alloc: std.mem.Allocator) !void {
+        try sink.check(alloc, completed_property, world.completed);
+        // The terminal physical transition returns only after the public
+        // five-document reference model and single-shard profile pass.
+        try sink.check(alloc, acknowledged_property, !world.completed or world.stage == .done);
+    }
+
+    pub fn done(world: *World) bool {
+        return world.stage == .done;
+    }
 };
 
 fn expectBodyContainsAll(body: []const u8, needles: []const []const u8) !void {
@@ -1701,7 +1904,10 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
 
     const source_leader = switch (cfg.failure_mode) {
         .restart_source_group_leader, .restart_metadata_leader, .partition_then_restart_source_with_storage_crash => (try waitForGroupLeaderIndex(&cluster, initial_group_id, 64)) orelse return error.TestExpectedEqual,
-        else => null,
+        else => if (cfg.storage_crash_after_split)
+            (try waitForGroupLeaderIndex(&cluster, initial_group_id, 64)) orelse return error.TestExpectedEqual
+        else
+            null,
     };
     if (cfg.ensure_source_group_text_index_before_transition) {
         const source_leader_index = source_leader orelse return error.TestExpectedEqual;
@@ -1754,7 +1960,7 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
     const retirement = try retireFinalizedSplitTransition(cluster.node(verification_index), &auto_loop);
     try std.testing.expectEqual(@as(usize, 2), retirement.removal.range_upserts);
 
-    if (cfg.failure_mode == .partition_then_restart_source_with_storage_crash) {
+    if (cfg.failure_mode == .partition_then_restart_source_with_storage_crash or cfg.storage_crash_after_split) {
         if (!cfg.modeled_storage) return error.ModeledStorageRequired;
         cluster.cluster.healAll();
         const restart_index = source_leader orelse return error.TestExpectedEqual;
@@ -1874,6 +2080,50 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
             &acknowledged_model,
         );
     }
+}
+
+pub fn runDistributedDataVoprCampaignWithChoices(
+    alloc: std.mem.Allocator,
+    config: DistributedDataVoprCampaignConfig,
+    source: vopr.choice.Source,
+) !vopr.trace.Trace {
+    try config.validate();
+    var context = DistributedDataVoprContext{ .config = config };
+    const parameters = [_]vopr.trace.Parameter{.named("distributed_data.table_id", @intCast(config.table_id))};
+    var backend_ids = [_]u64{
+        vopr.id.stable("backend", "raft.memory"),
+        vopr.id.stable("backend", "storage.modeled_lsm"),
+    };
+    std.mem.sort(u64, &backend_ids, {}, std.sort.asc(u64));
+    return try vopr.runner.run(DistributedDataVoprScenario, alloc, source, .{
+        .system = "antfly",
+        .seed = config.seed,
+        .transition_budget = 4,
+        .resource_budget = 3,
+        .backend_ids = &backend_ids,
+        .scenario_parameters = &parameters,
+        .source_revision = "distributed-data-vopr-v1",
+        .target = "native",
+        .optimize = "test",
+        .scenario_context = &context,
+    });
+}
+
+pub fn recordDistributedDataVoprCampaign(
+    alloc: std.mem.Allocator,
+    config: DistributedDataVoprCampaignConfig,
+) !vopr.trace.Trace {
+    var seeded = vopr.choice.Seeded.init(config.seed);
+    return try runDistributedDataVoprCampaignWithChoices(alloc, config, seeded.source());
+}
+
+pub fn replayDistributedDataVoprCampaign(
+    alloc: std.mem.Allocator,
+    recorded: *const vopr.trace.Trace,
+) !vopr.trace.Trace {
+    const config = try DistributedDataVoprCampaignConfig.fromTrace(recorded);
+    var context = DistributedDataVoprContext{ .config = config };
+    return try vopr.replay.exactWithContext(DistributedDataVoprScenario, alloc, recorded, &context);
 }
 
 fn runAutomaticMergePublicTrafficScenario(cfg: AutomaticMergePublicTrafficScenario) !void {
@@ -9492,41 +9742,15 @@ test "metadata http cluster simulation serves public traffic across automatic sp
 }
 
 test "metadata VOPR distributed data survives split partition node restart and modeled storage crash" {
-    try runAutomaticSplitPublicTrafficScenario(.{
+    var recorded = try recordDistributedDataVoprCampaign(std.testing.allocator, .{
+        .seed = 0xd157_71b0_7ed0_0001,
         .table_id = 4553,
-        .path_prefix = "metadata-vopr-distributed-data",
-        .description = "VOPR distributed data durability docs",
-        .delayed_transport = true,
-        .bootstrap_rounds = 48,
-        .range_create_rounds = 64,
-        .projected_index_rounds = 96,
-        .finalize_rounds = 160,
-        .post_failure_leader_wait_rounds = 96,
-        .ensure_source_group_text_index_before_transition = true,
-        .modeled_storage = true,
-        .failure_mode = .partition_then_restart_source_with_storage_crash,
-        .verify = .{
-            .route_rounds = 96,
-            .active_rounds = 96,
-            .leader_rounds = 192,
-            .lookup_rounds = 192,
-            .count_profile_rounds = 192,
-        },
-        .compose_merge = .{
-            .transition_id = 45_530_002,
-            .finalize_rounds = 192,
-            .post_failure_leader_wait_rounds = 96,
-            .failure_mode = .none,
-            .verify = .{
-                .active_rounds = 128,
-                .absent_rounds = 128,
-                .route_rounds = 128,
-                .leader_rounds = 192,
-                .lookup_rounds = 192,
-                .expect_profile = true,
-            },
-        },
     });
+    defer recorded.deinit();
+    try std.testing.expectEqual(@as(u64, 4), recorded.summary.?.transitions);
+    try std.testing.expectEqual(@as(usize, 0), recorded.failures.items.len);
+    var replayed = try replayDistributedDataVoprCampaign(std.testing.allocator, &recorded);
+    replayed.deinit();
 }
 
 test "metadata http cluster simulation drives automatic merge through the control loop" {

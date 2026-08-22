@@ -34,7 +34,9 @@ fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
         const arg = args[index];
         if (std.mem.eql(u8, arg, "--scenario")) {
             scenario = try nextValue(args, &index);
-            if (!std.mem.eql(u8, scenario, "metadata") and !std.mem.eql(u8, scenario, "transaction")) return error.UnsupportedScenario;
+            if (!std.mem.eql(u8, scenario, "metadata") and
+                !std.mem.eql(u8, scenario, "transaction") and
+                !std.mem.eql(u8, scenario, "distributed-data")) return error.UnsupportedScenario;
         } else if (std.mem.eql(u8, arg, "--seed")) {
             seed = try std.fmt.parseInt(u64, try nextValue(args, &index), 0);
         } else if (std.mem.eql(u8, arg, "--transitions")) {
@@ -48,7 +50,7 @@ fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
         index += 1;
     }
     const output_path = trace_out orelse return error.TraceOutputRequired;
-    const transition_budget: usize = transitions orelse if (std.mem.eql(u8, scenario, "metadata")) 64 else 3;
+    const transition_budget: usize = transitions orelse if (std.mem.eql(u8, scenario, "metadata")) 64 else if (std.mem.eql(u8, scenario, "distributed-data")) 4 else 3;
     if (transition_budget == 0) return error.InvalidTransitionBudget;
     var artifact = if (std.mem.eql(u8, scenario, "metadata")) blk: {
         const base_id = 10_000 + seed % 1_000_000;
@@ -61,6 +63,13 @@ fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
             .split_group_id = base_id + 3,
             .split_transition_id = base_id + 4,
             .workload = workload,
+        });
+    } else if (std.mem.eql(u8, scenario, "distributed-data")) blk: {
+        if (transition_budget != 4) return error.DistributedDataScenarioRequiresFourTransitions;
+        const table_id = 10_000 + seed % 100_000;
+        break :blk try antfly.metadata_sim_harness.recordDistributedDataVoprCampaign(alloc, .{
+            .seed = seed,
+            .table_id = table_id,
         });
     } else blk: {
         if (transition_budget != 3) return error.TransactionScenarioRequiresThreeTransitions;
@@ -98,6 +107,8 @@ fn replayCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8)
 fn replayKnownScenario(alloc: std.mem.Allocator, recorded: *const vopr.trace.Trace) !vopr.trace.Trace {
     if (std.mem.eql(u8, recorded.header.scenario, "metadata-vopr"))
         return antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, recorded);
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.metadata_sim_harness.DistributedDataVoprScenario.name))
+        return antfly.metadata_sim_harness.replayDistributedDataVoprCampaign(alloc, recorded);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.transaction_vopr.Scenario.name))
         return antfly.transaction_vopr.replay(alloc, recorded);
     return error.UnsupportedScenario;
@@ -693,7 +704,7 @@ fn report(action: []const u8, path: []const u8, artifact: *const vopr.trace.Trac
 fn usage() error{InvalidUsage} {
     std.debug.print(
         \\usage:
-        \\  vopr run --scenario metadata|transaction --seed <u64> [--transitions <n>] [--workload smoke|expanded] --trace-out <path>
+        \\  vopr run --scenario metadata|transaction|distributed-data --seed <u64> [--transitions <n>] [--workload smoke|expanded] --trace-out <path>
         \\  vopr replay --trace <path>
         \\  vopr campaign --scenario metadata --histories <n> --transitions <n> --workers <n> --artifact-dir <path>
         \\  vopr reduce --trace <path> --out <path> [--attempts <n>]

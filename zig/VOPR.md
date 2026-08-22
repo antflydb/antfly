@@ -1,9 +1,9 @@
 # VOPR: Deterministic Autonomous Simulation for Antfly
 
-Status: implementation in progress; Phases 0, 0.5, 1, 2, and 5 complete; the
-Phase 4 exit scenario and fixed split-to-merge composition are complete, while
-atomic generated choices for that expensive distributed scenario remain a
-follow-on migration
+Status: implementation in progress; Phases 0, 0.5, 1, 2, 3, and 5 are
+complete; the Phase 4 exit scenario now has generated/replayable plan choices
+and split-to-merge composition, while decomposition of its terminal physical
+integration run into individually scheduled data-plane transitions remains
 
 Scope: Zig Antfly simulation, VOPR, modeled-storage, and chaos tests
 
@@ -367,7 +367,8 @@ Required implementations:
 - **Mutating**: replays a prefix, changes selected decisions, and generates a
   suffix.
 - **Scripted**: useful for named scenario tests and hand-authored fixtures.
-- **Enumerating**, later: systematically explores small bounded choice trees.
+- **Enumerating**: systematically explores small bounded dynamic choice trees
+  in depth-first order without snapshotting world state.
 
 Choice namespaces should distinguish scheduler, workload, fault, parameters,
 and implementation entropy. This makes traces readable and permits targeted
@@ -1821,6 +1822,13 @@ meta-test also reopens its promoted fixture as a fresh persistent corpus,
 selects it for mutation, and exact-replays the result. Richer command-aware
 deletion operators remain a useful follow-on reduction improvement.
 
+The standalone choice engine also implements weighted seeded selection while
+preserving the legacy all-uniform PRNG stream, plus a bounded depth-first
+`Enumerating` source for dynamic choice trees. A finite meta-suite exhaustively
+discovers all five required interaction shapes—message ordering, fault/workload
+overlap, crash between write and sync, clock jump before retry, and two-client
+interleaving—then exact-replays and same-fingerprint reduces each failure.
+
 ### Phase 4: Storage and Data Integration
 
 - wrap existing modeled-storage campaigns in the common runner
@@ -1871,6 +1879,18 @@ group, and requires all five acknowledged documents plus the single-shard
 query profile. This is a topology composition, not two independent fixtures,
 so the preceding partition, restart, modeled crash, and acknowledged writes
 remain live history for the merge assertion.
+
+`DistributedDataVoprScenario` makes the expensive integration history a
+versioned VOPR scenario. Seeded generation chooses immediate versus delayed
+transport, one of three split fault plans, and one of four merge fault plans
+from canonical weighted alternatives. The terminal workload transition runs
+the physical three-node scenario with a required modeled storage crash. Its
+artifact records stable observations and the named split/merge completion and
+acknowledged-data properties; exact replay rebuilds fresh cluster, API, and
+modeled-device state and byte-compares the complete artifact. The CLI accepts
+`vopr run --scenario distributed-data` and dispatches its artifacts through the
+same generic replay command. The focused gate performs both physical record and
+clean-world replay.
 
 The hosted HTTP topology rig deliberately models merge progress in
 `SimMergeRuntime`; it does not own `DataServer`'s cached-writer leases and must
@@ -1943,10 +1963,12 @@ sidecar shape, and the emitted five-event commit history passes the real
 `make tla-trace-txn` segmentation and TLC refinement pipeline against
 `TraceAntflyTransaction.tla`.
 
-Phase 4's stated exit condition is now met, including fixed split-to-merge
-composition. Migrating this expensive macro-scenario into atomic,
-generated/replayable VOPR choices remains follow-on work; until then it is a
-promoted deterministic scenario rather than a search-space participant.
+Phase 4's stated exit condition is now met, including split-to-merge
+composition and generated/replayable fault-plan choices. The physical
+integration history remains one terminal workload transition because the
+hosted HTTP rig owns real threaded listeners and cached DB writers; further
+decomposition must happen at the DataServer lease and request-executor seams,
+not by opening competing simulated writers.
 Modeled partial writes, dropped syncs, and both Raft and transaction TLA+
 export are complete.
 
@@ -2162,10 +2184,10 @@ Implementation resolved the Phase 0 design questions as follows:
 - compiler coverage remains optional secondary feedback because the current
   Zig/LLVM instrumentation surface is not stable enough to join the replay ABI
 
-Two bounded follow-ons remain. The distributed public-data macro-scenario
-should eventually expose each workload, transition, restart, and storage fault
-through generated VOPR choices; its current deterministic composition already
-satisfies the Phase 4 exit property. Physical temporary directories remain
+Two bounded follow-ons remain. The distributed public-data scenario now
+generates and replays its transport and fault plan, but its terminal physical
+history should be decomposed further as DataServer lease and HTTP execution
+seams become scheduler-controlled. Physical temporary directories remain
 acceptable for integration scenarios, while deterministic histories that make
 durability claims must use `ModeledDevice` or an equally explicit storage
 capability. Neither follow-on changes the standalone runtime boundary or trace

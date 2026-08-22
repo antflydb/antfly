@@ -13,6 +13,11 @@ pub const Transition = struct {
     actor_id: ?ids.StableId = null,
     resource_id: ?ids.StableId = null,
     parameter: i64 = 0,
+    /// Generation-only relative weight. It is deliberately not part of the
+    /// stable transition identity or replay payload: exact replay consumes the
+    /// selected ID from the artifact, while seeded exploration uses this hint
+    /// to bias discovery without changing semantics.
+    weight: u32 = 1,
 
     pub fn named(kind: Kind, name: []const u8) Transition {
         return .{ .id = ids.stable("transition", name), .name = name, .kind = kind };
@@ -24,7 +29,8 @@ pub const Transition = struct {
             lhs.kind == rhs.kind and
             lhs.actor_id == rhs.actor_id and
             lhs.resource_id == rhs.resource_id and
-            lhs.parameter == rhs.parameter;
+            lhs.parameter == rhs.parameter and
+            lhs.weight == rhs.weight;
     }
 
     pub fn payloadDigest(self: Transition) u64 {
@@ -50,6 +56,7 @@ pub const List = struct {
         for (self.items.items, 0..) |item, index| {
             if (item.name.len == 0) return error.EmptyTransitionName;
             if (item.id == 0) return error.InvalidTransitionId;
+            if (item.weight == 0) return error.InvalidTransitionWeight;
             if (index > 0 and self.items.items[index - 1].id == item.id) return error.DuplicateTransitionId;
         }
     }
@@ -75,4 +82,11 @@ test "duplicate transition IDs are rejected" {
     try list.append(std.testing.allocator, .{ .id = 2, .name = "a", .kind = .workload });
     try list.append(std.testing.allocator, .{ .id = 2, .name = "b", .kind = .fault });
     try std.testing.expectError(error.DuplicateTransitionId, list.canonicalize());
+}
+
+test "zero transition weight is rejected" {
+    var list = List{};
+    defer list.deinit(std.testing.allocator);
+    try list.append(std.testing.allocator, .{ .id = 2, .name = "never", .kind = .workload, .weight = 0 });
+    try std.testing.expectError(error.InvalidTransitionWeight, list.canonicalize());
 }
