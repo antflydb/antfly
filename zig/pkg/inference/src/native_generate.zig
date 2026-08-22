@@ -3770,6 +3770,24 @@ fn metalStatsCompactJson(
         allocator,
         &out,
         \\,
+        \\"mapped_layer0_selected_prefetch":{{
+        \\"attempts":{d},
+        \\"successes":{d},
+        \\"failures":{d},
+        \\"logical_bytes":{d}
+        \\}}
+    ,
+        .{
+            provider.a4b_moe_mapped_layer0_selected_prefetch_attempts,
+            provider.a4b_moe_mapped_layer0_selected_prefetch_successes,
+            provider.a4b_moe_mapped_layer0_selected_prefetch_failures,
+            provider.a4b_moe_mapped_layer0_selected_prefetch_logical_bytes,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
         \\"mapped_layer0_prewarm":{{
         \\"attempts":{d},
         \\"successes":{d},
@@ -5606,7 +5624,7 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
     const top_fallback = graph_mod.executor_stats.quantKernelTopFallbackReason(plan_stats);
     const fast_path_misses = graph_mod.executor_stats.quantKernelFastPathMisses(plan_stats);
     print(
-        "metal_a4b_moe: linear_attempts={d} linear_successes={d} linear_fallbacks={d} pair_attempts={d} pair_successes={d} pair_fallbacks={d} scatter_attempts={d} scatter_successes={d} scatter_fallbacks={d} slot_arena_attempts={d} slot_arena_successes={d} slot_arena_failures={d} mapped_layer0_attempts={d} mapped_layer0_successes={d} mapped_layer0_failures={d} prewarm_attempts={d} prewarm_successes={d} prewarm_failures={d} prewarm_logical_bytes={d} prewarm_page_touches={d} prewarm_ms={d} checkpoint_attempts={d} checkpoint_all_hit_tokens={d} checkpoint_miss_tokens={d} checkpoint_replays={d} slot_uploads={d} slot_upload_bytes={d}\n",
+        "metal_a4b_moe: linear_attempts={d} linear_successes={d} linear_fallbacks={d} pair_attempts={d} pair_successes={d} pair_fallbacks={d} scatter_attempts={d} scatter_successes={d} scatter_fallbacks={d} slot_arena_attempts={d} slot_arena_successes={d} slot_arena_failures={d} mapped_layer0_attempts={d} mapped_layer0_successes={d} mapped_layer0_failures={d} selected_prefetch_attempts={d} selected_prefetch_successes={d} selected_prefetch_failures={d} selected_prefetch_logical_bytes={d} prewarm_attempts={d} prewarm_successes={d} prewarm_failures={d} prewarm_logical_bytes={d} prewarm_page_touches={d} prewarm_ms={d} checkpoint_attempts={d} checkpoint_all_hit_tokens={d} checkpoint_miss_tokens={d} checkpoint_replays={d} slot_uploads={d} slot_upload_bytes={d}\n",
         .{
             metal_snapshot.provider.a4b_packed_q4_0_linear_attempts,
             metal_snapshot.provider.a4b_packed_q4_0_linear_successes,
@@ -5623,6 +5641,10 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
             metal_snapshot.provider.a4b_moe_mapped_layer0_attempts,
             metal_snapshot.provider.a4b_moe_mapped_layer0_successes,
             metal_snapshot.provider.a4b_moe_mapped_layer0_failures,
+            metal_snapshot.provider.a4b_moe_mapped_layer0_selected_prefetch_attempts,
+            metal_snapshot.provider.a4b_moe_mapped_layer0_selected_prefetch_successes,
+            metal_snapshot.provider.a4b_moe_mapped_layer0_selected_prefetch_failures,
+            metal_snapshot.provider.a4b_moe_mapped_layer0_selected_prefetch_logical_bytes,
             metal_snapshot.provider.a4b_moe_mapped_layer0_prewarm_attempts,
             metal_snapshot.provider.a4b_moe_mapped_layer0_prewarm_successes,
             metal_snapshot.provider.a4b_moe_mapped_layer0_prewarm_failures,

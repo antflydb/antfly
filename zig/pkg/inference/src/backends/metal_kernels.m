@@ -1000,6 +1000,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> moe_slot_q4_0_down_pipeline;
     id<MTLComputePipelineState> moe_slot_reduce_pipeline;
     id<MTLComputePipelineState> mapped_page_touch_pipeline;
+    id<MTLComputePipelineState> mapped_selected_expert_page_touch_pipeline;
     id<MTLComputePipelineState> masked_bce_loss_pipeline;
     id<MTLComputePipelineState> masked_bce_backward_pipeline;
     id<MTLComputePipelineState> reduce_last_dim_pipeline;
@@ -1310,8 +1311,10 @@ typedef struct termite_metal_decode_runtime {
     id<MTLBuffer> moe_slot_gate_buffer;
     id<MTLBuffer> moe_slot_up_buffer;
     id<MTLBuffer> moe_slot_route_output_buffer;
+    id<MTLBuffer> moe_selected_expert_prefetch_scratch_buffer;
     size_t moe_slot_intermediate_capacity;
     size_t moe_slot_route_output_capacity;
+    size_t moe_selected_expert_prefetch_scratch_capacity;
     id<MTLBuffer> hot_hidden_buffers[4];
     id<MTLBuffer> hot_intermediate_buffers[5];
     id<MTLBuffer> direct_block_hidden_buffers[TERMITE_METAL_DIRECT_BLOCK_HIDDEN_BUFFER_COUNT];
@@ -4224,6 +4227,18 @@ typedef struct termite_metal_mapped_page_touch_params {
     uint32_t page_size;
     uint32_t page_count;
 } termite_metal_mapped_page_touch_params;
+
+typedef struct termite_metal_mapped_selected_expert_page_touch_params {
+    uint32_t route_count;
+    uint32_t expert_count;
+    uint32_t source_out_dim;
+    uint32_t row_offset;
+    uint32_t logical_out_dim;
+    uint32_t row_stride;
+    uint32_t page_size;
+    uint32_t max_pages_per_route;
+    uint32_t weight_view_offset;
+} termite_metal_mapped_selected_expert_page_touch_params;
 
 typedef struct termite_metal_reduce_last_dim_params {
     uint32_t rows;
@@ -7263,6 +7278,7 @@ static NSString *termite_metal_shader_source(void) {
            "struct termite_metal_moe_slot_q4_0_down_params { uint route_rows; uint in_dim; uint out_dim; uint row_blocks; uint down_offset; uint expert_stride; uint slot_count; uint reserved; };\n"
            "struct termite_metal_moe_slot_reduce_params { uint rows; uint top_k; uint dim; uint has_expert_scale; };\n"
            "struct termite_metal_mapped_page_touch_params { uint page_size; uint page_count; };\n"
+           "struct termite_metal_mapped_selected_expert_page_touch_params { uint route_count; uint expert_count; uint source_out_dim; uint row_offset; uint logical_out_dim; uint row_stride; uint page_size; uint max_pages_per_route; uint weight_view_offset; };\n"
            // Bit-exact Q4_0 arithmetic from the qualified compact-A4B route,
            // with one material change: route_slots directly addresses a fixed
            // private arena. UINT32_MAX and out-of-range slots fail closed to
@@ -7294,6 +7310,15 @@ static NSString *termite_metal_shader_source(void) {
            // compiler cannot discard the reads as dead work.
            "kernel void termite_mapped_page_touch(device const uchar *input [[buffer(0)]], device uint *output [[buffer(1)]], constant termite_metal_mapped_page_touch_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
            "    if (gid >= p.page_count) return; output[gid] = uint(input[ulong(gid) * ulong(p.page_size)]);\n"
+           "}\n"
+           // Route ids remain GPU-resident. Each route touches only the VM
+           // pages intersecting that expert's logical projection rows inside
+           // the aligned mmap view; excess threads in the bounded dispatch do
+           // no memory access.
+           "kernel void termite_mapped_selected_expert_page_touch(device const uchar *input [[buffer(0)]], device const uint *expert_ids [[buffer(1)]], device uint *output [[buffer(2)]], constant termite_metal_mapped_selected_expert_page_touch_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    uint total = p.route_count * p.max_pages_per_route; if (gid >= total || p.page_size == 0u) return; uint route = gid / p.max_pages_per_route; uint local_page = gid - route * p.max_pages_per_route; uint expert = expert_ids[route]; if (expert >= p.expert_count) { output[gid] = 0u; return; }\n"
+           "    ulong first_row = ulong(expert) * ulong(p.source_out_dim) + ulong(p.row_offset); ulong span_start = ulong(p.weight_view_offset) + first_row * ulong(p.row_stride); ulong span_bytes = ulong(p.logical_out_dim) * ulong(p.row_stride); ulong first_page = (span_start / ulong(p.page_size)) * ulong(p.page_size); ulong end_page = ((span_start + span_bytes + ulong(p.page_size) - 1ul) / ulong(p.page_size)) * ulong(p.page_size); ulong page_count = (end_page - first_page) / ulong(p.page_size); if (ulong(local_page) >= page_count) { output[gid] = 0u; return; }\n"
+           "    output[gid] = uint(input[first_page + ulong(local_page) * ulong(p.page_size)]);\n"
            "}\n"
            "kernel void termite_reduce_last_dim_rows(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_reduce_last_dim_params &p [[buffer(2)]], threadgroup float *shmem [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
            "    if (row >= p.rows || p.dim == 0u) return;\n"
@@ -20051,6 +20076,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->moe_slot_q4_0_down_pipeline = termite_metal_make_pipeline(device, library, @"termite_moe_slot_q4_0_down");
         runtime->moe_slot_reduce_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_moe_slot_reduce");
         runtime->mapped_page_touch_pipeline = termite_metal_make_pipeline(device, library, @"termite_mapped_page_touch");
+        runtime->mapped_selected_expert_page_touch_pipeline = termite_metal_make_pipeline(device, library, @"termite_mapped_selected_expert_page_touch");
         runtime->masked_bce_loss_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_masked_bce_with_logits_loss");
         runtime->masked_bce_backward_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_masked_bce_with_logits_backward");
         runtime->reduce_last_dim_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_reduce_last_dim_rows");
@@ -20748,6 +20774,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->moe_slot_q4_0_down_pipeline = nil;
     runtime->moe_slot_reduce_pipeline = nil;
     runtime->mapped_page_touch_pipeline = nil;
+    runtime->mapped_selected_expert_page_touch_pipeline = nil;
     runtime->masked_bce_loss_pipeline = nil;
     runtime->masked_bce_backward_pipeline = nil;
     runtime->reduce_last_dim_pipeline = nil;
@@ -21008,11 +21035,13 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->moe_slot_gate_buffer = nil;
     runtime->moe_slot_up_buffer = nil;
     runtime->moe_slot_route_output_buffer = nil;
+    runtime->moe_selected_expert_prefetch_scratch_buffer = nil;
     runtime->moe_route_capacity = 0;
     runtime->moe_route_slot_capacity = 0;
     runtime->moe_route_miss_rows_capacity = 0;
     runtime->moe_slot_intermediate_capacity = 0;
     runtime->moe_slot_route_output_capacity = 0;
+    runtime->moe_selected_expert_prefetch_scratch_capacity = 0;
     for (size_t layer = 0; layer < TERMITE_METAL_MOE_LAYER_SLOT_CAPACITY; ++layer) {
         runtime->moe_expert_slot_map_buffers[layer] = nil;
         runtime->moe_expert_slot_map_counts[layer] = 0;
@@ -21150,6 +21179,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->sample_logits_capacity = 0;
     runtime->sample_topk_capacity = 0;
     runtime->moe_route_capacity = 0;
+    runtime->moe_selected_expert_prefetch_scratch_capacity = 0;
     runtime->hot_hidden_capacity = 0;
     runtime->hot_intermediate_capacity = 0;
     runtime->direct_block_hidden_capacity = 0;
@@ -34614,6 +34644,7 @@ int termite_metal_decode_runtime_moe_forward_q4_0_mapped_layer0_device(
     size_t num_experts,
     size_t top_k,
     uint32_t activation_kind,
+    uint32_t selected_expert_prefetch,
     void *expert_scale_handle,
     size_t expert_scale_offset,
     void *output_handle,
@@ -34624,7 +34655,8 @@ int termite_metal_decode_runtime_moe_forward_q4_0_mapped_layer0_device(
         up_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || down_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY ||
         runtime->q4_0_pair_id_pipeline == nil || runtime->q4_0_id_pipeline == nil ||
         runtime->broadcast_f32_pipeline == nil || runtime->activation_multiply_pipeline == nil ||
-        runtime->moe_slot_reduce_pipeline == nil) return -2;
+        runtime->moe_slot_reduce_pipeline == nil ||
+        (selected_expert_prefetch != 0u && runtime->mapped_selected_expert_page_touch_pipeline == nil)) return -2;
     if (runtime->active_frame_cb == nil || runtime->submitted_frame_cb != nil) return -3;
     if (rows == 0 || rows > UINT32_MAX || hidden_size == 0 || hidden_size > UINT32_MAX ||
         inter_size == 0 || inter_size > UINT32_MAX || num_experts == 0 || num_experts > UINT32_MAX ||
@@ -34639,8 +34671,11 @@ int termite_metal_decode_runtime_moe_forward_q4_0_mapped_layer0_device(
 
     const size_t slots[3] = { gate_slot, up_slot, down_slot };
     const size_t source_out_dims[3] = { gate_source_out_dim, up_source_out_dim, down_source_out_dim };
+    const size_t logical_out_dims[3] = { inter_size, inter_size, hidden_size };
+    const size_t row_offsets[3] = { gate_row_offset, up_row_offset, down_row_offset };
     const size_t expected_in_dims[3] = { hidden_size, hidden_size, inter_size };
     size_t weight_lengths[3] = { 0, 0, 0 };
+    size_t row_strides[3] = { 0, 0, 0 };
     for (size_t index = 0; index < 3; ++index) {
         const size_t slot = slots[index];
         if (source_out_dims[index] > SIZE_MAX / num_experts) return -6;
@@ -34657,6 +34692,7 @@ int termite_metal_decode_runtime_moe_forward_q4_0_mapped_layer0_device(
             weight_offset > runtime->quant_linear_weight_buffers[slot].length ||
             flat_out_dim * row_stride > runtime->quant_linear_weight_buffers[slot].length - weight_offset) return -8;
         weight_lengths[index] = flat_out_dim * row_stride;
+        row_strides[index] = row_stride;
     }
 
     size_t route_rows = 0, route_bytes = 0, intermediate_bytes = 0, route_output_bytes = 0;
@@ -34701,6 +34737,41 @@ int termite_metal_decode_runtime_moe_forward_q4_0_mapped_layer0_device(
             if (weight_views[index] == nil) return -11;
         }
 
+        uint32_t max_pages_per_route[3] = { 0, 0, 0 };
+        size_t prefetch_scratch_offsets[3] = { 0, 0, 0 };
+        size_t prefetch_scratch_bytes = 0;
+        uint32_t prefetch_page_size = 0;
+        if (selected_expert_prefetch != 0u) {
+            const long system_page_size = sysconf(_SC_PAGESIZE);
+            if (system_page_size <= 0 || (unsigned long)system_page_size > UINT32_MAX) return -11;
+            prefetch_page_size = (uint32_t)system_page_size;
+            for (size_t index = 0; index < 3; ++index) {
+                size_t span_bytes = 0;
+                if (row_strides[index] > UINT32_MAX || source_out_dims[index] > UINT32_MAX ||
+                    logical_out_dims[index] > UINT32_MAX || row_offsets[index] > UINT32_MAX ||
+                    weight_view_offsets[index] > UINT32_MAX ||
+                    !termite_metal_size_mul(logical_out_dims[index], row_strides[index], &span_bytes) ||
+                    span_bytes > SIZE_MAX - ((size_t)prefetch_page_size - 1u)) return -11;
+                const size_t max_pages = (span_bytes + (size_t)prefetch_page_size - 1u) / (size_t)prefetch_page_size + 1u;
+                if (max_pages == 0 || max_pages > UINT32_MAX ||
+                    route_rows > UINT32_MAX / max_pages || route_rows > SIZE_MAX / max_pages) return -11;
+                const size_t candidates = route_rows * max_pages;
+                if (candidates > SIZE_MAX / sizeof(uint32_t) ||
+                    prefetch_scratch_bytes > SIZE_MAX - candidates * sizeof(uint32_t)) return -11;
+                prefetch_scratch_offsets[index] = prefetch_scratch_bytes;
+                prefetch_scratch_bytes += candidates * sizeof(uint32_t);
+                max_pages_per_route[index] = (uint32_t)max_pages;
+            }
+            if (runtime->moe_selected_expert_prefetch_scratch_buffer == nil ||
+                runtime->moe_selected_expert_prefetch_scratch_capacity < prefetch_scratch_bytes)
+            {
+                id<MTLBuffer> scratch = [runtime->device newBufferWithLength:prefetch_scratch_bytes options:MTLResourceStorageModePrivate];
+                if (scratch == nil) return -11;
+                runtime->moe_selected_expert_prefetch_scratch_buffer = scratch;
+                runtime->moe_selected_expert_prefetch_scratch_capacity = prefetch_scratch_bytes;
+            }
+        }
+
         id<MTLBuffer> input = (__bridge id<MTLBuffer>)input_handle;
         id<MTLBuffer> output = (__bridge id<MTLBuffer>)output_handle;
         id<MTLBuffer> gate_weight = weight_views[0];
@@ -34720,6 +34791,33 @@ int termite_metal_decode_runtime_moe_forward_q4_0_mapped_layer0_device(
         id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(
             runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_FFN, &encoder_owned);
         if (encoder == nil) return -14;
+
+        if (selected_expert_prefetch != 0u) {
+            [encoder setComputePipelineState:runtime->mapped_selected_expert_page_touch_pipeline];
+            for (size_t index = 0; index < 3; ++index) {
+                termite_metal_mapped_selected_expert_page_touch_params params = {
+                    .route_count = (uint32_t)route_rows,
+                    .expert_count = (uint32_t)num_experts,
+                    .source_out_dim = (uint32_t)source_out_dims[index],
+                    .row_offset = (uint32_t)row_offsets[index],
+                    .logical_out_dim = (uint32_t)logical_out_dims[index],
+                    .row_stride = (uint32_t)row_strides[index],
+                    .page_size = prefetch_page_size,
+                    .max_pages_per_route = max_pages_per_route[index],
+                    .weight_view_offset = (uint32_t)weight_view_offsets[index],
+                };
+                const size_t candidates = route_rows * (size_t)max_pages_per_route[index];
+                [encoder setBuffer:weight_views[index] offset:0 atIndex:0];
+                [encoder setBuffer:runtime->moe_route_ids_buffer offset:0 atIndex:1];
+                [encoder setBuffer:runtime->moe_selected_expert_prefetch_scratch_buffer
+                    offset:prefetch_scratch_offsets[index] atIndex:2];
+                [encoder setBytes:&params length:sizeof(params) atIndex:3];
+                [encoder dispatchThreads:MTLSizeMake(candidates, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(
+                        termite_metal_thread_width(runtime->mapped_selected_expert_page_touch_pipeline, candidates), 1, 1)];
+            }
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
 
         termite_metal_broadcast_f32_params broadcast = {0};
         broadcast.rank = 2u;
@@ -50833,6 +50931,7 @@ int termite_metal_decode_runtime_memory_snapshot(
     termite_metal_decode_runtime_memory_add_buffer(snapshot, runtime->moe_slot_gate_buffer, &snapshot->scratch_bytes);
     termite_metal_decode_runtime_memory_add_buffer(snapshot, runtime->moe_slot_up_buffer, &snapshot->scratch_bytes);
     termite_metal_decode_runtime_memory_add_buffer(snapshot, runtime->moe_slot_route_output_buffer, &snapshot->scratch_bytes);
+    termite_metal_decode_runtime_memory_add_buffer(snapshot, runtime->moe_selected_expert_prefetch_scratch_buffer, &snapshot->scratch_bytes);
     for (size_t layer = 0; layer < TERMITE_METAL_MOE_LAYER_SLOT_CAPACITY; ++layer) {
         termite_metal_decode_runtime_memory_add_buffer(snapshot, runtime->moe_expert_slot_map_buffers[layer], &snapshot->scratch_bytes);
         termite_metal_decode_runtime_memory_add_buffer(snapshot, runtime->moe_slot_layer_arena_buffers[layer], &snapshot->quant_linear_bytes);

@@ -5373,6 +5373,7 @@ pub fn decoderRuntimeMoeForwardQ4_0MappedLayer0Device(
     num_experts: usize,
     top_k: usize,
     activation_kind: ops.DecoderRuntimeActivationKind,
+    selected_expert_prefetch: bool,
     expert_scale: ?MetalTensor,
 ) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
@@ -5407,6 +5408,7 @@ pub fn decoderRuntimeMoeForwardQ4_0MappedLayer0Device(
         num_experts,
         top_k,
         @intFromEnum(activation_kind),
+        @intFromBool(selected_expert_prefetch),
         if (expert_scale) |scale| scale.deviceHandle() else null,
         if (expert_scale) |scale| scale.deviceByteOffset() else 0,
         output.deviceHandle(),
@@ -18024,6 +18026,7 @@ pub extern fn termite_metal_decode_runtime_moe_forward_q4_0_mapped_layer0_device
     num_experts: usize,
     top_k: usize,
     activation_kind: u32,
+    selected_expert_prefetch: u32,
     expert_scale_handle: ?*anyopaque,
     expert_scale_offset: usize,
     output_handle: ?*anyopaque,
@@ -38237,6 +38240,83 @@ test "A4B Metal Q4_0 expert slot arena matches dequantized routed FFN" {
     }
 }
 
+const MappedSelectedExpertPageSpan = struct {
+    first_page_offset: usize,
+    page_count: usize,
+};
+
+// Mirrors the device kernel's page-range arithmetic. Keeping this overflow-
+// checked oracle next to the Metal parity test makes the head/tail-page
+// contract explicit without adding a route readback to the runtime.
+fn mappedSelectedExpertPageSpan(
+    weight_view_offset: usize,
+    expert: usize,
+    source_out_dim: usize,
+    row_offset: usize,
+    logical_out_dim: usize,
+    row_stride: usize,
+    page_size: usize,
+) ?MappedSelectedExpertPageSpan {
+    if (logical_out_dim == 0 or row_stride == 0 or page_size == 0) return null;
+    const expert_row = std.math.mul(usize, expert, source_out_dim) catch return null;
+    const first_row = std.math.add(usize, expert_row, row_offset) catch return null;
+    const row_byte_offset = std.math.mul(usize, first_row, row_stride) catch return null;
+    const span_start = std.math.add(usize, weight_view_offset, row_byte_offset) catch return null;
+    const span_bytes = std.math.mul(usize, logical_out_dim, row_stride) catch return null;
+    const span_end = std.math.add(usize, span_start, span_bytes) catch return null;
+    const first_page_index = span_start / page_size;
+    const end_page_index = (span_end - 1) / page_size + 1;
+    return .{
+        .first_page_offset = first_page_index * page_size,
+        .page_count = end_page_index - first_page_index,
+    };
+}
+
+test "A4B Metal selected expert mapped-page accounting covers exact logical spans" {
+    const page_size: usize = 16 * 1024;
+    const hidden: usize = 2816;
+    const inter: usize = 704;
+    const top_k: usize = 8;
+    const gate_row_stride = (hidden / 32) * 18;
+    const down_row_stride = (inter / 32) * 18;
+    const gate_expert_bytes = inter * gate_row_stride;
+    const down_expert_bytes = hidden * down_row_stride;
+    try std.testing.expectEqual(@as(usize, 1_115_136), gate_expert_bytes);
+    try std.testing.expectEqual(gate_expert_bytes, down_expert_bytes);
+    try std.testing.expectEqual(@as(usize, 26_763_264), top_k * (2 * gate_expert_bytes + down_expert_bytes));
+
+    const aligned = mappedSelectedExpertPageSpan(0, 15, inter, 0, inter, gate_row_stride, page_size) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 69), aligned.page_count);
+
+    // A 32-byte mmap-view head shifts every sixteenth expert across one more
+    // physical page. The device dispatch uses the 70-page upper bound and its
+    // range guard reduces this selected set to exactly 556 touches.
+    const selected_ids = [_]usize{ 0, 15, 16, 31, 32, 47, 48, 127 };
+    var selected_page_touches: usize = 0;
+    for (selected_ids) |expert| {
+        const span = mappedSelectedExpertPageSpan(32, expert, inter, 0, inter, gate_row_stride, page_size) orelse
+            return error.TestUnexpectedResult;
+        selected_page_touches += span.page_count;
+        try std.testing.expect(span.first_page_offset <= 32 + expert * gate_expert_bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 556), selected_page_touches);
+    try std.testing.expectEqual(@as(usize, 12), 3 * top_k * 70 - 3 * selected_page_touches);
+
+    // Fused packed tensors may expose the logical gate/up half through a row
+    // offset; it must still cover only one expert projection, not both halves.
+    const fused_half = mappedSelectedExpertPageSpan(
+        0,
+        0,
+        inter * 2,
+        inter,
+        inter,
+        gate_row_stride,
+        page_size,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 69), fused_half.page_count);
+}
+
 test "A4B Metal layer0 device-mapped Q4_0 MoE matches dequantized routed FFN" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
@@ -38417,6 +38497,7 @@ test "A4B Metal layer0 device-mapped Q4_0 MoE matches dequantized routed FFN" {
         num_experts,
         top_k,
         .gelu_new,
+        false,
         null,
     )) == null);
     var output = (try decoderRuntimeMoeForwardQ4_0MappedLayer0Device(
@@ -38432,6 +38513,7 @@ test "A4B Metal layer0 device-mapped Q4_0 MoE matches dequantized routed FFN" {
         num_experts,
         top_k,
         .gelu_new,
+        true,
         null,
     )) orelse return error.UnexpectedNull;
     defer output.deinit();

@@ -5113,6 +5113,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const config = self.data.a4b_inference orelse return null;
         const mapped_layer0 = getenvBool("TERMITE_METAL_ENABLE_A4B_LAYER0_DEVICE_MAPPED_MOE");
+        const selected_expert_prefetch = getenvBool("TERMITE_METAL_ENABLE_A4B_LAYER0_SELECTED_EXPERT_PREFETCH");
         const slot_arena = getenvBool("TERMITE_METAL_ENABLE_A4B_EXPERT_SLOT_ARENA");
         if (!mapped_layer0 and !slot_arena) return null;
         if (request.total != 1 or request.activation != .gelu_new or request.layer_index >= config.geometry.moe_layer_count or
@@ -5175,6 +5176,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             var scale: ?MetalTensor = null;
             defer if (scale) |*value| value.deinit();
             if (request.expert_scale) |scale_ct| scale = try self.ownedDeviceMetalTensorFromCt(scale_ct);
+            if (selected_expert_prefetch) {
+                self.timing_stats.a4b_moe_mapped_layer0_selected_prefetch_attempts +|= 1;
+            }
             const output = (try metal_runtime.decoderRuntimeMoeForwardQ4_0MappedLayer0Device(
                 self.provider_impl,
                 request.layer_index,
@@ -5188,11 +5192,21 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 request.num_experts,
                 request.top_k,
                 request.activation,
+                selected_expert_prefetch,
                 scale,
             )) orelse {
+                if (selected_expert_prefetch) {
+                    self.timing_stats.a4b_moe_mapped_layer0_selected_prefetch_failures +|= 1;
+                }
                 self.timing_stats.a4b_moe_mapped_layer0_failures += 1;
                 return error.A4bMetalRouteDispatchFailed;
             };
+            if (selected_expert_prefetch) {
+                const selected_routes: u64 = @intCast(request.total * request.top_k);
+                self.timing_stats.a4b_moe_mapped_layer0_selected_prefetch_successes +|= 1;
+                self.timing_stats.a4b_moe_mapped_layer0_selected_prefetch_logical_bytes +|=
+                    selected_routes *| config.geometry.encoded_expert_bytes;
+            }
             self.timing_stats.a4b_moe_mapped_layer0_successes += 1;
             return self.ctFromOwnedMetalTensor(output);
         }
