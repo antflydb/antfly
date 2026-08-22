@@ -554,6 +554,15 @@ fn executeGraphSearches(alloc: Allocator, result: *SearchResult, request: Search
         // Resolve start node keys
         const resolved_keys = switch (gs.query.start_nodes) {
             .keys => |k| k,
+            .identities => |identities| blk: {
+                const keys = try alloc.alloc([]const u8, identities.len);
+                errdefer alloc.free(keys);
+                for (identities, 0..) |identity, identity_index| {
+                    if (identity.table != null) return error.UnsupportedQueryRequest;
+                    keys[identity_index] = identity.key;
+                }
+                break :blk keys;
+            },
             .result_ref => |ref| blk: {
                 // Extract doc IDs from search hits as keys
                 _ = ref;
@@ -577,6 +586,7 @@ fn executeGraphSearches(alloc: Allocator, result: *SearchResult, request: Search
         // Free resolved keys if they were allocated from result_ref
         switch (gs.query.start_nodes) {
             .result_ref => alloc.free(resolved_keys),
+            .identities => alloc.free(resolved_keys),
             .keys => {},
         }
     }

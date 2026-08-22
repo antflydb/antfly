@@ -8695,10 +8695,10 @@ fn parseGraphPathQuery(
     if (k == 0 or k > 100) return error.InvalidQueryRequest;
     const index = try alloc.dupe(u8, index_value);
     errdefer alloc.free(index);
-    const starts = try cloneFields(alloc, &.{path.from.key});
-    errdefer freeOwnedStringSlice(alloc, starts);
-    const targets = try cloneFields(alloc, &.{path.to.key});
-    errdefer freeOwnedStringSlice(alloc, targets);
+    const starts = try parseGraphPathEndpointSelector(alloc, path.from);
+    errdefer freeGraphNodeSelector(alloc, starts);
+    const targets = try parseGraphPathEndpointSelector(alloc, path.to);
+    errdefer freeGraphNodeSelector(alloc, targets);
     const edge_types = if (path.edge_types) |types| try cloneFields(alloc, types) else &.{};
     errdefer freeOwnedStringSlice(alloc, edge_types);
     const filter = try parseGraphFilterValue(alloc, path.filter);
@@ -8708,8 +8708,8 @@ fn parseGraphPathQuery(
     return .{
         .query_type = query_type,
         .index_name = index,
-        .start_nodes = .{ .keys = starts },
-        .target_nodes = .{ .keys = targets },
+        .start_nodes = starts,
+        .target_nodes = targets,
         .k = k,
         .params = .{
             .edge_types = edge_types,
@@ -8728,6 +8728,17 @@ fn parseGraphPathQuery(
         .fields = fields,
         .include_all_fields = path.fields == null,
     };
+}
+
+fn parseGraphPathEndpointSelector(alloc: std.mem.Allocator, endpoint: anytype) !graph_query_mod.NodeSelector {
+    const identities = try alloc.alloc(graph_query_mod.NodeIdentity, 1);
+    errdefer alloc.free(identities);
+    const key = try alloc.dupe(u8, endpoint.key);
+    errdefer alloc.free(key);
+    const table = if (endpoint.table) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (table) |value| alloc.free(value);
+    identities[0] = .{ .key = key, .table = table };
+    return .{ .identities = identities };
 }
 
 fn parseGraphMatchQuery(alloc: std.mem.Allocator, value: indexes_openapi.GraphMatchQuery) !graph_query_mod.GraphQuery {
@@ -8988,9 +8999,32 @@ fn parseGraphNodeSelector(
     selector: indexes_openapi.GraphNodeSelector,
 ) !graph_query_mod.NodeSelector {
     if (selector.node_filter != null) return error.UnsupportedQueryRequest;
+    const selector_count = @as(u8, @intFromBool(selector.keys != null)) +
+        @as(u8, @intFromBool(selector.identities != null)) +
+        @as(u8, @intFromBool(selector.result_ref != null));
+    if (selector_count != 1) return error.InvalidQueryRequest;
     if (selector.keys) |keys| {
+        if (selector.limit != null) return error.InvalidQueryRequest;
         const owned_keys = try cloneFields(alloc, keys);
         return .{ .keys = owned_keys };
+    }
+    if (selector.identities) |identities| {
+        if (selector.limit != null or identities.len == 0) return error.InvalidQueryRequest;
+        const owned = try alloc.alloc(graph_query_mod.NodeIdentity, identities.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (owned[0..initialized]) |identity| {
+                alloc.free(identity.key);
+                if (identity.table) |table| alloc.free(table);
+            }
+            alloc.free(owned);
+        }
+        for (identities, 0..) |identity, i| {
+            owned[i] = .{ .key = try alloc.dupe(u8, identity.key), .table = null };
+            initialized += 1;
+            if (identity.table) |value| owned[i].table = try alloc.dupe(u8, value);
+        }
+        return .{ .identities = owned };
     }
     if (selector.result_ref) |result_ref| {
         return .{ .result_ref = .{
@@ -10915,6 +10949,13 @@ fn freeGraphNodeSelector(alloc: std.mem.Allocator, selector: graph_query_mod.Nod
         .keys => |keys| {
             for (keys) |key| alloc.free(key);
             if (keys.len > 0) alloc.free(keys);
+        },
+        .identities => |identities| {
+            for (identities) |identity| {
+                alloc.free(identity.key);
+                if (identity.table) |table| alloc.free(table);
+            }
+            if (identities.len > 0) alloc.free(identities);
         },
         .result_ref => |result_ref| {
             alloc.free(result_ref.ref);

@@ -11331,11 +11331,13 @@ export interface components {
             /** @description Handlebars template to render document text for reranking. */
             template?: string;
         } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["OllamaRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
+        /** @description A document-query expression in either public QueryRequest.filter_query syntax or canonical Antfly filter AST syntax. Graph queries embed this existing document query language; alias-to-alias predicates belong in GraphMatch.where. */
+        GraphDocumentQuery: {
+            [key: string]: unknown;
+        };
         GraphMatchNode: {
             /** @description Canonical Antfly document-query expression evaluated for this alias. */
-            filter?: {
-                [key: string]: unknown;
-            };
+            filter?: components["schemas"]["GraphDocumentQuery"];
         };
         GraphMatchEdge: {
             from: string;
@@ -11410,26 +11412,31 @@ export interface components {
             match: components["schemas"]["GraphMatch"];
             return: components["schemas"]["GraphReturn"];
         };
+        GraphPathEndpoint: {
+            key: string;
+            /** @description Optional table qualifier for an exact cross-table node identity. Omit for the query table. */
+            table?: string;
+        };
         /** @description Filter nodes during graph traversal using existing query primitives */
         NodeFilter: {
             /** @description Antfly query to filter nodes (same syntax as search filter_query) */
-            filter_query?: {
-                [key: string]: unknown;
-            };
+            filter_query?: components["schemas"]["GraphDocumentQuery"];
             /** @description Filter by key prefix */
             filter_prefix?: string;
         };
-        /** @description Defines how to select start/target nodes for graph queries */
+        /** @description Select graph nodes by exactly one of keys, identities, or result_ref. Unqualified keys retain legacy cross-table wildcard semantics; identities are exact. */
         GraphNodeSelector: {
-            /** @description Explicit list of node keys */
+            /** @description Legacy list of node keys, matching the key in any reachable table. Prefer identities when keys may collide across tables. */
             keys?: string[];
+            /** @description Exact node identities. Omitted table means the query table. */
+            identities?: components["schemas"]["GraphPathEndpoint"][];
             /**
              * @description Reference to search results to use as nodes:
              *     - "$full_text_results" - use full-text search results
              *     - "$embeddings_results.index_name" - use vector search results from specific index
              */
             result_ref?: string;
-            /** @description Maximum number of nodes to select from the referenced results */
+            /** @description Maximum number of nodes to select from result_ref; invalid with keys or identities. */
             limit?: number;
             /** @description Filter which nodes to use as start/target */
             node_filter?: components["schemas"]["NodeFilter"];
@@ -11458,16 +11465,11 @@ export interface components {
             /** @description Document fields to include when include_documents is true. Omit to include all fields. */
             fields?: string[];
             /** @description Canonical Antfly document-query AST (the same shape accepted by QueryRequest.filter_query). */
-            filter?: {
-                [key: string]: unknown;
-            };
+            filter?: components["schemas"]["GraphDocumentQuery"];
         };
         GraphTraverseQuery: {
             index: string;
             traverse: components["schemas"]["GraphTraversal"];
-        };
-        GraphPathEndpoint: {
-            key: string;
         };
         /**
          * @description Path weighting algorithm for pathfinding:
@@ -11490,9 +11492,7 @@ export interface components {
             max_weight?: number;
             weight_mode?: components["schemas"]["PathWeightMode"];
             /** @description Canonical Antfly document-query AST. */
-            filter?: {
-                [key: string]: unknown;
-            };
+            filter?: components["schemas"]["GraphDocumentQuery"];
             /**
              * @description Include stored documents on nodes returned with the path.
              * @default false
@@ -11505,8 +11505,28 @@ export interface components {
             index: string;
             shortest_path: components["schemas"]["GraphShortestPath"];
         };
-        GraphKShortestPaths: components["schemas"]["GraphShortestPath"] & {
+        GraphKShortestPaths: {
+            from: components["schemas"]["GraphPathEndpoint"];
+            to: components["schemas"]["GraphPathEndpoint"];
             k: number;
+            edge_types?: string[];
+            direction?: components["schemas"]["EdgeDirection"];
+            /** @default 10 */
+            max_depth?: number;
+            /** Format: double */
+            min_weight?: number;
+            /** Format: double */
+            max_weight?: number;
+            weight_mode?: components["schemas"]["PathWeightMode"];
+            /** @description Canonical Antfly document-query AST. */
+            filter?: components["schemas"]["GraphDocumentQuery"];
+            /**
+             * @description Include stored documents on nodes returned with each path.
+             * @default false
+             */
+            include_documents?: boolean;
+            /** @description Document fields to include when include_documents is true. Omit to include all fields. */
+            fields?: string[];
         };
         GraphKShortestPathsQuery: {
             index: string;

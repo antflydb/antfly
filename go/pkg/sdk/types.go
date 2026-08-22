@@ -261,6 +261,7 @@ type (
 
 	// Graph query types
 	GraphQuery               = oapi.GraphQuery
+	GraphDocumentQuery       = oapi.GraphDocumentQuery
 	LegacyGraphQuery         = oapi.LegacyGraphQuery
 	GraphQueryType           = oapi.GraphQueryType
 	GraphQueryParams         = oapi.GraphQueryParams
@@ -269,17 +270,30 @@ type (
 	PatternMatch             = oapi.PatternMatch
 	GraphQueryResult         = oapi.GraphQueryResult
 	GraphNodeSelector        = oapi.GraphNodeSelector
+	GraphPathEndpoint        = oapi.GraphPathEndpoint
 	GraphResultNode          = oapi.GraphResultNode
 	GraphMatchQuery          = oapi.GraphMatchQuery
 	GraphTraverseQuery       = oapi.GraphTraverseQuery
 	GraphShortestPathQuery   = oapi.GraphShortestPathQuery
 	GraphKShortestPathsQuery = oapi.GraphKShortestPathsQuery
+	GraphTraversal           = oapi.GraphTraversal
+	GraphShortestPath        = oapi.GraphShortestPath
+	GraphKShortestPaths      = oapi.GraphKShortestPaths
 	GraphMatch               = oapi.GraphMatch
+	GraphMatchNode           = oapi.GraphMatchNode
+	GraphMatchEdge           = oapi.GraphMatchEdge
+	GraphOptionalMatch       = oapi.GraphOptionalMatch
 	GraphReturn              = oapi.GraphReturn
 	GraphBindingsReturn      = oapi.GraphBindingsReturn
 	GraphAggregatesReturn    = oapi.GraphAggregatesReturn
 	GraphCountAggregate      = oapi.GraphCountAggregate
 	GraphWhereExpression     = oapi.GraphWhereExpression
+	GraphAliasOperand        = oapi.GraphAliasOperand
+	GraphNotEqualPredicate   = oapi.GraphNotEqualPredicate
+	GraphNotExistsPattern    = oapi.GraphNotExistsPattern
+	GraphWhereAnd            = oapi.GraphWhereAnd
+	GraphWhereNotEqual       = oapi.GraphWhereNotEqual
+	GraphWhereNotExists      = oapi.GraphWhereNotExists
 
 	// Graph traversal types
 	TraverseResponse = oapi.TraverseResponse

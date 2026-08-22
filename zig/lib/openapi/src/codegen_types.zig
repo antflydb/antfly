@@ -120,6 +120,20 @@ pub const TypeGenerator = struct {
             return;
         }
 
+        // A named free-form object must retain its arbitrary JSON fields. An
+        // empty Zig struct would parse successfully while silently discarding
+        // the entire payload.
+        if (schema.properties.count() == 0) {
+            if (schema.additional_properties) |additional_properties| switch (additional_properties) {
+                .boolean => |allowed| if (allowed) {
+                    if (schema.description) |desc| try self.w.docComment(desc);
+                    try self.w.line("pub const {s} = std.json.Value;", .{type_name});
+                    return;
+                },
+                .schema => {},
+            };
+        }
+
         // Object with properties → struct
         const primary_type = schema.primaryType();
         if (schema.properties.count() > 0 or
@@ -863,6 +877,30 @@ test "zigTypeForSchema primitives" {
     // 3.1 type arrays should also work
     try std.testing.expectEqualStrings("[]const u8", try gen.zigTypeForSchema(.{ .schema_type = .{ .array = &.{ "string", "null" } } }));
     try std.testing.expectEqualStrings("i64", try gen.zigTypeForSchema(.{ .schema_type = .{ .array = &.{ "integer", "null" } } }));
+}
+
+test "named free-form object preserves arbitrary JSON" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var schemas = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try schemas.put(arena, "DocumentQuery", .{ .schema = .{
+        .schema_type = .{ .single = "object" },
+        .additional_properties = .{ .boolean = true },
+    } });
+    const doc = types.OpenApiDoc{
+        .openapi = "3.0.3",
+        .info = .{ .title = "Test", .version = "1.0" },
+        .components = .{ .schemas = schemas },
+    };
+    var resolver = Resolver.init(arena, &doc);
+    var w = SourceWriter.init(arena);
+    var gen = TypeGenerator.init(arena, &w, &resolver);
+    try gen.generateAll(&doc);
+
+    try std.testing.expect(std.mem.indexOf(u8, w.toSlice(), "pub const DocumentQuery = std.json.Value;") != null);
 }
 
 test "required + nullable field codegen" {

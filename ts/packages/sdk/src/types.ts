@@ -183,8 +183,14 @@ export type EdgeDirection = components["schemas"]["EdgeDirection"];
 export type EdgesResponse = components["schemas"]["EdgesResponse"];
 export type TraversalRules = components["schemas"]["TraversalRules"];
 export type TraversalResult = components["schemas"]["TraversalResult"];
+export type GraphDocumentQuery = components["schemas"]["GraphDocumentQuery"];
+export type GraphPathEndpoint = components["schemas"]["GraphPathEndpoint"];
+export type GraphMatchEdge = components["schemas"]["GraphMatchEdge"];
+export type GraphAliasOperand = components["schemas"]["GraphAliasOperand"];
+export type GraphNotEqualPredicate = components["schemas"]["GraphNotEqualPredicate"];
+export type GraphNotExistsPattern = components["schemas"]["GraphNotExistsPattern"];
 export type GraphMatchNode = Omit<components["schemas"]["GraphMatchNode"], "filter"> & {
-  filter?: AntflyQuery;
+  filter?: GraphDocumentQuery;
 };
 export type GraphOptionalMatch = Omit<components["schemas"]["GraphOptionalMatch"], "nodes"> & {
   nodes?: Record<string, GraphMatchNode>;
@@ -197,20 +203,20 @@ export type GraphMatchQuery = Omit<components["schemas"]["GraphMatchQuery"], "ma
   match: GraphMatch;
 };
 export type GraphTraversal = Omit<components["schemas"]["GraphTraversal"], "filter"> & {
-  filter?: AntflyQuery;
+  filter?: GraphDocumentQuery;
 };
 export type GraphTraverseQuery = Omit<components["schemas"]["GraphTraverseQuery"], "traverse"> & {
   traverse: GraphTraversal;
 };
 export type GraphShortestPath = Omit<components["schemas"]["GraphShortestPath"], "filter"> & {
-  filter?: AntflyQuery;
+  filter?: GraphDocumentQuery;
 };
 export type GraphShortestPathQuery = Omit<
   components["schemas"]["GraphShortestPathQuery"],
   "shortest_path"
 > & { shortest_path: GraphShortestPath };
 export type GraphKShortestPaths = Omit<components["schemas"]["GraphKShortestPaths"], "filter"> & {
-  filter?: AntflyQuery;
+  filter?: GraphDocumentQuery;
 };
 export type GraphKShortestPathsQuery = Omit<
   components["schemas"]["GraphKShortestPathsQuery"],

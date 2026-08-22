@@ -9,8 +9,8 @@ from ..models.edge_direction import EdgeDirection
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.graph_document_query import GraphDocumentQuery
     from ..models.graph_node_selector import GraphNodeSelector
-    from ..models.graph_traversal_filter import GraphTraversalFilter
 
 
 T = TypeVar("T", bound="GraphTraversal")
@@ -20,7 +20,8 @@ T = TypeVar("T", bound="GraphTraversal")
 class GraphTraversal:
     """
     Attributes:
-        start (GraphNodeSelector): Defines how to select start/target nodes for graph queries
+        start (GraphNodeSelector): Select graph nodes by exactly one of keys, identities, or result_ref. Unqualified
+            keys retain legacy cross-table wildcard semantics; identities are exact.
         edge_types (list[str] | Unset):
         direction (EdgeDirection | Unset): Direction of edges to query:
             - out: Outgoing edges from the node
@@ -35,8 +36,9 @@ class GraphTraversal:
         include_documents (bool | Unset): Include each result node's stored document. Default: False.
         fields (list[str] | Unset): Document fields to include when include_documents is true. Omit to include all
             fields.
-        filter_ (GraphTraversalFilter | Unset): Canonical Antfly document-query AST (the same shape accepted by
-            QueryRequest.filter_query).
+        filter_ (GraphDocumentQuery | Unset): A document-query expression in either public QueryRequest.filter_query
+            syntax or canonical Antfly filter AST syntax. Graph queries embed this existing document query language; alias-
+            to-alias predicates belong in GraphMatch.where.
     """
 
     start: GraphNodeSelector
@@ -50,7 +52,7 @@ class GraphTraversal:
     include_paths: bool | Unset = False
     include_documents: bool | Unset = False
     fields: list[str] | Unset = UNSET
-    filter_: GraphTraversalFilter | Unset = UNSET
+    filter_: GraphDocumentQuery | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         start = self.start.to_dict()
@@ -119,8 +121,8 @@ class GraphTraversal:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.graph_document_query import GraphDocumentQuery
         from ..models.graph_node_selector import GraphNodeSelector
-        from ..models.graph_traversal_filter import GraphTraversalFilter
 
         d = dict(src_dict)
         start = GraphNodeSelector.from_dict(d.pop("start"))
@@ -151,11 +153,11 @@ class GraphTraversal:
         fields = cast(list[str], d.pop("fields", UNSET))
 
         _filter_ = d.pop("filter", UNSET)
-        filter_: GraphTraversalFilter | Unset
+        filter_: GraphDocumentQuery | Unset
         if isinstance(_filter_, Unset):
             filter_ = UNSET
         else:
-            filter_ = GraphTraversalFilter.from_dict(_filter_)
+            filter_ = GraphDocumentQuery.from_dict(_filter_)
 
         graph_traversal = cls(
             start=start,

@@ -3321,10 +3321,7 @@ pub const HttpHandler = struct {
         named_query: db_types.NamedGraphQuery,
         available_sets: []const GraphResultSet,
     ) !db_types.GraphSearchResult {
-        const start_keys = try public_graph_query.resolveGraphSelectorAlloc(self.alloc, named_query.query.start_nodes, available_sets);
-        defer freeOwnedKeySlice(self.alloc, start_keys);
-        const start_key_refs = try castOwnedKeysToConst(self.alloc, start_keys);
-        defer self.alloc.free(start_key_refs);
+        const conjunctive_pattern = named_query.query.match_pattern;
         const target_keys = if (named_query.query.target_nodes) |selector|
             try public_graph_query.resolveGraphSelectorAlloc(self.alloc, selector, available_sets)
         else
@@ -3336,9 +3333,26 @@ pub const HttpHandler = struct {
         defer self.alloc.free(target_nodes);
         for (target_key_refs, 0..) |key, i| target_nodes[i] = .{ .table = null, .key = key };
 
-        const need_docs = named_query.query.include_documents or patternRequiresDocumentFilter(named_query.query.pattern);
+        // Canonical MATCH needs the complete published document relation both
+        // to enumerate its selected anchor and to evaluate alias filters.
+        const need_docs = conjunctive_pattern != null or named_query.query.include_documents or patternRequiresDocumentFilter(named_query.query.pattern);
         const docs: []const query_materializer.Document = if (need_docs) try self.allocPublishedDocumentsAlloc(session) else &.{};
         defer if (need_docs) query_materializer.freeDocuments(self.alloc, @constCast(docs));
+
+        var filter_ctx = PatternDocumentFilterContext{
+            .alloc = self.alloc,
+            .docs = docs,
+            .cache = db_query_graph.PreparedPatternFilterCache.init(self.alloc),
+        };
+        defer filter_ctx.cache.deinit();
+
+        const start_keys = if (conjunctive_pattern) |pattern|
+            try allocConjunctiveAnchorKeys(self.alloc, docs, pattern, &filter_ctx)
+        else
+            try public_graph_query.resolveGraphSelectorAlloc(self.alloc, named_query.query.start_nodes, available_sets);
+        defer freeOwnedKeySlice(self.alloc, start_keys);
+        const start_key_refs = try castOwnedKeysToConst(self.alloc, start_keys);
+        defer self.alloc.free(start_key_refs);
 
         const graph_index = query_mod.graph_reader.findGraphArtifactIndex(session, named_query.query.index_name) orelse return error.GraphSegmentNotFound;
         try session.warmArtifact(graph_index);
@@ -3470,33 +3484,89 @@ pub const HttpHandler = struct {
             }
         };
 
-        var filter_ctx = PatternDocumentFilterContext{
-            .alloc = self.alloc,
-            .docs = docs,
-            .cache = db_query_graph.PreparedPatternFilterCache.init(self.alloc),
+        const edge_reader = ServerlessPatternEdgeReader{ .segment = &segment };
+        const match_opts = graph_pattern_mod.MatchOptions{
+            .max_results = if (named_query.query.return_limit > 0)
+                std.math.add(u32, named_query.query.return_limit, 1) catch named_query.query.return_limit
+            else
+                named_query.query.params.max_results,
+            .return_aliases = named_query.query.return_aliases,
+            .target_nodes = target_nodes,
+            .target_required = named_query.query.target_nodes != null,
+            .include_paths = named_query.query.params.include_paths,
+            .evaluator = if (need_docs) .{
+                .ctx = @ptrCast(&filter_ctx),
+                .func = publishedPatternNodeFilterEvaluator,
+            } else null,
         };
-        defer filter_ctx.cache.deinit();
 
-        const raw_matches = try graph_pattern_mod.matchPatternWithEdgeReader(
-            self.alloc,
-            ServerlessPatternEdgeReader{ .segment = &segment },
-            start_key_refs,
-            named_query.query.pattern,
-            .{
-                .max_results = named_query.query.params.max_results,
-                .return_aliases = named_query.query.return_aliases,
-                .target_nodes = target_nodes,
-                .target_required = named_query.query.target_nodes != null,
-                .include_paths = named_query.query.params.include_paths,
-                .evaluator = if (need_docs) .{
-                    .ctx = @ptrCast(&filter_ctx),
-                    .func = publishedPatternNodeFilterEvaluator,
-                } else null,
-            },
-        );
+        if (conjunctive_pattern) |pattern| {
+            if (named_query.query.aggregates.len > 0) {
+                const specs = try self.alloc.alloc(graph_pattern_mod.CountAggregateSpec, named_query.query.aggregates.len);
+                defer self.alloc.free(specs);
+                for (named_query.query.aggregates, 0..) |aggregate, i| specs[i] = .{
+                    .alias = if (std.mem.eql(u8, aggregate.of, "*")) null else aggregate.of,
+                    .distinct = aggregate.distinct,
+                };
+                const computed = try graph_pattern_mod.aggregateConjunctivePatternWithEdgeReader(
+                    self.alloc,
+                    edge_reader,
+                    start_key_refs,
+                    pattern,
+                    specs,
+                    match_opts,
+                );
+                defer {
+                    for (computed) |*aggregate| aggregate.deinit(self.alloc);
+                    if (computed.len > 0) self.alloc.free(computed);
+                }
+                const aggregates = try self.alloc.alloc(db_types.GraphAggregateResult, computed.len);
+                var initialized: usize = 0;
+                errdefer {
+                    for (aggregates[0..initialized]) |*aggregate| aggregate.deinit(self.alloc);
+                    if (aggregates.len > 0) self.alloc.free(aggregates);
+                }
+                for (computed, 0..) |*aggregate, i| {
+                    aggregates[i] = .{
+                        .name = try self.alloc.dupe(u8, named_query.query.aggregates[i].name),
+                        .value = aggregate.value,
+                        .distinct_values = aggregate.distinct_values,
+                    };
+                    aggregate.distinct_values = &.{};
+                    initialized += 1;
+                }
+                return .{
+                    .name = try self.alloc.dupe(u8, named_query.name),
+                    .aggregates = aggregates,
+                    .hits = &.{},
+                    .total_hits = 0,
+                };
+            }
+        }
+
+        const raw_matches = if (conjunctive_pattern) |pattern|
+            try graph_pattern_mod.matchConjunctivePatternWithEdgeReader(
+                self.alloc,
+                edge_reader,
+                start_key_refs,
+                pattern,
+                match_opts,
+            )
+        else
+            try graph_pattern_mod.matchPatternWithEdgeReader(
+                self.alloc,
+                edge_reader,
+                start_key_refs,
+                named_query.query.pattern,
+                match_opts,
+            );
         defer graph_pattern_mod.freeMatches(self.alloc, raw_matches);
 
-        const matches = try self.convertPatternMatchesToGraphMatchesAlloc(raw_matches);
+        const result_len = if (named_query.query.return_limit > 0)
+            @min(raw_matches.len, named_query.query.return_limit)
+        else
+            raw_matches.len;
+        const matches = try self.convertPatternMatchesToGraphMatchesAlloc(raw_matches[0..result_len]);
         errdefer {
             for (matches) |*match| match.deinit(self.alloc);
             if (matches.len > 0) self.alloc.free(matches);
@@ -3515,6 +3585,7 @@ pub const HttpHandler = struct {
             .matches = matches,
             .hits = hits,
             .total_hits = @intCast(raw_matches.len),
+            .truncated = named_query.query.return_limit > 0 and raw_matches.len > named_query.query.return_limit,
         };
     }
 
@@ -4846,6 +4917,31 @@ const PatternDocumentFilterContext = struct {
     docs: []const query_materializer.Document,
     cache: db_query_graph.PreparedPatternFilterCache,
 };
+
+fn allocConjunctiveAnchorKeys(
+    alloc: Allocator,
+    docs: []const query_materializer.Document,
+    pattern: graph_pattern_mod.ConjunctivePattern,
+    filter_ctx: *PatternDocumentFilterContext,
+) ![][]u8 {
+    const anchor = graph_pattern_mod.selectConjunctiveAnchor(pattern) orelse return error.InvalidQueryRequest;
+    var keys = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (keys.items) |key| alloc.free(key);
+        keys.deinit(alloc);
+    }
+    for (docs) |doc| {
+        if (!try publishedPatternNodeFilterEvaluator(
+            @ptrCast(filter_ctx),
+            .{ .table = null, .key = doc.doc_id },
+            anchor.filter,
+        )) continue;
+        try keys.append(alloc, try alloc.dupe(u8, doc.doc_id));
+        if (keys.items.len > graph_pattern_mod.default_max_intermediate_states)
+            return error.QueryCandidateBudgetExceeded;
+    }
+    return try keys.toOwnedSlice(alloc);
+}
 
 fn patternRequiresDocumentFilter(pattern: []const graph_pattern_mod.PatternStep) bool {
     for (pattern) |step| {

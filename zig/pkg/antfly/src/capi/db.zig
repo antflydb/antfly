@@ -5208,6 +5208,13 @@ fn deinitOwnedNodeSelector(alloc: Allocator, selector: *graph_query_mod.NodeSele
             for (keys) |key| alloc.free(@constCast(key));
             if (keys.len > 0) alloc.free(keys);
         },
+        .identities => |identities| {
+            for (identities) |identity| {
+                alloc.free(@constCast(identity.key));
+                if (identity.table) |table| alloc.free(@constCast(table));
+            }
+            if (identities.len > 0) alloc.free(identities);
+        },
         .result_ref => |result_ref| {
             alloc.free(@constCast(result_ref.ref));
         },

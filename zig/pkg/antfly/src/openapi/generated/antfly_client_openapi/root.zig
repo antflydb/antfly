@@ -206,6 +206,7 @@ pub const GraphAggregatesReturn = types.GraphAggregatesReturn;
 pub const GraphAliasOperand = types.GraphAliasOperand;
 pub const GraphBindingsReturn = types.GraphBindingsReturn;
 pub const GraphCountAggregate = types.GraphCountAggregate;
+pub const GraphDocumentQuery = types.GraphDocumentQuery;
 pub const GraphIndexConfig = types.GraphIndexConfig;
 pub const GraphIndexStats = types.GraphIndexStats;
 pub const GraphKShortestPaths = types.GraphKShortestPaths;

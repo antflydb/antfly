@@ -300,6 +300,7 @@ fn graphQueriesNeedBaseResolvedDocSet(graph_queries: []const types.NamedGraphQue
 fn selectorNeedsBaseResolvedDocSet(selector: graph_query_mod.NodeSelector) bool {
     return switch (selector) {
         .keys => false,
+        .identities => false,
         .result_ref => |result_ref| result_ref.limit == 0 and isBaseResultRef(result_ref.ref),
     };
 }
@@ -406,6 +407,7 @@ fn visitGraphQuery(
 fn graphQueryDependencyName(selector: graph_query_mod.NodeSelector) ?[]const u8 {
     return switch (selector) {
         .keys => null,
+        .identities => null,
         .result_ref => |result_ref| blk: {
             if (std.mem.startsWith(u8, result_ref.ref, "$graph_results.")) {
                 break :blk result_ref.ref["$graph_results.".len..];
@@ -1237,6 +1239,7 @@ fn patternQueryNeedsHits(req: types.SearchRequest, named: *const types.NamedGrap
 fn selectorReferencesGraphResult(selector: graph_query_mod.NodeSelector, name: []const u8) bool {
     return switch (selector) {
         .keys => false,
+        .identities => false,
         .result_ref => |result_ref| blk: {
             if (std.mem.eql(u8, result_ref.ref, name)) break :blk true;
             const prefix = "$graph_results.";
@@ -2104,6 +2107,23 @@ pub fn resolveGraphSelector(alloc: Allocator, selector: graph_query_mod.NodeSele
             }
             for (keys, 0..) |key, i| {
                 duped[i] = try alloc.dupe(u8, key);
+                initialized += 1;
+            }
+            break :blk duped;
+        },
+        .identities => |identities| blk: {
+            var duped = try alloc.alloc([]u8, identities.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (duped[0..initialized]) |key| alloc.free(key);
+                alloc.free(duped);
+            }
+            for (identities, 0..) |identity, i| {
+                // This executor is scoped to one table. Qualified endpoints must
+                // be resolved by the distributed graph executor, which preserves
+                // the table as part of node identity throughout traversal.
+                if (identity.table != null) return error.UnsupportedQueryRequest;
+                duped[i] = try alloc.dupe(u8, identity.key);
                 initialized += 1;
             }
             break :blk duped;
@@ -3930,6 +3950,7 @@ pub fn resolveGraphSelectorFromSets(
 ) ![][]u8 {
     return switch (selector) {
         .keys => |keys| resolveGraphSelector(alloc, .{ .keys = keys }, null),
+        .identities => |identities| resolveGraphSelector(alloc, .{ .identities = identities }, null),
         .result_ref => |result_ref| blk: {
             const set = findNamedSetByRef(named_sets, result_ref.ref) orelse return error.GraphResultRefNotImplemented;
             if (result_ref.limit == 0) {

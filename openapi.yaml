@@ -21305,13 +21305,18 @@ components:
         provider: ollama
         model: dengcao/Qwen3-Reranker-0.6B:F16
         field: content
+    GraphDocumentQuery:
+      type: object
+      additionalProperties: true
+      description: A document-query expression in either public QueryRequest.filter_query syntax or canonical
+        Antfly filter AST syntax. Graph queries embed this existing document query language; alias-to-alias
+        predicates belong in GraphMatch.where.
     GraphMatchNode:
       type: object
       additionalProperties: false
       properties:
         filter:
-          type: object
-          additionalProperties: true
+          $ref: '#/components/schemas/GraphDocumentQuery'
           description: Canonical Antfly document-query expression evaluated for this alias.
     GraphMatchEdge:
       type: object
@@ -21507,6 +21512,18 @@ components:
           $ref: '#/components/schemas/GraphMatch'
         return:
           $ref: '#/components/schemas/GraphReturn'
+    GraphPathEndpoint:
+      type: object
+      additionalProperties: false
+      required:
+        - key
+      properties:
+        key:
+          type: string
+        table:
+          type: string
+          description: Optional table qualifier for an exact cross-table node identity. Omit for the query
+            table.
     NodeFilter:
       x-go-type-skip-optional-pointer: true
       type: object
@@ -21514,8 +21531,7 @@ components:
       properties:
         filter_query:
           x-go-type-skip-optional-pointer: true
-          type: object
-          additionalProperties: true
+          $ref: '#/components/schemas/GraphDocumentQuery'
           description: Antfly query to filter nodes (same syntax as search filter_query)
         filter_prefix:
           x-go-type-skip-optional-pointer: true
@@ -21524,14 +21540,24 @@ components:
     GraphNodeSelector:
       x-go-type-skip-optional-pointer: true
       type: object
-      description: Defines how to select start/target nodes for graph queries
+      additionalProperties: false
+      description: Select graph nodes by exactly one of keys, identities, or result_ref. Unqualified keys
+        retain legacy cross-table wildcard semantics; identities are exact.
       properties:
         keys:
           x-go-type-skip-optional-pointer: true
           type: array
           items:
             type: string
-          description: Explicit list of node keys
+          description: Legacy list of node keys, matching the key in any reachable table. Prefer identities
+            when keys may collide across tables.
+        identities:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/GraphPathEndpoint'
+          description: Exact node identities. Omitted table means the query table.
         result_ref:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -21544,7 +21570,7 @@ components:
         limit:
           x-go-type-skip-optional-pointer: true
           type: integer
-          description: Maximum number of nodes to select from the referenced results
+          description: Maximum number of nodes to select from result_ref; invalid with keys or identities.
         node_filter:
           $ref: '#/components/schemas/NodeFilter'
           description: Filter which nodes to use as start/target
@@ -21595,8 +21621,7 @@ components:
           description: Document fields to include when include_documents is true. Omit to include all
             fields.
         filter:
-          type: object
-          additionalProperties: true
+          $ref: '#/components/schemas/GraphDocumentQuery'
           description: Canonical Antfly document-query AST (the same shape accepted by QueryRequest.filter_query).
     GraphTraverseQuery:
       type: object
@@ -21609,14 +21634,6 @@ components:
           type: string
         traverse:
           $ref: '#/components/schemas/GraphTraversal'
-    GraphPathEndpoint:
-      type: object
-      additionalProperties: false
-      required:
-        - key
-      properties:
-        key:
-          type: string
     PathWeightMode:
       x-go-type-skip-optional-pointer: true
       type: string
@@ -21663,8 +21680,7 @@ components:
         weight_mode:
           $ref: '#/components/schemas/PathWeightMode'
         filter:
-          type: object
-          additionalProperties: true
+          $ref: '#/components/schemas/GraphDocumentQuery'
           description: Canonical Antfly document-query AST.
         include_documents:
           type: boolean
@@ -21688,16 +21704,53 @@ components:
         shortest_path:
           $ref: '#/components/schemas/GraphShortestPath'
     GraphKShortestPaths:
-      allOf:
-        - $ref: '#/components/schemas/GraphShortestPath'
-        - type: object
-          required:
-            - k
-          properties:
-            k:
-              type: integer
-              minimum: 1
-              maximum: 100
+      type: object
+      additionalProperties: false
+      required:
+        - from
+        - to
+        - k
+      properties:
+        from:
+          $ref: '#/components/schemas/GraphPathEndpoint'
+        to:
+          $ref: '#/components/schemas/GraphPathEndpoint'
+        k:
+          type: integer
+          minimum: 1
+          maximum: 100
+        edge_types:
+          type: array
+          items:
+            type: string
+        direction:
+          $ref: '#/components/schemas/EdgeDirection'
+        max_depth:
+          type: integer
+          minimum: 1
+          maximum: 64
+          default: 10
+        min_weight:
+          type: number
+          format: double
+        max_weight:
+          type: number
+          format: double
+        weight_mode:
+          $ref: '#/components/schemas/PathWeightMode'
+        filter:
+          $ref: '#/components/schemas/GraphDocumentQuery'
+          description: Canonical Antfly document-query AST.
+        include_documents:
+          type: boolean
+          default: false
+          description: Include stored documents on nodes returned with each path.
+        fields:
+          type: array
+          items:
+            type: string
+          description: Document fields to include when include_documents is true. Omit to include all
+            fields.
     GraphKShortestPathsQuery:
       type: object
       additionalProperties: false

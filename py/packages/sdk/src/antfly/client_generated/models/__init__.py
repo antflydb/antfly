@@ -278,6 +278,7 @@ from .graph_aggregates_return_aggregates import GraphAggregatesReturnAggregates
 from .graph_alias_operand import GraphAliasOperand
 from .graph_bindings_return import GraphBindingsReturn
 from .graph_count_aggregate import GraphCountAggregate
+from .graph_document_query import GraphDocumentQuery
 from .graph_index_config import GraphIndexConfig
 from .graph_index_stats import GraphIndexStats
 from .graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
@@ -294,7 +295,6 @@ from .graph_k_shortest_paths_query import GraphKShortestPathsQuery
 from .graph_match import GraphMatch
 from .graph_match_edge import GraphMatchEdge
 from .graph_match_node import GraphMatchNode
-from .graph_match_node_filter import GraphMatchNodeFilter
 from .graph_match_nodes import GraphMatchNodes
 from .graph_match_query import GraphMatchQuery
 from .graph_node_selector import GraphNodeSelector
@@ -314,10 +314,8 @@ from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
 from .graph_result_row_type_0 import GraphResultRowType0
 from .graph_shortest_path import GraphShortestPath
-from .graph_shortest_path_filter import GraphShortestPathFilter
 from .graph_shortest_path_query import GraphShortestPathQuery
 from .graph_traversal import GraphTraversal
-from .graph_traversal_filter import GraphTraversalFilter
 from .graph_traverse_query import GraphTraverseQuery
 from .graph_where_and import GraphWhereAnd
 from .graph_where_not_equal import GraphWhereNotEqual
@@ -565,7 +563,6 @@ from .multi_match_body_type import MultiMatchBodyType
 from .multi_match_query import MultiMatchQuery
 from .multi_phrase_query import MultiPhraseQuery
 from .node_filter import NodeFilter
-from .node_filter_filter_query import NodeFilterFilterQuery
 from .numeric_range_query import NumericRangeQuery
 from .ollama_embedder_config import OllamaEmbedderConfig
 from .ollama_generator_config import OllamaGeneratorConfig
@@ -1072,6 +1069,7 @@ __all__ = (
     "GraphAliasOperand",
     "GraphBindingsReturn",
     "GraphCountAggregate",
+    "GraphDocumentQuery",
     "GraphIndexConfig",
     "GraphIndexStats",
     "GraphIndexStatsAlgebraicGraph",
@@ -1088,7 +1086,6 @@ __all__ = (
     "GraphMatch",
     "GraphMatchEdge",
     "GraphMatchNode",
-    "GraphMatchNodeFilter",
     "GraphMatchNodes",
     "GraphMatchQuery",
     "GraphNodeSelector",
@@ -1108,10 +1105,8 @@ __all__ = (
     "GraphResultNodeEvidence",
     "GraphResultRowType0",
     "GraphShortestPath",
-    "GraphShortestPathFilter",
     "GraphShortestPathQuery",
     "GraphTraversal",
-    "GraphTraversalFilter",
     "GraphTraverseQuery",
     "GraphWhereAnd",
     "GraphWhereNotEqual",
@@ -1357,7 +1352,6 @@ __all__ = (
     "MultiMatchQuery",
     "MultiPhraseQuery",
     "NodeFilter",
-    "NodeFilterFilterQuery",
     "NumericRangeQuery",
     "OllamaEmbedderConfig",
     "OllamaGeneratorConfig",

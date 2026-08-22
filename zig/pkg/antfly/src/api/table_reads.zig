@@ -47,6 +47,7 @@ const db_query_search = @import("../storage/db/query/search_exec.zig");
 const index_manager_mod = @import("../storage/db/catalog/index_manager.zig");
 const introducer_mod = @import("../introducer.zig");
 const graph_mod = @import("../graph/graph.zig");
+const graph_pattern_mod = @import("../graph/pattern.zig");
 const graph_paths = @import("../graph/paths.zig");
 const graph_query_mod = @import("../graph/query.zig");
 const reranking_runtime = @import("../reranking/mod.zig");
@@ -3122,13 +3123,17 @@ pub const ProvisionedTableReadSource = struct {
             var match_anchor_result: ?db_mod.types.SearchResult = null;
             defer if (match_anchor_result) |*result| result.deinit();
             if (distributed_graph.requiresCompleteMatchAnchors(req)) {
+                var anchor_req = completeGraphMatchAnchorRequest(req);
+                const anchor_filter = try completeGraphMatchAnchorFilterAlloc(alloc, req);
+                defer if (anchor_filter) |value| alloc.free(value);
+                if (anchor_filter) |value| anchor_req.filter_query_json = value;
                 const required_generations = try distributedIdentityGenerationsForGroupsAlloc(alloc, group_ids, merged);
                 defer alloc.free(required_generations);
                 match_anchor_result = try queryProvisionedAcrossGroupsAtGenerations(
                     self,
                     alloc,
                     group_ids,
-                    completeGraphMatchAnchorRequest(req),
+                    anchor_req,
                     table_name,
                     .stale,
                     required_generations,
@@ -4163,13 +4168,17 @@ pub const HostedProvisionedTableReadSource = struct {
             var match_anchor_result: ?db_mod.types.SearchResult = null;
             defer if (match_anchor_result) |*result| result.deinit();
             if (distributed_graph.requiresCompleteMatchAnchors(req)) {
+                var anchor_req = completeGraphMatchAnchorRequest(req);
+                const anchor_filter = try completeGraphMatchAnchorFilterAlloc(alloc, req);
+                defer if (anchor_filter) |value| alloc.free(value);
+                if (anchor_filter) |value| anchor_req.filter_query_json = value;
                 const required_generations = try distributedIdentityGenerationsForGroupsAlloc(alloc, group_ids, merged);
                 defer alloc.free(required_generations);
                 match_anchor_result = try queryHostedAcrossGroupsAtGenerations(
                     self,
                     alloc,
                     group_ids,
-                    completeGraphMatchAnchorRequest(req),
+                    anchor_req,
                     table_name,
                     consistency,
                     required_generations,
@@ -5093,6 +5102,48 @@ fn completeGraphMatchAnchorRequest(req: db_mod.types.SearchRequest) db_mod.types
     };
 }
 
+/// Builds the additional identity-scan predicate for every canonical MATCH in
+/// the request. Each matcher sees only its own selected anchor filter, so the
+/// shared scan must take their union; the request/authorization predicate is
+/// then conjoined with that union.
+fn completeGraphMatchAnchorFilterAlloc(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+) !?[]u8 {
+    var filters = std.ArrayListUnmanaged([]const u8).empty;
+    defer filters.deinit(alloc);
+    for (req.graph_queries) |named_query| {
+        const pattern = named_query.query.match_pattern orelse continue;
+        const anchor = graph_pattern_mod.selectConjunctiveAnchor(pattern) orelse return error.InvalidQueryRequest;
+        // A prefix-only or unfiltered anchor cannot safely participate in a
+        // JSON-query union, so retain the complete authorized source relation.
+        const filter = anchor.filter.filter_query_json orelse return null;
+        if (anchor.filter.filter_prefix.len > 0) return null;
+        try filters.append(alloc, filter);
+    }
+    if (filters.items.len == 0) return null;
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    if (req.filter_query_json.len > 0) try out.appendSlice(alloc, "{\"bool\":{\"must\":[");
+    if (filters.items.len == 1) {
+        try out.appendSlice(alloc, filters.items[0]);
+    } else {
+        try out.appendSlice(alloc, "{\"bool\":{\"should\":[");
+        for (filters.items, 0..) |filter, i| {
+            if (i > 0) try out.append(alloc, ',');
+            try out.appendSlice(alloc, filter);
+        }
+        try out.appendSlice(alloc, "],\"minimum_should_match\":1}}");
+    }
+    if (req.filter_query_json.len > 0) {
+        try out.append(alloc, ',');
+        try out.appendSlice(alloc, req.filter_query_json);
+        try out.appendSlice(alloc, "]}}");
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
 test "complete graph match anchors retain admission and discard retrieval shaping" {
     const filter_ids = [_]u64{ 3, 7 };
     const excluded_ids = [_]u64{11};
@@ -5153,6 +5204,31 @@ test "complete graph match anchors retain admission and discard retrieval shapin
     try std.testing.expectEqualStrings("hidden", anchors.exclude_doc_ids[0]);
     try std.testing.expectEqual(@as(?u64, 1234), anchors.execution_deadline_ns);
     try std.testing.expect(anchors.require_algebraic_filter_resolution);
+}
+
+test "complete graph match anchor scan conjoins authorization with selected anchor union" {
+    const nodes_a = [_]graph_pattern_mod.MatchNode{
+        .{ .alias = "unfiltered" },
+        .{ .alias = "selected", .filter = .{ .filter_query_json = "{\"ids\":[\"a\"]}" } },
+    };
+    const nodes_b = [_]graph_pattern_mod.MatchNode{
+        .{ .alias = "selected", .filter = .{ .filter_query_json = "{\"ids\":[\"b\"]}" } },
+        .{ .alias = "unfiltered" },
+    };
+    const queries = [_]db_mod.types.NamedGraphQuery{
+        .{ .name = "a", .query = .{ .query_type = .pattern, .index_name = "g", .start_nodes = .{ .keys = &.{} }, .match_pattern = .{ .nodes = &nodes_a, .edges = &.{} } } },
+        .{ .name = "b", .query = .{ .query_type = .pattern, .index_name = "g", .start_nodes = .{ .keys = &.{} }, .match_pattern = .{ .nodes = &nodes_b, .edges = &.{} } } },
+    };
+    const combined = (try completeGraphMatchAnchorFilterAlloc(std.testing.allocator, .{
+        .filter_query_json = "{\"term\":{\"tenant\":\"one\"}}",
+        .graph_queries = &queries,
+    })).?;
+    defer std.testing.allocator.free(combined);
+
+    try std.testing.expectEqualStrings(
+        "{\"bool\":{\"must\":[{\"bool\":{\"should\":[{\"ids\":[\"a\"]},{\"ids\":[\"b\"]}],\"minimum_should_match\":1}},{\"term\":{\"tenant\":\"one\"}}]}}",
+        combined,
+    );
 }
 
 fn distributedSearchShardRequest(
@@ -6572,7 +6648,28 @@ fn requiresDistributedGraphCoordinator(
     req: db_mod.types.SearchRequest,
 ) bool {
     return distributed_graph.supportsCrossRange(req) and
-        (group_count > 1 or req.graph_table_read_authorizer != null);
+        (group_count > 1 or
+            req.graph_table_read_authorizer != null or
+            graphRequestHasQualifiedIdentity(req));
+}
+
+fn graphRequestHasQualifiedIdentity(req: db_mod.types.SearchRequest) bool {
+    for (req.graph_queries) |graph_query| {
+        if (selectorHasQualifiedIdentity(graph_query.query.start_nodes)) return true;
+        if (graph_query.query.target_nodes) |selector| {
+            if (selectorHasQualifiedIdentity(selector)) return true;
+        }
+    }
+    return false;
+}
+
+fn selectorHasQualifiedIdentity(selector: graph_query_mod.NodeSelector) bool {
+    return switch (selector) {
+        .identities => |identities| for (identities) |identity| {
+            if (identity.table != null) break true;
+        } else false,
+        .keys, .result_ref => false,
+    };
 }
 
 fn validateGraphHydrateResolvedDocFilterForDb(req: distributed_graph.GraphHydrateRequest, db: *db_mod.DB) !void {
@@ -16789,6 +16886,19 @@ fn appendGraphNodeSelectorField(
             }
             try out.append(alloc, ']');
         },
+        .identities => |identities| {
+            try appendJsonFieldName(alloc, out, &selector_first, "identities");
+            try out.append(alloc, '[');
+            for (identities, 0..) |identity, i| {
+                if (i > 0) try out.append(alloc, ',');
+                try out.append(alloc, '{');
+                var identity_first = true;
+                try appendJsonFieldString(alloc, out, &identity_first, "key", identity.key);
+                if (identity.table) |table| try appendJsonFieldString(alloc, out, &identity_first, "table", table);
+                try out.append(alloc, '}');
+            }
+            try out.append(alloc, ']');
+        },
         .result_ref => |result_ref| {
             try appendJsonFieldString(alloc, out, &selector_first, "result_ref", result_ref.ref);
             if (result_ref.limit > 0) try appendJsonFieldU32(alloc, out, &selector_first, "limit", result_ref.limit);
@@ -25494,6 +25604,22 @@ test "authenticated single-group graph queries require distributed coordination"
     req.graph_table_read_authorizer = null;
     try std.testing.expect(!requiresDistributedGraphCoordinator(1, req));
     try std.testing.expect(requiresDistributedGraphCoordinator(2, req));
+}
+
+test "qualified graph endpoint requires coordination for a single source group" {
+    const starts = [_]graph_query_mod.NodeIdentity{.{ .key = "shared" }};
+    const targets = [_]graph_query_mod.NodeIdentity{.{ .key = "shared", .table = "companies" }};
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "path",
+        .query = .{
+            .query_type = .shortest_path,
+            .index_name = "graph_v1",
+            .start_nodes = .{ .identities = &starts },
+            .target_nodes = .{ .identities = &targets },
+        },
+    }};
+
+    try std.testing.expect(requiresDistributedGraphCoordinator(1, .{ .graph_queries = &graph_queries }));
 }
 
 test "hosted cross-range graph query expands explicit local start keys" {

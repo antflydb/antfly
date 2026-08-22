@@ -3841,6 +3841,9 @@ pub const GraphCountAggregate = struct {
     distinct: ?bool = null,
 };
 
+/// A document-query expression in either public QueryRequest.filter_query syntax or canonical Antfly filter AST syntax. Graph queries embed this existing document query language; alias-to-alias predicates belong in GraphMatch.where.
+pub const GraphDocumentQuery = std.json.Value;
+
 /// Configuration for graph index type
 pub const GraphIndexConfig = struct {
     /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
@@ -3953,6 +3956,7 @@ pub const GraphIndexStats = struct {
 pub const GraphKShortestPaths = struct {
     from: GraphPathEndpoint,
     to: GraphPathEndpoint,
+    k: i64,
     edge_types: ?[]const []const u8 = null,
     direction: ?EdgeDirection = null,
     max_depth: ?i64 = null,
@@ -3960,12 +3964,11 @@ pub const GraphKShortestPaths = struct {
     max_weight: ?f64 = null,
     weight_mode: ?PathWeightMode = null,
     /// Canonical Antfly document-query AST.
-    filter: ?std.json.Value = null,
-    /// Include stored documents on nodes returned with the path.
+    filter: ?GraphDocumentQuery = null,
+    /// Include stored documents on nodes returned with each path.
     include_documents: ?bool = null,
     /// Document fields to include when include_documents is true. Omit to include all fields.
     fields: ?[]const []const u8 = null,
-    k: i64,
 };
 
 pub const GraphKShortestPathsQuery = struct {
@@ -3994,7 +3997,7 @@ pub const GraphMatchEdge = struct {
 
 pub const GraphMatchNode = struct {
     /// Canonical Antfly document-query expression evaluated for this alias.
-    filter: ?std.json.Value = null,
+    filter: ?GraphDocumentQuery = null,
 };
 
 pub const GraphMatchQuery = struct {
@@ -4003,13 +4006,15 @@ pub const GraphMatchQuery = struct {
     @"return": GraphReturn,
 };
 
-/// Defines how to select start/target nodes for graph queries
+/// Select graph nodes by exactly one of keys, identities, or result_ref. Unqualified keys retain legacy cross-table wildcard semantics; identities are exact.
 pub const GraphNodeSelector = struct {
-    /// Explicit list of node keys
+    /// Legacy list of node keys, matching the key in any reachable table. Prefer identities when keys may collide across tables.
     keys: ?[]const []const u8 = null,
+    /// Exact node identities. Omitted table means the query table.
+    identities: ?[]const GraphPathEndpoint = null,
     /// Reference to search results to use as nodes: - "$full_text_results" - use full-text search results - "$embeddings_results.index_name" - use vector search results from specific index
     result_ref: ?[]const u8 = null,
-    /// Maximum number of nodes to select from the referenced results
+    /// Maximum number of nodes to select from result_ref; invalid with keys or identities.
     limit: ?i64 = null,
     /// Filter which nodes to use as start/target
     node_filter: ?NodeFilter = null,
@@ -4032,6 +4037,8 @@ pub const GraphOptionalMatch = struct {
 
 pub const GraphPathEndpoint = struct {
     key: []const u8,
+    /// Optional table qualifier for an exact cross-table node identity. Omit for the query table.
+    table: ?[]const u8 = null,
 };
 
 pub const GraphQuery = union(enum) {
@@ -4267,7 +4274,7 @@ pub const GraphShortestPath = struct {
     max_weight: ?f64 = null,
     weight_mode: ?PathWeightMode = null,
     /// Canonical Antfly document-query AST.
-    filter: ?std.json.Value = null,
+    filter: ?GraphDocumentQuery = null,
     /// Include stored documents on nodes returned with the path.
     include_documents: ?bool = null,
     /// Document fields to include when include_documents is true. Omit to include all fields.
@@ -4294,7 +4301,7 @@ pub const GraphTraversal = struct {
     /// Document fields to include when include_documents is true. Omit to include all fields.
     fields: ?[]const []const u8 = null,
     /// Canonical Antfly document-query AST (the same shape accepted by QueryRequest.filter_query).
-    filter: ?std.json.Value = null,
+    filter: ?GraphDocumentQuery = null,
 };
 
 pub const GraphTraverseQuery = struct {
@@ -6617,7 +6624,7 @@ pub const MultiPhraseQuery = struct {
 /// Filter nodes during graph traversal using existing query primitives
 pub const NodeFilter = struct {
     /// Antfly query to filter nodes (same syntax as search filter_query)
-    filter_query: ?std.json.Value = null,
+    filter_query: ?GraphDocumentQuery = null,
     /// Filter by key prefix
     filter_prefix: ?[]const u8 = null,
 };

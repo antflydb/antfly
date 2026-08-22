@@ -757,6 +757,7 @@ fn rejectUnstampedResultRefs(
 fn selectorUsesResultRef(selector: graph_query_mod.NodeSelector) bool {
     return switch (selector) {
         .keys => false,
+        .identities => false,
         .result_ref => true,
     };
 }
@@ -998,7 +999,7 @@ const TargetNodeSet = struct {
                     };
                 }
             },
-            .result_ref => {
+            .identities, .result_ref => {
                 for (nodes) |node| {
                     _ = try out.exact.putIfAbsent(alloc, node.ref(), {});
                 }
@@ -2671,6 +2672,7 @@ fn findDistributedShortestPath(
 fn supportsSelectorRef(req: db_mod.types.SearchRequest, selector: graph_query_mod.NodeSelector) bool {
     return switch (selector) {
         .keys => true,
+        .identities => true,
         .result_ref => |result_ref| supportsResultRef(req, result_ref.ref),
     };
 }
@@ -4348,6 +4350,19 @@ fn resolveSelectorNodes(
             }
             break :blk out;
         },
+        .identities => |identities| blk: {
+            const out = try alloc.alloc(GraphNodeIdentity, identities.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (out[0..initialized]) |*node| node.deinit(alloc);
+                alloc.free(out);
+            }
+            for (identities, 0..) |identity, i| {
+                out[i] = try cloneGraphNodeIdentityParts(alloc, identity.key, identity.table);
+                initialized += 1;
+            }
+            break :blk out;
+        },
         .result_ref => |result_ref| resolveResultRefNodes(
             alloc,
             req,
@@ -4367,6 +4382,12 @@ fn resolveSelectorKeys(
 ) ![][]u8 {
     return switch (selector) {
         .keys => |keys| dupKeys(alloc, keys),
+        .identities => |identities| blk: {
+            const refs = try alloc.alloc([]const u8, identities.len);
+            defer alloc.free(refs);
+            for (identities, 0..) |identity, i| refs[i] = identity.key;
+            break :blk try dupKeys(alloc, refs);
+        },
         .result_ref => |result_ref| resolveResultRefKeys(alloc, req, base_result, prior_results, result_ref),
     };
 }
@@ -5012,6 +5033,13 @@ pub fn freeExpandSearchRequest(alloc: std.mem.Allocator, req: db_mod.types.Searc
                 for (keys) |key| alloc.free(@constCast(key));
                 alloc.free(keys);
             },
+            .identities => |identities| {
+                for (identities) |identity| {
+                    alloc.free(@constCast(identity.key));
+                    if (identity.table) |table| alloc.free(@constCast(table));
+                }
+                alloc.free(identities);
+            },
             .result_ref => {},
         }
         if (graph_query.query.target_nodes) |target_nodes| {
@@ -5019,6 +5047,13 @@ pub fn freeExpandSearchRequest(alloc: std.mem.Allocator, req: db_mod.types.Searc
                 .keys => |keys| {
                     for (keys) |key| alloc.free(@constCast(key));
                     alloc.free(keys);
+                },
+                .identities => |identities| {
+                    for (identities) |identity| {
+                        alloc.free(@constCast(identity.key));
+                        if (identity.table) |table| alloc.free(@constCast(table));
+                    }
+                    alloc.free(identities);
                 },
                 .result_ref => {},
             }

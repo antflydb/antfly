@@ -5,6 +5,8 @@ from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 
+from ..types import UNSET, Unset
+
 T = TypeVar("T", bound="GraphPathEndpoint")
 
 
@@ -13,12 +15,16 @@ class GraphPathEndpoint:
     """
     Attributes:
         key (str):
+        table (str | Unset): Optional table qualifier for an exact cross-table node identity. Omit for the query table.
     """
 
     key: str
+    table: str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         key = self.key
+
+        table = self.table
 
         field_dict: dict[str, Any] = {}
 
@@ -27,6 +33,8 @@ class GraphPathEndpoint:
                 "key": key,
             }
         )
+        if table is not UNSET:
+            field_dict["table"] = table
 
         return field_dict
 
@@ -35,8 +43,11 @@ class GraphPathEndpoint:
         d = dict(src_dict)
         key = d.pop("key")
 
+        table = d.pop("table", UNSET)
+
         graph_path_endpoint = cls(
             key=key,
+            table=table,
         )
 
         return graph_path_endpoint

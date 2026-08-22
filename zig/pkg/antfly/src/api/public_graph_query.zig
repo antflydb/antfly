@@ -142,6 +142,20 @@ pub fn resolveGraphSelectorAlloc(
             }
             break :blk duped;
         },
+        .identities => |identities| blk: {
+            const duped = try alloc.alloc([]u8, identities.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (duped[0..initialized]) |key| alloc.free(key);
+                alloc.free(duped);
+            }
+            for (identities, 0..) |identity, i| {
+                if (identity.table != null) return error.UnsupportedQueryRequest;
+                duped[i] = try alloc.dupe(u8, identity.key);
+                initialized += 1;
+            }
+            break :blk duped;
+        },
         .result_ref => |result_ref| blk: {
             const set = findResultSetByRef(available_sets, result_ref.ref) orelse return error.GraphResultRefNotImplemented;
             if (result_ref.limit == 0 and resultSetMayBeIncompleteForUnboundedRef(set)) return error.UnsupportedQueryRequest;
@@ -258,6 +272,7 @@ fn visitQuery(
 fn dependencyName(selector: graph_query_mod.NodeSelector) ?[]const u8 {
     return switch (selector) {
         .keys => null,
+        .identities => null,
         .result_ref => |result_ref| blk: {
             if (std.mem.startsWith(u8, result_ref.ref, "$graph_results.")) {
                 break :blk result_ref.ref["$graph_results.".len..];

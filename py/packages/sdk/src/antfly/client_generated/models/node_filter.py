@@ -9,7 +9,7 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.node_filter_filter_query import NodeFilterFilterQuery
+    from ..models.graph_document_query import GraphDocumentQuery
 
 
 T = TypeVar("T", bound="NodeFilter")
@@ -20,11 +20,13 @@ class NodeFilter:
     """Filter nodes during graph traversal using existing query primitives
 
     Attributes:
-        filter_query (NodeFilterFilterQuery | Unset): Antfly query to filter nodes (same syntax as search filter_query)
+        filter_query (GraphDocumentQuery | Unset): A document-query expression in either public
+            QueryRequest.filter_query syntax or canonical Antfly filter AST syntax. Graph queries embed this existing
+            document query language; alias-to-alias predicates belong in GraphMatch.where.
         filter_prefix (str | Unset): Filter by key prefix
     """
 
-    filter_query: NodeFilterFilterQuery | Unset = UNSET
+    filter_query: GraphDocumentQuery | Unset = UNSET
     filter_prefix: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -47,15 +49,15 @@ class NodeFilter:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.node_filter_filter_query import NodeFilterFilterQuery
+        from ..models.graph_document_query import GraphDocumentQuery
 
         d = dict(src_dict)
         _filter_query = d.pop("filter_query", UNSET)
-        filter_query: NodeFilterFilterQuery | Unset
+        filter_query: GraphDocumentQuery | Unset
         if isinstance(_filter_query, Unset):
             filter_query = UNSET
         else:
-            filter_query = NodeFilterFilterQuery.from_dict(_filter_query)
+            filter_query = GraphDocumentQuery.from_dict(_filter_query)
 
         filter_prefix = d.pop("filter_prefix", UNSET)
 

@@ -8,7 +8,7 @@ from attrs import define as _attrs_define
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.graph_match_node_filter import GraphMatchNodeFilter
+    from ..models.graph_document_query import GraphDocumentQuery
 
 
 T = TypeVar("T", bound="GraphMatchNode")
@@ -18,10 +18,12 @@ T = TypeVar("T", bound="GraphMatchNode")
 class GraphMatchNode:
     """
     Attributes:
-        filter_ (GraphMatchNodeFilter | Unset): Canonical Antfly document-query expression evaluated for this alias.
+        filter_ (GraphDocumentQuery | Unset): A document-query expression in either public QueryRequest.filter_query
+            syntax or canonical Antfly filter AST syntax. Graph queries embed this existing document query language; alias-
+            to-alias predicates belong in GraphMatch.where.
     """
 
-    filter_: GraphMatchNodeFilter | Unset = UNSET
+    filter_: GraphDocumentQuery | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         filter_: dict[str, Any] | Unset = UNSET
@@ -38,15 +40,15 @@ class GraphMatchNode:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.graph_match_node_filter import GraphMatchNodeFilter
+        from ..models.graph_document_query import GraphDocumentQuery
 
         d = dict(src_dict)
         _filter_ = d.pop("filter", UNSET)
-        filter_: GraphMatchNodeFilter | Unset
+        filter_: GraphDocumentQuery | Unset
         if isinstance(_filter_, Unset):
             filter_ = UNSET
         else:
-            filter_ = GraphMatchNodeFilter.from_dict(_filter_)
+            filter_ = GraphDocumentQuery.from_dict(_filter_)
 
         graph_match_node = cls(
             filter_=filter_,

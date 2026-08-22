@@ -234,7 +234,6 @@ def test_graph_neighbors_traverse_and_shortest_path(serverless_api):
     assert public_neighbors is not None
     public_neighbor_result = _graph_result(public_neighbors, "neighbors")
     assert public_neighbor_result is not None
-    assert public_neighbor_result["type"] == "neighbors"
     assert len(public_neighbor_result["nodes"]) == 2
     assert [node["key"] for node in public_neighbor_result["nodes"]] == ["bob", "carol"]
 
@@ -602,23 +601,29 @@ def test_serverless_graph_pattern_two_hop_and_documents(serverless_api):
     except requests.HTTPError:
         pass
 
+    two_hop_match = {
+        "nodes": {
+            "a": {"filter": {"ids": ["doc-a"]}},
+            "b": {"filter": {"term": {"path": "title", "value": "beta"}}},
+            "c": {"filter": {"prefix": {"path": "title", "prefix": "ga"}}},
+        },
+        "edges": [
+            {"from": "a", "to": "b", "types": ["cites"], "direction": "out"},
+            {"from": "b", "to": "c", "types": ["cites"], "direction": "out"},
+        ],
+    }
     query_payload = {
         "graph_queries": {
             "two_hop": {
                 "index": "graph_idx",
-                "match": {
-                    "nodes": {
-                        "a": {"filter": {"doc_id": ["doc-a"]}},
-                        "b": {"filter": {"term": {"path": "title", "value": "beta"}}},
-                        "c": {"filter": {"prefix": {"path": "title", "prefix": "ga"}}},
-                    },
-                    "edges": [
-                        {"from": "a", "to": "b", "types": ["cites"], "direction": "out"},
-                        {"from": "b", "to": "c", "types": ["cites"], "direction": "out"},
-                    ],
-                },
+                "match": two_hop_match,
                 "return": {"bindings": ["a", "b", "c"], "limit": 10},
-            }
+            },
+            "two_hop_count": {
+                "index": "graph_idx",
+                "match": two_hop_match,
+                "return": {"aggregates": {"rows": {"count": "*"}}},
+            },
         },
         "limit": 10,
     }
@@ -633,6 +638,9 @@ def test_serverless_graph_pattern_two_hop_and_documents(serverless_api):
     assert row["a"]["key"] == "doc-a"
     assert row["b"]["key"] == "doc-b"
     assert row["c"]["key"] == "doc-c"
+    count_result = _query_graph_result(serverless_api, table_name, query_payload, "two_hop_count")
+    assert count_result is not None
+    assert count_result["aggregates"]["rows"] == {"value": "1", "exact": True}
 
 
 def test_multi_batch_graph_push_preserves_boundary_error_and_existing_edges(backup_api):
@@ -726,7 +734,7 @@ def test_stateful_graph_field_edges_extract_and_update(backup_api):
                 "index": "hierarchy",
                 "match": {
                     "nodes": {
-                        "child": {"filter": {"doc_id": ["child"]}},
+                        "child": {"filter": {"ids": ["child"]}},
                         "parent": {},
                     },
                     "edges": [{"from": "child", "to": "parent", "types": ["child_of"], "direction": "out"}],
@@ -879,7 +887,7 @@ def test_stateful_graph_pattern_two_hop_and_documents(backup_api):
                 "index": "graph_idx",
                 "match": {
                     "nodes": {
-                        "a": {"filter": {"doc_id": ["doc-a"]}},
+                        "a": {"filter": {"ids": ["doc-a"]}},
                         "b": {},
                         "c": {},
                     },
@@ -951,7 +959,7 @@ def test_stateful_graph_pattern_variable_length_and_cycle(backup_api):
                 "index": "graph_idx",
                 "match": {
                     "nodes": {
-                        "start": {"filter": {"doc_id": ["doc-a"]}},
+                        "start": {"filter": {"ids": ["doc-a"]}},
                         "end": {},
                     },
                     "edges": [{"from": "start", "to": "end", "types": ["knows"], "direction": "out", "min_hops": 1, "max_hops": 2}],
@@ -961,7 +969,7 @@ def test_stateful_graph_pattern_variable_length_and_cycle(backup_api):
             "cycle": {
                 "index": "graph_idx",
                 "match": {
-                    "nodes": {"x": {"filter": {"doc_id": ["doc-a"]}}},
+                    "nodes": {"x": {"filter": {"ids": ["doc-a"]}}},
                     "edges": [{"from": "x", "to": "x", "types": ["knows"], "direction": "out", "min_hops": 1, "max_hops": 3}],
                 },
                 "return": {"bindings": ["x"], "limit": 10},
@@ -1052,7 +1060,7 @@ def test_stateful_graph_pattern_diamond_and_edge_type_filter(backup_api):
                 "index": "graph_idx",
                 "match": {
                     "nodes": {
-                        "a": {"filter": {"doc_id": ["doc-a"]}},
+                        "a": {"filter": {"ids": ["doc-a"]}},
                         "middle": {},
                         "d": {},
                     },
@@ -1067,7 +1075,7 @@ def test_stateful_graph_pattern_diamond_and_edge_type_filter(backup_api):
                 "index": "graph_idx",
                 "match": {
                     "nodes": {
-                        "a": {"filter": {"doc_id": ["doc-a"]}},
+                        "a": {"filter": {"ids": ["doc-a"]}},
                         "b": {},
                         "c": {},
                     },
@@ -1147,7 +1155,7 @@ def test_stateful_graph_conjunctive_optional_negative_and_aggregates(backup_api)
     assert batch["inserted"] == 4
 
     branch = {
-        "nodes": {"a": {"filter": {"doc_id": ["doc-a"]}}, "b": {}, "c": {}},
+        "nodes": {"a": {"filter": {"ids": ["doc-a"]}}, "b": {}, "c": {}},
         "edges": [
             {"from": "a", "to": "b", "types": ["knows"]},
             {"from": "a", "to": "c", "types": ["knows"]},
@@ -1181,7 +1189,7 @@ def test_stateful_graph_conjunctive_optional_negative_and_aggregates(backup_api)
             "optional": {
                 "index": "graph_idx",
                 "match": {
-                    "nodes": {"a": {"filter": {"doc_id": ["doc-a"]}}, "b": {}},
+                    "nodes": {"a": {"filter": {"ids": ["doc-a"]}}, "b": {}},
                     "edges": [{"from": "a", "to": "b", "types": ["knows"]}],
                     "optional": [
                         {
@@ -1195,7 +1203,7 @@ def test_stateful_graph_conjunctive_optional_negative_and_aggregates(backup_api)
             "counts": {
                 "index": "graph_idx",
                 "match": {
-                    "nodes": {"a": {"filter": {"doc_id": ["doc-a"]}}, "b": {}},
+                    "nodes": {"a": {"filter": {"ids": ["doc-a"]}}, "b": {}},
                     "edges": [{"from": "a", "to": "b", "types": ["knows"]}],
                 },
                 "return": {

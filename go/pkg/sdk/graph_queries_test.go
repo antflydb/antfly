@@ -14,6 +14,18 @@ import (
 )
 
 func TestGraphQueryConstructors(t *testing.T) {
+	notEqual, err := NewGraphNotEqual("a", "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	notExists, err := NewGraphNotExists([]GraphMatchEdge{{From: "a", To: "b"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	where, err := NewGraphWhereAnd(notEqual, notExists)
+	if err != nil {
+		t.Fatal(err)
+	}
 	graphReturn, err := NewGraphAggregatesReturn(map[string]GraphCountAggregate{
 		"rows":      CountGraphRows(),
 		"neighbors": CountGraphAlias("b", true),
@@ -23,7 +35,7 @@ func TestGraphQueryConstructors(t *testing.T) {
 	}
 	query, err := NewGraphMatchQuery(GraphMatchQuery{
 		Index:  "graph_idx",
-		Match:  GraphMatch{},
+		Match:  GraphMatch{Where: where},
 		Return: graphReturn,
 	})
 	if err != nil {
@@ -46,5 +58,10 @@ func TestGraphQueryConstructors(t *testing.T) {
 	}
 	if _, ok := returns["aggregates"]; !ok {
 		t.Fatalf("return = %#v", returns)
+	}
+	match := decoded["match"].(map[string]any)
+	whereJSON := match["where"].(map[string]any)
+	if predicates, ok := whereJSON["and"].([]any); !ok || len(predicates) != 2 {
+		t.Fatalf("where = %#v", whereJSON)
 	}
 }

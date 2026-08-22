@@ -1850,6 +1850,31 @@ test "query parser accepts graph queries" {
     }
 }
 
+test "query parser preserves exact graph path endpoint identities" {
+    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+        \\{"graph_queries":{"path":{"index":"graph_idx","shortest_path":{"from":{"key":"shared"},"to":{"key":"shared","table":"companies"}}}},"limit":10}
+    );
+    defer owned.deinit(std.testing.allocator);
+
+    const graph_query = owned.req.graph_queries[0].query;
+    switch (graph_query.start_nodes) {
+        .identities => |identities| {
+            try std.testing.expectEqual(@as(usize, 1), identities.len);
+            try std.testing.expectEqualStrings("shared", identities[0].key);
+            try std.testing.expect(identities[0].table == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (graph_query.target_nodes.?) {
+        .identities => |identities| {
+            try std.testing.expectEqual(@as(usize, 1), identities.len);
+            try std.testing.expectEqualStrings("shared", identities[0].key);
+            try std.testing.expectEqualStrings("companies", identities[0].table.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "query parser adapts deprecated graph searches" {
     var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
         \\{"graph_searches":{"neighbors":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]},"params":{"edge_types":["links"],"max_depth":1}}},"limit":10}

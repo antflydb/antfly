@@ -4,15 +4,14 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
-from attrs import field as _attrs_field
 
 from ..models.edge_direction import EdgeDirection
 from ..models.path_weight_mode import PathWeightMode
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.graph_document_query import GraphDocumentQuery
     from ..models.graph_path_endpoint import GraphPathEndpoint
-    from ..models.graph_shortest_path_filter import GraphShortestPathFilter
 
 
 T = TypeVar("T", bound="GraphKShortestPaths")
@@ -37,8 +36,10 @@ class GraphKShortestPaths:
             - min_hops: Minimize number of edges
             - min_weight: Minimize sum of edge weights
             - max_weight: Maximize product of edge weights
-        filter_ (GraphShortestPathFilter | Unset): Canonical Antfly document-query AST.
-        include_documents (bool | Unset): Include stored documents on nodes returned with the path. Default: False.
+        filter_ (GraphDocumentQuery | Unset): A document-query expression in either public QueryRequest.filter_query
+            syntax or canonical Antfly filter AST syntax. Graph queries embed this existing document query language; alias-
+            to-alias predicates belong in GraphMatch.where.
+        include_documents (bool | Unset): Include stored documents on nodes returned with each path. Default: False.
         fields (list[str] | Unset): Document fields to include when include_documents is true. Omit to include all
             fields.
     """
@@ -52,10 +53,9 @@ class GraphKShortestPaths:
     min_weight: float | Unset = UNSET
     max_weight: float | Unset = UNSET
     weight_mode: PathWeightMode | Unset = UNSET
-    filter_: GraphShortestPathFilter | Unset = UNSET
+    filter_: GraphDocumentQuery | Unset = UNSET
     include_documents: bool | Unset = False
     fields: list[str] | Unset = UNSET
-    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         from_ = self.from_.to_dict()
@@ -93,7 +93,7 @@ class GraphKShortestPaths:
             fields = self.fields
 
         field_dict: dict[str, Any] = {}
-        field_dict.update(self.additional_properties)
+
         field_dict.update(
             {
                 "from": from_,
@@ -124,8 +124,8 @@ class GraphKShortestPaths:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.graph_document_query import GraphDocumentQuery
         from ..models.graph_path_endpoint import GraphPathEndpoint
-        from ..models.graph_shortest_path_filter import GraphShortestPathFilter
 
         d = dict(src_dict)
         from_ = GraphPathEndpoint.from_dict(d.pop("from"))
@@ -157,11 +157,11 @@ class GraphKShortestPaths:
             weight_mode = PathWeightMode(_weight_mode)
 
         _filter_ = d.pop("filter", UNSET)
-        filter_: GraphShortestPathFilter | Unset
+        filter_: GraphDocumentQuery | Unset
         if isinstance(_filter_, Unset):
             filter_ = UNSET
         else:
-            filter_ = GraphShortestPathFilter.from_dict(_filter_)
+            filter_ = GraphDocumentQuery.from_dict(_filter_)
 
         include_documents = d.pop("include_documents", UNSET)
 
@@ -182,21 +182,4 @@ class GraphKShortestPaths:
             fields=fields,
         )
 
-        graph_k_shortest_paths.additional_properties = d
         return graph_k_shortest_paths
-
-    @property
-    def additional_keys(self) -> list[str]:
-        return list(self.additional_properties.keys())
-
-    def __getitem__(self, key: str) -> Any:
-        return self.additional_properties[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        self.additional_properties[key] = value
-
-    def __delitem__(self, key: str) -> None:
-        del self.additional_properties[key]
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.additional_properties

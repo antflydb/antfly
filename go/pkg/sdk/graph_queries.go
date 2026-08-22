@@ -60,3 +60,32 @@ func CountGraphRows() GraphCountAggregate {
 func CountGraphAlias(alias string, distinct bool) GraphCountAggregate {
 	return GraphCountAggregate{Count: alias, Distinct: distinct}
 }
+
+// NewGraphNotEqual rejects rows where two aliases resolve to the same exact
+// (table, key) node identity.
+func NewGraphNotEqual(left, right string) (GraphWhereExpression, error) {
+	var result GraphWhereExpression
+	err := result.FromGraphWhereNotEqual(GraphWhereNotEqual{
+		NotEqual: GraphNotEqualPredicate{
+			Left:  GraphAliasOperand{Alias: left},
+			Right: GraphAliasOperand{Alias: right},
+		},
+	})
+	return result, err
+}
+
+// NewGraphNotExists creates a correlated negative-edge predicate.
+func NewGraphNotExists(edges []GraphMatchEdge) (GraphWhereExpression, error) {
+	var result GraphWhereExpression
+	err := result.FromGraphWhereNotExists(GraphWhereNotExists{
+		NotExists: GraphNotExistsPattern{Edges: edges},
+	})
+	return result, err
+}
+
+// NewGraphWhereAnd combines graph predicates conjunctively.
+func NewGraphWhereAnd(expressions ...GraphWhereExpression) (GraphWhereExpression, error) {
+	var result GraphWhereExpression
+	err := result.FromGraphWhereAnd(GraphWhereAnd{And: expressions})
+	return result, err
+}

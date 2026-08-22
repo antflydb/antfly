@@ -25598,6 +25598,7 @@ pub const DB = struct {
         defer if (graph_query.target_nodes != null) {
             switch (resolved_query.target_nodes.?) {
                 .keys => |owned| alloc.free(owned),
+                .identities => unreachable,
                 .result_ref => unreachable,
             }
         };
@@ -25626,6 +25627,7 @@ pub const DB = struct {
         defer if (graph_query.target_nodes != null) {
             switch (resolved_query.target_nodes.?) {
                 .keys => |owned| alloc.free(owned),
+                .identities => unreachable,
                 .result_ref => unreachable,
             }
         };
@@ -32397,6 +32399,7 @@ fn visitGraphQuery(
 fn graphQueryDependencyName(selector: graph_query_mod.NodeSelector) ?[]const u8 {
     return switch (selector) {
         .keys => null,
+        .identities => null,
         .result_ref => |result_ref| blk: {
             if (std.mem.startsWith(u8, result_ref.ref, "$graph_results.")) {
                 break :blk result_ref.ref["$graph_results.".len..];

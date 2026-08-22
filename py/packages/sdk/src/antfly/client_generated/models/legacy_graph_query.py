@@ -25,8 +25,10 @@ class LegacyGraphQuery:
     Attributes:
         type_ (GraphQueryType): Deprecated discriminator used by LegacyGraphQuery.
         index_name (str):
-        start_nodes (GraphNodeSelector | Unset): Defines how to select start/target nodes for graph queries
-        target_nodes (GraphNodeSelector | Unset): Defines how to select start/target nodes for graph queries
+        start_nodes (GraphNodeSelector | Unset): Select graph nodes by exactly one of keys, identities, or result_ref.
+            Unqualified keys retain legacy cross-table wildcard semantics; identities are exact.
+        target_nodes (GraphNodeSelector | Unset): Select graph nodes by exactly one of keys, identities, or result_ref.
+            Unqualified keys retain legacy cross-table wildcard semantics; identities are exact.
         params (GraphQueryParams | Unset): Deprecated graph_searches traversal and path parameters.
         pattern (list[PatternStep] | Unset):
         return_aliases (list[str] | Unset):

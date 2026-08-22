@@ -4646,7 +4646,7 @@ pub const FunctionObject = struct {
 };
 
 /// The parameters the functions accepts, described as a JSON Schema object. See the [guide](/docs/guides/function-calling) for examples, and the [JSON Schema reference](https://json-schema.org/understanding-json-schema/) for documentation about the format. Omitting `parameters` defines a function with an empty parameter list.
-pub const FunctionParameters = struct {};
+pub const FunctionParameters = std.json.Value;
 
 /// Execute a shell command.
 pub const FunctionShellAction = struct {
@@ -10012,7 +10012,7 @@ pub const ResponseFormatJsonSchema = struct {
 };
 
 /// The schema for the response format, described as a JSON Schema object. Learn how to build JSON schemas [here](https://json-schema.org/).
-pub const ResponseFormatJsonSchemaSchema = struct {};
+pub const ResponseFormatJsonSchemaSchema = std.json.Value;
 
 /// Default response format. Used to generate text responses.
 pub const ResponseFormatText = struct {

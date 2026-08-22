@@ -32,6 +32,10 @@ pub const NodeFilter = struct {
     filter_query_json: ?[]const u8 = null,
 };
 
+pub fn nodeFilterActive(filter: NodeFilter) bool {
+    return filter.filter_prefix.len > 0 or filter.filter_query_json != null;
+}
+
 pub const FilterEvaluator = struct {
     ctx: ?*anyopaque = null,
     func: ?*const fn (?*anyopaque, node_identity.Ref, NodeFilter) anyerror!bool = null,
@@ -186,12 +190,15 @@ const Frontier = struct {
     key: []u8,
     table: ?[]u8 = null,
     path: []paths_mod.PathEdge,
+    path_nodes: []node_identity.Key,
     hops: u32,
 
     fn deinit(self: *Frontier, alloc: Allocator) void {
         alloc.free(self.key);
         if (self.table) |table| alloc.free(table);
         freePathEdges(alloc, self.path);
+        for (self.path_nodes) |*node| node.deinit(alloc);
+        alloc.free(self.path_nodes);
         self.* = undefined;
     }
 };
@@ -769,25 +776,16 @@ fn findReachableNodes(
         results.deinit(alloc);
     }
 
-    var visited = node_identity.Map(void){};
-    defer visited.deinit(alloc);
-
     var current = std.ArrayListUnmanaged(Frontier).empty;
     defer {
         for (current.items) |*frontier| frontier.deinit(alloc);
         current.deinit(alloc);
     }
     {
-        var initial = try initFrontier(alloc, start_key, start_table, &.{}, 0);
+        var initial = try initFrontier(alloc, start_key, start_table, &.{}, &.{}, 0);
         errdefer initial.deinit(alloc);
         try current.append(alloc, initial);
     }
-    _ = try visited.putIfAbsent(
-        alloc,
-        .{ .table = start_table, .key = start_key },
-        {},
-    );
-
     while (current.items.len > 0 and results.items.len < result_limit) {
         var next = std.ArrayListUnmanaged(Frontier).empty;
         errdefer {
@@ -833,8 +831,7 @@ fn findReachableNodes(
                     );
                     const closes_required_target = target_required and
                         targetNodeMatches(.{ .table = target_table, .key = target_key }, target_nodes, true);
-                    if ((std.mem.eql(u8, target_key, frontier.key) or
-                        visited.contains(.{ .table = target_table, .key = target_key })) and
+                    if (frontierContainsNode(frontier.*, .{ .table = target_table, .key = target_key }) and
                         !closes_required_target) continue;
                     candidate_indexes.appendAssumeCapacity(edge_index);
                     candidate_nodes.appendAssumeCapacity(.{
@@ -856,23 +853,24 @@ fn findReachableNodes(
 
             for (edges, 0..) |graph_edge, edge_index| {
                 const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
-                if (admitted_edges) |mask| {
-                    if (!mask[edge_index]) continue;
-                } else {
-                    if (!edgeMatches(graph_edge, edge)) continue;
-                    const candidate_table = edgeTargetTable(frontier.table, graph_edge, target_key);
-                    const closes_required_target = target_required and
-                        targetNodeMatches(.{ .table = candidate_table, .key = target_key }, target_nodes, true);
-                    if ((std.mem.eql(u8, target_key, frontier.key) or
-                        visited.contains(.{ .table = candidate_table, .key = target_key })) and
-                        !closes_required_target) continue;
-                }
-                const new_hops = frontier.hops + 1;
                 const target_table = edgeTargetTable(
                     frontier.table,
                     graph_edge,
                     target_key,
                 );
+                const revisits_path = frontierContainsNode(
+                    frontier.*,
+                    .{ .table = target_table, .key = target_key },
+                );
+                if (admitted_edges) |mask| {
+                    if (!mask[edge_index]) continue;
+                } else {
+                    if (!edgeMatches(graph_edge, edge)) continue;
+                    const closes_required_target = target_required and
+                        targetNodeMatches(.{ .table = target_table, .key = target_key }, target_nodes, true);
+                    if (revisits_path and !closes_required_target) continue;
+                }
+                const new_hops = frontier.hops + 1;
                 const new_path = if (include_paths)
                     try appendPathEdge(alloc, frontier.path, graph_edge, frontier.key, target_key)
                 else
@@ -900,16 +898,15 @@ fn findReachableNodes(
                     }
                 }
 
-                if (new_hops < max_hops and try visited.putIfAbsent(
-                    alloc,
-                    .{ .table = target_table, .key = target_key },
-                    {},
-                )) {
+                // A repeated node is permitted only to materialize an explicit
+                // cycle-closing target. Do not expand it into non-simple paths.
+                if (new_hops < max_hops and !revisits_path) {
                     var next_item = try initFrontier(
                         alloc,
                         target_key,
                         target_table,
                         new_path,
+                        frontier.path_nodes,
                         new_hops,
                     );
                     new_path_owned = false;
@@ -1095,8 +1092,8 @@ fn buildConjunctiveStates(
     if (pattern.nodes.len == 0 or pattern.nodes.len > max_pattern_steps) return error.InvalidArgument;
     try validateConjunctivePattern(pattern);
 
-    const anchor_alias = if (pattern.edges.len > 0) pattern.edges[0].from else pattern.nodes[0].alias;
-    const anchor_node = findMatchNode(pattern.nodes, anchor_alias) orelse return error.InvalidArgument;
+    const anchor_node = selectConjunctiveAnchor(pattern) orelse return error.InvalidArgument;
+    const anchor_alias = anchor_node.alias;
     var work_budget = WorkBudget{
         .remaining_nodes = opts.max_explored_nodes,
         .remaining_edges = opts.max_explored_edges,
@@ -1160,6 +1157,36 @@ fn buildConjunctiveStates(
         current = next;
     }
     return current;
+}
+
+/// Selects one logical MATCH anchor independently of JSON object and edge-array
+/// ordering. Filtered aliases are preferred so callers can push the same filter
+/// into their identity scan, then higher-degree aliases reduce branch fan-out;
+/// lexical ordering makes otherwise equivalent patterns plan identically.
+pub fn selectConjunctiveAnchor(pattern: ConjunctivePattern) ?MatchNode {
+    if (pattern.nodes.len == 0) return null;
+    var selected = pattern.nodes[0];
+    for (pattern.nodes[1..]) |candidate| {
+        const selected_filtered = nodeFilterActive(selected.filter);
+        const candidate_filtered = nodeFilterActive(candidate.filter);
+        const selected_degree = aliasRequiredDegree(pattern.edges, selected.alias);
+        const candidate_degree = aliasRequiredDegree(pattern.edges, candidate.alias);
+        if ((candidate_filtered and !selected_filtered) or
+            (candidate_filtered == selected_filtered and candidate_degree > selected_degree) or
+            (candidate_filtered == selected_filtered and candidate_degree == selected_degree and std.mem.order(u8, candidate.alias, selected.alias) == .lt))
+        {
+            selected = candidate;
+        }
+    }
+    return selected;
+}
+
+fn aliasRequiredDegree(edges: []const MatchEdge, alias: []const u8) usize {
+    var degree: usize = 0;
+    for (edges) |edge| {
+        if (std.mem.eql(u8, edge.from, alias) or std.mem.eql(u8, edge.to, alias)) degree += 1;
+    }
+    return degree;
 }
 
 pub const CountAggregateSpec = struct {
@@ -1731,18 +1758,39 @@ fn initFrontier(
     key: []const u8,
     table: ?[]const u8,
     path: []paths_mod.PathEdge,
+    parent_path_nodes: []const node_identity.Key,
     hops: u32,
 ) !Frontier {
     const owned_key = try alloc.dupe(u8, key);
     errdefer alloc.free(owned_key);
     const owned_table = if (table) |table_name| try alloc.dupe(u8, table_name) else null;
     errdefer if (owned_table) |table_name| alloc.free(table_name);
+    const path_nodes = try alloc.alloc(node_identity.Key, parent_path_nodes.len + 1);
+    var initialized: usize = 0;
+    errdefer {
+        for (path_nodes[0..initialized]) |*node| node.deinit(alloc);
+        alloc.free(path_nodes);
+    }
+    for (parent_path_nodes, 0..) |node, i| {
+        path_nodes[i] = try node_identity.Key.init(alloc, .{ .table = node.table(), .key = node.key() });
+        initialized += 1;
+    }
+    path_nodes[parent_path_nodes.len] = try node_identity.Key.init(alloc, .{ .table = table, .key = key });
+    initialized += 1;
     return .{
         .key = owned_key,
         .table = owned_table,
         .path = path,
+        .path_nodes = path_nodes,
         .hops = hops,
     };
+}
+
+fn frontierContainsNode(frontier: Frontier, node: node_identity.Ref) bool {
+    for (frontier.path_nodes) |path_node| {
+        if (optionalTableEql(path_node.table(), node.table) and std.mem.eql(u8, path_node.key(), node.key)) return true;
+    }
+    return false;
 }
 
 fn initReachableNode(
@@ -2075,6 +2123,59 @@ test "conjunctive matcher admits anchors before alias evaluation" {
 
     try std.testing.expectEqual(@as(usize, 1), matches.len);
     try std.testing.expectEqualStrings("allowed", matches[0].bindings[0].key);
+}
+
+test "conjunctive anchor selection prefers filters and ignores declaration order" {
+    const first = [_]MatchNode{
+        .{ .alias = "z" },
+        .{ .alias = "b", .filter = .{ .filter_query_json = "{\"ids\":[\"b\"]}" } },
+        .{ .alias = "a", .filter = .{ .filter_query_json = "{\"ids\":[\"a\"]}" } },
+    };
+    const second = [_]MatchNode{
+        first[2],
+        first[0],
+        first[1],
+    };
+    try std.testing.expectEqualStrings("a", selectConjunctiveAnchor(.{ .nodes = &first, .edges = &.{} }).?.alias);
+    try std.testing.expectEqualStrings("a", selectConjunctiveAnchor(.{ .nodes = &second, .edges = &.{} }).?.alias);
+}
+
+test "variable length conjunctive edge preserves simple path multiplicity" {
+    const Reader = struct {
+        const from_a = [_]graph_mod.Edge{
+            .{ .source = "a", .target = "b", .edge_type = "links", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
+            .{ .source = "a", .target = "c", .edge_type = "links", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
+        };
+        const from_b = [_]graph_mod.Edge{.{ .source = "b", .target = "d", .edge_type = "links", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" }};
+        const from_c = [_]graph_mod.Edge{.{ .source = "c", .target = "d", .edge_type = "links", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" }};
+
+        pub fn getEdges(_: @This(), _: Allocator, _: ?[]const u8, key: []const u8, _: []const []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            if (std.mem.eql(u8, key, "a")) return @constCast(from_a[0..]);
+            if (std.mem.eql(u8, key, "b")) return @constCast(from_b[0..]);
+            if (std.mem.eql(u8, key, "c")) return @constCast(from_c[0..]);
+            return @constCast((&[_]graph_mod.Edge{})[0..]);
+        }
+
+        pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
+    };
+    const nodes = [_]MatchNode{ .{ .alias = "a" }, .{ .alias = "d" } };
+    const edges = [_]MatchEdge{.{
+        .from = "a",
+        .to = "d",
+        .step = .{ .types = &.{"links"}, .min_hops = 2, .max_hops = 2 },
+    }};
+    const matches = try matchConjunctivePatternWithEdgeReader(
+        std.testing.allocator,
+        Reader{},
+        &.{"a"},
+        .{ .nodes = &nodes, .edges = &edges },
+        .{ .max_results = 10 },
+    );
+    defer freeMatches(std.testing.allocator, matches);
+
+    try std.testing.expectEqual(@as(usize, 2), matches.len);
+    try std.testing.expectEqualStrings("d", matches[0].bindings[1].key);
+    try std.testing.expectEqualStrings("d", matches[1].bindings[1].key);
 }
 
 test "conjunctive cycle closure survives node admission deduplication" {

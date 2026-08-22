@@ -48,7 +48,13 @@ pub const QueryType = enum {
 
 pub const NodeSelector = union(enum) {
     keys: []const []const u8,
+    identities: []const NodeIdentity,
     result_ref: ResultRef,
+};
+
+pub const NodeIdentity = struct {
+    key: []const u8,
+    table: ?[]const u8 = null,
 };
 
 pub const ResultRef = struct {
@@ -903,6 +909,7 @@ fn resolveTargetKeys(gq: GraphQuery) []const []const u8 {
     if (gq.target_nodes) |tn| {
         switch (tn) {
             .keys => |k| return k,
+            .identities => return &.{}, // cross-table identities require the distributed executor
             .result_ref => return &.{}, // caller should have resolved
         }
     }
@@ -1464,12 +1471,14 @@ test "NodeSelector keys vs result_ref" {
     const keys_sel = NodeSelector{ .keys = &.{ "a", "b", "c" } };
     switch (keys_sel) {
         .keys => |k| try std.testing.expectEqual(@as(usize, 3), k.len),
+        .identities => unreachable,
         .result_ref => unreachable,
     }
 
     const ref_sel = NodeSelector{ .result_ref = .{ .ref = "$full_text_results", .limit = 10 } };
     switch (ref_sel) {
         .keys => unreachable,
+        .identities => unreachable,
         .result_ref => |r| {
             try std.testing.expectEqualStrings("$full_text_results", r.ref);
             try std.testing.expectEqual(@as(u32, 10), r.limit);
