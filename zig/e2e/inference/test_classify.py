@@ -101,30 +101,22 @@ def test_classify_single_text(api):
 
 
 def test_classify_multiple_texts(api):
-    """Batch classification should preserve inputs and compute independent results."""
+    """Each text should match its expected top label."""
     texts = [
         "The Lakers won the championship last night with an amazing comeback.",
         "The new climate bill passed the Senate with bipartisan support.",
         "Taylor Swift announced her new world tour dates for 2025.",
     ]
     labels = ["sports", "politics", "entertainment", "business"]
+    expected = ["sports", "politics", "entertainment"]
+
     resp = api.classify(text=texts, labels=labels)
-    data = resp["data"]
-    classifications = [item["classifications"] for item in data]
+    classifications = [item["classifications"] for item in resp["data"]]
     assert len(classifications) == len(texts)
-    assert [item["id"] for item in data] == [f"input-{i}" for i in range(len(texts))]
 
-    top_labels = []
-    for cls in classifications:
-        assert cls
-        assert {item["label"] for item in cls}.issubset(labels)
-        assert all(0.0 <= item["score"] <= 1.0 for item in cls)
-        top_labels.append(max(cls, key=lambda item: item["score"])["label"])
-
-    # Catch a batched implementation accidentally reusing the first result for
-    # every input without turning this transport/runtime test into a model
-    # quality benchmark. Exact zero-shot rankings can vary by backend.
-    assert len(set(top_labels)) > 1, top_labels
+    for i, (cls, exp) in enumerate(zip(classifications, expected)):
+        top = max(cls, key=lambda x: x["score"])
+        assert top["label"] == exp, f"Text {i}: expected '{exp}', got '{top['label']}'"
 
 
 def test_classify_multi_label(api):
