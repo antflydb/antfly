@@ -34,6 +34,15 @@ const algebraic_ir = @import("../storage/db/algebraic/ir.zig");
 const algebraic_planner = @import("../storage/db/algebraic/planner.zig");
 const algebraic_path_mod = @import("../storage/db/algebraic/path.zig");
 
+pub const max_named_queries: usize = 64;
+pub const max_query_name_codepoints: usize = 128;
+
+pub fn isValidQueryName(name: []const u8) bool {
+    if (name.len == 0 or name.len > max_query_name_codepoints * 4) return false;
+    const codepoints = std.unicode.utf8CountCodepoints(name) catch return false;
+    return codepoints >= 1 and codepoints <= max_query_name_codepoints;
+}
+
 // ============================================================================
 // Query types
 // ============================================================================

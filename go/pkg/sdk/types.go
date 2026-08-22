@@ -304,12 +304,16 @@ type (
 	PatternEdgeStep            = oapi.PatternEdgeStep
 	PatternMatch               = oapi.PatternMatch
 	GraphQueryResult           = oapi.GraphQueryResult
+	GraphQueryStats            = oapi.GraphQueryStats
 	GraphNodeSelector          = oapi.GraphNodeSelector
 	GraphKeyNodeSelector       = oapi.GraphKeyNodeSelector
 	GraphIdentityNodeSelector  = oapi.GraphIdentityNodeSelector
 	GraphResultRefNodeSelector = oapi.GraphResultRefNodeSelector
 	GraphPathEndpoint          = oapi.GraphPathEndpoint
 	GraphResultNode            = oapi.GraphResultNode
+	GraphResultBinding         = oapi.GraphResultBinding
+	GraphResultRow             = oapi.GraphResultRow
+	GraphAggregateValue        = oapi.GraphAggregateValue
 	GraphMatchQuery            = oapi.GraphMatchQuery
 	GraphTraverseQuery         = oapi.GraphTraverseQuery
 	GraphShortestPathQuery     = oapi.GraphShortestPathQuery

@@ -222,9 +222,11 @@ pub const SearchGraphExecutor = struct {
 const VisitState = enum { unvisited, visiting, done };
 
 pub fn sortGraphQueriesByDependencies(alloc: Allocator, queries: []const types.NamedGraphQuery) ![]usize {
+    if (queries.len > graph_query_mod.max_named_queries) return error.InvalidQueryRequest;
     var by_name = std.StringHashMapUnmanaged(usize).empty;
     defer by_name.deinit(alloc);
     for (queries, 0..) |query, i| {
+        if (!graph_query_mod.isValidQueryName(query.name)) return error.InvalidQueryRequest;
         const result = try by_name.getOrPut(alloc, query.name);
         if (result.found_existing) return error.InvalidQueryRequest;
         result.value_ptr.* = i;
@@ -242,6 +244,37 @@ pub fn sortGraphQueriesByDependencies(alloc: Allocator, queries: []const types.N
     }
 
     return try sorted.toOwnedSlice(alloc);
+}
+
+test "graph query dependency sorting enforces request-wide operation bounds" {
+    const item = types.NamedGraphQuery{
+        .name = "query",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+        },
+    };
+    const too_many = [_]types.NamedGraphQuery{item} ** (graph_query_mod.max_named_queries + 1);
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        sortGraphQueriesByDependencies(std.testing.allocator, &too_many),
+    );
+
+    var empty_name = item;
+    empty_name.name = "";
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        sortGraphQueriesByDependencies(std.testing.allocator, &.{empty_name}),
+    );
+
+    const too_long_name = [_]u8{'q'} ** (graph_query_mod.max_query_name_codepoints + 1);
+    var overlong = item;
+    overlong.name = &too_long_name;
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        sortGraphQueriesByDependencies(std.testing.allocator, &.{overlong}),
+    );
 }
 
 pub fn executeGraphQueries(

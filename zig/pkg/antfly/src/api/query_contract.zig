@@ -8439,6 +8439,9 @@ fn buildGraphQueries(
 ) ![]const db_mod.types.NamedGraphQuery {
     if (request.graph_queries != null and request.graph_searches != null)
         return error.InvalidQueryRequest;
+    if (request.graph_queries) |queries| {
+        if (queries.map.count() > graph_query_mod.max_named_queries) return error.InvalidQueryRequest;
+    }
 
     var items = std.ArrayListUnmanaged(db_mod.types.NamedGraphQuery).empty;
     errdefer {
@@ -8452,6 +8455,7 @@ fn buildGraphQueries(
     if (request.graph_queries) |graph_queries| {
         var it = graph_queries.map.iterator();
         while (it.next()) |entry| {
+            if (!graph_query_mod.isValidQueryName(entry.key_ptr.*)) return error.InvalidQueryRequest;
             const name = try alloc.dupe(u8, entry.key_ptr.*);
             var name_owned = true;
             errdefer if (name_owned) alloc.free(name);

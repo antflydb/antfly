@@ -3064,6 +3064,7 @@ components:
           x-go-type: time.Duration
           description: "Query execution time"
     GraphResultBinding:
+      x-go-type: '*GraphResultNode'
       oneOf:
         - $ref: '#/components/schemas/GraphResultNode'
         - enum: [null]

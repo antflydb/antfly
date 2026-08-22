@@ -189,3 +189,24 @@ func TestGraphResultBindingSelector(t *testing.T) {
 		t.Fatal("expected legacy lane-specific reference to fail in canonical helper")
 	}
 }
+
+func TestGraphResultRowUsesNullableTypedBindings(t *testing.T) {
+	row := GraphResultRow{
+		"author":   &GraphResultNode{Key: "person:1"},
+		"optional": nil,
+	}
+	encoded, err := json.Marshal(row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded GraphResultRow
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded["author"] == nil || decoded["author"].Key != "person:1" {
+		t.Fatalf("author binding = %#v", decoded["author"])
+	}
+	if decoded["optional"] != nil {
+		t.Fatalf("optional binding = %#v", decoded["optional"])
+	}
+}

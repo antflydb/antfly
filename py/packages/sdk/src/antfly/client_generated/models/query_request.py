@@ -280,7 +280,9 @@ class QueryRequest:
         analyses (Analyses | Unset):
         graph_queries (QueryRequestGraphQueries | Unset): Declarative graph matching, traversal, and path queries. A
             nested node
-            `filter` uses the same canonical query DSL as document search.
+            `filter` uses the same canonical query DSL as document search. A request
+            may contain at most 64 named graph operations; operation names must be
+            1-128 characters.
         graph_searches (QueryRequestGraphSearches | Unset): Deprecated compatibility alias for the v0.2 graph query
             contract.
             Use `graph_queries`; requests containing both fields are rejected.

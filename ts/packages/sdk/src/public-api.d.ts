@@ -6680,7 +6680,9 @@ export interface components {
             analyses?: components["schemas"]["Analyses"];
             /**
              * @description Declarative graph matching, traversal, and path queries. A nested node
-             *     `filter` uses the same canonical query DSL as document search.
+             *     `filter` uses the same canonical query DSL as document search. A request
+             *     may contain at most 64 named graph operations; operation names must be
+             *     1-128 characters.
              */
             graph_queries?: {
                 [key: string]: components["schemas"]["GraphQuery"];

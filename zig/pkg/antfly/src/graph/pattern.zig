@@ -1208,8 +1208,9 @@ pub const CountAggregateResult = struct {
     }
 };
 
-/// Aggregate directly from matcher states. Exact aggregate queries therefore
-/// avoid allocating and converting one public result row per graph binding.
+/// Stream completed graph bindings directly into aggregate accumulators. Exact
+/// aggregate queries retain only counters and distinct identities, rather than
+/// materializing either internal matcher states or public result rows.
 pub fn aggregateConjunctivePattern(
     alloc: Allocator,
     graph_index: *graph_mod.GraphIndex,
@@ -1244,49 +1245,282 @@ pub fn aggregateConjunctivePatternWithEdgeReader(
     var aggregate_opts = opts;
     aggregate_opts.max_results = 0;
     aggregate_opts.require_complete = true;
-    var states = try buildConjunctiveStates(alloc, edge_reader, start_keys, pattern, aggregate_opts);
-    defer freeConjunctiveStates(alloc, &states);
+    if (pattern.nodes.len == 0 or pattern.nodes.len > max_pattern_steps) return error.InvalidArgument;
+    try validateConjunctivePattern(pattern);
 
-    const results = try alloc.alloc(CountAggregateResult, specs.len);
-    var initialized: usize = 0;
+    const accumulators = try alloc.alloc(StreamingCountAccumulator, specs.len);
+    var initialized_accumulators: usize = 0;
     errdefer {
-        for (results[0..initialized]) |*result| result.deinit(alloc);
-        if (results.len > 0) alloc.free(results);
+        for (accumulators[0..initialized_accumulators]) |*accumulator| accumulator.deinit(alloc);
+        if (accumulators.len > 0) alloc.free(accumulators);
     }
     for (specs, 0..) |spec, i| {
-        results[i] = try aggregateConjunctiveStates(alloc, states.items, spec);
-        initialized += 1;
+        accumulators[i] = .{ .spec = spec };
+        initialized_accumulators += 1;
     }
+
+    const anchor_node = selectConjunctiveAnchor(pattern) orelse return error.InvalidArgument;
+    var work_budget = WorkBudget{
+        .remaining_nodes = aggregate_opts.max_explored_nodes,
+        .remaining_edges = aggregate_opts.max_explored_edges,
+    };
+    const admitted_starts = if (aggregate_opts.node_admission) |admission|
+        try admission.filterLocalKeysAlloc(alloc, start_keys)
+    else
+        null;
+    defer if (admitted_starts) |mask| alloc.free(mask);
+
+    const processed = try alloc.alloc(bool, pattern.edges.len);
+    defer alloc.free(processed);
+    for (start_keys, 0..) |key, start_index| {
+        try work_budget.consumeNode();
+        if (admitted_starts) |mask| if (!mask[start_index]) continue;
+        if (!(try passesNodeFilter(.{ .table = null, .key = key }, anchor_node.filter, aggregate_opts.evaluator))) continue;
+
+        const bindings = try alloc.alloc(PatternBinding, 1);
+        bindings[0] = initPatternBinding(alloc, anchor_node.alias, key, null, 0) catch |err| {
+            alloc.free(bindings);
+            return err;
+        };
+        var state = ConjunctiveState{ .bindings = bindings };
+        defer state.deinit(alloc);
+        @memset(processed, false);
+        try streamAggregateConjunctiveGroup(
+            alloc,
+            edge_reader,
+            pattern,
+            pattern.nodes,
+            pattern.edges,
+            pattern.predicates,
+            state,
+            processed,
+            0,
+            null,
+            null,
+            aggregate_opts,
+            &work_budget,
+            accumulators,
+        );
+    }
+
+    const results = try alloc.alloc(CountAggregateResult, specs.len);
+    var initialized_results: usize = 0;
+    errdefer {
+        for (results[0..initialized_results]) |*result| result.deinit(alloc);
+        if (results.len > 0) alloc.free(results);
+    }
+    for (accumulators, 0..) |*accumulator, i| {
+        results[i] = try accumulator.finish(alloc);
+        initialized_results += 1;
+    }
+    for (accumulators) |*accumulator| accumulator.deinit(alloc);
+    if (accumulators.len > 0) alloc.free(accumulators);
     return results;
 }
 
-fn aggregateConjunctiveStates(alloc: Allocator, states: []const ConjunctiveState, spec: CountAggregateSpec) !CountAggregateResult {
-    if (spec.alias == null) return .{ .value = states.len };
-    if (!spec.distinct) {
-        var count: u128 = 0;
-        for (states) |state| if (findBinding(state.bindings, spec.alias.?) != null) {
-            count += 1;
-        };
-        return .{ .value = count };
+const StreamingCountAccumulator = struct {
+    spec: CountAggregateSpec,
+    value: u128 = 0,
+    seen: node_identity.Map(void) = .{},
+    distinct_values: std.ArrayListUnmanaged(node_identity.Ref) = .empty,
+
+    fn observe(self: *StreamingCountAccumulator, alloc: Allocator, state: ConjunctiveState) !void {
+        if (self.spec.alias == null) {
+            self.value = std.math.add(u128, self.value, 1) catch return error.QueryCandidateBudgetExceeded;
+            return;
+        }
+        const binding = findBinding(state.bindings, self.spec.alias.?) orelse return;
+        if (!self.spec.distinct) {
+            self.value = std.math.add(u128, self.value, 1) catch return error.QueryCandidateBudgetExceeded;
+            return;
+        }
+        const ref = node_identity.Ref{ .table = binding.table, .key = binding.key };
+        if (self.seen.contains(ref)) return;
+        try appendOwnedIdentity(alloc, &self.distinct_values, binding.table, binding.key);
+        const owned = self.distinct_values.items[self.distinct_values.items.len - 1];
+        _ = try self.seen.putIfAbsent(alloc, owned, {});
+        self.value = @intCast(self.distinct_values.items.len);
     }
 
-    var seen = node_identity.Map(void){};
-    defer seen.deinit(alloc);
-    var values = std.ArrayListUnmanaged(node_identity.Ref).empty;
-    errdefer {
-        for (values.items) |identity| {
+    fn finish(self: *StreamingCountAccumulator, alloc: Allocator) !CountAggregateResult {
+        const values = try self.distinct_values.toOwnedSlice(alloc);
+        self.distinct_values = .empty;
+        return .{ .value = self.value, .distinct_values = values };
+    }
+
+    fn deinit(self: *StreamingCountAccumulator, alloc: Allocator) void {
+        self.seen.deinit(alloc);
+        for (self.distinct_values.items) |identity| {
             if (identity.table) |table| alloc.free(table);
             alloc.free(identity.key);
         }
-        values.deinit(alloc);
+        self.distinct_values.deinit(alloc);
+        self.* = undefined;
     }
-    for (states) |state| {
-        const binding = findBinding(state.bindings, spec.alias.?) orelse continue;
-        if (!try seen.putIfAbsent(alloc, .{ .table = binding.table, .key = binding.key }, {})) continue;
-        try appendOwnedIdentity(alloc, &values, binding.table, binding.key);
+};
+
+fn streamAggregateOptionalGroups(
+    alloc: Allocator,
+    edge_reader: anytype,
+    pattern: ConjunctivePattern,
+    optional_index: usize,
+    state: ConjunctiveState,
+    opts: MatchOptions,
+    work_budget: *WorkBudget,
+    accumulators: []StreamingCountAccumulator,
+) anyerror!void {
+    if (optional_index == pattern.optional.len) {
+        for (accumulators) |*accumulator| try accumulator.observe(alloc, state);
+        return;
     }
-    const distinct_values = try values.toOwnedSlice(alloc);
-    return .{ .value = distinct_values.len, .distinct_values = distinct_values };
+
+    const group = pattern.optional[optional_index];
+    const processed = try alloc.alloc(bool, group.edges.len);
+    defer alloc.free(processed);
+    @memset(processed, false);
+    var matched: usize = 0;
+    try streamAggregateConjunctiveGroup(
+        alloc,
+        edge_reader,
+        pattern,
+        group.nodes,
+        group.edges,
+        group.predicates,
+        state,
+        processed,
+        0,
+        optional_index,
+        &matched,
+        opts,
+        work_budget,
+        accumulators,
+    );
+    if (matched != 0) return;
+
+    var null_extended = try cloneConjunctiveState(alloc, state);
+    defer null_extended.deinit(alloc);
+    for (group.nodes) |node| {
+        if (findBinding(null_extended.bindings, node.alias) != null or containsString(null_extended.null_aliases, node.alias)) continue;
+        try appendNullAlias(alloc, &null_extended, node.alias);
+    }
+    try streamAggregateOptionalGroups(
+        alloc,
+        edge_reader,
+        pattern,
+        optional_index + 1,
+        null_extended,
+        opts,
+        work_budget,
+        accumulators,
+    );
+}
+
+fn streamAggregateConjunctiveGroup(
+    alloc: Allocator,
+    edge_reader: anytype,
+    pattern: ConjunctivePattern,
+    group_nodes: []const MatchNode,
+    edges: []const MatchEdge,
+    predicates: []const MatchPredicate,
+    state: ConjunctiveState,
+    processed: []bool,
+    processed_count: usize,
+    completed_optional_index: ?usize,
+    optional_match_count: ?*usize,
+    opts: MatchOptions,
+    work_budget: *WorkBudget,
+    accumulators: []StreamingCountAccumulator,
+) anyerror!void {
+    if (processed_count == edges.len) {
+        if (!(try conjunctivePredicatesPass(alloc, edge_reader, state, predicates, opts, work_budget))) return;
+        if (completed_optional_index) |optional_index| {
+            optional_match_count.?.* = std.math.add(usize, optional_match_count.?.*, 1) catch return error.QueryCandidateBudgetExceeded;
+            return try streamAggregateOptionalGroups(
+                alloc,
+                edge_reader,
+                pattern,
+                optional_index + 1,
+                state,
+                opts,
+                work_budget,
+                accumulators,
+            );
+        }
+        return try streamAggregateOptionalGroups(alloc, edge_reader, pattern, 0, state, opts, work_budget, accumulators);
+    }
+
+    var selected: ?usize = null;
+    for (edges, 0..) |edge, edge_index| {
+        if (processed[edge_index]) continue;
+        if (bindingOrNullKnown(state, edge.from) or bindingOrNullKnown(state, edge.to)) {
+            selected = edge_index;
+            break;
+        }
+    }
+    const edge_index = selected orelse return error.InvalidArgument;
+    const edge = edges[edge_index];
+    const from_binding = findBinding(state.bindings, edge.from);
+    const to_binding = findBinding(state.bindings, edge.to);
+    if ((from_binding == null and containsString(state.null_aliases, edge.from)) or
+        (to_binding == null and containsString(state.null_aliases, edge.to))) return;
+    if (from_binding == null and to_binding == null) return error.InvalidArgument;
+
+    const source = from_binding orelse to_binding.?;
+    const target = if (from_binding != null) to_binding else from_binding;
+    var step = edge.step;
+    const new_alias = if (from_binding != null) edge.to else edge.from;
+    if (from_binding == null) step.direction = reverseDirection(step.direction);
+    const node_filter = if (findMatchNode(group_nodes, new_alias)) |node| node.filter else NodeFilter{};
+    var target_node_storage: [1]node_identity.Ref = undefined;
+    const target_nodes: []const node_identity.Ref = if (target) |binding| blk: {
+        target_node_storage[0] = .{ .key = binding.key, .table = binding.table };
+        break :blk &target_node_storage;
+    } else &.{};
+    const reachable = try findReachableNodes(
+        alloc,
+        edge_reader,
+        source.key,
+        source.table,
+        step,
+        node_filter,
+        target_nodes,
+        target != null,
+        0,
+        true,
+        opts.evaluator,
+        opts.node_admission,
+        false,
+        opts.stats,
+        work_budget,
+    );
+    defer {
+        for (reachable) |*node| node.deinit(alloc);
+        if (reachable.len > 0) alloc.free(reachable);
+    }
+
+    processed[edge_index] = true;
+    defer processed[edge_index] = false;
+    for (reachable) |reached| {
+        var expanded = try cloneConjunctiveState(alloc, state);
+        defer expanded.deinit(alloc);
+        if (target == null) try appendConcreteBinding(alloc, &expanded, new_alias, reached);
+        try streamAggregateConjunctiveGroup(
+            alloc,
+            edge_reader,
+            pattern,
+            group_nodes,
+            edges,
+            predicates,
+            expanded,
+            processed,
+            processed_count + 1,
+            completed_optional_index,
+            optional_match_count,
+            opts,
+            work_budget,
+            accumulators,
+        );
+    }
 }
 
 fn appendOwnedIdentity(alloc: Allocator, values: *std.ArrayListUnmanaged(node_identity.Ref), table_name: ?[]const u8, key_name: []const u8) !void {
@@ -2009,6 +2243,21 @@ test "conjunctive match supports branches anti joins inequality and optional nul
     }
     try std.testing.expectEqual(@as(u128, 4), aggregates[0].value);
     try std.testing.expectEqual(@as(u128, 4), aggregates[1].value);
+
+    const streamed = try aggregateConjunctivePatternWithEdgeReader(
+        alloc,
+        Reader{},
+        &.{ "a", "x" },
+        .{ .nodes = &nodes, .edges = &required, .predicates = &predicates, .optional = &optional },
+        &specs,
+        .{ .max_intermediate_states = 1 },
+    );
+    defer {
+        for (streamed) |*aggregate| aggregate.deinit(alloc);
+        alloc.free(streamed);
+    }
+    try std.testing.expectEqual(@as(u128, 4), streamed[0].value);
+    try std.testing.expectEqual(@as(u128, 4), streamed[1].value);
 }
 
 test "conjunctive optional predicates reject aliases outside their ordered scope" {

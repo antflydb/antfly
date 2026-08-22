@@ -3766,6 +3766,7 @@ pub fn build(b: *std.Build) void {
         "query parser preserves exact graph path endpoint identities",
         "query merge allocation scales with the selected page",
         "graph merge enforces query-wide row limit and exact distinct identity",
+        "graph query dependency sorting enforces request-wide operation bounds",
         "pattern response omits paths unless requested",
         "graph aggregate response preserves exact decimal counts",
         "api query contract preflight summarizes query lanes and result refs",
@@ -3791,6 +3792,7 @@ pub fn build(b: *std.Build) void {
         "db graph hydration fails closed for a not-yet-promoted entity node",
         "api distributed graph cross-table hydrate enforces target authorization",
         "authenticated single-group graph queries require distributed coordination",
+        "parseRemoteSearchResult preserves typed graph rows and hydrated documents",
     };
     const lib_unit_filters = selectTestFilters(b, &lib_unit_default_filters);
     const lib_unit_tests = b.addTest(.{
