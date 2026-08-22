@@ -1,8 +1,9 @@
 # VOPR: Deterministic Autonomous Simulation for Antfly
 
 Status: implementation in progress; Phases 0, 0.5, 1, 2, and 5 complete; the
-Phase 4 exit scenario is complete and its generated split/merge composition is
-the remaining phase-level implementation item
+Phase 4 exit scenario and fixed split-to-merge composition are complete, while
+atomic generated choices for that expensive distributed scenario remain a
+follow-on migration
 
 Scope: Zig Antfly simulation, VOPR, modeled-storage, and chaos tests
 
@@ -1851,6 +1852,31 @@ isolates the metadata leader while the transition finalizes, heals the
 network, crashes the source leader's modeled device, restarts that node and
 the public API stack, then acknowledges two more cross-range writes.
 
+The same world now composes the split with an explicit merge of the two child
+ranges. Because split assigns distinct document-identity namespaces, the merge
+uses the production policy's explicit identity-reassignment opt-in rather than
+weakening automatic admission. It waits for finalized transition state,
+retires the donor, resolves a former right-range key through the surviving
+group, and requires all five acknowledged documents plus the single-shard
+query profile. This is a topology composition, not two independent fixtures,
+so the preceding partition, restart, modeled crash, and acknowledged writes
+remain live history for the merge assertion.
+
+The hosted HTTP topology rig deliberately models merge progress in
+`SimMergeRuntime`; it does not own `DataServer`'s cached-writer leases and must
+not open a second LSM writer to impersonate the data runtime. Its modeled
+bootstrap therefore materializes donor documents on each active receiver
+replica before retirement. A paired production-path regression in
+`data/runtime.zig` exercises the real borrowed-lease `MergeCoordinator`: it
+seeds an existing donor apply projection, adds a boundary document later to the
+authoritative donor DB, performs merge accept/catch-up, and requires both the
+old and boundary documents in the receiver. `initLocalMergeRuntime` now
+reconciles an existing projection at its exact Raft watermark instead of using
+the split-only seed-if-absent shortcut. This closes the split-destination-as-
+merge-donor data-loss hole without giving the control-plane simulator unsafe
+storage ownership. The regression is included in `zig build
+lib-data-runtime-test`.
+
 An explicit acknowledged-data reference model records keys only after a
 successful public response. Its terminal property checks every modeled key by
 public point lookup and checks the complete set through a routed full-text
@@ -1907,10 +1933,12 @@ sidecar shape, and the emitted five-event commit history passes the real
 `make tla-trace-txn` segmentation and TLC refinement pipeline against
 `TraceAntflyTransaction.tla`.
 
-Phase 4's stated exit condition is now met. The phase remains open for modeled
-migration of the fixed distributed scenario into generated/replayable VOPR
-choices and merge composition. Modeled partial writes, dropped syncs, and both
-Raft and transaction TLA+ export are complete.
+Phase 4's stated exit condition is now met, including fixed split-to-merge
+composition. Migrating this expensive macro-scenario into atomic,
+generated/replayable VOPR choices remains follow-on work; until then it is a
+promoted deterministic scenario rather than a search-space participant.
+Modeled partial writes, dropped syncs, and both Raft and transaction TLA+
+export are complete.
 
 ### Phase 5: Search and Snapshot Optimizations
 

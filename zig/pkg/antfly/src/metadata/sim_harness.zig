@@ -1082,7 +1082,7 @@ const AcknowledgedPublicDataModel = struct {
     ) !void {
         var query_needles: [5][]const u8 = undefined;
         for (self.entries[0..self.len], 0..) |entry, index| {
-            try std.testing.expect(try waitForLookupContains(
+            const visible = try waitForLookupContains(
                 cluster,
                 client,
                 client_base,
@@ -1090,7 +1090,9 @@ const AcknowledgedPublicDataModel = struct {
                 entry.key,
                 entry.value_needle,
                 max_rounds,
-            ));
+            );
+            if (!visible) std.debug.print("acknowledged data missing after transition key={s}\n", .{entry.key});
+            try std.testing.expect(visible);
             query_needles[index] = entry.query_needle;
         }
         try std.testing.expect(try waitForQueryContainsAll(
@@ -1159,6 +1161,7 @@ const AutomaticSplitPublicTrafficScenario = struct {
     modeled_storage: bool = false,
     failure_mode: AutomaticSplitPublicTrafficFailureMode = .none,
     verify: SplitPublicVerificationConfig,
+    compose_merge: ?ComposedMergePublicTrafficConfig = null,
 };
 
 const AutomaticMergePublicTrafficFailureMode = enum {
@@ -1176,6 +1179,14 @@ const AutomaticMergePublicTrafficScenario = struct {
     bootstrap_rounds: usize,
     range_create_rounds: usize,
     projected_index_rounds: usize,
+    finalize_rounds: usize,
+    post_failure_leader_wait_rounds: usize = 0,
+    failure_mode: AutomaticMergePublicTrafficFailureMode = .none,
+    verify: MergePublicVerificationConfig,
+};
+
+const ComposedMergePublicTrafficConfig = struct {
+    transition_id: u64,
     finalize_rounds: usize,
     post_failure_leader_wait_rounds: usize = 0,
     failure_mode: AutomaticMergePublicTrafficFailureMode = .none,
@@ -1528,6 +1539,35 @@ fn verifyMergePublicTraffic(
     }
 }
 
+fn verifyComposedMergePublicTraffic(
+    cluster: *MetadataHttpClusterSimulation,
+    client: *api_http_client.ApiHttpClient,
+    api_base_uris: []const []const u8,
+    catalog: api_table_catalog.CatalogSource,
+    table_name: []const u8,
+    roots: []const []const u8,
+    merged_group: u64,
+    removed_group: u64,
+    cfg: MergePublicVerificationConfig,
+    acknowledged_model: *AcknowledgedPublicDataModel,
+) !void {
+    try std.testing.expect(try cluster.waitForGroupStatusCount(merged_group, .active, cfg.merged_active_count, cfg.active_rounds));
+    try std.testing.expect(try cluster.waitForGroupStatusCount(removed_group, .absent, cfg.removed_absent_count, cfg.absent_rounds));
+    _ = try waitForResolvedGroupForKey(cluster, catalog, table_name, "doc:z", merged_group, cfg.route_rounds);
+    const merged_leader_index = (try waitForGroupLeaderIndex(cluster, merged_group, cfg.leader_rounds)) orelse return error.TestExpectedEqual;
+    const client_base = api_base_uris[merged_leader_index];
+    try ensureGroupTextIndexOnActiveReplicas(cluster, roots, merged_group, api_tables.default_full_text_index_name, 40);
+    const status_index = currentMetadataLeaderIndex(cluster) orelse 0;
+    const merge_groups = [_]u64{merged_group};
+    try reportRuntimeDocIdentityForActiveReplicas(cluster, cluster.node(status_index), roots, table_name, merge_groups[0..], null);
+    try cluster.stepAll();
+
+    try acknowledged_model.verify(cluster, client, client_base, table_name, cfg.lookup_rounds);
+    if (cfg.expect_profile) {
+        try std.testing.expect(try waitForHelloCountProfile(cluster, client, client_base, table_name, @intCast(acknowledged_model.len), 1, true, cfg.lookup_rounds));
+    }
+}
+
 fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenario) !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1740,6 +1780,100 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
         cfg.verify,
         if (cfg.modeled_storage) &acknowledged_model else null,
     );
+
+    if (cfg.compose_merge) |merge_cfg| {
+        if (!cfg.modeled_storage) return error.ModeledStorageRequired;
+        cluster.cluster.healAll();
+        try cluster.stepAll();
+
+        const merge_leader_index = currentMetadataLeaderIndex(&cluster) orelse
+            ((try cluster.waitForMetadataLeader(merge_cfg.post_failure_leader_wait_rounds)) orelse return error.TestExpectedEqual);
+        const merge_catalog = public_api.catalog_sources[merge_leader_index].iface();
+        const groups = try waitForSplitResolvedGroups(&cluster, merge_catalog, "docs", merge_cfg.verify.route_rounds);
+        try reportMergeCandidateStatuses(cluster.node(merge_leader_index), groups.left_group, 16, 10, groups.right_group, 12, 12);
+        try cluster.stepAll();
+
+        // Split assigns distinct document-identity namespaces to the two
+        // children. Their deliberate recombination therefore uses the public
+        // merge workflow's explicit reassignment opt-in; automatic admission
+        // correctly refuses to infer that policy decision.
+        const merge_summary = try workflow.requestMerge(&cluster.node(merge_leader_index), .{
+            .transition_id = merge_cfg.transition_id,
+            .table_id = cfg.table_id,
+            .donor_group_id = groups.right_group,
+            .receiver_group_id = groups.left_group,
+            .allow_doc_identity_reassignment = true,
+        });
+        try std.testing.expectEqual(@as(usize, 1), merge_summary.merge_upserts);
+        const merge_query_index = currentMetadataLeaderIndex(&cluster) orelse merge_leader_index;
+        const merge_transitions = try cluster.node(merge_query_index).listProjectedMergeTransitions(std.testing.allocator);
+        defer cluster.node(merge_query_index).freeProjectedMergeTransitions(std.testing.allocator, merge_transitions);
+        try std.testing.expectEqual(@as(usize, 1), merge_transitions.len);
+        const merge_transition_id = merge_transitions[0].transition_id;
+        const donor_leader_index = (try waitForGroupLeaderIndex(&cluster, groups.right_group, merge_cfg.verify.leader_rounds)) orelse return error.TestExpectedEqual;
+
+        const merge_observer_index: ?usize = switch (merge_cfg.failure_mode) {
+            .none => null,
+            .restart_metadata_leader => blk: {
+                try cluster.restartNode(merge_query_index);
+                break :blk (try cluster.waitForMetadataLeader(merge_cfg.post_failure_leader_wait_rounds)) orelse return error.TestExpectedEqual;
+            },
+            .restart_donor_group_leader => blk: {
+                try cluster.restartNode(donor_leader_index);
+                break :blk (try cluster.waitForMetadataLeader(merge_cfg.post_failure_leader_wait_rounds)) orelse return error.TestExpectedEqual;
+            },
+            .partition_metadata_leader => blk: {
+                try isolateMetadataNode(&cluster, merge_query_index);
+                break :blk (try waitForMetadataLeaderExcluding(&cluster, merge_query_index, merge_cfg.post_failure_leader_wait_rounds)) orelse return error.TestExpectedEqual;
+            },
+        };
+
+        try std.testing.expect(try waitForMergeTransitionFinalized(
+            &cluster,
+            merge_transition_id,
+            merge_observer_index,
+            merge_query_index,
+            merge_cfg.finalize_rounds,
+        ));
+        // This HTTP topology rig models transition progress in
+        // `SimMergeRuntime`; it does not own the data server's borrowed DB
+        // leases. Materialize the modeled bootstrap on every active receiver
+        // replica before retiring the donor. The production-path regression
+        // for the same split->merge handoff lives beside DataServer's local
+        // merge fallback and exercises the real coordinator and leases.
+        try mirrorGroupBatchToActiveReplicas(
+            &cluster,
+            &client,
+            public_api.api_base_uris[0..],
+            groups.left_group,
+            "docs",
+            split_right_cutover_body,
+        );
+        try mirrorGroupBatchToActiveReplicas(
+            &cluster,
+            &client,
+            public_api.api_base_uris[0..],
+            groups.left_group,
+            "docs",
+            split_right_post_batch_body,
+        );
+        const merge_verification_index = merge_observer_index orelse (currentMetadataLeaderIndex(&cluster) orelse merge_query_index);
+        const merge_retirement = try retireFinalizedMergeTransition(cluster.node(merge_verification_index), workflow.controlLoop());
+        try std.testing.expectEqual(@as(usize, 1), merge_retirement.removal.range_upserts);
+        try std.testing.expectEqual(@as(usize, 1), merge_retirement.removal.range_removals);
+        try verifyComposedMergePublicTraffic(
+            &cluster,
+            &client,
+            public_api.api_base_uris[0..],
+            public_api.catalog_sources[merge_verification_index].iface(),
+            "docs",
+            roots[0..],
+            groups.left_group,
+            groups.right_group,
+            merge_cfg.verify,
+            &acknowledged_model,
+        );
+    }
 }
 
 fn runAutomaticMergePublicTrafficScenario(cfg: AutomaticMergePublicTrafficScenario) !void {
@@ -9377,6 +9511,20 @@ test "metadata VOPR distributed data survives split partition node restart and m
             .leader_rounds = 192,
             .lookup_rounds = 192,
             .count_profile_rounds = 192,
+        },
+        .compose_merge = .{
+            .transition_id = 45_530_002,
+            .finalize_rounds = 192,
+            .post_failure_leader_wait_rounds = 96,
+            .failure_mode = .none,
+            .verify = .{
+                .active_rounds = 128,
+                .absent_rounds = 128,
+                .route_rounds = 128,
+                .leader_rounds = 192,
+                .lookup_rounds = 192,
+                .expect_profile = true,
+            },
         },
     });
 }

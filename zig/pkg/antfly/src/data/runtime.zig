@@ -9886,7 +9886,13 @@ pub const DataServer = struct {
         );
         receiver_db_options.identity_namespace = receiver_namespace;
         receiver_db_options.prefer_existing_identity_namespace = true;
-        try self.ensureSplitSourceApplyStoreSeeded(
+        // A merge donor may itself be the destination of an earlier split.
+        // Its apply projection can therefore exist while lagging authoritative
+        // documents copied by that transition or accepted afterward. Reconcile
+        // at the exact Raft watermark instead of applying the split-only
+        // seed-if-absent shortcut, or a split->merge composition can finalize
+        // while dropping the boundary document from the donor.
+        try self.reconcileSplitSourceApplyStore(
             donor_root_dir,
             donor_group_id,
             table_contract,
@@ -10031,6 +10037,29 @@ pub const DataServer = struct {
         var source_store = try antfly.data.RaftApplyStore.init(self.alloc, .{ .root_dir = source_root_dir });
         defer source_store.deinit();
         try self.ensureSplitSourceApplyStoreSeededInto(
+            &source_store,
+            source_group_id,
+            table_contract,
+        );
+    }
+
+    fn reconcileSplitSourceApplyStore(
+        self: *DataServer,
+        source_root_dir: []const u8,
+        source_group_id: u64,
+        table_contract: antfly.metadata.TransitionTableContract,
+    ) !void {
+        _ = try self.ensureBackendRuntime();
+        if (self.localTransitionApplyStore()) |source_store| {
+            return try self.reconcileSplitSourceApplyStoreDocuments(
+                source_store,
+                source_group_id,
+                table_contract,
+            );
+        }
+        var source_store = try antfly.data.RaftApplyStore.init(self.alloc, .{ .root_dir = source_root_dir });
+        defer source_store.deinit();
+        try self.reconcileSplitSourceApplyStoreDocuments(
             &source_store,
             source_group_id,
             table_contract,
@@ -20206,6 +20235,27 @@ test "data runtime local merge fallback uses its durable table contract" {
     };
     defer server.deinit();
 
+    // Model a donor that was itself bootstrapped by an earlier split: its
+    // apply projection exists before the authoritative serving DB receives a
+    // boundary document. A merge must reconcile that existing projection,
+    // not mistake its presence for completeness.
+    try server.ensureSplitSourceApplyStoreSeeded(
+        donor_db_path,
+        190,
+        table_contract,
+    );
+    {
+        var donor = try antfly.db.DB.open(alloc, donor_db_path, .{
+            .identity_namespace = donor_namespace,
+            .start_index_workers = false,
+            .backend_runtime = server.backend_runtime,
+        });
+        defer donor.close();
+        try donor.batch(.{
+            .writes = &.{.{ .key = "doc:m", .value = "{\"v\":\"boundary\"}" }},
+        });
+    }
+
     var ops = server.localShardOperationAdapter();
     try ops.execute(.{ .accept_merge_receiver = .{
         .transition_id = 9002,
@@ -20231,6 +20281,9 @@ test "data runtime local merge fallback uses its durable table contract" {
     const replayed = (try reopened.get(alloc, "doc:t")) orelse return error.TestUnexpectedResult;
     defer alloc.free(replayed);
     try std.testing.expectEqualStrings("{\"v\":\"donor\"}", replayed);
+    const boundary = (try reopened.get(alloc, "doc:m")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(boundary);
+    try std.testing.expectEqualStrings("{\"v\":\"boundary\"}", boundary);
 
     const stats = try reopened.runtimeStatusStatsConsistent(alloc);
     try std.testing.expectEqual(target_namespace.table_id, stats.doc_identity.namespace_table_id);
