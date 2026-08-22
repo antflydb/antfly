@@ -6710,6 +6710,12 @@ pub fn build(b: *std.Build) void {
     const sim_promote_step = b.step("sim-promote", "Promote a reviewed reduced VOPR failure fixture");
     sim_promote_step.dependOn(&promote_sim_cli.step);
 
+    const tla_sim_cli = b.addRunArtifact(sim_cli);
+    tla_sim_cli.addArg("tla");
+    if (b.args) |args| tla_sim_cli.addArgs(args);
+    const sim_tla_step = b.step("sim-tla", "Exact-replay a VOPR artifact and export TLA+ Raft NDJSON");
+    sim_tla_step.dependOn(&tla_sim_cli.step);
+
     const sim_test_step = b.step("sim-test", "Run mocked-time Antfly simulation suites");
     sim_test_step.dependOn(&run_sim_contract_tests.step);
     sim_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
@@ -7168,6 +7174,7 @@ pub fn build(b: *std.Build) void {
             "wal modeled crash runner preserves acknowledged public append",
             "wal modeled VOPR campaign stays green",
             "modeled WAL campaign records and exactly replays VOPR traces",
+            "modeled WAL VOPR classifies injected write and sync outcomes",
             "wal modeled replay fixtures stay green",
             "wal modeled crash fixtures stay green",
             "wal modeled commit backend completion uses scheduled virtual time",

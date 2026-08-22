@@ -60,6 +60,7 @@ const docstore_mod = @import("../storage/docstore.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const storage_sim = @import("../storage/sim_runtime.zig");
+const raft_trace_logger = @import("../tracing/raft_trace_logger.zig");
 const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
 const usermgr = @import("../usermgr/mod.zig");
@@ -2559,6 +2560,8 @@ const TestDescriptorFactory = struct {
     merge_runtime: SimMergeRuntime = .{},
     group_stores: std.AutoHashMapUnmanaged(u64, *raft_engine.core.MemoryStorage) = .empty,
     primary_group_id: ?u64 = null,
+    trace_group_id: ?u64 = null,
+    trace_logger: ?raft_engine.core.TraceLogger = null,
     active_descriptors: usize = 0,
 
     fn iface(self: *@This()) raft_host.ReplicaDescriptorFactory {
@@ -2604,6 +2607,7 @@ const TestDescriptorFactory = struct {
                     .pre_vote = false,
                     .check_quorum = true,
                     .step_down_on_removal = true,
+                    .trace_logger = if (self.trace_group_id == record.group_id) self.trace_logger else null,
                 },
                 .storage = store.storage(),
             },
@@ -6611,6 +6615,15 @@ pub fn runMetadataVoprCampaignWithChoices(
     cfg: MetadataVoprCampaignConfig,
     source: vopr.choice.Source,
 ) !vopr.trace.Trace {
+    return try runMetadataVoprCampaignWithChoicesAndRaftTrace(alloc, cfg, source, null);
+}
+
+fn runMetadataVoprCampaignWithChoicesAndRaftTrace(
+    alloc: std.mem.Allocator,
+    cfg: MetadataVoprCampaignConfig,
+    source: vopr.choice.Source,
+    raft_trace_writer: ?*std.Io.Writer,
+) !vopr.trace.Trace {
     var scratch = try MetadataVoprScratch.init(alloc);
     defer scratch.deinit();
 
@@ -6624,6 +6637,15 @@ pub fn runMetadataVoprCampaignWithChoices(
     var factory_a = TestDescriptorFactory{ .alloc = alloc, .store = &store_a, .peers = &.{ 1, 2, 3 } };
     var factory_b = TestDescriptorFactory{ .alloc = alloc, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = alloc, .store = &store_c, .peers = &.{ 1, 2, 3 } };
+    var raft_loggers: [3]raft_trace_logger.RaftNdjsonTraceLogger = undefined;
+    if (raft_trace_writer) |writer| {
+        const factories = [_]*TestDescriptorFactory{ &factory_a, &factory_b, &factory_c };
+        for (&raft_loggers, factories) |*logger, factory| {
+            logger.* = .{ .writer = writer };
+            factory.trace_group_id = cfg.metadata_group_id;
+            factory.trace_logger = logger.traceLogger();
+        }
+    }
 
     const root_a = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-a", .{ scratch.sub_path, cfg.seed });
     defer alloc.free(root_a);
@@ -6679,9 +6701,25 @@ pub fn recordMetadataVoprCampaign(alloc: std.mem.Allocator, cfg: MetadataVoprCam
 }
 
 pub fn replayMetadataVoprCampaign(alloc: std.mem.Allocator, recorded: *const vopr.trace.Trace) !vopr.trace.Trace {
+    return try replayMetadataVoprCampaignWithRaftTrace(alloc, recorded, null);
+}
+
+pub fn replayMetadataVoprCampaignToRaftTrace(
+    alloc: std.mem.Allocator,
+    recorded: *const vopr.trace.Trace,
+    writer: *std.Io.Writer,
+) !vopr.trace.Trace {
+    return try replayMetadataVoprCampaignWithRaftTrace(alloc, recorded, writer);
+}
+
+fn replayMetadataVoprCampaignWithRaftTrace(
+    alloc: std.mem.Allocator,
+    recorded: *const vopr.trace.Trace,
+    writer: ?*std.Io.Writer,
+) !vopr.trace.Trace {
     const cfg = try MetadataVoprCampaignConfig.fromTrace(recorded);
     var replay_source = vopr.choice.Replay{ .records = recorded.choices.items };
-    var replayed = try runMetadataVoprCampaignWithChoices(alloc, cfg, replay_source.source());
+    var replayed = try runMetadataVoprCampaignWithChoicesAndRaftTrace(alloc, cfg, replay_source.source(), writer);
     errdefer replayed.deinit();
     const expected = try recorded.renderAlloc(alloc);
     defer alloc.free(expected);

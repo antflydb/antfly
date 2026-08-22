@@ -28,6 +28,8 @@ const reopen_base = vopr.id.stable("transition", "storage.wal.reopen_and_verify_
 const truncate_base = vopr.id.stable("transition", "storage.wal.truncate_and_verify_from");
 const verify_base = vopr.id.stable("transition", "storage.wal.verify_from");
 const crash_id = vopr.id.stable("transition", "storage.wal.crash_and_recover");
+const inject_write_failure_id = vopr.id.stable("transition", "storage.wal.inject_write_failure");
+const inject_sync_failure_id = vopr.id.stable("transition", "storage.wal.inject_sync_failure");
 
 const model_property_id = vopr.id.stable("property", "storage.wal.visible_state_matches_acknowledged_model");
 const durable_property_id = vopr.id.stable("property", "storage.wal.acknowledged_entries_survive_crash");
@@ -38,7 +40,7 @@ fn ModeledWalScenario(comptime action_budget: u64) type {
         const Self = @This();
 
         pub const name: []const u8 = "modeled-wal";
-        pub const version: u32 = 1;
+        pub const version: u32 = 2;
         pub const properties = &[_]vopr.property.Declaration{
             .{ .id = model_property_id, .name = "storage.wal.visible_state_matches_acknowledged_model", .kind = .always },
             .{ .id = durable_property_id, .name = "storage.wal.acknowledged_entries_survive_crash", .kind = .always },
@@ -46,6 +48,8 @@ fn ModeledWalScenario(comptime action_budget: u64) type {
         };
 
         const State = struct {
+            const PendingIoFault = enum { write, sync };
+
             allocator: Allocator,
             runtime: storage_sim.Runtime,
             device: storage_sim.ModeledDevice,
@@ -57,6 +61,8 @@ fn ModeledWalScenario(comptime action_budget: u64) type {
             decisions: u64 = 0,
             reopens: u64 = 0,
             recovered: bool = false,
+            pending_io_fault: ?PendingIoFault = null,
+            rejected_operations: u64 = 0,
 
             fn deinit(self: *State) void {
                 if (self.wal_open) self.wal.close();
@@ -95,6 +101,8 @@ fn ModeledWalScenario(comptime action_budget: u64) type {
             state.decisions = 0;
             state.reopens = 0;
             state.recovered = false;
+            state.pending_io_fault = null;
+            state.rejected_operations = 0;
             return .{ .state = state };
         }
 
@@ -106,7 +114,7 @@ fn ModeledWalScenario(comptime action_budget: u64) type {
 
         pub fn enumerate(world: *World, list: *vopr.transition.List, allocator: Allocator) !void {
             const state = world.state;
-            if (state.decisions >= action_budget) {
+            if (state.decisions >= action_budget and state.pending_io_fault == null) {
                 try list.append(allocator, .{
                     .id = crash_id,
                     .name = "storage.wal.crash_and_recover",
@@ -119,6 +127,17 @@ fn ModeledWalScenario(comptime action_budget: u64) type {
                 .id = append_id,
                 .name = "storage.wal.append",
                 .kind = .workload,
+            });
+            if (state.pending_io_fault != null) return;
+            try list.append(allocator, .{
+                .id = inject_write_failure_id,
+                .name = "storage.wal.inject_write_failure",
+                .kind = .fault,
+            });
+            try list.append(allocator, .{
+                .id = inject_sync_failure_id,
+                .name = "storage.wal.inject_sync_failure",
+                .kind = .fault,
             });
             for (2..5) |batch_len| {
                 try list.append(allocator, .{
@@ -179,6 +198,18 @@ fn ModeledWalScenario(comptime action_budget: u64) type {
             }
 
             state.decisions += 1;
+            if (selected.id == inject_write_failure_id) {
+                state.device.injectWriteFailure();
+                state.pending_io_fault = .write;
+                try events.emitNamed(allocator, .injected_error, "storage.wal.write_failure_armed", state.decisions);
+                return;
+            }
+            if (selected.id == inject_sync_failure_id) {
+                state.device.injectSyncFailure();
+                state.pending_io_fault = .sync;
+                try events.emitNamed(allocator, .injected_error, "storage.wal.sync_failure_armed", state.decisions);
+                return;
+            }
             if (selected.id == append_id) {
                 try appendOne(state, events, allocator, 0);
                 return;
@@ -216,6 +247,8 @@ fn ModeledWalScenario(comptime action_budget: u64) type {
             try builder.addNamed(allocator, "storage.wal.virtual_time_ns", @intCast(state.runtime.clock().nowNs()));
             try builder.addNamed(allocator, "storage.wal.reopen_count", @intCast(state.reopens));
             try builder.addNamed(allocator, "storage.wal.recovered", @intFromBool(state.recovered));
+            try builder.addNamed(allocator, "storage.wal.io_fault_pending", @intFromBool(state.pending_io_fault != null));
+            try builder.addNamed(allocator, "storage.wal.rejected_operations", @intCast(state.rejected_operations));
         }
 
         pub fn evaluate(world: *World, sink: *vopr.property.Sink, allocator: Allocator) !void {
@@ -235,7 +268,20 @@ fn ModeledWalScenario(comptime action_budget: u64) type {
 fn appendOne(state: anytype, events: *vopr.event.Sink, allocator: Allocator, slot: usize) !void {
     const payload = try payloadAlloc(state.allocator, state.decisions, slot);
     errdefer state.allocator.free(payload);
-    const lsn = try state.wal.append(payload);
+    const lsn = state.wal.append(payload) catch |err| {
+        const pending = state.pending_io_fault orelse return err;
+        const expected = switch (pending) {
+            .write => err == error.InjectedWriteFault,
+            .sync => err == error.InjectedSyncFault,
+        };
+        if (!expected) return err;
+        state.pending_io_fault = null;
+        state.rejected_operations += 1;
+        try events.emitNamed(allocator, .client_response, "storage.wal.append_rejected", vopr.id.digest(@errorName(err)));
+        state.allocator.free(payload);
+        return;
+    };
+    if (state.pending_io_fault != null) return error.InjectedIoFaultWasNotConsumed;
     if (lsn != state.next_lsn) return error.WalLsnDiverged;
     try state.model.append(state.allocator, .{ .lsn = lsn, .data = payload });
     state.next_lsn += 1;
@@ -347,7 +393,8 @@ fn runRecordReplay(comptime action_budget: u64, seed: u64) !void {
     defer recorded.deinit();
     try std.testing.expectEqual(@as(u64, 0), recorded.summary.?.property_failures);
     try std.testing.expectEqual(action_budget + 1, recorded.summary.?.transitions);
-    try std.testing.expectEqual(@as(usize, 1), recorded.faults.items.len);
+    try std.testing.expect(recorded.faults.items.len >= 1);
+    try std.testing.expectEqual(crash_id, recorded.faults.items[recorded.faults.items.len - 1].id);
 
     const encoded = try recorded.renderAlloc(std.testing.allocator);
     defer std.testing.allocator.free(encoded);
@@ -360,4 +407,52 @@ fn runRecordReplay(comptime action_budget: u64, seed: u64) !void {
 test "modeled WAL campaign records and exactly replays VOPR traces" {
     try runRecordReplay(24, 0xA17F_5001);
     try runRecordReplay(24, 0xA17F_5002);
+}
+
+test "modeled WAL VOPR classifies injected write and sync outcomes" {
+    const Scenario = ModeledWalScenario(4);
+    const FaultSequence = struct {
+        phase: usize = 0,
+
+        fn source(self: *@This()) vopr.choice.Source {
+            return .{ .ptr = self, .choose_fn = choose, .finish_fn = finish };
+        }
+
+        fn finish(_: *anyopaque) !void {}
+
+        fn choose(ptr: *anyopaque, request: vopr.choice.Request) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const names = [_][]const u8{
+                "storage.wal.inject_write_failure",
+                "storage.wal.append",
+                "storage.wal.inject_sync_failure",
+                "storage.wal.append",
+                "storage.wal.crash_and_recover",
+            };
+            const wanted = names[self.phase];
+            for (request.enabled) |candidate| {
+                if (!std.mem.eql(u8, candidate.name, wanted)) continue;
+                self.phase += 1;
+                return candidate.id;
+            }
+            return error.ExpectedWalFaultTransitionNotEnabled;
+        }
+    };
+
+    var sequence = FaultSequence{};
+    var recorded = try vopr.runner.run(Scenario, std.testing.allocator, sequence.source(), .{
+        .system = "antfly",
+        .seed = 0xA17F_FA17,
+        .transition_budget = 5,
+    });
+    defer recorded.deinit();
+    try std.testing.expectEqual(@as(usize, 5), sequence.phase);
+    try std.testing.expectEqual(@as(usize, 3), recorded.faults.items.len);
+    try std.testing.expectEqual(@as(u64, 0), recorded.summary.?.property_failures);
+    var rejected: usize = 0;
+    for (recorded.events.items) |event| rejected += @intFromBool(std.mem.eql(u8, event.name, "storage.wal.append_rejected"));
+    try std.testing.expectEqual(@as(usize, 2), rejected);
+
+    var replayed = try vopr.replay.exact(Scenario, std.testing.allocator, &recorded);
+    replayed.deinit();
 }

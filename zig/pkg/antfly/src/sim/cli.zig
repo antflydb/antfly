@@ -18,6 +18,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, argv[1], "campaign")) return campaignCommand(alloc, io, argv[2..]);
     if (std.mem.eql(u8, argv[1], "reduce")) return reduceCommand(alloc, io, argv[2..]);
     if (std.mem.eql(u8, argv[1], "promote")) return promoteCommand(alloc, io, argv[2..]);
+    if (std.mem.eql(u8, argv[1], "tla")) return tlaCommand(alloc, io, argv[2..]);
     return usage();
 }
 
@@ -84,6 +85,78 @@ fn replayCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var replayed = try antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, &recorded);
     defer replayed.deinit();
     report("replayed", path, &replayed);
+}
+
+fn tlaCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    var trace_path: ?[]const u8 = null;
+    var output_path: ?[]const u8 = null;
+    var domain: []const u8 = "raft";
+    var index: usize = 0;
+    while (index < args.len) {
+        if (std.mem.eql(u8, args[index], "--trace")) {
+            trace_path = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, args[index], "--out")) {
+            output_path = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, args[index], "--domain")) {
+            domain = try nextValue(args, &index);
+        } else return error.UnknownArgument;
+        index += 1;
+    }
+    if (!std.mem.eql(u8, domain, "raft")) return error.UnsupportedTlaDomain;
+    const input = trace_path orelse return error.TracePathRequired;
+    const output = output_path orelse return error.TraceOutputRequired;
+    const encoded = try std.Io.Dir.cwd().readFileAlloc(io, input, alloc, .limited(max_trace_bytes));
+    defer alloc.free(encoded);
+    var recorded = try vopr.trace.parseAlloc(alloc, encoded);
+    defer recorded.deinit();
+
+    var ndjson: std.Io.Writer.Allocating = .init(alloc);
+    defer ndjson.deinit();
+    var replayed = try antfly.metadata_sim_harness.replayMetadataVoprCampaignToRaftTrace(alloc, &recorded, &ndjson.writer);
+    defer replayed.deinit();
+    try validateRaftTraceNdjson(alloc, ndjson.written());
+    if (std.fs.path.dirname(output)) |parent| try ensureDir(io, parent);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output, .data = ndjson.written() });
+    std.debug.print("VOPR TLA export domain=raft events={d} trace={s} out={s}\n", .{
+        countNonEmptyLines(ndjson.written()),
+        input,
+        output,
+    });
+}
+
+fn validateRaftTraceNdjson(alloc: std.mem.Allocator, encoded: []const u8) !void {
+    var event_count: usize = 0;
+    var lines = std.mem.splitScalar(u8, encoded, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
+        defer parsed.deinit();
+        const object = switch (parsed.value) {
+            .object => |value| value,
+            else => return error.InvalidTlaTraceRecord,
+        };
+        const tag = object.get("tag") orelse return error.InvalidTlaTraceRecord;
+        const tag_text = switch (tag) {
+            .string => |value| value,
+            else => return error.InvalidTlaTraceRecord,
+        };
+        if (!std.mem.eql(u8, tag_text, "trace")) return error.InvalidTlaTraceRecord;
+        const event_value = object.get("event") orelse return error.InvalidTlaTraceRecord;
+        const event_object = switch (event_value) {
+            .object => |value| value,
+            else => return error.InvalidTlaTraceRecord,
+        };
+        if (event_object.get("name") == null) return error.InvalidTlaTraceRecord;
+        event_count += 1;
+    }
+    if (event_count == 0) return error.EmptyTlaTrace;
+}
+
+fn countNonEmptyLines(encoded: []const u8) usize {
+    var count: usize = 0;
+    var lines = std.mem.splitScalar(u8, encoded, '\n');
+    while (lines.next()) |line| count += @intFromBool(line.len > 0);
+    return count;
 }
 
 fn campaignCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
@@ -442,6 +515,7 @@ fn usage() error{InvalidUsage} {
         \\  vopr campaign --scenario metadata --histories <n> --transitions <n> --workers <n> --artifact-dir <path>
         \\  vopr reduce --trace <path> --out <path> [--attempts <n>]
         \\  vopr promote --trace <path> --name <fixture-name> [--force]
+        \\  vopr tla --trace <path> --domain raft --out <path.ndjson>
         \\
     , .{});
     return error.InvalidUsage;
@@ -473,6 +547,12 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
     try std.testing.expectEqual(reduced.target_fingerprint, promoted.failures.items[0].fingerprint);
     var promoted_replay = try antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, &promoted);
     promoted_replay.deinit();
+    var raft_ndjson: std.Io.Writer.Allocating = .init(alloc);
+    defer raft_ndjson.deinit();
+    var formal_replay = try antfly.metadata_sim_harness.replayMetadataVoprCampaignToRaftTrace(alloc, &promoted, &raft_ndjson.writer);
+    formal_replay.deinit();
+    try validateRaftTraceNdjson(alloc, raft_ndjson.written());
+    try std.testing.expect(std.mem.indexOf(u8, raft_ndjson.written(), "\"name\":\"InitState\"") != null);
 
     const corpus_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(corpus_path);

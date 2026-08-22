@@ -1376,6 +1376,12 @@ zig build sim-promote -- \
   --trace /tmp/metadata-reduced.simtrace \
   --name split-leader-restart-before-finalize
 
+# Exact-replay an eligible artifact and export its formal Raft event stream.
+zig build sim-tla -- \
+  --trace /tmp/metadata-reduced.simtrace \
+  --domain raft \
+  --out /tmp/metadata-raft.ndjson
+
 # Run a bounded local campaign.
 zig build sim-campaign -- \
   --scenario metadata \
@@ -1799,10 +1805,30 @@ protocol: capacity, Raft membership, and document-identity evidence are
 reported together, so the scenario exercises the same automatic-split safety
 preconditions as production.
 
+Modeled WAL write and sync failures are now first-class fault transitions in
+scenario version 2 rather than unclassified harness errors. Once armed, the
+next enabled workload operation must consume the fault; the public append is
+classified as rejected, is not added to the acknowledged model, and emits a
+stable response event containing the error-class digest. Observations expose
+pending-fault and rejected-operation state. A scripted regression forces both
+outcomes, checks that neither becomes a phantom acknowledgement, crashes and
+recovers the device, and exact-replays all five decisions.
+
+Eligible metadata VOPR artifacts can also be exact-replayed with a formal Raft
+sidecar through `zig build sim-tla -- --trace ... --domain raft --out ...`.
+Replay attaches Antfly's existing `RaftNdjsonTraceLogger` only to the metadata
+group at descriptor construction, so data-group events cannot contaminate the
+single-group `Traceetcdraft.tla` model. The CLI validates every generated
+NDJSON record before writing it, and the end-to-end meta-test requires a
+promoted trace to replay byte-for-byte while producing a non-empty stream that
+contains `InitState`. The resulting file is directly consumable by the
+existing `tla-trace-raft` validation target; formal output remains a derived
+sidecar, so it does not change the canonical `vopr-trace-v1` replay ABI.
+
 Phase 4's stated exit condition is now met. The phase remains open for modeled
-I/O outcome-set transitions, migration of this fixed distributed scenario into
-generated/replayable VOPR choices, merge composition, and TLA+ export from
-promoted VOPR histories.
+partial-write and dropped-sync outcome sets, migration of the fixed distributed
+scenario into generated/replayable VOPR choices, merge composition, and
+transaction-event TLA+ export.
 
 ### Phase 5: Search and Snapshot Optimizations
 

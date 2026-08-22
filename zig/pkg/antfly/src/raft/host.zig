@@ -363,8 +363,11 @@ pub const Host = struct {
         const factory = self.deps.descriptor_factory orelse return error.MissingReplicaDescriptorFactory;
         var descriptor = try factory.buildDescriptor(record);
         errdefer factory.freeDescriptor(self.alloc, &descriptor);
-        descriptor.group.raft_config.trace_logger = self.cfg.trace_logger orelse
-            if (comptime build_options.with_tla) tracing.stderrRaftTraceLogger() else null;
+        if (self.cfg.trace_logger) |trace_logger| {
+            descriptor.group.raft_config.trace_logger = trace_logger;
+        } else if (comptime build_options.with_tla) {
+            descriptor.group.raft_config.trace_logger = tracing.stderrRaftTraceLogger();
+        }
 
         // Persist admission before publication. A crash between these steps
         // leaves a recoverable catalog entry instead of an untracked live group.
