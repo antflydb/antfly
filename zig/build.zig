@@ -3752,6 +3752,7 @@ pub fn build(b: *std.Build) void {
         "conjunctive validation bounds total recursive pattern shape",
         "exact conjunctive aggregate does not inherit row expansion window",
         "conjunctive matcher admits anchors before alias evaluation",
+        "prevalidated conjunctive anchors skip duplicate checks but reached nodes remain guarded",
         "conjunctive anchor selection prefers filters and ignores declaration order",
         "variable length conjunctive edge preserves simple path multiplicity",
         "conjunctive cycle closure survives node admission deduplication",

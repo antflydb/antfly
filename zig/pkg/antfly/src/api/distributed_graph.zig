@@ -1899,6 +1899,13 @@ fn executeDistributedConjunctivePattern(
             .batch_func = DistributedPatternFilterEvaluator.evaluateMany,
         },
         .node_admission = admission.iface(),
+        // Canonical paged anchors were produced by the same snapshot-pinned
+        // source scan with authorization and the explicit anchor filter
+        // already applied. Materialized/legacy starts do not carry that proof.
+        .start_validation = switch (anchor_source) {
+            .paged => .prevalidated,
+            .materialized => .required,
+        },
         .work_budget = &work_budget,
     };
 

@@ -165,6 +165,11 @@ pub const MatchOptions = struct {
     include_paths: bool = true,
     evaluator: ?FilterEvaluator = null,
     node_admission: ?NodeAdmission = null,
+    /// Whether the caller has already applied both node admission and the
+    /// selected anchor's node filter to every supplied start identity. This is
+    /// trusted execution metadata, not a query option: reached nodes always go
+    /// through the normal admission and filter paths.
+    start_validation: enum { required, prevalidated } = .required,
     stats: ?*MatchStats = null,
     max_explored_nodes: usize = default_max_explored_nodes,
     max_explored_edges: usize = default_max_explored_edges,
@@ -1187,19 +1192,21 @@ fn buildConjunctiveStates(
 
     var current = std.ArrayListUnmanaged(ConjunctiveState).empty;
     errdefer freeConjunctiveStates(alloc, &current);
-    const admitted_starts = if (opts.node_admission) |admission|
-        try admission.filterLocalKeysAlloc(alloc, start_keys)
+    const admitted_starts = if (opts.start_validation == .required and opts.node_admission != null)
+        try opts.node_admission.?.filterLocalKeysAlloc(alloc, start_keys)
     else
         null;
     defer if (admitted_starts) |mask| alloc.free(mask);
-    const start_refs = try alloc.alloc(node_identity.Ref, start_keys.len);
-    defer alloc.free(start_refs);
-    for (start_keys, 0..) |key, i| start_refs[i] = .{ .table = null, .key = key };
-    const filtered_starts = try evaluateNodeFiltersAlloc(alloc, start_refs, anchor_node.filter, opts.evaluator);
-    defer alloc.free(filtered_starts);
+    const filtered_starts = if (opts.start_validation == .required) blk: {
+        const start_refs = try alloc.alloc(node_identity.Ref, start_keys.len);
+        defer alloc.free(start_refs);
+        for (start_keys, 0..) |key, i| start_refs[i] = .{ .table = null, .key = key };
+        break :blk try evaluateNodeFiltersAlloc(alloc, start_refs, anchor_node.filter, opts.evaluator);
+    } else null;
+    defer if (filtered_starts) |mask| alloc.free(mask);
     for (start_keys, 0..) |key, start_index| {
         if (admitted_starts) |mask| if (!mask[start_index]) continue;
-        if (!filtered_starts[start_index]) continue;
+        if (filtered_starts) |mask| if (!mask[start_index]) continue;
         const bindings = try alloc.alloc(PatternBinding, 1);
         bindings[0] = initPatternBinding(alloc, anchor_alias, key, null, 0) catch |err| {
             alloc.free(bindings);
@@ -1363,22 +1370,24 @@ pub fn aggregateConjunctivePatternWithEdgeReader(
     const anchor_node = selectConjunctiveAnchor(pattern) orelse return error.InvalidArgument;
     var local_work_budget = WorkBudget.init(aggregate_opts.max_explored_nodes, aggregate_opts.max_explored_edges);
     const work_budget = aggregate_opts.work_budget orelse &local_work_budget;
-    const admitted_starts = if (aggregate_opts.node_admission) |admission|
-        try admission.filterLocalKeysAlloc(alloc, start_keys)
+    const admitted_starts = if (aggregate_opts.start_validation == .required and aggregate_opts.node_admission != null)
+        try aggregate_opts.node_admission.?.filterLocalKeysAlloc(alloc, start_keys)
     else
         null;
     defer if (admitted_starts) |mask| alloc.free(mask);
-    const start_refs = try alloc.alloc(node_identity.Ref, start_keys.len);
-    defer alloc.free(start_refs);
-    for (start_keys, 0..) |key, i| start_refs[i] = .{ .table = null, .key = key };
-    const filtered_starts = try evaluateNodeFiltersAlloc(alloc, start_refs, anchor_node.filter, aggregate_opts.evaluator);
-    defer alloc.free(filtered_starts);
+    const filtered_starts = if (aggregate_opts.start_validation == .required) blk: {
+        const start_refs = try alloc.alloc(node_identity.Ref, start_keys.len);
+        defer alloc.free(start_refs);
+        for (start_keys, 0..) |key, i| start_refs[i] = .{ .table = null, .key = key };
+        break :blk try evaluateNodeFiltersAlloc(alloc, start_refs, anchor_node.filter, aggregate_opts.evaluator);
+    } else null;
+    defer if (filtered_starts) |mask| alloc.free(mask);
 
     const processed = try alloc.alloc(bool, pattern.edges.len);
     defer alloc.free(processed);
     for (start_keys, 0..) |key, start_index| {
         if (admitted_starts) |mask| if (!mask[start_index]) continue;
-        if (!filtered_starts[start_index]) continue;
+        if (filtered_starts) |mask| if (!mask[start_index]) continue;
 
         const bindings = try alloc.alloc(PatternBinding, 1);
         bindings[0] = initPatternBinding(alloc, anchor_node.alias, key, null, 0) catch |err| {
@@ -2561,6 +2570,88 @@ test "conjunctive matcher admits anchors before alias evaluation" {
 
     try std.testing.expectEqual(@as(usize, 1), matches.len);
     try std.testing.expectEqualStrings("allowed", matches[0].bindings[0].key);
+}
+
+test "prevalidated conjunctive anchors skip duplicate checks but reached nodes remain guarded" {
+    const Reader = struct {
+        const edge = [_]graph_mod.Edge{.{
+            .source = "anchor",
+            .target = "reached",
+            .edge_type = "links",
+            .weight = 1,
+            .created_at = 0,
+            .updated_at = 0,
+            .metadata = "",
+        }};
+
+        pub fn getEdges(_: @This(), _: Allocator, _: ?[]const u8, key: []const u8, _: []const []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            if (std.mem.eql(u8, key, "anchor")) return @constCast(edge[0..]);
+            return @constCast((&[_]graph_mod.Edge{})[0..]);
+        }
+
+        pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
+    };
+    const Checks = struct {
+        admission_nodes: usize = 0,
+        filter_nodes: usize = 0,
+
+        fn admit(ctx: ?*anyopaque, alloc: Allocator, refs: []const NodeRef) anyerror![]bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.admission_nodes += refs.len;
+            const mask = try alloc.alloc(bool, refs.len);
+            @memset(mask, true);
+            return mask;
+        }
+
+        fn filter(ctx: ?*anyopaque, alloc: Allocator, refs: []const node_identity.Ref, _: NodeFilter) anyerror![]bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.filter_nodes += refs.len;
+            const mask = try alloc.alloc(bool, refs.len);
+            for (refs, 0..) |ref, i| mask[i] = !std.mem.eql(u8, ref.key, "reached");
+            return mask;
+        }
+    };
+    const nodes = [_]MatchNode{
+        .{ .alias = "a", .filter = .{ .filter_query_json = "{}" } },
+        .{ .alias = "b", .filter = .{ .filter_query_json = "{}" } },
+    };
+    const edges = [_]MatchEdge{.{ .from = "a", .to = "b", .step = .{ .types = &.{"links"} } }};
+    var checks = Checks{};
+    const opts = MatchOptions{
+        .node_admission = .{ .ctx = &checks, .filter_many = Checks.admit },
+        .evaluator = .{ .ctx = &checks, .batch_func = Checks.filter },
+        .start_validation = .prevalidated,
+    };
+
+    const matches = try matchConjunctivePatternWithEdgeReader(
+        std.testing.allocator,
+        Reader{},
+        &.{"anchor"},
+        .{ .anchor_alias = "a", .nodes = &nodes, .edges = &edges },
+        opts,
+    );
+    defer freeMatches(std.testing.allocator, matches);
+    try std.testing.expectEqual(@as(usize, 0), matches.len);
+    try std.testing.expectEqual(@as(usize, 1), checks.admission_nodes);
+    try std.testing.expectEqual(@as(usize, 1), checks.filter_nodes);
+
+    checks = .{};
+    const specs = [_]CountAggregateSpec{.{}};
+    const aggregates = try aggregateConjunctivePatternWithEdgeReader(
+        std.testing.allocator,
+        Reader{},
+        &.{"anchor"},
+        .{ .anchor_alias = "a", .nodes = &nodes, .edges = &edges },
+        &specs,
+        opts,
+    );
+    defer {
+        for (aggregates) |*aggregate| aggregate.deinit(std.testing.allocator);
+        std.testing.allocator.free(aggregates);
+    }
+    try std.testing.expectEqual(@as(u128, 0), aggregates[0].value);
+    try std.testing.expectEqual(@as(usize, 1), checks.admission_nodes);
+    try std.testing.expectEqual(@as(usize, 1), checks.filter_nodes);
 }
 
 test "conjunctive anchor selection prefers filters and ignores declaration order" {

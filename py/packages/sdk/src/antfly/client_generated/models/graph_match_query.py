@@ -16,9 +16,10 @@ T = TypeVar("T", bound="GraphMatchQuery")
 
 @_attrs_define
 class GraphMatchQuery:
-    """Conjunctive graph match over the complete authorized source universe. Results are exact or the request fails;
-    execution never labels a partial aggregate exact. Source anchors are streamed in stable snapshot-pinned pages;
-    transient expansion state remains bounded, and execution observes request deadlines, cancellation, and server
+    """Conjunctive graph match over the complete authorized source universe. Top-level retrieval queries and filters do not
+    scope that universe; put source constraints on the node named by match.anchor. Results are exact or the request
+    fails; execution never labels a partial aggregate exact. Source anchors are streamed in stable snapshot-pinned
+    pages; transient expansion state remains bounded, and execution observes request deadlines, cancellation, and server
     resource admission.
 
         Attributes:

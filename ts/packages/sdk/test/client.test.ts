@@ -838,13 +838,10 @@ describe("AntflyClient", () => {
       });
 
       expect(result).toEqual(created);
-      expect(mockPost).toHaveBeenCalledWith(
-        "/db/v1/tables/{tableName}/indexes/{indexName}",
-        {
-          params: { path: { tableName: "wikipedia", indexName: "thumbnail" } },
-          body: { type: "embeddings", dimension: 512 },
-        }
-      );
+      expect(mockPost).toHaveBeenCalledWith("/db/v1/tables/{tableName}/indexes/{indexName}", {
+        params: { path: { tableName: "wikipedia", indexName: "thumbnail" } },
+        body: { type: "embeddings", dimension: 512 },
+      });
     });
 
     it("rejects an empty create response", async () => {

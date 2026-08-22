@@ -49,8 +49,10 @@ describe("Antfly Query Type Integration", () => {
     it("types both retryable 503 variants", () => {
       type BackupUnavailable = components["schemas"]["BackupMetadataUnavailableError"];
       type Backup503 = operations["backup"]["responses"][503]["content"]["application/json"];
-      type BackupTable503 = operations["backupTable"]["responses"][503]["content"]["application/json"];
-      type BackupTable409 = operations["backupTable"]["responses"][409]["content"]["application/json"];
+      type BackupTable503 =
+        operations["backupTable"]["responses"][503]["content"]["application/json"];
+      type BackupTable409 =
+        operations["backupTable"]["responses"][409]["content"]["application/json"];
       type ClusterBackup = components["schemas"]["ClusterBackupResponse"];
 
       const capability: BackupUnavailable = {
@@ -71,7 +73,8 @@ describe("Antfly Query Type Integration", () => {
       const ambiguous: BackupTable409 = {
         code: "backup_outcome_ambiguous",
         error: "backup outcome is ambiguous; inspect the backup id before retrying",
-        message: "backup outcome is ambiguous; inspect the backup id and artifact id before retrying",
+        message:
+          "backup outcome is ambiguous; inspect the backup id and artifact id before retrying",
         retryable: false,
         backup_id: "snap",
         artifact_backup_id: "generation-7",
@@ -79,14 +82,16 @@ describe("Antfly Query Type Integration", () => {
       const ambiguousCluster: ClusterBackup = {
         backup_id: "nightly",
         status: "ambiguous",
-        tables: [{
-          name: "docs",
-          status: "ambiguous",
-          code: "backup_outcome_ambiguous",
-          retryable: false,
-          backup_id: "attempt-t-0",
-          artifact_backup_id: "attempt-a-0",
-        }],
+        tables: [
+          {
+            name: "docs",
+            status: "ambiguous",
+            code: "backup_outcome_ambiguous",
+            retryable: false,
+            backup_id: "attempt-t-0",
+            artifact_backup_id: "attempt-a-0",
+          },
+        ],
       };
 
       expectTypeOf<Backup503>().toEqualTypeOf<BackupUnavailable>();
