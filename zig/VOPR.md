@@ -1686,7 +1686,8 @@ directed-link partitions may overlap, a whole-node partition remains exclusive
 to preserve the scenario's healthy-quorum budget, and each active fault plus
 the aggregate heal action is independently selectable. Active link, node, and
 total fault counts are semantic observations, and the metadata replay ABI was
-bumped to version 2 for the changed enabled sets. Phase 2 remains open for
+bumped for the changed enabled sets (currently version 3 after adding the
+meta-test configuration field). Phase 2 remains open for
 moving additional production background services onto `SimRuntime` instead of
 their current manual domain runtimes.
 
@@ -1726,9 +1727,19 @@ artifact directory. Metadata reduction first shrinks the generated workload
 budget and then performs same-fingerprint structured scheduling/fault
 substitution, exact-replaying every accepted result. Promotion refuses
 non-failing or non-replaying traces, validates fixture names, and avoids
-overwriting by default. Phase 3 remains open for richer deletion passes,
-cross-run persistent corpus queues, and an Antfly-level injected-bug meta-test
-that exercises the CLI promotion path end to end.
+overwriting by default.
+
+The `sim-meta-test` gate closes the Phase 3 exit condition. It enables a
+test-only named metadata oracle bug that is reachable only while two directed
+link partitions overlap. A target-state choice source discovers that state
+from the actual enabled transition sets; the test then exact-replays the
+failure, reduces it under the same fingerprint, promotes the canonical trace
+through the same guarded writer as the CLI, refuses an accidental overwrite,
+parses the promoted file, and exact-replays it again. The injection changes no
+production behavior and is serialized as an explicit scenario parameter.
+Richer deletion operators and loading persisted queues into future campaigns
+remain useful follow-on search improvements, but are no longer prerequisites
+for proving the autonomous failure lifecycle.
 
 ### Phase 4: Storage and Data Integration
 

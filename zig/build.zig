@@ -6660,6 +6660,13 @@ pub fn build(b: *std.Build) void {
     sim_cli_mod.addImport("vopr", vopr_mod);
     sim_cli_mod.link_libc = true;
     const sim_cli = b.addExecutable(.{ .name = "vopr", .root_module = sim_cli_mod });
+    const sim_cli_meta_tests = b.addTest(.{
+        .root_module = sim_cli_mod,
+        .filters = &.{"Antfly injected bug is discovered replayed reduced and promoted"},
+    });
+    const run_sim_cli_meta_tests = b.addRunArtifact(sim_cli_meta_tests);
+    const sim_meta_test_step = b.step("sim-meta-test", "Prove Antfly VOPR discovery, replay, reduction, and promotion end to end");
+    sim_meta_test_step.dependOn(&run_sim_cli_meta_tests.step);
 
     const run_sim_cli = b.addRunArtifact(sim_cli);
     run_sim_cli.addArg("run");
@@ -6696,6 +6703,7 @@ pub fn build(b: *std.Build) void {
     sim_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
     sim_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
     sim_test_step.dependOn(&run_lib_raft_sim_tests.step);
+    sim_test_step.dependOn(&run_sim_cli_meta_tests.step);
 
     const integration_test_step = b.step("integration-test", "Run focused real HTTP and public API integration suites");
     integration_test_step.dependOn(&run_lib_metadata_sim_public_tests.step);

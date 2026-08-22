@@ -5226,17 +5226,24 @@ pub const MetadataVoprCampaignConfig = struct {
     split_group_id: u64,
     split_transition_id: u64,
     workload: MetadataVoprWorkload = .smoke,
+    injected_bug: MetadataVoprInjectedBug = .none,
 
     pub fn fromTrace(artifact: *const vopr.trace.Trace) !MetadataVoprCampaignConfig {
         if (!std.mem.eql(u8, artifact.header.system, "antfly") or
             !std.mem.eql(u8, artifact.header.scenario, "metadata-vopr") or
-            artifact.header.scenario_version != 2)
+            artifact.header.scenario_version != 3)
             return error.IncompatibleMetadataVoprTrace;
         const workload_value = try traceParameter(artifact, "metadata.workload");
         const workload: MetadataVoprWorkload = switch (workload_value) {
             0 => .smoke,
             1 => .expanded,
             else => return error.InvalidMetadataVoprWorkload,
+        };
+        const injected_bug_value = try traceParameter(artifact, "metadata.injected_bug");
+        const injected_bug: MetadataVoprInjectedBug = switch (injected_bug_value) {
+            0 => .none,
+            1 => .overlapping_link_fault_safety,
+            else => return error.InvalidMetadataVoprInjectedBug,
         };
         const operation_count_value = try traceParameter(artifact, "metadata.operation_count");
         const result = MetadataVoprCampaignConfig{
@@ -5248,6 +5255,7 @@ pub const MetadataVoprCampaignConfig = struct {
             .split_group_id = try traceParameter(artifact, "metadata.split_group_id"),
             .split_transition_id = try traceParameter(artifact, "metadata.split_transition_id"),
             .workload = workload,
+            .injected_bug = injected_bug,
         };
         try result.validate();
         return result;
@@ -5276,6 +5284,44 @@ pub const MetadataVoprCampaignConfig = struct {
 pub const MetadataVoprWorkload = enum {
     smoke,
     expanded,
+};
+
+/// Test-only faults in the oracle, never in production behavior. These make
+/// the autonomous discovery/replay/reduction/promotion pipeline itself
+/// regression-testable without checking in a broken Antfly implementation.
+pub const MetadataVoprInjectedBug = enum {
+    none,
+    overlapping_link_fault_safety,
+};
+
+/// Deterministic target-state source used only to meta-test the Antfly VOPR
+/// pipeline. It discovers the injected overlap invariant by selecting two
+/// distinct link-partition transitions from the actual enabled sets, then
+/// lets the quiet suffix choose canonical ordinary work.
+pub const MetadataOverlapDiscoveryChoice = struct {
+    link_starts: u8 = 0,
+
+    pub fn source(self: *MetadataOverlapDiscoveryChoice) vopr.choice.Source {
+        return .{ .ptr = self, .choose_fn = choose, .finish_fn = finish };
+    }
+
+    fn choose(ptr: *anyopaque, request: vopr.choice.Request) !u64 {
+        const self: *MetadataOverlapDiscoveryChoice = @ptrCast(@alignCast(ptr));
+        if (self.link_starts < 2) {
+            for (request.enabled) |candidate| {
+                if (!std.mem.eql(u8, candidate.name, "metadata.network.partition_link")) continue;
+                self.link_starts += 1;
+                return candidate.id;
+            }
+            return error.InjectedOverlapTargetNotEnabled;
+        }
+        return request.enabled[0].id;
+    }
+
+    fn finish(ptr: *anyopaque) !void {
+        const self: *MetadataOverlapDiscoveryChoice = @ptrCast(@alignCast(ptr));
+        if (self.link_starts != 2) return error.InjectedOverlapTargetNotReached;
+    }
 };
 
 const MetadataVoprAction = enum {
@@ -5439,6 +5485,7 @@ const MetadataVoprDriver = struct {
     leader_failure_at: ?u64 = null,
     monotonic_failure_at: ?u64 = null,
     recovery_failure_at: ?u64 = null,
+    injected_failure_at: ?u64 = null,
     quiet_mode: bool = false,
     recovery_satisfied: bool = false,
 
@@ -5446,6 +5493,7 @@ const MetadataVoprDriver = struct {
     const leader_property = vopr.id.stable("property", "metadata.raft.leader_unique_per_term");
     const monotonic_property = vopr.id.stable("property", "metadata.raft.indices_monotonic");
     const recovery_property = vopr.id.stable("property", "metadata.eventually_recovers_after_quiescence");
+    pub const injected_overlap_property = vopr.id.stable("property", "metadata.injected.overlapping_link_fault_safety");
 
     fn init(
         alloc: std.mem.Allocator,
@@ -5462,6 +5510,7 @@ const MetadataVoprDriver = struct {
             .named("metadata.split_group_id", @intCast(cfg.split_group_id)),
             .named("metadata.split_transition_id", @intCast(cfg.split_transition_id)),
             .named("metadata.workload", @intFromEnum(cfg.workload)),
+            .named("metadata.injected_bug", @intFromEnum(cfg.injected_bug)),
         };
         std.mem.sort(vopr.trace.Parameter, &scenario_parameters, {}, struct {
             fn lessThan(_: void, lhs: vopr.trace.Parameter, rhs: vopr.trace.Parameter) bool {
@@ -5476,7 +5525,7 @@ const MetadataVoprDriver = struct {
             .artifact = try vopr.trace.Trace.init(alloc, .{
                 .system = "antfly",
                 .scenario = "metadata-vopr",
-                .scenario_version = 2,
+                .scenario_version = 3,
                 .source_revision = "vopr-metadata-phase1",
                 .target = "native",
                 .optimize = "test",
@@ -5873,34 +5922,58 @@ const MetadataVoprDriver = struct {
         }
         if (!leader_unique and self.leader_failure_at == null) self.leader_failure_at = index;
         if (!monotonic and self.monotonic_failure_at == null) self.monotonic_failure_at = index;
-        try self.trace().addProperty(.{
+        var pending: [4]vopr.trace.PropertyRecord = undefined;
+        var pending_count: usize = 0;
+        pending[pending_count] = .{
             .index = index,
             .property_id = leader_property,
             .name = "metadata.raft.leader_unique_per_term",
             .kind = .always,
             .condition = leader_unique,
             .details = "at most one metadata leader is visible in each term",
-        });
-        try self.trace().addProperty(.{
+        };
+        pending_count += 1;
+        pending[pending_count] = .{
             .index = index,
             .property_id = monotonic_property,
             .name = "metadata.raft.indices_monotonic",
             .kind = .always,
             .condition = monotonic,
             .details = "per-node commit and applied indices do not regress",
-        });
+        };
+        pending_count += 1;
         if (self.quiet_mode) {
             const recovered = leader_count == 1;
             self.recovery_satisfied = self.recovery_satisfied or recovered;
-            try self.trace().addProperty(.{
+            pending[pending_count] = .{
                 .index = index,
                 .property_id = recovery_property,
                 .name = "metadata.eventually_recovers_after_quiescence",
                 .kind = .eventually_after_quiescence,
                 .condition = recovered,
                 .details = "a single metadata leader is restored during the quiet suffix",
-            });
+            };
+            pending_count += 1;
         }
+        if (self.cfg.injected_bug == .overlapping_link_fault_safety) {
+            const safe = self.state.active_link_count < 2;
+            if (!safe and self.injected_failure_at == null) self.injected_failure_at = index;
+            pending[pending_count] = .{
+                .index = index,
+                .property_id = injected_overlap_property,
+                .name = "metadata.injected.overlapping_link_fault_safety",
+                .kind = .always,
+                .condition = safe,
+                .details = "synthetic meta-test invariant fails only when two directed link faults overlap",
+            };
+            pending_count += 1;
+        }
+        std.mem.sort(vopr.trace.PropertyRecord, pending[0..pending_count], {}, struct {
+            fn lessThan(_: void, lhs: vopr.trace.PropertyRecord, rhs: vopr.trace.PropertyRecord) bool {
+                return lhs.property_id < rhs.property_id;
+            }
+        }.lessThan);
+        for (pending[0..pending_count]) |record| try self.trace().addProperty(record);
     }
 
     fn beginQuietSuffix(self: *MetadataVoprDriver, budget: usize) !void {
@@ -5914,7 +5987,7 @@ const MetadataVoprDriver = struct {
         try self.source.finish();
         const final_digest = self.trace().observations.items[self.trace().observations.items.len - 1].digest;
         const PendingFailure = struct { index: u64, property_id: u64, name: []const u8 };
-        var failures: [3]PendingFailure = undefined;
+        var failures: [4]PendingFailure = undefined;
         var failure_count: usize = 0;
         if (self.leader_failure_at) |index| {
             failures[failure_count] = .{ .index = index, .property_id = leader_property, .name = "metadata.raft.leader_unique_per_term" };
@@ -5926,6 +5999,10 @@ const MetadataVoprDriver = struct {
         }
         if (self.recovery_failure_at) |index| {
             failures[failure_count] = .{ .index = index, .property_id = recovery_property, .name = "metadata.eventually_recovers_after_quiescence" };
+            failure_count += 1;
+        }
+        if (self.injected_failure_at) |index| {
+            failures[failure_count] = .{ .index = index, .property_id = injected_overlap_property, .name = "metadata.injected.overlapping_link_fault_safety" };
             failure_count += 1;
         }
         std.mem.sort(PendingFailure, failures[0..failure_count], {}, struct {
@@ -6537,6 +6614,37 @@ fn runMetadataVoprCampaign(alloc: std.mem.Allocator, cfg: MetadataVoprCampaignCo
     defer recorded.deinit();
     var replayed = try replayMetadataVoprCampaign(alloc, &recorded);
     defer replayed.deinit();
+}
+
+pub fn discoverMetadataVoprInjectedOverlap(alloc: std.mem.Allocator, seed: u64) !vopr.trace.Trace {
+    const base_id = 70_000 + seed % 1_000_000;
+    var discovery = MetadataOverlapDiscoveryChoice{};
+    return try runMetadataVoprCampaignWithChoices(alloc, .{
+        .seed = seed,
+        .operation_count = 2,
+        .metadata_group_id = base_id,
+        .table_id = base_id + 1,
+        .range_group_id = base_id + 2,
+        .split_group_id = base_id + 3,
+        .split_transition_id = base_id + 4,
+        .injected_bug = .overlapping_link_fault_safety,
+    }, discovery.source());
+}
+
+test "metadata VOPR injected overlap bug is discovered replayed and reduced" {
+    var discovered = try discoverMetadataVoprInjectedOverlap(std.testing.allocator, 0xA17F_FA11);
+    defer discovered.deinit();
+    try std.testing.expectEqual(@as(usize, 1), discovered.failures.items.len);
+    try std.testing.expectEqual(MetadataVoprDriver.injected_overlap_property, discovered.failures.items[0].property_id.?);
+
+    var replayed = try replayMetadataVoprCampaign(std.testing.allocator, &discovered);
+    replayed.deinit();
+    var reduced = try reduceMetadataVoprCampaign(std.testing.allocator, &discovered, 8);
+    defer reduced.deinit();
+    try std.testing.expectEqual(discovered.failures.items[0].fingerprint, reduced.target_fingerprint);
+    try std.testing.expect(reduced.reduced_transitions <= reduced.original_transitions);
+    var reduced_replay = try replayMetadataVoprCampaign(std.testing.allocator, &reduced.artifact);
+    reduced_replay.deinit();
 }
 
 test "metadata VOPR seeded smoke campaign" {

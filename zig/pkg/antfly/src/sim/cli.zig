@@ -199,10 +199,30 @@ fn promoteCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8
     replayed.deinit();
     const fixture_dir = "pkg/antfly/src/sim/fixtures/metadata";
     try ensureDir(io, fixture_dir);
-    const output = try std.fmt.allocPrint(alloc, "{s}/{s}.simtrace", .{ fixture_dir, name });
+    var dir = try std.Io.Dir.cwd().openDir(io, fixture_dir, .{});
+    defer dir.close(io);
+    const filename = try promoteRecordedToDir(alloc, io, dir, &recorded, name, force);
+    defer alloc.free(filename);
+    const output = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ fixture_dir, filename });
     defer alloc.free(output);
+    std.debug.print("VOPR promoted fingerprint={x} fixture={s}\n", .{ recorded.failures.items[0].fingerprint, output });
+}
+
+fn promoteRecordedToDir(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    recorded: *const vopr.trace.Trace,
+    name: []const u8,
+    force: bool,
+) ![]u8 {
+    try validateFixtureName(name);
+    try recorded.validate();
+    if (recorded.failures.items.len == 0) return error.FailingTraceRequired;
+    const filename = try std.fmt.allocPrint(alloc, "{s}.simtrace", .{name});
+    errdefer alloc.free(filename);
     if (!force) {
-        if (std.Io.Dir.cwd().statFile(io, output, .{})) |_| {
+        if (dir.statFile(io, filename, .{})) |_| {
             return error.FixtureAlreadyExists;
         } else |err| switch (err) {
             error.FileNotFound => {},
@@ -211,8 +231,8 @@ fn promoteCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8
     }
     const canonical = try recorded.renderAlloc(alloc);
     defer alloc.free(canonical);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output, .data = canonical });
-    std.debug.print("VOPR promoted fingerprint={x} fixture={s}\n", .{ recorded.failures.items[0].fingerprint, output });
+    try dir.writeFile(io, .{ .sub_path = filename, .data = canonical });
+    return filename;
 }
 
 fn validateFixtureName(name: []const u8) !void {
@@ -317,4 +337,32 @@ fn usage() error{InvalidUsage} {
         \\
     , .{});
     return error.InvalidUsage;
+}
+
+test "Antfly injected bug is discovered replayed reduced and promoted" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var discovered = try antfly.metadata_sim_harness.discoverMetadataVoprInjectedOverlap(alloc, 0xA17F_FA11);
+    defer discovered.deinit();
+    try std.testing.expectEqual(@as(usize, 1), discovered.failures.items.len);
+
+    var replayed = try antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, &discovered);
+    replayed.deinit();
+    var reduced = try antfly.metadata_sim_harness.reduceMetadataVoprCampaign(alloc, &discovered, 8);
+    defer reduced.deinit();
+    try std.testing.expectEqual(discovered.failures.items[0].fingerprint, reduced.target_fingerprint);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const filename = try promoteRecordedToDir(alloc, io, tmp.dir, &reduced.artifact, "injected-overlap", false);
+    defer alloc.free(filename);
+    try std.testing.expectError(error.FixtureAlreadyExists, promoteRecordedToDir(alloc, io, tmp.dir, &reduced.artifact, "injected-overlap", false));
+
+    const encoded = try tmp.dir.readFileAlloc(io, filename, alloc, .limited(max_trace_bytes));
+    defer alloc.free(encoded);
+    var promoted = try vopr.trace.parseAlloc(alloc, encoded);
+    defer promoted.deinit();
+    try std.testing.expectEqual(reduced.target_fingerprint, promoted.failures.items[0].fingerprint);
+    var promoted_replay = try antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, &promoted);
+    promoted_replay.deinit();
 }
