@@ -4054,6 +4054,7 @@ pub fn build(b: *std.Build) void {
     http_low_fd_ratchet_test_step.dependOn(&run_http_low_fd_ratchet_tests.step);
 
     const lib_raft_sim_default_filters = [_][]const u8{
+        "virtual http network exposes selected message transitions",
         "managed host simulation drives add and peer refresh through deterministic steps",
         "managed host simulation restores through both raft state backends",
         "managed host simulation keeps WAL replay debt bounded across repeated proposals",
@@ -6649,6 +6650,46 @@ pub fn build(b: *std.Build) void {
     vopr_test_step.dependOn(&run_sim_contract_tests.step);
     const sim_contract_test_step = b.step("sim-contract-test", "Run deterministic simulation contract and replay-equivalence tests");
     sim_contract_test_step.dependOn(&run_sim_contract_tests.step);
+
+    const sim_cli_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/sim/cli.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sim_cli_mod.addImport("antfly", lib_test_mod);
+    sim_cli_mod.addImport("vopr", vopr_mod);
+    sim_cli_mod.link_libc = true;
+    const sim_cli = b.addExecutable(.{ .name = "vopr", .root_module = sim_cli_mod });
+
+    const run_sim_cli = b.addRunArtifact(sim_cli);
+    run_sim_cli.addArg("run");
+    if (b.args) |args| run_sim_cli.addArgs(args);
+    const sim_run_step = b.step("sim-run", "Run one deterministic generated VOPR history");
+    sim_run_step.dependOn(&run_sim_cli.step);
+
+    const replay_sim_cli = b.addRunArtifact(sim_cli);
+    replay_sim_cli.addArg("replay");
+    if (b.args) |args| replay_sim_cli.addArgs(args);
+    const sim_replay_step = b.step("sim-replay", "Replay one exact VOPR artifact");
+    sim_replay_step.dependOn(&replay_sim_cli.step);
+
+    const campaign_sim_cli = b.addRunArtifact(sim_cli);
+    campaign_sim_cli.addArg("campaign");
+    if (b.args) |args| campaign_sim_cli.addArgs(args);
+    const sim_campaign_step = b.step("sim-campaign", "Run a bounded parallel VOPR campaign");
+    sim_campaign_step.dependOn(&campaign_sim_cli.step);
+
+    const reduce_sim_cli = b.addRunArtifact(sim_cli);
+    reduce_sim_cli.addArg("reduce");
+    if (b.args) |args| reduce_sim_cli.addArgs(args);
+    const sim_reduce_step = b.step("sim-reduce", "Reduce a VOPR failure while preserving its fingerprint");
+    sim_reduce_step.dependOn(&reduce_sim_cli.step);
+
+    const promote_sim_cli = b.addRunArtifact(sim_cli);
+    promote_sim_cli.addArg("promote");
+    if (b.args) |args| promote_sim_cli.addArgs(args);
+    const sim_promote_step = b.step("sim-promote", "Promote a reviewed reduced VOPR failure fixture");
+    sim_promote_step.dependOn(&promote_sim_cli.step);
 
     const sim_test_step = b.step("sim-test", "Run mocked-time Antfly simulation suites");
     sim_test_step.dependOn(&run_sim_contract_tests.step);

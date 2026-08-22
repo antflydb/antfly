@@ -265,6 +265,14 @@ pub const VirtualHttpNetwork = struct {
         target_id: u64,
     };
 
+    pub const MessageInfo = struct {
+        id: u64,
+        due_tick: u64,
+        source_id: ?u64,
+        target_id: u64,
+        payload_digest: u64,
+    };
+
     const QueuedRequest = struct {
         due_tick: u64,
         sequence: u64,
@@ -378,6 +386,71 @@ pub const VirtualHttpNetwork = struct {
 
     pub fn queuedCount(self: *const VirtualHttpNetwork) usize {
         return self.queued_requests.items.len;
+    }
+
+    /// Returns a canonical logical snapshot of the queue. Enumeration has no
+    /// side effects and never exposes allocation addresses or owned buffers.
+    pub fn queuedMessages(self: *const VirtualHttpNetwork, alloc: std.mem.Allocator) ![]MessageInfo {
+        const result = try alloc.alloc(MessageInfo, self.queued_requests.items.len);
+        errdefer alloc.free(result);
+        for (self.queued_requests.items, result) |queued, *info| {
+            const route = splitVirtualUri(queued.base_uri) orelse return error.InvalidQueuedVirtualRoute;
+            var digest: u64 = 0xcbf29ce484222325;
+            digestBytes(&digest, queued.request.uri);
+            digestBytes(&digest, queued.request.body);
+            info.* = .{
+                .id = queued.sequence +| 1,
+                .due_tick = queued.due_tick,
+                .source_id = queued.request.source_node_id,
+                .target_id = route.node_id,
+                .payload_digest = digest,
+            };
+        }
+        std.mem.sort(MessageInfo, result, {}, struct {
+            fn lessThan(_: void, lhs: MessageInfo, rhs: MessageInfo) bool {
+                return lhs.id < rhs.id;
+            }
+        }.lessThan);
+        return result;
+    }
+
+    pub fn deliverMessage(self: *VirtualHttpNetwork, message_id: u64) !void {
+        const index = self.messageIndex(message_id) orelse return error.UnknownVirtualMessage;
+        if (self.queued_requests.items[index].due_tick > self.virtual_tick) return error.VirtualMessageNotDue;
+        var queued = self.queued_requests.orderedRemove(index);
+        defer queued.deinit(self.queue_alloc);
+        try self.deliverQueued(&queued);
+    }
+
+    pub fn dropMessage(self: *VirtualHttpNetwork, message_id: u64) !void {
+        const index = self.messageIndex(message_id) orelse return error.UnknownVirtualMessage;
+        var queued = self.queued_requests.orderedRemove(index);
+        queued.deinit(self.queue_alloc);
+        self.dropped_count +|= 1;
+    }
+
+    pub fn duplicateMessage(self: *VirtualHttpNetwork, message_id: u64) !u64 {
+        const index = self.messageIndex(message_id) orelse return error.UnknownVirtualMessage;
+        const queued = &self.queued_requests.items[index];
+        const delay = queued.due_tick -| self.virtual_tick;
+        try self.enqueue(queued.base_uri, queued.request, delay);
+        self.duplicated_count +|= 1;
+        return self.next_sequence;
+    }
+
+    pub fn nextDueTick(self: *const VirtualHttpNetwork) ?u64 {
+        var result: ?u64 = null;
+        for (self.queued_requests.items) |queued| {
+            if (queued.due_tick <= self.virtual_tick) continue;
+            if (result == null or queued.due_tick < result.?) result = queued.due_tick;
+        }
+        return result;
+    }
+
+    /// Advances only logical network time. Delivery remains a separately
+    /// selected transition.
+    pub fn advanceClockTicks(self: *VirtualHttpNetwork, ticks: u64) void {
+        self.virtual_tick +|= ticks;
     }
 
     pub fn useFifoRelease(self: *VirtualHttpNetwork) void {
@@ -614,6 +687,22 @@ pub const VirtualHttpNetwork = struct {
         self.delivered_count +|= 1;
     }
 
+    fn messageIndex(self: *const VirtualHttpNetwork, message_id: u64) ?usize {
+        if (message_id == 0) return null;
+        const sequence = message_id - 1;
+        for (self.queued_requests.items, 0..) |queued, index| {
+            if (queued.sequence == sequence) return index;
+        }
+        return null;
+    }
+
+    fn digestBytes(hash: *u64, bytes: []const u8) void {
+        for (bytes) |byte| {
+            hash.* ^= byte;
+            hash.* *%= 0x100000001b3;
+        }
+    }
+
     fn nextDueIndex(self: *VirtualHttpNetwork) ?usize {
         if (self.release_policy == .random_by_seed) return self.nextRandomDueIndex();
         return self.nextFifoDueIndex();
@@ -836,6 +925,50 @@ test "virtual http network can partition and heal target nodes" {
     try std.testing.expectEqual(@as(usize, 3), try network.runUntilIdle());
     try std.testing.expectEqual(@as(u64, 10), target.count);
     network.useFifoRelease();
+}
+
+test "virtual http network exposes selected message transitions" {
+    const RecordingExecutor = struct {
+        count: usize = 0,
+        fn executor(self: *@This()) transport.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: transport.HttpRequest) !transport.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.count += 1;
+            return .{ .status = 200 };
+        }
+    };
+    var network = VirtualHttpNetwork.init(std.testing.allocator);
+    defer network.deinit();
+    network.useQueuedDelivery();
+    var target = RecordingExecutor{};
+    try network.registerNode(7, target.executor());
+    network.delayNextTicks(2);
+    var accepted = try network.executor().execute(std.testing.allocator, .{
+        .method = .POST,
+        .uri = "sim://raft-node/7/raft/v1/frame",
+        .source_node_id = 3,
+        .body = "frame",
+    });
+    accepted.deinit(std.testing.allocator);
+
+    const messages = try network.queuedMessages(std.testing.allocator);
+    defer std.testing.allocator.free(messages);
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expectEqual(@as(u64, 1), messages[0].id);
+    try std.testing.expectEqual(@as(u64, 2), messages[0].due_tick);
+    try std.testing.expectEqual(@as(?u64, 3), messages[0].source_id);
+    try std.testing.expectEqual(@as(u64, 7), messages[0].target_id);
+    try std.testing.expectError(error.VirtualMessageNotDue, network.deliverMessage(messages[0].id));
+
+    const duplicate_id = try network.duplicateMessage(messages[0].id);
+    try std.testing.expectEqual(@as(u64, 2), duplicate_id);
+    try network.dropMessage(duplicate_id);
+    network.advanceClockTicks(2);
+    try network.deliverMessage(messages[0].id);
+    try std.testing.expectEqual(@as(usize, 1), target.count);
+    try std.testing.expectEqual(@as(usize, 0), network.queuedCount());
 }
 
 test "virtual http network delivers queued GET requests synchronously" {

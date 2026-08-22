@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const vopr = @import("vopr");
 const metadata_api = @import("api.zig");
 const metadata_control_loop = @import("control_loop.zig");
 const metadata_http_client = @import("http_client.zig");
@@ -1805,7 +1806,7 @@ fn buildHealthyStoreStatusReports(
     node: anytype,
     group_statuses: []const metadata_table_manager.GroupStatusReport,
 ) ![]metadata_table_manager.StoreStatusReport {
-    const alloc = std.testing.allocator;
+    const alloc = node.cluster.alloc;
     const projected_stores = try node.listProjectedStores(alloc);
     defer node.freeProjectedStores(alloc, projected_stores);
     const projected_intents = try node.listProjectedPlacementIntents(alloc);
@@ -1907,8 +1908,9 @@ fn reportHealthyStoreStatuses(
     node: anytype,
     group_statuses: []const metadata_table_manager.GroupStatusReport,
 ) !void {
+    const alloc = node.cluster.alloc;
     const reports = try buildHealthyStoreStatusReports(node, group_statuses);
-    defer freeOwnedSimStoreStatusReports(std.testing.allocator, reports);
+    defer freeOwnedSimStoreStatusReports(alloc, reports);
     try std.testing.expectEqual(reports.len, try node.reportStoreStatuses(reports));
 }
 
@@ -3311,6 +3313,20 @@ pub const MetadataHttpClusterSimulation = struct {
         for (0..self.cluster.nodes.len) |i| {
             try self.refreshOwnedMetadataRuntimes(i);
         }
+    }
+
+    /// One atomic node round for the VOPR scheduler. Network delivery and time
+    /// advancement are intentionally separate transitions.
+    pub fn stepNode(self: *MetadataHttpClusterSimulation, index: usize) anyerror!void {
+        if (index >= self.cluster.nodes.len) return error.InvalidNodeIndex;
+        try self.refreshOwnedMetadataRuntimes(index);
+        _ = try self.cluster.node(index).stepOnce();
+        try self.refreshOwnedMetadataRuntimes(index);
+    }
+
+    pub fn advanceSimTime(self: *MetadataHttpClusterSimulation, ticks: u64) void {
+        self.manual_clock.advanceMs(ticks *| 100);
+        self.virtual_network.advanceClockTicks(ticks);
     }
 
     pub fn stepAllExcept(self: *MetadataHttpClusterSimulation, stalled_index: usize) anyerror!void {
@@ -5201,7 +5217,7 @@ fn startBootstrappedMetadataCluster(
     return leader_index;
 }
 
-const MetadataVoprCampaignConfig = struct {
+pub const MetadataVoprCampaignConfig = struct {
     seed: u64,
     operation_count: usize = 64,
     metadata_group_id: u64,
@@ -5210,15 +5226,61 @@ const MetadataVoprCampaignConfig = struct {
     split_group_id: u64,
     split_transition_id: u64,
     workload: MetadataVoprWorkload = .smoke,
+
+    pub fn fromTrace(artifact: *const vopr.trace.Trace) !MetadataVoprCampaignConfig {
+        if (!std.mem.eql(u8, artifact.header.system, "antfly") or !std.mem.eql(u8, artifact.header.scenario, "metadata-vopr")) return error.IncompatibleMetadataVoprTrace;
+        const workload_value = try traceParameter(artifact, "metadata.workload");
+        const workload: MetadataVoprWorkload = switch (workload_value) {
+            0 => .smoke,
+            1 => .expanded,
+            else => return error.InvalidMetadataVoprWorkload,
+        };
+        const operation_count_value = try traceParameter(artifact, "metadata.operation_count");
+        const result = MetadataVoprCampaignConfig{
+            .seed = artifact.config.seed orelse return error.MetadataVoprSeedMissing,
+            .operation_count = std.math.cast(usize, operation_count_value) orelse return error.InvalidMetadataVoprParameter,
+            .metadata_group_id = try traceParameter(artifact, "metadata.group_id"),
+            .table_id = try traceParameter(artifact, "metadata.table_id"),
+            .range_group_id = try traceParameter(artifact, "metadata.range_group_id"),
+            .split_group_id = try traceParameter(artifact, "metadata.split_group_id"),
+            .split_transition_id = try traceParameter(artifact, "metadata.split_transition_id"),
+            .workload = workload,
+        };
+        try result.validate();
+        return result;
+    }
+
+    pub fn validate(self: MetadataVoprCampaignConfig) !void {
+        if (self.operation_count == 0) return error.InvalidMetadataVoprOperationBudget;
+        const values = [_]u64{ self.metadata_group_id, self.table_id, self.range_group_id, self.split_group_id, self.split_transition_id };
+        for (values, 0..) |value, index| {
+            if (value == 0 or value > std.math.maxInt(i64)) return error.InvalidMetadataVoprId;
+            for (values[0..index]) |prior| if (prior == value) return error.DuplicateMetadataVoprId;
+        }
+    }
+
+    fn traceParameter(artifact: *const vopr.trace.Trace, name: []const u8) !u64 {
+        const parameter_id = vopr.id.stable("parameter", name);
+        for (artifact.config.scenario_parameters) |parameter| {
+            if (parameter.id != parameter_id) continue;
+            if (parameter.value < 0) return error.InvalidMetadataVoprParameter;
+            return @intCast(parameter.value);
+        }
+        return error.MetadataVoprParameterMissing;
+    }
 };
 
-const MetadataVoprWorkload = enum {
+pub const MetadataVoprWorkload = enum {
     smoke,
     expanded,
 };
 
 const MetadataVoprAction = enum {
     step,
+    network_deliver,
+    network_drop,
+    network_duplicate,
+    time_advance,
     drop_next,
     duplicate_next,
     delay_next,
@@ -5233,6 +5295,10 @@ const MetadataVoprAction = enum {
 fn metadataVoprActionName(action: MetadataVoprAction) []const u8 {
     return switch (action) {
         .step => "step",
+        .network_deliver => "network_deliver",
+        .network_drop => "network_drop",
+        .network_duplicate => "network_duplicate",
+        .time_advance => "time_advance",
         .drop_next => "drop_next",
         .duplicate_next => "duplicate_next",
         .delay_next => "delay_next",
@@ -5266,15 +5332,6 @@ fn metadataVoprNodeId(cluster: *MetadataHttpClusterSimulation, index: usize) u64
     return cluster.cluster.configs[index].host.http.host.local_node_id;
 }
 
-fn metadataVoprPickIndex(random: std.Random, node_count: usize, exclude: ?usize) usize {
-    std.debug.assert(node_count > 0);
-    var index = @as(usize, @intCast(random.intRangeLessThan(u32, 0, @as(u32, @intCast(node_count)))));
-    if (exclude) |excluded| {
-        if (node_count > 1 and index == excluded) index = (index + 1) % node_count;
-    }
-    return index;
-}
-
 fn metadataVoprReportFailure(
     cfg: MetadataVoprCampaignConfig,
     operation_index: ?usize,
@@ -5294,24 +5351,500 @@ fn metadataVoprReportFailure(
     }
 }
 
-fn metadataVoprRunRandomTransportActions(
+const MetadataVoprCandidate = struct {
+    transition: vopr.transition.Transition,
+    action: MetadataVoprAction,
+    source_node_id: ?u64 = null,
+    target_node_id: ?u64 = null,
+    node_index: ?usize = null,
+    ticks: u64 = 0,
+    message_id: ?u64 = null,
+};
+
+const MetadataVoprDriver = struct {
+    alloc: std.mem.Allocator,
     cluster: *MetadataHttpClusterSimulation,
-    random: std.Random,
     cfg: MetadataVoprCampaignConfig,
-    state: *MetadataVoprCampaignState,
-    operation_index: *usize,
-    count: usize,
-) !void {
-    const action_count = std.meta.tags(MetadataVoprAction).len;
-    for (0..count) |_| {
-        const action = @as(MetadataVoprAction, @enumFromInt(random.intRangeLessThan(u32, 0, @intCast(action_count))));
-        metadataVoprRunAction(cluster, random, cfg, state, operation_index.*, action) catch |err| {
-            metadataVoprReportFailure(cfg, operation_index.*, action, err);
+    source: vopr.choice.Source,
+    artifact: ?vopr.trace.Trace,
+    state: MetadataVoprCampaignState = .{},
+    occurrence: u64 = 0,
+    last_committed: [3]u64 = @splat(0),
+    last_applied: [3]u64 = @splat(0),
+    leader_failure_at: ?u64 = null,
+    monotonic_failure_at: ?u64 = null,
+    recovery_failure_at: ?u64 = null,
+    quiet_mode: bool = false,
+    recovery_satisfied: bool = false,
+
+    const choice_site = vopr.id.stable("choice", "antfly.metadata.transport_action");
+    const leader_property = vopr.id.stable("property", "metadata.raft.leader_unique_per_term");
+    const monotonic_property = vopr.id.stable("property", "metadata.raft.indices_monotonic");
+    const recovery_property = vopr.id.stable("property", "metadata.eventually_recovers_after_quiescence");
+
+    fn init(
+        alloc: std.mem.Allocator,
+        cluster: *MetadataHttpClusterSimulation,
+        cfg: MetadataVoprCampaignConfig,
+        source: vopr.choice.Source,
+    ) !MetadataVoprDriver {
+        try cfg.validate();
+        var scenario_parameters = [_]vopr.trace.Parameter{
+            .named("metadata.operation_count", @intCast(cfg.operation_count)),
+            .named("metadata.group_id", @intCast(cfg.metadata_group_id)),
+            .named("metadata.table_id", @intCast(cfg.table_id)),
+            .named("metadata.range_group_id", @intCast(cfg.range_group_id)),
+            .named("metadata.split_group_id", @intCast(cfg.split_group_id)),
+            .named("metadata.split_transition_id", @intCast(cfg.split_transition_id)),
+            .named("metadata.workload", @intFromEnum(cfg.workload)),
+        };
+        std.mem.sort(vopr.trace.Parameter, &scenario_parameters, {}, struct {
+            fn lessThan(_: void, lhs: vopr.trace.Parameter, rhs: vopr.trace.Parameter) bool {
+                return lhs.id < rhs.id;
+            }
+        }.lessThan);
+        var self = MetadataVoprDriver{
+            .alloc = alloc,
+            .cluster = cluster,
+            .cfg = cfg,
+            .source = source,
+            .artifact = try vopr.trace.Trace.init(alloc, .{
+                .system = "antfly",
+                .scenario = "metadata-vopr",
+                .scenario_version = 1,
+                .source_revision = "vopr-metadata-phase1",
+                .target = "native",
+                .optimize = "test",
+            }, .{
+                .seed = cfg.seed,
+                .transition_budget = @intCast(cfg.operation_count + 64),
+                .resource_budget = 3,
+                .fixture_hashes = &.{},
+                .feature_flags = &.{},
+                .backend_ids = &.{vopr.id.stable("backend", "raft.memory")},
+                .scenario_parameters = &scenario_parameters,
+            }),
+        };
+        errdefer self.artifact.?.deinit();
+        _ = try self.recordObservation(0);
+        return self;
+    }
+
+    fn deinit(self: *MetadataVoprDriver) void {
+        if (self.artifact) |*artifact| artifact.deinit();
+        self.artifact = null;
+    }
+
+    fn trace(self: *MetadataVoprDriver) *vopr.trace.Trace {
+        return &self.artifact.?;
+    }
+
+    fn actionId(action: MetadataVoprAction, discriminator: u64) u64 {
+        return vopr.id.derive("antfly.metadata.action", @intFromEnum(action) + 1, discriminator);
+    }
+
+    fn appendCandidate(
+        candidates: *std.ArrayListUnmanaged(MetadataVoprCandidate),
+        alloc: std.mem.Allocator,
+        candidate: MetadataVoprCandidate,
+    ) !void {
+        try candidates.append(alloc, candidate);
+    }
+
+    fn enumerate(self: *MetadataVoprDriver, candidates: *std.ArrayListUnmanaged(MetadataVoprCandidate)) !void {
+        for (0..self.cluster.cluster.nodes.len) |node_index| {
+            const node_id = metadataVoprNodeId(self.cluster, node_index);
+            try appendCandidate(candidates, self.alloc, .{
+                .transition = .{
+                    .id = actionId(.step, node_id),
+                    .name = "metadata.node_round",
+                    .kind = .scheduler,
+                    .actor_id = node_id,
+                    .parameter = @intCast(node_index),
+                },
+                .action = .step,
+                .source_node_id = node_id,
+                .node_index = node_index,
+            });
+        }
+        const messages = try self.cluster.virtual_network.queuedMessages(self.alloc);
+        defer self.alloc.free(messages);
+        for (messages) |message| {
+            if (message.due_tick <= self.cluster.virtual_network.virtual_tick) {
+                try appendCandidate(candidates, self.alloc, .{
+                    .transition = .{
+                        .id = actionId(.network_deliver, message.id),
+                        .name = "metadata.network.deliver_message",
+                        .kind = .scheduler,
+                        .actor_id = message.source_id,
+                        .resource_id = message.id,
+                        .parameter = @intCast(@min(message.due_tick, @as(u64, std.math.maxInt(i64)))),
+                    },
+                    .action = .network_deliver,
+                    .message_id = message.id,
+                });
+            }
+            try appendCandidate(candidates, self.alloc, .{
+                .transition = .{
+                    .id = actionId(.network_drop, message.id),
+                    .name = "metadata.network.drop_message",
+                    .kind = .fault,
+                    .actor_id = message.source_id,
+                    .resource_id = message.id,
+                },
+                .action = .network_drop,
+                .message_id = message.id,
+            });
+            try appendCandidate(candidates, self.alloc, .{
+                .transition = .{
+                    .id = actionId(.network_duplicate, message.id),
+                    .name = "metadata.network.duplicate_message",
+                    .kind = .fault,
+                    .actor_id = message.source_id,
+                    .resource_id = message.id,
+                },
+                .action = .network_duplicate,
+                .message_id = message.id,
+            });
+        }
+        const next_tick = self.cluster.virtual_network.virtual_tick +| 1;
+        try appendCandidate(candidates, self.alloc, .{
+            .transition = .{
+                .id = actionId(.time_advance, next_tick),
+                .name = "metadata.time_advance",
+                .kind = .scheduler,
+                .parameter = @intCast(@min(next_tick, @as(u64, std.math.maxInt(i64)))),
+            },
+            .action = .time_advance,
+            .ticks = 1,
+        });
+        if (self.quiet_mode) return;
+        try appendCandidate(candidates, self.alloc, .{
+            .transition = .{ .id = actionId(.drop_next, 0), .name = "metadata.network.drop_next", .kind = .fault },
+            .action = .drop_next,
+        });
+        try appendCandidate(candidates, self.alloc, .{
+            .transition = .{ .id = actionId(.duplicate_next, 0), .name = "metadata.network.duplicate_next", .kind = .fault },
+            .action = .duplicate_next,
+        });
+        for (1..4) |ticks| {
+            try appendCandidate(candidates, self.alloc, .{
+                .transition = .{ .id = actionId(.delay_next, ticks), .name = "metadata.network.delay_next", .kind = .fault, .parameter = @intCast(ticks) },
+                .action = .delay_next,
+                .ticks = ticks,
+            });
+        }
+        try appendCandidate(candidates, self.alloc, .{
+            .transition = .{ .id = actionId(.release_fifo, 0), .name = "metadata.network.release_fifo", .kind = .scheduler },
+            .action = .release_fifo,
+        });
+        try appendCandidate(candidates, self.alloc, .{
+            .transition = .{ .id = actionId(.release_random, 0), .name = "metadata.network.release_seeded", .kind = .scheduler },
+            .action = .release_random,
+        });
+
+        if (self.state.active_link == null and self.state.active_node_id == null) {
+            for (0..self.cluster.cluster.nodes.len) |source_index| {
+                const source_id = metadataVoprNodeId(self.cluster, source_index);
+                for (0..self.cluster.cluster.nodes.len) |target_index| {
+                    if (source_index == target_index) continue;
+                    const target_id = metadataVoprNodeId(self.cluster, target_index);
+                    const link_id = vopr.id.derive("antfly.metadata.link", source_id, target_id);
+                    try appendCandidate(candidates, self.alloc, .{
+                        .transition = .{
+                            .id = actionId(.start_link_partition, link_id),
+                            .name = "metadata.network.partition_link",
+                            .kind = .fault,
+                            .actor_id = source_id,
+                            .resource_id = target_id,
+                        },
+                        .action = .start_link_partition,
+                        .source_node_id = source_id,
+                        .target_node_id = target_id,
+                    });
+                }
+                try appendCandidate(candidates, self.alloc, .{
+                    .transition = .{
+                        .id = actionId(.start_node_partition, source_id),
+                        .name = "metadata.network.partition_node",
+                        .kind = .fault,
+                        .actor_id = source_id,
+                    },
+                    .action = .start_node_partition,
+                    .source_node_id = source_id,
+                });
+            }
+        } else {
+            try appendCandidate(candidates, self.alloc, .{
+                .transition = .{ .id = actionId(.heal_all, 0), .name = "metadata.network.heal_all", .kind = .fault },
+                .action = .heal_all,
+            });
+        }
+
+        const leader_index = currentMetadataLeaderIndex(self.cluster);
+        for (0..self.cluster.cluster.nodes.len) |node_index| {
+            if (leader_index != null and leader_index.? == node_index) continue;
+            const node_id = metadataVoprNodeId(self.cluster, node_index);
+            try appendCandidate(candidates, self.alloc, .{
+                .transition = .{
+                    .id = actionId(.restart_follower, node_id),
+                    .name = "metadata.node.restart",
+                    .kind = .fault,
+                    .actor_id = node_id,
+                    .parameter = @intCast(node_index),
+                },
+                .action = .restart_follower,
+                .source_node_id = node_id,
+                .node_index = node_index,
+            });
+        }
+    }
+
+    fn runActions(self: *MetadataVoprDriver, count: usize) !void {
+        for (0..count) |_| try self.runOne();
+    }
+
+    fn runOne(self: *MetadataVoprDriver) !void {
+        var candidates: std.ArrayListUnmanaged(MetadataVoprCandidate) = .empty;
+        defer candidates.deinit(self.alloc);
+        try self.enumerate(&candidates);
+        var transitions = vopr.transition.List{};
+        defer transitions.deinit(self.alloc);
+        for (candidates.items) |candidate| try transitions.append(self.alloc, candidate.transition);
+        try transitions.canonicalize();
+        const selected_id = try self.source.choose(.{
+            .site_id = choice_site,
+            .site_name = "antfly.metadata.transport_action",
+            .occurrence = self.occurrence,
+            .enabled = transitions.items.items,
+        });
+        const enabled_ids = try self.alloc.alloc(u64, transitions.items.items.len);
+        defer self.alloc.free(enabled_ids);
+        for (transitions.items.items, 0..) |enabled, index| enabled_ids[index] = enabled.id;
+        try self.trace().addChoice(.{
+            .site_id = choice_site,
+            .site_name = "antfly.metadata.transport_action",
+            .occurrence = self.occurrence,
+            .enabled_ids = enabled_ids,
+            .selected_id = selected_id,
+        });
+        const selected = for (candidates.items) |candidate| {
+            if (candidate.transition.id == selected_id) break candidate;
+        } else return error.SelectedMetadataActionMissing;
+
+        self.execute(selected) catch |err| {
+            metadataVoprReportFailure(self.cfg, @intCast(self.occurrence), selected.action, err);
             return err;
         };
-        operation_index.* += 1;
+        self.occurrence += 1;
+        try self.trace().addTransition(.{
+            .index = self.occurrence,
+            .id = selected.transition.id,
+            .name = selected.transition.name,
+            .kind = selected.transition.kind,
+            .actor_id = selected.transition.actor_id,
+            .resource_id = selected.transition.resource_id,
+            .parameter = selected.transition.parameter,
+            .payload_digest = selected.transition.payloadDigest(),
+        });
+        if (selected.transition.kind == .fault) {
+            const phase: vopr.trace.FaultPhase = switch (selected.action) {
+                .start_link_partition, .start_node_partition => .start,
+                .heal_all => .end,
+                else => .pulse,
+            };
+            try self.trace().addFault(.{ .index = self.occurrence, .id = selected.transition.id, .name = selected.transition.name, .phase = phase });
+        }
+        try self.trace().addEvent(.{
+            .index = self.occurrence,
+            .ordinal = 0,
+            .id = vopr.id.stable("event", "metadata.action_applied"),
+            .name = "metadata.action_applied",
+            .kind = .state_change,
+            .actor_id = selected.transition.actor_id,
+            .resource_id = selected.transition.resource_id,
+            .payload_digest = @bitCast(selected.transition.parameter),
+        });
+        _ = try self.recordObservation(self.occurrence);
+        try self.evaluateProperties(self.occurrence);
     }
-}
+
+    fn execute(self: *MetadataVoprDriver, selected: MetadataVoprCandidate) !void {
+        switch (selected.action) {
+            .step => try self.cluster.stepNode(selected.node_index.?),
+            .network_deliver => try self.cluster.virtual_network.deliverMessage(selected.message_id.?),
+            .network_drop => try self.cluster.virtual_network.dropMessage(selected.message_id.?),
+            .network_duplicate => _ = try self.cluster.virtual_network.duplicateMessage(selected.message_id.?),
+            .time_advance => self.cluster.advanceSimTime(selected.ticks),
+            .drop_next => {
+                try self.cluster.cluster.inject(.drop_next);
+            },
+            .duplicate_next => {
+                try self.cluster.cluster.inject(.duplicate_next);
+            },
+            .delay_next => {
+                try self.cluster.cluster.inject(.{ .delay_next_ticks = selected.ticks });
+            },
+            .release_fifo => {
+                try self.cluster.cluster.inject(.release_fifo);
+            },
+            .release_random => {
+                try self.cluster.cluster.inject(.{ .release_random = self.cfg.seed ^ self.occurrence });
+            },
+            .start_link_partition => {
+                const link = raft_sim.VirtualHttpNetwork.Link{ .source_id = selected.source_node_id.?, .target_id = selected.target_node_id.? };
+                try self.cluster.cluster.inject(.{ .partition_link = link });
+                self.state.active_link = link;
+            },
+            .start_node_partition => {
+                const node_id = selected.source_node_id.?;
+                try self.cluster.cluster.inject(.{ .partition_node = node_id });
+                self.state.active_node_id = node_id;
+            },
+            .heal_all => {
+                self.cluster.cluster.healAll();
+                self.state.clear();
+            },
+            .restart_follower => {
+                try self.cluster.restartNode(selected.node_index.?);
+            },
+        }
+    }
+
+    fn recordObservation(self: *MetadataVoprDriver, index: u64) !u64 {
+        var builder = vopr.observation.Builder{};
+        defer builder.deinit(self.alloc);
+        try builder.addNamed(self.alloc, "metadata.network.queued", @intCast(self.cluster.virtual_network.queuedCount()));
+        try builder.addNamed(self.alloc, "metadata.network.tick", @intCast(@min(self.cluster.virtual_network.virtual_tick, @as(u64, std.math.maxInt(i64)))));
+        try builder.addNamed(self.alloc, "metadata.network.requests", @intCast(@min(self.cluster.virtual_network.request_count, @as(u64, std.math.maxInt(i64)))));
+        try builder.addNamed(self.alloc, "metadata.network.delivered", @intCast(@min(self.cluster.virtual_network.delivered_count, @as(u64, std.math.maxInt(i64)))));
+        try builder.addNamed(self.alloc, "metadata.network.dropped", @intCast(@min(self.cluster.virtual_network.dropped_count, @as(u64, std.math.maxInt(i64)))));
+        try builder.addNamed(self.alloc, "metadata.network.duplicated", @intCast(@min(self.cluster.virtual_network.duplicated_count, @as(u64, std.math.maxInt(i64)))));
+        try builder.addNamed(self.alloc, "metadata.network.delayed", @intCast(@min(self.cluster.virtual_network.delayed_count, @as(u64, std.math.maxInt(i64)))));
+        try builder.addNamed(self.alloc, "metadata.fault.active", @intFromBool(self.state.active_link != null or self.state.active_node_id != null));
+        try builder.addNamed(self.alloc, "metadata.phase.quiet", @intFromBool(self.quiet_mode));
+        var leader_count: i64 = 0;
+        var commit_total: u64 = 0;
+        var applied_total: u64 = 0;
+        for (self.cluster.cluster.nodes) |*node| {
+            if (node.raftStatus(self.cluster.metadata_group_id)) |status| {
+                leader_count += @intFromBool(status.soft.role == .leader);
+                commit_total +|= status.hard.commit_index;
+                applied_total +|= status.applied_index;
+            }
+        }
+        try builder.addNamed(self.alloc, "metadata.raft.leader_count", leader_count);
+        try builder.addNamed(self.alloc, "metadata.raft.commit_total", @intCast(@min(commit_total, @as(u64, std.math.maxInt(i64)))));
+        try builder.addNamed(self.alloc, "metadata.raft.applied_total", @intCast(@min(applied_total, @as(u64, std.math.maxInt(i64)))));
+        try builder.canonicalize();
+        const digest = builder.digest();
+        try self.trace().addObservation(.{ .index = index, .digest = digest, .features = builder.features.items });
+        return digest;
+    }
+
+    fn evaluateProperties(self: *MetadataVoprDriver, index: u64) !void {
+        var leader_count: usize = 0;
+        var leader_terms: [3]u64 = undefined;
+        var leader_unique = true;
+        var monotonic = true;
+        for (self.cluster.cluster.nodes, 0..) |*node, node_index| {
+            if (node.raftStatus(self.cluster.metadata_group_id)) |status| {
+                if (status.soft.role == .leader) {
+                    for (leader_terms[0..leader_count]) |term| {
+                        if (term == status.hard.current_term) leader_unique = false;
+                    }
+                    leader_terms[leader_count] = status.hard.current_term;
+                    leader_count += 1;
+                }
+                monotonic = monotonic and status.hard.commit_index >= self.last_committed[node_index] and status.applied_index >= self.last_applied[node_index];
+                self.last_committed[node_index] = status.hard.commit_index;
+                self.last_applied[node_index] = status.applied_index;
+            }
+        }
+        if (!leader_unique and self.leader_failure_at == null) self.leader_failure_at = index;
+        if (!monotonic and self.monotonic_failure_at == null) self.monotonic_failure_at = index;
+        try self.trace().addProperty(.{
+            .index = index,
+            .property_id = leader_property,
+            .name = "metadata.raft.leader_unique_per_term",
+            .kind = .always,
+            .condition = leader_unique,
+            .details = "at most one metadata leader is visible in each term",
+        });
+        try self.trace().addProperty(.{
+            .index = index,
+            .property_id = monotonic_property,
+            .name = "metadata.raft.indices_monotonic",
+            .kind = .always,
+            .condition = monotonic,
+            .details = "per-node commit and applied indices do not regress",
+        });
+        if (self.quiet_mode) {
+            const recovered = leader_count == 1;
+            self.recovery_satisfied = self.recovery_satisfied or recovered;
+            try self.trace().addProperty(.{
+                .index = index,
+                .property_id = recovery_property,
+                .name = "metadata.eventually_recovers_after_quiescence",
+                .kind = .eventually_after_quiescence,
+                .condition = recovered,
+                .details = "a single metadata leader is restored during the quiet suffix",
+            });
+        }
+    }
+
+    fn beginQuietSuffix(self: *MetadataVoprDriver, budget: usize) !void {
+        if (budget == 0) return error.InvalidQuietSuffixBudget;
+        self.quiet_mode = true;
+        try self.runActions(budget);
+        if (!self.recovery_satisfied) self.recovery_failure_at = self.occurrence;
+    }
+
+    fn finish(self: *MetadataVoprDriver) !vopr.trace.Trace {
+        try self.source.finish();
+        const final_digest = self.trace().observations.items[self.trace().observations.items.len - 1].digest;
+        const PendingFailure = struct { index: u64, property_id: u64, name: []const u8 };
+        var failures: [3]PendingFailure = undefined;
+        var failure_count: usize = 0;
+        if (self.leader_failure_at) |index| {
+            failures[failure_count] = .{ .index = index, .property_id = leader_property, .name = "metadata.raft.leader_unique_per_term" };
+            failure_count += 1;
+        }
+        if (self.monotonic_failure_at) |index| {
+            failures[failure_count] = .{ .index = index, .property_id = monotonic_property, .name = "metadata.raft.indices_monotonic" };
+            failure_count += 1;
+        }
+        if (self.recovery_failure_at) |index| {
+            failures[failure_count] = .{ .index = index, .property_id = recovery_property, .name = "metadata.eventually_recovers_after_quiescence" };
+            failure_count += 1;
+        }
+        std.mem.sort(PendingFailure, failures[0..failure_count], {}, struct {
+            fn lessThan(_: void, lhs: PendingFailure, rhs: PendingFailure) bool {
+                if (lhs.index != rhs.index) return lhs.index < rhs.index;
+                return lhs.property_id < rhs.property_id;
+            }
+        }.lessThan);
+        for (failures[0..failure_count]) |failure| {
+            try self.trace().addFailure(.{
+                .index = failure.index,
+                .class = .property,
+                .property_id = failure.property_id,
+                .identity = failure.name,
+                .fingerprint = vopr.id.derive("failure", failure.property_id, 1),
+                .observation_digest = null,
+            });
+        }
+        self.trace().summary = .{
+            .transitions = self.occurrence,
+            .final_observation_digest = final_digest,
+            .property_failures = failure_count,
+        };
+        try self.trace().validate();
+        const result = self.artifact.?;
+        self.artifact = null;
+        return result;
+    }
+};
 
 fn metadataVoprStartFollowerPartition(
     cluster: *MetadataHttpClusterSimulation,
@@ -5350,78 +5883,6 @@ fn metadataVoprHealAll(
     state.clear();
     for (0..4) |_| try cluster.stepAll();
     _ = try cluster.waitForMetadataLeader(96) orelse return error.NotLeader;
-}
-
-fn metadataVoprRunAction(
-    cluster: *MetadataHttpClusterSimulation,
-    random: std.Random,
-    cfg: MetadataVoprCampaignConfig,
-    state: *MetadataVoprCampaignState,
-    operation_index: usize,
-    action: MetadataVoprAction,
-) !void {
-    const node_count = cluster.cluster.nodes.len;
-    switch (action) {
-        .step => try cluster.stepAll(),
-        .drop_next => {
-            try cluster.cluster.inject(.drop_next);
-            try cluster.stepAll();
-        },
-        .duplicate_next => {
-            try cluster.cluster.inject(.duplicate_next);
-            try cluster.stepAll();
-        },
-        .delay_next => {
-            const ticks = @as(u64, random.intRangeLessThan(u32, 1, 4));
-            try cluster.cluster.inject(.{ .delay_next_ticks = ticks });
-            try cluster.stepAll();
-        },
-        .release_fifo => {
-            try cluster.cluster.inject(.release_fifo);
-            try cluster.stepAll();
-        },
-        .release_random => {
-            try cluster.cluster.inject(.{ .release_random = cfg.seed ^ @as(u64, @intCast(operation_index)) });
-            try cluster.stepAll();
-        },
-        .start_link_partition => {
-            if (state.active_link != null or state.active_node_id != null) {
-                try cluster.stepAll();
-                return;
-            }
-            const source_index = metadataVoprPickIndex(random, node_count, null);
-            const target_index = metadataVoprPickIndex(random, node_count, source_index);
-            const link = raft_sim.VirtualHttpNetwork.Link{
-                .source_id = metadataVoprNodeId(cluster, source_index),
-                .target_id = metadataVoprNodeId(cluster, target_index),
-            };
-            try cluster.cluster.inject(.{ .partition_link = link });
-            state.active_link = link;
-            try cluster.stepAll();
-        },
-        .start_node_partition => {
-            if (state.active_link != null or state.active_node_id != null) {
-                try cluster.stepAll();
-                return;
-            }
-            const index = metadataVoprPickIndex(random, node_count, null);
-            const node_id = metadataVoprNodeId(cluster, index);
-            try cluster.cluster.inject(.{ .partition_node = node_id });
-            state.active_node_id = node_id;
-            try cluster.stepAll();
-        },
-        .heal_all => {
-            cluster.cluster.healAll();
-            state.clear();
-            try cluster.stepAll();
-        },
-        .restart_follower => {
-            const leader_index = currentMetadataLeaderIndex(cluster);
-            const index = metadataVoprPickIndex(random, node_count, leader_index);
-            try cluster.restartNode(index);
-            try cluster.stepAll();
-        },
-    }
 }
 
 fn metadataVoprLeaderIndex(cluster: *MetadataHttpClusterSimulation) !usize {
@@ -5553,13 +6014,11 @@ fn metadataVoprAddRange(
 fn metadataVoprRunLivenessWorkload(
     cluster: *MetadataHttpClusterSimulation,
     cfg: MetadataVoprCampaignConfig,
-    random: std.Random,
-    state: *MetadataVoprCampaignState,
-    operation_index: *usize,
+    driver: *MetadataVoprDriver,
 ) !void {
     return switch (cfg.workload) {
         .smoke => metadataVoprRunSmokeLivenessWorkload(cluster, cfg),
-        .expanded => metadataVoprRunExpandedLivenessWorkload(cluster, cfg, random, state, operation_index),
+        .expanded => metadataVoprRunExpandedLivenessWorkload(cluster, cfg, driver),
     };
 }
 
@@ -5588,34 +6047,32 @@ fn metadataVoprRunSmokeLivenessWorkload(
 fn metadataVoprRunExpandedLivenessWorkload(
     cluster: *MetadataHttpClusterSimulation,
     cfg: MetadataVoprCampaignConfig,
-    random: std.Random,
-    state: *MetadataVoprCampaignState,
-    operation_index: *usize,
+    driver: *MetadataVoprDriver,
 ) !void {
     var workflow = metadata_table_workflow.TableWorkflow.init(cluster.alloc);
     defer workflow.deinit();
     const phase_fault_actions = @max(@as(usize, 1), cfg.operation_count / 12);
 
     try metadataVoprCreateActiveTable(cluster, &workflow, cfg.table_id, "vopr-docs", cfg.range_group_id, 3, 96);
-    try metadataVoprRunRandomTransportActions(cluster, random, cfg, state, operation_index, phase_fault_actions);
-    try metadataVoprHealAll(cluster, state);
+    try driver.runActions(phase_fault_actions);
+    try metadataVoprHealAll(cluster, &driver.state);
 
     var lifecycle = metadata_table_workflow.TableWorkflow.init(cluster.alloc);
     defer lifecycle.deinit();
     const lifecycle_table_id = cfg.table_id + 1000;
     const lifecycle_group_a = cfg.range_group_id + 1000;
     const lifecycle_group_b = cfg.range_group_id + 1001;
-    try metadataVoprStartFollowerPartition(cluster, state);
+    try metadataVoprStartFollowerPartition(cluster, &driver.state);
     try metadataVoprCreateActiveTable(cluster, &lifecycle, lifecycle_table_id, "vopr-life", lifecycle_group_a, 2, 64);
     const drop_leader_index = try metadataVoprLeaderIndex(cluster);
     const drop_summary = try lifecycle.dropTable(&cluster.node(drop_leader_index), lifecycle_table_id);
     try std.testing.expectEqual(@as(usize, 1), drop_summary.table_removals);
-    try metadataVoprHealAll(cluster, state);
+    try metadataVoprHealAll(cluster, &driver.state);
     try std.testing.expect(try cluster.waitForGroupStatus(lifecycle_group_a, .absent, 64));
     try metadataVoprCreateActiveTable(cluster, &lifecycle, lifecycle_table_id, "vopr-life", lifecycle_group_b, 2, 64);
     try std.testing.expect(try cluster.waitForGroupStatusCount(lifecycle_group_b, .active, 2, 64));
-    try metadataVoprRunRandomTransportActions(cluster, random, cfg, state, operation_index, phase_fault_actions);
-    try metadataVoprHealAll(cluster, state);
+    try driver.runActions(phase_fault_actions);
+    try metadataVoprHealAll(cluster, &driver.state);
 
     var churn_workflow = metadata_table_workflow.TableWorkflow.init(cluster.alloc);
     defer churn_workflow.deinit();
@@ -5637,8 +6094,8 @@ fn metadataVoprRunExpandedLivenessWorkload(
     ));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, churn_group_id, .active, 64));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(2, churn_group_id, .active, 64));
-    try metadataVoprRunRandomTransportActions(cluster, random, cfg, state, operation_index, phase_fault_actions);
-    try metadataVoprHealAll(cluster, state);
+    try driver.runActions(phase_fault_actions);
+    try metadataVoprHealAll(cluster, &driver.state);
 
     var merge_workflow = metadata_table_workflow.TableWorkflow.init(cluster.alloc);
     defer merge_workflow.deinit();
@@ -5652,7 +6109,7 @@ fn metadataVoprRunExpandedLivenessWorkload(
         .start_key = "doc:a",
         .end_key = "doc:m",
     }};
-    try metadataVoprStartFollowerLinkPartition(cluster, state);
+    try metadataVoprStartFollowerLinkPartition(cluster, &driver.state);
     _ = try metadataVoprCreateTableWithRanges(cluster, &merge_workflow, .{
         .table_id = merge_table_id,
         .name = "vopr-merge",
@@ -5677,29 +6134,29 @@ fn metadataVoprRunExpandedLivenessWorkload(
         .allow_doc_identity_reassignment = true,
     });
     try std.testing.expectEqual(@as(usize, 1), merge_summary.merge_upserts);
-    try metadataVoprHealAll(cluster, state);
+    try metadataVoprHealAll(cluster, &driver.state);
     var merge_ctx = MetadataMergeTransitionProgressContext{ .transition_id = merge_transition_id };
     try cluster.assertProgress("metadata-vopr-merge-progress", 48, &merge_ctx, metadataMergeTransitionProgressPredicate);
-    try metadataVoprRunRandomTransportActions(cluster, random, cfg, state, operation_index, phase_fault_actions);
-    try metadataVoprHealAll(cluster, state);
+    try driver.runActions(phase_fault_actions);
+    try metadataVoprHealAll(cluster, &driver.state);
 
     const topo_leader_index = try metadataVoprLeaderIndex(cluster);
-    try metadataVoprStartFollowerLinkPartition(cluster, state);
+    try metadataVoprStartFollowerLinkPartition(cluster, &driver.state);
     try cluster.node(topo_leader_index).upsertNode(.{ .node_id = 3, .role = "maintenance" });
     try cluster.node(topo_leader_index).upsertStore(.{ .store_id = 3, .node_id = 3, .role = "data", .live = false });
-    try metadataVoprHealAll(cluster, state);
+    try metadataVoprHealAll(cluster, &driver.state);
     var store_down_ctx = VoprStoreLiveProgressContext{ .store_id = 3, .expected_live = false };
     try cluster.assertProgress("metadata-vopr-store-down", 32, &store_down_ctx, voprStoreLiveProgressPredicate);
     try cluster.node(try metadataVoprLeaderIndex(cluster)).upsertNode(.{ .node_id = 3, .role = "data" });
     try cluster.node(try metadataVoprLeaderIndex(cluster)).upsertStore(.{ .store_id = 3, .node_id = 3, .role = "data", .live = true });
     var store_up_ctx = VoprStoreLiveProgressContext{ .store_id = 3, .expected_live = true };
     try cluster.assertProgress("metadata-vopr-store-up", 32, &store_up_ctx, voprStoreLiveProgressPredicate);
-    try metadataVoprRunRandomTransportActions(cluster, random, cfg, state, operation_index, phase_fault_actions);
-    try metadataVoprHealAll(cluster, state);
+    try driver.runActions(phase_fault_actions);
+    try metadataVoprHealAll(cluster, &driver.state);
 
     const split_leader_index = try metadataVoprLeaderIndex(cluster);
     try reportSplitCandidateStatus(cluster.node(split_leader_index), cfg.range_group_id, 256, 180, "doc:m");
-    try metadataVoprStartFollowerPartition(cluster, state);
+    try metadataVoprStartFollowerPartition(cluster, &driver.state);
     const split_summary = try workflow.requestSplit(&cluster.node(split_leader_index), .{
         .transition_id = cfg.split_transition_id,
         .table_id = cfg.table_id,
@@ -5709,13 +6166,13 @@ fn metadataVoprRunExpandedLivenessWorkload(
     });
     try std.testing.expectEqual(@as(usize, 1), split_summary.split_admissions);
     try cluster.restartNode(split_leader_index);
-    try metadataVoprHealAll(cluster, state);
+    try metadataVoprHealAll(cluster, &driver.state);
     _ = try metadataVoprLeaderIndex(cluster);
     var split_ctx = MetadataSplitTransitionProgressContext{ .transition_id = cfg.split_transition_id };
     try cluster.assertProgress("metadata-vopr-restart-split-progress", 64, &split_ctx, metadataSplitTransitionProgressPredicate);
 
-    try metadataVoprStartFollowerLinkPartition(cluster, state);
-    try metadataVoprHealAll(cluster, state);
+    try metadataVoprStartFollowerLinkPartition(cluster, &driver.state);
+    try metadataVoprHealAll(cluster, &driver.state);
     const shutdown_leader_index = try metadataVoprLeaderIndex(cluster);
     const shutdown_node_id = metadataVoprNodeId(cluster, (shutdown_leader_index + 1) % cluster.cluster.nodes.len);
     var drain_ctx = VoprStoreDrainProgressContext{ .store_id = shutdown_node_id, .expected_drain_requested = true };
@@ -5724,14 +6181,53 @@ fn metadataVoprRunExpandedLivenessWorkload(
         reportMetadataVoprDrainState(cluster, shutdown_node_id);
         return err;
     };
-    try metadataVoprRunRandomTransportActions(cluster, random, cfg, state, operation_index, phase_fault_actions);
-    try metadataVoprHealAll(cluster, state);
+    try driver.runActions(phase_fault_actions);
+    try metadataVoprHealAll(cluster, &driver.state);
     try cluster.assertProgress("metadata-vopr-store-drain-requested", 48, &drain_ctx, voprStoreDrainProgressPredicate);
 }
 
-fn runMetadataVoprCampaign(alloc: std.mem.Allocator, cfg: MetadataVoprCampaignConfig) !void {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+const MetadataVoprScratch = struct {
+    alloc: std.mem.Allocator,
+    io_impl: *std.Io.Threaded,
+    sub_path: []u8,
+
+    fn init(alloc: std.mem.Allocator) !MetadataVoprScratch {
+        const io_impl = try alloc.create(std.Io.Threaded);
+        errdefer alloc.destroy(io_impl);
+        io_impl.* = std.Io.Threaded.init(alloc, .{});
+        errdefer io_impl.deinit();
+        var random_bytes: [12]u8 = undefined;
+        io_impl.io().random(&random_bytes);
+        var encoded: [std.base64.url_safe.Encoder.calcSize(random_bytes.len)]u8 = undefined;
+        _ = std.base64.url_safe.Encoder.encode(&encoded, &random_bytes);
+        const sub_path = try alloc.dupe(u8, &encoded);
+        errdefer alloc.free(sub_path);
+        const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{sub_path});
+        defer alloc.free(path);
+        try std.Io.Dir.cwd().createDirPath(io_impl.io(), path);
+        return .{ .alloc = alloc, .io_impl = io_impl, .sub_path = sub_path };
+    }
+
+    fn deinit(self: *MetadataVoprScratch) void {
+        const path = std.fmt.allocPrint(self.alloc, ".zig-cache/tmp/{s}", .{self.sub_path}) catch null;
+        if (path) |owned_path| {
+            std.Io.Dir.cwd().deleteTree(self.io_impl.io(), owned_path) catch {};
+            self.alloc.free(owned_path);
+        }
+        self.alloc.free(self.sub_path);
+        self.io_impl.deinit();
+        self.alloc.destroy(self.io_impl);
+        self.* = undefined;
+    }
+};
+
+pub fn runMetadataVoprCampaignWithChoices(
+    alloc: std.mem.Allocator,
+    cfg: MetadataVoprCampaignConfig,
+    source: vopr.choice.Source,
+) !vopr.trace.Trace {
+    var scratch = try MetadataVoprScratch.init(alloc);
+    defer scratch.deinit();
 
     var store_a = raft_engine.core.MemoryStorage.init(alloc);
     defer store_a.deinit();
@@ -5744,17 +6240,17 @@ fn runMetadataVoprCampaign(alloc: std.mem.Allocator, cfg: MetadataVoprCampaignCo
     var factory_b = TestDescriptorFactory{ .alloc = alloc, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = alloc, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-a", .{ tmp.sub_path, cfg.seed });
+    const root_a = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-a", .{ scratch.sub_path, cfg.seed });
     defer alloc.free(root_a);
-    const root_b = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-b", .{ tmp.sub_path, cfg.seed });
+    const root_b = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-b", .{ scratch.sub_path, cfg.seed });
     defer alloc.free(root_b);
-    const root_c = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-c", .{ tmp.sub_path, cfg.seed });
+    const root_c = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-c", .{ scratch.sub_path, cfg.seed });
     defer alloc.free(root_c);
-    const cat_a = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-a.txt", .{ tmp.sub_path, cfg.seed });
+    const cat_a = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-a.txt", .{ scratch.sub_path, cfg.seed });
     defer alloc.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-b.txt", .{ tmp.sub_path, cfg.seed });
+    const cat_b = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-b.txt", .{ scratch.sub_path, cfg.seed });
     defer alloc.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-c.txt", .{ tmp.sub_path, cfg.seed });
+    const cat_c = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-c.txt", .{ scratch.sub_path, cfg.seed });
     defer alloc.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
@@ -5774,19 +6270,163 @@ fn runMetadataVoprCampaign(alloc: std.mem.Allocator, cfg: MetadataVoprCampaignCo
 
     _ = try startBootstrappedMetadataCluster(&cluster, 48, true);
 
-    var prng = std.Random.DefaultPrng.init(cfg.seed);
-    const random = prng.random();
-    var campaign_state = MetadataVoprCampaignState{};
-    var operation_index: usize = 0;
+    var driver = try MetadataVoprDriver.init(alloc, &cluster, cfg, source);
+    defer driver.deinit();
     if (cfg.workload == .smoke) {
-        try metadataVoprRunRandomTransportActions(&cluster, random, cfg, &campaign_state, &operation_index, cfg.operation_count);
-        try metadataVoprHealAll(&cluster, &campaign_state);
+        try driver.runActions(cfg.operation_count);
+        try metadataVoprHealAll(&cluster, &driver.state);
     }
-    metadataVoprRunLivenessWorkload(&cluster, cfg, random, &campaign_state, &operation_index) catch |err| {
+    metadataVoprRunLivenessWorkload(&cluster, cfg, &driver) catch |err| {
         metadataVoprReportFailure(cfg, null, null, err);
         return err;
     };
-    try metadataVoprHealAll(&cluster, &campaign_state);
+    try metadataVoprHealAll(&cluster, &driver.state);
+    // Heal hostile faults, then permit only node/message/time transitions. The
+    // bounded quiet suffix is itself part of the decision trace and is checked
+    // by an eventually-after-quiescence property.
+    try driver.beginQuietSuffix(12);
+    return try driver.finish();
+}
+
+pub fn recordMetadataVoprCampaign(alloc: std.mem.Allocator, cfg: MetadataVoprCampaignConfig) !vopr.trace.Trace {
+    var seeded = vopr.choice.Seeded.init(cfg.seed);
+    return try runMetadataVoprCampaignWithChoices(alloc, cfg, seeded.source());
+}
+
+pub fn replayMetadataVoprCampaign(alloc: std.mem.Allocator, recorded: *const vopr.trace.Trace) !vopr.trace.Trace {
+    const cfg = try MetadataVoprCampaignConfig.fromTrace(recorded);
+    var replay_source = vopr.choice.Replay{ .records = recorded.choices.items };
+    var replayed = try runMetadataVoprCampaignWithChoices(alloc, cfg, replay_source.source());
+    errdefer replayed.deinit();
+    const expected = try recorded.renderAlloc(alloc);
+    defer alloc.free(expected);
+    const actual = try replayed.renderAlloc(alloc);
+    defer alloc.free(actual);
+    if (!std.mem.eql(u8, expected, actual)) return error.MetadataVoprReplayArtifactDiverged;
+    return replayed;
+}
+
+pub const MetadataVoprReduction = struct {
+    artifact: vopr.trace.Trace,
+    original_transitions: u64,
+    reduced_transitions: u64,
+    target_fingerprint: u64,
+    attempts: u64,
+
+    pub fn deinit(self: *MetadataVoprReduction) void {
+        self.artifact.deinit();
+        self.* = undefined;
+    }
+};
+
+pub fn reduceMetadataVoprCampaign(
+    alloc: std.mem.Allocator,
+    recorded: *const vopr.trace.Trace,
+    max_attempts: u64,
+) !MetadataVoprReduction {
+    if (max_attempts == 0) return error.InvalidReductionAttemptBudget;
+    const target = if (recorded.failures.items.len > 0) recorded.failures.items[0].fingerprint else return error.FailingTraceRequired;
+    var proof = try replayMetadataVoprCampaign(alloc, recorded);
+    proof.deinit();
+    var current = try cloneMetadataTrace(alloc, recorded);
+    errdefer current.deinit();
+    const original_count = current.summary.?.transitions;
+    var attempts: u64 = 0;
+
+    // First shrink the generated workload budget. The fixed final decision is
+    // retained explicitly so every candidate still includes the quiet
+    // workload and final observation checkpoint.
+    var cfg = try MetadataVoprCampaignConfig.fromTrace(&current);
+    if (cfg.workload == .smoke) {
+        var candidate_count = cfg.operation_count;
+        while (candidate_count > 0 and attempts < max_attempts) {
+            candidate_count -= 1;
+            attempts += 1;
+            const quiet_suffix_choices = 12;
+            const selections = try alloc.alloc(u64, candidate_count + quiet_suffix_choices);
+            defer alloc.free(selections);
+            for (current.choices.items[0..candidate_count], selections[0..candidate_count]) |record, *selection| selection.* = record.selected_id;
+            const current_quiet = current.choices.items[current.choices.items.len - quiet_suffix_choices ..];
+            for (current_quiet, selections[candidate_count..]) |record, *selection| selection.* = record.selected_id;
+            var scripted = vopr.choice.Scripted{ .selections = selections };
+            var candidate_cfg = cfg;
+            candidate_cfg.operation_count = candidate_count;
+            var candidate = runMetadataVoprCampaignWithChoices(alloc, candidate_cfg, scripted.source()) catch continue;
+            defer candidate.deinit();
+            if (!metadataTraceHasFingerprint(&candidate, target)) continue;
+            var exact = replayMetadataVoprCampaign(alloc, &candidate) catch continue;
+            exact.deinit();
+            const replacement = try cloneMetadataTrace(alloc, &candidate);
+            current.deinit();
+            current = replacement;
+            cfg = candidate_cfg;
+        }
+    }
+
+    // Then simplify individual scheduling/fault choices while preserving the
+    // target. Equal-length candidates must be lexicographically smaller, which
+    // makes the pass convergent and deterministic.
+    var changed = true;
+    while (changed and attempts < max_attempts) {
+        changed = false;
+        var choice_index = current.choices.items.len;
+        while (choice_index > 0 and attempts < max_attempts) {
+            choice_index -= 1;
+            const record = current.choices.items[choice_index];
+            for (record.enabled_ids) |alternative| {
+                if (alternative == record.selected_id or attempts == max_attempts) continue;
+                attempts += 1;
+                var mutating = vopr.choice.Mutating.init(current.choices.items, choice_index, alternative, 0x6d65_7461_7265_6475 +% attempts);
+                var candidate = runMetadataVoprCampaignWithChoices(alloc, cfg, mutating.source()) catch continue;
+                defer candidate.deinit();
+                if (!metadataTraceHasFingerprint(&candidate, target)) continue;
+                if (!try metadataTraceSimpler(alloc, &candidate, &current)) continue;
+                var exact = replayMetadataVoprCampaign(alloc, &candidate) catch continue;
+                exact.deinit();
+                const replacement = try cloneMetadataTrace(alloc, &candidate);
+                current.deinit();
+                current = replacement;
+                changed = true;
+                break;
+            }
+            if (changed) break;
+        }
+    }
+
+    return .{
+        .artifact = current,
+        .original_transitions = original_count,
+        .reduced_transitions = current.summary.?.transitions,
+        .target_fingerprint = target,
+        .attempts = attempts,
+    };
+}
+
+fn metadataTraceHasFingerprint(artifact: *const vopr.trace.Trace, target: u64) bool {
+    for (artifact.failures.items) |failure| if (failure.fingerprint == target) return true;
+    return false;
+}
+
+fn cloneMetadataTrace(alloc: std.mem.Allocator, artifact: *const vopr.trace.Trace) !vopr.trace.Trace {
+    const bytes = try artifact.renderAlloc(alloc);
+    defer alloc.free(bytes);
+    return try vopr.trace.parseAlloc(alloc, bytes);
+}
+
+fn metadataTraceSimpler(alloc: std.mem.Allocator, candidate: *const vopr.trace.Trace, current: *const vopr.trace.Trace) !bool {
+    if (candidate.summary.?.transitions != current.summary.?.transitions) return candidate.summary.?.transitions < current.summary.?.transitions;
+    const candidate_bytes = try candidate.renderAlloc(alloc);
+    defer alloc.free(candidate_bytes);
+    const current_bytes = try current.renderAlloc(alloc);
+    defer alloc.free(current_bytes);
+    return std.mem.lessThan(u8, candidate_bytes, current_bytes);
+}
+
+fn runMetadataVoprCampaign(alloc: std.mem.Allocator, cfg: MetadataVoprCampaignConfig) !void {
+    var recorded = try recordMetadataVoprCampaign(alloc, cfg);
+    defer recorded.deinit();
+    var replayed = try replayMetadataVoprCampaign(alloc, &recorded);
+    defer replayed.deinit();
 }
 
 test "metadata VOPR seeded smoke campaign" {

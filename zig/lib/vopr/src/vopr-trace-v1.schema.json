@@ -36,7 +36,7 @@
     "config": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "seed", "transition_budget", "resource_budget", "fixture_hashes", "feature_flags", "backend_ids"],
+      "required": ["type", "seed", "transition_budget", "resource_budget", "fixture_hashes", "feature_flags", "backend_ids", "scenario_parameters"],
       "properties": {
         "type": { "const": "config" },
         "seed": { "oneOf": [{ "$ref": "#/$defs/u64" }, { "type": "null" }] },
@@ -44,7 +44,20 @@
         "resource_budget": { "$ref": "#/$defs/u64" },
         "fixture_hashes": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/u64" } },
         "feature_flags": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/u64" } },
-        "backend_ids": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/u64" } }
+        "backend_ids": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/u64" } },
+        "scenario_parameters": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "name", "value"],
+            "properties": {
+              "id": { "$ref": "#/$defs/u64" },
+              "name": { "type": "string", "minLength": 1 },
+              "value": { "type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807 }
+            }
+          }
+        }
       }
     },
     "choice": {
@@ -63,13 +76,17 @@
     "transition": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "index", "id", "name", "kind"],
+      "required": ["type", "index", "id", "name", "kind", "actor_id", "resource_id", "parameter", "payload_digest"],
       "properties": {
         "type": { "const": "transition" },
         "index": { "type": "integer", "minimum": 1 },
         "id": { "$ref": "#/$defs/u64" },
         "name": { "type": "string", "minLength": 1 },
-        "kind": { "enum": ["scheduler", "workload", "fault", "maintenance", "quiescence"] }
+        "kind": { "enum": ["scheduler", "workload", "fault", "maintenance", "quiescence"] },
+        "actor_id": { "oneOf": [{ "$ref": "#/$defs/u64" }, { "type": "null" }] },
+        "resource_id": { "oneOf": [{ "$ref": "#/$defs/u64" }, { "type": "null" }] },
+        "parameter": { "type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807 },
+        "payload_digest": { "$ref": "#/$defs/u64" }
       }
     },
     "fault": {

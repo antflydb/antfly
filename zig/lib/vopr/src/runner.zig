@@ -20,6 +20,7 @@ pub const Config = struct {
     fixture_hashes: []const u64 = &.{},
     feature_flags: []const ids.StableId = &.{},
     backend_ids: []const ids.StableId = &.{},
+    scenario_parameters: []const trace.Parameter = &.{},
     source_revision: []const u8 = "unknown",
     target: []const u8 = "native",
     optimize: []const u8 = "unknown",
@@ -57,6 +58,7 @@ pub fn run(
         .fixture_hashes = config.fixture_hashes,
         .feature_flags = config.feature_flags,
         .backend_ids = config.backend_ids,
+        .scenario_parameters = config.scenario_parameters,
     });
     errdefer result.deinit();
 
@@ -102,6 +104,10 @@ pub fn run(
             .id = selected_transition.id,
             .name = selected_transition.name,
             .kind = selected_transition.kind,
+            .actor_id = selected_transition.actor_id,
+            .resource_id = selected_transition.resource_id,
+            .parameter = selected_transition.parameter,
+            .payload_digest = selected_transition.payloadDigest(),
         });
         if (selected_transition.kind == .fault) {
             try result.addFault(.{

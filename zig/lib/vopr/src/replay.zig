@@ -25,6 +25,7 @@ pub fn exact(comptime Scenario: type, allocator: std.mem.Allocator, recorded: *c
         .fixture_hashes = recorded.config.fixture_hashes,
         .feature_flags = recorded.config.feature_flags,
         .backend_ids = recorded.config.backend_ids,
+        .scenario_parameters = recorded.config.scenario_parameters,
         .source_revision = recorded.header.source_revision,
         .target = recorded.header.target,
         .optimize = recorded.header.optimize,

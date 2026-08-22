@@ -20,6 +20,16 @@ pub const Header = struct {
     optimize: []const u8 = "unknown",
 };
 
+pub const Parameter = struct {
+    id: ids.StableId,
+    name: []const u8,
+    value: i64,
+
+    pub fn named(name: []const u8, value: i64) Parameter {
+        return .{ .id = ids.stable("parameter", name), .name = name, .value = value };
+    }
+};
+
 pub const Config = struct {
     seed: ?u64 = null,
     transition_budget: u64,
@@ -27,6 +37,7 @@ pub const Config = struct {
     fixture_hashes: []const u64 = &.{},
     feature_flags: []const ids.StableId = &.{},
     backend_ids: []const ids.StableId = &.{},
+    scenario_parameters: []const Parameter = &.{},
 };
 
 pub const ChoiceRecord = struct {
@@ -42,6 +53,10 @@ pub const TransitionRecord = struct {
     id: ids.StableId,
     name: []const u8,
     kind: transition.Kind,
+    actor_id: ?ids.StableId = null,
+    resource_id: ?ids.StableId = null,
+    parameter: i64 = 0,
+    payload_digest: u64 = 0,
 };
 
 pub const FaultPhase = enum { start, end, pulse };
@@ -126,6 +141,18 @@ pub const Trace = struct {
         errdefer allocator.free(feature_flags);
         const backend_ids = try allocator.dupe(ids.StableId, config.backend_ids);
         errdefer allocator.free(backend_ids);
+        const scenario_parameters = try allocator.alloc(Parameter, config.scenario_parameters.len);
+        errdefer allocator.free(scenario_parameters);
+        var initialized_parameters: usize = 0;
+        errdefer for (scenario_parameters[0..initialized_parameters]) |parameter| allocator.free(parameter.name);
+        for (config.scenario_parameters, 0..) |parameter, index| {
+            scenario_parameters[index] = .{
+                .id = parameter.id,
+                .name = try allocator.dupe(u8, parameter.name),
+                .value = parameter.value,
+            };
+            initialized_parameters += 1;
+        }
         return .{
             .allocator = allocator,
             .header = .{
@@ -143,6 +170,7 @@ pub const Trace = struct {
                 .fixture_hashes = fixture_hashes,
                 .feature_flags = feature_flags,
                 .backend_ids = backend_ids,
+                .scenario_parameters = scenario_parameters,
             },
         };
     }
@@ -156,6 +184,8 @@ pub const Trace = struct {
         self.allocator.free(self.config.fixture_hashes);
         self.allocator.free(self.config.feature_flags);
         self.allocator.free(self.config.backend_ids);
+        for (self.config.scenario_parameters) |parameter| self.allocator.free(parameter.name);
+        self.allocator.free(self.config.scenario_parameters);
         for (self.choices.items) |record| {
             self.allocator.free(record.site_name);
             self.allocator.free(record.enabled_ids);
@@ -199,7 +229,16 @@ pub const Trace = struct {
     pub fn addTransition(self: *Trace, record: TransitionRecord) !void {
         const name = try self.allocator.dupe(u8, record.name);
         errdefer self.allocator.free(name);
-        try self.transitions.append(self.allocator, .{ .index = record.index, .id = record.id, .name = name, .kind = record.kind });
+        try self.transitions.append(self.allocator, .{
+            .index = record.index,
+            .id = record.id,
+            .name = name,
+            .kind = record.kind,
+            .actor_id = record.actor_id,
+            .resource_id = record.resource_id,
+            .parameter = record.parameter,
+            .payload_digest = record.payload_digest,
+        });
     }
 
     pub fn addFault(self: *Trace, record: FaultRecord) !void {
@@ -270,6 +309,12 @@ pub const Trace = struct {
         try ids.validateCanonical(self.config.fixture_hashes);
         try ids.validateCanonical(self.config.feature_flags);
         try ids.validateCanonical(self.config.backend_ids);
+        var prior_parameter_id: ids.StableId = 0;
+        for (self.config.scenario_parameters, 0..) |parameter, index| {
+            if (parameter.id == 0 or parameter.name.len == 0) return error.InvalidScenarioParameter;
+            if (index > 0 and parameter.id <= prior_parameter_id) return error.NonCanonicalScenarioParameters;
+            prior_parameter_id = parameter.id;
+        }
         var expected_index: u64 = 1;
         for (self.transitions.items) |record| {
             if (record.index != expected_index) return error.NonCanonicalTransitionIndex;
@@ -357,6 +402,7 @@ pub const Trace = struct {
             .fixture_hashes = self.config.fixture_hashes,
             .feature_flags = self.config.feature_flags,
             .backend_ids = self.config.backend_ids,
+            .scenario_parameters = self.config.scenario_parameters,
         });
         for (self.choices.items) |record| try appendJsonLine(allocator, &out, ChoiceWire.from(record));
         for (self.transitions.items) |record| try appendJsonLine(allocator, &out, TransitionWire.from(record));
@@ -389,6 +435,7 @@ const ConfigWire = struct {
     fixture_hashes: []const u64,
     feature_flags: []const u64,
     backend_ids: []const u64,
+    scenario_parameters: []const Parameter,
 };
 const ChoiceWire = struct {
     type: []const u8 = "choice",
@@ -407,8 +454,21 @@ const TransitionWire = struct {
     id: u64,
     name: []const u8,
     kind: transition.Kind,
+    actor_id: ?u64,
+    resource_id: ?u64,
+    parameter: i64,
+    payload_digest: u64,
     fn from(record: TransitionRecord) TransitionWire {
-        return .{ .index = record.index, .id = record.id, .name = record.name, .kind = record.kind };
+        return .{
+            .index = record.index,
+            .id = record.id,
+            .name = record.name,
+            .kind = record.kind,
+            .actor_id = record.actor_id,
+            .resource_id = record.resource_id,
+            .parameter = record.parameter,
+            .payload_digest = record.payload_digest,
+        };
     }
 };
 const FaultWire = struct {
@@ -512,6 +572,7 @@ pub fn parseAlloc(allocator: std.mem.Allocator, encoded: []const u8) !Trace {
         .fixture_hashes = parsed_config.value.fixture_hashes,
         .feature_flags = parsed_config.value.feature_flags,
         .backend_ids = parsed_config.value.backend_ids,
+        .scenario_parameters = parsed_config.value.scenario_parameters,
     });
     errdefer result.deinit();
 
@@ -533,7 +594,16 @@ pub fn parseAlloc(allocator: std.mem.Allocator, encoded: []const u8) !Trace {
         } else if (std.mem.eql(u8, record_type, "transition")) {
             var parsed = try std.json.parseFromSlice(TransitionWire, allocator, line, .{ .ignore_unknown_fields = false });
             defer parsed.deinit();
-            try result.addTransition(.{ .index = parsed.value.index, .id = parsed.value.id, .name = parsed.value.name, .kind = parsed.value.kind });
+            try result.addTransition(.{
+                .index = parsed.value.index,
+                .id = parsed.value.id,
+                .name = parsed.value.name,
+                .kind = parsed.value.kind,
+                .actor_id = parsed.value.actor_id,
+                .resource_id = parsed.value.resource_id,
+                .parameter = parsed.value.parameter,
+                .payload_digest = parsed.value.payload_digest,
+            });
         } else if (std.mem.eql(u8, record_type, "fault")) {
             var parsed = try std.json.parseFromSlice(FaultWire, allocator, line, .{ .ignore_unknown_fields = false });
             defer parsed.deinit();

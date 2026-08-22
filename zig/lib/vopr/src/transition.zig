@@ -26,6 +26,11 @@ pub const Transition = struct {
             lhs.resource_id == rhs.resource_id and
             lhs.parameter == rhs.parameter;
     }
+
+    pub fn payloadDigest(self: Transition) u64 {
+        const actors = ids.derive("transition.payload.actors", self.actor_id orelse 0, self.resource_id orelse 0);
+        return ids.derive("transition.payload", actors, @bitCast(self.parameter));
+    }
 };
 
 pub const List = struct {

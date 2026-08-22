@@ -98,6 +98,7 @@ fn runnerConfig(artifact: *const trace.Trace) runner.Config {
         .fixture_hashes = artifact.config.fixture_hashes,
         .feature_flags = artifact.config.feature_flags,
         .backend_ids = artifact.config.backend_ids,
+        .scenario_parameters = artifact.config.scenario_parameters,
         .source_revision = artifact.header.source_revision,
         .target = artifact.header.target,
         .optimize = artifact.header.optimize,

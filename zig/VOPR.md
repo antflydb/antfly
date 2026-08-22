@@ -1,6 +1,6 @@
 # VOPR: Deterministic Autonomous Simulation for Antfly
 
-Status: proposed design
+Status: implementation in progress; Phases 0, 0.5, and 1 complete
 
 Scope: Zig Antfly simulation, VOPR, modeled-storage, and chaos tests
 
@@ -1628,6 +1628,25 @@ adapter.
 Exit condition: current VOPR behavior is preserved, but any generated history
 can be replayed from a trace.
 
+#### Phase 1 implementation (2026-08-22)
+
+Phase 1 is implemented for the existing smoke and expanded metadata campaigns.
+The transport campaign no longer draws opaque actions and parameters directly
+from a test-local PRNG. It enumerates canonical concrete alternatives for node
+rounds, selected queued messages, time advancement, exact link and node
+partitions, one-shot transport faults, healing, and node restart, then consumes
+them through `vopr.choice.Source`.
+
+Every history records the full enabled set and selection plus atomic transition
+payload identity, fault lifecycle, consequence event, semantic observation,
+and the named leader-uniqueness and index-monotonicity properties. Scenario
+parameters such as metadata IDs, workload tier, and operation budget are part
+of the v1 artifact, so replay requires no out-of-band test configuration.
+Both existing build aliases remain wrappers; each records a history, rebuilds
+a fresh three-node cluster, consumes `choice.Replay`, and byte-compares the
+complete canonical artifact. The standalone `sim-run` and `sim-replay` build
+steps exercise the same non-test entry points and scratch-directory lifecycle.
+
 ### Phase 2: Atomic Scheduler and Properties
 
 - implement `SimRuntime` task and timer queues behind the Phase 0.5 contracts
@@ -1654,10 +1673,17 @@ receive only `Runtime`; only the scheduler receives `SchedulerPort`.
 before execution. It rejects a scenario whose enumeration has side effects or
 whose selected transition changes during selection. `choice.Mutating` now
 provides clean-world prefix replay, a structured branch at one decision, and a
-seeded suffix. These pieces satisfy the generic portion of Phase 2, but Phase 2
-is not complete until the Antfly metadata world exposes individual network
-messages and node rounds through this kernel and its recovery invariants are
-registered as named properties.
+seeded suffix.
+
+The Antfly metadata adapter now exposes individual node rounds, virtual-time
+advancement, and selected queued-message delivery, drop, and duplication. The
+virtual network provides a side-effect-free canonical message snapshot and
+exact message operations with stable logical sequence IDs and payload digests.
+A bounded quiet suffix disables hostile fault choices and evaluates the named
+`metadata.eventually_recovers_after_quiescence` property. Phase 2 remains open
+for budgeted overlapping lifecycle faults and for moving additional production
+background services onto `SimRuntime` instead of their current manual domain
+runtimes.
 
 ### Phase 3: Coverage, Corpus, and Reduction
 
@@ -1685,9 +1711,19 @@ choices, and retains novel or failing histories.
 replacements from a clean world, accepts only strictly simpler artifacts with
 the same failure fingerprint, and exact-replays every accepted result. Its
 meta-test injects a named property bug and reduces a three-transition history
-to one transition. Phase 3 remains open for Antfly artifact directories,
-failure promotion, the standalone CLI, richer fault/workload deletion passes,
-and campaign reports integrated with metadata.
+to one transition.
+
+The Antfly CLI now exposes distinct `sim-campaign`, `sim-reduce`, and
+`sim-promote` workflows in addition to run and replay. Campaign workers execute
+independent deterministic histories in parallel, merge stable semantic
+coverage under a mutex, and retain novel or failing artifacts under the chosen
+artifact directory. Metadata reduction first shrinks the generated workload
+budget and then performs same-fingerprint structured scheduling/fault
+substitution, exact-replaying every accepted result. Promotion refuses
+non-failing or non-replaying traces, validates fixture names, and avoids
+overwriting by default. Phase 3 remains open for richer deletion passes,
+cross-run persistent corpus queues, and an Antfly-level injected-bug meta-test
+that exercises the CLI promotion path end to end.
 
 ### Phase 4: Storage and Data Integration
 
