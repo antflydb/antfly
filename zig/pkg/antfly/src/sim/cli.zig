@@ -19,6 +19,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, argv[1], "reduce")) return reduceCommand(alloc, io, argv[2..]);
     if (std.mem.eql(u8, argv[1], "promote")) return promoteCommand(alloc, io, argv[2..]);
     if (std.mem.eql(u8, argv[1], "tla")) return tlaCommand(alloc, io, argv[2..]);
+    if (std.mem.eql(u8, argv[1], "explain")) return explainCommand(alloc, io, argv[2..]);
     return usage();
 }
 
@@ -159,6 +160,42 @@ fn countNonEmptyLines(encoded: []const u8) usize {
     return count;
 }
 
+fn explainCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    var trace_path: ?[]const u8 = null;
+    var output_path: ?[]const u8 = null;
+    var failure_ordinal: usize = 0;
+    var index: usize = 0;
+    while (index < args.len) {
+        if (std.mem.eql(u8, args[index], "--trace")) {
+            trace_path = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, args[index], "--out")) {
+            output_path = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, args[index], "--failure")) {
+            failure_ordinal = try std.fmt.parseInt(usize, try nextValue(args, &index), 10);
+        } else return error.UnknownArgument;
+        index += 1;
+    }
+    const input = trace_path orelse return error.TracePathRequired;
+    const output = output_path orelse return error.TraceOutputRequired;
+    const encoded = try std.Io.Dir.cwd().readFileAlloc(io, input, alloc, .limited(max_trace_bytes));
+    defer alloc.free(encoded);
+    var recorded = try vopr.trace.parseAlloc(alloc, encoded);
+    defer recorded.deinit();
+    var replayed = try antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, &recorded);
+    replayed.deinit();
+    var causal_report = try vopr.causal.analyzeAlloc(alloc, &recorded, failure_ordinal);
+    defer causal_report.deinit();
+    const report_bytes = try causal_report.renderAlloc(alloc);
+    defer alloc.free(report_bytes);
+    if (std.fs.path.dirname(output)) |parent| try ensureDir(io, parent);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output, .data = report_bytes });
+    std.debug.print("VOPR causal report fingerprint={x} causes={d} out={s}\n", .{
+        causal_report.failure_fingerprint,
+        causal_report.items.len,
+        output,
+    });
+}
+
 fn campaignCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     var histories: u64 = 100;
     var transitions: usize = 64;
@@ -210,8 +247,8 @@ fn campaignCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u
     for (threads) |thread| thread.join();
     if (context.first_error) |err| return err;
     std.debug.print(
-        "VOPR campaign histories={d} seeded={d} retained={d} failures={d} features={d} workers={d} artifacts={s}\n",
-        .{ histories, context.seeded_entries, context.retained, context.failures, context.coverage.hits.count(), worker_count, artifact_dir },
+        "VOPR campaign histories={d} seeded={d} retained={d} failures={d} features={d} splice_attempts={d} spliced={d} splice_rejected={d} workers={d} artifacts={s}\n",
+        .{ histories, context.seeded_entries, context.retained, context.failures, context.coverage.hits.count(), context.splice_attempts, context.spliced, context.splice_rejected, worker_count, artifact_dir },
     );
 }
 
@@ -332,6 +369,9 @@ const CampaignContext = struct {
     seeded_entries: u64 = 0,
     retained: u64 = 0,
     failures: u64 = 0,
+    splice_attempts: u64 = 0,
+    spliced: u64 = 0,
+    splice_rejected: u64 = 0,
     first_error: ?anyerror = null,
 
     fn worker(self: *@This()) void {
@@ -351,7 +391,10 @@ const CampaignContext = struct {
         const alloc = std.heap.smp_allocator;
         const seed = self.base_seed +% history_index *% 0x9e37_79b9_7f4a_7c15;
         var artifact = (try self.mutateCorpusEntry(alloc, seed)) orelse blk: {
-            const base_id = 10_000 + seed % 1_000_000;
+            // Keep semantic identities stable across a campaign. The history
+            // seed still varies scheduling, while stable IDs allow compatible
+            // observation states from independent histories to be spliced.
+            const base_id = 10_000 + self.base_seed % 1_000_000;
             break :blk try antfly.metadata_sim_harness.recordMetadataVoprCampaign(alloc, .{
                 .seed = seed,
                 .operation_count = self.transitions,
@@ -395,6 +438,13 @@ const CampaignContext = struct {
             self.mutex.unlock(self.io);
             return null;
         }
+        const should_splice = self.corpus.entries.items.len >= 2 and prng.random().uintLessThan(u8, 100) < 20;
+        self.mutex.unlock(self.io);
+        if (should_splice) {
+            if (try self.spliceCorpusEntries(alloc, &prng)) |artifact| return artifact;
+        }
+
+        try self.mutex.lock(self.io);
         const parent_index = self.corpus.select(prng.random()) catch |err| {
             self.mutex.unlock(self.io);
             return err;
@@ -446,6 +496,100 @@ const CampaignContext = struct {
             => null,
             else => return err,
         };
+    }
+
+    fn spliceCorpusEntries(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        prng: *std.Random.DefaultPrng,
+    ) !?vopr.trace.Trace {
+        try self.mutex.lock(self.io);
+        if (self.corpus.entries.items.len < 2) {
+            self.mutex.unlock(self.io);
+            return null;
+        }
+        self.splice_attempts += 1;
+        const left_index = self.corpus.select(prng.random()) catch |err| {
+            self.mutex.unlock(self.io);
+            return err;
+        };
+        var right_index = self.corpus.select(prng.random()) catch |err| {
+            self.mutex.unlock(self.io);
+            return err;
+        };
+        if (right_index == left_index) right_index = (right_index + 1) % self.corpus.entries.items.len;
+        const left_bytes = alloc.dupe(u8, self.corpus.entries.items[left_index].bytes) catch |err| {
+            self.mutex.unlock(self.io);
+            return err;
+        };
+        const right_bytes = alloc.dupe(u8, self.corpus.entries.items[right_index].bytes) catch |err| {
+            alloc.free(left_bytes);
+            self.mutex.unlock(self.io);
+            return err;
+        };
+        self.mutex.unlock(self.io);
+        defer alloc.free(left_bytes);
+        defer alloc.free(right_bytes);
+
+        var left = try vopr.trace.parseAlloc(alloc, left_bytes);
+        defer left.deinit();
+        var right = try vopr.trace.parseAlloc(alloc, right_bytes);
+        defer right.deinit();
+        if (!std.mem.eql(u8, left.header.scenario, right.header.scenario) or
+            left.header.scenario_version != right.header.scenario_version)
+        {
+            try self.recordSpliceResult(false);
+            return null;
+        }
+        const points = try vopr.splice.findPoints(alloc, &left, &right);
+        defer alloc.free(points);
+        var usable: usize = 0;
+        for (points) |point| {
+            const combined = point.left_choice_count + right.choices.items.len - point.right_choice_start;
+            // The metadata driver has a fixed operation count plus quiet
+            // suffix. Preserve its total choice count while joining states.
+            usable += @intFromBool(combined == left.choices.items.len);
+        }
+        if (usable == 0) {
+            try self.recordSpliceResult(false);
+            return null;
+        }
+        var ordinal = prng.random().uintLessThan(usize, usable);
+        const point = for (points) |candidate| {
+            const combined = candidate.left_choice_count + right.choices.items.len - candidate.right_choice_start;
+            if (combined != left.choices.items.len) continue;
+            if (ordinal == 0) break candidate;
+            ordinal -= 1;
+        } else unreachable;
+        const cfg = try antfly.metadata_sim_harness.MetadataVoprCampaignConfig.fromTrace(&left);
+        var source = try vopr.splice.Source.init(left.choices.items, right.choices.items, point);
+        var artifact = antfly.metadata_sim_harness.runMetadataVoprCampaignWithChoices(alloc, cfg, source.source()) catch |err| switch (err) {
+            error.SpliceChoiceExhausted,
+            error.SpliceChoiceSiteDiverged,
+            error.SpliceEnabledSetDiverged,
+            error.SpliceHasTrailingChoices,
+            error.ChoiceSourceSelectedDisabledAlternative,
+            => {
+                try self.recordSpliceResult(false);
+                return null;
+            },
+            else => return err,
+        };
+        errdefer artifact.deinit();
+        var replayed = try antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, &artifact);
+        replayed.deinit();
+        try self.recordSpliceResult(true);
+        return artifact;
+    }
+
+    fn recordSpliceResult(self: *@This(), accepted: bool) !void {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+        if (accepted) {
+            self.spliced += 1;
+        } else {
+            self.splice_rejected += 1;
+        }
     }
 
     fn primeCorpus(self: *@This(), alloc: std.mem.Allocator) !void {
@@ -516,6 +660,7 @@ fn usage() error{InvalidUsage} {
         \\  vopr reduce --trace <path> --out <path> [--attempts <n>]
         \\  vopr promote --trace <path> --name <fixture-name> [--force]
         \\  vopr tla --trace <path> --domain raft --out <path.ndjson>
+        \\  vopr explain --trace <path> [--failure <ordinal>] --out <path.json>
         \\
     , .{});
     return error.InvalidUsage;
@@ -553,6 +698,12 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
     formal_replay.deinit();
     try validateRaftTraceNdjson(alloc, raft_ndjson.written());
     try std.testing.expect(std.mem.indexOf(u8, raft_ndjson.written(), "\"name\":\"InitState\"") != null);
+    var causal_report = try vopr.causal.analyzeAlloc(alloc, &promoted, 0);
+    defer causal_report.deinit();
+    try std.testing.expect(causal_report.items.len > 0);
+    const causal_json = try causal_report.renderAlloc(alloc);
+    defer alloc.free(causal_json);
+    try std.testing.expect(std.mem.indexOf(u8, causal_json, "metadata.injected.overlapping_link_fault_safety") != null);
 
     const corpus_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(corpus_path);

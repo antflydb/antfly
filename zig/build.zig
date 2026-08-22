@@ -6716,6 +6716,12 @@ pub fn build(b: *std.Build) void {
     const sim_tla_step = b.step("sim-tla", "Exact-replay a VOPR artifact and export TLA+ Raft NDJSON");
     sim_tla_step.dependOn(&tla_sim_cli.step);
 
+    const explain_sim_cli = b.addRunArtifact(sim_cli);
+    explain_sim_cli.addArg("explain");
+    if (b.args) |args| explain_sim_cli.addArgs(args);
+    const sim_explain_step = b.step("sim-explain", "Exact-replay a failing VOPR artifact and render its semantic causal slice");
+    sim_explain_step.dependOn(&explain_sim_cli.step);
+
     const sim_test_step = b.step("sim-test", "Run mocked-time Antfly simulation suites");
     sim_test_step.dependOn(&run_sim_contract_tests.step);
     sim_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);

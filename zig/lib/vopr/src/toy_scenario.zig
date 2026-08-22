@@ -54,4 +54,17 @@ pub const ToyScenario = struct {
     pub fn done(world: *World) bool {
         return world.steps == 4;
     }
+
+    pub fn snapshotAlloc(world: *const World, allocator: std.mem.Allocator) ![]u8 {
+        const bytes = try allocator.alloc(u8, @sizeOf(i64) + @sizeOf(u8));
+        std.mem.writeInt(i64, bytes[0..@sizeOf(i64)], world.counter, .little);
+        bytes[@sizeOf(i64)] = world.steps;
+        return bytes;
+    }
+
+    pub fn restoreSnapshot(world: *World, bytes: []const u8, _: std.mem.Allocator) !void {
+        if (bytes.len != @sizeOf(i64) + @sizeOf(u8)) return error.InvalidToySnapshot;
+        world.counter = std.mem.readInt(i64, bytes[0..@sizeOf(i64)], .little);
+        world.steps = bytes[@sizeOf(i64)];
+    }
 };

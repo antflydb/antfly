@@ -1,6 +1,7 @@
 # VOPR: Deterministic Autonomous Simulation for Antfly
 
-Status: implementation in progress; Phases 0, 0.5, and 1 complete; Phases 2–4 partially implemented
+Status: implementation in progress; Phases 0, 0.5, and 1 complete; the Phase 4
+exit scenario is complete; Phases 2–5 have documented follow-on work
 
 Scope: Zig Antfly simulation, VOPR, modeled-storage, and chaos tests
 
@@ -1317,6 +1318,9 @@ lib/vopr/
     coverage.zig
     corpus.zig
     explorer.zig
+    splice.zig
+    snapshot.zig
+    causal.zig
     reducer.zig
     fixture.zig
 
@@ -1381,6 +1385,12 @@ zig build sim-tla -- \
   --trace /tmp/metadata-reduced.simtrace \
   --domain raft \
   --out /tmp/metadata-raft.ndjson
+
+# Exact-replay a failure and render a deterministic semantic causal slice.
+zig build sim-explain -- \
+  --trace /tmp/metadata-reduced.simtrace \
+  --failure 0 \
+  --out /tmp/metadata-causal.json
 
 # Run a bounded local campaign.
 zig build sim-campaign -- \
@@ -1468,6 +1478,14 @@ A per-failure timeline should interleave:
 - important state observation changes
 - property outcomes
 - domain trace events
+
+The initial `sim-explain` implementation emits a smaller deterministic causal
+slice rather than copying the whole timeline. It starts at the selected failure
+boundary, retains active or nearby faults and nearby client/injected-error
+outcomes, then walks backward through shared stable actor and resource IDs.
+This is explicitly a semantic debugging heuristic, not proof of causality. The
+report records each retained transition's role and the stable failure identity,
+and the command exact-replays the input before producing JSON.
 
 Verbose logs remain available but should not be required to understand the
 causal sequence.
@@ -1862,10 +1880,33 @@ and logical IDs through explicit hooks instead of copying heap pointers or OS
 resources. Checkpoints are exploration accelerators only: retained histories
 remain decision traces and must pass clean-world exact replay.
 
-Phase 5 remains open for wiring splice/checkpoint selection into long-running
-campaign workers, evaluating compiler coverage hooks, causal-report enrichment,
-and committing a benchmark that demonstrates improved states or failures per
-CPU unit without changing replay results.
+The generic campaign now chooses splicing under a bounded policy, rejects
+incompatible joins, exact-replays every successful result, and reports attempt,
+acceptance, and rejection counts. Its mutation path also selects logical
+checkpoint prefixes, re-executes and validates the prefix observation, captures
+only scenario-owned bytes, perturbs the world, restores it, validates the
+restored observation, and deduplicates the checkpoint. This deliberately proves
+the snapshot contract before using it as an execution shortcut.
+
+The long-running Antfly metadata workers also attempt splices between retained
+persistent-corpus entries. IDs for independent generated histories remain
+stable within a campaign while seeds vary scheduling; candidate joins preserve
+the metadata driver's fixed operation-plus-quiet-suffix choice count, reproduce
+the complete enabled sets, and exact-replay before retention. The campaign
+summary reports splice attempts and accepted joins.
+
+`lib/vopr/src/causal.zig` implements the actor/resource/fault semantic slice
+described above, and `zig build sim-explain` exposes it for metadata artifacts.
+The injected-bug meta-test requires the promoted trace to yield a non-empty
+causal report containing the stable property identity.
+
+Phase 5 remains open for actually resuming generic execution from a logical
+checkpoint (including reconstruction of property-tracker state), evaluating
+compiler coverage hooks, enriching causal links with domain-specific message
+and storage operation IDs, and committing a deterministic work-unit benchmark
+that demonstrates improved states or failures per CPU unit. Until that
+benchmark exists, checkpoint capture is correctness scaffolding rather than a
+claimed performance improvement.
 
 ## Risks and Mitigations
 
