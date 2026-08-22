@@ -28,6 +28,7 @@ pub const max_conjunctive_edges: usize = 64;
 pub const max_optional_patterns: usize = 64;
 pub const max_match_predicates: usize = 64;
 pub const max_match_predicate_depth: usize = 16;
+pub const max_count_aggregates: usize = 64;
 pub const default_max_explored_nodes: usize = 100_000;
 pub const default_max_explored_edges: usize = 1_000_000;
 pub const default_max_intermediate_states: usize = 100_000;
@@ -1247,6 +1248,7 @@ pub fn aggregateConjunctivePatternWithEdgeReader(
     specs: []const CountAggregateSpec,
     opts: MatchOptions,
 ) ![]CountAggregateResult {
+    if (specs.len == 0 or specs.len > max_count_aggregates) return error.InvalidArgument;
     var aggregate_opts = opts;
     aggregate_opts.max_results = 0;
     aggregate_opts.require_complete = true;
@@ -2400,6 +2402,16 @@ test "exact conjunctive aggregate does not inherit row expansion window" {
         alloc.free(aggregates);
     }
     try std.testing.expectEqual(@as(u128, targets.len), aggregates[0].value);
+
+    const too_many_specs = [_]CountAggregateSpec{.{}} ** (max_count_aggregates + 1);
+    try std.testing.expectError(error.InvalidArgument, aggregateConjunctivePatternWithEdgeReader(
+        alloc,
+        Reader{ .targets = &targets },
+        &.{"anchor"},
+        .{ .nodes = &nodes, .edges = &edges },
+        &too_many_specs,
+        .{ .max_explored_edges = 2_000, .max_intermediate_states = 2_000 },
+    ));
 }
 
 test "conjunctive matcher admits anchors before alias evaluation" {

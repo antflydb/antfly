@@ -19,6 +19,16 @@ from antfly import (  # noqa: E402
 )
 from antfly.client import normalize_base_url  # noqa: E402
 from antfly.client_generated.models.batch_request import BatchRequest  # noqa: E402
+from antfly.client_generated.models.graph_document_fuzzy_filter import (  # noqa: E402
+    GraphDocumentFuzzyFilter,
+)
+from antfly.client_generated.models.graph_document_numeric_range_filter import (  # noqa: E402
+    GraphDocumentNumericRangeFilter,
+)
+from antfly.client_generated.models.graph_document_term_filter import (  # noqa: E402
+    GraphDocumentTermFilter,
+)
+from antfly.client_generated.models.graph_match_node import GraphMatchNode  # noqa: E402
 from antfly.client_generated.models.inference_chat_message import InferenceChatMessage  # noqa: E402
 from antfly.client_generated.models.inference_generate_request import InferenceGenerateRequest  # noqa: E402
 from antfly.client_generated.models.inference_role import InferenceRole  # noqa: E402
@@ -78,6 +88,25 @@ class TestAntflyClient:
         assert request["type"] == "embeddings"
         assert request["dimension"] == 512
         assert "name" not in request
+
+    def test_graph_document_filters_parse_to_unambiguous_sdk_types(self) -> None:
+        exact = GraphMatchNode.from_dict({"filter": {"term": "beta", "field": "title"}})
+        fuzzy = GraphMatchNode.from_dict(
+            {"filter": {"term": "beta", "field": "title", "fuzziness": 1}}
+        )
+        numeric = GraphMatchNode.from_dict(
+            {"filter": {"numeric_range": {"field": "score", "min": 0.8}}}
+        )
+
+        assert isinstance(exact.filter_, GraphDocumentTermFilter)
+        assert isinstance(fuzzy.filter_, GraphDocumentFuzzyFilter)
+        assert isinstance(numeric.filter_, GraphDocumentNumericRangeFilter)
+        assert exact.to_dict()["filter"] == {"term": "beta", "field": "title"}
+        assert fuzzy.to_dict()["filter"] == {
+            "term": "beta",
+            "field": "title",
+            "fuzziness": 1,
+        }
 
     def test_min_transform_serializes_from_generated_models(self) -> None:
         request = BatchRequest(

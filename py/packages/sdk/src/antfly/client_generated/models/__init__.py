@@ -322,9 +322,25 @@ from .graph_bindings_return import GraphBindingsReturn
 from .graph_bounded_traversal_config import GraphBoundedTraversalConfig
 from .graph_bounded_traversal_config_law import GraphBoundedTraversalConfigLaw
 from .graph_count_aggregate import GraphCountAggregate
+from .graph_document_bool_field_filter import GraphDocumentBoolFieldFilter
+from .graph_document_date_range_filter import GraphDocumentDateRangeFilter
 from .graph_document_filter_boolean import GraphDocumentFilterBoolean
 from .graph_document_filter_conjunction import GraphDocumentFilterConjunction
 from .graph_document_filter_disjunction import GraphDocumentFilterDisjunction
+from .graph_document_fuzzy_filter import GraphDocumentFuzzyFilter
+from .graph_document_ids_filter import GraphDocumentIdsFilter
+from .graph_document_match_all_filter import GraphDocumentMatchAllFilter
+from .graph_document_match_all_filter_match_all import GraphDocumentMatchAllFilterMatchAll
+from .graph_document_match_none_filter import GraphDocumentMatchNoneFilter
+from .graph_document_match_none_filter_match_none import GraphDocumentMatchNoneFilterMatchNone
+from .graph_document_numeric_range_body import GraphDocumentNumericRangeBody
+from .graph_document_numeric_range_filter import GraphDocumentNumericRangeFilter
+from .graph_document_prefix_filter import GraphDocumentPrefixFilter
+from .graph_document_regexp_filter import GraphDocumentRegexpFilter
+from .graph_document_term_filter import GraphDocumentTermFilter
+from .graph_document_term_range_body import GraphDocumentTermRangeBody
+from .graph_document_term_range_filter import GraphDocumentTermRangeFilter
+from .graph_document_wildcard_filter import GraphDocumentWildcardFilter
 from .graph_identity_node_selector import GraphIdentityNodeSelector
 from .graph_index_config import GraphIndexConfig
 from .graph_index_stats import GraphIndexStats
@@ -1182,9 +1198,25 @@ __all__ = (
     "GraphBoundedTraversalConfig",
     "GraphBoundedTraversalConfigLaw",
     "GraphCountAggregate",
+    "GraphDocumentBoolFieldFilter",
+    "GraphDocumentDateRangeFilter",
     "GraphDocumentFilterBoolean",
     "GraphDocumentFilterConjunction",
     "GraphDocumentFilterDisjunction",
+    "GraphDocumentFuzzyFilter",
+    "GraphDocumentIdsFilter",
+    "GraphDocumentMatchAllFilter",
+    "GraphDocumentMatchAllFilterMatchAll",
+    "GraphDocumentMatchNoneFilter",
+    "GraphDocumentMatchNoneFilterMatchNone",
+    "GraphDocumentNumericRangeBody",
+    "GraphDocumentNumericRangeFilter",
+    "GraphDocumentPrefixFilter",
+    "GraphDocumentRegexpFilter",
+    "GraphDocumentTermFilter",
+    "GraphDocumentTermRangeBody",
+    "GraphDocumentTermRangeFilter",
+    "GraphDocumentWildcardFilter",
     "GraphIdentityNodeSelector",
     "GraphIndexConfig",
     "GraphIndexStats",

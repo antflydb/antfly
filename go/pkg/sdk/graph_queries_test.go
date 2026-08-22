@@ -9,6 +9,7 @@
 package sdk
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/antflydb/antfly/go/pkg/libaf/json"
@@ -188,6 +189,35 @@ func TestGraphConstructorsRejectSemanticErrors(t *testing.T) {
 		Return: validReturn,
 	}); err == nil {
 		t.Fatal("expected graph edge complexity budget error")
+	}
+}
+
+func TestGraphDocumentFilterUsesDiscriminatedRangeWireShape(t *testing.T) {
+	filter, err := NewGraphDocumentFilter(querydsl.NewNumericRange(1, 10, "score"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var value map[string]any
+	if err := json.Unmarshal(encoded, &value); err != nil {
+		t.Fatal(err)
+	}
+	body, ok := value["numeric_range"].(map[string]any)
+	if !ok || body["field"] != "score" || body["min"] != float64(1) || body["max"] != float64(10) {
+		t.Fatalf("unexpected graph range filter: %#v", value)
+	}
+}
+
+func TestGraphAggregateConstructorEnforcesComplexityBudget(t *testing.T) {
+	aggregates := make(map[string]GraphCountAggregate, maxGraphCountAggregates+1)
+	for i := 0; i <= maxGraphCountAggregates; i++ {
+		aggregates[fmt.Sprintf("aggregate_%d", i)] = CountGraphRows()
+	}
+	if _, err := NewGraphAggregatesReturn(aggregates); err == nil {
+		t.Fatal("expected graph aggregate complexity budget error")
 	}
 }
 

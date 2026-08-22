@@ -287,6 +287,13 @@ func TestGraphVisualizationQueryUsesAutographIndex(t *testing.T) {
 	if traverse["direction"] != "both" || traverse["max_depth"] != 1 {
 		t.Fatalf("unexpected traversal: %#v", traverse)
 	}
+	if traverse["include_documents"] != true {
+		t.Fatalf("graph traversal must hydrate visualization documents: %#v", traverse)
+	}
+	fields, ok := traverse["fields"].([]string)
+	if !ok || len(fields) != 3 || fields[0] != "title" || fields[1] != "url" || fields[2] != "metadata" {
+		t.Fatalf("unexpected graph document fields: %#v", traverse["fields"])
+	}
 }
 
 func TestBuildGraphVisualizationConvertsGraphResults(t *testing.T) {

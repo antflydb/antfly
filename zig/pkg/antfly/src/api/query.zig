@@ -119,9 +119,7 @@ fn mergeGenericSearchResultsWithRuntimeSchema(
 ) !db_mod.types.SearchResult {
     var total_hits: u32 = 0;
     var total_hits_relation: db_mod.types.TotalHitsRelation = .exact;
-    var has_graph_results = false;
     for (results) |result| {
-        if (result.graph_results.len > 0) has_graph_results = true;
         total_hits +|= result.total_hits;
         if (result.total_hits_relation == .gte) total_hits_relation = .gte;
     }
@@ -137,7 +135,7 @@ fn mergeGenericSearchResultsWithRuntimeSchema(
             if (final_hits.len > 0) alloc.free(final_hits);
         }
 
-        const graph_results = if (has_graph_results)
+        const graph_results = if (req.graph_queries.len > 0)
             try mergeGraphSearchResults(alloc, req.graph_queries, results)
         else
             @constCast((&[_]db_mod.types.GraphSearchResult{})[0..]);
@@ -220,7 +218,7 @@ fn mergeGenericSearchResultsWithRuntimeSchema(
         moved += 1;
     }
 
-    const graph_results = if (has_graph_results)
+    const graph_results = if (req.graph_queries.len > 0)
         try mergeGraphSearchResults(alloc, req.graph_queries, results)
     else
         @constCast((&[_]db_mod.types.GraphSearchResult{})[0..]);
@@ -407,14 +405,7 @@ fn mergeHierarchyUnitSearchResults(
     merged.total_hits_relation = total_hits_relation;
     merged.identity_read_generation = identity_generation;
 
-    var has_graph_results = false;
-    for (results) |result| {
-        if (result.graph_results.len > 0) {
-            has_graph_results = true;
-            break;
-        }
-    }
-    if (has_graph_results) {
+    if (req.graph_queries.len > 0) {
         const graph_results = try mergeGraphSearchResults(alloc, req.graph_queries, results);
         errdefer {
             for (graph_results) |*graph_result| graph_result.deinit(alloc);
@@ -951,7 +942,9 @@ fn mergeGraphSearchResults(
     }
 
     for (results) |result| {
+        try validateGraphAggregateQueriesForShard(queries, result.graph_results);
         for (result.graph_results) |graph_result| {
+            try validateGraphAggregateShard(queries, graph_result);
             const idx = blk: {
                 for (builders.items, 0..) |builder, i| {
                     if (std.mem.eql(u8, builder.name, graph_result.name)) break :blk i;
@@ -1045,6 +1038,46 @@ fn mergeGraphSearchResults(
         initialized += 1;
     }
     return merged;
+}
+
+fn validateGraphAggregateQueriesForShard(
+    queries: []const db_mod.types.NamedGraphQuery,
+    graph_results: []const db_mod.types.GraphSearchResult,
+) !void {
+    for (queries) |named| {
+        if (named.query.aggregates.len == 0) continue;
+        var occurrences: usize = 0;
+        for (graph_results) |graph_result| {
+            if (std.mem.eql(u8, named.name, graph_result.name)) occurrences += 1;
+        }
+        if (occurrences != 1) return error.InvalidRemoteResponse;
+    }
+}
+
+fn validateGraphAggregateShard(
+    queries: []const db_mod.types.NamedGraphQuery,
+    graph_result: db_mod.types.GraphSearchResult,
+) !void {
+    const query = blk: {
+        for (queries) |named| {
+            if (std.mem.eql(u8, named.name, graph_result.name)) break :blk named.query;
+        }
+        return error.InvalidRemoteResponse;
+    };
+    if (query.aggregates.len == 0) {
+        if (graph_result.aggregates.len != 0) return error.InvalidRemoteResponse;
+        return;
+    }
+    if (graph_result.aggregates.len != query.aggregates.len) return error.InvalidRemoteResponse;
+    for (query.aggregates) |requested| {
+        var occurrences: usize = 0;
+        for (graph_result.aggregates) |aggregate| {
+            if (!std.mem.eql(u8, requested.name, aggregate.name)) continue;
+            if (!aggregate.exact) return error.QueryCandidateBudgetExceeded;
+            occurrences += 1;
+        }
+        if (occurrences != 1) return error.InvalidRemoteResponse;
+    }
 }
 
 fn graphAggregateIsDistinct(
@@ -3318,6 +3351,66 @@ test "graph merge enforces query-wide row limit and exact distinct identity" {
     try std.testing.expect(merged[0].truncated);
     try std.testing.expectEqual(@as(u128, 2), merged[1].aggregates[0].value);
     try std.testing.expectEqual(@as(usize, 2), merged[1].aggregates[0].distinct_values.len);
+}
+
+test "graph merge rejects missing and inexact aggregate shards" {
+    const alloc = std.testing.allocator;
+    const aggregates = [_]graph_query_mod.NamedCountAggregate{.{ .name = "count", .of = "*" }};
+    const queries = [_]db_mod.types.NamedGraphQuery{.{ .name = "counted", .query = .{
+        .query_type = .pattern,
+        .index_name = "graph",
+        .start_nodes = .{ .keys = &.{} },
+        .aggregates = &aggregates,
+    } }};
+
+    var missing_graph = [_]db_mod.types.GraphSearchResult{.{
+        .name = @constCast("counted"),
+        .hits = &.{},
+        .total_hits = 0,
+    }};
+    const missing_results = [_]db_mod.types.SearchResult{.{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = &missing_graph,
+    }};
+    try std.testing.expectError(
+        error.InvalidRemoteResponse,
+        mergeGraphSearchResults(alloc, &queries, &missing_results),
+    );
+
+    const omitted_results = [_]db_mod.types.SearchResult{.{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = &.{},
+    }};
+    try std.testing.expectError(
+        error.InvalidRemoteResponse,
+        mergeGraphSearchResults(alloc, &queries, &omitted_results),
+    );
+
+    var partial = [_]db_mod.types.GraphAggregateResult{.{
+        .name = @constCast("count"),
+        .value = 1,
+        .exact = false,
+    }};
+    var partial_graph = [_]db_mod.types.GraphSearchResult{.{
+        .name = @constCast("counted"),
+        .aggregates = &partial,
+        .hits = &.{},
+        .total_hits = 0,
+    }};
+    const partial_results = [_]db_mod.types.SearchResult{.{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = &partial_graph,
+    }};
+    try std.testing.expectError(
+        error.QueryCandidateBudgetExceeded,
+        mergeGraphSearchResults(alloc, &queries, &partial_results),
+    );
 }
 
 test "query merge preserves lower-bound total relation" {

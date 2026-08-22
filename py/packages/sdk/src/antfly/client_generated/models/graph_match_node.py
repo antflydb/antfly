@@ -8,21 +8,21 @@ from attrs import define as _attrs_define
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.bool_field_query import BoolFieldQuery
-    from ..models.date_range_string_query import DateRangeStringQuery
-    from ..models.doc_id_query import DocIdQuery
-    from ..models.fuzzy_query import FuzzyQuery
+    from ..models.graph_document_bool_field_filter import GraphDocumentBoolFieldFilter
+    from ..models.graph_document_date_range_filter import GraphDocumentDateRangeFilter
     from ..models.graph_document_filter_boolean import GraphDocumentFilterBoolean
     from ..models.graph_document_filter_conjunction import GraphDocumentFilterConjunction
     from ..models.graph_document_filter_disjunction import GraphDocumentFilterDisjunction
-    from ..models.match_all_query import MatchAllQuery
-    from ..models.match_none_query import MatchNoneQuery
-    from ..models.numeric_range_query import NumericRangeQuery
-    from ..models.prefix_query import PrefixQuery
-    from ..models.regexp_query import RegexpQuery
-    from ..models.term_query import TermQuery
-    from ..models.term_range_query import TermRangeQuery
-    from ..models.wildcard_query import WildcardQuery
+    from ..models.graph_document_fuzzy_filter import GraphDocumentFuzzyFilter
+    from ..models.graph_document_ids_filter import GraphDocumentIdsFilter
+    from ..models.graph_document_match_all_filter import GraphDocumentMatchAllFilter
+    from ..models.graph_document_match_none_filter import GraphDocumentMatchNoneFilter
+    from ..models.graph_document_numeric_range_filter import GraphDocumentNumericRangeFilter
+    from ..models.graph_document_prefix_filter import GraphDocumentPrefixFilter
+    from ..models.graph_document_regexp_filter import GraphDocumentRegexpFilter
+    from ..models.graph_document_term_filter import GraphDocumentTermFilter
+    from ..models.graph_document_term_range_filter import GraphDocumentTermRangeFilter
+    from ..models.graph_document_wildcard_filter import GraphDocumentWildcardFilter
 
 
 T = TypeVar("T", bound="GraphMatchNode")
@@ -32,75 +32,78 @@ T = TypeVar("T", bound="GraphMatchNode")
 class GraphMatchNode:
     """
     Attributes:
-        filter_ (BoolFieldQuery | DateRangeStringQuery | DocIdQuery | FuzzyQuery | GraphDocumentFilterBoolean |
-            GraphDocumentFilterConjunction | GraphDocumentFilterDisjunction | MatchAllQuery | MatchNoneQuery |
-            NumericRangeQuery | PrefixQuery | RegexpQuery | TermQuery | TermRangeQuery | Unset | WildcardQuery): A non-
-            scoring stored-document predicate embedded at a graph node. It reuses the structured field-filter shapes from
-            QueryRequest.filter_query, but deliberately excludes analyzer-backed full-text clauses such as match, phrase,
-            multi_match, and query_string. Alias-to-alias predicates belong in GraphMatch.where.
+        filter_ (GraphDocumentBoolFieldFilter | GraphDocumentDateRangeFilter | GraphDocumentFilterBoolean |
+            GraphDocumentFilterConjunction | GraphDocumentFilterDisjunction | GraphDocumentFuzzyFilter |
+            GraphDocumentIdsFilter | GraphDocumentMatchAllFilter | GraphDocumentMatchNoneFilter |
+            GraphDocumentNumericRangeFilter | GraphDocumentPrefixFilter | GraphDocumentRegexpFilter |
+            GraphDocumentTermFilter | GraphDocumentTermRangeFilter | GraphDocumentWildcardFilter | Unset): A non-scoring
+            stored-document predicate embedded at a graph node. It uses structurally distinct stored-field predicates and
+            deliberately excludes analyzer-backed full-text clauses such as match, phrase, multi_match, and query_string.
+            Fuzzy predicates require an explicit fuzziness, and range predicates use numeric_range or term_range wrappers.
+            Alias-to-alias predicates belong in GraphMatch.where.
     """
 
     filter_: (
-        BoolFieldQuery
-        | DateRangeStringQuery
-        | DocIdQuery
-        | FuzzyQuery
+        GraphDocumentBoolFieldFilter
+        | GraphDocumentDateRangeFilter
         | GraphDocumentFilterBoolean
         | GraphDocumentFilterConjunction
         | GraphDocumentFilterDisjunction
-        | MatchAllQuery
-        | MatchNoneQuery
-        | NumericRangeQuery
-        | PrefixQuery
-        | RegexpQuery
-        | TermQuery
-        | TermRangeQuery
+        | GraphDocumentFuzzyFilter
+        | GraphDocumentIdsFilter
+        | GraphDocumentMatchAllFilter
+        | GraphDocumentMatchNoneFilter
+        | GraphDocumentNumericRangeFilter
+        | GraphDocumentPrefixFilter
+        | GraphDocumentRegexpFilter
+        | GraphDocumentTermFilter
+        | GraphDocumentTermRangeFilter
+        | GraphDocumentWildcardFilter
         | Unset
-        | WildcardQuery
     ) = UNSET
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.bool_field_query import BoolFieldQuery
-        from ..models.date_range_string_query import DateRangeStringQuery
-        from ..models.doc_id_query import DocIdQuery
-        from ..models.fuzzy_query import FuzzyQuery
+        from ..models.graph_document_bool_field_filter import GraphDocumentBoolFieldFilter
+        from ..models.graph_document_date_range_filter import GraphDocumentDateRangeFilter
         from ..models.graph_document_filter_boolean import GraphDocumentFilterBoolean
         from ..models.graph_document_filter_conjunction import GraphDocumentFilterConjunction
-        from ..models.match_all_query import MatchAllQuery
-        from ..models.match_none_query import MatchNoneQuery
-        from ..models.numeric_range_query import NumericRangeQuery
-        from ..models.prefix_query import PrefixQuery
-        from ..models.regexp_query import RegexpQuery
-        from ..models.term_query import TermQuery
-        from ..models.term_range_query import TermRangeQuery
-        from ..models.wildcard_query import WildcardQuery
+        from ..models.graph_document_fuzzy_filter import GraphDocumentFuzzyFilter
+        from ..models.graph_document_ids_filter import GraphDocumentIdsFilter
+        from ..models.graph_document_match_all_filter import GraphDocumentMatchAllFilter
+        from ..models.graph_document_match_none_filter import GraphDocumentMatchNoneFilter
+        from ..models.graph_document_numeric_range_filter import GraphDocumentNumericRangeFilter
+        from ..models.graph_document_prefix_filter import GraphDocumentPrefixFilter
+        from ..models.graph_document_regexp_filter import GraphDocumentRegexpFilter
+        from ..models.graph_document_term_filter import GraphDocumentTermFilter
+        from ..models.graph_document_term_range_filter import GraphDocumentTermRangeFilter
+        from ..models.graph_document_wildcard_filter import GraphDocumentWildcardFilter
 
         filter_: dict[str, Any] | Unset
         if isinstance(self.filter_, Unset):
             filter_ = UNSET
-        elif isinstance(self.filter_, TermQuery):
+        elif isinstance(self.filter_, GraphDocumentFuzzyFilter):
             filter_ = self.filter_.to_dict()
-        elif isinstance(self.filter_, FuzzyQuery):
+        elif isinstance(self.filter_, GraphDocumentTermFilter):
             filter_ = self.filter_.to_dict()
-        elif isinstance(self.filter_, PrefixQuery):
+        elif isinstance(self.filter_, GraphDocumentPrefixFilter):
             filter_ = self.filter_.to_dict()
-        elif isinstance(self.filter_, RegexpQuery):
+        elif isinstance(self.filter_, GraphDocumentRegexpFilter):
             filter_ = self.filter_.to_dict()
-        elif isinstance(self.filter_, WildcardQuery):
+        elif isinstance(self.filter_, GraphDocumentWildcardFilter):
             filter_ = self.filter_.to_dict()
-        elif isinstance(self.filter_, NumericRangeQuery):
+        elif isinstance(self.filter_, GraphDocumentNumericRangeFilter):
             filter_ = self.filter_.to_dict()
-        elif isinstance(self.filter_, TermRangeQuery):
+        elif isinstance(self.filter_, GraphDocumentTermRangeFilter):
             filter_ = self.filter_.to_dict()
-        elif isinstance(self.filter_, DateRangeStringQuery):
+        elif isinstance(self.filter_, GraphDocumentDateRangeFilter):
             filter_ = self.filter_.to_dict()
-        elif isinstance(self.filter_, MatchAllQuery):
+        elif isinstance(self.filter_, GraphDocumentMatchAllFilter):
             filter_ = self.filter_.to_dict()
-        elif isinstance(self.filter_, MatchNoneQuery):
+        elif isinstance(self.filter_, GraphDocumentMatchNoneFilter):
             filter_ = self.filter_.to_dict()
-        elif isinstance(self.filter_, DocIdQuery):
+        elif isinstance(self.filter_, GraphDocumentIdsFilter):
             filter_ = self.filter_.to_dict()
-        elif isinstance(self.filter_, BoolFieldQuery):
+        elif isinstance(self.filter_, GraphDocumentBoolFieldFilter):
             filter_ = self.filter_.to_dict()
         elif isinstance(self.filter_, GraphDocumentFilterBoolean):
             filter_ = self.filter_.to_dict()
@@ -119,50 +122,50 @@ class GraphMatchNode:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.bool_field_query import BoolFieldQuery
-        from ..models.date_range_string_query import DateRangeStringQuery
-        from ..models.doc_id_query import DocIdQuery
-        from ..models.fuzzy_query import FuzzyQuery
+        from ..models.graph_document_bool_field_filter import GraphDocumentBoolFieldFilter
+        from ..models.graph_document_date_range_filter import GraphDocumentDateRangeFilter
         from ..models.graph_document_filter_boolean import GraphDocumentFilterBoolean
         from ..models.graph_document_filter_conjunction import GraphDocumentFilterConjunction
         from ..models.graph_document_filter_disjunction import GraphDocumentFilterDisjunction
-        from ..models.match_all_query import MatchAllQuery
-        from ..models.match_none_query import MatchNoneQuery
-        from ..models.numeric_range_query import NumericRangeQuery
-        from ..models.prefix_query import PrefixQuery
-        from ..models.regexp_query import RegexpQuery
-        from ..models.term_query import TermQuery
-        from ..models.term_range_query import TermRangeQuery
-        from ..models.wildcard_query import WildcardQuery
+        from ..models.graph_document_fuzzy_filter import GraphDocumentFuzzyFilter
+        from ..models.graph_document_ids_filter import GraphDocumentIdsFilter
+        from ..models.graph_document_match_all_filter import GraphDocumentMatchAllFilter
+        from ..models.graph_document_match_none_filter import GraphDocumentMatchNoneFilter
+        from ..models.graph_document_numeric_range_filter import GraphDocumentNumericRangeFilter
+        from ..models.graph_document_prefix_filter import GraphDocumentPrefixFilter
+        from ..models.graph_document_regexp_filter import GraphDocumentRegexpFilter
+        from ..models.graph_document_term_filter import GraphDocumentTermFilter
+        from ..models.graph_document_term_range_filter import GraphDocumentTermRangeFilter
+        from ..models.graph_document_wildcard_filter import GraphDocumentWildcardFilter
 
         d = dict(src_dict)
 
         def _parse_filter_(
             data: object,
         ) -> (
-            BoolFieldQuery
-            | DateRangeStringQuery
-            | DocIdQuery
-            | FuzzyQuery
+            GraphDocumentBoolFieldFilter
+            | GraphDocumentDateRangeFilter
             | GraphDocumentFilterBoolean
             | GraphDocumentFilterConjunction
             | GraphDocumentFilterDisjunction
-            | MatchAllQuery
-            | MatchNoneQuery
-            | NumericRangeQuery
-            | PrefixQuery
-            | RegexpQuery
-            | TermQuery
-            | TermRangeQuery
+            | GraphDocumentFuzzyFilter
+            | GraphDocumentIdsFilter
+            | GraphDocumentMatchAllFilter
+            | GraphDocumentMatchNoneFilter
+            | GraphDocumentNumericRangeFilter
+            | GraphDocumentPrefixFilter
+            | GraphDocumentRegexpFilter
+            | GraphDocumentTermFilter
+            | GraphDocumentTermRangeFilter
+            | GraphDocumentWildcardFilter
             | Unset
-            | WildcardQuery
         ):
             if isinstance(data, Unset):
                 return data
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_graph_document_filter_type_0 = TermQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_0 = GraphDocumentFuzzyFilter.from_dict(data)
 
                 return componentsschemas_graph_document_filter_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -170,7 +173,7 @@ class GraphMatchNode:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_graph_document_filter_type_1 = FuzzyQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_1 = GraphDocumentTermFilter.from_dict(data)
 
                 return componentsschemas_graph_document_filter_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -178,7 +181,7 @@ class GraphMatchNode:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_graph_document_filter_type_2 = PrefixQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_2 = GraphDocumentPrefixFilter.from_dict(data)
 
                 return componentsschemas_graph_document_filter_type_2
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -186,7 +189,7 @@ class GraphMatchNode:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_graph_document_filter_type_3 = RegexpQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_3 = GraphDocumentRegexpFilter.from_dict(data)
 
                 return componentsschemas_graph_document_filter_type_3
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -194,7 +197,7 @@ class GraphMatchNode:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_graph_document_filter_type_4 = WildcardQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_4 = GraphDocumentWildcardFilter.from_dict(data)
 
                 return componentsschemas_graph_document_filter_type_4
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -202,7 +205,7 @@ class GraphMatchNode:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_graph_document_filter_type_5 = NumericRangeQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_5 = GraphDocumentNumericRangeFilter.from_dict(data)
 
                 return componentsschemas_graph_document_filter_type_5
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -210,7 +213,7 @@ class GraphMatchNode:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_graph_document_filter_type_6 = TermRangeQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_6 = GraphDocumentTermRangeFilter.from_dict(data)
 
                 return componentsschemas_graph_document_filter_type_6
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -218,7 +221,7 @@ class GraphMatchNode:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_graph_document_filter_type_7 = DateRangeStringQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_7 = GraphDocumentDateRangeFilter.from_dict(data)
 
                 return componentsschemas_graph_document_filter_type_7
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -226,7 +229,7 @@ class GraphMatchNode:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_graph_document_filter_type_8 = MatchAllQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_8 = GraphDocumentMatchAllFilter.from_dict(data)
 
                 return componentsschemas_graph_document_filter_type_8
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -234,7 +237,7 @@ class GraphMatchNode:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_graph_document_filter_type_9 = MatchNoneQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_9 = GraphDocumentMatchNoneFilter.from_dict(data)
 
                 return componentsschemas_graph_document_filter_type_9
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -242,7 +245,7 @@ class GraphMatchNode:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_graph_document_filter_type_10 = DocIdQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_10 = GraphDocumentIdsFilter.from_dict(data)
 
                 return componentsschemas_graph_document_filter_type_10
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -250,7 +253,7 @@ class GraphMatchNode:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_graph_document_filter_type_11 = BoolFieldQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_11 = GraphDocumentBoolFieldFilter.from_dict(data)
 
                 return componentsschemas_graph_document_filter_type_11
             except (TypeError, ValueError, AttributeError, KeyError):

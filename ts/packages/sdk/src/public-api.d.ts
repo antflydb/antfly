@@ -11647,6 +11647,83 @@ export interface components {
             /** @description Handlebars template to render document text for reranking. */
             template?: string;
         } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["OllamaRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
+        GraphDocumentFuzzyFilter: {
+            term: string;
+            field: string;
+            /** @description Required so fuzzy and exact term predicates remain structurally distinct. */
+            fuzziness: components["schemas"]["Fuzziness"];
+            /** Format: int32 */
+            prefix_length?: number;
+        };
+        GraphDocumentTermFilter: {
+            term: string;
+            field: string;
+        };
+        GraphDocumentPrefixFilter: {
+            prefix: string;
+            field: string;
+        };
+        GraphDocumentRegexpFilter: {
+            regexp: string;
+            field: string;
+        };
+        GraphDocumentWildcardFilter: {
+            wildcard: string;
+            field: string;
+        };
+        /** @description At least one of min or max is required and enforced by the server. */
+        GraphDocumentNumericRangeBody: {
+            field: string;
+            /** Format: double */
+            min?: number;
+            /** Format: double */
+            max?: number;
+            /** @default true */
+            inclusive_min?: boolean;
+            /** @default false */
+            inclusive_max?: boolean;
+        };
+        GraphDocumentNumericRangeFilter: {
+            numeric_range: components["schemas"]["GraphDocumentNumericRangeBody"];
+        };
+        /** @description At least one of min or max is required and enforced by the server. */
+        GraphDocumentTermRangeBody: {
+            field: string;
+            min?: string;
+            max?: string;
+            /** @default true */
+            inclusive_min?: boolean;
+            /** @default false */
+            inclusive_max?: boolean;
+        };
+        GraphDocumentTermRangeFilter: {
+            term_range: components["schemas"]["GraphDocumentTermRangeBody"];
+        };
+        /** @description At least one of start or end is required and enforced by the server. */
+        GraphDocumentDateRangeFilter: {
+            field: string;
+            /** Format: date-time */
+            start?: string;
+            /** Format: date-time */
+            end?: string;
+            /** @default true */
+            inclusive_start?: boolean;
+            /** @default false */
+            inclusive_end?: boolean;
+        };
+        GraphDocumentMatchAllFilter: {
+            match_all: Record<string, never>;
+        };
+        GraphDocumentMatchNoneFilter: {
+            match_none: Record<string, never>;
+        };
+        GraphDocumentIdsFilter: {
+            ids: string[];
+        };
+        GraphDocumentBoolFieldFilter: {
+            bool: boolean;
+            field: string;
+        };
         GraphDocumentFilterConjunction: {
             conjuncts: components["schemas"]["GraphDocumentFilter"][];
         };
@@ -11661,8 +11738,8 @@ export interface components {
             must_not?: components["schemas"]["GraphDocumentFilterDisjunction"];
             filter?: components["schemas"]["GraphDocumentFilter"];
         };
-        /** @description A non-scoring stored-document predicate embedded at a graph node. It reuses the structured field-filter shapes from QueryRequest.filter_query, but deliberately excludes analyzer-backed full-text clauses such as match, phrase, multi_match, and query_string. Alias-to-alias predicates belong in GraphMatch.where. */
-        GraphDocumentFilter: components["schemas"]["TermQuery"] | components["schemas"]["FuzzyQuery"] | components["schemas"]["PrefixQuery"] | components["schemas"]["RegexpQuery"] | components["schemas"]["WildcardQuery"] | components["schemas"]["NumericRangeQuery"] | components["schemas"]["TermRangeQuery"] | components["schemas"]["DateRangeStringQuery"] | components["schemas"]["MatchAllQuery"] | components["schemas"]["MatchNoneQuery"] | components["schemas"]["DocIdQuery"] | components["schemas"]["BoolFieldQuery"] | components["schemas"]["GraphDocumentFilterBoolean"] | components["schemas"]["GraphDocumentFilterConjunction"] | components["schemas"]["GraphDocumentFilterDisjunction"];
+        /** @description A non-scoring stored-document predicate embedded at a graph node. It uses structurally distinct stored-field predicates and deliberately excludes analyzer-backed full-text clauses such as match, phrase, multi_match, and query_string. Fuzzy predicates require an explicit fuzziness, and range predicates use numeric_range or term_range wrappers. Alias-to-alias predicates belong in GraphMatch.where. */
+        GraphDocumentFilter: components["schemas"]["GraphDocumentFuzzyFilter"] | components["schemas"]["GraphDocumentTermFilter"] | components["schemas"]["GraphDocumentPrefixFilter"] | components["schemas"]["GraphDocumentRegexpFilter"] | components["schemas"]["GraphDocumentWildcardFilter"] | components["schemas"]["GraphDocumentNumericRangeFilter"] | components["schemas"]["GraphDocumentTermRangeFilter"] | components["schemas"]["GraphDocumentDateRangeFilter"] | components["schemas"]["GraphDocumentMatchAllFilter"] | components["schemas"]["GraphDocumentMatchNoneFilter"] | components["schemas"]["GraphDocumentIdsFilter"] | components["schemas"]["GraphDocumentBoolFieldFilter"] | components["schemas"]["GraphDocumentFilterBoolean"] | components["schemas"]["GraphDocumentFilterConjunction"] | components["schemas"]["GraphDocumentFilterDisjunction"];
         GraphMatchNode: {
             /** @description Non-scoring structured stored-document predicate evaluated for this alias. */
             filter?: components["schemas"]["GraphDocumentFilter"];

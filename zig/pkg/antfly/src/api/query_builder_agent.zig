@@ -4845,14 +4845,12 @@ fn graphNodeSelectorSingleKey(selector: indexes_openapi.GraphNodeSelector) ?[]co
 fn graphNodeSelectorFilterValue(
     alloc: std.mem.Allocator,
     selector: indexes_openapi.GraphNodeSelector,
-) !?std.json.Value {
+) !?indexes_openapi.GraphDocumentFilter {
     const keys = graphNodeSelectorKeys(selector) orelse return null;
     if (keys.len == 0) return null;
-    var ids = std.json.Array.init(alloc);
-    for (keys) |key| try ids.append(.{ .string = key });
-    var object = std.json.ObjectMap.empty;
-    try object.put(alloc, "ids", .{ .array = ids });
-    return .{ .object = object };
+    const ids = try alloc.create(indexes_openapi.GraphDocumentIdsFilter);
+    ids.* = .{ .ids = try alloc.dupe([]const u8, keys) };
+    return .{ .graph_document_ids_filter = ids };
 }
 
 const QueryBuilderGraphType = enum { traverse, neighbors, shortest_path, k_shortest_paths, pattern };

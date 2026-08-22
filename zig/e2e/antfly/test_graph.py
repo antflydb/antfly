@@ -600,8 +600,8 @@ def test_serverless_graph_pattern_two_hop_and_documents(serverless_api):
     two_hop_match = {
         "nodes": {
             "a": {"filter": {"ids": ["doc-a"]}},
-            "b": {"filter": {"term": {"path": "title", "value": "beta"}}},
-            "c": {"filter": {"prefix": {"path": "title", "prefix": "ga"}}},
+            "b": {"filter": {"term": "beta", "field": "title"}},
+            "c": {"filter": {"prefix": "ga", "field": "title"}},
         },
         "edges": [
             {"from": "a", "to": "b", "types": ["cites"], "direction": "out"},

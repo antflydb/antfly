@@ -219,6 +219,52 @@ answer. Path-producing results are not currently valid node selectors.
 Table-qualified identities use `{"key":"…","table":"…"}`; omitting `table`,
 or explicitly naming the queried table, has the same identity semantics.
 
+`match` expresses branched conjunctive patterns and can return rows or exact
+named counts. Node filters are non-scoring stored-document predicates; they do
+not run full-text analyzers. Range predicates use explicit `numeric_range` or
+`term_range` wrappers so their types remain unambiguous in every SDK.
+
+```jsonc
+{
+  "graph_queries": {
+    "authored_replies": {
+      "index": "social_graph",
+      "match": {
+        "nodes": {
+          "author": {"filter": {"term": "person", "field": "kind"}},
+          "post": {},
+          "reply": {
+            "filter": {
+              "numeric_range": {"field": "score", "min": 0.8}
+            }
+          }
+        },
+        "edges": [
+          {"from": "author", "to": "post", "types": ["AUTHORED"]},
+          {"from": "reply", "to": "post", "types": ["REPLIES_TO"]}
+        ],
+        "where": {
+          "not_equal": {
+            "left": {"alias": "author"},
+            "right": {"alias": "reply"}
+          }
+        }
+      },
+      "return": {
+        "aggregates": {
+          "matches": {"count": "*"},
+          "distinct_replies": {"count": "reply", "distinct": true}
+        }
+      }
+    }
+  }
+}
+```
+
+Exact aggregation streams bindings without materializing a bounded row page.
+If Antfly cannot enumerate the complete authorized anchor relation or exhausts
+its graph work budget, the request fails instead of returning a partial count.
+
 The deprecated `graph_searches` request field remains a wire-compatibility
 adapter for the v0.2 shape. New clients should generate only `graph_queries`.
 

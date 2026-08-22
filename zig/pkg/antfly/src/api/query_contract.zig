@@ -2303,6 +2303,17 @@ pub fn validateRawGraphQueriesValueAlloc(
             if (entry.value_ptr.object.get("match")) |match_value| {
                 try validateRawGraphMatchComplexityAlloc(alloc, match_value);
             }
+            if (entry.value_ptr.object.get("return")) |return_value| {
+                if (return_value != .object) return error.InvalidQueryRequest;
+                if (return_value.object.get("aggregates")) |aggregates| {
+                    if (aggregates != .object or
+                        aggregates.object.count() == 0 or
+                        aggregates.object.count() > graph_pattern_mod.max_count_aggregates)
+                    {
+                        return error.InvalidQueryRequest;
+                    }
+                }
+            }
         }
     }
 
@@ -5229,6 +5240,15 @@ fn buildGraphQueryResults(
     var out: std.json.ArrayHashMap(indexes_openapi.GraphQueryResult) = .{};
     errdefer out.deinit(alloc);
 
+    for (req.graph_queries) |requested| {
+        if (requested.query.aggregates.len == 0) continue;
+        var occurrences: usize = 0;
+        for (result.graph_results) |graph_result| {
+            if (std.mem.eql(u8, requested.name, graph_result.name)) occurrences += 1;
+        }
+        if (occurrences != 1) return error.InvalidRemoteResponse;
+    }
+
     for (result.graph_results) |graph_result| {
         const graph_query = findGraphQuery(req.graph_queries, graph_result.name) orelse continue;
         try out.map.put(alloc, graph_result.name, try toOpenApiGraphQueryResult(
@@ -5399,47 +5419,22 @@ fn toOpenApiGraphAggregates(
 ) !std.json.ArrayHashMap(indexes_openapi.GraphAggregateValue) {
     var out: std.json.ArrayHashMap(indexes_openapi.GraphAggregateValue) = .{};
     errdefer out.deinit(alloc);
-    if (graph_result.aggregates.len > 0) {
+    if (graph_result.aggregates.len != query.aggregates.len) return error.InvalidRemoteResponse;
+    for (query.aggregates) |requested| {
+        var found: ?db_mod.types.GraphAggregateResult = null;
         for (graph_result.aggregates) |aggregate| {
-            try out.map.put(alloc, aggregate.name, .{
-                .value = try std.fmt.allocPrint(alloc, "{d}", .{aggregate.value}),
-                .exact = aggregate.exact,
-            });
+            if (!std.mem.eql(u8, requested.name, aggregate.name)) continue;
+            if (found != null) return error.InvalidRemoteResponse;
+            found = aggregate;
         }
-        return out;
-    }
-    for (query.aggregates) |aggregate| {
-        const count = if (std.mem.eql(u8, aggregate.of, "*"))
-            graph_result.matches.len
-        else
-            try countGraphAlias(alloc, graph_result.matches, aggregate.of, aggregate.distinct);
+        const aggregate = found orelse return error.InvalidRemoteResponse;
+        if (!aggregate.exact) return error.QueryCandidateBudgetExceeded;
         try out.map.put(alloc, aggregate.name, .{
-            .value = try std.fmt.allocPrint(alloc, "{d}", .{count}),
+            .value = try std.fmt.allocPrint(alloc, "{d}", .{aggregate.value}),
             .exact = true,
         });
     }
     return out;
-}
-
-fn countGraphAlias(
-    alloc: std.mem.Allocator,
-    matches: []const db_mod.types.GraphPatternMatch,
-    alias: []const u8,
-    distinct: bool,
-) !usize {
-    var count: usize = 0;
-    var seen = graph_node_identity.Map(void){};
-    defer seen.deinit(alloc);
-    for (matches) |match| {
-        for (match.bindings) |binding| {
-            if (!std.mem.eql(u8, binding.alias, alias)) continue;
-            if (!distinct) {
-                count += 1;
-            } else if (try seen.putIfAbsent(alloc, .{ .table = binding.node.table, .key = binding.node.key }, {})) count += 1;
-            break;
-        }
-    }
-    return count;
 }
 
 test "pattern response omits paths unless requested" {
@@ -5515,6 +5510,50 @@ test "graph aggregate response preserves exact decimal counts" {
     try std.testing.expect(count.exact);
     try std.testing.expect(result.rows == null);
     try std.testing.expectEqual(@as(i64, 1), result.stats.?.returned_items);
+}
+
+test "graph aggregate response fails closed on missing or inexact results" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const requested = [_]graph_query_mod.NamedCountAggregate{.{ .name = "count", .of = "*" }};
+    const query = graph_query_mod.GraphQuery{
+        .query_type = .pattern,
+        .index_name = "graph_idx",
+        .start_nodes = .{ .keys = &.{} },
+        .match_pattern = .{ .nodes = &.{}, .edges = &.{} },
+        .aggregates = &requested,
+    };
+    const named_queries = [_]db_mod.types.NamedGraphQuery{.{ .name = "counted", .query = query }};
+    try std.testing.expectError(error.InvalidRemoteResponse, buildGraphQueryResults(
+        alloc,
+        .{ .graph_queries = &named_queries },
+        .{},
+        .{ .alloc = alloc, .hits = &.{}, .total_hits = 0, .graph_results = &.{} },
+    ));
+    try std.testing.expectError(error.InvalidRemoteResponse, toOpenApiGraphQueryResult(
+        alloc,
+        query,
+        .{},
+        .{ .name = @constCast("counted"), .hits = &.{}, .total_hits = 0 },
+    ));
+
+    const partial = [_]db_mod.types.GraphAggregateResult{.{
+        .name = @constCast("count"),
+        .value = 1,
+        .exact = false,
+    }};
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, toOpenApiGraphQueryResult(
+        alloc,
+        query,
+        .{},
+        .{
+            .name = @constCast("counted"),
+            .aggregates = @constCast(partial[0..]),
+            .hits = &.{},
+            .total_hits = 0,
+        },
+    ));
 }
 
 test "deprecated graph search preserves its response envelope" {
@@ -9114,7 +9153,8 @@ fn parseGraphOptionalPatterns(alloc: std.mem.Allocator, value: []const indexes_o
 }
 
 fn parseGraphCountAggregates(alloc: std.mem.Allocator, value: std.json.ArrayHashMap(indexes_openapi.GraphCountAggregate)) ![]const graph_query_mod.NamedCountAggregate {
-    if (value.map.count() == 0) return error.InvalidQueryRequest;
+    if (value.map.count() == 0 or value.map.count() > graph_pattern_mod.max_count_aggregates)
+        return error.InvalidQueryRequest;
     const aggregates = try alloc.alloc(graph_query_mod.NamedCountAggregate, value.map.count());
     var initialized: usize = 0;
     errdefer {
@@ -9140,18 +9180,23 @@ fn parseGraphCountAggregates(alloc: std.mem.Allocator, value: std.json.ArrayHash
     return aggregates;
 }
 
-fn parseGraphFilterValue(alloc: std.mem.Allocator, value: ?std.json.Value) !graph_pattern_mod.NodeFilter {
+fn parseGraphFilterValue(alloc: std.mem.Allocator, value: ?indexes_openapi.GraphDocumentFilter) !graph_pattern_mod.NodeFilter {
     const filter = value orelse return .{};
+    const encoded = try jsonStringifyAlloc(alloc, filter);
+    defer alloc.free(encoded);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, encoded, .{}) catch
+        return error.InvalidQueryRequest;
+    defer parsed.deinit();
     // Graph filters run against stored documents, not a full-text index. Keep
     // the public graph contract honest by rejecting analyzer-backed MATCH at
     // admission instead of silently giving it storage-only semantics. Bound
     // the generic tree before this recursive inspection; the normalizer also
     // validates the tree, but this ordering is what makes recursion safe.
-    try validatePublicQueryTraversalBudgetAlloc(alloc, filter);
-    if (graphDocumentFilterContainsAnalyzerBackedClause(filter)) {
+    try validatePublicQueryTraversalBudgetAlloc(alloc, parsed.value);
+    if (graphDocumentFilterContainsAnalyzerBackedClause(parsed.value)) {
         return error.UnsupportedQueryRequest;
     }
-    return .{ .filter_query_json = try normalizePublicStoredFilterQueryAlloc(alloc, filter) };
+    return .{ .filter_query_json = try normalizePublicStoredFilterQueryAlloc(alloc, parsed.value) };
 }
 
 fn graphDocumentFilterContainsAnalyzerBackedClause(value: std.json.Value) bool {

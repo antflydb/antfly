@@ -705,7 +705,7 @@ test "parse supported graph queries accepts pattern node filter queries" {
 
 test "graph node filters reject analyzer-backed text clauses" {
     const alloc = std.testing.allocator;
-    var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
+    try std.testing.expectError(error.UnexpectedToken, ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
         \\{
         \\  "graph_queries": {
         \\    "walk": {
@@ -718,10 +718,7 @@ test "graph node filters reject analyzer-backed text clauses" {
         \\    }
         \\  }
         \\}
-    , .{});
-    defer parsed.deinit();
-
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseSupportedGraphQueriesAlloc(alloc, parsed.value));
+    , .{}));
 }
 
 test "raw graph admission rejects recursive edge shapes above the contract budget" {
@@ -738,6 +735,18 @@ test "raw graph admission rejects recursive edge shapes above the contract budge
     try body.appendSlice(alloc,
         \\]},"return":{"bindings":["a"]}}}}
     );
+
+    try std.testing.expectError(error.InvalidQueryRequest, rejectInternalDocIdentityFields(alloc, body.items));
+
+    body.clearRetainingCapacity();
+    try body.appendSlice(alloc,
+        \\{"graph_queries":{"q":{"index":"graph","match":{"nodes":{"a":{}},"edges":[]},"return":{"aggregates":{
+    );
+    for (0..graph_pattern_mod.max_count_aggregates + 1) |i| {
+        if (i > 0) try body.append(alloc, ',');
+        try body.print(alloc, "\"count_{d}\":{{\"count\":\"*\"}}", .{i});
+    }
+    try body.appendSlice(alloc, "}}}}}");
 
     try std.testing.expectError(error.InvalidQueryRequest, rejectInternalDocIdentityFields(alloc, body.items));
 }

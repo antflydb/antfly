@@ -30,6 +30,7 @@ const (
 	maxGraphOptionalPatterns    = 64
 	maxGraphMatchPredicates     = 64
 	maxGraphMatchPredicateDepth = 16
+	maxGraphCountAggregates     = 64
 )
 
 // NewGraphDocumentFilter adapts the non-scoring stored-document subset of the
@@ -44,11 +45,92 @@ func NewGraphDocumentFilter(filter querydsl.Query) (GraphDocumentFilter, error) 
 	if err := validateGraphDocumentFilterJSON(encoded); err != nil {
 		return GraphDocumentFilter{}, err
 	}
+	var decoded any
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		return GraphDocumentFilter{}, err
+	}
+	decoded, err = normalizeGraphDocumentFilterRanges(decoded)
+	if err != nil {
+		return GraphDocumentFilter{}, err
+	}
+	encoded, err = json.Marshal(decoded)
+	if err != nil {
+		return GraphDocumentFilter{}, err
+	}
 	var result GraphDocumentFilter
 	if err := json.Unmarshal(encoded, &result); err != nil {
 		return GraphDocumentFilter{}, err
 	}
 	return result, nil
+}
+
+// Range query variants share the same flat full-text shape, which makes an
+// OpenAPI oneOf impossible to discriminate reliably. Graph filters use
+// explicit numeric_range and term_range operator wrappers on the wire.
+func normalizeGraphDocumentFilterRanges(value any) (any, error) {
+	switch current := value.(type) {
+	case map[string]any:
+		// Canonical graph ranges are already discriminated. Keeping this
+		// normalization idempotent also prevents a canonical range body from
+		// being wrapped a second time when it is nested in a boolean filter.
+		if _, ok := current["numeric_range"]; ok {
+			return current, nil
+		}
+		if _, ok := current["term_range"]; ok {
+			return current, nil
+		}
+		_, hasField := current["field"]
+		min, hasMin := current["min"]
+		max, hasMax := current["max"]
+		if hasField && (hasMin || hasMax) {
+			kind := ""
+			for _, bound := range []struct {
+				value any
+				set   bool
+			}{{min, hasMin}, {max, hasMax}} {
+				if !bound.set {
+					continue
+				}
+				switch bound.value.(type) {
+				case string:
+					if kind == "numeric_range" {
+						return nil, fmt.Errorf("antfly: graph range bounds must have one scalar type")
+					}
+					kind = "term_range"
+				case float64:
+					if kind == "term_range" {
+						return nil, fmt.Errorf("antfly: graph range bounds must have one scalar type")
+					}
+					kind = "numeric_range"
+				default:
+					return nil, fmt.Errorf("antfly: graph range bounds must be strings or numbers")
+				}
+			}
+			if kind == "" {
+				return nil, fmt.Errorf("antfly: graph range requires min or max")
+			}
+			return map[string]any{kind: current}, nil
+		}
+		for key, child := range current {
+			normalized, err := normalizeGraphDocumentFilterRanges(child)
+			if err != nil {
+				return nil, err
+			}
+			current[key] = normalized
+		}
+		return current, nil
+	case []any:
+		for i, child := range current {
+			normalized, err := normalizeGraphDocumentFilterRanges(child)
+			if err != nil {
+				return nil, err
+			}
+			current[i] = normalized
+		}
+		return current, nil
+	default:
+		return value, nil
+	}
 }
 
 // NewGraphFilter is retained as a concise compatibility alias for
@@ -227,6 +309,9 @@ func NewGraphBindingsReturn(bindings []string, options GraphBindingsOptions) (Gr
 func NewGraphAggregatesReturn(aggregates map[string]GraphCountAggregate) (GraphReturn, error) {
 	if len(aggregates) == 0 {
 		return GraphReturn{}, fmt.Errorf("antfly: graph aggregates must not be empty")
+	}
+	if len(aggregates) > maxGraphCountAggregates {
+		return GraphReturn{}, fmt.Errorf("antfly: graph aggregates exceed the maximum of %d", maxGraphCountAggregates)
 	}
 	for name, aggregate := range aggregates {
 		if strings.TrimSpace(name) == "" {

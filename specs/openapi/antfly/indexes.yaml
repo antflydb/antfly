@@ -2618,6 +2618,124 @@ components:
       additionalProperties: true
       description: >-
         Deprecated free-form graph filter accepted by the v0.2 compatibility contract.
+    GraphDocumentTermFilter:
+      type: object
+      additionalProperties: false
+      required: [term, field]
+      properties:
+        term: { type: string }
+        field: { type: string }
+    GraphDocumentFuzzyFilter:
+      type: object
+      additionalProperties: false
+      required: [term, field, fuzziness]
+      properties:
+        term: { type: string }
+        field: { type: string }
+        fuzziness:
+          $ref: 'query.yaml#/components/schemas/Fuzziness'
+          description: Required so fuzzy and exact term predicates remain structurally distinct.
+        prefix_length:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 255
+    GraphDocumentPrefixFilter:
+      type: object
+      additionalProperties: false
+      required: [prefix, field]
+      properties:
+        prefix: { type: string }
+        field: { type: string }
+    GraphDocumentRegexpFilter:
+      type: object
+      additionalProperties: false
+      required: [regexp, field]
+      properties:
+        regexp: { type: string }
+        field: { type: string }
+    GraphDocumentWildcardFilter:
+      type: object
+      additionalProperties: false
+      required: [wildcard, field]
+      properties:
+        wildcard: { type: string }
+        field: { type: string }
+    GraphDocumentNumericRangeBody:
+      type: object
+      additionalProperties: false
+      required: [field]
+      description: At least one of min or max is required and enforced by the server.
+      properties:
+        field: { type: string }
+        min: { type: number, format: double }
+        max: { type: number, format: double }
+        inclusive_min: { type: boolean, default: true }
+        inclusive_max: { type: boolean, default: false }
+    GraphDocumentNumericRangeFilter:
+      type: object
+      additionalProperties: false
+      required: [numeric_range]
+      properties:
+        numeric_range: { $ref: '#/components/schemas/GraphDocumentNumericRangeBody' }
+    GraphDocumentTermRangeBody:
+      type: object
+      additionalProperties: false
+      required: [field]
+      description: At least one of min or max is required and enforced by the server.
+      properties:
+        field: { type: string }
+        min: { type: string }
+        max: { type: string }
+        inclusive_min: { type: boolean, default: true }
+        inclusive_max: { type: boolean, default: false }
+    GraphDocumentTermRangeFilter:
+      type: object
+      additionalProperties: false
+      required: [term_range]
+      properties:
+        term_range: { $ref: '#/components/schemas/GraphDocumentTermRangeBody' }
+    GraphDocumentDateRangeFilter:
+      type: object
+      additionalProperties: false
+      required: [field]
+      description: At least one of start or end is required and enforced by the server.
+      properties:
+        field: { type: string }
+        start: { type: string, format: date-time }
+        end: { type: string, format: date-time }
+        inclusive_start: { type: boolean, default: true }
+        inclusive_end: { type: boolean, default: false }
+    GraphDocumentMatchAllFilter:
+      type: object
+      additionalProperties: false
+      required: [match_all]
+      properties:
+        match_all: { type: object, additionalProperties: false }
+    GraphDocumentMatchNoneFilter:
+      type: object
+      additionalProperties: false
+      required: [match_none]
+      properties:
+        match_none: { type: object, additionalProperties: false }
+    GraphDocumentIdsFilter:
+      type: object
+      additionalProperties: false
+      required: [ids]
+      properties:
+        ids:
+          type: array
+          minItems: 1
+          maxItems: 10000
+          uniqueItems: true
+          items: { type: string }
+    GraphDocumentBoolFieldFilter:
+      type: object
+      additionalProperties: false
+      required: [bool, field]
+      properties:
+        bool: { type: boolean }
+        field: { type: string }
     GraphDocumentFilterBoolean:
       type: object
       additionalProperties: false
@@ -2657,27 +2775,28 @@ components:
           minimum: 0
     GraphDocumentFilter:
       oneOf:
-        - $ref: 'query.yaml#/components/schemas/TermQuery'
-        - $ref: 'query.yaml#/components/schemas/FuzzyQuery'
-        - $ref: 'query.yaml#/components/schemas/PrefixQuery'
-        - $ref: 'query.yaml#/components/schemas/RegexpQuery'
-        - $ref: 'query.yaml#/components/schemas/WildcardQuery'
-        - $ref: 'query.yaml#/components/schemas/NumericRangeQuery'
-        - $ref: 'query.yaml#/components/schemas/TermRangeQuery'
-        - $ref: 'query.yaml#/components/schemas/DateRangeStringQuery'
-        - $ref: 'query.yaml#/components/schemas/MatchAllQuery'
-        - $ref: 'query.yaml#/components/schemas/MatchNoneQuery'
-        - $ref: 'query.yaml#/components/schemas/DocIdQuery'
-        - $ref: 'query.yaml#/components/schemas/BoolFieldQuery'
+        - $ref: '#/components/schemas/GraphDocumentFuzzyFilter'
+        - $ref: '#/components/schemas/GraphDocumentTermFilter'
+        - $ref: '#/components/schemas/GraphDocumentPrefixFilter'
+        - $ref: '#/components/schemas/GraphDocumentRegexpFilter'
+        - $ref: '#/components/schemas/GraphDocumentWildcardFilter'
+        - $ref: '#/components/schemas/GraphDocumentNumericRangeFilter'
+        - $ref: '#/components/schemas/GraphDocumentTermRangeFilter'
+        - $ref: '#/components/schemas/GraphDocumentDateRangeFilter'
+        - $ref: '#/components/schemas/GraphDocumentMatchAllFilter'
+        - $ref: '#/components/schemas/GraphDocumentMatchNoneFilter'
+        - $ref: '#/components/schemas/GraphDocumentIdsFilter'
+        - $ref: '#/components/schemas/GraphDocumentBoolFieldFilter'
         - $ref: '#/components/schemas/GraphDocumentFilterBoolean'
         - $ref: '#/components/schemas/GraphDocumentFilterConjunction'
         - $ref: '#/components/schemas/GraphDocumentFilterDisjunction'
       description: >-
         A non-scoring stored-document predicate embedded at a graph node. It
-        reuses the structured field-filter shapes from QueryRequest.filter_query,
-        but deliberately excludes analyzer-backed full-text clauses such as
-        match, phrase, multi_match, and query_string. Alias-to-alias predicates
-        belong in GraphMatch.where.
+        uses structurally distinct stored-field predicates and deliberately
+        excludes analyzer-backed full-text clauses such as match, phrase,
+        multi_match, and query_string. Fuzzy predicates require an explicit
+        fuzziness, and range predicates use numeric_range or term_range wrappers.
+        Alias-to-alias predicates belong in GraphMatch.where.
     GraphTraversal:
       type: object
       additionalProperties: false
@@ -2947,6 +3066,7 @@ components:
         aggregates:
           type: object
           minProperties: 1
+          maxProperties: 64
           additionalProperties: { $ref: '#/components/schemas/GraphCountAggregate' }
     GraphReturn:
       oneOf:
