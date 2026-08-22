@@ -1389,6 +1389,7 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 
 	if admin := ha.Admin; admin != nil {
 		errors = append(errors, validateHAAdminURL(admin.PrimaryURL, "spec.highAvailability.admin.primaryURL")...)
+		errors = append(errors, validateHAAdminURL(admin.PrimaryActionURL, "spec.highAvailability.admin.primaryActionURL")...)
 		if strings.TrimSpace(admin.TokenEnvVar) == "" && admin.TokenEnvVar != "" {
 			errors = append(errors, "spec.highAvailability.admin.tokenEnvVar must not be whitespace")
 		}

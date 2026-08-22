@@ -2564,6 +2564,7 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidAdminURLs(t *testing.T) {
 		Mode: HAModeHotStandby,
 		Admin: &HAAdminSpec{
 			PrimaryURL:                       "primary-ha.default.svc:8081",
+			PrimaryActionURL:                 "grpc://primary-ha.default.svc:8081",
 			ExecutePlannedActions:            true,
 			JobBackoffLimit:                  &backoffLimit,
 			JobTimeoutSeconds:                &timeoutSeconds,
@@ -2586,6 +2587,7 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidAdminURLs(t *testing.T) {
 		t.Fatal("expected invalid HA admin endpoint configuration to be rejected")
 	}
 	if !strings.Contains(err.Error(), "admin.primaryURL") ||
+		!strings.Contains(err.Error(), "admin.primaryActionURL") ||
 		!strings.Contains(err.Error(), "standbys[0].adminURL") ||
 		!strings.Contains(err.Error(), "admin.jobBackoffLimit") ||
 		!strings.Contains(err.Error(), "admin.jobTimeoutSeconds") ||
@@ -2661,7 +2663,8 @@ func TestValidateCreate_HighAvailabilityRejectsPaddedAdminURLs(t *testing.T) {
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Admin: &HAAdminSpec{
-			PrimaryURL: " http://primary-ha.default.svc:8081 ",
+			PrimaryURL:       " http://primary-ha.default.svc:8081 ",
+			PrimaryActionURL: " http://primary-action-ha.default.svc:8081 ",
 		},
 		Standbys: []HAStandbySpec{{
 			Name:     "standby-a",
@@ -2689,6 +2692,7 @@ func TestValidateCreate_HighAvailabilityRejectsPaddedAdminURLs(t *testing.T) {
 	}
 	for _, want := range []string{
 		"admin.primaryURL must not have leading or trailing whitespace",
+		"admin.primaryActionURL must not have leading or trailing whitespace",
 		"standbys[0].adminURL must not have leading or trailing whitespace",
 		"runtime.standby.upstreamURL must not have leading or trailing whitespace",
 	} {

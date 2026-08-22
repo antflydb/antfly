@@ -2933,7 +2933,7 @@ func haAdminURL(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec, statu
 	}
 	switch action.Kind {
 	case haActionCreateSlot, haActionResumeSlot, haActionPauseSlot, haActionDropSlot, haActionSeedStandby, haActionFinishStandbySeed, haActionCaptureSeedArtifact, haActionActivateSeededSlot, haActionMarkReseed:
-		return haCurrentPrimaryAdminURL(ha, status)
+		return haCurrentPrimaryActionURL(ha, status)
 	case haActionAcquireFence:
 		return haStandbyAdminURL(ha, action.StandbyName)
 	case haActionFenceFormerPrimary:
@@ -2948,7 +2948,7 @@ func haAdminURL(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec, statu
 		// Reseed is a current-primary operation: it marks the old primary's
 		// replication slot as needing a fresh base backup. The following
 		// SeedStandby/BootstrapStandby actions rebuild the former primary.
-		return haCurrentPrimaryAdminURL(ha, status)
+		return haCurrentPrimaryActionURL(ha, status)
 	default:
 		return ""
 	}
@@ -2962,7 +2962,7 @@ func haFormerPrimaryAdminURL(ha *antflyv1.HighAvailabilitySpec, action haPlanned
 		return ""
 	}
 	if ha != nil && ha.Admin != nil {
-		return ha.Admin.PrimaryURL
+		return haPrimaryActionURL(ha.Admin)
 	}
 	return ""
 }
@@ -2978,6 +2978,29 @@ func haCurrentPrimaryAdminURL(ha *antflyv1.HighAvailabilitySpec, status *antflyv
 		return ha.Admin.PrimaryURL
 	}
 	return ""
+}
+
+func haCurrentPrimaryActionURL(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) string {
+	if promoted := haPromotedPrimaryNodeID(status); promoted != "" {
+		if url := haStandbyAdminURL(ha, promoted); url != "" {
+			return url
+		}
+		return ""
+	}
+	if ha != nil && ha.Admin != nil {
+		return haPrimaryActionURL(ha.Admin)
+	}
+	return ""
+}
+
+func haPrimaryActionURL(admin *antflyv1.HAAdminSpec) string {
+	if admin == nil {
+		return ""
+	}
+	if actionURL := strings.TrimSpace(admin.PrimaryActionURL); actionURL != "" {
+		return actionURL
+	}
+	return admin.PrimaryURL
 }
 
 func haAdminNodeID(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) string {

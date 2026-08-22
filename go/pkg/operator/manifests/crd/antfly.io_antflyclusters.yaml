@@ -809,6 +809,8 @@ spec:
                       jobTimeoutSeconds:
                         format: int64
                         type: integer
+                      primaryActionURL:
+                        type: string
                       primaryURL:
                         type: string
                       retryGeneration:

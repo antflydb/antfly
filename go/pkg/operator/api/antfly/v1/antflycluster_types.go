@@ -959,9 +959,15 @@ type HAStandbyRuntimeSpec struct {
 
 // HAAdminSpec configures operator access to HA admin endpoints.
 type HAAdminSpec struct {
-	// PrimaryURL is the primary HA admin endpoint used for typed status, slot, seed, and fence actions.
+	// PrimaryURL is the routed primary HA admin endpoint used for typed status observations.
 	// +optional
 	PrimaryURL string `json:"primaryURL,omitempty"`
+
+	// PrimaryActionURL is the node-local primary HA admin endpoint used for slot and seed actions
+	// that must remain reachable while the routed primary is intentionally unready. When omitted,
+	// actions use PrimaryURL for backward compatibility.
+	// +optional
+	PrimaryActionURL string `json:"primaryActionURL,omitempty"`
 
 	// ExecutePlannedActions lets the operator execute planned HA actions.
 	// The operator prefers typed /admin/v1/ha calls and uses CLI-backed Kubernetes Jobs for pod-local files, shared backup volumes, or break-glass workflows.

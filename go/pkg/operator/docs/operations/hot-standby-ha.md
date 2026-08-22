@@ -31,7 +31,11 @@ Hot standby requires an `AntflyCluster` with:
 - standby topology, including standby names, slots, and admin URLs;
 - durable runtime paths for the primary HA log, standby received-WAL log,
   progress WAL, fence WAL, and former-primary log where applicable;
-- `spec.highAvailability.admin.primaryURL` for primary-scoped actions;
+- `spec.highAvailability.admin.primaryURL` through the production route for
+  primary status and authority observations;
+- optional `spec.highAvailability.admin.primaryActionURL` for primary-scoped
+  slot and seed actions that must remain reachable while that route is
+  intentionally unready (actions fall back to `primaryURL` when omitted);
 - `spec.highAvailability.admin.executePlannedActions: true` when the operator
   is expected to execute typed admin actions;
 - matching admin bearer-token environment injection for the operator and

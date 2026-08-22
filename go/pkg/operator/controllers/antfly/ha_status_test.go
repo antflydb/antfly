@@ -2285,7 +2285,7 @@ func TestOperatorCRDExposesHAAdminRuntimeFields(t *testing.T) {
 
 	admin := crdSchemaProperty(t, ha, "admin")
 	adminProperties := crdSchemaProperties(t, admin)
-	for _, field := range []string{"primaryURL", "executePlannedActions", "tokenEnvVar", "jobBackoffLimit", "volumes", "volumeMounts"} {
+	for _, field := range []string{"primaryURL", "primaryActionURL", "executePlannedActions", "tokenEnvVar", "jobBackoffLimit", "volumes", "volumeMounts"} {
 		if _, ok := adminProperties[field]; !ok {
 			t.Fatalf("operator CRD spec.highAvailability.admin is missing %q", field)
 		}
@@ -2435,7 +2435,10 @@ func TestHADirectAdminSupportMatchesAdminOperations(t *testing.T) {
 
 func TestHAAdminURLTargetsNodeLocalAdminAPI(t *testing.T) {
 	ha := &antflyv1.HighAvailabilitySpec{
-		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
+		Admin: &antflyv1.HAAdminSpec{
+			PrimaryURL:       "http://primary-route.default.svc:80",
+			PrimaryActionURL: "http://primary-ha.default.svc:8081",
+		},
 		Standbys: []antflyv1.HAStandbySpec{{
 			Name:     "standby-a",
 			AdminURL: "http://standby-a-ha.default.svc:8081",
@@ -2443,6 +2446,9 @@ func TestHAAdminURLTargetsNodeLocalAdminAPI(t *testing.T) {
 			Name:     "old-primary",
 			AdminURL: "http://old-primary-ha.default.svc:8081",
 		}},
+	}
+	if got := haCurrentPrimaryAdminURL(ha, nil); got != "http://primary-route.default.svc:80" {
+		t.Fatalf("status observation must retain the routed primary URL, got %q", got)
 	}
 
 	tests := []struct {
