@@ -49,7 +49,7 @@ export type QueryRequest = Omit<
   filter_query?: AntflyQuery;
   /** Full JSON Antfly exclusion query with proper type checking */
   exclusion_query?: AntflyQuery;
-  /** Named graph queries; MATCH node filters use the same Antfly query AST. */
+  /** Named graph queries with non-scoring, stored-document node filters. */
   graph_queries?: Record<string, GraphQuery>;
 };
 export type QueryResult = components["schemas"]["QueryResult"];
@@ -189,7 +189,7 @@ export type EdgeDirection = components["schemas"]["EdgeDirection"];
 export type EdgesResponse = components["schemas"]["EdgesResponse"];
 export type TraversalRules = components["schemas"]["TraversalRules"];
 export type TraversalResult = components["schemas"]["TraversalResult"];
-export type GraphFilterQuery = AntflyQuery;
+export type GraphFilterQuery = components["schemas"]["GraphDocumentFilter"];
 /** @deprecated Use GraphFilterQuery. */
 export type GraphDocumentQuery = GraphFilterQuery;
 export type GraphPathEndpoint = components["schemas"]["GraphPathEndpoint"];
@@ -197,44 +197,17 @@ export type GraphMatchEdge = components["schemas"]["GraphMatchEdge"];
 export type GraphAliasOperand = components["schemas"]["GraphAliasOperand"];
 export type GraphNotEqualPredicate = components["schemas"]["GraphNotEqualPredicate"];
 export type GraphNotExistsPattern = components["schemas"]["GraphNotExistsPattern"];
-export type GraphMatchNode = Omit<components["schemas"]["GraphMatchNode"], "filter"> & {
-  filter?: GraphFilterQuery;
-};
-export type GraphOptionalMatch = Omit<components["schemas"]["GraphOptionalMatch"], "nodes"> & {
-  nodes?: Record<string, GraphMatchNode>;
-};
-export type GraphMatch = Omit<components["schemas"]["GraphMatch"], "nodes" | "optional"> & {
-  nodes: Record<string, GraphMatchNode>;
-  optional?: GraphOptionalMatch[];
-};
-export type GraphMatchQuery = Omit<components["schemas"]["GraphMatchQuery"], "match"> & {
-  match: GraphMatch;
-};
-export type GraphTraversal = Omit<components["schemas"]["GraphTraversal"], "filter"> & {
-  filter?: GraphFilterQuery;
-};
-export type GraphTraverseQuery = Omit<components["schemas"]["GraphTraverseQuery"], "traverse"> & {
-  traverse: GraphTraversal;
-};
-export type GraphShortestPath = Omit<components["schemas"]["GraphShortestPath"], "filter"> & {
-  filter?: GraphFilterQuery;
-};
-export type GraphShortestPathQuery = Omit<
-  components["schemas"]["GraphShortestPathQuery"],
-  "shortest_path"
-> & { shortest_path: GraphShortestPath };
-export type GraphKShortestPaths = Omit<components["schemas"]["GraphKShortestPaths"], "filter"> & {
-  filter?: GraphFilterQuery;
-};
-export type GraphKShortestPathsQuery = Omit<
-  components["schemas"]["GraphKShortestPathsQuery"],
-  "k_shortest_paths"
-> & { k_shortest_paths: GraphKShortestPaths };
-export type GraphQuery =
-  | GraphMatchQuery
-  | GraphTraverseQuery
-  | GraphShortestPathQuery
-  | GraphKShortestPathsQuery;
+export type GraphMatchNode = components["schemas"]["GraphMatchNode"];
+export type GraphOptionalMatch = components["schemas"]["GraphOptionalMatch"];
+export type GraphMatch = components["schemas"]["GraphMatch"];
+export type GraphMatchQuery = components["schemas"]["GraphMatchQuery"];
+export type GraphTraversal = components["schemas"]["GraphTraversal"];
+export type GraphTraverseQuery = components["schemas"]["GraphTraverseQuery"];
+export type GraphShortestPath = components["schemas"]["GraphShortestPath"];
+export type GraphShortestPathQuery = components["schemas"]["GraphShortestPathQuery"];
+export type GraphKShortestPaths = components["schemas"]["GraphKShortestPaths"];
+export type GraphKShortestPathsQuery = components["schemas"]["GraphKShortestPathsQuery"];
+export type GraphQuery = components["schemas"]["GraphQuery"];
 /** @deprecated Use GraphQuery through QueryRequest.graph_queries. */
 export type LegacyGraphQuery = components["schemas"]["LegacyGraphQuery"];
 /** @deprecated Compatibility type for LegacyGraphQuery. */

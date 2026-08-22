@@ -154,6 +154,7 @@ func validateGraphDocumentFilterJSON(encoded []byte) error {
 		"match": {}, "multi_match": {}, "match_phrase": {}, "terms": {},
 		"query": {}, "polygon_points": {}, "location": {}, "geometry": {}, "cidr": {},
 		"min_lat": {}, "min_lon": {}, "max_lat": {}, "max_lon": {},
+		"boost": {},
 	}
 	for len(pending) > 0 {
 		item := pending[len(pending)-1]
@@ -164,6 +165,24 @@ func validateGraphDocumentFilterJSON(encoded []byte) error {
 		}
 		switch current := item.value.(type) {
 		case map[string]any:
+			_, hasField := current["field"]
+			hasScalarOperator := false
+			for _, key := range []string{"term", "prefix", "regexp", "wildcard", "bool"} {
+				if _, ok := current[key]; ok {
+					hasScalarOperator = true
+					break
+				}
+			}
+			if hasScalarOperator && !hasField {
+				return fmt.Errorf("antfly: graph document scalar filters require a field")
+			}
+			_, hasMin := current["min"]
+			_, hasMax := current["max"]
+			_, hasStart := current["start"]
+			_, hasEnd := current["end"]
+			if hasField && !hasScalarOperator && !hasMin && !hasMax && !hasStart && !hasEnd {
+				return fmt.Errorf("antfly: graph document range filters require a bound")
+			}
 			for key, child := range current {
 				if _, blocked := unsupported[key]; blocked {
 					return fmt.Errorf("antfly: graph document filters do not support analyzer-backed or index-only clause %q", key)
@@ -313,6 +332,7 @@ func NewGraphAggregatesReturn(aggregates map[string]GraphCountAggregate) (GraphR
 	if len(aggregates) > maxGraphCountAggregates {
 		return GraphReturn{}, fmt.Errorf("antfly: graph aggregates exceed the maximum of %d", maxGraphCountAggregates)
 	}
+	seenExpressions := make(map[string]string, len(aggregates))
 	for name, aggregate := range aggregates {
 		if strings.TrimSpace(name) == "" {
 			return GraphReturn{}, fmt.Errorf("antfly: graph aggregate name must not be empty")
@@ -323,6 +343,11 @@ func NewGraphAggregatesReturn(aggregates map[string]GraphCountAggregate) (GraphR
 		if aggregate.Count == "*" && aggregate.Distinct {
 			return GraphReturn{}, fmt.Errorf("antfly: graph aggregate %q cannot use distinct count(*)", name)
 		}
+		expression := fmt.Sprintf("%t\x00%s", aggregate.Distinct, aggregate.Count)
+		if prior, ok := seenExpressions[expression]; ok {
+			return GraphReturn{}, fmt.Errorf("antfly: graph aggregates %q and %q duplicate the same count expression", prior, name)
+		}
+		seenExpressions[expression] = name
 	}
 	var result GraphReturn
 	err := result.FromGraphAggregatesReturn(GraphAggregatesReturn{Aggregates: aggregates})

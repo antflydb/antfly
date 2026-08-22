@@ -1214,6 +1214,21 @@ pub const CountAggregateResult = struct {
     }
 };
 
+fn countAggregateSpecsEqual(left: CountAggregateSpec, right: CountAggregateSpec) bool {
+    if (left.distinct != right.distinct) return false;
+    if (left.alias == null or right.alias == null) return left.alias == null and right.alias == null;
+    return std.mem.eql(u8, left.alias.?, right.alias.?);
+}
+
+fn validateCountAggregateSpecs(specs: []const CountAggregateSpec) !void {
+    if (specs.len == 0 or specs.len > max_count_aggregates) return error.InvalidArgument;
+    for (specs, 0..) |spec, i| {
+        for (specs[0..i]) |prior| {
+            if (countAggregateSpecsEqual(spec, prior)) return error.InvalidArgument;
+        }
+    }
+}
+
 /// Stream completed graph bindings directly into aggregate accumulators. Exact
 /// aggregate queries retain only counters and distinct identities, rather than
 /// materializing either internal matcher states or public result rows.
@@ -1248,7 +1263,7 @@ pub fn aggregateConjunctivePatternWithEdgeReader(
     specs: []const CountAggregateSpec,
     opts: MatchOptions,
 ) ![]CountAggregateResult {
-    if (specs.len == 0 or specs.len > max_count_aggregates) return error.InvalidArgument;
+    try validateCountAggregateSpecs(specs);
     var aggregate_opts = opts;
     aggregate_opts.max_results = 0;
     aggregate_opts.require_complete = true;
@@ -2410,6 +2425,19 @@ test "exact conjunctive aggregate does not inherit row expansion window" {
         &.{"anchor"},
         .{ .nodes = &nodes, .edges = &edges },
         &too_many_specs,
+        .{ .max_explored_edges = 2_000, .max_intermediate_states = 2_000 },
+    ));
+
+    const duplicate_specs = [_]CountAggregateSpec{
+        .{ .alias = "b", .distinct = true },
+        .{ .alias = "b", .distinct = true },
+    };
+    try std.testing.expectError(error.InvalidArgument, aggregateConjunctivePatternWithEdgeReader(
+        alloc,
+        Reader{ .targets = &targets },
+        &.{"anchor"},
+        .{ .nodes = &nodes, .edges = &edges },
+        &duplicate_specs,
         .{ .max_explored_edges = 2_000, .max_intermediate_states = 2_000 },
     ));
 }

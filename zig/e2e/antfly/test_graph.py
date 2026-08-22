@@ -57,8 +57,7 @@ def _wait_for_graph_result(
     return wait_until(
         lambda: (
             result
-            if (result := _query_graph_result(api, table_name, payload, name)) is not None
-            and predicate(result)
+            if (result := _query_graph_result(api, table_name, payload, name)) is not None and predicate(result)
             else None
         ),
         timeout_s=timeout_s,
@@ -152,7 +151,11 @@ def test_graph_neighbors_traverse_and_shortest_path(serverless_api):
             },
             "second_hop": {
                 "index": "graph_idx",
-                "traverse": {"start": {"result_ref": "$graph_results.first_hop"}, "edge_types": ["cites"], "max_depth": 1},
+                "traverse": {
+                    "start": {"result_ref": "$graph_results.first_hop"},
+                    "edge_types": ["cites"],
+                    "max_depth": 1,
+                },
             },
         },
         "limit": 10,
@@ -166,7 +169,11 @@ def test_graph_neighbors_traverse_and_shortest_path(serverless_api):
                     "graph_queries": {
                         "neighbors": {
                             "index": "graph_idx",
-                            "traverse": {"start": {"keys": ["alice"]}, "edge_types": ["cites", "related"], "max_depth": 1},
+                            "traverse": {
+                                "start": {"keys": ["alice"]},
+                                "edge_types": ["cites", "related"],
+                                "max_depth": 1,
+                            },
                         }
                     },
                     "limit": 10,
@@ -320,7 +327,11 @@ def test_graph_neighbors_traverse_and_shortest_path(serverless_api):
             "graph_queries": {
                 "neighbors_from_search": {
                     "index": "graph_idx",
-                    "traverse": {"start": {"result_ref": "$query_results", "limit": 1}, "edge_types": ["cites", "related"], "max_depth": 1},
+                    "traverse": {
+                        "start": {"result_ref": "$query_results", "limit": 1},
+                        "edge_types": ["cites", "related"],
+                        "max_depth": 1,
+                    },
                 }
             },
             "limit": 10,
@@ -339,7 +350,11 @@ def test_graph_neighbors_traverse_and_shortest_path(serverless_api):
                 "graph_queries": {
                     "neighbors_from_fused": {
                         "index": "graph_idx",
-                        "traverse": {"start": {"result_ref": "$query_results", "limit": 1}, "edge_types": ["cites", "related"], "max_depth": 1},
+                        "traverse": {
+                            "start": {"result_ref": "$query_results", "limit": 1},
+                            "edge_types": ["cites", "related"],
+                            "max_depth": 1,
+                        },
                     }
                 },
                 "limit": 10,
@@ -401,7 +416,11 @@ def test_stateful_graph_neighbors_traverse_and_shortest_path(backup_api):
             },
             "second_hop": {
                 "index": "graph_idx",
-                "traverse": {"start": {"result_ref": "$graph_results.first_hop"}, "edge_types": ["cites"], "max_depth": 1},
+                "traverse": {
+                    "start": {"result_ref": "$graph_results.first_hop"},
+                    "edge_types": ["cites"],
+                    "max_depth": 1,
+                },
             },
         },
         "limit": 10,
@@ -411,7 +430,11 @@ def test_stateful_graph_neighbors_traverse_and_shortest_path(backup_api):
         "graph_queries": {
             "neighbors_from_search": {
                 "index": "graph_idx",
-                "traverse": {"start": {"result_ref": "$query_results", "limit": 1}, "edge_types": ["cites", "related"], "max_depth": 1},
+                "traverse": {
+                    "start": {"result_ref": "$query_results", "limit": 1},
+                    "edge_types": ["cites", "related"],
+                    "max_depth": 1,
+                },
             }
         },
         "limit": 10,
@@ -421,7 +444,11 @@ def test_stateful_graph_neighbors_traverse_and_shortest_path(backup_api):
         "graph_queries": {
             "neighbors_from_fused": {
                 "index": "graph_idx",
-                "traverse": {"start": {"result_ref": "$query_results", "limit": 1}, "edge_types": ["cites", "related"], "max_depth": 1},
+                "traverse": {
+                    "start": {"result_ref": "$query_results", "limit": 1},
+                    "edge_types": ["cites", "related"],
+                    "max_depth": 1,
+                },
             }
         },
         "limit": 10,
@@ -445,7 +472,7 @@ def test_stateful_graph_neighbors_traverse_and_shortest_path(backup_api):
             },
         ),
         "graph_idx",
-        'graph',
+        "graph",
     )
 
     batch = _batch_write_stateful(
@@ -654,7 +681,7 @@ def test_multi_batch_graph_push_preserves_boundary_error_and_existing_edges(back
             },
         ),
         "graph_idx",
-        'graph',
+        "graph",
     )
     seeded = _batch_write_stateful(
         backup_api,
@@ -763,7 +790,7 @@ def test_stateful_graph_field_edges_extract_and_update(backup_api):
             },
         ),
         "hierarchy",
-        'graph',
+        "graph",
     )
 
     batch = _batch_write_stateful(
@@ -859,21 +886,15 @@ def test_stateful_graph_pattern_two_hop_and_documents(backup_api):
             },
         ),
         "graph_idx",
-        'graph',
+        "graph",
     )
 
     batch = _batch_write_stateful(
         backup_api,
         table_name,
         inserts={
-            "doc-a": {
-                "title": "alpha",
-                "_edges": {"graph_idx": {"knows": [{"target": "doc-b", "weight": 1.0}]}}
-            },
-            "doc-b": {
-                "title": "beta",
-                "_edges": {"graph_idx": {"knows": [{"target": "doc-c", "weight": 1.0}]}}
-            },
+            "doc-a": {"title": "alpha", "_edges": {"graph_idx": {"knows": [{"target": "doc-b", "weight": 1.0}]}}},
+            "doc-b": {"title": "beta", "_edges": {"graph_idx": {"knows": [{"target": "doc-c", "weight": 1.0}]}}},
             "doc-c": {"title": "gamma"},
         },
         sync_level="full_index",
@@ -930,24 +951,15 @@ def test_stateful_graph_pattern_variable_length_and_cycle(backup_api):
             },
         ),
         "graph_idx",
-        'graph',
+        "graph",
     )
 
     batch = backup_api.batch_write(
         table_name,
         inserts={
-            "doc-a": {
-                "title": "alpha",
-                "_edges": {"graph_idx": {"knows": [{"target": "doc-b", "weight": 1.0}]}}
-            },
-            "doc-b": {
-                "title": "beta",
-                "_edges": {"graph_idx": {"knows": [{"target": "doc-c", "weight": 1.0}]}}
-            },
-            "doc-c": {
-                "title": "gamma",
-                "_edges": {"graph_idx": {"knows": [{"target": "doc-a", "weight": 1.0}]}}
-            },
+            "doc-a": {"title": "alpha", "_edges": {"graph_idx": {"knows": [{"target": "doc-b", "weight": 1.0}]}}},
+            "doc-b": {"title": "beta", "_edges": {"graph_idx": {"knows": [{"target": "doc-c", "weight": 1.0}]}}},
+            "doc-c": {"title": "gamma", "_edges": {"graph_idx": {"knows": [{"target": "doc-a", "weight": 1.0}]}}},
         },
         sync_level="full_index",
     )
@@ -962,7 +974,16 @@ def test_stateful_graph_pattern_variable_length_and_cycle(backup_api):
                         "start": {"filter": {"ids": ["doc-a"]}},
                         "end": {},
                     },
-                    "edges": [{"from": "start", "to": "end", "types": ["knows"], "direction": "out", "min_hops": 1, "max_hops": 2}],
+                    "edges": [
+                        {
+                            "from": "start",
+                            "to": "end",
+                            "types": ["knows"],
+                            "direction": "out",
+                            "min_hops": 1,
+                            "max_hops": 2,
+                        }
+                    ],
                 },
                 "return": {"bindings": ["end"], "limit": 10},
             },
@@ -970,7 +991,9 @@ def test_stateful_graph_pattern_variable_length_and_cycle(backup_api):
                 "index": "graph_idx",
                 "match": {
                     "nodes": {"x": {"filter": {"ids": ["doc-a"]}}},
-                    "edges": [{"from": "x", "to": "x", "types": ["knows"], "direction": "out", "min_hops": 1, "max_hops": 3}],
+                    "edges": [
+                        {"from": "x", "to": "x", "types": ["knows"], "direction": "out", "min_hops": 1, "max_hops": 3}
+                    ],
                 },
                 "return": {"bindings": ["x"], "limit": 10},
             },
@@ -1014,41 +1037,48 @@ def test_stateful_graph_pattern_diamond_and_edge_type_filter(backup_api):
             },
         ),
         "graph_idx",
-        'graph',
+        "graph",
     )
 
     batch = wait_until(
-        lambda: _batch if (_batch := _try_batch_write(
-            backup_api,
-            table_name,
-            inserts={
-                "doc-a": {
-                    "title": "alpha",
-                    "_edges": {
-                        "graph_idx": {
-                            "knows": [
-                                {"target": "doc-b", "weight": 1.0},
-                                {"target": "doc-c", "weight": 1.0},
-                            ]
-                        }
+        lambda: (
+            _batch
+            if (
+                _batch := _try_batch_write(
+                    backup_api,
+                    table_name,
+                    inserts={
+                        "doc-a": {
+                            "title": "alpha",
+                            "_edges": {
+                                "graph_idx": {
+                                    "knows": [
+                                        {"target": "doc-b", "weight": 1.0},
+                                        {"target": "doc-c", "weight": 1.0},
+                                    ]
+                                }
+                            },
+                        },
+                        "doc-b": {
+                            "title": "beta",
+                            "_edges": {"graph_idx": {"knows": [{"target": "doc-d", "weight": 1.0}]}},
+                        },
+                        "doc-c": {
+                            "title": "gamma",
+                            "_edges": {"graph_idx": {"knows": [{"target": "doc-d", "weight": 1.0}]}},
+                        },
+                        "doc-d": {"title": "delta"},
+                        "doc-x": {
+                            "title": "extra",
+                            "_edges": {"graph_idx": {"follows": [{"target": "doc-d", "weight": 1.0}]}},
+                        },
                     },
-                },
-                "doc-b": {
-                    "title": "beta",
-                    "_edges": {"graph_idx": {"knows": [{"target": "doc-d", "weight": 1.0}]}}
-                },
-                "doc-c": {
-                    "title": "gamma",
-                    "_edges": {"graph_idx": {"knows": [{"target": "doc-d", "weight": 1.0}]}}
-                },
-                "doc-d": {"title": "delta"},
-                "doc-x": {
-                    "title": "extra",
-                    "_edges": {"graph_idx": {"follows": [{"target": "doc-d", "weight": 1.0}]}}
-                },
-            },
-            sync_level="full_index",
-        )) is not None else None,
+                    sync_level="full_index",
+                )
+            )
+            is not None
+            else None
+        ),
         timeout_s=30.0,
         interval_s=0.5,
     )
@@ -1181,11 +1211,7 @@ def test_stateful_graph_conjunctive_optional_negative_and_aggregates(backup_api)
                     "where": {
                         "and": [
                             branch["where"],
-                            {
-                                "not_exists": {
-                                    "edges": [{"from": "b", "to": "c", "types": ["blocks"]}]
-                                }
-                            },
+                            {"not_exists": {"edges": [{"from": "b", "to": "c", "types": ["blocks"]}]}},
                         ]
                     },
                 },
@@ -1225,7 +1251,8 @@ def test_stateful_graph_conjunctive_optional_negative_and_aggregates(backup_api)
     results = wait_until(
         lambda: (
             value
-            if (value := backup_api.query_table(table_name, query_payload)).get("responses", [{}])[0]
+            if (value := backup_api.query_table(table_name, query_payload))
+            .get("responses", [{}])[0]
             .get("graph_results", {})
             .get("counts", {})
             .get("aggregates", {})
@@ -1248,6 +1275,347 @@ def test_stateful_graph_conjunctive_optional_negative_and_aggregates(backup_api)
     assert graph_results["counts"]["aggregates"]["neighbors"] == {"value": "2", "exact": True}
 
 
+def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
+    """Exercise the nine authoritative LSQB patterns through the public graph DSL."""
+    table_name = f"graph_lsqb_{time.time_ns()}"
+    created = _create_stateful_table(backup_api, table_name, num_shards=1)
+    assert created["name"] == table_name
+
+    edge_types = [
+        "IS_PART_OF",
+        "IS_LOCATED_IN",
+        "HAS_MEMBER",
+        "CONTAINER_OF",
+        "REPLY_OF",
+        "HAS_TAG",
+        "HAS_TYPE",
+        "KNOWS",
+        "HAS_CREATOR",
+        "LIKES",
+        "HAS_INTEREST",
+    ]
+    assert_created_index(
+        _create_index(
+            backup_api,
+            table_name,
+            "social",
+            {
+                "name": "social",
+                "type": "graph",
+                "edge_types": [{"name": edge_type} for edge_type in edge_types],
+            },
+        ),
+        "social",
+        "graph",
+    )
+
+    def doc(label: str, edges: dict | None = None) -> dict:
+        value = {"type": label}
+        if edges:
+            value["_edges"] = {"social": edges}
+        return value
+
+    inserts = {
+        "country": doc("Country"),
+        "city-1": doc("City", {"IS_PART_OF": [{"target": "country"}]}),
+        "city-2": doc("City", {"IS_PART_OF": [{"target": "country"}]}),
+        "city-3": doc("City", {"IS_PART_OF": [{"target": "country"}]}),
+        "person-a": doc(
+            "Person",
+            {
+                "IS_LOCATED_IN": [{"target": "city-1"}],
+                "KNOWS": [{"target": "person-b"}],
+            },
+        ),
+        "person-b": doc(
+            "Person",
+            {
+                "IS_LOCATED_IN": [{"target": "city-2"}],
+                "KNOWS": [{"target": "person-c"}],
+            },
+        ),
+        "person-c": doc(
+            "Person",
+            {
+                "IS_LOCATED_IN": [{"target": "city-3"}],
+                "KNOWS": [{"target": "person-a"}],
+            },
+        ),
+        "forum": doc(
+            "Forum",
+            {
+                "HAS_MEMBER": [{"target": "person-a"}],
+                "CONTAINER_OF": [{"target": "post-q1"}],
+            },
+        ),
+        "post-q1": doc("Post"),
+        "comment-q1": doc(
+            "Comment",
+            {
+                "REPLY_OF": [{"target": "post-q1"}],
+                "HAS_TAG": [{"target": "tag-q1"}],
+            },
+        ),
+        "tag-q1": doc("Tag", {"HAS_TYPE": [{"target": "tag-class"}]}),
+        "tag-class": doc("TagClass"),
+        "comment-q2": doc(
+            "Comment",
+            {
+                "HAS_CREATOR": [{"target": "person-a"}],
+                "REPLY_OF": [{"target": "post-q2"}],
+            },
+        ),
+        "post-q2": doc("Post", {"HAS_CREATOR": [{"target": "person-b"}]}),
+        "chain-a": doc("Person", {"KNOWS": [{"target": "chain-b"}]}),
+        "chain-b": doc("Person", {"KNOWS": [{"target": "chain-c"}]}),
+        "chain-c": doc("Person", {"HAS_INTEREST": [{"target": "interest-tag"}]}),
+        "interest-tag": doc("Tag"),
+        "creator": doc("Person"),
+        "liker": doc("Person", {"LIKES": [{"target": "message-optional"}]}),
+        "message-optional": doc(
+            "Message",
+            {
+                "HAS_TAG": [{"target": "tag-q4"}],
+                "HAS_CREATOR": [{"target": "creator"}],
+            },
+        ),
+        "message-no-optional": doc(
+            "Message",
+            {
+                "HAS_TAG": [{"target": "tag-q4"}],
+                "HAS_CREATOR": [{"target": "creator"}],
+            },
+        ),
+        "comment-optional": doc("Comment", {"REPLY_OF": [{"target": "message-optional"}]}),
+        "tag-q4": doc("Tag"),
+        "message-q5": doc("Message", {"HAS_TAG": [{"target": "tag-left"}]}),
+        "comment-q5": doc(
+            "Comment",
+            {
+                "REPLY_OF": [{"target": "message-q5"}],
+                "HAS_TAG": [{"target": "tag-right"}],
+            },
+        ),
+        "comment-q8-blocked": doc(
+            "Comment",
+            {
+                "REPLY_OF": [{"target": "message-q5"}],
+                "HAS_TAG": [{"target": "tag-left"}, {"target": "tag-right"}],
+            },
+        ),
+        "tag-left": doc("Tag"),
+        "tag-right": doc("Tag"),
+    }
+    batch = _batch_write_stateful(
+        backup_api,
+        table_name,
+        inserts=inserts,
+        sync_level="full_index",
+    )
+    assert batch["inserted"] == len(inserts)
+
+    def node(label: str) -> dict:
+        return {"filter": {"term": label, "field": "type"}}
+
+    def count_query(nodes: dict, edges: list, *, where=None, optional=None) -> dict:
+        match = {"nodes": nodes, "edges": edges}
+        if where is not None:
+            match["where"] = where
+        if optional is not None:
+            match["optional"] = optional
+        return {
+            "index": "social",
+            "match": match,
+            "return": {"aggregates": {"count": {"count": "*"}}},
+        }
+
+    neq = lambda left, right: {"not_equal": {"left": {"alias": left}, "right": {"alias": right}}}
+    queries = {
+        "q1": count_query(
+            {
+                "country": node("Country"),
+                "city": node("City"),
+                "person": node("Person"),
+                "forum": node("Forum"),
+                "post": node("Post"),
+                "comment": node("Comment"),
+                "tag": node("Tag"),
+                "tag_class": node("TagClass"),
+            },
+            [
+                {"from": "city", "to": "country", "types": ["IS_PART_OF"]},
+                {"from": "person", "to": "city", "types": ["IS_LOCATED_IN"]},
+                {"from": "forum", "to": "person", "types": ["HAS_MEMBER"]},
+                {"from": "forum", "to": "post", "types": ["CONTAINER_OF"]},
+                {"from": "comment", "to": "post", "types": ["REPLY_OF"]},
+                {"from": "comment", "to": "tag", "types": ["HAS_TAG"]},
+                {"from": "tag", "to": "tag_class", "types": ["HAS_TYPE"]},
+            ],
+        ),
+        "q2": count_query(
+            {
+                "person1": node("Person"),
+                "person2": node("Person"),
+                "comment": node("Comment"),
+                "post": node("Post"),
+            },
+            [
+                {"from": "person1", "to": "person2", "types": ["KNOWS"], "direction": "both"},
+                {"from": "comment", "to": "person1", "types": ["HAS_CREATOR"]},
+                {"from": "comment", "to": "post", "types": ["REPLY_OF"]},
+                {"from": "post", "to": "person2", "types": ["HAS_CREATOR"]},
+            ],
+        ),
+        "q3": count_query(
+            {
+                "country": node("Country"),
+                "person1": node("Person"),
+                "city1": node("City"),
+                "person2": node("Person"),
+                "city2": node("City"),
+                "person3": node("Person"),
+                "city3": node("City"),
+            },
+            [
+                {"from": "person1", "to": "city1", "types": ["IS_LOCATED_IN"]},
+                {"from": "city1", "to": "country", "types": ["IS_PART_OF"]},
+                {"from": "person2", "to": "city2", "types": ["IS_LOCATED_IN"]},
+                {"from": "city2", "to": "country", "types": ["IS_PART_OF"]},
+                {"from": "person3", "to": "city3", "types": ["IS_LOCATED_IN"]},
+                {"from": "city3", "to": "country", "types": ["IS_PART_OF"]},
+                {"from": "person1", "to": "person2", "types": ["KNOWS"], "direction": "both"},
+                {"from": "person2", "to": "person3", "types": ["KNOWS"], "direction": "both"},
+                {"from": "person3", "to": "person1", "types": ["KNOWS"], "direction": "both"},
+            ],
+        ),
+        "q4": count_query(
+            {
+                "tag": node("Tag"),
+                "message": node("Message"),
+                "creator": node("Person"),
+                "liker": node("Person"),
+                "comment": node("Comment"),
+            },
+            [
+                {"from": "message", "to": "tag", "types": ["HAS_TAG"]},
+                {"from": "message", "to": "creator", "types": ["HAS_CREATOR"]},
+                {"from": "liker", "to": "message", "types": ["LIKES"]},
+                {"from": "comment", "to": "message", "types": ["REPLY_OF"]},
+            ],
+        ),
+        "q5": count_query(
+            {
+                "tag1": node("Tag"),
+                "message": node("Message"),
+                "comment": node("Comment"),
+                "tag2": node("Tag"),
+            },
+            [
+                {"from": "message", "to": "tag1", "types": ["HAS_TAG"]},
+                {"from": "comment", "to": "message", "types": ["REPLY_OF"]},
+                {"from": "comment", "to": "tag2", "types": ["HAS_TAG"]},
+            ],
+            where=neq("tag1", "tag2"),
+        ),
+        "q6": count_query(
+            {
+                "person1": node("Person"),
+                "person2": node("Person"),
+                "person3": node("Person"),
+                "tag": node("Tag"),
+            },
+            [
+                {"from": "person1", "to": "person2", "types": ["KNOWS"], "direction": "both"},
+                {"from": "person2", "to": "person3", "types": ["KNOWS"], "direction": "both"},
+                {"from": "person3", "to": "tag", "types": ["HAS_INTEREST"]},
+            ],
+            where=neq("person1", "person3"),
+        ),
+        "q7": count_query(
+            {
+                "tag": node("Tag"),
+                "message": node("Message"),
+                "creator": node("Person"),
+            },
+            [
+                {"from": "message", "to": "tag", "types": ["HAS_TAG"]},
+                {"from": "message", "to": "creator", "types": ["HAS_CREATOR"]},
+            ],
+            optional=[
+                {
+                    "nodes": {"liker": node("Person")},
+                    "edges": [{"from": "liker", "to": "message", "types": ["LIKES"]}],
+                },
+                {
+                    "nodes": {"comment": node("Comment")},
+                    "edges": [{"from": "comment", "to": "message", "types": ["REPLY_OF"]}],
+                },
+            ],
+        ),
+        "q8": count_query(
+            {
+                "tag1": node("Tag"),
+                "message": node("Message"),
+                "comment": node("Comment"),
+                "tag2": node("Tag"),
+            },
+            [
+                {"from": "message", "to": "tag1", "types": ["HAS_TAG"]},
+                {"from": "comment", "to": "message", "types": ["REPLY_OF"]},
+                {"from": "comment", "to": "tag2", "types": ["HAS_TAG"]},
+            ],
+            where={
+                "and": [
+                    {"not_exists": {"edges": [{"from": "comment", "to": "tag1", "types": ["HAS_TAG"]}]}},
+                    neq("tag1", "tag2"),
+                ]
+            },
+        ),
+        "q9": count_query(
+            {
+                "person1": node("Person"),
+                "person2": node("Person"),
+                "person3": node("Person"),
+                "tag": node("Tag"),
+            },
+            [
+                {"from": "person1", "to": "person2", "types": ["KNOWS"], "direction": "both"},
+                {"from": "person2", "to": "person3", "types": ["KNOWS"], "direction": "both"},
+                {"from": "person3", "to": "tag", "types": ["HAS_INTEREST"]},
+            ],
+            where={
+                "and": [
+                    {
+                        "not_exists": {
+                            "edges": [
+                                {
+                                    "from": "person1",
+                                    "to": "person3",
+                                    "types": ["KNOWS"],
+                                    "direction": "both",
+                                }
+                            ]
+                        }
+                    },
+                    neq("person1", "person3"),
+                ]
+            },
+        ),
+    }
+    expected = {"q1": "1", "q2": "1", "q3": "6", "q4": "1", "q5": "2", "q6": "1", "q7": "2", "q8": "1", "q9": "1"}
+
+    def exact_counts() -> dict | None:
+        response = backup_api.query_table(table_name, {"graph_queries": queries, "limit": 10})
+        graph_results = response.get("responses", [{}])[0].get("graph_results", {})
+        actual = {name: result.get("aggregates", {}).get("count") for name, result in graph_results.items()}
+        if all(actual.get(name) == {"value": count, "exact": True} for name, count in expected.items()):
+            return actual
+        return None
+
+    counts = wait_until(exact_counts, timeout_s=120.0, interval_s=0.5)
+    assert counts == {name: {"value": count, "exact": True} for name, count in expected.items()}
+
+
 def test_stateful_graph_pattern_max_results_limit(backup_api):
     table_name = f"graph_pattern_limit_{time.time_ns()}"
 
@@ -1266,7 +1634,7 @@ def test_stateful_graph_pattern_max_results_limit(backup_api):
             },
         ),
         "graph_idx",
-        'graph',
+        "graph",
     )
 
     batch = _batch_write_stateful(

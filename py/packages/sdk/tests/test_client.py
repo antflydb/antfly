@@ -91,12 +91,8 @@ class TestAntflyClient:
 
     def test_graph_document_filters_parse_to_unambiguous_sdk_types(self) -> None:
         exact = GraphMatchNode.from_dict({"filter": {"term": "beta", "field": "title"}})
-        fuzzy = GraphMatchNode.from_dict(
-            {"filter": {"term": "beta", "field": "title", "fuzziness": 1}}
-        )
-        numeric = GraphMatchNode.from_dict(
-            {"filter": {"numeric_range": {"field": "score", "min": 0.8}}}
-        )
+        fuzzy = GraphMatchNode.from_dict({"filter": {"term": "beta", "field": "title", "fuzziness": 1}})
+        numeric = GraphMatchNode.from_dict({"filter": {"numeric_range": {"field": "score", "min": 0.8}}})
 
         assert isinstance(exact.filter_, GraphDocumentTermFilter)
         assert isinstance(fuzzy.filter_, GraphDocumentFuzzyFilter)

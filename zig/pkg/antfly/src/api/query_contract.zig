@@ -9166,6 +9166,13 @@ fn parseGraphCountAggregates(alloc: std.mem.Allocator, value: std.json.ArrayHash
     }
     var it = value.map.iterator();
     while (it.next()) |entry| {
+        for (aggregates[0..initialized]) |prior| {
+            if (prior.distinct == (entry.value_ptr.distinct orelse false) and
+                std.mem.eql(u8, prior.of, entry.value_ptr.count))
+            {
+                return error.InvalidQueryRequest;
+            }
+        }
         const name = try alloc.dupe(u8, entry.key_ptr.*);
         errdefer alloc.free(name);
         const of = try alloc.dupe(u8, entry.value_ptr.count);

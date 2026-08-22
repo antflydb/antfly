@@ -863,12 +863,67 @@ fn textBoolQueryIsScoreBearing(query: db_mod.types.TextBoolQuery) bool {
     return false;
 }
 
+const GraphAggregateResultBuilder = struct {
+    name: []u8,
+    value: u128 = 0,
+    exact: bool = true,
+    distinct: bool,
+    distinct_values: std.ArrayListUnmanaged(graph_node_identity.Ref) = .empty,
+    distinct_seen: graph_node_identity.Map(void) = .{},
+
+    fn appendDistinctValues(
+        self: *GraphAggregateResultBuilder,
+        alloc: std.mem.Allocator,
+        incoming: db_mod.types.GraphAggregateResult,
+    ) !void {
+        if (incoming.value > 0 and incoming.distinct_values.len == 0)
+            return error.InvalidQueryRequest;
+        for (incoming.distinct_values) |value| {
+            if (self.distinct_seen.contains(value)) continue;
+            try appendClonedGraphNodeRef(alloc, &self.distinct_values, value);
+            const owned = self.distinct_values.items[self.distinct_values.items.len - 1];
+            errdefer {
+                const removed = self.distinct_values.pop().?;
+                if (removed.table) |table| alloc.free(table);
+                alloc.free(removed.key);
+            }
+            _ = try self.distinct_seen.putIfAbsent(alloc, owned, {});
+        }
+        self.value = self.distinct_values.items.len;
+    }
+
+    fn deinit(self: *GraphAggregateResultBuilder, alloc: std.mem.Allocator) void {
+        if (self.name.len > 0) alloc.free(self.name);
+        self.distinct_seen.deinit(alloc);
+        for (self.distinct_values.items) |value| {
+            if (value.table) |table| alloc.free(table);
+            alloc.free(value.key);
+        }
+        self.distinct_values.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn toOwned(self: *GraphAggregateResultBuilder, alloc: std.mem.Allocator) !db_mod.types.GraphAggregateResult {
+        const values = try self.distinct_values.toOwnedSlice(alloc);
+        self.distinct_seen.deinit(alloc);
+        self.distinct_seen = .{};
+        const name = self.name;
+        self.name = &.{};
+        return .{
+            .name = name,
+            .value = self.value,
+            .exact = self.exact,
+            .distinct_values = values,
+        };
+    }
+};
+
 const GraphSearchResultBuilder = struct {
     name: []u8,
     nodes: std.ArrayListUnmanaged(graph_query_mod.GraphResultNode) = .empty,
     paths: std.ArrayListUnmanaged(db_mod.types.GraphPath) = .empty,
     matches: std.ArrayListUnmanaged(db_mod.types.GraphPatternMatch) = .empty,
-    aggregates: std.ArrayListUnmanaged(db_mod.types.GraphAggregateResult) = .empty,
+    aggregates: std.ArrayListUnmanaged(GraphAggregateResultBuilder) = .empty,
     hits: std.ArrayListUnmanaged(db_mod.types.SearchHit) = .empty,
     total_hits: u32 = 0,
     truncated: bool = false,
@@ -904,11 +959,18 @@ const GraphSearchResultBuilder = struct {
             for (matches) |*match| match.deinit(alloc);
             if (matches.len > 0) alloc.free(matches);
         }
-        const aggregates = try self.aggregates.toOwnedSlice(alloc);
+        const aggregates = try alloc.alloc(db_mod.types.GraphAggregateResult, self.aggregates.items.len);
+        var initialized_aggregates: usize = 0;
         errdefer {
-            for (aggregates) |*aggregate| aggregate.deinit(alloc);
+            for (aggregates[0..initialized_aggregates]) |*aggregate| aggregate.deinit(alloc);
             if (aggregates.len > 0) alloc.free(aggregates);
         }
+        for (self.aggregates.items, 0..) |*aggregate, i| {
+            aggregates[i] = try aggregate.toOwned(alloc);
+            initialized_aggregates += 1;
+        }
+        self.aggregates.deinit(alloc);
+        self.aggregates = .empty;
         const hits = try self.hits.toOwnedSlice(alloc);
         errdefer {
             for (hits) |*hit| hit.deinit(alloc);
@@ -987,12 +1049,14 @@ fn mergeGraphSearchResults(
                 };
             }
             for (graph_result.aggregates) |aggregate| {
+                const distinct = graphAggregateIsDistinct(queries, graph_result.name, aggregate.name);
                 var found = false;
                 for (builder.aggregates.items) |*existing| {
                     if (!std.mem.eql(u8, existing.name, aggregate.name)) continue;
+                    if (existing.distinct != distinct) return error.InvalidRemoteResponse;
                     existing.exact = existing.exact and aggregate.exact;
-                    if (graphAggregateIsDistinct(queries, graph_result.name, aggregate.name)) {
-                        try mergeDistinctGraphAggregate(alloc, existing, aggregate);
+                    if (distinct) {
+                        try existing.appendDistinctValues(alloc, aggregate);
                     } else {
                         existing.value = std.math.add(u128, existing.value, aggregate.value) catch return error.Overflow;
                     }
@@ -1001,20 +1065,17 @@ fn mergeGraphSearchResults(
                 }
                 if (!found) {
                     const name = try alloc.dupe(u8, aggregate.name);
-                    const distinct_values = cloneGraphNodeRefs(alloc, aggregate.distinct_values) catch |err| {
-                        alloc.free(name);
-                        return err;
-                    };
-                    builder.aggregates.append(alloc, .{
+                    var owned = GraphAggregateResultBuilder{
                         .name = name,
-                        .value = aggregate.value,
+                        .value = if (distinct) 0 else aggregate.value,
                         .exact = aggregate.exact,
-                        .distinct_values = distinct_values,
-                    }) catch |err| {
-                        alloc.free(name);
-                        freeGraphNodeRefs(alloc, distinct_values);
-                        return err;
+                        .distinct = distinct,
                     };
+                    var owned_active = true;
+                    errdefer if (owned_active) owned.deinit(alloc);
+                    if (distinct) try owned.appendDistinctValues(alloc, aggregate);
+                    try builder.aggregates.append(alloc, owned);
+                    owned_active = false;
                 }
             }
             for (graph_result.hits) |hit| {
@@ -1074,6 +1135,12 @@ fn validateGraphAggregateShard(
         for (graph_result.aggregates) |aggregate| {
             if (!std.mem.eql(u8, requested.name, aggregate.name)) continue;
             if (!aggregate.exact) return error.QueryCandidateBudgetExceeded;
+            if (requested.distinct) {
+                if (aggregate.value != aggregate.distinct_values.len)
+                    return error.InvalidRemoteResponse;
+            } else if (aggregate.distinct_values.len != 0) {
+                return error.InvalidRemoteResponse;
+            }
             occurrences += 1;
         }
         if (occurrences != 1) return error.InvalidRemoteResponse;
@@ -1103,42 +1170,6 @@ fn graphQueryReturnLimit(
         if (std.mem.eql(u8, named.name, query_name)) return named.query.return_limit;
     }
     return 0;
-}
-
-fn mergeDistinctGraphAggregate(
-    alloc: std.mem.Allocator,
-    existing: *db_mod.types.GraphAggregateResult,
-    incoming: db_mod.types.GraphAggregateResult,
-) !void {
-    if ((existing.value > 0 and existing.distinct_values.len == 0) or
-        (incoming.value > 0 and incoming.distinct_values.len == 0))
-        return error.InvalidQueryRequest;
-
-    var seen = graph_node_identity.Map(void){};
-    defer seen.deinit(alloc);
-    for (existing.distinct_values) |value| {
-        _ = try seen.putIfAbsent(alloc, value, {});
-    }
-
-    var merged = std.ArrayListUnmanaged(graph_node_identity.Ref).empty;
-    errdefer {
-        for (merged.items) |value| {
-            if (value.table) |table| alloc.free(table);
-            alloc.free(value.key);
-        }
-        merged.deinit(alloc);
-    }
-    try merged.ensureTotalCapacity(alloc, existing.distinct_values.len + incoming.distinct_values.len);
-    for (existing.distinct_values) |value| try appendClonedGraphNodeRef(alloc, &merged, value);
-    for (incoming.distinct_values) |value| {
-        if (!try seen.putIfAbsent(alloc, value, {})) continue;
-        try appendClonedGraphNodeRef(alloc, &merged, value);
-    }
-
-    const owned = try merged.toOwnedSlice(alloc);
-    freeGraphNodeRefs(alloc, existing.distinct_values);
-    existing.distinct_values = owned;
-    existing.value = existing.distinct_values.len;
 }
 
 fn cloneGraphNodeRefs(alloc: std.mem.Allocator, values: []const graph_node_identity.Ref) ![]graph_node_identity.Ref {
@@ -1962,6 +1993,12 @@ test "query parser accepts exact graph count aggregates" {
     try std.testing.expectEqual(@as(usize, 1), graph_query.aggregates.len);
     try std.testing.expectEqualStrings("count", graph_query.aggregates[0].name);
     try std.testing.expectEqualStrings("*", graph_query.aggregates[0].of);
+}
+
+test "query parser rejects duplicate graph count expressions" {
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
+        \\{"graph_queries":{"pattern_count":{"index":"graph_idx","match":{"nodes":{"a":{}},"edges":[]},"return":{"aggregates":{"first":{"count":"a","distinct":true},"second":{"count":"a","distinct":true}}}}},"limit":10}
+    ));
 }
 
 test "query parser rejects semantic search offsets" {
@@ -3303,8 +3340,7 @@ test "query merge preserves graph table provenance under allocation failure" {
     );
 }
 
-test "graph merge enforces query-wide row limit and exact distinct identity" {
-    const alloc = std.testing.allocator;
+fn expectGraphMergeRowLimitAndDistinctIdentity(alloc: std.mem.Allocator) !void {
     var binding_a = [_]db_mod.types.GraphPatternBinding{.{ .alias = @constCast("n"), .node = .{ .key = @constCast("shared"), .table = @constCast("people"), .depth = 0, .distance = 0, .path = &.{}, .path_edges = &.{} } }};
     var binding_b = [_]db_mod.types.GraphPatternBinding{.{ .alias = @constCast("n"), .node = .{ .key = @constCast("other"), .table = @constCast("people"), .depth = 0, .distance = 0, .path = &.{}, .path_edges = &.{} } }};
     var binding_c = [_]db_mod.types.GraphPatternBinding{.{ .alias = @constCast("n"), .node = .{ .key = @constCast("shared"), .table = @constCast("companies"), .depth = 0, .distance = 0, .path = &.{}, .path_edges = &.{} } }};
@@ -3351,6 +3387,18 @@ test "graph merge enforces query-wide row limit and exact distinct identity" {
     try std.testing.expect(merged[0].truncated);
     try std.testing.expectEqual(@as(u128, 2), merged[1].aggregates[0].value);
     try std.testing.expectEqual(@as(usize, 2), merged[1].aggregates[0].distinct_values.len);
+}
+
+test "graph merge enforces query-wide row limit and exact distinct identity" {
+    try expectGraphMergeRowLimitAndDistinctIdentity(std.testing.allocator);
+}
+
+test "graph distinct merge preserves ownership under allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        expectGraphMergeRowLimitAndDistinctIdentity,
+        .{},
+    );
 }
 
 test "graph merge rejects missing and inexact aggregate shards" {
@@ -3410,6 +3458,40 @@ test "graph merge rejects missing and inexact aggregate shards" {
     try std.testing.expectError(
         error.QueryCandidateBudgetExceeded,
         mergeGraphSearchResults(alloc, &queries, &partial_results),
+    );
+
+    const distinct_aggregates = [_]graph_query_mod.NamedCountAggregate{.{
+        .name = "unique",
+        .of = "person",
+        .distinct = true,
+    }};
+    const distinct_queries = [_]db_mod.types.NamedGraphQuery{.{ .name = "counted", .query = .{
+        .query_type = .pattern,
+        .index_name = "graph",
+        .start_nodes = .{ .keys = &.{} },
+        .aggregates = &distinct_aggregates,
+    } }};
+    var incomplete_values = [_]graph_node_identity.Ref{.{ .table = "people", .key = "one" }};
+    var incomplete = [_]db_mod.types.GraphAggregateResult{.{
+        .name = @constCast("unique"),
+        .value = 2,
+        .distinct_values = &incomplete_values,
+    }};
+    var incomplete_graph = [_]db_mod.types.GraphSearchResult{.{
+        .name = @constCast("counted"),
+        .aggregates = &incomplete,
+        .hits = &.{},
+        .total_hits = 0,
+    }};
+    const incomplete_results = [_]db_mod.types.SearchResult{.{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = &incomplete_graph,
+    }};
+    try std.testing.expectError(
+        error.InvalidRemoteResponse,
+        mergeGraphSearchResults(alloc, &distinct_queries, &incomplete_results),
     );
 }
 

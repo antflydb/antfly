@@ -8396,7 +8396,7 @@ pub const QueryRequest = struct {
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?RerankerConfig = null,
     analyses: ?Analyses = null,
-    /// Declarative graph matching, traversal, and path queries. A nested node `filter` uses the same canonical query DSL as document search. A request may contain at most 64 named graph operations; operation names must be 1-128 characters.
+    /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations; operation names must be 1-128 characters.
     graph_queries: ?std.json.ArrayHashMap(GraphQuery) = null,
     /// Deprecated compatibility alias for the v0.2 graph query contract. Use `graph_queries`; requests containing both fields are rejected.
     graph_searches: ?std.json.ArrayHashMap(LegacyGraphQuery) = null,
@@ -8953,7 +8953,7 @@ pub const RetrievalQueryRequest = struct {
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?RerankerConfig = null,
     analyses: ?Analyses = null,
-    /// Declarative graph matching, traversal, and path queries. A nested node `filter` uses the same canonical query DSL as document search. A request may contain at most 64 named graph operations; operation names must be 1-128 characters.
+    /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations; operation names must be 1-128 characters.
     graph_queries: ?std.json.ArrayHashMap(GraphQuery) = null,
     /// Deprecated compatibility alias for the v0.2 graph query contract. Use `graph_queries`; requests containing both fields are rejected.
     graph_searches: ?std.json.ArrayHashMap(LegacyGraphQuery) = null,

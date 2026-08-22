@@ -19,9 +19,10 @@ T = TypeVar("T", bound="QueryRequestGraphQueries")
 @_attrs_define
 class QueryRequestGraphQueries:
     """Declarative graph matching, traversal, and path queries. A nested node
-    `filter` uses the same canonical query DSL as document search. A request
-    may contain at most 64 named graph operations; operation names must be
-    1-128 characters.
+    `filter` is a typed, non-scoring stored-document predicate. It shares
+    familiar scalar syntax with document queries but deliberately excludes
+    analyzer-backed and index-only clauses. A request may contain at most
+    64 named graph operations; operation names must be 1-128 characters.
 
     """
 

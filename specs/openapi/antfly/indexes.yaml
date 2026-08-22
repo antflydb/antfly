@@ -2668,10 +2668,22 @@ components:
       description: At least one of min or max is required and enforced by the server.
       properties:
         field: { type: string }
-        min: { type: number, format: double }
-        max: { type: number, format: double }
-        inclusive_min: { type: boolean, default: true }
-        inclusive_max: { type: boolean, default: false }
+        min:
+          type: number
+          format: double
+          x-go-type-skip-optional-pointer: false
+        max:
+          type: number
+          format: double
+          x-go-type-skip-optional-pointer: false
+        inclusive_min:
+          type: boolean
+          default: true
+          x-go-type-skip-optional-pointer: false
+        inclusive_max:
+          type: boolean
+          default: false
+          x-go-type-skip-optional-pointer: false
     GraphDocumentNumericRangeFilter:
       type: object
       additionalProperties: false
@@ -2685,10 +2697,20 @@ components:
       description: At least one of min or max is required and enforced by the server.
       properties:
         field: { type: string }
-        min: { type: string }
-        max: { type: string }
-        inclusive_min: { type: boolean, default: true }
-        inclusive_max: { type: boolean, default: false }
+        min:
+          type: string
+          x-go-type-skip-optional-pointer: false
+        max:
+          type: string
+          x-go-type-skip-optional-pointer: false
+        inclusive_min:
+          type: boolean
+          default: true
+          x-go-type-skip-optional-pointer: false
+        inclusive_max:
+          type: boolean
+          default: false
+          x-go-type-skip-optional-pointer: false
     GraphDocumentTermRangeFilter:
       type: object
       additionalProperties: false
@@ -2702,10 +2724,22 @@ components:
       description: At least one of start or end is required and enforced by the server.
       properties:
         field: { type: string }
-        start: { type: string, format: date-time }
-        end: { type: string, format: date-time }
-        inclusive_start: { type: boolean, default: true }
-        inclusive_end: { type: boolean, default: false }
+        start:
+          type: string
+          format: date-time
+          x-go-type-skip-optional-pointer: false
+        end:
+          type: string
+          format: date-time
+          x-go-type-skip-optional-pointer: false
+        inclusive_start:
+          type: boolean
+          default: true
+          x-go-type-skip-optional-pointer: false
+        inclusive_end:
+          type: boolean
+          default: false
+          x-go-type-skip-optional-pointer: false
     GraphDocumentMatchAllFilter:
       type: object
       additionalProperties: false

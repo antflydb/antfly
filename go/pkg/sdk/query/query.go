@@ -310,7 +310,7 @@ func NewPrefix(prefix string, field string) Query {
 //
 //	q := query.NewNumericRange(0, 1000, "price")
 func NewNumericRange(min float64, max float64, field string) Query {
-	return NumericRangeQuery{Min: min, Max: max, Field: field}.ToQuery()
+	return NumericRangeQuery{Min: &min, Max: &max, Field: field}.ToQuery()
 }
 
 // NewDateRange creates a DateRangeStringQuery.
@@ -321,7 +321,7 @@ func NewNumericRange(min float64, max float64, field string) Query {
 //	end := time.Date(2024, 12, 31, 23, 59, 59, 0, time.UTC)
 //	q := query.NewDateRange(start, end, "created_at")
 func NewDateRange(start time.Time, end time.Time, field string) Query {
-	return DateRangeStringQuery{Start: start, End: end, Field: field}.ToQuery()
+	return DateRangeStringQuery{Start: &start, End: &end, Field: field}.ToQuery()
 }
 
 // NewMatchAll creates a MatchAllQuery.

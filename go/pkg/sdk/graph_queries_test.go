@@ -142,6 +142,12 @@ func TestGraphConstructorsRejectSemanticErrors(t *testing.T) {
 	if _, err := NewGraphDocumentFilter(querydsl.NewGeoBoundingBox(37, -123, 38, -122, "location")); err == nil {
 		t.Fatal("expected index-only graph filter to fail")
 	}
+	if _, err := NewGraphDocumentFilter(querydsl.TermQuery{Term: "beta", Field: "title", Boost: 2}.ToQuery()); err == nil {
+		t.Fatal("expected scoring graph filter to fail")
+	}
+	if _, err := NewGraphDocumentFilter(querydsl.NumericRangeQuery{Field: "score"}.ToQuery()); err == nil {
+		t.Fatal("expected boundless graph range filter to fail")
+	}
 	if _, err := NewGraphResultRefSelector("$embeddings_results.vector_idx", 10); err == nil {
 		t.Fatal("expected invalid result reference")
 	}
@@ -193,7 +199,15 @@ func TestGraphConstructorsRejectSemanticErrors(t *testing.T) {
 }
 
 func TestGraphDocumentFilterUsesDiscriminatedRangeWireShape(t *testing.T) {
-	filter, err := NewGraphDocumentFilter(querydsl.NewNumericRange(1, 10, "score"))
+	zero := 0.0
+	ten := 10.0
+	exclusive := false
+	filter, err := NewGraphDocumentFilter(querydsl.NumericRangeQuery{
+		Field:        "score",
+		Min:          &zero,
+		Max:          &ten,
+		InclusiveMin: &exclusive,
+	}.ToQuery())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +220,7 @@ func TestGraphDocumentFilterUsesDiscriminatedRangeWireShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, ok := value["numeric_range"].(map[string]any)
-	if !ok || body["field"] != "score" || body["min"] != float64(1) || body["max"] != float64(10) {
+	if !ok || body["field"] != "score" || body["min"] != float64(0) || body["max"] != float64(10) || body["inclusive_min"] != false {
 		t.Fatalf("unexpected graph range filter: %#v", value)
 	}
 }
@@ -218,6 +232,15 @@ func TestGraphAggregateConstructorEnforcesComplexityBudget(t *testing.T) {
 	}
 	if _, err := NewGraphAggregatesReturn(aggregates); err == nil {
 		t.Fatal("expected graph aggregate complexity budget error")
+	}
+}
+
+func TestGraphAggregateConstructorRejectsDuplicateExpressions(t *testing.T) {
+	if _, err := NewGraphAggregatesReturn(map[string]GraphCountAggregate{
+		"first":  CountGraphAlias("person", true),
+		"second": CountGraphAlias("person", true),
+	}); err == nil {
+		t.Fatal("expected duplicate aggregate expression error")
 	}
 }
 
