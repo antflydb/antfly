@@ -22,3 +22,4 @@ jobs:
     uses: ./.github/workflows/zig-inference-l4-spot.yml
     with:
       scope: ${{ inputs.scope }}
+      artifact_run_id: "32598323363"
