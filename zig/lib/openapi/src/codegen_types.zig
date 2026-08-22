@@ -84,6 +84,16 @@ pub const TypeGenerator = struct {
             return;
         }
 
+        // A oneOf containing exactly one concrete type and the JSON null
+        // literal is a nullable value, not an opaque union. Keeping the
+        // concrete type is especially important when it is used as a typed
+        // additionalProperties value.
+        if (try self.nullableOneOfType(schema.one_of)) |inner_type| {
+            if (schema.description) |desc| try self.w.docComment(desc);
+            try self.w.line("pub const {s} = ?{s};", .{ type_name, inner_type });
+            return;
+        }
+
         // allOf: merge into single struct
         if (schema.all_of.len > 0) {
             try self.generateAllOfStruct(type_name, schema);
@@ -802,6 +812,10 @@ pub const TypeGenerator = struct {
             return self.zigTypeForSchemaOrRef(schema.all_of[0]);
         }
 
+        if (try self.nullableOneOfType(schema.one_of)) |inner_type| {
+            return std.fmt.allocPrint(self.arena, "?{s}", .{inner_type});
+        }
+
         // String enum → will be a named type, but when used inline just emit Value
         if (schema.enum_values.len > 0) {
             return "[]const u8"; // unnamed enums default to string
@@ -848,6 +862,43 @@ pub const TypeGenerator = struct {
         }
 
         return "std.json.Value";
+    }
+
+    fn nullableOneOfType(self: *TypeGenerator, members: []const types.SchemaOrRef) GenError!?[]const u8 {
+        if (members.len != 2) return null;
+
+        var saw_null = false;
+        var inner: ?types.SchemaOrRef = null;
+        for (members) |member| switch (member) {
+            .schema => |schema| {
+                if (isNullOnlySchema(schema)) {
+                    if (saw_null) return null;
+                    saw_null = true;
+                } else {
+                    if (inner != null) return null;
+                    inner = member;
+                }
+            },
+            .ref => {
+                if (inner != null) return null;
+                inner = member;
+            },
+        };
+        if (!saw_null or inner == null) return null;
+        const inner_type = try self.zigTypeForSchemaOrRef(inner.?);
+        return inner_type;
+    }
+
+    fn isNullOnlySchema(schema: types.Schema) bool {
+        return schema.enum_has_null and
+            schema.enum_values.len == 0 and
+            schema.schema_type == null and
+            schema.all_of.len == 0 and
+            schema.one_of.len == 0 and
+            schema.any_of.len == 0 and
+            schema.properties.count() == 0 and
+            schema.items == null and
+            schema.additional_properties == null;
     }
 };
 
@@ -936,6 +987,39 @@ test "named typed map preserves additional property values" {
         w.toSlice(),
         "pub const NodeMap = std.json.ArrayHashMap(Node);",
     ) != null);
+}
+
+test "named nullable oneOf remains typed inside additional properties" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const nullable_members = try arena.alloc(types.SchemaOrRef, 2);
+    nullable_members[0] = .{ .ref = .{ .ref_string = "#/components/schemas/Node" } };
+    nullable_members[1] = .{ .schema = .{ .enum_has_null = true } };
+    const map_value = try arena.create(types.SchemaOrRef);
+    map_value.* = .{ .ref = .{ .ref_string = "#/components/schemas/NullableNode" } };
+
+    var schemas = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try schemas.put(arena, "NullableNode", .{ .schema = .{ .one_of = nullable_members } });
+    try schemas.put(arena, "NodeMap", .{ .schema = .{
+        .schema_type = .{ .single = "object" },
+        .additional_properties = .{ .schema = map_value },
+    } });
+    const doc = types.OpenApiDoc{
+        .openapi = "3.0.3",
+        .info = .{ .title = "Test", .version = "1.0" },
+        .components = .{ .schemas = schemas },
+    };
+    var resolver = Resolver.init(arena, &doc);
+    var w = SourceWriter.init(arena);
+    var gen = TypeGenerator.init(arena, &w, &resolver);
+    try gen.generateAll(&doc);
+
+    const output = w.toSlice();
+    try std.testing.expect(std.mem.indexOf(u8, output, "pub const NullableNode = ?Node;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "pub const NodeMap = std.json.ArrayHashMap(NullableNode);") != null);
 }
 
 test "required + nullable field codegen" {

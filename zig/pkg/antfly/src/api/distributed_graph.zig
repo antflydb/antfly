@@ -30,6 +30,7 @@ const graph_pattern_mod = @import("../graph/pattern.zig");
 const graph_paths_mod = @import("../graph/paths.zig");
 const graph_traversal_mod = @import("../graph/traversal.zig");
 const doc_set = @import("../storage/db/doc_set.zig");
+const graph_exec = @import("../storage/db/query/graph_exec.zig");
 const algebraic_ir = db_mod.algebraic.ir;
 const algebraic_law = db_mod.algebraic.law;
 const algebraic_planner = db_mod.algebraic.planner;
@@ -926,13 +927,16 @@ fn executeCrossRangeOnce(
         try validateSourceSnapshotGroupSet(alloc, catalog, table_name, anchors);
 
     const results = try alloc.alloc(db_mod.types.GraphSearchResult, req.graph_queries.len);
+    const sorted_query_indexes = try graph_exec.sortGraphQueriesByDependencies(alloc, req.graph_queries);
+    defer alloc.free(sorted_query_indexes);
     var initialized: usize = 0;
     errdefer {
         for (results[0..initialized]) |*result| result.deinit(alloc);
         alloc.free(results);
     }
 
-    for (req.graph_queries, 0..) |graph_query, i| {
+    for (sorted_query_indexes, 0..) |query_index, i| {
+        const graph_query = req.graph_queries[query_index];
         results[i] = try executeSingleCrossRange(
             alloc,
             catalog,
@@ -8555,6 +8559,172 @@ test "distributed graph traverse target nodes filter returned nodes without prun
     try std.testing.expectEqual(@as(u32, 2), results[0].nodes[0].depth);
     try std.testing.expectEqual(@as(usize, 1), results[0].hits.len);
     try std.testing.expectEqualStrings("doc:c", results[0].hits[0].id);
+}
+
+test "distributed graph executes result dependencies before declaration order" {
+    const TestState = struct {
+        expand_calls: u32 = 0,
+        hydrate_calls: u32 = 0,
+    };
+
+    const FakeCatalog = struct {
+        const tables = [_]metadata_table_manager.TableRecord{
+            .{ .table_id = 7, .name = "docs", .placement_role = "data" },
+        };
+        const ranges = [_]metadata_table_manager.RangeRecord{
+            .{ .group_id = 11, .table_id = 7, .start_key = "", .end_key = null },
+        };
+        const statuses = [_]metadata_reconciler.MergedGroupStatus{
+            .{ .group_id = 11 },
+        };
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                .merged_group_statuses = @constCast(statuses[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeWorker = struct {
+        fn iface(state: *TestState) Worker {
+            return .{
+                .ptr = state,
+                .vtable = &.{
+                    .execute_graph_expand = executeGraphExpand,
+                    .execute_graph_hydrate = executeGraphHydrate,
+                },
+            };
+        }
+
+        fn executeGraphExpand(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            req: GraphExpandRequest,
+            _: raft_mod.ReadConsistency,
+        ) !GraphExpandResponse {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            state.expand_calls += 1;
+            try std.testing.expectEqual(@as(usize, 1), req.frontier.len);
+
+            const next_key = if (std.mem.eql(u8, req.name, "seed")) blk: {
+                try std.testing.expectEqualStrings("doc:a", req.frontier[0].key);
+                break :blk "doc:b";
+            } else if (std.mem.eql(u8, req.name, "dependent")) blk: {
+                try std.testing.expectEqualStrings("doc:b", req.frontier[0].key);
+                break :blk "doc:c";
+            } else return error.TestUnexpectedResult;
+
+            const nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
+            nodes[0] = .{
+                .key = try alloc.dupe(u8, next_key),
+                .depth = 1,
+                .distance = 1.0,
+                .path = null,
+                .path_edges = null,
+            };
+            const expansions = try alloc.alloc(GraphExpansion, 1);
+            expansions[0] = .{
+                .frontier_id = req.frontier[0].id,
+                .frontier_key = try alloc.dupe(u8, req.frontier[0].key),
+                .graph_result = .{
+                    .name = try alloc.dupe(u8, req.name),
+                    .nodes = nodes,
+                    .hits = &.{},
+                    .total_hits = 1,
+                },
+            };
+            return .{ .expansions = expansions };
+        }
+
+        fn executeGraphHydrate(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            req: GraphHydrateRequest,
+            _: raft_mod.ReadConsistency,
+        ) !GraphHydrateResponse {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            state.hydrate_calls += 1;
+            const hits = try alloc.alloc(db_mod.types.SearchHit, req.keys.len);
+            for (req.keys, 0..) |key, i| hits[i] = .{ .id = try alloc.dupe(u8, key) };
+            return .{ .hits = hits };
+        }
+    };
+
+    var state = TestState{};
+    const req = db_mod.types.SearchRequest{
+        .graph_queries = &.{
+            .{
+                .name = "dependent",
+                .query = .{
+                    .query_type = .traverse,
+                    .index_name = "graph_idx",
+                    .start_nodes = .{ .result_ref = .{ .ref = "$graph_results.seed", .limit = 1 } },
+                    .params = .{ .max_depth = 1 },
+                },
+            },
+            .{
+                .name = "seed",
+                .query = .{
+                    .query_type = .traverse,
+                    .index_name = "graph_idx",
+                    .start_nodes = .{ .keys = &.{"doc:a"} },
+                    .params = .{ .max_depth = 1 },
+                },
+            },
+        },
+        .identity_read_generation = 9,
+    };
+    const base_result = db_mod.types.SearchResult{
+        .alloc = std.testing.allocator,
+        .hits = &.{},
+        .total_hits = 0,
+        .identity_read_generation = 9,
+    };
+
+    const results = try executeCrossRange(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        FakeWorker.iface(&state),
+        "docs",
+        req,
+        base_result,
+        .read_index,
+    );
+    defer {
+        for (results) |*result| result.deinit(std.testing.allocator);
+        std.testing.allocator.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("seed", results[0].name);
+    try std.testing.expectEqualStrings("doc:b", results[0].nodes[0].key);
+    try std.testing.expectEqualStrings("dependent", results[1].name);
+    try std.testing.expectEqualStrings("doc:c", results[1].nodes[0].key);
+    try std.testing.expectEqual(@as(u32, 2), state.expand_calls);
+    try std.testing.expectEqual(@as(u32, 2), state.hydrate_calls);
 }
 
 test "distributed graph traverse routes cross-table frontier by table generation" {

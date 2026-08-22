@@ -5247,11 +5247,9 @@ fn toOpenApiGraphRows(
                 .evidence = try graphNodeEvidenceJsonValue(alloc, binding.node),
                 .edges = null,
             };
-            const encoded = try std.json.Stringify.valueAlloc(alloc, node, .{ .emit_null_optional_fields = false });
-            defer alloc.free(encoded);
-            try row.map.put(alloc, binding.alias, try std.json.parseFromSliceLeaky(std.json.Value, alloc, encoded, .{}));
+            try row.map.put(alloc, binding.alias, node);
         }
-        for (match.null_aliases) |alias| try row.map.put(alloc, alias, .null);
+        for (match.null_aliases) |alias| try row.map.put(alloc, alias, null);
         out[i] = row;
     }
     return out;
@@ -9190,7 +9188,7 @@ fn validateGraphResultRef(ref: []const u8) !void {
 fn legacyGraphResultRef(ref: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, ref, "$full_text_results") or
         std.mem.eql(u8, ref, "$embeddings_results") or
-        std.mem.eql(u8, ref, "$fused_results")) return "$query_results";
+        std.mem.eql(u8, ref, "$fused_results")) return ref;
     if (std.mem.startsWith(u8, ref, "$graph_results.") and
         ref.len > "$graph_results.".len) return ref;
     return null;

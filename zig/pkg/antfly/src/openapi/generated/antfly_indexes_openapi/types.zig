@@ -1686,7 +1686,7 @@ pub const GraphResolverConfig = struct {
     config_generation: ?i64 = null,
 };
 
-pub const GraphResultBinding = std.json.Value;
+pub const GraphResultBinding = ?GraphResultNode;
 
 /// A node in graph query results
 pub const GraphResultNode = struct {

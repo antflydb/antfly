@@ -452,7 +452,7 @@ test "parse supported graph queries rejects canonical and legacy fields together
     try std.testing.expectError(error.InvalidQueryRequest, parseSupportedGraphQueriesAlloc(alloc, parsed.value));
 }
 
-test "legacy graph result refs normalize to the ranked query result" {
+test "legacy graph result refs preserve their retrieval lane" {
     const alloc = std.testing.allocator;
     var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
         \\{
@@ -469,7 +469,7 @@ test "legacy graph result refs normalize to the ranked query result" {
     const items = try parseSupportedGraphQueriesAlloc(alloc, parsed.value);
     defer freeNamedGraphQueries(alloc, items);
     try std.testing.expect(items[0].query.legacy_response);
-    try std.testing.expectEqualStrings("$query_results", items[0].query.start_nodes.result_ref.ref);
+    try std.testing.expectEqualStrings("$full_text_results", items[0].query.start_nodes.result_ref.ref);
 }
 
 test "parse supported graph queries reject unbounded traversal limits" {

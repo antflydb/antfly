@@ -2703,6 +2703,7 @@ pub const HttpHandler = struct {
         if (requestHasSearchInputs(request)) {
             var search_request = request;
             search_request.graph_queries = null;
+            search_request.graph_searches = null;
             const search_body = try std.json.Stringify.valueAlloc(self.alloc, search_request, .{});
             defer self.alloc.free(search_body);
 
@@ -2730,6 +2731,32 @@ pub const HttpHandler = struct {
                 .hits = search_hits,
                 .total_hits = search_total_hits,
             });
+            try initial_sets.append(self.alloc, .{
+                .name = "$fused_results",
+                .hits = search_hits,
+                .total_hits = search_total_hits,
+            });
+            if (request.full_text_search != null) {
+                try initial_sets.append(self.alloc, .{
+                    .name = "$full_text_results",
+                    .hits = search_hits,
+                    .total_hits = search_total_hits,
+                });
+            }
+            if (execution.plan.usesVectorLane() and !execution.plan.usesTextLane() and !execution.plan.usesSparseLane()) {
+                try initial_sets.append(self.alloc, .{
+                    .name = "$embeddings_results",
+                    .hits = search_hits,
+                    .total_hits = search_total_hits,
+                });
+            }
+            if (execution.plan.usesSparseLane() and !execution.plan.usesTextLane() and !execution.plan.usesVectorLane()) {
+                try initial_sets.append(self.alloc, .{
+                    .name = "$embeddings_results",
+                    .hits = search_hits,
+                    .total_hits = search_total_hits,
+                });
+            }
 
             session = execution.takeSession();
             session_initialized = true;
@@ -9913,9 +9940,12 @@ test "http handler serves published graph query endpoints" {
     const two_hop = parsed_pattern.value.responses.?[0].graph_results.?.map.get("two_hop").?;
     try std.testing.expectEqual(@as(usize, 1), two_hop.rows.?.len);
     const row = two_hop.rows.?[0].map;
-    try std.testing.expectEqualStrings("doc-a", row.get("a").?.object.get("key").?.string);
-    try std.testing.expectEqualStrings("doc-b", row.get("b").?.object.get("key").?.string);
-    try std.testing.expectEqualStrings("doc-c", row.get("c").?.object.get("key").?.string);
+    const binding_a = row.get("a").? orelse return error.TestUnexpectedResult;
+    const binding_b = row.get("b").? orelse return error.TestUnexpectedResult;
+    const binding_c = row.get("c").? orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("doc-a", binding_a.key);
+    try std.testing.expectEqualStrings("doc-b", binding_b.key);
+    try std.testing.expectEqualStrings("doc-c", binding_c.key);
 
     var invalid_version_neighbors = try handler.handle(.{
         .method = .post,
