@@ -17,6 +17,15 @@ pub const Transition = struct {
     pub fn named(kind: Kind, name: []const u8) Transition {
         return .{ .id = ids.stable("transition", name), .name = name, .kind = kind };
     }
+
+    pub fn eql(lhs: Transition, rhs: Transition) bool {
+        return lhs.id == rhs.id and
+            std.mem.eql(u8, lhs.name, rhs.name) and
+            lhs.kind == rhs.kind and
+            lhs.actor_id == rhs.actor_id and
+            lhs.resource_id == rhs.resource_id and
+            lhs.parameter == rhs.parameter;
+    }
 };
 
 pub const List = struct {

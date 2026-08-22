@@ -1,0 +1,118 @@
+// Copyright 2026 Antfly, Inc.
+// Licensed under the Elastic License 2.0 (ELv2).
+
+//! Owned, canonical trace corpus with deterministic deduplication and energy.
+
+const std = @import("std");
+const coverage = @import("coverage.zig");
+const ids = @import("id.zig");
+const trace = @import("trace.zig");
+
+pub const Key = struct {
+    trace_digest: u64,
+    final_observation_digest: u64,
+    failure_fingerprint: u64,
+};
+
+pub const Entry = struct {
+    key: Key,
+    bytes: []const u8,
+    novelty: usize,
+    rarity_score: u64,
+    selections: u64 = 0,
+    productive_children: u64 = 0,
+
+    pub fn energy(self: Entry) u64 {
+        const novelty_energy: u64 = @intCast(@min(self.novelty, 1024));
+        const productivity = self.productive_children *| 8;
+        const selection_penalty = self.selections / 4;
+        return @max(@as(u64, 1), 1 +| novelty_energy *| 16 +| self.rarity_score / 100_000 +| productivity -| selection_penalty);
+    }
+};
+
+pub const Corpus = struct {
+    allocator: std.mem.Allocator,
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
+    keys: std.AutoHashMapUnmanaged(Key, usize) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) Corpus {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *Corpus) void {
+        for (self.entries.items) |entry| self.allocator.free(entry.bytes);
+        self.entries.deinit(self.allocator);
+        self.keys.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn add(self: *Corpus, artifact: *const trace.Trace, novelty: coverage.Novelty) !struct { index: usize, inserted: bool } {
+        const bytes = try artifact.renderAlloc(self.allocator);
+        errdefer self.allocator.free(bytes);
+        const summary = artifact.summary orelse return error.MissingTraceSummary;
+        const fingerprint = if (artifact.failures.items.len == 0) 0 else artifact.failures.items[0].fingerprint;
+        const key = Key{
+            .trace_digest = ids.digest(bytes),
+            .final_observation_digest = summary.final_observation_digest,
+            .failure_fingerprint = fingerprint,
+        };
+        const gop = try self.keys.getOrPut(self.allocator, key);
+        if (gop.found_existing) {
+            self.allocator.free(bytes);
+            return .{ .index = gop.value_ptr.*, .inserted = false };
+        }
+        errdefer _ = self.keys.remove(key);
+        const index = self.entries.items.len;
+        try self.entries.append(self.allocator, .{
+            .key = key,
+            .bytes = bytes,
+            .novelty = novelty.discovered,
+            .rarity_score = novelty.rarity_score,
+        });
+        gop.value_ptr.* = index;
+        return .{ .index = index, .inserted = true };
+    }
+
+    pub fn select(self: *Corpus, random: std.Random) !usize {
+        if (self.entries.items.len == 0) return error.EmptyCorpus;
+        var total: u64 = 0;
+        for (self.entries.items) |entry| total +|= entry.energy();
+        var ticket = random.intRangeLessThan(u64, 0, total);
+        for (self.entries.items, 0..) |*entry, index| {
+            const energy_value = entry.energy();
+            if (ticket < energy_value) {
+                entry.selections +|= 1;
+                return index;
+            }
+            ticket -= energy_value;
+        }
+        unreachable;
+    }
+
+    pub fn markProductive(self: *Corpus, index: usize) !void {
+        if (index >= self.entries.items.len) return error.InvalidCorpusIndex;
+        self.entries.items[index].productive_children +|= 1;
+    }
+};
+
+test "corpus deduplicates canonical artifacts and selects deterministically" {
+    var artifact = try trace.Trace.init(std.testing.allocator, .{ .scenario = "corpus", .scenario_version = 1 }, .{ .transition_budget = 1 });
+    defer artifact.deinit();
+    try artifact.addChoice(.{ .site_id = 1, .site_name = "choice", .occurrence = 0, .enabled_ids = &.{2}, .selected_id = 2 });
+    try artifact.addTransition(.{ .index = 1, .id = 2, .name = "step", .kind = .workload });
+    const empty_digest = @import("observation.zig").digestFeatures(&.{});
+    try artifact.addObservation(.{ .index = 0, .digest = empty_digest, .features = &.{} });
+    try artifact.addObservation(.{ .index = 1, .digest = empty_digest, .features = &.{} });
+    artifact.summary = .{ .transitions = 1, .final_observation_digest = empty_digest, .property_failures = 0 };
+    try artifact.validate();
+
+    var corpus = Corpus.init(std.testing.allocator);
+    defer corpus.deinit();
+    const first = try corpus.add(&artifact, .{ .discovered = 2, .rarity_score = 50 });
+    const duplicate = try corpus.add(&artifact, .{ .discovered = 0 });
+    try std.testing.expect(first.inserted);
+    try std.testing.expect(!duplicate.inserted);
+    try std.testing.expectEqual(@as(usize, 1), corpus.entries.items.len);
+    var prng = std.Random.DefaultPrng.init(1);
+    try std.testing.expectEqual(@as(usize, 0), try corpus.select(prng.random()));
+}

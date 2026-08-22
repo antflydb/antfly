@@ -1311,8 +1311,9 @@ lib/vopr/
     property.zig
     observation.zig
     runtime.zig
+    sim_runtime.zig
     vopr-trace-v1.schema.json
-    scheduler.zig               # Phase 2
+    scheduler.zig
     coverage.zig
     corpus.zig
     explorer.zig
@@ -1640,6 +1641,24 @@ can be replayed from a trace.
 Exit condition: scheduler mutation reaches different valid message/node/fault
 interleavings while replay remains exact.
 
+#### Phase 2 implementation progress (2026-08-22)
+
+The generic deterministic execution kernel is implemented and independently
+tested. `sim_runtime.zig` owns submitted tasks and timers, exposes each ready
+task and due timer as a stable atomic transition, and exposes the next timer
+deadline as an explicit virtual-time transition. Cancellation, execution,
+failed submission, and teardown have exact-once ownership tests. Applications
+receive only `Runtime`; only the scheduler receives `SchedulerPort`.
+
+`scheduler.zig` canonicalizes enabled transitions and re-enumerates immediately
+before execution. It rejects a scenario whose enumeration has side effects or
+whose selected transition changes during selection. `choice.Mutating` now
+provides clean-world prefix replay, a structured branch at one decision, and a
+seeded suffix. These pieces satisfy the generic portion of Phase 2, but Phase 2
+is not complete until the Antfly metadata world exposes individual network
+messages and node rounds through this kernel and its recovery invariants are
+registered as named properties.
+
 ### Phase 3: Coverage, Corpus, and Reduction
 
 - add semantic observers and novelty scoring
@@ -1650,6 +1669,25 @@ interleavings while replay remains exact.
 
 Exit condition: injected meta-test bugs are autonomously discovered, replayed,
 reduced, and promoted.
+
+#### Phase 3 implementation progress (2026-08-22)
+
+The standalone engine now has the initial inspectable search loop described in
+this design. `coverage.zig` derives semantic coverage only from stable
+transition, event, observation-feature, property, and failure identities and
+tracks fixed-point rarity. `corpus.zig` owns canonical traces, deduplicates by
+trace digest, final observation, and failure fingerprint, and assigns bounded
+rarity/productivity energy. `explorer.zig` runs deterministic history-count
+campaigns, reserves configurable uniform exploration, mutates structured
+choices, and retains novel or failing histories.
+
+`reducer.zig` verifies the original exact replay, explores structured choice
+replacements from a clean world, accepts only strictly simpler artifacts with
+the same failure fingerprint, and exact-replays every accepted result. Its
+meta-test injects a named property bug and reduces a three-transition history
+to one transition. Phase 3 remains open for Antfly artifact directories,
+failure promotion, the standalone CLI, richer fault/workload deletion passes,
+and campaign reports integrated with metadata.
 
 ### Phase 4: Storage and Data Integration
 

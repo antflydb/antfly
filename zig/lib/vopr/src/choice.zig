@@ -98,6 +98,70 @@ pub const Replay = struct {
     }
 };
 
+/// Replays an exact prefix, replaces one decision with a requested enabled
+/// alternative, then generates a new suffix. This is the basic branching
+/// primitive; it rebuilds a clean world and never snapshots pointer state.
+pub const Mutating = struct {
+    base: []const trace.ChoiceRecord,
+    mutation_index: usize,
+    replacement_id: ids.StableId,
+    prng: std.Random.DefaultPrng,
+    cursor: usize = 0,
+    mutated: bool = false,
+
+    pub fn init(base: []const trace.ChoiceRecord, mutation_index: usize, replacement_id: ids.StableId, suffix_seed: u64) Mutating {
+        return .{
+            .base = base,
+            .mutation_index = mutation_index,
+            .replacement_id = replacement_id,
+            .prng = std.Random.DefaultPrng.init(suffix_seed),
+        };
+    }
+
+    pub fn source(self: *Mutating) Source {
+        return .{ .ptr = self, .choose_fn = choose, .finish_fn = finish };
+    }
+
+    fn choose(ptr: *anyopaque, request: Request) !ids.StableId {
+        const self: *Mutating = @ptrCast(@alignCast(ptr));
+        const index = self.cursor;
+        self.cursor += 1;
+        if (index < self.mutation_index) {
+            if (index >= self.base.len) return error.MutationPrefixExhausted;
+            const record = self.base[index];
+            try verifyRecord(record, request);
+            return record.selected_id;
+        }
+        if (index == self.mutation_index) {
+            if (index >= self.base.len) return error.MutationPointOutOfRange;
+            const record = self.base[index];
+            try verifySite(record, request);
+            if (record.selected_id == self.replacement_id) return error.MutationDidNotChangeChoice;
+            self.mutated = true;
+            return self.replacement_id;
+        }
+        const selected_index = self.prng.random().intRangeLessThan(usize, 0, request.enabled.len);
+        return request.enabled[selected_index].id;
+    }
+
+    fn finish(ptr: *anyopaque) !void {
+        const self: *Mutating = @ptrCast(@alignCast(ptr));
+        if (!self.mutated) return error.MutationPointNotReached;
+    }
+};
+
+fn verifySite(record: trace.ChoiceRecord, request: Request) !void {
+    if (record.site_id != request.site_id or !std.mem.eql(u8, record.site_name, request.site_name) or record.occurrence != request.occurrence) return error.ReplayChoiceSiteDiverged;
+}
+
+fn verifyRecord(record: trace.ChoiceRecord, request: Request) !void {
+    try verifySite(record, request);
+    if (record.enabled_ids.len != request.enabled.len) return error.ReplayEnabledSetDiverged;
+    for (request.enabled, record.enabled_ids) |enabled, recorded_id| {
+        if (enabled.id != recorded_id) return error.ReplayEnabledSetDiverged;
+    }
+}
+
 test "replay diagnoses enabled-set divergence" {
     const records = [_]trace.ChoiceRecord{.{ .site_id = 7, .site_name = "site", .occurrence = 0, .enabled_ids = &.{ 1, 2 }, .selected_id = 1 }};
     const enabled = [_]transition.Transition{
@@ -106,4 +170,20 @@ test "replay diagnoses enabled-set divergence" {
     };
     var replay = Replay{ .records = &records };
     try std.testing.expectError(error.ReplayEnabledSetDiverged, replay.source().choose(.{ .site_id = 7, .site_name = "site", .occurrence = 0, .enabled = &enabled }));
+}
+
+test "mutating choice source replays a prefix and branches" {
+    const records = [_]trace.ChoiceRecord{
+        .{ .site_id = 7, .site_name = "site", .occurrence = 0, .enabled_ids = &.{ 1, 2 }, .selected_id = 1 },
+        .{ .site_id = 7, .site_name = "site", .occurrence = 1, .enabled_ids = &.{ 1, 2 }, .selected_id = 1 },
+    };
+    const enabled = [_]transition.Transition{
+        .{ .id = 1, .name = "one", .kind = .workload },
+        .{ .id = 2, .name = "two", .kind = .workload },
+    };
+    var mutating = Mutating.init(&records, 1, 2, 99);
+    const source = mutating.source();
+    try std.testing.expectEqual(@as(u64, 1), try source.choose(.{ .site_id = 7, .site_name = "site", .occurrence = 0, .enabled = &enabled }));
+    try std.testing.expectEqual(@as(u64, 2), try source.choose(.{ .site_id = 7, .site_name = "site", .occurrence = 1, .enabled = &enabled }));
+    try source.finish();
 }

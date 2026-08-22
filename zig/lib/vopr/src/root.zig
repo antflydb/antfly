@@ -4,12 +4,18 @@
 const std = @import("std");
 
 pub const choice = @import("choice.zig");
+pub const coverage = @import("coverage.zig");
+pub const corpus = @import("corpus.zig");
 pub const event = @import("event.zig");
+pub const explorer = @import("explorer.zig");
 pub const id = @import("id.zig");
 pub const observation = @import("observation.zig");
 pub const property = @import("property.zig");
 pub const replay = @import("replay.zig");
+pub const reducer = @import("reducer.zig");
 pub const runtime = @import("runtime.zig");
+pub const scheduler = @import("scheduler.zig");
+pub const sim_runtime = @import("sim_runtime.zig");
 pub const runner = @import("runner.zig");
 pub const scenario = @import("scenario.zig");
 pub const trace = @import("trace.zig");
@@ -126,11 +132,17 @@ test "trace v1 schema is checked in and valid JSON" {
 
 test {
     _ = choice;
+    _ = coverage;
+    _ = corpus;
     _ = event;
+    _ = explorer;
     _ = id;
     _ = observation;
     _ = property;
     _ = replay;
+    _ = reducer;
     _ = runtime;
+    _ = scheduler;
+    _ = sim_runtime;
     _ = transition;
 }

@@ -8,6 +8,7 @@ const ids = @import("id.zig");
 const observation = @import("observation.zig");
 const property = @import("property.zig");
 const scenario_contract = @import("scenario.zig");
+const scheduler = @import("scheduler.zig");
 const trace = @import("trace.zig");
 const transition = @import("transition.zig");
 
@@ -64,10 +65,8 @@ pub fn run(
     while (!Scenario.done(&world)) {
         if (transition_index == config.transition_budget) return error.TransitionBudgetExceeded;
 
-        var enabled = transition.List{};
+        var enabled = try scheduler.enumerateCanonical(Scenario, &world, allocator);
         defer enabled.deinit(allocator);
-        try Scenario.enumerate(&world, &enabled, allocator);
-        try enabled.canonicalize();
         if (enabled.items.items.len == 0) return error.ScenarioDeadlock;
 
         const occurrence = transition_index;
@@ -94,6 +93,7 @@ pub fn run(
 
         transition_index += 1;
         const selected_transition = selected orelse return error.ChoiceSourceSelectedDisabledAlternative;
+        try scheduler.verifyStillEnabled(Scenario, &world, allocator, enabled.items.items, selected_transition);
         var events = event.Sink{};
         defer events.deinit(allocator);
         try Scenario.execute(&world, selected_transition, &events, allocator);
