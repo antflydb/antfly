@@ -8084,6 +8084,46 @@ pub const KernelModule = struct {
         try launch1d(self.conv2d_f32, ctx, out_count, &params);
     }
 
+    /// Launch attention for the ComputeBackend contract: Q/K/V and output are
+    /// token-major [batch, sequence, heads * head_dim]. Keeping this entry
+    /// point separate prevents ComputeBackend callers from accidentally opting
+    /// into the low-level head-major layout used by specialized kernels.
+    pub fn launchTokenMajorAttentionF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        mask: buffer_mod.DeviceBuffer,
+        bias: buffer_mod.DeviceBuffer,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        causal: bool,
+        has_mask: bool,
+        bias_mode: u32,
+    ) driver_mod.Error!void {
+        return self.launchAttentionF32(
+            ctx,
+            dst,
+            q,
+            k,
+            v,
+            mask,
+            bias,
+            batch,
+            seq_len,
+            num_heads,
+            head_dim,
+            causal,
+            has_mask,
+            bias_mode,
+            false,
+        );
+    }
+
     pub fn launchAttentionF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -20564,7 +20604,7 @@ fn smokeAttentionF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext
     try q.copyFromHost(ctx, std.mem.sliceAsBytes(&q_token_major));
     try k.copyFromHost(ctx, std.mem.sliceAsBytes(&k_token_major));
     try v.copyFromHost(ctx, std.mem.sliceAsBytes(&v_token_major));
-    try module.launchAttentionF32(ctx, output, q, k, v, .{}, .{}, batch, seq, heads, dim, true, false, 0, false);
+    try module.launchTokenMajorAttentionF32(ctx, output, q, k, v, .{}, .{}, batch, seq, heads, dim, true, false, 0);
     try ctx.synchronize();
     const out = try allocator.alloc(f32, q_token_major.len);
     defer allocator.free(out);
@@ -20577,7 +20617,7 @@ fn smokeAttentionF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext
     var mask = try buffer_mod.DeviceBuffer.alloc(ctx, mask_data.len * @sizeOf(i64));
     defer mask.free(ctx);
     try mask.copyFromHost(ctx, std.mem.sliceAsBytes(&mask_data));
-    try module.launchAttentionF32(ctx, output, q, k, v, mask, .{}, batch, seq, heads, dim, false, true, 0, true);
+    try module.launchTokenMajorAttentionF32(ctx, output, q, k, v, mask, .{}, batch, seq, heads, dim, false, true, 0);
     try ctx.synchronize();
     try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
     try ctx.synchronize();
@@ -20642,7 +20682,7 @@ fn smokeAttentionF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext
     try parity_k_device.copyFromHost(ctx, std.mem.sliceAsBytes(&parity_k));
     try parity_v_device.copyFromHost(ctx, std.mem.sliceAsBytes(&parity_v));
     try parity_mask_device.copyFromHost(ctx, std.mem.sliceAsBytes(&parity_mask));
-    try module.launchAttentionF32(
+    try module.launchTokenMajorAttentionF32(
         ctx,
         parity_output,
         parity_q_device,
@@ -20657,7 +20697,6 @@ fn smokeAttentionF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext
         false,
         true,
         0,
-        false,
     );
     try ctx.synchronize();
     var parity_out: [parity_q.len]f32 = undefined;

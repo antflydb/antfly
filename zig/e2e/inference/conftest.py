@@ -333,6 +333,15 @@ class InferenceServer:
         finally:
             self.output.seek(position)
 
+    def selected_backends(self, supported_backends: set[str]) -> set[str]:
+        """Return every model-session backend recorded by the local server."""
+
+        return {
+            backend
+            for backend in supported_backends
+            if self.output_contains(f"selected backend {backend} for ")
+        }
+
     def failure_diagnostic(self) -> str:
         returncode = self.proc.poll()
         if returncode is None:
@@ -432,16 +441,21 @@ def base_url():
     unexpected_exit = server.proc.poll() is not None
     diagnostic = server.failure_diagnostic() if unexpected_exit else None
     server.stop(close_output=False)
-    if (
-        diagnostic is None
-        and required_backend
-        and not server.output_contains(f"selected backend {required_backend} for ")
-    ):
-        diagnostic = (
-            f"Inference E2E required a real {required_backend!r} model session, "
-            "but the server never selected that backend.\n"
-            f"Server output tail:\n{server.read_output()}"
-        )
+    if diagnostic is None and required_backend:
+        selected_backends = server.selected_backends(supported_backends)
+        if required_backend not in selected_backends:
+            diagnostic = (
+                f"Inference E2E required a real {required_backend!r} model session, "
+                "but the server never selected that backend.\n"
+                f"Server output tail:\n{server.read_output()}"
+            )
+        elif unexpected_backends := selected_backends - {required_backend}:
+            diagnostic = (
+                f"Inference E2E required every model session to use {required_backend!r}, "
+                "but the server also selected: "
+                f"{', '.join(sorted(unexpected_backends))}.\n"
+                f"Server output tail:\n{server.read_output()}"
+            )
     server.output.close()
     if diagnostic is not None and not server.failure_reported:
         pytest.fail(diagnostic, pytrace=False)

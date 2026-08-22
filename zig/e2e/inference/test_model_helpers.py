@@ -825,18 +825,23 @@ def test_live_server_tail_read_does_not_move_shared_output_offset():
         server.output.close()
 
 
-def test_server_output_contains_searches_full_capture_without_moving_offset():
+def test_server_output_backend_scan_searches_full_capture_without_moving_offset():
     server = InferenceServer.__new__(InferenceServer)
     server.output = tempfile.TemporaryFile(mode="w+b")
     server.proc = SimpleNamespace(poll=lambda: 0)
     try:
-        server.output.write(b"selected backend cuda for model\n")
+        server.output.write(b"selected backend cuda for first-model\n")
         server.output.write(b"x" * (70 * 1024))
+        server.output.write(b"selected backend native for second-model\n")
         server.output.seek(7)
         position = server.output.tell()
 
-        assert server.output_contains("selected backend cuda for model")
+        assert server.output_contains("selected backend cuda for first-model")
         assert not server.output_contains("selected backend metal for model")
+        assert server.selected_backends({"cuda", "metal", "native"}) == {
+            "cuda",
+            "native",
+        }
         assert server.output.tell() == position
     finally:
         server.output.close()
