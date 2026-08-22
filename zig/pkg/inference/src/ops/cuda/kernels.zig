@@ -8084,6 +8084,46 @@ pub const KernelModule = struct {
         try launch1d(self.conv2d_f32, ctx, out_count, &params);
     }
 
+    /// Launch attention for the ComputeBackend contract: Q/K/V and output are
+    /// token-major [batch, sequence, heads * head_dim]. Keeping this entry
+    /// point separate prevents ComputeBackend callers from accidentally opting
+    /// into the low-level head-major layout used by specialized kernels.
+    pub fn launchTokenMajorAttentionF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        mask: buffer_mod.DeviceBuffer,
+        bias: buffer_mod.DeviceBuffer,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        causal: bool,
+        has_mask: bool,
+        bias_mode: u32,
+    ) driver_mod.Error!void {
+        return self.launchAttentionF32(
+            ctx,
+            dst,
+            q,
+            k,
+            v,
+            mask,
+            bias,
+            batch,
+            seq_len,
+            num_heads,
+            head_dim,
+            causal,
+            has_mask,
+            bias_mode,
+            false,
+        );
+    }
+
     pub fn launchAttentionF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -20564,7 +20604,7 @@ fn smokeAttentionF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext
     try q.copyFromHost(ctx, std.mem.sliceAsBytes(&q_token_major));
     try k.copyFromHost(ctx, std.mem.sliceAsBytes(&k_token_major));
     try v.copyFromHost(ctx, std.mem.sliceAsBytes(&v_token_major));
-    try module.launchAttentionF32(ctx, output, q, k, v, .{}, .{}, batch, seq, heads, dim, true, false, 0, false);
+    try module.launchTokenMajorAttentionF32(ctx, output, q, k, v, .{}, .{}, batch, seq, heads, dim, true, false, 0);
     try ctx.synchronize();
     const out = try allocator.alloc(f32, q_token_major.len);
     defer allocator.free(out);
@@ -20577,11 +20617,92 @@ fn smokeAttentionF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext
     var mask = try buffer_mod.DeviceBuffer.alloc(ctx, mask_data.len * @sizeOf(i64));
     defer mask.free(ctx);
     try mask.copyFromHost(ctx, std.mem.sliceAsBytes(&mask_data));
-    try module.launchAttentionF32(ctx, output, q, k, v, mask, .{}, batch, seq, heads, dim, false, true, 0, true);
+    try module.launchTokenMajorAttentionF32(ctx, output, q, k, v, mask, .{}, batch, seq, heads, dim, false, true, 0);
     try ctx.synchronize();
     try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
     try ctx.synchronize();
     try expectApproxSlice(out, &expected_sdpa, 0.001);
+
+    // Exercise the public ComputeBackend layout with dimensions that make it
+    // observably different from head-major storage. The former 1x1-head smoke
+    // could not catch an accidental layout switch in the CUDA adapter.
+    const parity_batch: usize = 2;
+    const parity_seq: usize = 2;
+    const parity_heads: usize = 2;
+    const parity_dim: usize = 1;
+    const parity_q = [_]f32{
+        1, 2, 3, 4,
+        5, 6, 7, 8,
+    };
+    const parity_k = [_]f32{
+        1, -1, 2, -2,
+        3, -3, 4, -4,
+    };
+    const parity_v = [_]f32{
+        10, 20, 30, 40,
+        50, 60, 70, 80,
+    };
+    const parity_mask = [_]i64{ 1, 1, 1, 0 };
+    var parity_expected: [parity_q.len]f32 = undefined;
+    for (0..parity_batch) |b| {
+        for (0..parity_seq) |qi| {
+            for (0..parity_heads) |head| {
+                const q_idx = (b * parity_seq + qi) * parity_heads + head;
+                var max_score: f32 = -std.math.inf(f32);
+                for (0..parity_seq) |ki| {
+                    if (parity_mask[b * parity_seq + ki] == 0) continue;
+                    const k_idx = (b * parity_seq + ki) * parity_heads + head;
+                    max_score = @max(max_score, parity_q[q_idx] * parity_k[k_idx]);
+                }
+                var denom: f32 = 0;
+                var weighted: f32 = 0;
+                for (0..parity_seq) |ki| {
+                    if (parity_mask[b * parity_seq + ki] == 0) continue;
+                    const kv_idx = (b * parity_seq + ki) * parity_heads + head;
+                    const probability = @exp(parity_q[q_idx] * parity_k[kv_idx] - max_score);
+                    denom += probability;
+                    weighted += probability * parity_v[kv_idx];
+                }
+                parity_expected[q_idx] = weighted / denom;
+            }
+        }
+    }
+
+    var parity_q_device = try buffer_mod.DeviceBuffer.alloc(ctx, parity_q.len * @sizeOf(f32));
+    defer parity_q_device.free(ctx);
+    var parity_k_device = try buffer_mod.DeviceBuffer.alloc(ctx, parity_k.len * @sizeOf(f32));
+    defer parity_k_device.free(ctx);
+    var parity_v_device = try buffer_mod.DeviceBuffer.alloc(ctx, parity_v.len * @sizeOf(f32));
+    defer parity_v_device.free(ctx);
+    var parity_mask_device = try buffer_mod.DeviceBuffer.alloc(ctx, parity_mask.len * @sizeOf(i64));
+    defer parity_mask_device.free(ctx);
+    var parity_output = try buffer_mod.DeviceBuffer.alloc(ctx, parity_q.len * @sizeOf(f32));
+    defer parity_output.free(ctx);
+    try parity_q_device.copyFromHost(ctx, std.mem.sliceAsBytes(&parity_q));
+    try parity_k_device.copyFromHost(ctx, std.mem.sliceAsBytes(&parity_k));
+    try parity_v_device.copyFromHost(ctx, std.mem.sliceAsBytes(&parity_v));
+    try parity_mask_device.copyFromHost(ctx, std.mem.sliceAsBytes(&parity_mask));
+    try module.launchTokenMajorAttentionF32(
+        ctx,
+        parity_output,
+        parity_q_device,
+        parity_k_device,
+        parity_v_device,
+        parity_mask_device,
+        .{},
+        parity_batch,
+        parity_seq,
+        parity_heads,
+        parity_dim,
+        false,
+        true,
+        0,
+    );
+    try ctx.synchronize();
+    var parity_out: [parity_q.len]f32 = undefined;
+    try parity_output.copyToHost(ctx, std.mem.sliceAsBytes(&parity_out));
+    try ctx.synchronize();
+    try expectApproxSlice(&parity_out, &parity_expected, 0.001);
 }
 
 fn smokeFlorence2CrossAttentionF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
