@@ -214,7 +214,6 @@ pub fn neighborsWithLimitsAlloc(
     }
     if (req.limit == 0) return try alloc.alloc(Neighbor, 0);
     const graph_index = findGraphArtifactIndex(session, req.index_name) orelse return error.GraphSegmentNotFound;
-    try session.warmArtifact(graph_index);
     const payload = try session.fetchArtifactAlloc(graph_index);
     defer alloc.free(payload);
     var segment = try graph_segment_mod.decodeAlloc(alloc, payload);
@@ -249,7 +248,6 @@ pub fn traverseWithLimitsAlloc(
     }
     if (req.limit == 0) return try alloc.alloc(TraversalNode, 0);
     const graph_index = findGraphArtifactIndex(session, req.index_name) orelse return error.GraphSegmentNotFound;
-    try session.warmArtifact(graph_index);
     const payload = try session.fetchArtifactAlloc(graph_index);
     defer alloc.free(payload);
     var segment = try graph_segment_mod.decodeAlloc(alloc, payload);
@@ -321,7 +319,6 @@ pub fn shortestPathWithLimitsAlloc(
         return error.GraphTraversalQueryBudgetExceeded;
     }
     const graph_index = findGraphArtifactIndex(session, req.index_name) orelse return error.GraphSegmentNotFound;
-    try session.warmArtifact(graph_index);
     const payload = try session.fetchArtifactAlloc(graph_index);
     defer alloc.free(payload);
     var segment = try graph_segment_mod.decodeAlloc(alloc, payload);

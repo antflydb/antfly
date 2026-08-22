@@ -620,6 +620,8 @@ pub const HttpHandler = struct {
             .cache_exact_payload_block_misses = cache_stats.exact_payload_block_misses,
             .cache_exact_payload_block_writes = cache_stats.exact_payload_block_writes,
             .cache_evictions = cache_stats.evictions,
+            .cache_bypasses = cache_stats.bypasses,
+            .cache_integrity_failures = cache_stats.integrity_failures,
             .cache_current_bytes = cache_stats.current_bytes,
             .cache_pinned_bytes = cache_stats.pinned_bytes,
             .cache_payload_bytes = cache_stats.payload_bytes,
@@ -1155,7 +1157,6 @@ pub const HttpHandler = struct {
         var session = try self.query.openHeadSession(namespace);
         errdefer session.deinit();
         session.setCancellation(cancellation);
-        try query_mod.warmIndexedSearchPlanPath(&session, plan);
 
         var execution_stats = query_mod.QuerySearchExecutionStats{};
         const hits = try query_mod.searchIndexedPlanWithStatsAlloc(self.alloc, &session, plan, &execution_stats);
@@ -3339,7 +3340,6 @@ pub const HttpHandler = struct {
         defer if (need_docs) query_materializer.freeDocuments(self.alloc, @constCast(docs));
 
         const graph_index = query_mod.graph_reader.findGraphArtifactIndex(session, named_query.query.index_name) orelse return error.GraphSegmentNotFound;
-        try session.warmArtifact(graph_index);
         const payload = try session.fetchArtifactAlloc(graph_index);
         defer self.alloc.free(payload);
         var segment = try graph_segment_mod.decodeAlloc(self.alloc, payload);
@@ -4181,8 +4181,6 @@ pub const HttpHandler = struct {
     }
 
     fn allocPublishedDocumentsAlloc(self: *HttpHandler, session: *query_mod.QuerySession) ![]query_materializer.Document {
-        try session.warmArtifactKind(.document_segment);
-        try session.warmArtifactKind(.mutation_segment);
         for (0..session.artifactCount()) |artifact_index| {
             const artifact_ref = session.artifactRef(artifact_index) orelse continue;
             if (artifact_ref.kind != .document_segment) continue;

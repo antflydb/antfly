@@ -20,6 +20,7 @@ const catalog_mod = @import("../catalog/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
 const graph_segment_mod = @import("../graph_segment/mod.zig");
 const cache_mod = @import("cache.zig");
+const bounded_decode = @import("../bounded_decode.zig");
 const graph_reader = @import("graph_reader.zig");
 const request_mod = @import("request.zig");
 const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
@@ -108,6 +109,15 @@ pub const QueryRuntime = struct {
     pub fn recordSearchStats(self: *QueryRuntime, namespace: []const u8, mode: request_mod.QueryMode, stats: anytype) !void {
         lockAtomic(&self.metrics_mu);
         defer self.metrics_mu.unlock();
+
+        var namespace_metrics = self.namespace_metrics.getPtr(namespace);
+        if (namespace_metrics == null) {
+            try self.namespace_metrics.ensureUnusedCapacity(self.alloc, 1);
+            const owned_namespace = try self.alloc.dupe(u8, namespace);
+            self.namespace_metrics.putAssumeCapacityNoClobber(owned_namespace, .{});
+            namespace_metrics = self.namespace_metrics.getPtr(owned_namespace).?;
+        }
+
         self.metrics.total_queries += 1;
         applyModeCount(&self.metrics, mode);
         self.metrics.total_actual_probes += stats.actual_probe_count;
@@ -116,18 +126,13 @@ pub const QueryRuntime = struct {
         self.metrics.total_exact_reranks += stats.exact_rerank_count;
         self.metrics.total_cluster_prunes += stats.cluster_prune_count;
 
-        const gop = self.namespace_metrics.getOrPut(self.alloc, namespace) catch return error.OutOfMemory;
-        if (!gop.found_existing) {
-            gop.key_ptr.* = self.alloc.dupe(u8, namespace) catch return error.OutOfMemory;
-            gop.value_ptr.* = .{};
-        }
-        gop.value_ptr.total_queries += 1;
-        applyModeCount(gop.value_ptr, mode);
-        gop.value_ptr.total_actual_probes += stats.actual_probe_count;
-        gop.value_ptr.total_shortlist_candidates += stats.actual_shortlist_count;
-        gop.value_ptr.total_quantized_candidates += stats.quantized_candidate_count;
-        gop.value_ptr.total_exact_reranks += stats.exact_rerank_count;
-        gop.value_ptr.total_cluster_prunes += stats.cluster_prune_count;
+        namespace_metrics.?.total_queries += 1;
+        applyModeCount(namespace_metrics.?, mode);
+        namespace_metrics.?.total_actual_probes += stats.actual_probe_count;
+        namespace_metrics.?.total_shortlist_candidates += stats.actual_shortlist_count;
+        namespace_metrics.?.total_quantized_candidates += stats.quantized_candidate_count;
+        namespace_metrics.?.total_exact_reranks += stats.exact_rerank_count;
+        namespace_metrics.?.total_cluster_prunes += stats.cluster_prune_count;
     }
 
     pub fn metricsSnapshot(self: *QueryRuntime) QueryExecutionMetrics {
@@ -142,6 +147,7 @@ pub const QueryRuntime = struct {
         const out = try alloc.alloc(NamespaceQueryExecutionMetrics, self.namespace_metrics.count());
         errdefer alloc.free(out);
         var idx: usize = 0;
+        errdefer for (out[0..idx]) |*entry| entry.deinit(alloc);
         var it = self.namespace_metrics.iterator();
         while (it.next()) |entry| : (idx += 1) {
             out[idx] = .{
@@ -208,10 +214,22 @@ pub const QuerySession = struct {
     pub fn fetchArtifactAlloc(self: *QuerySession, index: usize) ![]u8 {
         try self.checkCancellation();
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
+        try validateArtifactForQuery(artifact);
         const result = if (self.cache) |cache|
-            try cache.getOrFetchAllocWithCancellation(self.artifacts, artifact.artifact_id, self.cancellation)
+            try cache.getOrFetchVerifiedAllocWithCancellation(
+                self.artifacts,
+                artifact.artifact_id,
+                artifact.byte_len,
+                artifact.checksum,
+                self.cancellation,
+            )
         else
-            try self.artifacts.getAllocWithCancellation(artifact.artifact_id, self.cancellation);
+            try self.artifacts.getVerifiedAllocWithCancellation(
+                artifact.artifact_id,
+                artifact.byte_len,
+                artifact.checksum,
+                self.cancellation,
+            );
         errdefer self.alloc.free(result);
         try self.checkCancellation();
         return result;
@@ -220,6 +238,7 @@ pub const QuerySession = struct {
     pub fn fetchArtifactRangeAlloc(self: *QuerySession, index: usize, offset: u64, len: usize) ![]u8 {
         try self.checkCancellation();
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
+        try validateArtifactRange(artifact, offset, len);
         const result = if (self.cache) |cache|
             try cache.getRangeOrFetchAllocWithCancellation(self.artifacts, artifact.artifact_id, offset, len, self.cancellation)
         else
@@ -232,6 +251,7 @@ pub const QuerySession = struct {
     pub fn fetchArtifactBlockRangeAlloc(self: *QuerySession, index: usize, block_id: []const u8, offset: u64, len: usize) ![]u8 {
         try self.checkCancellation();
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
+        try validateArtifactRange(artifact, offset, len);
         const result = if (self.cache) |cache|
             try cache.getBlockOrFetchRangeAllocWithCancellation(self.artifacts, artifact.artifact_id, block_id, offset, len, self.cancellation)
         else
@@ -252,6 +272,26 @@ pub const QuerySession = struct {
         try self.warmArtifact(index);
     }
 };
+
+fn validateArtifactRange(artifact: manifest_mod.ArtifactRef, offset: u64, len: usize) !void {
+    try validateArtifactIdentity(artifact);
+    if (len > (bounded_decode.Limits{}).max_artifact_bytes) return error.QueryArtifactBudgetExceeded;
+    const len_u64 = std.math.cast(u64, len) orelse return error.ArtifactRangeTooLarge;
+    const end = std.math.add(u64, offset, len_u64) catch return error.InvalidArtifactRange;
+    if (end > artifact.byte_len) return error.InvalidArtifactRange;
+}
+
+fn validateArtifactForQuery(artifact: manifest_mod.ArtifactRef) !void {
+    try validateArtifactIdentity(artifact);
+    if (artifact.byte_len > (bounded_decode.Limits{}).max_artifact_bytes) {
+        return error.QueryArtifactBudgetExceeded;
+    }
+}
+
+fn validateArtifactIdentity(artifact: manifest_mod.ArtifactRef) !void {
+    artifacts_mod.validateSha256ArtifactIdentity(artifact.artifact_id, artifact.checksum) catch
+        return error.ArtifactIntegrityMismatch;
+}
 
 test "query runtime pins manifest version while head advances" {
     const alloc = std.testing.allocator;
@@ -661,8 +701,16 @@ test "serverless query session propagates cancellation through full and cached r
             return error.ExpectedCancellation;
         }
 
-        fn stat(_: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.ArtifactMetadata {
-            return error.UnexpectedStat;
+        fn stat(_: *anyopaque, result_alloc: Allocator, artifact_id: []const u8) !artifacts_mod.ArtifactMetadata {
+            const owned_id = try result_alloc.dupe(u8, artifact_id);
+            errdefer result_alloc.free(owned_id);
+            const checksum = try result_alloc.dupe(u8, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+            errdefer result_alloc.free(checksum);
+            return .{
+                .artifact_id = owned_id,
+                .byte_len = 7,
+                .checksum = checksum,
+            };
         }
 
         fn delete(_: *anyopaque, _: []const u8) !void {
@@ -711,7 +759,8 @@ test "serverless query session propagates cancellation through full and cached r
     };
 
     try std.testing.expectError(error.Canceled, session.fetchArtifactAlloc(0));
-    try std.testing.expectEqual(@as(usize, 1), state.full_calls);
+    try std.testing.expectEqual(@as(usize, 0), state.full_calls);
+    try std.testing.expectEqual(@as(usize, 1), state.range_calls);
 
     var cache_root_buf: [256]u8 = undefined;
     const cache_root = tmpPath(&cache_root_buf, "transport-cancellation-cache");
@@ -721,7 +770,7 @@ test "serverless query session propagates cancellation through full and cached r
     session.cache = &cache;
     cancelled.store(false, .release);
     try std.testing.expectError(error.Canceled, session.fetchArtifactBlockRangeAlloc(0, "vector-header", 0, 7));
-    try std.testing.expectEqual(@as(usize, 1), state.range_calls);
+    try std.testing.expectEqual(@as(usize, 2), state.range_calls);
 }
 
 test "query runtime tracks namespace-scoped search metrics" {
@@ -779,6 +828,57 @@ test "query runtime tracks namespace-scoped search metrics" {
     try std.testing.expectEqual(@as(u64, 5), docs_a.?.metrics.total_actual_probes);
     try std.testing.expectEqual(@as(u64, 1), docs_b.?.metrics.total_queries);
     try std.testing.expectEqual(@as(u64, 1), docs_b.?.metrics.sparse_queries);
+}
+
+test "serverless query runtime metrics remain valid across every allocation failure" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var runtime = QueryRuntime.init(alloc, undefined, undefined, undefined);
+            defer runtime.deinit();
+            const stats = .{
+                .actual_probe_count = @as(u32, 1),
+                .actual_shortlist_count = @as(u32, 2),
+                .quantized_candidate_count = @as(u32, 3),
+                .exact_rerank_count = @as(u32, 4),
+                .cluster_prune_count = @as(u32, 5),
+            };
+            try runtime.recordSearchStats("docs-a", .vector, stats);
+            try runtime.recordSearchStats("docs-b", .hybrid, stats);
+            const snapshot = try runtime.namespaceMetricsAlloc(alloc);
+            defer {
+                for (snapshot) |*entry| entry.deinit(alloc);
+                alloc.free(snapshot);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "serverless query session validates content addresses and declared range bounds" {
+    const alloc = std.testing.allocator;
+    var refs = [_]manifest_mod.ArtifactRef{.{
+        .kind = .vector_segment,
+        .artifact_id = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        .byte_len = 8,
+        .checksum = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    }};
+    var session = QuerySession{
+        .alloc = alloc,
+        .artifacts = undefined,
+        .manifest = .{
+            .namespace = "docs",
+            .version = 1,
+            .built_at_ns = 1,
+            .wal_start_lsn = 1,
+            .wal_end_lsn = 1,
+            .stats = .{},
+            .artifacts = &refs,
+        },
+    };
+    try std.testing.expectError(error.InvalidArtifactRange, session.fetchArtifactRangeAlloc(0, 7, 2));
+    try std.testing.expectError(error.InvalidArtifactRange, session.fetchArtifactBlockRangeAlloc(0, "vector-header", std.math.maxInt(u64), 2));
+    refs[0].artifact_id = "../../outside-cache";
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, session.fetchArtifactRangeAlloc(0, 0, 1));
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

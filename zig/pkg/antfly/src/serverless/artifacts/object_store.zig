@@ -64,30 +64,47 @@ pub const ObjectStore = struct {
         fs.* = try objectstore.FilesystemClient.init(alloc, path);
 
         var owned_client = fs.client();
+        var client_initialized = true;
+        errdefer if (client_initialized) owned_client.deinit();
         if (!(try owned_client.bucketExists("serverless-artifacts"))) try owned_client.makeBucket("serverless-artifacts");
+        const owned_bucket = try alloc.dupe(u8, "serverless-artifacts");
+        errdefer alloc.free(owned_bucket);
+        const owned_prefix = try alloc.dupe(u8, "");
+        errdefer alloc.free(owned_prefix);
+        client_initialized = false;
         return .{
             .alloc = alloc,
             .client = owned_client,
             .fs_client = fs,
-            .bucket = try alloc.dupe(u8, "serverless-artifacts"),
-            .prefix = try alloc.dupe(u8, ""),
+            .bucket = owned_bucket,
+            .prefix = owned_prefix,
         };
     }
 
     pub fn initGcsUri(alloc: std.mem.Allocator, bucket: []const u8, prefix: []const u8) !ObjectStore {
         const gcs = try alloc.create(objectstore.Gcs.JsonApiClient);
         errdefer alloc.destroy(gcs);
-        const cfg = try objectstore.Gcs.jsonApiClientConfigFromEnvAlloc(alloc);
+        var cfg = try objectstore.Gcs.jsonApiClientConfigFromEnvAlloc(alloc);
+        var config_owned = true;
+        errdefer if (config_owned) cfg.deinit(alloc);
         gcs.* = try objectstore.Gcs.JsonApiClient.init(alloc, cfg);
+        config_owned = false;
 
         var owned_client = gcs.client();
+        var client_initialized = true;
+        errdefer if (client_initialized) owned_client.deinit();
         if (!(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
+        const owned_bucket = try alloc.dupe(u8, bucket);
+        errdefer alloc.free(owned_bucket);
+        const owned_prefix = try alloc.dupe(u8, prefix);
+        errdefer alloc.free(owned_prefix);
+        client_initialized = false;
         return .{
             .alloc = alloc,
             .client = owned_client,
             .gcs_client = gcs,
-            .bucket = try alloc.dupe(u8, bucket),
-            .prefix = try alloc.dupe(u8, prefix),
+            .bucket = owned_bucket,
+            .prefix = owned_prefix,
         };
     }
 
@@ -103,29 +120,43 @@ pub const ObjectStore = struct {
     ) !ObjectStore {
         const s3 = try alloc.create(objectstore.S3.Client);
         errdefer alloc.destroy(s3);
-        const cfg = try object_store_support.s3ConfigAlloc(alloc, options);
+        var cfg = try object_store_support.s3ConfigAlloc(alloc, options);
+        var config_owned = true;
+        errdefer if (config_owned) cfg.deinit(alloc);
         s3.* = try objectstore.S3.Client.init(alloc, cfg);
+        config_owned = false;
 
         var owned_client = s3.client();
+        var client_initialized = true;
+        errdefer if (client_initialized) owned_client.deinit();
         if (!(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
+        const owned_bucket = try alloc.dupe(u8, bucket);
+        errdefer alloc.free(owned_bucket);
+        const owned_prefix = try alloc.dupe(u8, prefix);
+        errdefer alloc.free(owned_prefix);
+        client_initialized = false;
         return .{
             .alloc = alloc,
             .client = owned_client,
             .s3_client = s3,
-            .bucket = try alloc.dupe(u8, bucket),
-            .prefix = try alloc.dupe(u8, prefix),
+            .bucket = owned_bucket,
+            .prefix = owned_prefix,
         };
     }
 
     pub fn initWithClient(alloc: std.mem.Allocator, client: objectstore.Client, bucket: []const u8, prefix: []const u8) !ObjectStore {
         var owned_client = client;
         if (!(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
+        const owned_bucket = try alloc.dupe(u8, bucket);
+        errdefer alloc.free(owned_bucket);
+        const owned_prefix = try alloc.dupe(u8, prefix);
+        errdefer alloc.free(owned_prefix);
         return .{
             .alloc = alloc,
             .client = owned_client,
             .owns_client = false,
-            .bucket = try alloc.dupe(u8, bucket),
-            .prefix = try alloc.dupe(u8, prefix),
+            .bucket = owned_bucket,
+            .prefix = owned_prefix,
         };
     }
 
@@ -158,7 +189,7 @@ pub const ObjectStore = struct {
         var result = try self.client.putObject(self.bucket, key, contents, .{
             .content_type = "application/octet-stream",
         });
-        defer result.deinit(alloc);
+        defer result.deinit(self.client.allocator);
 
         return .{
             .artifact_id = artifact_id,
@@ -184,7 +215,7 @@ pub const ObjectStore = struct {
         var result = self.client.getObject(self.bucket, key, .{
             .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
         }) catch |err| return normalizeCancellationError(err);
-        defer result.deinit(alloc);
+        defer result.deinit(self.client.allocator);
         try cancellation.check();
         return try dupeWithCancellationAlloc(alloc, result.body, cancellation);
     }
@@ -211,7 +242,7 @@ pub const ObjectStore = struct {
             .max_response_bytes = len,
             .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
         }) catch |err| return normalizeCancellationError(err);
-        defer result.deinit(alloc);
+        defer result.deinit(self.client.allocator);
         try cancellation.check();
         return try dupeWithCancellationAlloc(alloc, result.body, cancellation);
     }
@@ -235,7 +266,7 @@ pub const ObjectStore = struct {
         var meta = self.client.statObjectWithOptions(self.bucket, key, .{
             .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
         }) catch |err| return normalizeCancellationError(err);
-        defer meta.deinit(alloc);
+        defer meta.deinit(self.client.allocator);
         try cancellation.check();
         return .{
             .artifact_id = try alloc.dupe(u8, artifact_id),
@@ -401,6 +432,56 @@ test "objectstore-backed artifacts store opens gs uri through parser with inject
     const got = try store.getAlloc(meta.artifact_id);
     defer alloc.free(got);
     try std.testing.expectEqualStrings("payload", got);
+}
+
+test "serverless objectstore-backed artifacts preserve distinct client and result allocators" {
+    const result_alloc = std.testing.allocator;
+    var client_buffer: [256 * 1024]u8 = undefined;
+    var client_fba = std.heap.FixedBufferAllocator.init(&client_buffer);
+    const client_alloc = client_fba.allocator();
+    var memory = objectstore.MemoryClient.init(client_alloc);
+    defer memory.deinit();
+    var impl = try ObjectStore.initWithClient(result_alloc, memory.client(), "bucket", "tenant/a");
+    var store = impl.artifactStore();
+    defer store.deinit();
+
+    var meta = try store.put("allocator-safe");
+    defer meta.deinit(result_alloc);
+    const got = try store.getAlloc(meta.artifact_id);
+    defer result_alloc.free(got);
+    try std.testing.expectEqualStrings("allocator-safe", got);
+    const range = try store.getRangeAlloc(meta.artifact_id, 10, 4);
+    defer result_alloc.free(range);
+    try std.testing.expectEqualStrings("safe", range);
+    var stat = try store.stat(meta.artifact_id);
+    defer stat.deinit(result_alloc);
+    try std.testing.expectEqual(@as(u64, "allocator-safe".len), stat.byte_len);
+}
+
+test "serverless objectstore-backed artifact initialization cleans up every allocation failure" {
+    var file_root_buf: [256]u8 = undefined;
+    const file_root = tmpPath(&file_root_buf, "owned-init-oom");
+    defer cleanupTmp(file_root);
+    var uri_buf: [320]u8 = undefined;
+    const file_uri = try std.fmt.bufPrint(&uri_buf, "file://{s}", .{std.mem.span(file_root)});
+    var seeded_store = try ObjectStore.initFileUri(std.testing.allocator, file_uri);
+    seeded_store.deinit();
+
+    const Runner = struct {
+        fn borrowed(alloc: std.mem.Allocator) !void {
+            var memory = objectstore.MemoryClient.init(alloc);
+            defer memory.deinit();
+            var impl = try ObjectStore.initWithClient(alloc, memory.client(), "bucket", "tenant/a");
+            defer impl.deinit();
+        }
+
+        fn owned(alloc: std.mem.Allocator, uri: []const u8) !void {
+            var impl = try ObjectStore.initFileUri(alloc, uri);
+            defer impl.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.borrowed, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.owned, .{file_uri});
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

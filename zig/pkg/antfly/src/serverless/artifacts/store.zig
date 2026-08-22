@@ -106,6 +106,44 @@ pub const ArtifactStore = struct {
         return payload;
     }
 
+    /// Loads one content-addressed artifact without trusting either the backing
+    /// store or its metadata to honor the manifest contract. The declared size
+    /// bounds the transport allocation and the digest is checked before bytes
+    /// can reach a decoder or cache.
+    pub fn getVerifiedAllocWithCancellation(
+        self: *ArtifactStore,
+        artifact_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        try cancellation.check();
+        validateSha256ArtifactIdentity(artifact_id, expected_checksum) catch
+            return error.ArtifactIntegrityMismatch;
+        const expected_len = std.math.cast(usize, expected_byte_len) orelse
+            return error.ArtifactTooLarge;
+
+        var metadata = try self.statWithCancellation(artifact_id, cancellation);
+        defer metadata.deinit(self.allocator);
+        if (!std.mem.eql(u8, metadata.artifact_id, artifact_id) or
+            metadata.byte_len != expected_byte_len or
+            !std.mem.eql(u8, metadata.checksum, expected_checksum))
+        {
+            return error.ArtifactIntegrityMismatch;
+        }
+
+        const payload = try self.getRangeAllocWithCancellation(
+            artifact_id,
+            0,
+            expected_len,
+            cancellation,
+        );
+        errdefer self.allocator.free(payload);
+        if (payload.len != expected_len) return error.ArtifactIntegrityMismatch;
+        try validatePayloadSha256WithCancellation(payload, expected_checksum, cancellation);
+        return payload;
+    }
+
     pub fn getRangeAlloc(self: *ArtifactStore, artifact_id: []const u8, offset: u64, len: usize) ![]u8 {
         return try self.getRangeAllocWithCancellation(artifact_id, offset, len, .none);
     }
@@ -146,6 +184,28 @@ pub const ArtifactStore = struct {
         try self.vtable.delete(self.ptr, artifact_id);
     }
 };
+
+pub fn validatePayloadSha256WithCancellation(
+    payload: []const u8,
+    expected_checksum: []const u8,
+    cancellation: CancellationToken,
+) !void {
+    validateSha256Checksum(expected_checksum) catch return error.ArtifactIntegrityMismatch;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    const cancellation_chunk_bytes = 1024 * 1024;
+    var offset: usize = 0;
+    while (offset < payload.len) {
+        try cancellation.check();
+        const chunk_len = @min(cancellation_chunk_bytes, payload.len - offset);
+        hasher.update(payload[offset..][0..chunk_len]);
+        offset += chunk_len;
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const actual = std.fmt.bytesToHex(digest, .lower);
+    if (!std.mem.eql(u8, &actual, expected_checksum)) return error.ArtifactIntegrityMismatch;
+    try cancellation.check();
+}
 
 test "artifact identities require canonical matching sha256 values" {
     const checksum = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";

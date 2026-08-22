@@ -21,6 +21,7 @@ pub const ArtifactStore = store.ArtifactStore;
 pub const sha256ChecksumFromArtifactId = store.sha256ChecksumFromArtifactId;
 pub const validateSha256ArtifactIdentity = store.validateSha256ArtifactIdentity;
 pub const validateSha256Checksum = store.validateSha256Checksum;
+pub const validatePayloadSha256WithCancellation = store.validatePayloadSha256WithCancellation;
 pub const FsStore = fs_store.FsStore;
 pub const RemoteStore = remote_store.RemoteStore;
 
@@ -33,6 +34,7 @@ test "serverless artifacts module compiles" {
     _ = sha256ChecksumFromArtifactId;
     _ = validateSha256ArtifactIdentity;
     _ = validateSha256Checksum;
+    _ = validatePayloadSha256WithCancellation;
     _ = FsStore;
     _ = RemoteStore;
 }
