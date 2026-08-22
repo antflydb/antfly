@@ -18,6 +18,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, argv[1], "campaign")) return campaignCommand(alloc, io, argv[2..]);
     if (std.mem.eql(u8, argv[1], "reduce")) return reduceCommand(alloc, io, argv[2..]);
     if (std.mem.eql(u8, argv[1], "promote")) return promoteCommand(alloc, io, argv[2..]);
+    if (std.mem.eql(u8, argv[1], "migrate")) return migrateCommand(alloc, io, argv[2..]);
     if (std.mem.eql(u8, argv[1], "tla")) return tlaCommand(alloc, io, argv[2..]);
     if (std.mem.eql(u8, argv[1], "explain")) return explainCommand(alloc, io, argv[2..]);
     return usage();
@@ -343,7 +344,7 @@ fn promoteCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8
     }
     const input = trace_path orelse return error.TracePathRequired;
     const name = fixture_name orelse return error.FixtureNameRequired;
-    try validateFixtureName(name);
+    try vopr.fixture.validateName(name);
     const encoded = try std.Io.Dir.cwd().readFileAlloc(io, input, alloc, .limited(max_trace_bytes));
     defer alloc.free(encoded);
     var recorded = try vopr.trace.parseAlloc(alloc, encoded);
@@ -360,6 +361,63 @@ fn promoteCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8
     const output = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ fixture_dir, filename });
     defer alloc.free(output);
     std.debug.print("VOPR promoted fingerprint={x} fixture={s}\n", .{ recorded.failures.items[0].fingerprint, output });
+}
+
+fn migrateCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    var trace_path: ?[]const u8 = null;
+    var output_path: ?[]const u8 = null;
+    var force = false;
+    var index: usize = 0;
+    while (index < args.len) {
+        if (std.mem.eql(u8, args[index], "--trace")) {
+            trace_path = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, args[index], "--out")) {
+            output_path = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, args[index], "--force")) {
+            force = true;
+        } else return error.UnknownArgument;
+        index += 1;
+    }
+    const input = trace_path orelse return error.TracePathRequired;
+    const output = output_path orelse return error.TraceOutputRequired;
+    if (std.mem.eql(u8, input, output)) return error.InPlaceFixtureMigrationForbidden;
+    const encoded = try std.Io.Dir.cwd().readFileAlloc(io, input, alloc, .limited(max_trace_bytes));
+    defer alloc.free(encoded);
+    var recorded = try vopr.trace.parseAlloc(alloc, encoded);
+    defer recorded.deinit();
+    var migration = try vopr.fixture.migrate(
+        alloc,
+        &recorded,
+        replayKnownScenario,
+        vopr.fixture.canonicalClone,
+        replayKnownScenario,
+        .{},
+    );
+    defer migration.deinit();
+    if (!force) {
+        if (std.Io.Dir.cwd().statFile(io, output, .{})) |_| {
+            return error.MigrationOutputAlreadyExists;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+    }
+    const migrated_bytes = try migration.artifact.renderAlloc(alloc);
+    defer alloc.free(migrated_bytes);
+    if (std.fs.path.dirname(output)) |parent| try ensureDir(io, parent);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output, .data = migrated_bytes });
+    std.debug.print(
+        "VOPR migrated scenario={s} version={d}->{d} trace={x}->{x} outcome={x} out={s}\n",
+        .{
+            migration.artifact.header.scenario,
+            migration.report.source_scenario_version,
+            migration.report.migrated_scenario_version,
+            migration.report.source_trace_digest,
+            migration.report.migrated_trace_digest,
+            migration.report.migrated_outcome_digest,
+            output,
+        },
+    );
 }
 
 fn fixtureDirForScenario(recorded: *const vopr.trace.Trace) ![]const u8 {
@@ -380,9 +438,7 @@ fn promoteRecordedToDir(
     name: []const u8,
     force: bool,
 ) ![]u8 {
-    try validateFixtureName(name);
-    try recorded.validate();
-    if (recorded.failures.items.len == 0) return error.FailingTraceRequired;
+    try vopr.fixture.validatePromotion(recorded, name);
     const filename = try std.fmt.allocPrint(alloc, "{s}.simtrace", .{name});
     errdefer alloc.free(filename);
     if (!force) {
@@ -397,14 +453,6 @@ fn promoteRecordedToDir(
     defer alloc.free(canonical);
     try dir.writeFile(io, .{ .sub_path = filename, .data = canonical });
     return filename;
-}
-
-fn validateFixtureName(name: []const u8) !void {
-    if (name.len == 0) return error.InvalidFixtureName;
-    for (name) |byte| {
-        if (std.ascii.isLower(byte) or std.ascii.isDigit(byte) or byte == '-') continue;
-        return error.InvalidFixtureName;
-    }
 }
 
 const CampaignContext = struct {
@@ -719,6 +767,7 @@ fn usage() error{InvalidUsage} {
         \\  vopr campaign --scenario metadata --histories <n> --transitions <n> --workers <n> --artifact-dir <path>
         \\  vopr reduce --trace <path> --out <path> [--attempts <n>]
         \\  vopr promote --trace <path> --name <fixture-name> [--force]
+        \\  vopr migrate --trace <path> --out <path> [--force]
         \\  vopr tla --trace <path> --domain raft|transaction --out <path.ndjson>
         \\  vopr explain --trace <path> [--failure <ordinal>] --out <path.json>
         \\
