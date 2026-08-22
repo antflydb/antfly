@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 
 pub const Edge = struct {
     neighbor_id: []u8,
@@ -60,12 +61,22 @@ pub const AdjacencyIndex = struct {
     by_node_id: Map = .empty,
 
     pub fn init(alloc: Allocator, segment: Segment) !AdjacencyIndex {
+        return try initWithCancellation(alloc, segment, .none);
+    }
+
+    pub fn initWithCancellation(
+        alloc: Allocator,
+        segment: Segment,
+        cancellation: CancellationToken,
+    ) !AdjacencyIndex {
+        try cancellation.check();
         var self = AdjacencyIndex{};
         errdefer self.deinit(alloc);
         const capacity = std.math.cast(Map.Size, segment.adjacencies.len) orelse
             return error.InvalidGraphSegment;
         try self.by_node_id.ensureTotalCapacity(alloc, capacity);
         for (segment.adjacencies, 0..) |adjacency, idx| {
+            if (idx % 64 == 0) try cancellation.check();
             const gop = self.by_node_id.getOrPutAssumeCapacity(adjacency.node_id);
             if (gop.found_existing) return error.InvalidGraphSegment;
             gop.value_ptr.* = idx;

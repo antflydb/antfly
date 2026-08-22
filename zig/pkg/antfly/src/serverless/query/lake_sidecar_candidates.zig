@@ -68,6 +68,14 @@ pub const CandidateServingLimits = struct {
     }
 };
 
+/// Execution controls shared by direct single-sidecar APIs. The limits remain
+/// value-owned while the cancellation token borrows its callback context for
+/// the duration of the synchronous call.
+pub const CandidateServingOptions = struct {
+    limits: CandidateServingLimits = .{},
+    cancellation: CancellationToken = .none,
+};
+
 pub const TextCandidateRequest = struct {
     text: []const u8,
     operator: query_request.QueryOperator = .any_terms,
@@ -207,6 +215,10 @@ const CandidateServingBudget = struct {
         if (next_edges % 64 == 0) try self.cancellation.check();
     }
 
+    fn checkCancellation(self: CandidateServingBudget) !void {
+        try self.cancellation.check();
+    }
+
     fn remainingArtifacts(self: CandidateServingBudget) usize {
         std.debug.assert(self.artifacts <= self.limits.max_artifacts);
         return self.limits.max_artifacts - self.artifacts;
@@ -305,13 +317,23 @@ fn candidateSetFromKeysBudgetAlloc(
     keys: []const []const u8,
     budget: *CandidateServingBudget,
 ) !OwnedCandidateSet {
-    const row_ref_bytes = try source_binding.rowRefsOwnedAllocationBytesFromKeys(declaration.binding, keys);
+    try budget.checkCancellation();
+    const row_ref_bytes = try source_binding.rowRefsOwnedAllocationBytesFromKeysWithCancellation(
+        declaration.binding,
+        keys,
+        budget.cancellation,
+    );
     const output_bytes = std.math.add(usize, row_ref_bytes, declaration.name.len) catch
         return error.LakeSidecarCandidateBudgetExceeded;
     try budget.admitCandidateOutput(keys.len, output_bytes);
     errdefer budget.releaseCandidateOutput(keys.len, output_bytes);
 
-    const refs = try source_binding.rowRefsFromKeysAlloc(alloc, declaration.binding, keys);
+    const refs = try source_binding.rowRefsFromKeysWithCancellationAlloc(
+        alloc,
+        declaration.binding,
+        keys,
+        budget.cancellation,
+    );
     errdefer source_binding.freeOwnedRowRefs(alloc, refs);
     return .{
         .sidecar_name = try alloc.dupe(u8, declaration.name),
@@ -335,9 +357,20 @@ pub fn textCandidateSetFromPayloadWithLimitsAlloc(
     request: TextCandidateRequest,
     limits: CandidateServingLimits,
 ) !OwnedCandidateSet {
-    try validateTextCandidateRequest(request, limits);
-    try validatePayloadAgainstDeclaration(payload, declaration, limits);
-    var budget = try CandidateServingBudget.init(limits);
+    return try textCandidateSetFromPayloadWithOptionsAlloc(alloc, declaration, payload, request, .{ .limits = limits });
+}
+
+pub fn textCandidateSetFromPayloadWithOptionsAlloc(
+    alloc: Allocator,
+    declaration: sidecar_manifest.DeclaredArtifact,
+    payload: []const u8,
+    request: TextCandidateRequest,
+    options: CandidateServingOptions,
+) !OwnedCandidateSet {
+    var budget = try CandidateServingBudget.initWithCancellation(options.limits, options.cancellation);
+    try validateTextCandidateRequest(request, options.limits);
+    try budget.checkCancellation();
+    try validatePayloadAgainstDeclarationWithCancellation(payload, declaration, options.limits, options.cancellation);
     var bounded_request = request;
     bounded_request.limit = budget.generationLimit(request.limit);
     return try textCandidateSetFromPayloadWithBudgetAlloc(alloc, declaration, payload, bounded_request, &budget);
@@ -350,6 +383,7 @@ fn textCandidateSetFromPayloadWithBudgetAlloc(
     request: TextCandidateRequest,
     budget: *CandidateServingBudget,
 ) !OwnedCandidateSet {
+    try budget.checkCancellation();
     var limiter = try bounded_decode.AllocationLimiter.init(alloc, budget.limits.decode.max_allocation_bytes);
     return textCandidateSetFromPayloadBoundedAlloc(limiter.allocator(), declaration, payload, request, budget) catch |err| {
         if (err == error.OutOfMemory and limiter.limit_exceeded) return error.LakeSidecarCandidateBudgetExceeded;
@@ -364,14 +398,16 @@ fn textCandidateSetFromPayloadBoundedAlloc(
     request: TextCandidateRequest,
     budget: *CandidateServingBudget,
 ) !OwnedCandidateSet {
+    try budget.checkCancellation();
     try declaration.validate();
     if (declaration.binding.sidecar_kind != .text) return error.UnsupportedLakeSidecarCandidateSource;
     if (declaration.artifact.kind != artifact_ref.ArtifactKind.text_segment) return error.UnsupportedLakeSidecarCandidateSource;
 
     var segment = try text_segment.decodeAllocWithLimits(alloc, payload, budget.limits.decode);
     defer text_segment.freeSegment(alloc, &segment);
+    try budget.checkCancellation();
 
-    const hits = try indexed_reader.searchTextSegmentDocIdsAlloc(
+    const hits = try indexed_reader.searchTextSegmentDocIdsWithCancellationAlloc(
         alloc,
         segment,
         request.text,
@@ -379,12 +415,17 @@ fn textCandidateSetFromPayloadBoundedAlloc(
         request.offset,
         request.limit,
         request.min_score,
+        budget.cancellation,
     );
     defer indexed_reader.freeScoredDocs(alloc, hits);
+    try budget.checkCancellation();
 
     const keys = try alloc.alloc([]const u8, hits.len);
     defer alloc.free(keys);
-    for (hits, 0..) |hit, idx| keys[idx] = hit.doc_id;
+    for (hits, 0..) |hit, idx| {
+        if (idx % 64 == 0) try budget.checkCancellation();
+        keys[idx] = hit.doc_id;
+    }
 
     return try candidateSetFromKeysBudgetAlloc(alloc, declaration, keys, budget);
 }
@@ -395,8 +436,19 @@ pub fn textCandidateSetsFromArtifactStoreAlloc(
     declarations: []const sidecar_manifest.DeclaredArtifact,
     plan: TextCandidatePlan,
 ) !OwnedCandidateSets {
-    var budget = try CandidateServingBudget.init(.{});
-    return try textCandidateSetsFromArtifactStoreBudgetAlloc(alloc, artifacts, declarations, plan, .{}, &budget, null);
+    return try textCandidateSetsFromArtifactStoreWithOptionsAlloc(alloc, artifacts, declarations, plan, .{});
+}
+
+pub fn textCandidateSetsFromArtifactStoreWithOptionsAlloc(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    declarations: []const sidecar_manifest.DeclaredArtifact,
+    plan: TextCandidatePlan,
+    options: CandidateServingOptions,
+) !OwnedCandidateSets {
+    var budget = try CandidateServingBudget.initWithCancellation(options.limits, options.cancellation);
+    try budget.admitPlans(1);
+    return try textCandidateSetsFromArtifactStoreBudgetAlloc(alloc, artifacts, declarations, plan, options.limits, &budget, null);
 }
 
 fn textCandidateSetsFromArtifactStoreBudgetAlloc(
@@ -451,9 +503,20 @@ pub fn sparseCandidateSetFromPayloadWithLimitsAlloc(
     request: SparseCandidateRequest,
     limits: CandidateServingLimits,
 ) !OwnedCandidateSet {
-    try validateSparseCandidateRequest(request, limits);
-    try validatePayloadAgainstDeclaration(payload, declaration, limits);
-    var budget = try CandidateServingBudget.init(limits);
+    return try sparseCandidateSetFromPayloadWithOptionsAlloc(alloc, declaration, payload, request, .{ .limits = limits });
+}
+
+pub fn sparseCandidateSetFromPayloadWithOptionsAlloc(
+    alloc: Allocator,
+    declaration: sidecar_manifest.DeclaredArtifact,
+    payload: []const u8,
+    request: SparseCandidateRequest,
+    options: CandidateServingOptions,
+) !OwnedCandidateSet {
+    var budget = try CandidateServingBudget.initWithCancellation(options.limits, options.cancellation);
+    try validateSparseCandidateRequestWithCancellation(request, options.limits, options.cancellation);
+    try budget.checkCancellation();
+    try validatePayloadAgainstDeclarationWithCancellation(payload, declaration, options.limits, options.cancellation);
     var bounded_request = request;
     bounded_request.limit = budget.generationLimit(request.limit);
     return try sparseCandidateSetFromPayloadWithBudgetAlloc(alloc, declaration, payload, bounded_request, &budget);
@@ -466,6 +529,7 @@ fn sparseCandidateSetFromPayloadWithBudgetAlloc(
     request: SparseCandidateRequest,
     budget: *CandidateServingBudget,
 ) !OwnedCandidateSet {
+    try budget.checkCancellation();
     var limiter = try bounded_decode.AllocationLimiter.init(alloc, budget.limits.decode.max_allocation_bytes);
     return sparseCandidateSetFromPayloadBoundedAlloc(limiter.allocator(), declaration, payload, request, budget) catch |err| {
         if (err == error.OutOfMemory and limiter.limit_exceeded) return error.LakeSidecarCandidateBudgetExceeded;
@@ -480,26 +544,33 @@ fn sparseCandidateSetFromPayloadBoundedAlloc(
     request: SparseCandidateRequest,
     budget: *CandidateServingBudget,
 ) !OwnedCandidateSet {
+    try budget.checkCancellation();
     try declaration.validate();
     if (declaration.binding.sidecar_kind != .sparse) return error.UnsupportedLakeSidecarCandidateSource;
     if (declaration.artifact.kind != artifact_ref.ArtifactKind.sparse_segment) return error.UnsupportedLakeSidecarCandidateSource;
 
     var segment = try sparse_segment.decodeAllocWithLimits(alloc, payload, budget.limits.decode);
     defer sparse_segment.freeSegment(alloc, &segment);
+    try budget.checkCancellation();
 
-    const hits = try indexed_reader.searchSparseSegmentDocIdsAlloc(
+    const hits = try indexed_reader.searchSparseSegmentDocIdsWithCancellationAlloc(
         alloc,
         segment,
         request.terms,
         request.offset,
         request.limit,
         request.min_score,
+        budget.cancellation,
     );
     defer indexed_reader.freeScoredDocs(alloc, hits);
+    try budget.checkCancellation();
 
     const keys = try alloc.alloc([]const u8, hits.len);
     defer alloc.free(keys);
-    for (hits, 0..) |hit, idx| keys[idx] = hit.doc_id;
+    for (hits, 0..) |hit, idx| {
+        if (idx % 64 == 0) try budget.checkCancellation();
+        keys[idx] = hit.doc_id;
+    }
 
     return try candidateSetFromKeysBudgetAlloc(alloc, declaration, keys, budget);
 }
@@ -510,8 +581,19 @@ pub fn sparseCandidateSetsFromArtifactStoreAlloc(
     declarations: []const sidecar_manifest.DeclaredArtifact,
     plan: SparseCandidatePlan,
 ) !OwnedCandidateSets {
-    var budget = try CandidateServingBudget.init(.{});
-    return try sparseCandidateSetsFromArtifactStoreBudgetAlloc(alloc, artifacts, declarations, plan, .{}, &budget, null);
+    return try sparseCandidateSetsFromArtifactStoreWithOptionsAlloc(alloc, artifacts, declarations, plan, .{});
+}
+
+pub fn sparseCandidateSetsFromArtifactStoreWithOptionsAlloc(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    declarations: []const sidecar_manifest.DeclaredArtifact,
+    plan: SparseCandidatePlan,
+    options: CandidateServingOptions,
+) !OwnedCandidateSets {
+    var budget = try CandidateServingBudget.initWithCancellation(options.limits, options.cancellation);
+    try budget.admitPlans(1);
+    return try sparseCandidateSetsFromArtifactStoreBudgetAlloc(alloc, artifacts, declarations, plan, options.limits, &budget, null);
 }
 
 fn sparseCandidateSetsFromArtifactStoreBudgetAlloc(
@@ -523,9 +605,9 @@ fn sparseCandidateSetsFromArtifactStoreBudgetAlloc(
     budget: *CandidateServingBudget,
     declaration_index: ?*const SidecarDeclarationIndex,
 ) !OwnedCandidateSets {
-    try validateSparseCandidateRequest(plan.request, limits);
+    try validateSparseCandidateRequestWithCancellation(plan.request, limits, budget.cancellation);
     if (plan.request.terms.len == 0 or plan.request.limit == 0) return .{ .sets = try alloc.alloc(OwnedCandidateSet, 0) };
-    const query_shape = try sparseCandidateQueryShape(plan.request);
+    const query_shape = try sparseCandidateQueryShapeWithCancellation(plan.request, budget.cancellation);
     try budget.admitQueryShape(query_shape.items, query_shape.bytes);
 
     const selected = try selectedSparseDeclarationsAlloc(alloc, declarations, declaration_index, plan.sidecar_names, budget);
@@ -568,9 +650,21 @@ pub fn vectorCandidateSetFromPayloadWithLimitsAlloc(
     stats: *indexed_reader.SearchExecutionStats,
     limits: CandidateServingLimits,
 ) !OwnedCandidateSet {
-    try validateVectorCandidateRequest(request, limits);
-    try validatePayloadAgainstDeclaration(payload, declaration, limits);
-    var budget = try CandidateServingBudget.init(limits);
+    return try vectorCandidateSetFromPayloadWithOptionsAlloc(alloc, declaration, payload, request, stats, .{ .limits = limits });
+}
+
+pub fn vectorCandidateSetFromPayloadWithOptionsAlloc(
+    alloc: Allocator,
+    declaration: sidecar_manifest.DeclaredArtifact,
+    payload: []const u8,
+    request: VectorCandidateRequest,
+    stats: *indexed_reader.SearchExecutionStats,
+    options: CandidateServingOptions,
+) !OwnedCandidateSet {
+    var budget = try CandidateServingBudget.initWithCancellation(options.limits, options.cancellation);
+    try validateVectorCandidateRequest(request, options.limits);
+    try budget.checkCancellation();
+    try validatePayloadAgainstDeclarationWithCancellation(payload, declaration, options.limits, options.cancellation);
     var bounded_request = request;
     bounded_request.limit = budget.generationLimit(request.limit);
     return try vectorCandidateSetFromPayloadWithBudgetAlloc(alloc, declaration, payload, bounded_request, stats, &budget);
@@ -584,6 +678,7 @@ fn vectorCandidateSetFromPayloadWithBudgetAlloc(
     stats: *indexed_reader.SearchExecutionStats,
     budget: *CandidateServingBudget,
 ) !OwnedCandidateSet {
+    try budget.checkCancellation();
     var limiter = try bounded_decode.AllocationLimiter.init(alloc, budget.limits.decode.max_allocation_bytes);
     return vectorCandidateSetFromPayloadBoundedAlloc(limiter.allocator(), declaration, payload, request, stats, budget) catch |err| {
         if (err == error.OutOfMemory and limiter.limit_exceeded) return error.LakeSidecarCandidateBudgetExceeded;
@@ -599,14 +694,16 @@ fn vectorCandidateSetFromPayloadBoundedAlloc(
     stats: *indexed_reader.SearchExecutionStats,
     budget: *CandidateServingBudget,
 ) !OwnedCandidateSet {
+    try budget.checkCancellation();
     try declaration.validate();
     if (declaration.binding.sidecar_kind != .vector) return error.UnsupportedLakeSidecarCandidateSource;
     if (declaration.artifact.kind != artifact_ref.ArtifactKind.vector_segment) return error.UnsupportedLakeSidecarCandidateSource;
 
     var segment = try vector_segment.decodeAllocWithLimits(alloc, payload, budget.limits.decode);
     defer vector_segment.freeSegment(alloc, &segment);
+    try budget.checkCancellation();
 
-    const hits = try indexed_reader.searchVectorSegmentDocIdsAlloc(
+    const hits = try indexed_reader.searchVectorSegmentDocIdsWithCancellationAlloc(
         alloc,
         segment,
         request.vector,
@@ -616,12 +713,17 @@ fn vectorCandidateSetFromPayloadBoundedAlloc(
         request.num_probes,
         request.search_effort,
         stats,
+        budget.cancellation,
     );
     defer indexed_reader.freeScoredDocs(alloc, hits);
+    try budget.checkCancellation();
 
     const keys = try alloc.alloc([]const u8, hits.len);
     defer alloc.free(keys);
-    for (hits, 0..) |hit, idx| keys[idx] = hit.doc_id;
+    for (hits, 0..) |hit, idx| {
+        if (idx % 64 == 0) try budget.checkCancellation();
+        keys[idx] = hit.doc_id;
+    }
 
     return try candidateSetFromKeysBudgetAlloc(alloc, declaration, keys, budget);
 }
@@ -633,8 +735,20 @@ pub fn vectorCandidateSetsFromArtifactStoreAlloc(
     plan: VectorCandidatePlan,
     stats: *indexed_reader.SearchExecutionStats,
 ) !OwnedCandidateSets {
-    var budget = try CandidateServingBudget.init(.{});
-    return try vectorCandidateSetsFromArtifactStoreBudgetAlloc(alloc, artifacts, declarations, plan, stats, .{}, &budget, null);
+    return try vectorCandidateSetsFromArtifactStoreWithOptionsAlloc(alloc, artifacts, declarations, plan, stats, .{});
+}
+
+pub fn vectorCandidateSetsFromArtifactStoreWithOptionsAlloc(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    declarations: []const sidecar_manifest.DeclaredArtifact,
+    plan: VectorCandidatePlan,
+    stats: *indexed_reader.SearchExecutionStats,
+    options: CandidateServingOptions,
+) !OwnedCandidateSets {
+    var budget = try CandidateServingBudget.initWithCancellation(options.limits, options.cancellation);
+    try budget.admitPlans(1);
+    return try vectorCandidateSetsFromArtifactStoreBudgetAlloc(alloc, artifacts, declarations, plan, stats, options.limits, &budget, null);
 }
 
 fn vectorCandidateSetsFromArtifactStoreBudgetAlloc(
@@ -690,9 +804,20 @@ pub fn graphCandidateSetFromPayloadWithLimitsAlloc(
     request: GraphCandidateRequest,
     limits: CandidateServingLimits,
 ) !OwnedCandidateSet {
-    try validateGraphCandidateRequest(request, limits);
-    try validatePayloadAgainstDeclaration(payload, declaration, limits);
-    var budget = try CandidateServingBudget.init(limits);
+    return try graphCandidateSetFromPayloadWithOptionsAlloc(alloc, declaration, payload, request, .{ .limits = limits });
+}
+
+pub fn graphCandidateSetFromPayloadWithOptionsAlloc(
+    alloc: Allocator,
+    declaration: sidecar_manifest.DeclaredArtifact,
+    payload: []const u8,
+    request: GraphCandidateRequest,
+    options: CandidateServingOptions,
+) !OwnedCandidateSet {
+    var budget = try CandidateServingBudget.initWithCancellation(options.limits, options.cancellation);
+    try validateGraphCandidateRequest(request, options.limits);
+    try budget.checkCancellation();
+    try validatePayloadAgainstDeclarationWithCancellation(payload, declaration, options.limits, options.cancellation);
     var bounded_request = request;
     bounded_request.limit = budget.generationLimit(request.limit);
     return try graphCandidateSetFromPayloadWithBudgetAlloc(alloc, declaration, payload, bounded_request, &budget);
@@ -705,6 +830,7 @@ fn graphCandidateSetFromPayloadWithBudgetAlloc(
     request: GraphCandidateRequest,
     budget: *CandidateServingBudget,
 ) !OwnedCandidateSet {
+    try budget.checkCancellation();
     var limiter = try bounded_decode.AllocationLimiter.init(alloc, budget.limits.decode.max_allocation_bytes);
     return graphCandidateSetFromPayloadBoundedAlloc(limiter.allocator(), declaration, payload, request, budget) catch |err| {
         if (err == error.OutOfMemory and limiter.limit_exceeded) return error.LakeSidecarCandidateBudgetExceeded;
@@ -719,6 +845,7 @@ fn graphCandidateSetFromPayloadBoundedAlloc(
     request: GraphCandidateRequest,
     budget: *CandidateServingBudget,
 ) !OwnedCandidateSet {
+    try budget.checkCancellation();
     try declaration.validate();
     if (declaration.binding.sidecar_kind != .graph) return error.UnsupportedLakeSidecarCandidateSource;
     if (declaration.artifact.kind != artifact_ref.ArtifactKind.graph_segment) return error.UnsupportedLakeSidecarCandidateSource;
@@ -729,6 +856,7 @@ fn graphCandidateSetFromPayloadBoundedAlloc(
 
     var segment = try graph_segment.decodeAllocWithLimits(alloc, payload, budget.limits.decode);
     defer graph_segment.freeSegment(alloc, &segment);
+    try budget.checkCancellation();
     var edge_type_filter = try GraphEdgeTypeFilter.init(alloc, request.edge_types);
     defer edge_type_filter.deinit(alloc);
 
@@ -750,8 +878,19 @@ pub fn graphCandidateSetsFromArtifactStoreAlloc(
     declarations: []const sidecar_manifest.DeclaredArtifact,
     plan: GraphCandidatePlan,
 ) !OwnedCandidateSets {
-    var budget = try CandidateServingBudget.init(.{});
-    return try graphCandidateSetsFromArtifactStoreBudgetAlloc(alloc, artifacts, declarations, plan, .{}, &budget, null);
+    return try graphCandidateSetsFromArtifactStoreWithOptionsAlloc(alloc, artifacts, declarations, plan, .{});
+}
+
+pub fn graphCandidateSetsFromArtifactStoreWithOptionsAlloc(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    declarations: []const sidecar_manifest.DeclaredArtifact,
+    plan: GraphCandidatePlan,
+    options: CandidateServingOptions,
+) !OwnedCandidateSets {
+    var budget = try CandidateServingBudget.initWithCancellation(options.limits, options.cancellation);
+    try budget.admitPlans(1);
+    return try graphCandidateSetsFromArtifactStoreBudgetAlloc(alloc, artifacts, declarations, plan, options.limits, &budget, null);
 }
 
 fn graphCandidateSetsFromArtifactStoreBudgetAlloc(
@@ -806,17 +945,19 @@ pub fn candidateSetsFromArtifactStoreAlloc(
     try budget.admitPlans(plan_count);
     if (plan_count == 0) return .{ .sets = try alloc.alloc(OwnedCandidateSet, 0) };
     if (declarations.len > plans.limits.max_declarations) return error.LakeSidecarCandidateBudgetExceeded;
-    var declaration_index = try SidecarDeclarationIndex.init(alloc, declarations);
+    var declaration_index = try SidecarDeclarationIndex.initWithCancellation(alloc, declarations, plans.cancellation);
     defer declaration_index.deinit(alloc);
     var sets = std.ArrayListUnmanaged(OwnedCandidateSet).empty;
     errdefer deinitOwnedCandidateSetList(alloc, &sets);
 
     for (plans.text_plans) |plan| {
+        try budget.checkCancellation();
         var produced = try textCandidateSetsFromArtifactStoreBudgetAlloc(alloc, artifacts, declarations, plan, plans.limits, &budget, &declaration_index);
         defer produced.deinit(alloc);
         try appendOwnedCandidateSetsIntersectingDuplicatesAlloc(alloc, &sets, produced.takeSets());
     }
     for (plans.sparse_plans) |plan| {
+        try budget.checkCancellation();
         var produced = try sparseCandidateSetsFromArtifactStoreBudgetAlloc(alloc, artifacts, declarations, plan, plans.limits, &budget, &declaration_index);
         defer produced.deinit(alloc);
         try appendOwnedCandidateSetsIntersectingDuplicatesAlloc(alloc, &sets, produced.takeSets());
@@ -824,11 +965,13 @@ pub fn candidateSetsFromArtifactStoreAlloc(
     var local_vector_stats = indexed_reader.SearchExecutionStats{};
     const vector_stats = plans.vector_stats orelse &local_vector_stats;
     for (plans.vector_plans) |plan| {
+        try budget.checkCancellation();
         var produced = try vectorCandidateSetsFromArtifactStoreBudgetAlloc(alloc, artifacts, declarations, plan, vector_stats, plans.limits, &budget, &declaration_index);
         defer produced.deinit(alloc);
         try appendOwnedCandidateSetsIntersectingDuplicatesAlloc(alloc, &sets, produced.takeSets());
     }
     for (plans.graph_plans) |plan| {
+        try budget.checkCancellation();
         var produced = try graphCandidateSetsFromArtifactStoreBudgetAlloc(alloc, artifacts, declarations, plan, plans.limits, &budget, &declaration_index);
         defer produced.deinit(alloc);
         try appendOwnedCandidateSetsIntersectingDuplicatesAlloc(alloc, &sets, produced.takeSets());
@@ -850,8 +993,17 @@ fn textCandidateQueryShape(request: TextCandidateRequest) !CandidateQueryShape {
 }
 
 fn sparseCandidateQueryShape(request: SparseCandidateRequest) !CandidateQueryShape {
+    return try sparseCandidateQueryShapeWithCancellation(request, .none);
+}
+
+fn sparseCandidateQueryShapeWithCancellation(
+    request: SparseCandidateRequest,
+    cancellation: CancellationToken,
+) !CandidateQueryShape {
+    try cancellation.check();
     var bytes: usize = 0;
-    for (request.terms) |term| {
+    for (request.terms, 0..) |term, idx| {
+        if (idx % 64 == 0) try cancellation.check();
         bytes = std.math.add(usize, bytes, term.term.len) catch return error.LakeSidecarCandidateBudgetExceeded;
     }
     return .{ .items = request.terms.len, .bytes = bytes };
@@ -884,9 +1036,18 @@ fn validateTextCandidateRequest(request: TextCandidateRequest, limits: Candidate
 }
 
 fn validateSparseCandidateRequest(request: SparseCandidateRequest, limits: CandidateServingLimits) !void {
+    return try validateSparseCandidateRequestWithCancellation(request, limits, .none);
+}
+
+fn validateSparseCandidateRequestWithCancellation(
+    request: SparseCandidateRequest,
+    limits: CandidateServingLimits,
+    cancellation: CancellationToken,
+) !void {
+    try cancellation.check();
     try limits.validate();
     try validateCandidateWindow(request.offset, request.limit, limits);
-    const shape = try sparseCandidateQueryShape(request);
+    const shape = try sparseCandidateQueryShapeWithCancellation(request, cancellation);
     if (shape.items > limits.max_query_items or shape.bytes > limits.max_query_bytes) {
         return error.LakeSidecarCandidateBudgetExceeded;
     }
@@ -933,6 +1094,16 @@ fn validatePayloadAgainstDeclaration(
     declaration: sidecar_manifest.DeclaredArtifact,
     limits: CandidateServingLimits,
 ) !void {
+    return try validatePayloadAgainstDeclarationWithCancellation(payload, declaration, limits, .none);
+}
+
+fn validatePayloadAgainstDeclarationWithCancellation(
+    payload: []const u8,
+    declaration: sidecar_manifest.DeclaredArtifact,
+    limits: CandidateServingLimits,
+    cancellation: CancellationToken,
+) !void {
+    try cancellation.check();
     try limits.validate();
     try declaration.validate();
     artifacts_mod.validateSha256ArtifactIdentity(
@@ -943,7 +1114,7 @@ fn validatePayloadAgainstDeclaration(
     const declared_len = std.math.cast(usize, declaration.artifact.byte_len) orelse
         return error.LakeSidecarArtifactIntegrityMismatch;
     if (payload.len != declared_len) return error.LakeSidecarArtifactIntegrityMismatch;
-    if (!payloadMatchesSha256(payload, declaration.artifact.checksum)) {
+    if (!try payloadMatchesSha256(payload, declaration.artifact.checksum, cancellation)) {
         return error.LakeSidecarArtifactIntegrityMismatch;
     }
 }
@@ -953,11 +1124,15 @@ fn loadVerifiedArtifactAlloc(
     declaration: sidecar_manifest.DeclaredArtifact,
     budget: *CandidateServingBudget,
 ) ![]u8 {
+    try budget.checkCancellation();
     try declaration.validate();
     artifacts_mod.validateSha256ArtifactIdentity(
         declaration.artifact.artifact_id,
         declaration.artifact.checksum,
     ) catch return error.LakeSidecarArtifactIntegrityMismatch;
+    // Check at each transport boundary: cancellation may arrive while local
+    // validation or a preceding artifact is being processed.
+    try budget.checkCancellation();
     var metadata = try artifacts.stat(declaration.artifact.artifact_id);
     defer metadata.deinit(artifacts.allocator);
     if (!std.mem.eql(u8, metadata.artifact_id, declaration.artifact.artifact_id) or
@@ -967,18 +1142,32 @@ fn loadVerifiedArtifactAlloc(
         return error.LakeSidecarArtifactIntegrityMismatch;
     }
     const admitted_len = try budget.admitArtifact(metadata.byte_len);
+    try budget.checkCancellation();
 
     // Fetch exactly the admitted range so remote implementations can enforce
     // the bound at the transport layer as well as after download.
     const payload = try artifacts.getRangeAlloc(declaration.artifact.artifact_id, 0, admitted_len);
     errdefer artifacts.allocator.free(payload);
-    try validatePayloadAgainstDeclaration(payload, declaration, budget.limits);
+    try validatePayloadAgainstDeclarationWithCancellation(payload, declaration, budget.limits, budget.cancellation);
     return payload;
 }
 
-fn payloadMatchesSha256(payload: []const u8, expected: []const u8) bool {
+fn payloadMatchesSha256(
+    payload: []const u8,
+    expected: []const u8,
+    cancellation: CancellationToken,
+) !bool {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var offset: usize = 0;
+    while (offset < payload.len) {
+        try cancellation.check();
+        const end = @min(payload.len, offset +| 1024 * 1024);
+        hasher.update(payload[offset..end]);
+        offset = end;
+    }
+    try cancellation.check();
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+    hasher.final(&digest);
     const actual = std.fmt.bytesToHex(digest, .lower);
     return std.mem.eql(u8, &actual, expected);
 }
@@ -1162,9 +1351,19 @@ const SidecarDeclarationIndex = struct {
         alloc: Allocator,
         declarations: []const sidecar_manifest.DeclaredArtifact,
     ) !SidecarDeclarationIndex {
+        return try initWithCancellation(alloc, declarations, .none);
+    }
+
+    fn initWithCancellation(
+        alloc: Allocator,
+        declarations: []const sidecar_manifest.DeclaredArtifact,
+        cancellation: CancellationToken,
+    ) !SidecarDeclarationIndex {
+        try cancellation.check();
         var index = SidecarDeclarationIndex{};
         errdefer index.deinit(alloc);
-        for (declarations) |declaration| {
+        for (declarations, 0..) |declaration, idx| {
+            if (idx % 64 == 0) try cancellation.check();
             const kind = declarationKind(declaration) orelse continue;
             const entry = try index.by_name.getOrPut(alloc, declaration.name);
             if (entry.found_existing) return error.AmbiguousLakeSidecarCandidateSource;
@@ -1193,6 +1392,7 @@ fn selectedDeclarationsAlloc(
     budget: *CandidateServingBudget,
     kind: SidecarDeclarationKind,
 ) ![]sidecar_manifest.DeclaredArtifact {
+    try budget.checkCancellation();
     var selected = std.ArrayListUnmanaged(sidecar_manifest.DeclaredArtifact).empty;
     errdefer selected.deinit(alloc);
     if (maybe_declaration_index == null and declarations.len > budget.limits.max_declarations) {
@@ -1201,7 +1401,8 @@ fn selectedDeclarationsAlloc(
 
     if (maybe_names) |names| {
         var total_name_bytes: usize = 0;
-        for (names) |name| {
+        for (names, 0..) |name, idx| {
+            if (idx % 64 == 0) try budget.checkCancellation();
             if (name.len == 0) return error.InvalidLakeSidecarCandidateRequest;
             total_name_bytes = std.math.add(usize, total_name_bytes, name.len) catch
                 return error.LakeSidecarCandidateBudgetExceeded;
@@ -1212,7 +1413,8 @@ fn selectedDeclarationsAlloc(
         defer unique_names.deinit(alloc);
         var requested = std.StringHashMapUnmanaged(void).empty;
         defer requested.deinit(alloc);
-        for (names) |name| {
+        for (names, 0..) |name, idx| {
+            if (idx % 64 == 0) try budget.checkCancellation();
             const entry = try requested.getOrPut(alloc, name);
             if (entry.found_existing) continue;
             if (unique_names.items.len >= budget.remainingArtifacts()) return error.LakeSidecarCandidateBudgetExceeded;
@@ -1221,13 +1423,14 @@ fn selectedDeclarationsAlloc(
 
         var local_index: SidecarDeclarationIndex = undefined;
         const declaration_index = maybe_declaration_index orelse blk: {
-            local_index = try SidecarDeclarationIndex.init(alloc, declarations);
+            local_index = try SidecarDeclarationIndex.initWithCancellation(alloc, declarations, budget.cancellation);
             break :blk &local_index;
         };
         defer if (maybe_declaration_index == null) local_index.deinit(alloc);
 
         try selected.ensureTotalCapacity(alloc, unique_names.items.len);
-        for (unique_names.items) |name| {
+        for (unique_names.items, 0..) |name, idx| {
+            if (idx % 64 == 0) try budget.checkCancellation();
             const declaration = declaration_index.by_name.get(name) orelse return error.MissingLakeSidecarCandidateSource;
             if (!isDeclarationKind(declaration, kind)) return error.MissingLakeSidecarCandidateSource;
             selected.appendAssumeCapacity(declaration);
@@ -1237,7 +1440,7 @@ fn selectedDeclarationsAlloc(
 
     var local_index: SidecarDeclarationIndex = undefined;
     const declaration_index = maybe_declaration_index orelse blk: {
-        local_index = try SidecarDeclarationIndex.init(alloc, declarations);
+        local_index = try SidecarDeclarationIndex.initWithCancellation(alloc, declarations, budget.cancellation);
         break :blk &local_index;
     };
     defer if (maybe_declaration_index == null) local_index.deinit(alloc);
@@ -1404,6 +1607,111 @@ test "lake graph sidecar candidate admission bounds filters, edge work, and canc
     );
 }
 
+test "lake sidecar cancellation after metadata stat prevents artifact range fetch" {
+    const alloc = std.testing.allocator;
+    const checksum = "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881";
+    const artifact_id = "sha256:" ++ checksum;
+
+    const CancellationStore = struct {
+        const State = struct {
+            cancelled: *std.atomic.Value(bool),
+            stat_calls: usize = 0,
+            range_calls: usize = 0,
+        };
+
+        fn deinit(_: Allocator, _: *anyopaque) void {}
+
+        fn put(_: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.ArtifactMetadata {
+            return error.UnsupportedTestOperation;
+        }
+
+        fn getAlloc(_: *anyopaque, _: Allocator, _: []const u8) ![]u8 {
+            return error.UnsupportedTestOperation;
+        }
+
+        fn getRangeAlloc(
+            ptr: *anyopaque,
+            allocator: Allocator,
+            _: []const u8,
+            _: u64,
+            _: usize,
+        ) ![]u8 {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            state.range_calls += 1;
+            return try allocator.dupe(u8, "x");
+        }
+
+        fn stat(ptr: *anyopaque, allocator: Allocator, _: []const u8) !artifacts_mod.ArtifactMetadata {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            state.stat_calls += 1;
+            state.cancelled.store(true, .release);
+            const owned_id = try allocator.dupe(u8, artifact_id);
+            errdefer allocator.free(owned_id);
+            return .{
+                .artifact_id = owned_id,
+                .byte_len = 1,
+                .checksum = try allocator.dupe(u8, checksum),
+            };
+        }
+
+        fn delete(_: *anyopaque, _: []const u8) !void {
+            return error.UnsupportedTestOperation;
+        }
+
+        const vtable = artifacts_mod.ArtifactStore.VTable{
+            .deinit = deinit,
+            .put = put,
+            .get_alloc = getAlloc,
+            .get_range_alloc = getRangeAlloc,
+            .stat = stat,
+            .delete = delete,
+        };
+    };
+
+    var cancelled = std.atomic.Value(bool).init(false);
+    var state = CancellationStore.State{ .cancelled = &cancelled };
+    var store = artifacts_mod.ArtifactStore{
+        .allocator = alloc,
+        .ptr = &state,
+        .vtable = &CancellationStore.vtable,
+    };
+    defer store.deinit();
+
+    const declaration = sidecar_manifest.DeclaredArtifact{
+        .name = "events.body.text",
+        .binding = .{
+            .sidecar_kind = .text,
+            .source_kind = .external_iceberg,
+            .row_ref_kind = .external,
+            .source_id = "events",
+            .snapshot_id = "iceberg-7",
+            .schema_fingerprint = "schema-v1",
+            .column_bindings = &.{"body"},
+            .index_config_hash = "sha256:text",
+        },
+        .artifact = .{
+            .kind = .text_segment,
+            .name = "events.body.text",
+            .artifact_id = artifact_id,
+            .byte_len = 1,
+            .checksum = checksum,
+        },
+    };
+    const names = [_][]const u8{"events.body.text"};
+    try std.testing.expectError(
+        error.Canceled,
+        textCandidateSetsFromArtifactStoreWithOptionsAlloc(
+            alloc,
+            &store,
+            &.{declaration},
+            .{ .request = .{ .text = "query" }, .sidecar_names = &names },
+            .{ .cancellation = CancellationToken.fromAtomic(&cancelled) },
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), state.stat_calls);
+    try std.testing.expectEqual(@as(usize, 0), state.range_calls);
+}
+
 fn testCandidateDeclaration(
     name: []const u8,
     sidecar_kind: source_binding.SidecarKind,
@@ -1460,7 +1768,7 @@ fn graphNeighborCandidateKeysAlloc(
     edge_type_filter: *const GraphEdgeTypeFilter,
     budget: *CandidateServingBudget,
 ) ![]const []const u8 {
-    const adjacency = findGraphAdjacency(segment, request.start_node_id) orelse return try alloc.alloc([]const u8, 0);
+    const adjacency = try findGraphAdjacency(segment, request.start_node_id, budget) orelse return try alloc.alloc([]const u8, 0);
     var keys = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
         for (keys.items) |key| alloc.free(@constCast(key));
@@ -1504,7 +1812,7 @@ fn graphTraversalCandidateKeysAlloc(
     edge_type_filter: *const GraphEdgeTypeFilter,
     budget: *CandidateServingBudget,
 ) ![]const []const u8 {
-    var adjacency_index = try graph_segment.AdjacencyIndex.init(alloc, segment);
+    var adjacency_index = try graph_segment.AdjacencyIndex.initWithCancellation(alloc, segment, budget.cancellation);
     defer adjacency_index.deinit(alloc);
     if (adjacency_index.find(segment, request.start_node_id) == null) return try alloc.alloc([]const u8, 0);
 
@@ -1568,8 +1876,13 @@ fn enqueueGraphTraversalEdgesAlloc(
     }
 }
 
-fn findGraphAdjacency(segment: graph_segment.Segment, node_id: []const u8) ?graph_segment.Adjacency {
-    for (segment.adjacencies) |adjacency| {
+fn findGraphAdjacency(
+    segment: graph_segment.Segment,
+    node_id: []const u8,
+    budget: *CandidateServingBudget,
+) !?graph_segment.Adjacency {
+    for (segment.adjacencies, 0..) |adjacency, idx| {
+        if (idx % 64 == 0) try budget.checkCancellation();
         if (std.mem.eql(u8, adjacency.node_id, node_id)) return adjacency;
     }
     return null;

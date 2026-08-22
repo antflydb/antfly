@@ -349,7 +349,8 @@ fn searchHybridAllocResolved(
 }
 
 fn searchTextSegmentAlloc(alloc: Allocator, text_segment: text_segment_mod.Segment, req: query_request.QueryRequest, session: ?*runtime_mod.QuerySession) ![]ScoredDoc {
-    return try searchTextSegmentSpecAlloc(alloc, text_segment, req.text, req.operator, req.offset, req.limit, req.min_score, session);
+    const cancellation = if (session) |value| value.cancellation else CancellationToken.none;
+    return try searchTextSegmentSpecAlloc(alloc, text_segment, req.text, req.operator, req.offset, req.limit, req.min_score, cancellation);
 }
 
 pub fn searchTextSegmentDocIdsAlloc(
@@ -361,7 +362,29 @@ pub fn searchTextSegmentDocIdsAlloc(
     limit: usize,
     min_score: u32,
 ) ![]ScoredDoc {
-    return try searchTextSegmentSpecAlloc(alloc, text_segment, text, operator, offset, limit, min_score, null);
+    return try searchTextSegmentDocIdsWithCancellationAlloc(
+        alloc,
+        text_segment,
+        text,
+        operator,
+        offset,
+        limit,
+        min_score,
+        .none,
+    );
+}
+
+pub fn searchTextSegmentDocIdsWithCancellationAlloc(
+    alloc: Allocator,
+    text_segment: text_segment_mod.Segment,
+    text: []const u8,
+    operator: query_request.QueryOperator,
+    offset: usize,
+    limit: usize,
+    min_score: u32,
+    cancellation: CancellationToken,
+) ![]ScoredDoc {
+    return try searchTextSegmentSpecAlloc(alloc, text_segment, text, operator, offset, limit, min_score, cancellation);
 }
 
 fn searchTextSegmentSpecAlloc(
@@ -372,9 +395,8 @@ fn searchTextSegmentSpecAlloc(
     offset: usize,
     limit: usize,
     min_score: u32,
-    session: ?*runtime_mod.QuerySession,
+    cancellation: CancellationToken,
 ) ![]ScoredDoc {
-    const cancellation = if (session) |value| value.cancellation else CancellationToken.none;
     try cancellation.check();
     const normalized_query = try normalizeAlloc(alloc, text);
     defer alloc.free(normalized_query);
@@ -411,7 +433,9 @@ fn searchTextSegmentSpecAlloc(
         });
     }
 
+    try cancellation.check();
     std.mem.sort(ScoredDoc, scored.items, {}, lessScoredDoc);
+    try cancellation.check();
     return try clipScoredDocsAlloc(alloc, scored.items, offset, limit, min_score);
 }
 
@@ -428,13 +452,13 @@ fn applyTextFilterSetsAlloc(
     defer text_segment_mod.freeSegment(alloc, &text_segment);
 
     const filter_hits = if (req.filter_text) |text|
-        try searchTextSegmentSpecAlloc(alloc, text_segment, text, req.filter_operator, 0, text_segment.docs.len, 0, session)
+        try searchTextSegmentSpecAlloc(alloc, text_segment, text, req.filter_operator, 0, text_segment.docs.len, 0, session.cancellation)
     else
         try alloc.alloc(ScoredDoc, 0);
     defer freeScoredDocs(alloc, filter_hits);
 
     const exclusion_hits = if (req.exclusion_text) |text|
-        try searchTextSegmentSpecAlloc(alloc, text_segment, text, req.exclusion_operator, 0, text_segment.docs.len, 0, session)
+        try searchTextSegmentSpecAlloc(alloc, text_segment, text, req.exclusion_operator, 0, text_segment.docs.len, 0, session.cancellation)
     else
         try alloc.alloc(ScoredDoc, 0);
     defer freeScoredDocs(alloc, exclusion_hits);
@@ -524,6 +548,7 @@ fn searchSparseSegmentAlloc(alloc: Allocator, sparse_segment: sparse_segment_mod
         req.offset,
         req.limit,
         req.min_score,
+        .none,
     );
 }
 
@@ -535,7 +560,27 @@ pub fn searchSparseSegmentDocIdsAlloc(
     limit: usize,
     min_score: u32,
 ) ![]ScoredDoc {
-    return try searchSparseSegmentSpecAlloc(alloc, sparse_segment, sparse_query, offset, limit, min_score);
+    return try searchSparseSegmentDocIdsWithCancellationAlloc(
+        alloc,
+        sparse_segment,
+        sparse_query,
+        offset,
+        limit,
+        min_score,
+        .none,
+    );
+}
+
+pub fn searchSparseSegmentDocIdsWithCancellationAlloc(
+    alloc: Allocator,
+    sparse_segment: sparse_segment_mod.Segment,
+    sparse_query: []const query_request.SparseTermWeight,
+    offset: usize,
+    limit: usize,
+    min_score: u32,
+    cancellation: CancellationToken,
+) ![]ScoredDoc {
+    return try searchSparseSegmentSpecAlloc(alloc, sparse_segment, sparse_query, offset, limit, min_score, cancellation);
 }
 
 fn searchSparseSegmentSpecAlloc(
@@ -545,20 +590,24 @@ fn searchSparseSegmentSpecAlloc(
     offset: usize,
     limit: usize,
     min_score: u32,
+    cancellation: CancellationToken,
 ) ![]ScoredDoc {
+    try cancellation.check();
     if (sparse_query.len == 0) return try alloc.alloc(ScoredDoc, 0);
 
     const scores = try alloc.alloc(f32, sparse_segment.docs.len);
     defer alloc.free(scores);
     @memset(scores, 0);
 
-    for (sparse_query) |feature| {
+    for (sparse_query, 0..) |feature, feature_index| {
+        if (feature_index % 16 == 0) try cancellation.check();
         const normalized_term = try normalizeAlloc(alloc, feature.term);
         defer alloc.free(normalized_term);
         if (normalized_term.len == 0) continue;
         const maybe_term = findSparseTermEntry(sparse_segment, normalized_term);
         const term = maybe_term orelse continue;
-        for (term.postings) |posting| {
+        for (term.postings, 0..) |posting, posting_index| {
+            if (posting_index % 64 == 0) try cancellation.check();
             scores[posting.doc_index] += posting.weight * feature.weight;
         }
     }
@@ -566,13 +615,16 @@ fn searchSparseSegmentSpecAlloc(
     var scored = std.ArrayListUnmanaged(ScoredDoc).empty;
     defer scored.deinit(alloc);
     for (scores, 0..) |score, doc_index| {
+        if (doc_index % 64 == 0) try cancellation.check();
         if (score <= 0) continue;
         try scored.append(alloc, .{
             .doc_id = try alloc.dupe(u8, sparse_segment.docs[doc_index].doc_id),
             .score = @intFromFloat(score * 1000.0),
         });
     }
+    try cancellation.check();
     std.mem.sort(ScoredDoc, scored.items, {}, lessScoredDoc);
+    try cancellation.check();
     return try clipScoredDocsAlloc(alloc, scored.items, offset, limit, min_score);
 }
 
@@ -664,8 +716,10 @@ fn searchVectorSegmentAlloc(
     vector_segment: vector_segment_mod.Segment,
     req: query_request.QueryRequest,
     query_vector: []const f32,
+    cancellation: CancellationToken,
     stats: *SearchExecutionStats,
 ) ![]ScoredDoc {
+    try cancellation.check();
     if (query_vector.len != vector_segment.dims) return error.VectorDimsMismatch;
     if (vector_segment.clusters.len == 0) return try alloc.alloc(ScoredDoc, 0);
     const effective_query = try normalizedCosineQueryAlloc(alloc, vector_segment.metric, query_vector);
@@ -678,12 +732,15 @@ fn searchVectorSegmentAlloc(
     var clusters = try alloc.alloc(ScoredCluster, vector_segment.clusters.len);
     defer alloc.free(clusters);
     for (vector_segment.clusters, 0..) |cluster, idx| {
+        if (idx % 64 == 0) try cancellation.check();
         clusters[idx] = .{
             .cluster_index = idx,
             .score = routingScoreForQuery(effective_query, query_measure, cluster.centroid, vector_segment.metric),
         };
     }
+    try cancellation.check();
     std.mem.sort(ScoredCluster, clusters, {}, lessScoredCluster);
+    try cancellation.check();
     const probes = effectiveProbeCount(req, vector_segment.base_probe_count, clusters);
     stats.actual_probe_count = probes;
 
@@ -691,6 +748,7 @@ fn searchVectorSegmentAlloc(
     defer candidates.deinit(alloc);
     const needed = boundedRequestedCount(vector_segment.entries.len, req.offset, req.limit);
     for (clusters[0..probes], 0..) |cluster_hit, probe_rank| {
+        try cancellation.check();
         const cluster = vector_segment.clusters[cluster_hit.cluster_index];
         const start: usize = cluster.start_index;
         const end: usize = start + cluster.entry_count;
@@ -704,10 +762,13 @@ fn searchVectorSegmentAlloc(
             defer alloc.free(distances);
             const error_bounds = try alloc.alloc(f32, count);
             defer alloc.free(error_bounds);
+            try cancellation.check();
             try quantizer.estimateDistances(&quantized, effective_query, distances, error_bounds);
+            try cancellation.check();
             var local_candidates = std.ArrayListUnmanaged(ApproxCandidate).empty;
             defer local_candidates.deinit(alloc);
             for (distances, error_bounds, 0..) |distance, error_bound, idx| {
+                if (idx % 64 == 0) try cancellation.check();
                 try local_candidates.append(alloc, .{
                     .cluster_index = cluster_hit.cluster_index,
                     .local_index = idx,
@@ -715,7 +776,9 @@ fn searchVectorSegmentAlloc(
                     .error_bound = error_bound,
                 });
             }
+            try cancellation.check();
             std.mem.sort(ApproxCandidate, local_candidates.items, {}, lessApproxCandidate);
+            try cancellation.check();
             const local_cap = clusterCandidateCap(local_candidates.items, cluster, needed, probes, probe_rank);
             stats.quantized_candidate_count += local_candidates.items.len;
             if (local_cap < local_candidates.items.len) stats.cluster_prune_count += 1;
@@ -725,7 +788,8 @@ fn searchVectorSegmentAlloc(
             continue;
         }
 
-        for (start..end) |entry_index| {
+        for (start..end, 0..) |entry_index, local_index| {
+            if (local_index % 64 == 0) try cancellation.check();
             const entry = vector_segment.entries[entry_index];
             try candidates.append(alloc, .{
                 .cluster_index = cluster_hit.cluster_index,
@@ -738,7 +802,9 @@ fn searchVectorSegmentAlloc(
 
     if (candidates.items.len == 0) return try alloc.alloc(ScoredDoc, 0);
 
+    try cancellation.check();
     std.mem.sort(ApproxCandidate, candidates.items, {}, lessApproxCandidate);
+    try cancellation.check();
     const shortlist_count = vectorShortlistCount(candidates.items.len, probes, req.limit, req.offset, vector_segment.shortlist_multiplier);
     stats.actual_shortlist_count = shortlist_count;
 
@@ -756,7 +822,8 @@ fn searchVectorSegmentAlloc(
     }
     @memset(exact_blocks, null);
 
-    for (candidates.items[0..shortlist_count]) |candidate| {
+    for (candidates.items[0..shortlist_count], 0..) |candidate, candidate_index| {
+        if (candidate_index % 64 == 0) try cancellation.check();
         if (optimisticScoreCannotBeatFloor(candidate, vector_segment.metric, scored.items, needed)) break;
         if (exact_blocks[candidate.cluster_index] == null) {
             const cluster = vector_segment.clusters[candidate.cluster_index];
@@ -795,6 +862,32 @@ pub fn searchVectorSegmentDocIdsAlloc(
     search_effort: ?f32,
     stats: *SearchExecutionStats,
 ) ![]ScoredDoc {
+    return try searchVectorSegmentDocIdsWithCancellationAlloc(
+        alloc,
+        vector_segment,
+        query_vector,
+        offset,
+        limit,
+        min_score,
+        num_probes,
+        search_effort,
+        stats,
+        .none,
+    );
+}
+
+pub fn searchVectorSegmentDocIdsWithCancellationAlloc(
+    alloc: Allocator,
+    vector_segment: vector_segment_mod.Segment,
+    query_vector: []const f32,
+    offset: usize,
+    limit: usize,
+    min_score: u32,
+    num_probes: u32,
+    search_effort: ?f32,
+    stats: *SearchExecutionStats,
+    cancellation: CancellationToken,
+) ![]ScoredDoc {
     const req = query_request.QueryRequest{
         .text = @constCast(""),
         .vector = @constCast(query_vector),
@@ -804,7 +897,7 @@ pub fn searchVectorSegmentDocIdsAlloc(
         .num_probes = num_probes,
         .search_effort = search_effort,
     };
-    return try searchVectorSegmentAlloc(alloc, vector_segment, req, query_vector, stats);
+    return try searchVectorSegmentAlloc(alloc, vector_segment, req, query_vector, cancellation, stats);
 }
 
 fn searchVectorArtifactAlloc(
@@ -1840,7 +1933,7 @@ test "serverless indexed reader scores vector segment by cosine similarity" {
     };
     defer req.deinit(alloc);
     var stats: SearchExecutionStats = .{};
-    const hits = try searchVectorSegmentAlloc(alloc, vector_segment, req, req.vector.?, &stats);
+    const hits = try searchVectorSegmentAlloc(alloc, vector_segment, req, req.vector.?, .none, &stats);
     defer freeScoredDocs(alloc, hits);
     try std.testing.expectEqual(@as(usize, 2), hits.len);
     try std.testing.expectEqualStrings("doc-a", hits[0].doc_id);
@@ -1909,7 +2002,7 @@ test "serverless indexed reader scores vector segment by inner product" {
     };
     defer req.deinit(alloc);
     var stats: SearchExecutionStats = .{};
-    const hits = try searchVectorSegmentAlloc(alloc, vector_segment, req, req.vector.?, &stats);
+    const hits = try searchVectorSegmentAlloc(alloc, vector_segment, req, req.vector.?, .none, &stats);
     defer freeScoredDocs(alloc, hits);
     try std.testing.expectEqual(@as(usize, 2), hits.len);
     try std.testing.expectEqualStrings("doc-dot", hits[0].doc_id);
@@ -1979,7 +2072,7 @@ test "serverless indexed reader scores vector segment by l2 distance" {
     };
     defer req.deinit(alloc);
     var stats: SearchExecutionStats = .{};
-    const hits = try searchVectorSegmentAlloc(alloc, vector_segment, req, req.vector.?, &stats);
+    const hits = try searchVectorSegmentAlloc(alloc, vector_segment, req, req.vector.?, .none, &stats);
     defer freeScoredDocs(alloc, hits);
     try std.testing.expectEqual(@as(usize, 2), hits.len);
     try std.testing.expectEqualStrings("doc-near", hits[0].doc_id);

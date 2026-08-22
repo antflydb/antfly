@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const rowsource = @import("../../storage/rowsource/types.zig");
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 
 pub const SidecarKind = enum(u8) {
     text = 1,
@@ -358,9 +359,19 @@ pub fn rowRefsOwnedAllocationBytesFromKeys(
     binding: Binding,
     keys: []const []const u8,
 ) !usize {
+    return try rowRefsOwnedAllocationBytesFromKeysWithCancellation(binding, keys, .none);
+}
+
+pub fn rowRefsOwnedAllocationBytesFromKeysWithCancellation(
+    binding: Binding,
+    keys: []const []const u8,
+    cancellation: CancellationToken,
+) !usize {
+    try cancellation.check();
     var total = std.math.mul(usize, keys.len, @sizeOf(rowsource.RowRef)) catch
         return error.InvalidSidecarRowRefKey;
-    for (keys) |key| {
+    for (keys, 0..) |key, idx| {
+        if (idx % 64 == 0) try cancellation.check();
         const row_ref = try rowRefFromKey(key);
         try validateRowRefAgainstBinding(binding, row_ref);
         const retained_bytes = switch (row_ref) {
@@ -385,6 +396,16 @@ pub fn rowRefsFromKeysAlloc(
     binding: Binding,
     keys: []const []const u8,
 ) ![]rowsource.RowRef {
+    return try rowRefsFromKeysWithCancellationAlloc(alloc, binding, keys, .none);
+}
+
+pub fn rowRefsFromKeysWithCancellationAlloc(
+    alloc: std.mem.Allocator,
+    binding: Binding,
+    keys: []const []const u8,
+    cancellation: CancellationToken,
+) ![]rowsource.RowRef {
+    try cancellation.check();
     const refs = try alloc.alloc(rowsource.RowRef, keys.len);
     var initialized: usize = 0;
     errdefer {
@@ -392,6 +413,7 @@ pub fn rowRefsFromKeysAlloc(
         alloc.free(refs);
     }
     for (keys, 0..) |key, idx| {
+        if (idx % 64 == 0) try cancellation.check();
         refs[idx] = try rowRefFromKeyAlloc(alloc, key);
         initialized += 1;
         try validateRowRefAgainstBinding(binding, refs[idx]);
