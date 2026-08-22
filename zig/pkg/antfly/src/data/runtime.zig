@@ -5585,6 +5585,17 @@ pub const DataServer = struct {
                 return left.group_id < right.group_id;
             }
         }.lessThan);
+        // Legacy catalog records leave the document-identity fields at zero and
+        // derive their namespace from the group/range IDs at runtime. Seed
+        // topologies are portable, explicit contracts: persist the effective
+        // namespace in both the catalog and replica entries so a promoted
+        // runtime opens the copied store with the same identity it was created
+        // with. Keeping zeros here would make activation fail closed with
+        // IdentityNamespaceMismatch.
+        for (metadata_snapshot.ranges) |*range| {
+            range.doc_identity_shard_id = antfly.metadata.table_manager.rangeDocIdentityShardId(range.*);
+            range.doc_identity_range_id = antfly.metadata.table_manager.rangeDocIdentityRangeId(range.*);
+        }
         std.mem.sort(antfly.extensions.PackageManifest, metadata_snapshot.extension_packages, {}, struct {
             fn lessThan(_: void, left: antfly.extensions.PackageManifest, right: antfly.extensions.PackageManifest) bool {
                 const name_order = std.mem.order(u8, left.name, right.name);
@@ -25480,8 +25491,10 @@ test "storage.ha data runtime default seed snapshot derives standalone groups fr
                     .table_id = 7,
                     .start_key = "",
                     .end_key = null,
-                    .doc_identity_shard_id = 77,
-                    .doc_identity_range_id = 77,
+                    // Legacy metadata omitted these fields. The store still
+                    // uses the canonical group/range fallback namespace.
+                    .doc_identity_shard_id = 0,
+                    .doc_identity_range_id = 0,
                 }})[0..]),
                 .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
@@ -25562,6 +25575,11 @@ test "storage.ha data runtime default seed snapshot derives standalone groups fr
     try std.testing.expectEqual(@as(usize, 1), topology.value.replicas.len);
     try std.testing.expectEqual(@as(u64, 77), topology.value.replicas[0].group_id);
     try std.testing.expectEqualStrings("docs", topology.value.replicas[0].table_name);
+    try std.testing.expectEqual(@as(u64, 77), topology.value.catalog.ranges[0].doc_identity_shard_id);
+    try std.testing.expectEqual(@as(u64, 77), topology.value.catalog.ranges[0].doc_identity_range_id);
+    try std.testing.expectEqual(@as(u64, 7), topology.value.replicas[0].identity_table_id);
+    try std.testing.expectEqual(@as(u64, 77), topology.value.replicas[0].identity_shard_id);
+    try std.testing.expectEqual(@as(u64, 77), topology.value.replicas[0].identity_range_id);
 
     var distributed = DataServer.initFromLocalMetadataSources(alloc, .{
         .replica_root_dir = replica_root,
