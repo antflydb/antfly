@@ -36,6 +36,7 @@ const db_mod = @import("../../storage/db/mod.zig");
 const db_transform = @import("../../storage/db/transform.zig");
 const db_types = @import("../../storage/db/types.zig");
 const db_query_graph = @import("../../storage/db/query/graph_exec.zig");
+const db_embedder = @import("../../storage/db/enrichment/embedder.zig");
 const distributed_stats_mod = @import("../../search/distributed_stats.zig");
 const graph_mod = @import("../../graph/graph.zig");
 const graph_pattern_mod = @import("../../graph/pattern.zig");
@@ -174,6 +175,20 @@ const freeSupportedJoinRequest = query_execution.freeSupportedJoinRequest;
 const joinUsesForeignSource = query_execution.joinUsesForeignSource;
 const parseSupportedJoinRequest = query_execution.parseSupportedJoinRequest;
 const parseSupportedJoinClauseValue = query_execution.parseSupportedJoinClauseValue;
+
+fn normalizeServerlessCreateIndexConfig(
+    alloc: Allocator,
+    index_name: []const u8,
+    expanded_index_json: []const u8,
+    options: managed_embedder.InitOptions,
+) ![]u8 {
+    return try table_writes.normalizeManagedEmbeddingIndexDimensionJsonWithOptions(
+        alloc,
+        index_name,
+        expanded_index_json,
+        options,
+    );
+}
 
 pub const HttpHandler = struct {
     alloc: Allocator,
@@ -911,7 +926,7 @@ pub const HttpHandler = struct {
         var resp = try public_table_http.handleTableCreateIndex(self.alloc, table_name, index_name, body, self.tableApi(.none));
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
-            201 => try typedJsonResponse(struct {}, self.alloc, 201, resp.body),
+            201 => try typedJsonResponse(indexes_openapi.types.CreatedIndex, self.alloc, 201, resp.body),
             else => try textResponse(self.alloc, resp.status, resp.body),
         };
     }
@@ -4700,6 +4715,7 @@ pub const HttpHandler = struct {
         _: []const u8,
         _: []const u8,
         _: backups_api.BackupFormat,
+        _: ?backups_api.TableBackupFence,
         _: []const u8,
         _: []const u8,
         _: *backups_api.BackupLocation,
@@ -4759,7 +4775,7 @@ pub const HttpHandler = struct {
         index_name: []const u8,
         body: []const u8,
         request: api_operation.RequestContext,
-    ) public_table_http.TableApi.ExecuteCreateIndexError!void {
+    ) public_table_http.TableApi.ExecuteCreateIndexError![]u8 {
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         if (self.runtime_status.role == .query_only) return error.MethodNotAllowed;
         var table = (self.catalog.getTableAlloc(self.alloc, table_name) catch return error.InternalFailure) orelse return error.NotFound;
@@ -4777,15 +4793,37 @@ pub const HttpHandler = struct {
             else => return error.InternalFailure,
         };
         defer alloc.free(expanded_index_json);
-        table_writes.validateIndexConfig(alloc, index_name, expanded_index_json) catch |err| switch (err) {
+        const normalized_index_json = normalizeServerlessCreateIndexConfig(
+            alloc,
+            index_name,
+            expanded_index_json,
+            .{
+                .io = self.io,
+                .remote_content = self.remote_content,
+            },
+        ) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
+            error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.ModelNotFound => return error.ModelNotFound,
             else => return error.InternalFailure,
         };
-        const next_indexes_json = indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, expanded_index_json) catch |err| switch (err) {
+        defer alloc.free(normalized_index_json);
+        table_writes.validateIndexConfigWithOptions(alloc, index_name, normalized_index_json, .{
+            .io = self.io,
+            .remote_content = self.remote_content,
+        }) catch |err| switch (err) {
+            error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
+            error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.ModelNotFound => return error.ModelNotFound,
+            else => return error.InternalFailure,
+        };
+        const next_indexes_json = indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, normalized_index_json) catch |err| switch (err) {
             error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
         };
         defer alloc.free(next_indexes_json);
+        const response_body = indexes_api.encodeCreatedIndexConfig(alloc, index_name, normalized_index_json) catch return error.InternalFailure;
+        errdefer alloc.free(response_body);
         validateServerlessIndexCatalog(alloc, next_indexes_json) catch |err| switch (err) {
             error.UnsupportedCreateTableRequest, error.InvalidTableIndexMetadata => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
@@ -4802,6 +4840,7 @@ pub const HttpHandler = struct {
             next_indexes_json,
         ) catch return error.InternalFailure;
         if (!updated) return error.NotFound;
+        return response_body;
     }
 
     fn executePublicTableDeleteIndex(
@@ -6027,6 +6066,10 @@ fn findNamedArtifactPublicationAction(
 }
 
 fn validateServerlessIndexCatalog(alloc: Allocator, indexes_json: []const u8) !void {
+    table_writes.validateGraphIndexesJson(alloc, indexes_json) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidTableIndexMetadata,
+    };
     var parsed = try std.json.parseFromSlice(JsonValueMap, alloc, indexes_json, .{});
     defer parsed.deinit();
 
@@ -8425,7 +8468,77 @@ test "http handler create index expands schema-derived algebraic config" {
     try std.testing.expect(std.mem.indexOf(u8, detail.body, "\"group_fields\"") != null);
 }
 
-test "serverless algebraic index catalog validation rejects malformed configs" {
+test "serverless create index normalization resolves and persists one probed embedding dimension" {
+    const FakeProvider = struct {
+        calls: usize = 0,
+
+        fn provider(self: *@This()) managed_embedder.AntflyProvider {
+            return .{
+                .ptr = self,
+                .embed_dense_texts = embedDense,
+                .embed_sparse_texts = embedSparse,
+            };
+        }
+
+        fn embedDense(ptr: *anyopaque, alloc: Allocator, _: []const u8, texts: []const []const u8) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const vectors = try alloc.alloc([]f32, texts.len);
+            errdefer alloc.free(vectors);
+            var initialized: usize = 0;
+            errdefer for (vectors[0..initialized]) |vector| alloc.free(vector);
+            for (vectors) |*vector| {
+                vector.* = try alloc.dupe(f32, &.{ 0.25, 0.5, 0.75 });
+                initialized += 1;
+            }
+            return vectors;
+        }
+
+        fn embedSparse(_: *anyopaque, alloc: Allocator, _: []const u8, _: []const []const u8) ![]db_embedder.SparseEmbedding {
+            return try alloc.alloc(db_embedder.SparseEmbedding, 0);
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var provider = FakeProvider{};
+    const options = managed_embedder.InitOptions{ .antfly_provider = provider.provider() };
+    const normalized = try normalizeServerlessCreateIndexConfig(alloc, "semantic_idx",
+        \\{"type":"embeddings","field":"body","embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
+    , options);
+    defer alloc.free(normalized);
+
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
+    try table_writes.validateIndexConfigWithOptions(alloc, "semantic_idx", normalized, options);
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, normalized, .{});
+    defer parsed.deinit();
+    const dimension = parsed.value.object.get("dimension") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 3), dimension.integer);
+
+    const indexes_json = try indexes_api.addIndexToTableIndexesJson(
+        alloc,
+        tables_api.default_indexes_json,
+        "semantic_idx",
+        normalized,
+    );
+    defer alloc.free(indexes_json);
+    var parsed_indexes = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer parsed_indexes.deinit();
+    const stored = parsed_indexes.value.object.get("semantic_idx") orelse return error.TestUnexpectedResult;
+    const stored_dimension = stored.object.get("dimension") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 3), stored_dimension.integer);
+
+    const response = try indexes_api.encodeCreatedIndexConfig(alloc, "semantic_idx", normalized);
+    defer alloc.free(response);
+    try ant_json.testing.expectEqualJsonText(
+        alloc,
+        "{\"name\":\"semantic_idx\",\"type\":\"embeddings\",\"field\":\"body\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"dimension\":3}",
+        response,
+    );
+}
+
+test "serverless index catalog validation rejects malformed configs" {
     const alloc = std.testing.allocator;
 
     try validateServerlessIndexCatalog(alloc,
@@ -8442,6 +8555,10 @@ test "serverless algebraic index catalog validation rejects malformed configs" {
 
     try std.testing.expectError(error.InvalidTableIndexMetadata, validateServerlessIndexCatalog(alloc,
         \\{"sales_rollup":{"type":"algebraic","version":1,"time_fields":[{"name":"created_at","path":"created_at","type":"datetime"}],"materializations":[{"name":"bad","op":"count","time":"created_at","bucket":"week"}]}}
+    ));
+
+    try std.testing.expectError(error.InvalidTableIndexMetadata, validateServerlessIndexCatalog(alloc,
+        \\{"relations":{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[0]"}}}
     ));
 }
 

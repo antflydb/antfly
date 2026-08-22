@@ -31,7 +31,10 @@ fn metadata(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
         return metadataStatus(allocator, io, client);
     };
 
-    if (std.mem.eql(u8, subcommand, "status")) return metadataStatus(allocator, io, client);
+    if (std.mem.eql(u8, subcommand, "status")) {
+        cli.rejectRemainingArgs(args, "internal metadata status");
+        return metadataStatus(allocator, io, client);
+    }
 
     cli.fatal("unknown internal metadata subcommand: {s}", .{subcommand});
 }

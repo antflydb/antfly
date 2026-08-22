@@ -28,6 +28,9 @@ Usage:
     # Optional inference server model-cache limit:
     ANTFLY_INFERENCE_MAX_LOADED_MODELS=1 uv run --project e2e/inference pytest e2e/inference
 
+    # Separate deadline for explicitly marked first-use model/backend initialization:
+    ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT=1800 uv run --project e2e/inference pytest e2e/inference
+
     # Lazily pull missing models with a local antfly binary (opt-in):
     ANTFLY_INFERENCE_DOWNLOAD=1 uv run --project e2e/inference pytest e2e/inference
 
@@ -59,7 +62,31 @@ from .models import (
 
 API_PREFIX = "/ai/v1"
 ML_API_PREFIX = "/ml/v1"
-DEFAULT_REQUEST_TIMEOUT = float(os.environ.get("ANTFLY_INFERENCE_REQUEST_TIMEOUT", "30"))
+
+
+def _positive_timeout(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    try:
+        value = default if raw is None else float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must be a positive finite number, got {raw!r}"
+        ) from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a positive finite number, got {value!r}")
+    return value
+
+
+DEFAULT_REQUEST_TIMEOUT = _positive_timeout("ANTFLY_INFERENCE_REQUEST_TIMEOUT", 30)
+# Cold model import and backend/projector initialization are different from the
+# steady request-latency contract. Tests must opt into this larger deadline so a
+# global timeout increase cannot hide an ordinary serving hang.
+FIRST_USE_REQUEST_TIMEOUT = max(
+    DEFAULT_REQUEST_TIMEOUT,
+    _positive_timeout(
+        "ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT", DEFAULT_REQUEST_TIMEOUT
+    ),
+)
 SERVER_OUTPUT_LIMIT = 64 * 1024
 CAPACITY_RETRY_TIMEOUT = float(
     os.environ.get("ANTFLY_INFERENCE_CAPACITY_RETRY_TIMEOUT", "30")
@@ -78,6 +105,35 @@ def env_first(*names: str) -> str | None:
         if value:
             return value
     return None
+
+
+_SERVER_BUDGET_FLAGS = (
+    ("ANTFLY_INFERENCE_HOST_BUDGET_MB", "--host-budget-mb"),
+    ("ANTFLY_INFERENCE_BACKEND_BUDGET_MB", "--backend-budget-mb"),
+    ("ANTFLY_INFERENCE_COMBINED_BUDGET_MB", "--combined-budget-mb"),
+    ("ANTFLY_INFERENCE_KV_BUDGET_MB", "--kv-budget-mb"),
+    ("ANTFLY_INFERENCE_SCRATCH_BUDGET_MB", "--scratch-budget-mb"),
+)
+
+
+def _server_budget_args() -> list[str]:
+    """Translate explicit E2E budget policy into injection-safe CLI args."""
+
+    args: list[str] = []
+    for env_name, flag in _SERVER_BUDGET_FLAGS:
+        raw = env_first(env_name)
+        if raw is None:
+            continue
+        try:
+            value = int(raw, 10)
+        except ValueError as exc:
+            raise pytest.UsageError(
+                f"{env_name} must be a non-negative integer"
+            ) from exc
+        if value < 0:
+            raise pytest.UsageError(f"{env_name} must be a non-negative integer")
+        args.extend((flag, str(value)))
+    return args
 
 
 def api_path(path: str) -> str:
@@ -184,6 +240,7 @@ class InferenceServer:
         port: int,
         max_loaded_models: str | None = None,
         extra_env: dict[str, str] | None = None,
+        extra_args: list[str] | None = None,
     ):
         self.url = f"http://{host}:{port}"
         self.failure_reported = False
@@ -207,6 +264,7 @@ class InferenceServer:
                     if max_loaded_models is not None
                     else []
                 ),
+                *(extra_args or []),
             ],
             stdout=self.output,
             stderr=subprocess.STDOUT,
@@ -249,6 +307,16 @@ class InferenceServer:
         else:
             status = f"exited with status {returncode}"
         return f"Local inference server {status}. Output tail:\n{self.read_output()}"
+
+    def request_failure_diagnostic(
+        self, method: str, path: str, exc: requests.RequestException
+    ) -> str:
+        """Attach bounded live-server output to transport failures."""
+
+        return (
+            f"Inference {method.upper()} {path} failed: {exc}\n"
+            f"{self.failure_diagnostic()}"
+        )
 
     def report_http_failure_once(self) -> None:
         """Expose backend logs for a live local server without moving its write offset."""
@@ -302,6 +370,7 @@ def base_url():
         "127.0.0.1",
         port,
         max_loaded_models=env_first("ANTFLY_INFERENCE_MAX_LOADED_MODELS"),
+        extra_args=_server_budget_args(),
     )
     _LOCAL_SERVERS_BY_URL[server.url] = server
     yield server.url
@@ -362,12 +431,14 @@ def api(base_url):
                 try:
                     return request(f"{self.url}{normalized_path}", json=json, **kwargs)
                 except requests.RequestException as exc:
-                    if (
-                        local_server is not None
-                        and local_server.proc.poll() is not None
-                    ):
-                        local_server.failure_reported = True
-                        raise AssertionError(local_server.failure_diagnostic()) from exc
+                    if local_server is not None:
+                        if local_server.proc.poll() is not None:
+                            local_server.failure_reported = True
+                        raise AssertionError(
+                            local_server.request_failure_diagnostic(
+                                method, normalized_path, exc
+                            )
+                        ) from exc
                     raise
 
             response = send()
@@ -409,27 +480,59 @@ def api(base_url):
             _check(r)
             return r.json()
 
-        def generate(self, messages: list[dict], model: str = "", stream: bool = False, **kwargs):
+        def generate(
+            self,
+            messages: list[dict],
+            model: str = "",
+            stream: bool = False,
+            *,
+            request_timeout: float | None = None,
+            **kwargs,
+        ):
             body = {"model": model, "messages": messages, "stream": stream, **kwargs}
+            request_kwargs = (
+                {"timeout": request_timeout} if request_timeout is not None else {}
+            )
             if stream:
-                r = self.post("/generate", json=body, stream=True)
+                r = self.post("/generate", json=body, stream=True, **request_kwargs)
                 _check(r)
                 return r
-            r = self.post("/generate", json=body)
+            r = self.post("/generate", json=body, **request_kwargs)
             _check(r)
             return r.json()
 
-        def chat(self, messages: list[dict], model: str = "", stream: bool = False, **kwargs):
+        def chat(
+            self,
+            messages: list[dict],
+            model: str = "",
+            stream: bool = False,
+            *,
+            request_timeout: float | None = None,
+            **kwargs,
+        ):
             body = {"model": model, "messages": messages, "stream": stream, **kwargs}
+            request_kwargs = (
+                {"timeout": request_timeout} if request_timeout is not None else {}
+            )
             if stream:
-                r = self.post("/chat/completions", json=body, stream=True)
+                r = self.post(
+                    "/chat/completions", json=body, stream=True, **request_kwargs
+                )
                 _check(r)
                 return r
-            r = self.post("/chat/completions", json=body)
+            r = self.post("/chat/completions", json=body, **request_kwargs)
             _check(r)
             return r.json()
 
-        def classify(self, text: list[str], labels: list[str], model: str = "", **kwargs):
+        def classify(
+            self,
+            text: list[str],
+            labels: list[str],
+            model: str = "",
+            *,
+            request_timeout: float | None = None,
+            **kwargs,
+        ):
             multi_label = bool(kwargs.pop("multi_label", False))
             hypothesis_template = kwargs.pop("hypothesis_template", None)
             top_k = kwargs.pop("top_k", None)
@@ -457,7 +560,10 @@ def api(base_url):
             }
             if threshold is not None:
                 body["options"]["threshold"] = threshold
-            r = self.post("/extract", json=body)
+            request_kwargs = (
+                {"timeout": request_timeout} if request_timeout is not None else {}
+            )
+            r = self.post("/extract", json=body, **request_kwargs)
             _check(r)
             return r.json()
 

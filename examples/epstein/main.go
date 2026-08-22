@@ -1508,7 +1508,11 @@ func loadCmd(args []string) error {
 			if err != nil {
 				return fmt.Errorf("failed to create artifact graph index config: %w", err)
 			}
-			indexes[*artifactGraphIndex] = *graphIndex
+			graphRequest, err := antfly.NewCreateIndexRequest(graphIndex)
+			if err != nil {
+				return fmt.Errorf("failed to create artifact graph index request: %w", err)
+			}
+			indexes[*artifactGraphIndex] = *graphRequest
 		}
 
 		err = client.CreateTable(ctx, *tableName, antfly.CreateTableRequest{
@@ -1629,7 +1633,11 @@ func syncCmd(args []string) error {
 			if err != nil {
 				return fmt.Errorf("failed to create artifact graph index config: %w", err)
 			}
-			indexes[*artifactGraphIndex] = *graphIndex
+			graphRequest, err := antfly.NewCreateIndexRequest(graphIndex)
+			if err != nil {
+				return fmt.Errorf("failed to create artifact graph index request: %w", err)
+			}
+			indexes[*artifactGraphIndex] = *graphRequest
 		}
 
 		err = client.CreateTable(ctx, *tableName, antfly.CreateTableRequest{
@@ -2254,18 +2262,14 @@ func createEmbeddingIndex(embeddingModel, inferenceURL, chunkerModel string, tar
 		return nil, fmt.Errorf("failed to configure chunker URL: %w", err)
 	}
 
-	chunker := antfly.ChunkerConfig{}
-	chunker.Provider = antfly.ChunkerProviderAntfly
-	err = chunker.FromAntflyChunkerConfig(antfly.AntflyChunkerConfig{
-		ApiUrl: chunkerURL,
-		Model:  chunkerModel,
+	chunker := antfly.ChunkerConfig{
+		Provider: antfly.ChunkerProviderAntfly,
+		ApiUrl:   chunkerURL,
+		Model:    chunkerModel,
 		Text: antfly.TextChunkOptions{
 			TargetTokens:  targetTokens,
 			OverlapTokens: overlapTokens,
 		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to configure chunker: %w", err)
 	}
 
 	err = embeddingIndexConfig.FromEmbeddingsIndexConfig(antfly.EmbeddingsIndexConfig{
@@ -2292,9 +2296,13 @@ func createFullTextIndex() (antfly.IndexConfig, error) {
 	return idx, nil
 }
 
-func createSearchTableIndexes(embeddingIndex antfly.IndexConfig) (map[string]antfly.IndexConfig, error) {
-	return map[string]antfly.IndexConfig{
-		DefaultEmbeddingIndex: embeddingIndex,
+func createSearchTableIndexes(embeddingIndex antfly.IndexConfig) (map[string]antfly.CreateIndexRequest, error) {
+	request, err := antfly.NewCreateIndexRequest(embeddingIndex)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build embedding index request: %w", err)
+	}
+	return map[string]antfly.CreateIndexRequest{
+		DefaultEmbeddingIndex: *request,
 	}, nil
 }
 

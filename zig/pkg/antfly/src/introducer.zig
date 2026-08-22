@@ -371,7 +371,11 @@ const TextBuildResourceTracker = struct {
 
     fn release(self: *TextBuildResourceTracker) void {
         if (self.manager) |manager| {
-            manager.releaseBytes(.full_text_build_working_set, self.current_bytes);
+            manager.adjustUsage(
+                .full_text_build_working_set,
+                &self.current_bytes,
+                0,
+            ) catch {};
         }
         self.current_bytes = 0;
     }

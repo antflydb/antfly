@@ -39,12 +39,14 @@ export {
   DEFAULT_WRITE_MAX_REQUEST_BYTES,
   DEFAULT_WRITE_MAX_RESPONSE_BYTES,
   HierarchyCursorStaleError,
+  type IndexOperations,
   QUERY_TEMPORARILY_UNAVAILABLE_CODES,
   type QueryExecutionOptions,
   type QueryTemporarilyUnavailableCode,
   QueryTemporarilyUnavailableError,
   type RestoreOptions,
   StorageReadTemporarilyUnavailableError,
+  StorageResourceExhaustedError,
 } from "./client.js";
 export {
   InferenceAPIError,
@@ -164,6 +166,13 @@ export type {
   ConnectionKind,
   ConnectionStatus,
   ConnectionsResponse,
+  CreateAlgebraicIndexRequest,
+  CreatedIndex,
+  CreateEmbeddingsIndexRequest,
+  CreateFullTextIndexRequest,
+  CreateGraphIndexRequest,
+  // Index types
+  CreateIndexRequest,
   CreateTableRequest,
   CreateUserRequest,
   DenseEmbedding,
@@ -235,7 +244,6 @@ export type {
   GraphTraversal,
   GraphTraverseQuery,
   GraphWhereExpression,
-  // Index types
   IndexConfig,
   IndexStatus,
   IndexType,

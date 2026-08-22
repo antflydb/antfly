@@ -73,7 +73,16 @@ pub const CreateUserRequest = struct {
 };
 
 pub const Error = struct {
+    /// Optional stable machine-readable error code for programmatic handling.
+    code: ?[]const u8 = null,
+    /// Legacy human-readable error text.
     @"error": []const u8,
+    /// Human-readable error description when supplied by the endpoint.
+    message: ?[]const u8 = null,
+    /// Whether retrying the operation may succeed without changing the request.
+    retryable: ?bool = null,
+    /// Suggested minimum retry delay in milliseconds.
+    retry_after_ms: ?i32 = null,
 };
 
 pub const Permission = struct {

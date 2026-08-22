@@ -108,6 +108,23 @@ pub fn syncDirectoryFdPortable(fd: std.posix.fd_t) !void {
     };
 }
 
+/// Syncs a directory represented by a `std.Io.Dir`, including traversal-only
+/// handles. On Linux, `openDir` uses `O_PATH` unless iteration is requested,
+/// and `Dir.cwd()` is represented by `AT_FDCWD`; neither may be passed directly
+/// to `fsync`. Reopening `.` through the held directory keeps resolution bound
+/// to the same directory while obtaining a sync-capable descriptor.
+pub fn syncDirectoryHandlePortable(io: anytype, dir: std.Io.Dir) !void {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
+        return error.DurableDirectorySyncUnsupported;
+
+    var sync_dir = try dir.openDir(io, ".", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer sync_dir.close(io);
+    try syncDirectoryFdPortable(sync_dir.handle);
+}
+
 pub fn syncFilePortable(io: anytype, path: []const u8) !void {
     const file = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(io, path, .{})
@@ -157,6 +174,25 @@ test "syncDirPortable opens a real directory fd" {
     defer std.testing.allocator.free(path);
 
     try syncDirPortable(io_impl.io(), path);
+}
+
+test "syncDirectoryHandlePortable supports cwd and traversal-only handles" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    try syncDirectoryHandlePortable(io, std.Io.Dir.cwd());
+
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    var traversal_dir = try std.Io.Dir.cwd().openDir(io, path, .{
+        .follow_symlinks = false,
+    });
+    defer traversal_dir.close(io);
+    try syncDirectoryHandlePortable(io, traversal_dir);
 }
 
 test "createDirPathPortable creates absolute nested directories" {

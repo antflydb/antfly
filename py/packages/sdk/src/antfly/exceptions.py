@@ -49,3 +49,21 @@ class InferenceCapacityError(InferenceAPIError):
         self.reason = reason
         self.retry_after_ms = retry_after_ms
         super().__init__(503, code, message, True)
+
+
+class StorageResourceExhaustedError(AntflyException):
+    """Retryable storage admission rejection with an actionable delay."""
+
+    def __init__(
+        self,
+        message: str,
+        retry_after_ms: int,
+        retry_after_seconds: int | None = None,
+    ) -> None:
+        self.status_code = 429
+        self.code = "storage_resource_exhausted"
+        self.detail = message
+        self.retryable = True
+        self.retry_after_ms = retry_after_ms
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__(f"storage resource exhausted (429): {message}")

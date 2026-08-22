@@ -763,6 +763,14 @@ pub const WeightStore = struct {
     residency: ?moe_residency.SharedResidency = null,
     tier_cache: ?tier_cache_mod.SharedCache = null,
     shared_prefetch: ?*tier_shared_mod.SharedPrefetchState = null,
+    /// Once authoritative live admission reports host pressure, keep clean
+    /// GGUF source pages request-scoped for this session. A loaded entry may
+    /// retain a prepared representation while its mmap source would otherwise
+    /// accumulate outside cache-residency accounting as tensors are touched.
+    discard_file_cache_under_pressure: std.atomic.Value(bool) = .init(false),
+    /// Bound cgroup probing to one caller per interval. Tensor handles are
+    /// released far more frequently than pressure state needs to be sampled.
+    last_file_cache_pressure_probe_ns: std.atomic.Value(u64) = .init(0),
     allow_direct_quant: bool = true,
     gliner_head_dense_cache: std.StringHashMapUnmanaged(DenseDequantCacheEntry) = .{},
     gliner_head_dense_cache_bytes: usize = 0,
@@ -4504,12 +4512,13 @@ fn freeTensor(ctx: *anyopaque, tensor: CT) void {
                 platform.time.yieldBriefly();
             }
             defer guard.unlock();
-            if (entry.pin_count > 0) entry.pin_count -= 1;
-        } else if (entry.pin_count > 0) {
-            entry.pin_count -= 1;
+            releaseLazyEntryPinLocked(self.data, entry);
+        } else {
+            releaseLazyEntryPinLocked(self.data, entry);
         }
-        if (b.name.len > 0) releaseWeightReservation(self, b.name);
     }
+    if (b.reservation != null and b.name.len > 0)
+        releaseWeightReservation(self, b.name);
     releaseOwnedDenseData(b);
     releaseLogicalShape(b);
     if (b.view_strides) |strides| b.allocator.free(strides);
@@ -4524,17 +4533,80 @@ fn freeTensor(ctx: *anyopaque, tensor: CT) void {
     b.allocator.destroy(b);
 }
 
-fn acquireWeightReservation(self: *NativeCompute, name: []const u8, bytes: usize) !void {
-    if (self.run_budget == null or name.len == 0) return;
+/// Release a borrower while holding the entry's residency guard (when one is
+/// configured). Clean mapped pages are discarded only after the last borrower
+/// leaves, so pressure reclamation cannot invalidate an active computation.
+fn releaseLazyEntryPinLocked(data: *WeightStore, entry: *LazyWeightEntry) void {
+    if (entry.pin_count == 0) return;
+    entry.pin_count -= 1;
+    if (entry.pin_count == 0 and shouldDiscardFileCacheUnderPressure(data)) {
+        discardLazyEntryFileCache(data, entry);
+    }
+}
+
+const file_cache_pressure_probe_interval_ns = 100 * std.time.ns_per_ms;
+
+/// Page faults are not allocator calls, so a request can cross the process
+/// envelope during compute without another reservation. Probe at a bounded
+/// cadence on safe last-borrower boundaries and latch pressure mode for the
+/// session once the owner's emergency reserve is reached.
+fn shouldDiscardFileCacheUnderPressure(data: *WeightStore) bool {
+    if (data.discard_file_cache_under_pressure.load(.acquire)) return true;
+    const tier_cache = if (data.tier_cache) |*cache| cache else return false;
+
+    const now_ns = platform.time.monotonicNs();
+    var last_ns = data.last_file_cache_pressure_probe_ns.load(.acquire);
+    while (last_ns == 0 or now_ns -| last_ns >= file_cache_pressure_probe_interval_ns) {
+        last_ns = data.last_file_cache_pressure_probe_ns.cmpxchgWeak(
+            last_ns,
+            now_ns,
+            .acq_rel,
+            .acquire,
+        ) orelse {
+            if (tier_cache.isLiveHostUnderPressure()) {
+                data.discard_file_cache_under_pressure.store(true, .release);
+                return true;
+            }
+            return false;
+        };
+    }
+    return data.discard_file_cache_under_pressure.load(.acquire);
+}
+
+/// A completed weight operation is the earliest safe point at which its source
+/// pages are no longer needed by that operation. This boundary is intentionally
+/// independent of handle lifetime: graph scopes may retain a pinned handle long
+/// after the mapped range was consumed, allowing working set to outrun a
+/// release-only pressure probe.
+fn maybeDiscardLazyEntryFileCacheAfterUse(
+    data: *WeightStore,
+    entry: *const LazyWeightEntry,
+) bool {
+    if (!shouldDiscardFileCacheUnderPressure(data)) return false;
+    discardLazyEntryFileCache(data, entry);
+    return true;
+}
+
+fn maybeDiscardMappedWeightAfterUse(self: *NativeCompute, weight: CT) void {
+    const entry = toBuf(weight).lazy_entry orelse return;
+    _ = maybeDiscardLazyEntryFileCacheAfterUse(self.data, entry);
+}
+
+fn acquireWeightReservation(self: *NativeCompute, name: []const u8, bytes: usize) !?run_memory.Reservation {
+    if (self.run_budget == null or name.len == 0 or bytes == 0) return null;
     if (self.weight_reservations.getPtr(name)) |state| {
         state.count += 1;
-        return;
+        return state.reservation;
     }
     const reservation = try self.run_budget.?.tryReserveWeight(.host, bytes);
-    try self.weight_reservations.put(self.allocator, try self.allocator.dupe(u8, name), .{
+    errdefer self.run_budget.?.release(reservation);
+    const owned_name = try self.allocator.dupe(u8, name);
+    errdefer self.allocator.free(owned_name);
+    try self.weight_reservations.put(self.allocator, owned_name, .{
         .count = 1,
         .reservation = reservation,
     });
+    return reservation;
 }
 
 fn releaseWeightReservation(self: *NativeCompute, name: []const u8) void {
@@ -4556,32 +4628,125 @@ fn releaseWeightReservation(self: *NativeCompute, name: []const u8) void {
     }
 }
 
+fn finishWeight(
+    self: *NativeCompute,
+    tensor: CT,
+    name: []const u8,
+    bytes: usize,
+    shape: []const i64,
+) !CT {
+    errdefer freeTensor(self, tensor);
+    toBuf(tensor).reservation = try acquireWeightReservation(self, name, bytes);
+    return self.withLogicalShape(tensor, shape);
+}
+
+/// Finish a weight while the caller owns the lazy-weight guard. Error cleanup
+/// must not call freeTensor with the guarded entry attached, because freeTensor
+/// would attempt to reacquire that same non-reentrant guard.
+fn finishLazyWeightLocked(
+    self: *NativeCompute,
+    tensor: CT,
+    reservation: ?run_memory.Reservation,
+    shape: []const i64,
+) !CT {
+    errdefer {
+        const buf = toBuf(tensor);
+        buf.lazy_entry = null;
+        buf.reservation = null;
+        freeTensor(self, tensor);
+    }
+    toBuf(tensor).reservation = reservation;
+    return self.withLogicalShape(tensor, shape);
+}
+
+fn checkedF32Bytes(len: usize) usize {
+    return std.math.mul(usize, len, @sizeOf(f32)) catch
+        std.math.maxInt(usize);
+}
+
+fn loadedWeightHandleBytes(loaded: *const LoadedWeight, name: []const u8, cached_bytes: usize) usize {
+    if (loaded.quantized_storage != null or
+        loaded.tensor.dtype == .f32 or
+        shouldBorrowEmbeddingTensor(name))
+    {
+        return cached_bytes;
+    }
+    const element_bytes = loaded.tensor.dtype.byteSize();
+    if (element_bytes == 0 or loaded.tensor.data.len % element_bytes != 0)
+        return std.math.maxInt(usize);
+    return checkedF32Bytes(loaded.tensor.data.len / element_bytes);
+}
+
+fn makeBufFromWeightView(
+    self: *NativeCompute,
+    view: WeightF32View,
+    name: []const u8,
+    lazy_entry: ?*LazyWeightEntry,
+    quantized_storage: ?*const QuantizedStorage,
+) !CT {
+    return self.makeBufWithEntry(
+        @constCast(view.data),
+        view.owned != null,
+        name,
+        lazy_entry,
+        quantized_storage,
+        null,
+    ) catch |err| {
+        if (view.owned) |owned| self.allocator.free(owned);
+        return err;
+    };
+}
+
+test "native weight handles reserve and release run budget capacity" {
+    const allocator = std.testing.allocator;
+    var store = WeightStore{
+        .allocator = allocator,
+        .resident_weights = .{},
+        .lazy_weights = .{},
+    };
+    var budget = run_memory.RunBudget.init(.{ .host_limit_bytes = 96 });
+    var compute = NativeCompute.init(allocator, &store, &budget);
+    defer compute.weight_reservations.deinit(allocator);
+
+    try std.testing.expect((try acquireWeightReservation(&compute, "weight", 64)) != null);
+    try std.testing.expect((try acquireWeightReservation(&compute, "weight", 64)) != null);
+    try std.testing.expectEqual(@as(usize, 64), budget.host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 2), compute.weight_reservations.get("weight").?.count);
+
+    releaseWeightReservation(&compute, "weight");
+    try std.testing.expectEqual(@as(usize, 64), budget.host_weight_bytes);
+    releaseWeightReservation(&compute, "weight");
+    try std.testing.expectEqual(@as(usize, 0), budget.host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 0), compute.weight_reservations.count());
+}
+
 fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     if (self.data.resident_weights.getPtr(name)) |w| {
         if (w.quantized_storage) |*storage| {
-            try ensurePreparedKBlock(self, storage);
+            try ensurePreparedKBlock(self, storage, null);
             const view = if (w.tensor.data.len > 0)
                 try tensorF32View(self, &w.tensor)
             else
                 WeightF32View{ .data = empty_f32[0..] };
-            const tensor = try self.makeBufWithEntry(@constCast(view.data), view.owned != null, name, null, storage, null);
-            errdefer freeTensor(self, tensor);
-            return self.withLogicalShape(tensor, w.tensor.shape);
+            const tensor = try makeBufFromWeightView(self, view, name, null, storage);
+            return finishWeight(self, tensor, name, quantizedStorageBudgetBytes(storage), w.tensor.shape);
         }
         if (w.tensor.dtype == .f32) {
             const view = try tensorF32View(self, &w.tensor);
-            const tensor = try self.makeBufWithEntry(@constCast(view.data), view.owned != null, name, null, null, null);
-            errdefer freeTensor(self, tensor);
-            return self.withLogicalShape(tensor, w.tensor.shape);
+            const tensor = try makeBufFromWeightView(self, view, name, null, null);
+            return finishWeight(self, tensor, name, checkedF32Bytes(view.data.len), w.tensor.shape);
         }
         if (shouldBorrowEmbeddingTensor(name)) {
-            return self.makeBufWithEntry(empty_f32[0..], false, name, null, null, &w.tensor);
+            const tensor = try self.makeBufWithEntry(empty_f32[0..], false, name, null, null, &w.tensor);
+            return finishWeight(self, tensor, name, w.tensor.data.len, w.tensor.shape);
         }
         const converted = try convertTensorToOwnedF32(self.allocator, &w.tensor);
-        const tensor = try self.makeBufWithEntry(converted, true, name, null, null, null);
-        errdefer freeTensor(self, tensor);
-        return self.withLogicalShape(tensor, w.tensor.shape);
+        const tensor = self.makeBufWithEntry(converted, true, name, null, null, null) catch |err| {
+            self.allocator.free(converted);
+            return err;
+        };
+        return finishWeight(self, tensor, name, checkedF32Bytes(converted.len), w.tensor.shape);
     }
 
     self.data.prefetch.lock();
@@ -4602,31 +4767,39 @@ fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
             },
             else => return err,
         };
-        entry.pin_count += 1;
         const loaded = &(entry.loaded.?);
+        const reservation = try acquireWeightReservation(
+            self,
+            name,
+            loadedWeightHandleBytes(loaded, name, entry.loaded_bytes),
+        );
+        errdefer if (reservation != null) releaseWeightReservation(self, name);
+        entry.pin_count += 1;
+        errdefer entry.pin_count -= 1;
         if (loaded.quantized_storage) |*storage| {
-            try ensurePreparedKBlock(self, storage);
+            try ensurePreparedKBlock(self, storage, &entry.loaded_bytes);
             const view = if (loaded.tensor.data.len > 0)
                 try tensorF32View(self, &loaded.tensor)
             else
                 WeightF32View{ .data = empty_f32[0..] };
-            const tensor = try self.makeBufWithEntry(@constCast(view.data), view.owned != null, name, entry, storage, null);
-            errdefer freeTensor(self, tensor);
-            return self.withLogicalShape(tensor, loaded.tensor.shape);
+            const tensor = try makeBufFromWeightView(self, view, name, entry, storage);
+            return finishLazyWeightLocked(self, tensor, reservation, loaded.tensor.shape);
         }
         if (loaded.tensor.dtype == .f32) {
             const view = try tensorF32View(self, &loaded.tensor);
-            const tensor = try self.makeBufWithEntry(@constCast(view.data), view.owned != null, name, entry, null, null);
-            errdefer freeTensor(self, tensor);
-            return self.withLogicalShape(tensor, loaded.tensor.shape);
+            const tensor = try makeBufFromWeightView(self, view, name, entry, null);
+            return finishLazyWeightLocked(self, tensor, reservation, loaded.tensor.shape);
         }
         if (shouldBorrowEmbeddingTensor(name)) {
-            return self.makeBufWithEntry(empty_f32[0..], false, name, entry, null, &loaded.tensor);
+            const tensor = try self.makeBufWithEntry(empty_f32[0..], false, name, entry, null, &loaded.tensor);
+            return finishLazyWeightLocked(self, tensor, reservation, loaded.tensor.shape);
         }
         const converted = try convertTensorToOwnedF32(self.allocator, &loaded.tensor);
-        const tensor = try self.makeBufWithEntry(converted, true, name, entry, null, null);
-        errdefer freeTensor(self, tensor);
-        return self.withLogicalShape(tensor, loaded.tensor.shape);
+        const tensor = self.makeBufWithEntry(converted, true, name, entry, null, null) catch |err| {
+            self.allocator.free(converted);
+            return err;
+        };
+        return finishLazyWeightLocked(self, tensor, reservation, loaded.tensor.shape);
     }
 
     std.log.debug("MissingWeight: '{s}'", .{name});
@@ -4719,8 +4892,19 @@ pub fn ensureLazyWeightLoadedLocked(data: *WeightStore, run_budget: ?*run_memory
         return;
     }
     const tensor_store = data.tensor_store orelse return error.MissingWeight;
+    var cache_reserved_bytes: usize = 0;
+    errdefer if (cache_reserved_bytes != 0) {
+        if (data.tier_cache) |*tier_cache|
+            tier_cache.noteRelease(.host, cache_reserved_bytes);
+    };
     var direct_quant_storage: ?QuantizedStorage = null;
     errdefer if (direct_quant_storage) |*storage| storage.deinit();
+    errdefer if (entry.loaded) |*loaded| {
+        loaded.deinit();
+        entry.loaded = null;
+        entry.loaded_bytes = 0;
+        entry.active_tier = entry.placement.spill_tier;
+    };
 
     var expected_bytes = if (entry.loaded_bytes != 0) entry.loaded_bytes else entry.tensor_ref.byte_len;
     if (data.allow_direct_quant) {
@@ -4741,17 +4925,22 @@ pub fn ensureLazyWeightLoadedLocked(data: *WeightStore, run_budget: ?*run_memory
             } else {
                 evictColdNonExpertWeightsToFitLocked(data, .host, expected_bytes, entry);
             }
-            if (!tier_cache.canFitAdditional(.host, expected_bytes)) {
-                tier_cache.noteDenied(.host, expected_bytes);
-                noteSharedCacheDenial(run_budget, tier_cache, .host, expected_bytes);
-                return error.MemoryBudgetExceeded;
-            }
         }
+        reserveHostCacheWithReclaimLocked(data, expected_bytes, entry) catch |err| {
+            tier_cache.noteDenied(.host, expected_bytes);
+            noteSharedCacheDenial(run_budget, tier_cache, .host, expected_bytes);
+            return err;
+        };
+        cache_reserved_bytes = expected_bytes;
     }
 
     if (data.allow_direct_quant) {
         if (direct_quant_storage) |*storage_ref| {
-            try prepareNativeQuantizedStorageBudgetedLocked(data, run_budget, storage_ref);
+            // The outer load reservation already includes every prepared
+            // representation reported by expectedQuantizedStorageLoadBytes.
+            // Rechecking those bytes here would double-charge the same growth
+            // and can incorrectly suppress preparation near the cache ceiling.
+            try prepareNativeQuantizedStorage(storage_ref);
             entry.loaded = .{
                 .tensor = .{
                     .data = empty_u8[0..],
@@ -4794,7 +4983,18 @@ pub fn ensureLazyWeightLoadedLocked(data: *WeightStore, run_budget: ?*run_memory
     }
     entry.active_tier = .host;
     if (data.tier_cache) |*tier_cache| {
-        tier_cache.noteResident(.host, entry.loaded_bytes);
+        if (entry.loaded_bytes > cache_reserved_bytes) {
+            const additional = entry.loaded_bytes - cache_reserved_bytes;
+            reserveHostCacheWithReclaimLocked(data, additional, entry) catch |err| {
+                tier_cache.noteDenied(.host, additional);
+                noteSharedCacheDenial(run_budget, tier_cache, .host, additional);
+                return err;
+            };
+            cache_reserved_bytes = entry.loaded_bytes;
+        } else if (entry.loaded_bytes < cache_reserved_bytes) {
+            tier_cache.noteRelease(.host, cache_reserved_bytes - entry.loaded_bytes);
+            cache_reserved_bytes = entry.loaded_bytes;
+        }
     }
     if (entry.expert_coord) |coord| {
         if (data.residency) |*residency| {
@@ -4832,6 +5032,203 @@ fn evictColdNonExpertWeightsToFitLocked(
         const victim = findNonExpertEvictionVictimLocked(data, tier, protected) orelse break;
         unloadLazyEntryTierLocked(data, victim, tier);
     }
+}
+
+/// Release one cold, unpinned lazy-weight residency while the caller owns the
+/// prefetch mutex. Live process pressure can become tighter after model load as
+/// mmap-backed source pages are faulted in; hard cache geometry alone cannot
+/// detect that transition. Returning exact released bytes lets admission retry
+/// only after useful progress and prevents an unbounded retry loop.
+fn reclaimOneHostCacheEntryLocked(
+    data: *WeightStore,
+    protected: ?*LazyWeightEntry,
+) usize {
+    if (findAnyExpertEvictionVictimLocked(data, .host, protected)) |coord| {
+        var released_bytes: usize = 0;
+        var it = data.lazy_weights.iterator();
+        while (it.next()) |entry| {
+            const entry_coord = entry.value_ptr.expert_coord orelse continue;
+            if (entry_coord.layer_index != coord.layer_index or
+                entry_coord.expert_index != coord.expert_index or
+                !entryResidentAtTier(entry.value_ptr.*, .host))
+            {
+                continue;
+            }
+            released_bytes +|= entry.value_ptr.loaded_bytes;
+        }
+        unloadExpertTierLocked(data, coord, .host);
+        return released_bytes;
+    }
+
+    const victim = findNonExpertEvictionVictimLocked(data, .host, protected) orelse
+        return 0;
+    const released_bytes = victim.loaded_bytes;
+    unloadLazyEntryTierLocked(data, victim, .host);
+    return released_bytes;
+}
+
+/// Retry an exact host-cache reservation after shedding one useful cold entry
+/// per denial. The prefetch mutex is the ownership boundary for lazy entry
+/// residency and pin counts, so callers must already hold it.
+fn reserveHostCacheWithReclaimLocked(
+    data: *WeightStore,
+    bytes: usize,
+    protected: ?*LazyWeightEntry,
+) tier_cache_mod.ReserveError!void {
+    const tier_cache = if (data.tier_cache) |*cache| cache else return;
+    if (tier_cache.budget.host_limit_bytes != 0 and
+        bytes > tier_cache.budget.host_limit_bytes)
+    {
+        return error.MemoryBudgetExceeded;
+    }
+    while (true) {
+        tier_cache.reserve(.host, bytes) catch |err| {
+            if (err == error.ResourceTemporarilyUnavailable) {
+                // The controller observes total process/cgroup pressure that
+                // cache geometry cannot see. Retain pressure mode even if no
+                // cold cache entry exists: active mmap pages become safely
+                // reclaimable as their last tensor handle is released.
+                data.discard_file_cache_under_pressure.store(true, .release);
+            }
+            if (reclaimOneHostCacheEntryLocked(data, protected) == 0) return err;
+            continue;
+        };
+        return;
+    }
+}
+
+/// Shed one unpinned native/PJRT host-cache entry for process-wide admission.
+/// This is intentionally bounded to one victim so ModelManager can re-probe
+/// the authoritative controller after every physical release.
+pub fn reclaimOneHostCacheEntry(data: *WeightStore) usize {
+    // This capability is invoked only after authoritative host admission has
+    // denied a request. Mark the session before inspecting victims so pinned
+    // entries shed clean source pages as soon as their borrowers depart.
+    data.discard_file_cache_under_pressure.store(true, .release);
+    if (!data.prefetch_initialized) return 0;
+    data.prefetch.lock();
+    defer data.prefetch.unlock();
+    return reclaimOneHostCacheEntryLocked(data, null);
+}
+
+test "live host cache reservation reclaims only unpinned lazy weights" {
+    const allocator = std.testing.allocator;
+    const tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 12 });
+    var store = WeightStore{
+        .allocator = allocator,
+        .resident_weights = .{},
+        .lazy_weights = .{},
+        .tier_cache = tier_cache,
+    };
+    try store.lazy_weights.ensureTotalCapacity(allocator, 2);
+    defer {
+        deinitPrefetchQueue(&store);
+        var it = store.lazy_weights.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.loaded) |*loaded| loaded.deinit();
+        }
+        store.lazy_weights.deinit(allocator);
+    }
+
+    const cold_tensor = try tensor_mod.Tensor.initFloat32(
+        allocator,
+        "cold.weight",
+        &.{2},
+        &.{ 1.0, 2.0 },
+    );
+    store.lazy_weights.putAssumeCapacity("cold.weight", .{
+        .tensor_ref = undefined,
+        .loaded = .{ .tensor = cold_tensor },
+        .loaded_bytes = 8,
+        .prefetch_score = 1,
+        .active_tier = .host,
+    });
+    const pinned_tensor = try tensor_mod.Tensor.initFloat32(
+        allocator,
+        "pinned.weight",
+        &.{1},
+        &.{3.0},
+    );
+    store.lazy_weights.putAssumeCapacity("pinned.weight", .{
+        .tensor_ref = undefined,
+        .loaded = .{ .tensor = pinned_tensor },
+        .loaded_bytes = 4,
+        .pin_count = 1,
+        .active_tier = .host,
+    });
+    store.tier_cache.?.noteResident(.host, 12);
+    initPrefetchQueue(&store, allocator);
+
+    store.prefetch.lock();
+    try std.testing.expectError(
+        error.MemoryBudgetExceeded,
+        reserveHostCacheWithReclaimLocked(&store, 13, null),
+    );
+    try std.testing.expect(store.lazy_weights.get("cold.weight").?.loaded != null);
+    try reserveHostCacheWithReclaimLocked(&store, 6, null);
+    store.prefetch.unlock();
+
+    try std.testing.expect(store.lazy_weights.get("cold.weight").?.loaded == null);
+    try std.testing.expect(store.lazy_weights.get("pinned.weight").?.loaded != null);
+    try std.testing.expectEqual(@as(usize, 10), store.tier_cache.?.host_bytes);
+
+    store.tier_cache.?.noteRelease(.host, 6);
+    try std.testing.expectEqual(@as(usize, 0), reclaimOneHostCacheEntry(&store));
+    try std.testing.expect(store.discard_file_cache_under_pressure.load(.acquire));
+    store.prefetch.lock();
+    const pinned = store.lazy_weights.getPtr("pinned.weight").?;
+    releaseLazyEntryPinLocked(&store, pinned);
+    try std.testing.expectEqual(@as(usize, 0), pinned.pin_count);
+    unloadLazyEntryTierLocked(&store, pinned, .host);
+    store.prefetch.unlock();
+}
+
+test "live host cache denial enables mapped-page pressure mode" {
+    var controller = run_memory.AdmissionController{};
+    controller.configureSharedLimits(.{ .host_limit_bytes = 1024 });
+    controller.configureProcessMemoryLimit(2, .explicit);
+    defer controller.deinit();
+
+    const limits = run_memory.Limits{
+        .host_limit_bytes = 1024,
+        .combined_limit_bytes = 1024,
+    };
+    var store = WeightStore{
+        .allocator = std.testing.allocator,
+        .resident_weights = .{},
+        .lazy_weights = .{},
+        .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 1024 }),
+    };
+    defer store.lazy_weights.deinit(std.testing.allocator);
+    try store.tier_cache.?.configureAdmission(
+        std.testing.allocator,
+        &controller,
+        .cpu,
+        limits,
+        .{},
+    );
+    defer store.tier_cache.?.deinitAdmission();
+
+    store.last_file_cache_pressure_probe_ns.store(std.math.maxInt(u64), .release);
+    try std.testing.expect(!shouldDiscardFileCacheUnderPressure(&store));
+    store.last_file_cache_pressure_probe_ns.store(0, .release);
+    try std.testing.expect(shouldDiscardFileCacheUnderPressure(&store));
+    try std.testing.expect(store.discard_file_cache_under_pressure.load(.acquire));
+    var active_entry = LazyWeightEntry{
+        .tensor_ref = undefined,
+        .pin_count = 1,
+    };
+    try std.testing.expect(maybeDiscardLazyEntryFileCacheAfterUse(&store, &active_entry));
+    try std.testing.expectEqual(@as(usize, 1), active_entry.pin_count);
+    store.discard_file_cache_under_pressure.store(false, .release);
+    store.last_file_cache_pressure_probe_ns.store(0, .release);
+
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        reserveHostCacheWithReclaimLocked(&store, 2, null),
+    );
+    try std.testing.expect(store.discard_file_cache_under_pressure.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.host_bytes);
 }
 
 fn shouldEvictTierLocked(data: *const WeightStore, layer_index: usize, tier: ResidencyTier) bool {
@@ -4889,6 +5286,34 @@ fn findNonExpertEvictionVictimLocked(
     return best;
 }
 
+fn findAnyExpertEvictionVictimLocked(
+    data: *WeightStore,
+    tier: ResidencyTier,
+    protected: ?*LazyWeightEntry,
+) ?ExpertCoord {
+    const protected_coord = if (protected) |entry| entry.expert_coord else null;
+    const residency = data.residency;
+    var best: ?ExpertCoord = null;
+    var it = data.lazy_weights.iterator();
+    while (it.next()) |entry| {
+        const coord = entry.value_ptr.expert_coord orelse continue;
+        if (protected_coord) |kept| {
+            if (coord.layer_index == kept.layer_index and
+                coord.expert_index == kept.expert_index)
+            {
+                continue;
+            }
+        }
+        if (!expertCanEvictLocked(data, coord, tier)) continue;
+        if (best == null or
+            (residency != null and residency.?.isMoreEvictable(coord, best.?)))
+        {
+            best = coord;
+        }
+    }
+    return best;
+}
+
 fn entryResidentAtTier(entry: LazyWeightEntry, tier: ResidencyTier) bool {
     return switch (tier) {
         .disk => false,
@@ -4920,6 +5345,7 @@ fn unloadExpertTierLocked(data: *WeightStore, coord: ExpertCoord, tier: Residenc
                 loaded.deinit();
                 entry.value_ptr.loaded = null;
                 entry.value_ptr.active_tier = entry.value_ptr.placement.spill_tier;
+                discardLazyEntryFileCache(data, entry.value_ptr);
                 if (data.tier_cache) |*tier_cache| {
                     tier_cache.noteRelease(.host, entry.value_ptr.loaded_bytes);
                 }
@@ -4938,12 +5364,18 @@ fn unloadLazyEntryTierLocked(data: *WeightStore, entry: *LazyWeightEntry, tier: 
             loaded.deinit();
             entry.loaded = null;
             entry.active_tier = entry.placement.spill_tier;
+            discardLazyEntryFileCache(data, entry);
             if (data.tier_cache) |*tier_cache| {
                 tier_cache.noteRelease(.host, entry.loaded_bytes);
             }
         },
         else => {},
     }
+}
+
+fn discardLazyEntryFileCache(data: *WeightStore, entry: *const LazyWeightEntry) void {
+    const tensor_store = data.tensor_store orelse return;
+    tensor_store.discardTensorFileCache(entry.tensor_ref.source_name orelse entry.tensor_ref.name);
 }
 
 fn freeLazyWeights(data: *WeightStore, allocator: std.mem.Allocator) void {
@@ -4962,6 +5394,7 @@ fn freeLazyWeights(data: *WeightStore, allocator: std.mem.Allocator) void {
 
 fn embeddingLookup(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, dim: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, weight);
     const out_len = std.math.mul(usize, total, dim) catch return error.UnsupportedShape;
     const out = try self.allocator.alloc(f32, out_len);
     errdefer self.allocator.free(out);
@@ -5227,6 +5660,7 @@ fn dispatchQuantizedLinear(request: QuantLinearRequest) !bool {
 
 fn linearOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, weight);
     const output = try self.allocator.alloc(f32, rows * out_dim);
     errdefer self.allocator.free(output);
     const weight_buf = toBuf(weight);
@@ -5479,14 +5913,18 @@ fn cachedQuantDequantDenseWeight(
         return null;
     }
     if (self.data.tier_cache) |*tier_cache| {
-        if (!tier_cache.canFitAdditional(.host, bytes)) {
+        tier_cache.reserve(.host, bytes) catch {
             self.data.quant_dequant_cache_tier_denied += 1;
             tier_cache.noteDenied(.host, bytes);
             noteSharedCacheDenial(self.run_budget, tier_cache, .host, bytes);
             logSharedCacheDenial("quant_dequant_dense_cache", tier_cache, name);
             return null;
-        }
+        };
     }
+    var cache_reserved = self.data.tier_cache != null;
+    errdefer if (cache_reserved) {
+        self.data.tier_cache.?.noteRelease(.host, bytes);
+    };
 
     const owned_name = try self.data.allocator.dupe(u8, name);
     errdefer self.data.allocator.free(owned_name);
@@ -5500,7 +5938,7 @@ fn cachedQuantDequantDenseWeight(
     });
     self.data.gliner_head_dense_cache_bytes += bytes;
     self.data.quant_dequant_cache_inserts += 1;
-    if (self.data.tier_cache) |*tier_cache| tier_cache.noteResident(.host, bytes);
+    cache_reserved = false;
     return dense_weight;
 }
 
@@ -5532,6 +5970,9 @@ fn linearLoRAOp(
     out_dim: usize,
 ) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, base_weight);
+    defer maybeDiscardMappedWeightAfterUse(self, lora_a);
+    defer maybeDiscardMappedWeightAfterUse(self, lora_b);
     _ = rank;
 
     const input_data = getData(input);
@@ -5575,6 +6016,8 @@ fn linearLoRAOp(
 
 fn layerNormOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, gamma);
+    defer maybeDiscardMappedWeightAfterUse(self, beta);
     const output = try self.allocator.dupe(f32, getData(input));
     activations_mod.layerNorm(output, getData(gamma), getData(beta), dim, eps);
     const result = try self.makeOwnedBuf(output);
@@ -5582,7 +6025,10 @@ fn layerNormOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dim: usize, eps:
     return propagateLogicalShapeLike(self, result, input);
 }
 
-fn layerNormConsumeInputOp(_: *anyopaque, input: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?CT {
+fn layerNormConsumeInputOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, gamma);
+    defer maybeDiscardMappedWeightAfterUse(self, beta);
     const buf = uniqueOwnedDenseBuf(input) orelse return null;
     activations_mod.layerNorm(buf.data, getData(gamma), getData(beta), dim, eps);
     return input;
@@ -6425,6 +6871,7 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
 
 fn linearNoBiasOp(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, weight);
     const output = try self.allocator.alloc(f32, rows * out_dim);
     errdefer self.allocator.free(output);
     @memset(output, 0.0);
@@ -6472,6 +6919,7 @@ fn linearNoBiasPlannedOp(ctx: *anyopaque, request: *const ops.LinearNoBiasPlanne
     const weight_buf = toBuf(request.weight);
     const storage = weight_buf.quantized_storage orelse
         return linearNoBiasOp(ctx, request.input, request.weight, request.rows, request.in_dim, request.out_dim);
+    defer maybeDiscardMappedWeightAfterUse(self, request.weight);
     try validateQuantLinearPlan(request.operator_plan, storage, request.rows, request.in_dim, request.out_dim);
 
     var output_opt: ?[]f32 = try self.allocator.alloc(f32, request.rows * request.out_dim);
@@ -6502,6 +6950,7 @@ fn linearPlannedOp(ctx: *anyopaque, request: *const ops.LinearPlannedRequest) an
     const weight_buf = toBuf(request.weight);
     const storage = weight_buf.quantized_storage orelse
         return linearOp(ctx, request.input, request.weight, request.bias, request.rows, request.in_dim, request.out_dim);
+    defer maybeDiscardMappedWeightAfterUse(self, request.weight);
     try validateQuantLinearPlan(request.operator_plan, storage, request.rows, request.in_dim, request.out_dim);
 
     var output_opt: ?[]f32 = try self.allocator.alloc(f32, request.rows * request.out_dim);
@@ -6549,6 +6998,8 @@ fn linearNoBiasPairOp(
     const weight_buf_b = toBuf(weight_b);
     if (weight_buf_a.quantized_storage) |storage_a| {
         if (weight_buf_b.quantized_storage) |storage_b| {
+            defer maybeDiscardMappedWeightAfterUse(self, weight_a);
+            defer maybeDiscardMappedWeightAfterUse(self, weight_b);
             var first_output: ?[]f32 = try self.allocator.alloc(f32, rows * out_dim);
             errdefer if (first_output) |output| self.allocator.free(output);
             var second_output: ?[]f32 = try self.allocator.alloc(f32, rows * out_dim);
@@ -6748,6 +7199,7 @@ fn mulMatIdQuantizedOp(
 
 fn mulMatIdOp(ctx: *anyopaque, request: *const ops.MulMatIdRequest) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, request.weight);
     if (request.expert_ids.len != request.rows) return error.InvalidPackedExpertTensor;
     const input = getData(request.input);
     if (input.len < request.rows * request.in_dim) return error.UnexpectedOutputShape;
@@ -6807,6 +7259,8 @@ fn linearPairOp(
 
     if (weight_buf_a.quantized_storage) |storage_a| {
         if (weight_buf_b.quantized_storage) |storage_b| {
+            defer maybeDiscardMappedWeightAfterUse(self, weight_a);
+            defer maybeDiscardMappedWeightAfterUse(self, weight_b);
             var first_raw: ?[]f32 = try self.allocator.alloc(f32, rows * out_dim);
             errdefer if (first_raw) |raw| self.allocator.free(raw);
             var second_raw: ?[]f32 = try self.allocator.alloc(f32, rows * out_dim);
@@ -6872,6 +7326,9 @@ fn linearTripleOp(
     if (weight_buf_a.quantized_storage) |storage_a| {
         if (weight_buf_b.quantized_storage) |storage_b| {
             if (weight_buf_c.quantized_storage) |storage_c| {
+                defer maybeDiscardMappedWeightAfterUse(self, weight_a);
+                defer maybeDiscardMappedWeightAfterUse(self, weight_b);
+                defer maybeDiscardMappedWeightAfterUse(self, weight_c);
                 var first_raw: ?[]f32 = try self.allocator.alloc(f32, rows * out_dim);
                 errdefer if (first_raw) |raw| self.allocator.free(raw);
                 var second_raw: ?[]f32 = try self.allocator.alloc(f32, rows * out_dim);
@@ -8547,7 +9004,11 @@ fn nativePreparedStorageComplete(storage: *const QuantizedStorage, known: gguf_t
     return true;
 }
 
-fn ensurePreparedKBlock(self: *NativeCompute, storage: *QuantizedStorage) !void {
+fn ensurePreparedKBlock(
+    self: *NativeCompute,
+    storage: *QuantizedStorage,
+    tracked_entry_bytes: ?*usize,
+) !void {
     const known = switch (storage.tensor_type) {
         .known => |value| value,
         else => return,
@@ -8563,12 +9024,11 @@ fn ensurePreparedKBlock(self: *NativeCompute, storage: *QuantizedStorage) !void 
     var reserved_bytes: usize = 0;
     if (self.data.tier_cache) |*tier_cache| {
         if (additional_bytes != 0) {
-            if (!tier_cache.canFitAdditional(.host, additional_bytes)) {
+            tier_cache.reserve(.host, additional_bytes) catch {
                 tier_cache.noteDenied(.host, additional_bytes);
                 noteSharedCacheDenial(self.run_budget, tier_cache, .host, additional_bytes);
                 return;
-            }
-            tier_cache.noteResident(.host, additional_bytes);
+            };
             reserved_bytes = additional_bytes;
         }
     }
@@ -8576,33 +9036,10 @@ fn ensurePreparedKBlock(self: *NativeCompute, storage: *QuantizedStorage) !void 
         if (self.data.tier_cache) |*tier_cache| tier_cache.noteRelease(.host, reserved_bytes);
     };
     try prepareNativeQuantizedStorage(storage);
-}
-
-fn prepareNativeQuantizedStorageBudgetedLocked(
-    data: *WeightStore,
-    run_budget: ?*run_memory.RunBudget,
-    storage: *QuantizedStorage,
-) !void {
-    const known = switch (storage.tensor_type) {
-        .known => |value| value,
-        else => return,
-    };
-    if (known != .Q1_0 and known != .Q4_0 and known != .Q4_1 and known != .Q5_0 and known != .Q5_1 and known != .Q2_K and known != .Q3_K and known != .Q4_K and known != .Q5_K and known != .Q6_K and known != .Q8_0 and known != .Q8_1 and known != .Q8_K) return;
-    if (nativePreparedStorageComplete(storage, known)) return;
-
-    const additional_bytes = preparedKBlockAdditionalBytes(storage);
-    if (additional_bytes == 0) return;
-
-    if (data.tier_cache) |*tier_cache| {
-        evictColdNonExpertWeightsToFitLocked(data, .host, additional_bytes, null);
-        if (!tier_cache.canFitAdditional(.host, additional_bytes)) {
-            tier_cache.noteDenied(.host, additional_bytes);
-            noteSharedCacheDenial(run_budget, tier_cache, .host, additional_bytes);
-            return;
-        }
+    if (tracked_entry_bytes) |bytes| {
+        std.debug.assert(std.math.maxInt(usize) - bytes.* >= additional_bytes);
+        bytes.* += additional_bytes;
     }
-
-    try prepareNativeQuantizedStorage(storage);
 }
 
 fn writePreparedQ4KBlock(
@@ -8896,6 +9333,17 @@ fn preparedKPanel16ByteSize(out_dim: usize, row_blocks: usize) usize {
 
 fn preparedKQKVPanel16ByteSize(out_dim: usize, row_blocks: usize) usize {
     return (out_dim / prepared_k_panel16_nr) * row_blocks * prepared_k_qkv_panel16_block_bytes;
+}
+
+fn preparedKQKVPanel16OwnedByteSize(
+    out_dim: usize,
+    row_blocks: usize,
+    key_b: []const u8,
+    key_c: []const u8,
+) ?usize {
+    const packed_bytes = preparedKQKVPanel16ByteSize(out_dim, row_blocks);
+    const with_key_b = std.math.add(usize, packed_bytes, key_b.len) catch return null;
+    return std.math.add(usize, with_key_b, key_c.len) catch null;
 }
 
 fn prepareQ8_0PanelPackedStorage(storage: *QuantizedStorage) !void {
@@ -9524,8 +9972,19 @@ fn ensureQ4Q5QKVPanel16Cache(
     const row_blocks = in_dim / 256;
     const expected_bytes = preparedKQKVPanel16ByteSize(out_dim, row_blocks);
     if (expected_bytes == 0) return;
+    const expected_owned_bytes = preparedKQKVPanel16OwnedByteSize(
+        out_dim,
+        row_blocks,
+        weight_buf_b.name,
+        weight_buf_c.name,
+    ) orelse return;
     if (preparedQKVPanel16GroupCacheMatches(storage_a_const, weight_buf_b.name, weight_buf_c.name, expected_bytes, row_blocks)) return;
 
+    // Match the global lazy-entry lock order (prefetch, then preparation).
+    // Besides protecting pin counts during pressure reclamation, this prevents
+    // the background prefetch worker from immediately restoring a victim.
+    self.data.prefetch.lock();
+    defer self.data.prefetch.unlock();
     while (!self.data.quantized_prepare_lock.tryLock()) {
         platform.time.yieldBriefly();
     }
@@ -9541,15 +10000,20 @@ fn ensureQ4Q5QKVPanel16Cache(
         if (weight_buf_a.lazy_entry) |entry| entry.loaded_bytes = quantizedStorageBudgetBytes(storage_a);
     }
 
+    var cache_reserved_bytes: usize = 0;
     if (self.data.tier_cache) |*tier_cache| {
-        evictColdNonExpertWeightsToFitLocked(self.data, .host, expected_bytes, weight_buf_a.lazy_entry);
-        if (!tier_cache.canFitAdditional(.host, expected_bytes)) {
-            tier_cache.noteDenied(.host, expected_bytes);
-            noteSharedCacheDenial(self.run_budget, tier_cache, .host, expected_bytes);
+        evictColdNonExpertWeightsToFitLocked(self.data, .host, expected_owned_bytes, weight_buf_a.lazy_entry);
+        reserveHostCacheWithReclaimLocked(self.data, expected_owned_bytes, weight_buf_a.lazy_entry) catch {
+            tier_cache.noteDenied(.host, expected_owned_bytes);
+            noteSharedCacheDenial(self.run_budget, tier_cache, .host, expected_owned_bytes);
             logSharedCacheDenial("q4q5_qkv_panel16_cache", tier_cache, weight_buf_a.name);
             return;
-        }
+        };
+        cache_reserved_bytes = expected_owned_bytes;
     }
+    errdefer if (cache_reserved_bytes != 0) {
+        self.data.tier_cache.?.noteRelease(.host, cache_reserved_bytes);
+    };
 
     const inserted_bytes = try prepareQ4Q5QKVPanel16PackedStorage(
         storage_a,
@@ -9562,8 +10026,16 @@ fn ensureQ4Q5QKVPanel16Cache(
         row_blocks,
     );
     if (inserted_bytes != 0) {
-        if (self.data.tier_cache) |*tier_cache| tier_cache.noteResident(.host, inserted_bytes);
+        if (self.data.tier_cache) |*tier_cache| {
+            if (inserted_bytes < cache_reserved_bytes) {
+                tier_cache.noteRelease(.host, cache_reserved_bytes - inserted_bytes);
+            } else std.debug.assert(inserted_bytes == cache_reserved_bytes);
+        }
+        cache_reserved_bytes = 0;
         if (weight_buf_a.lazy_entry) |entry| entry.loaded_bytes = quantizedStorageBudgetBytes(storage_a);
+    } else if (cache_reserved_bytes != 0) {
+        self.data.tier_cache.?.noteRelease(.host, cache_reserved_bytes);
+        cache_reserved_bytes = 0;
     }
 }
 
@@ -34133,6 +34605,7 @@ fn decodeF32Le(b0: u8, b1: u8, b2: u8, b3: u8) f32 {
 
 fn rmsNormOp(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, weight);
     const output = try self.allocator.dupe(f32, getData(input));
     activations_mod.rmsNorm(output, getData(weight), dim, eps);
     const result = try self.makeOwnedBuf(output);
@@ -34140,7 +34613,9 @@ fn rmsNormOp(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyer
     return propagateLogicalShapeLike(self, result, input);
 }
 
-fn rmsNormConsumeInputOp(_: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!?CT {
+fn rmsNormConsumeInputOp(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, weight);
     const buf = uniqueOwnedDenseBuf(input) orelse return null;
     activations_mod.rmsNorm(buf.data, getData(weight), dim, eps);
     return input;
@@ -34208,6 +34683,8 @@ fn linearRowsNative(
     weight: CT,
     bias: CT,
 ) ![]f32 {
+    defer maybeDiscardMappedWeightAfterUse(self, weight);
+    defer maybeDiscardMappedWeightAfterUse(self, bias);
     const weight_view = try denseWeightView(self, weight);
     defer if (weight_view.owned) |owned| self.allocator.free(owned);
     const bias_view = try denseWeightView(self, bias);
@@ -34359,6 +34836,8 @@ fn tokenGridConv2dOp(
     groups: usize,
 ) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, weight);
+    defer maybeDiscardMappedWeightAfterUse(self, bias);
     const input_tokens = getData(input);
     const out_h = (height + 2 * padding_h - kernel_h) / stride_h + 1;
     const out_w = (width + 2 * padding_w - kernel_w) / stride_w + 1;
@@ -34462,6 +34941,7 @@ fn crossAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, enc_mask: []c
 
 fn relativePositionBiasOp(ctx: *anyopaque, weight: CT, q_len: usize, k_len: usize, num_heads: usize, num_buckets: usize, max_distance: usize, bidirectional: bool) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, weight);
     const table = getData(weight); // [num_heads, num_buckets]
 
     // Output: [num_heads, q_len, k_len]
@@ -35167,6 +35647,7 @@ fn multiplyOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
 
 fn conv1dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_channels: usize, out_channels: usize, time_steps: usize, kernel_size: usize, stride: usize, padding: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, weight);
     const in_data = getData(input);
     const w_data = getData(weight);
     const b_data = getData(bias);
@@ -35213,6 +35694,7 @@ fn conv1dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_c
 
 fn conv2dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_channels: usize, out_channels: usize, height: usize, width: usize, kernel_h: usize, kernel_w: usize, stride_h: usize, stride_w: usize, padding_h: usize, padding_w: usize, groups: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, weight);
     if (batch == 0 or in_channels == 0 or out_channels == 0 or height == 0 or width == 0 or kernel_h == 0 or kernel_w == 0 or stride_h == 0 or stride_w == 0 or groups == 0 or in_channels % groups != 0 or out_channels % groups != 0) return error.InvalidInputShape;
 
     const padded_h = std.math.add(usize, height, std.math.mul(usize, padding_h, 2) catch return error.InvalidInputShape) catch return error.InvalidInputShape;
@@ -42811,6 +43293,10 @@ test "prepared q5_k packed qkv panel16 mr2 uses packed cache" {
 
     try prepareQ4Q5QKVPanel16PackedStorageForBench(&storage_a, &storage_b, &storage_c, "k.weight", "v.weight");
     try std.testing.expectEqual(preparedKQKVPanel16ByteSize(out_dim, row_blocks), preparedQKVPanel16GroupPackedBytes(&storage_a, out_dim, row_blocks).?.len);
+    try std.testing.expectEqual(
+        preparedKQKVPanel16OwnedByteSize(out_dim, row_blocks, "k.weight", "v.weight").?,
+        storage_a.prepared_group_cache.?.ownedBytes(),
+    );
     @memset(storage_a.preparedBytes(.panel16).?, 0xA5);
     @memset(storage_b.preparedBytes(.panel16).?, 0xA5);
     @memset(storage_c.preparedBytes(.panel16).?, 0xA5);
@@ -45284,17 +45770,22 @@ test "getWeight preserves resident dense tensor shape metadata" {
         .resident_weights = resident_weights,
         .lazy_weights = .{},
     };
-    var compute = NativeCompute.init(allocator, &weight_store, null);
+    var run_budget = run_memory.RunBudget.init(.{ .host_limit_bytes = 1024 });
+    var compute = NativeCompute.init(allocator, &weight_store, &run_budget);
+    defer compute.weight_reservations.deinit(allocator);
     const cb = compute.computeBackend();
 
     const weight = try cb.getWeight(name);
-    defer cb.free(weight);
+    errdefer cb.free(weight);
+    try std.testing.expectEqual(elem_count * @sizeOf(f32), run_budget.host_weight_bytes);
 
     const got_shape = try cb.tensorShape(weight, allocator);
     defer allocator.free(got_shape);
 
     try std.testing.expectEqualDeep(&[_]i64{ 12, 4 }, got_shape);
     try std.testing.expectEqual(tensor_mod.DType.f32, try cb.tensorDType(weight));
+    cb.free(weight);
+    try std.testing.expectEqual(@as(usize, 0), run_budget.host_weight_bytes);
 }
 
 test "native quant budget pressure degrades only for non-expert weights" {

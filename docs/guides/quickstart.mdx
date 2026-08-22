@@ -418,11 +418,20 @@ client
 The CLI `load` command reads a JSON file and batches documents automatically. For SDK usage with large files, see the [Batch Operations](/docs/api/data-operations) documentation.
 </Callout>
 
-Embedding generation runs in the background. Monitor progress:
+Embedding generation runs in the background. Wait for the semantic index to be
+fully queryable before running semantic, hybrid, or RAG examples:
 
 ```bash
-antfly index list --table wikipedia
+antfly index wait --table wikipedia \
+  --index title_body \
+  --timeout 20m
 ```
+
+Use `antfly index list --table wikipedia` for a compact progress summary, or
+add `--output json` for the complete diagnostic payload.
+On a laptop, the initial local-model download and 10,000-document backfill can
+take several minutes; the wait command reports bounded periodic progress and
+enforces the timeout.
 
 ## Search
 
@@ -857,7 +866,8 @@ Add a ClipClap-based index to embed each article's Wikipedia thumbnail:
 antfly index create --table wikipedia \
   --index thumbnail \
   --type embeddings \
-  --template "{{media url=thumbnail_url}}" \
+  --coverage-policy partial \
+  --template "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}" \
   --embedder '{"provider": "antfly", "model": "antflydb/clipclap"}' \
   --dimension 512
 ```
@@ -869,7 +879,8 @@ curl -X POST http://localhost:8080/db/v1/tables/wikipedia/indexes/thumbnail \
   -H "Content-Type: application/json" \
   -d '{
     "type": "embeddings",
-    "template": "{{media url=thumbnail_url}}",
+    "coverage_policy": "partial",
+    "template": "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}",
     "embedder": {
       "provider": "antfly",
       "model": "antflydb/clipclap"
@@ -882,9 +893,10 @@ curl -X POST http://localhost:8080/db/v1/tables/wikipedia/indexes/thumbnail \
 
   <TabsContent value="typescript">
 ```typescript
-await client.tables.addIndex('wikipedia', 'thumbnail', {
+const createdIndex = await client.indexes.create('wikipedia', 'thumbnail', {
   type: 'embeddings',
-  template: '{{media url=thumbnail_url}}',
+  coverage_policy: 'partial',
+  template: '{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}',
   embedder: {
     provider: 'antfly',
     model: 'antflydb/clipclap',
@@ -897,60 +909,79 @@ await client.tables.addIndex('wikipedia', 'thumbnail', {
 
   <TabsContent value="python">
 ```python
-client.add_index(
-    table='wikipedia',
-    name='thumbnail',
-    type='embeddings',
-    template='{{media url=thumbnail_url}}',
-    embedder={
-        'provider': 'inference',
-        'model': 'antflydb/clipclap',
-    },
-    dimension=512,
-    distance_metric='cosine',
+from antfly import (
+    CreateEmbeddingsIndexRequest,
+    CreateEmbeddingsIndexRequestType,
+    DerivedCoveragePolicy,
+    DistanceMetric,
+    antfly_embedder,
+)
+
+created_index = client.indexes.create(
+    'wikipedia',
+    'thumbnail',
+    CreateEmbeddingsIndexRequest(
+        type_=CreateEmbeddingsIndexRequestType.EMBEDDINGS,
+        coverage_policy=DerivedCoveragePolicy.PARTIAL,
+        template='{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}',
+        embedder=antfly_embedder('antflydb/clipclap'),
+        dimension=512,
+        distance_metric=DistanceMetric.COSINE,
+    ),
 )
 ```
   </TabsContent>
 
   <TabsContent value="go">
 ```go
-_, err = client.AddIndexWithResponse(
-	context.Background(),
-	"wikipedia",
-	"thumbnail",
-	antfly.AddIndexJSONRequestBody{
-		Type:     strPtr("embeddings"),
-		Template: strPtr("{{media url=thumbnail_url}}"),
-		Embedder: &map[string]interface{}{
-			"provider": "antfly",
-			"model":    "antflydb/clipclap",
-		},
-		Dimension:      intPtr(512),
-		DistanceMetric: strPtr("cosine"),
-	},
-)
+embedder, err := antfly.NewEmbedderConfig(antfly.AntflyEmbedderConfig{
+	Model: "antflydb/clipclap",
+})
+if err != nil { return err }
+request, err := antfly.NewCreateIndexRequest(antfly.EmbeddingsIndexConfig{
+	CoveragePolicy: antfly.DerivedCoveragePolicyPartial,
+	Template:       "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}",
+	Embedder:       *embedder,
+	Dimension:      512,
+	DistanceMetric: antfly.DistanceMetricCosine,
+})
+if err != nil { return err }
+createdIndex, err := client.CreateIndex(context.Background(), "wikipedia", "thumbnail", *request)
+if err != nil { return err }
 ```
   </TabsContent>
 
   <TabsContent value="rust">
 ```rust
-client
-    .add_index("wikipedia", "thumbnail", &json!({
-        "type": "embeddings",
-        "template": "{{media url=thumbnail_url}}",
-        "embedder": {
-            "provider": "antfly",
-            "model": "antflydb/clipclap"
-        },
-        "dimension": 512,
-        "distance_metric": "cosine"
-    }))
-    .await?;
+use antfly_sdk::types;
+use std::num::NonZeroU64;
+
+let request = types::CreateEmbeddingsIndexRequest {
+    coverage_policy: Some(types::DerivedCoveragePolicy::Partial),
+    template: Some("{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}".into()),
+    embedder: Some(antfly_sdk::antfly_embedder("antflydb/clipclap")),
+    dimension: NonZeroU64::new(512),
+    distance_metric: Some(types::DistanceMetric::Cosine),
+    ..Default::default()
+};
+let request: types::CreateIndexRequest = request.into();
+let created_index = client
+    .create_index("wikipedia", "thumbnail", &request)
+    .await?
+    .into_inner();
 ```
   </TabsContent>
 </Tabs>
 
-Adding an index to a table with existing data triggers background embedding generation. Articles without a `thumbnail_url` are skipped. Monitor progress with `antfly index list --table wikipedia`.
+Adding an index to a table with existing data triggers background embedding generation. The `partial` coverage policy treats articles without a `thumbnail_url` as intentional skips while still requiring every article to reach a durable outcome. Wait until the image index is queryable before continuing:
+
+```bash
+antfly index wait --table wikipedia \
+  --index thumbnail \
+  --timeout 20m
+```
+
+Use `antfly index list --table wikipedia` to monitor detailed progress.
 
 ### Search by visual content
 

@@ -15,9 +15,9 @@ components:
     ChunkerConfig:
       description: "A unified configuration for a chunking provider."
       allOf:
-        - oneOf:
-            - $ref: "#/components/schemas/AntflyChunkerConfig"
-        - properties:
+        - $ref: "#/components/schemas/AntflyChunkerConfig"
+        - type: object
+          properties:
             provider:
               $ref: "#/components/schemas/ChunkerProvider"
             store_chunks:
@@ -36,6 +36,31 @@ components:
                 When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's _chunks field.
                 When absent, chunks use :c: suffix and are only used for vector embeddings.
               additionalProperties: true
+            # Repeat all inherited fields for generators that flatten only one
+            # allOf level. This direct reference preserves the standalone
+            # AntflyChunkerConfig type without generating union state.
+            api_url:
+              type: string
+              format: uri
+              description: "The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL."
+              example: "http://localhost:8080"
+            model:
+              type: string
+              description: "The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other values select a model from models/chunkers/{name}/. Successful create responses include the effective model."
+              default: "fixed"
+              example: "fixed"
+            max_chunks:
+              type: integer
+              minimum: 1
+            threshold:
+              type: number
+              format: float
+              minimum: 0
+              maximum: 1
+            text:
+              $ref: "../shared/chunking.yaml#/components/schemas/TextChunkOptions"
+            audio:
+              $ref: "../shared/chunking.yaml#/components/schemas/AudioChunkOptions"
           required:
             - provider
       example:
@@ -71,11 +96,9 @@ components:
               example: "http://localhost:8080"
             model:
               type: string
-              description: "The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/."
+              description: "The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other values select a model from models/chunkers/{name}/. Successful create responses include the effective model."
               default: "fixed"
               example: "fixed"
-          required:
-            - model
       example:
         provider: "antfly"
         api_url: "http://localhost:8080"

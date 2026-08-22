@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const abi = @import("kernel_abi.zig");
 const server_mod = @import("http_server.zig");
 const handler_mod = @import("httpx_handler.zig");
@@ -683,6 +684,10 @@ test "linked API dispatch preserves kernel-owned ingress policy" {
     try std.testing.expectEqual(@as(u16, 503), retry_response.status);
     try std.testing.expectEqualStrings("1", responseHeader(retry_response, "Retry-After").?);
     try std.testing.expectEqualStrings("true", responseHeader(retry_response, "X-Antfly-Metadata-Not-Leader").?);
-    try std.testing.expectEqualStrings("{\"error\":\"metadata leader unavailable\"}", retry_response.body.slice());
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"code\":\"metadata_leader_unavailable\",\"error\":\"metadata leader unavailable\",\"message\":\"metadata leader unavailable\",\"retryable\":true,\"retry_after_ms\":1000}",
+        retry_response.body.slice(),
+    );
     try std.testing.expectEqual(@as(u64, 2), api_server.requestStats().request_count);
 }

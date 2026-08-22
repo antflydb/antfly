@@ -25,6 +25,218 @@ func TestNewEmbedderConfigSupportsAntfly(t *testing.T) {
 	}
 }
 
+func TestNewCreateIndexRequestOmitsPathIdentity(t *testing.T) {
+	request, err := NewCreateIndexRequest(EmbeddingsIndexConfig{Dimension: 512})
+	if err != nil {
+		t.Fatalf("NewCreateIndexRequest failed: %v", err)
+	}
+	data, err := json.Marshal(request)
+	if err != nil {
+		t.Fatalf("marshal create index request: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatalf("unmarshal create index request: %v", err)
+	}
+	if _, exists := body["name"]; exists {
+		t.Fatalf("request must not duplicate path-owned name: %s", data)
+	}
+	if body["type"] != "embeddings" || body["dimension"] != float64(512) {
+		t.Fatalf("unexpected request: %s", data)
+	}
+}
+
+func TestNewCreateIndexRequestPreservesFullTypedRequest(t *testing.T) {
+	request, err := NewCreateIndexRequest(CreateEmbeddingsIndexRequest{
+		Description: "semantic product search",
+		Dimension:   768,
+		External:    true,
+	})
+	if err != nil {
+		t.Fatalf("NewCreateIndexRequest failed: %v", err)
+	}
+	variant, err := request.AsCreateEmbeddingsIndexRequest()
+	if err != nil {
+		t.Fatalf("AsCreateEmbeddingsIndexRequest failed: %v", err)
+	}
+	if variant.Type != CreateEmbeddingsIndexRequestTypeEmbeddings {
+		t.Fatalf("type = %q, want embeddings", variant.Type)
+	}
+	if variant.Description != "semantic product search" || variant.Dimension != 768 || !variant.External {
+		t.Fatalf("common or variant fields were lost: %#v", variant)
+	}
+}
+
+func TestNewCreateIndexRequestConvertsNamedIndexConfig(t *testing.T) {
+	legacy, err := NewIndexConfig("semantic", EmbeddingsIndexConfig{
+		Dimension: 384,
+		Chunker: ChunkerConfig{
+			Provider: ChunkerProviderAntfly,
+			ApiUrl:   "https://inference.example/ai/v1",
+			Model:    "antfly/chunker-v2",
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewIndexConfig failed: %v", err)
+	}
+
+	request, err := NewCreateIndexRequest(legacy)
+	if err != nil {
+		t.Fatalf("NewCreateIndexRequest failed: %v", err)
+	}
+	data, err := json.Marshal(request)
+	if err != nil {
+		t.Fatalf("marshal create index request: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatalf("unmarshal create index request: %v", err)
+	}
+	if _, exists := body["name"]; exists {
+		t.Fatalf("request must not duplicate path-owned name: %s", data)
+	}
+	chunker, ok := body["chunker"].(map[string]any)
+	if !ok {
+		t.Fatalf("chunker missing from converted request: %s", data)
+	}
+	if chunker["model"] != "antfly/chunker-v2" || chunker["api_url"] != "https://inference.example/ai/v1" {
+		t.Fatalf("converted request lost chunker fields: %s", data)
+	}
+}
+
+func TestNewCreateIndexRequestPreservesSupportedGraphMappingPayload(t *testing.T) {
+	var legacy IndexConfig
+	if err := json.Unmarshal([]byte(`{
+		"name":"relationships",
+		"type":"graph",
+		"source":{"kind":"artifact","artifact":"relations"},
+		"nodes":{"model":"document","target":"{{ _item.target.text }}"},
+		"edge":{"weight":"{{ _item.score }}","metadata":{"source":"extractor"}},
+		"context":{"doc_fields":["title"]},
+		"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring"}}
+	}`), &legacy); err != nil {
+		t.Fatalf("unmarshal index config: %v", err)
+	}
+
+	request, err := NewCreateIndexRequest(legacy)
+	if err != nil {
+		t.Fatalf("NewCreateIndexRequest failed: %v", err)
+	}
+	data, err := json.Marshal(request)
+	if err != nil {
+		t.Fatalf("marshal create index request: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatalf("unmarshal create index request: %v", err)
+	}
+	if _, exists := body["name"]; exists {
+		t.Fatalf("request must not duplicate path-owned name: %s", data)
+	}
+	nodes, ok := body["nodes"].(map[string]any)
+	if !ok || nodes["target"] != "{{ _item.target.text }}" {
+		t.Fatalf("converted request lost node mapping: %s", data)
+	}
+	edge, ok := body["edge"].(map[string]any)
+	if !ok || edge["weight"] != "{{ _item.score }}" {
+		t.Fatalf("converted request lost edge mapping: %s", data)
+	}
+	planning, ok := body["algebraic_planning"].(map[string]any)
+	if !ok {
+		t.Fatalf("converted request lost algebraic planning: %s", data)
+	}
+	bounded, ok := planning["bounded_traversal"].(map[string]any)
+	if !ok || bounded["law"] != "provenance_semiring" {
+		t.Fatalf("converted request lost traversal law: %s", data)
+	}
+}
+
+func TestNewCreateIndexRequestSupportsTypedGraphMapping(t *testing.T) {
+	var source, target, edgeType, weight GraphTemplateValue
+	if err := source.FromGraphTemplateValue0("{{ _doc.key }}"); err != nil {
+		t.Fatalf("set source template: %v", err)
+	}
+	if err := target.FromGraphTemplateValue0("{{ _item.target.text }}"); err != nil {
+		t.Fatalf("set target template: %v", err)
+	}
+	if err := edgeType.FromGraphTemplateValue0("{{ _item.type }}"); err != nil {
+		t.Fatalf("set edge type template: %v", err)
+	}
+	if err := weight.FromGraphTemplateValue1(0.75); err != nil {
+		t.Fatalf("set edge weight: %v", err)
+	}
+
+	request, err := NewCreateIndexRequest(GraphIndexConfig{
+		Source: GraphArtifactSourceConfig{
+			Kind:     GraphArtifactSourceConfigKindArtifact,
+			Artifact: "relations_v1",
+			Format:   GraphArtifactSourceConfigFormatExtractionGraph,
+		},
+		Artifact: GraphArtifactProducerConfig{
+			Name: "relations_v1",
+			Kind: GraphArtifactProducerConfigKindAsset,
+			Source: GraphArtifactProducerSourceConfig{
+				Type:  GraphArtifactProducerSourceConfigTypeTemplate,
+				Value: "{{ body }}",
+			},
+			Execution: ExecutionPolicy{
+				BatchItems: 8,
+			},
+		},
+		Nodes: GraphArtifactNodeMappingConfig{
+			Model:  GraphArtifactNodeMappingConfigModelDocument,
+			Source: source,
+			Target: target,
+		},
+		Edge: GraphArtifactEdgeMappingConfig{
+			Type:     edgeType,
+			Weight:   weight,
+			Metadata: map[string]any{"source": "extractor"},
+		},
+		Context: GraphArtifactContextConfig{DocFields: []string{"title", "body"}},
+		AlgebraicPlanning: GraphAlgebraicPlanningConfig{
+			BoundedTraversal: GraphBoundedTraversalConfig{
+				Law: GraphBoundedTraversalConfigLawProvenanceSemiring,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewCreateIndexRequest failed: %v", err)
+	}
+	data, err := json.Marshal(request)
+	if err != nil {
+		t.Fatalf("marshal create index request: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatalf("unmarshal create index request: %v", err)
+	}
+	if body["type"] != "graph" {
+		t.Fatalf("type = %v, want graph: %s", body["type"], data)
+	}
+	edge := body["edge"].(map[string]any)
+	if edge["weight"] != 0.75 {
+		t.Fatalf("edge weight = %v, want 0.75: %s", edge["weight"], data)
+	}
+	planning := body["algebraic_planning"].(map[string]any)
+	bounded := planning["bounded_traversal"].(map[string]any)
+	if bounded["law"] != "provenance_semiring" {
+		t.Fatalf("traversal law = %v: %s", bounded["law"], data)
+	}
+	if _, exists := bounded["enabled"]; exists {
+		t.Fatalf("bounded traversal must use presence semantics without enabled: %s", data)
+	}
+	artifact := body["artifact"].(map[string]any)
+	sourceConfig := artifact["source"].(map[string]any)
+	if sourceConfig["type"] != "template" || sourceConfig["value"] != "{{ body }}" {
+		t.Fatalf("artifact source = %v: %s", sourceConfig, data)
+	}
+	execution := artifact["execution"].(map[string]any)
+	if execution["batch_items"] != float64(8) {
+		t.Fatalf("artifact batch_items = %v: %s", execution["batch_items"], data)
+	}
+}
+
 func TestNewArtifactEmbeddingIndexConfig(t *testing.T) {
 	embedder, err := NewEmbedderConfig(OllamaEmbedderConfig{Model: "embeddinggemma"})
 	if err != nil {
