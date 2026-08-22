@@ -4,6 +4,7 @@
 const std = @import("std");
 
 pub const choice = @import("choice.zig");
+pub const benchmark = @import("benchmark.zig");
 pub const causal = @import("causal.zig");
 pub const coverage = @import("coverage.zig");
 pub const corpus = @import("corpus.zig");
@@ -88,6 +89,41 @@ test "exact replay rejects a scenario ABI mismatch" {
     try std.testing.expectError(error.IncompatibleScenarioVersion, replay.exact(ToyScenario, std.testing.allocator, &recorded));
 }
 
+test "logical checkpoint resumes a mutated suffix with exact property history" {
+    var seeded = choice.Seeded.init(0xc4ec_5001);
+    var parent = try runner.run(ToyScenario, std.testing.allocator, seeded.source(), .{
+        .system = "vopr-test",
+        .seed = 0xc4ec_5001,
+        .transition_budget = 4,
+    });
+    defer parent.deinit();
+    var mutation_index: usize = 0;
+    for (parent.choices.items, 0..) |record, index| {
+        if (index > 0 and record.enabled_ids.len > 1) {
+            mutation_index = index;
+            break;
+        }
+    }
+    const record = parent.choices.items[mutation_index];
+    var replacement = record.selected_id;
+    for (record.enabled_ids) |candidate| {
+        if (candidate != record.selected_id) {
+            replacement = candidate;
+            break;
+        }
+    }
+    try std.testing.expect(replacement != record.selected_id);
+
+    var checkpoint = try runner.captureCheckpoint(ToyScenario, std.testing.allocator, &parent, mutation_index);
+    defer checkpoint.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, ToyScenario.properties.len), checkpoint.property_statuses.len);
+    var mutating = choice.Mutating.initAt(parent.choices.items, mutation_index, replacement, 0x55aa, mutation_index);
+    var resumed = try runner.resumeFromCheckpoint(ToyScenario, std.testing.allocator, &parent, checkpoint, mutating.source());
+    defer resumed.deinit();
+    var replayed = try replay.exact(ToyScenario, std.testing.allocator, &resumed);
+    replayed.deinit();
+}
+
 test "property violations are recorded with stable failure fingerprints" {
     var seeded = choice.Seeded.init(3);
     var recorded = try runner.run(FailingScenario, std.testing.allocator, seeded.source(), .{ .seed = 3, .transition_budget = 1 });
@@ -135,6 +171,7 @@ test "trace v1 schema is checked in and valid JSON" {
 
 test {
     _ = choice;
+    _ = benchmark;
     _ = causal;
     _ = coverage;
     _ = corpus;

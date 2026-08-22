@@ -6663,6 +6663,16 @@ pub fn build(b: *std.Build) void {
     const sim_contract_test_step = b.step("sim-contract-test", "Run deterministic simulation contract and replay-equivalence tests");
     sim_contract_test_step.dependOn(&run_sim_contract_tests.step);
 
+    const vopr_benchmark_mod = b.createModule(.{
+        .root_source_file = b.path("lib/vopr/src/benchmark_main.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+    });
+    vopr_benchmark_mod.addImport("vopr", vopr_mod);
+    const vopr_benchmark = b.addExecutable(.{ .name = "vopr-benchmark", .root_module = vopr_benchmark_mod });
+    const vopr_benchmark_step = b.step("vopr-benchmark", "Run deterministic VOPR search-efficiency benchmarks");
+    vopr_benchmark_step.dependOn(&b.addRunArtifact(vopr_benchmark).step);
+
     const sim_cli_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/sim/cli.zig"),
         .target = target,

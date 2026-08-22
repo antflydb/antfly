@@ -110,11 +110,24 @@ pub const Mutating = struct {
     mutated: bool = false,
 
     pub fn init(base: []const trace.ChoiceRecord, mutation_index: usize, replacement_id: ids.StableId, suffix_seed: u64) Mutating {
+        return initAt(base, mutation_index, replacement_id, suffix_seed, 0);
+    }
+
+    /// Resume at an already-restored exact prefix. The caller is responsible
+    /// for binding the restored state to `base[0..cursor]`.
+    pub fn initAt(
+        base: []const trace.ChoiceRecord,
+        mutation_index: usize,
+        replacement_id: ids.StableId,
+        suffix_seed: u64,
+        cursor: usize,
+    ) Mutating {
         return .{
             .base = base,
             .mutation_index = mutation_index,
             .replacement_id = replacement_id,
             .prng = std.Random.DefaultPrng.init(suffix_seed),
+            .cursor = cursor,
         };
     }
 

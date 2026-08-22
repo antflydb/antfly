@@ -37,19 +37,8 @@ pub const Tracker = struct {
     /// Scores and merges one history. Duplicate features within the history
     /// count once so long histories cannot manufacture energy by repetition.
     pub fn observe(self: *Tracker, artifact: *const trace.Trace) !Novelty {
-        var local: std.AutoHashMapUnmanaged(ids.StableId, void) = .empty;
+        var local = try collect(self.allocator, artifact);
         defer local.deinit(self.allocator);
-        for (artifact.transitions.items) |record| try local.put(self.allocator, ids.derive("coverage.transition", record.id, @intFromEnum(record.kind)), {});
-        for (artifact.events.items) |record| try local.put(self.allocator, ids.derive("coverage.event", record.id, record.payload_digest), {});
-        for (artifact.observations.items) |record| {
-            for (record.features) |feature| {
-                try local.put(self.allocator, ids.derive("coverage.feature", feature.id, @bitCast(feature.value)), {});
-            }
-        }
-        for (artifact.properties.items) |record| {
-            try local.put(self.allocator, ids.derive("coverage.property", record.property_id, @intFromBool(record.condition)), {});
-        }
-        for (artifact.failures.items) |record| try local.put(self.allocator, ids.derive("coverage.failure", record.fingerprint, @intFromEnum(record.class)), {});
 
         var result = Novelty{ .observed = local.count() };
         var iterator = local.keyIterator();
@@ -67,10 +56,43 @@ pub const Tracker = struct {
         return result;
     }
 
+    /// Computes the result `observe` would return without changing hit counts.
+    /// This lets callers validate an expensive candidate only when it is about
+    /// to affect corpus state, while invalid candidates remain invisible.
+    pub fn preview(self: *const Tracker, artifact: *const trace.Trace) !Novelty {
+        var local = try collect(self.allocator, artifact);
+        defer local.deinit(self.allocator);
+        var result = Novelty{ .observed = local.count() };
+        var iterator = local.keyIterator();
+        while (iterator.next()) |feature| {
+            const prior = self.hits.get(feature.*) orelse 0;
+            result.discovered += @intFromBool(prior == 0);
+            result.rarity_score +|= 1_000_000 / (prior +| 1);
+        }
+        return result;
+    }
+
     pub fn hitCount(self: *const Tracker, feature: ids.StableId) u64 {
         return self.hits.get(feature) orelse 0;
     }
 };
+
+fn collect(allocator: std.mem.Allocator, artifact: *const trace.Trace) !std.AutoHashMapUnmanaged(ids.StableId, void) {
+    var local: std.AutoHashMapUnmanaged(ids.StableId, void) = .empty;
+    errdefer local.deinit(allocator);
+    for (artifact.transitions.items) |record| try local.put(allocator, ids.derive("coverage.transition", record.id, @intFromEnum(record.kind)), {});
+    for (artifact.events.items) |record| try local.put(allocator, ids.derive("coverage.event", record.id, record.payload_digest), {});
+    for (artifact.observations.items) |record| {
+        for (record.features) |feature| {
+            try local.put(allocator, ids.derive("coverage.feature", feature.id, @bitCast(feature.value)), {});
+        }
+    }
+    for (artifact.properties.items) |record| {
+        try local.put(allocator, ids.derive("coverage.property", record.property_id, @intFromBool(record.condition)), {});
+    }
+    for (artifact.failures.items) |record| try local.put(allocator, ids.derive("coverage.failure", record.fingerprint, @intFromEnum(record.class)), {});
+    return local;
+}
 
 /// Score explicit target-state features without mutating global coverage.
 /// Repeated observations count once per target, so extending a history cannot

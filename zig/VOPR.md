@@ -1,7 +1,7 @@
 # VOPR: Deterministic Autonomous Simulation for Antfly
 
-Status: implementation in progress; Phases 0, 0.5, and 1 complete; the Phase 4
-exit scenario is complete; Phases 2–5 have documented follow-on work
+Status: implementation in progress; Phases 0, 0.5, 1, and 5 complete; the
+Phase 4 exit scenario is complete; Phases 2–4 have documented follow-on work
 
 Scope: Zig Antfly simulation, VOPR, modeled-storage, and chaos tests
 
@@ -1318,6 +1318,7 @@ lib/vopr/
     coverage.zig
     corpus.zig
     explorer.zig
+    benchmark.zig
     splice.zig
     snapshot.zig
     causal.zig
@@ -1399,6 +1400,9 @@ zig build sim-campaign -- \
   --transitions 500 \
   --workers 8 \
   --artifact-dir /tmp/antfly-sim
+
+# Compare baseline and checkpoint-resumed search in deterministic work units.
+zig build vopr-benchmark
 ```
 
 Names may be refined during implementation, but run, replay, reduce, promote,
@@ -1877,16 +1881,20 @@ cannot silently create an invalid history.
 `lib/vopr/src/snapshot.zig` defines scenario-owned logical checkpoints with
 integrity digests and deduplicated storage. Scenarios serialize modeled values
 and logical IDs through explicit hooks instead of copying heap pointers or OS
-resources. Checkpoints are exploration accelerators only: retained histories
-remain decision traces and must pass clean-world exact replay.
+resources. A checkpoint is bound to the scenario ABI and a stable digest of
+the complete configuration and exact choice prefix. It also owns a canonical
+copy of every property status, including first-failure and quiescence state, so
+resuming cannot reset an accumulated safety or recovery obligation.
 
 The generic campaign now chooses splicing under a bounded policy, rejects
 incompatible joins, exact-replays every successful result, and reports attempt,
 acceptance, and rejection counts. Its mutation path also selects logical
-checkpoint prefixes, re-executes and validates the prefix observation, captures
-only scenario-owned bytes, perturbs the world, restores it, validates the
-restored observation, and deduplicates the checkpoint. This deliberately proves
-the snapshot contract before using it as an execution shortcut.
+checkpoint prefixes, re-executes and byte-compares the complete canonical
+prefix artifact, captures only scenario-owned bytes and property values, and
+deduplicates the checkpoint. Subsequent mutations restore that state, begin at
+the exact mutation occurrence, and combine the original prefix records with the
+new suffix. A candidate that would affect corpus state is exact-replayed from a
+clean world before retention; uninteresting candidates avoid that full replay.
 
 The long-running Antfly metadata workers also attempt splices between retained
 persistent-corpus entries. IDs for independent generated histories remain
@@ -1900,13 +1908,22 @@ described above, and `zig build sim-explain` exposes it for metadata artifacts.
 The injected-bug meta-test requires the promoted trace to yield a non-empty
 causal report containing the stable property identity.
 
-Phase 5 remains open for actually resuming generic execution from a logical
-checkpoint (including reconstruction of property-tracker state), evaluating
-compiler coverage hooks, enriching causal links with domain-specific message
-and storage operation IDs, and committing a deterministic work-unit benchmark
-that demonstrates improved states or failures per CPU unit. Until that
-benchmark exists, checkpoint capture is correctness scaffolding rather than a
-claimed performance improvement.
+`lib/vopr/src/benchmark.zig` commits a host-independent benchmark that counts
+executed modeled transitions rather than wall time. With 128 fixed-seed toy
+histories, baseline and optimized campaigns both retain two histories, discover
+20 semantic features, and find no failures. The baseline executes 512
+transition work units; checkpoint resume executes 281, a 451,171 ppm (45.1%)
+reduction, with 123 checkpoint hits and 244 prefix transitions avoided. The
+`zig build vopr-benchmark` command emits these inputs and results as JSON, and
+the test fails if search results differ or the optimization does not improve
+work units.
+
+Phase 5's exit condition is met. Compiler coverage was evaluated and remains an
+optional secondary feedback channel: Zig/LLVM instrumentation interfaces are
+not yet stable enough to become part of the replay or CI ABI, while semantic
+coverage already provides stable host-independent guidance. Future causal
+enrichment with domain-specific message and storage-operation links can improve
+triage without reopening the phase or changing replay semantics.
 
 ## Risks and Mitigations
 

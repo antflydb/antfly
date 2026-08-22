@@ -7,12 +7,8 @@ const std = @import("std");
 const choice = @import("choice.zig");
 const corpus_mod = @import("corpus.zig");
 const coverage_mod = @import("coverage.zig");
-const event = @import("event.zig");
-const ids = @import("id.zig");
-const observation = @import("observation.zig");
 const replay = @import("replay.zig");
 const runner = @import("runner.zig");
-const scheduler = @import("scheduler.zig");
 const snapshot = @import("snapshot.zig");
 const splice = @import("splice.zig");
 const trace = @import("trace.zig");
@@ -46,6 +42,10 @@ pub const Report = struct {
     checkpoint_preflights: u64 = 0,
     checkpoints_inserted: u64 = 0,
     checkpoints_deduplicated: u64 = 0,
+    checkpoint_hits: u64 = 0,
+    checkpoint_resumes: u64 = 0,
+    checkpoint_transitions_avoided: u64 = 0,
+    transition_work_units: u64 = 0,
     retained: u64 = 0,
     failures: u64 = 0,
     semantic_features: usize = 0,
@@ -157,8 +157,9 @@ pub fn Campaign(comptime Scenario: type) type {
             defer artifact.deinit();
             var replayed = try replay.exact(Scenario, self.allocator, &artifact);
             replayed.deinit();
+            self.report.transition_work_units +|= artifact.summary.?.transitions *| 2;
             self.report.spliced += 1;
-            try self.consider(&artifact, left_index);
+            try self.consider(&artifact, left_index, false);
             return true;
         }
 
@@ -171,14 +172,14 @@ pub fn Campaign(comptime Scenario: type) type {
             });
             defer artifact.deinit();
             self.report.generated += 1;
-            try self.consider(&artifact, null);
+            self.report.transition_work_units +|= artifact.summary.?.transitions;
+            try self.consider(&artifact, null, false);
         }
 
         fn runMutation(self: *Self, parent_index: usize) !bool {
             const bytes = self.corpus.entries.items[parent_index].bytes;
             var parent = try trace.parseAlloc(self.allocator, bytes);
             defer parent.deinit();
-            try self.maybePreflightCheckpoint(&parent);
             var mutable_count: usize = 0;
             for (parent.choices.items) |record| mutable_count += @intFromBool(record.enabled_ids.len > 1);
             if (mutable_count == 0) return false;
@@ -205,6 +206,23 @@ pub fn Campaign(comptime Scenario: type) type {
                 }
                 replacement_ordinal -= 1;
             }
+            if (try self.checkpointForMutation(&parent, mutation_index)) |checkpoint| {
+                var mutating = choice.Mutating.initAt(
+                    parent.choices.items,
+                    mutation_index,
+                    replacement,
+                    self.prng.random().int(u64),
+                    mutation_index,
+                );
+                var artifact = try runner.resumeFromCheckpoint(Scenario, self.allocator, &parent, checkpoint, mutating.source());
+                defer artifact.deinit();
+                self.report.checkpoint_resumes += 1;
+                self.report.checkpoint_transitions_avoided +|= mutation_index;
+                self.report.transition_work_units +|= artifact.summary.?.transitions - mutation_index;
+                self.report.mutated += 1;
+                try self.consider(&artifact, parent_index, true);
+                return true;
+            }
             var mutating = choice.Mutating.init(parent.choices.items, mutation_index, replacement, self.prng.random().int(u64));
             var artifact = try runner.run(Scenario, self.allocator, mutating.source(), .{
                 .system = self.config.system,
@@ -212,42 +230,61 @@ pub fn Campaign(comptime Scenario: type) type {
             });
             defer artifact.deinit();
             self.report.mutated += 1;
-            try self.consider(&artifact, parent_index);
+            self.report.transition_work_units +|= artifact.summary.?.transitions;
+            try self.consider(&artifact, parent_index, false);
             return true;
         }
 
-        fn maybePreflightCheckpoint(self: *Self, parent: *const trace.Trace) !void {
-            if (comptime !(@hasDecl(Scenario, "snapshotAlloc") and @hasDecl(Scenario, "restoreSnapshot"))) return;
-            if (self.prng.random().uintLessThan(u8, 100) >= self.config.checkpoint_percent) return;
+        fn checkpointForMutation(self: *Self, parent: *const trace.Trace, mutation_index: usize) !?snapshot.Logical {
+            if (comptime !(@hasDecl(Scenario, "snapshotAlloc") and @hasDecl(Scenario, "restoreSnapshot"))) return null;
+            if (self.prng.random().uintLessThan(u8, 100) >= self.config.checkpoint_percent) return null;
             self.report.checkpoint_preflights += 1;
-            const prefix_len = self.prng.random().uintLessThan(usize, parent.choices.items.len + 1);
-            var world = try Scenario.init(self.allocator);
-            defer Scenario.deinit(&world, self.allocator);
-            for (0..prefix_len) |index| try executeRecordedChoice(Scenario, self.allocator, &world, parent, index);
-            const before_digest = try observeDigest(Scenario, self.allocator, &world);
-            if (before_digest != parent.observations.items[prefix_len].digest) return error.CheckpointPrefixObservationDiverged;
-            var checkpoint = try snapshot.capture(Scenario, self.allocator, &world, prefix_len, before_digest);
+            const prefix_digest = try snapshot.prefixDigest(parent, mutation_index);
+            if (self.checkpoints.findPrefix(prefix_digest)) |checkpoint| {
+                self.report.checkpoint_hits += 1;
+                return checkpoint;
+            }
+            var checkpoint = try runner.captureCheckpoint(Scenario, self.allocator, parent, mutation_index);
+            self.report.transition_work_units +|= mutation_index;
             var checkpoint_owned = true;
             errdefer if (checkpoint_owned) checkpoint.deinit(self.allocator);
-            if (prefix_len < parent.choices.items.len) try executeRecordedChoice(Scenario, self.allocator, &world, parent, prefix_len);
-            try snapshot.restore(Scenario, &world, checkpoint, self.allocator);
-            if (try observeDigest(Scenario, self.allocator, &world) != before_digest) return error.CheckpointRestoreObservationDiverged;
             const added = try self.checkpoints.add(checkpoint);
             if (added.inserted) {
                 checkpoint_owned = false;
                 self.report.checkpoints_inserted += 1;
+                return self.checkpoints.checkpoints.items[added.index];
             } else {
                 checkpoint.deinit(self.allocator);
                 checkpoint_owned = false;
                 self.report.checkpoints_deduplicated += 1;
+                self.report.checkpoint_hits += 1;
+                return self.checkpoints.checkpoints.items[added.index];
             }
         }
 
-        fn consider(self: *Self, artifact: *const trace.Trace, parent_index: ?usize) !void {
-            var novelty = try self.coverage.observe(artifact);
+        fn consider(
+            self: *Self,
+            artifact: *const trace.Trace,
+            parent_index: ?usize,
+            exact_replay_before_retention: bool,
+        ) !void {
+            var novelty = if (exact_replay_before_retention)
+                try self.coverage.preview(artifact)
+            else
+                try self.coverage.observe(artifact);
             novelty.target_score = try coverage_mod.scoreTargets(self.allocator, artifact, self.config.targets);
-            if (novelty.target_score > 0) self.report.target_hits += 1;
             const failed = artifact.failures.items.len > 0;
+            const retain = novelty.discovered > 0 or novelty.target_score > 0 or failed or self.corpus.entries.items.len == 0;
+            if (exact_replay_before_retention) {
+                if (retain) {
+                    var replayed = try replay.exact(Scenario, self.allocator, artifact);
+                    replayed.deinit();
+                    self.report.transition_work_units +|= artifact.summary.?.transitions;
+                }
+                novelty = try self.coverage.observe(artifact);
+                novelty.target_score = try coverage_mod.scoreTargets(self.allocator, artifact, self.config.targets);
+            }
+            if (novelty.target_score > 0) self.report.target_hits += 1;
             if (failed) self.report.failures += 1;
             if (novelty.discovered == 0 and novelty.target_score == 0 and !failed and self.corpus.entries.items.len > 0) return;
             const added = try self.corpus.add(artifact, novelty);
@@ -257,38 +294,6 @@ pub fn Campaign(comptime Scenario: type) type {
             }
         }
     };
-}
-
-fn executeRecordedChoice(
-    comptime Scenario: type,
-    allocator: std.mem.Allocator,
-    world: *Scenario.World,
-    artifact: *const trace.Trace,
-    index: usize,
-) !void {
-    const record = artifact.choices.items[index];
-    if (record.site_id != ids.stable("choice", Scenario.name ++ ".transition") or
-        record.occurrence != index) return error.CheckpointChoiceSiteDiverged;
-    var enabled = try scheduler.enumerateCanonical(Scenario, world, allocator);
-    defer enabled.deinit(allocator);
-    if (record.enabled_ids.len != enabled.items.items.len) return error.CheckpointEnabledSetDiverged;
-    var selected: ?@import("transition.zig").Transition = null;
-    for (enabled.items.items, record.enabled_ids) |candidate, expected_id| {
-        if (candidate.id != expected_id) return error.CheckpointEnabledSetDiverged;
-        if (candidate.id == record.selected_id) selected = candidate;
-    }
-    const selected_transition = selected orelse return error.CheckpointSelectedTransitionMissing;
-    var events = event.Sink{};
-    defer events.deinit(allocator);
-    try Scenario.execute(world, selected_transition, &events, allocator);
-}
-
-fn observeDigest(comptime Scenario: type, allocator: std.mem.Allocator, world: *Scenario.World) !u64 {
-    var builder = observation.Builder{};
-    defer builder.deinit(allocator);
-    try Scenario.observe(world, &builder, allocator);
-    try builder.canonicalize();
-    return builder.digest();
 }
 
 test "campaign generates, mutates, and retains semantic histories" {
@@ -347,7 +352,15 @@ test "campaign selects validates and deduplicates logical checkpoints" {
     try campaign.run();
     try std.testing.expect(campaign.report.checkpoint_preflights > 0);
     try std.testing.expect(campaign.report.checkpoints_inserted > 0);
+    try std.testing.expect(campaign.report.checkpoint_resumes > 0);
+    try std.testing.expect(campaign.report.checkpoint_transitions_avoided > 0);
     try std.testing.expectEqual(campaign.checkpoints.checkpoints.items.len, campaign.report.checkpoints_inserted);
+    for (campaign.corpus.entries.items) |entry| {
+        var artifact = try trace.parseAlloc(std.testing.allocator, entry.bytes);
+        defer artifact.deinit();
+        var replayed = try replay.exact(ToyScenario, std.testing.allocator, &artifact);
+        replayed.deinit();
+    }
 }
 
 test "campaign retains and energizes target-state histories" {
