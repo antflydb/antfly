@@ -80,8 +80,9 @@ func TestHARuntimeLeaseEnvBindsExactAuthorityAndPersistentSentinel(t *testing.T)
 func TestHARuntimeLeaseWatchdogConfiguresStandbyWithoutRenewal(t *testing.T) {
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
 	cluster.Spec.HighAvailability.Runtime.Role = "Standby"
+	cluster.Spec.HighAvailability.Admin.ExecutePlannedActions = false
 	if !haRuntimeLeaseWatchdogEnabled(cluster) {
-		t.Fatal("standby promotion candidate must observe the fencing Lease")
+		t.Fatal("non-executing standby promotion candidate must observe the fencing Lease")
 	}
 	if haKubernetesLeaseRenewalEnabled(cluster) {
 		t.Fatal("standby promotion candidate must not renew primary authority")
@@ -107,6 +108,12 @@ func TestHARuntimeLeaseWatchdogConfiguresStandbyWithoutRenewal(t *testing.T) {
 	if len(role.Rules) != 1 || len(role.Rules[0].Verbs) != 2 ||
 		role.Rules[0].Verbs[0] != "get" || role.Rules[0].Verbs[1] != "watch" {
 		t.Fatalf("standby runtime Lease access is not read-only: %#v", role.Rules)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.Role = "Primary"
+	if haRuntimeLeaseWatchdogEnabled(cluster) || haKubernetesLeaseRenewalEnabled(cluster) ||
+		len(haRuntimeLeaseEnv(cluster)) != 0 {
+		t.Fatal("non-executing primary must not arm a watchdog that the controller cannot renew")
 	}
 }
 
