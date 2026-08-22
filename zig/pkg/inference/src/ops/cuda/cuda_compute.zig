@@ -16484,7 +16484,11 @@ fn sdpaLaunch(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: ?[]const i64,
     errdefer device.free(&self.ctx);
     var prefill_profile_scope = beginPrefillProfile(self, .attention, token_count);
     defer if (prefill_profile_scope) |*scope| scope.end();
-    try self.kernels.launchAttentionF32(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, mask_device, bias_buffer, batch, seq_len, num_heads, head_dim, false, has_mask, bias_mode, true);
+    // The ComputeBackend attention contract is token-major:
+    // [batch, sequence, heads * head_dim]. Linear projections preserve that
+    // layout. Advertising these buffers as head-major mixes tokens, heads,
+    // and (for batch > 1) requests inside the attention kernel.
+    try self.kernels.launchAttentionF32(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, mask_device, bias_buffer, batch, seq_len, num_heads, head_dim, false, has_mask, bias_mode, false);
     self.stats.launch_attention += 1;
     return createTensor(self, device, shape, count);
 }
