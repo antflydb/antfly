@@ -152,8 +152,14 @@ def _first_choice(resp: dict) -> dict:
 
 
 def test_basic_generation(api):
+    model = _first_generator_model(api)
     messages = [{"role": "user", "content": "Hello"}]
-    resp = api.generate(messages, max_tokens=50)
+    resp = api.generate(
+        messages,
+        model=model,
+        max_tokens=50,
+        request_timeout=FIRST_USE_REQUEST_TIMEOUT,
+    )
     content = _message_content(resp)
     assert content, f"No generated content in response: {resp}"
 
