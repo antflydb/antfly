@@ -36348,11 +36348,13 @@ fn checkpointManagedProjectionEffectsForAppliedSequenceUpdates(
             .kind = cfg.kind,
         });
         if (cfg.kind == .dense_vector) {
-            // The posting sidecar is optional derived acceleration. Publish it
-            // only after the authoritative HBC WAL is at a durable boundary,
-            // but before the source applied watermark can advance. Failure is
-            // handled by durable invalidation and never rolls back source/HBC.
-            index_manager.persistDensePostingSidecarByNameBestEffort(update.index_name, update.sequence);
+            // Publish posting state after HBC's metadata WAL is durable but
+            // before the source applied watermark advances. An optional
+            // sidecar can invalidate and fall back to HBC's LSM. Once the
+            // persisted WAL-authoritative marker exists, publication is a
+            // required half of this durability boundary and failure leaves
+            // the source watermark unchanged for replay.
+            try index_manager.persistDensePostingSidecarByName(update.index_name, update.sequence);
         }
     }
 }
@@ -40685,9 +40687,17 @@ fn applyDerivedBatchToIndexReplay(ctx_ptr: *anyopaque, batch: derived_types.Deri
 fn beginDerivedCatchUpWindow(ctx_ptr: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) !void {
     if (index_ref.kind != .dense_vector) return;
     const replay_ctx: *ReplayApplyContext = @ptrCast(@alignCast(ctx_ptr));
-    const started_capture = try replay_ctx.db.core.batchExecutionResources().index_manager.beginDensePostingSidecarCaptureByName(index_ref.name);
-    errdefer if (started_capture) replay_ctx.db.core.batchExecutionResources().index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
-    try replay_ctx.db.core.batchExecutionResources().index_manager.beginDenseStreamingReplaySessionByName(index_ref.name);
+    const resources = replay_ctx.db.core.batchExecutionResources();
+    // Capture ownership and the streaming-session lease are one lifecycle
+    // transition. Serialize both against posting maintenance and foreground
+    // apply; otherwise a maintenance capture can be observed here and finish
+    // before the first replay mutation, leaving that mutation outside either
+    // WAL transaction boundary.
+    var index_apply_guard = try resources.index_manager.lockManagedIndexApply(index_ref);
+    defer index_apply_guard.unlock();
+    const started_capture = try resources.index_manager.beginDensePostingSidecarCaptureByName(index_ref.name);
+    errdefer if (started_capture) resources.index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
+    try resources.index_manager.beginDenseStreamingReplaySessionByName(index_ref.name);
 }
 
 fn finishDerivedCatchUpWindow(ctx_ptr: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, success: bool) !void {
@@ -40712,6 +40722,8 @@ fn finishDerivedCatchUpWindow(ctx_ptr: *anyopaque, index_ref: index_manager_mod.
 fn beginDerivedCatchUpWindowContext(ctx_ptr: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) !void {
     if (index_ref.kind != .dense_vector) return;
     const replay_ctx: *ReplayApplyContextBatch = @ptrCast(@alignCast(ctx_ptr));
+    var index_apply_guard = try replay_ctx.batch.index_manager.lockManagedIndexApply(index_ref);
+    defer index_apply_guard.unlock();
     const started_capture = try replay_ctx.batch.index_manager.beginDensePostingSidecarCaptureByName(index_ref.name);
     errdefer if (started_capture) replay_ctx.batch.index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
     try replay_ctx.batch.index_manager.beginDenseStreamingReplaySessionByName(index_ref.name);
@@ -42255,9 +42267,14 @@ fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.Deriv
     return true;
 }
 
-fn beginDenseStreamingReplaySessionForAsyncCatchUp(ctx: *AsyncContext, index_ref: index_manager_mod.ManagedIndexRef) !void {
+fn beginDensePostingCaptureAndStreamingReplaySessionForAsyncCatchUp(
+    ctx: *AsyncContext,
+    index_ref: index_manager_mod.ManagedIndexRef,
+) !void {
     var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
     defer index_apply_guard.unlock();
+    const started_capture = try ctx.index_manager.beginDensePostingSidecarCaptureByName(index_ref.name);
+    errdefer if (started_capture) ctx.index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
     try ctx.index_manager.beginDenseStreamingReplaySessionByName(index_ref.name);
 }
 
@@ -42283,9 +42300,8 @@ fn beginDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manager
 
     try beginDenseCatchUpSessionTracked(ctx, index_ref.name);
     errdefer finishDenseCatchUpSessionTrackedBestEffort(ctx, index_ref.name);
-    const started_capture = try ctx.index_manager.beginDensePostingSidecarCaptureByName(index_ref.name);
-    errdefer if (started_capture) ctx.index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
-    try beginDenseStreamingReplaySessionForAsyncCatchUp(ctx, index_ref);
+    try beginDensePostingCaptureAndStreamingReplaySessionForAsyncCatchUp(ctx, index_ref);
+    errdefer ctx.index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
     errdefer abortDenseStreamingReplaySessionForAsyncCatchUp(ctx, index_ref);
     _ = ctx.stats.dense_catch_up.begin_calls.fetchAdd(1, .monotonic);
 }

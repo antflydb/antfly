@@ -4007,6 +4007,16 @@ pub const IndexManager = struct {
     pub fn runDensePostingMaintenance(self: *IndexManager, options: DensePostingMaintenanceOptions) !usize {
         var total_steps: usize = 0;
         for (self.dense_indexes.items) |*entry| {
+            // Capture ownership is protected by the same per-index apply
+            // mutex as replay. Without this fence, catch-up can observe an
+            // active maintenance capture, decline to start its own capture,
+            // then mutate after maintenance has published and released it.
+            // Holding the mutex through maintenance publication makes the
+            // two legal cases explicit: maintenance either joins an already
+            // active source window or fully finishes before that window starts.
+            lockAtomicWithBackoff(entry.apply_mutex);
+            defer entry.apply_mutex.unlock();
+
             // A write path observed a tree-link inconsistency (stale parent
             // pointer / dangling node reference): run a bounded repair sweep
             // before posting maintenance so traversals stop tripping on it.
@@ -7368,8 +7378,8 @@ pub const IndexManager = struct {
         return entry.index.getWriteProfile();
     }
 
-    fn densePostingSidecarEnabled() bool {
-        const raw_z = getenv("ANTFLY_HBC_POSTING_SIDECAR") orelse return false;
+    fn enabledEnvironmentFlag(name: [*:0]const u8) bool {
+        const raw_z = getenv(name) orelse return false;
         const raw = std.mem.span(raw_z);
         return raw.len == 0 or
             std.ascii.eqlIgnoreCase(raw, "1") or
@@ -7378,11 +7388,33 @@ pub const IndexManager = struct {
             std.ascii.eqlIgnoreCase(raw, "on");
     }
 
+    fn densePostingWalMutationStoreEnabled() bool {
+        return enabledEnvironmentFlag("ANTFLY_HBC_POSTING_WAL_STORE");
+    }
+
+    fn densePostingSidecarEnabled() bool {
+        return densePostingWalMutationStoreEnabled() or
+            enabledEnvironmentFlag("ANTFLY_HBC_POSTING_SIDECAR");
+    }
+
     pub fn beginDensePostingSidecarCaptureByName(self: *IndexManager, name: []const u8) !bool {
-        if (!densePostingSidecarEnabled()) return false;
         const entry = self.denseIndex(name) orelse return error.IndexNotFound;
-        if (entry.index.experimentalPostingMutationCaptureActive()) return false;
-        if (entry.index.lsmSessionBatchingActive()) return false;
+        // The durable authority marker is sticky. Once an index has moved its
+        // query-facing state to segment+WAL, every later process must preserve
+        // that transaction boundary even if the rollout environment flag is
+        // removed. Treating the flag as the sole gate would make restart
+        // silently skip capture and then reject the first derived mutation.
+        if (!densePostingSidecarEnabled() and !entry.index.experimentalPostingWalAuthoritative()) return false;
+        if (entry.index.experimentalPostingMutationCaptureActive()) {
+            // An already-open streaming session identifies the one supported
+            // nesting case: a replay batch joins its catch-up window's source
+            // capture. A capture without that session belongs to independent
+            // maintenance. Never let a new source window silently borrow it;
+            // maintenance may publish and close the capture before the source
+            // mutation begins.
+            if (entry.index.lsmSessionBatchingActive()) return false;
+            return error.PostingWalCaptureOwnershipConflict;
+        }
         try entry.index.beginExperimentalPostingMutationCapture();
         return true;
     }
@@ -7392,11 +7424,19 @@ pub const IndexManager = struct {
         entry.index.cancelExperimentalPostingMutationCapture();
     }
 
-    pub fn persistDensePostingSidecarByNameBestEffort(self: *IndexManager, name: []const u8, applied_sequence: u64) void {
-        if (!densePostingSidecarEnabled()) return;
+    pub fn persistDensePostingSidecarByName(self: *IndexManager, name: []const u8, applied_sequence: u64) !void {
         const entry = self.denseIndex(name) orelse return;
+        if (!densePostingSidecarEnabled() and !entry.index.experimentalPostingWalAuthoritative()) return;
         entry.index.persistExperimentalPostingSidecarAtAppliedSequence(applied_sequence, .{}) catch |err| {
-            std.log.warn("dense posting sidecar disabled after publication failure index={s} sequence={} err={s}", .{
+            if (entry.index.experimentalPostingWalAuthoritative()) {
+                std.log.err("dense posting WAL publication failed before applied watermark index={s} sequence={} err={s}", .{
+                    name,
+                    applied_sequence,
+                    @errorName(err),
+                });
+                return err;
+            }
+            std.log.warn("dense posting sidecar disabled after optional publication failure index={s} sequence={} err={s}", .{
                 name,
                 applied_sequence,
                 @errorName(err),
@@ -10570,7 +10610,7 @@ pub const IndexManager = struct {
                 index.setExternalVectorBatchScratchLoader(vector_loader_context, loadDenseVectorsForHbcBatch);
                 index.setExternalVectorBatchTransformedMatrixLoader(vector_loader_context, loadDenseVectorsForHbcBatchIntoTransformedMatrix);
                 index.setExternalVectorBatchDistanceLoader(vector_loader_context, scoreDenseVectorsForHbcBatch);
-                if (densePostingSidecarEnabled()) {
+                if (densePostingSidecarEnabled() or index.experimentalPostingWalAuthoritative()) {
                     const applied_sequence = try apply_state.loadAppliedSequenceWithCheckpoint(
                         self.alloc,
                         self.checkpointIo(),
@@ -10578,10 +10618,25 @@ pub const IndexManager = struct {
                         self.applied_sequence_checkpoint_path,
                         cfg.name,
                     );
-                    index.activateExperimentalPostingReads(applied_sequence) catch |err| switch (err) {
-                        error.MissingPostingCheckpoint,
-                        error.PostingCheckpointSequenceMismatch,
-                        => {
+                    var posting_sequence = applied_sequence;
+                    if (index.experimentalPostingWalAuthoritative()) {
+                        posting_sequence = index.activateExperimentalPostingReadsAtOrAfter(applied_sequence) catch |err| {
+                            std.log.err("dense posting WAL startup validation failed index={s} applied_sequence={} err={s}", .{
+                                cfg.name,
+                                applied_sequence,
+                                @errorName(err),
+                            });
+                            return error.PostingWalMutationStoreRequiresRebuild;
+                        };
+                        if (posting_sequence > applied_sequence) {
+                            std.log.warn("dense posting WAL recovered prepared-ahead generation index={s} applied_sequence={} posting_sequence={}", .{
+                                cfg.name,
+                                applied_sequence,
+                                posting_sequence,
+                            });
+                        }
+                    } else index.activateExperimentalPostingReads(applied_sequence) catch |err| switch (err) {
+                        error.MissingPostingCheckpoint, error.PostingCheckpointSequenceMismatch => {
                             if (!read_only) index.invalidateExperimentalPostingSidecar() catch |invalidate_err| {
                                 std.log.warn("dense posting sidecar startup invalidation failed index={s} err={s}", .{ cfg.name, @errorName(invalidate_err) });
                             };
@@ -10594,8 +10649,11 @@ pub const IndexManager = struct {
                         },
                     };
                     if (index.experimentalPostingReadsEnabled()) {
-                        std.log.info("dense posting sidecar activated index={s} sequence={}", .{ cfg.name, applied_sequence });
+                        std.log.info("dense posting sidecar activated index={s} sequence={}", .{ cfg.name, posting_sequence });
                     }
+                }
+                if (densePostingWalMutationStoreEnabled() or index.experimentalPostingWalAuthoritative()) {
+                    index.enableExperimentalPostingWalMutations();
                 }
                 const apply_mutex = try self.allocIndexApplyMutex();
                 var apply_mutex_owned = true;
@@ -26716,6 +26774,56 @@ test "dense hbc batch options store vectors when no external loader can serve sk
     try std.testing.expect(!opts.defer_leaf_splits_to_bulk_finish);
     try std.testing.expectEqual(@as(usize, 0), opts.bulk_rebuild_leaf_min_members);
     try std.testing.expect(!opts.skip_vector_store);
+}
+
+test "authoritative posting capture starts inside an existing replay session" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    }});
+
+    const entry = manager.denseIndex("dv_v1") orelse return error.IndexNotFound;
+    // Model a restart that loaded the durable authority marker. Capture is no
+    // longer an opt-in sidecar behavior and must not depend on the rollout
+    // environment remaining set in every future process.
+    _ = try entry.index.publishExperimentalPostingCheckpoint(0);
+    entry.index.experimental_posting_wal_authoritative.store(true, .release);
+    entry.index.enableExperimentalPostingWalMutations();
+
+    // A source window may not mistake an independently owned maintenance
+    // capture for its own transaction boundary.
+    try entry.index.beginExperimentalPostingMutationCapture();
+    try std.testing.expectError(
+        error.PostingWalCaptureOwnershipConflict,
+        manager.beginDensePostingSidecarCaptureByName("dv_v1"),
+    );
+    entry.index.cancelExperimentalPostingMutationCapture();
+
+    try manager.beginDenseStreamingReplaySessionByName("dv_v1");
+    var session_open = true;
+    defer if (session_open) manager.abortDenseStreamingReplaySessionByName("dv_v1");
+
+    try std.testing.expect(try manager.beginDensePostingSidecarCaptureByName("dv_v1"));
+    try std.testing.expect(entry.index.experimentalPostingMutationCaptureActive());
+    try std.testing.expect(!try manager.beginDensePostingSidecarCaptureByName("dv_v1"));
+    manager.cancelDensePostingSidecarCaptureByName("dv_v1");
+    manager.abortDenseStreamingReplaySessionByName("dv_v1");
+    session_open = false;
 }
 
 test "dense replay keep mask keeps only the last write per doc and index" {

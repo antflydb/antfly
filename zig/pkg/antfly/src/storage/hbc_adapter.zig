@@ -114,6 +114,8 @@ fn hbcRuntimeBatchMode(in_bulk_session: bool, lsm_direct_bulk_ingest_enabled: ?b
 // ============================================================================
 
 const meta_key = vectorindex_hbc.meta_key;
+const posting_wal_authoritative_key = "hbc:posting-wal-authoritative-v1";
+const posting_wal_authoritative_value = "1";
 const bulk_publish_state_key = "__bulk_publish_state";
 const bulk_publish_state_value = "incomplete";
 pub const WriteSessionKind = enum {
@@ -1409,27 +1411,37 @@ fn claimLocalClockSlot(clock_keys: []u64, start_slot: usize, key: u64) ?usize {
 // HBC Index
 // ============================================================================
 
+const ExperimentalPostingMaterializedValue = struct {
+    bytes: ?[]const u8,
+    owned: bool,
+};
+
 const ExperimentalPostingReadState = struct {
     alloc: Allocator,
+    covered_source_sequence: u64,
     retained_segment: posting_segment_store_mod.RetainedSegment,
     segment: vectorindex_posting_segment.VerifiedReader,
     vector_directory: ?vectorindex_hbc_vector_directory.Reader = null,
-    wal: posting_segment_store_mod.RecoveredWal,
-    materialized: std.AutoHashMapUnmanaged(u128, ?[]u8) = .empty,
+    // Full WAL records borrow directly from this one retained buffer. Only
+    // decoded replacement patches allocate individual owned values, avoiding
+    // a second full copy of the bounded WAL tail after restart.
+    wal_bytes: ?[]u8 = null,
+    wal_committed_bytes: u64,
+    materialized: std.AutoHashMapUnmanaged(u128, ExperimentalPostingMaterializedValue) = .empty,
 
     fn deinit(self: *ExperimentalPostingReadState) void {
         var values = self.materialized.valueIterator();
-        while (values.next()) |slot| if (slot.*) |owned| self.alloc.free(owned);
+        while (values.next()) |slot| if (slot.owned) if (slot.bytes) |owned| self.alloc.free(owned);
         self.materialized.deinit(self.alloc);
+        if (self.wal_bytes) |bytes| self.alloc.free(bytes);
         self.segment.deinit();
         self.retained_segment.deinit(self.alloc);
-        self.wal.deinit();
         self.* = undefined;
     }
 
     fn value(self: *ExperimentalPostingReadState, posting_id: u64, kind: vectorindex_posting_wal.RecordKind) !?[]const u8 {
-        if (self.materialized.get(experimentalPostingValueKey(posting_id, kind))) |maybe_value| {
-            return maybe_value orelse error.NotFound;
+        if (self.materialized.get(experimentalPostingValueKey(posting_id, kind))) |materialized| {
+            return materialized.bytes orelse error.NotFound;
         }
         if (self.vector_directory) |directory| switch (kind) {
             .vector_leaf => return try directory.get(.leaf, posting_id),
@@ -1440,18 +1452,36 @@ const ExperimentalPostingReadState = struct {
         return try self.segment.getValue(posting_id, entry_kind);
     }
 
-    fn set(self: *ExperimentalPostingReadState, posting_id: u64, kind: vectorindex_posting_wal.RecordKind, value_bytes: ?[]const u8) !void {
+    fn replaceMaterialized(
+        self: *ExperimentalPostingReadState,
+        posting_id: u64,
+        kind: vectorindex_posting_wal.RecordKind,
+        materialized_value: ExperimentalPostingMaterializedValue,
+    ) !void {
         const key = experimentalPostingValueKey(posting_id, kind);
-        const owned = if (value_bytes) |bytes| try self.alloc.dupe(u8, bytes) else null;
-        errdefer if (owned) |bytes| self.alloc.free(bytes);
         const result = try self.materialized.getOrPut(self.alloc, key);
-        if (result.found_existing) if (result.value_ptr.*) |old| self.alloc.free(old);
-        result.value_ptr.* = owned;
+        if (result.found_existing and result.value_ptr.owned) if (result.value_ptr.bytes) |old| self.alloc.free(old);
+        result.value_ptr.* = materialized_value;
     }
 
-    fn materializeWal(self: *ExperimentalPostingReadState) !void {
-        for (self.wal.replay.records.items) |record| switch (record.kind) {
-            .base, .quantized_checkpoint, .posting_state, .node_range, .vector_leaf, .vector_metadata, .index_metadata => try self.set(record.posting_id, record.kind, record.payload),
+    fn set(self: *ExperimentalPostingReadState, posting_id: u64, kind: vectorindex_posting_wal.RecordKind, value_bytes: ?[]const u8) !void {
+        const owned = if (value_bytes) |bytes| try self.alloc.dupe(u8, bytes) else null;
+        errdefer if (owned) |bytes| self.alloc.free(bytes);
+        try self.replaceMaterialized(posting_id, kind, .{ .bytes = owned, .owned = owned != null });
+    }
+
+    fn setBorrowed(self: *ExperimentalPostingReadState, posting_id: u64, kind: vectorindex_posting_wal.RecordKind, value_bytes: ?[]const u8) !void {
+        try self.replaceMaterialized(posting_id, kind, .{ .bytes = value_bytes, .owned = false });
+    }
+
+    fn setOwned(self: *ExperimentalPostingReadState, posting_id: u64, kind: vectorindex_posting_wal.RecordKind, value_bytes: []u8) !void {
+        errdefer self.alloc.free(value_bytes);
+        try self.replaceMaterialized(posting_id, kind, .{ .bytes = value_bytes, .owned = true });
+    }
+
+    fn materializeWal(self: *ExperimentalPostingReadState, wal: *const posting_segment_store_mod.RecoveredWal) !void {
+        for (wal.replay.records.items) |record| switch (record.kind) {
+            .base, .quantized_checkpoint, .posting_state, .node_range, .vector_leaf, .vector_metadata, .index_metadata => try self.setBorrowed(record.posting_id, record.kind, record.payload),
             .mutation => {
                 if (record.payload.len < 6) return error.CorruptedPostingPatch;
                 const target: vectorindex_posting_wal.RecordKind = switch (record.payload[5]) {
@@ -1469,9 +1499,11 @@ const ExperimentalPostingReadState = struct {
                     else => return err,
                 } orelse return error.PostingPatchBaseMismatch;
                 const decoded = try vectorindex_posting_wal.applyReplacementPatchAlloc(self.alloc, record.payload, base);
-                defer self.alloc.free(decoded.replacement);
-                if (decoded.target != target) return error.InvalidPostingPatchTarget;
-                try self.set(record.posting_id, target, decoded.replacement);
+                if (decoded.target != target) {
+                    self.alloc.free(decoded.replacement);
+                    return error.InvalidPostingPatchTarget;
+                }
+                try self.setOwned(record.posting_id, target, decoded.replacement);
             },
             .tombstone => inline for (.{
                 vectorindex_posting_wal.RecordKind.base,
@@ -1481,14 +1513,14 @@ const ExperimentalPostingReadState = struct {
                 vectorindex_posting_wal.RecordKind.vector_leaf,
                 vectorindex_posting_wal.RecordKind.vector_metadata,
                 vectorindex_posting_wal.RecordKind.index_metadata,
-            }) |kind| try self.set(record.posting_id, kind, null),
-            .base_tombstone => try self.set(record.posting_id, .base, null),
-            .quantized_checkpoint_tombstone => try self.set(record.posting_id, .quantized_checkpoint, null),
-            .posting_state_tombstone => try self.set(record.posting_id, .posting_state, null),
-            .node_range_tombstone => try self.set(record.posting_id, .node_range, null),
-            .vector_leaf_tombstone => try self.set(record.posting_id, .vector_leaf, null),
-            .vector_metadata_tombstone => try self.set(record.posting_id, .vector_metadata, null),
-            .index_metadata_tombstone => try self.set(record.posting_id, .index_metadata, null),
+            }) |kind| try self.setBorrowed(record.posting_id, kind, null),
+            .base_tombstone => try self.setBorrowed(record.posting_id, .base, null),
+            .quantized_checkpoint_tombstone => try self.setBorrowed(record.posting_id, .quantized_checkpoint, null),
+            .posting_state_tombstone => try self.setBorrowed(record.posting_id, .posting_state, null),
+            .node_range_tombstone => try self.setBorrowed(record.posting_id, .node_range, null),
+            .vector_leaf_tombstone => try self.setBorrowed(record.posting_id, .vector_leaf, null),
+            .vector_metadata_tombstone => try self.setBorrowed(record.posting_id, .vector_metadata, null),
+            .index_metadata_tombstone => try self.setBorrowed(record.posting_id, .index_metadata, null),
             .coverage => {},
             .centroid_directory, .commit => return error.UnsupportedExperimentalPostingWalRecord,
         };
@@ -1590,6 +1622,7 @@ fn experimentalPostingValueKeyId(key: u128) u64 {
 }
 
 const ExperimentalPostingLatestValues = std.AutoHashMapUnmanaged(u128, ?[]const u8);
+const ExperimentalPostingCapturedValues = std.AutoHashMapUnmanaged(u128, ?[]u8);
 
 fn experimentalPostingRootState(generation: *ExperimentalPostingReadGeneration) ?*ExperimentalPostingReadState {
     var current: ?*ExperimentalPostingReadGeneration = generation;
@@ -1617,7 +1650,7 @@ fn collectExperimentalPostingLatestValues(
             var materialized = state.materialized.iterator();
             while (materialized.next()) |entry| {
                 const result = try latest.getOrPut(alloc, entry.key_ptr.*);
-                if (!result.found_existing) result.value_ptr.* = entry.value_ptr.*;
+                if (!result.found_existing) result.value_ptr.* = entry.value_ptr.bytes;
             }
             break;
         }
@@ -1804,8 +1837,12 @@ pub const HBCIndex = struct {
     experimental_posting_write_store: ?posting_segment_store_mod.Store = null,
     experimental_posting_checkpoint_build: ?*ExperimentalPostingCheckpointBuild = null,
     experimental_posting_overlay_collapsed_wal_bytes: u64 = 0,
+    experimental_posting_wal_mutations_enabled: bool = false,
+    experimental_posting_wal_authoritative: std.atomic.Value(bool) = .init(false),
+    experimental_posting_wal_authoritative_persisted: bool = false,
+    experimental_posting_mutation_base_generation: ?*ExperimentalPostingReadGeneration = null,
     experimental_posting_capture_enabled: bool = false,
-    experimental_touched_posting_values: std.AutoHashMapUnmanaged(u128, void) = .empty,
+    experimental_posting_captured_values: ExperimentalPostingCapturedValues = .empty,
     rng: go_rand.GoPcg,
     // Set when a write path observes a tree-link inconsistency (stale parent
     // pointer, dangling node reference); background maintenance runs a
@@ -2484,6 +2521,15 @@ pub const HBCIndex = struct {
         const cache_identity = try hbcCacheIdentityAlloc(alloc, std.mem.span(path));
         errdefer alloc.free(cache_identity.stable_path);
 
+        var marker_txn = try store.beginRead();
+        defer marker_txn.abort();
+        const posting_wal_authoritative = if (marker_txn.get(.meta, posting_wal_authoritative_key)) |value|
+            std.mem.eql(u8, value, posting_wal_authoritative_value)
+        else |err| switch (err) {
+            error.NotFound => false,
+            else => return err,
+        };
+
         const idx = HBCIndex{
             .alloc = alloc,
             .env_owner = env_owner,
@@ -2494,6 +2540,8 @@ pub const HBCIndex = struct {
             .published_active_count = .init(metadata.active_count),
             .published_node_count = .init(metadata.node_count),
             .published_generation = .init(0),
+            .experimental_posting_wal_authoritative = .init(posting_wal_authoritative),
+            .experimental_posting_wal_authoritative_persisted = posting_wal_authoritative,
             .rng = go_rand.GoPcg.init(effective_config.quantizer_seed, 1024),
             .quantizer = quantizer,
             .rot = rot,
@@ -3068,6 +3116,7 @@ pub const HBCIndex = struct {
 
     fn deinitWithBackendDisposition(self: *HBCIndex, abandon_after_crash: bool) void {
         self.discardExperimentalPostingCheckpointBuild();
+        self.clearExperimentalPostingMutationBase();
         self.experimental_posting_reads_enabled.store(false, .release);
         self.clearExperimentalPostingReadGeneration();
         if (self.experimental_posting_delta_base_state) |state| {
@@ -3079,7 +3128,8 @@ pub const HBCIndex = struct {
             store.deinit();
             self.experimental_posting_write_store = null;
         }
-        self.experimental_touched_posting_values.deinit(self.alloc);
+        self.clearExperimentalPostingCapturedValues();
+        self.experimental_posting_captured_values.deinit(self.alloc);
         if (self.shared_cache == null) {
             self.clearNodeCache();
             self.clearQuantizedCache();
@@ -3284,7 +3334,6 @@ pub const HBCIndex = struct {
 
     fn publishExperimentalPostingReadOverlay(
         self: *HBCIndex,
-        txn: *vectorindex_store.NamespaceReadTxn,
         touched_keys: []const u128,
     ) !void {
         const parent = self.retainCurrentExperimentalPostingReadGeneration() orelse return;
@@ -3295,37 +3344,85 @@ pub const HBCIndex = struct {
         for (touched_keys) |key| {
             const posting_id = experimentalPostingValueKeyId(key);
             const kind = try experimentalPostingValueKeyKind(key);
-            const current = self.readCommittedExperimentalPostingValue(txn, posting_id, kind) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
-            try generation.set(posting_id, kind, current);
+            const captured = self.experimental_posting_captured_values.getPtr(key) orelse
+                return error.MissingExperimentalPostingCaptureValue;
+            const result = generation.values.getOrPutAssumeCapacity(experimentalPostingValueKey(posting_id, kind));
+            std.debug.assert(!result.found_existing);
+            // The durable append no longer borrows these bytes. Transfer the
+            // transaction-local allocation into the immutable overlay instead
+            // of briefly holding a second full posting copy at publication.
+            result.value_ptr.* = captured.*;
+            captured.* = null;
         }
         self.installExperimentalPostingReadGeneration(generation);
+    }
+
+    fn decodeExperimentalPostingMetadata(self: *const HBCIndex, encoded: []const u8) !IndexMetadata {
+        if (encoded.len != IndexMetadata.encoded_size) return error.CorruptedPostingMetadata;
+        const metadata = IndexMetadata.decode(encoded);
+        if (metadata.version != self.metadata.version or
+            metadata.dims != self.metadata.dims or
+            metadata.branching_factor != self.metadata.branching_factor or
+            metadata.leaf_size != self.metadata.leaf_size or
+            metadata.use_quantization != self.metadata.use_quantization or
+            metadata.quantizer_seed != self.metadata.quantizer_seed or
+            metadata.metric != self.metadata.metric)
+        {
+            return error.PostingCheckpointMetadataMismatch;
+        }
+        return metadata;
+    }
+
+    fn metadataFromExperimentalPostingGeneration(
+        self: *const HBCIndex,
+        generation: *ExperimentalPostingReadGeneration,
+    ) !IndexMetadata {
+        const encoded = try generation.value(0, .index_metadata) orelse
+            return error.MissingPostingMetadata;
+        return try self.decodeExperimentalPostingMetadata(encoded);
+    }
+
+    fn installExperimentalPostingRootGeneration(
+        self: *HBCIndex,
+        generation: *ExperimentalPostingReadGeneration,
+    ) !void {
+        const metadata = try self.metadataFromExperimentalPostingGeneration(generation);
+        self.beginPublishedSearchStateRefresh();
+        self.metadata = metadata;
+        self.installExperimentalPostingReadGeneration(generation);
+        self.finishPublishedSearchStateRefresh();
+    }
+
+    fn refreshExperimentalPostingReadGeneration(
+        self: *HBCIndex,
+        covered_source_sequence: u64,
+    ) !void {
+        const state = try self.loadExperimentalPostingState(covered_source_sequence);
+        var state_owned = true;
+        errdefer if (state_owned) {
+            state.deinit();
+            self.alloc.destroy(state);
+        };
+        const generation = try ExperimentalPostingReadGeneration.createRoot(self.alloc, state);
+        state_owned = false;
+        var generation_owned = true;
+        errdefer if (generation_owned) generation.release();
+        try self.installExperimentalPostingRootGeneration(generation);
+        generation_owned = false;
+        self.experimental_posting_sidecar_managed = true;
     }
 
     fn refreshExperimentalPostingReadGenerationBestEffort(
         self: *HBCIndex,
         covered_source_sequence: u64,
     ) void {
-        const state = self.loadExperimentalPostingState(covered_source_sequence) catch |err| {
+        self.refreshExperimentalPostingReadGeneration(covered_source_sequence) catch |err| {
             std.log.warn("dense posting sidecar live generation refresh failed sequence={} err={s}", .{
                 covered_source_sequence,
                 @errorName(err),
             });
             return;
         };
-        const generation = ExperimentalPostingReadGeneration.createRoot(self.alloc, state) catch |err| {
-            state.deinit();
-            self.alloc.destroy(state);
-            std.log.warn("dense posting sidecar live generation allocation failed sequence={} err={s}", .{
-                covered_source_sequence,
-                @errorName(err),
-            });
-            return;
-        };
-        self.experimental_posting_sidecar_managed = true;
-        self.installExperimentalPostingReadGeneration(generation);
     }
 
     fn discardExperimentalPostingDeltaBaseState(self: *HBCIndex) void {
@@ -3334,6 +3431,34 @@ pub const HBCIndex = struct {
             self.alloc.destroy(state);
             self.experimental_posting_delta_base_state = null;
         }
+    }
+
+    fn clearExperimentalPostingCapturedValues(self: *HBCIndex) void {
+        var values = self.experimental_posting_captured_values.valueIterator();
+        while (values.next()) |value| if (value.*) |owned| self.alloc.free(owned);
+        self.experimental_posting_captured_values.clearRetainingCapacity();
+    }
+
+    fn clearExperimentalPostingMutationBase(self: *HBCIndex) void {
+        if (self.experimental_posting_mutation_base_generation) |generation| {
+            self.experimental_posting_mutation_base_generation = null;
+            generation.release();
+        }
+    }
+
+    fn restoreExperimentalPostingMutationBase(self: *HBCIndex) !void {
+        const generation = self.experimental_posting_mutation_base_generation orelse return;
+        self.metadata = try self.metadataFromExperimentalPostingGeneration(generation);
+        self.refreshPublishedSearchState();
+        self.clearAllCaches();
+    }
+
+    fn preserveExperimentalPostingWalAfterCaptureFailure(self: *HBCIndex) void {
+        self.closeExperimentalPostingWalWriter();
+        self.restoreExperimentalPostingMutationBase() catch |err| {
+            std.log.err("dense posting WAL could not restore the last committed mutation base err={s}", .{@errorName(err)});
+            self.disableExperimentalPostingReads();
+        };
     }
 
     fn openExperimentalPostingStore(self: *HBCIndex) !posting_segment_store_mod.Store {
@@ -3433,11 +3558,10 @@ pub const HBCIndex = struct {
                 build.covered_source_sequence,
                 @errorName(err),
             });
-            // The source transaction is already durable, so surface the
-            // derived failure to the caller's existing fail-closed
-            // invalidation path. Retrying a full checkpoint on every replay
-            // callback would otherwise turn a persistent storage or memory
-            // error into an unbounded background-build storm.
+            // WAL-authoritative callers retain the committed tail and defer
+            // compaction; optional sidecars may invalidate and fall back to
+            // the LSM. In neither mode may a failed build publish partial
+            // checkpoint state.
             return err;
         }
         if (posting_store.wal_generation != build.wal_generation) {
@@ -3517,11 +3641,60 @@ pub const HBCIndex = struct {
         }
     }
 
+    /// Resolve an ambiguous append by reopening and parsing the durable WAL
+    /// prefix. If the intended batch committed, acknowledge it exactly once;
+    /// if it did not, retry it once on the repaired/truncated WAL. A different
+    /// next batch id means another writer violated the single-writer contract.
+    fn appendExperimentalPostingBatchDurably(
+        self: *HBCIndex,
+        batch_id: u64,
+        records: []const posting_segment_store_mod.BatchRecord,
+        covered_source_sequence: u64,
+        options: ExperimentalPostingWalAppendOptions,
+    ) !void {
+        if (self.experimental_posting_write_store == null) {
+            self.experimental_posting_write_store = try self.openExperimentalPostingStore();
+        }
+        self.experimental_posting_write_store.?.appendBatchWithOptions(
+            batch_id,
+            records,
+            covered_source_sequence,
+            .{ .sync = options.sync },
+        ) catch |first_err| {
+            self.closeExperimentalPostingWalWriter();
+            self.experimental_posting_write_store = self.openExperimentalPostingStore() catch |reopen_err| {
+                std.log.err("dense posting WAL append recovery failed append_err={s} reopen_err={s}", .{
+                    @errorName(first_err),
+                    @errorName(reopen_err),
+                });
+                return reopen_err;
+            };
+            const recovered = &self.experimental_posting_write_store.?;
+            if (recovered.last_committed_batch == batch_id) {
+                if (recovered.covered_source_sequence != covered_source_sequence) {
+                    return error.PostingWalAmbiguousCommitMismatch;
+                }
+                return;
+            }
+            if (try recovered.nextBatchId() != batch_id) return error.PostingWalConcurrentWriter;
+            recovered.appendBatchWithOptions(
+                batch_id,
+                records,
+                covered_source_sequence,
+                .{ .sync = options.sync },
+            ) catch |retry_err| {
+                self.closeExperimentalPostingWalWriter();
+                return retry_err;
+            };
+        };
+    }
+
     pub fn invalidateExperimentalPostingSidecar(self: *HBCIndex) !void {
         self.discardExperimentalPostingCheckpointBuild();
         self.experimental_posting_overlay_collapsed_wal_bytes = 0;
         self.experimental_posting_capture_enabled = false;
-        self.experimental_touched_posting_values.clearRetainingCapacity();
+        self.clearExperimentalPostingMutationBase();
+        self.clearExperimentalPostingCapturedValues();
         self.disableExperimentalPostingReads();
         self.clearExperimentalPostingReadGeneration();
         self.discardExperimentalPostingDeltaBaseState();
@@ -3545,7 +3718,8 @@ pub const HBCIndex = struct {
         var posting_store = &self.experimental_posting_write_store.?;
         if (posting_store.checkpoint == null) {
             self.experimental_posting_capture_enabled = false;
-            self.experimental_touched_posting_values.clearRetainingCapacity();
+            self.clearExperimentalPostingMutationBase();
+            self.clearExperimentalPostingCapturedValues();
             _ = try self.publishExperimentalPostingCheckpoint(applied_sequence);
             return;
         }
@@ -3562,24 +3736,55 @@ pub const HBCIndex = struct {
                 options,
             );
         } else if (posting_store.covered_source_sequence < applied_sequence) {
-            try posting_store.appendCoverage(
-                try posting_store.nextBatchId(),
-                applied_sequence,
-                .{ .sync = options.sync },
-            );
+            const batch_id = try posting_store.nextBatchId();
+            const coverage = [_]posting_segment_store_mod.BatchRecord{.{
+                .kind = .coverage,
+                .posting_id = 0,
+                .source_sequence = applied_sequence,
+                .payload = &.{},
+            }};
+            try self.appendExperimentalPostingBatchDurably(batch_id, &coverage, applied_sequence, options);
         }
 
         // finishExperimentalPostingMutationCapture may have lazily replaced
         // the writer handle, so resolve it again before applying the tail
         // policy.
         posting_store = &self.experimental_posting_write_store.?;
-        try self.maintainExperimentalPostingCheckpoint(posting_store);
+        self.maintainExperimentalPostingCheckpoint(posting_store) catch |err| {
+            // The committed WAL batch above is already sufficient for exact
+            // recovery. Compaction is bounded maintenance debt, not part of
+            // the source transaction's durability decision.
+            if (!self.experimental_posting_wal_authoritative.load(.acquire)) return err;
+            std.log.warn("dense posting WAL checkpoint maintenance deferred sequence={} err={s}", .{
+                posting_store.covered_source_sequence,
+                @errorName(err),
+            });
+        };
     }
 
     pub fn beginExperimentalPostingMutationCapture(self: *HBCIndex) !void {
-        if (self.write_session_depth != 0) return error.ActiveWriteSession;
         if (self.experimental_posting_capture_enabled) return error.ExperimentalPostingCaptureAlreadyActive;
-        self.experimental_touched_posting_values.clearRetainingCapacity();
+        // A posting capture is the derived-state transaction boundary, not an
+        // LSM snapshot. It is valid (and required) inside a streaming replay
+        // or bulk publication session: those sessions only batch backend
+        // durability and may outlive several independently committed source
+        // windows. The captured values are owned copies and publication still
+        // waits until the outer write session is durably finished.
+        self.clearExperimentalPostingCapturedValues();
+        self.clearExperimentalPostingMutationBase();
+        const wal_authoritative = self.experimental_posting_wal_authoritative.load(.acquire);
+        if (self.experimental_posting_wal_mutations_enabled or wal_authoritative) {
+            self.experimental_posting_mutation_base_generation = self.acquireExperimentalPostingReadGeneration();
+            // A persisted authority marker is irreversible without an
+            // explicit rebuild. Never route a later mutation into the stale
+            // LSM merely because the live immutable generation became
+            // unavailable after startup or an allocation failure.
+            if (wal_authoritative and
+                self.experimental_posting_mutation_base_generation == null)
+            {
+                return error.PostingWalMutationStoreUnavailable;
+            }
+        }
         self.experimental_posting_sidecar_managed = true;
         self.experimental_posting_capture_enabled = true;
     }
@@ -3588,10 +3793,40 @@ pub const HBCIndex = struct {
         return self.experimental_posting_capture_enabled;
     }
 
+    /// Routes query-facing HBC mutations through the committed posting WAL
+    /// once an immutable base generation is available. Bootstrap and rebuild
+    /// still use the general store until the first complete checkpoint exists.
+    pub fn enableExperimentalPostingWalMutations(self: *HBCIndex) void {
+        self.experimental_posting_wal_mutations_enabled = true;
+    }
+
+    pub fn experimentalPostingWalAuthoritative(self: *const HBCIndex) bool {
+        return self.experimental_posting_wal_authoritative.load(.acquire);
+    }
+
     pub fn cancelExperimentalPostingMutationCapture(self: *HBCIndex) void {
         self.experimental_posting_capture_enabled = false;
-        self.experimental_touched_posting_values.clearRetainingCapacity();
-        if (self.experimental_posting_sidecar_managed and self.experimentalPostingReadGenerationLoaded()) {
+        var mutation_base_restored = true;
+        if (self.experimental_posting_wal_authoritative.load(.acquire) and
+            self.experimental_posting_mutation_base_generation != null)
+        {
+            // The source window may fail after one or more local HBC
+            // transactions committed but before their posting-WAL batch was
+            // published. Those transactions were WAL-only for derived state;
+            // restore mutable topology and discard caches populated from the
+            // abandoned overlay before admitting another query or replay.
+            self.restoreExperimentalPostingMutationBase() catch |err| {
+                mutation_base_restored = false;
+                self.disableExperimentalPostingReads();
+                std.log.err("dense posting WAL capture rollback could not restore committed base err={s}", .{@errorName(err)});
+            };
+        }
+        self.clearExperimentalPostingMutationBase();
+        self.clearExperimentalPostingCapturedValues();
+        if (mutation_base_restored and
+            self.experimental_posting_sidecar_managed and
+            self.experimentalPostingReadGenerationLoaded())
+        {
             self.experimental_posting_reads_enabled.store(true, .release);
         }
     }
@@ -3619,31 +3854,17 @@ pub const HBCIndex = struct {
     }
 
     /// Completes an independently committed maintenance transaction without
-    /// advancing authoritative source coverage. Failure cannot roll back that
-    /// transaction, so remove CURRENT and retain the LSM as the safe fallback.
-    fn finishExperimentalPostingMaintenanceCaptureBestEffort(
-        self: *HBCIndex,
-        capture: ExperimentalPostingMaintenanceCapture,
-    ) void {
-        if (self.experimental_touched_posting_values.count() == 0) {
-            self.cancelExperimentalPostingMaintenanceCapture();
-            return;
-        }
-        self.finishExperimentalPostingMaintenanceCapture(capture) catch |err| {
-            std.log.warn("dense posting sidecar disabled after maintenance publication failure sequence={} err={s}", .{
-                capture.covered_source_sequence,
-                @errorName(err),
-            });
-            self.invalidateExperimentalPostingSidecar() catch |invalidate_err| {
-                std.log.warn("dense posting sidecar maintenance invalidation failed err={s}", .{@errorName(invalidate_err)});
-            };
-        };
-    }
-
+    /// advancing authoritative source coverage. In WAL-authoritative mode the
+    /// caller observes publication failure and can retry the idempotent repair;
+    /// optional sidecar mode invalidates itself and continues from the LSM.
     fn finishExperimentalPostingMaintenanceCapture(
         self: *HBCIndex,
         capture: ExperimentalPostingMaintenanceCapture,
     ) !void {
+        if (self.experimental_posting_captured_values.count() == 0) {
+            self.cancelExperimentalPostingMaintenanceCapture();
+            return;
+        }
         if (self.experimental_posting_write_store == null) return error.MissingPostingCheckpoint;
         var posting_store = &self.experimental_posting_write_store.?;
         if (posting_store.covered_source_sequence != capture.covered_source_sequence) {
@@ -3655,7 +3876,13 @@ pub const HBCIndex = struct {
             .{},
         );
         posting_store = &self.experimental_posting_write_store.?;
-        try self.maintainExperimentalPostingCheckpoint(posting_store);
+        self.maintainExperimentalPostingCheckpoint(posting_store) catch |err| {
+            if (!self.experimental_posting_wal_authoritative.load(.acquire)) return err;
+            std.log.warn("dense posting WAL maintenance checkpoint deferred sequence={} err={s}", .{
+                capture.covered_source_sequence,
+                @errorName(err),
+            });
+        };
     }
 
     fn experimentalPostingKindBenefitsFromPatch(kind: vectorindex_posting_wal.RecordKind) bool {
@@ -3681,17 +3908,22 @@ pub const HBCIndex = struct {
     ) !PostingWalAppendStats {
         if (!self.experimental_posting_capture_enabled) return error.ExperimentalPostingCaptureNotActive;
         self.experimental_posting_capture_enabled = false;
-        defer self.experimental_touched_posting_values.clearRetainingCapacity();
-        // The authoritative transaction has already committed. Any failure
-        // from here must fail closed so neither live reads nor restart can
-        // admit a stale posting generation.
-        errdefer self.invalidateExperimentalPostingSidecar() catch |invalidate_err| {
-            std.log.warn("dense posting sidecar capture invalidation failed err={s}", .{@errorName(invalidate_err)});
-        };
+        defer self.clearExperimentalPostingMutationBase();
+        defer self.clearExperimentalPostingCapturedValues();
+        // The source/HBC transaction has already committed locally, but its
+        // applied watermark has not. Optional dual-write mode may invalidate
+        // and serve the complete LSM state. WAL-authoritative mode has no such
+        // fallback: retain and restore the last committed generation so replay
+        // can retry without ever exposing a partial mutation.
+        errdefer if (self.experimental_posting_wal_authoritative.load(.acquire))
+            self.preserveExperimentalPostingWalAfterCaptureFailure()
+        else
+            self.invalidateExperimentalPostingSidecar() catch |invalidate_err| {
+                std.log.warn("dense posting sidecar capture invalidation failed err={s}", .{@errorName(invalidate_err)});
+            };
         if (self.experimental_posting_write_store == null) {
             self.experimental_posting_write_store = try self.openExperimentalPostingStore();
         }
-        const posting_store = &self.experimental_posting_write_store.?;
         const delta_base_generation = self.retainCurrentExperimentalPostingReadGeneration();
         defer if (delta_base_generation) |generation| generation.release();
         const delta_base_state = if (delta_base_generation == null)
@@ -3699,84 +3931,28 @@ pub const HBCIndex = struct {
         else
             null;
 
-        const touched_keys = try self.alloc.alloc(u128, self.experimental_touched_posting_values.count());
+        const touched_keys = try self.alloc.alloc(u128, self.experimental_posting_captured_values.count());
         defer self.alloc.free(touched_keys);
         var touched_index: usize = 0;
-        var touched_it = self.experimental_touched_posting_values.keyIterator();
+        var touched_it = self.experimental_posting_captured_values.keyIterator();
         while (touched_it.next()) |key| : (touched_index += 1) touched_keys[touched_index] = key.*;
         std.mem.sort(u128, touched_keys, {}, std.sort.asc(u128));
 
         var records = std.ArrayListUnmanaged(posting_segment_store_mod.BatchRecord).empty;
         defer records.deinit(self.alloc);
-        var owned_payloads = std.ArrayListUnmanaged([]u8).empty;
+        var owned_patches = std.ArrayListUnmanaged([]u8).empty;
         defer {
-            for (owned_payloads.items) |payload| self.alloc.free(payload);
-            owned_payloads.deinit(self.alloc);
+            for (owned_patches.items) |payload| self.alloc.free(payload);
+            owned_patches.deinit(self.alloc);
         }
         try records.ensureTotalCapacity(self.alloc, @max(touched_keys.len, 1));
-        try owned_payloads.ensureTotalCapacity(self.alloc, touched_keys.len);
+        try owned_patches.ensureTotalCapacity(self.alloc, touched_keys.len);
 
-        var txn = try self.store.beginRead();
-        defer txn.abort();
-
-        const VectorLookup = struct {
-            logical_key: u128,
-            storage_key: [10]u8,
-
-            fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
-                return std.mem.order(u8, &lhs.storage_key, &rhs.storage_key) == .lt;
-            }
-        };
-        var vector_lookup_count: usize = 0;
-        for (touched_keys) |key| switch (try experimentalPostingValueKeyKind(key)) {
-            .vector_leaf, .vector_metadata => vector_lookup_count += 1,
-            else => {},
-        };
-        const vector_lookups = try self.alloc.alloc(VectorLookup, vector_lookup_count);
-        defer self.alloc.free(vector_lookups);
-        var next_vector_lookup: usize = 0;
-        for (touched_keys) |key| {
-            const id = experimentalPostingValueKeyId(key);
-            const kind = try experimentalPostingValueKeyKind(key);
-            const storage_key = switch (kind) {
-                .vector_leaf => blk: {
-                    var buf: [10]u8 = undefined;
-                    _ = encodeVecLeafKey(&buf, id);
-                    break :blk buf;
-                },
-                .vector_metadata => blk: {
-                    var buf: [10]u8 = undefined;
-                    _ = encodeVecMetaKey(&buf, id);
-                    break :blk buf;
-                },
-                else => continue,
-            };
-            vector_lookups[next_vector_lookup] = .{ .logical_key = key, .storage_key = storage_key };
-            next_vector_lookup += 1;
-        }
-        std.mem.sort(VectorLookup, vector_lookups, {}, VectorLookup.lessThan);
-        const vector_key_views = try self.alloc.alloc([]const u8, vector_lookup_count);
-        defer self.alloc.free(vector_key_views);
-        const vector_values = try self.alloc.alloc(?[]const u8, vector_lookup_count);
-        defer self.alloc.free(vector_values);
-        for (vector_lookups, vector_key_views) |*lookup, *key| key.* = &lookup.storage_key;
-        if (vector_lookup_count > 0) try txn.getManySorted(.vecs, vector_key_views, vector_values);
-        var committed_vector_values = std.AutoHashMapUnmanaged(u128, ?[]const u8).empty;
-        defer committed_vector_values.deinit(self.alloc);
-        try committed_vector_values.ensureTotalCapacity(self.alloc, @intCast(vector_lookup_count));
-        for (vector_lookups, vector_values) |lookup, value| {
-            committed_vector_values.putAssumeCapacity(lookup.logical_key, value);
-        }
         for (touched_keys) |key| {
             const posting_id = experimentalPostingValueKeyId(key);
             const kind = try experimentalPostingValueKeyKind(key);
-            const current = if (committed_vector_values.get(key)) |value|
-                value
-            else
-                self.readCommittedExperimentalPostingValue(&txn, posting_id, kind) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
+            const current = self.experimental_posting_captured_values.get(key) orelse
+                return error.MissingExperimentalPostingCaptureValue;
             if (current) |value| {
                 var emitted_patch = false;
                 if (experimentalPostingKindBenefitsFromPatch(kind)) {
@@ -3790,7 +3966,7 @@ pub const HBCIndex = struct {
                     if (previous) |base| {
                         const patch = try vectorindex_posting_wal.encodeReplacementPatchAlloc(self.alloc, kind, base, value);
                         if (patch.len < value.len) {
-                            owned_payloads.appendAssumeCapacity(patch);
+                            owned_patches.appendAssumeCapacity(patch);
                             records.appendAssumeCapacity(.{
                                 .kind = .mutation,
                                 .posting_id = posting_id,
@@ -3804,13 +3980,11 @@ pub const HBCIndex = struct {
                     }
                 }
                 if (!emitted_patch) {
-                    const owned = try self.alloc.dupe(u8, value);
-                    owned_payloads.appendAssumeCapacity(owned);
                     records.appendAssumeCapacity(.{
                         .kind = kind,
                         .posting_id = posting_id,
                         .source_sequence = covered_source_sequence,
-                        .payload = owned,
+                        .payload = value,
                     });
                 }
             } else {
@@ -3839,7 +4013,7 @@ pub const HBCIndex = struct {
                 .payload = &.{},
             });
         }
-        try posting_store.appendBatchWithOptions(batch_id, records.items, covered_source_sequence, .{ .sync = options.sync });
+        try self.appendExperimentalPostingBatchDurably(batch_id, records.items, covered_source_sequence, options);
 
         // The live immutable generation is itself the next delta encoder base.
         // Only the restart/fallback path maintains a separate materialized
@@ -3848,27 +4022,41 @@ pub const HBCIndex = struct {
             for (touched_keys) |key| {
                 const posting_id = experimentalPostingValueKeyId(key);
                 const kind = try experimentalPostingValueKeyKind(key);
-                const current = if (committed_vector_values.get(key)) |value|
-                    value
-                else
-                    self.readCommittedExperimentalPostingValue(&txn, posting_id, kind) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
+                const current = self.experimental_posting_captured_values.get(key) orelse
+                    return error.MissingExperimentalPostingCaptureValue;
                 try state.set(posting_id, kind, current);
             }
         }
-        if (touched_keys.len > 0) self.publishExperimentalPostingReadOverlay(&txn, touched_keys) catch |err| {
-            // The durable segment + WAL remains valid. Drop only the live
-            // generation so queries safely use LSM until restart instead of
-            // invalidating a successfully committed derived batch.
-            std.log.warn("dense posting sidecar live overlay publication failed sequence={} err={s}", .{
-                covered_source_sequence,
-                @errorName(err),
-            });
-            self.disableExperimentalPostingReads();
-            self.clearExperimentalPostingReadGeneration();
-        };
+        if (touched_keys.len > 0) {
+            self.publishExperimentalPostingReadOverlay(touched_keys) catch |overlay_err| {
+                if (self.experimental_posting_wal_authoritative.load(.acquire)) {
+                    // The durable batch is complete. Reconstruct a flat root
+                    // from disk so lack of memory for a cheap live overlay
+                    // cannot force an invalid LSM fallback.
+                    self.refreshExperimentalPostingReadGeneration(covered_source_sequence) catch |refresh_err| {
+                        // The batch is durable but cannot be installed. Stop
+                        // all reads and subsequent mutations from falling back
+                        // to stale LSM state; the owning runtime can reopen and
+                        // recover the committed WAL generation.
+                        self.disableExperimentalPostingReads();
+                        std.log.err("dense posting WAL durable generation reload failed sequence={} overlay_err={s} reload_err={s}", .{
+                            covered_source_sequence,
+                            @errorName(overlay_err),
+                            @errorName(refresh_err),
+                        });
+                        return refresh_err;
+                    };
+                } else {
+                    std.log.warn("dense posting sidecar live overlay publication failed sequence={} err={s}", .{
+                        covered_source_sequence,
+                        @errorName(overlay_err),
+                    });
+                    self.disableExperimentalPostingReads();
+                    self.clearExperimentalPostingReadGeneration();
+                }
+            };
+        }
+        const posting_store = &self.experimental_posting_write_store.?;
         return .{
             .batch_id = batch_id,
             .covered_source_sequence = covered_source_sequence,
@@ -4283,17 +4471,7 @@ pub const HBCIndex = struct {
         var segment_owned = true;
         errdefer if (segment_owned) segment.deinit();
         if (try segment.getValue(0, .index_metadata)) |encoded_metadata| {
-            const checkpoint_metadata = IndexMetadata.decode(encoded_metadata);
-            if (checkpoint_metadata.version != self.metadata.version or
-                checkpoint_metadata.dims != self.metadata.dims or
-                checkpoint_metadata.branching_factor != self.metadata.branching_factor or
-                checkpoint_metadata.leaf_size != self.metadata.leaf_size or
-                checkpoint_metadata.use_quantization != self.metadata.use_quantization or
-                checkpoint_metadata.quantizer_seed != self.metadata.quantizer_seed or
-                checkpoint_metadata.metric != self.metadata.metric)
-            {
-                return error.PostingCheckpointMetadataMismatch;
-            }
+            _ = try self.decodeExperimentalPostingMetadata(encoded_metadata);
         }
         var wal = try opened.store.recoverWal();
         var wal_owned = true;
@@ -4331,17 +4509,22 @@ pub const HBCIndex = struct {
         errdefer self.alloc.destroy(state);
         state.* = .{
             .alloc = self.alloc,
+            .covered_source_sequence = opened.store.covered_source_sequence,
             .retained_segment = opened.segment,
             .segment = segment,
             .vector_directory = vector_directory,
-            .wal = wal,
+            .wal_committed_bytes = @intCast(wal.replay.committed_bytes),
         };
         segment_bytes_owned = false;
         segment_owned = false;
-        wal_owned = false;
         var state_initialized = true;
         errdefer if (state_initialized) state.deinit();
-        try state.materializeWal();
+        try state.materializeWal(&wal);
+        // Materialized full values borrow from the recovered byte buffer; the
+        // replay frame index itself is no longer needed after activation.
+        state.wal_bytes = wal.bytes;
+        wal.replay.deinit();
+        wal_owned = false;
         state_initialized = false;
         return state;
     }
@@ -4361,14 +4544,40 @@ pub const HBCIndex = struct {
     pub fn activateExperimentalPostingReads(self: *HBCIndex, expected_source_sequence: u64) !void {
         if (self.experimentalPostingReadGenerationLoaded()) return error.ExperimentalPostingReadsAlreadyLoaded;
         const state = try self.loadExperimentalPostingState(expected_source_sequence);
-        errdefer {
+        try self.activateExperimentalPostingReadState(state);
+    }
+
+    /// A WAL-authoritative generation may be one committed source operation
+    /// ahead when a process crashes after posting-WAL fsync but before the
+    /// catalog watermark write. Existing source replay is idempotent, so this
+    /// is valid prepared state. Falling behind the catalog is never valid.
+    pub fn activateExperimentalPostingReadsAtOrAfter(self: *HBCIndex, minimum_source_sequence: u64) !u64 {
+        if (self.experimentalPostingReadGenerationLoaded()) return error.ExperimentalPostingReadsAlreadyLoaded;
+        const state = try self.loadExperimentalPostingState(null);
+        const covered_source_sequence = state.covered_source_sequence;
+        if (covered_source_sequence < minimum_source_sequence) {
             state.deinit();
             self.alloc.destroy(state);
+            return error.PostingCheckpointSequenceMismatch;
         }
+        try self.activateExperimentalPostingReadState(state);
+        return covered_source_sequence;
+    }
+
+    fn activateExperimentalPostingReadState(self: *HBCIndex, state: *ExperimentalPostingReadState) !void {
+        var state_owned = true;
+        errdefer if (state_owned) {
+            state.deinit();
+            self.alloc.destroy(state);
+        };
         const generation = try ExperimentalPostingReadGeneration.createRoot(self.alloc, state);
+        state_owned = false;
+        var generation_owned = true;
+        errdefer if (generation_owned) generation.release();
+        try self.installExperimentalPostingRootGeneration(generation);
+        generation_owned = false;
         self.experimental_posting_sidecar_managed = true;
-        self.experimental_posting_overlay_collapsed_wal_bytes = @intCast(state.wal.replay.committed_bytes);
-        self.installExperimentalPostingReadGeneration(generation);
+        self.experimental_posting_overlay_collapsed_wal_bytes = state.wal_committed_bytes;
     }
 
     pub fn experimentalPostingReadsEnabled(self: *const HBCIndex) bool {
@@ -4545,11 +4754,14 @@ pub const HBCIndex = struct {
                 .posting_id = decodeQuantizedNodeId(key) orelse return null,
                 .kind = .quantized_checkpoint,
             },
-            // Projection/applied-sequence changes share the global metadata
-            // row but are not query-derived index mutations. The immutable
-            // checkpoint retains a recovery/config copy; runtime metadata
-            // remains sourced from the authoritative catalog.
-            .meta => null,
+            // Mutable topology and counts must recover from the same epoch as
+            // posting values. Projection progress shares this compact row, so
+            // independent metadata-only updates are published as maintenance
+            // batches at the current source sequence.
+            .meta => if (std.mem.eql(u8, key, meta_key))
+                .{ .posting_id = 0, .kind = .index_metadata }
+            else
+                null,
             .vecs => if (decodeVectorDerivedKey(key)) |decoded|
                 .{ .posting_id = decoded.vector_id, .kind = decoded.kind }
             else
@@ -4560,17 +4772,32 @@ pub const HBCIndex = struct {
     /// Called before the authoritative mutation is staged. Non-posting keys
     /// cannot stale the sidecar. A covered posting mutation is captured;
     /// otherwise CURRENT is removed before that mutation can commit.
-    fn noteExperimentalPostingMutation(self: *HBCIndex, namespace: Namespace, key: []const u8) !void {
-        const posting_value = experimentalPostingMutationIdentity(namespace, key) orelse return;
+    fn noteExperimentalPostingMutation(
+        self: *HBCIndex,
+        namespace: Namespace,
+        key: []const u8,
+        value: ?[]const u8,
+    ) !bool {
+        const posting_value = experimentalPostingMutationIdentity(namespace, key) orelse return false;
         if (!self.experimental_posting_capture_enabled) {
+            if (self.experimental_posting_wal_authoritative.load(.acquire)) {
+                // A query-facing derived mutation outside a publication
+                // boundary would otherwise exist in neither the committed WAL
+                // nor a complete LSM fallback. Refuse it before staging.
+                return error.PostingWalMutationOutsideCapture;
+            }
             if (self.experimental_posting_sidecar_managed) try self.invalidateExperimentalPostingSidecar();
-            return;
+            return false;
         }
-        try self.experimental_touched_posting_values.put(
+        const owned = if (value) |bytes| try self.alloc.dupe(u8, bytes) else null;
+        errdefer if (owned) |bytes| self.alloc.free(bytes);
+        const result = try self.experimental_posting_captured_values.getOrPut(
             self.alloc,
             experimentalPostingValueKey(posting_value.posting_id, posting_value.kind),
-            {},
         );
+        if (result.found_existing) if (result.value_ptr.*) |old| self.alloc.free(old);
+        result.value_ptr.* = owned;
+        return self.experimental_posting_mutation_base_generation != null;
     }
 
     fn experimentalPostingValue(self: *HBCIndex, txn: anytype, namespace: Namespace, key: []const u8) !?[]const u8 {
@@ -4605,6 +4832,22 @@ pub const HBCIndex = struct {
         };
     }
 
+    /// Resolves mutation reads against the transaction-window overlay and its
+    /// pinned immutable base. Read transactions deliberately do not use this
+    /// path: they keep serving the last fully committed generation until WAL
+    /// commit and overlay publication complete together.
+    fn experimentalPostingMutationValue(self: *HBCIndex, txn: anytype, namespace: Namespace, key: []const u8) !?[]const u8 {
+        const Child = comptime txnLikeChild(@TypeOf(txn));
+        if (comptime Child == vectorindex_store.NamespaceReadTxn) return null;
+        const base = self.experimental_posting_mutation_base_generation orelse return null;
+        const identity = experimentalPostingMutationIdentity(namespace, key) orelse return null;
+        const logical_key = experimentalPostingValueKey(identity.posting_id, identity.kind);
+        if (self.experimental_posting_captured_values.get(logical_key)) |captured| {
+            return captured orelse error.NotFound;
+        }
+        return try base.value(identity.posting_id, identity.kind);
+    }
+
     /// Batch lookups must honor the same immutable transaction lease as point
     /// reads; otherwise rerank metadata and split planning silently fall back
     /// to a newer LSM snapshot than the posting generation.
@@ -4627,6 +4870,14 @@ pub const HBCIndex = struct {
                 }
                 return;
             }
+        } else if (self.experimental_posting_mutation_base_generation != null) {
+            for (keys, values) |key, *value| {
+                value.* = self.getNamespaced(txn, namespace, key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+            }
+            return;
         }
         try txn.getManySorted(namespace, keys, values);
     }
@@ -4637,6 +4888,7 @@ pub const HBCIndex = struct {
                 return staged.value orelse error.NotFound;
             }
         }
+        if (try self.experimentalPostingMutationValue(txn, namespace, key)) |value| return value;
         if (try self.experimentalPostingValue(txn, namespace, key)) |value| return value;
         const Child = comptime txnLikeChild(@TypeOf(txn));
         switch (Child) {
@@ -4649,6 +4901,7 @@ pub const HBCIndex = struct {
     }
 
     fn getNamespacedCommitted(self: *HBCIndex, txn: anytype, comptime namespace: Namespace, key: []const u8) ![]const u8 {
+        if (try self.experimentalPostingMutationValue(txn, namespace, key)) |value| return value;
         if (try self.experimentalPostingValue(txn, namespace, key)) |value| return value;
         const Child = comptime txnLikeChild(@TypeOf(txn));
         switch (Child) {
@@ -4666,8 +4919,9 @@ pub const HBCIndex = struct {
             vectorindex_store.NamespaceWriteTxn,
             vectorindex_store.NamespaceBatch,
             => {
-                try self.noteExperimentalPostingMutation(namespace, key);
+                const wal_owned = try self.noteExperimentalPostingMutation(namespace, key, value);
                 if (namespace == .nodes and try self.stageNodeKeyPut(key, value)) return;
+                if (wal_owned) return;
                 try txn.put(namespace, key, value);
                 self.noteNamespacePut(namespace, key.len, value.len, false);
             },
@@ -4680,7 +4934,7 @@ pub const HBCIndex = struct {
         const Child = comptime txnLikeChild(@TypeOf(txn));
         switch (Child) {
             vectorindex_store.NamespaceWriteTxn => {
-                try self.noteExperimentalPostingMutation(namespace, key);
+                if (try self.noteExperimentalPostingMutation(namespace, key, value)) return;
                 txn.appendPut(namespace, key, value) catch |err| switch (err) {
                     error.Unsupported => {
                         try txn.put(namespace, key, value);
@@ -4692,7 +4946,7 @@ pub const HBCIndex = struct {
                 self.noteNamespacePut(namespace, key.len, value.len, true);
             },
             vectorindex_store.NamespaceBatch => {
-                try self.noteExperimentalPostingMutation(namespace, key);
+                if (try self.noteExperimentalPostingMutation(namespace, key, value)) return;
                 txn.appendPut(namespace, key, value) catch |err| switch (err) {
                     error.Unsupported => {
                         try txn.put(namespace, key, value);
@@ -4714,8 +4968,9 @@ pub const HBCIndex = struct {
             vectorindex_store.NamespaceWriteTxn,
             vectorindex_store.NamespaceBatch,
             => {
-                try self.noteExperimentalPostingMutation(namespace, key);
+                const wal_owned = try self.noteExperimentalPostingMutation(namespace, key, null);
                 if (namespace == .nodes and try self.stageNodeKeyDelete(key)) return;
+                if (wal_owned) return;
                 try txn.delete(namespace, key);
                 self.noteNamespaceDelete(namespace, key.len);
             },
@@ -4804,6 +5059,9 @@ pub const HBCIndex = struct {
     pub fn beginRuntimeReadTxn(self: *HBCIndex) !vectorindex_store.NamespaceReadTxn {
         while (true) {
             const generation = self.acquireExperimentalPostingReadGeneration();
+            if (generation == null and self.experimental_posting_wal_authoritative.load(.acquire)) {
+                return error.PostingWalMutationStoreUnavailable;
+            }
             var txn = self.store.beginRead() catch |err| {
                 if (generation) |acquired| acquired.release();
                 return err;
@@ -4826,6 +5084,9 @@ pub const HBCIndex = struct {
     pub fn beginRuntimeSearchTxn(self: *HBCIndex) !vectorindex_store.NamespaceReadTxn {
         while (true) {
             const generation = self.acquireExperimentalPostingReadGeneration();
+            if (generation == null and self.experimental_posting_wal_authoritative.load(.acquire)) {
+                return error.PostingWalMutationStoreUnavailable;
+            }
             var txn = self.store.beginProbeOrRead() catch |err| {
                 if (generation) |acquired| acquired.release();
                 return err;
@@ -4853,7 +5114,10 @@ pub const HBCIndex = struct {
             self.apply_workspace_split_bytes = 0;
             self.observeApplyWorkspaceBytes();
         }
-        return try self.store.beginWrite();
+        var txn = try self.store.beginWrite();
+        errdefer txn.abort();
+        try self.markExperimentalPostingWalAuthoritative(&txn);
+        return txn;
     }
 
     pub fn beginRuntimeBatchTxn(self: *HBCIndex) !vectorindex_store.NamespaceBatch {
@@ -4864,7 +5128,10 @@ pub const HBCIndex = struct {
             self.apply_workspace_split_bytes = 0;
             self.observeApplyWorkspaceBytes();
         }
-        return try self.store.beginBatch();
+        var txn = try self.store.beginBatch();
+        errdefer txn.abort();
+        try self.markExperimentalPostingWalAuthoritative(&txn);
+        return txn;
     }
 
     pub fn beginRuntimeBatchTxnOptions(self: *HBCIndex, options: BatchInsertOptions) !vectorindex_store.NamespaceBatch {
@@ -4884,10 +5151,32 @@ pub const HBCIndex = struct {
         // batch-exit maintenance until the session boundary. Direct-bulk LSM
         // profiles and non-LSM backends stay in default mode; otherwise stale
         // internal rewrites can become durable table bytes during large loads.
-        return try self.store.beginBatchWithOptions(.{
+        var txn = try self.store.beginBatchWithOptions(.{
             .mode = self.runtimeBatchMode(in_bulk_session),
             .defer_commit_flush = in_bulk_session,
         });
+        errdefer txn.abort();
+        try self.markExperimentalPostingWalAuthoritative(&txn);
+        return txn;
+    }
+
+    fn markExperimentalPostingWalAuthoritative(self: *HBCIndex, txn: anytype) !void {
+        if (self.experimental_posting_mutation_base_generation == null or
+            self.experimental_posting_wal_authoritative_persisted) return;
+        try txn.put(.meta, posting_wal_authoritative_key, posting_wal_authoritative_value);
+        // This is conservatively sticky in memory even if the surrounding
+        // transaction later aborts. The next writable transaction stages the
+        // same idempotent marker again, while startup trusts only committed
+        // storage.
+        self.experimental_posting_wal_authoritative.store(true, .release);
+    }
+
+    fn noteExperimentalPostingWalAuthorityCommit(self: *HBCIndex) void {
+        if (self.experimental_posting_mutation_base_generation != null and
+            self.experimental_posting_wal_authoritative.load(.acquire))
+        {
+            self.experimental_posting_wal_authoritative_persisted = true;
+        }
     }
 
     fn runtimeBatchMode(self: *const HBCIndex, in_bulk_session: bool) vectorindex_store.BatchMode {
@@ -5685,13 +5974,17 @@ pub const HBCIndex = struct {
     }
 
     pub fn saveProjectionCheckpointMetadata(self: *HBCIndex, checkpoint: ProjectionCheckpointMetadata) !void {
+        const posting_capture = try self.beginExperimentalPostingMaintenanceCapture();
+        errdefer if (posting_capture != null) self.cancelExperimentalPostingMaintenanceCapture();
         var txn = try self.beginRuntimeBatchTxnOptions(.{});
         var active = true;
         errdefer if (active) txn.abort();
         self.metadata.setProjectionCheckpoint(checkpoint);
         try self.flushMetadataNow(&txn);
         try txn.commit();
+        self.noteExperimentalPostingWalAuthorityCommit();
         active = false;
+        if (posting_capture) |capture| try self.finishExperimentalPostingMaintenanceCapture(capture);
     }
 
     fn persistBulkPublishState(self: *HBCIndex) !void {
@@ -5751,6 +6044,7 @@ pub const HBCIndex = struct {
         self.beginPublishedSearchStateRefresh();
         errdefer self.abortPublishedSearchStateRefresh();
         try commitTxn(txn);
+        self.noteExperimentalPostingWalAuthorityCommit();
         self.write_profile.insert_commit_ns += elapsedSince(commit_start);
         self.finishPublishedSearchStateRefresh();
     }
@@ -7939,7 +8233,7 @@ pub const HBCIndex = struct {
         const posting_capture = try self.beginExperimentalPostingMaintenanceCapture();
         errdefer if (posting_capture != null) self.cancelExperimentalPostingMaintenanceCapture();
         const report = try vectorindex_hbc_index.repairLinks(self, max_nodes);
-        if (posting_capture) |capture| self.finishExperimentalPostingMaintenanceCaptureBestEffort(capture);
+        if (posting_capture) |capture| try self.finishExperimentalPostingMaintenanceCapture(capture);
         if (report.completed) self.link_repair_pending.store(false, .release);
         return report;
     }
@@ -8031,9 +8325,10 @@ pub const HBCIndex = struct {
         self.beginPublishedSearchStateRefresh();
         errdefer self.abortPublishedSearchStateRefresh();
         try commitTxn(&txn);
+        self.noteExperimentalPostingWalAuthorityCommit();
         self.write_profile.insert_commit_ns += elapsedSince(commit_start);
         self.finishPublishedSearchStateRefresh();
-        if (posting_capture) |capture| self.finishExperimentalPostingMaintenanceCaptureBestEffort(capture);
+        if (posting_capture) |capture| try self.finishExperimentalPostingMaintenanceCapture(capture);
         return result;
     }
 
@@ -9125,6 +9420,252 @@ test "background posting checkpoint preserves concurrent same-sequence WAL tail"
     defer results.deinit();
     try std.testing.expectEqual(@as(usize, 5), results.items.items.len);
     try std.testing.expectEqualStrings("doc:5", results.items.items[0].metadata.?);
+}
+
+test "posting WAL mutations provide read your writes without derived LSM persistence" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    {
+        var idx = try HBCIndex.open(alloc, path, .{
+            .dims = 2,
+            .leaf_size = 8,
+            .branching_factor = 2,
+            .search_width = 8,
+            .use_quantization = true,
+            .storage_backend = .lsm,
+        });
+        defer idx.close();
+
+        // Bootstrap remains authoritative in the LSM until one complete
+        // immutable generation exists.
+        try idx.beginExperimentalPostingMutationCapture();
+        try idx.insertWithMetadata(1, &[_]f32{ 1.0, 0.0 }, "doc:1");
+        try idx.persistExperimentalPostingSidecarAtAppliedSequence(1, .{});
+        idx.enableExperimentalPostingWalMutations();
+
+        var pinned_before_mutation = try idx.beginReadTxn();
+        try idx.beginExperimentalPostingMutationCapture();
+        try idx.insertWithMetadata(2, &[_]f32{ 0.0, 1.0 }, "doc:2");
+
+        // Queries remain on the committed generation until the derived batch
+        // commits. The transaction window itself has already routed and read
+        // through its pinned base plus captured writes.
+        try std.testing.expectEqual(@as(?[]const u8, null), try idx.getMetadataInTxn(&pinned_before_mutation, 2));
+
+        var leaf_key_buf: [10]u8 = undefined;
+        var lsm_read = try idx.store.beginRead();
+        defer lsm_read.abort();
+        try std.testing.expectError(error.NotFound, lsm_read.get(.vecs, encodeVecLeafKey(&leaf_key_buf, 2)));
+
+        try idx.persistExperimentalPostingSidecarAtAppliedSequence(2, .{});
+        try std.testing.expectEqual(@as(?[]const u8, null), try idx.getMetadataInTxn(&pinned_before_mutation, 2));
+        pinned_before_mutation.abort();
+        var after_publish = try idx.search(&[_]f32{ 0.0, 1.0 }, 2);
+        defer after_publish.deinit();
+        try std.testing.expectEqual(@as(usize, 2), after_publish.items.items.len);
+        try std.testing.expectEqualStrings("doc:2", after_publish.items.items[0].metadata.?);
+    }
+
+    {
+        var reopened = try HBCIndex.open(alloc, path, .{
+            .dims = 2,
+            .leaf_size = 8,
+            .branching_factor = 2,
+            .search_width = 8,
+            .use_quantization = true,
+            .storage_backend = .lsm,
+        });
+        defer reopened.close();
+        try std.testing.expect(reopened.experimentalPostingWalAuthoritative());
+        try reopened.activateExperimentalPostingReads(2);
+
+        // Durable authority itself makes WAL routing sticky; a post-restart
+        // mutation must not depend on the original rollout flag or another
+        // enable call. The corresponding derived LSM rows do not exist.
+        try reopened.beginExperimentalPostingMutationCapture();
+        try reopened.insertWithMetadata(3, &[_]f32{ 0.5, 0.5 }, "doc:3");
+        try reopened.persistExperimentalPostingSidecarAtAppliedSequence(3, .{});
+        var results = try reopened.search(&[_]f32{ 0.5, 0.5 }, 3);
+        defer results.deinit();
+        try std.testing.expectEqual(@as(usize, 3), results.items.items.len);
+        try std.testing.expectEqualStrings("doc:3", results.items.items[0].metadata.?);
+
+        // Model the stale mutable metadata that remains in the LSM after
+        // query-facing state moves to the posting store. Restart must source
+        // mutable topology/count metadata from the same WAL generation as the
+        // postings, not combine two different recovery epochs.
+        var stale_metadata = reopened.metadata;
+        stale_metadata.root_node = 1;
+        stale_metadata.active_count = 0;
+        stale_metadata.node_count = 1;
+        var metadata_buf: [IndexMetadata.encoded_size]u8 = undefined;
+        var stale_txn = try reopened.store.beginWrite();
+        errdefer stale_txn.abort();
+        try stale_txn.put(.meta, meta_key, stale_metadata.encode(&metadata_buf));
+        try stale_txn.commit();
+    }
+
+    var final = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 8,
+        .branching_factor = 2,
+        .search_width = 8,
+        .use_quantization = true,
+        .storage_backend = .lsm,
+    });
+    defer final.close();
+    try std.testing.expectEqual(@as(u64, 0), final.stats().active_count);
+    try std.testing.expectError(error.PostingCheckpointSequenceMismatch, final.activateExperimentalPostingReads(2));
+    try std.testing.expectEqual(@as(u64, 3), try final.activateExperimentalPostingReadsAtOrAfter(2));
+    try std.testing.expectEqual(@as(u64, 3), final.stats().active_count);
+    var results = try final.search(&[_]f32{ 0.5, 0.5 }, 3);
+    defer results.deinit();
+    try std.testing.expectEqual(@as(usize, 3), results.items.items.len);
+    try std.testing.expectEqualStrings("doc:3", results.items.items[0].metadata.?);
+}
+
+test "posting WAL mutation capture aborts without publishing partial state" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 8,
+        .branching_factor = 2,
+        .search_width = 8,
+        .use_quantization = true,
+        .storage_backend = .lsm,
+    });
+    defer idx.close();
+
+    try idx.beginExperimentalPostingMutationCapture();
+    try idx.insertWithMetadata(1, &[_]f32{ 1.0, 0.0 }, "doc:1");
+    try idx.persistExperimentalPostingSidecarAtAppliedSequence(1, .{});
+    idx.enableExperimentalPostingWalMutations();
+
+    var store_before = try idx.openExperimentalPostingStore();
+    const committed_bytes_before = store_before.wal_committed_bytes;
+    const last_batch_before = store_before.last_committed_batch;
+    store_before.deinit();
+
+    try idx.beginExperimentalPostingMutationCapture();
+    var txn = try idx.beginWriteTxn();
+    var txn_active = true;
+    defer if (txn_active) txn.abort();
+    var leaf_key_buf: [10]u8 = undefined;
+    const leaf_key = encodeVecLeafKey(&leaf_key_buf, 99);
+    try idx.putNamespaced(&txn, .vecs, leaf_key, &.{ 1, 2, 3, 4 });
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, try idx.getNamespaced(&txn, .vecs, leaf_key));
+    txn.abort();
+    txn_active = false;
+    idx.cancelExperimentalPostingMutationCapture();
+
+    var committed_read = try idx.beginReadTxn();
+    defer committed_read.abort();
+    try std.testing.expectError(error.NotFound, idx.getNamespaced(&committed_read, .vecs, leaf_key));
+    var store_after = try idx.openExperimentalPostingStore();
+    defer store_after.deinit();
+    try std.testing.expectEqual(committed_bytes_before, store_after.wal_committed_bytes);
+    try std.testing.expectEqual(last_batch_before, store_after.last_committed_batch);
+
+    // A source window can also fail after its local HBC transaction commits
+    // but before posting-WAL publication. WAL-only state and mutable metadata
+    // must roll back to the pinned immutable base, not linger in caches.
+    try idx.beginExperimentalPostingMutationCapture();
+    try idx.insertWithMetadata(2, &[_]f32{ 0.0, 1.0 }, "doc:2");
+    try std.testing.expectEqual(@as(u64, 2), idx.stats().active_count);
+    idx.cancelExperimentalPostingMutationCapture();
+    try std.testing.expectEqual(@as(u64, 1), idx.stats().active_count);
+    var after_cancel = try idx.search(&[_]f32{ 0.0, 1.0 }, 2);
+    defer after_cancel.deinit();
+    try std.testing.expectEqual(@as(usize, 1), after_cancel.items.items.len);
+    try std.testing.expectEqualStrings("doc:1", after_cancel.items.items[0].metadata.?);
+
+    // Once the marker is authoritative, query-facing mutations outside a
+    // capture boundary are rejected before either store is changed.
+    idx.experimental_posting_wal_authoritative.store(true, .release);
+    var outside_txn = try idx.beginWriteTxn();
+    defer outside_txn.abort();
+    try std.testing.expectError(
+        error.PostingWalMutationOutsideCapture,
+        idx.putNamespaced(&outside_txn, .vecs, leaf_key, &.{9}),
+    );
+
+    // If an authoritative live generation becomes unavailable, neither
+    // queries nor the next mutation may silently consult stale LSM rows.
+    idx.disableExperimentalPostingReads();
+    try std.testing.expectError(error.PostingWalMutationStoreUnavailable, idx.beginRuntimeReadTxn());
+    try std.testing.expectError(error.PostingWalMutationStoreUnavailable, idx.beginRuntimeSearchTxn());
+    try std.testing.expectError(error.PostingWalMutationStoreUnavailable, idx.beginExperimentalPostingMutationCapture());
+}
+
+test "posting WAL capture can begin inside a streaming replay session" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    {
+        var idx = try HBCIndex.open(alloc, path, .{
+            .dims = 2,
+            .leaf_size = 8,
+            .branching_factor = 2,
+            .search_width = 8,
+            .use_quantization = true,
+            .storage_backend = .lsm,
+        });
+        defer idx.close();
+
+        try idx.beginExperimentalPostingMutationCapture();
+        try idx.insertWithMetadata(1, &[_]f32{ 1.0, 0.0 }, "doc:1");
+        try idx.persistExperimentalPostingSidecarAtAppliedSequence(1, .{});
+        idx.enableExperimentalPostingWalMutations();
+
+        // A long-lived replay session can already be open when the next
+        // independently durable source window begins. This ordering used to
+        // silently skip capture and later fail with
+        // PostingWalMutationOutsideCapture.
+        try idx.beginStreamingReplaySession();
+        var session_open = true;
+        defer if (session_open) idx.abortStreamingReplaySession();
+        try idx.beginExperimentalPostingMutationCapture();
+        try idx.insertWithMetadata(2, &[_]f32{ 0.0, 1.0 }, "doc:2");
+
+        // WAL publication remains fenced until the backend session itself has
+        // established its durability boundary.
+        try std.testing.expectError(
+            error.ActiveWriteSession,
+            idx.persistExperimentalPostingSidecarAtAppliedSequence(2, .{}),
+        );
+        try idx.finishStreamingReplaySessionWithOptions(.{ .compact = false });
+        session_open = false;
+        try idx.persistExperimentalPostingSidecarAtAppliedSequence(2, .{});
+
+        var leaf_key_buf: [10]u8 = undefined;
+        var lsm_read = try idx.store.beginRead();
+        defer lsm_read.abort();
+        try std.testing.expectError(error.NotFound, lsm_read.get(.vecs, encodeVecLeafKey(&leaf_key_buf, 2)));
+    }
+
+    var reopened = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 8,
+        .branching_factor = 2,
+        .search_width = 8,
+        .use_quantization = true,
+        .storage_backend = .lsm,
+    });
+    defer reopened.close();
+    try reopened.activateExperimentalPostingReads(2);
+    var results = try reopened.search(&[_]f32{ 0.0, 1.0 }, 2);
+    defer results.deinit();
+    try std.testing.expectEqual(@as(usize, 2), results.items.items.len);
+    try std.testing.expectEqualStrings("doc:2", results.items.items[0].metadata.?);
 }
 
 test "managed posting sidecar follows applied sequence and uncovered writes invalidate it" {

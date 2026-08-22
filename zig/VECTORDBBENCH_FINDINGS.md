@@ -908,14 +908,132 @@ Restart admitted the mmap generation at exact sequence 501 and served 110 QPS
 at concurrency 1 and 695 at concurrency 5 before the external harness was
 interrupted. Recall remained within the prior public runs' normal spread.
 
-This does **not** yet remove derived HBC keys from the general LSM. The segment
-and WAL are a rebuildable acceleration while the LSM/source journal remains
-the recovery authority and supplies transaction-local read-your-writes. Safely
-removing duplicate derived persistence requires a transactional delta writer
-that participates in HBC mutations, supports rollback/read-your-writes, and
-has an explicit rebuild/failover contract. Deleting LSM keys after commit or
-making the current post-commit capture authoritative would create a crash
-window and is not an acceptable benchmark optimization.
+### WAL-authoritative mutation-store follow-up
+
+The next implementation removes normal query-facing HBC mutation persistence
+from the general LSM after one complete immutable generation exists. This is a
+storage ownership change, not a benchmark-only omission. The source table and
+its replay journal remain authoritative for documents and raw embeddings. The
+posting segment plus its ordered WAL become authoritative for the derived HBC
+query state: packed nodes, posting-maintenance state, quantized checkpoints,
+node split ranges, vector-to-leaf assignments, result metadata, and mutable
+topology/count metadata.
+
+The transition is explicit and crash-safe. A new or legacy index first builds
+a complete checkpoint from the LSM. The next covered mutation pins that
+immutable generation, owns each final value in a transaction-local map, and
+stages a sticky authority marker in HBC metadata. Query-facing derived puts and
+deletes then bypass the LSM. The source transaction/replay window establishes
+its backend durability boundary before one checksummed posting-WAL batch is
+fsynced; only after that append succeeds may the source applied watermark
+advance. A crash after the posting append but before the applied-watermark
+write is a prepared-ahead generation: startup admits it at or above the older
+source watermark and idempotent source replay closes the gap.
+
+Read-your-writes no longer requires a post-commit LSM snapshot. Write
+transactions resolve the owned mutation map first and their pinned immutable
+base second. Committed queries retain one immutable generation lease; an
+overlay is installed only after its WAL commit, so old queries finish on the
+old view and new queries observe the complete new view. Captured allocations
+move into the immutable overlay rather than being copied again. Raw vectors
+remain source-owned and use the external loader, avoiding a duplicate
+1,536-dimensional or 768-dimensional corpus in the posting format.
+
+Failure behavior changes once the marker commits. An optional pre-transition
+sidecar may still invalidate and use the complete LSM. A WAL-authoritative
+index may not: missing/corrupt startup state, a mutation outside capture, a
+missing live generation, or failure to reinstall a durably appended generation
+fails closed and leaves the source watermark unchanged. Ambiguous append
+errors reopen and parse the durable prefix: an already committed intended
+batch is acknowledged exactly once, an absent batch is retried once on the
+repaired tail, and a different batch id is a single-writer violation. The
+authority bit is atomic for concurrent query admission and remains effective
+after restart even when the rollout environment flag is removed.
+
+Maintenance uses the same store without fabricating source progress. A bounded
+posting repair opens its own capture only when no source capture exists and
+appends an independently ordered batch at the current covered source sequence.
+If it runs inside source replay, it joins that source capture. Compaction is not
+part of the foreground commit after a WAL batch is durable: overlays collapse
+at 32 MiB, an immutable background checkpoint starts at 128 MiB, and only the
+256 MiB recovery-debt ceiling may join the builder. Segment, next-generation
+WAL, then `CURRENT` remains the publication order.
+
+Legacy derived LSM rows are intentionally not deleted on the transition. They
+are unreachable after the authority marker and removing them eagerly would
+manufacture compaction debt during rollout. A rebuild can always regenerate a
+complete generation from the source journal; physical legacy-key reclamation
+belongs in a separately budgeted migration/compaction pass.
+
+The final public 50K qualification of this WAL-authoritative path used the
+standalone `/db/v1` API, batch size 100, four load workers, no default full-text
+index, asynchronous replay, the normal boundary rerank policy, live search,
+and process restart:
+
+| Public 50K WAL-authoritative | Insert | Catch-up | Total ready | Recall / NDCG | Serial p50 / p95 / p99 | Valid QPS at 1 / 5 / 10 / 20 / 30 | Load demand / RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Live | 38.53 s | 2.27 s | 40.80 s | 0.9860 / 0.9882 | 2.8 / 3.9 / 15.9 ms | 99 / 558 / 382 / 435 / 571 | 879 MB / 1.49 GB |
+| Restart at sequence 501 | -- | -- | -- | 0.9863 / 0.9885 | 2.5 / 3.2 / 6.7 ms | 104 / 608 / 350 / 435 / 509 | -- |
+
+All 50,000 vectors were query-visible. The durable posting state was a 629 KB
+bootstrap segment plus a 70.3 MB WAL; no derived leaf row for post-transition
+vectors existed in the HBC LSM. Concurrency 40 and above crossed public-server
+admission and returned HTTP 429, so VectorDBBench's larger nominal QPS values
+are rejected-attempt artifacts and are not saturation results.
+
+The first 1M attempt was stopped at about 843,400 visible rows rather than
+accepted after `PostingWalMutationOutsideCapture`. Bounded posting maintenance
+had just completed, and the next replay window inherited an already-open HBC
+streaming session. A guard from the old snapshot/readback design silently
+refused to start a new capture whenever LSM session batching was active. The
+WAL backend does not need an LSM snapshot, so capture ownership is now
+independent of LSM batching while publication remains forbidden until that
+session establishes durability.
+
+A second fresh run exposed a separate ownership race at about 562,400 visible
+rows. Catch-up startup saw that posting maintenance already owned a capture and
+treated `capture already active` as if the new source window owned it. The
+maintenance transaction then published and closed its capture before the first
+source mutation. Capture plus streaming-session acquisition is now atomic under
+the per-index apply mutex, posting maintenance uses the same mutex through WAL
+publication, and the only legal nested-capture case requires an already-open
+streaming-session lease. An active capture without that lease is an explicit
+`PostingWalCaptureOwnershipConflict`, never a silent join.
+
+Focused HBC and index-manager regressions exercise streaming-session-first
+ordering, independent-maintenance ownership rejection, legal source-window
+nesting, sticky post-restart authority, WAL read-your-writes, abort without
+publication, missing-generation fail-closed behavior, and restart recovery
+without derived LSM persistence. Both stopped 1M samples are diagnostic only;
+a fresh public qualification is required below.
+
+The final fresh public 1M lifecycle completed without a posting-WAL, runtime,
+or request failure. It crossed both former failure points and, more
+importantly, exercised the contested transition directly: posting maintenance
+repaired 73 steps at about 691K, 75 at about 834K, and 76 later in the load;
+catch-up continued and published new immutable generations after every event.
+
+| Public 1M WAL-authoritative | Insert | Catch-up | Total ready | Recall / NDCG | Serial p50 / p95 / p99 | Valid QPS at 1 / 5 / 10 / 20 / 30 | Demand / RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Live | 1,767.39 s | 6.72 s | 1,774.12 s | 0.9848 / 0.9869 | 35 / 638 / 660 ms | 3 / 28 / 66 / 86 / 68 | 2.91 GB / 2.59 GB ingestion |
+| Restart at sequence 10001 | -- | -- | -- | 0.9851 / 0.9871 | 36 / 562 / 589 ms | 3 / 39 / 77 / 97 / 93 | 2.60 GB / 1.77 GB query |
+
+All 1,000,000 vectors were query-visible. Recall changed by 0.03 percentage
+points across restart. The final durable posting state was a 242.5 MB mapped
+segment plus a 108.1 MB WAL; the entire table directory was 3.6 GB. The
+ingestion physical-footprint ledger peak was 1.90 GB. Concurrency 40 and above
+returned HTTP 429 and is excluded. The live query immediately followed primary
+LSM compaction; restart improved c5--c30 throughput and tail latency while the
+borrowed-WAL loader kept restart RSS well below ingestion RSS.
+
+This is 41% faster than the reported 3,000-second load, but it does **not**
+meet the hypothesized 13-minute target and is slower than the earlier 1,612
+second full-segment diagnostic. The remaining ingestion cost is now visibly in
+the source/embedding LSM rather than duplicated HBC posting persistence: the
+final source LSM reported 2.52 GB of cumulative mutable snapshot copies and
+3.24 GB of read-snapshot rotations despite only one pressure compaction. That
+is the next general Antfly bottleneck; it should not be hidden by weakening
+posting-WAL durability or rerank policy.
 
 The follow-up sampler had one incomplete `vmmap` sample while the original
 server process was exiting; its RSS fallback made the synthesized
@@ -967,16 +1085,15 @@ published.
    41.65 seconds with a 38.72--43.14 second range, but the single follow-up 1M
    lifecycle remains diagnostic because compaction scheduling produced
    materially different curves on the same host.
-5. Repeat the public 1M qualification with the ordered derived epoch and
-   transaction-leased immutable generations, checking that `CURRENT` remains
-   uninterrupted through maintenance and delayed applied-sequence callbacks.
-   Preserve exact source-sequence admission, safe failure fallback, normal
-   rerank-policy boundaries, and identical LSM/sidecar ranked results.
-6. Repeat the public 1M qualification with the full derived-state directory,
-   mmap/index-first admission, and batched tiny-value capture. Track insert,
-   catch-up, recall, serial and saturated query latency, segment/WAL size,
-   snapshot copies, attributable demand, and cache-inclusive RSS separately.
-7. Before removing derived HBC keys from the LSM, prototype a transactional
-   segment-WAL mutation backend with rollback and read-your-writes. Prove crash
-   recovery at every source/derived publication boundary and preserve the
-   existing authoritative-journal rebuild path.
+5. Add deterministic fault injection at every posting-WAL append, fsync,
+   checkpoint staging, `CURRENT` replacement, overlay allocation, and applied
+   watermark boundary. The production ordering and fail-closed recovery paths
+   now exist; exhaustive crash-matrix automation remains the release gate.
+6. Move the WAL-authoritative store from rollout environment flags to an
+   explicit catalog capability once mixed-version upgrade/downgrade policy is
+   defined. Keep the persisted authority marker sticky and require an explicit
+   source-journal rebuild to move back to the general LSM.
+7. Profile primary document/embedding LSM snapshot rotation and post-load
+   compaction at 1M. The posting store removed normal derived HBC writes, but
+   2.52 GB of mutable clones, 3.24 GB of read-snapshot rotations, and immediate
+   post-load compaction still dominate readiness, demand, and query tails.

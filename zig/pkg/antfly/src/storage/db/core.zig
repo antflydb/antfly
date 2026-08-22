@@ -849,7 +849,7 @@ pub const DBCore = struct {
                 .name = index_name,
                 .kind = .dense_vector,
             });
-            self.index_manager.persistDensePostingSidecarByNameBestEffort(index_name, sequence);
+            try self.index_manager.persistDensePostingSidecarByName(index_name, sequence);
         } else if (cfg) |value| {
             try self.index_manager.checkpointLsmWalForManagedIndex(.{
                 .name = index_name,
