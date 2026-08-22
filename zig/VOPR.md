@@ -1,9 +1,9 @@
 # VOPR: Deterministic Autonomous Simulation for Antfly
 
-Status: implementation in progress; Phases 0, 0.5, 1, 2, 3, and 5 are
-complete; the Phase 4 exit scenario now has generated/replayable plan choices
-and split-to-merge composition, while decomposition of its terminal physical
-integration run into individually scheduled data-plane transitions remains
+Status: all phased exit conditions are implemented. The Phase 4 scenario has
+generated/replayable plan choices and split-to-merge composition; finer-grained
+control inside its real DataServer/HTTP integration remains an explicitly
+bounded production-seam expansion, not a replay-kernel dependency.
 
 Scope: Zig Antfly simulation, VOPR, modeled-storage, and chaos tests
 
@@ -1730,18 +1730,25 @@ provides clean-world prefix replay, a structured branch at one decision, and a
 seeded suffix.
 
 The Antfly metadata adapter now exposes individual node rounds, virtual-time
-advancement, and selected queued-message delivery, drop, and duplication. The
-virtual network provides a side-effect-free canonical message snapshot and
-exact message operations with stable logical sequence IDs and payload digests.
+advancement, and selected queued-message delivery, drop, duplication, delay,
+and release. The virtual network provides a side-effect-free canonical message
+snapshot and exact message operations with stable logical sequence IDs and
+payload digests. Bounded burst loss, one-shot connection reset, persistent
+route unavailability, and queue-capacity saturation are explicit injectable
+faults with independent semantic counters. Compatibility `drop_next`,
+`duplicate_next`, and `delay_next` operations remain, but generated histories
+prefer selected-message operations whenever a message already exists.
 A bounded quiet suffix disables hostile fault choices and evaluates the named
 `metadata.eventually_recovers_after_quiescence` property. Metadata partitions
 now have explicit start and stop lifecycle transitions: up to two independent
 directed-link partitions may overlap, a whole-node partition remains exclusive
 to preserve the scenario's healthy-quorum budget, and each active fault plus
-the aggregate heal action is independently selectable. Active link, node, and
-total fault counts are semantic observations, and the metadata replay ABI was
-bumped for the changed enabled sets (currently version 3 after adding the
-meta-test configuration field). The remaining Phase 2 follow-on was to move a
+the aggregate heal action is independently selectable. Node pause and resume
+are lifecycle transitions: pausing suppresses only that node's scheduler round
+while preserving its memory, durable state, and network fault state. Active
+link, node, pause, route, queue, and total fault counts are semantic
+observations, and the metadata replay ABI is version 5 after these enabled-set
+changes. The remaining Phase 2 follow-on was to move a
 shared production background-service seam onto `SimRuntime` instead of leaving
 all such work in manual domain runtimes.
 
@@ -1940,6 +1947,25 @@ than repaired by the harness. The modeled device counts fault consumption so a
 fault that misses its intended write or sync becomes a harness error. Both
 outcome sets exact-replay through the focused `wal-vopr-test` gate.
 
+Scenario version 4 adds generated device-full failures. The scenario sets the
+device capacity to the exact currently used byte count, requires the next WAL
+append to consume `InjectedDeviceFull`, classifies the public operation as
+rejected, clears the bounded fault, and exact-replays the resulting history.
+The underlying `ModeledDevice` now has typed next-operation and path-targeted
+failures for read, write, sync, truncate, rename, and delete; explicit capacity
+accounting; and selected volatile-versus-durable byte corruption. Volatile
+corruption disappears on crash unless synced, while durable corruption remains
+in the recovered image, so recovery promises can test detection without
+conflating the two states. Partial writes, dropped syncs, and device-full each
+have explicit consumption counters that turn a missed intended operation into
+a harness error.
+
+The `storage-sim-runtime-test` target now actually references the modeled
+runtime test declaration and supplies its platform dependency. This corrected
+a prior zero-test gate: it now executes the complete imported storage suite
+(168 tests at this checkpoint), including the typed fault, capacity, namespace
+durability, and corruption cases.
+
 Eligible metadata VOPR artifacts can also be exact-replayed with a formal Raft
 sidecar through `zig build sim-tla -- --trace ... --domain raft --out ...`.
 Replay attaches Antfly's existing `RaftNdjsonTraceLogger` only to the metadata
@@ -1969,8 +1995,8 @@ integration history remains one terminal workload transition because the
 hosted HTTP rig owns real threaded listeners and cached DB writers; further
 decomposition must happen at the DataServer lease and request-executor seams,
 not by opening competing simulated writers.
-Modeled partial writes, dropped syncs, and both Raft and transaction TLA+
-export are complete.
+Modeled partial writes, dropped syncs, device-full outcomes, and both Raft and
+transaction TLA+ export are complete.
 
 ### Phase 5: Search and Snapshot Optimizations
 
@@ -2015,6 +2041,10 @@ deduplicates the checkpoint. Subsequent mutations restore that state, begin at
 the exact mutation occurrence, and combine the original prefix records with the
 new suffix. A candidate that would affect corpus state is exact-replayed from a
 clean world before retention; uninteresting candidates avoid that full replay.
+Campaign reports separately count clean histories, property-failing histories,
+non-property failures, harness errors, replay divergences, and exact-replay
+checks. This prevents an invalid choice stream or simulator error from being
+presented as an Antfly correctness failure.
 
 The long-running Antfly metadata workers also attempt splices between retained
 persistent-corpus entries. IDs for independent generated histories remain
@@ -2024,7 +2054,9 @@ the complete enabled sets, and exact-replay before retention. The campaign
 summary reports splice attempts and accepted joins.
 
 `lib/vopr/src/causal.zig` implements the actor/resource/fault semantic slice
-described above, and `zig build sim-explain` exposes it for metadata artifacts.
+described above, and `zig build sim-explain` exposes it after dispatching exact
+replay by artifact scenario. Promotion uses the same fail-closed registry and
+separate metadata, distributed-data, and transaction fixture namespaces.
 The injected-bug meta-test requires the promoted trace to yield a non-empty
 causal report containing the stable property identity.
 
@@ -2184,14 +2216,15 @@ Implementation resolved the Phase 0 design questions as follows:
 - compiler coverage remains optional secondary feedback because the current
   Zig/LLVM instrumentation surface is not stable enough to join the replay ABI
 
-Two bounded follow-ons remain. The distributed public-data scenario now
-generates and replays its transport and fault plan, but its terminal physical
-history should be decomposed further as DataServer lease and HTTP execution
-seams become scheduler-controlled. Physical temporary directories remain
-acceptable for integration scenarios, while deterministic histories that make
-durability claims must use `ModeledDevice` or an equally explicit storage
-capability. Neither follow-on changes the standalone runtime boundary or trace
-format decisions above.
+One bounded expansion remains outside the phased exit conditions. The
+distributed public-data scenario generates and replays its transport and fault
+plan, but its terminal physical history can be decomposed further only after
+DataServer borrowed-lease and HTTP execution seams become scheduler-controlled.
+Opening competing simulated writers would invalidate the test, so the current
+integration transition deliberately preserves production ownership. Physical
+temporary directories remain acceptable for that integration shell; every
+durability claim inside the history uses `ModeledDevice`. This expansion does
+not change the standalone runtime boundary or trace format decisions above.
 
 ## Conclusion
 

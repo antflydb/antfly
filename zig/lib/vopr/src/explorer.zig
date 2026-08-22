@@ -48,6 +48,12 @@ pub const Report = struct {
     transition_work_units: u64 = 0,
     retained: u64 = 0,
     failures: u64 = 0,
+    clean_histories: u64 = 0,
+    property_failure_histories: u64 = 0,
+    non_property_failure_histories: u64 = 0,
+    harness_errors: u64 = 0,
+    replay_divergences: u64 = 0,
+    exact_replay_checks: u64 = 0,
     semantic_features: usize = 0,
     target_hits: u64 = 0,
 };
@@ -150,13 +156,21 @@ pub fn Campaign(comptime Scenario: type) type {
                 error.TransitionBudgetExceeded,
                 => {
                     self.report.splice_rejected += 1;
+                    self.report.replay_divergences += 1;
                     return false;
                 },
-                else => return err,
+                else => {
+                    self.report.harness_errors += 1;
+                    return err;
+                },
             };
             defer artifact.deinit();
-            var replayed = try replay.exact(Scenario, self.allocator, &artifact);
+            var replayed = replay.exact(Scenario, self.allocator, &artifact) catch |err| {
+                self.report.replay_divergences += 1;
+                return err;
+            };
             replayed.deinit();
+            self.report.exact_replay_checks += 1;
             self.report.transition_work_units +|= artifact.summary.?.transitions *| 2;
             self.report.spliced += 1;
             try self.consider(&artifact, left_index, false);
@@ -165,11 +179,14 @@ pub fn Campaign(comptime Scenario: type) type {
 
         fn runGenerated(self: *Self, seed: u64) !void {
             var seeded = choice.Seeded.init(seed);
-            var artifact = try runner.run(Scenario, self.allocator, seeded.source(), .{
+            var artifact = runner.run(Scenario, self.allocator, seeded.source(), .{
                 .system = self.config.system,
                 .seed = seed,
                 .transition_budget = self.config.transition_budget,
-            });
+            }) catch |err| {
+                self.report.harness_errors += 1;
+                return err;
+            };
             defer artifact.deinit();
             self.report.generated += 1;
             self.report.transition_work_units +|= artifact.summary.?.transitions;
@@ -214,7 +231,10 @@ pub fn Campaign(comptime Scenario: type) type {
                     self.prng.random().int(u64),
                     mutation_index,
                 );
-                var artifact = try runner.resumeFromCheckpoint(Scenario, self.allocator, &parent, checkpoint, mutating.source());
+                var artifact = runner.resumeFromCheckpoint(Scenario, self.allocator, &parent, checkpoint, mutating.source()) catch |err| {
+                    self.report.harness_errors += 1;
+                    return err;
+                };
                 defer artifact.deinit();
                 self.report.checkpoint_resumes += 1;
                 self.report.checkpoint_transitions_avoided +|= mutation_index;
@@ -224,10 +244,13 @@ pub fn Campaign(comptime Scenario: type) type {
                 return true;
             }
             var mutating = choice.Mutating.init(parent.choices.items, mutation_index, replacement, self.prng.random().int(u64));
-            var artifact = try runner.run(Scenario, self.allocator, mutating.source(), .{
+            var artifact = runner.run(Scenario, self.allocator, mutating.source(), .{
                 .system = self.config.system,
                 .transition_budget = self.config.transition_budget,
-            });
+            }) catch |err| {
+                self.report.harness_errors += 1;
+                return err;
+            };
             defer artifact.deinit();
             self.report.mutated += 1;
             self.report.transition_work_units +|= artifact.summary.?.transitions;
@@ -274,11 +297,25 @@ pub fn Campaign(comptime Scenario: type) type {
                 try self.coverage.observe(artifact);
             novelty.target_score = try coverage_mod.scoreTargets(self.allocator, artifact, self.config.targets);
             const failed = artifact.failures.items.len > 0;
+            if (!failed) {
+                self.report.clean_histories += 1;
+            } else {
+                var property_failure = false;
+                for (artifact.failures.items) |failure| property_failure = property_failure or failure.class == .property;
+                if (property_failure)
+                    self.report.property_failure_histories += 1
+                else
+                    self.report.non_property_failure_histories += 1;
+            }
             const retain = novelty.discovered > 0 or novelty.target_score > 0 or failed or self.corpus.entries.items.len == 0;
             if (exact_replay_before_retention) {
                 if (retain) {
-                    var replayed = try replay.exact(Scenario, self.allocator, artifact);
+                    var replayed = replay.exact(Scenario, self.allocator, artifact) catch |err| {
+                        self.report.replay_divergences += 1;
+                        return err;
+                    };
                     replayed.deinit();
+                    self.report.exact_replay_checks += 1;
                     self.report.transition_work_units +|= artifact.summary.?.transitions;
                 }
                 novelty = try self.coverage.observe(artifact);
@@ -313,6 +350,9 @@ test "campaign generates, mutates, and retains semantic histories" {
     try std.testing.expect(campaign.report.mutated >= 1);
     try std.testing.expect(campaign.report.retained >= 1);
     try std.testing.expect(campaign.report.semantic_features > 0);
+    try std.testing.expectEqual(campaign.report.histories, campaign.report.clean_histories + campaign.report.property_failure_histories + campaign.report.non_property_failure_histories);
+    try std.testing.expectEqual(@as(u64, 0), campaign.report.harness_errors);
+    try std.testing.expectEqual(@as(u64, 0), campaign.report.replay_divergences);
 }
 
 test "campaign exact-replays compatible splices before retention" {

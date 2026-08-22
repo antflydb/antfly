@@ -222,7 +222,7 @@ fn explainCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8
     defer alloc.free(encoded);
     var recorded = try vopr.trace.parseAlloc(alloc, encoded);
     defer recorded.deinit();
-    var replayed = try antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, &recorded);
+    var replayed = try replayKnownScenario(alloc, &recorded);
     replayed.deinit();
     var causal_report = try vopr.causal.analyzeAlloc(alloc, &recorded, failure_ordinal);
     defer causal_report.deinit();
@@ -349,9 +349,9 @@ fn promoteCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8
     var recorded = try vopr.trace.parseAlloc(alloc, encoded);
     defer recorded.deinit();
     if (recorded.failures.items.len == 0) return error.FailingTraceRequired;
-    var replayed = try antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, &recorded);
+    var replayed = try replayKnownScenario(alloc, &recorded);
     replayed.deinit();
-    const fixture_dir = "pkg/antfly/src/sim/fixtures/metadata";
+    const fixture_dir = try fixtureDirForScenario(&recorded);
     try ensureDir(io, fixture_dir);
     var dir = try std.Io.Dir.cwd().openDir(io, fixture_dir, .{});
     defer dir.close(io);
@@ -360,6 +360,16 @@ fn promoteCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8
     const output = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ fixture_dir, filename });
     defer alloc.free(output);
     std.debug.print("VOPR promoted fingerprint={x} fixture={s}\n", .{ recorded.failures.items[0].fingerprint, output });
+}
+
+fn fixtureDirForScenario(recorded: *const vopr.trace.Trace) ![]const u8 {
+    if (std.mem.eql(u8, recorded.header.scenario, "metadata-vopr"))
+        return "pkg/antfly/src/sim/fixtures/metadata";
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.metadata_sim_harness.DistributedDataVoprScenario.name))
+        return "pkg/antfly/src/sim/fixtures/distributed-data";
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.transaction_vopr.Scenario.name))
+        return "pkg/antfly/src/sim/fixtures/transaction";
+    return error.UnsupportedScenario;
 }
 
 fn promoteRecordedToDir(
@@ -780,6 +790,10 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
 
     var transaction_artifact = try antfly.transaction_vopr.record(alloc, 0xA17F_7A4A);
     defer transaction_artifact.deinit();
+    try std.testing.expectEqualStrings("pkg/antfly/src/sim/fixtures/metadata", try fixtureDirForScenario(&promoted));
+    try std.testing.expectEqualStrings("pkg/antfly/src/sim/fixtures/transaction", try fixtureDirForScenario(&transaction_artifact));
+    var generic_transaction_replay = try replayKnownScenario(alloc, &transaction_artifact);
+    generic_transaction_replay.deinit();
     var transaction_ndjson: std.Io.Writer.Allocating = .init(alloc);
     defer transaction_ndjson.deinit();
     var transaction_replay = try antfly.transaction_vopr.replayToTransactionTrace(alloc, &transaction_artifact, &transaction_ndjson.writer);
