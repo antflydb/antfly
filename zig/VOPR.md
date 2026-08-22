@@ -1680,10 +1680,15 @@ advancement, and selected queued-message delivery, drop, and duplication. The
 virtual network provides a side-effect-free canonical message snapshot and
 exact message operations with stable logical sequence IDs and payload digests.
 A bounded quiet suffix disables hostile fault choices and evaluates the named
-`metadata.eventually_recovers_after_quiescence` property. Phase 2 remains open
-for budgeted overlapping lifecycle faults and for moving additional production
-background services onto `SimRuntime` instead of their current manual domain
-runtimes.
+`metadata.eventually_recovers_after_quiescence` property. Metadata partitions
+now have explicit start and stop lifecycle transitions: up to two independent
+directed-link partitions may overlap, a whole-node partition remains exclusive
+to preserve the scenario's healthy-quorum budget, and each active fault plus
+the aggregate heal action is independently selectable. Active link, node, and
+total fault counts are semantic observations, and the metadata replay ABI was
+bumped to version 2 for the changed enabled sets. Phase 2 remains open for
+moving additional production background services onto `SimRuntime` instead of
+their current manual domain runtimes.
 
 ### Phase 3: Coverage, Corpus, and Reduction
 

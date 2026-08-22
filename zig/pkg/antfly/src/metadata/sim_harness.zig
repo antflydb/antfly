@@ -5228,7 +5228,10 @@ pub const MetadataVoprCampaignConfig = struct {
     workload: MetadataVoprWorkload = .smoke,
 
     pub fn fromTrace(artifact: *const vopr.trace.Trace) !MetadataVoprCampaignConfig {
-        if (!std.mem.eql(u8, artifact.header.system, "antfly") or !std.mem.eql(u8, artifact.header.scenario, "metadata-vopr")) return error.IncompatibleMetadataVoprTrace;
+        if (!std.mem.eql(u8, artifact.header.system, "antfly") or
+            !std.mem.eql(u8, artifact.header.scenario, "metadata-vopr") or
+            artifact.header.scenario_version != 2)
+            return error.IncompatibleMetadataVoprTrace;
         const workload_value = try traceParameter(artifact, "metadata.workload");
         const workload: MetadataVoprWorkload = switch (workload_value) {
             0 => .smoke,
@@ -5288,6 +5291,8 @@ const MetadataVoprAction = enum {
     release_random,
     start_link_partition,
     start_node_partition,
+    stop_link_partition,
+    stop_node_partition,
     heal_all,
     restart_follower,
 };
@@ -5306,6 +5311,8 @@ fn metadataVoprActionName(action: MetadataVoprAction) []const u8 {
         .release_random => "release_random",
         .start_link_partition => "start_link_partition",
         .start_node_partition => "start_node_partition",
+        .stop_link_partition => "stop_link_partition",
+        .stop_node_partition => "stop_node_partition",
         .heal_all => "heal_all",
         .restart_follower => "restart_follower",
     };
@@ -5319,14 +5326,72 @@ fn metadataVoprReplayCommand(cfg: MetadataVoprCampaignConfig) []const u8 {
 }
 
 const MetadataVoprCampaignState = struct {
-    active_link: ?raft_sim.VirtualHttpNetwork.Link = null,
-    active_node_id: ?u64 = null,
+    active_links: [2]raft_sim.VirtualHttpNetwork.Link = undefined,
+    active_link_count: usize = 0,
+    active_node_ids: [1]u64 = undefined,
+    active_node_count: usize = 0,
+
+    fn faultCount(self: *const MetadataVoprCampaignState) usize {
+        return self.active_link_count + self.active_node_count;
+    }
+
+    fn containsLink(self: *const MetadataVoprCampaignState, link: raft_sim.VirtualHttpNetwork.Link) bool {
+        for (self.active_links[0..self.active_link_count]) |active| {
+            if (active.source_id == link.source_id and active.target_id == link.target_id) return true;
+        }
+        return false;
+    }
+
+    fn addLink(self: *MetadataVoprCampaignState, link: raft_sim.VirtualHttpNetwork.Link) !void {
+        if (self.containsLink(link)) return error.MetadataVoprFaultAlreadyActive;
+        if (self.active_link_count == self.active_links.len) return error.MetadataVoprFaultBudgetExceeded;
+        self.active_links[self.active_link_count] = link;
+        self.active_link_count += 1;
+    }
+
+    fn removeLink(self: *MetadataVoprCampaignState, link: raft_sim.VirtualHttpNetwork.Link) !void {
+        for (self.active_links[0..self.active_link_count], 0..) |active, index| {
+            if (active.source_id != link.source_id or active.target_id != link.target_id) continue;
+            _ = orderedRemove(raft_sim.VirtualHttpNetwork.Link, self.active_links[0..self.active_link_count], index);
+            self.active_link_count -= 1;
+            return;
+        }
+        return error.MetadataVoprFaultNotActive;
+    }
+
+    fn containsNode(self: *const MetadataVoprCampaignState, node_id: u64) bool {
+        for (self.active_node_ids[0..self.active_node_count]) |active| if (active == node_id) return true;
+        return false;
+    }
+
+    fn addNode(self: *MetadataVoprCampaignState, node_id: u64) !void {
+        if (self.containsNode(node_id)) return error.MetadataVoprFaultAlreadyActive;
+        if (self.active_node_count == self.active_node_ids.len) return error.MetadataVoprFaultBudgetExceeded;
+        self.active_node_ids[self.active_node_count] = node_id;
+        self.active_node_count += 1;
+    }
+
+    fn removeNode(self: *MetadataVoprCampaignState, node_id: u64) !void {
+        for (self.active_node_ids[0..self.active_node_count], 0..) |active, index| {
+            if (active != node_id) continue;
+            _ = orderedRemove(u64, self.active_node_ids[0..self.active_node_count], index);
+            self.active_node_count -= 1;
+            return;
+        }
+        return error.MetadataVoprFaultNotActive;
+    }
 
     fn clear(self: *MetadataVoprCampaignState) void {
-        self.active_link = null;
-        self.active_node_id = null;
+        self.active_link_count = 0;
+        self.active_node_count = 0;
     }
 };
+
+fn orderedRemove(comptime T: type, values: []T, index: usize) T {
+    const removed = values[index];
+    std.mem.copyForwards(T, values[index .. values.len - 1], values[index + 1 ..]);
+    return removed;
+}
 
 fn metadataVoprNodeId(cluster: *MetadataHttpClusterSimulation, index: usize) u64 {
     return cluster.cluster.configs[index].host.http.host.local_node_id;
@@ -5411,7 +5476,7 @@ const MetadataVoprDriver = struct {
             .artifact = try vopr.trace.Trace.init(alloc, .{
                 .system = "antfly",
                 .scenario = "metadata-vopr",
-                .scenario_version = 1,
+                .scenario_version = 2,
                 .source_revision = "vopr-metadata-phase1",
                 .target = "native",
                 .optimize = "test",
@@ -5440,7 +5505,7 @@ const MetadataVoprDriver = struct {
     }
 
     fn actionId(action: MetadataVoprAction, discriminator: u64) u64 {
-        return vopr.id.derive("antfly.metadata.action", @intFromEnum(action) + 1, discriminator);
+        return vopr.id.derive("antfly.metadata.action", @as(u64, @intFromEnum(action)) + 1, discriminator);
     }
 
     fn appendCandidate(
@@ -5543,12 +5608,16 @@ const MetadataVoprDriver = struct {
             .action = .release_random,
         });
 
-        if (self.state.active_link == null and self.state.active_node_id == null) {
+        // Preserve a healthy-quorum-oriented budget: up to two directed link
+        // faults may overlap, while a whole-node isolation remains exclusive.
+        if (self.state.active_node_count == 0 and self.state.active_link_count < self.state.active_links.len) {
             for (0..self.cluster.cluster.nodes.len) |source_index| {
                 const source_id = metadataVoprNodeId(self.cluster, source_index);
                 for (0..self.cluster.cluster.nodes.len) |target_index| {
                     if (source_index == target_index) continue;
                     const target_id = metadataVoprNodeId(self.cluster, target_index);
+                    const link = raft_sim.VirtualHttpNetwork.Link{ .source_id = source_id, .target_id = target_id };
+                    if (self.state.containsLink(link)) continue;
                     const link_id = vopr.id.derive("antfly.metadata.link", source_id, target_id);
                     try appendCandidate(candidates, self.alloc, .{
                         .transition = .{
@@ -5563,23 +5632,51 @@ const MetadataVoprDriver = struct {
                         .target_node_id = target_id,
                     });
                 }
-                try appendCandidate(candidates, self.alloc, .{
-                    .transition = .{
-                        .id = actionId(.start_node_partition, source_id),
-                        .name = "metadata.network.partition_node",
-                        .kind = .fault,
-                        .actor_id = source_id,
-                    },
-                    .action = .start_node_partition,
-                    .source_node_id = source_id,
-                });
+                if (self.state.faultCount() == 0) {
+                    try appendCandidate(candidates, self.alloc, .{
+                        .transition = .{
+                            .id = actionId(.start_node_partition, source_id),
+                            .name = "metadata.network.partition_node",
+                            .kind = .fault,
+                            .actor_id = source_id,
+                        },
+                        .action = .start_node_partition,
+                        .source_node_id = source_id,
+                    });
+                }
             }
-        } else {
+        }
+        for (self.state.active_links[0..self.state.active_link_count]) |link| {
+            const link_id = vopr.id.derive("antfly.metadata.link", link.source_id, link.target_id);
             try appendCandidate(candidates, self.alloc, .{
-                .transition = .{ .id = actionId(.heal_all, 0), .name = "metadata.network.heal_all", .kind = .fault },
-                .action = .heal_all,
+                .transition = .{
+                    .id = actionId(.stop_link_partition, link_id),
+                    .name = "metadata.network.heal_link",
+                    .kind = .fault,
+                    .actor_id = link.source_id,
+                    .resource_id = link.target_id,
+                },
+                .action = .stop_link_partition,
+                .source_node_id = link.source_id,
+                .target_node_id = link.target_id,
             });
         }
+        for (self.state.active_node_ids[0..self.state.active_node_count]) |node_id| {
+            try appendCandidate(candidates, self.alloc, .{
+                .transition = .{
+                    .id = actionId(.stop_node_partition, node_id),
+                    .name = "metadata.network.heal_node",
+                    .kind = .fault,
+                    .actor_id = node_id,
+                },
+                .action = .stop_node_partition,
+                .source_node_id = node_id,
+            });
+        }
+        if (self.state.faultCount() > 0) try appendCandidate(candidates, self.alloc, .{
+            .transition = .{ .id = actionId(.heal_all, 0), .name = "metadata.network.heal_all", .kind = .fault },
+            .action = .heal_all,
+        });
 
         const leader_index = currentMetadataLeaderIndex(self.cluster);
         for (0..self.cluster.cluster.nodes.len) |node_index| {
@@ -5650,7 +5747,7 @@ const MetadataVoprDriver = struct {
         if (selected.transition.kind == .fault) {
             const phase: vopr.trace.FaultPhase = switch (selected.action) {
                 .start_link_partition, .start_node_partition => .start,
-                .heal_all => .end,
+                .stop_link_partition, .stop_node_partition, .heal_all => .end,
                 else => .pulse,
             };
             try self.trace().addFault(.{ .index = self.occurrence, .id = selected.transition.id, .name = selected.transition.name, .phase = phase });
@@ -5694,12 +5791,22 @@ const MetadataVoprDriver = struct {
             .start_link_partition => {
                 const link = raft_sim.VirtualHttpNetwork.Link{ .source_id = selected.source_node_id.?, .target_id = selected.target_node_id.? };
                 try self.cluster.cluster.inject(.{ .partition_link = link });
-                self.state.active_link = link;
+                try self.state.addLink(link);
             },
             .start_node_partition => {
                 const node_id = selected.source_node_id.?;
                 try self.cluster.cluster.inject(.{ .partition_node = node_id });
-                self.state.active_node_id = node_id;
+                try self.state.addNode(node_id);
+            },
+            .stop_link_partition => {
+                const link = raft_sim.VirtualHttpNetwork.Link{ .source_id = selected.source_node_id.?, .target_id = selected.target_node_id.? };
+                self.cluster.cluster.heal(.{ .partition_link = link });
+                try self.state.removeLink(link);
+            },
+            .stop_node_partition => {
+                const node_id = selected.source_node_id.?;
+                self.cluster.cluster.heal(.{ .partition_node = node_id });
+                try self.state.removeNode(node_id);
             },
             .heal_all => {
                 self.cluster.cluster.healAll();
@@ -5721,7 +5828,10 @@ const MetadataVoprDriver = struct {
         try builder.addNamed(self.alloc, "metadata.network.dropped", @intCast(@min(self.cluster.virtual_network.dropped_count, @as(u64, std.math.maxInt(i64)))));
         try builder.addNamed(self.alloc, "metadata.network.duplicated", @intCast(@min(self.cluster.virtual_network.duplicated_count, @as(u64, std.math.maxInt(i64)))));
         try builder.addNamed(self.alloc, "metadata.network.delayed", @intCast(@min(self.cluster.virtual_network.delayed_count, @as(u64, std.math.maxInt(i64)))));
-        try builder.addNamed(self.alloc, "metadata.fault.active", @intFromBool(self.state.active_link != null or self.state.active_node_id != null));
+        try builder.addNamed(self.alloc, "metadata.fault.active", @intFromBool(self.state.faultCount() > 0));
+        try builder.addNamed(self.alloc, "metadata.fault.active_count", @intCast(self.state.faultCount()));
+        try builder.addNamed(self.alloc, "metadata.fault.partitioned_links", @intCast(self.state.active_link_count));
+        try builder.addNamed(self.alloc, "metadata.fault.partitioned_nodes", @intCast(self.state.active_node_count));
         try builder.addNamed(self.alloc, "metadata.phase.quiet", @intFromBool(self.quiet_mode));
         var leader_count: i64 = 0;
         var commit_total: u64 = 0;
@@ -5850,12 +5960,12 @@ fn metadataVoprStartFollowerPartition(
     cluster: *MetadataHttpClusterSimulation,
     state: *MetadataVoprCampaignState,
 ) !void {
-    if (state.active_link != null or state.active_node_id != null) return;
+    if (state.faultCount() != 0) return;
     const leader_index = try metadataVoprLeaderIndex(cluster);
     const follower_index = (leader_index + 1) % cluster.cluster.nodes.len;
     const node_id = metadataVoprNodeId(cluster, follower_index);
     try cluster.cluster.inject(.{ .partition_node = node_id });
-    state.active_node_id = node_id;
+    try state.addNode(node_id);
     try cluster.stepAll();
 }
 
@@ -5863,7 +5973,7 @@ fn metadataVoprStartFollowerLinkPartition(
     cluster: *MetadataHttpClusterSimulation,
     state: *MetadataVoprCampaignState,
 ) !void {
-    if (state.active_link != null or state.active_node_id != null) return;
+    if (state.faultCount() != 0) return;
     const leader_index = try metadataVoprLeaderIndex(cluster);
     const follower_index = (leader_index + 1) % cluster.cluster.nodes.len;
     const link = raft_sim.VirtualHttpNetwork.Link{
@@ -5871,7 +5981,7 @@ fn metadataVoprStartFollowerLinkPartition(
         .target_id = metadataVoprNodeId(cluster, leader_index),
     };
     try cluster.cluster.inject(.{ .partition_link = link });
-    state.active_link = link;
+    try state.addLink(link);
     try cluster.stepAll();
 }
 
