@@ -361,7 +361,7 @@ from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
 from .graph_result_ref_node_selector import GraphResultRefNodeSelector
-from .graph_result_row_type_0 import GraphResultRowType0
+from .graph_result_row import GraphResultRow
 from .graph_shortest_path import GraphShortestPath
 from .graph_shortest_path_query import GraphShortestPathQuery
 from .graph_traversal import GraphTraversal
@@ -1218,7 +1218,7 @@ __all__ = (
     "GraphResultNodeDocument",
     "GraphResultNodeEvidence",
     "GraphResultRefNodeSelector",
-    "GraphResultRowType0",
+    "GraphResultRow",
     "GraphShortestPath",
     "GraphShortestPathQuery",
     "GraphTraversal",

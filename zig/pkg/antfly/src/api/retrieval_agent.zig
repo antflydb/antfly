@@ -5932,9 +5932,7 @@ fn treeSeedResultRef(query_request: QueryRequest) ?[]const u8 {
         query_request.exclusion_query != null;
     const has_semantic = query_request.semantic_search != null or
         query_request.embeddings != null;
-    if (has_lexical and has_semantic) return "$fused_results";
-    if (has_semantic) return "$embeddings_results";
-    if (has_lexical) return "$full_text_results";
+    if (has_lexical or has_semantic) return "$query_results";
     return null;
 }
 
@@ -6481,7 +6479,7 @@ test "retrieval agent supports inline tree search" {
             defer parsed_query.deinit();
             const graph_queries = parsed_query.value.graph_queries.?;
             const tree_query = graph_queries.map.get("tree_search").?;
-            try std.testing.expectEqualStrings("$embeddings_results", tree_query.graph_traverse_query.traverse.start.graph_result_ref_node_selector.result_ref);
+            try std.testing.expectEqualStrings("$query_results", tree_query.graph_traverse_query.traverse.start.graph_result_ref_node_selector.result_ref);
             try std.testing.expectEqual(true, tree_query.graph_traverse_query.traverse.include_documents.?);
             try std.testing.expectEqual(true, tree_query.graph_traverse_query.traverse.include_paths.?);
             return .{

@@ -20251,7 +20251,7 @@ test "provisioned table read source preflights every local group" {
                 .query = .{
                     .query_type = .neighbors,
                     .index_name = "graph_v1",
-                    .start_nodes = .{ .result_ref = .{ .ref = "$embeddings_results", .limit = 1 } },
+                    .start_nodes = .{ .result_ref = .{ .ref = "$query_results", .limit = 1 } },
                     .params = .{ .edge_types = &.{}, .max_depth = 1 },
                 },
             },
@@ -25442,7 +25442,7 @@ test "hosted table read source preflights every local group" {
                 .query = .{
                     .query_type = .neighbors,
                     .index_name = "graph_v1",
-                    .start_nodes = .{ .result_ref = .{ .ref = "$embeddings_results", .limit = 1 } },
+                    .start_nodes = .{ .result_ref = .{ .ref = "$query_results", .limit = 1 } },
                     .params = .{ .edge_types = &.{}, .max_depth = 1 },
                 },
             },

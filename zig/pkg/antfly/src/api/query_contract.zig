@@ -2957,7 +2957,14 @@ pub fn preflightQueryRequestAlloc(
     for (preflight_req.req.graph_queries) |graph_query| {
         try appendUniqueOwnedString(alloc, &graph_indexes, graph_query.query.index_name);
     }
-    for (runtime_preflight.result_refs) |result_ref| try appendUniqueOwnedString(alloc, &result_refs, result_ref);
+    // The runtime keeps lane-specific result sets for execution planning, but
+    // those are not part of the canonical public graph DSL. Present one stable
+    // ranked-result reference plus prior graph outputs to callers and agents.
+    try appendUniqueOwnedString(alloc, &result_refs, "$query_results");
+    for (runtime_preflight.result_refs) |result_ref| {
+        if (std.mem.startsWith(u8, result_ref, "$graph_results."))
+            try appendUniqueOwnedString(alloc, &result_refs, result_ref);
+    }
     for (runtime_preflight.graph_query_order) |name| try appendUniqueOwnedString(alloc, &graph_query_order, name);
 
     return .{
@@ -5146,13 +5153,21 @@ fn toOpenApiGraphQueryResult(
         try toOpenApiGraphAggregates(alloc, query, graph_result)
     else
         null;
+    const returned_items: usize = if (rows) |items|
+        items.len
+    else if (aggregates) |items|
+        items.map.count()
+    else if (graph_result.paths.len > 0)
+        graph_result.paths.len
+    else
+        graph_result.nodes.len;
     return .{
         .nodes = if (query.match_pattern == null) try toOpenApiGraphNodes(alloc, graph_result) else null,
         .paths = if (query.match_pattern == null) try toOpenApiPaths(alloc, graph_result.paths) else null,
         .rows = rows,
         .aggregates = aggregates,
         .stats = .{
-            .returned_rows = @intCast(if (rows) |items| items.len else 0),
+            .returned_items = @intCast(returned_items),
             .truncated = graph_result.truncated,
         },
         .took = meta.took_ms,
@@ -5209,10 +5224,10 @@ fn toOpenApiLegacyPatternMatches(
 fn toOpenApiGraphRows(
     alloc: std.mem.Allocator,
     graph_result: db_mod.types.GraphSearchResult,
-) ![]const std.json.Value {
-    const out = try alloc.alloc(std.json.Value, graph_result.matches.len);
+) ![]const indexes_openapi.GraphResultRow {
+    const out = try alloc.alloc(indexes_openapi.GraphResultRow, graph_result.matches.len);
     for (graph_result.matches, 0..) |match, i| {
-        var row = std.json.ObjectMap.empty;
+        var row: indexes_openapi.GraphResultRow = .{};
         errdefer row.deinit(alloc);
         for (match.bindings) |binding| {
             const node = indexes_openapi.GraphResultNode{
@@ -5234,10 +5249,10 @@ fn toOpenApiGraphRows(
             };
             const encoded = try std.json.Stringify.valueAlloc(alloc, node, .{ .emit_null_optional_fields = false });
             defer alloc.free(encoded);
-            try row.put(alloc, binding.alias, try std.json.parseFromSliceLeaky(std.json.Value, alloc, encoded, .{}));
+            try row.map.put(alloc, binding.alias, try std.json.parseFromSliceLeaky(std.json.Value, alloc, encoded, .{}));
         }
-        for (match.null_aliases) |alias| try row.put(alloc, alias, .null);
-        out[i] = .{ .object = row };
+        for (match.null_aliases) |alias| try row.map.put(alloc, alias, .null);
+        out[i] = row;
     }
     return out;
 }
@@ -5326,7 +5341,7 @@ test "pattern response omits paths unless requested" {
 
     const rows = try toOpenApiGraphRows(alloc, graph_result);
     try std.testing.expectEqual(@as(usize, 1), rows.len);
-    try std.testing.expect(rows[0].object.get("node") != null);
+    try std.testing.expect(rows[0].map.get("node") != null);
 }
 
 test "graph aggregate response preserves exact decimal counts" {
@@ -5364,6 +5379,7 @@ test "graph aggregate response preserves exact decimal counts" {
     try std.testing.expectEqualStrings("9384729384729384", count.value);
     try std.testing.expect(count.exact);
     try std.testing.expect(result.rows == null);
+    try std.testing.expectEqual(@as(i64, 1), result.stats.?.returned_items);
 }
 
 test "deprecated graph search preserves its response envelope" {
@@ -8744,7 +8760,7 @@ fn parseGraphPathEndpointSelector(alloc: std.mem.Allocator, endpoint: anytype) !
 fn parseGraphMatchQuery(alloc: std.mem.Allocator, value: indexes_openapi.GraphMatchQuery) !graph_query_mod.GraphQuery {
     const index = try alloc.dupe(u8, value.index);
     errdefer alloc.free(index);
-    const base_ref = try alloc.dupe(u8, "$full_text_results");
+    const base_ref = try alloc.dupe(u8, "$query_results");
     errdefer alloc.free(base_ref);
     const nodes = try parseGraphMatchNodes(alloc, value.match.nodes);
     errdefer freeGraphMatchNodes(alloc, nodes);
@@ -9022,12 +9038,21 @@ fn parseGraphNodeSelector(
         },
         .graph_result_ref_node_selector => |value| blk: {
             try validateGraphResultRef(value.result_ref);
+            if (value.binding != null and !std.mem.startsWith(u8, value.result_ref, "$graph_results."))
+                return error.InvalidQueryRequest;
+            if (value.binding) |binding| if (binding.len == 0) return error.InvalidQueryRequest;
+            const owned_ref = try alloc.dupe(u8, value.result_ref);
+            errdefer alloc.free(owned_ref);
+            const owned_binding = if (value.binding) |binding| try alloc.dupe(u8, binding) else null;
+            errdefer if (owned_binding) |binding| alloc.free(binding);
+            const limit = if (value.limit) |raw_limit|
+                try parseGraphBoundedU32(raw_limit, 0, 1, 10_000)
+            else
+                0;
             break :blk .{ .result_ref = .{
-                .ref = try alloc.dupe(u8, value.result_ref),
-                .limit = if (value.limit) |limit|
-                    try parseGraphBoundedU32(limit, 0, 1, 10_000)
-                else
-                    0,
+                .ref = owned_ref,
+                .binding = owned_binding,
+                .limit = limit,
             } };
         },
     };
@@ -9066,8 +9091,9 @@ fn parseLegacyGraphNodeSelector(
         return .{ .identities = owned };
     }
     if (selector.result_ref) |result_ref| {
+        const canonical_ref = legacyGraphResultRef(result_ref) orelse return error.InvalidQueryRequest;
         return .{ .result_ref = .{
-            .ref = try alloc.dupe(u8, result_ref),
+            .ref = try alloc.dupe(u8, canonical_ref),
             .limit = if (selector.limit) |limit|
                 std.math.cast(u32, limit) orelse return error.InvalidQueryRequest
             else
@@ -9155,12 +9181,19 @@ const GraphNodeIdentityContext = struct {
 const GraphNodeIdentitySet = std.HashMapUnmanaged(GraphNodeIdentityKey, void, GraphNodeIdentityContext, 80);
 
 fn validateGraphResultRef(ref: []const u8) !void {
-    if (std.mem.eql(u8, ref, "$full_text_results") or
-        std.mem.eql(u8, ref, "$embeddings_results") or
-        std.mem.eql(u8, ref, "$fused_results")) return;
+    if (std.mem.eql(u8, ref, "$query_results")) return;
     if (std.mem.startsWith(u8, ref, "$graph_results.") and
         ref.len > "$graph_results.".len) return;
     return error.InvalidQueryRequest;
+}
+
+fn legacyGraphResultRef(ref: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, ref, "$full_text_results") or
+        std.mem.eql(u8, ref, "$embeddings_results") or
+        std.mem.eql(u8, ref, "$fused_results")) return "$query_results";
+    if (std.mem.startsWith(u8, ref, "$graph_results.") and
+        ref.len > "$graph_results.".len) return ref;
+    return null;
 }
 
 fn parseExpandStrategy(text: []const u8) !graph_query_mod.ExpandStrategy {
@@ -11084,6 +11117,7 @@ fn freeGraphNodeSelector(alloc: std.mem.Allocator, selector: graph_query_mod.Nod
         },
         .result_ref => |result_ref| {
             alloc.free(result_ref.ref);
+            if (result_ref.binding) |binding| alloc.free(binding);
         },
     }
 }
@@ -13281,7 +13315,7 @@ test "api query contract preflight summarizes query lanes and result refs" {
         \\    "seeded": {
         \\      "index": "doc_graph",
         \\      "traverse": {
-        \\        "start": {"result_ref": "$fused_results", "limit": 3},
+        \\        "start": {"result_ref": "$query_results", "limit": 3},
         \\        "max_depth": 1
         \\      }
         \\    },
@@ -13306,27 +13340,18 @@ test "api query contract preflight summarizes query lanes and result refs" {
     try std.testing.expectEqualStrings("body_embedding", summary.embedding_indexes[0]);
     try std.testing.expectEqual(@as(usize, 1), summary.graph_indexes.len);
     try std.testing.expectEqualStrings("doc_graph", summary.graph_indexes[0]);
-    try std.testing.expectEqual(@as(usize, 6), summary.result_refs.len);
-    var saw_full_text = false;
-    var saw_named_embedding = false;
-    var saw_embeddings = false;
-    var saw_fused = false;
+    try std.testing.expectEqual(@as(usize, 3), summary.result_refs.len);
     var saw_seeded = false;
     var saw_graph = false;
+    var saw_query = false;
     for (summary.result_refs) |result_ref| {
-        if (std.mem.eql(u8, result_ref, "$full_text_results")) saw_full_text = true;
-        if (std.mem.eql(u8, result_ref, "body_embedding")) saw_named_embedding = true;
-        if (std.mem.eql(u8, result_ref, "$embeddings_results")) saw_embeddings = true;
-        if (std.mem.eql(u8, result_ref, "$fused_results")) saw_fused = true;
         if (std.mem.eql(u8, result_ref, "$graph_results.seeded")) saw_seeded = true;
         if (std.mem.eql(u8, result_ref, "$graph_results.related")) saw_graph = true;
+        if (std.mem.eql(u8, result_ref, "$query_results")) saw_query = true;
     }
-    try std.testing.expect(saw_full_text);
-    try std.testing.expect(saw_named_embedding);
-    try std.testing.expect(saw_embeddings);
-    try std.testing.expect(saw_fused);
     try std.testing.expect(saw_seeded);
     try std.testing.expect(saw_graph);
+    try std.testing.expect(saw_query);
     try std.testing.expectEqual(@as(usize, 2), summary.graph_query_order.len);
     try std.testing.expectEqualStrings("seeded", summary.graph_query_order[0]);
     try std.testing.expectEqualStrings("related", summary.graph_query_order[1]);

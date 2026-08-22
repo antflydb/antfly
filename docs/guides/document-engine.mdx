@@ -177,6 +177,51 @@ ordering decides which page is returned.
 }
 ```
 
+## Graph Queries
+
+`graph_queries` is an operation-keyed DSL. Each named query contains exactly
+one of `traverse`, `match`, `shortest_path`, or `k_shortest_paths`. A traversal
+defaults to one hop, and stored documents are returned only when the operation
+enables `include_documents`.
+
+Use `$query_results` to seed a graph operation from the final ranked result page,
+regardless of whether retrieval was lexical, vector, or fused:
+
+```jsonc
+{
+  "full_text_search": {"query": "database"},
+  "graph_queries": {
+    "citations": {
+      "index": "citation_graph",
+      "traverse": {
+        "start": {"result_ref": "$query_results", "limit": 20},
+        "edge_types": ["cites"],
+        "max_depth": 1,
+        "include_documents": true,
+        "fields": ["title"]
+      }
+    }
+  }
+}
+```
+
+Traversal outputs can seed another traversal with
+`$graph_results.<query-name>`. MATCH produces rows with multiple aliases, so a
+downstream selector must also name the returned `binding`:
+
+```jsonc
+{"result_ref": "$graph_results.authors_and_posts", "binding": "post", "limit": 100}
+```
+
+Omit `limit` only when the referenced result is complete. Antfly rejects
+unbounded references to truncated result pages rather than returning a partial
+answer. Path-producing results are not currently valid node selectors.
+Table-qualified identities use `{"key":"…","table":"…"}`; omitting `table`,
+or explicitly naming the queried table, has the same identity semantics.
+
+The deprecated `graph_searches` request field remains a wire-compatibility
+adapter for the v0.2 shape. New clients should generate only `graph_queries`.
+
 ## Full-Text And Vector Search
 
 Full-text search uses analyzed text fields and returns BM25-style relevance.

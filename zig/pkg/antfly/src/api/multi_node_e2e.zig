@@ -6197,7 +6197,7 @@ test "public api multi-node e2e routes split flow from a non-host node" {
         "alpha",
         "walk_from_text",
         "graph_idx",
-        "$full_text_results",
+        "$query_results",
         2,
         10,
     );
@@ -6218,7 +6218,7 @@ test "public api multi-node e2e routes split flow from a non-host node" {
         "alpha",
         "walk_from_fused",
         "graph_idx",
-        "$fused_results",
+        "$query_results",
         2,
         10,
     );

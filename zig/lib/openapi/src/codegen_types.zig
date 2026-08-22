@@ -130,7 +130,12 @@ pub const TypeGenerator = struct {
                     try self.w.line("pub const {s} = std.json.Value;", .{type_name});
                     return;
                 },
-                .schema => {},
+                .schema => {
+                    if (schema.description) |desc| try self.w.docComment(desc);
+                    const zig_type = try self.zigTypeForSchema(schema);
+                    try self.w.line("pub const {s} = {s};", .{ type_name, zig_type });
+                    return;
+                },
             };
         }
 
@@ -901,6 +906,36 @@ test "named free-form object preserves arbitrary JSON" {
     try gen.generateAll(&doc);
 
     try std.testing.expect(std.mem.indexOf(u8, w.toSlice(), "pub const DocumentQuery = std.json.Value;") != null);
+}
+
+test "named typed map preserves additional property values" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const value_schema = try arena.create(types.SchemaOrRef);
+    value_schema.* = .{ .ref = .{ .ref_string = "#/components/schemas/Node" } };
+    var schemas = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try schemas.put(arena, "NodeMap", .{ .schema = .{
+        .schema_type = .{ .single = "object" },
+        .additional_properties = .{ .schema = value_schema },
+    } });
+    const doc = types.OpenApiDoc{
+        .openapi = "3.0.3",
+        .info = .{ .title = "Test", .version = "1.0" },
+        .components = .{ .schemas = schemas },
+    };
+    var resolver = Resolver.init(arena, &doc);
+    var w = SourceWriter.init(arena);
+    var gen = TypeGenerator.init(arena, &w, &resolver);
+    try gen.generateAll(&doc);
+
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        w.toSlice(),
+        "pub const NodeMap = std.json.ArrayHashMap(Node);",
+    ) != null);
 }
 
 test "required + nullable field codegen" {

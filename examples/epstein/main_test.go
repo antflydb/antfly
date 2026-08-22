@@ -281,7 +281,7 @@ func TestGraphVisualizationQueryUsesAutographIndex(t *testing.T) {
 		t.Fatalf("traverse operation missing: %#v", graph)
 	}
 	startNodes, ok := traverse["start"].(map[string]any)
-	if !ok || startNodes["result_ref"] != "$full_text_results" || startNodes["limit"] != 8 {
+	if !ok || startNodes["result_ref"] != "$query_results" || startNodes["limit"] != 8 {
 		t.Fatalf("unexpected start nodes: %#v", traverse["start"])
 	}
 	if traverse["direction"] != "both" || traverse["max_depth"] != 1 {

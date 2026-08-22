@@ -165,3 +165,27 @@ func TestGraphConstructorsRejectSemanticErrors(t *testing.T) {
 		t.Fatal("expected unknown return alias error")
 	}
 }
+
+func TestGraphResultBindingSelector(t *testing.T) {
+	selector, err := NewGraphResultBindingSelector("authors_and_posts", "post", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var value map[string]any
+	if err := json.Unmarshal(encoded, &value); err != nil {
+		t.Fatal(err)
+	}
+	if value["result_ref"] != "$graph_results.authors_and_posts" || value["binding"] != "post" {
+		t.Fatalf("selector = %#v", value)
+	}
+	if _, err := NewGraphResultBindingSelector("", "post", 1); err == nil {
+		t.Fatal("expected empty graph result query name to fail")
+	}
+	if _, err := NewGraphResultRefSelector("$full_text_results", 1); err == nil {
+		t.Fatal("expected legacy lane-specific reference to fail in canonical helper")
+	}
+}

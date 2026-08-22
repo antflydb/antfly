@@ -320,7 +320,7 @@ def test_graph_neighbors_traverse_and_shortest_path(serverless_api):
             "graph_queries": {
                 "neighbors_from_search": {
                     "index": "graph_idx",
-                    "traverse": {"start": {"result_ref": "$full_text_results", "limit": 1}, "edge_types": ["cites", "related"], "max_depth": 1},
+                    "traverse": {"start": {"result_ref": "$query_results", "limit": 1}, "edge_types": ["cites", "related"], "max_depth": 1},
                 }
             },
             "limit": 10,
@@ -339,7 +339,7 @@ def test_graph_neighbors_traverse_and_shortest_path(serverless_api):
                 "graph_queries": {
                     "neighbors_from_fused": {
                         "index": "graph_idx",
-                        "traverse": {"start": {"result_ref": "$fused_results", "limit": 1}, "edge_types": ["cites", "related"], "max_depth": 1},
+                        "traverse": {"start": {"result_ref": "$query_results", "limit": 1}, "edge_types": ["cites", "related"], "max_depth": 1},
                     }
                 },
                 "limit": 10,
@@ -411,7 +411,7 @@ def test_stateful_graph_neighbors_traverse_and_shortest_path(backup_api):
         "graph_queries": {
             "neighbors_from_search": {
                 "index": "graph_idx",
-                "traverse": {"start": {"result_ref": "$full_text_results", "limit": 1}, "edge_types": ["cites", "related"], "max_depth": 1},
+                "traverse": {"start": {"result_ref": "$query_results", "limit": 1}, "edge_types": ["cites", "related"], "max_depth": 1},
             }
         },
         "limit": 10,
@@ -421,7 +421,7 @@ def test_stateful_graph_neighbors_traverse_and_shortest_path(backup_api):
         "graph_queries": {
             "neighbors_from_fused": {
                 "index": "graph_idx",
-                "traverse": {"start": {"result_ref": "$fused_results", "limit": 1}, "edge_types": ["cites", "related"], "max_depth": 1},
+                "traverse": {"start": {"result_ref": "$query_results", "limit": 1}, "edge_types": ["cites", "related"], "max_depth": 1},
             }
         },
         "limit": 10,
@@ -1347,7 +1347,7 @@ def test_stateful_graph_pattern_max_results_limit(backup_api):
     )
     assert limited is not None
     assert len(limited["rows"]) == 2
-    assert limited["stats"] == {"returned_rows": 2, "truncated": True}
+    assert limited["stats"] == {"returned_items": 2, "truncated": True}
     counts = wait_until(
         lambda: (
             result

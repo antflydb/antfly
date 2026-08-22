@@ -4568,6 +4568,7 @@ pub const GraphNodeSelector = union(enum) {
         if (source != .object) return error.UnexpectedToken;
         if (objectHasAnyKey(source.object, &.{
             "result_ref",
+            "binding",
             "limit",
         })) {
             if (try parseStructuralVariant(GraphResultRefNodeSelector, allocator, source, options)) |parsed| return .{ .graph_result_ref_node_selector = parsed };
@@ -4720,7 +4721,8 @@ pub const GraphQueryResult = struct {
 };
 
 pub const GraphQueryStats = struct {
-    returned_rows: i64,
+    /// Number of primary result items returned (nodes, paths, rows, or aggregates).
+    returned_items: i64,
     truncated: bool,
 };
 
@@ -4808,13 +4810,15 @@ pub const GraphResultNode = struct {
 };
 
 pub const GraphResultRefNodeSelector = struct {
-    /// A prior result set: `$full_text_results`, `$embeddings_results`, `$fused_results`, or `$graph_results.<query-name>`.
+    /// `$query_results` selects the final ranked query results. `$graph_results.<query-name>` selects a prior graph query result. Prior MATCH results require `binding`; traversal results prohibit it. Path-producing results cannot currently be used as node selectors.
     result_ref: []const u8,
+    /// Binding alias to select from a prior MATCH result. Valid only with `$graph_results.<query-name>` when that query returns MATCH rows.
+    binding: ?[]const u8 = null,
     /// Maximum referenced results to use. Omit only when the referenced result is complete.
     limit: ?i64 = null,
 };
 
-pub const GraphResultRow = std.json.Value;
+pub const GraphResultRow = std.json.ArrayHashMap(GraphResultBinding);
 
 /// Return bindings or exact aggregates. Bindings and aggregates are mutually exclusive.
 pub const GraphReturn = union(enum) {

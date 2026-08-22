@@ -1564,29 +1564,9 @@ fn metadataValidateGraphSelectorResultRef(
         }
         return null;
     }
-    if (std.mem.eql(u8, result_ref, "$full_text_results")) {
-        if (query_request.full_text_search == null) {
-            return try std.fmt.allocPrint(alloc, "graph_queries.{s}.{s} references $full_text_results but query_request.full_text_search is absent", .{ search_name, selector_name });
-        }
-        return null;
-    }
-    if (std.mem.eql(u8, result_ref, "$fused_results")) {
-        if (query_request.full_text_search == null or !metadataQueryRequestHasVectorResults(query_request)) {
-            return try std.fmt.allocPrint(alloc, "graph_queries.{s}.{s} references $fused_results but the query_request cannot produce fused full-text and vector results", .{ search_name, selector_name });
-        }
-        return null;
-    }
-    if (std.mem.eql(u8, result_ref, "$embeddings_results")) {
-        if (!metadataQueryRequestHasVectorResults(query_request)) {
-            return try std.fmt.allocPrint(alloc, "graph_queries.{s}.{s} references {s} but query_request has no semantic_search or embeddings", .{ search_name, selector_name, result_ref });
-        }
-        return null;
-    }
+    _ = query_request;
+    if (std.mem.eql(u8, result_ref, "$query_results")) return null;
     return try std.fmt.allocPrint(alloc, "graph_queries.{s}.{s} references unsupported result ref '{s}'", .{ search_name, selector_name, result_ref });
-}
-
-fn metadataQueryRequestHasVectorResults(query_request: metadata_openapi.QueryRequest) bool {
-    return query_request.semantic_search != null or query_request.embeddings != null;
 }
 
 fn metadataPreflightGraphSearchesAgainstExecutorParser(
@@ -3023,7 +3003,7 @@ fn buildGraphQueryBuilderRepairMessages(
         \\- graph_queries must be non-empty.
         \\- Every GraphQuery must include index_name and start_nodes.
         \\- Use only listed graph indexes.
-        \\- Use start_nodes/target_nodes keys or one of $full_text_results, $fused_results, $embeddings_results, or $graph_results.<search_name>.
+        \\- Use explicit start/target keys, $query_results, or a compatible $graph_results.<search_name> output.
         \\- $graph_results.<search_name> refs must point to another graph_queries entry and must not form a cycle.
         \\- node_filter is supported in params and pattern steps, but not inside start_nodes or target_nodes.
         \\- Do not include algorithm, algorithm_params, include_edges, or unknown fields.
@@ -3552,12 +3532,12 @@ fn buildGraphQueryBuilderSystemPrompt(
         \\You are an expert Antfly graph query builder. Translate natural-language graph retrieval intent into Antfly graph_queries JSON.
         \\
         \\GraphQuery forms:
-        \\- Neighbors: {"index":"graph_idx","traverse":{"start":{"result_ref":"$full_text_results","limit":5},"edge_types":["links"],"max_depth":1}}
+        \\- Neighbors: {"index":"graph_idx","traverse":{"start":{"result_ref":"$query_results","limit":5},"edge_types":["links"],"max_depth":1}}
         \\- Traverse: {"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]},"edge_types":["references"],"max_depth":2,"deduplicate_nodes":true}}
         \\- Shortest path: {"index":"graph_idx","shortest_path":{"from":{"key":"doc:a"},"to":{"key":"doc:b"},"edge_types":["depends_on"],"max_depth":6}}
         \\- Match with exact endpoints: {"index":"graph_idx","match":{"nodes":{"a":{"filter":{"ids":["doc:a"]}},"b":{},"c":{"filter":{"ids":["doc:c"]}}},"edges":[{"from":"a","to":"b","types":["links"]},{"from":"b","to":"c","types":["links"]}]},"return":{"bindings":["c"]}}
         \\
-        \\Always include index and exactly one operation key. For traversal, use {"result_ref":"$full_text_results"} when node keys are not explicit. Prefer named graph indexes listed below.
+        \\Always include index and exactly one operation key. For traversal, use {"result_ref":"$query_results"} when node keys are not explicit. Prefer named graph indexes listed below.
         \\Use fields only from the schema context. Do not invent fields or indexes.
         \\
     );
@@ -3802,9 +3782,7 @@ fn makeGraphResultRefNodeSelector(
 }
 
 fn isAllowedGeneratedGraphResultRef(result_ref: []const u8) bool {
-    return std.mem.eql(u8, result_ref, "$full_text_results") or
-        std.mem.eql(u8, result_ref, "$fused_results") or
-        std.mem.eql(u8, result_ref, "$embeddings_results") or
+    return std.mem.eql(u8, result_ref, "$query_results") or
         generatedGraphResultDependencyName(result_ref) != null;
 }
 
@@ -5008,9 +4986,8 @@ fn queryBuilderPatternAlias(
 
 fn queryBuilderGraphSeedResultRef(built: BuiltQueryBuilderQuery) ?[]const u8 {
     return switch (built.query_kind) {
-        .generic, .field_match, .conjunction, .llm_full_text => "$full_text_results",
-        .hybrid => "$fused_results",
-        .semantic => if (built.indexes != null and built.indexes.?.len > 0) "$embeddings_results" else null,
+        .generic, .field_match, .conjunction, .llm_full_text, .hybrid => "$query_results",
+        .semantic => if (built.indexes != null and built.indexes.?.len > 0) "$query_results" else null,
         .status_only => null,
     };
 }
@@ -6901,7 +6878,7 @@ test "query builder metadata validator rejects graph result refs without seed re
         \\  "graph_queries": {
         \\    "graph_search": {
         \\      "index": "doc_graph",
-        \\      "traverse": {"start": {"result_ref": "$full_text_results"}, "max_depth": 1}
+        \\      "traverse": {"start": {"result_ref": "$query_results"}, "max_depth": 1}
         \\    }
         \\  }
         \\}
@@ -6915,7 +6892,7 @@ test "query builder metadata validator rejects graph result refs without seed re
     defer if (feedback) |value| std.testing.allocator.free(value);
 
     try std.testing.expect(feedback != null);
-    try std.testing.expect(std.mem.indexOf(u8, feedback.?, "$full_text_results") != null);
+    try std.testing.expect(std.mem.indexOf(u8, feedback.?, "$query_results") != null);
     try std.testing.expect(std.mem.indexOf(u8, feedback.?, "full_text_search is absent") != null);
 }
 
@@ -7507,7 +7484,7 @@ test "query builder preflight plan mode summarizes bound indexes and result refs
         \\  "graph_queries": {
         \\    "related": {
         \\      "index": "doc_graph",
-        \\      "traverse": {"start": {"result_ref": "$fused_results", "limit": 3}, "max_depth": 1}
+        \\      "traverse": {"start": {"result_ref": "$query_results", "limit": 3}, "max_depth": 1}
         \\    }
         \\  }
         \\}
@@ -7536,10 +7513,9 @@ test "query builder preflight plan mode summarizes bound indexes and result refs
     try std.testing.expect(queryBuilderFieldInSlice(plan_summary.full_text_indexes, "search_idx"));
     try std.testing.expect(queryBuilderFieldInSlice(plan_summary.embedding_indexes, "body_embedding"));
     try std.testing.expect(queryBuilderFieldInSlice(plan_summary.graph_indexes, "doc_graph"));
-    try std.testing.expect(queryBuilderFieldInSlice(plan_summary.result_refs, "$full_text_results"));
-    try std.testing.expect(queryBuilderFieldInSlice(plan_summary.result_refs, "$embeddings_results"));
-    try std.testing.expect(queryBuilderFieldInSlice(plan_summary.result_refs, "$fused_results"));
+    try std.testing.expect(queryBuilderFieldInSlice(plan_summary.result_refs, "$query_results"));
     try std.testing.expect(queryBuilderFieldInSlice(plan_summary.result_refs, "$graph_results.related"));
+    try std.testing.expectEqual(@as(usize, 2), plan_summary.result_refs.len);
     try std.testing.expectEqual(@as(usize, 1), plan_summary.graph_query_order.len);
     try std.testing.expectEqualStrings("related", plan_summary.graph_query_order[0]);
     try std.testing.expectEqual(@as(u32, 5), plan_summary.requested_limit);
@@ -8371,7 +8347,7 @@ test "query builder uses generated graph specialist when runner is provided" {
             try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "related raft documents") != null);
             return .{
                 .content = try alloc.dupe(u8,
-                    \\{"graph_queries":{"related":{"index":"doc_graph","traverse":{"start":{"result_ref":"$full_text_results","limit":5},"edge_types":["references"],"max_depth":1}}},"explanation":"Expands from lexical matches through reference edges.","confidence":0.87,"warnings":["used table graph index"]}
+                    \\{"graph_queries":{"related":{"index":"doc_graph","traverse":{"start":{"result_ref":"$query_results","limit":5},"edge_types":["references"],"max_depth":1}}},"explanation":"Expands from ranked matches through reference edges.","confidence":0.87,"warnings":["used table graph index"]}
                 ),
                 .allocator = alloc,
             };
@@ -8407,7 +8383,7 @@ test "query builder uses generated graph specialist when runner is provided" {
     try std.testing.expectEqual(@as(f64, 0.87), result.confidence.?);
     const graph_query = result.query_request.?.graph_queries.?.map.get("related").?;
     try std.testing.expectEqualStrings("doc_graph", graph_query.graph_traverse_query.index);
-    try std.testing.expectEqualStrings("$full_text_results", graph_query.graph_traverse_query.traverse.start.graph_result_ref_node_selector.result_ref);
+    try std.testing.expectEqualStrings("$query_results", graph_query.graph_traverse_query.traverse.start.graph_result_ref_node_selector.result_ref);
     try std.testing.expectEqualStrings("references", graph_query.graph_traverse_query.traverse.edge_types.?[0]);
     try std.testing.expectEqualStrings("used table graph index", result.warnings.?[0]);
 }
@@ -8435,7 +8411,7 @@ test "query builder repairs invalid generated graph plan once" {
                 try std.testing.expectEqual(@as(usize, 2), messages.len);
                 return .{
                     .content = try alloc.dupe(u8,
-                        \\{"graph_queries":{"bad":{"index":"missing_graph","traverse":{"start":{"result_ref":"$full_text_results"},"max_depth":1}}},"explanation":"bad index","confidence":0.99}
+                        \\{"graph_queries":{"bad":{"index":"missing_graph","traverse":{"start":{"result_ref":"$query_results"},"max_depth":1}}},"explanation":"bad index","confidence":0.99}
                     ),
                     .allocator = alloc,
                 };
@@ -8446,7 +8422,7 @@ test "query builder repairs invalid generated graph plan once" {
             try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[2]), "Regenerate a valid response") != null);
             return .{
                 .content = try alloc.dupe(u8,
-                    \\{"graph_queries":{"repaired":{"index":"doc_graph","traverse":{"start":{"result_ref":"$full_text_results","limit":3},"edge_types":["references"],"max_depth":1}}},"explanation":"Repaired to use the table graph index.","confidence":0.72}
+                    \\{"graph_queries":{"repaired":{"index":"doc_graph","traverse":{"start":{"result_ref":"$query_results","limit":3},"edge_types":["references"],"max_depth":1}}},"explanation":"Repaired to use the table graph index.","confidence":0.72}
                 ),
                 .allocator = alloc,
             };
@@ -8475,7 +8451,7 @@ test "query builder repairs invalid generated graph plan once" {
     try std.testing.expectEqualStrings("Repaired to use the table graph index.", result.explanation.?);
     const graph_query = result.query_request.?.graph_queries.?.map.get("repaired").?;
     try std.testing.expectEqualStrings("doc_graph", graph_query.graph_traverse_query.index);
-    try std.testing.expectEqualStrings("$full_text_results", graph_query.graph_traverse_query.traverse.start.graph_result_ref_node_selector.result_ref);
+    try std.testing.expectEqualStrings("$query_results", graph_query.graph_traverse_query.traverse.start.graph_result_ref_node_selector.result_ref);
     try std.testing.expectEqualStrings("references", graph_query.graph_traverse_query.traverse.edge_types.?[0]);
     if (result.warnings) |warnings| {
         for (warnings) |warning| {
@@ -8507,7 +8483,7 @@ test "query builder repairs generated graph plan with unavailable seed ref" {
                 try std.testing.expectEqual(@as(usize, 2), messages.len);
                 return .{
                     .content = try alloc.dupe(u8,
-                        \\{"graph_queries":{"bad_seed":{"index":"doc_graph","traverse":{"start":{"result_ref":"$embeddings_results"},"edge_types":["references"],"max_depth":1}}},"explanation":"bad seed","confidence":0.99}
+                        \\{"graph_queries":{"bad_seed":{"index":"doc_graph","traverse":{"start":{"result_ref":"$unknown_results"},"edge_types":["references"],"max_depth":1}}},"explanation":"bad seed","confidence":0.99}
                     ),
                     .allocator = alloc,
                 };
@@ -8515,10 +8491,10 @@ test "query builder repairs generated graph plan with unavailable seed ref" {
 
             try std.testing.expectEqual(@as(usize, 3), messages.len);
             try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[2]), "Query-builder plan validation feedback") != null);
-            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[2]), "$embeddings_results") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[2]), "$unknown_results") != null);
             return .{
                 .content = try alloc.dupe(u8,
-                    \\{"graph_queries":{"related":{"index":"doc_graph","traverse":{"start":{"result_ref":"$full_text_results","limit":3},"edge_types":["references"],"max_depth":1}}},"explanation":"Repaired to use the available lexical seed.","confidence":0.76}
+                    \\{"graph_queries":{"related":{"index":"doc_graph","traverse":{"start":{"result_ref":"$query_results","limit":3},"edge_types":["references"],"max_depth":1}}},"explanation":"Repaired to use the ranked query seed.","confidence":0.76}
                 ),
                 .allocator = alloc,
             };
@@ -8546,7 +8522,7 @@ test "query builder repairs generated graph plan with unavailable seed ref" {
     try std.testing.expectEqualStrings("graph", result.specialist.?);
     try std.testing.expectEqualStrings("Repaired to use the available lexical seed.", result.explanation.?);
     const graph_query = result.query_request.?.graph_queries.?.map.get("related").?;
-    try std.testing.expectEqualStrings("$full_text_results", graph_query.graph_traverse_query.traverse.start.graph_result_ref_node_selector.result_ref);
+    try std.testing.expectEqualStrings("$query_results", graph_query.graph_traverse_query.traverse.start.graph_result_ref_node_selector.result_ref);
 }
 
 test "query builder accepts generated graph result dependencies" {
@@ -8567,7 +8543,7 @@ test "query builder accepts generated graph result dependencies" {
             try std.testing.expectEqual(@as(usize, 2), messages.len);
             return .{
                 .content = try alloc.dupe(u8,
-                    \\{"graph_queries":{"seed":{"index":"doc_graph","traverse":{"start":{"result_ref":"$full_text_results","limit":4},"edge_types":["references"],"max_depth":1}},"expand_seed":{"index":"doc_graph","traverse":{"start":{"result_ref":"$graph_results.seed","limit":6},"edge_types":["links"],"max_depth":2}}},"explanation":"Chains graph expansion from a generated seed set.","confidence":0.78}
+                    \\{"graph_queries":{"seed":{"index":"doc_graph","traverse":{"start":{"result_ref":"$query_results","limit":4},"edge_types":["references"],"max_depth":1}},"expand_seed":{"index":"doc_graph","traverse":{"start":{"result_ref":"$graph_results.seed","limit":6},"edge_types":["links"],"max_depth":2}}},"explanation":"Chains graph expansion from a generated seed set.","confidence":0.78}
                 ),
                 .allocator = alloc,
             };
@@ -8622,7 +8598,7 @@ test "query builder repairs generated graph plan from validator feedback" {
                 try std.testing.expectEqual(@as(usize, 2), messages.len);
                 return .{
                     .content = try alloc.dupe(u8,
-                        \\{"graph_queries":{"related":{"index":"doc_graph","traverse":{"start":{"result_ref":"$full_text_results"},"edge_types":["missing_edge"],"max_depth":1}}},"explanation":"Uses an unavailable edge type.","confidence":0.8}
+                        \\{"graph_queries":{"related":{"index":"doc_graph","traverse":{"start":{"result_ref":"$query_results"},"edge_types":["missing_edge"],"max_depth":1}}},"explanation":"Uses an unavailable edge type.","confidence":0.8}
                     ),
                     .allocator = alloc,
                 };
@@ -8633,7 +8609,7 @@ test "query builder repairs generated graph plan from validator feedback" {
             try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[2]), "missing_edge") != null);
             return .{
                 .content = try alloc.dupe(u8,
-                    \\{"graph_queries":{"related":{"index":"doc_graph","traverse":{"start":{"result_ref":"$full_text_results"},"edge_types":["references"],"max_depth":1}}},"explanation":"Uses the available reference edge type.","confidence":0.84}
+                    \\{"graph_queries":{"related":{"index":"doc_graph","traverse":{"start":{"result_ref":"$query_results"},"edge_types":["references"],"max_depth":1}}},"explanation":"Uses the available reference edge type.","confidence":0.84}
                 ),
                 .allocator = alloc,
             };
@@ -8855,7 +8831,7 @@ test "query builder rejects generated graph indexes outside context and falls ba
         ) !generating.GenerateResult {
             return .{
                 .content = try alloc.dupe(u8,
-                    \\{"graph_queries":{"bad":{"index":"missing_graph","traverse":{"start":{"result_ref":"$full_text_results"},"max_depth":1}}},"explanation":"bad index","confidence":0.99}
+                    \\{"graph_queries":{"bad":{"index":"missing_graph","traverse":{"start":{"result_ref":"$query_results"},"max_depth":1}}},"explanation":"bad index","confidence":0.99}
                 ),
                 .allocator = alloc,
             };
@@ -9664,7 +9640,7 @@ test "query builder infers graph search from table context" {
     try std.testing.expectEqualStrings("graph", result.specialist.?);
     const graph_query = result.query_request.?.graph_queries.?.map.get("graph_search").?;
     try std.testing.expectEqualStrings("doc_graph", graph_query.graph_traverse_query.index);
-    try std.testing.expectEqualStrings("$full_text_results", graph_query.graph_traverse_query.traverse.start.graph_result_ref_node_selector.result_ref);
+    try std.testing.expectEqualStrings("$query_results", graph_query.graph_traverse_query.traverse.start.graph_result_ref_node_selector.result_ref);
     try std.testing.expectEqual(@as(i64, 2), graph_query.graph_traverse_query.traverse.max_depth.?);
 }
 
@@ -9690,7 +9666,7 @@ test "query builder infers dense graph seed from semantic results" {
     try std.testing.expectEqualStrings("semantic", result.specialist.?);
     try std.testing.expect(result.query_request.?.semantic_search != null);
     const graph_query = result.query_request.?.graph_queries.?.map.get("graph_search").?;
-    try std.testing.expectEqualStrings("$embeddings_results", graph_query.graph_traverse_query.traverse.start.graph_result_ref_node_selector.result_ref);
+    try std.testing.expectEqualStrings("$query_results", graph_query.graph_traverse_query.traverse.start.graph_result_ref_node_selector.result_ref);
 }
 
 test "query builder preserves legacy flat graph indexes without structured metadata" {

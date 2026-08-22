@@ -2051,7 +2051,7 @@ func graphVisualizationQuery(searchText string) map[string]any {
 			"relations": map[string]any{
 				"index": DefaultAutographIndex,
 				"traverse": map[string]any{
-					"start":         map[string]any{"result_ref": "$full_text_results", "limit": 8},
+					"start":         map[string]any{"result_ref": "$query_results", "limit": 8},
 					"direction":     "both",
 					"max_depth":     1,
 					"limit":         80,
@@ -2072,7 +2072,7 @@ func graphVisualizationSampleQuery() map[string]any {
 			"relations": map[string]any{
 				"index": DefaultAutographIndex,
 				"traverse": map[string]any{
-					"start":         map[string]any{"result_ref": "$fused_results", "limit": 8},
+					"start":         map[string]any{"result_ref": "$query_results", "limit": 8},
 					"direction":     "both",
 					"max_depth":     1,
 					"limit":         80,

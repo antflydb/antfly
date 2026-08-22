@@ -13,16 +13,16 @@ T = TypeVar("T", bound="GraphQueryStats")
 class GraphQueryStats:
     """
     Attributes:
-        returned_rows (int):
+        returned_items (int): Number of primary result items returned (nodes, paths, rows, or aggregates).
         truncated (bool):
     """
 
-    returned_rows: int
+    returned_items: int
     truncated: bool
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        returned_rows = self.returned_rows
+        returned_items = self.returned_items
 
         truncated = self.truncated
 
@@ -30,7 +30,7 @@ class GraphQueryStats:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
-                "returned_rows": returned_rows,
+                "returned_items": returned_items,
                 "truncated": truncated,
             }
         )
@@ -40,12 +40,12 @@ class GraphQueryStats:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        returned_rows = d.pop("returned_rows")
+        returned_items = d.pop("returned_items")
 
         truncated = d.pop("truncated")
 
         graph_query_stats = cls(
-            returned_rows=returned_rows,
+            returned_items=returned_items,
             truncated=truncated,
         )
 

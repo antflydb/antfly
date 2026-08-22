@@ -10,11 +10,11 @@ if TYPE_CHECKING:
     from ..models.graph_result_node import GraphResultNode
 
 
-T = TypeVar("T", bound="GraphResultRowType0")
+T = TypeVar("T", bound="GraphResultRow")
 
 
 @_attrs_define
-class GraphResultRowType0:
+class GraphResultRow:
     """ """
 
     additional_properties: dict[str, GraphResultNode | None] = _attrs_field(init=False, factory=dict)
@@ -36,7 +36,7 @@ class GraphResultRowType0:
         from ..models.graph_result_node import GraphResultNode
 
         d = dict(src_dict)
-        graph_result_row_type_0 = cls()
+        graph_result_row = cls()
 
         additional_properties = {}
         for prop_name, prop_dict in d.items():
@@ -58,8 +58,8 @@ class GraphResultRowType0:
 
             additional_properties[prop_name] = additional_property
 
-        graph_result_row_type_0.additional_properties = additional_properties
-        return graph_result_row_type_0
+        graph_result_row.additional_properties = additional_properties
+        return graph_result_row
 
     @property
     def additional_keys(self) -> list[str]:

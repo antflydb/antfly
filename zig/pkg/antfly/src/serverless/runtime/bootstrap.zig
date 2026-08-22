@@ -976,7 +976,7 @@ test "runtime bootstrap supports published semantic search with embedding_templa
     var dense_graph_resp = try stack.handler.handle(.{
         .method = .post,
         .path = "/tables/docs/query",
-        .body = "{\"embeddings\":{\"serverless_chunk\":[1,0,0]},\"graph_queries\":{\"neighbors_from_dense\":{\"index\":\"graph_idx\",\"traverse\":{\"start\":{\"result_ref\":\"$embeddings_results\",\"limit\":1},\"edge_types\":[\"cites\"],\"max_depth\":1}}},\"limit\":5}",
+        .body = "{\"embeddings\":{\"serverless_chunk\":[1,0,0]},\"graph_queries\":{\"neighbors_from_dense\":{\"index\":\"graph_idx\",\"traverse\":{\"start\":{\"result_ref\":\"$query_results\",\"limit\":1},\"edge_types\":[\"cites\"],\"max_depth\":1}}},\"limit\":5}",
     });
     defer dense_graph_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), dense_graph_resp.status);
@@ -986,7 +986,7 @@ test "runtime bootstrap supports published semantic search with embedding_templa
     var sparse_graph_resp = try stack.handler.handle(.{
         .method = .post,
         .path = "/tables/docs/query",
-        .body = "{\"embeddings\":{\"serverless_sparse\":{\"indices\":[1,2],\"values\":[1.0,0.5]}},\"graph_queries\":{\"neighbors_from_sparse\":{\"index\":\"graph_idx\",\"traverse\":{\"start\":{\"result_ref\":\"$embeddings_results\",\"limit\":1},\"edge_types\":[\"cites\"],\"max_depth\":1}}},\"limit\":5}",
+        .body = "{\"embeddings\":{\"serverless_sparse\":{\"indices\":[1,2],\"values\":[1.0,0.5]}},\"graph_queries\":{\"neighbors_from_sparse\":{\"index\":\"graph_idx\",\"traverse\":{\"start\":{\"result_ref\":\"$query_results\",\"limit\":1},\"edge_types\":[\"cites\"],\"max_depth\":1}}},\"limit\":5}",
     });
     defer sparse_graph_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), sparse_graph_resp.status);

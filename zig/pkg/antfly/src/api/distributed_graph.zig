@@ -984,6 +984,7 @@ const TargetNodeSet = struct {
 
     fn init(
         alloc: std.mem.Allocator,
+        source_table: []const u8,
         req: db_mod.types.SearchRequest,
         base_result: db_mod.types.SearchResult,
         prior_results: []const db_mod.types.GraphSearchResult,
@@ -991,6 +992,7 @@ const TargetNodeSet = struct {
     ) !TargetNodeSet {
         const nodes = try resolveSelectorNodes(
             alloc,
+            source_table,
             req,
             base_result,
             prior_results,
@@ -1571,7 +1573,7 @@ fn executeDistributedPattern(
         base_result;
     var selector_req = req;
     if (canonical_match) selector_req.limit = 0;
-    const frontier = try resolveStartFrontier(alloc, &state, selector_req, selector_result, prior_results, graph_query.query.start_nodes, false);
+    const frontier = try resolveStartFrontier(alloc, &state, table_name, selector_req, selector_result, prior_results, graph_query.query.start_nodes, false);
     defer freeFrontier(alloc, frontier);
 
     const start_nodes = try alloc.alloc(graph_node_identity.Ref, frontier.len);
@@ -1581,7 +1583,7 @@ fn executeDistributedPattern(
     }
 
     const target_frontier = if (graph_query.query.target_nodes) |selector|
-        try resolveStartFrontier(alloc, &state, req, base_result, prior_results, selector, false)
+        try resolveStartFrontier(alloc, &state, table_name, req, base_result, prior_results, selector, false)
     else
         try alloc.alloc(FrontierState, 0);
     defer freeFrontier(alloc, target_frontier);
@@ -1935,6 +1937,7 @@ fn executeDistributedTraverse(
     if (graph_query.query.target_nodes) |selector| {
         target_nodes = try TargetNodeSet.init(
             alloc,
+            table_name,
             req,
             base_result,
             prior_results,
@@ -1945,7 +1948,7 @@ fn executeDistributedTraverse(
     var state = QueryState{ .name = try alloc.dupe(u8, graph_query.name) };
     errdefer state.deinit(alloc);
 
-    var frontier = try resolveStartFrontier(alloc, &state, req, base_result, prior_results, graph_query.query.start_nodes, include_paths);
+    var frontier = try resolveStartFrontier(alloc, &state, table_name, req, base_result, prior_results, graph_query.query.start_nodes, include_paths);
     defer freeFrontier(alloc, frontier);
     frontier = try retainAdmittedFrontier(alloc, admission, frontier);
 
@@ -2304,6 +2307,7 @@ fn executeDistributedKShortestPaths(
 ) !db_mod.types.GraphSearchResult {
     const start_nodes = try resolveSelectorNodes(
         alloc,
+        table_name,
         req,
         base_result,
         prior_results,
@@ -2312,6 +2316,7 @@ fn executeDistributedKShortestPaths(
     defer freeNodeIdentities(alloc, start_nodes);
     const target_nodes = try resolveSelectorNodes(
         alloc,
+        table_name,
         req,
         base_result,
         prior_results,
@@ -2546,6 +2551,7 @@ fn findDistributedShortestPath(
 
     var target_set = try TargetNodeSet.init(
         alloc,
+        table_name,
         req,
         base_result,
         prior_results,
@@ -2558,7 +2564,7 @@ fn findDistributedShortestPath(
         for (frontier.items) |*item| item.deinit(alloc);
         frontier.deinit(alloc);
     }
-    const roots = try resolveStartFrontier(alloc, &state, req, base_result, prior_results, graph_query.query.start_nodes, true);
+    const roots = try resolveStartFrontier(alloc, &state, table_name, req, base_result, prior_results, graph_query.query.start_nodes, true);
     defer freeFrontier(alloc, roots);
     if (start_table_override) |table| {
         try overrideFrontierTables(alloc, &state, roots, table);
@@ -2717,14 +2723,9 @@ fn supportsSelectorRef(req: db_mod.types.SearchRequest, selector: graph_query_mo
 }
 
 fn supportsResultRef(req: db_mod.types.SearchRequest, ref: []const u8) bool {
+    _ = req;
     if (std.mem.startsWith(u8, ref, "$graph_results.")) return true;
-    if (!std.mem.eql(u8, ref, "$fused_results") and
-        !std.mem.eql(u8, ref, "$full_text_results") and
-        !std.mem.eql(u8, ref, "$embeddings_results"))
-    {
-        return false;
-    }
-    return req.full_text_queries.len == 0 and req.dense_queries.len == 0 and req.sparse_queries.len == 0 and req.merge_config == null;
+    return std.mem.eql(u8, ref, "$query_results");
 }
 
 fn batchFrontierByGroup(
@@ -4187,6 +4188,7 @@ test "distributed graph result selectors retain root table provenance" {
     const frontier = try resolveStartFrontier(
         alloc,
         &state,
+        "docs",
         .{ .identity_read_generation = 7 },
         base_result,
         prior_results[0..],
@@ -4227,6 +4229,7 @@ test "distributed graph target refs are table exact while raw keys remain wildca
 
     var exact = try TargetNodeSet.init(
         alloc,
+        "docs",
         req,
         base_result,
         prior_results[0..],
@@ -4238,6 +4241,7 @@ test "distributed graph target refs are table exact while raw keys remain wildca
 
     var wildcard = try TargetNodeSet.init(
         alloc,
+        "docs",
         req,
         base_result,
         prior_results[0..],
@@ -4246,6 +4250,39 @@ test "distributed graph target refs are table exact while raw keys remain wildca
     defer wildcard.deinit(alloc);
     try std.testing.expect(wildcard.contains(null, "shared"));
     try std.testing.expect(wildcard.contains("entities", "shared"));
+
+    var same_table = try TargetNodeSet.init(
+        alloc,
+        "docs",
+        req,
+        base_result,
+        &.{},
+        .{ .identities = &.{.{ .key = "doc:b", .table = "docs" }} },
+    );
+    defer same_table.deinit(alloc);
+    try std.testing.expect(same_table.contains(null, "doc:b"));
+    try std.testing.expect(!same_table.contains("docs", "doc:b"));
+}
+
+test "distributed graph MATCH binding refs preserve table identity and deduplicate" {
+    const alloc = std.testing.allocator;
+    var first_bindings = [_]db_mod.types.GraphPatternBinding{.{
+        .alias = @constCast("post"),
+        .node = .{ .key = "post:1", .table = "docs", .depth = 0, .distance = 0, .path = null, .path_edges = null },
+    }};
+    var second_bindings = [_]db_mod.types.GraphPatternBinding{.{
+        .alias = @constCast("post"),
+        .node = .{ .key = "post:1", .table = "docs", .depth = 0, .distance = 0, .path = null, .path_edges = null },
+    }};
+    const matches = [_]db_mod.types.GraphPatternMatch{
+        .{ .bindings = &first_bindings, .path = &.{} },
+        .{ .bindings = &second_bindings, .path = &.{} },
+    };
+    const nodes = try resolveMatchBindingNodes(alloc, "docs", &matches, "post", 0);
+    defer freeNodeIdentities(alloc, nodes);
+    try std.testing.expectEqual(@as(usize, 1), nodes.len);
+    try std.testing.expect(nodes[0].table == null);
+    try std.testing.expectEqualStrings("post:1", nodes[0].key);
 }
 
 test "distributed graph complete anchors require the source snapshot" {
@@ -4355,13 +4392,14 @@ fn materializePathStateNode(
 fn resolveStartFrontier(
     alloc: std.mem.Allocator,
     state: *QueryState,
+    source_table: []const u8,
     req: db_mod.types.SearchRequest,
     base_result: db_mod.types.SearchResult,
     prior_results: []const db_mod.types.GraphSearchResult,
     selector: graph_query_mod.NodeSelector,
     include_paths: bool,
 ) ![]FrontierState {
-    const nodes = try resolveSelectorNodes(alloc, req, base_result, prior_results, selector);
+    const nodes = try resolveSelectorNodes(alloc, source_table, req, base_result, prior_results, selector);
     var transferred: usize = 0;
     defer {
         for (nodes[transferred..]) |*node| node.deinit(alloc);
@@ -4395,6 +4433,7 @@ fn resolveStartFrontier(
 
 fn resolveSelectorNodes(
     alloc: std.mem.Allocator,
+    source_table: []const u8,
     req: db_mod.types.SearchRequest,
     base_result: db_mod.types.SearchResult,
     prior_results: []const db_mod.types.GraphSearchResult,
@@ -4422,13 +4461,18 @@ fn resolveSelectorNodes(
                 alloc.free(out);
             }
             for (identities, 0..) |identity, i| {
-                out[i] = try cloneGraphNodeIdentityParts(alloc, identity.key, identity.table);
+                out[i] = try cloneGraphNodeIdentityParts(
+                    alloc,
+                    identity.key,
+                    canonicalGraphNodeTable(source_table, identity.table),
+                );
                 initialized += 1;
             }
             break :blk out;
         },
         .result_ref => |result_ref| resolveResultRefNodes(
             alloc,
+            source_table,
             req,
             base_result,
             prior_results,
@@ -4439,6 +4483,7 @@ fn resolveSelectorNodes(
 
 fn resolveSelectorKeys(
     alloc: std.mem.Allocator,
+    source_table: []const u8,
     req: db_mod.types.SearchRequest,
     base_result: db_mod.types.SearchResult,
     prior_results: []const db_mod.types.GraphSearchResult,
@@ -4452,7 +4497,7 @@ fn resolveSelectorKeys(
             for (identities, 0..) |identity, i| refs[i] = identity.key;
             break :blk try dupKeys(alloc, refs);
         },
-        .result_ref => |result_ref| resolveResultRefKeys(alloc, req, base_result, prior_results, result_ref),
+        .result_ref => |result_ref| resolveResultRefKeys(alloc, source_table, req, base_result, prior_results, result_ref),
     };
 }
 
@@ -4561,6 +4606,7 @@ fn retainAdmittedFrontier(
 
 fn resolveResultRefNodes(
     alloc: std.mem.Allocator,
+    source_table: []const u8,
     req: db_mod.types.SearchRequest,
     base_result: db_mod.types.SearchResult,
     prior_results: []const db_mod.types.GraphSearchResult,
@@ -4572,8 +4618,20 @@ fn resolveResultRefNodes(
         const name = result_ref.ref["$graph_results.".len..];
         for (prior_results) |graph_result| {
             if (!std.mem.eql(u8, graph_result.name, name)) continue;
+            if (result_ref.binding) |binding| {
+                if (result_ref.limit == 0 and
+                    (graph_result.truncated or @as(u64, graph_result.total_hits) > graph_result.matches.len))
+                    return error.UnsupportedQueryRequest;
+                return try resolveMatchBindingNodes(
+                    alloc,
+                    source_table,
+                    graph_result.matches,
+                    binding,
+                    result_ref.limit,
+                );
+            }
             if (result_ref.limit == 0 and
-                @as(u64, graph_result.total_hits) > graph_result.nodes.len)
+                (graph_result.truncated or @as(u64, graph_result.total_hits) > graph_result.nodes.len))
             {
                 return error.UnsupportedQueryRequest;
             }
@@ -4591,7 +4649,7 @@ fn resolveResultRefNodes(
                 out[i] = try cloneGraphNodeIdentityParts(
                     alloc,
                     node.key,
-                    node.table,
+                    canonicalGraphNodeTable(source_table, node.table),
                 );
                 initialized += 1;
             }
@@ -4600,10 +4658,7 @@ fn resolveResultRefNodes(
         return error.GraphResultRefNotImplemented;
     }
 
-    if (!std.mem.eql(u8, result_ref.ref, "$fused_results") and
-        !std.mem.eql(u8, result_ref.ref, "$full_text_results") and
-        !std.mem.eql(u8, result_ref.ref, "$embeddings_results"))
-    {
+    if (!std.mem.eql(u8, result_ref.ref, "$query_results") or result_ref.binding != null) {
         return error.GraphResultRefNotImplemented;
     }
 
@@ -4623,60 +4678,70 @@ fn resolveResultRefNodes(
         out[i] = try cloneGraphNodeIdentityParts(
             alloc,
             hit.id,
-            hit.source_table,
+            canonicalGraphNodeTable(source_table, hit.source_table),
         );
         initialized += 1;
     }
     return out;
 }
 
+fn resolveMatchBindingNodes(
+    alloc: std.mem.Allocator,
+    source_table: []const u8,
+    matches: []const db_mod.types.GraphPatternMatch,
+    alias: []const u8,
+    limit: u32,
+) ![]GraphNodeIdentity {
+    var nodes = std.ArrayListUnmanaged(GraphNodeIdentity).empty;
+    errdefer {
+        for (nodes.items) |*node| node.deinit(alloc);
+        nodes.deinit(alloc);
+    }
+    var seen = graph_node_identity.Map(void){};
+    defer seen.deinit(alloc);
+
+    for (matches) |match| {
+        for (match.bindings) |binding| {
+            if (!std.mem.eql(u8, binding.alias, alias)) continue;
+            const table = canonicalGraphNodeTable(source_table, binding.node.table);
+            const ref = graph_node_identity.Ref{ .table = table, .key = binding.node.key };
+            if (seen.contains(ref)) break;
+            var node = try cloneGraphNodeIdentityParts(alloc, binding.node.key, table);
+            errdefer node.deinit(alloc);
+            _ = try seen.putIfAbsent(alloc, node.ref(), {});
+            try nodes.append(alloc, node);
+            if (limit > 0 and nodes.items.len >= limit) return try nodes.toOwnedSlice(alloc);
+            break;
+        }
+    }
+    return try nodes.toOwnedSlice(alloc);
+}
+
 fn resolveResultRefKeys(
     alloc: std.mem.Allocator,
+    source_table: []const u8,
     req: db_mod.types.SearchRequest,
     base_result: db_mod.types.SearchResult,
     prior_results: []const db_mod.types.GraphSearchResult,
     result_ref: graph_query_mod.ResultRef,
 ) ![][]u8 {
-    if (!resultHasIdentitySnapshot(req, base_result)) return error.UnsupportedQueryRequest;
-
-    if (std.mem.startsWith(u8, result_ref.ref, "$graph_results.")) {
-        const name = result_ref.ref["$graph_results.".len..];
-        for (prior_results) |graph_result| {
-            if (!std.mem.eql(u8, graph_result.name, name)) continue;
-            if (result_ref.limit == 0 and @as(u64, graph_result.total_hits) > graph_result.nodes.len) return error.UnsupportedQueryRequest;
-            const count: usize = if (result_ref.limit == 0) graph_result.nodes.len else @min(graph_result.nodes.len, result_ref.limit);
-            const out = try alloc.alloc([]u8, count);
-            var initialized: usize = 0;
-            errdefer {
-                for (out[0..initialized]) |key| alloc.free(key);
-                alloc.free(out);
-            }
-            for (graph_result.nodes[0..count], 0..) |node, i| {
-                out[i] = try alloc.dupe(u8, node.key);
-                initialized += 1;
-            }
-            return out;
-        }
-        return error.GraphResultRefNotImplemented;
-    }
-
-    if (!std.mem.eql(u8, result_ref.ref, "$fused_results") and
-        !std.mem.eql(u8, result_ref.ref, "$full_text_results") and
-        !std.mem.eql(u8, result_ref.ref, "$embeddings_results"))
-    {
-        return error.GraphResultRefNotImplemented;
-    }
-
-    if (result_ref.limit == 0 and baseResultRefMayBeIncomplete(req, base_result)) return error.UnsupportedQueryRequest;
-    const count: usize = if (result_ref.limit == 0) base_result.hits.len else @min(base_result.hits.len, result_ref.limit);
-    const out = try alloc.alloc([]u8, count);
+    const nodes = try resolveResultRefNodes(
+        alloc,
+        source_table,
+        req,
+        base_result,
+        prior_results,
+        result_ref,
+    );
+    defer freeNodeIdentities(alloc, nodes);
+    const out = try alloc.alloc([]u8, nodes.len);
     var initialized: usize = 0;
     errdefer {
         for (out[0..initialized]) |key| alloc.free(key);
         alloc.free(out);
     }
-    for (base_result.hits[0..count], 0..) |hit, i| {
-        out[i] = try alloc.dupe(u8, hit.id);
+    for (nodes, 0..) |node, i| {
+        out[i] = try alloc.dupe(u8, node.key);
         initialized += 1;
     }
     return out;
@@ -6020,26 +6085,29 @@ pub fn testResultRefFailClosedGuards(alloc: std.mem.Allocator) !void {
 
         try std.testing.expectError(error.UnsupportedQueryRequest, resolveResultRefKeys(
             alloc,
+            "docs",
             req,
             base_result,
             &.{},
-            .{ .ref = "$full_text_results", .limit = 0 },
+            .{ .ref = "$query_results", .limit = 0 },
         ));
 
         try std.testing.expectError(error.UnsupportedQueryRequest, resolveResultRefKeys(
             alloc,
+            "docs",
             .{ .limit = 10 },
             base_result,
             &.{},
-            .{ .ref = "$full_text_results", .limit = 1 },
+            .{ .ref = "$query_results", .limit = 1 },
         ));
 
         const limited = try resolveResultRefKeys(
             alloc,
+            "docs",
             req,
             base_result,
             &.{},
-            .{ .ref = "$full_text_results", .limit = 1 },
+            .{ .ref = "$query_results", .limit = 1 },
         );
         defer freeKeys(alloc, limited);
         try std.testing.expectEqual(@as(usize, 1), limited.len);
@@ -6058,10 +6126,11 @@ pub fn testResultRefFailClosedGuards(alloc: std.mem.Allocator) !void {
 
         try std.testing.expectError(error.UnsupportedQueryRequest, resolveResultRefKeys(
             alloc,
+            "docs",
             req,
             base_result,
             &.{},
-            .{ .ref = "$fused_results", .limit = 0 },
+            .{ .ref = "$query_results", .limit = 0 },
         ));
     }
 
@@ -6082,6 +6151,7 @@ pub fn testResultRefFailClosedGuards(alloc: std.mem.Allocator) !void {
 
         try std.testing.expectError(error.UnsupportedQueryRequest, resolveResultRefKeys(
             alloc,
+            "docs",
             .{ .identity_read_generation = 9 },
             base_result,
             &.{graph_result},
@@ -6090,6 +6160,7 @@ pub fn testResultRefFailClosedGuards(alloc: std.mem.Allocator) !void {
 
         try std.testing.expectError(error.UnsupportedQueryRequest, resolveResultRefKeys(
             alloc,
+            "docs",
             .{},
             base_result,
             &.{graph_result},
@@ -6098,6 +6169,7 @@ pub fn testResultRefFailClosedGuards(alloc: std.mem.Allocator) !void {
 
         const limited = try resolveResultRefKeys(
             alloc,
+            "docs",
             .{ .identity_read_generation = 9 },
             base_result,
             &.{graph_result},
@@ -7799,26 +7871,29 @@ test "distributed graph result_ref fails closed for unbounded paged base results
 
     try std.testing.expectError(error.UnsupportedQueryRequest, resolveResultRefKeys(
         alloc,
+        "docs",
         req,
         base_result,
         &.{},
-        .{ .ref = "$full_text_results", .limit = 0 },
+        .{ .ref = "$query_results", .limit = 0 },
     ));
 
     try std.testing.expectError(error.UnsupportedQueryRequest, resolveResultRefKeys(
         alloc,
+        "docs",
         .{ .limit = 10 },
         base_result,
         &.{},
-        .{ .ref = "$full_text_results", .limit = 1 },
+        .{ .ref = "$query_results", .limit = 1 },
     ));
 
     const limited = try resolveResultRefKeys(
         alloc,
+        "docs",
         req,
         base_result,
         &.{},
-        .{ .ref = "$full_text_results", .limit = 1 },
+        .{ .ref = "$query_results", .limit = 1 },
     );
     defer freeKeys(alloc, limited);
     try std.testing.expectEqual(@as(usize, 1), limited.len);
@@ -7839,10 +7914,11 @@ test "distributed graph result_ref fails closed for saturated base result page" 
 
     try std.testing.expectError(error.UnsupportedQueryRequest, resolveResultRefKeys(
         alloc,
+        "docs",
         req,
         base_result,
         &.{},
-        .{ .ref = "$fused_results", .limit = 0 },
+        .{ .ref = "$query_results", .limit = 0 },
     ));
 }
 
@@ -7865,6 +7941,7 @@ test "distributed graph result_ref fails closed for unbounded paged graph result
 
     try std.testing.expectError(error.UnsupportedQueryRequest, resolveResultRefKeys(
         alloc,
+        "docs",
         .{ .identity_read_generation = 9 },
         base_result,
         &.{graph_result},
@@ -7873,6 +7950,7 @@ test "distributed graph result_ref fails closed for unbounded paged graph result
 
     try std.testing.expectError(error.UnsupportedQueryRequest, resolveResultRefKeys(
         alloc,
+        "docs",
         .{},
         base_result,
         &.{graph_result},
@@ -7881,6 +7959,7 @@ test "distributed graph result_ref fails closed for unbounded paged graph result
 
     const limited = try resolveResultRefKeys(
         alloc,
+        "docs",
         .{ .identity_read_generation = 9 },
         base_result,
         &.{graph_result},
@@ -7899,7 +7978,7 @@ test "distributed graph rejects unstamped result refs before cross-range fanout"
                 .query = .{
                     .query_type = .neighbors,
                     .index_name = "graph_idx",
-                    .start_nodes = .{ .result_ref = .{ .ref = "$full_text_results", .limit = 1 } },
+                    .start_nodes = .{ .result_ref = .{ .ref = "$query_results", .limit = 1 } },
                     .params = .{},
                 },
             },
@@ -8105,7 +8184,7 @@ pub fn testPerShardSnapshotsAcrossGraphPhases(alloc: std.mem.Allocator) !void {
                 .query = .{
                     .query_type = .traverse,
                     .index_name = "graph_idx",
-                    .start_nodes = .{ .result_ref = .{ .ref = "$full_text_results", .limit = 1 } },
+                    .start_nodes = .{ .result_ref = .{ .ref = "$query_results", .limit = 1 } },
                     .include_documents = true,
                     .params = .{ .max_depth = 2 },
                 },

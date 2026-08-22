@@ -14,16 +14,22 @@ T = TypeVar("T", bound="GraphResultRefNodeSelector")
 class GraphResultRefNodeSelector:
     """
     Attributes:
-        result_ref (str): A prior result set: `$full_text_results`, `$embeddings_results`, `$fused_results`, or
-            `$graph_results.<query-name>`.
+        result_ref (str): `$query_results` selects the final ranked query results. `$graph_results.<query-name>` selects
+            a prior graph query result. Prior MATCH results require `binding`; traversal results prohibit it. Path-producing
+            results cannot currently be used as node selectors.
+        binding (str | Unset): Binding alias to select from a prior MATCH result. Valid only with
+            `$graph_results.<query-name>` when that query returns MATCH rows.
         limit (int | Unset): Maximum referenced results to use. Omit only when the referenced result is complete.
     """
 
     result_ref: str
+    binding: str | Unset = UNSET
     limit: int | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         result_ref = self.result_ref
+
+        binding = self.binding
 
         limit = self.limit
 
@@ -34,6 +40,8 @@ class GraphResultRefNodeSelector:
                 "result_ref": result_ref,
             }
         )
+        if binding is not UNSET:
+            field_dict["binding"] = binding
         if limit is not UNSET:
             field_dict["limit"] = limit
 
@@ -44,10 +52,13 @@ class GraphResultRefNodeSelector:
         d = dict(src_dict)
         result_ref = d.pop("result_ref")
 
+        binding = d.pop("binding", UNSET)
+
         limit = d.pop("limit", UNSET)
 
         graph_result_ref_node_selector = cls(
             result_ref=result_ref,
+            binding=binding,
             limit=limit,
         )
 

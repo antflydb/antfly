@@ -58,7 +58,10 @@ pub const NodeIdentity = struct {
 };
 
 pub const ResultRef = struct {
-    ref: []const u8, // e.g. "$full_text_results"
+    ref: []const u8, // "$query_results" or "$graph_results.<query-name>"
+    /// Required when the referenced graph query returns MATCH rows. Selecting
+    /// one alias avoids ambiguous flattening of branched bindings.
+    binding: ?[]const u8 = null,
     limit: u32 = 0, // 0 = use all results
 };
 
@@ -1475,12 +1478,12 @@ test "NodeSelector keys vs result_ref" {
         .result_ref => unreachable,
     }
 
-    const ref_sel = NodeSelector{ .result_ref = .{ .ref = "$full_text_results", .limit = 10 } };
+    const ref_sel = NodeSelector{ .result_ref = .{ .ref = "$query_results", .limit = 10 } };
     switch (ref_sel) {
         .keys => unreachable,
         .identities => unreachable,
         .result_ref => |r| {
-            try std.testing.expectEqualStrings("$full_text_results", r.ref);
+            try std.testing.expectEqualStrings("$query_results", r.ref);
             try std.testing.expectEqual(@as(u32, 10), r.limit);
         },
     }

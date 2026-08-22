@@ -77630,7 +77630,7 @@ test "db search supports graph result_ref from full-text hits" {
                 .query = .{
                     .query_type = .neighbors,
                     .index_name = "gr_v1",
-                    .start_nodes = .{ .result_ref = .{ .ref = "$full_text_results", .limit = 0 } },
+                    .start_nodes = .{ .result_ref = .{ .ref = "$query_results", .limit = 0 } },
                     .params = .{ .direction = .out, .edge_types = &.{"cites"} },
                 },
             },
@@ -77689,7 +77689,7 @@ test "db search supports graph result_ref from dense hits without public id hand
                 .query = .{
                     .query_type = .neighbors,
                     .index_name = "gr_v1",
-                    .start_nodes = .{ .result_ref = .{ .ref = "$embeddings_results", .limit = 0 } },
+                    .start_nodes = .{ .result_ref = .{ .ref = "$query_results", .limit = 0 } },
                     .params = .{ .direction = .out, .edge_types = &.{"cites"} },
                 },
             },
@@ -77749,7 +77749,7 @@ test "db search rejects unbounded graph result_ref when base result is paged" {
                 .query = .{
                     .query_type = .neighbors,
                     .index_name = "gr_v1",
-                    .start_nodes = .{ .result_ref = .{ .ref = "$full_text_results", .limit = 0 } },
+                    .start_nodes = .{ .result_ref = .{ .ref = "$query_results", .limit = 0 } },
                     .params = .{ .direction = .out, .edge_types = &.{"cites"} },
                 },
             },
@@ -78302,7 +78302,7 @@ test "db search supports fused graph selectors for single-lane full-text searche
                 .query = .{
                     .query_type = .neighbors,
                     .index_name = "gr_v1",
-                    .start_nodes = .{ .result_ref = .{ .ref = "$fused_results", .limit = 5 } },
+                    .start_nodes = .{ .result_ref = .{ .ref = "$query_results", .limit = 5 } },
                     .params = .{ .direction = .out, .edge_types = &.{"cites"} },
                 },
             },
@@ -78380,7 +78380,7 @@ test "db search fuses full_text and dense named searches before graph expansion"
                 .query = .{
                     .query_type = .neighbors,
                     .index_name = "gr_v1",
-                    .start_nodes = .{ .result_ref = .{ .ref = "$fused_results", .limit = 1 } },
+                    .start_nodes = .{ .result_ref = .{ .ref = "$query_results", .limit = 1 } },
                     .params = .{ .direction = .out, .edge_types = &.{"links"} },
                 },
             },
@@ -78588,7 +78588,7 @@ test "db search fuses full_text and dense named searches before graph expansion 
                 .query = .{
                     .query_type = .neighbors,
                     .index_name = "gr_v1",
-                    .start_nodes = .{ .result_ref = .{ .ref = "$fused_results", .limit = 1 } },
+                    .start_nodes = .{ .result_ref = .{ .ref = "$query_results", .limit = 1 } },
                     .params = .{ .direction = .out, .edge_types = &.{"links"} },
                 },
             },
@@ -78688,7 +78688,7 @@ test "db search supports named full_text queries fused with dense and sparse bef
                 .query = .{
                     .query_type = .neighbors,
                     .index_name = "gr_v1",
-                    .start_nodes = .{ .result_ref = .{ .ref = "$fused_results", .limit = 1 } },
+                    .start_nodes = .{ .result_ref = .{ .ref = "$query_results", .limit = 1 } },
                     .params = .{ .direction = .out, .edge_types = &.{"links"} },
                 },
             },
@@ -78790,7 +78790,7 @@ test "db search supports named full_text queries fused with dense and sparse bef
                 .query = .{
                     .query_type = .neighbors,
                     .index_name = "gr_v1",
-                    .start_nodes = .{ .result_ref = .{ .ref = "$fused_results", .limit = 1 } },
+                    .start_nodes = .{ .result_ref = .{ .ref = "$query_results", .limit = 1 } },
                     .params = .{ .direction = .out, .edge_types = &.{"links"} },
                 },
             },

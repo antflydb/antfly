@@ -147,6 +147,7 @@ const GraphResultSet = struct {
     name: []const u8,
     hits: []const db_types.SearchHit,
     total_hits: u32,
+    graph_result: ?*const db_types.GraphSearchResult = null,
 };
 
 fn publicGraphSeedTotalHits(hits_len: usize, limit: u32) u32 {
@@ -2725,31 +2726,10 @@ pub const HttpHandler = struct {
             search_hits = try allocDbSearchHitsAlloc(self.alloc, execution.hits);
             search_total_hits = publicGraphSeedTotalHits(execution.hits.len, req.limit);
             try initial_sets.append(self.alloc, .{
-                .name = "$fused_results",
+                .name = "$query_results",
                 .hits = search_hits,
                 .total_hits = search_total_hits,
             });
-            if (request.full_text_search != null) {
-                try initial_sets.append(self.alloc, .{
-                    .name = "$full_text_results",
-                    .hits = search_hits,
-                    .total_hits = search_total_hits,
-                });
-            }
-            if (execution.plan.usesVectorLane() and !execution.plan.usesTextLane() and !execution.plan.usesSparseLane()) {
-                try initial_sets.append(self.alloc, .{
-                    .name = "$embeddings_results",
-                    .hits = search_hits,
-                    .total_hits = search_total_hits,
-                });
-            }
-            if (execution.plan.usesSparseLane() and !execution.plan.usesTextLane() and !execution.plan.usesVectorLane()) {
-                try initial_sets.append(self.alloc, .{
-                    .name = "$embeddings_results",
-                    .hits = search_hits,
-                    .total_hits = search_total_hits,
-                });
-            }
 
             session = execution.takeSession();
             session_initialized = true;
@@ -2762,7 +2742,7 @@ pub const HttpHandler = struct {
             session.setCancellation(cancellation);
         }
 
-        const results = try self.executePublicGraphQueriesAlloc(&session, graph_queries, initial_sets.items);
+        const results = try self.executePublicGraphQueriesAlloc(&session, table_name, graph_queries, initial_sets.items);
         defer {
             for (results) |*result| result.deinit(self.alloc);
             if (results.len > 0) self.alloc.free(results);
@@ -3076,6 +3056,7 @@ pub const HttpHandler = struct {
     fn executePublicGraphQueriesAlloc(
         self: *HttpHandler,
         session: *query_mod.QuerySession,
+        source_table: []const u8,
         graph_queries: []const db_types.NamedGraphQuery,
         initial_sets: []const GraphResultSet,
     ) ![]db_types.GraphSearchResult {
@@ -3094,11 +3075,12 @@ pub const HttpHandler = struct {
         }
         for (sorted_query_indexes, 0..) |query_index, idx| {
             try session.checkCancellation();
-            results[idx] = try self.executePublicGraphQueryAlloc(session, graph_queries[query_index], available_sets.items);
+            results[idx] = try self.executePublicGraphQueryAlloc(session, source_table, graph_queries[query_index], available_sets.items);
             try available_sets.append(self.alloc, .{
                 .name = results[idx].name,
                 .hits = results[idx].hits,
                 .total_hits = results[idx].total_hits,
+                .graph_result = &results[idx],
             });
             initialized += 1;
         }
@@ -3108,14 +3090,15 @@ pub const HttpHandler = struct {
     fn executePublicGraphQueryAlloc(
         self: *HttpHandler,
         session: *query_mod.QuerySession,
+        source_table: []const u8,
         named_query: db_types.NamedGraphQuery,
         available_sets: []const GraphResultSet,
     ) !db_types.GraphSearchResult {
         return switch (named_query.query.query_type) {
-            .neighbors => try self.executePublicNeighborsQueryAlloc(session, named_query, available_sets),
-            .traverse => try self.executePublicTraverseQueryAlloc(session, named_query, available_sets),
-            .shortest_path => try self.executePublicShortestPathQueryAlloc(session, named_query, available_sets),
-            .pattern => try self.executePublicPatternQueryAlloc(session, named_query, available_sets),
+            .neighbors => try self.executePublicNeighborsQueryAlloc(session, source_table, named_query, available_sets),
+            .traverse => try self.executePublicTraverseQueryAlloc(session, source_table, named_query, available_sets),
+            .shortest_path => try self.executePublicShortestPathQueryAlloc(session, source_table, named_query, available_sets),
+            .pattern => try self.executePublicPatternQueryAlloc(session, source_table, named_query, available_sets),
             else => error.UnsupportedQueryRequest,
         };
     }
@@ -3123,10 +3106,11 @@ pub const HttpHandler = struct {
     fn executePublicNeighborsQueryAlloc(
         self: *HttpHandler,
         session: *query_mod.QuerySession,
+        source_table: []const u8,
         named_query: db_types.NamedGraphQuery,
         available_sets: []const GraphResultSet,
     ) !db_types.GraphSearchResult {
-        const start_keys = try public_graph_query.resolveGraphSelectorAlloc(self.alloc, named_query.query.start_nodes, available_sets);
+        const start_keys = try public_graph_query.resolveGraphSelectorAlloc(self.alloc, source_table, named_query.query.start_nodes, available_sets);
         defer freeOwnedKeySlice(self.alloc, start_keys);
 
         var nodes = std.ArrayListUnmanaged(graph_query_mod.GraphResultNode).empty;
@@ -3203,10 +3187,11 @@ pub const HttpHandler = struct {
     fn executePublicTraverseQueryAlloc(
         self: *HttpHandler,
         session: *query_mod.QuerySession,
+        source_table: []const u8,
         named_query: db_types.NamedGraphQuery,
         available_sets: []const GraphResultSet,
     ) !db_types.GraphSearchResult {
-        const start_keys = try public_graph_query.resolveGraphSelectorAlloc(self.alloc, named_query.query.start_nodes, available_sets);
+        const start_keys = try public_graph_query.resolveGraphSelectorAlloc(self.alloc, source_table, named_query.query.start_nodes, available_sets);
         defer freeOwnedKeySlice(self.alloc, start_keys);
 
         var nodes = std.ArrayListUnmanaged(graph_query_mod.GraphResultNode).empty;
@@ -3285,13 +3270,14 @@ pub const HttpHandler = struct {
     fn executePublicShortestPathQueryAlloc(
         self: *HttpHandler,
         session: *query_mod.QuerySession,
+        source_table: []const u8,
         named_query: db_types.NamedGraphQuery,
         available_sets: []const GraphResultSet,
     ) !db_types.GraphSearchResult {
-        const start_keys = try public_graph_query.resolveGraphSelectorAlloc(self.alloc, named_query.query.start_nodes, available_sets);
+        const start_keys = try public_graph_query.resolveGraphSelectorAlloc(self.alloc, source_table, named_query.query.start_nodes, available_sets);
         defer freeOwnedKeySlice(self.alloc, start_keys);
         const target_selector = named_query.query.target_nodes orelse return error.UnsupportedQueryRequest;
-        const target_keys = try public_graph_query.resolveGraphSelectorAlloc(self.alloc, target_selector, available_sets);
+        const target_keys = try public_graph_query.resolveGraphSelectorAlloc(self.alloc, source_table, target_selector, available_sets);
         defer freeOwnedKeySlice(self.alloc, target_keys);
 
         var paths = std.ArrayListUnmanaged(db_types.GraphPath).empty;
@@ -3333,12 +3319,13 @@ pub const HttpHandler = struct {
     fn executePublicPatternQueryAlloc(
         self: *HttpHandler,
         session: *query_mod.QuerySession,
+        source_table: []const u8,
         named_query: db_types.NamedGraphQuery,
         available_sets: []const GraphResultSet,
     ) !db_types.GraphSearchResult {
         const conjunctive_pattern = named_query.query.match_pattern;
         const target_keys = if (named_query.query.target_nodes) |selector|
-            try public_graph_query.resolveGraphSelectorAlloc(self.alloc, selector, available_sets)
+            try public_graph_query.resolveGraphSelectorAlloc(self.alloc, source_table, selector, available_sets)
         else
             try self.alloc.alloc([]u8, 0);
         defer freeOwnedKeySlice(self.alloc, target_keys);
@@ -3364,7 +3351,7 @@ pub const HttpHandler = struct {
         const start_keys = if (conjunctive_pattern) |pattern|
             try allocConjunctiveAnchorKeys(self.alloc, docs, pattern, &filter_ctx)
         else
-            try public_graph_query.resolveGraphSelectorAlloc(self.alloc, named_query.query.start_nodes, available_sets);
+            try public_graph_query.resolveGraphSelectorAlloc(self.alloc, source_table, named_query.query.start_nodes, available_sets);
         defer freeOwnedKeySlice(self.alloc, start_keys);
         const start_key_refs = try castOwnedKeysToConst(self.alloc, start_keys);
         defer self.alloc.free(start_key_refs);
@@ -9880,7 +9867,7 @@ test "http handler serves published graph query endpoints" {
         .method = .post,
         .path = "/tables/docs/query",
         .body =
-        \\{"full_text_search":{"query":"alpha"},"graph_queries":{"neighbors_from_search":{"index":"graph_idx","traverse":{"start":{"result_ref":"$full_text_results","limit":1},"edge_types":["cites","related"],"max_depth":1}}},"limit":10}
+        \\{"full_text_search":{"query":"alpha"},"graph_queries":{"neighbors_from_search":{"index":"graph_idx","traverse":{"start":{"result_ref":"$query_results","limit":1},"edge_types":["cites","related"],"max_depth":1}}},"limit":10}
         ,
     });
     defer from_search.deinit(alloc);
@@ -9898,7 +9885,7 @@ test "http handler serves published graph query endpoints" {
         .method = .post,
         .path = "/tables/docs/query",
         .body =
-        \\{"full_text_search":{"query":"alpha"},"graph_queries":{"neighbors_from_fused":{"index":"graph_idx","traverse":{"start":{"result_ref":"$fused_results","limit":1},"edge_types":["cites","related"],"max_depth":1}}},"limit":10}
+        \\{"full_text_search":{"query":"alpha"},"graph_queries":{"neighbors_from_fused":{"index":"graph_idx","traverse":{"start":{"result_ref":"$query_results","limit":1},"edge_types":["cites","related"],"max_depth":1}}},"limit":10}
         ,
     });
     defer from_fused.deinit(alloc);
@@ -9925,7 +9912,7 @@ test "http handler serves published graph query endpoints" {
     defer parsed_pattern.deinit();
     const two_hop = parsed_pattern.value.responses.?[0].graph_results.?.map.get("two_hop").?;
     try std.testing.expectEqual(@as(usize, 1), two_hop.rows.?.len);
-    const row = two_hop.rows.?[0].object;
+    const row = two_hop.rows.?[0].map;
     try std.testing.expectEqualStrings("doc-a", row.get("a").?.object.get("key").?.string);
     try std.testing.expectEqualStrings("doc-b", row.get("b").?.object.get("key").?.string);
     try std.testing.expectEqualStrings("doc-c", row.get("c").?.object.get("key").?.string);

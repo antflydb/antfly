@@ -118,6 +118,26 @@ func NewGraphResultRefSelector(resultRef string, limit int) (GraphNodeSelector, 
 	return result, err
 }
 
+// NewGraphResultBindingSelector selects one returned alias from a prior MATCH
+// query. Selecting the alias explicitly avoids flattening unrelated bindings.
+func NewGraphResultBindingSelector(queryName, binding string, limit int) (GraphNodeSelector, error) {
+	queryName = strings.TrimSpace(queryName)
+	binding = strings.TrimSpace(binding)
+	if queryName == "" || binding == "" {
+		return GraphNodeSelector{}, fmt.Errorf("antfly: graph result query name and binding must not be empty")
+	}
+	if limit < 0 || limit > 10_000 {
+		return GraphNodeSelector{}, fmt.Errorf("antfly: graph result reference limit must be 0 or between 1 and 10000")
+	}
+	var result GraphNodeSelector
+	err := result.FromGraphResultRefNodeSelector(GraphResultRefNodeSelector{
+		ResultRef: "$graph_results." + queryName,
+		Binding:   binding,
+		Limit:     limit,
+	})
+	return result, err
+}
+
 // NewGraphBindingsReturn selects projected aliases and optional stored fields.
 func NewGraphBindingsReturn(bindings []string, options GraphBindingsOptions) (GraphReturn, error) {
 	if err := validateNonEmptyUnique("graph binding", bindings); err != nil {
@@ -234,15 +254,13 @@ func validateGraphMatchQuery(query GraphMatchQuery) error {
 			return fmt.Errorf("antfly: graph alias must not be empty")
 		}
 	}
+	visible := make(map[string]struct{}, len(query.Match.Nodes))
+	for alias := range query.Match.Nodes {
+		visible[alias] = struct{}{}
+	}
 	for _, edge := range query.Match.Edges {
-		if _, ok := query.Match.Nodes[edge.From]; !ok {
-			return fmt.Errorf("antfly: graph edge references unknown alias %q", edge.From)
-		}
-		if _, ok := query.Match.Nodes[edge.To]; !ok {
-			return fmt.Errorf("antfly: graph edge references unknown alias %q", edge.To)
-		}
-		if edge.MinHops < 0 || edge.MaxHops < 0 || (edge.MinHops > 0 && edge.MaxHops > 0 && edge.MinHops > edge.MaxHops) {
-			return fmt.Errorf("antfly: invalid graph edge hop range")
+		if err := validateGraphMatchEdge(edge, visible); err != nil {
+			return err
 		}
 	}
 	if len(query.Match.Nodes) > 1 {
@@ -273,7 +291,137 @@ func validateGraphMatchQuery(query GraphMatchQuery) error {
 			return fmt.Errorf("antfly: graph match nodes must form one connected pattern")
 		}
 	}
+	if err := validateGraphWhereExpression(query.Match.Where, visible); err != nil {
+		return err
+	}
+	for _, optional := range query.Match.Optional {
+		introduced := make(map[string]struct{}, len(optional.Nodes))
+		for alias := range optional.Nodes {
+			if strings.TrimSpace(alias) == "" {
+				return fmt.Errorf("antfly: optional graph alias must not be empty")
+			}
+			if _, exists := visible[alias]; exists {
+				return fmt.Errorf("antfly: duplicate optional graph alias %q", alias)
+			}
+			introduced[alias] = struct{}{}
+		}
+		optionalVisible := make(map[string]struct{}, len(visible)+len(introduced))
+		for alias := range visible {
+			optionalVisible[alias] = struct{}{}
+		}
+		for alias := range introduced {
+			optionalVisible[alias] = struct{}{}
+		}
+		for _, edge := range optional.Edges {
+			if err := validateGraphMatchEdge(edge, optionalVisible); err != nil {
+				return err
+			}
+		}
+		connected := make(map[string]struct{}, len(introduced))
+		changed := true
+		for changed {
+			changed = false
+			for _, edge := range optional.Edges {
+				_, fromPrior := visible[edge.From]
+				_, toPrior := visible[edge.To]
+				_, fromConnected := connected[edge.From]
+				_, toConnected := connected[edge.To]
+				if fromPrior || fromConnected {
+					if _, isNew := introduced[edge.To]; isNew && !toConnected {
+						connected[edge.To] = struct{}{}
+						changed = true
+					}
+				}
+				if toPrior || toConnected {
+					if _, isNew := introduced[edge.From]; isNew && !fromConnected {
+						connected[edge.From] = struct{}{}
+						changed = true
+					}
+				}
+			}
+		}
+		if len(connected) != len(introduced) {
+			return fmt.Errorf("antfly: optional graph pattern must be correlated and connected")
+		}
+		if err := validateGraphWhereExpression(optional.Where, optionalVisible); err != nil {
+			return err
+		}
+		for alias := range introduced {
+			visible[alias] = struct{}{}
+		}
+	}
 	return validateGraphReturn(query.Return, query.Match)
+}
+
+func validateGraphMatchEdge(edge GraphMatchEdge, aliases map[string]struct{}) error {
+	if _, ok := aliases[edge.From]; !ok {
+		return fmt.Errorf("antfly: graph edge references unknown alias %q", edge.From)
+	}
+	if _, ok := aliases[edge.To]; !ok {
+		return fmt.Errorf("antfly: graph edge references unknown alias %q", edge.To)
+	}
+	if edge.MinHops < 0 || edge.MaxHops < 0 || edge.MinHops > 64 || edge.MaxHops > 64 ||
+		(edge.MinHops > 0 && edge.MaxHops > 0 && edge.MinHops > edge.MaxHops) {
+		return fmt.Errorf("antfly: invalid graph edge hop range")
+	}
+	return nil
+}
+
+func validateGraphWhereExpression(where GraphWhereExpression, aliases map[string]struct{}) error {
+	encoded, err := json.Marshal(where)
+	if err != nil {
+		return err
+	}
+	trimmed := strings.TrimSpace(string(encoded))
+	if trimmed == "" || trimmed == "null" || trimmed == "{}" {
+		return nil
+	}
+	type whereJSON struct {
+		And       []json.RawMessage       `json:"and"`
+		NotEqual  *GraphNotEqualPredicate `json:"not_equal"`
+		NotExists *GraphNotExistsPattern  `json:"not_exists"`
+	}
+	var value whereJSON
+	if err := json.Unmarshal(encoded, &value); err != nil {
+		return err
+	}
+	forms := 0
+	if len(value.And) > 0 {
+		forms++
+		for _, child := range value.And {
+			var expression GraphWhereExpression
+			if err := json.Unmarshal(child, &expression); err != nil {
+				return err
+			}
+			if err := validateGraphWhereExpression(expression, aliases); err != nil {
+				return err
+			}
+		}
+	}
+	if value.NotEqual != nil {
+		forms++
+		if _, ok := aliases[value.NotEqual.Left.Alias]; !ok {
+			return fmt.Errorf("antfly: graph predicate references unknown alias %q", value.NotEqual.Left.Alias)
+		}
+		if _, ok := aliases[value.NotEqual.Right.Alias]; !ok {
+			return fmt.Errorf("antfly: graph predicate references unknown alias %q", value.NotEqual.Right.Alias)
+		}
+	}
+	if value.NotExists != nil {
+		forms++
+		if len(value.NotExists.Edges) == 0 {
+			return fmt.Errorf("antfly: graph not-exists edges must not be empty")
+		}
+		for _, edge := range value.NotExists.Edges {
+			if err := validateGraphMatchEdge(edge, aliases); err != nil {
+				return err
+			}
+		}
+	}
+	if forms != 1 {
+		return fmt.Errorf("antfly: graph where expression must contain exactly one predicate form")
+	}
+	return nil
 }
 
 func validateGraphReturn(graphReturn GraphReturn, match GraphMatch) error {
@@ -370,6 +518,7 @@ func validateGraphSelector(selector GraphNodeSelector) error {
 		Keys       []string            `json:"keys"`
 		Identities []GraphPathEndpoint `json:"identities"`
 		ResultRef  string              `json:"result_ref"`
+		Binding    string              `json:"binding"`
 		Limit      int                 `json:"limit"`
 	}
 	if err := json.Unmarshal(encoded, &value); err != nil {
@@ -398,6 +547,9 @@ func validateGraphSelector(selector GraphNodeSelector) error {
 		}
 		if value.Limit < 0 || value.Limit > 10_000 {
 			return fmt.Errorf("antfly: graph result reference limit must be 0 or between 1 and 10000")
+		}
+		if value.Binding != "" && !strings.HasPrefix(value.ResultRef, "$graph_results.") {
+			return fmt.Errorf("antfly: graph result binding requires a prior graph result reference")
 		}
 	}
 	if forms != 1 {
@@ -428,7 +580,7 @@ func validateGraphIdentities(identities []GraphPathEndpoint) error {
 }
 
 func validGraphResultRef(resultRef string) bool {
-	if resultRef == "$full_text_results" || resultRef == "$embeddings_results" || resultRef == "$fused_results" {
+	if resultRef == "$query_results" {
 		return true
 	}
 	const prefix = "$graph_results."

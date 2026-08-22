@@ -1176,6 +1176,13 @@ pub fn searchComposed(
         .total_hits_relation = base.total_hits_relation,
         .resolved_doc_set = fused_resolved_doc_set,
     });
+    try named_sets.append(alloc, .{
+        .name = "$query_results",
+        .hits = base.hits,
+        .total_hits = base.total_hits,
+        .total_hits_relation = base.total_hits_relation,
+        .resolved_doc_set = fused_resolved_doc_set,
+    });
 
     try appendEmbeddingsResultAlias(alloc, shared_req, executor, &named_sets, &owned_results, &owned_resolved_sets);
 

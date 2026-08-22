@@ -11745,8 +11745,10 @@ export interface components {
             identities: components["schemas"]["GraphPathEndpoint"][];
         };
         GraphResultRefNodeSelector: {
-            /** @description A prior result set: `$full_text_results`, `$embeddings_results`, `$fused_results`, or `$graph_results.<query-name>`. */
+            /** @description `$query_results` selects the final ranked query results. `$graph_results.<query-name>` selects a prior graph query result. Prior MATCH results require `binding`; traversal results prohibit it. Path-producing results cannot currently be used as node selectors. */
             result_ref: string;
+            /** @description Binding alias to select from a prior MATCH result. Valid only with `$graph_results.<query-name>` when that query returns MATCH rows. */
+            binding?: string;
             /** @description Maximum referenced results to use. Omit only when the referenced result is complete. */
             limit?: number;
         };
@@ -12045,8 +12047,11 @@ export interface components {
             exact: boolean;
         };
         GraphQueryStats: {
-            /** Format: uint64 */
-            returned_rows: number;
+            /**
+             * Format: uint64
+             * @description Number of primary result items returned (nodes, paths, rows, or aggregates).
+             */
+            returned_items: number;
             truncated: boolean;
         };
         /** @description Results of a graph query */

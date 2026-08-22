@@ -2466,8 +2466,16 @@ components:
         result_ref:
           type: string
           description: >-
-            A prior result set: `$full_text_results`, `$embeddings_results`,
-            `$fused_results`, or `$graph_results.<query-name>`.
+            `$query_results` selects the final ranked query results.
+            `$graph_results.<query-name>` selects a prior graph query result.
+            Prior MATCH results require `binding`; traversal results prohibit it.
+            Path-producing results cannot currently be used as node selectors.
+        binding:
+          type: string
+          minLength: 1
+          description: >-
+            Binding alias to select from a prior MATCH result. Valid only with
+            `$graph_results.<query-name>` when that query returns MATCH rows.
         limit:
           type: integer
           minimum: 1
@@ -3001,9 +3009,12 @@ components:
             $ref: '#/components/schemas/PathEdge'
     GraphQueryStats:
       type: object
-      required: [returned_rows, truncated]
+      required: [returned_items, truncated]
       properties:
-        returned_rows: { type: integer, format: uint64 }
+        returned_items:
+          type: integer
+          format: uint64
+          description: Number of primary result items returned (nodes, paths, rows, or aggregates).
         truncated: { type: boolean }
     GraphQueryResult:
       x-go-type-skip-optional-pointer: true
@@ -3057,6 +3068,5 @@ components:
         - $ref: '#/components/schemas/GraphResultNode'
         - enum: [null]
     GraphResultRow:
-      anyOf:
-        - type: object
-          additionalProperties: { $ref: '#/components/schemas/GraphResultBinding' }
+      type: object
+      additionalProperties: { $ref: '#/components/schemas/GraphResultBinding' }

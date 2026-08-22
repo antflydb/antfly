@@ -99,15 +99,13 @@ pub fn sortQueriesByDependencies(
     alloc: std.mem.Allocator,
     queries: []const db_mod.types.NamedGraphQuery,
 ) ![]usize {
-    if (queries.len <= 1) {
-        const indexes = try alloc.alloc(usize, queries.len);
-        for (indexes, 0..) |*index, i| index.* = i;
-        return indexes;
-    }
-
     var by_name = std.StringHashMapUnmanaged(usize).empty;
     defer by_name.deinit(alloc);
-    for (queries, 0..) |query, i| try by_name.put(alloc, query.name, i);
+    for (queries, 0..) |query, i| {
+        const result = try by_name.getOrPut(alloc, query.name);
+        if (result.found_existing) return error.InvalidQueryRequest;
+        result.value_ptr.* = i;
+    }
 
     var sorted = std.ArrayListUnmanaged(usize).empty;
     defer sorted.deinit(alloc);
@@ -125,6 +123,7 @@ pub fn sortQueriesByDependencies(
 
 pub fn resolveGraphSelectorAlloc(
     alloc: std.mem.Allocator,
+    source_table: []const u8,
     selector: graph_query_mod.NodeSelector,
     available_sets: anytype,
 ) ![][]u8 {
@@ -150,7 +149,9 @@ pub fn resolveGraphSelectorAlloc(
                 alloc.free(duped);
             }
             for (identities, 0..) |identity, i| {
-                if (identity.table != null) return error.UnsupportedQueryRequest;
+                if (identity.table) |table| {
+                    if (!std.mem.eql(u8, table, source_table)) return error.UnsupportedQueryRequest;
+                }
                 duped[i] = try alloc.dupe(u8, identity.key);
                 initialized += 1;
             }
@@ -158,6 +159,15 @@ pub fn resolveGraphSelectorAlloc(
         },
         .result_ref => |result_ref| blk: {
             const set = findResultSetByRef(available_sets, result_ref.ref) orelse return error.GraphResultRefNotImplemented;
+            if (result_ref.binding) |binding| {
+                const Set = @TypeOf(set);
+                if (!@hasField(Set, "graph_result")) return error.InvalidQueryRequest;
+                const graph_result = set.graph_result orelse return error.InvalidQueryRequest;
+                if (result_ref.limit == 0 and
+                    (graph_result.truncated or @as(u64, graph_result.total_hits) > graph_result.matches.len))
+                    return error.UnsupportedQueryRequest;
+                break :blk try resolveMatchBindingKeysAlloc(alloc, graph_result.matches, binding, result_ref.limit);
+            }
             if (result_ref.limit == 0 and resultSetMayBeIncompleteForUnboundedRef(set)) return error.UnsupportedQueryRequest;
             const count: usize = if (result_ref.limit == 0) set.hits.len else @min(set.hits.len, result_ref.limit);
             const duped = try alloc.alloc([]u8, count);
@@ -175,6 +185,34 @@ pub fn resolveGraphSelectorAlloc(
     };
 }
 
+fn resolveMatchBindingKeysAlloc(
+    alloc: std.mem.Allocator,
+    matches: []const db_mod.types.GraphPatternMatch,
+    alias: []const u8,
+    limit: u32,
+) ![][]u8 {
+    var keys = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (keys.items) |key| alloc.free(key);
+        keys.deinit(alloc);
+    }
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+
+    for (matches) |match| {
+        for (match.bindings) |binding| {
+            if (!std.mem.eql(u8, binding.alias, alias) or seen.contains(binding.node.key)) continue;
+            const key = try alloc.dupe(u8, binding.node.key);
+            errdefer alloc.free(key);
+            try seen.put(alloc, key, {});
+            try keys.append(alloc, key);
+            if (limit > 0 and keys.items.len >= limit) return try keys.toOwnedSlice(alloc);
+            break;
+        }
+    }
+    return try keys.toOwnedSlice(alloc);
+}
+
 pub fn testResolveGraphSelectorFailClosedGuard(alloc: std.mem.Allocator) !void {
     const ResultSet = struct {
         name: []const u8,
@@ -183,20 +221,22 @@ pub fn testResolveGraphSelectorFailClosedGuard(alloc: std.mem.Allocator) !void {
     };
     const hit = db_mod.types.SearchHit{ .id = @constCast("doc:a") };
     const sets = [_]ResultSet{.{
-        .name = "$full_text_results",
+        .name = "$query_results",
         .hits = @constCast((&[_]db_mod.types.SearchHit{hit})[0..]),
         .total_hits = 2,
     }};
 
     try std.testing.expectError(error.UnsupportedQueryRequest, resolveGraphSelectorAlloc(
         alloc,
-        .{ .result_ref = .{ .ref = "$full_text_results", .limit = 0 } },
+        "docs",
+        .{ .result_ref = .{ .ref = "$query_results", .limit = 0 } },
         &sets,
     ));
 
     const limited = try resolveGraphSelectorAlloc(
         alloc,
-        .{ .result_ref = .{ .ref = "$full_text_results", .limit = 1 } },
+        "docs",
+        .{ .result_ref = .{ .ref = "$query_results", .limit = 1 } },
         &sets,
     );
     defer {
@@ -212,15 +252,35 @@ pub fn testResolveGraphSelectorFailClosedGuard(alloc: std.mem.Allocator) !void {
         total_hits: u32,
         page_limit: u32,
     }{.{
-        .name = "$fused_results",
+        .name = "$query_results",
         .hits = @constCast((&[_]db_mod.types.SearchHit{hit})[0..]),
         .total_hits = 1,
         .page_limit = 1,
     }};
     try std.testing.expectError(error.UnsupportedQueryRequest, resolveGraphSelectorAlloc(
         alloc,
-        .{ .result_ref = .{ .ref = "$fused_results", .limit = 0 } },
+        "docs",
+        .{ .result_ref = .{ .ref = "$query_results", .limit = 0 } },
         &saturated_sets,
+    ));
+
+    const same_table = try resolveGraphSelectorAlloc(
+        alloc,
+        "docs",
+        .{ .identities = &.{.{ .key = "doc:a", .table = "docs" }} },
+        &sets,
+    );
+    defer {
+        for (same_table) |key| alloc.free(key);
+        alloc.free(same_table);
+    }
+    try std.testing.expectEqualStrings("doc:a", same_table[0]);
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, resolveGraphSelectorAlloc(
+        alloc,
+        "docs",
+        .{ .identities = &.{.{ .key = "doc:a", .table = "other" }} },
+        &sets,
     ));
 }
 
@@ -251,35 +311,54 @@ fn visitQuery(
 ) !void {
     switch (states[index]) {
         .done => return,
-        .visiting => return error.GraphQueryCycle,
+        .visiting => return error.InvalidQueryRequest,
         .unvisited => {},
     }
 
     states[index] = .visiting;
     const query = queries[index];
-    if (dependencyName(query.query.start_nodes)) |dep_name| {
-        if (by_name.get(dep_name)) |dep_index| try visitQuery(alloc, queries, by_name, states, sorted, dep_index);
+    if (try dependencyIndex(queries, by_name, query.query.start_nodes)) |dep_index| {
+        try visitQuery(alloc, queries, by_name, states, sorted, dep_index);
     }
     if (query.query.target_nodes) |target_nodes| {
-        if (dependencyName(target_nodes)) |dep_name| {
-            if (by_name.get(dep_name)) |dep_index| try visitQuery(alloc, queries, by_name, states, sorted, dep_index);
-        }
+        if (try dependencyIndex(queries, by_name, target_nodes)) |dep_index|
+            try visitQuery(alloc, queries, by_name, states, sorted, dep_index);
     }
     states[index] = .done;
     try sorted.append(alloc, index);
 }
 
-fn dependencyName(selector: graph_query_mod.NodeSelector) ?[]const u8 {
-    return switch (selector) {
-        .keys => null,
-        .identities => null,
-        .result_ref => |result_ref| blk: {
-            if (std.mem.startsWith(u8, result_ref.ref, "$graph_results.")) {
-                break :blk result_ref.ref["$graph_results.".len..];
-            }
-            break :blk null;
-        },
+fn dependencyIndex(
+    queries: []const db_mod.types.NamedGraphQuery,
+    by_name: *const std.StringHashMapUnmanaged(usize),
+    selector: graph_query_mod.NodeSelector,
+) !?usize {
+    const result_ref = switch (selector) {
+        .keys, .identities => return null,
+        .result_ref => |value| value,
     };
+    if (!std.mem.startsWith(u8, result_ref.ref, "$graph_results.")) return null;
+    const dep_name = result_ref.ref["$graph_results.".len..];
+    const dep_index = by_name.get(dep_name) orelse return error.InvalidQueryRequest;
+    const dependency = queries[dep_index].query;
+    switch (dependency.query_type) {
+        .neighbors, .traverse => if (result_ref.binding != null) return error.InvalidQueryRequest,
+        .pattern => {
+            const binding = result_ref.binding orelse return error.InvalidQueryRequest;
+            if (dependency.match_pattern == null or dependency.aggregates.len > 0)
+                return error.InvalidQueryRequest;
+            var returned = false;
+            for (dependency.return_aliases) |alias| {
+                if (std.mem.eql(u8, alias, binding)) {
+                    returned = true;
+                    break;
+                }
+            }
+            if (!returned) return error.InvalidQueryRequest;
+        },
+        .shortest_path, .k_shortest_paths => return error.InvalidQueryRequest,
+    }
+    return dep_index;
 }
 
 fn findResultSetByRef(available_sets: anytype, ref: []const u8) ?@TypeOf(available_sets[0]) {
@@ -288,11 +367,7 @@ fn findResultSetByRef(available_sets: anytype, ref: []const u8) ?@TypeOf(availab
     }
     const name = if (std.mem.startsWith(u8, ref, "$graph_results."))
         ref["$graph_results.".len..]
-    else if (std.mem.eql(u8, ref, "$full_text_results"))
-        ref
-    else if (std.mem.eql(u8, ref, "$fused_results"))
-        ref
-    else if (std.mem.eql(u8, ref, "$embeddings_results"))
+    else if (std.mem.eql(u8, ref, "$query_results"))
         ref
     else
         return null;
@@ -377,6 +452,26 @@ test "parse supported graph queries rejects canonical and legacy fields together
     try std.testing.expectError(error.InvalidQueryRequest, parseSupportedGraphQueriesAlloc(alloc, parsed.value));
 }
 
+test "legacy graph result refs normalize to the ranked query result" {
+    const alloc = std.testing.allocator;
+    var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
+        \\{
+        \\  "graph_searches": {
+        \\    "legacy": {
+        \\      "type": "neighbors",
+        \\      "index_name": "graph_idx",
+        \\      "start_nodes": {"result_ref": "$full_text_results", "limit": 2}
+        \\    }
+        \\  }
+        \\}
+    , .{});
+    defer parsed.deinit();
+    const items = try parseSupportedGraphQueriesAlloc(alloc, parsed.value);
+    defer freeNamedGraphQueries(alloc, items);
+    try std.testing.expect(items[0].query.legacy_response);
+    try std.testing.expectEqualStrings("$query_results", items[0].query.start_nodes.result_ref.ref);
+}
+
 test "parse supported graph queries reject unbounded traversal limits" {
     const alloc = std.testing.allocator;
     var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
@@ -427,14 +522,14 @@ test "parse supported graph queries accepts graph result refs" {
     try std.testing.expectEqual(@as(u32, 5), items[0].query.start_nodes.result_ref.limit);
 }
 
-test "parse supported graph queries accepts full text result refs" {
+test "parse supported graph queries accepts ranked query result refs" {
     const alloc = std.testing.allocator;
     var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
         \\{
         \\  "graph_queries": {
         \\    "neighbors": {
         \\      "index": "graph_idx",
-        \\      "traverse": {"start": {"result_ref": "$full_text_results", "limit": 2}}
+        \\      "traverse": {"start": {"result_ref": "$query_results", "limit": 2}}
         \\    }
         \\  }
         \\}
@@ -444,18 +539,18 @@ test "parse supported graph queries accepts full text result refs" {
     const items = try parseSupportedGraphQueriesAlloc(alloc, parsed.value);
     defer freeNamedGraphQueries(alloc, items);
 
-    try std.testing.expectEqualStrings("$full_text_results", items[0].query.start_nodes.result_ref.ref);
+    try std.testing.expectEqualStrings("$query_results", items[0].query.start_nodes.result_ref.ref);
     try std.testing.expectEqual(@as(u32, 2), items[0].query.start_nodes.result_ref.limit);
 }
 
-test "parse supported graph queries accepts fused result refs" {
+test "parse supported graph queries accepts ranked query refs for traversal" {
     const alloc = std.testing.allocator;
     const body =
         \\{
         \\  "graph_queries": {
         \\    "neighbors": {
         \\      "index": "graph_idx",
-        \\      "traverse": {"start": {"result_ref": "$fused_results", "limit": 3}}
+        \\      "traverse": {"start": {"result_ref": "$query_results", "limit": 3}}
         \\    }
         \\  }
         \\}
@@ -470,11 +565,11 @@ test "parse supported graph queries accepts fused result refs" {
     defer freeNamedGraphQueries(alloc, items);
 
     try std.testing.expectEqual(@as(usize, 1), items.len);
-    try std.testing.expectEqualStrings("$fused_results", items[0].query.start_nodes.result_ref.ref);
+    try std.testing.expectEqualStrings("$query_results", items[0].query.start_nodes.result_ref.ref);
     try std.testing.expectEqual(@as(u32, 3), items[0].query.start_nodes.result_ref.limit);
 }
 
-test "parse supported graph queries accepts embeddings result refs" {
+test "parse supported graph queries accepts ranked query refs for vector retrieval" {
     const alloc = std.testing.allocator;
 
     var embeddings_parsed = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
@@ -482,7 +577,7 @@ test "parse supported graph queries accepts embeddings result refs" {
         \\  "graph_queries": {
         \\    "walk": {
         \\      "index": "graph_idx",
-        \\      "traverse": {"start": {"result_ref": "$embeddings_results", "limit": 2}}
+        \\      "traverse": {"start": {"result_ref": "$query_results", "limit": 2}}
         \\    }
         \\  }
         \\}
@@ -491,7 +586,7 @@ test "parse supported graph queries accepts embeddings result refs" {
 
     const embeddings_items = try parseSupportedGraphQueriesAlloc(alloc, embeddings_parsed.value);
     defer freeNamedGraphQueries(alloc, embeddings_items);
-    try std.testing.expectEqualStrings("$embeddings_results", embeddings_items[0].query.start_nodes.result_ref.ref);
+    try std.testing.expectEqualStrings("$query_results", embeddings_items[0].query.start_nodes.result_ref.ref);
     try std.testing.expectEqual(@as(u32, 2), embeddings_items[0].query.start_nodes.result_ref.limit);
 }
 
@@ -526,6 +621,46 @@ test "parse supported graph queries accepts pattern requests" {
     try std.testing.expectEqual(@as(usize, 1), items[0].query.match_pattern.?.edges.len);
     try std.testing.expectEqual(@as(usize, 1), items[0].query.return_aliases.len);
     try std.testing.expectEqualStrings("b", items[0].query.return_aliases[0]);
+}
+
+test "graph query dependencies require compatible explicit outputs" {
+    const alloc = std.testing.allocator;
+    var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
+        \\{
+        \\  "graph_queries": {
+        \\    "seed": {
+        \\      "index": "graph_idx",
+        \\      "match": {
+        \\        "nodes": {"a": {}, "b": {}},
+        \\        "edges": [{"from": "a", "to": "b"}]
+        \\      },
+        \\      "return": {"bindings": ["b"]}
+        \\    },
+        \\    "next": {
+        \\      "index": "graph_idx",
+        \\      "traverse": {"start": {"result_ref": "$graph_results.seed", "binding": "b"}}
+        \\    }
+        \\  }
+        \\}
+    , .{});
+    defer parsed.deinit();
+    const items = try parseSupportedGraphQueriesAlloc(alloc, parsed.value);
+    defer freeNamedGraphQueries(alloc, items);
+    const order = try sortQueriesByDependencies(alloc, items);
+    defer alloc.free(order);
+    try std.testing.expectEqualStrings("seed", items[order[0]].name);
+    try std.testing.expectEqualStrings("next", items[order[1]].name);
+
+    var missing_binding = items[order[1]].query;
+    missing_binding.start_nodes.result_ref.binding = null;
+    var invalid = [_]db_mod.types.NamedGraphQuery{
+        items[order[0]],
+        .{ .name = "next", .query = missing_binding },
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, sortQueriesByDependencies(alloc, &invalid));
+
+    invalid[1].query.start_nodes.result_ref.ref = "$graph_results.missing";
+    try std.testing.expectError(error.InvalidQueryRequest, sortQueriesByDependencies(alloc, &invalid));
 }
 
 test "parse supported graph queries accepts pattern node filter queries" {
