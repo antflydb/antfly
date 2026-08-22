@@ -5,6 +5,7 @@ const std = @import("std");
 const ids = @import("id.zig");
 
 pub const Kind = enum { scheduler, workload, fault, maintenance, quiescence };
+pub const FaultPhase = enum { start, end, pulse };
 
 pub const Transition = struct {
     id: ids.StableId,
@@ -13,6 +14,9 @@ pub const Transition = struct {
     actor_id: ?ids.StableId = null,
     resource_id: ?ids.StableId = null,
     parameter: i64 = 0,
+    /// Required for explicit lifecycle transitions. Legacy fault transitions
+    /// default to a pulse when this is null.
+    fault_phase: ?FaultPhase = null,
     /// Generation-only relative weight. It is deliberately not part of the
     /// stable transition identity or replay payload: exact replay consumes the
     /// selected ID from the artifact, while seeded exploration uses this hint
@@ -30,12 +34,17 @@ pub const Transition = struct {
             lhs.actor_id == rhs.actor_id and
             lhs.resource_id == rhs.resource_id and
             lhs.parameter == rhs.parameter and
+            lhs.fault_phase == rhs.fault_phase and
             lhs.weight == rhs.weight;
     }
 
     pub fn payloadDigest(self: Transition) u64 {
         const actors = ids.derive("transition.payload.actors", self.actor_id orelse 0, self.resource_id orelse 0);
-        return ids.derive("transition.payload", actors, @bitCast(self.parameter));
+        const legacy = ids.derive("transition.payload", actors, @bitCast(self.parameter));
+        return if (self.fault_phase) |phase|
+            ids.derive("transition.payload.fault-phase", legacy, @as(u64, @intFromEnum(phase)) + 1)
+        else
+            legacy;
     }
 };
 

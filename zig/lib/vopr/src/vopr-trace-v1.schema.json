@@ -111,7 +111,7 @@
         "ordinal": { "$ref": "#/$defs/u64" },
         "id": { "$ref": "#/$defs/u64" },
         "name": { "type": "string", "minLength": 1 },
-        "kind": { "enum": ["message_enqueued", "state_change", "client_response", "injected_error", "domain"] },
+        "kind": { "enum": ["message_enqueued", "state_change", "client_response", "injected_error", "fault_started", "fault_stopped", "domain"] },
         "actor_id": { "oneOf": [{ "$ref": "#/$defs/u64" }, { "type": "null" }] },
         "resource_id": { "oneOf": [{ "$ref": "#/$defs/u64" }, { "type": "null" }] },
         "payload_digest": { "$ref": "#/$defs/u64" }

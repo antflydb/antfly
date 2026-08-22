@@ -266,12 +266,29 @@ fn executeStep(
         .parameter = selected_transition.parameter,
         .payload_digest = selected_transition.payloadDigest(),
     });
-    if (selected_transition.kind == .fault) {
+    var has_explicit_fault_lifecycle = false;
+    for (events.events.items) |emitted| {
+        const phase: ?trace.FaultPhase = switch (emitted.kind) {
+            .fault_started => .start,
+            .fault_stopped => .end,
+            else => null,
+        };
+        if (phase) |fault_phase| {
+            has_explicit_fault_lifecycle = true;
+            try result.addFault(.{
+                .index = transition_index.*,
+                .id = emitted.resource_id orelse return error.FaultLifecycleEventMissingFaultId,
+                .name = emitted.name,
+                .phase = fault_phase,
+            });
+        }
+    }
+    if (selected_transition.kind == .fault and !has_explicit_fault_lifecycle) {
         try result.addFault(.{
             .index = transition_index.*,
             .id = selected_transition.id,
             .name = selected_transition.name,
-            .phase = .pulse,
+            .phase = selected_transition.fault_phase orelse .pulse,
         });
     }
     for (events.events.items, 0..) |emitted, ordinal| {

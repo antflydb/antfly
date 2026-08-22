@@ -59,7 +59,7 @@ pub const TransitionRecord = struct {
     payload_digest: u64 = 0,
 };
 
-pub const FaultPhase = enum { start, end, pulse };
+pub const FaultPhase = transition.FaultPhase;
 pub const FaultRecord = struct {
     index: u64,
     id: ids.StableId,

@@ -4,7 +4,7 @@
 const std = @import("std");
 const ids = @import("id.zig");
 
-pub const Kind = enum { message_enqueued, state_change, client_response, injected_error, domain };
+pub const Kind = enum { message_enqueued, state_change, client_response, injected_error, fault_started, fault_stopped, domain };
 
 pub const Event = struct {
     id: ids.StableId,

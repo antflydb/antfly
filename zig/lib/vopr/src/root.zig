@@ -10,6 +10,7 @@ pub const coverage = @import("coverage.zig");
 pub const corpus = @import("corpus.zig");
 pub const event = @import("event.zig");
 pub const explorer = @import("explorer.zig");
+pub const fault = @import("fault.zig");
 pub const id = @import("id.zig");
 pub const meta_test = @import("meta_test.zig");
 pub const observation = @import("observation.zig");
@@ -180,6 +181,7 @@ test {
     _ = corpus;
     _ = event;
     _ = explorer;
+    _ = fault;
     _ = id;
     _ = observation;
     _ = outcome;
