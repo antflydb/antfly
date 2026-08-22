@@ -5915,10 +5915,18 @@ const MetadataVoprAction = enum {
     network_deliver,
     network_drop,
     network_duplicate,
+    network_delay,
+    network_release,
     time_advance,
     drop_next,
+    drop_burst,
+    reset_next,
     duplicate_next,
     delay_next,
+    start_queue_limit,
+    stop_queue_limit,
+    start_route_unavailable,
+    stop_route_unavailable,
     release_fifo,
     release_random,
     start_link_partition,
@@ -5935,10 +5943,18 @@ fn metadataVoprActionName(action: MetadataVoprAction) []const u8 {
         .network_deliver => "network_deliver",
         .network_drop => "network_drop",
         .network_duplicate => "network_duplicate",
+        .network_delay => "network_delay",
+        .network_release => "network_release",
         .time_advance => "time_advance",
         .drop_next => "drop_next",
+        .drop_burst => "drop_burst",
+        .reset_next => "reset_next",
         .duplicate_next => "duplicate_next",
         .delay_next => "delay_next",
+        .start_queue_limit => "start_queue_limit",
+        .stop_queue_limit => "stop_queue_limit",
+        .start_route_unavailable => "start_route_unavailable",
+        .stop_route_unavailable => "stop_route_unavailable",
         .release_fifo => "release_fifo",
         .release_random => "release_random",
         .start_link_partition => "start_link_partition",
@@ -5962,9 +5978,11 @@ const MetadataVoprCampaignState = struct {
     active_link_count: usize = 0,
     active_node_ids: [1]u64 = undefined,
     active_node_count: usize = 0,
+    unavailable_node_id: ?u64 = null,
+    queue_capacity: ?usize = null,
 
     fn faultCount(self: *const MetadataVoprCampaignState) usize {
-        return self.active_link_count + self.active_node_count;
+        return self.active_link_count + self.active_node_count + @intFromBool(self.unavailable_node_id != null) + @intFromBool(self.queue_capacity != null);
     }
 
     fn containsLink(self: *const MetadataVoprCampaignState, link: raft_sim.VirtualHttpNetwork.Link) bool {
@@ -6016,6 +6034,8 @@ const MetadataVoprCampaignState = struct {
     fn clear(self: *MetadataVoprCampaignState) void {
         self.active_link_count = 0;
         self.active_node_count = 0;
+        self.unavailable_node_id = null;
+        self.queue_capacity = null;
     }
 };
 
@@ -6111,7 +6131,7 @@ const MetadataVoprDriver = struct {
             .artifact = try vopr.trace.Trace.init(alloc, .{
                 .system = "antfly",
                 .scenario = "metadata-vopr",
-                .scenario_version = 3,
+                .scenario_version = 4,
                 .source_revision = "vopr-metadata-phase1",
                 .target = "native",
                 .optimize = "test",
@@ -6206,6 +6226,32 @@ const MetadataVoprDriver = struct {
                 .action = .network_duplicate,
                 .message_id = message.id,
             });
+            try appendCandidate(candidates, self.alloc, .{
+                .transition = .{
+                    .id = actionId(.network_delay, message.id),
+                    .name = "metadata.network.delay_message",
+                    .kind = .fault,
+                    .actor_id = message.source_id,
+                    .resource_id = message.id,
+                    .parameter = 2,
+                },
+                .action = .network_delay,
+                .message_id = message.id,
+                .ticks = 2,
+            });
+            if (message.due_tick > self.cluster.virtual_network.virtual_tick) {
+                try appendCandidate(candidates, self.alloc, .{
+                    .transition = .{
+                        .id = actionId(.network_release, message.id),
+                        .name = "metadata.network.release_message",
+                        .kind = .scheduler,
+                        .actor_id = message.source_id,
+                        .resource_id = message.id,
+                    },
+                    .action = .network_release,
+                    .message_id = message.id,
+                });
+            }
         }
         const next_tick = self.cluster.virtual_network.virtual_tick +| 1;
         try appendCandidate(candidates, self.alloc, .{
@@ -6222,6 +6268,15 @@ const MetadataVoprDriver = struct {
         try appendCandidate(candidates, self.alloc, .{
             .transition = .{ .id = actionId(.drop_next, 0), .name = "metadata.network.drop_next", .kind = .fault },
             .action = .drop_next,
+        });
+        try appendCandidate(candidates, self.alloc, .{
+            .transition = .{ .id = actionId(.drop_burst, 2), .name = "metadata.network.drop_burst", .kind = .fault, .parameter = 2 },
+            .action = .drop_burst,
+            .ticks = 2,
+        });
+        try appendCandidate(candidates, self.alloc, .{
+            .transition = .{ .id = actionId(.reset_next, 0), .name = "metadata.network.reset_next", .kind = .fault },
+            .action = .reset_next,
         });
         try appendCandidate(candidates, self.alloc, .{
             .transition = .{ .id = actionId(.duplicate_next, 0), .name = "metadata.network.duplicate_next", .kind = .fault },
@@ -6241,6 +6296,54 @@ const MetadataVoprDriver = struct {
         try appendCandidate(candidates, self.alloc, .{
             .transition = .{ .id = actionId(.release_random, 0), .name = "metadata.network.release_seeded", .kind = .scheduler },
             .action = .release_random,
+        });
+
+        if (self.state.faultCount() == 0) {
+            for (1..3) |capacity| {
+                try appendCandidate(candidates, self.alloc, .{
+                    .transition = .{
+                        .id = actionId(.start_queue_limit, capacity),
+                        .name = "metadata.network.limit_queue",
+                        .kind = .fault,
+                        .parameter = @intCast(capacity),
+                    },
+                    .action = .start_queue_limit,
+                    .ticks = capacity,
+                });
+            }
+            for (0..self.cluster.cluster.nodes.len) |node_index| {
+                const node_id = metadataVoprNodeId(self.cluster, node_index);
+                try appendCandidate(candidates, self.alloc, .{
+                    .transition = .{
+                        .id = actionId(.start_route_unavailable, node_id),
+                        .name = "metadata.network.route_unavailable",
+                        .kind = .fault,
+                        .actor_id = node_id,
+                    },
+                    .action = .start_route_unavailable,
+                    .source_node_id = node_id,
+                });
+            }
+        }
+        if (self.state.queue_capacity) |capacity| try appendCandidate(candidates, self.alloc, .{
+            .transition = .{
+                .id = actionId(.stop_queue_limit, capacity),
+                .name = "metadata.network.clear_queue_limit",
+                .kind = .fault,
+                .parameter = @intCast(capacity),
+            },
+            .action = .stop_queue_limit,
+            .ticks = capacity,
+        });
+        if (self.state.unavailable_node_id) |node_id| try appendCandidate(candidates, self.alloc, .{
+            .transition = .{
+                .id = actionId(.stop_route_unavailable, node_id),
+                .name = "metadata.network.route_restored",
+                .kind = .fault,
+                .actor_id = node_id,
+            },
+            .action = .stop_route_unavailable,
+            .source_node_id = node_id,
         });
 
         // Preserve a healthy-quorum-oriented budget: up to two directed link
@@ -6381,8 +6484,8 @@ const MetadataVoprDriver = struct {
         });
         if (selected.transition.kind == .fault) {
             const phase: vopr.trace.FaultPhase = switch (selected.action) {
-                .start_link_partition, .start_node_partition => .start,
-                .stop_link_partition, .stop_node_partition, .heal_all => .end,
+                .start_link_partition, .start_node_partition, .start_queue_limit, .start_route_unavailable => .start,
+                .stop_link_partition, .stop_node_partition, .stop_queue_limit, .stop_route_unavailable, .heal_all => .end,
                 else => .pulse,
             };
             try self.trace().addFault(.{ .index = self.occurrence, .id = selected.transition.id, .name = selected.transition.name, .phase = phase });
@@ -6407,15 +6510,41 @@ const MetadataVoprDriver = struct {
             .network_deliver => try self.cluster.virtual_network.deliverMessage(selected.message_id.?),
             .network_drop => try self.cluster.virtual_network.dropMessage(selected.message_id.?),
             .network_duplicate => _ = try self.cluster.virtual_network.duplicateMessage(selected.message_id.?),
+            .network_delay => try self.cluster.virtual_network.delayMessage(selected.message_id.?, selected.ticks),
+            .network_release => try self.cluster.virtual_network.releaseMessage(selected.message_id.?),
             .time_advance => self.cluster.advanceSimTime(selected.ticks),
             .drop_next => {
                 try self.cluster.cluster.inject(.drop_next);
+            },
+            .drop_burst => {
+                try self.cluster.cluster.inject(.{ .drop_burst = @intCast(selected.ticks) });
+            },
+            .reset_next => {
+                try self.cluster.cluster.inject(.reset_next);
             },
             .duplicate_next => {
                 try self.cluster.cluster.inject(.duplicate_next);
             },
             .delay_next => {
                 try self.cluster.cluster.inject(.{ .delay_next_ticks = selected.ticks });
+            },
+            .start_queue_limit => {
+                try self.cluster.cluster.inject(.{ .queue_capacity = @intCast(selected.ticks) });
+                self.state.queue_capacity = @intCast(selected.ticks);
+            },
+            .stop_queue_limit => {
+                try self.cluster.cluster.inject(.clear_queue_capacity);
+                self.state.queue_capacity = null;
+            },
+            .start_route_unavailable => {
+                const node_id = selected.source_node_id.?;
+                try self.cluster.cluster.inject(.{ .route_unavailable = node_id });
+                self.state.unavailable_node_id = node_id;
+            },
+            .stop_route_unavailable => {
+                const node_id = selected.source_node_id.?;
+                self.cluster.cluster.heal(.{ .route_unavailable = node_id });
+                self.state.unavailable_node_id = null;
             },
             .release_fifo => {
                 try self.cluster.cluster.inject(.release_fifo);
@@ -6463,10 +6592,15 @@ const MetadataVoprDriver = struct {
         try builder.addNamed(self.alloc, "metadata.network.dropped", @intCast(@min(self.cluster.virtual_network.dropped_count, @as(u64, std.math.maxInt(i64)))));
         try builder.addNamed(self.alloc, "metadata.network.duplicated", @intCast(@min(self.cluster.virtual_network.duplicated_count, @as(u64, std.math.maxInt(i64)))));
         try builder.addNamed(self.alloc, "metadata.network.delayed", @intCast(@min(self.cluster.virtual_network.delayed_count, @as(u64, std.math.maxInt(i64)))));
+        try builder.addNamed(self.alloc, "metadata.network.reset", @intCast(@min(self.cluster.virtual_network.reset_count, @as(u64, std.math.maxInt(i64)))));
+        try builder.addNamed(self.alloc, "metadata.network.unavailable", @intCast(@min(self.cluster.virtual_network.unavailable_count, @as(u64, std.math.maxInt(i64)))));
+        try builder.addNamed(self.alloc, "metadata.network.saturated", @intCast(@min(self.cluster.virtual_network.saturated_count, @as(u64, std.math.maxInt(i64)))));
         try builder.addNamed(self.alloc, "metadata.fault.active", @intFromBool(self.state.faultCount() > 0));
         try builder.addNamed(self.alloc, "metadata.fault.active_count", @intCast(self.state.faultCount()));
         try builder.addNamed(self.alloc, "metadata.fault.partitioned_links", @intCast(self.state.active_link_count));
         try builder.addNamed(self.alloc, "metadata.fault.partitioned_nodes", @intCast(self.state.active_node_count));
+        try builder.addNamed(self.alloc, "metadata.fault.route_unavailable", @intFromBool(self.state.unavailable_node_id != null));
+        try builder.addNamed(self.alloc, "metadata.fault.queue_limited", @intFromBool(self.state.queue_capacity != null));
         try builder.addNamed(self.alloc, "metadata.phase.quiet", @intFromBool(self.quiet_mode));
         var leader_count: i64 = 0;
         var commit_total: u64 = 0;

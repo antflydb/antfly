@@ -299,6 +299,7 @@ pub const VirtualHttpNetwork = struct {
     routes: std.StringHashMapUnmanaged(transport.RequestExecutor) = .empty,
     partitioned_nodes: std.AutoHashMapUnmanaged(u64, void) = .empty,
     partitioned_links: std.AutoHashMapUnmanaged(Link, void) = .empty,
+    unavailable_nodes: std.AutoHashMapUnmanaged(u64, void) = .empty,
     queued_requests: std.ArrayListUnmanaged(QueuedRequest) = .empty,
     random_drop_prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
     release_prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
@@ -306,8 +307,10 @@ pub const VirtualHttpNetwork = struct {
     random_drop_numerator: u32 = 0,
     random_drop_denominator: u32 = 0,
     drop_next_count: u32 = 0,
+    reset_next_count: u32 = 0,
     duplicate_next_count: u32 = 0,
     delay_next_ticks_value: u64 = 0,
+    queue_capacity: ?usize = null,
     delivery_mode: DeliveryMode = .immediate,
     virtual_tick: u64 = 0,
     next_sequence: u64 = 0,
@@ -316,6 +319,9 @@ pub const VirtualHttpNetwork = struct {
     dropped_count: u64 = 0,
     duplicated_count: u64 = 0,
     delayed_count: u64 = 0,
+    reset_count: u64 = 0,
+    unavailable_count: u64 = 0,
+    saturated_count: u64 = 0,
 
     pub fn init(alloc: std.mem.Allocator) VirtualHttpNetwork {
         return .{
@@ -336,6 +342,7 @@ pub const VirtualHttpNetwork = struct {
         self.routes.deinit(self.alloc);
         self.partitioned_nodes.deinit(self.alloc);
         self.partitioned_links.deinit(self.alloc);
+        self.unavailable_nodes.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -438,6 +445,23 @@ pub const VirtualHttpNetwork = struct {
         return self.next_sequence;
     }
 
+    /// Extends the selected message's logical deadline. Unlike delay-next,
+    /// this operation is stable under unrelated traffic and is therefore the
+    /// preferred primitive for replayable schedules.
+    pub fn delayMessage(self: *VirtualHttpNetwork, message_id: u64, ticks: u64) !void {
+        const index = self.messageIndex(message_id) orelse return error.UnknownVirtualMessage;
+        const queued = &self.queued_requests.items[index];
+        queued.due_tick = @max(queued.due_tick, self.virtual_tick) +| ticks;
+        self.delayed_count +|= 1;
+    }
+
+    /// Makes a delayed selected message eligible without advancing time.
+    /// Delivery remains a separate scheduler transition.
+    pub fn releaseMessage(self: *VirtualHttpNetwork, message_id: u64) !void {
+        const index = self.messageIndex(message_id) orelse return error.UnknownVirtualMessage;
+        self.queued_requests.items[index].due_tick = self.virtual_tick;
+    }
+
     pub fn nextDueTick(self: *const VirtualHttpNetwork) ?u64 {
         var result: ?u64 = null;
         for (self.queued_requests.items) |queued| {
@@ -473,6 +497,7 @@ pub const VirtualHttpNetwork = struct {
     pub fn healAll(self: *VirtualHttpNetwork) void {
         self.partitioned_nodes.clearRetainingCapacity();
         self.partitioned_links.clearRetainingCapacity();
+        self.unavailable_nodes.clearRetainingCapacity();
     }
 
     pub fn isPartitioned(self: *const VirtualHttpNetwork, node_id: u64) bool {
@@ -495,6 +520,14 @@ pub const VirtualHttpNetwork = struct {
         self.drop_next_count +|= 1;
     }
 
+    pub fn dropBurst(self: *VirtualHttpNetwork, count: u32) void {
+        self.drop_next_count +|= count;
+    }
+
+    pub fn resetNext(self: *VirtualHttpNetwork) void {
+        self.reset_next_count +|= 1;
+    }
+
     pub fn duplicateNext(self: *VirtualHttpNetwork) void {
         self.duplicate_next_count +|= 1;
     }
@@ -515,8 +548,25 @@ pub const VirtualHttpNetwork = struct {
         self.random_drop_denominator = 0;
     }
 
+    pub fn setQueueCapacity(self: *VirtualHttpNetwork, capacity: ?usize) void {
+        self.queue_capacity = capacity;
+    }
+
+    pub fn setRouteUnavailable(self: *VirtualHttpNetwork, node_id: u64) !void {
+        try self.unavailable_nodes.put(self.alloc, node_id, {});
+    }
+
+    pub fn restoreRoute(self: *VirtualHttpNetwork, node_id: u64) void {
+        _ = self.unavailable_nodes.remove(node_id);
+    }
+
+    pub fn isRouteUnavailable(self: *const VirtualHttpNetwork, node_id: u64) bool {
+        return self.unavailable_nodes.contains(node_id);
+    }
+
     pub fn clearOneShotFaults(self: *VirtualHttpNetwork) void {
         self.drop_next_count = 0;
+        self.reset_next_count = 0;
         self.duplicate_next_count = 0;
         self.delay_next_ticks_value = 0;
     }
@@ -531,6 +581,10 @@ pub const VirtualHttpNetwork = struct {
         if (self.partitioned_nodes.contains(route.node_id)) {
             self.dropped_count +|= 1;
             return error.VirtualNetworkPartitioned;
+        }
+        if (self.unavailable_nodes.contains(route.node_id)) {
+            self.unavailable_count +|= 1;
+            return error.VirtualNetworkRouteUnavailable;
         }
         if (req.source_node_id) |source_id| {
             if (self.partitioned_links.contains(.{ .source_id = source_id, .target_id = route.node_id })) {
@@ -553,6 +607,11 @@ pub const VirtualHttpNetwork = struct {
             self.drop_next_count -= 1;
             self.dropped_count +|= 1;
             return error.VirtualNetworkDropped;
+        }
+        if (self.reset_next_count > 0) {
+            self.reset_next_count -= 1;
+            self.reset_count +|= 1;
+            return error.VirtualNetworkConnectionReset;
         }
         var delay_ticks: u64 = 0;
         if (self.delay_next_ticks_value > 0) {
@@ -617,6 +676,12 @@ pub const VirtualHttpNetwork = struct {
     }
 
     fn enqueue(self: *VirtualHttpNetwork, base_uri: []const u8, request: transport.HttpRequest, delay_ticks: u64) !void {
+        if (self.queue_capacity) |capacity| {
+            if (self.queued_requests.items.len >= capacity) {
+                self.saturated_count +|= 1;
+                return error.VirtualNetworkQueueFull;
+            }
+        }
         const owned_base_uri = try self.queue_alloc.dupe(u8, base_uri);
         errdefer self.queue_alloc.free(owned_base_uri);
         const owned_uri = try self.queue_alloc.dupe(u8, request.uri);
@@ -670,6 +735,10 @@ pub const VirtualHttpNetwork = struct {
         };
         if (self.partitioned_nodes.contains(split.node_id)) {
             self.dropped_count +|= 1;
+            return;
+        }
+        if (self.unavailable_nodes.contains(split.node_id)) {
+            self.unavailable_count +|= 1;
             return;
         }
         if (queued.request.source_node_id) |source_id| {
@@ -965,10 +1034,63 @@ test "virtual http network exposes selected message transitions" {
     const duplicate_id = try network.duplicateMessage(messages[0].id);
     try std.testing.expectEqual(@as(u64, 2), duplicate_id);
     try network.dropMessage(duplicate_id);
-    network.advanceClockTicks(2);
+    try network.delayMessage(messages[0].id, 3);
+    const delayed = try network.queuedMessages(std.testing.allocator);
+    defer std.testing.allocator.free(delayed);
+    try std.testing.expectEqual(@as(u64, 5), delayed[0].due_tick);
+    try network.releaseMessage(messages[0].id);
     try network.deliverMessage(messages[0].id);
     try std.testing.expectEqual(@as(usize, 1), target.count);
     try std.testing.expectEqual(@as(usize, 0), network.queuedCount());
+    try std.testing.expectEqual(@as(u64, 2), network.delayed_count);
+}
+
+test "virtual http network models route reset burst and queue capacity faults" {
+    const RecordingExecutor = struct {
+        count: usize = 0,
+        fn executor(self: *@This()) transport.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: transport.HttpRequest) !transport.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.count += 1;
+            return .{ .status = 200 };
+        }
+    };
+
+    var network = VirtualHttpNetwork.init(std.testing.allocator);
+    defer network.deinit();
+    var target = RecordingExecutor{};
+    try network.registerNode(7, target.executor());
+    const request = transport.HttpRequest{ .method = .POST, .uri = "sim://raft-node/7/raft/v1/frame" };
+
+    try network.setRouteUnavailable(7);
+    try std.testing.expect(network.isRouteUnavailable(7));
+    try std.testing.expectError(error.VirtualNetworkRouteUnavailable, network.executor().execute(std.testing.allocator, request));
+    network.restoreRoute(7);
+
+    network.resetNext();
+    try std.testing.expectError(error.VirtualNetworkConnectionReset, network.executor().execute(std.testing.allocator, request));
+    network.dropBurst(2);
+    try std.testing.expectError(error.VirtualNetworkDropped, network.executor().execute(std.testing.allocator, request));
+    try std.testing.expectError(error.VirtualNetworkDropped, network.executor().execute(std.testing.allocator, request));
+    var delivered = try network.executor().execute(std.testing.allocator, request);
+    delivered.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), target.count);
+    try std.testing.expectEqual(@as(u64, 1), network.unavailable_count);
+    try std.testing.expectEqual(@as(u64, 1), network.reset_count);
+
+    network.useQueuedDelivery();
+    network.setQueueCapacity(1);
+    var accepted = try network.executor().execute(std.testing.allocator, request);
+    accepted.deinit(std.testing.allocator);
+    try std.testing.expectError(error.VirtualNetworkQueueFull, network.executor().execute(std.testing.allocator, request));
+    try std.testing.expectEqual(@as(u64, 1), network.saturated_count);
+    network.setQueueCapacity(null);
+    var accepted_after_heal = try network.executor().execute(std.testing.allocator, request);
+    accepted_after_heal.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), try network.runUntilIdle());
+    try std.testing.expectEqual(@as(usize, 3), target.count);
 }
 
 test "virtual http network delivers queued GET requests synchronously" {
@@ -1482,9 +1604,14 @@ pub const ManagedHttpClusterSimulation = struct {
     pub const Fault = union(enum) {
         partition_node: u64,
         partition_link: VirtualHttpNetwork.Link,
+        route_unavailable: u64,
         drop_next,
+        drop_burst: u32,
+        reset_next,
         duplicate_next,
         delay_next_ticks: u64,
+        queue_capacity: usize,
+        clear_queue_capacity,
         random_drop: VirtualHttpNetwork.RandomDropConfig,
         clear_random_drop,
         release_fifo,
@@ -1623,9 +1750,14 @@ pub const ManagedHttpClusterSimulation = struct {
         switch (fault) {
             .partition_node => |node_id| try self.network.partitionNode(node_id),
             .partition_link => |link| try self.network.partitionLink(link),
+            .route_unavailable => |node_id| try self.network.setRouteUnavailable(node_id),
             .drop_next => self.network.dropNext(),
+            .drop_burst => |count| self.network.dropBurst(count),
+            .reset_next => self.network.resetNext(),
             .duplicate_next => self.network.duplicateNext(),
             .delay_next_ticks => |ticks| self.network.delayNextTicks(ticks),
+            .queue_capacity => |capacity| self.network.setQueueCapacity(capacity),
+            .clear_queue_capacity => self.network.setQueueCapacity(null),
             .random_drop => |cfg| try self.network.configureRandomDrop(cfg),
             .clear_random_drop => self.network.clearRandomDrop(),
             .release_fifo => self.network.useFifoRelease(),
@@ -1637,7 +1769,9 @@ pub const ManagedHttpClusterSimulation = struct {
         switch (fault) {
             .partition_node => |node_id| self.network.healNode(node_id),
             .partition_link => |link| self.network.healLink(link),
-            .drop_next, .duplicate_next, .delay_next_ticks => self.network.clearOneShotFaults(),
+            .route_unavailable => |node_id| self.network.restoreRoute(node_id),
+            .drop_next, .drop_burst, .reset_next, .duplicate_next, .delay_next_ticks => self.network.clearOneShotFaults(),
+            .queue_capacity, .clear_queue_capacity => self.network.setQueueCapacity(null),
             .random_drop, .clear_random_drop => self.network.clearRandomDrop(),
             .release_fifo, .release_random => self.network.useFifoRelease(),
         }
@@ -1646,6 +1780,7 @@ pub const ManagedHttpClusterSimulation = struct {
     pub fn healAll(self: *ManagedHttpClusterSimulation) void {
         self.network.clearOneShotFaults();
         self.network.clearRandomDrop();
+        self.network.setQueueCapacity(null);
         self.network.useFifoRelease();
         self.network.healAll();
     }
