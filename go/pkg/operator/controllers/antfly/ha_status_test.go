@@ -164,6 +164,52 @@ func TestHASeedPlanPreservesObservedSourcePVCUIDOnlyForTheSameClaim(t *testing.T
 	}
 }
 
+func TestHASeedPlanRetainsCompletedReceiptsUntilExactTopologyChanges(t *testing.T) {
+	standby := antflyv1.HAStandbySpec{
+		Name: "standby-a", SlotName: "standby-a",
+		SeedArtifact: &antflyv1.HASeedArtifactSpec{
+			Location: "s3://ha-seeds/cluster-a", Generation: "seed-standby-a-10", StagingRoot: "/target/staging",
+			TopologyID: "topology-a", TopologyGeneration: 7, NodeID: "standby-a", TargetPVCUID: "target-pvc-uid",
+			SourcePVC: &antflyv1.HASeedArtifactPVCSpec{ClaimName: "primary-data", MountPath: "/source"},
+			TargetPVC: &antflyv1.HASeedArtifactPVCSpec{ClaimName: "standby-data", MountPath: "/target"},
+		},
+	}
+	ha := &antflyv1.HighAvailabilitySpec{Standbys: []antflyv1.HAStandbySpec{standby}}
+	completed := haPlannedActionStatuses(
+		haSeedCompletionActions(standby, "standby-a", 10, "test", ""),
+		ha,
+		&antflyv1.HAStatus{},
+	)
+	if len(completed) != 8 {
+		t.Fatalf("expected complete eight-action portable seed chain, got %d", len(completed))
+	}
+	for i := range completed {
+		completed[i].AdminJobName = "completed-action"
+		completed[i].AdminJobPhase = haAdminJobPhaseSucceeded
+	}
+	prune := &completed[len(completed)-1]
+	prune.SeedArtifactReceipt = &antflyv1.HASeedArtifactReceiptStatus{
+		FormatVersion: 1, Generation: prune.SeedArtifactGeneration, SlotName: prune.SlotName,
+		RetainedCount: 1,
+	}
+
+	retained := haPlannedActionStatuses(nil, ha, &antflyv1.HAStatus{PlannedActions: completed})
+	if len(retained) != len(completed) {
+		t.Fatalf("COMPLETED_SEED_RECEIPTS_DROPPED: expected %d retained actions, got %#v", len(completed), retained)
+	}
+	for i := range retained {
+		if retained[i].Kind != completed[i].Kind || retained[i].OperationID != completed[i].OperationID {
+			t.Fatalf("retained seed action %d changed immutable identity: got %#v want %#v", i, retained[i], completed[i])
+		}
+	}
+
+	replacement := ha.DeepCopy()
+	replacement.Standbys[0].SeedArtifact.TopologyGeneration++
+	if stale := haPlannedActionStatuses(nil, replacement, &antflyv1.HAStatus{PlannedActions: completed}); len(stale) != 0 {
+		t.Fatalf("STALE_SEED_RECEIPTS_RETAINED: topology advance must drop old receipt chain, got %#v", stale)
+	}
+}
+
 func TestHAReplicationIdentityAllowsWholeInstanceScope(t *testing.T) {
 	ha := &antflyv1.HighAvailabilitySpec{
 		Identity: &antflyv1.HAReplicationIdentitySpec{

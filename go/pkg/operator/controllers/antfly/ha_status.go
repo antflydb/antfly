@@ -1641,7 +1641,8 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 			break
 		}
 	}
-	if len(actions) == 0 && completedRewind == nil {
+	retainedSeedActions := haRetainedCompletedSeedActions(actions, ha, status)
+	if len(actions) == 0 && completedRewind == nil && len(retainedSeedActions) == 0 {
 		return nil
 	}
 	retainedAssessment := haRetainedFormerPrimaryAssessment(actions, status)
@@ -1652,6 +1653,7 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 	if retainedAssessment != nil {
 		outCapacity++
 	}
+	outCapacity += len(retainedSeedActions)
 	out := make([]antflyv1.HAPlannedActionStatus, 0, outCapacity)
 	if completedRewind != nil {
 		if retainedAssessment != nil {
@@ -1721,7 +1723,97 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 		statusAction = haPreservePlannedActionExecution(statusAction, status, clusters...)
 		out = append(out, statusAction)
 	}
+	out = append(out, retainedSeedActions...)
 	return out
+}
+
+// haRetainedCompletedSeedActions keeps the operator-observed portable-seed
+// receipt chain available after the primary slot becomes active. That receipt
+// is the cross-CR authority used to open the target runtime's startup gate; if
+// the planner discarded it as soon as the slot activated, the primary and
+// target controllers could each wait forever for evidence owned by the other.
+//
+// Retention is deliberately bounded to one completed runtime-owned chain per
+// currently desired standby and is tied to the exact declared generation,
+// topology, node, and PVC incarnation. Any topology/PVC/generation change
+// drops the old evidence rather than allowing it to authorize a replacement.
+func haRetainedCompletedSeedActions(
+	planned []haPlannedAction,
+	ha *antflyv1.HighAvailabilitySpec,
+	status *antflyv1.HAStatus,
+) []antflyv1.HAPlannedActionStatus {
+	if ha == nil || status == nil || len(status.PlannedActions) == 0 {
+		return nil
+	}
+	expectedKinds := [...]haActionKind{
+		haActionCaptureSeedArtifact,
+		haActionPublishSeedArtifact,
+		haActionGCSourceSeedGenerations,
+		haActionRestoreSeedArtifact,
+		haActionActivateSeedArtifact,
+		haActionActivateSeededSlot,
+		haActionGCTargetSeedGenerations,
+		haActionPruneSeedArtifacts,
+	}
+	retained := make([]antflyv1.HAPlannedActionStatus, 0, len(expectedKinds))
+	for _, standby := range ha.Standbys {
+		if !standbyDesired(standby) || !haStandbyUsesRuntimeOwnedSeedCapture(standby) || standby.SeedArtifact == nil {
+			continue
+		}
+		artifact := standby.SeedArtifact
+		slotName := standbySlotName(standby)
+		generation := strings.TrimSpace(artifact.Generation)
+		if generation == "" || strings.TrimSpace(artifact.TopologyID) == "" || artifact.TopologyGeneration <= 0 ||
+			strings.TrimSpace(artifact.NodeID) != strings.TrimSpace(standby.Name) || artifact.TargetPVC == nil ||
+			strings.TrimSpace(artifact.TargetPVC.ClaimName) == "" || strings.TrimSpace(artifact.TargetPVCUID) == "" {
+			continue
+		}
+		// A live plan for this exact generation already preserves execution
+		// state through haPreservePlannedActionExecution; do not duplicate it.
+		alreadyPlanned := false
+		for _, action := range planned {
+			if strings.TrimSpace(action.StandbyName) == strings.TrimSpace(standby.Name) &&
+				strings.TrimSpace(action.SlotName) == strings.TrimSpace(slotName) &&
+				strings.TrimSpace(action.SeedArtifactGeneration) == generation {
+				alreadyPlanned = true
+				break
+			}
+		}
+		if alreadyPlanned {
+			continue
+		}
+
+		chain := make([]antflyv1.HAPlannedActionStatus, 0, len(expectedKinds))
+		for _, kind := range expectedKinds {
+			found := false
+			for i := range status.PlannedActions {
+				action := status.PlannedActions[i]
+				if haActionKind(action.Kind) != kind || action.AdminJobPhase != haAdminJobPhaseSucceeded ||
+					strings.TrimSpace(action.StandbyName) != strings.TrimSpace(standby.Name) ||
+					strings.TrimSpace(action.SlotName) != strings.TrimSpace(slotName) ||
+					strings.TrimSpace(action.SeedArtifactGeneration) != generation ||
+					strings.TrimSpace(action.TopologyID) != strings.TrimSpace(artifact.TopologyID) ||
+					action.TopologyGeneration != artifact.TopologyGeneration ||
+					strings.TrimSpace(action.TopologyNodeID) != strings.TrimSpace(artifact.NodeID) ||
+					strings.TrimSpace(action.TargetPVCName) != strings.TrimSpace(artifact.TargetPVC.ClaimName) ||
+					strings.TrimSpace(action.TargetPVCUID) != strings.TrimSpace(artifact.TargetPVCUID) {
+					continue
+				}
+				chain = append(chain, *action.DeepCopy())
+				found = true
+				break
+			}
+			if !found {
+				chain = nil
+				break
+			}
+		}
+		if len(chain) != len(expectedKinds) || !haAdminActionSucceededWithEvidence(chain[len(chain)-1]) {
+			continue
+		}
+		retained = append(retained, chain...)
+	}
+	return retained
 }
 
 func haBindFormerPrimaryTopology(action *haPlannedAction, ha *antflyv1.HighAvailabilitySpec) {
