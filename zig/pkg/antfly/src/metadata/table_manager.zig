@@ -15,7 +15,10 @@
 const std = @import("std");
 const group_ids = @import("../common/group_ids.zig");
 const topology_records = @import("../common/topology_records.zig");
+const index_repair_status = @import("../common/index_repair_status.zig");
 const transition_state = @import("transition_state.zig");
+
+pub const IndexRepairStatus = index_repair_status.IndexRepairStatus;
 
 pub const PlacementClass = enum {
     data,
@@ -285,6 +288,11 @@ pub const NodeRecord = struct {
 pub const StoreRecord = struct {
     store_id: u64,
     node_id: u64,
+    /// Random non-zero process incarnation established by store registration.
+    /// Status generations are comparable only within this incarnation.
+    reporter_incarnation: u64 = 0,
+    /// Highest status snapshot generation accepted for `reporter_incarnation`.
+    status_generation: u64 = 0,
     api_url: []const u8 = "",
     raft_url: []const u8 = "",
     role: []const u8 = "data",
@@ -630,6 +638,11 @@ pub fn voterSetFingerprint(node_ids: []const u64, required_node_id: ?u64) VoterS
 
 pub const StoreStatusReport = struct {
     store_id: u64,
+    /// Must match the incarnation established by store registration. Zero is
+    /// reserved for rolling-upgrade compatibility with legacy reporters.
+    reporter_incarnation: u64 = 0,
+    /// Monotonic snapshot generation within `reporter_incarnation`.
+    status_generation: u64 = 0,
     live: bool = true,
     health_class: []const u8 = "healthy",
     capacity_bytes: u64 = 0,
@@ -642,6 +655,12 @@ pub const StoreStatusReport = struct {
     group_statuses: []GroupStatusReport = &.{},
     runtime_statuses: []RuntimeGroupStatusReport = &.{},
 };
+
+/// Generation zero is valid before the first snapshot, but a generation can
+/// never exist without the process incarnation that gives it meaning.
+pub fn reporterFenceValid(reporter_incarnation: u64, status_generation: u64) bool {
+    return reporter_incarnation != 0 or status_generation == 0;
+}
 
 pub const RuntimeEnrichmentStatusReport = struct {
     enabled: bool = false,
@@ -808,6 +827,10 @@ pub const RuntimeIndexStatusReport = struct {
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
     replay_catch_up_required: bool = false,
+    repair_status: ?IndexRepairStatus = null,
+    /// This proof is meaningful only while repair_status is non-null. Missing
+    /// proof is deliberately false so mixed-version reports fail closed.
+    repair_active_generation_serviceable: bool = false,
 };
 
 pub const SchemaProgressRecord = struct {
@@ -1932,6 +1955,8 @@ pub fn cloneStore(alloc: std.mem.Allocator, record: StoreRecord) !StoreRecord {
     return .{
         .store_id = record.store_id,
         .node_id = record.node_id,
+        .reporter_incarnation = record.reporter_incarnation,
+        .status_generation = record.status_generation,
         .api_url = api_url,
         .raft_url = raft_url,
         .role = role,
@@ -2123,6 +2148,8 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
         .replay_applied_sequence = record.replay_applied_sequence,
         .replay_target_sequence = record.replay_target_sequence,
         .replay_catch_up_required = record.replay_catch_up_required,
+        .repair_status = record.repair_status,
+        .repair_active_generation_serviceable = record.repair_active_generation_serviceable,
     };
 }
 

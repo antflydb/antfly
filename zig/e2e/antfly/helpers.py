@@ -17,10 +17,26 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
+from socketserver import BaseServer
 from typing import Callable
 
 import requests
+
+
+HTTP_SERVER_POLL_INTERVAL_S = 0.02
+
+
+def start_http_server(server: BaseServer) -> threading.Thread:
+    """Start a test HTTP server without Python's 500ms shutdown latency."""
+    thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": HTTP_SERVER_POLL_INTERVAL_S},
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 def json_doc(**fields) -> str:
@@ -35,6 +51,19 @@ def assert_single_top_hit(payload: dict, doc_id: str) -> None:
     hits = payload["hits"]
     assert len(hits) >= 1
     assert hits[0]["doc_id"] == doc_id
+
+
+def assert_created_index(created: dict, name: str, index_type: str) -> None:
+    assert created["name"] == name
+    assert created["type"] == index_type
+
+
+def create_index_payload(payload: dict, index_name: str) -> dict:
+    """Return the path-owned create payload without mutating the caller's value."""
+    body = payload.copy()
+    repeated_name = body.pop("name", index_name)
+    assert repeated_name == index_name, "index payload name must match the path name"
+    return body
 
 
 def query_hits_total_value(hits: dict) -> int:

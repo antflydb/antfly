@@ -6,6 +6,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, expectTypeOf, it } from "vitest";
+import type { components, operations } from "../src/public-api.js";
 import { match as matchQuery } from "../src/query-helpers.js";
 import type {
   AntflyQuery,
@@ -13,6 +14,7 @@ import type {
   BooleanQuery,
   BoolFieldQuery,
   ConjunctionQuery,
+  CreateIndexRequest,
   DisjunctionQuery,
   GraphIndexStats,
   GraphMetricBuildPageStatus,
@@ -55,6 +57,118 @@ describe("Antfly Query Type Integration", () => {
     };
 
     expect(page.range_kind).toBe("summary");
+  });
+
+  describe("Backup metadata availability responses", () => {
+    it("types both retryable 503 variants", () => {
+      type BackupUnavailable = components["schemas"]["BackupMetadataUnavailableError"];
+      type Backup503 = operations["backup"]["responses"][503]["content"]["application/json"];
+      type BackupTable503 = operations["backupTable"]["responses"][503]["content"]["application/json"];
+      type BackupTable409 = operations["backupTable"]["responses"][409]["content"]["application/json"];
+      type ClusterBackup = components["schemas"]["ClusterBackupResponse"];
+
+      const capability: BackupUnavailable = {
+        code: "metadata_capability_unavailable",
+        error: "metadata capability unavailable",
+        message: "upgrade metadata nodes",
+        required_capability: "linearizable_snapshot",
+        retryable: true,
+        retry_after_ms: 5000,
+      };
+      const leader: BackupUnavailable = {
+        code: "metadata_leader_unavailable",
+        error: "metadata leader unavailable",
+        message: "metadata leader unavailable",
+        retryable: true,
+        retry_after_ms: 1000,
+      };
+      const ambiguous: BackupTable409 = {
+        code: "backup_outcome_ambiguous",
+        error: "backup outcome is ambiguous; inspect the backup id before retrying",
+        message: "backup outcome is ambiguous; inspect the backup id and artifact id before retrying",
+        retryable: false,
+        backup_id: "snap",
+        artifact_backup_id: "generation-7",
+      };
+      const ambiguousCluster: ClusterBackup = {
+        backup_id: "nightly",
+        status: "ambiguous",
+        tables: [{
+          name: "docs",
+          status: "ambiguous",
+          code: "backup_outcome_ambiguous",
+          retryable: false,
+          backup_id: "attempt-t-0",
+          artifact_backup_id: "attempt-a-0",
+        }],
+      };
+
+      expectTypeOf<Backup503>().toEqualTypeOf<BackupUnavailable>();
+      expectTypeOf<BackupTable503>().toEqualTypeOf<BackupUnavailable>();
+      expect(capability.required_capability).toBe("linearizable_snapshot");
+      expect(leader.error).toBe("metadata leader unavailable");
+      expect(ambiguous.code).toBe("backup_outcome_ambiguous");
+      expect(ambiguousCluster.tables[0]?.artifact_backup_id).toBe("attempt-a-0");
+    });
+  });
+
+  describe("CreateIndexRequest type safety", () => {
+    it("discriminates index-specific fields", () => {
+      const embeddings: CreateIndexRequest = {
+        type: "embeddings",
+        dimension: 512,
+      };
+      const fullText: CreateIndexRequest = {
+        type: "full_text",
+        mem_only: true,
+      };
+
+      expect(embeddings.type).toBe("embeddings");
+      expect(fullText.type).toBe("full_text");
+    });
+
+    it("rejects fields from a different index kind", () => {
+      // @ts-expect-error dimension is embeddings-only.
+      const invalid: CreateIndexRequest = { type: "full_text", dimension: 512 };
+      expect(invalid.type).toBe("full_text");
+    });
+
+    it("types artifact graph mappings and algebraic planning", () => {
+      const graph: CreateIndexRequest = {
+        type: "graph",
+        source: {
+          kind: "artifact",
+          artifact: "relations_v1",
+          format: "extraction_graph",
+        },
+        artifact: {
+          name: "relations_v1",
+          kind: "asset",
+          source: { type: "template", value: "{{ body }}" },
+          execution: { batch_items: 8 },
+        },
+        nodes: {
+          model: "document",
+          source: "{{ _doc.key }}",
+          target: "{{ _item.target.text }}",
+        },
+        edge: {
+          type: "{{ _item.type }}",
+          weight: 0.75,
+          metadata: { source: "extractor" },
+        },
+        context: { doc_fields: ["title", "body"] },
+        algebraic_planning: {
+          bounded_traversal: {
+            law: "provenance_semiring",
+          },
+        },
+      };
+
+      expect(graph.edge?.weight).toBe(0.75);
+      expect(graph.artifact?.execution?.batch_items).toBe(8);
+      expect(graph.algebraic_planning?.bounded_traversal?.law).toBe("provenance_semiring");
+    });
   });
 
   describe("Batch transform types", () => {

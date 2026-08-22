@@ -10,6 +10,15 @@
 const std = @import("std");
 
 pub const format_version: u32 = 2;
+pub const backup_fence_metadata_group_id_header = "X-Antfly-Backup-Metadata-Group-Id";
+pub const backup_fence_metadata_incarnation_header = "X-Antfly-Backup-Metadata-Incarnation";
+pub const backup_fence_table_id_header = "X-Antfly-Backup-Table-Id";
+pub const backup_fence_definition_header = "X-Antfly-Backup-Definition-SHA256";
+pub const backup_fence_topology_count_header = "X-Antfly-Backup-Topology-Count";
+pub const backup_fence_topology_header = "X-Antfly-Backup-Topology-SHA256";
+pub const backup_writer_not_after_header = "X-Antfly-Backup-Writer-Not-After-Unix-Ns";
+pub const catalog_changed_message = "table changed during backup admission";
+pub const backup_outcome_ambiguous_message = "backup outcome is ambiguous; inspect the backup id before retrying";
 
 pub const BackupFormat = enum {
     native,
@@ -20,6 +29,74 @@ pub const ArtifactIntegrityMode = enum {
     declared,
     derive_after_materialization,
 };
+
+/// Compact, allocation-free catalog identity carried with backup execution.
+/// Storage owners must validate it after acquiring their structural-operation
+/// guard so a drop/recreate or schema/topology change cannot pair artifacts
+/// from one table incarnation with metadata from another.
+pub const TableBackupFence = struct {
+    metadata_group_id: u64,
+    /// Canonical 128-bit metadata-cluster identity encoded as lowercase hex.
+    /// All zeroes represent a legacy snapshot that did not expose incarnation.
+    metadata_incarnation: [32]u8,
+    table_id: u64,
+    definition_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    topology_range_count: u64,
+    topology_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    /// Current coordinators bound how long a forwarded request may wait before
+    /// its storage owner adopts the pre-created writer lease. Null identifies
+    /// a legacy delivery that requires a permanent cleanup tombstone.
+    writer_not_after_unix_ns: ?u64 = null,
+
+    pub fn hasMetadataIdentity(self: @This()) bool {
+        return self.metadata_group_id != 0 and
+            !std.mem.allEqual(u8, &self.metadata_incarnation, 0);
+    }
+
+    /// Checks an observed fence against this expected fence. Legacy expected
+    /// fences intentionally omit metadata identity for one rolling-upgrade
+    /// window. A current expected fence never accepts an observation that
+    /// cannot prove the same metadata-cluster incarnation.
+    pub fn matches(expected: @This(), observed: @This()) bool {
+        const metadata_identity_matches = !expected.hasMetadataIdentity() or
+            (observed.hasMetadataIdentity() and
+                expected.metadata_group_id == observed.metadata_group_id and
+                std.crypto.timing_safe.eql(@TypeOf(expected.metadata_incarnation), expected.metadata_incarnation, observed.metadata_incarnation));
+        return metadata_identity_matches and expected.table_id == observed.table_id and
+            expected.topology_range_count == observed.topology_range_count and
+            std.crypto.timing_safe.eql(@TypeOf(expected.definition_digest), expected.definition_digest, observed.definition_digest) and
+            std.crypto.timing_safe.eql(@TypeOf(expected.topology_digest), expected.topology_digest, observed.topology_digest);
+    }
+};
+
+fn hashDefinitionField(hasher: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
+    var encoded_len: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded_len, @intCast(value.len), .big);
+    hasher.update(&encoded_len);
+    hasher.update(value);
+}
+
+pub fn tableDefinitionDigest(
+    table_id: u64,
+    name: []const u8,
+    description: []const u8,
+    schema_json: []const u8,
+    read_schema_json: []const u8,
+    indexes_json: []const u8,
+    replication_sources_json: []const u8,
+) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var encoded_table_id: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded_table_id, table_id, .big);
+    hasher.update(&encoded_table_id);
+    hashDefinitionField(&hasher, name);
+    hashDefinitionField(&hasher, description);
+    hashDefinitionField(&hasher, schema_json);
+    hashDefinitionField(&hasher, read_schema_json);
+    hashDefinitionField(&hasher, indexes_json);
+    hashDefinitionField(&hasher, replication_sources_json);
+    return hasher.finalResult();
+}
 
 pub const ShardSnapshot = struct {
     group_id: u64,
@@ -83,6 +160,7 @@ pub const TableBackupPlan = struct {
     backup_id: []const u8,
     format: BackupFormat = .native,
     io: ?std.Io = null,
+    fence: ?TableBackupFence = null,
 };
 
 pub const TableRestorePlan = struct {

@@ -333,8 +333,8 @@ pub const CreateIndexPathParams = struct {
 };
 
 /// Parse the JSON request body for createIndex.
-pub fn parseCreateIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.IndexConfig) {
-    return std.json.parseFromSlice(antfly_indexes_openapi.IndexConfig, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseCreateIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.CreateIndexRequest) {
+    return std.json.parseFromSlice(antfly_indexes_openapi.CreateIndexRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Drop an index from a table

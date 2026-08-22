@@ -32,7 +32,7 @@ import pytest
 import requests
 
 from conftest import antfly_public_api_url, inference_public_api_url
-from helpers import wait_until
+from helpers import assert_created_index, wait_until
 from port_reservations import LoopbackPortReservations
 
 
@@ -534,8 +534,8 @@ def test_standalone_drop_tables_with_pending_embedded_embeddings(
             created = embedded_standalone_api.create_table(table_name, num_shards=1)
             created_tables.add(table_name)
             assert created["name"] == table_name
-            assert (
-                embedded_standalone_api.create_index(
+            assert_created_index(
+        embedded_standalone_api.create_index(
                     table_name,
                     "semantic_idx",
                     {
@@ -548,9 +548,10 @@ def test_standalone_drop_tables_with_pending_embedded_embeddings(
                             "model": "BAAI/bge-small-en-v1.5",
                         },
                     },
-                )
-                == {}
-            )
+                ),
+        "semantic_idx",
+        'embeddings',
+    )
 
         docs = {
             f"doc-{i:02d}": {

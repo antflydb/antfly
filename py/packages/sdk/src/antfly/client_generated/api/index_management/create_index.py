@@ -1,16 +1,21 @@
 from http import HTTPStatus
-from typing import Any, cast
+from typing import Any
 from urllib.parse import quote
 
 import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.algebraic_index_config import AlgebraicIndexConfig
-from ...models.embeddings_index_config import EmbeddingsIndexConfig
+from ...models.create_algebraic_index_request import CreateAlgebraicIndexRequest
+from ...models.create_embeddings_index_request import CreateEmbeddingsIndexRequest
+from ...models.create_full_text_index_request import CreateFullTextIndexRequest
+from ...models.create_graph_index_request import CreateGraphIndexRequest
+from ...models.created_algebraic_index import CreatedAlgebraicIndex
+from ...models.created_embeddings_index import CreatedEmbeddingsIndex
+from ...models.created_full_text_index import CreatedFullTextIndex
+from ...models.created_graph_index import CreatedGraphIndex
 from ...models.error import Error
-from ...models.full_text_index_config import FullTextIndexConfig
-from ...models.graph_index_config import GraphIndexConfig
+from ...models.storage_resource_exhausted_error import StorageResourceExhaustedError
 from ...types import Response
 
 
@@ -18,7 +23,10 @@ def _get_kwargs(
     table_name: str,
     index_name: str,
     *,
-    body: AlgebraicIndexConfig | EmbeddingsIndexConfig | FullTextIndexConfig | GraphIndexConfig,
+    body: CreateAlgebraicIndexRequest
+    | CreateEmbeddingsIndexRequest
+    | CreateFullTextIndexRequest
+    | CreateGraphIndexRequest,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
@@ -30,11 +38,11 @@ def _get_kwargs(
         ),
     }
 
-    if isinstance(body, FullTextIndexConfig):
+    if isinstance(body, CreateFullTextIndexRequest):
         _kwargs["json"] = body.to_dict()
-    elif isinstance(body, EmbeddingsIndexConfig):
+    elif isinstance(body, CreateEmbeddingsIndexRequest):
         _kwargs["json"] = body.to_dict()
-    elif isinstance(body, GraphIndexConfig):
+    elif isinstance(body, CreateGraphIndexRequest):
         _kwargs["json"] = body.to_dict()
     else:
         _kwargs["json"] = body.to_dict()
@@ -45,9 +53,54 @@ def _get_kwargs(
     return _kwargs
 
 
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | Error | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> (
+    CreatedAlgebraicIndex
+    | CreatedEmbeddingsIndex
+    | CreatedFullTextIndex
+    | CreatedGraphIndex
+    | Error
+    | StorageResourceExhaustedError
+    | None
+):
     if response.status_code == 201:
-        response_201 = cast(Any, None)
+
+        def _parse_response_201(
+            data: object,
+        ) -> CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex:
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_created_index_type_0 = CreatedFullTextIndex.from_dict(data)
+
+                return componentsschemas_created_index_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_created_index_type_1 = CreatedEmbeddingsIndex.from_dict(data)
+
+                return componentsschemas_created_index_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_created_index_type_2 = CreatedGraphIndex.from_dict(data)
+
+                return componentsschemas_created_index_type_2
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            if not isinstance(data, dict):
+                raise TypeError()
+            componentsschemas_created_index_type_3 = CreatedAlgebraicIndex.from_dict(data)
+
+            return componentsschemas_created_index_type_3
+
+        response_201 = _parse_response_201(response.json())
+
         return response_201
 
     if response.status_code == 400:
@@ -55,10 +108,35 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
 
         return response_400
 
+    if response.status_code == 404:
+        response_404 = Error.from_dict(response.json())
+
+        return response_404
+
+    if response.status_code == 405:
+        response_405 = Error.from_dict(response.json())
+
+        return response_405
+
+    if response.status_code == 409:
+        response_409 = Error.from_dict(response.json())
+
+        return response_409
+
+    if response.status_code == 429:
+        response_429 = StorageResourceExhaustedError.from_dict(response.json())
+
+        return response_429
+
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
 
         return response_500
+
+    if response.status_code == 503:
+        response_503 = Error.from_dict(response.json())
+
+        return response_503
 
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
@@ -66,7 +144,16 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | Error]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[
+    CreatedAlgebraicIndex
+    | CreatedEmbeddingsIndex
+    | CreatedFullTextIndex
+    | CreatedGraphIndex
+    | Error
+    | StorageResourceExhaustedError
+]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -80,22 +167,33 @@ def sync_detailed(
     index_name: str,
     *,
     client: AuthenticatedClient,
-    body: AlgebraicIndexConfig | EmbeddingsIndexConfig | FullTextIndexConfig | GraphIndexConfig,
-) -> Response[Any | Error]:
+    body: CreateAlgebraicIndexRequest
+    | CreateEmbeddingsIndexRequest
+    | CreateFullTextIndexRequest
+    | CreateGraphIndexRequest,
+) -> Response[
+    CreatedAlgebraicIndex
+    | CreatedEmbeddingsIndex
+    | CreatedFullTextIndex
+    | CreatedGraphIndex
+    | Error
+    | StorageResourceExhaustedError
+]:
     """Add an index to a table
 
     Args:
         table_name (str):
         index_name (str):
-        body (AlgebraicIndexConfig | EmbeddingsIndexConfig | FullTextIndexConfig |
-            GraphIndexConfig): Configuration for an index
+        body (CreateAlgebraicIndexRequest | CreateEmbeddingsIndexRequest |
+            CreateFullTextIndexRequest | CreateGraphIndexRequest): Type-safe configuration for a new
+            index. The index name is owned by the request path.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | Error]
+        Response[CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | StorageResourceExhaustedError]
     """
 
     kwargs = _get_kwargs(
@@ -116,22 +214,34 @@ def sync(
     index_name: str,
     *,
     client: AuthenticatedClient,
-    body: AlgebraicIndexConfig | EmbeddingsIndexConfig | FullTextIndexConfig | GraphIndexConfig,
-) -> Any | Error | None:
+    body: CreateAlgebraicIndexRequest
+    | CreateEmbeddingsIndexRequest
+    | CreateFullTextIndexRequest
+    | CreateGraphIndexRequest,
+) -> (
+    CreatedAlgebraicIndex
+    | CreatedEmbeddingsIndex
+    | CreatedFullTextIndex
+    | CreatedGraphIndex
+    | Error
+    | StorageResourceExhaustedError
+    | None
+):
     """Add an index to a table
 
     Args:
         table_name (str):
         index_name (str):
-        body (AlgebraicIndexConfig | EmbeddingsIndexConfig | FullTextIndexConfig |
-            GraphIndexConfig): Configuration for an index
+        body (CreateAlgebraicIndexRequest | CreateEmbeddingsIndexRequest |
+            CreateFullTextIndexRequest | CreateGraphIndexRequest): Type-safe configuration for a new
+            index. The index name is owned by the request path.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | Error
+        CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | StorageResourceExhaustedError
     """
 
     return sync_detailed(
@@ -147,22 +257,33 @@ async def asyncio_detailed(
     index_name: str,
     *,
     client: AuthenticatedClient,
-    body: AlgebraicIndexConfig | EmbeddingsIndexConfig | FullTextIndexConfig | GraphIndexConfig,
-) -> Response[Any | Error]:
+    body: CreateAlgebraicIndexRequest
+    | CreateEmbeddingsIndexRequest
+    | CreateFullTextIndexRequest
+    | CreateGraphIndexRequest,
+) -> Response[
+    CreatedAlgebraicIndex
+    | CreatedEmbeddingsIndex
+    | CreatedFullTextIndex
+    | CreatedGraphIndex
+    | Error
+    | StorageResourceExhaustedError
+]:
     """Add an index to a table
 
     Args:
         table_name (str):
         index_name (str):
-        body (AlgebraicIndexConfig | EmbeddingsIndexConfig | FullTextIndexConfig |
-            GraphIndexConfig): Configuration for an index
+        body (CreateAlgebraicIndexRequest | CreateEmbeddingsIndexRequest |
+            CreateFullTextIndexRequest | CreateGraphIndexRequest): Type-safe configuration for a new
+            index. The index name is owned by the request path.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | Error]
+        Response[CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | StorageResourceExhaustedError]
     """
 
     kwargs = _get_kwargs(
@@ -181,22 +302,34 @@ async def asyncio(
     index_name: str,
     *,
     client: AuthenticatedClient,
-    body: AlgebraicIndexConfig | EmbeddingsIndexConfig | FullTextIndexConfig | GraphIndexConfig,
-) -> Any | Error | None:
+    body: CreateAlgebraicIndexRequest
+    | CreateEmbeddingsIndexRequest
+    | CreateFullTextIndexRequest
+    | CreateGraphIndexRequest,
+) -> (
+    CreatedAlgebraicIndex
+    | CreatedEmbeddingsIndex
+    | CreatedFullTextIndex
+    | CreatedGraphIndex
+    | Error
+    | StorageResourceExhaustedError
+    | None
+):
     """Add an index to a table
 
     Args:
         table_name (str):
         index_name (str):
-        body (AlgebraicIndexConfig | EmbeddingsIndexConfig | FullTextIndexConfig |
-            GraphIndexConfig): Configuration for an index
+        body (CreateAlgebraicIndexRequest | CreateEmbeddingsIndexRequest |
+            CreateFullTextIndexRequest | CreateGraphIndexRequest): Type-safe configuration for a new
+            index. The index name is owned by the request path.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | Error
+        CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | StorageResourceExhaustedError
     """
 
     return (

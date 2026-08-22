@@ -3567,6 +3567,7 @@ const LegacyTableWriteSource = struct {
             table_name: []const u8,
             backup_id: []const u8,
             format: backups_api.BackupFormat,
+            fence: backups_api.TableBackupFence,
             location_uri: []const u8,
             connection: []const u8,
             location: *backups_api.BackupLocation,
@@ -3934,12 +3935,13 @@ const LegacyTableWriteSource = struct {
         table_name: []const u8,
         backup_id: []const u8,
         format: backups_api.BackupFormat,
+        fence: backups_api.TableBackupFence,
         location_uri: []const u8,
         connection: []const u8,
         location: *backups_api.BackupLocation,
     ) !?[]backups_api.ShardSnapshot {
         const fn_ptr = self.vtable.backup_table_to_location orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, backup_id, format, location_uri, connection, location);
+        return try fn_ptr(self.ptr, alloc, table_name, backup_id, format, fence, location_uri, connection, location);
     }
 
     pub fn restoreTable(
@@ -10842,7 +10844,16 @@ pub const ProvisionedTableWriteSource = struct {
         const min_refresh_interval_ns = std.time.ns_per_s;
         if (statuses.items.len == 0) return true;
         for (statuses.items) |status| {
-            if (status.metadata.source != .cached_snapshot) continue;
+            // A live-writer publication is still a point-in-time cache entry.
+            // Enrichment and derived-index workers can advance immediately
+            // after it is published (notably after inline table creation), so
+            // treating it as permanently current strands readiness at the
+            // pre-replay snapshot. Refresh both recovered and writer-published
+            // observations from the already-open writer at the bounded cadence.
+            switch (status.metadata.source) {
+                .cached_snapshot, .live_writer_publish => {},
+                else => continue,
+            }
             if (!runtime_status.statusRuntimeFresh(status)) return true;
             if (status.metadata.updated_at_ns == 0) return true;
             if (now_ns -| status.metadata.updated_at_ns >= min_refresh_interval_ns) return true;
@@ -13280,6 +13291,26 @@ pub const ProvisionedTableWriteSource = struct {
                     target_generations[group_index] = entry.lsm_root_generation;
                     try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, cached.db);
                     try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
+                    // Catalog admission and local create can race an earlier
+                    // startup/status open of this generation. The entry
+                    // fingerprint is publication metadata, not proof that the
+                    // resident DB successfully installed the same producer
+                    // set: an adopted/opened writer can carry the new catalog
+                    // fingerprint while still owning the old (often empty)
+                    // runtime. Create is the authoritative, one-shot commit
+                    // boundary, so always install its requested runtime before
+                    // reconciling durable indexes. Publish the matching
+                    // fingerprint only after every group commits.
+                    try reconfigureManagedDbEnrichmentRuntime(
+                        alloc,
+                        cached.db,
+                        indexes_json,
+                        self.backend_runtime,
+                        self.antfly_provider,
+                        self.inference_api_url,
+                        self.secret_store,
+                        self.remote_content,
+                    );
                     _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
                         .drain_resolver_backfill = false,
                     });
@@ -14143,13 +14174,15 @@ pub const ProvisionedTableWriteSource = struct {
         plan: backups_api.TableBackupPlan,
     ) !?[]backups_api.ShardSnapshot {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (self.localWriteOwnerSource()) |owner| return try owner.backupTable(alloc, table_name, plan);
-
-        const group_id = (try table_catalog.resolveSingleRangeGroup(alloc, self.catalog, table_name)) orelse return null;
+        const group_id = (try resolveFencedBackupGroup(self.catalog, table_name, plan.fence)) orelse return null;
         self.beginGroupOperation(table_name, group_id);
         defer {
             self.endGroupOperation(table_name, group_id);
         }
+        const guarded_group_id = (try resolveFencedBackupGroup(self.catalog, table_name, plan.fence)) orelse return error.CatalogChanged;
+        if (guarded_group_id != group_id) return error.CatalogChanged;
+
+        if (self.localWriteOwnerSource()) |owner| return try owner.backupTable(alloc, table_name, plan);
 
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
@@ -16475,6 +16508,58 @@ test "hosted backup forwarding preserves external io authority" {
     try std.testing.expectEqualStrings("portable", parsed.value.format);
 }
 
+test "backup storage resolution rejects a reused table name from another incarnation" {
+    const Catalog = struct {
+        table_id: u64 = 7,
+        metadata_incarnation: metadata_api.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const tables = try std.testing.allocator.alloc(metadata_table_manager.TableRecord, 1);
+            errdefer std.testing.allocator.free(tables);
+            tables[0] = .{ .table_id = self.table_id, .name = "docs", .placement_role = "data", .schema_json = "{}", .indexes_json = "{}" };
+            const ranges = try std.testing.allocator.alloc(metadata_table_manager.RangeRecord, 1);
+            ranges[0] = .{ .group_id = 7001, .table_id = self.table_id, .start_key = "", .end_key = null };
+            return .{
+                .status = .{ .metadata_group_id = 1, .metadata_incarnation = self.metadata_incarnation, .metrics = .{} },
+                .tables = tables,
+                .ranges = ranges,
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            std.testing.allocator.free(snapshot.tables);
+            std.testing.allocator.free(snapshot.ranges);
+        }
+    };
+
+    var catalog = Catalog{};
+    var admitted = try catalog.iface().adminSnapshot();
+    const fence = backups_api.tableBackupFence(&admitted, &admitted.tables[0]);
+    catalog.iface().freeAdminSnapshot(&admitted);
+    try std.testing.expectEqual(@as(?u64, 7001), try resolveFencedBackupGroup(catalog.iface(), "docs", fence));
+
+    catalog.metadata_incarnation = "fedcba9876543210fedcba9876543210".*;
+    try std.testing.expectError(error.CatalogChanged, resolveFencedBackupGroup(catalog.iface(), "docs", fence));
+    catalog.metadata_incarnation = "0123456789abcdef0123456789abcdef".*;
+    catalog.table_id = 8;
+    try std.testing.expectError(error.CatalogChanged, resolveFencedBackupGroup(catalog.iface(), "docs", fence));
+}
+
 pub const HostedProvisionedTableWriteSource = struct {
     replica_root_dir: []const u8,
     catalog: table_catalog.CatalogSource,
@@ -17472,13 +17557,14 @@ pub const HostedProvisionedTableWriteSource = struct {
         table_name: []const u8,
         backup_id: []const u8,
         format: backups_api.BackupFormat,
+        fence: backups_api.TableBackupFence,
         location_uri: []const u8,
         connection: []const u8,
         location_ptr: *anyopaque,
     ) !?[]backups_api.ShardSnapshot {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const location: *backups_api.BackupLocation = @ptrCast(@alignCast(location_ptr));
-        const group_id = (try table_catalog.resolveSingleRangeGroup(alloc, self.catalog, table_name)) orelse return null;
+        const group_id = (try resolveFencedBackupGroup(self.catalog, table_name, fence)) orelse return null;
         const resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
         var route = resolved_route orelse return null;
         defer route.deinit(alloc);
@@ -17489,7 +17575,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 defer alloc.free(body);
 
                 var client = http_client.ApiHttpClient.init(alloc, self.executor);
-                var response = try client.fetchBackupTable(remote.base_uri, table_name, body);
+                var response = try client.fetchBackupTableFenced(remote.base_uri, table_name, body, fence);
                 response.deinit(alloc);
 
                 var manifest = try backups_api.readManifestFromLocation(alloc, location, backup_id);
@@ -18501,7 +18587,7 @@ fn parseIndexConfigWithOptions(
 }
 
 pub fn validateIndexConfig(alloc: std.mem.Allocator, index_name: []const u8, index_json: []const u8) !void {
-    return try validateIndexConfigWithOptions(alloc, index_name, index_json, .{});
+    return table_index_config.validateIndexConfig(alloc, index_name, index_json);
 }
 
 pub fn validateIndexConfigWithOptions(
@@ -18510,20 +18596,10 @@ pub fn validateIndexConfigWithOptions(
     index_json: []const u8,
     options: managed_embedder.InitOptions,
 ) !void {
-    const cfg = try parseIndexConfigWithOptions(alloc, index_name, index_json, options);
-    defer {
-        alloc.free(cfg.name);
-        alloc.free(cfg.config_json);
-    }
-    if (cfg.kind == .algebraic) {
-        var parsed = std.json.parseFromSlice(db_mod.algebraic.index.Config, alloc, cfg.config_json, .{
-            .allocate = .alloc_always,
-            .ignore_unknown_fields = true,
-        }) catch return error.InvalidCreateTableRequest;
-        defer parsed.deinit();
-        db_mod.algebraic.index.validateConfig(parsed.value) catch return error.InvalidCreateTableRequest;
-    }
+    return table_index_config.validateIndexConfigWithOptions(alloc, index_name, index_json, options);
 }
+
+pub const validateGraphIndexesJson = table_index_config.validateGraphIndexesJson;
 
 fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, value: std.json.Value) ![]u8 {
     return try extractIndexConfigJsonWithOptions(alloc, index_name, value, .{});
@@ -18650,6 +18726,16 @@ test "table write index validation checks expanded algebraic config semantics" {
 
     try std.testing.expectError(error.InvalidCreateTableRequest, validateIndexConfig(alloc, "sales_rollup",
         \\{"type":"algebraic","table":"sales","schema_version":1,"capability_fingerprint":"sales:v1","group_fields":[{"name":"customer","path":"customer","type":"keyword"}],"measure_fields":[{"name":"amount","path":"amount","type":"number"}],"materializations":[{"name":"sum_by_customer","op":"sum","group_by":["missing"],"measure":"amount"}]}
+    ));
+
+    try validateIndexConfig(alloc, "relations_graph",
+        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]"}}
+    );
+    try std.testing.expectError(error.InvalidCreateTableRequest, validateIndexConfig(alloc, "relations_graph",
+        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[0]"}}
+    ));
+    try std.testing.expectError(error.InvalidCreateTableRequest, validateIndexConfig(alloc, "relations_graph",
+        \\{"type":"graph","edge_types":[{"name":"mentions","topology":"dag"}]}
     ));
 }
 
@@ -21300,7 +21386,7 @@ test "provisioning detects model backed graph shorthand assets inside config_jso
         \\[{
         \\  "name":"relations_graph",
         \\  "kind":"graph",
-        \\  "config_json":"{\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"field\":\"body\",\"producer_json\":{\"type\":\"extractor\",\"config\":{\"provider\":\"antfly\"}}}}"
+        \\  "config_json":"{\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"body\"},\"producer_json\":{\"type\":\"extractor\",\"config\":{\"provider\":\"antfly\"}}}}"
         \\}]
     ));
 }
@@ -21311,14 +21397,14 @@ test "provisioning does not require asset producer for copy graph shorthand asse
         \\[{
         \\  "name":"relations_graph",
         \\  "kind":"graph",
-        \\  "config_json":"{\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"field\":\"relations\"}}"
+        \\  "config_json":"{\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"relations\"}}}"
         \\}]
     )));
     try std.testing.expect(try indexesJsonHasGeneratedEnrichment(alloc,
         \\[{
         \\  "name":"relations_graph",
         \\  "kind":"graph",
-        \\  "config_json":"{\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"field\":\"relations\"}}"
+        \\  "config_json":"{\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"relations\"}}}"
         \\}]
     ));
 }
@@ -23556,6 +23642,29 @@ fn loadTableManagedMetadata(
         .indexes_json = indexes_json,
         .schema_json = schema_json,
     };
+}
+
+/// Resolves the single storage group while checking the complete table
+/// incarnation carried by backup admission. Callers repeat this after taking
+/// their structural-operation guard so catalog replacement cannot redirect a
+/// snapshot by reusing the same table name.
+fn resolveFencedBackupGroup(
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    expected_fence: ?backups_api.TableBackupFence,
+) !?u64 {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+    const resolution = metadata_api.catalogTableTopologyResolution(table.table_id, snapshot.ranges);
+    if (expected_fence) |expected| {
+        const actual = backups_api.tableBackupFenceWithTopology(&snapshot, table, resolution.topology);
+        if (!expected.matches(actual)) return error.CatalogChanged;
+    }
+
+    if (resolution.topology.range_count == 0) return null;
+    if (resolution.topology.range_count != 1) return error.UnsupportedMultiRangeTable;
+    return resolution.single_group_id orelse error.CatalogChanged;
 }
 
 fn loadTableIdentityNamespaceForGroup(
@@ -40976,6 +41085,196 @@ test "provisioned create reuses a generation opened by startup reconciliation" {
     var admitted = (try serving_owner.db.lookup(alloc, "doc:admitted", .{})) orelse return error.TestUnexpectedResult;
     defer admitted.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, admitted.json, "already provisioned") != null);
+}
+
+test "provisioned create installs managed enrichment despite a matching stale fingerprint" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const FakeEmbeddingProvider = struct {
+        var request_count: std.atomic.Value(u32) = .init(0);
+
+        fn executor() http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, arena: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/v1/embeddings"));
+            _ = request_count.fetchAdd(1, .monotonic);
+
+            var parsed_req = try parseJsonBodyIgnoreUnknown(TestEmbeddingRequest, arena, req.body);
+            defer parsed_req.deinit();
+            try std.testing.expect(jsonValueContainsText(parsed_req.value.input, "alpha body"));
+
+            return .{
+                .status = 200,
+                .content_type = try arena.dupe(u8, "application/json"),
+                .body = try arena.dupe(u8,
+                    \\{"object":"list","data":[{"object":"embedding","index":0,"embedding":[1,0,0]}],"model":"test-embed","usage":{"prompt_tokens":1,"total_tokens":1}}
+                ),
+            };
+        }
+    };
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/create-managed-runtime-race", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(path);
+
+    // Model the create-table race: startup observed the catalog before the
+    // managed index was published and opened the generation with only the
+    // default index. The create request below is the newer authority.
+    const Catalog = struct {
+        var indexes_json_buf: []const u8 = tables_api.default_indexes_json;
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            const tables = try std.testing.allocator.alloc(metadata_table_manager.TableRecord, 1);
+            errdefer std.testing.allocator.free(tables);
+            tables[0] = .{
+                .table_id = 7,
+                .name = "docs",
+                .schema_json = tables_api.default_schema_json,
+                .indexes_json = indexes_json_buf,
+                .placement_role = "data",
+            };
+            const ranges = try std.testing.allocator.alloc(metadata_table_manager.RangeRecord, 1);
+            errdefer std.testing.allocator.free(ranges);
+            ranges[0] = .{
+                .group_id = 7001,
+                .range_id = 7101,
+                .table_id = 7,
+                .start_key = "",
+                .end_key = null,
+            };
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = tables,
+                .ranges = ranges,
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            std.testing.allocator.free(snapshot.tables);
+            std.testing.allocator.free(snapshot.ranges);
+        }
+    };
+
+    var listener = std_http_listener.StdHttpListener.init(alloc, .{}, FakeEmbeddingProvider.executor());
+    defer listener.deinit();
+    try listener.start();
+    const base_uri = try listener.baseUri(alloc);
+    defer alloc.free(base_uri);
+
+    const managed_indexes_json = try std.fmt.allocPrint(alloc,
+        \\{{"full_text_index_v0":{{"name":"full_text_index_v0","type":"full_text"}},"title_body":{{"name":"title_body","type":"embeddings","template":"{{{{title}}}} {{{{body}}}}","dimension":3,"embedder":{{"provider":"openai","model":"test-embed","url":"{s}"}}}}}}
+    , .{base_uri});
+    defer alloc.free(managed_indexes_json);
+    Catalog.indexes_json_buf = tables_api.default_indexes_json;
+    FakeEmbeddingProvider.request_count.store(0, .monotonic);
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+
+    {
+        var stale_owner = try write_cache.getOrOpenLockedMode(
+            path,
+            Catalog.iface(),
+            7001,
+            source.visibleRootGeneration(7001),
+            "docs",
+            .startup_catch_up,
+        );
+        defer stale_owner.deinit(alloc);
+        try std.testing.expect(stale_owner.db.enrichment_runtime == null);
+        // Reproduce the production failure precisely: metadata publication
+        // advanced independently while the resident runtime stayed stale.
+        // A fingerprint match alone must never let create skip installation.
+        ProvisionedTableWriteCache.publishEntryManagedConfig(stale_owner.entry.?, managed_indexes_json);
+        try std.testing.expect(ProvisionedTableWriteCache.entryManagedConfigMatches(
+            stale_owner.entry.?,
+            managed_indexes_json,
+        ));
+    }
+
+    // Admission has committed the new catalog value, but the startup cache
+    // still owns a writer constructed from the earlier snapshot.
+    Catalog.indexes_json_buf = managed_indexes_json;
+    var req = tables_api.CreateTableRequest{
+        .indexes_json = try alloc.dupe(u8, managed_indexes_json),
+    };
+    defer req.deinit(alloc);
+    _ = try source.source().createTable(alloc, "docs", req);
+
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    const entry = write_cache.entries.items[0];
+    try std.testing.expect(ProvisionedTableWriteCache.entryManagedConfigMatches(entry, managed_indexes_json));
+    try std.testing.expect(entry.db.core.index_manager.denseIndex("title_body") != null);
+    const runtime = entry.db.enrichment_runtime orelse return error.MissingDbEnrichmentRuntime;
+    try std.testing.expect(runtime.stats().worker_started);
+
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha body\"}" }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expect(FakeEmbeddingProvider.request_count.load(.monotonic) > 0);
+    try std.testing.expect(entry.db.core.index_manager.denseIndex("title_body").?.index.metadata.active_count > 0);
+
+    const query_vec = [_]f32{ 1, 0, 0 };
+    var result = try entry.db.search(alloc, .{
+        .index_name = "title_body",
+        .dense = .{ .vector = query_vec[0..], .k = 1 },
+        .limit = 1,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "runtime status refreshes aged live writer publications" {
+    const now_ns = 2 * std.time.ns_per_s;
+    var item = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7001,
+        .metadata = .{
+            .source = .live_writer_publish,
+            .freshness = .fresh,
+            .updated_at_ns = 1,
+        },
+        .stats = .{},
+    };
+    var items = [_]runtime_status.LocalTableRuntimeStatus{item};
+    var statuses = runtime_status.LocalTableRuntimeStatuses{ .items = items[0..] };
+    try std.testing.expect(ProvisionedTableWriteSource.runtimeStatusesNeedWriterRefresh(&statuses, now_ns));
+
+    item.metadata.updated_at_ns = now_ns;
+    statuses.items[0] = item;
+    try std.testing.expect(!ProvisionedTableWriteSource.runtimeStatusesNeedWriterRefresh(&statuses, now_ns));
+
+    item.metadata.source = .synthetic_config;
+    item.metadata.updated_at_ns = 1;
+    statuses.items[0] = item;
+    try std.testing.expect(!ProvisionedTableWriteSource.runtimeStatusesNeedWriterRefresh(&statuses, now_ns));
 }
 
 test "provisioned table write source restore table does not hold local db mutex during restore work" {

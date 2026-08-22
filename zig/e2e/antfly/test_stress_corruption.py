@@ -28,7 +28,7 @@ import time
 
 import pytest
 
-from helpers import wait_until
+from helpers import assert_created_index, wait_until
 from test_backup_restore import _chunked_doc, _semantic_top_hit
 
 pytestmark = pytest.mark.slow
@@ -42,8 +42,8 @@ def test_stress_chunked_semantic_corruption(backup_api, openai_embedder):
         created = backup_api.create_table(table_name, num_shards=1, description="stress")
         assert created["name"] == table_name
 
-        assert (
-            backup_api.create_index(
+        assert_created_index(
+        backup_api.create_index(
                 table_name,
                 "semantic_chunked_idx",
                 {
@@ -67,9 +67,10 @@ def test_stress_chunked_semantic_corruption(backup_api, openai_embedder):
                         },
                     },
                 },
-            )
-            == {}
-        )
+            ),
+        "semantic_chunked_idx",
+        'embeddings',
+    )
 
         backup_api.wait_index_ready(table_name, "semantic_chunked_idx", timeout_s=30.0, interval_s=0.5)
 

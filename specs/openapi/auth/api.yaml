@@ -170,9 +170,24 @@ components:
     Error:
       type: object
       properties:
+        code:
+          type: string
+          description: Optional stable machine-readable error code for programmatic handling.
         error:
           type: string
           example: "An error message"
+          description: Legacy human-readable error text.
+        message:
+          type: string
+          description: Human-readable error description when supplied by the endpoint.
+        retryable:
+          type: boolean
+          description: Whether retrying the operation may succeed without changing the request.
+        retry_after_ms:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Suggested minimum retry delay in milliseconds.
       required:
         - error
 

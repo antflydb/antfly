@@ -115,6 +115,7 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             backup_id: []const u8,
             format: backup_contract.BackupFormat,
+            fence: backup_contract.TableBackupFence,
             location_uri: []const u8,
             connection: []const u8,
             location: *anyopaque,
@@ -565,12 +566,13 @@ pub const TableWriteSource = struct {
         table_name: []const u8,
         backup_id: []const u8,
         format: backup_contract.BackupFormat,
+        fence: backup_contract.TableBackupFence,
         location_uri: []const u8,
         connection: []const u8,
         location: *anyopaque,
     ) !?[]backup_contract.ShardSnapshot {
         const fn_ptr = self.vtable.backup_table_to_location orelse return null;
-        return try BoundaryAbi.call("backup_table_to_location", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, backup_id, format, location_uri, connection, location });
+        return try BoundaryAbi.call("backup_table_to_location", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, backup_id, format, fence, location_uri, connection, location });
     }
 
     pub fn restoreTable(

@@ -30,6 +30,7 @@ const api_http_client = @import("../api/http_client.zig");
 const api_http_test_runtime = @import("../api/http_test_runtime.zig");
 const api_http_routes = @import("../api/http_routes.zig");
 const api_http_server = @import("../api/http_server.zig");
+const api_operation = @import("../api/operation.zig");
 const backups_api = @import("../api/backups.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
 const api_table_reads = @import("../api/table_reads.zig");
@@ -4634,7 +4635,7 @@ const PublicApiStatusSource = struct {
                 .status = status,
                 .admin_snapshot = adminSnapshot,
                 .cached_admin_snapshot = cachedAdminSnapshot,
-                .ensure_linearizable_read = ensureLinearizableRead,
+                .linearizable_snapshot = linearizableSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
                 .create_table = createTable,
                 .drop_table = dropTable,
@@ -4659,9 +4660,13 @@ const PublicApiStatusSource = struct {
         return try adminSnapshot(ptr);
     }
 
-    fn ensureLinearizableRead(ptr: *anyopaque) !void {
+    fn linearizableSnapshot(ptr: *anyopaque, request: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+        try request.ensureActive();
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        if (self.linearizable_read_driver) |driver| return try driver.ensure();
+        if (self.linearizable_read_driver) |driver| {
+            try driver.ensure();
+            return try self.metadataNode().adminSnapshot();
+        }
         const target = self.metadataNode();
         const leader_index = self.node.cluster.currentMetadataLeaderIndex() orelse
             return error.MetadataLinearizableReadTimeout;
@@ -4670,6 +4675,7 @@ const PublicApiStatusSource = struct {
         const raft_status = target.sim().raftStatus(self.node.cluster.metadata_group_id) orelse
             return error.MetadataLinearizableReadTimeout;
         if (raft_status.soft.role != .leader) return error.NotLeader;
+        return try target.adminSnapshot();
     }
 
     fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
