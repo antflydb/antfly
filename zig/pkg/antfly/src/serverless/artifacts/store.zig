@@ -96,12 +96,21 @@ pub const ArtifactStore = struct {
         artifact_id: []const u8,
         cancellation: CancellationToken,
     ) ![]u8 {
+        return try self.getAllocWithCancellationUsingAllocator(self.allocator, artifact_id, cancellation);
+    }
+
+    pub fn getAllocWithCancellationUsingAllocator(
+        self: *ArtifactStore,
+        result_alloc: Allocator,
+        artifact_id: []const u8,
+        cancellation: CancellationToken,
+    ) ![]u8 {
         try cancellation.check();
         const payload = if (self.vtable.get_alloc_with_cancellation) |get_with_cancellation|
-            try get_with_cancellation(self.ptr, self.allocator, artifact_id, cancellation)
+            try get_with_cancellation(self.ptr, result_alloc, artifact_id, cancellation)
         else
-            try self.vtable.get_alloc(self.ptr, self.allocator, artifact_id);
-        errdefer self.allocator.free(payload);
+            try self.vtable.get_alloc(self.ptr, result_alloc, artifact_id);
+        errdefer result_alloc.free(payload);
         try cancellation.check();
         return payload;
     }
@@ -117,28 +126,55 @@ pub const ArtifactStore = struct {
         expected_checksum: []const u8,
         cancellation: CancellationToken,
     ) ![]u8 {
+        return try self.getVerifiedAllocWithCancellationUsingAllocator(
+            self.allocator,
+            artifact_id,
+            expected_byte_len,
+            expected_checksum,
+            cancellation,
+        );
+    }
+
+    pub fn getVerifiedAllocWithCancellationUsingAllocator(
+        self: *ArtifactStore,
+        result_alloc: Allocator,
+        artifact_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        cancellation: CancellationToken,
+    ) ![]u8 {
         try cancellation.check();
         validateSha256ArtifactIdentity(artifact_id, expected_checksum) catch
             return error.ArtifactIntegrityMismatch;
         const expected_len = std.math.cast(usize, expected_byte_len) orelse
             return error.ArtifactTooLarge;
 
-        var metadata = try self.statWithCancellation(artifact_id, cancellation);
-        defer metadata.deinit(self.allocator);
-        if (!std.mem.eql(u8, metadata.artifact_id, artifact_id) or
-            metadata.byte_len != expected_byte_len or
-            !std.mem.eql(u8, metadata.checksum, expected_checksum))
         {
-            return error.ArtifactIntegrityMismatch;
+            var metadata = try self.statWithCancellationUsingAllocator(result_alloc, artifact_id, cancellation);
+            defer metadata.deinit(result_alloc);
+            if (!std.mem.eql(u8, metadata.artifact_id, artifact_id) or
+                metadata.byte_len != expected_byte_len or
+                !std.mem.eql(u8, metadata.checksum, expected_checksum))
+            {
+                return error.ArtifactIntegrityMismatch;
+            }
         }
 
-        const payload = try self.getRangeAllocWithCancellation(
+        if (expected_len == 0) {
+            const payload = try result_alloc.alloc(u8, 0);
+            errdefer result_alloc.free(payload);
+            try validatePayloadSha256WithCancellation(payload, expected_checksum, cancellation);
+            return payload;
+        }
+
+        const payload = try self.getRangeAllocWithCancellationUsingAllocator(
+            result_alloc,
             artifact_id,
             0,
             expected_len,
             cancellation,
         );
-        errdefer self.allocator.free(payload);
+        errdefer result_alloc.free(payload);
         if (payload.len != expected_len) return error.ArtifactIntegrityMismatch;
         try validatePayloadSha256WithCancellation(payload, expected_checksum, cancellation);
         return payload;
@@ -155,12 +191,23 @@ pub const ArtifactStore = struct {
         len: usize,
         cancellation: CancellationToken,
     ) ![]u8 {
+        return try self.getRangeAllocWithCancellationUsingAllocator(self.allocator, artifact_id, offset, len, cancellation);
+    }
+
+    pub fn getRangeAllocWithCancellationUsingAllocator(
+        self: *ArtifactStore,
+        result_alloc: Allocator,
+        artifact_id: []const u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) ![]u8 {
         try cancellation.check();
         const payload = if (self.vtable.get_range_alloc_with_cancellation) |get_with_cancellation|
-            try get_with_cancellation(self.ptr, self.allocator, artifact_id, offset, len, cancellation)
+            try get_with_cancellation(self.ptr, result_alloc, artifact_id, offset, len, cancellation)
         else
-            try self.vtable.get_range_alloc(self.ptr, self.allocator, artifact_id, offset, len);
-        errdefer self.allocator.free(payload);
+            try self.vtable.get_range_alloc(self.ptr, result_alloc, artifact_id, offset, len);
+        errdefer result_alloc.free(payload);
         try cancellation.check();
         return payload;
     }
@@ -170,12 +217,21 @@ pub const ArtifactStore = struct {
     }
 
     pub fn statWithCancellation(self: *ArtifactStore, artifact_id: []const u8, cancellation: CancellationToken) !ArtifactMetadata {
+        return try self.statWithCancellationUsingAllocator(self.allocator, artifact_id, cancellation);
+    }
+
+    pub fn statWithCancellationUsingAllocator(
+        self: *ArtifactStore,
+        result_alloc: Allocator,
+        artifact_id: []const u8,
+        cancellation: CancellationToken,
+    ) !ArtifactMetadata {
         try cancellation.check();
         var metadata = if (self.vtable.stat_with_cancellation) |stat_with_cancellation|
-            try stat_with_cancellation(self.ptr, self.allocator, artifact_id, cancellation)
+            try stat_with_cancellation(self.ptr, result_alloc, artifact_id, cancellation)
         else
-            try self.vtable.stat(self.ptr, self.allocator, artifact_id);
-        errdefer metadata.deinit(self.allocator);
+            try self.vtable.stat(self.ptr, result_alloc, artifact_id);
+        errdefer metadata.deinit(result_alloc);
         try cancellation.check();
         return metadata;
     }
@@ -225,4 +281,77 @@ test "artifact identities require canonical matching sha256 values" {
             "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         ),
     );
+}
+
+test "serverless verified empty artifacts avoid invalid cloud ranges" {
+    const alloc = std.testing.allocator;
+    const empty_checksum = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const empty_artifact_id = sha256_artifact_id_prefix ++ empty_checksum;
+
+    const State = struct {
+        range_calls: usize = 0,
+
+        fn deinit(_: Allocator, _: *anyopaque) void {}
+
+        fn put(_: *anyopaque, _: Allocator, _: []const u8) anyerror!ArtifactMetadata {
+            return error.UnexpectedCall;
+        }
+
+        fn getAlloc(_: *anyopaque, _: Allocator, _: []const u8) anyerror![]u8 {
+            return error.UnexpectedCall;
+        }
+
+        fn getRangeAlloc(
+            raw: *anyopaque,
+            _: Allocator,
+            _: []const u8,
+            _: u64,
+            _: usize,
+        ) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.range_calls += 1;
+            return error.UnexpectedRangeRequest;
+        }
+
+        fn stat(raw: *anyopaque, result_alloc: Allocator, artifact_id: []const u8) anyerror!ArtifactMetadata {
+            _ = raw;
+            if (!std.mem.eql(u8, artifact_id, empty_artifact_id)) return error.FileNotFound;
+            const artifact_id_copy = try result_alloc.dupe(u8, empty_artifact_id);
+            errdefer result_alloc.free(artifact_id_copy);
+            return .{
+                .artifact_id = artifact_id_copy,
+                .byte_len = 0,
+                .checksum = try result_alloc.dupe(u8, empty_checksum),
+            };
+        }
+
+        fn delete(_: *anyopaque, _: []const u8) anyerror!void {
+            return error.UnexpectedCall;
+        }
+    };
+
+    const vtable = ArtifactStore.VTable{
+        .deinit = State.deinit,
+        .put = State.put,
+        .get_alloc = State.getAlloc,
+        .get_range_alloc = State.getRangeAlloc,
+        .stat = State.stat,
+        .delete = State.delete,
+    };
+    var state = State{};
+    var store = ArtifactStore{
+        .allocator = alloc,
+        .ptr = &state,
+        .vtable = &vtable,
+    };
+
+    const payload = try store.getVerifiedAllocWithCancellation(
+        empty_artifact_id,
+        0,
+        empty_checksum,
+        .none,
+    );
+    defer alloc.free(payload);
+    try std.testing.expectEqual(@as(usize, 0), payload.len);
+    try std.testing.expectEqual(@as(usize, 0), state.range_calls);
 }

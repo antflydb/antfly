@@ -216,7 +216,8 @@ pub const QuerySession = struct {
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         try validateArtifactForQuery(artifact);
         const result = if (self.cache) |cache|
-            try cache.getOrFetchVerifiedAllocWithCancellation(
+            try cache.getOrFetchVerifiedAllocWithCancellationUsingAllocator(
+                self.alloc,
                 self.artifacts,
                 artifact.artifact_id,
                 artifact.byte_len,
@@ -224,7 +225,8 @@ pub const QuerySession = struct {
                 self.cancellation,
             )
         else
-            try self.artifacts.getVerifiedAllocWithCancellation(
+            try self.artifacts.getVerifiedAllocWithCancellationUsingAllocator(
+                self.alloc,
                 artifact.artifact_id,
                 artifact.byte_len,
                 artifact.checksum,
@@ -240,9 +242,9 @@ pub const QuerySession = struct {
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         try validateArtifactRange(artifact, offset, len);
         const result = if (self.cache) |cache|
-            try cache.getRangeOrFetchAllocWithCancellation(self.artifacts, artifact.artifact_id, offset, len, self.cancellation)
+            try cache.getRangeOrFetchAllocWithCancellationUsingAllocator(self.alloc, self.artifacts, artifact.artifact_id, offset, len, self.cancellation)
         else
-            try self.artifacts.getRangeAllocWithCancellation(artifact.artifact_id, offset, len, self.cancellation);
+            try self.artifacts.getRangeAllocWithCancellationUsingAllocator(self.alloc, artifact.artifact_id, offset, len, self.cancellation);
         errdefer self.alloc.free(result);
         try self.checkCancellation();
         return result;
@@ -253,9 +255,9 @@ pub const QuerySession = struct {
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         try validateArtifactRange(artifact, offset, len);
         const result = if (self.cache) |cache|
-            try cache.getBlockOrFetchRangeAllocWithCancellation(self.artifacts, artifact.artifact_id, block_id, offset, len, self.cancellation)
+            try cache.getBlockOrFetchRangeAllocWithCancellationUsingAllocator(self.alloc, self.artifacts, artifact.artifact_id, block_id, offset, len, self.cancellation)
         else
-            try self.artifacts.getRangeAllocWithCancellation(artifact.artifact_id, offset, len, self.cancellation);
+            try self.artifacts.getRangeAllocWithCancellationUsingAllocator(self.alloc, artifact.artifact_id, offset, len, self.cancellation);
         errdefer self.alloc.free(result);
         try self.checkCancellation();
         return result;

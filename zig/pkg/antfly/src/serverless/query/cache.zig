@@ -19,6 +19,10 @@ const CancellationToken = @import("../../common/cancellation.zig").CancellationT
 const fs_paths = @import("../../common/fs_paths.zig");
 const artifacts_mod = @import("../artifacts/mod.zig");
 
+const cache_record_magic = "AFQCR001";
+const cache_record_digest_len = std.crypto.hash.sha2.Sha256.digest_length;
+const cache_record_header_len = cache_record_magic.len + @sizeOf(u64) + cache_record_digest_len;
+
 pub const QueryCacheConfig = struct {
     max_bytes: u64 = 0,
     max_payload_bytes: u64 = 0,
@@ -116,6 +120,7 @@ const EvictableFile = struct {
     size: u64,
     last_access_ns: i128,
     payload_block_class: PayloadBlockClass,
+    counts_as_payload_block: bool,
 };
 
 pub const QueryCache = struct {
@@ -135,6 +140,7 @@ pub const QueryCache = struct {
         var io_impl = threadedIo();
         defer io_impl.deinit();
         try fs_paths.createDirPathPortable(io_impl.io(), root_dir);
+        try cleanupInterruptedCacheWrites(alloc, root_dir);
         var cache = QueryCache{
             .alloc = alloc,
             .root_dir = try alloc.dupe(u8, root_dir),
@@ -147,6 +153,7 @@ pub const QueryCache = struct {
         errdefer cache.deinit();
         cache.usage = try cacheUsageNoLock(alloc, root_dir, .none);
         applyUsageToStats(&cache.stats, cache.usage);
+        try enforceStartupCapacity(&cache);
         return cache;
     }
 
@@ -171,12 +178,22 @@ pub const QueryCache = struct {
         artifact_id: []const u8,
         cancellation: CancellationToken,
     ) ![]u8 {
+        return try self.getOrFetchAllocWithCancellationUsingAllocator(self.alloc, artifacts, artifact_id, cancellation);
+    }
+
+    pub fn getOrFetchAllocWithCancellationUsingAllocator(
+        self: *QueryCache,
+        result_alloc: Allocator,
+        artifacts: *artifacts_mod.ArtifactStore,
+        artifact_id: []const u8,
+        cancellation: CancellationToken,
+    ) ![]u8 {
         try cancellation.check();
         const checksum = try artifacts_mod.sha256ChecksumFromArtifactId(artifact_id);
         const path = try cachePathAlloc(self.alloc, self.root_dir, artifact_id);
         defer self.alloc.free(path);
 
-        const cached = readFileAllocWithLimitAndCancellation(self.alloc, path, cacheReadLimit(self), cancellation) catch |err| switch (err) {
+        const cached = readFileAllocWithLimitAndCancellation(result_alloc, path, cacheReadLimit(self), cancellation) catch |err| switch (err) {
             error.FileNotFound => null,
             error.CacheEntryTooLarge => blk: {
                 try removeCorruptCacheEntry(self, path, cancellation);
@@ -187,14 +204,14 @@ pub const QueryCache = struct {
         if (cached) |value| {
             artifacts_mod.validatePayloadSha256WithCancellation(value, checksum, cancellation) catch |err| switch (err) {
                 error.Canceled => {
-                    self.alloc.free(value);
+                    result_alloc.free(value);
                     return err;
                 },
                 else => {
-                    self.alloc.free(value);
+                    result_alloc.free(value);
                     try removeCorruptCacheEntry(self, path, cancellation);
-                    const byte_len = try fileSizeForArtifact(artifacts, artifact_id, cancellation);
-                    return try self.fetchAndPublishVerifiedArtifact(artifacts, artifact_id, byte_len, checksum, path, cancellation);
+                    const byte_len = try fileSizeForArtifact(result_alloc, artifacts, artifact_id, cancellation);
+                    return try self.fetchAndPublishVerifiedArtifact(result_alloc, artifacts, artifact_id, byte_len, checksum, path, cancellation);
                 },
             };
             touchFileNow(path) catch {};
@@ -202,12 +219,31 @@ pub const QueryCache = struct {
             return value;
         }
 
-        const byte_len = try fileSizeForArtifact(artifacts, artifact_id, cancellation);
-        return try self.fetchAndPublishVerifiedArtifact(artifacts, artifact_id, byte_len, checksum, path, cancellation);
+        const byte_len = try fileSizeForArtifact(result_alloc, artifacts, artifact_id, cancellation);
+        return try self.fetchAndPublishVerifiedArtifact(result_alloc, artifacts, artifact_id, byte_len, checksum, path, cancellation);
     }
 
     pub fn getOrFetchVerifiedAllocWithCancellation(
         self: *QueryCache,
+        artifacts: *artifacts_mod.ArtifactStore,
+        artifact_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        return try self.getOrFetchVerifiedAllocWithCancellationUsingAllocator(
+            self.alloc,
+            artifacts,
+            artifact_id,
+            expected_byte_len,
+            expected_checksum,
+            cancellation,
+        );
+    }
+
+    pub fn getOrFetchVerifiedAllocWithCancellationUsingAllocator(
+        self: *QueryCache,
+        result_alloc: Allocator,
         artifacts: *artifacts_mod.ArtifactStore,
         artifact_id: []const u8,
         expected_byte_len: u64,
@@ -221,7 +257,7 @@ pub const QueryCache = struct {
         const path = try cachePathAlloc(self.alloc, self.root_dir, artifact_id);
         defer self.alloc.free(path);
 
-        const cached = readFileExactAllocWithCancellation(self.alloc, path, expected_len, cancellation) catch |err| switch (err) {
+        const cached = readFileExactAllocWithCancellation(result_alloc, path, expected_len, cancellation) catch |err| switch (err) {
             error.FileNotFound => null,
             error.CacheEntryCorrupt => blk: {
                 try removeCorruptCacheEntry(self, path, cancellation);
@@ -232,13 +268,14 @@ pub const QueryCache = struct {
         if (cached) |value| {
             artifacts_mod.validatePayloadSha256WithCancellation(value, expected_checksum, cancellation) catch |err| switch (err) {
                 error.Canceled => {
-                    self.alloc.free(value);
+                    result_alloc.free(value);
                     return err;
                 },
                 else => {
-                    self.alloc.free(value);
+                    result_alloc.free(value);
                     try removeCorruptCacheEntry(self, path, cancellation);
                     return try self.fetchAndPublishVerifiedArtifact(
+                        result_alloc,
                         artifacts,
                         artifact_id,
                         expected_byte_len,
@@ -253,6 +290,7 @@ pub const QueryCache = struct {
             return value;
         }
         return try self.fetchAndPublishVerifiedArtifact(
+            result_alloc,
             artifacts,
             artifact_id,
             expected_byte_len,
@@ -264,6 +302,7 @@ pub const QueryCache = struct {
 
     fn fetchAndPublishVerifiedArtifact(
         self: *QueryCache,
+        result_alloc: Allocator,
         artifacts: *artifacts_mod.ArtifactStore,
         artifact_id: []const u8,
         expected_byte_len: u64,
@@ -271,13 +310,14 @@ pub const QueryCache = struct {
         path: []const u8,
         cancellation: CancellationToken,
     ) ![]u8 {
-        const contents = try artifacts.getVerifiedAllocWithCancellation(
+        const contents = try artifacts.getVerifiedAllocWithCancellationUsingAllocator(
+            result_alloc,
             artifact_id,
             expected_byte_len,
             expected_checksum,
             cancellation,
         );
-        errdefer self.alloc.free(contents);
+        errdefer result_alloc.free(contents);
         const published = try publishCacheEntry(self, path, contents, .full, cancellation);
         recordFullMiss(self, published);
         return contents;
@@ -301,24 +341,22 @@ pub const QueryCache = struct {
         len: usize,
         cancellation: CancellationToken,
     ) ![]u8 {
+        return try self.getRangeOrFetchAllocWithCancellationUsingAllocator(self.alloc, artifacts, artifact_id, offset, len, cancellation);
+    }
+
+    pub fn getRangeOrFetchAllocWithCancellationUsingAllocator(
+        self: *QueryCache,
+        result_alloc: Allocator,
+        artifacts: *artifacts_mod.ArtifactStore,
+        artifact_id: []const u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) ![]u8 {
         try cancellation.check();
-        const full_path = try cachePathAlloc(self.alloc, self.root_dir, artifact_id);
-        defer self.alloc.free(full_path);
-
-        const full_cached = readFileRangeAllocWithCancellation(self.alloc, full_path, offset, len, cancellation) catch |err| switch (err) {
-            error.FileNotFound => null,
-            else => return err,
-        };
-        if (full_cached) |value| {
-            errdefer self.alloc.free(value);
-            touchFileNow(full_path) catch {};
-            recordRangeHit(self);
-            return value;
-        }
-
         const range_path = try rangeCachePathAlloc(self.alloc, self.root_dir, artifact_id, offset, len);
         defer self.alloc.free(range_path);
-        const cached = readFileExactAllocWithCancellation(self.alloc, range_path, len, cancellation) catch |err| switch (err) {
+        const cached = readVerifiedCacheRecordAllocWithCancellation(result_alloc, range_path, len, cancellation) catch |err| switch (err) {
             error.FileNotFound => null,
             error.CacheEntryCorrupt => blk: {
                 try removeCorruptCacheEntry(self, range_path, cancellation);
@@ -327,14 +365,14 @@ pub const QueryCache = struct {
             else => return err,
         };
         if (cached) |value| {
-            errdefer self.alloc.free(value);
+            errdefer result_alloc.free(value);
             touchFileNow(range_path) catch {};
             recordRangeHit(self);
             return value;
         }
 
-        const contents = try artifacts.getRangeAllocWithCancellation(artifact_id, offset, len, cancellation);
-        errdefer self.alloc.free(contents);
+        const contents = try artifacts.getRangeAllocWithCancellationUsingAllocator(result_alloc, artifact_id, offset, len, cancellation);
+        errdefer result_alloc.free(contents);
         if (contents.len != len) return error.ArtifactIntegrityMismatch;
         const published = try publishCacheEntry(self, range_path, contents, .range, cancellation);
         recordRangeMiss(self, published);
@@ -361,26 +399,25 @@ pub const QueryCache = struct {
         len: usize,
         cancellation: CancellationToken,
     ) ![]u8 {
+        return try self.getBlockOrFetchRangeAllocWithCancellationUsingAllocator(self.alloc, artifacts, artifact_id, block_id, offset, len, cancellation);
+    }
+
+    pub fn getBlockOrFetchRangeAllocWithCancellationUsingAllocator(
+        self: *QueryCache,
+        result_alloc: Allocator,
+        artifacts: *artifacts_mod.ArtifactStore,
+        artifact_id: []const u8,
+        block_id: []const u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) ![]u8 {
         try cancellation.check();
         const block_class = classifyBlockId(block_id);
         const payload_block_class = classifyPayloadBlockId(block_id);
-        const full_path = try cachePathAlloc(self.alloc, self.root_dir, artifact_id);
-        defer self.alloc.free(full_path);
-
-        const full_cached = readFileRangeAllocWithCancellation(self.alloc, full_path, offset, len, cancellation) catch |err| switch (err) {
-            error.FileNotFound => null,
-            else => return err,
-        };
-        if (full_cached) |value| {
-            errdefer self.alloc.free(value);
-            touchFileNow(full_path) catch {};
-            recordBlockHit(self, block_class, payload_block_class);
-            return value;
-        }
-
-        const block_path = try blockCachePathAlloc(self.alloc, self.root_dir, artifact_id, block_id, block_class);
+        const block_path = try blockCachePathAlloc(self.alloc, self.root_dir, artifact_id, block_id, offset, len, block_class);
         defer self.alloc.free(block_path);
-        const cached = readFileExactAllocWithCancellation(self.alloc, block_path, len, cancellation) catch |err| switch (err) {
+        const cached = readVerifiedCacheRecordAllocWithCancellation(result_alloc, block_path, len, cancellation) catch |err| switch (err) {
             error.FileNotFound => null,
             error.CacheEntryCorrupt => blk: {
                 try removeCorruptCacheEntry(self, block_path, cancellation);
@@ -389,14 +426,14 @@ pub const QueryCache = struct {
             else => return err,
         };
         if (cached) |value| {
-            errdefer self.alloc.free(value);
+            errdefer result_alloc.free(value);
             touchFileNow(block_path) catch {};
             recordBlockHit(self, block_class, payload_block_class);
             return value;
         }
 
-        const contents = try artifacts.getRangeAllocWithCancellation(artifact_id, offset, len, cancellation);
-        errdefer self.alloc.free(contents);
+        const contents = try artifacts.getRangeAllocWithCancellationUsingAllocator(result_alloc, artifact_id, offset, len, cancellation);
+        errdefer result_alloc.free(contents);
         if (contents.len != len) return error.ArtifactIntegrityMismatch;
         const published = try publishCacheEntry(self, block_path, contents, switch (block_class) {
             .routing => .routing_block,
@@ -428,6 +465,8 @@ fn blockCachePathAlloc(
     root_dir: []const u8,
     artifact_id: []const u8,
     block_id: []const u8,
+    offset: u64,
+    len: usize,
     block_class: BlockClass,
 ) ![]u8 {
     const checksum = try artifacts_mod.sha256ChecksumFromArtifactId(artifact_id);
@@ -436,7 +475,13 @@ fn blockCachePathAlloc(
         .payload => ".blocks",
     };
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(block_id, &digest, .{});
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(block_id);
+    var coordinates: [@sizeOf(u64) * 2]u8 = undefined;
+    std.mem.writeInt(u64, coordinates[0..8], offset, .little);
+    std.mem.writeInt(u64, coordinates[8..16], std.math.cast(u64, len) orelse return error.CacheEntryTooLarge, .little);
+    hasher.update(&coordinates);
+    hasher.final(&digest);
     const digest_hex = std.fmt.bytesToHex(digest, .lower);
     const class_prefix = switch (classifyPayloadBlockId(block_id)) {
         .none => "routing",
@@ -481,6 +526,52 @@ fn readFileExactAllocWithCancellation(
     return payload;
 }
 
+fn readVerifiedCacheRecordAllocWithCancellation(
+    alloc: Allocator,
+    path: []const u8,
+    expected_payload_len: usize,
+    cancellation: CancellationToken,
+) ![]u8 {
+    try cancellation.check();
+    const expected_file_len = storedCacheEntryBytes(expected_payload_len, .range) catch return error.CacheEntryCorrupt;
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const file = try openFilePath(io, path);
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.size != expected_file_len) return error.CacheEntryCorrupt;
+
+    var header: [cache_record_header_len]u8 = undefined;
+    if (try file.readPositionalAll(io, &header, 0) != header.len) return error.CacheEntryCorrupt;
+    if (!std.mem.eql(u8, header[0..cache_record_magic.len], cache_record_magic)) return error.CacheEntryCorrupt;
+    const declared_len = std.mem.readInt(u64, header[cache_record_magic.len..][0..8], .little);
+    const expected_payload_len_u64 = std.math.cast(u64, expected_payload_len) orelse return error.CacheEntryCorrupt;
+    if (declared_len != expected_payload_len_u64) return error.CacheEntryCorrupt;
+    const expected_digest = header[cache_record_magic.len + @sizeOf(u64) ..][0..cache_record_digest_len];
+
+    const payload = try alloc.alloc(u8, expected_payload_len);
+    errdefer alloc.free(payload);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    const cancellation_chunk_bytes = 1024 * 1024;
+    var copied: usize = 0;
+    while (copied < payload.len) {
+        try cancellation.check();
+        const chunk_len = @min(cancellation_chunk_bytes, payload.len - copied);
+        const chunk = payload[copied..][0..chunk_len];
+        if (try file.readPositionalAll(io, chunk, @intCast(cache_record_header_len + copied)) != chunk.len) {
+            return error.CacheEntryCorrupt;
+        }
+        hasher.update(chunk);
+        copied += chunk.len;
+    }
+    var actual_digest: [cache_record_digest_len]u8 = undefined;
+    hasher.final(&actual_digest);
+    if (!std.mem.eql(u8, &actual_digest, expected_digest)) return error.CacheEntryCorrupt;
+    try cancellation.check();
+    return payload;
+}
+
 /// Returns null when the file exists but the requested offset is beyond its
 /// current end. Range callers can then fall through to their authoritative
 /// source without allocating the entire cached artifact.
@@ -522,12 +613,13 @@ fn cacheReadLimit(self: *const QueryCache) usize {
 }
 
 fn fileSizeForArtifact(
+    result_alloc: Allocator,
     artifacts: *artifacts_mod.ArtifactStore,
     artifact_id: []const u8,
     cancellation: CancellationToken,
 ) !u64 {
-    var metadata = try artifacts.statWithCancellation(artifact_id, cancellation);
-    defer metadata.deinit(artifacts.allocator);
+    var metadata = try artifacts.statWithCancellationUsingAllocator(result_alloc, artifact_id, cancellation);
+    defer metadata.deinit(result_alloc);
     const checksum = try artifacts_mod.sha256ChecksumFromArtifactId(artifact_id);
     if (!std.mem.eql(u8, metadata.artifact_id, artifact_id) or
         !std.mem.eql(u8, metadata.checksum, checksum))
@@ -550,6 +642,7 @@ fn writeTempFileWithCancellation(
     alloc: Allocator,
     path: []const u8,
     contents: []const u8,
+    lane: CacheWriteLane,
     cancellation: CancellationToken,
 ) ![]u8 {
     try cancellation.check();
@@ -566,6 +659,15 @@ fn writeTempFileWithCancellation(
         defer file.close(io);
         var buf: [4096]u8 = undefined;
         var writer = file.writer(io, &buf);
+        if (usesVerifiedCacheRecord(lane)) {
+            var header: [cache_record_header_len]u8 = undefined;
+            @memcpy(header[0..cache_record_magic.len], cache_record_magic);
+            std.mem.writeInt(u64, header[cache_record_magic.len..][0..8], @intCast(contents.len), .little);
+            var digest: [cache_record_digest_len]u8 = undefined;
+            try sha256DigestWithCancellation(contents, &digest, cancellation);
+            @memcpy(header[cache_record_magic.len + @sizeOf(u64) ..], &digest);
+            try writer.interface.writeAll(&header);
+        }
         const cancellation_chunk_bytes = 1024 * 1024;
         var written: usize = 0;
         while (written < contents.len) {
@@ -580,6 +682,34 @@ fn writeTempFileWithCancellation(
     return tmp_path;
 }
 
+fn usesVerifiedCacheRecord(lane: CacheWriteLane) bool {
+    return lane != .full;
+}
+
+fn storedCacheEntryBytes(payload_len: usize, lane: CacheWriteLane) !u64 {
+    const payload_bytes = std.math.cast(u64, payload_len) orelse return error.CacheEntryTooLarge;
+    if (!usesVerifiedCacheRecord(lane)) return payload_bytes;
+    return std.math.add(u64, payload_bytes, cache_record_header_len) catch return error.CacheEntryTooLarge;
+}
+
+fn sha256DigestWithCancellation(
+    contents: []const u8,
+    digest: *[cache_record_digest_len]u8,
+    cancellation: CancellationToken,
+) !void {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    const cancellation_chunk_bytes = 1024 * 1024;
+    var offset: usize = 0;
+    while (offset < contents.len) {
+        try cancellation.check();
+        const chunk_len = @min(cancellation_chunk_bytes, contents.len - offset);
+        hasher.update(contents[offset..][0..chunk_len]);
+        offset += chunk_len;
+    }
+    hasher.final(digest);
+    try cancellation.check();
+}
+
 fn publishCacheEntry(
     self: *QueryCache,
     path: []const u8,
@@ -587,12 +717,12 @@ fn publishCacheEntry(
     lane: CacheWriteLane,
     cancellation: CancellationToken,
 ) !bool {
-    const incoming_bytes: u64 = @intCast(contents.len);
+    const incoming_bytes = try storedCacheEntryBytes(contents.len, lane);
     if (!entryFitsEmptyCache(self.cfg, incoming_bytes, lane)) {
         recordBypass(self);
         return false;
     }
-    const tmp_path = try writeTempFileWithCancellation(self.alloc, path, contents, cancellation);
+    const tmp_path = try writeTempFileWithCancellation(self.alloc, path, contents, lane, cancellation);
     defer self.alloc.free(tmp_path);
     defer {
         var cleanup_io = threadedIo();
@@ -657,7 +787,7 @@ fn ensureCapacityForWrite(
         deleteFilePath(io_impl.io(), file.path) catch continue;
         self.usage.total_bytes -= @min(self.usage.total_bytes, file.size);
         self.usage.payload_bytes -= @min(self.usage.payload_bytes, file.size);
-        if (file.payload_block_class != .none) {
+        if (file.counts_as_payload_block) {
             self.usage.payload_block_count -= @min(self.usage.payload_block_count, 1);
         }
         evicted_any = true;
@@ -682,9 +812,42 @@ fn ensureCapacityForWrite(
     return !needsEviction(self.cfg, self.usage, incoming_bytes, lane);
 }
 
+fn enforceStartupCapacity(self: *QueryCache) !void {
+    if (!needsEviction(self.cfg, self.usage, 0, .full)) return;
+    _ = try ensureCapacityForWrite(self, 0, .full, .none);
+    if (self.cfg.max_bytes > 0 and self.usage.total_bytes > self.cfg.max_bytes) {
+        try evictPinnedFilesToBudget(self);
+    }
+    if (needsEviction(self.cfg, self.usage, 0, .full)) {
+        return error.QueryCacheBudgetCannotBeEnforced;
+    }
+    recordUsage(self);
+}
+
+fn evictPinnedFilesToBudget(self: *QueryCache) !void {
+    const files = try collectEvictablePinnedFilesAlloc(self.alloc, self.root_dir, .none);
+    defer freeEvictableFiles(self.alloc, files);
+    std.mem.sort(EvictableFile, files, {}, lessEvictableFile);
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    var evicted_any = false;
+    for (files) |file| {
+        if (self.cfg.max_bytes == 0 or self.usage.total_bytes <= self.cfg.max_bytes) break;
+        deleteFilePath(io_impl.io(), file.path) catch continue;
+        self.usage.total_bytes -= @min(self.usage.total_bytes, file.size);
+        self.usage.pinned_bytes -= @min(self.usage.pinned_bytes, file.size);
+        self.usage.pinned_block_count -= @min(self.usage.pinned_block_count, 1);
+        evicted_any = true;
+    }
+    if (evicted_any) recordEviction(self);
+}
+
 fn needsEviction(cfg: QueryCacheConfig, usage: CacheUsage, incoming_bytes: u64, lane: CacheWriteLane) bool {
-    if (cfg.max_bytes > 0 and incoming_bytes > cfg.max_bytes -| usage.total_bytes) return true;
-    if (cfg.max_payload_bytes > 0 and consumesPayloadBudget(lane) and incoming_bytes > cfg.max_payload_bytes -| usage.payload_bytes) return true;
+    if (cfg.max_bytes > 0 and
+        (usage.total_bytes > cfg.max_bytes or incoming_bytes > cfg.max_bytes - usage.total_bytes)) return true;
+    if (cfg.max_payload_bytes > 0 and
+        consumesPayloadBudget(lane) and
+        (usage.payload_bytes > cfg.max_payload_bytes or incoming_bytes > cfg.max_payload_bytes - usage.payload_bytes)) return true;
     return false;
 }
 
@@ -734,6 +897,27 @@ fn cacheUsageNoLock(alloc: Allocator, root_dir: []const u8, cancellation: Cancel
         }
     }
     return usage;
+}
+
+fn cleanupInterruptedCacheWrites(alloc: Allocator, root_dir: []const u8) !void {
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    var dir = std.Io.Dir.cwd().openDir(io_impl.io(), root_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close(io_impl.io());
+    var walker = try dir.walk(alloc);
+    defer walker.deinit();
+    while (try walker.next(io_impl.io())) |entry| {
+        if (entry.kind != .file or !isTemporaryCachePath(entry.path)) continue;
+        const path = try std.fs.path.join(alloc, &.{ root_dir, entry.path });
+        defer alloc.free(path);
+        deleteFilePath(io_impl.io(), path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
@@ -981,6 +1165,7 @@ fn collectEvictablePayloadFilesAlloc(alloc: Allocator, root_dir: []const u8, can
                 cachedPayloadBlockClass(std.fs.path.basename(entry.path))
             else
                 .approximate,
+            .counts_as_payload_block = std.mem.startsWith(u8, entry.path, ".blocks/"),
         });
     }
     return try out.toOwnedSlice(alloc);
@@ -1011,6 +1196,37 @@ fn collectEvictableRootFilesAlloc(alloc: Allocator, root_dir: []const u8, cancel
             .size = stat.size,
             .last_access_ns = stat.mtime.toNanoseconds(),
             .payload_block_class = .approximate,
+            .counts_as_payload_block = false,
+        });
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn collectEvictablePinnedFilesAlloc(alloc: Allocator, root_dir: []const u8, cancellation: CancellationToken) ![]EvictableFile {
+    var out = std.ArrayListUnmanaged(EvictableFile).empty;
+    errdefer freeEvictableFiles(alloc, out.items);
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    var dir = std.Io.Dir.cwd().openDir(io_impl.io(), root_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return try out.toOwnedSlice(alloc),
+        else => return err,
+    };
+    defer dir.close(io_impl.io());
+    var walker = try dir.walk(alloc);
+    defer walker.deinit();
+    while (try walker.next(io_impl.io())) |entry| {
+        try cancellation.check();
+        if (entry.kind != .file or isTemporaryCachePath(entry.path)) continue;
+        if (!std.mem.startsWith(u8, entry.path, ".blocks-pinned/")) continue;
+        const path = try std.fs.path.join(alloc, &.{ root_dir, entry.path });
+        errdefer alloc.free(path);
+        const stat = try dir.statFile(io_impl.io(), entry.path, .{});
+        try out.append(alloc, .{
+            .path = path,
+            .size = stat.size,
+            .last_access_ns = stat.mtime.toNanoseconds(),
+            .payload_block_class = .none,
+            .counts_as_payload_block = false,
         });
     }
     return try out.toOwnedSlice(alloc);
@@ -1253,6 +1469,165 @@ test "serverless query cache rejects corrupted verified full entries" {
     try std.testing.expect(!fileExists(path));
 }
 
+test "serverless query cache uses the requested allocator on misses and hits" {
+    const alloc = std.testing.allocator;
+    var artifact_root_buf: [256]u8 = undefined;
+    var cache_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-result-allocator");
+    const cache_root = tmpPath(&cache_root_buf, "cache-result-allocator");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(cache_root);
+
+    var fs_artifacts = try artifacts_mod.FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+    var meta = try artifact_store.put("allocator-owned");
+    defer meta.deinit(alloc);
+    var cache = try QueryCache.init(alloc, std.mem.span(cache_root));
+    defer cache.deinit();
+
+    var result_storage: [4096]u8 = undefined;
+    var result_fba = std.heap.FixedBufferAllocator.init(&result_storage);
+    const result_alloc = result_fba.allocator();
+
+    const first = try cache.getOrFetchVerifiedAllocWithCancellationUsingAllocator(
+        result_alloc,
+        &artifact_store,
+        meta.artifact_id,
+        meta.byte_len,
+        meta.checksum,
+        .none,
+    );
+    try expectSliceInBuffer(first, &result_storage);
+    result_alloc.free(first);
+    try std.testing.expectEqual(@as(usize, 0), result_fba.end_index);
+
+    try artifact_store.delete(meta.artifact_id);
+    const second = try cache.getOrFetchVerifiedAllocWithCancellationUsingAllocator(
+        result_alloc,
+        &artifact_store,
+        meta.artifact_id,
+        meta.byte_len,
+        meta.checksum,
+        .none,
+    );
+    try expectSliceInBuffer(second, &result_storage);
+    try std.testing.expectEqualStrings("allocator-owned", second);
+    result_alloc.free(second);
+    try std.testing.expectEqual(@as(usize, 0), result_fba.end_index);
+}
+
+test "serverless query cache rejects same-size corrupted range and block records" {
+    const alloc = std.testing.allocator;
+    var artifact_root_buf: [256]u8 = undefined;
+    var cache_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-corrupt-records");
+    const cache_root = tmpPath(&cache_root_buf, "cache-corrupt-records");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(cache_root);
+
+    var fs_artifacts = try artifacts_mod.FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+    var range_meta = try artifact_store.put("range-data");
+    defer range_meta.deinit(alloc);
+    var block_meta = try artifact_store.put("block-data");
+    defer block_meta.deinit(alloc);
+    var cache = try QueryCache.init(alloc, std.mem.span(cache_root));
+    defer cache.deinit();
+
+    const range = try cache.getRangeOrFetchAlloc(&artifact_store, range_meta.artifact_id, 1, 3);
+    alloc.free(range);
+    const block = try cache.getBlockOrFetchRangeAlloc(&artifact_store, block_meta.artifact_id, "vector-cluster-0-exact", 1, 3);
+    alloc.free(block);
+
+    const range_path = try rangeCachePathAlloc(alloc, std.mem.span(cache_root), range_meta.artifact_id, 1, 3);
+    defer alloc.free(range_path);
+    const block_path = try blockCachePathAlloc(
+        alloc,
+        std.mem.span(cache_root),
+        block_meta.artifact_id,
+        "vector-cluster-0-exact",
+        1,
+        3,
+        .payload,
+    );
+    defer alloc.free(block_path);
+    const corrupt_record = [_]u8{'x'} ** (cache_record_header_len + 3);
+    try overwriteFile(range_path, &corrupt_record);
+    try overwriteFile(block_path, &corrupt_record);
+    try artifact_store.delete(range_meta.artifact_id);
+    try artifact_store.delete(block_meta.artifact_id);
+
+    try std.testing.expectError(
+        error.FileNotFound,
+        cache.getRangeOrFetchAlloc(&artifact_store, range_meta.artifact_id, 1, 3),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        cache.getBlockOrFetchRangeAlloc(&artifact_store, block_meta.artifact_id, "vector-cluster-0-exact", 1, 3),
+    );
+    try std.testing.expectEqual(@as(u64, 2), cache.statsSnapshot().integrity_failures);
+    try std.testing.expect(!fileExists(range_path));
+    try std.testing.expect(!fileExists(block_path));
+}
+
+test "serverless query cache removes interrupted writes during startup" {
+    const alloc = std.testing.allocator;
+    var cache_root_buf: [256]u8 = undefined;
+    const cache_root = tmpPath(&cache_root_buf, "cache-startup-temp");
+    defer cleanupTmp(cache_root);
+
+    var initial = try QueryCache.init(alloc, std.mem.span(cache_root));
+    initial.deinit();
+    const orphan_path = try std.fs.path.join(alloc, &.{ std.mem.span(cache_root), "orphan.tmp-query-cache-42" });
+    defer alloc.free(orphan_path);
+    try overwriteFile(orphan_path, "incomplete");
+    try std.testing.expect(fileExists(orphan_path));
+
+    var recovered = try QueryCache.init(alloc, std.mem.span(cache_root));
+    defer recovered.deinit();
+    try std.testing.expect(!fileExists(orphan_path));
+    try std.testing.expectEqual(@as(u64, 0), recovered.statsSnapshot().current_bytes);
+}
+
+test "serverless query cache enforces tighter budgets during startup" {
+    const alloc = std.testing.allocator;
+    var artifact_root_buf: [256]u8 = undefined;
+    var cache_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-startup-budget");
+    const cache_root = tmpPath(&cache_root_buf, "cache-startup-budget");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(cache_root);
+
+    var fs_artifacts = try artifacts_mod.FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+    var full_meta = try artifact_store.put("full");
+    defer full_meta.deinit(alloc);
+    var routing_meta = try artifact_store.put("hdr");
+    defer routing_meta.deinit(alloc);
+
+    var initial = try QueryCache.init(alloc, std.mem.span(cache_root));
+    const full = try initial.getOrFetchAlloc(&artifact_store, full_meta.artifact_id);
+    alloc.free(full);
+    const routing = try initial.getBlockOrFetchRangeAlloc(&artifact_store, routing_meta.artifact_id, "vector-header", 0, 3);
+    alloc.free(routing);
+    initial.deinit();
+
+    var constrained = try QueryCache.initWithConfig(alloc, std.mem.span(cache_root), .{
+        .max_bytes = 4,
+        .max_payload_bytes = 4,
+    });
+    defer constrained.deinit();
+    const stats = constrained.statsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), stats.current_bytes);
+    try std.testing.expect(stats.payload_bytes <= 4);
+    try std.testing.expectEqual(@as(u64, 0), stats.pinned_bytes);
+    try std.testing.expectEqual(@as(u64, 0), stats.pinned_block_count);
+    try std.testing.expect(stats.evictions >= 1);
+}
+
 test "serverless query cache maintenance waits remain cancellation responsive" {
     const alloc = std.testing.allocator;
     var cache_root_buf: [256]u8 = undefined;
@@ -1324,7 +1699,7 @@ test "serverless query cache clears cache when max bytes would be exceeded" {
     try std.testing.expect(stats.current_bytes <= 4);
 }
 
-test "serverless query cache caches artifact ranges and can reuse full artifact cache" {
+test "serverless query cache keeps integrity-checked ranges independent of full artifacts" {
     const alloc = std.testing.allocator;
     var artifact_root_buf: [256]u8 = undefined;
     var cache_root_buf: [256]u8 = undefined;
@@ -1362,6 +1737,39 @@ test "serverless query cache caches artifact ranges and can reuse full artifact 
     try std.testing.expect(stats.range_hits >= 1);
     try std.testing.expect(stats.range_misses >= 1);
     try std.testing.expect(stats.full_misses >= 1);
+}
+
+test "serverless query cache binds named block keys to exact coordinates" {
+    const alloc = std.testing.allocator;
+    var artifact_root_buf: [256]u8 = undefined;
+    var cache_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-block-coordinates");
+    const cache_root = tmpPath(&cache_root_buf, "cache-block-coordinates");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(cache_root);
+
+    var fs_artifacts = try artifacts_mod.FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+    var meta = try artifact_store.put("abcdef");
+    defer meta.deinit(alloc);
+    var cache = try QueryCache.init(alloc, std.mem.span(cache_root));
+    defer cache.deinit();
+
+    const first = try cache.getBlockOrFetchRangeAlloc(&artifact_store, meta.artifact_id, "vector-cluster-0-exact", 0, 3);
+    defer alloc.free(first);
+    const second = try cache.getBlockOrFetchRangeAlloc(&artifact_store, meta.artifact_id, "vector-cluster-0-exact", 3, 3);
+    defer alloc.free(second);
+    try std.testing.expectEqualStrings("abc", first);
+    try std.testing.expectEqualStrings("def", second);
+
+    try artifact_store.delete(meta.artifact_id);
+    const first_cached = try cache.getBlockOrFetchRangeAlloc(&artifact_store, meta.artifact_id, "vector-cluster-0-exact", 0, 3);
+    defer alloc.free(first_cached);
+    const second_cached = try cache.getBlockOrFetchRangeAlloc(&artifact_store, meta.artifact_id, "vector-cluster-0-exact", 3, 3);
+    defer alloc.free(second_cached);
+    try std.testing.expectEqualStrings("abc", first_cached);
+    try std.testing.expectEqualStrings("def", second_cached);
 }
 
 test "serverless query cache caches named blocks by artifact and block id" {
@@ -1422,8 +1830,8 @@ test "serverless query cache preserves pinned routing blocks when evicting paylo
     defer payload_meta_b.deinit(alloc);
 
     var cache = try QueryCache.initWithConfig(alloc, std.mem.span(cache_root), .{
-        .max_bytes = 5,
-        .max_payload_bytes = 5,
+        .max_bytes = 101,
+        .max_payload_bytes = 50,
     });
     defer cache.deinit();
 
@@ -1474,8 +1882,8 @@ test "serverless query cache evicts colder payload blocks before hotter ones" {
     defer incoming_meta.deinit(alloc);
 
     var cache = try QueryCache.initWithConfig(alloc, std.mem.span(cache_root), .{
-        .max_bytes = 8,
-        .max_payload_bytes = 8,
+        .max_bytes = 104,
+        .max_payload_bytes = 104,
     });
     defer cache.deinit();
 
@@ -1484,9 +1892,9 @@ test "serverless query cache evicts colder payload blocks before hotter ones" {
     const hot_first = try cache.getBlockOrFetchRangeAlloc(&artifact_store, hot_meta.artifact_id, "vector-cluster-1-exact", 0, 4);
     defer alloc.free(hot_first);
 
-    const cold_path = try blockCachePathAlloc(alloc, std.mem.span(cache_root), cold_meta.artifact_id, "vector-cluster-0-exact", .payload);
+    const cold_path = try blockCachePathAlloc(alloc, std.mem.span(cache_root), cold_meta.artifact_id, "vector-cluster-0-exact", 0, 4, .payload);
     defer alloc.free(cold_path);
-    const hot_path = try blockCachePathAlloc(alloc, std.mem.span(cache_root), hot_meta.artifact_id, "vector-cluster-1-exact", .payload);
+    const hot_path = try blockCachePathAlloc(alloc, std.mem.span(cache_root), hot_meta.artifact_id, "vector-cluster-1-exact", 0, 4, .payload);
     defer alloc.free(hot_path);
 
     try setFileModifyTimestamp(cold_path, 1);
@@ -1517,6 +1925,56 @@ test "serverless query cache evicts colder payload blocks before hotter ones" {
     try std.testing.expect(stats.payload_block_hits >= 1);
 }
 
+test "serverless query cache does not count range entries as payload blocks during eviction" {
+    const alloc = std.testing.allocator;
+    var artifact_root_buf: [256]u8 = undefined;
+    var cache_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-range-accounting");
+    const cache_root = tmpPath(&cache_root_buf, "cache-range-accounting");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(cache_root);
+
+    var fs_artifacts = try artifacts_mod.FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+    var range_meta = try artifact_store.put("rang");
+    defer range_meta.deinit(alloc);
+    var block_meta = try artifact_store.put("blok");
+    defer block_meta.deinit(alloc);
+    var incoming_meta = try artifact_store.put("next");
+    defer incoming_meta.deinit(alloc);
+    var cache = try QueryCache.initWithConfig(alloc, std.mem.span(cache_root), .{
+        .max_bytes = 104,
+        .max_payload_bytes = 104,
+    });
+    defer cache.deinit();
+
+    const range = try cache.getRangeOrFetchAlloc(&artifact_store, range_meta.artifact_id, 0, 4);
+    defer alloc.free(range);
+    const block = try cache.getBlockOrFetchRangeAlloc(&artifact_store, block_meta.artifact_id, "vector-cluster-0-exact", 0, 4);
+    defer alloc.free(block);
+    const range_path = try rangeCachePathAlloc(alloc, std.mem.span(cache_root), range_meta.artifact_id, 0, 4);
+    defer alloc.free(range_path);
+    const block_path = try blockCachePathAlloc(
+        alloc,
+        std.mem.span(cache_root),
+        block_meta.artifact_id,
+        "vector-cluster-0-exact",
+        0,
+        4,
+        .payload,
+    );
+    defer alloc.free(block_path);
+    try setFileModifyTimestamp(range_path, 1);
+    try setFileModifyTimestamp(block_path, 2);
+
+    const incoming = try cache.getBlockOrFetchRangeAlloc(&artifact_store, incoming_meta.artifact_id, "vector-cluster-1-exact", 0, 4);
+    defer alloc.free(incoming);
+    try std.testing.expect(!fileExists(range_path));
+    try std.testing.expect(fileExists(block_path));
+    try std.testing.expectEqual(@as(u64, 2), cache.statsSnapshot().payload_block_count);
+}
+
 test "serverless query cache prefers evicting exact payload blocks before approximate ones" {
     const alloc = std.testing.allocator;
     var artifact_root_buf: [256]u8 = undefined;
@@ -1538,8 +1996,8 @@ test "serverless query cache prefers evicting exact payload blocks before approx
     defer incoming_meta.deinit(alloc);
 
     var cache = try QueryCache.initWithConfig(alloc, std.mem.span(cache_root), .{
-        .max_bytes = 8,
-        .max_payload_bytes = 8,
+        .max_bytes = 104,
+        .max_payload_bytes = 104,
     });
     defer cache.deinit();
 
@@ -1548,9 +2006,9 @@ test "serverless query cache prefers evicting exact payload blocks before approx
     const exact = try cache.getBlockOrFetchRangeAlloc(&artifact_store, exact_meta.artifact_id, "vector-cluster-0-exact", 0, 4);
     defer alloc.free(exact);
 
-    const approx_path = try blockCachePathAlloc(alloc, std.mem.span(cache_root), approx_meta.artifact_id, "vector-cluster-0-quantized", .payload);
+    const approx_path = try blockCachePathAlloc(alloc, std.mem.span(cache_root), approx_meta.artifact_id, "vector-cluster-0-quantized", 0, 4, .payload);
     defer alloc.free(approx_path);
-    const exact_path = try blockCachePathAlloc(alloc, std.mem.span(cache_root), exact_meta.artifact_id, "vector-cluster-0-exact", .payload);
+    const exact_path = try blockCachePathAlloc(alloc, std.mem.span(cache_root), exact_meta.artifact_id, "vector-cluster-0-exact", 0, 4, .payload);
     defer alloc.free(exact_path);
     try setFileModifyTimestamp(approx_path, 1);
     try setFileModifyTimestamp(exact_path, 1);
@@ -1591,6 +2049,14 @@ fn overwriteFile(path: []const u8, contents: []const u8) !void {
     var writer = file.writer(io_impl.io(), &buffer);
     try writer.interface.writeAll(contents);
     try writer.end();
+}
+
+fn expectSliceInBuffer(slice: []const u8, buffer: []const u8) !void {
+    const buffer_start = @intFromPtr(buffer.ptr);
+    const buffer_end = buffer_start + buffer.len;
+    const slice_start = @intFromPtr(slice.ptr);
+    try std.testing.expect(slice_start >= buffer_start);
+    try std.testing.expect(slice_start + slice.len <= buffer_end);
 }
 
 fn tmpPath(buf: []u8, label: []const u8) [*:0]const u8 {

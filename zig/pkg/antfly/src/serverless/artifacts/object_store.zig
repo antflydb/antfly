@@ -183,8 +183,8 @@ pub const ObjectStore = struct {
         errdefer alloc.free(checksum);
         const artifact_id = try makeArtifactIdAlloc(alloc, checksum);
         errdefer alloc.free(artifact_id);
-        const key = try keyForChecksumAlloc(alloc, self.prefix, checksum);
-        defer alloc.free(key);
+        const key = try keyForChecksumAlloc(self.alloc, self.prefix, checksum);
+        defer self.alloc.free(key);
 
         var result = try self.client.putObject(self.bucket, key, contents, .{
             .content_type = "application/octet-stream",
@@ -210,8 +210,8 @@ pub const ObjectStore = struct {
     ) ![]u8 {
         try cancellation.check();
         const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
-        const key = try keyForChecksumAlloc(alloc, self.prefix, checksum);
-        defer alloc.free(key);
+        const key = try keyForChecksumAlloc(self.alloc, self.prefix, checksum);
+        defer self.alloc.free(key);
         var result = self.client.getObject(self.bucket, key, .{
             .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
         }) catch |err| return normalizeCancellationError(err);
@@ -234,8 +234,8 @@ pub const ObjectStore = struct {
     ) ![]u8 {
         try cancellation.check();
         const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
-        const key = try keyForChecksumAlloc(alloc, self.prefix, checksum);
-        defer alloc.free(key);
+        const key = try keyForChecksumAlloc(self.alloc, self.prefix, checksum);
+        defer self.alloc.free(key);
         var result = self.client.getObject(self.bucket, key, .{
             .range = .{ .offset = offset, .length = len },
             .skip_metadata_probe = true,
@@ -261,8 +261,8 @@ pub const ObjectStore = struct {
         const checksum_value = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         const checksum = try alloc.dupe(u8, checksum_value);
         errdefer alloc.free(checksum);
-        const key = try keyForChecksumAlloc(alloc, self.prefix, checksum);
-        defer alloc.free(key);
+        const key = try keyForChecksumAlloc(self.alloc, self.prefix, checksum);
+        defer self.alloc.free(key);
         var meta = self.client.statObjectWithOptions(self.bucket, key, .{
             .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
         }) catch |err| return normalizeCancellationError(err);
@@ -456,6 +456,20 @@ test "serverless objectstore-backed artifacts preserve distinct client and resul
     var stat = try store.stat(meta.artifact_id);
     defer stat.deinit(result_alloc);
     try std.testing.expectEqual(@as(u64, "allocator-safe".len), stat.byte_len);
+
+    var query_buffer: [1024]u8 = undefined;
+    var query_fba = std.heap.FixedBufferAllocator.init(&query_buffer);
+    const query_alloc = query_fba.allocator();
+    const verified = try store.getVerifiedAllocWithCancellationUsingAllocator(
+        query_alloc,
+        meta.artifact_id,
+        meta.byte_len,
+        meta.checksum,
+        .none,
+    );
+    try std.testing.expect(query_fba.ownsSlice(verified));
+    query_alloc.free(verified);
+    try std.testing.expectEqual(@as(usize, 0), query_fba.end_index);
 }
 
 test "serverless objectstore-backed artifact initialization cleans up every allocation failure" {

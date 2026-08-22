@@ -51,8 +51,8 @@ pub const FsStore = struct {
         const artifact_id = try makeArtifactIdAlloc(alloc, checksum);
         errdefer alloc.free(artifact_id);
 
-        const path = try pathForArtifactAlloc(alloc, self.root_dir, checksum);
-        defer alloc.free(path);
+        const path = try pathForArtifactAlloc(self.alloc, self.root_dir, checksum);
+        defer self.alloc.free(path);
 
         if (!fileExists(path)) {
             try ensureParentDir(path);
@@ -78,8 +78,8 @@ pub const FsStore = struct {
     ) ![]u8 {
         try cancellation.check();
         const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
-        const path = try pathForArtifactAlloc(alloc, self.root_dir, checksum);
-        defer alloc.free(path);
+        const path = try pathForArtifactAlloc(self.alloc, self.root_dir, checksum);
+        defer self.alloc.free(path);
         return try readFileAllocWithCancellation(alloc, path, cancellation);
     }
 
@@ -97,8 +97,8 @@ pub const FsStore = struct {
     ) ![]u8 {
         try cancellation.check();
         const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
-        const path = try pathForArtifactAlloc(alloc, self.root_dir, checksum);
-        defer alloc.free(path);
+        const path = try pathForArtifactAlloc(self.alloc, self.root_dir, checksum);
+        defer self.alloc.free(path);
         return try readFileRangeAllocWithCancellation(alloc, path, offset, len, cancellation);
     }
 
@@ -113,8 +113,8 @@ pub const FsStore = struct {
         errdefer alloc.free(checksum);
         const artifact_id_copy = try alloc.dupe(u8, artifact_id);
         errdefer alloc.free(artifact_id_copy);
-        const path = try pathForArtifactAlloc(alloc, self.root_dir, checksum);
-        defer alloc.free(path);
+        const path = try pathForArtifactAlloc(self.alloc, self.root_dir, checksum);
+        defer self.alloc.free(path);
 
         var io_impl = threadedIo();
         defer io_impl.deinit();
