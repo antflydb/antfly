@@ -188,7 +188,8 @@ func haRuntimeLeaseWatchdogEnabled(cluster *antflyv1.AntflyCluster) bool {
 		ha.AutomaticFailover == nil || !ha.AutomaticFailover.Enabled ||
 		!haAutomaticFailoverExecutionEnabled(ha) ||
 		ha.AutomaticFailover.FencingAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
-		ha.Runtime == nil || ha.Runtime.Role != antflyv1.HARuntimeRolePrimary ||
+		ha.Runtime == nil ||
+		(ha.Runtime.Role != antflyv1.HARuntimeRolePrimary && ha.Runtime.Role != antflyv1.HARuntimeRoleStandby) ||
 		ha.Runtime.FencingLease == nil {
 		return false
 	}
