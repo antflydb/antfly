@@ -27,6 +27,7 @@ pub const runner = @import("runner.zig");
 pub const scenario = @import("scenario.zig");
 pub const trace = @import("trace.zig");
 pub const transition = @import("transition.zig");
+pub const time = @import("time.zig");
 
 const ToyScenario = @import("toy_scenario.zig").ToyScenario;
 
@@ -194,4 +195,5 @@ test {
     _ = snapshot;
     _ = splice;
     _ = transition;
+    _ = time;
 }
