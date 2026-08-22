@@ -11,28 +11,17 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.bool_field_query import BoolFieldQuery
-    from ..models.boolean_query import BooleanQuery
-    from ..models.conjunction_query import ConjunctionQuery
     from ..models.date_range_string_query import DateRangeStringQuery
-    from ..models.disjunction_query import DisjunctionQuery
     from ..models.doc_id_query import DocIdQuery
     from ..models.fuzzy_query import FuzzyQuery
-    from ..models.geo_bounding_box_query import GeoBoundingBoxQuery
-    from ..models.geo_bounding_polygon_query import GeoBoundingPolygonQuery
-    from ..models.geo_distance_query import GeoDistanceQuery
-    from ..models.geo_shape_query import GeoShapeQuery
+    from ..models.graph_document_filter_boolean import GraphDocumentFilterBoolean
+    from ..models.graph_document_filter_conjunction import GraphDocumentFilterConjunction
+    from ..models.graph_document_filter_disjunction import GraphDocumentFilterDisjunction
     from ..models.graph_path_endpoint import GraphPathEndpoint
-    from ..models.ip_range_query import IPRangeQuery
     from ..models.match_all_query import MatchAllQuery
     from ..models.match_none_query import MatchNoneQuery
-    from ..models.match_phrase_query import MatchPhraseQuery
-    from ..models.match_query import MatchQuery
-    from ..models.multi_match_query import MultiMatchQuery
-    from ..models.multi_phrase_query import MultiPhraseQuery
     from ..models.numeric_range_query import NumericRangeQuery
-    from ..models.phrase_query import PhraseQuery
     from ..models.prefix_query import PrefixQuery
-    from ..models.query_string_query import QueryStringQuery
     from ..models.regexp_query import RegexpQuery
     from ..models.term_query import TermQuery
     from ..models.term_range_query import TermRangeQuery
@@ -60,11 +49,12 @@ class GraphShortestPath:
             - min_hops: Minimize number of edges
             - min_weight: Minimize sum of edge weights
             - max_weight: Maximize product of edge weights
-        filter_ (BooleanQuery | BoolFieldQuery | ConjunctionQuery | DateRangeStringQuery | DisjunctionQuery | DocIdQuery
-            | FuzzyQuery | GeoBoundingBoxQuery | GeoBoundingPolygonQuery | GeoDistanceQuery | GeoShapeQuery | IPRangeQuery |
-            MatchAllQuery | MatchNoneQuery | MatchPhraseQuery | MatchQuery | MultiMatchQuery | MultiPhraseQuery |
-            NumericRangeQuery | PhraseQuery | PrefixQuery | QueryStringQuery | RegexpQuery | TermQuery | TermRangeQuery |
-            Unset | WildcardQuery):
+        filter_ (BoolFieldQuery | DateRangeStringQuery | DocIdQuery | FuzzyQuery | GraphDocumentFilterBoolean |
+            GraphDocumentFilterConjunction | GraphDocumentFilterDisjunction | MatchAllQuery | MatchNoneQuery |
+            NumericRangeQuery | PrefixQuery | RegexpQuery | TermQuery | TermRangeQuery | Unset | WildcardQuery): A non-
+            scoring stored-document predicate embedded at a graph node. It reuses the structured field-filter shapes from
+            QueryRequest.filter_query, but deliberately excludes analyzer-backed full-text clauses such as match, phrase,
+            multi_match, and query_string. Alias-to-alias predicates belong in GraphMatch.where.
         include_documents (bool | Unset): Include stored documents on nodes returned with the path. Default: False.
         fields (list[str] | Unset): Document fields to include when include_documents is true. Omit to include all
             fields.
@@ -79,28 +69,17 @@ class GraphShortestPath:
     max_weight: float | Unset = UNSET
     weight_mode: PathWeightMode | Unset = UNSET
     filter_: (
-        BooleanQuery
-        | BoolFieldQuery
-        | ConjunctionQuery
+        BoolFieldQuery
         | DateRangeStringQuery
-        | DisjunctionQuery
         | DocIdQuery
         | FuzzyQuery
-        | GeoBoundingBoxQuery
-        | GeoBoundingPolygonQuery
-        | GeoDistanceQuery
-        | GeoShapeQuery
-        | IPRangeQuery
+        | GraphDocumentFilterBoolean
+        | GraphDocumentFilterConjunction
+        | GraphDocumentFilterDisjunction
         | MatchAllQuery
         | MatchNoneQuery
-        | MatchPhraseQuery
-        | MatchQuery
-        | MultiMatchQuery
-        | MultiPhraseQuery
         | NumericRangeQuery
-        | PhraseQuery
         | PrefixQuery
-        | QueryStringQuery
         | RegexpQuery
         | TermQuery
         | TermRangeQuery
@@ -112,26 +91,15 @@ class GraphShortestPath:
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.bool_field_query import BoolFieldQuery
-        from ..models.boolean_query import BooleanQuery
-        from ..models.conjunction_query import ConjunctionQuery
         from ..models.date_range_string_query import DateRangeStringQuery
-        from ..models.disjunction_query import DisjunctionQuery
         from ..models.doc_id_query import DocIdQuery
         from ..models.fuzzy_query import FuzzyQuery
-        from ..models.geo_bounding_box_query import GeoBoundingBoxQuery
-        from ..models.geo_bounding_polygon_query import GeoBoundingPolygonQuery
-        from ..models.geo_distance_query import GeoDistanceQuery
-        from ..models.ip_range_query import IPRangeQuery
+        from ..models.graph_document_filter_boolean import GraphDocumentFilterBoolean
+        from ..models.graph_document_filter_conjunction import GraphDocumentFilterConjunction
         from ..models.match_all_query import MatchAllQuery
         from ..models.match_none_query import MatchNoneQuery
-        from ..models.match_phrase_query import MatchPhraseQuery
-        from ..models.match_query import MatchQuery
-        from ..models.multi_match_query import MultiMatchQuery
-        from ..models.multi_phrase_query import MultiPhraseQuery
         from ..models.numeric_range_query import NumericRangeQuery
-        from ..models.phrase_query import PhraseQuery
         from ..models.prefix_query import PrefixQuery
-        from ..models.query_string_query import QueryStringQuery
         from ..models.regexp_query import RegexpQuery
         from ..models.term_query import TermQuery
         from ..models.term_range_query import TermRangeQuery
@@ -164,16 +132,6 @@ class GraphShortestPath:
             filter_ = UNSET
         elif isinstance(self.filter_, TermQuery):
             filter_ = self.filter_.to_dict()
-        elif isinstance(self.filter_, MatchQuery):
-            filter_ = self.filter_.to_dict()
-        elif isinstance(self.filter_, MultiMatchQuery):
-            filter_ = self.filter_.to_dict()
-        elif isinstance(self.filter_, MatchPhraseQuery):
-            filter_ = self.filter_.to_dict()
-        elif isinstance(self.filter_, PhraseQuery):
-            filter_ = self.filter_.to_dict()
-        elif isinstance(self.filter_, MultiPhraseQuery):
-            filter_ = self.filter_.to_dict()
         elif isinstance(self.filter_, FuzzyQuery):
             filter_ = self.filter_.to_dict()
         elif isinstance(self.filter_, PrefixQuery):
@@ -182,19 +140,11 @@ class GraphShortestPath:
             filter_ = self.filter_.to_dict()
         elif isinstance(self.filter_, WildcardQuery):
             filter_ = self.filter_.to_dict()
-        elif isinstance(self.filter_, QueryStringQuery):
-            filter_ = self.filter_.to_dict()
         elif isinstance(self.filter_, NumericRangeQuery):
             filter_ = self.filter_.to_dict()
         elif isinstance(self.filter_, TermRangeQuery):
             filter_ = self.filter_.to_dict()
         elif isinstance(self.filter_, DateRangeStringQuery):
-            filter_ = self.filter_.to_dict()
-        elif isinstance(self.filter_, BooleanQuery):
-            filter_ = self.filter_.to_dict()
-        elif isinstance(self.filter_, ConjunctionQuery):
-            filter_ = self.filter_.to_dict()
-        elif isinstance(self.filter_, DisjunctionQuery):
             filter_ = self.filter_.to_dict()
         elif isinstance(self.filter_, MatchAllQuery):
             filter_ = self.filter_.to_dict()
@@ -204,13 +154,9 @@ class GraphShortestPath:
             filter_ = self.filter_.to_dict()
         elif isinstance(self.filter_, BoolFieldQuery):
             filter_ = self.filter_.to_dict()
-        elif isinstance(self.filter_, IPRangeQuery):
+        elif isinstance(self.filter_, GraphDocumentFilterBoolean):
             filter_ = self.filter_.to_dict()
-        elif isinstance(self.filter_, GeoBoundingBoxQuery):
-            filter_ = self.filter_.to_dict()
-        elif isinstance(self.filter_, GeoDistanceQuery):
-            filter_ = self.filter_.to_dict()
-        elif isinstance(self.filter_, GeoBoundingPolygonQuery):
+        elif isinstance(self.filter_, GraphDocumentFilterConjunction):
             filter_ = self.filter_.to_dict()
         else:
             filter_ = self.filter_.to_dict()
@@ -253,28 +199,17 @@ class GraphShortestPath:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.bool_field_query import BoolFieldQuery
-        from ..models.boolean_query import BooleanQuery
-        from ..models.conjunction_query import ConjunctionQuery
         from ..models.date_range_string_query import DateRangeStringQuery
-        from ..models.disjunction_query import DisjunctionQuery
         from ..models.doc_id_query import DocIdQuery
         from ..models.fuzzy_query import FuzzyQuery
-        from ..models.geo_bounding_box_query import GeoBoundingBoxQuery
-        from ..models.geo_bounding_polygon_query import GeoBoundingPolygonQuery
-        from ..models.geo_distance_query import GeoDistanceQuery
-        from ..models.geo_shape_query import GeoShapeQuery
+        from ..models.graph_document_filter_boolean import GraphDocumentFilterBoolean
+        from ..models.graph_document_filter_conjunction import GraphDocumentFilterConjunction
+        from ..models.graph_document_filter_disjunction import GraphDocumentFilterDisjunction
         from ..models.graph_path_endpoint import GraphPathEndpoint
-        from ..models.ip_range_query import IPRangeQuery
         from ..models.match_all_query import MatchAllQuery
         from ..models.match_none_query import MatchNoneQuery
-        from ..models.match_phrase_query import MatchPhraseQuery
-        from ..models.match_query import MatchQuery
-        from ..models.multi_match_query import MultiMatchQuery
-        from ..models.multi_phrase_query import MultiPhraseQuery
         from ..models.numeric_range_query import NumericRangeQuery
-        from ..models.phrase_query import PhraseQuery
         from ..models.prefix_query import PrefixQuery
-        from ..models.query_string_query import QueryStringQuery
         from ..models.regexp_query import RegexpQuery
         from ..models.term_query import TermQuery
         from ..models.term_range_query import TermRangeQuery
@@ -310,28 +245,17 @@ class GraphShortestPath:
         def _parse_filter_(
             data: object,
         ) -> (
-            BooleanQuery
-            | BoolFieldQuery
-            | ConjunctionQuery
+            BoolFieldQuery
             | DateRangeStringQuery
-            | DisjunctionQuery
             | DocIdQuery
             | FuzzyQuery
-            | GeoBoundingBoxQuery
-            | GeoBoundingPolygonQuery
-            | GeoDistanceQuery
-            | GeoShapeQuery
-            | IPRangeQuery
+            | GraphDocumentFilterBoolean
+            | GraphDocumentFilterConjunction
+            | GraphDocumentFilterDisjunction
             | MatchAllQuery
             | MatchNoneQuery
-            | MatchPhraseQuery
-            | MatchQuery
-            | MultiMatchQuery
-            | MultiPhraseQuery
             | NumericRangeQuery
-            | PhraseQuery
             | PrefixQuery
-            | QueryStringQuery
             | RegexpQuery
             | TermQuery
             | TermRangeQuery
@@ -343,208 +267,120 @@ class GraphShortestPath:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_0 = TermQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_0 = TermQuery.from_dict(data)
 
-                return componentsschemas_query_type_0
+                return componentsschemas_graph_document_filter_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_1 = MatchQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_1 = FuzzyQuery.from_dict(data)
 
-                return componentsschemas_query_type_1
+                return componentsschemas_graph_document_filter_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_2 = MultiMatchQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_2 = PrefixQuery.from_dict(data)
 
-                return componentsschemas_query_type_2
+                return componentsschemas_graph_document_filter_type_2
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_3 = MatchPhraseQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_3 = RegexpQuery.from_dict(data)
 
-                return componentsschemas_query_type_3
+                return componentsschemas_graph_document_filter_type_3
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_4 = PhraseQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_4 = WildcardQuery.from_dict(data)
 
-                return componentsschemas_query_type_4
+                return componentsschemas_graph_document_filter_type_4
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_5 = MultiPhraseQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_5 = NumericRangeQuery.from_dict(data)
 
-                return componentsschemas_query_type_5
+                return componentsschemas_graph_document_filter_type_5
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_6 = FuzzyQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_6 = TermRangeQuery.from_dict(data)
 
-                return componentsschemas_query_type_6
+                return componentsschemas_graph_document_filter_type_6
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_7 = PrefixQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_7 = DateRangeStringQuery.from_dict(data)
 
-                return componentsschemas_query_type_7
+                return componentsschemas_graph_document_filter_type_7
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_8 = RegexpQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_8 = MatchAllQuery.from_dict(data)
 
-                return componentsschemas_query_type_8
+                return componentsschemas_graph_document_filter_type_8
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_9 = WildcardQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_9 = MatchNoneQuery.from_dict(data)
 
-                return componentsschemas_query_type_9
+                return componentsschemas_graph_document_filter_type_9
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_10 = QueryStringQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_10 = DocIdQuery.from_dict(data)
 
-                return componentsschemas_query_type_10
+                return componentsschemas_graph_document_filter_type_10
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_11 = NumericRangeQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_11 = BoolFieldQuery.from_dict(data)
 
-                return componentsschemas_query_type_11
+                return componentsschemas_graph_document_filter_type_11
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_12 = TermRangeQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_12 = GraphDocumentFilterBoolean.from_dict(data)
 
-                return componentsschemas_query_type_12
+                return componentsschemas_graph_document_filter_type_12
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_13 = DateRangeStringQuery.from_dict(data)
+                componentsschemas_graph_document_filter_type_13 = GraphDocumentFilterConjunction.from_dict(data)
 
-                return componentsschemas_query_type_13
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                componentsschemas_query_type_14 = BooleanQuery.from_dict(data)
-
-                return componentsschemas_query_type_14
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                componentsschemas_query_type_15 = ConjunctionQuery.from_dict(data)
-
-                return componentsschemas_query_type_15
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                componentsschemas_query_type_16 = DisjunctionQuery.from_dict(data)
-
-                return componentsschemas_query_type_16
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                componentsschemas_query_type_17 = MatchAllQuery.from_dict(data)
-
-                return componentsschemas_query_type_17
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                componentsschemas_query_type_18 = MatchNoneQuery.from_dict(data)
-
-                return componentsschemas_query_type_18
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                componentsschemas_query_type_19 = DocIdQuery.from_dict(data)
-
-                return componentsschemas_query_type_19
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                componentsschemas_query_type_20 = BoolFieldQuery.from_dict(data)
-
-                return componentsschemas_query_type_20
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                componentsschemas_query_type_21 = IPRangeQuery.from_dict(data)
-
-                return componentsschemas_query_type_21
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                componentsschemas_query_type_22 = GeoBoundingBoxQuery.from_dict(data)
-
-                return componentsschemas_query_type_22
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                componentsschemas_query_type_23 = GeoDistanceQuery.from_dict(data)
-
-                return componentsschemas_query_type_23
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                componentsschemas_query_type_24 = GeoBoundingPolygonQuery.from_dict(data)
-
-                return componentsschemas_query_type_24
+                return componentsschemas_graph_document_filter_type_13
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             if not isinstance(data, dict):
                 raise TypeError()
-            componentsschemas_query_type_25 = GeoShapeQuery.from_dict(data)
+            componentsschemas_graph_document_filter_type_14 = GraphDocumentFilterDisjunction.from_dict(data)
 
-            return componentsschemas_query_type_25
+            return componentsschemas_graph_document_filter_type_14
 
         filter_ = _parse_filter_(d.pop("filter", UNSET))
 

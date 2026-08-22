@@ -2276,10 +2276,147 @@ const QueryBodyContractFields = struct {
     has_query_timeout: bool,
 };
 
+const RawGraphValueEntry = struct {
+    value: std.json.Value,
+    depth: usize,
+};
+
+/// Validate graph request shape before the generated recursive union decoder
+/// runs. This keeps public input recursion and aggregate DFS depth within the
+/// same small, deterministic contract budget.
+pub fn validateRawGraphQueriesValueAlloc(
+    alloc: std.mem.Allocator,
+    root: std.json.Value,
+) !void {
+    if (root != .object) return error.InvalidQueryRequest;
+    const graph_queries = root.object.get("graph_queries") orelse return;
+    if (graph_queries == .null) return;
+    if (graph_queries != .object or graph_queries.object.count() > graph_query_mod.max_named_queries)
+        return error.InvalidQueryRequest;
+
+    var pending = std.ArrayListUnmanaged(RawGraphValueEntry).empty;
+    defer pending.deinit(alloc);
+    var query_it = graph_queries.object.iterator();
+    while (query_it.next()) |entry| {
+        try pending.append(alloc, .{ .value = entry.value_ptr.*, .depth = 0 });
+        if (entry.value_ptr.* == .object) {
+            if (entry.value_ptr.object.get("match")) |match_value| {
+                try validateRawGraphMatchComplexityAlloc(alloc, match_value);
+            }
+        }
+    }
+
+    var visited: usize = 0;
+    while (pending.pop()) |entry| {
+        visited += 1;
+        if (visited > public_query_max_tree_nodes or entry.depth > public_query_max_tree_depth)
+            return error.InvalidQueryRequest;
+        const child_depth = entry.depth + 1;
+        switch (entry.value) {
+            .array => |array| for (array.items) |child| {
+                try pending.append(alloc, .{ .value = child, .depth = child_depth });
+            },
+            .object => |object| {
+                var it = object.iterator();
+                while (it.next()) |child| {
+                    try pending.append(alloc, .{ .value = child.value_ptr.*, .depth = child_depth });
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+fn addRawGraphComplexity(total: *usize, amount: usize, limit: usize) !void {
+    total.* = std.math.add(usize, total.*, amount) catch return error.InvalidQueryRequest;
+    if (total.* > limit) return error.InvalidQueryRequest;
+}
+
+fn rawGraphObjectCount(value: ?std.json.Value) !usize {
+    const item = value orelse return 0;
+    if (item != .object) return error.InvalidQueryRequest;
+    return item.object.count();
+}
+
+fn rawGraphArrayLength(value: ?std.json.Value) !usize {
+    const item = value orelse return 0;
+    if (item != .array) return error.InvalidQueryRequest;
+    return item.array.items.len;
+}
+
+fn validateRawGraphMatchComplexityAlloc(
+    alloc: std.mem.Allocator,
+    match_value: std.json.Value,
+) !void {
+    if (match_value != .object) return error.InvalidQueryRequest;
+    var total_nodes = try rawGraphObjectCount(match_value.object.get("nodes"));
+    var total_edges = try rawGraphArrayLength(match_value.object.get("edges"));
+    var total_predicates: usize = 0;
+    if (total_nodes == 0 or
+        total_nodes > graph_pattern_mod.max_conjunctive_nodes or
+        total_edges > graph_pattern_mod.max_conjunctive_edges)
+        return error.InvalidQueryRequest;
+
+    if (match_value.object.get("where")) |where| {
+        try validateRawGraphWhereAlloc(alloc, where, &total_edges, &total_predicates);
+    }
+    if (match_value.object.get("optional")) |optional_value| {
+        if (optional_value != .array or optional_value.array.items.len > graph_pattern_mod.max_optional_patterns)
+            return error.InvalidQueryRequest;
+        for (optional_value.array.items) |group| {
+            if (group != .object) return error.InvalidQueryRequest;
+            try addRawGraphComplexity(
+                &total_nodes,
+                try rawGraphObjectCount(group.object.get("nodes")),
+                graph_pattern_mod.max_conjunctive_nodes,
+            );
+            const group_edges = try rawGraphArrayLength(group.object.get("edges"));
+            if (group_edges == 0) return error.InvalidQueryRequest;
+            try addRawGraphComplexity(&total_edges, group_edges, graph_pattern_mod.max_conjunctive_edges);
+            if (group.object.get("where")) |where| {
+                try validateRawGraphWhereAlloc(alloc, where, &total_edges, &total_predicates);
+            }
+        }
+    }
+}
+
+fn validateRawGraphWhereAlloc(
+    alloc: std.mem.Allocator,
+    root: std.json.Value,
+    total_edges: *usize,
+    total_predicates: *usize,
+) !void {
+    var pending = std.ArrayListUnmanaged(RawGraphValueEntry).empty;
+    defer pending.deinit(alloc);
+    try pending.append(alloc, .{ .value = root, .depth = 0 });
+    while (pending.pop()) |entry| {
+        if (entry.depth >= graph_pattern_mod.max_match_predicate_depth or entry.value != .object)
+            return error.InvalidQueryRequest;
+        if (entry.value.object.get("and")) |children| {
+            if (children != .array or
+                children.array.items.len == 0 or
+                children.array.items.len > graph_pattern_mod.max_match_predicates)
+                return error.InvalidQueryRequest;
+            for (children.array.items) |child| {
+                try pending.append(alloc, .{ .value = child, .depth = entry.depth + 1 });
+            }
+            continue;
+        }
+        try addRawGraphComplexity(total_predicates, 1, graph_pattern_mod.max_match_predicates);
+        if (entry.value.object.get("not_exists")) |not_exists| {
+            if (not_exists != .object) return error.InvalidQueryRequest;
+            const edges = try rawGraphArrayLength(not_exists.object.get("edges"));
+            if (edges == 0) return error.InvalidQueryRequest;
+            try addRawGraphComplexity(total_edges, edges, graph_pattern_mod.max_conjunctive_edges);
+        }
+    }
+}
+
 fn queryBodyContractFields(alloc: std.mem.Allocator, body: []const u8) !QueryBodyContractFields {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
+    try validateRawGraphQueriesValueAlloc(alloc, parsed.value);
     return .{
         .has_internal_shard_fields = objectHasInternalShardField(parsed.value.object),
         .has_public_doc_filter_bindings = parsed.value.object.get("with") != null,
@@ -8870,6 +9007,7 @@ fn parseGraphMatchNodes(alloc: std.mem.Allocator, value: std.json.ArrayHashMap(i
 }
 
 fn parseGraphMatchEdges(alloc: std.mem.Allocator, value: []const indexes_openapi.GraphMatchEdge) ![]const graph_pattern_mod.MatchEdge {
+    if (value.len > graph_pattern_mod.max_conjunctive_edges) return error.InvalidQueryRequest;
     const edges = try alloc.alloc(graph_pattern_mod.MatchEdge, value.len);
     var initialized: usize = 0;
     errdefer {
@@ -8911,13 +9049,26 @@ fn parseGraphWherePredicates(alloc: std.mem.Allocator, value: ?indexes_openapi.G
         freeGraphMatchPredicates(alloc, predicates.items);
         predicates.deinit(alloc);
     }
-    if (value) |where| try appendGraphWherePredicates(alloc, &predicates, where);
+    if (value) |where| try appendGraphWherePredicates(alloc, &predicates, where, 0);
     return try predicates.toOwnedSlice(alloc);
 }
 
-fn appendGraphWherePredicates(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(graph_pattern_mod.MatchPredicate), value: indexes_openapi.GraphWhereExpression) !void {
+fn appendGraphWherePredicates(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(graph_pattern_mod.MatchPredicate),
+    value: indexes_openapi.GraphWhereExpression,
+    depth: usize,
+) !void {
+    if (depth >= graph_pattern_mod.max_match_predicate_depth or
+        out.items.len >= graph_pattern_mod.max_match_predicates)
+        return error.InvalidQueryRequest;
     switch (value) {
-        .graph_where_and => |where_and| for (where_and.@"and") |child| try appendGraphWherePredicates(alloc, out, child),
+        .graph_where_and => |where_and| {
+            if (where_and.@"and".len == 0 or
+                where_and.@"and".len > graph_pattern_mod.max_match_predicates)
+                return error.InvalidQueryRequest;
+            for (where_and.@"and") |child| try appendGraphWherePredicates(alloc, out, child, depth + 1);
+        },
         .graph_where_not_equal => |where_neq| {
             const left = try alloc.dupe(u8, where_neq.not_equal.left.alias);
             errdefer alloc.free(left);
@@ -8934,6 +9085,7 @@ fn appendGraphWherePredicates(alloc: std.mem.Allocator, out: *std.ArrayListUnman
 }
 
 fn parseGraphOptionalPatterns(alloc: std.mem.Allocator, value: []const indexes_openapi.GraphOptionalMatch) ![]const graph_pattern_mod.OptionalPattern {
+    if (value.len > graph_pattern_mod.max_optional_patterns) return error.InvalidQueryRequest;
     const groups = try alloc.alloc(graph_pattern_mod.OptionalPattern, value.len);
     var initialized: usize = 0;
     errdefer {
@@ -8990,9 +9142,35 @@ fn parseGraphCountAggregates(alloc: std.mem.Allocator, value: std.json.ArrayHash
 
 fn parseGraphFilterValue(alloc: std.mem.Allocator, value: ?std.json.Value) !graph_pattern_mod.NodeFilter {
     const filter = value orelse return .{};
-    const query = try parseSupportedFullTextQuery(alloc, filter, 10);
-    defer freeTextQuery(alloc, query);
-    return .{ .filter_query_json = try encodePatternFilterQuery(alloc, query) };
+    // Graph filters run against stored documents, not a full-text index. Keep
+    // the public graph contract honest by rejecting analyzer-backed MATCH at
+    // admission instead of silently giving it storage-only semantics. Bound
+    // the generic tree before this recursive inspection; the normalizer also
+    // validates the tree, but this ordering is what makes recursion safe.
+    try validatePublicQueryTraversalBudgetAlloc(alloc, filter);
+    if (graphDocumentFilterContainsAnalyzerBackedClause(filter)) {
+        return error.UnsupportedQueryRequest;
+    }
+    return .{ .filter_query_json = try normalizePublicStoredFilterQueryAlloc(alloc, filter) };
+}
+
+fn graphDocumentFilterContainsAnalyzerBackedClause(value: std.json.Value) bool {
+    switch (value) {
+        .array => |array| {
+            for (array.items) |child| {
+                if (graphDocumentFilterContainsAnalyzerBackedClause(child)) return true;
+            }
+        },
+        .object => |object| {
+            if (object.get("match") != null) return true;
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (graphDocumentFilterContainsAnalyzerBackedClause(entry.value_ptr.*)) return true;
+            }
+        },
+        else => {},
+    }
+    return false;
 }
 
 fn parseGraphDirection(value: ?indexes_openapi.EdgeDirection) graph_mod.EdgeDirection {

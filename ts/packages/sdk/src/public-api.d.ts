@@ -11647,11 +11647,25 @@ export interface components {
             /** @description Handlebars template to render document text for reranking. */
             template?: string;
         } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["OllamaRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
-        /** @description The same validated QueryRequest.filter_query DSL, embedded at a graph node. Alias-to-alias predicates belong in GraphMatch.where. */
-        GraphFilterQuery: components["schemas"]["Query"];
+        GraphDocumentFilterConjunction: {
+            conjuncts: components["schemas"]["GraphDocumentFilter"][];
+        };
+        GraphDocumentFilterDisjunction: {
+            disjuncts: components["schemas"]["GraphDocumentFilter"][];
+            /** Format: double */
+            min?: number;
+        };
+        GraphDocumentFilterBoolean: {
+            must?: components["schemas"]["GraphDocumentFilterConjunction"];
+            should?: components["schemas"]["GraphDocumentFilterDisjunction"];
+            must_not?: components["schemas"]["GraphDocumentFilterDisjunction"];
+            filter?: components["schemas"]["GraphDocumentFilter"];
+        };
+        /** @description A non-scoring stored-document predicate embedded at a graph node. It reuses the structured field-filter shapes from QueryRequest.filter_query, but deliberately excludes analyzer-backed full-text clauses such as match, phrase, multi_match, and query_string. Alias-to-alias predicates belong in GraphMatch.where. */
+        GraphDocumentFilter: components["schemas"]["TermQuery"] | components["schemas"]["FuzzyQuery"] | components["schemas"]["PrefixQuery"] | components["schemas"]["RegexpQuery"] | components["schemas"]["WildcardQuery"] | components["schemas"]["NumericRangeQuery"] | components["schemas"]["TermRangeQuery"] | components["schemas"]["DateRangeStringQuery"] | components["schemas"]["MatchAllQuery"] | components["schemas"]["MatchNoneQuery"] | components["schemas"]["DocIdQuery"] | components["schemas"]["BoolFieldQuery"] | components["schemas"]["GraphDocumentFilterBoolean"] | components["schemas"]["GraphDocumentFilterConjunction"] | components["schemas"]["GraphDocumentFilterDisjunction"];
         GraphMatchNode: {
-            /** @description The QueryRequest.filter_query expression evaluated for this alias. */
-            filter?: components["schemas"]["GraphFilterQuery"];
+            /** @description Non-scoring structured stored-document predicate evaluated for this alias. */
+            filter?: components["schemas"]["GraphDocumentFilter"];
         };
         GraphMatchEdge: {
             from: string;
@@ -11681,6 +11695,7 @@ export interface components {
         GraphWhereNotEqual: {
             not_equal: components["schemas"]["GraphNotEqualPredicate"];
         };
+        /** @description Correlated negative-edge predicate over aliases already visible at this point in the MATCH. It does not introduce new aliases. */
         GraphNotExistsPattern: {
             edges: components["schemas"]["GraphMatchEdge"][];
         };
@@ -11728,6 +11743,7 @@ export interface components {
         };
         /** @description Return bindings or exact aggregates. Bindings and aggregates are mutually exclusive. */
         GraphReturn: components["schemas"]["GraphBindingsReturn"] | components["schemas"]["GraphAggregatesReturn"];
+        /** @description Conjunctive graph match over the complete authorized source universe. Results are exact or the request fails; execution never labels a partial aggregate exact. The default explored-node budget admits at most 100,000 distributed source anchors before graph expansion. */
         GraphMatchQuery: {
             index: string;
             match: components["schemas"]["GraphMatch"];
@@ -11782,8 +11798,8 @@ export interface components {
             include_documents?: boolean;
             /** @description Document fields to include when include_documents is true. Omit to include all fields. */
             fields?: string[];
-            /** @description The same document-query DSL accepted by QueryRequest.filter_query. */
-            filter?: components["schemas"]["GraphFilterQuery"];
+            /** @description Non-scoring structured stored-document predicate for reached nodes. */
+            filter?: components["schemas"]["GraphDocumentFilter"];
         };
         GraphTraverseQuery: {
             index: string;
@@ -11809,8 +11825,8 @@ export interface components {
             /** Format: double */
             max_weight?: number;
             weight_mode?: components["schemas"]["PathWeightMode"];
-            /** @description The same document-query DSL accepted by QueryRequest.filter_query. */
-            filter?: components["schemas"]["GraphFilterQuery"];
+            /** @description Non-scoring structured stored-document predicate for path nodes. */
+            filter?: components["schemas"]["GraphDocumentFilter"];
             /**
              * @description Include stored documents on nodes returned with the path.
              * @default false
@@ -11836,8 +11852,8 @@ export interface components {
             /** Format: double */
             max_weight?: number;
             weight_mode?: components["schemas"]["PathWeightMode"];
-            /** @description The same document-query DSL accepted by QueryRequest.filter_query. */
-            filter?: components["schemas"]["GraphFilterQuery"];
+            /** @description Non-scoring structured stored-document predicate for path nodes. */
+            filter?: components["schemas"]["GraphDocumentFilter"];
             /**
              * @description Include stored documents on nodes returned with each path.
              * @default false

@@ -737,7 +737,12 @@ pub fn requiresCompleteMatchAnchors(req: db_mod.types.SearchRequest) bool {
     return false;
 }
 
-pub const complete_match_anchor_limit: u32 = graph_pattern_mod.default_max_intermediate_states + 1;
+/// Canonical MATCH consumes one explored-node budget unit for every admitted
+/// anchor before expansion. Fetch one extra identity so the coordinator can
+/// distinguish a complete budget-sized universe from a truncated one and fail
+/// closed without pretending a partial aggregate is exact.
+pub const max_complete_match_anchors: usize = graph_pattern_mod.default_max_explored_nodes;
+pub const complete_match_anchor_probe_limit: u32 = max_complete_match_anchors + 1;
 
 fn resultHasIdentitySnapshot(
     req: db_mod.types.SearchRequest,
@@ -879,7 +884,7 @@ pub fn executeCrossRangeWithMatchAnchors(
     if (match_anchor_result) |anchors| {
         if (anchors.total_hits_relation != .exact or
             @as(u64, anchors.total_hits) > anchors.hits.len or
-            anchors.hits.len > graph_pattern_mod.default_max_intermediate_states)
+            anchors.hits.len > max_complete_match_anchors)
             return error.QueryCandidateBudgetExceeded;
         if (@as(u64, anchors.total_hits) < anchors.hits.len)
             return error.InvalidQueryResult;
@@ -7227,7 +7232,9 @@ test "distributed graph expand request preserves algebraic semiring planning fla
     try std.testing.expectEqual(@as(?u64, 12345), parsed_hydrate.identity_read_generation);
     try std.testing.expect(!parsed_hydrate.include_stored);
     try std.testing.expect(!parsed_hydrate.include_all_fields);
-    try std.testing.expectEqualSlices([]const u8, &.{ "title", "summary" }, parsed_hydrate.fields);
+    try std.testing.expectEqual(@as(usize, 2), parsed_hydrate.fields.len);
+    try std.testing.expectEqualStrings("title", parsed_hydrate.fields[0]);
+    try std.testing.expectEqualStrings("summary", parsed_hydrate.fields[1]);
     try std.testing.expect(!parsed_hydrate.include_hits);
     try std.testing.expectEqualStrings("graph_idx", parsed_hydrate.incoming_index_name);
 

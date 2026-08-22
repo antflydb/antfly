@@ -1257,8 +1257,24 @@ pub const GraphCountAggregate = struct {
     distinct: ?bool = null,
 };
 
-/// The same validated QueryRequest.filter_query DSL, embedded at a graph node. Alias-to-alias predicates belong in GraphMatch.where.
-pub const GraphFilterQuery = std.json.Value;
+/// A non-scoring stored-document predicate embedded at a graph node. It reuses the structured field-filter shapes from QueryRequest.filter_query, but deliberately excludes analyzer-backed full-text clauses such as match, phrase, multi_match, and query_string. Alias-to-alias predicates belong in GraphMatch.where.
+pub const GraphDocumentFilter = std.json.Value;
+
+pub const GraphDocumentFilterBoolean = struct {
+    must: ?GraphDocumentFilterConjunction = null,
+    should: ?GraphDocumentFilterDisjunction = null,
+    must_not: ?GraphDocumentFilterDisjunction = null,
+    filter: ?GraphDocumentFilter = null,
+};
+
+pub const GraphDocumentFilterConjunction = struct {
+    conjuncts: []const GraphDocumentFilter,
+};
+
+pub const GraphDocumentFilterDisjunction = struct {
+    disjuncts: []const GraphDocumentFilter,
+    min: ?f64 = null,
+};
 
 pub const GraphIdentityNodeSelector = struct {
     /// Exact node identities. Omitted table means the query table.
@@ -1391,8 +1407,8 @@ pub const GraphKShortestPaths = struct {
     min_weight: ?f64 = null,
     max_weight: ?f64 = null,
     weight_mode: ?PathWeightMode = null,
-    /// The same document-query DSL accepted by QueryRequest.filter_query.
-    filter: ?GraphFilterQuery = null,
+    /// Non-scoring structured stored-document predicate for path nodes.
+    filter: ?GraphDocumentFilter = null,
     /// Include stored documents on nodes returned with each path.
     include_documents: ?bool = null,
     /// Document fields to include when include_documents is true. Omit to include all fields.
@@ -1429,10 +1445,11 @@ pub const GraphMatchEdge = struct {
 };
 
 pub const GraphMatchNode = struct {
-    /// The QueryRequest.filter_query expression evaluated for this alias.
-    filter: ?GraphFilterQuery = null,
+    /// Non-scoring structured stored-document predicate evaluated for this alias.
+    filter: ?GraphDocumentFilter = null,
 };
 
+/// Conjunctive graph match over the complete authorized source universe. Results are exact or the request fails; execution never labels a partial aggregate exact. The default explored-node budget admits at most 100,000 distributed source anchors before graph expansion.
 pub const GraphMatchQuery = struct {
     index: []const u8,
     match: GraphMatch,
@@ -1503,6 +1520,7 @@ pub const GraphNotEqualPredicate = struct {
     right: GraphAliasOperand,
 };
 
+/// Correlated negative-edge predicate over aliases already visible at this point in the MATCH. It does not introduce new aliases.
 pub const GraphNotExistsPattern = struct {
     edges: []const GraphMatchEdge,
 };
@@ -1785,8 +1803,8 @@ pub const GraphShortestPath = struct {
     min_weight: ?f64 = null,
     max_weight: ?f64 = null,
     weight_mode: ?PathWeightMode = null,
-    /// The same document-query DSL accepted by QueryRequest.filter_query.
-    filter: ?GraphFilterQuery = null,
+    /// Non-scoring structured stored-document predicate for path nodes.
+    filter: ?GraphDocumentFilter = null,
     /// Include stored documents on nodes returned with the path.
     include_documents: ?bool = null,
     /// Document fields to include when include_documents is true. Omit to include all fields.
@@ -1816,8 +1834,8 @@ pub const GraphTraversal = struct {
     include_documents: ?bool = null,
     /// Document fields to include when include_documents is true. Omit to include all fields.
     fields: ?[]const []const u8 = null,
-    /// The same document-query DSL accepted by QueryRequest.filter_query.
-    filter: ?GraphFilterQuery = null,
+    /// Non-scoring structured stored-document predicate for reached nodes.
+    filter: ?GraphDocumentFilter = null,
 };
 
 pub const GraphTraverseQuery = struct {

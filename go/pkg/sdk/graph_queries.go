@@ -24,18 +24,77 @@ type GraphBindingsOptions struct {
 	Fields           []string
 }
 
-// NewGraphFilter adapts the same typed query value used by QueryRequest to a
-// graph node filter. The wire representation is unchanged.
-func NewGraphFilter(filter querydsl.Query) (GraphFilter, error) {
+const (
+	maxGraphMatchNodes          = 64
+	maxGraphMatchEdges          = 64
+	maxGraphOptionalPatterns    = 64
+	maxGraphMatchPredicates     = 64
+	maxGraphMatchPredicateDepth = 16
+)
+
+// NewGraphDocumentFilter adapts the non-scoring stored-document subset of the
+// query DSL to a graph node filter. Analyzer-backed full-text clauses are
+// rejected locally because evaluating them against stored JSON would change
+// both their semantics and cost model.
+func NewGraphDocumentFilter(filter querydsl.Query) (GraphDocumentFilter, error) {
 	encoded, err := json.Marshal(filter)
 	if err != nil {
-		return GraphFilter{}, err
+		return GraphDocumentFilter{}, err
 	}
-	var result GraphFilter
+	if err := validateGraphDocumentFilterJSON(encoded); err != nil {
+		return GraphDocumentFilter{}, err
+	}
+	var result GraphDocumentFilter
 	if err := json.Unmarshal(encoded, &result); err != nil {
-		return GraphFilter{}, err
+		return GraphDocumentFilter{}, err
 	}
 	return result, nil
+}
+
+// NewGraphFilter is retained as a concise compatibility alias for
+// NewGraphDocumentFilter.
+func NewGraphFilter(filter querydsl.Query) (GraphDocumentFilter, error) {
+	return NewGraphDocumentFilter(filter)
+}
+
+func validateGraphDocumentFilterJSON(encoded []byte) error {
+	var value any
+	if err := json.Unmarshal(encoded, &value); err != nil {
+		return err
+	}
+	type entry struct {
+		value any
+		depth int
+	}
+	pending := []entry{{value: value}}
+	visited := 0
+	unsupported := map[string]struct{}{
+		"match": {}, "multi_match": {}, "match_phrase": {}, "terms": {},
+		"query": {}, "polygon_points": {}, "location": {}, "geometry": {}, "cidr": {},
+		"min_lat": {}, "min_lon": {}, "max_lat": {}, "max_lon": {},
+	}
+	for len(pending) > 0 {
+		item := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		visited++
+		if item.depth > 64 || visited > 16_384 {
+			return fmt.Errorf("antfly: graph document filter exceeds the query complexity budget")
+		}
+		switch current := item.value.(type) {
+		case map[string]any:
+			for key, child := range current {
+				if _, blocked := unsupported[key]; blocked {
+					return fmt.Errorf("antfly: graph document filters do not support analyzer-backed or index-only clause %q", key)
+				}
+				pending = append(pending, entry{value: child, depth: item.depth + 1})
+			}
+		case []any:
+			for _, child := range current {
+				pending = append(pending, entry{value: child, depth: item.depth + 1})
+			}
+		}
+	}
+	return nil
 }
 
 // NewGraphMatchQuery wraps a MATCH query in the canonical GraphQuery union.
@@ -217,8 +276,8 @@ func NewGraphNotEqual(left, right string) (GraphWhereExpression, error) {
 
 // NewGraphNotExists creates a correlated negative-edge predicate.
 func NewGraphNotExists(edges []GraphMatchEdge) (GraphWhereExpression, error) {
-	if len(edges) == 0 {
-		return GraphWhereExpression{}, fmt.Errorf("antfly: graph not-exists edges must not be empty")
+	if len(edges) == 0 || len(edges) > maxGraphMatchEdges {
+		return GraphWhereExpression{}, fmt.Errorf("antfly: graph not-exists edges must contain between 1 and %d entries", maxGraphMatchEdges)
 	}
 	for _, edge := range edges {
 		if strings.TrimSpace(edge.From) == "" || strings.TrimSpace(edge.To) == "" {
@@ -234,8 +293,8 @@ func NewGraphNotExists(edges []GraphMatchEdge) (GraphWhereExpression, error) {
 
 // NewGraphWhereAnd combines graph predicates conjunctively.
 func NewGraphWhereAnd(expressions ...GraphWhereExpression) (GraphWhereExpression, error) {
-	if len(expressions) == 0 {
-		return GraphWhereExpression{}, fmt.Errorf("antfly: graph where-and expressions must not be empty")
+	if len(expressions) == 0 || len(expressions) > maxGraphMatchPredicates {
+		return GraphWhereExpression{}, fmt.Errorf("antfly: graph where-and must contain between 1 and %d expressions", maxGraphMatchPredicates)
 	}
 	var result GraphWhereExpression
 	err := result.FromGraphWhereAnd(GraphWhereAnd{And: expressions})
@@ -246,9 +305,16 @@ func validateGraphMatchQuery(query GraphMatchQuery) error {
 	if strings.TrimSpace(query.Index) == "" {
 		return fmt.Errorf("antfly: graph index must not be empty")
 	}
-	if len(query.Match.Nodes) == 0 {
-		return fmt.Errorf("antfly: graph match nodes must not be empty")
+	if len(query.Match.Nodes) == 0 || len(query.Match.Nodes) > maxGraphMatchNodes {
+		return fmt.Errorf("antfly: graph match nodes must contain between 1 and %d aliases", maxGraphMatchNodes)
 	}
+	if len(query.Match.Edges) > maxGraphMatchEdges {
+		return fmt.Errorf("antfly: graph match exceeds the %d-edge complexity budget", maxGraphMatchEdges)
+	}
+	if len(query.Match.Optional) > maxGraphOptionalPatterns {
+		return fmt.Errorf("antfly: graph match exceeds the %d optional-pattern complexity budget", maxGraphOptionalPatterns)
+	}
+	complexity := graphMatchComplexity{nodes: len(query.Match.Nodes), edges: len(query.Match.Edges)}
 	for alias := range query.Match.Nodes {
 		if strings.TrimSpace(alias) == "" {
 			return fmt.Errorf("antfly: graph alias must not be empty")
@@ -291,10 +357,19 @@ func validateGraphMatchQuery(query GraphMatchQuery) error {
 			return fmt.Errorf("antfly: graph match nodes must form one connected pattern")
 		}
 	}
-	if err := validateGraphWhereExpression(query.Match.Where, visible); err != nil {
+	if err := validateGraphWhereExpression(query.Match.Where, visible, &complexity, 0); err != nil {
 		return err
 	}
 	for _, optional := range query.Match.Optional {
+		if err := complexity.addNodes(len(optional.Nodes)); err != nil {
+			return err
+		}
+		if len(optional.Edges) == 0 {
+			return fmt.Errorf("antfly: optional graph pattern edges must not be empty")
+		}
+		if err := complexity.addEdges(len(optional.Edges)); err != nil {
+			return err
+		}
 		introduced := make(map[string]struct{}, len(optional.Nodes))
 		for alias := range optional.Nodes {
 			if strings.TrimSpace(alias) == "" {
@@ -343,7 +418,7 @@ func validateGraphMatchQuery(query GraphMatchQuery) error {
 		if len(connected) != len(introduced) {
 			return fmt.Errorf("antfly: optional graph pattern must be correlated and connected")
 		}
-		if err := validateGraphWhereExpression(optional.Where, optionalVisible); err != nil {
+		if err := validateGraphWhereExpression(optional.Where, optionalVisible, &complexity, 0); err != nil {
 			return err
 		}
 		for alias := range introduced {
@@ -351,6 +426,36 @@ func validateGraphMatchQuery(query GraphMatchQuery) error {
 		}
 	}
 	return validateGraphReturn(query.Return, query.Match)
+}
+
+type graphMatchComplexity struct {
+	nodes      int
+	edges      int
+	predicates int
+}
+
+func (c *graphMatchComplexity) addNodes(count int) error {
+	c.nodes += count
+	if c.nodes > maxGraphMatchNodes {
+		return fmt.Errorf("antfly: graph match exceeds the %d-alias complexity budget", maxGraphMatchNodes)
+	}
+	return nil
+}
+
+func (c *graphMatchComplexity) addEdges(count int) error {
+	c.edges += count
+	if c.edges > maxGraphMatchEdges {
+		return fmt.Errorf("antfly: graph match exceeds the %d-edge complexity budget", maxGraphMatchEdges)
+	}
+	return nil
+}
+
+func (c *graphMatchComplexity) addPredicate() error {
+	c.predicates++
+	if c.predicates > maxGraphMatchPredicates {
+		return fmt.Errorf("antfly: graph match exceeds the %d-predicate complexity budget", maxGraphMatchPredicates)
+	}
+	return nil
 }
 
 func validateGraphMatchEdge(edge GraphMatchEdge, aliases map[string]struct{}) error {
@@ -367,7 +472,10 @@ func validateGraphMatchEdge(edge GraphMatchEdge, aliases map[string]struct{}) er
 	return nil
 }
 
-func validateGraphWhereExpression(where GraphWhereExpression, aliases map[string]struct{}) error {
+func validateGraphWhereExpression(where GraphWhereExpression, aliases map[string]struct{}, complexity *graphMatchComplexity, depth int) error {
+	if depth >= maxGraphMatchPredicateDepth {
+		return fmt.Errorf("antfly: graph where expression exceeds the maximum depth of %d", maxGraphMatchPredicateDepth)
+	}
 	encoded, err := json.Marshal(where)
 	if err != nil {
 		return err
@@ -388,18 +496,24 @@ func validateGraphWhereExpression(where GraphWhereExpression, aliases map[string
 	forms := 0
 	if len(value.And) > 0 {
 		forms++
+		if len(value.And) > maxGraphMatchPredicates {
+			return fmt.Errorf("antfly: graph where-and exceeds %d expressions", maxGraphMatchPredicates)
+		}
 		for _, child := range value.And {
 			var expression GraphWhereExpression
 			if err := json.Unmarshal(child, &expression); err != nil {
 				return err
 			}
-			if err := validateGraphWhereExpression(expression, aliases); err != nil {
+			if err := validateGraphWhereExpression(expression, aliases, complexity, depth+1); err != nil {
 				return err
 			}
 		}
 	}
 	if value.NotEqual != nil {
 		forms++
+		if err := complexity.addPredicate(); err != nil {
+			return err
+		}
 		if _, ok := aliases[value.NotEqual.Left.Alias]; !ok {
 			return fmt.Errorf("antfly: graph predicate references unknown alias %q", value.NotEqual.Left.Alias)
 		}
@@ -409,8 +523,14 @@ func validateGraphWhereExpression(where GraphWhereExpression, aliases map[string
 	}
 	if value.NotExists != nil {
 		forms++
+		if err := complexity.addPredicate(); err != nil {
+			return err
+		}
 		if len(value.NotExists.Edges) == 0 {
 			return fmt.Errorf("antfly: graph not-exists edges must not be empty")
+		}
+		if err := complexity.addEdges(len(value.NotExists.Edges)); err != nil {
+			return err
 		}
 		for _, edge := range value.NotExists.Edges {
 			if err := validateGraphMatchEdge(edge, aliases); err != nil {

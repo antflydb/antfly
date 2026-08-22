@@ -2618,12 +2618,66 @@ components:
       additionalProperties: true
       description: >-
         Deprecated free-form graph filter accepted by the v0.2 compatibility contract.
-    GraphFilterQuery:
+    GraphDocumentFilterBoolean:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        must:
+          $ref: '#/components/schemas/GraphDocumentFilterConjunction'
+        should:
+          $ref: '#/components/schemas/GraphDocumentFilterDisjunction'
+        must_not:
+          $ref: '#/components/schemas/GraphDocumentFilterDisjunction'
+        filter:
+          $ref: '#/components/schemas/GraphDocumentFilter'
+    GraphDocumentFilterConjunction:
+      type: object
+      additionalProperties: false
+      required: [conjuncts]
+      properties:
+        conjuncts:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items: { $ref: '#/components/schemas/GraphDocumentFilter' }
+    GraphDocumentFilterDisjunction:
+      type: object
+      additionalProperties: false
+      required: [disjuncts]
+      properties:
+        disjuncts:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items: { $ref: '#/components/schemas/GraphDocumentFilter' }
+        min:
+          type: number
+          format: double
+          minimum: 0
+    GraphDocumentFilter:
       oneOf:
-        - $ref: 'query.yaml#/components/schemas/Query'
+        - $ref: 'query.yaml#/components/schemas/TermQuery'
+        - $ref: 'query.yaml#/components/schemas/FuzzyQuery'
+        - $ref: 'query.yaml#/components/schemas/PrefixQuery'
+        - $ref: 'query.yaml#/components/schemas/RegexpQuery'
+        - $ref: 'query.yaml#/components/schemas/WildcardQuery'
+        - $ref: 'query.yaml#/components/schemas/NumericRangeQuery'
+        - $ref: 'query.yaml#/components/schemas/TermRangeQuery'
+        - $ref: 'query.yaml#/components/schemas/DateRangeStringQuery'
+        - $ref: 'query.yaml#/components/schemas/MatchAllQuery'
+        - $ref: 'query.yaml#/components/schemas/MatchNoneQuery'
+        - $ref: 'query.yaml#/components/schemas/DocIdQuery'
+        - $ref: 'query.yaml#/components/schemas/BoolFieldQuery'
+        - $ref: '#/components/schemas/GraphDocumentFilterBoolean'
+        - $ref: '#/components/schemas/GraphDocumentFilterConjunction'
+        - $ref: '#/components/schemas/GraphDocumentFilterDisjunction'
       description: >-
-        The same validated QueryRequest.filter_query DSL, embedded at a graph
-        node. Alias-to-alias predicates belong in GraphMatch.where.
+        A non-scoring stored-document predicate embedded at a graph node. It
+        reuses the structured field-filter shapes from QueryRequest.filter_query,
+        but deliberately excludes analyzer-backed full-text clauses such as
+        match, phrase, multi_match, and query_string. Alias-to-alias predicates
+        belong in GraphMatch.where.
     GraphTraversal:
       type: object
       additionalProperties: false
@@ -2660,8 +2714,8 @@ components:
           items: { type: string }
           description: Document fields to include when include_documents is true. Omit to include all fields.
         filter:
-          $ref: '#/components/schemas/GraphFilterQuery'
-          description: The same document-query DSL accepted by QueryRequest.filter_query.
+          $ref: '#/components/schemas/GraphDocumentFilter'
+          description: Non-scoring structured stored-document predicate for reached nodes.
     GraphPathEndpoint:
       type: object
       additionalProperties: false
@@ -2691,8 +2745,8 @@ components:
         max_weight: { type: number, format: double }
         weight_mode: { $ref: '#/components/schemas/PathWeightMode' }
         filter:
-          $ref: '#/components/schemas/GraphFilterQuery'
-          description: The same document-query DSL accepted by QueryRequest.filter_query.
+          $ref: '#/components/schemas/GraphDocumentFilter'
+          description: Non-scoring structured stored-document predicate for path nodes.
         include_documents:
           type: boolean
           default: false
@@ -2725,8 +2779,8 @@ components:
         max_weight: { type: number, format: double }
         weight_mode: { $ref: '#/components/schemas/PathWeightMode' }
         filter:
-          $ref: '#/components/schemas/GraphFilterQuery'
-          description: The same document-query DSL accepted by QueryRequest.filter_query.
+          $ref: '#/components/schemas/GraphDocumentFilter'
+          description: Non-scoring structured stored-document predicate for path nodes.
         include_documents:
           type: boolean
           default: false
@@ -2740,8 +2794,8 @@ components:
       additionalProperties: false
       properties:
         filter:
-          $ref: '#/components/schemas/GraphFilterQuery'
-          description: The QueryRequest.filter_query expression evaluated for this alias.
+          $ref: '#/components/schemas/GraphDocumentFilter'
+          description: Non-scoring structured stored-document predicate evaluated for this alias.
     GraphMatchEdge:
       type: object
       additionalProperties: false
@@ -2787,7 +2841,11 @@ components:
         edges:
           type: array
           minItems: 1
+          maxItems: 64
           items: { $ref: '#/components/schemas/GraphMatchEdge' }
+      description: >-
+        Correlated negative-edge predicate over aliases already visible at this
+        point in the MATCH. It does not introduce new aliases.
     GraphWhereAnd:
       type: object
       additionalProperties: false
@@ -2796,6 +2854,7 @@ components:
         and:
           type: array
           minItems: 1
+          maxItems: 64
           items: { $ref: '#/components/schemas/GraphWhereExpression' }
     GraphWhereNotEqual:
       type: object
@@ -2821,10 +2880,12 @@ components:
       properties:
         nodes:
           type: object
+          maxProperties: 64
           additionalProperties: { $ref: '#/components/schemas/GraphMatchNode' }
         edges:
           type: array
           minItems: 1
+          maxItems: 64
           items: { $ref: '#/components/schemas/GraphMatchEdge' }
         where: { $ref: '#/components/schemas/GraphWhereExpression' }
     GraphMatch:
@@ -2835,13 +2896,16 @@ components:
         nodes:
           type: object
           minProperties: 1
+          maxProperties: 64
           additionalProperties: { $ref: '#/components/schemas/GraphMatchNode' }
         edges:
           type: array
+          maxItems: 64
           items: { $ref: '#/components/schemas/GraphMatchEdge' }
         where: { $ref: '#/components/schemas/GraphWhereExpression' }
         optional:
           type: array
+          maxItems: 64
           items: { $ref: '#/components/schemas/GraphOptionalMatch' }
     GraphCountAggregate:
       type: object
@@ -2893,6 +2957,11 @@ components:
       type: object
       additionalProperties: false
       required: [index, match, return]
+      description: >-
+        Conjunctive graph match over the complete authorized source universe.
+        Results are exact or the request fails; execution never labels a partial
+        aggregate exact. The default explored-node budget admits at most 100,000
+        distributed source anchors before graph expansion.
       properties:
         index: { type: string }
         match: { $ref: '#/components/schemas/GraphMatch' }

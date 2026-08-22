@@ -14,9 +14,11 @@ T = TypeVar("T", bound="GraphNotExistsPattern")
 
 @_attrs_define
 class GraphNotExistsPattern:
-    """
-    Attributes:
-        edges (list[GraphMatchEdge]):
+    """Correlated negative-edge predicate over aliases already visible at this point in the MATCH. It does not introduce
+    new aliases.
+
+        Attributes:
+            edges (list[GraphMatchEdge]):
     """
 
     edges: list[GraphMatchEdge]

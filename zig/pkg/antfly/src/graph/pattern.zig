@@ -23,6 +23,11 @@ const node_identity = @import("node_identity.zig");
 
 pub const max_pattern_steps: usize = 64;
 pub const max_pattern_hops: u32 = 64;
+pub const max_conjunctive_nodes: usize = 64;
+pub const max_conjunctive_edges: usize = 64;
+pub const max_optional_patterns: usize = 64;
+pub const max_match_predicates: usize = 64;
+pub const max_match_predicate_depth: usize = 16;
 pub const default_max_explored_nodes: usize = 100_000;
 pub const default_max_explored_edges: usize = 1_000_000;
 pub const default_max_intermediate_states: usize = 100_000;
@@ -1532,6 +1537,24 @@ fn appendOwnedIdentity(alloc: Allocator, values: *std.ArrayListUnmanaged(node_id
 }
 
 pub fn validateConjunctivePattern(pattern: ConjunctivePattern) !void {
+    if (pattern.nodes.len == 0 or
+        pattern.nodes.len > max_conjunctive_nodes or
+        pattern.edges.len > max_conjunctive_edges or
+        pattern.optional.len > max_optional_patterns or
+        pattern.predicates.len > max_match_predicates)
+        return error.InvalidArgument;
+
+    var total_nodes = pattern.nodes.len;
+    var total_edges = pattern.edges.len;
+    var total_predicates = pattern.predicates.len;
+    try addPatternPredicateEdges(&total_edges, pattern.predicates);
+    for (pattern.optional) |optional_pattern| {
+        try addPatternComplexity(&total_nodes, optional_pattern.nodes.len, max_conjunctive_nodes);
+        try addPatternComplexity(&total_edges, optional_pattern.edges.len, max_conjunctive_edges);
+        try addPatternComplexity(&total_predicates, optional_pattern.predicates.len, max_match_predicates);
+        try addPatternPredicateEdges(&total_edges, optional_pattern.predicates);
+    }
+
     for (pattern.nodes, 0..) |node, i| {
         if (node.alias.len == 0) return error.InvalidArgument;
         for (pattern.nodes[0..i]) |prior| if (std.mem.eql(u8, prior.alias, node.alias)) return error.InvalidArgument;
@@ -1571,6 +1594,21 @@ pub fn validateConjunctivePattern(pattern: ConjunctivePattern) !void {
             },
         };
     }
+}
+
+fn addPatternComplexity(total: *usize, amount: usize, limit: usize) !void {
+    total.* = std.math.add(usize, total.*, amount) catch return error.InvalidArgument;
+    if (total.* > limit) return error.InvalidArgument;
+}
+
+fn addPatternPredicateEdges(total_edges: *usize, predicates: []const MatchPredicate) !void {
+    for (predicates) |predicate| switch (predicate) {
+        .not_equal => {},
+        .not_exists => |edges| {
+            if (edges.len == 0 or edges.len > max_conjunctive_edges) return error.InvalidArgument;
+            try addPatternComplexity(total_edges, edges.len, max_conjunctive_edges);
+        },
+    };
 }
 
 /// Required MATCH has conjunctive semantics, not an implicit Cartesian
@@ -2294,6 +2332,27 @@ test "conjunctive validation rejects disconnected and unused aliases" {
         .nodes = &base_nodes,
         .edges = &.{},
         .optional = &optional,
+    }));
+}
+
+test "conjunctive validation bounds total recursive pattern shape" {
+    const nodes = [_]MatchNode{ .{ .alias = "a" }, .{ .alias = "b" } };
+    const edge = MatchEdge{ .from = "a", .to = "b" };
+    const too_many_edges = [_]MatchEdge{edge} ** (max_conjunctive_edges + 1);
+    try std.testing.expectError(error.InvalidArgument, validateConjunctivePattern(.{
+        .nodes = &nodes,
+        .edges = &too_many_edges,
+    }));
+
+    const base_nodes = [_]MatchNode{.{ .alias = "root" }};
+    const optional_node = [_]MatchNode{.{ .alias = "child" }};
+    const optional_edge = [_]MatchEdge{.{ .from = "root", .to = "child" }};
+    const optional_group = OptionalPattern{ .nodes = &optional_node, .edges = &optional_edge };
+    const too_many_optional = [_]OptionalPattern{optional_group} ** (max_optional_patterns + 1);
+    try std.testing.expectError(error.InvalidArgument, validateConjunctivePattern(.{
+        .nodes = &base_nodes,
+        .edges = &.{},
+        .optional = &too_many_optional,
     }));
 }
 

@@ -135,6 +135,12 @@ func TestGraphSelectorAndProjectionConstructors(t *testing.T) {
 }
 
 func TestGraphConstructorsRejectSemanticErrors(t *testing.T) {
+	if _, err := NewGraphDocumentFilter(querydsl.NewMatch("beta", "title")); err == nil {
+		t.Fatal("expected analyzer-backed graph filter to fail")
+	}
+	if _, err := NewGraphDocumentFilter(querydsl.NewGeoBoundingBox(37, -123, 38, -122, "location")); err == nil {
+		t.Fatal("expected index-only graph filter to fail")
+	}
 	if _, err := NewGraphResultRefSelector("$embeddings_results.vector_idx", 10); err == nil {
 		t.Fatal("expected invalid result reference")
 	}
@@ -163,6 +169,25 @@ func TestGraphConstructorsRejectSemanticErrors(t *testing.T) {
 		Return: graphReturn,
 	}); err == nil {
 		t.Fatal("expected unknown return alias error")
+	}
+
+	validReturn, err := NewGraphBindingsReturn([]string{"b"}, GraphBindingsOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	edges := make([]GraphMatchEdge, maxGraphMatchEdges+1)
+	for i := range edges {
+		edges[i] = GraphMatchEdge{From: "a", To: "b"}
+	}
+	if _, err := NewGraphMatchQuery(GraphMatchQuery{
+		Index: "graph_idx",
+		Match: GraphMatch{
+			Nodes: map[string]GraphMatchNode{"a": {}, "b": {}},
+			Edges: edges,
+		},
+		Return: validReturn,
+	}); err == nil {
+		t.Fatal("expected graph edge complexity budget error")
 	}
 }
 

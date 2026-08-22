@@ -2625,6 +2625,7 @@ pub const HttpHandler = struct {
         try cancellation.check();
         public_graph_query.rejectInternalDocIdentityFields(self.alloc, body) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
+            error.OutOfMemory => return error.OutOfMemory,
         };
         var raw_request = ant_json.parseFromSlice(std.json.Value, self.alloc, body, .{}) catch return null;
         defer raw_request.deinit();

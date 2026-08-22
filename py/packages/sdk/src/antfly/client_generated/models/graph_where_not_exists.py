@@ -16,7 +16,8 @@ T = TypeVar("T", bound="GraphWhereNotExists")
 class GraphWhereNotExists:
     """
     Attributes:
-        not_exists (GraphNotExistsPattern):
+        not_exists (GraphNotExistsPattern): Correlated negative-edge predicate over aliases already visible at this
+            point in the MATCH. It does not introduce new aliases.
     """
 
     not_exists: GraphNotExistsPattern

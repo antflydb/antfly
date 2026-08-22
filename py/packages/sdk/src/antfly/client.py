@@ -581,6 +581,7 @@ class AntflyClient:
         reranker: dict[str, Any] | None = None,
         analyses: dict[str, Any] | None = None,
         graph_queries: dict[str, Any] | None = None,
+        graph_searches: dict[str, Any] | None = None,
         expand_strategy: str | None = None,
         document_renderer: str | None = None,
         pruner: dict[str, Any] | None = None,
@@ -623,6 +624,9 @@ class AntflyClient:
             reranker: Reranker configuration
             analyses: Analysis configuration
             graph_queries: Graph query configuration
+            graph_searches: Deprecated v0.2 graph query configuration. Use
+                ``graph_queries``; this compatibility argument will be removed
+                in the next major release.
             expand_strategy: Graph result expansion strategy
             document_renderer: Handlebars document renderer
             pruner: Result pruning configuration
@@ -639,6 +643,8 @@ class AntflyClient:
         """
         if aggregations is not None and facets is not None:
             raise AntflyException("query accepts either aggregations or facets, not both")
+        if graph_queries is not None and graph_searches is not None:
+            raise AntflyException("query accepts either graph_queries or graph_searches, not both")
 
         body: dict[str, Any] = {}
         if extra is not None:
@@ -671,6 +677,7 @@ class AntflyClient:
             "reranker": reranker,
             "analyses": analyses,
             "graph_queries": graph_queries,
+            "graph_searches": graph_searches,
             "expand_strategy": expand_strategy,
             "document_renderer": document_renderer,
             "pruner": pruner,

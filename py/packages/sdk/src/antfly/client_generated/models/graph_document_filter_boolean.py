@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 
-from ..models.edge_direction import EdgeDirection
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -13,12 +12,8 @@ if TYPE_CHECKING:
     from ..models.date_range_string_query import DateRangeStringQuery
     from ..models.doc_id_query import DocIdQuery
     from ..models.fuzzy_query import FuzzyQuery
-    from ..models.graph_document_filter_boolean import GraphDocumentFilterBoolean
     from ..models.graph_document_filter_conjunction import GraphDocumentFilterConjunction
     from ..models.graph_document_filter_disjunction import GraphDocumentFilterDisjunction
-    from ..models.graph_identity_node_selector import GraphIdentityNodeSelector
-    from ..models.graph_key_node_selector import GraphKeyNodeSelector
-    from ..models.graph_result_ref_node_selector import GraphResultRefNodeSelector
     from ..models.match_all_query import MatchAllQuery
     from ..models.match_none_query import MatchNoneQuery
     from ..models.numeric_range_query import NumericRangeQuery
@@ -29,29 +24,16 @@ if TYPE_CHECKING:
     from ..models.wildcard_query import WildcardQuery
 
 
-T = TypeVar("T", bound="GraphTraversal")
+T = TypeVar("T", bound="GraphDocumentFilterBoolean")
 
 
 @_attrs_define
-class GraphTraversal:
+class GraphDocumentFilterBoolean:
     """
     Attributes:
-        start (GraphIdentityNodeSelector | GraphKeyNodeSelector | GraphResultRefNodeSelector): Select graph nodes using
-            exactly one explicit, exact selector form.
-        edge_types (list[str] | Unset):
-        direction (EdgeDirection | Unset): Direction of edges to query:
-            - out: Outgoing edges from the node
-            - in: Incoming edges to the node
-            - both: Both outgoing and incoming edges
-        max_depth (int | Unset): Maximum traversal depth. Defaults to one hop to keep fan-out explicit. Default: 1.
-        min_weight (float | Unset):
-        max_weight (float | Unset):
-        limit (int | Unset):  Default: 100.
-        deduplicate_nodes (bool | Unset):  Default: True.
-        include_paths (bool | Unset):  Default: False.
-        include_documents (bool | Unset): Include each result node's stored document. Default: False.
-        fields (list[str] | Unset): Document fields to include when include_documents is true. Omit to include all
-            fields.
+        must (GraphDocumentFilterConjunction | Unset):
+        should (GraphDocumentFilterDisjunction | Unset):
+        must_not (GraphDocumentFilterDisjunction | Unset):
         filter_ (BoolFieldQuery | DateRangeStringQuery | DocIdQuery | FuzzyQuery | GraphDocumentFilterBoolean |
             GraphDocumentFilterConjunction | GraphDocumentFilterDisjunction | MatchAllQuery | MatchNoneQuery |
             NumericRangeQuery | PrefixQuery | RegexpQuery | TermQuery | TermRangeQuery | Unset | WildcardQuery): A non-
@@ -60,17 +42,9 @@ class GraphTraversal:
             multi_match, and query_string. Alias-to-alias predicates belong in GraphMatch.where.
     """
 
-    start: GraphIdentityNodeSelector | GraphKeyNodeSelector | GraphResultRefNodeSelector
-    edge_types: list[str] | Unset = UNSET
-    direction: EdgeDirection | Unset = UNSET
-    max_depth: int | Unset = 1
-    min_weight: float | Unset = UNSET
-    max_weight: float | Unset = UNSET
-    limit: int | Unset = 100
-    deduplicate_nodes: bool | Unset = True
-    include_paths: bool | Unset = False
-    include_documents: bool | Unset = False
-    fields: list[str] | Unset = UNSET
+    must: GraphDocumentFilterConjunction | Unset = UNSET
+    should: GraphDocumentFilterDisjunction | Unset = UNSET
+    must_not: GraphDocumentFilterDisjunction | Unset = UNSET
     filter_: (
         BoolFieldQuery
         | DateRangeStringQuery
@@ -95,10 +69,7 @@ class GraphTraversal:
         from ..models.date_range_string_query import DateRangeStringQuery
         from ..models.doc_id_query import DocIdQuery
         from ..models.fuzzy_query import FuzzyQuery
-        from ..models.graph_document_filter_boolean import GraphDocumentFilterBoolean
         from ..models.graph_document_filter_conjunction import GraphDocumentFilterConjunction
-        from ..models.graph_identity_node_selector import GraphIdentityNodeSelector
-        from ..models.graph_key_node_selector import GraphKeyNodeSelector
         from ..models.match_all_query import MatchAllQuery
         from ..models.match_none_query import MatchNoneQuery
         from ..models.numeric_range_query import NumericRangeQuery
@@ -108,39 +79,17 @@ class GraphTraversal:
         from ..models.term_range_query import TermRangeQuery
         from ..models.wildcard_query import WildcardQuery
 
-        start: dict[str, Any]
-        if isinstance(self.start, GraphKeyNodeSelector):
-            start = self.start.to_dict()
-        elif isinstance(self.start, GraphIdentityNodeSelector):
-            start = self.start.to_dict()
-        else:
-            start = self.start.to_dict()
+        must: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.must, Unset):
+            must = self.must.to_dict()
 
-        edge_types: list[str] | Unset = UNSET
-        if not isinstance(self.edge_types, Unset):
-            edge_types = self.edge_types
+        should: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.should, Unset):
+            should = self.should.to_dict()
 
-        direction: str | Unset = UNSET
-        if not isinstance(self.direction, Unset):
-            direction = self.direction.value
-
-        max_depth = self.max_depth
-
-        min_weight = self.min_weight
-
-        max_weight = self.max_weight
-
-        limit = self.limit
-
-        deduplicate_nodes = self.deduplicate_nodes
-
-        include_paths = self.include_paths
-
-        include_documents = self.include_documents
-
-        fields: list[str] | Unset = UNSET
-        if not isinstance(self.fields, Unset):
-            fields = self.fields
+        must_not: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.must_not, Unset):
+            must_not = self.must_not.to_dict()
 
         filter_: dict[str, Any] | Unset
         if isinstance(self.filter_, Unset):
@@ -178,31 +127,13 @@ class GraphTraversal:
 
         field_dict: dict[str, Any] = {}
 
-        field_dict.update(
-            {
-                "start": start,
-            }
-        )
-        if edge_types is not UNSET:
-            field_dict["edge_types"] = edge_types
-        if direction is not UNSET:
-            field_dict["direction"] = direction
-        if max_depth is not UNSET:
-            field_dict["max_depth"] = max_depth
-        if min_weight is not UNSET:
-            field_dict["min_weight"] = min_weight
-        if max_weight is not UNSET:
-            field_dict["max_weight"] = max_weight
-        if limit is not UNSET:
-            field_dict["limit"] = limit
-        if deduplicate_nodes is not UNSET:
-            field_dict["deduplicate_nodes"] = deduplicate_nodes
-        if include_paths is not UNSET:
-            field_dict["include_paths"] = include_paths
-        if include_documents is not UNSET:
-            field_dict["include_documents"] = include_documents
-        if fields is not UNSET:
-            field_dict["fields"] = fields
+        field_dict.update({})
+        if must is not UNSET:
+            field_dict["must"] = must
+        if should is not UNSET:
+            field_dict["should"] = should
+        if must_not is not UNSET:
+            field_dict["must_not"] = must_not
         if filter_ is not UNSET:
             field_dict["filter"] = filter_
 
@@ -214,12 +145,8 @@ class GraphTraversal:
         from ..models.date_range_string_query import DateRangeStringQuery
         from ..models.doc_id_query import DocIdQuery
         from ..models.fuzzy_query import FuzzyQuery
-        from ..models.graph_document_filter_boolean import GraphDocumentFilterBoolean
         from ..models.graph_document_filter_conjunction import GraphDocumentFilterConjunction
         from ..models.graph_document_filter_disjunction import GraphDocumentFilterDisjunction
-        from ..models.graph_identity_node_selector import GraphIdentityNodeSelector
-        from ..models.graph_key_node_selector import GraphKeyNodeSelector
-        from ..models.graph_result_ref_node_selector import GraphResultRefNodeSelector
         from ..models.match_all_query import MatchAllQuery
         from ..models.match_none_query import MatchNoneQuery
         from ..models.numeric_range_query import NumericRangeQuery
@@ -230,56 +157,26 @@ class GraphTraversal:
         from ..models.wildcard_query import WildcardQuery
 
         d = dict(src_dict)
-
-        def _parse_start(data: object) -> GraphIdentityNodeSelector | GraphKeyNodeSelector | GraphResultRefNodeSelector:
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                componentsschemas_graph_node_selector_type_0 = GraphKeyNodeSelector.from_dict(data)
-
-                return componentsschemas_graph_node_selector_type_0
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                componentsschemas_graph_node_selector_type_1 = GraphIdentityNodeSelector.from_dict(data)
-
-                return componentsschemas_graph_node_selector_type_1
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            if not isinstance(data, dict):
-                raise TypeError()
-            componentsschemas_graph_node_selector_type_2 = GraphResultRefNodeSelector.from_dict(data)
-
-            return componentsschemas_graph_node_selector_type_2
-
-        start = _parse_start(d.pop("start"))
-
-        edge_types = cast(list[str], d.pop("edge_types", UNSET))
-
-        _direction = d.pop("direction", UNSET)
-        direction: EdgeDirection | Unset
-        if isinstance(_direction, Unset):
-            direction = UNSET
+        _must = d.pop("must", UNSET)
+        must: GraphDocumentFilterConjunction | Unset
+        if isinstance(_must, Unset):
+            must = UNSET
         else:
-            direction = EdgeDirection(_direction)
+            must = GraphDocumentFilterConjunction.from_dict(_must)
 
-        max_depth = d.pop("max_depth", UNSET)
+        _should = d.pop("should", UNSET)
+        should: GraphDocumentFilterDisjunction | Unset
+        if isinstance(_should, Unset):
+            should = UNSET
+        else:
+            should = GraphDocumentFilterDisjunction.from_dict(_should)
 
-        min_weight = d.pop("min_weight", UNSET)
-
-        max_weight = d.pop("max_weight", UNSET)
-
-        limit = d.pop("limit", UNSET)
-
-        deduplicate_nodes = d.pop("deduplicate_nodes", UNSET)
-
-        include_paths = d.pop("include_paths", UNSET)
-
-        include_documents = d.pop("include_documents", UNSET)
-
-        fields = cast(list[str], d.pop("fields", UNSET))
+        _must_not = d.pop("must_not", UNSET)
+        must_not: GraphDocumentFilterDisjunction | Unset
+        if isinstance(_must_not, Unset):
+            must_not = UNSET
+        else:
+            must_not = GraphDocumentFilterDisjunction.from_dict(_must_not)
 
         def _parse_filter_(
             data: object,
@@ -423,19 +320,11 @@ class GraphTraversal:
 
         filter_ = _parse_filter_(d.pop("filter", UNSET))
 
-        graph_traversal = cls(
-            start=start,
-            edge_types=edge_types,
-            direction=direction,
-            max_depth=max_depth,
-            min_weight=min_weight,
-            max_weight=max_weight,
-            limit=limit,
-            deduplicate_nodes=deduplicate_nodes,
-            include_paths=include_paths,
-            include_documents=include_documents,
-            fields=fields,
+        graph_document_filter_boolean = cls(
+            must=must,
+            should=should,
+            must_not=must_not,
             filter_=filter_,
         )
 
-        return graph_traversal
+        return graph_document_filter_boolean

@@ -372,6 +372,30 @@ class TestAntflyClient:
             client.query(table="docs", aggregations={"a": {}}, facets={"b": {}})
 
     @patch("antfly.client.Client")
+    def test_query_preserves_legacy_graph_searches_bridge(self, mock_client_class: MagicMock) -> None:
+        mock_httpx = MagicMock()
+        configure_response(mock_httpx, 200, {"responses": []})
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+
+        client = AntflyClient(base_url="http://localhost:8080")
+        client.query(
+            table="docs",
+            graph_searches={"related": {"type": "neighbors", "index_name": "graph"}},
+        )
+
+        mock_httpx.stream.assert_called_once_with(
+            "POST",
+            "/db/v1/tables/docs/query",
+            json={"graph_searches": {"related": {"type": "neighbors", "index_name": "graph"}}},
+        )
+
+    def test_query_rejects_mixed_graph_contracts(self) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+
+        with pytest.raises(AntflyException, match="either graph_queries or graph_searches"):
+            client.query(table="docs", graph_queries={}, graph_searches={})
+
+    @patch("antfly.client.Client")
     @patch("antfly.client.lookup_key")
     def test_get_record(self, mock_lookup_key: MagicMock, mock_client_class: MagicMock) -> None:
         """Test getting a record by key."""

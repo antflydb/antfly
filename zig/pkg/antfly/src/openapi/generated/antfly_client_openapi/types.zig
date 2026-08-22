@@ -4354,8 +4354,178 @@ pub const GraphCountAggregate = struct {
     distinct: ?bool = null,
 };
 
-/// The same validated QueryRequest.filter_query DSL, embedded at a graph node. Alias-to-alias predicates belong in GraphMatch.where.
-pub const GraphFilterQuery = std.json.Value;
+/// A non-scoring stored-document predicate embedded at a graph node. It reuses the structured field-filter shapes from QueryRequest.filter_query, but deliberately excludes analyzer-backed full-text clauses such as match, phrase, multi_match, and query_string. Alias-to-alias predicates belong in GraphMatch.where.
+pub const GraphDocumentFilter = union(enum) {
+    date_range_string_query: *DateRangeStringQuery,
+    graph_document_filter_boolean: *GraphDocumentFilterBoolean,
+    numeric_range_query: *NumericRangeQuery,
+    term_range_query: *TermRangeQuery,
+    fuzzy_query: *FuzzyQuery,
+    graph_document_filter_disjunction: *GraphDocumentFilterDisjunction,
+    bool_field_query: *BoolFieldQuery,
+    doc_id_query: *DocIdQuery,
+    graph_document_filter_conjunction: *GraphDocumentFilterConjunction,
+    match_all_query: *MatchAllQuery,
+    match_none_query: *MatchNoneQuery,
+    prefix_query: *PrefixQuery,
+    regexp_query: *RegexpQuery,
+    term_query: *TermQuery,
+    wildcard_query: *WildcardQuery,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "start",
+            "end",
+            "inclusive_start",
+            "inclusive_end",
+            "datetime_parser",
+        })) {
+            if (try parseStructuralVariant(DateRangeStringQuery, allocator, source, options)) |parsed| return .{ .date_range_string_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "must",
+            "should",
+            "must_not",
+            "filter",
+        })) {
+            if (try parseStructuralVariant(GraphDocumentFilterBoolean, allocator, source, options)) |parsed| return .{ .graph_document_filter_boolean = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "min",
+            "max",
+            "inclusive_min",
+            "inclusive_max",
+        })) {
+            if (try parseStructuralVariant(NumericRangeQuery, allocator, source, options)) |parsed| return .{ .numeric_range_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "min",
+            "max",
+            "inclusive_min",
+            "inclusive_max",
+        })) {
+            if (try parseStructuralVariant(TermRangeQuery, allocator, source, options)) |parsed| return .{ .term_range_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "term",
+            "prefix_length",
+            "fuzziness",
+        })) {
+            if (try parseStructuralVariant(FuzzyQuery, allocator, source, options)) |parsed| return .{ .fuzzy_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "disjuncts",
+            "min",
+        })) {
+            if (try parseStructuralVariant(GraphDocumentFilterDisjunction, allocator, source, options)) |parsed| return .{ .graph_document_filter_disjunction = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "bool",
+        })) {
+            if (try parseStructuralVariant(BoolFieldQuery, allocator, source, options)) |parsed| return .{ .bool_field_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "ids",
+        })) {
+            if (try parseStructuralVariant(DocIdQuery, allocator, source, options)) |parsed| return .{ .doc_id_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "conjuncts",
+        })) {
+            if (try parseStructuralVariant(GraphDocumentFilterConjunction, allocator, source, options)) |parsed| return .{ .graph_document_filter_conjunction = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "match_all",
+        })) {
+            if (try parseStructuralVariant(MatchAllQuery, allocator, source, options)) |parsed| return .{ .match_all_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "match_none",
+        })) {
+            if (try parseStructuralVariant(MatchNoneQuery, allocator, source, options)) |parsed| return .{ .match_none_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "prefix",
+        })) {
+            if (try parseStructuralVariant(PrefixQuery, allocator, source, options)) |parsed| return .{ .prefix_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "regexp",
+        })) {
+            if (try parseStructuralVariant(RegexpQuery, allocator, source, options)) |parsed| return .{ .regexp_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "term",
+        })) {
+            if (try parseStructuralVariant(TermQuery, allocator, source, options)) |parsed| return .{ .term_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "wildcard",
+        })) {
+            if (try parseStructuralVariant(WildcardQuery, allocator, source, options)) |parsed| return .{ .wildcard_query = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .date_range_string_query => |v| try jw.write(v.*),
+            .graph_document_filter_boolean => |v| try jw.write(v.*),
+            .numeric_range_query => |v| try jw.write(v.*),
+            .term_range_query => |v| try jw.write(v.*),
+            .fuzzy_query => |v| try jw.write(v.*),
+            .graph_document_filter_disjunction => |v| try jw.write(v.*),
+            .bool_field_query => |v| try jw.write(v.*),
+            .doc_id_query => |v| try jw.write(v.*),
+            .graph_document_filter_conjunction => |v| try jw.write(v.*),
+            .match_all_query => |v| try jw.write(v.*),
+            .match_none_query => |v| try jw.write(v.*),
+            .prefix_query => |v| try jw.write(v.*),
+            .regexp_query => |v| try jw.write(v.*),
+            .term_query => |v| try jw.write(v.*),
+            .wildcard_query => |v| try jw.write(v.*),
+        }
+    }
+};
+
+pub const GraphDocumentFilterBoolean = struct {
+    must: ?GraphDocumentFilterConjunction = null,
+    should: ?GraphDocumentFilterDisjunction = null,
+    must_not: ?GraphDocumentFilterDisjunction = null,
+    filter: ?GraphDocumentFilter = null,
+};
+
+pub const GraphDocumentFilterConjunction = struct {
+    conjuncts: []const GraphDocumentFilter,
+};
+
+pub const GraphDocumentFilterDisjunction = struct {
+    disjuncts: []const GraphDocumentFilter,
+    min: ?f64 = null,
+};
 
 pub const GraphIdentityNodeSelector = struct {
     /// Exact node identities. Omitted table means the query table.
@@ -4488,8 +4658,8 @@ pub const GraphKShortestPaths = struct {
     min_weight: ?f64 = null,
     max_weight: ?f64 = null,
     weight_mode: ?PathWeightMode = null,
-    /// The same document-query DSL accepted by QueryRequest.filter_query.
-    filter: ?GraphFilterQuery = null,
+    /// Non-scoring structured stored-document predicate for path nodes.
+    filter: ?GraphDocumentFilter = null,
     /// Include stored documents on nodes returned with each path.
     include_documents: ?bool = null,
     /// Document fields to include when include_documents is true. Omit to include all fields.
@@ -4526,10 +4696,11 @@ pub const GraphMatchEdge = struct {
 };
 
 pub const GraphMatchNode = struct {
-    /// The QueryRequest.filter_query expression evaluated for this alias.
-    filter: ?GraphFilterQuery = null,
+    /// Non-scoring structured stored-document predicate evaluated for this alias.
+    filter: ?GraphDocumentFilter = null,
 };
 
+/// Conjunctive graph match over the complete authorized source universe. Results are exact or the request fails; execution never labels a partial aggregate exact. The default explored-node budget admits at most 100,000 distributed source anchors before graph expansion.
 pub const GraphMatchQuery = struct {
     index: []const u8,
     match: GraphMatch,
@@ -4600,6 +4771,7 @@ pub const GraphNotEqualPredicate = struct {
     right: GraphAliasOperand,
 };
 
+/// Correlated negative-edge predicate over aliases already visible at this point in the MATCH. It does not introduce new aliases.
 pub const GraphNotExistsPattern = struct {
     edges: []const GraphMatchEdge,
 };
@@ -4882,8 +5054,8 @@ pub const GraphShortestPath = struct {
     min_weight: ?f64 = null,
     max_weight: ?f64 = null,
     weight_mode: ?PathWeightMode = null,
-    /// The same document-query DSL accepted by QueryRequest.filter_query.
-    filter: ?GraphFilterQuery = null,
+    /// Non-scoring structured stored-document predicate for path nodes.
+    filter: ?GraphDocumentFilter = null,
     /// Include stored documents on nodes returned with the path.
     include_documents: ?bool = null,
     /// Document fields to include when include_documents is true. Omit to include all fields.
@@ -4913,8 +5085,8 @@ pub const GraphTraversal = struct {
     include_documents: ?bool = null,
     /// Document fields to include when include_documents is true. Omit to include all fields.
     fields: ?[]const []const u8 = null,
-    /// The same document-query DSL accepted by QueryRequest.filter_query.
-    filter: ?GraphFilterQuery = null,
+    /// Non-scoring structured stored-document predicate for reached nodes.
+    filter: ?GraphDocumentFilter = null,
 };
 
 pub const GraphTraverseQuery = struct {

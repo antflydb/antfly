@@ -5085,7 +5085,7 @@ fn completeGraphMatchAnchorRequest(req: db_mod.types.SearchRequest) db_mod.types
         .doc_filter_bindings = req.doc_filter_bindings,
         .include_all_fields = false,
         .include_stored = false,
-        .limit = distributed_graph.complete_match_anchor_limit,
+        .limit = distributed_graph.complete_match_anchor_probe_limit,
         .filter_prefix = req.filter_prefix,
         .filter_ids = req.filter_ids,
         .exclude_ids = req.exclude_ids,
@@ -5185,7 +5185,7 @@ test "complete graph match anchors retain admission and discard retrieval shapin
     try std.testing.expectEqual(@as(usize, 0), anchors.order_by.len);
     try std.testing.expectEqual(@as(usize, 0), anchors.search_after.len);
     try std.testing.expectEqual(@as(u32, 0), anchors.offset);
-    try std.testing.expectEqual(distributed_graph.complete_match_anchor_limit, anchors.limit);
+    try std.testing.expectEqual(distributed_graph.complete_match_anchor_probe_limit, anchors.limit);
     try std.testing.expect(!anchors.include_all_fields);
     try std.testing.expect(!anchors.include_stored);
     try std.testing.expectEqualStrings("", anchors.aggregations_json);

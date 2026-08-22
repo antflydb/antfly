@@ -17,6 +17,7 @@ const ant_json = @import("antfly-json");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const db_mod = @import("../storage/db/mod.zig");
+const graph_pattern_mod = @import("../graph/pattern.zig");
 const graph_query_mod = @import("../graph/query.zig");
 const query_contract = @import("query_contract.zig");
 
@@ -25,6 +26,7 @@ pub fn rejectInternalDocIdentityFields(alloc: std.mem.Allocator, body: []const u
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     if (objectHasInternalDocIdentityField(parsed.value.object)) return error.InvalidQueryRequest;
+    try query_contract.validateRawGraphQueriesValueAlloc(alloc, parsed.value);
 }
 
 fn objectHasInternalDocIdentityField(object: std.json.ObjectMap) bool {
@@ -699,6 +701,45 @@ test "parse supported graph queries accepts pattern node filter queries" {
         "{\"term\":{\"path\":\"title\",\"term\":\"beta\"}}",
         items[0].query.match_pattern.?.nodes[1].filter.filter_query_json.?,
     );
+}
+
+test "graph node filters reject analyzer-backed text clauses" {
+    const alloc = std.testing.allocator;
+    var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
+        \\{
+        \\  "graph_queries": {
+        \\    "walk": {
+        \\      "index": "graph_idx",
+        \\      "match": {
+        \\        "nodes": {"a": {}, "b": {"filter": {"match": "beta", "field": "title"}}},
+        \\        "edges": [{"from": "a", "to": "b"}]
+        \\      },
+        \\      "return": {"bindings": ["b"]}
+        \\    }
+        \\  }
+        \\}
+    , .{});
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseSupportedGraphQueriesAlloc(alloc, parsed.value));
+}
+
+test "raw graph admission rejects recursive edge shapes above the contract budget" {
+    const alloc = std.testing.allocator;
+    var body = std.ArrayListUnmanaged(u8).empty;
+    defer body.deinit(alloc);
+    try body.appendSlice(alloc,
+        \\{"graph_queries":{"q":{"index":"graph","match":{"nodes":{"a":{},"b":{}},"edges":[
+    );
+    for (0..graph_pattern_mod.max_conjunctive_edges + 1) |i| {
+        if (i > 0) try body.append(alloc, ',');
+        try body.appendSlice(alloc, "{\"from\":\"a\",\"to\":\"b\"}");
+    }
+    try body.appendSlice(alloc,
+        \\]},"return":{"bindings":["a"]}}}}
+    );
+
+    try std.testing.expectError(error.InvalidQueryRequest, rejectInternalDocIdentityFields(alloc, body.items));
 }
 
 test "parse supported graph queries require document hydration for projected fields" {

@@ -16,12 +16,15 @@ T = TypeVar("T", bound="GraphMatchQuery")
 
 @_attrs_define
 class GraphMatchQuery:
-    """
-    Attributes:
-        index (str):
-        match (GraphMatch):
-        return_ (GraphAggregatesReturn | GraphBindingsReturn): Return bindings or exact aggregates. Bindings and
-            aggregates are mutually exclusive.
+    """Conjunctive graph match over the complete authorized source universe. Results are exact or the request fails;
+    execution never labels a partial aggregate exact. The default explored-node budget admits at most 100,000
+    distributed source anchors before graph expansion.
+
+        Attributes:
+            index (str):
+            match (GraphMatch):
+            return_ (GraphAggregatesReturn | GraphBindingsReturn): Return bindings or exact aggregates. Bindings and
+                aggregates are mutually exclusive.
     """
 
     index: str

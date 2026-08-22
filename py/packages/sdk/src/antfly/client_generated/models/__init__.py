@@ -322,6 +322,9 @@ from .graph_bindings_return import GraphBindingsReturn
 from .graph_bounded_traversal_config import GraphBoundedTraversalConfig
 from .graph_bounded_traversal_config_law import GraphBoundedTraversalConfigLaw
 from .graph_count_aggregate import GraphCountAggregate
+from .graph_document_filter_boolean import GraphDocumentFilterBoolean
+from .graph_document_filter_conjunction import GraphDocumentFilterConjunction
+from .graph_document_filter_disjunction import GraphDocumentFilterDisjunction
 from .graph_identity_node_selector import GraphIdentityNodeSelector
 from .graph_index_config import GraphIndexConfig
 from .graph_index_stats import GraphIndexStats
@@ -1179,6 +1182,9 @@ __all__ = (
     "GraphBoundedTraversalConfig",
     "GraphBoundedTraversalConfigLaw",
     "GraphCountAggregate",
+    "GraphDocumentFilterBoolean",
+    "GraphDocumentFilterConjunction",
+    "GraphDocumentFilterDisjunction",
     "GraphIdentityNodeSelector",
     "GraphIndexConfig",
     "GraphIndexStats",
