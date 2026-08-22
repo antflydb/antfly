@@ -608,6 +608,7 @@ test "parse supported graph queries accepts pattern requests" {
         \\    "walk": {
         \\      "index": "graph_idx",
         \\      "match": {
+        \\        "anchor": "a",
         \\        "nodes": {"a": {}, "b": {}},
         \\        "edges": [{"from": "a", "to": "b", "types": ["links"], "direction": "out", "min_hops": 1, "max_hops": 2}]
         \\      },
@@ -637,6 +638,7 @@ test "graph query dependencies require compatible explicit outputs" {
         \\    "seed": {
         \\      "index": "graph_idx",
         \\      "match": {
+        \\        "anchor": "a",
         \\        "nodes": {"a": {}, "b": {}},
         \\        "edges": [{"from": "a", "to": "b"}]
         \\      },
@@ -677,6 +679,7 @@ test "parse supported graph queries accepts pattern node filter queries" {
         \\    "walk": {
         \\      "index": "graph_idx",
         \\      "match": {
+        \\        "anchor": "a",
         \\        "nodes": {"a": {}, "b": {"filter": {"term": "beta", "field": "title"}}},
         \\        "edges": [{"from": "a", "to": "b", "types": ["links"]}]
         \\      },
@@ -711,6 +714,7 @@ test "graph node filters reject analyzer-backed text clauses" {
         \\    "walk": {
         \\      "index": "graph_idx",
         \\      "match": {
+        \\        "anchor": "a",
         \\        "nodes": {"a": {}, "b": {"filter": {"match": "beta", "field": "title"}}},
         \\        "edges": [{"from": "a", "to": "b"}]
         \\      },
@@ -726,7 +730,7 @@ test "raw graph admission rejects recursive edge shapes above the contract budge
     var body = std.ArrayListUnmanaged(u8).empty;
     defer body.deinit(alloc);
     try body.appendSlice(alloc,
-        \\{"graph_queries":{"q":{"index":"graph","match":{"nodes":{"a":{},"b":{}},"edges":[
+        \\{"graph_queries":{"q":{"index":"graph","match":{"anchor":"a","nodes":{"a":{},"b":{}},"edges":[
     );
     for (0..graph_pattern_mod.max_conjunctive_edges + 1) |i| {
         if (i > 0) try body.append(alloc, ',');
@@ -740,7 +744,7 @@ test "raw graph admission rejects recursive edge shapes above the contract budge
 
     body.clearRetainingCapacity();
     try body.appendSlice(alloc,
-        \\{"graph_queries":{"q":{"index":"graph","match":{"nodes":{"a":{}},"edges":[]},"return":{"aggregates":{
+        \\{"graph_queries":{"q":{"index":"graph","match":{"anchor":"a","nodes":{"a":{}},"edges":[]},"return":{"aggregates":{
     );
     for (0..graph_pattern_mod.max_count_aggregates + 1) |i| {
         if (i > 0) try body.append(alloc, ',');
@@ -759,6 +763,7 @@ test "parse supported graph queries require document hydration for projected fie
         \\    "walk": {
         \\      "index": "graph_idx",
         \\      "match": {
+        \\        "anchor": "a",
         \\        "nodes": {"a": {}, "b": {}},
         \\        "edges": [{"from": "a", "to": "b"}]
         \\      },
@@ -780,6 +785,7 @@ test "parse supported graph queries accepts branches predicates optional groups 
         \\    "parity": {
         \\      "index": "graph_idx",
         \\      "match": {
+        \\        "anchor": "a",
         \\        "nodes": {"a": {}, "b": {}, "c": {}},
         \\        "edges": [
         \\          {"from": "a", "to": "b", "types": ["links"]},

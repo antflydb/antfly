@@ -8990,7 +8990,14 @@ fn parseGraphMatchQuery(alloc: std.mem.Allocator, value: indexes_openapi.GraphMa
     else
         &.{};
     errdefer freeOwnedStringSlice(alloc, fields);
-    const match_pattern = graph_pattern_mod.ConjunctivePattern{ .nodes = nodes, .edges = edges, .predicates = predicates, .optional = optional };
+    if (!graphAliasIsDeclared(nodes, &.{}, value.match.anchor)) return error.InvalidQueryRequest;
+    const match_pattern = graph_pattern_mod.ConjunctivePattern{
+        .anchor_alias = value.match.anchor,
+        .nodes = nodes,
+        .edges = edges,
+        .predicates = predicates,
+        .optional = optional,
+    };
     graph_pattern_mod.validateConjunctivePattern(match_pattern) catch return error.InvalidQueryRequest;
     return .{
         .query_type = .pattern,
@@ -9166,13 +9173,6 @@ fn parseGraphCountAggregates(alloc: std.mem.Allocator, value: std.json.ArrayHash
     }
     var it = value.map.iterator();
     while (it.next()) |entry| {
-        for (aggregates[0..initialized]) |prior| {
-            if (prior.distinct == (entry.value_ptr.distinct orelse false) and
-                std.mem.eql(u8, prior.of, entry.value_ptr.count))
-            {
-                return error.InvalidQueryRequest;
-            }
-        }
         const name = try alloc.dupe(u8, entry.key_ptr.*);
         errdefer alloc.free(name);
         const of = try alloc.dupe(u8, entry.value_ptr.count);

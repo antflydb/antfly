@@ -39,9 +39,10 @@ func TestGraphQueryConstructors(t *testing.T) {
 	query, err := NewGraphMatchQuery(GraphMatchQuery{
 		Index: "graph_idx",
 		Match: GraphMatch{
-			Nodes: map[string]GraphMatchNode{"a": {}, "b": {}},
-			Edges: []GraphMatchEdge{{From: "a", To: "b", Types: []string{"links"}}},
-			Where: where,
+			Anchor: "a",
+			Nodes:  map[string]GraphMatchNode{"a": {}, "b": {}},
+			Edges:  []GraphMatchEdge{{From: "a", To: "b", Types: []string{"links"}}},
+			Where:  where,
 		},
 		Return: graphReturn,
 	})
@@ -170,8 +171,9 @@ func TestGraphConstructorsRejectSemanticErrors(t *testing.T) {
 	if _, err := NewGraphMatchQuery(GraphMatchQuery{
 		Index: "graph_idx",
 		Match: GraphMatch{
-			Nodes: map[string]GraphMatchNode{"a": {}, "b": {}},
-			Edges: []GraphMatchEdge{{From: "a", To: "b"}},
+			Anchor: "a",
+			Nodes:  map[string]GraphMatchNode{"a": {}, "b": {}},
+			Edges:  []GraphMatchEdge{{From: "a", To: "b"}},
 		},
 		Return: graphReturn,
 	}); err == nil {
@@ -189,8 +191,9 @@ func TestGraphConstructorsRejectSemanticErrors(t *testing.T) {
 	if _, err := NewGraphMatchQuery(GraphMatchQuery{
 		Index: "graph_idx",
 		Match: GraphMatch{
-			Nodes: map[string]GraphMatchNode{"a": {}, "b": {}},
-			Edges: edges,
+			Anchor: "a",
+			Nodes:  map[string]GraphMatchNode{"a": {}, "b": {}},
+			Edges:  edges,
 		},
 		Return: validReturn,
 	}); err == nil {
@@ -235,12 +238,33 @@ func TestGraphAggregateConstructorEnforcesComplexityBudget(t *testing.T) {
 	}
 }
 
-func TestGraphAggregateConstructorRejectsDuplicateExpressions(t *testing.T) {
+func TestGraphAggregateConstructorAllowsDuplicateExpressionsUnderDifferentNames(t *testing.T) {
 	if _, err := NewGraphAggregatesReturn(map[string]GraphCountAggregate{
 		"first":  CountGraphAlias("person", true),
 		"second": CountGraphAlias("person", true),
-	}); err == nil {
-		t.Fatal("expected duplicate aggregate expression error")
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGraphMatchConstructorRequiresDeclaredSourceAnchor(t *testing.T) {
+	graphReturn, err := NewGraphBindingsReturn([]string{"a"}, GraphBindingsOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, anchor := range []string{"", "missing"} {
+		_, err := NewGraphMatchQuery(GraphMatchQuery{
+			Index: "graph_idx",
+			Match: GraphMatch{
+				Anchor: anchor,
+				Nodes:  map[string]GraphMatchNode{"a": {}},
+				Edges:  []GraphMatchEdge{},
+			},
+			Return: graphReturn,
+		})
+		if err == nil {
+			t.Fatalf("expected invalid graph anchor %q to fail", anchor)
+		}
 	}
 }
 

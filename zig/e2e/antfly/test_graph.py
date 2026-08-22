@@ -625,6 +625,7 @@ def test_serverless_graph_pattern_two_hop_and_documents(serverless_api):
         pass
 
     two_hop_match = {
+        "anchor": "a",
         "nodes": {
             "a": {"filter": {"ids": ["doc-a"]}},
             "b": {"filter": {"term": "beta", "field": "title"}},
@@ -757,6 +758,7 @@ def test_stateful_graph_field_edges_extract_and_update(backup_api):
             "parent": {
                 "index": "hierarchy",
                 "match": {
+                    "anchor": "child",
                     "nodes": {
                         "child": {"filter": {"ids": ["child"]}},
                         "parent": {},
@@ -906,6 +908,7 @@ def test_stateful_graph_pattern_two_hop_and_documents(backup_api):
             "two_hop": {
                 "index": "graph_idx",
                 "match": {
+                    "anchor": "a",
                     "nodes": {
                         "a": {"filter": {"ids": ["doc-a"]}},
                         "b": {},
@@ -970,6 +973,7 @@ def test_stateful_graph_pattern_variable_length_and_cycle(backup_api):
             "var_length": {
                 "index": "graph_idx",
                 "match": {
+                    "anchor": "start",
                     "nodes": {
                         "start": {"filter": {"ids": ["doc-a"]}},
                         "end": {},
@@ -990,6 +994,7 @@ def test_stateful_graph_pattern_variable_length_and_cycle(backup_api):
             "cycle": {
                 "index": "graph_idx",
                 "match": {
+                    "anchor": "x",
                     "nodes": {"x": {"filter": {"ids": ["doc-a"]}}},
                     "edges": [
                         {"from": "x", "to": "x", "types": ["knows"], "direction": "out", "min_hops": 1, "max_hops": 3}
@@ -1090,6 +1095,7 @@ def test_stateful_graph_pattern_diamond_and_edge_type_filter(backup_api):
             "diamond": {
                 "index": "graph_idx",
                 "match": {
+                    "anchor": "a",
                     "nodes": {
                         "a": {"filter": {"ids": ["doc-a"]}},
                         "middle": {},
@@ -1105,6 +1111,7 @@ def test_stateful_graph_pattern_diamond_and_edge_type_filter(backup_api):
             "edge_filter": {
                 "index": "graph_idx",
                 "match": {
+                    "anchor": "a",
                     "nodes": {
                         "a": {"filter": {"ids": ["doc-a"]}},
                         "b": {},
@@ -1190,6 +1197,7 @@ def test_stateful_graph_conjunctive_optional_negative_and_aggregates(backup_api)
     assert batch["inserted"] == 4
 
     branch = {
+        "anchor": "a",
         "nodes": {"a": {"filter": {"ids": ["doc-a"]}}, "b": {}, "c": {}},
         "edges": [
             {"from": "a", "to": "b", "types": ["knows"]},
@@ -1220,6 +1228,7 @@ def test_stateful_graph_conjunctive_optional_negative_and_aggregates(backup_api)
             "optional": {
                 "index": "graph_idx",
                 "match": {
+                    "anchor": "a",
                     "nodes": {"a": {"filter": {"ids": ["doc-a"]}}, "b": {}},
                     "edges": [{"from": "a", "to": "b", "types": ["knows"]}],
                     "optional": [
@@ -1234,6 +1243,7 @@ def test_stateful_graph_conjunctive_optional_negative_and_aggregates(backup_api)
             "counts": {
                 "index": "graph_idx",
                 "match": {
+                    "anchor": "a",
                     "nodes": {"a": {"filter": {"ids": ["doc-a"]}}, "b": {}},
                     "edges": [{"from": "a", "to": "b", "types": ["knows"]}],
                 },
@@ -1418,7 +1428,7 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
         return {"filter": {"term": label, "field": "type"}}
 
     def count_query(nodes: dict, edges: list, *, where=None, optional=None) -> dict:
-        match = {"nodes": nodes, "edges": edges}
+        match = {"anchor": next(iter(nodes)), "nodes": nodes, "edges": edges}
         if where is not None:
             match["where"] = where
         if optional is not None:
@@ -1679,6 +1689,7 @@ def test_stateful_graph_pattern_max_results_limit(backup_api):
             "limited": {
                 "index": "graph_idx",
                 "match": {
+                    "anchor": "a",
                     "nodes": {
                         "a": {},
                         "b": {},
@@ -1690,6 +1701,7 @@ def test_stateful_graph_pattern_max_results_limit(backup_api):
             "counts": {
                 "index": "graph_idx",
                 "match": {
+                    "anchor": "a",
                     "nodes": {"a": {}, "b": {}},
                     "edges": [{"from": "a", "to": "b", "types": ["knows"], "direction": "out"}],
                 },

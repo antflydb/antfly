@@ -11745,6 +11745,7 @@ export interface components {
             /** @description Non-scoring structured stored-document predicate evaluated for this alias. */
             filter?: components["schemas"]["GraphDocumentFilter"];
         };
+        /** @description Structural edge expansion between aliases. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. */
         GraphMatchEdge: {
             from: string;
             to: string;
@@ -11789,6 +11790,8 @@ export interface components {
             where?: components["schemas"]["GraphWhereExpression"];
         };
         GraphMatch: {
+            /** @description Alias enumerated from the query table as the source relation. Every other alias is reached through graph edges and may resolve to a table-qualified target identity. */
+            anchor: string;
             nodes: {
                 [key: string]: components["schemas"]["GraphMatchNode"];
             };
@@ -11821,7 +11824,7 @@ export interface components {
         };
         /** @description Return bindings or exact aggregates. Bindings and aggregates are mutually exclusive. */
         GraphReturn: components["schemas"]["GraphBindingsReturn"] | components["schemas"]["GraphAggregatesReturn"];
-        /** @description Conjunctive graph match over the complete authorized source universe. Results are exact or the request fails; execution never labels a partial aggregate exact. The default explored-node budget admits at most 100,000 distributed source anchors before graph expansion. */
+        /** @description Conjunctive graph match over the complete authorized source universe. Results are exact or the request fails; execution never labels a partial aggregate exact. Source anchors are streamed in stable snapshot-pinned pages; transient expansion state remains bounded, and execution observes request deadlines, cancellation, and server resource admission. */
         GraphMatchQuery: {
             index: string;
             match: components["schemas"]["GraphMatch"];

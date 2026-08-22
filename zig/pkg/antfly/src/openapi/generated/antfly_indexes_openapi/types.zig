@@ -1654,12 +1654,15 @@ pub const GraphKeyNodeSelector = struct {
 };
 
 pub const GraphMatch = struct {
+    /// Alias enumerated from the query table as the source relation. Every other alias is reached through graph edges and may resolve to a table-qualified target identity.
+    anchor: []const u8,
     nodes: std.json.ArrayHashMap(GraphMatchNode),
     edges: []const GraphMatchEdge,
     where: ?GraphWhereExpression = null,
     optional: ?[]const GraphOptionalMatch = null,
 };
 
+/// Structural edge expansion between aliases. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle.
 pub const GraphMatchEdge = struct {
     from: []const u8,
     to: []const u8,
@@ -1677,7 +1680,7 @@ pub const GraphMatchNode = struct {
     filter: ?GraphDocumentFilter = null,
 };
 
-/// Conjunctive graph match over the complete authorized source universe. Results are exact or the request fails; execution never labels a partial aggregate exact. The default explored-node budget admits at most 100,000 distributed source anchors before graph expansion.
+/// Conjunctive graph match over the complete authorized source universe. Results are exact or the request fails; execution never labels a partial aggregate exact. Source anchors are streamed in stable snapshot-pinned pages; transient expansion state remains bounded, and execution observes request deadlines, cancellation, and server resource admission.
 pub const GraphMatchQuery = struct {
     index: []const u8,
     match: GraphMatch,

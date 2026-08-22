@@ -3535,7 +3535,7 @@ fn buildGraphQueryBuilderSystemPrompt(
         \\- Neighbors: {"index":"graph_idx","traverse":{"start":{"result_ref":"$query_results","limit":5},"edge_types":["links"],"max_depth":1}}
         \\- Traverse: {"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]},"edge_types":["references"],"max_depth":2,"deduplicate_nodes":true}}
         \\- Shortest path: {"index":"graph_idx","shortest_path":{"from":{"key":"doc:a"},"to":{"key":"doc:b"},"edge_types":["depends_on"],"max_depth":6}}
-        \\- Match with exact endpoints: {"index":"graph_idx","match":{"nodes":{"a":{"filter":{"ids":["doc:a"]}},"b":{},"c":{"filter":{"ids":["doc:c"]}}},"edges":[{"from":"a","to":"b","types":["links"]},{"from":"b","to":"c","types":["links"]}]},"return":{"bindings":["c"]}}
+        \\- Match with exact endpoints: {"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc:a"]}},"b":{},"c":{"filter":{"ids":["doc:c"]}}},"edges":[{"from":"a","to":"b","types":["links"]},{"from":"b","to":"c","types":["links"]}]},"return":{"bindings":["c"]}}
         \\
         \\Always include index and exactly one operation key. For traversal, use {"result_ref":"$query_results"} when node keys are not explicit. Prefer named graph indexes listed below.
         \\Use fields only from the schema context. Do not invent fields or indexes.
@@ -4814,7 +4814,7 @@ fn queryBuilderInferredGraphSearches(
         return_value.* = .{ .bindings = try alloc.dupe([]const u8, &[_][]const u8{return_alias}) };
         query.* = .{
             .index = try alloc.dupe(u8, std.mem.trim(u8, index, " \t\r\n")),
-            .match = .{ .nodes = nodes, .edges = edges },
+            .match = .{ .anchor = try queryBuilderPatternAlias(alloc, 0), .nodes = nodes, .edges = edges },
             .@"return" = .{ .graph_bindings_return = return_value },
         };
         try graph_queries.map.put(alloc, "graph_search", .{ .graph_match_query = query });
@@ -8921,7 +8921,7 @@ test "query builder rejects generated graph malformed patterns" {
         ) !generating.GenerateResult {
             return .{
                 .content = try alloc.dupe(u8,
-                    \\{"graph_queries":{"bad":{"index":"doc_graph","match":{"nodes":{"a":{},"b":{}},"edges":[{"from":"a","to":"b","types":["links"],"min_hops":2,"max_hops":1}]},"return":{"bindings":["missing"]}}},"explanation":"bad pattern","confidence":0.99}
+                    \\{"graph_queries":{"bad":{"index":"doc_graph","match":{"anchor":"a","nodes":{"a":{},"b":{}},"edges":[{"from":"a","to":"b","types":["links"],"min_hops":2,"max_hops":1}]},"return":{"bindings":["missing"]}}},"explanation":"bad pattern","confidence":0.99}
                 ),
                 .allocator = alloc,
             };

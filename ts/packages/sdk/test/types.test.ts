@@ -180,7 +180,7 @@ describe("Antfly Query Type Integration", () => {
       };
       const graph: GraphMatchQuery = {
         index: "social",
-        match: { nodes: { person: { filter } }, edges: [] },
+        match: { anchor: "person", nodes: { person: { filter } }, edges: [] },
         return: { aggregates: { count: { count: "*" } } },
       };
       const request: QueryRequest = { graph_queries: { people: graph } };

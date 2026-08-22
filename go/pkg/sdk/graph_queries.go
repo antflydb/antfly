@@ -332,7 +332,6 @@ func NewGraphAggregatesReturn(aggregates map[string]GraphCountAggregate) (GraphR
 	if len(aggregates) > maxGraphCountAggregates {
 		return GraphReturn{}, fmt.Errorf("antfly: graph aggregates exceed the maximum of %d", maxGraphCountAggregates)
 	}
-	seenExpressions := make(map[string]string, len(aggregates))
 	for name, aggregate := range aggregates {
 		if strings.TrimSpace(name) == "" {
 			return GraphReturn{}, fmt.Errorf("antfly: graph aggregate name must not be empty")
@@ -343,11 +342,6 @@ func NewGraphAggregatesReturn(aggregates map[string]GraphCountAggregate) (GraphR
 		if aggregate.Count == "*" && aggregate.Distinct {
 			return GraphReturn{}, fmt.Errorf("antfly: graph aggregate %q cannot use distinct count(*)", name)
 		}
-		expression := fmt.Sprintf("%t\x00%s", aggregate.Distinct, aggregate.Count)
-		if prior, ok := seenExpressions[expression]; ok {
-			return GraphReturn{}, fmt.Errorf("antfly: graph aggregates %q and %q duplicate the same count expression", prior, name)
-		}
-		seenExpressions[expression] = name
 	}
 	var result GraphReturn
 	err := result.FromGraphAggregatesReturn(GraphAggregatesReturn{Aggregates: aggregates})
@@ -433,6 +427,12 @@ func validateGraphMatchQuery(query GraphMatchQuery) error {
 	visible := make(map[string]struct{}, len(query.Match.Nodes))
 	for alias := range query.Match.Nodes {
 		visible[alias] = struct{}{}
+	}
+	if strings.TrimSpace(query.Match.Anchor) == "" {
+		return fmt.Errorf("antfly: graph match anchor must not be empty")
+	}
+	if _, ok := visible[query.Match.Anchor]; !ok {
+		return fmt.Errorf("antfly: graph match anchor %q is not declared in nodes", query.Match.Anchor)
 	}
 	for _, edge := range query.Match.Edges {
 		if err := validateGraphMatchEdge(edge, visible); err != nil {

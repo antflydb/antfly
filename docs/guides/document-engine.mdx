@@ -230,6 +230,7 @@ not run full-text analyzers. Range predicates use explicit `numeric_range` or
     "authored_replies": {
       "index": "social_graph",
       "match": {
+        "anchor": "author",
         "nodes": {
           "author": {"filter": {"term": "person", "field": "kind"}},
           "post": {},
@@ -262,6 +263,10 @@ not run full-text analyzers. Range predicates use explicit `numeric_range` or
 ```
 
 Exact aggregation streams bindings without materializing a bounded row page.
+`match.anchor` names the alias enumerated from the query table; aliases reached
+through cross-table edges retain their table-qualified identities. Anchor
+identities are read in stable snapshot-pinned pages, independently for each
+named graph operation.
 If Antfly cannot enumerate the complete authorized anchor relation or exhausts
 its graph work budget, the request fails instead of returning a partial count.
 

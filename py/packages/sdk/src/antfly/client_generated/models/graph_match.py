@@ -23,12 +23,15 @@ T = TypeVar("T", bound="GraphMatch")
 class GraphMatch:
     """
     Attributes:
+        anchor (str): Alias enumerated from the query table as the source relation. Every other alias is reached through
+            graph edges and may resolve to a table-qualified target identity.
         nodes (GraphMatchNodes):
         edges (list[GraphMatchEdge]):
         where (GraphWhereAnd | GraphWhereNotEqual | GraphWhereNotExists | Unset):
         optional (list[GraphOptionalMatch] | Unset):
     """
 
+    anchor: str
     nodes: GraphMatchNodes
     edges: list[GraphMatchEdge]
     where: GraphWhereAnd | GraphWhereNotEqual | GraphWhereNotExists | Unset = UNSET
@@ -37,6 +40,8 @@ class GraphMatch:
     def to_dict(self) -> dict[str, Any]:
         from ..models.graph_where_and import GraphWhereAnd
         from ..models.graph_where_not_equal import GraphWhereNotEqual
+
+        anchor = self.anchor
 
         nodes = self.nodes.to_dict()
 
@@ -66,6 +71,7 @@ class GraphMatch:
 
         field_dict.update(
             {
+                "anchor": anchor,
                 "nodes": nodes,
                 "edges": edges,
             }
@@ -87,6 +93,8 @@ class GraphMatch:
         from ..models.graph_where_not_exists import GraphWhereNotExists
 
         d = dict(src_dict)
+        anchor = d.pop("anchor")
+
         nodes = GraphMatchNodes.from_dict(d.pop("nodes"))
 
         edges = []
@@ -133,6 +141,7 @@ class GraphMatch:
                 optional.append(optional_item)
 
         graph_match = cls(
+            anchor=anchor,
             nodes=nodes,
             edges=edges,
             where=where,

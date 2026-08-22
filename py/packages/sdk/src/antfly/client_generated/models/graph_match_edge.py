@@ -13,19 +13,22 @@ T = TypeVar("T", bound="GraphMatchEdge")
 
 @_attrs_define
 class GraphMatchEdge:
-    """
-    Attributes:
-        from_ (str):
-        to (str):
-        types (list[str] | Unset): Empty or omitted matches every edge type.
-        direction (EdgeDirection | Unset): Direction of edges to query:
-            - out: Outgoing edges from the node
-            - in: Incoming edges to the node
-            - both: Both outgoing and incoming edges
-        min_hops (int | Unset):  Default: 1.
-        max_hops (int | Unset):  Default: 1.
-        min_weight (float | Unset):
-        max_weight (float | Unset):
+    """Structural edge expansion between aliases. Variable-length expansion uses node-simple paths: a (table, key) identity
+    is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an
+    explicit cycle.
+
+        Attributes:
+            from_ (str):
+            to (str):
+            types (list[str] | Unset): Empty or omitted matches every edge type.
+            direction (EdgeDirection | Unset): Direction of edges to query:
+                - out: Outgoing edges from the node
+                - in: Incoming edges to the node
+                - both: Both outgoing and incoming edges
+            min_hops (int | Unset):  Default: 1.
+            max_hops (int | Unset):  Default: 1.
+            min_weight (float | Unset):
+            max_weight (float | Unset):
     """
 
     from_: str

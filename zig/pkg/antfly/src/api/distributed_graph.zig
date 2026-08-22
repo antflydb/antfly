@@ -737,12 +737,37 @@ pub fn requiresCompleteMatchAnchors(req: db_mod.types.SearchRequest) bool {
     return false;
 }
 
-/// Canonical MATCH consumes one explored-node budget unit for every admitted
-/// anchor before expansion. Fetch one extra identity so the coordinator can
-/// distinguish a complete budget-sized universe from a truncated one and fail
-/// closed without pretending a partial aggregate is exact.
-pub const max_complete_match_anchors: usize = graph_pattern_mod.default_max_explored_nodes;
-pub const complete_match_anchor_probe_limit: u32 = max_complete_match_anchors + 1;
+/// Storage-backed canonical MATCH anchors are consumed as stable `_id` cursor
+/// pages. The page bound controls transient memory only; it is deliberately not
+/// a semantic limit on exact aggregation.
+pub const complete_match_anchor_page_size: u32 = 4096;
+
+pub const MatchAnchorPageSource = struct {
+    ctx: *anyopaque,
+    fetch_fn: *const fn (
+        ctx: *anyopaque,
+        alloc: std.mem.Allocator,
+        graph_query: db_mod.types.NamedGraphQuery,
+        search_after: []const std.json.Value,
+    ) anyerror!db_mod.types.SearchResult,
+
+    fn fetch(
+        self: MatchAnchorPageSource,
+        alloc: std.mem.Allocator,
+        graph_query: db_mod.types.NamedGraphQuery,
+        search_after: []const std.json.Value,
+    ) !db_mod.types.SearchResult {
+        return self.fetch_fn(self.ctx, alloc, graph_query, search_after);
+    }
+};
+
+pub const MatchAnchorSource = union(enum) {
+    /// Compatibility path for embedded callers and focused tests. Production
+    /// table reads use `paged` so independent MATCH operations never share a
+    /// materialized candidate ceiling.
+    materialized: db_mod.types.SearchResult,
+    paged: MatchAnchorPageSource,
+};
 
 fn resultHasIdentitySnapshot(
     req: db_mod.types.SearchRequest,
@@ -861,7 +886,7 @@ pub fn executeCrossRange(
         table_name,
         req,
         base_result,
-        if (requiresCompleteMatchAnchors(req)) base_result else null,
+        if (requiresCompleteMatchAnchors(req)) MatchAnchorSource{ .materialized = base_result } else null,
         consistency,
     );
 }
@@ -873,23 +898,22 @@ pub fn executeCrossRangeWithMatchAnchors(
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
     base_result: db_mod.types.SearchResult,
-    match_anchor_result: ?db_mod.types.SearchResult,
+    match_anchor_source: ?MatchAnchorSource,
     consistency: raft_mod.ReadConsistency,
 ) ![]db_mod.types.GraphSearchResult {
     if (!supportsCrossRange(req)) return error.UnsupportedQueryRequest;
     try requireStampedCrossRangeRequest(req, base_result);
     try rejectUnstampedResultRefs(req, base_result);
-    if (requiresCompleteMatchAnchors(req) and match_anchor_result == null)
+    if (requiresCompleteMatchAnchors(req) and match_anchor_source == null)
         return error.UnsupportedQueryRequest;
-    if (match_anchor_result) |anchors| {
-        if (anchors.total_hits_relation != .exact or
-            @as(u64, anchors.total_hits) > anchors.hits.len or
-            anchors.hits.len > max_complete_match_anchors)
-            return error.QueryCandidateBudgetExceeded;
-        if (@as(u64, anchors.total_hits) < anchors.hits.len)
-            return error.InvalidQueryResult;
-        try validateMatchingSourceSnapshots(base_result, anchors);
-    }
+    if (match_anchor_source) |source| switch (source) {
+        .materialized => |anchors| {
+            if (anchors.total_hits_relation != .exact or @as(u64, anchors.total_hits) != anchors.hits.len)
+                return error.InvalidQueryResult;
+            try validateMatchingSourceSnapshots(base_result, anchors);
+        },
+        .paged => {},
+    };
 
     var request_worker = worker;
     request_worker.execution_deadline_ns = req.execution_deadline_ns;
@@ -899,7 +923,7 @@ pub fn executeCrossRangeWithMatchAnchors(
     var attempts: u32 = 0;
     while (true) : (attempts += 1) {
         try request_worker.ensureActive();
-        return executeCrossRangeOnce(alloc, catalog, request_worker, table_name, req, base_result, match_anchor_result, consistency) catch |err| switch (err) {
+        return executeCrossRangeOnce(alloc, catalog, request_worker, table_name, req, base_result, match_anchor_source, consistency) catch |err| switch (err) {
             error.TopologyChanged, error.UnknownGroup => {
                 if (attempts == 0) continue;
                 return err;
@@ -916,7 +940,7 @@ fn executeCrossRangeOnce(
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
     base_result: db_mod.types.SearchResult,
-    match_anchor_result: ?db_mod.types.SearchResult,
+    match_anchor_source: ?MatchAnchorSource,
     consistency: raft_mod.ReadConsistency,
 ) ![]db_mod.types.GraphSearchResult {
     if (!supportsCrossRange(req)) return error.UnsupportedQueryRequest;
@@ -928,8 +952,10 @@ fn executeCrossRangeOnce(
     // standalone catalog without weakening cross-shard snapshot fencing.
     try table_catalog.validateDocIdentityReadyForTable(alloc, catalog, table_name);
     try validateSourceSnapshotGroupSet(alloc, catalog, table_name, base_result);
-    if (match_anchor_result) |anchors|
-        try validateSourceSnapshotGroupSet(alloc, catalog, table_name, anchors);
+    if (match_anchor_source) |source| switch (source) {
+        .materialized => |anchors| try validateSourceSnapshotGroupSet(alloc, catalog, table_name, anchors),
+        .paged => {},
+    };
 
     const results = try alloc.alloc(db_mod.types.GraphSearchResult, req.graph_queries.len);
     const sorted_query_indexes = try graph_exec.sortGraphQueriesByDependencies(alloc, req.graph_queries);
@@ -949,7 +975,7 @@ fn executeCrossRangeOnce(
             table_name,
             req,
             base_result,
-            match_anchor_result,
+            match_anchor_source,
             results[0..initialized],
             graph_query,
             consistency,
@@ -1417,7 +1443,7 @@ fn executeSingleCrossRange(
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
     base_result: db_mod.types.SearchResult,
-    match_anchor_result: ?db_mod.types.SearchResult,
+    match_anchor_source: ?MatchAnchorSource,
     prior_results: []const db_mod.types.GraphSearchResult,
     graph_query: db_mod.types.NamedGraphQuery,
     consistency: raft_mod.ReadConsistency,
@@ -1480,7 +1506,7 @@ fn executeSingleCrossRange(
             table_name,
             req,
             base_result,
-            match_anchor_result,
+            match_anchor_source,
             prior_results,
             graph_query,
             consistency,
@@ -1566,7 +1592,7 @@ fn executeDistributedPattern(
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
     base_result: db_mod.types.SearchResult,
-    match_anchor_result: ?db_mod.types.SearchResult,
+    match_anchor_source: ?MatchAnchorSource,
     prior_results: []const db_mod.types.GraphSearchResult,
     graph_query: db_mod.types.NamedGraphQuery,
     consistency: raft_mod.ReadConsistency,
@@ -1575,11 +1601,28 @@ fn executeDistributedPattern(
     // Resolve start keys.
     var state = QueryState{ .name = try alloc.dupe(u8, graph_query.name) };
     errdefer state.deinit(alloc);
+    const edge_reader = DistributedEdgeReader{
+        .catalog = catalog,
+        .worker = worker,
+        .source_table = table_name,
+        .index_name = graph_query.query.index_name,
+        .consistency = consistency,
+        .admission = admission,
+    };
     const canonical_match = graph_query.query.match_pattern != null;
-    const selector_result = if (canonical_match)
-        match_anchor_result orelse return error.UnsupportedQueryRequest
-    else
-        base_result;
+    if (canonical_match) {
+        return try executeDistributedConjunctivePattern(
+            alloc,
+            edge_reader,
+            req,
+            graph_query,
+            match_anchor_source orelse return error.UnsupportedQueryRequest,
+            base_result,
+            admission,
+            &state,
+        );
+    }
+    const selector_result = base_result;
     var selector_req = req;
     if (canonical_match) selector_req.limit = 0;
     const frontier = try resolveStartFrontier(alloc, &state, table_name, selector_req, selector_result, prior_results, graph_query.query.start_nodes, false);
@@ -1600,29 +1643,6 @@ fn executeDistributedPattern(
     defer alloc.free(target_nodes);
     for (target_frontier, 0..) |item, i| {
         target_nodes[i] = .{ .table = item.table, .key = item.key };
-    }
-
-    // Build distributed edge reader.
-    const edge_reader = DistributedEdgeReader{
-        .catalog = catalog,
-        .worker = worker,
-        .source_table = table_name,
-        .index_name = graph_query.query.index_name,
-        .consistency = consistency,
-        .admission = admission,
-    };
-
-    if (graph_query.query.match_pattern) |conjunctive_pattern| {
-        return try executeDistributedConjunctivePattern(
-            alloc,
-            edge_reader,
-            req,
-            graph_query,
-            frontier,
-            conjunctive_pattern,
-            admission,
-            &state,
-        );
     }
 
     // Run pattern matching with distributed edges.
@@ -1680,65 +1700,242 @@ fn executeDistributedPattern(
     };
 }
 
+const AggregatePageAccumulator = struct {
+    distinct: bool,
+    value: u128 = 0,
+    seen: graph_node_identity.Map(void) = .{},
+
+    fn observe(self: *@This(), alloc: std.mem.Allocator, page: graph_pattern_mod.CountAggregateResult) !void {
+        if (!self.distinct) {
+            self.value = std.math.add(u128, self.value, page.value) catch return error.QueryCandidateBudgetExceeded;
+            return;
+        }
+        for (page.distinct_values) |identity| _ = try self.seen.putIfAbsent(alloc, identity, {});
+        self.value = @intCast(self.seen.count());
+    }
+
+    fn cloneDistinctValues(self: *@This(), alloc: std.mem.Allocator) ![]graph_node_identity.Ref {
+        if (!self.distinct) return &.{};
+        const values = try alloc.alloc(graph_node_identity.Ref, self.seen.count());
+        var initialized: usize = 0;
+        errdefer {
+            for (values[0..initialized]) |value| {
+                if (value.table) |table| alloc.free(table);
+                alloc.free(value.key);
+            }
+            if (values.len > 0) alloc.free(values);
+        }
+        var it = self.seen.keyIterator();
+        while (it.next()) |identity| {
+            const table = if (identity.table()) |table_name| try alloc.dupe(u8, table_name) else null;
+            errdefer if (table) |table_name| alloc.free(table_name);
+            values[initialized] = .{ .table = table, .key = try alloc.dupe(u8, identity.key()) };
+            initialized += 1;
+        }
+        return values;
+    }
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.seen.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+fn validateMatchAnchorPageOrder(
+    prior_cursor: ?[]const u8,
+    hits: []const db_mod.types.SearchHit,
+) !void {
+    var prior_id = prior_cursor;
+    for (hits) |hit| {
+        if (prior_id) |prior| {
+            if (std.mem.order(u8, prior, hit.id) != .lt) return error.InvalidQueryResult;
+        }
+        prior_id = hit.id;
+    }
+}
+
+fn countAggregateSpecEql(left: graph_pattern_mod.CountAggregateSpec, right: graph_pattern_mod.CountAggregateSpec) bool {
+    if (left.distinct != right.distinct) return false;
+    if (left.alias == null or right.alias == null) return left.alias == null and right.alias == null;
+    return std.mem.eql(u8, left.alias.?, right.alias.?);
+}
+
 fn executeDistributedConjunctivePattern(
     alloc: std.mem.Allocator,
     edge_reader: DistributedEdgeReader,
     req: db_mod.types.SearchRequest,
     graph_query: db_mod.types.NamedGraphQuery,
-    frontier: []const FrontierState,
-    pattern: graph_pattern_mod.ConjunctivePattern,
+    anchor_source: MatchAnchorSource,
+    base_result: db_mod.types.SearchResult,
     admission: *GraphNodeAdmissionContext,
     state: *QueryState,
 ) !db_mod.types.GraphSearchResult {
-    const start_keys = try alloc.alloc([]const u8, frontier.len);
-    defer alloc.free(start_keys);
-    for (frontier, 0..) |item, i| start_keys[i] = item.key;
-
+    const pattern = graph_query.query.match_pattern orelse return error.InvalidArgument;
     var filter_evaluator = DistributedPatternFilterEvaluator{ .admission = admission };
     defer filter_evaluator.deinit();
-    const opts = graph_pattern_mod.MatchOptions{
+    // Canonical MATCH streams source anchors and aggregate bindings, so a fixed
+    // query-wide candidate count would be a hidden cardinality ceiling rather
+    // than a memory safeguard. Deadline/cancellation and the bounded per-page
+    // intermediate-state limit remain the request work controls.
+    var work_budget = graph_pattern_mod.WorkBudget.init(
+        std.math.maxInt(usize),
+        std.math.maxInt(usize),
+    );
+    const base_opts = graph_pattern_mod.MatchOptions{
         .max_results = if (graph_query.query.return_limit > 0)
             std.math.add(u32, graph_query.query.return_limit, 1) catch graph_query.query.return_limit
         else
             graph_query.query.params.max_results,
         .return_aliases = graph_query.query.return_aliases,
         .include_paths = false,
-        .evaluator = .{ .ctx = &filter_evaluator, .func = DistributedPatternFilterEvaluator.evaluate },
+        .evaluator = .{
+            .ctx = &filter_evaluator,
+            .func = DistributedPatternFilterEvaluator.evaluate,
+            .batch_func = DistributedPatternFilterEvaluator.evaluateMany,
+        },
         .node_admission = admission.iface(),
+        .work_budget = &work_budget,
     };
 
-    if (graph_query.query.aggregates.len > 0) {
-        const specs = try alloc.alloc(graph_pattern_mod.CountAggregateSpec, graph_query.query.aggregates.len);
-        defer alloc.free(specs);
-        for (graph_query.query.aggregates, 0..) |aggregate, i| specs[i] = .{
+    var unique_specs = std.ArrayListUnmanaged(graph_pattern_mod.CountAggregateSpec).empty;
+    defer unique_specs.deinit(alloc);
+    const aggregate_indexes = try alloc.alloc(usize, graph_query.query.aggregates.len);
+    defer if (aggregate_indexes.len > 0) alloc.free(aggregate_indexes);
+    for (graph_query.query.aggregates, 0..) |aggregate, output_index| {
+        const spec = graph_pattern_mod.CountAggregateSpec{
             .alias = if (std.mem.eql(u8, aggregate.of, "*")) null else aggregate.of,
             .distinct = aggregate.distinct,
         };
-        const computed = try graph_pattern_mod.aggregateConjunctivePatternWithEdgeReader(
-            alloc,
-            edge_reader,
-            start_keys,
-            pattern,
-            specs,
-            opts,
-        );
-        defer {
-            for (computed) |*aggregate| aggregate.deinit(alloc);
-            if (computed.len > 0) alloc.free(computed);
+        var unique_index: ?usize = null;
+        for (unique_specs.items, 0..) |prior, i| {
+            if (countAggregateSpecEql(prior, spec)) {
+                unique_index = i;
+                break;
+            }
         }
-        const aggregates = try alloc.alloc(db_mod.types.GraphAggregateResult, computed.len);
+        if (unique_index == null) {
+            unique_index = unique_specs.items.len;
+            try unique_specs.append(alloc, spec);
+        }
+        aggregate_indexes[output_index] = unique_index.?;
+    }
+    const aggregate_accumulators = try alloc.alloc(AggregatePageAccumulator, unique_specs.items.len);
+    defer if (aggregate_accumulators.len > 0) alloc.free(aggregate_accumulators);
+    var initialized_accumulators: usize = 0;
+    defer for (aggregate_accumulators[0..initialized_accumulators]) |*accumulator| accumulator.deinit(alloc);
+    for (unique_specs.items, 0..) |spec, i| {
+        aggregate_accumulators[i] = .{ .distinct = spec.distinct };
+        initialized_accumulators += 1;
+    }
+
+    var collected_matches = std.ArrayListUnmanaged(graph_pattern_mod.PatternMatch).empty;
+    defer {
+        for (collected_matches.items) |*match| match.deinit(alloc);
+        collected_matches.deinit(alloc);
+    }
+    var cursor_key: ?[]u8 = null;
+    defer if (cursor_key) |key| alloc.free(key);
+    var materialized_consumed = false;
+    var truncated = false;
+    var expected_anchor_total: ?u64 = null;
+    var consumed_anchor_total: u64 = 0;
+
+    while (true) {
+        const cursor = if (cursor_key) |key| &[_]std.json.Value{.{ .string = key }} else &.{};
+        var page_owned = false;
+        var page = switch (anchor_source) {
+            .materialized => |result| blk: {
+                if (materialized_consumed) break;
+                materialized_consumed = true;
+                break :blk result;
+            },
+            .paged => |source| blk: {
+                page_owned = true;
+                break :blk try source.fetch(alloc, graph_query, cursor);
+            },
+        };
+        defer if (page_owned) page.deinit();
+
+        if (page.total_hits_relation != .exact or @as(u64, page.total_hits) < page.hits.len)
+            return error.InvalidQueryResult;
+        if (expected_anchor_total) |expected| {
+            if (expected != page.total_hits) return error.InvalidQueryResult;
+        } else {
+            expected_anchor_total = page.total_hits;
+        }
+        try validateSourceSnapshotGroupSet(alloc, edge_reader.catalog, edge_reader.source_table, page);
+        try validateMatchingSourceSnapshots(base_result, page);
+        try validateMatchAnchorPageOrder(cursor_key, page.hits);
+        if (page.hits.len == 0) break;
+        consumed_anchor_total = std.math.add(u64, consumed_anchor_total, page.hits.len) catch
+            return error.InvalidQueryResult;
+        if (consumed_anchor_total > expected_anchor_total.?) return error.InvalidQueryResult;
+
+        const start_keys = try alloc.alloc([]const u8, page.hits.len);
+        defer alloc.free(start_keys);
+        for (page.hits, 0..) |hit, i| start_keys[i] = hit.id;
+
+        if (unique_specs.items.len > 0) {
+            const computed = try graph_pattern_mod.aggregateConjunctivePatternWithEdgeReader(
+                alloc,
+                edge_reader,
+                start_keys,
+                pattern,
+                unique_specs.items,
+                base_opts,
+            );
+            defer {
+                for (computed) |*aggregate| aggregate.deinit(alloc);
+                if (computed.len > 0) alloc.free(computed);
+            }
+            for (computed, 0..) |aggregate, i| try aggregate_accumulators[i].observe(alloc, aggregate);
+        } else {
+            var page_opts = base_opts;
+            const desired = std.math.add(usize, graph_query.query.return_limit, 1) catch return error.QueryCandidateBudgetExceeded;
+            const remaining = desired -| collected_matches.items.len;
+            page_opts.max_results = @intCast(remaining);
+            const page_matches = try graph_pattern_mod.matchConjunctivePatternWithEdgeReader(
+                alloc,
+                edge_reader,
+                start_keys,
+                pattern,
+                page_opts,
+            );
+            defer graph_pattern_mod.freeMatches(alloc, page_matches);
+            for (page_matches) |*match| {
+                try collected_matches.append(alloc, match.*);
+                match.bindings = &.{};
+                match.path = &.{};
+            }
+            if (collected_matches.items.len >= desired) {
+                truncated = true;
+                break;
+            }
+        }
+
+        if (anchor_source == .materialized) break;
+        const next_cursor = try alloc.dupe(u8, page.hits[page.hits.len - 1].id);
+        if (cursor_key) |prior| alloc.free(prior);
+        cursor_key = next_cursor;
+    }
+
+    if (!truncated and consumed_anchor_total != (expected_anchor_total orelse 0))
+        return error.InvalidQueryResult;
+
+    if (unique_specs.items.len > 0) {
+        const aggregates = try alloc.alloc(db_mod.types.GraphAggregateResult, graph_query.query.aggregates.len);
         var initialized: usize = 0;
         errdefer {
             for (aggregates[0..initialized]) |*aggregate| aggregate.deinit(alloc);
             if (aggregates.len > 0) alloc.free(aggregates);
         }
-        for (computed, 0..) |*aggregate, i| {
+        for (graph_query.query.aggregates, 0..) |aggregate, i| {
+            const accumulator = &aggregate_accumulators[aggregate_indexes[i]];
             aggregates[i] = .{
-                .name = try alloc.dupe(u8, graph_query.query.aggregates[i].name),
-                .value = aggregate.value,
-                .distinct_values = aggregate.distinct_values,
+                .name = try alloc.dupe(u8, aggregate.name),
+                .value = accumulator.value,
+                .distinct_values = try accumulator.cloneDistinctValues(alloc),
             };
-            aggregate.distinct_values = &.{};
             initialized += 1;
         }
         const name = state.name;
@@ -1746,24 +1943,13 @@ fn executeDistributedConjunctivePattern(
         return .{ .name = name, .aggregates = aggregates, .hits = &.{}, .total_hits = 0 };
     }
 
-    const raw_matches = try graph_pattern_mod.matchConjunctivePatternWithEdgeReader(
-        alloc,
-        edge_reader,
-        start_keys,
-        pattern,
-        opts,
-    );
-    defer graph_pattern_mod.freeMatches(alloc, raw_matches);
-    const result_len = if (graph_query.query.return_limit > 0)
-        @min(raw_matches.len, graph_query.query.return_limit)
-    else
-        raw_matches.len;
-    const matches = try convertPatternMatches(alloc, raw_matches[0..result_len]);
+    const result_len = @min(collected_matches.items.len, graph_query.query.return_limit);
+    const matches = try convertPatternMatches(alloc, collected_matches.items[0..result_len]);
     errdefer {
         for (matches) |*match| match.deinit(alloc);
         if (matches.len > 0) alloc.free(matches);
     }
-    const unique_nodes = try graph_query_mod.collectUniqueNodesFromMatches(alloc, raw_matches[0..result_len]);
+    const unique_nodes = try graph_query_mod.collectUniqueNodesFromMatches(alloc, collected_matches.items[0..result_len]);
     defer {
         for (unique_nodes) |*node| node.deinit(alloc);
         if (unique_nodes.len > 0) alloc.free(unique_nodes);
@@ -1778,8 +1964,8 @@ fn executeDistributedConjunctivePattern(
         .name = name,
         .matches = matches,
         .hits = hits,
-        .total_hits = @intCast(raw_matches.len),
-        .truncated = graph_query.query.return_limit > 0 and raw_matches.len > graph_query.query.return_limit,
+        .total_hits = @intCast(collected_matches.items.len),
+        .truncated = truncated,
     };
 }
 
@@ -1795,6 +1981,25 @@ const DistributedPatternFilterEvaluator = struct {
         const decisions = try GraphNodeAdmissionContext.filterMany(scoped, self.admission.alloc, &nodes);
         defer self.admission.alloc.free(decisions);
         return decisions[0];
+    }
+
+    fn evaluateMany(
+        ctx: ?*anyopaque,
+        alloc: std.mem.Allocator,
+        nodes: []const graph_node_identity.Ref,
+        filter: graph_pattern_mod.NodeFilter,
+    ) anyerror![]bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        if (filter.filter_query_json == null) {
+            const decisions = try alloc.alloc(bool, nodes.len);
+            @memset(decisions, true);
+            return decisions;
+        }
+        const scoped = try self.contextFor(filter);
+        const refs = try alloc.alloc(graph_node_admission.NodeRef, nodes.len);
+        defer alloc.free(refs);
+        for (nodes, 0..) |node, i| refs[i] = .{ .table = node.table, .key = node.key };
+        return try GraphNodeAdmissionContext.filterMany(scoped, alloc, refs);
     }
 
     fn contextFor(self: *@This(), filter: graph_pattern_mod.NodeFilter) !*GraphNodeAdmissionContext {
@@ -4329,6 +4534,23 @@ test "distributed graph complete anchors require the source snapshot" {
         .shard_identity_read_generations = @constCast(stale_tokens[0..]),
     };
     try std.testing.expectError(error.TopologyChanged, validateMatchingSourceSnapshots(source, stale_snapshot));
+}
+
+test "distributed graph complete anchor pages require strict cursor order" {
+    const ordered = [_]db_mod.types.SearchHit{
+        .{ .id = @constCast("doc:b") },
+        .{ .id = @constCast("doc:c") },
+    };
+    try validateMatchAnchorPageOrder("doc:a", &ordered);
+
+    const repeated_cursor = [_]db_mod.types.SearchHit{.{ .id = @constCast("doc:a") }};
+    try std.testing.expectError(error.InvalidQueryResult, validateMatchAnchorPageOrder("doc:a", &repeated_cursor));
+
+    const out_of_order = [_]db_mod.types.SearchHit{
+        .{ .id = @constCast("doc:c") },
+        .{ .id = @constCast("doc:b") },
+    };
+    try std.testing.expectError(error.InvalidQueryResult, validateMatchAnchorPageOrder(null, &out_of_order));
 }
 
 fn edgeCost(_: FrontierState, node: graph_query_mod.GraphResultNode, mode: graph_paths_mod.PathWeightMode) f64 {

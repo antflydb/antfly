@@ -1959,7 +1959,7 @@ test "query parser rejects graph queries and graph searches together" {
 
 test "query parser accepts graph pattern searches" {
     var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"graph_queries":{"pattern_walk":{"index":"graph_idx","match":{"nodes":{"a":{"filter":{"ids":["doc:a"]}},"b":{}},"edges":[{"from":"a","to":"b","types":["links"],"max_hops":2}]},"return":{"bindings":["b"],"limit":10}}},"limit":10}
+        \\{"graph_queries":{"pattern_walk":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc:a"]}},"b":{}},"edges":[{"from":"a","to":"b","types":["links"],"max_hops":2}]},"return":{"bindings":["b"],"limit":10}}},"limit":10}
     );
     defer owned.deinit(std.testing.allocator);
 
@@ -1985,7 +1985,7 @@ test "query parser treats explicit graph document fields as a projection" {
 
 test "query parser accepts exact graph count aggregates" {
     var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"graph_queries":{"pattern_count":{"index":"graph_idx","match":{"nodes":{"a":{}},"edges":[]},"return":{"aggregates":{"count":{"count":"*"}}}}},"limit":10}
+        \\{"graph_queries":{"pattern_count":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{}},"edges":[]},"return":{"aggregates":{"count":{"count":"*"}}}}},"limit":10}
     );
     defer owned.deinit(std.testing.allocator);
 
@@ -1995,10 +1995,12 @@ test "query parser accepts exact graph count aggregates" {
     try std.testing.expectEqualStrings("*", graph_query.aggregates[0].of);
 }
 
-test "query parser rejects duplicate graph count expressions" {
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"graph_queries":{"pattern_count":{"index":"graph_idx","match":{"nodes":{"a":{}},"edges":[]},"return":{"aggregates":{"first":{"count":"a","distinct":true},"second":{"count":"a","distinct":true}}}}},"limit":10}
-    ));
+test "query parser accepts duplicate graph count expressions under different names" {
+    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+        \\{"graph_queries":{"pattern_count":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{}},"edges":[]},"return":{"aggregates":{"first":{"count":"a","distinct":true},"second":{"count":"a","distinct":true}}}}},"limit":10}
+    );
+    defer owned.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), owned.req.graph_queries[0].query.aggregates.len);
 }
 
 test "query parser rejects semantic search offsets" {

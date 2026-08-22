@@ -3120,24 +3120,21 @@ pub const ProvisionedTableReadSource = struct {
             };
             try checkQueryDeadline(base_req);
             defer merged.deinit();
-            var match_anchor_result: ?db_mod.types.SearchResult = null;
-            defer if (match_anchor_result) |*result| result.deinit();
+            var match_anchor_generations: []?u64 = &.{};
+            defer if (match_anchor_generations.len > 0) alloc.free(match_anchor_generations);
+            var match_anchor_pager: ProvisionedMatchAnchorPager = undefined;
+            var match_anchor_source: ?distributed_graph.MatchAnchorSource = null;
             if (distributed_graph.requiresCompleteMatchAnchors(req)) {
-                var anchor_req = completeGraphMatchAnchorRequest(req);
-                const anchor_filter = try completeGraphMatchAnchorFilterAlloc(alloc, req);
-                defer if (anchor_filter) |value| alloc.free(value);
-                if (anchor_filter) |value| anchor_req.filter_query_json = value;
-                const required_generations = try distributedIdentityGenerationsForGroupsAlloc(alloc, group_ids, merged);
-                defer alloc.free(required_generations);
-                match_anchor_result = try queryProvisionedAcrossGroupsAtGenerations(
-                    self,
-                    alloc,
-                    group_ids,
-                    anchor_req,
-                    table_name,
-                    .stale,
-                    required_generations,
-                );
+                match_anchor_generations = try distributedIdentityGenerationsForGroupsAlloc(alloc, group_ids, merged);
+                match_anchor_pager = .{
+                    .source = self,
+                    .group_ids = group_ids,
+                    .request = req,
+                    .table_name = table_name,
+                    .consistency = .stale,
+                    .generations = match_anchor_generations,
+                };
+                match_anchor_source = .{ .paged = .{ .ctx = &match_anchor_pager, .fetch_fn = ProvisionedMatchAnchorPager.fetch } };
             }
             const graph_req = requestWithResultIdentityGeneration(req, merged);
 
@@ -3158,7 +3155,7 @@ pub const ProvisionedTableReadSource = struct {
                 table_name,
                 graph_req,
                 merged,
-                match_anchor_result,
+                match_anchor_source,
                 consistency,
             );
             merged.graph_results = graph_results;
@@ -4165,24 +4162,21 @@ pub const HostedProvisionedTableReadSource = struct {
             var merged = try queryHostedAcrossGroups(self, alloc, group_ids, base_req, table_name, consistency);
             try checkQueryDeadline(base_req);
             defer merged.deinit();
-            var match_anchor_result: ?db_mod.types.SearchResult = null;
-            defer if (match_anchor_result) |*result| result.deinit();
+            var match_anchor_generations: []?u64 = &.{};
+            defer if (match_anchor_generations.len > 0) alloc.free(match_anchor_generations);
+            var match_anchor_pager: HostedMatchAnchorPager = undefined;
+            var match_anchor_source: ?distributed_graph.MatchAnchorSource = null;
             if (distributed_graph.requiresCompleteMatchAnchors(req)) {
-                var anchor_req = completeGraphMatchAnchorRequest(req);
-                const anchor_filter = try completeGraphMatchAnchorFilterAlloc(alloc, req);
-                defer if (anchor_filter) |value| alloc.free(value);
-                if (anchor_filter) |value| anchor_req.filter_query_json = value;
-                const required_generations = try distributedIdentityGenerationsForGroupsAlloc(alloc, group_ids, merged);
-                defer alloc.free(required_generations);
-                match_anchor_result = try queryHostedAcrossGroupsAtGenerations(
-                    self,
-                    alloc,
-                    group_ids,
-                    anchor_req,
-                    table_name,
-                    consistency,
-                    required_generations,
-                );
+                match_anchor_generations = try distributedIdentityGenerationsForGroupsAlloc(alloc, group_ids, merged);
+                match_anchor_pager = .{
+                    .source = self,
+                    .group_ids = group_ids,
+                    .request = req,
+                    .table_name = table_name,
+                    .consistency = consistency,
+                    .generations = match_anchor_generations,
+                };
+                match_anchor_source = .{ .paged = .{ .ctx = &match_anchor_pager, .fetch_fn = HostedMatchAnchorPager.fetch } };
             }
             const graph_req = requestWithResultIdentityGeneration(req, merged);
 
@@ -4194,7 +4188,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 table_name,
                 graph_req,
                 merged,
-                match_anchor_result,
+                match_anchor_source,
                 consistency,
             );
             merged.graph_results = graph_results;
@@ -5071,10 +5065,15 @@ fn distributedSearchShardLimit(req: db_mod.types.SearchRequest) u32 {
     return if (shard_limit == 0) req.limit else shard_limit;
 }
 
+const complete_match_anchor_order = [_]db_mod.types.SortField{.{ .field = "_id" }};
+
 /// Canonical MATCH is a graph relation over the authorized source-table
-/// universe, not over the public retrieval page. Build a bounded identity-only
-/// match-all request while retaining every request-scoped admission predicate.
-fn completeGraphMatchAnchorRequest(req: db_mod.types.SearchRequest) db_mod.types.SearchRequest {
+/// universe, not over the public retrieval page. Build one stable identity-only
+/// cursor page while retaining every request-scoped admission predicate.
+fn completeGraphMatchAnchorRequest(
+    req: db_mod.types.SearchRequest,
+    search_after: []const std.json.Value,
+) db_mod.types.SearchRequest {
     return .{
         .index_name = req.index_name,
         .primary_text_index_name = req.primary_text_index_name,
@@ -5085,7 +5084,9 @@ fn completeGraphMatchAnchorRequest(req: db_mod.types.SearchRequest) db_mod.types
         .doc_filter_bindings = req.doc_filter_bindings,
         .include_all_fields = false,
         .include_stored = false,
-        .limit = distributed_graph.complete_match_anchor_probe_limit,
+        .order_by = &complete_match_anchor_order,
+        .search_after = search_after,
+        .limit = distributed_graph.complete_match_anchor_page_size,
         .filter_prefix = req.filter_prefix,
         .filter_ids = req.filter_ids,
         .exclude_ids = req.exclude_ids,
@@ -5102,47 +5103,92 @@ fn completeGraphMatchAnchorRequest(req: db_mod.types.SearchRequest) db_mod.types
     };
 }
 
-/// Builds the additional identity-scan predicate for every canonical MATCH in
-/// the request. Each matcher sees only its own selected anchor filter, so the
-/// shared scan must take their union; the request/authorization predicate is
-/// then conjoined with that union.
+/// Builds the identity-scan predicate for one canonical MATCH. Named operations
+/// deliberately get independent scans so an unrelated pattern cannot expand a
+/// query's anchor relation or consume its transient page budget.
 fn completeGraphMatchAnchorFilterAlloc(
     alloc: std.mem.Allocator,
     req: db_mod.types.SearchRequest,
+    graph_query: db_mod.types.NamedGraphQuery,
 ) !?[]u8 {
-    var filters = std.ArrayListUnmanaged([]const u8).empty;
-    defer filters.deinit(alloc);
-    for (req.graph_queries) |named_query| {
-        const pattern = named_query.query.match_pattern orelse continue;
-        const anchor = graph_pattern_mod.selectConjunctiveAnchor(pattern) orelse return error.InvalidQueryRequest;
-        // A prefix-only or unfiltered anchor cannot safely participate in a
-        // JSON-query union, so retain the complete authorized source relation.
-        const filter = anchor.filter.filter_query_json orelse return null;
-        if (anchor.filter.filter_prefix.len > 0) return null;
-        try filters.append(alloc, filter);
-    }
-    if (filters.items.len == 0) return null;
+    const pattern = graph_query.query.match_pattern orelse return error.InvalidQueryRequest;
+    const anchor = graph_pattern_mod.selectConjunctiveAnchor(pattern) orelse return error.InvalidQueryRequest;
+    const filter = anchor.filter.filter_query_json;
+    if (filter == null and req.filter_query_json.len == 0) return null;
+    if (filter == null) return try alloc.dupe(u8, req.filter_query_json);
+    if (req.filter_query_json.len == 0) return try alloc.dupe(u8, filter.?);
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
-    if (req.filter_query_json.len > 0) try out.appendSlice(alloc, "{\"bool\":{\"must\":[");
-    if (filters.items.len == 1) {
-        try out.appendSlice(alloc, filters.items[0]);
-    } else {
-        try out.appendSlice(alloc, "{\"bool\":{\"should\":[");
-        for (filters.items, 0..) |filter, i| {
-            if (i > 0) try out.append(alloc, ',');
-            try out.appendSlice(alloc, filter);
-        }
-        try out.appendSlice(alloc, "],\"minimum_should_match\":1}}");
-    }
-    if (req.filter_query_json.len > 0) {
-        try out.append(alloc, ',');
-        try out.appendSlice(alloc, req.filter_query_json);
-        try out.appendSlice(alloc, "]}}");
-    }
+    try out.appendSlice(alloc, "{\"bool\":{\"must\":[");
+    try out.appendSlice(alloc, filter.?);
+    try out.append(alloc, ',');
+    try out.appendSlice(alloc, req.filter_query_json);
+    try out.appendSlice(alloc, "]}}");
     return try out.toOwnedSlice(alloc);
 }
+
+const ProvisionedMatchAnchorPager = struct {
+    source: *ProvisionedTableReadSource,
+    group_ids: []const u64,
+    request: db_mod.types.SearchRequest,
+    table_name: []const u8,
+    consistency: raft_mod.ReadConsistency,
+    generations: []const ?u64,
+
+    fn fetch(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        graph_query: db_mod.types.NamedGraphQuery,
+        search_after: []const std.json.Value,
+    ) !db_mod.types.SearchResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var anchor_req = completeGraphMatchAnchorRequest(self.request, search_after);
+        const anchor_filter = try completeGraphMatchAnchorFilterAlloc(alloc, self.request, graph_query);
+        defer if (anchor_filter) |value| alloc.free(value);
+        if (anchor_filter) |value| anchor_req.filter_query_json = value;
+        return try queryProvisionedAcrossGroupsAtGenerations(
+            self.source,
+            alloc,
+            self.group_ids,
+            anchor_req,
+            self.table_name,
+            self.consistency,
+            self.generations,
+        );
+    }
+};
+
+const HostedMatchAnchorPager = struct {
+    source: *HostedProvisionedTableReadSource,
+    group_ids: []const u64,
+    request: db_mod.types.SearchRequest,
+    table_name: []const u8,
+    consistency: raft_mod.ReadConsistency,
+    generations: []const ?u64,
+
+    fn fetch(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        graph_query: db_mod.types.NamedGraphQuery,
+        search_after: []const std.json.Value,
+    ) !db_mod.types.SearchResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var anchor_req = completeGraphMatchAnchorRequest(self.request, search_after);
+        const anchor_filter = try completeGraphMatchAnchorFilterAlloc(alloc, self.request, graph_query);
+        defer if (anchor_filter) |value| alloc.free(value);
+        if (anchor_filter) |value| anchor_req.filter_query_json = value;
+        return try queryHostedAcrossGroupsAtGenerations(
+            self.source,
+            alloc,
+            self.group_ids,
+            anchor_req,
+            self.table_name,
+            self.consistency,
+            self.generations,
+        );
+    }
+};
 
 test "complete graph match anchors retain admission and discard retrieval shaping" {
     const filter_ids = [_]u64{ 3, 7 };
@@ -5177,15 +5223,16 @@ test "complete graph match anchors retain admission and discard retrieval shapin
         .exclude_doc_ids = &excluded_doc_ids,
         .execution_deadline_ns = 1234,
         .require_algebraic_filter_resolution = true,
-    });
+    }, &.{});
 
     try std.testing.expectEqual(std.meta.Tag(db_mod.types.Query).match_all, std.meta.activeTag(anchors.query));
     try std.testing.expect(anchors.full_text == null);
     try std.testing.expectEqual(@as(usize, 0), anchors.graph_queries.len);
-    try std.testing.expectEqual(@as(usize, 0), anchors.order_by.len);
+    try std.testing.expectEqual(@as(usize, 1), anchors.order_by.len);
+    try std.testing.expectEqualStrings("_id", anchors.order_by[0].field);
     try std.testing.expectEqual(@as(usize, 0), anchors.search_after.len);
     try std.testing.expectEqual(@as(u32, 0), anchors.offset);
-    try std.testing.expectEqual(distributed_graph.complete_match_anchor_probe_limit, anchors.limit);
+    try std.testing.expectEqual(distributed_graph.complete_match_anchor_page_size, anchors.limit);
     try std.testing.expect(!anchors.include_all_fields);
     try std.testing.expect(!anchors.include_stored);
     try std.testing.expectEqualStrings("", anchors.aggregations_json);
@@ -5206,7 +5253,7 @@ test "complete graph match anchors retain admission and discard retrieval shapin
     try std.testing.expect(anchors.require_algebraic_filter_resolution);
 }
 
-test "complete graph match anchor scan conjoins authorization with selected anchor union" {
+test "complete graph match anchor scan is independent per named operation" {
     const nodes_a = [_]graph_pattern_mod.MatchNode{
         .{ .alias = "unfiltered" },
         .{ .alias = "selected", .filter = .{ .filter_query_json = "{\"ids\":[\"a\"]}" } },
@@ -5216,17 +5263,17 @@ test "complete graph match anchor scan conjoins authorization with selected anch
         .{ .alias = "unfiltered" },
     };
     const queries = [_]db_mod.types.NamedGraphQuery{
-        .{ .name = "a", .query = .{ .query_type = .pattern, .index_name = "g", .start_nodes = .{ .keys = &.{} }, .match_pattern = .{ .nodes = &nodes_a, .edges = &.{} } } },
-        .{ .name = "b", .query = .{ .query_type = .pattern, .index_name = "g", .start_nodes = .{ .keys = &.{} }, .match_pattern = .{ .nodes = &nodes_b, .edges = &.{} } } },
+        .{ .name = "a", .query = .{ .query_type = .pattern, .index_name = "g", .start_nodes = .{ .keys = &.{} }, .match_pattern = .{ .anchor_alias = "selected", .nodes = &nodes_a, .edges = &.{} } } },
+        .{ .name = "b", .query = .{ .query_type = .pattern, .index_name = "g", .start_nodes = .{ .keys = &.{} }, .match_pattern = .{ .anchor_alias = "selected", .nodes = &nodes_b, .edges = &.{} } } },
     };
     const combined = (try completeGraphMatchAnchorFilterAlloc(std.testing.allocator, .{
         .filter_query_json = "{\"term\":{\"tenant\":\"one\"}}",
         .graph_queries = &queries,
-    })).?;
+    }, queries[0])).?;
     defer std.testing.allocator.free(combined);
 
     try std.testing.expectEqualStrings(
-        "{\"bool\":{\"must\":[{\"bool\":{\"should\":[{\"ids\":[\"a\"]},{\"ids\":[\"b\"]}],\"minimum_should_match\":1}},{\"term\":{\"tenant\":\"one\"}}]}}",
+        "{\"bool\":{\"must\":[{\"ids\":[\"a\"]},{\"term\":{\"tenant\":\"one\"}}]}}",
         combined,
     );
 }
