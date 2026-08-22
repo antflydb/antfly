@@ -65,6 +65,10 @@ pub const MetadataControlLoop = struct {
         return &self.state;
     }
 
+    pub fn setClock(self: *MetadataControlLoop, clock: platform_clock.Clock) void {
+        self.reconciler.setClock(clock);
+    }
+
     /// Raw reconcile primitive.
     ///
     /// This intentionally bypasses runtime reconcile-lease fencing. Production

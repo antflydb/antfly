@@ -4981,6 +4981,7 @@ fn bootstrapDesiredLoop(
     node: MetadataHttpNodeSimulation,
     loop: *metadata_control_loop.MetadataControlLoop,
 ) !void {
+    loop.setClock(node.cluster.manual_clock.clock());
     try loop.stateRef().syncProjected(node);
     try loop.stateRef().seedDesiredFromProjected();
 }

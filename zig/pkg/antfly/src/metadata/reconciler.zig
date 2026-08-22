@@ -291,6 +291,10 @@ pub const Reconciler = struct {
         };
     }
 
+    pub fn setClock(self: *Reconciler, clock: platform_clock.Clock) void {
+        self.config.clock = clock;
+    }
+
     pub fn deinit(self: *Reconciler) void {
         self.shard_cooldowns.deinit(self.alloc);
         self.* = undefined;
