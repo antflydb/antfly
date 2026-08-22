@@ -27,10 +27,13 @@ const abandoned_cache_write_age_ns: i96 = 24 * std.time.ns_per_hour;
 const abandoned_cache_write_sweep_interval_ns: u64 = 5 * std.time.ns_per_min;
 const cache_write_owner_dir_name = ".query-cache-owners";
 const cache_write_owner_lease_suffix = ".lease";
+const cache_publication_lease_suffix = ".query-cache-publish.lease";
 const cache_coordination_file_name = ".query-cache-coordination.lock";
 const cache_coordination_magic = "AFQCC001";
 const cache_coordination_state_len = cache_coordination_magic.len + 2 * @sizeOf(u64);
 const reserved_cache_write_marker = ".tmp-query-cache-v2-";
+const abandoned_cache_write_dir_name = ".query-cache-abandoned";
+const abandoned_cache_write_suffix = ".abandoned";
 
 pub const QueryCacheConfig = struct {
     max_bytes: u64 = 0,
@@ -144,6 +147,28 @@ const CacheWriteOwnerLease = struct {
         self.file.unlock(io_impl.io());
         self.file.close(io_impl.io());
         deleteFilePath(io_impl.io(), self.path) catch {};
+        alloc.free(self.path);
+        self.* = undefined;
+    }
+};
+
+const CachePublicationLease = struct {
+    path: []u8,
+    file: std.Io.File,
+
+    fn release(self: *@This(), alloc: Allocator) void {
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        self.file.unlock(io_impl.io());
+        self.file.close(io_impl.io());
+        alloc.free(self.path);
+        self.* = undefined;
+    }
+
+    fn releaseAndDeleteUnderCoordinationLock(self: *@This(), alloc: Allocator, io: std.Io) void {
+        self.file.unlock(io);
+        self.file.close(io);
+        deleteFilePath(io, self.path) catch {};
         alloc.free(self.path);
         self.* = undefined;
     }
@@ -908,6 +933,8 @@ fn publishCacheEntry(
         recordBypass(self);
         return false;
     }
+    var publication_lease: ?CachePublicationLease = null;
+    defer if (publication_lease) |*lease| lease.release(self.alloc);
     var tmp_path: []u8 = undefined;
     {
         try lockAtomicWithCancellation(&self.maintenance_mu, cancellation);
@@ -925,6 +952,12 @@ fn publishCacheEntry(
             self.next_abandoned_write_sweep_ns = now_ns +| abandoned_cache_write_sweep_interval_ns;
         }
         if (fileExists(path)) return false;
+        try reapAbandonedCacheWritesUnderCoordinationLock(self, io, cancellation);
+        // The caller already owns the fetched bytes, so waiting for another
+        // publisher would only add tail latency. Treat its durable reservation
+        // as a per-key publication lease and let this caller return its bytes
+        // without consuming budget or evicting unrelated entries.
+        publication_lease = (try tryAcquireCachePublicationLease(self.alloc, io, path)) orelse return false;
 
         // Publish the mutation token before eviction or reservation creation.
         // A process crash at any later instruction forces every overlapping
@@ -932,6 +965,8 @@ fn publishCacheEntry(
         self.observed_coordination_generation = try advanceCacheCoordinationGeneration(self.coordination_file, io);
         if (!try ensureCapacityForWrite(self, incoming_bytes, lane, cancellation)) {
             recordBypass(self);
+            publication_lease.?.releaseAndDeleteUnderCoordinationLock(self.alloc, io);
+            publication_lease = null;
             return false;
         }
         tmp_path = try reserveTempFile(self.alloc, path, self.instance_id, incoming_bytes);
@@ -960,13 +995,35 @@ fn publishCacheEntry(
         subtractUsage(&self.usage, incoming_bytes, lane);
         recordUsage(self);
         reservation_active = false;
+        publication_lease.?.releaseAndDeleteUnderCoordinationLock(self.alloc, io);
+        publication_lease = null;
         return false;
     }
     try cancellation.check();
     try renameFilePath(io, tmp_path, path);
     recordUsage(self);
     reservation_active = false;
+    publication_lease.?.releaseAndDeleteUnderCoordinationLock(self.alloc, io);
+    publication_lease = null;
     return true;
+}
+
+fn tryAcquireCachePublicationLease(alloc: Allocator, io: std.Io, path: []const u8) !?CachePublicationLease {
+    try ensureParentDir(path);
+    const lease_path = try std.fmt.allocPrint(alloc, "{s}{s}", .{ path, cache_publication_lease_suffix });
+    errdefer alloc.free(lease_path);
+    var file = try fs_paths.createFilePortable(io, lease_path, .{
+        .read = true,
+        .truncate = false,
+    });
+    errdefer file.close(io);
+    const locked = try file.tryLock(io, .exclusive);
+    if (!locked) {
+        file.close(io);
+        alloc.free(lease_path);
+        return null;
+    }
+    return .{ .path = lease_path, .file = file };
 }
 
 fn discardCacheReservationBestEffort(
@@ -975,20 +1032,99 @@ fn discardCacheReservationBestEffort(
     reserved_bytes: u64,
     lane: CacheWriteLane,
 ) void {
-    lockAtomic(&self.maintenance_mu);
+    var abandoned_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abandoned_path = abandonedCacheWritePath(
+        &abandoned_path_buf,
+        self.root_dir,
+        tmp_path,
+    ) catch return;
+    ensureParentDir(abandoned_path) catch return;
+    var handoff_io = threadedIo();
+    defer handoff_io.deinit();
+    renameFilePath(handoff_io.io(), tmp_path, abandoned_path) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return,
+    };
+
+    // Request teardown must never wait behind cache maintenance or another
+    // process. The atomic rename above is the durable handoff; this fast path
+    // reclaims immediately only when both locks are already available.
+    if (!self.maintenance_mu.tryLock()) return;
     defer self.maintenance_mu.unlock();
     var coordination_io = threadedIo();
     defer coordination_io.deinit();
     const io = coordination_io.io();
-    lockFileExclusiveWithCancellation(self.coordination_file, io, .none) catch return;
+    const coordination_locked = self.coordination_file.tryLock(io, .exclusive) catch return;
+    if (!coordination_locked) return;
     defer self.coordination_file.unlock(io);
-    synchronizeCacheUsageUnderCoordinationLock(self, io, .none, false) catch return;
-    self.observed_coordination_generation = advanceCacheCoordinationGeneration(self.coordination_file, io) catch return;
-    deleteFilePath(io, tmp_path) catch |err| switch (err) {
+    // Keep cancellation teardown O(1): publish a dirty generation, remove this
+    // exact handoff, and adjust the conservative local snapshot. Intentionally
+    // leave observed_coordination_generation unchanged so the next ordinary
+    // operation reconciles any concurrent process mutations.
+    _ = advanceCacheCoordinationGeneration(self.coordination_file, io) catch return;
+    deleteFilePath(io, abandoned_path) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return,
     };
     subtractUsage(&self.usage, reserved_bytes, lane);
+    recordUsage(self);
+}
+
+fn abandonedCacheWritePath(buf: []u8, root_dir: []const u8, tmp_path: []const u8) ![]u8 {
+    const tmp_name = std.fs.path.basename(tmp_path);
+    const marker_index = std.mem.lastIndexOf(u8, tmp_name, reserved_cache_write_marker) orelse
+        return error.InvalidCacheReservation;
+    const separator = if (std.mem.endsWith(u8, root_dir, std.fs.path.sep_str)) "" else std.fs.path.sep_str;
+    return try std.fmt.bufPrint(
+        buf,
+        "{s}{s}{s}{s}{s}{s}",
+        .{
+            root_dir,
+            separator,
+            abandoned_cache_write_dir_name,
+            std.fs.path.sep_str,
+            tmp_name[marker_index..],
+            abandoned_cache_write_suffix,
+        },
+    );
+}
+
+fn isAbandonedCacheWrite(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, abandoned_cache_write_suffix) and
+        std.mem.indexOf(u8, path, reserved_cache_write_marker) != null;
+}
+
+fn abandonedCacheWritesExist(alloc: Allocator, io: std.Io, root_dir: []const u8) !bool {
+    const path = try std.fs.path.join(alloc, &.{ root_dir, abandoned_cache_write_dir_name });
+    defer alloc.free(path);
+    var dir = (if (std.fs.path.isAbsolute(path))
+        std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true })
+    else
+        std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true })) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer dir.close(io);
+    var iter = dir.iterateAssumeFirstIteration();
+    while (try iter.next(io)) |entry| {
+        if (entry.kind == .file and isAbandonedCacheWrite(entry.name)) return true;
+    }
+    return false;
+}
+
+fn reapAbandonedCacheWritesUnderCoordinationLock(
+    self: *QueryCache,
+    io: std.Io,
+    cancellation: CancellationToken,
+) !void {
+    if (!try abandonedCacheWritesExist(self.alloc, io, self.root_dir)) return;
+    // Publish the mutation before deleting durable handoffs. Only publish the
+    // observed generation after reconciliation succeeds, so an I/O failure
+    // forces the next operation to rescan instead of trusting stale counters.
+    const mutation_generation = try advanceCacheCoordinationGeneration(self.coordination_file, io);
+    const reconciled_usage = try reconcileCacheOnDisk(self.alloc, self.root_dir, self.instance_id, cancellation);
+    self.usage = reconciled_usage;
+    self.observed_coordination_generation = mutation_generation;
     recordUsage(self);
 }
 
@@ -1182,6 +1318,10 @@ fn reconcileCacheOnDisk(
     while (try walker.next(io)) |entry| {
         try cancellation.check();
         if (entry.kind != .file) continue;
+        if (isCachePublicationLeasePath(entry.path)) {
+            _ = try removeUnlockedCacheWrite(io, dir, entry.path, null);
+            continue;
+        }
         if (isQueryCacheControlPath(entry.path)) continue;
         const stat = dir.statFile(io, entry.path, .{}) catch |err| switch (err) {
             error.FileNotFound => continue,
@@ -1242,6 +1382,7 @@ fn reconcileTemporaryCacheWrite(
     observed_mtime_ns: i128,
     cutoff_ns: i128,
 ) !TemporaryCacheWriteDisposition {
+    if (isAbandonedCacheWrite(path)) return try removeUnlockedCacheWrite(io, dir, path, null);
     if (temporaryCacheWriteOwnerId(path)) |owner_id| {
         if (owner_id == current_instance_id) return .current_owner;
         switch (try cacheWriteOwnerState(alloc, io, root_dir, owner_id)) {
@@ -1301,7 +1442,11 @@ fn temporaryCacheWriteOwnerId(path: []const u8) ?u128 {
 
 fn temporaryCacheReservedBytes(path: []const u8) ?u64 {
     const marker_index = std.mem.lastIndexOf(u8, path, reserved_cache_write_marker) orelse return null;
-    const encoded = path[marker_index + reserved_cache_write_marker.len ..];
+    const raw_encoded = path[marker_index + reserved_cache_write_marker.len ..];
+    const encoded = if (std.mem.endsWith(u8, raw_encoded, abandoned_cache_write_suffix))
+        raw_encoded[0 .. raw_encoded.len - abandoned_cache_write_suffix.len]
+    else
+        raw_encoded;
     const separator = std.mem.lastIndexOfScalar(u8, encoded, '-') orelse return null;
     if (separator + 1 >= encoded.len) return null;
     return std.fmt.parseInt(u64, encoded[separator + 1 ..], 10) catch null;
@@ -1395,8 +1540,14 @@ fn isCacheWriteOwnerLeasePath(path: []const u8) bool {
         std.mem.endsWith(u8, std.fs.path.basename(path), cache_write_owner_lease_suffix);
 }
 
+fn isCachePublicationLeasePath(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, cache_publication_lease_suffix);
+}
+
 fn isQueryCacheControlPath(path: []const u8) bool {
-    return std.mem.eql(u8, path, cache_coordination_file_name) or isCacheWriteOwnerLeasePath(path);
+    return std.mem.eql(u8, path, cache_coordination_file_name) or
+        isCacheWriteOwnerLeasePath(path) or
+        isCachePublicationLeasePath(path);
 }
 
 fn usesVerifiedCacheRecordPath(path: []const u8) bool {
@@ -2256,6 +2407,104 @@ test "serverless query cache reserves shared disk budget before staging bytes" {
 
     discardCacheReservationBestEffort(&first, reservation_path, 8, .full);
     reservation_active = false;
+}
+
+test "serverless query cache coalesces duplicate publication reservations before eviction" {
+    const alloc = std.testing.allocator;
+    var cache_root_buf: [256]u8 = undefined;
+    const cache_root = tmpPath(&cache_root_buf, "cache-shared-publication-lease");
+    defer cleanupTmp(cache_root);
+
+    const cfg = QueryCacheConfig{
+        .max_bytes = 16,
+        .max_payload_bytes = 16,
+    };
+    var first = try QueryCache.initWithConfig(alloc, std.mem.span(cache_root), cfg);
+    defer first.deinit();
+    var overlap = try QueryCache.initWithConfig(alloc, std.mem.span(cache_root), cfg);
+    defer overlap.deinit();
+
+    const retained_path = try std.fs.path.join(alloc, &.{ std.mem.span(cache_root), "retained" });
+    defer alloc.free(retained_path);
+    try std.testing.expect(try publishCacheEntry(&first, retained_path, "12345678", .full, .none));
+
+    const shared_path = try std.fs.path.join(alloc, &.{ std.mem.span(cache_root), "shared" });
+    defer alloc.free(shared_path);
+    var reservation_path: []u8 = undefined;
+    var publication_lease: CachePublicationLease = undefined;
+    {
+        try lockAtomicWithCancellation(&first.maintenance_mu, .none);
+        defer first.maintenance_mu.unlock();
+        var coordination_io = threadedIo();
+        defer coordination_io.deinit();
+        const io = coordination_io.io();
+        try lockFileExclusiveWithCancellation(first.coordination_file, io, .none);
+        defer first.coordination_file.unlock(io);
+        try synchronizeCacheUsageUnderCoordinationLock(&first, io, .none, false);
+        publication_lease = (try tryAcquireCachePublicationLease(alloc, io, shared_path)).?;
+        first.observed_coordination_generation = try advanceCacheCoordinationGeneration(first.coordination_file, io);
+        try std.testing.expect(try ensureCapacityForWrite(&first, 8, .full, .none));
+        reservation_path = try reserveTempFile(alloc, shared_path, first.instance_id, 8);
+        addUsage(&first.usage, 8, .full);
+        recordUsage(&first);
+    }
+    defer publication_lease.release(alloc);
+    defer alloc.free(reservation_path);
+    var reservation_active = true;
+    defer if (reservation_active) discardCacheReservationBestEffort(&first, reservation_path, 8, .full);
+
+    try std.testing.expect(!try publishCacheEntry(&overlap, shared_path, "abcdefgh", .full, .none));
+    try std.testing.expect(fileExists(retained_path));
+    try std.testing.expect(!fileExists(shared_path));
+    try std.testing.expectEqual(@as(u64, 0), overlap.statsSnapshot().evictions);
+    try std.testing.expectEqual(@as(u64, 0), overlap.statsSnapshot().bypasses);
+    try std.testing.expectEqual(@as(u64, 16), overlap.statsSnapshot().current_bytes);
+
+    discardCacheReservationBestEffort(&first, reservation_path, 8, .full);
+    reservation_active = false;
+}
+
+test "serverless query cache hands cleanup off without waiting for maintenance" {
+    const alloc = std.testing.allocator;
+    var cache_root_buf: [256]u8 = undefined;
+    const cache_root = tmpPath(&cache_root_buf, "cache-cancel-cleanup-handoff");
+    defer cleanupTmp(cache_root);
+
+    var cache = try QueryCache.initWithConfig(alloc, std.mem.span(cache_root), .{
+        .max_bytes = 8,
+        .max_payload_bytes = 8,
+    });
+    defer cache.deinit();
+    const path = try std.fs.path.join(alloc, &.{ std.mem.span(cache_root), "canceled" });
+    defer alloc.free(path);
+    var reservation_path: []u8 = undefined;
+    var publication_lease: CachePublicationLease = undefined;
+    {
+        var coordination_io = threadedIo();
+        defer coordination_io.deinit();
+        const io = coordination_io.io();
+        try lockFileExclusiveWithCancellation(cache.coordination_file, io, .none);
+        defer cache.coordination_file.unlock(io);
+        publication_lease = (try tryAcquireCachePublicationLease(alloc, io, path)).?;
+        cache.observed_coordination_generation = try advanceCacheCoordinationGeneration(cache.coordination_file, io);
+        reservation_path = try reserveTempFile(alloc, path, cache.instance_id, 8);
+    }
+    defer alloc.free(reservation_path);
+    addUsage(&cache.usage, 8, .full);
+    recordUsage(&cache);
+
+    lockAtomic(&cache.maintenance_mu);
+    discardCacheReservationBestEffort(&cache, reservation_path, 8, .full);
+    cache.maintenance_mu.unlock();
+    // Cancellation releases the key lease without waiting for the global
+    // coordination lock. Its unlocked file is intentionally reusable.
+    publication_lease.release(alloc);
+
+    try std.testing.expect(!fileExists(reservation_path));
+    try std.testing.expectEqual(@as(u64, 8), try currentBytesNoLock(alloc, std.mem.span(cache_root)));
+    try std.testing.expect(try publishCacheEntry(&cache, path, "abcdefgh", .full, .none));
+    try std.testing.expectEqual(@as(u64, 8), try currentBytesNoLock(alloc, std.mem.span(cache_root)));
+    try std.testing.expectEqual(@as(u64, 8), cache.statsSnapshot().current_bytes);
 }
 
 test "serverless query cache prunes legacy pinned block records during startup" {
