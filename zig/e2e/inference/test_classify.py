@@ -111,6 +111,7 @@ def test_classify_multiple_texts(api):
     expected = ["sports", "politics", "entertainment"]
 
     resp = api.classify(text=texts, labels=labels)
+    print(f"classification_response={resp!r}")
     classifications = [item["classifications"] for item in resp["data"]]
     assert len(classifications) == len(texts)
 

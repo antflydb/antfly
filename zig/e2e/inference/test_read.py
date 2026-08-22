@@ -222,6 +222,7 @@ def test_read_image(api):
     resp = api.read(images=[TINY_PNG_URI])
     assert_openai_list_response(resp, expected_len=1)
     results = resp["data"]
+    print(f"florence_response={resp!r}")
     assert len(results) == 1
     _assert_read_result_shape(results[0])
 

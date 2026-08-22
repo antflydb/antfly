@@ -189,6 +189,13 @@ jobs:
               hf:ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_0 \
               --tasks generate \
               --projector Q8_0
+          elif [[ "${{ inputs.scope }}" == "regressions" ]]; then
+            ./zig-out/bin/antfly inference pull \
+              hf:cross-encoder/nli-distilroberta-base:native \
+              --tasks classify
+            ./zig-out/bin/antfly inference pull \
+              hf:antflydb/florence-2-base:gguf:Q4_K \
+              --tasks read
           else
             uv run --project e2e/inference python -m e2e.inference.pull_models
           fi
@@ -215,11 +222,33 @@ jobs:
             uv run --project e2e/inference pytest -q \
               e2e/inference/test_generate.py::test_configured_generation_smoke
           elif [[ "${{ inputs.scope }}" == "regressions" ]]; then
-            uv run --project e2e/inference pytest -q \
-              e2e/inference/test_classify.py::test_classify_multiple_texts \
-              e2e/inference/test_generate.py::test_multimodal_generation \
-              e2e/inference/test_model_helpers.py::test_server_budget_args_validate_and_preserve_values \
+            failures=0
+            run_case() {
+              if ! "$@"; then
+                failures=1
+              fi
+            }
+            run_case env \
+              ANTFLY_INFERENCE_PREFERRED_BACKEND=native \
+              ANTFLY_INFERENCE_REQUIRE_SELECTED_BACKEND=native \
+              uv run --project e2e/inference pytest -q -s \
+              e2e/inference/test_classify.py::test_classify_multiple_texts
+            run_case env \
+              ANTFLY_INFERENCE_PREFERRED_BACKEND=cuda \
+              ANTFLY_INFERENCE_REQUIRE_SELECTED_BACKEND=cuda \
+              uv run --project e2e/inference pytest -q -s \
+              e2e/inference/test_classify.py::test_classify_multiple_texts
+            run_case env \
+              ANTFLY_INFERENCE_PREFERRED_BACKEND=native \
+              ANTFLY_INFERENCE_REQUIRE_SELECTED_BACKEND=native \
+              uv run --project e2e/inference pytest -q -s \
               e2e/inference/test_read.py::test_read_florence_model_answers_text
+            run_case env \
+              ANTFLY_INFERENCE_PREFERRED_BACKEND=cuda \
+              ANTFLY_INFERENCE_REQUIRE_SELECTED_BACKEND=cuda \
+              uv run --project e2e/inference pytest -q -s \
+              e2e/inference/test_read.py::test_read_florence_model_answers_text
+            exit "$failures"
           else
             uv run --project e2e/inference pytest -q --continue-on-collection-errors \
               e2e/inference
