@@ -21408,23 +21408,13 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
                 status = cached_status;
                 status_initialized = true;
                 status_from_cached_best_effort = true;
-                if (cached_best_effort_source == .startup_catch_up or
-                    status.stats.async_indexing.startup.active)
-                {
-                    // Crossing out of startup is a lifecycle edge. Refresh
-                    // exact counters opportunistically, but preserve the
-                    // cached observation if a foreground apply owns the DB.
-                    if (!try refreshRuntimeStatusStatsIfAvailable(alloc, &status, db)) {
-                        db.overlayRuntimeStatusBestEffort(alloc, &status.stats);
-                    }
-                } else if (runtimeStatusNeedsAuthoritativeLifecycleRefresh(status)) {
-                    const fresh_stats = (try db.runtimeStatusStatsConsistentIfAvailable(alloc)) orelse
-                        return error.WriterLocked;
-                    db_mod.types.freeDBStats(alloc, status.stats);
-                    status.stats = fresh_stats;
-                } else {
-                    db.overlayRuntimeStatusBestEffort(alloc, &status.stats);
-                }
+                // Relabeling a cached observation as a fresh writer snapshot is
+                // safe only after sampling source cardinality and derived
+                // coverage under the same apply-lock boundary. A runtime-only
+                // overlay can legitimately no-op during foreground apply; in
+                // that case preserve the existing cached status and retry.
+                if (!try refreshRuntimeStatusStatsIfAvailable(alloc, &status, db)) return error.WriterLocked;
+                status_from_cached_best_effort = false;
             },
             .consistent => {
                 const disk_bytes = cached_status.disk_bytes;
@@ -35506,6 +35496,18 @@ test "provisioned table write source best effort publish does not advertise lock
     try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, published.items[0].metadata.freshness);
     try std.testing.expectEqual(@as(u64, 1), published.items[0].stats.source_doc_count);
     try std.testing.expectEqual(published.items[0].stats.doc_identity.live_ordinals, published.items[0].stats.source_doc_count);
+
+    const published_at_ns = published.items[0].metadata.updated_at_ns;
+    published.deinit(alloc);
+
+    db.core.lockApplyExclusive();
+    const republished_cached_while_busy = source.publishManagedRuntimeStatusBestEffort("docs", 7001, &db);
+    db.core.unlockApplyExclusive();
+    try std.testing.expect(!republished_cached_while_busy);
+
+    published = (try snapshot_cache.snapshot(alloc, "docs")).?;
+    try std.testing.expectEqual(published_at_ns, published.items[0].metadata.updated_at_ns);
+    try std.testing.expectEqual(@as(u64, 1), published.items[0].stats.source_doc_count);
 }
 
 test "provisioned table write source consistent visibility refreshes stale dense status" {

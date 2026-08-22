@@ -27,6 +27,10 @@ const abandoned_cache_write_age_ns: i96 = 24 * std.time.ns_per_hour;
 const abandoned_cache_write_sweep_interval_ns: u64 = 5 * std.time.ns_per_min;
 const cache_write_owner_dir_name = ".query-cache-owners";
 const cache_write_owner_lease_suffix = ".lease";
+const cache_coordination_file_name = ".query-cache-coordination.lock";
+const cache_coordination_magic = "AFQCC001";
+const cache_coordination_state_len = cache_coordination_magic.len + 2 * @sizeOf(u64);
+const reserved_cache_write_marker = ".tmp-query-cache-v2-";
 
 pub const QueryCacheConfig = struct {
     max_bytes: u64 = 0,
@@ -151,6 +155,8 @@ pub const QueryCache = struct {
     instance_id: u128,
     owner_lease_path: []u8,
     owner_lease_file: std.Io.File,
+    coordination_file: std.Io.File,
+    observed_coordination_generation: u64,
     next_abandoned_write_sweep_ns: u64,
     cfg: QueryCacheConfig,
     stats_mu: std.atomic.Mutex = .unlocked,
@@ -166,6 +172,17 @@ pub const QueryCache = struct {
         var io_impl = threadedIo();
         defer io_impl.deinit();
         try fs_paths.createDirPathPortable(io_impl.io(), root_dir);
+        const coordination_path = try std.fs.path.join(alloc, &.{ root_dir, cache_coordination_file_name });
+        defer alloc.free(coordination_path);
+        var coordination_file = try fs_paths.createFilePortable(io_impl.io(), coordination_path, .{
+            .read = true,
+            .truncate = false,
+        });
+        var coordination_file_transferred = false;
+        errdefer if (!coordination_file_transferred) coordination_file.close(io_impl.io());
+        try lockFileExclusiveWithCancellation(coordination_file, io_impl.io(), .none);
+        defer coordination_file.unlock(io_impl.io());
+        const coordination_generation = try advanceCacheCoordinationGeneration(coordination_file, io_impl.io());
         var instance_id: u128 = undefined;
         io_impl.io().random(std.mem.asBytes(&instance_id));
         var owner_lease = try acquireCacheWriteOwnerLease(alloc, root_dir, instance_id);
@@ -177,6 +194,8 @@ pub const QueryCache = struct {
             .instance_id = instance_id,
             .owner_lease_path = owner_lease.path,
             .owner_lease_file = owner_lease.file,
+            .coordination_file = coordination_file,
+            .observed_coordination_generation = coordination_generation,
             .next_abandoned_write_sweep_ns = platform_time.monotonicNs() +| abandoned_cache_write_sweep_interval_ns,
             .cfg = cfg,
             .stats = .{
@@ -185,7 +204,15 @@ pub const QueryCache = struct {
             },
         };
         owner_lease.transferred = true;
-        errdefer cache.deinit();
+        coordination_file_transferred = true;
+        errdefer {
+            cache.owner_lease_file.unlock(io_impl.io());
+            cache.owner_lease_file.close(io_impl.io());
+            deleteFilePath(io_impl.io(), cache.owner_lease_path) catch {};
+            cache.alloc.free(cache.owner_lease_path);
+            cache.alloc.free(cache.root_dir);
+            coordination_file_transferred = false;
+        }
         cache.usage = startup_usage;
         applyUsageToStats(&cache.stats, cache.usage);
         try enforceStartupCapacity(&cache);
@@ -195,9 +222,21 @@ pub const QueryCache = struct {
     pub fn deinit(self: *QueryCache) void {
         var io_impl = threadedIo();
         defer io_impl.deinit();
+        const coordination_locked = blk: {
+            lockFileExclusiveWithCancellation(self.coordination_file, io_impl.io(), .none) catch break :blk false;
+            break :blk true;
+        };
+        if (coordination_locked) {
+            self.observed_coordination_generation = advanceCacheCoordinationGeneration(self.coordination_file, io_impl.io()) catch self.observed_coordination_generation;
+        }
         self.owner_lease_file.unlock(io_impl.io());
         self.owner_lease_file.close(io_impl.io());
-        deleteFilePath(io_impl.io(), self.owner_lease_path) catch {};
+        // If the coordination lock itself is unavailable, leave the unlocked
+        // lease behind for the next reconciler. Deleting it without the lock
+        // would reopen the create-before-lock race this protocol prevents.
+        if (coordination_locked) deleteFilePath(io_impl.io(), self.owner_lease_path) catch {};
+        if (coordination_locked) self.coordination_file.unlock(io_impl.io());
+        self.coordination_file.close(io_impl.io());
         self.alloc.free(self.owner_lease_path);
         self.alloc.free(self.root_dir);
         self.* = undefined;
@@ -489,6 +528,68 @@ fn threadedIo() std.Io.Threaded {
     return std.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
+fn lockFileExclusiveWithCancellation(
+    file: std.Io.File,
+    io: std.Io,
+    cancellation: CancellationToken,
+) !void {
+    var attempts: usize = 0;
+    while (!try file.tryLock(io, .exclusive)) : (attempts += 1) {
+        try cancellation.check();
+        if (attempts < 64) {
+            std.atomic.spinLoopHint();
+        } else if (attempts < 256) {
+            std.Thread.yield() catch {};
+        } else {
+            platform_time.sleepNs(std.time.ns_per_ms);
+        }
+    }
+    errdefer file.unlock(io);
+    try cancellation.check();
+}
+
+fn readCacheCoordinationGeneration(file: std.Io.File, io: std.Io) !?u64 {
+    const stat = try file.stat(io);
+    if (stat.size != cache_coordination_state_len) return null;
+    var encoded: [cache_coordination_state_len]u8 = undefined;
+    if (try file.readPositionalAll(io, &encoded, 0) != encoded.len) return null;
+    if (!std.mem.eql(u8, encoded[0..cache_coordination_magic.len], cache_coordination_magic)) return null;
+    const generation = std.mem.readInt(u64, encoded[cache_coordination_magic.len..][0..8], .little);
+    const complement = std.mem.readInt(u64, encoded[cache_coordination_magic.len + 8 ..][0..8], .little);
+    if (complement != ~generation) return null;
+    return generation;
+}
+
+/// Advances the shared mutation token before changing cache files. A torn or
+/// missing token is intentionally treated as unknown by the next writer, which
+/// forces a complete reconciliation rather than trusting stale local usage.
+fn advanceCacheCoordinationGeneration(file: std.Io.File, io: std.Io) !u64 {
+    const previous = (try readCacheCoordinationGeneration(file, io)) orelse 0;
+    const generation = previous +% 1;
+    var encoded: [cache_coordination_state_len]u8 = undefined;
+    @memcpy(encoded[0..cache_coordination_magic.len], cache_coordination_magic);
+    std.mem.writeInt(u64, encoded[cache_coordination_magic.len..][0..8], generation, .little);
+    std.mem.writeInt(u64, encoded[cache_coordination_magic.len + 8 ..][0..8], ~generation, .little);
+    try file.setLength(io, encoded.len);
+    try file.writePositionalAll(io, &encoded, 0);
+    return generation;
+}
+
+fn synchronizeCacheUsageUnderCoordinationLock(
+    self: *QueryCache,
+    io: std.Io,
+    cancellation: CancellationToken,
+    force: bool,
+) !void {
+    const shared_generation = try readCacheCoordinationGeneration(self.coordination_file, io);
+    if (!force and shared_generation != null and shared_generation.? == self.observed_coordination_generation) return;
+    const reconciliation_generation = try advanceCacheCoordinationGeneration(self.coordination_file, io);
+    const reconciled_usage = try reconcileCacheOnDisk(self.alloc, self.root_dir, self.instance_id, cancellation);
+    self.usage = reconciled_usage;
+    self.observed_coordination_generation = reconciliation_generation;
+    recordUsage(self);
+}
+
 fn cacheWriteOwnerLeasePathAlloc(alloc: Allocator, root_dir: []const u8, instance_id: u128) ![]u8 {
     const file_name = try std.fmt.allocPrint(alloc, "{x}{s}", .{ instance_id, cache_write_owner_lease_suffix });
     defer alloc.free(file_name);
@@ -701,28 +802,48 @@ fn ensureParentDir(path: []const u8) !void {
 
 var nonce: std.atomic.Value(u64) = .init(0);
 
-fn writeTempFileWithCancellation(
+fn reserveTempFile(
     alloc: Allocator,
     path: []const u8,
     instance_id: u128,
-    contents: []const u8,
-    lane: CacheWriteLane,
-    cancellation: CancellationToken,
+    reserved_bytes: u64,
 ) ![]u8 {
-    try cancellation.check();
     try ensureParentDir(path);
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-query-cache-{x}-{d}", .{ path, instance_id, nonce.fetchAdd(1, .monotonic) });
+    const tmp_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}{s}{x}-{d}-{d}",
+        .{ path, reserved_cache_write_marker, instance_id, nonce.fetchAdd(1, .monotonic), reserved_bytes },
+    );
     errdefer alloc.free(tmp_path);
 
     var io_impl = threadedIo();
     defer io_impl.deinit();
     const io = io_impl.io();
     errdefer deleteFilePath(io, tmp_path) catch {};
+    var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true, .exclusive = true });
+    file.close(io);
+    return tmp_path;
+}
+
+fn writeReservedTempFileWithCancellation(
+    path: []const u8,
+    contents: []const u8,
+    lane: CacheWriteLane,
+    cancellation: CancellationToken,
+) !void {
+    try cancellation.check();
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const io = io_impl.io();
     {
-        var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true, .exclusive = true });
+        var file = if (std.fs.path.isAbsolute(path))
+            try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write })
+        else
+            try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
         defer file.close(io);
         try file.lock(io, .exclusive);
         defer file.unlock(io);
+        try file.setLength(io, 0);
         var buf: [4096]u8 = undefined;
         var writer = file.writer(io, &buf);
         if (usesVerifiedCacheRecord(lane)) {
@@ -745,7 +866,6 @@ fn writeTempFileWithCancellation(
         try writer.end();
     }
     try cancellation.check();
-    return tmp_path;
 }
 
 fn usesVerifiedCacheRecord(lane: CacheWriteLane) bool {
@@ -788,29 +908,88 @@ fn publishCacheEntry(
         recordBypass(self);
         return false;
     }
-    const tmp_path = try writeTempFileWithCancellation(self.alloc, path, self.instance_id, contents, lane, cancellation);
-    defer self.alloc.free(tmp_path);
-    defer {
-        var cleanup_io = threadedIo();
-        defer cleanup_io.deinit();
-        deleteFilePath(cleanup_io.io(), tmp_path) catch {};
-    }
+    var tmp_path: []u8 = undefined;
+    {
+        try lockAtomicWithCancellation(&self.maintenance_mu, cancellation);
+        defer self.maintenance_mu.unlock();
+        var coordination_io = threadedIo();
+        defer coordination_io.deinit();
+        const io = coordination_io.io();
+        try lockFileExclusiveWithCancellation(self.coordination_file, io, cancellation);
+        defer self.coordination_file.unlock(io);
 
+        const now_ns = platform_time.monotonicNs();
+        const periodic_reconcile_due = now_ns >= self.next_abandoned_write_sweep_ns;
+        try synchronizeCacheUsageUnderCoordinationLock(self, io, cancellation, periodic_reconcile_due);
+        if (periodic_reconcile_due) {
+            self.next_abandoned_write_sweep_ns = now_ns +| abandoned_cache_write_sweep_interval_ns;
+        }
+        if (fileExists(path)) return false;
+
+        // Publish the mutation token before eviction or reservation creation.
+        // A process crash at any later instruction forces every overlapping
+        // writer to reconcile the filesystem before trusting local usage.
+        self.observed_coordination_generation = try advanceCacheCoordinationGeneration(self.coordination_file, io);
+        if (!try ensureCapacityForWrite(self, incoming_bytes, lane, cancellation)) {
+            recordBypass(self);
+            return false;
+        }
+        tmp_path = try reserveTempFile(self.alloc, path, self.instance_id, incoming_bytes);
+        addUsage(&self.usage, incoming_bytes, lane);
+        recordUsage(self);
+    }
+    defer self.alloc.free(tmp_path);
+    var reservation_active = true;
+    defer if (reservation_active) discardCacheReservationBestEffort(self, tmp_path, incoming_bytes, lane);
+
+    try writeReservedTempFileWithCancellation(tmp_path, contents, lane, cancellation);
     try lockAtomicWithCancellation(&self.maintenance_mu, cancellation);
     defer self.maintenance_mu.unlock();
-    try maybeReconcileCacheOnDisk(self, cancellation);
-    if (fileExists(path)) return false;
-    if (!try ensureCapacityForWrite(self, incoming_bytes, lane, cancellation)) {
-        recordBypass(self);
+    var coordination_io = threadedIo();
+    defer coordination_io.deinit();
+    const io = coordination_io.io();
+    try lockFileExclusiveWithCancellation(self.coordination_file, io, cancellation);
+    defer self.coordination_file.unlock(io);
+    try synchronizeCacheUsageUnderCoordinationLock(self, io, cancellation, false);
+    self.observed_coordination_generation = try advanceCacheCoordinationGeneration(self.coordination_file, io);
+    if (fileExists(path)) {
+        deleteFilePath(io, tmp_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        subtractUsage(&self.usage, incoming_bytes, lane);
+        recordUsage(self);
+        reservation_active = false;
         return false;
     }
     try cancellation.check();
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    try renameFilePath(io_impl.io(), tmp_path, path);
-    addUsage(&self.usage, incoming_bytes, lane);
+    try renameFilePath(io, tmp_path, path);
     recordUsage(self);
+    reservation_active = false;
     return true;
+}
+
+fn discardCacheReservationBestEffort(
+    self: *QueryCache,
+    tmp_path: []const u8,
+    reserved_bytes: u64,
+    lane: CacheWriteLane,
+) void {
+    lockAtomic(&self.maintenance_mu);
+    defer self.maintenance_mu.unlock();
+    var coordination_io = threadedIo();
+    defer coordination_io.deinit();
+    const io = coordination_io.io();
+    lockFileExclusiveWithCancellation(self.coordination_file, io, .none) catch return;
+    defer self.coordination_file.unlock(io);
+    synchronizeCacheUsageUnderCoordinationLock(self, io, .none, false) catch return;
+    self.observed_coordination_generation = advanceCacheCoordinationGeneration(self.coordination_file, io) catch return;
+    deleteFilePath(io, tmp_path) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return,
+    };
+    subtractUsage(&self.usage, reserved_bytes, lane);
+    recordUsage(self);
 }
 
 fn touchFileNow(path: []const u8) !void {
@@ -932,13 +1111,12 @@ fn consumesPayloadBudget(lane: CacheWriteLane) bool {
 }
 
 fn currentBytesNoLock(alloc: Allocator, root_dir: []const u8) !u64 {
-    return (try cacheUsageNoLock(alloc, root_dir, null, .none)).total_bytes;
+    return (try cacheUsageNoLock(alloc, root_dir, .none)).total_bytes;
 }
 
 fn cacheUsageNoLock(
     alloc: Allocator,
     root_dir: []const u8,
-    current_instance_id: ?u128,
     cancellation: CancellationToken,
 ) !CacheUsage {
     var usage = CacheUsage{};
@@ -955,11 +1133,10 @@ fn cacheUsageNoLock(
     while (try walker.next(io_impl.io())) |entry| {
         try cancellation.check();
         if (entry.kind != .file) continue;
-        if (isCacheWriteOwnerLeasePath(entry.path)) continue;
+        if (isQueryCacheControlPath(entry.path)) continue;
         const stat = try dir.statFile(io_impl.io(), entry.path, .{});
         if (isTemporaryCachePath(entry.path)) {
-            if (current_instance_id != null and temporaryCacheWriteOwnerId(entry.path) == current_instance_id) continue;
-            addScannedFileUsage(&usage, entry.path, stat.size);
+            addScannedFileUsage(&usage, entry.path, temporaryCacheAccountedBytes(entry.path, stat.size));
             continue;
         }
         addScannedFileUsage(&usage, entry.path, stat.size);
@@ -1005,7 +1182,7 @@ fn reconcileCacheOnDisk(
     while (try walker.next(io)) |entry| {
         try cancellation.check();
         if (entry.kind != .file) continue;
-        if (isCacheWriteOwnerLeasePath(entry.path)) continue;
+        if (isQueryCacheControlPath(entry.path)) continue;
         const stat = dir.statFile(io, entry.path, .{}) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return err,
@@ -1021,7 +1198,9 @@ fn reconcileCacheOnDisk(
                 stat.mtime.toNanoseconds(),
                 cutoff_ns,
             );
-            if (disposition == .retained) addScannedFileUsage(&usage, entry.path, stat.size);
+            if (disposition != .removed) {
+                addScannedFileUsage(&usage, entry.path, temporaryCacheAccountedBytes(entry.path, stat.size));
+            }
             continue;
         }
         if (usesVerifiedCacheRecordPath(entry.path) and
@@ -1042,10 +1221,15 @@ fn reconcileCacheOnDisk(
 fn maybeReconcileCacheOnDisk(self: *QueryCache, cancellation: CancellationToken) !void {
     const now_ns = platform_time.monotonicNs();
     if (now_ns < self.next_abandoned_write_sweep_ns) return;
-    const usage = try reconcileCacheOnDisk(self.alloc, self.root_dir, self.instance_id, cancellation);
-    self.usage = usage;
+    try lockAtomicWithCancellation(&self.maintenance_mu, cancellation);
+    defer self.maintenance_mu.unlock();
+    var coordination_io = threadedIo();
+    defer coordination_io.deinit();
+    const io = coordination_io.io();
+    try lockFileExclusiveWithCancellation(self.coordination_file, io, cancellation);
+    defer self.coordination_file.unlock(io);
+    try synchronizeCacheUsageUnderCoordinationLock(self, io, cancellation, true);
     self.next_abandoned_write_sweep_ns = now_ns +| abandoned_cache_write_sweep_interval_ns;
-    recordUsage(self);
 }
 
 fn reconcileTemporaryCacheWrite(
@@ -1104,12 +1288,27 @@ fn removeUnlockedCacheWrite(
 }
 
 fn temporaryCacheWriteOwnerId(path: []const u8) ?u128 {
-    const marker = ".tmp-query-cache-";
+    const marker = if (std.mem.lastIndexOf(u8, path, reserved_cache_write_marker) != null)
+        reserved_cache_write_marker
+    else
+        ".tmp-query-cache-";
     const marker_index = std.mem.lastIndexOf(u8, path, marker) orelse return null;
     const encoded = path[marker_index + marker.len ..];
     const separator = std.mem.indexOfScalar(u8, encoded, '-') orelse return null;
     if (separator == 0) return null;
     return std.fmt.parseInt(u128, encoded[0..separator], 16) catch null;
+}
+
+fn temporaryCacheReservedBytes(path: []const u8) ?u64 {
+    const marker_index = std.mem.lastIndexOf(u8, path, reserved_cache_write_marker) orelse return null;
+    const encoded = path[marker_index + reserved_cache_write_marker.len ..];
+    const separator = std.mem.lastIndexOfScalar(u8, encoded, '-') orelse return null;
+    if (separator + 1 >= encoded.len) return null;
+    return std.fmt.parseInt(u64, encoded[separator + 1 ..], 10) catch null;
+}
+
+fn temporaryCacheAccountedBytes(path: []const u8, physical_bytes: u64) u64 {
+    return @max(physical_bytes, temporaryCacheReservedBytes(path) orelse 0);
 }
 
 fn cacheWriteOwnerState(
@@ -1191,8 +1390,13 @@ fn cacheWriteOwnerIdFromLeaseName(name: []const u8) ?u128 {
 }
 
 fn isCacheWriteOwnerLeasePath(path: []const u8) bool {
-    const prefix = cache_write_owner_dir_name ++ "/";
-    return std.mem.startsWith(u8, path, prefix) and std.mem.endsWith(u8, path, cache_write_owner_lease_suffix);
+    const parent = std.fs.path.dirname(path) orelse return false;
+    return std.mem.eql(u8, parent, cache_write_owner_dir_name) and
+        std.mem.endsWith(u8, std.fs.path.basename(path), cache_write_owner_lease_suffix);
+}
+
+fn isQueryCacheControlPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, cache_coordination_file_name) or isCacheWriteOwnerLeasePath(path);
 }
 
 fn usesVerifiedCacheRecordPath(path: []const u8) bool {
@@ -1267,6 +1471,21 @@ fn addUsage(usage: *CacheUsage, bytes: u64, lane: CacheWriteLane) void {
             usage.payload_block_count += 1;
         },
         .full, .range => usage.payload_bytes += bytes,
+    }
+}
+
+fn subtractUsage(usage: *CacheUsage, bytes: u64, lane: CacheWriteLane) void {
+    usage.total_bytes -|= bytes;
+    switch (lane) {
+        .routing_block => {
+            usage.pinned_bytes -|= bytes;
+            usage.pinned_block_count -|= 1;
+        },
+        .payload_block => {
+            usage.payload_bytes -|= bytes;
+            usage.payload_block_count -|= 1;
+        },
+        .full, .range => usage.payload_bytes -|= bytes,
     }
 }
 
@@ -1351,14 +1570,19 @@ fn recordBypass(self: *QueryCache) void {
 fn removeCorruptCacheEntry(self: *QueryCache, path: []const u8, cancellation: CancellationToken) !void {
     try lockAtomicWithCancellation(&self.maintenance_mu, cancellation);
     defer self.maintenance_mu.unlock();
+    var coordination_io = threadedIo();
+    defer coordination_io.deinit();
+    const io = coordination_io.io();
+    try lockFileExclusiveWithCancellation(self.coordination_file, io, cancellation);
+    defer self.coordination_file.unlock(io);
+    try synchronizeCacheUsageUnderCoordinationLock(self, io, cancellation, false);
+    self.observed_coordination_generation = try advanceCacheCoordinationGeneration(self.coordination_file, io);
     try cancellation.check();
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    deleteFilePath(io_impl.io(), path) catch |err| switch (err) {
+    deleteFilePath(io, path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
-    self.usage = try cacheUsageNoLock(self.alloc, self.root_dir, self.instance_id, cancellation);
+    self.usage = try cacheUsageNoLock(self.alloc, self.root_dir, cancellation);
     lockAtomic(&self.stats_mu);
     defer self.stats_mu.unlock();
     self.stats.integrity_failures += 1;
@@ -1460,7 +1684,7 @@ fn collectEvictablePayloadFilesAlloc(alloc: Allocator, root_dir: []const u8, can
     while (try walker.next(io_impl.io())) |entry| {
         try cancellation.check();
         if (entry.kind != .file) continue;
-        if (isTemporaryCachePath(entry.path)) continue;
+        if (isTemporaryCachePath(entry.path) or isQueryCacheControlPath(entry.path)) continue;
         const is_payload = std.mem.startsWith(u8, entry.path, ".blocks/") or std.mem.startsWith(u8, entry.path, ".ranges/");
         if (!is_payload) continue;
         const path = try std.fs.path.join(alloc, &.{ root_dir, entry.path });
@@ -1495,7 +1719,7 @@ fn collectEvictableRootFilesAlloc(alloc: Allocator, root_dir: []const u8, cancel
     while (try walker.next(io_impl.io())) |entry| {
         try cancellation.check();
         if (entry.kind != .file) continue;
-        if (isTemporaryCachePath(entry.path)) continue;
+        if (isTemporaryCachePath(entry.path) or isQueryCacheControlPath(entry.path)) continue;
         if (std.mem.indexOfScalar(u8, entry.path, std.fs.path.sep)) |_| continue;
         const path = try std.fs.path.join(alloc, &.{ root_dir, entry.path });
         errdefer alloc.free(path);
@@ -1525,7 +1749,7 @@ fn collectEvictablePinnedFilesAlloc(alloc: Allocator, root_dir: []const u8, canc
     defer walker.deinit();
     while (try walker.next(io_impl.io())) |entry| {
         try cancellation.check();
-        if (entry.kind != .file or isTemporaryCachePath(entry.path)) continue;
+        if (entry.kind != .file or isTemporaryCachePath(entry.path) or isQueryCacheControlPath(entry.path)) continue;
         if (!std.mem.startsWith(u8, entry.path, ".blocks-pinned/")) continue;
         const path = try std.fs.path.join(alloc, &.{ root_dir, entry.path });
         errdefer alloc.free(path);
@@ -1982,6 +2206,56 @@ test "serverless query cache maintenance reclaims newly orphaned owner writes" {
     try std.testing.expect(!fileExists(crashed_path));
     try std.testing.expect(!fileExists(crashed_lease_path));
     try std.testing.expectEqual(@as(u64, 0), cache.statsSnapshot().current_bytes);
+}
+
+test "serverless query cache reserves shared disk budget before staging bytes" {
+    const alloc = std.testing.allocator;
+    var cache_root_buf: [256]u8 = undefined;
+    const cache_root = tmpPath(&cache_root_buf, "cache-shared-reservation-budget");
+    defer cleanupTmp(cache_root);
+
+    const cfg = QueryCacheConfig{
+        .max_bytes = 10,
+        .max_payload_bytes = 10,
+    };
+    var first = try QueryCache.initWithConfig(alloc, std.mem.span(cache_root), cfg);
+    defer first.deinit();
+    // Open before the reservation to prove the shared mutation token repairs a
+    // stale per-process usage snapshot at the next admission boundary.
+    var overlap = try QueryCache.initWithConfig(alloc, std.mem.span(cache_root), cfg);
+    defer overlap.deinit();
+
+    const first_path = try std.fs.path.join(alloc, &.{ std.mem.span(cache_root), "first" });
+    defer alloc.free(first_path);
+    var reservation_path: []u8 = undefined;
+    {
+        try lockAtomicWithCancellation(&first.maintenance_mu, .none);
+        defer first.maintenance_mu.unlock();
+        var coordination_io = threadedIo();
+        defer coordination_io.deinit();
+        const io = coordination_io.io();
+        try lockFileExclusiveWithCancellation(first.coordination_file, io, .none);
+        defer first.coordination_file.unlock(io);
+        try synchronizeCacheUsageUnderCoordinationLock(&first, io, .none, false);
+        first.observed_coordination_generation = try advanceCacheCoordinationGeneration(first.coordination_file, io);
+        try std.testing.expect(try ensureCapacityForWrite(&first, 8, .full, .none));
+        reservation_path = try reserveTempFile(alloc, first_path, first.instance_id, 8);
+        addUsage(&first.usage, 8, .full);
+        recordUsage(&first);
+    }
+    defer alloc.free(reservation_path);
+    var reservation_active = true;
+    defer if (reservation_active) discardCacheReservationBestEffort(&first, reservation_path, 8, .full);
+
+    const second_path = try std.fs.path.join(alloc, &.{ std.mem.span(cache_root), "second" });
+    defer alloc.free(second_path);
+    try std.testing.expect(!try publishCacheEntry(&overlap, second_path, "12345678", .full, .none));
+    try std.testing.expect(fileExists(reservation_path));
+    try std.testing.expectEqual(@as(u64, 8), overlap.statsSnapshot().current_bytes);
+    try std.testing.expect(overlap.statsSnapshot().current_bytes <= cfg.max_bytes);
+
+    discardCacheReservationBestEffort(&first, reservation_path, 8, .full);
+    reservation_active = false;
 }
 
 test "serverless query cache prunes legacy pinned block records during startup" {
