@@ -6698,6 +6698,14 @@ pub fn build(b: *std.Build) void {
     const transaction_vopr_test_step = b.step("transaction-vopr-test", "Run deterministic transaction VOPR and formal trace export tests");
     transaction_vopr_test_step.dependOn(&run_transaction_vopr_tests.step);
 
+    const vopr_runtime_adapter_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"VOPR durable job"},
+    });
+    const run_vopr_runtime_adapter_tests = b.addRunArtifact(vopr_runtime_adapter_tests);
+    const vopr_runtime_adapter_test_step = b.step("vopr-runtime-test", "Run Antfly background-service adapters on the deterministic VOPR runtime");
+    vopr_runtime_adapter_test_step.dependOn(&run_vopr_runtime_adapter_tests.step);
+
     const run_sim_cli = b.addRunArtifact(sim_cli);
     run_sim_cli.addArg("run");
     if (b.args) |args| run_sim_cli.addArgs(args);
@@ -6743,6 +6751,7 @@ pub fn build(b: *std.Build) void {
     const sim_test_step = b.step("sim-test", "Run mocked-time Antfly simulation suites");
     sim_test_step.dependOn(&run_sim_contract_tests.step);
     sim_test_step.dependOn(&run_transaction_vopr_tests.step);
+    sim_test_step.dependOn(&run_vopr_runtime_adapter_tests.step);
     sim_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
     sim_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
     sim_test_step.dependOn(&run_lib_metadata_vopr_data_tests.step);

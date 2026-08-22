@@ -1,7 +1,8 @@
 # VOPR: Deterministic Autonomous Simulation for Antfly
 
-Status: implementation in progress; Phases 0, 0.5, 1, and 5 complete; the
-Phase 4 exit scenario is complete; Phases 2–4 have documented follow-on work
+Status: implementation in progress; Phases 0, 0.5, 1, 2, and 5 complete; the
+Phase 4 exit scenario is complete and its generated split/merge composition is
+the remaining phase-level implementation item
 
 Scope: Zig Antfly simulation, VOPR, modeled-storage, and chaos tests
 
@@ -1340,6 +1341,9 @@ pkg/antfly/src/sim/
     wal/
     lsm/
     ha/
+
+pkg/antfly/src/storage/
+  vopr_durable_job_lane.zig # Antfly Job -> generic VOPR Executor adapter
 ```
 
 Domain-specific adapters may live beside the domain when that produces a
@@ -1725,9 +1729,28 @@ to preserve the scenario's healthy-quorum budget, and each active fault plus
 the aggregate heal action is independently selectable. Active link, node, and
 total fault counts are semantic observations, and the metadata replay ABI was
 bumped for the changed enabled sets (currently version 3 after adding the
-meta-test configuration field). Phase 2 remains open for
-moving additional production background services onto `SimRuntime` instead of
-their current manual domain runtimes.
+meta-test configuration field). The remaining Phase 2 follow-on was to move a
+shared production background-service seam onto `SimRuntime` instead of leaving
+all such work in manual domain runtimes.
+
+That production seam is now implemented for the shared durable-job surface.
+`storage/vopr_durable_job_lane.zig` adapts Antfly's existing
+`DurableJobLane`—used by commit-durable, maintenance, and cleanup work—to the
+generic VOPR `Executor`. Submission creates a scheduler-visible atomic task;
+successful execution and owner cancellation preserve exact-once payload
+destruction, owner close rejects later work, and job failures are classified in
+stable adapter statistics instead of aborting the scheduler. The focused test
+runs the production LSM background executor through `SimRuntime`, proving this
+is a shared production seam rather than a test-only callback facade.
+
+Synchronous `drainOwner` cannot drive the deterministic scheduler from inside
+itself, so the adapter requires callers to reach quiescence before drain and
+fails loudly on misuse; `closeOwner` cancels queued transitions. This makes the
+lifetime distinction explicit instead of introducing hidden recursive
+scheduling. The `zig build vopr-runtime-test` gate is included in `sim-test`.
+Phase 2's exit condition is met. Long-lived services that directly require the
+full `std.Io` filesystem/network surface remain later integration work and do
+not justify widening the simulation runtime contract.
 
 ### Phase 3: Coverage, Corpus, and Reduction
 
