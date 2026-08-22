@@ -1075,19 +1075,17 @@ pub const ObjectRangeCache = struct {
         };
         if (read_len > self.policy.max_fetch_bytes) return error.LakeRangeReadTooLarge;
         const cache_key = try read.cacheKeyAlloc(alloc);
+        defer alloc.free(cache_key);
         if (self.entries.get(cache_key)) |cached| {
             if (cached.bytes.len != read_len) {
-                alloc.free(cache_key);
                 return error.InvalidLakeRangeRead;
             }
             const checksum = objectRangeCacheDigest(cached.bytes);
             if (!std.mem.eql(u8, &cached.checksum, &checksum)) {
-                alloc.free(cache_key);
                 return error.InvalidLakeRangeRead;
             }
             self.stats.hits += 1;
             self.stats.lanes[@intFromEnum(cache_lane)].hits += 1;
-            alloc.free(cache_key);
             return try alloc.dupe(u8, cached.bytes);
         }
 
@@ -1097,7 +1095,6 @@ pub const ObjectRangeCache = struct {
                 self.stats.hits += 1;
                 self.stats.lanes[@intFromEnum(cache_lane)].hits += 1;
                 try self.storeFetchedBytes(alloc, cache_key, cache_lane, bytes, false);
-                alloc.free(cache_key);
                 return bytes;
             }
         }
@@ -1107,7 +1104,6 @@ pub const ObjectRangeCache = struct {
         const bytes = try readObjectRangeAlloc(alloc, reader, read);
         errdefer alloc.free(bytes);
         try self.storeFetchedBytes(alloc, cache_key, cache_lane, bytes, true);
-        alloc.free(cache_key);
         return bytes;
     }
 
@@ -6794,6 +6790,44 @@ test "parquet object range cache enforces fetch admission before reader invocati
     };
     try std.testing.expectError(error.LakeRangeReadTooLarge, cache.readAlloc(alloc, reader, read));
     try std.testing.expectEqual(@as(usize, 0), reader_impl.calls);
+}
+
+test "parquet object range cache releases its cache key when a source read fails" {
+    const alloc = std.testing.allocator;
+    const FailingReader = struct {
+        fn readRangeAlloc(
+            ctx: *anyopaque,
+            a: Allocator,
+            bucket: []const u8,
+            key: []const u8,
+            offset: u64,
+            len: usize,
+        ) ![]u8 {
+            _ = ctx;
+            _ = a;
+            _ = bucket;
+            _ = key;
+            _ = offset;
+            _ = len;
+            return error.TestRangeReadFailure;
+        }
+    };
+    var unused: u8 = 0;
+    const reader = ObjectRangeReader{ .ctx = &unused, .read_range_alloc = FailingReader.readRangeAlloc };
+    var cache = ObjectRangeCache{};
+    defer cache.deinit(alloc);
+    const read = range_io.RangeRead{
+        .object = .{
+            .bucket = "bucket",
+            .key = "object",
+            .byte_len = 2,
+            .version = .{ .etag = "etag" },
+        },
+        .range = .{ .offset = 0, .len = 2 },
+        .purpose = .parquet_column_chunk,
+    };
+
+    try std.testing.expectError(error.TestRangeReadFailure, cache.readAlloc(alloc, reader, read));
 }
 
 test "parquet serving cache capacity does not reject larger safe reads" {

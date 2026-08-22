@@ -33,6 +33,7 @@ const rowsource = @import("../../storage/rowsource/types.zig");
 const indexed_reader = @import("indexed_reader.zig");
 const query_request = @import("request.zig");
 const lake_rows = @import("lake_rows.zig");
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 
 pub const default_candidate_limit: usize = 100;
 
@@ -43,6 +44,13 @@ pub const CandidateServingLimits = struct {
     max_query_items: usize = 1_000_000,
     max_query_bytes: usize = 16 * 1024 * 1024,
     max_graph_depth: u32 = 64,
+    /// Bounds filter construction independently of the general query-shape
+    /// ceiling and matches the public graph-query serving contract.
+    max_graph_edge_types: usize = 64,
+    max_graph_edge_type_bytes: usize = 64 * 1024,
+    /// Aggregate edge inspections across every graph plan and artifact in one
+    /// candidate request. This bounds work even when no edge matches.
+    max_graph_edges_scanned: usize = 1_000_000,
     max_artifacts: usize = 128,
     max_total_artifact_bytes: usize = 1024 * 1024 * 1024,
     max_total_candidates: usize = 1_000_000,
@@ -52,7 +60,8 @@ pub const CandidateServingLimits = struct {
     pub fn validate(self: CandidateServingLimits) !void {
         try self.decode.validate();
         if (self.max_candidate_window == 0 or self.max_plans == 0 or self.max_declarations == 0 or self.max_query_items == 0 or self.max_query_bytes == 0 or self.max_artifacts == 0 or
-            self.max_total_artifact_bytes == 0 or self.max_total_candidates == 0 or self.max_total_candidate_bytes == 0 or self.max_graph_depth == 0)
+            self.max_total_artifact_bytes == 0 or self.max_total_candidates == 0 or self.max_total_candidate_bytes == 0 or self.max_graph_depth == 0 or
+            self.max_graph_edge_types == 0 or self.max_graph_edge_type_bytes == 0 or self.max_graph_edges_scanned == 0)
         {
             return error.InvalidLakeSidecarCandidateLimits;
         }
@@ -125,10 +134,14 @@ pub const CandidatePlanSet = struct {
     graph_plans: []const GraphCandidatePlan = &.{},
     vector_stats: ?*indexed_reader.SearchExecutionStats = null,
     limits: CandidateServingLimits = .{},
+    /// Borrowed for the synchronous execution of this plan set. Cancellation
+    /// is checked before artifact I/O and periodically during graph scans.
+    cancellation: CancellationToken = .none,
 };
 
 const CandidateServingBudget = struct {
     limits: CandidateServingLimits,
+    cancellation: CancellationToken = .none,
     plans: usize = 0,
     query_items: usize = 0,
     query_bytes: usize = 0,
@@ -136,10 +149,16 @@ const CandidateServingBudget = struct {
     total_artifact_bytes: usize = 0,
     total_candidates: usize = 0,
     total_candidate_bytes: usize = 0,
+    graph_edges_scanned: usize = 0,
 
     fn init(limits: CandidateServingLimits) !CandidateServingBudget {
+        return try initWithCancellation(limits, .none);
+    }
+
+    fn initWithCancellation(limits: CandidateServingLimits, cancellation: CancellationToken) !CandidateServingBudget {
         try limits.validate();
-        return .{ .limits = limits };
+        try cancellation.check();
+        return .{ .limits = limits, .cancellation = cancellation };
     }
 
     fn admitArtifact(self: *CandidateServingBudget, byte_len: u64) !usize {
@@ -176,6 +195,16 @@ const CandidateServingBudget = struct {
             return error.LakeSidecarCandidateBudgetExceeded;
         if (next_plans > self.limits.max_plans) return error.LakeSidecarCandidateBudgetExceeded;
         self.plans = next_plans;
+    }
+
+    fn admitGraphEdge(self: *CandidateServingBudget) !void {
+        const next_edges = std.math.add(usize, self.graph_edges_scanned, 1) catch
+            return error.LakeSidecarCandidateBudgetExceeded;
+        if (next_edges > self.limits.max_graph_edges_scanned) {
+            return error.LakeSidecarCandidateBudgetExceeded;
+        }
+        self.graph_edges_scanned = next_edges;
+        if (next_edges % 64 == 0) try self.cancellation.check();
     }
 
     fn remainingArtifacts(self: CandidateServingBudget) usize {
@@ -700,10 +729,12 @@ fn graphCandidateSetFromPayloadBoundedAlloc(
 
     var segment = try graph_segment.decodeAllocWithLimits(alloc, payload, budget.limits.decode);
     defer graph_segment.freeSegment(alloc, &segment);
+    var edge_type_filter = try GraphEdgeTypeFilter.init(alloc, request.edge_types);
+    defer edge_type_filter.deinit(alloc);
 
     const keys = switch (request.mode) {
-        .neighbors => try graphNeighborCandidateKeysAlloc(alloc, segment, request),
-        .traverse => try graphTraversalCandidateKeysAlloc(alloc, segment, request),
+        .neighbors => try graphNeighborCandidateKeysAlloc(alloc, segment, request, &edge_type_filter, budget),
+        .traverse => try graphTraversalCandidateKeysAlloc(alloc, segment, request, &edge_type_filter, budget),
     };
     defer {
         for (keys) |key| alloc.free(@constCast(key));
@@ -765,7 +796,7 @@ pub fn candidateSetsFromArtifactStoreAlloc(
     declarations: []const sidecar_manifest.DeclaredArtifact,
     plans: CandidatePlanSet,
 ) !OwnedCandidateSets {
-    var budget = try CandidateServingBudget.init(plans.limits);
+    var budget = try CandidateServingBudget.initWithCancellation(plans.limits, plans.cancellation);
     var plan_count = std.math.add(usize, plans.text_plans.len, plans.sparse_plans.len) catch
         return error.LakeSidecarCandidateBudgetExceeded;
     plan_count = std.math.add(usize, plan_count, plans.vector_plans.len) catch
@@ -874,6 +905,16 @@ fn validateGraphCandidateRequest(request: GraphCandidateRequest, limits: Candida
     try limits.validate();
     try validateCandidateWindow(0, request.limit, limits);
     if (request.max_depth > limits.max_graph_depth) {
+        return error.LakeSidecarCandidateBudgetExceeded;
+    }
+    const edge_types = request.edge_types orelse &.{};
+    if (edge_types.len > limits.max_graph_edge_types) return error.LakeSidecarCandidateBudgetExceeded;
+    var edge_type_bytes: usize = 0;
+    for (edge_types) |edge_type| {
+        edge_type_bytes = std.math.add(usize, edge_type_bytes, edge_type.len) catch
+            return error.LakeSidecarCandidateBudgetExceeded;
+    }
+    if (edge_type_bytes > limits.max_graph_edge_type_bytes) {
         return error.LakeSidecarCandidateBudgetExceeded;
     }
     const shape = try graphCandidateQueryShape(request);
@@ -1315,6 +1356,54 @@ test "lake sidecar query shapes and plan counts use aggregate admission" {
     try std.testing.expectError(error.LakeSidecarCandidateBudgetExceeded, byte_budget.admitQueryShape(0, 4));
 }
 
+test "lake graph sidecar candidate admission bounds filters, edge work, and cancellation" {
+    const edge_types = [_][]const u8{ "cites", "related" };
+    try std.testing.expectError(
+        error.LakeSidecarCandidateBudgetExceeded,
+        validateGraphCandidateRequest(.{
+            .start_node_id = "doc-a",
+            .edge_types = &edge_types,
+        }, .{ .max_graph_edge_types = 1 }),
+    );
+    try std.testing.expectError(
+        error.LakeSidecarCandidateBudgetExceeded,
+        validateGraphCandidateRequest(.{
+            .start_node_id = "doc-a",
+            .edge_types = &edge_types,
+        }, .{ .max_graph_edge_type_bytes = 6 }),
+    );
+
+    var filter = try GraphEdgeTypeFilter.init(std.testing.allocator, &.{"wanted"});
+    defer filter.deinit(std.testing.allocator);
+    const edges = [_]graph_segment.Edge{
+        .{ .neighbor_id = @constCast("doc-b"), .edge_type = @constCast("other"), .weight = 1 },
+        .{ .neighbor_id = @constCast("doc-c"), .edge_type = @constCast("other"), .weight = 1 },
+        .{ .neighbor_id = @constCast("doc-d"), .edge_type = @constCast("other"), .weight = 1 },
+    };
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer keys.deinit(std.testing.allocator);
+    var budget = try CandidateServingBudget.init(.{ .max_graph_edges_scanned = 2 });
+    try std.testing.expectError(
+        error.LakeSidecarCandidateBudgetExceeded,
+        appendGraphNeighborKeysAlloc(
+            std.testing.allocator,
+            &keys,
+            &edges,
+            .{ .start_node_id = "doc-a", .limit = 1 },
+            &filter,
+            &budget,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 2), budget.graph_edges_scanned);
+    try std.testing.expectEqual(@as(usize, 0), keys.items.len);
+
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(
+        error.Canceled,
+        CandidateServingBudget.initWithCancellation(.{}, CancellationToken.fromAtomic(&cancelled)),
+    );
+}
+
 fn testCandidateDeclaration(
     name: []const u8,
     sidecar_kind: source_binding.SidecarKind,
@@ -1341,10 +1430,35 @@ fn testCandidateDeclaration(
     };
 }
 
+const GraphEdgeTypeFilter = struct {
+    allow_all: bool,
+    by_name: std.StringHashMapUnmanaged(void) = .empty,
+
+    fn init(alloc: Allocator, maybe_edge_types: ?[]const []const u8) !GraphEdgeTypeFilter {
+        const edge_types = maybe_edge_types orelse return .{ .allow_all = true };
+        var filter = GraphEdgeTypeFilter{ .allow_all = false };
+        errdefer filter.deinit(alloc);
+        try filter.by_name.ensureTotalCapacity(alloc, @intCast(edge_types.len));
+        for (edge_types) |edge_type| filter.by_name.putAssumeCapacity(edge_type, {});
+        return filter;
+    }
+
+    fn deinit(self: *GraphEdgeTypeFilter, alloc: Allocator) void {
+        self.by_name.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn matches(self: GraphEdgeTypeFilter, candidate: []const u8) bool {
+        return self.allow_all or self.by_name.contains(candidate);
+    }
+};
+
 fn graphNeighborCandidateKeysAlloc(
     alloc: Allocator,
     segment: graph_segment.Segment,
     request: GraphCandidateRequest,
+    edge_type_filter: *const GraphEdgeTypeFilter,
+    budget: *CandidateServingBudget,
 ) ![]const []const u8 {
     const adjacency = findGraphAdjacency(segment, request.start_node_id) orelse return try alloc.alloc([]const u8, 0);
     var keys = std.ArrayListUnmanaged([]const u8).empty;
@@ -1353,10 +1467,10 @@ fn graphNeighborCandidateKeysAlloc(
         keys.deinit(alloc);
     }
     if (request.direction == .out or request.direction == .both) {
-        try appendGraphNeighborKeysAlloc(alloc, &keys, adjacency.out_edges, request);
+        try appendGraphNeighborKeysAlloc(alloc, &keys, adjacency.out_edges, request, edge_type_filter, budget);
     }
     if (request.direction == .in or request.direction == .both) {
-        try appendGraphNeighborKeysAlloc(alloc, &keys, adjacency.in_edges, request);
+        try appendGraphNeighborKeysAlloc(alloc, &keys, adjacency.in_edges, request, edge_type_filter, budget);
     }
     return try keys.toOwnedSlice(alloc);
 }
@@ -1366,10 +1480,13 @@ fn appendGraphNeighborKeysAlloc(
     keys: *std.ArrayListUnmanaged([]const u8),
     edges: []const graph_segment.Edge,
     request: GraphCandidateRequest,
+    edge_type_filter: *const GraphEdgeTypeFilter,
+    budget: *CandidateServingBudget,
 ) !void {
     for (edges) |edge| {
         if (keys.items.len >= request.limit) return;
-        if (!graphEdgeTypeMatches(request.edge_types, edge.edge_type)) continue;
+        try budget.admitGraphEdge();
+        if (!edge_type_filter.matches(edge.edge_type)) continue;
         try keys.ensureUnusedCapacity(alloc, 1);
         keys.appendAssumeCapacity(try alloc.dupe(u8, edge.neighbor_id));
     }
@@ -1384,6 +1501,8 @@ fn graphTraversalCandidateKeysAlloc(
     alloc: Allocator,
     segment: graph_segment.Segment,
     request: GraphCandidateRequest,
+    edge_type_filter: *const GraphEdgeTypeFilter,
+    budget: *CandidateServingBudget,
 ) ![]const []const u8 {
     var adjacency_index = try graph_segment.AdjacencyIndex.init(alloc, segment);
     defer adjacency_index.deinit(alloc);
@@ -1416,10 +1535,10 @@ fn graphTraversalCandidateKeysAlloc(
         if (item.depth == request.max_depth) continue;
         const adjacency = adjacency_index.find(segment, item.node_id) orelse continue;
         if (request.direction == .out or request.direction == .both) {
-            try enqueueGraphTraversalEdgesAlloc(alloc, &queue, &seen, adjacency.out_edges, item, request, max_seen);
+            try enqueueGraphTraversalEdgesAlloc(alloc, &queue, &seen, adjacency.out_edges, item, max_seen, edge_type_filter, budget);
         }
         if (request.direction == .in or request.direction == .both) {
-            try enqueueGraphTraversalEdgesAlloc(alloc, &queue, &seen, adjacency.in_edges, item, request, max_seen);
+            try enqueueGraphTraversalEdgesAlloc(alloc, &queue, &seen, adjacency.in_edges, item, max_seen, edge_type_filter, budget);
         }
     }
 
@@ -1432,12 +1551,14 @@ fn enqueueGraphTraversalEdgesAlloc(
     seen: *std.StringHashMapUnmanaged(void),
     edges: []const graph_segment.Edge,
     current: GraphQueueItem,
-    request: GraphCandidateRequest,
     max_seen: usize,
+    edge_type_filter: *const GraphEdgeTypeFilter,
+    budget: *CandidateServingBudget,
 ) !void {
     for (edges) |edge| {
         if (seen.count() >= max_seen) return;
-        if (!graphEdgeTypeMatches(request.edge_types, edge.edge_type)) continue;
+        try budget.admitGraphEdge();
+        if (!edge_type_filter.matches(edge.edge_type)) continue;
         const gop = try seen.getOrPut(alloc, edge.neighbor_id);
         if (gop.found_existing) continue;
         try queue.append(alloc, .{
@@ -1452,14 +1573,6 @@ fn findGraphAdjacency(segment: graph_segment.Segment, node_id: []const u8) ?grap
         if (std.mem.eql(u8, adjacency.node_id, node_id)) return adjacency;
     }
     return null;
-}
-
-fn graphEdgeTypeMatches(edge_types: ?[]const []const u8, candidate: []const u8) bool {
-    const values = edge_types orelse return true;
-    for (values) |edge_type| {
-        if (std.mem.eql(u8, edge_type, candidate)) return true;
-    }
-    return false;
 }
 
 fn appendOwnedCandidateSetsIntersectingDuplicatesAlloc(
