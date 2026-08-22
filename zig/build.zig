@@ -9823,9 +9823,16 @@ pub fn build(b: *std.Build) void {
                 .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 4) * 1024 * 1024 * 1024,
                 // Clean aarch64-macOS ReleaseFast storage codegen reached
                 // 17.42 GB (16.23 GiB) with the platform frameworks enabled.
-                // Keep the
-                // tighter Linux reservation, where CI remains below 8 GiB.
-                .distributed => @as(usize, if (target.result.os.tag == .macos) 18 else 8) * 1024 * 1024 * 1024,
+                // An aarch64-linux-musl cross-build on an aarch64-macOS host
+                // reached 10.00 GB; reserve 12 GiB there so the scheduler does
+                // not reject a successful local KinD artifact build. Native
+                // Linux CI retains the tighter measured 8 GiB reservation.
+                .distributed => @as(usize, if (target.result.os.tag == .macos)
+                    18
+                else if (builtin.os.tag == .macos)
+                    12
+                else
+                    8) * 1024 * 1024 * 1024,
                 // The broad aarch64-macOS ReleaseFast inference root now
                 // reaches roughly 13.6 GB after storage/runtime integration.
                 // Reserve enough headroom for mode-dependent IR; the build
