@@ -1,0 +1,206 @@
+name: Zig Inference L4 Spot Canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: CUDA validation scope
+        required: true
+        default: smoke
+        type: choice
+        options:
+          - smoke
+          - inference-e2e
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zig-inference-l4-spot-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    name: Build CUDA E2E binary
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 90
+    env:
+      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
+      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
+      ANTFLY_CI_ZIG_OPTIMIZE: ReleaseSafe
+      ANTFLY_CI_ZIG_STRIP: "true"
+      ANTFLY_CI_ZIG_CUDA: "true"
+      ANTFLY_CI_ZIG_CUDA_ARTIFACTS: fatbin
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Restore ARC Zig cache dirs
+        run: |
+          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          global_cache="/mnt/cache/antfly/zig/zig-global"
+          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
+          mkdir -p "$local_cache" "$global_cache"
+
+      - name: Build CUDA-enabled E2E executable
+        run: scripts/ci/zig-build-e2e-binaries.sh
+
+      - name: Verify CUDA is compiled in
+        run: |
+          version="$(zig/zig-out/bin/antfly inference version)"
+          printf '%s\n' "$version"
+          grep -q 'cuda=true' <<<"$version"
+
+      - name: Package E2E executable
+        run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-cuda.tar.gz" zig-out/bin/antfly
+
+      - name: Upload E2E executable
+        uses: actions/upload-artifact@v6
+        with:
+          name: antfly-e2e-cuda-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/antfly-e2e-cuda.tar.gz
+          compression-level: 0
+          retention-days: 1
+
+  inference:
+    name: L4 Spot / ${{ inputs.scope }}
+    needs: build
+    runs-on: arc-antfly-l4-spot
+    timeout-minutes: 90
+    env:
+      UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
+      HF_HOME: /mnt/cache/antfly/zig/hf
+      ANTFLY_INFERENCE_DOWNLOAD: "1"
+      ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL: ggml-org/gemma-4-e2b-it-gguf
+      ANTFLY_INFERENCE_FLORENCE_MODEL: antflydb/florence-2-base
+      ANTFLY_INFERENCE_REQUEST_TIMEOUT: "300"
+      ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT: "600"
+      ANTFLY_INFERENCE_MAX_LOADED_MODELS: "1"
+      ANTFLY_INFERENCE_PREFERRED_BACKEND: cuda
+      ANTFLY_INFERENCE_REQUIRE_SELECTED_BACKEND: cuda
+      ANTFLY_PROCESS_MEMORY_BUDGET_MB: "14000"
+      RUN_MULTIMODAL_GENERATOR_TESTS: "1"
+      RUN_CLIPCLAP_CONTRACT_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Record canary start
+        run: |
+          date +%s > "${RUNNER_TEMP}/cuda-canary-start"
+          {
+            echo "### L4 Spot canary"
+            echo
+            echo "- Scope: ${{ inputs.scope }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install test tools
+        run: sudo apt-get update && sudo apt-get install -y ca-certificates git curl xz-utils
+
+      - name: Restore ARC model cache dirs
+        run: |
+          mkdir -p "$UV_CACHE_DIR" "$HF_HOME"
+          mkdir -p /mnt/cache/antfly/zig/home-cache /mnt/cache/antfly/zig/home-antfly
+          rm -rf ~/.cache ~/.antfly
+          ln -s /mnt/cache/antfly/zig/home-cache ~/.cache
+          ln -s /mnt/cache/antfly/zig/home-antfly ~/.antfly
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Download E2E executable
+        uses: actions/download-artifact@v6
+        with:
+          name: antfly-e2e-cuda-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/antfly-e2e-cuda
+
+      - name: Install E2E executable
+        run: |
+          tar -xzf "${RUNNER_TEMP}/antfly-e2e-cuda/antfly-e2e-cuda.tar.gz" -C zig
+          chmod +x zig/zig-out/bin/antfly
+
+      - name: Verify L4 hardware and CUDA runtime
+        working-directory: zig
+        run: |
+          set -euo pipefail
+          if ! command -v nvidia-smi >/dev/null 2>&1; then
+            if [[ -x /usr/local/nvidia/bin/nvidia-smi ]]; then
+              export PATH="/usr/local/nvidia/bin:$PATH"
+            else
+              echo "GKE did not expose nvidia-smi from the node driver" >&2
+              exit 1
+            fi
+          fi
+          echo "NVIDIA_SMI=$(command -v nvidia-smi)" >> "$GITHUB_ENV"
+          nvidia-smi --query-gpu=name,uuid,driver_version,compute_cap,memory.total --format=csv,noheader | tee "${RUNNER_TEMP}/gpu-before.csv"
+          grep -q 'NVIDIA L4' "${RUNNER_TEMP}/gpu-before.csv"
+          grep -q '8.9' "${RUNNER_TEMP}/gpu-before.csv"
+          version="$(./zig-out/bin/antfly inference version)"
+          printf '%s\n' "$version"
+          grep -q 'cuda=true' <<<"$version"
+          ./zig-out/bin/antfly inference cuda-info --smoke
+
+      - name: Run CUDA inference validation
+        working-directory: zig
+        env:
+          ANTFLY_BIN: ./zig-out/bin/antfly
+        run: |
+          set -euo pipefail
+          started="$(date +%s)"
+          "$NVIDIA_SMI" \
+            --query-gpu=timestamp,name,uuid,utilization.gpu,memory.used,memory.total,power.draw \
+            --format=csv --loop=10 > "${RUNNER_TEMP}/gpu-samples.csv" &
+          monitor_pid="$!"
+          cleanup() {
+            kill "$monitor_pid" 2>/dev/null || true
+            wait "$monitor_pid" 2>/dev/null || true
+            elapsed="$(( $(date +%s) - started ))"
+            echo "- Test elapsed: $((elapsed / 60))m $((elapsed % 60))s" >> "$GITHUB_STEP_SUMMARY"
+          }
+          trap cleanup EXIT
+          if [[ "${{ inputs.scope }}" == "smoke" ]]; then
+            uv run --project e2e/inference pytest -q \
+              e2e/inference/test_generate.py::test_basic_generation
+          else
+            uv run --project e2e/inference pytest -q --continue-on-collection-errors \
+              e2e/inference
+          fi
+
+      - name: Capture final GPU state and timing
+        if: always()
+        run: |
+          nvidia_smi="${NVIDIA_SMI:-$(command -v nvidia-smi || true)}"
+          if [[ -z "$nvidia_smi" && -x /usr/local/nvidia/bin/nvidia-smi ]]; then
+            nvidia_smi=/usr/local/nvidia/bin/nvidia-smi
+          fi
+          if [[ -n "$nvidia_smi" ]]; then
+            "$nvidia_smi" --query-gpu=name,uuid,utilization.gpu,memory.used,memory.total,power.draw --format=csv,noheader \
+              | tee "${RUNNER_TEMP}/gpu-after.csv" || true
+          fi
+          started="$(cat "${RUNNER_TEMP}/cuda-canary-start" 2>/dev/null || date +%s)"
+          elapsed="$(( $(date +%s) - started ))"
+          echo "- Runner elapsed: $((elapsed / 60))m $((elapsed % 60))s" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload GPU evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: l4-spot-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gpu-*.csv
+          if-no-files-found: warn
+          retention-days: 14

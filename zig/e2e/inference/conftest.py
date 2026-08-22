@@ -294,6 +294,45 @@ class InferenceServer:
             return "<output tail unavailable while this platform's server is running>"
         return data.decode(errors="replace")
 
+    def output_contains(self, needle: str) -> bool:
+        """Search captured output without disturbing the child write offset."""
+
+        encoded = needle.encode()
+        if not encoded:
+            return True
+        descriptor = self.output.fileno()
+        size = os.fstat(descriptor).st_size
+        chunk_size = 64 * 1024
+        overlap = max(0, len(encoded) - 1)
+        carry = b""
+
+        if hasattr(os, "pread"):
+            offset = 0
+            while offset < size:
+                data = os.pread(descriptor, min(chunk_size, size - offset), offset)
+                if not data:
+                    break
+                combined = carry + data
+                if encoded in combined:
+                    return True
+                carry = combined[-overlap:] if overlap else b""
+                offset += len(data)
+            return False
+
+        if self.proc.poll() is None:  # pragma: no cover - Windows live-child guard.
+            return False
+        position = self.output.tell()
+        try:  # pragma: no cover - exercised only on platforms without pread.
+            self.output.seek(0)
+            while data := self.output.read(chunk_size):
+                combined = carry + data
+                if encoded in combined:
+                    return True
+                carry = combined[-overlap:] if overlap else b""
+            return False
+        finally:
+            self.output.seek(position)
+
     def failure_diagnostic(self) -> str:
         returncode = self.proc.poll()
         if returncode is None:
@@ -346,8 +385,23 @@ def base_url():
     If ANTFLY_INFERENCE_URL is set, use it directly (external server).
     Otherwise, start a local server from ANTFLY_BIN.
     """
+    required_backend = env_first("ANTFLY_INFERENCE_REQUIRE_SELECTED_BACKEND")
+    if required_backend is not None:
+        required_backend = required_backend.strip().lower()
+        supported_backends = {"cuda", "metal", "native", "onnx", "pjrt", "wasm"}
+        if required_backend not in supported_backends:
+            raise pytest.UsageError(
+                "ANTFLY_INFERENCE_REQUIRE_SELECTED_BACKEND must be one of "
+                f"{', '.join(sorted(supported_backends))}, got {required_backend!r}"
+            )
+
     url = env_first("ANTFLY_INFERENCE_URL")
     if url:
+        if required_backend:
+            raise pytest.UsageError(
+                "ANTFLY_INFERENCE_REQUIRE_SELECTED_BACKEND requires the local "
+                "E2E-managed server so its backend-selection logs can be verified"
+            )
         url = url.rstrip("/")
         if not wait_for_server(url, timeout=10):
             pytest.skip(f"Server at {url} is not reachable")
@@ -378,8 +432,18 @@ def base_url():
     unexpected_exit = server.proc.poll() is not None
     diagnostic = server.failure_diagnostic() if unexpected_exit else None
     server.stop(close_output=False)
+    if (
+        diagnostic is None
+        and required_backend
+        and not server.output_contains(f"selected backend {required_backend} for ")
+    ):
+        diagnostic = (
+            f"Inference E2E required a real {required_backend!r} model session, "
+            "but the server never selected that backend.\n"
+            f"Server output tail:\n{server.read_output()}"
+        )
     server.output.close()
-    if unexpected_exit and not server.failure_reported:
+    if diagnostic is not None and not server.failure_reported:
         pytest.fail(diagnostic, pytrace=False)
 
 
