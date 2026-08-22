@@ -78,6 +78,11 @@ pub const Runtime = struct {
     next_sequence: u64 = 0,
     events: std.ArrayListUnmanaged(Event) = .empty,
 
+    pub const PendingCompletion = struct {
+        sequence: u64,
+        due_ns: u64,
+    };
+
     pub fn init(alloc: Allocator) Runtime {
         return .{ .alloc = alloc };
     }
@@ -120,6 +125,60 @@ pub const Runtime = struct {
     pub fn advanceNs(self: *Runtime, delta_ns: u64) !void {
         self.now_ns +|= delta_ns;
         try self.runDue();
+    }
+
+    /// Advances the virtual clock without completing eligible operations.
+    /// Deterministic scenarios use this with pendingCompletionsAlloc and
+    /// completeSelected to expose delay and completion ordering as choices.
+    pub fn advanceClockNs(self: *Runtime, delta_ns: u64) !void {
+        self.now_ns = std.math.add(u64, self.now_ns, delta_ns) catch
+            return error.StorageRuntimeTimeOverflow;
+    }
+
+    /// Returns a canonical snapshot sorted by due time and stable creation
+    /// sequence. The snapshot owns no callback or context pointers.
+    pub fn pendingCompletionsAlloc(self: *const Runtime, alloc: Allocator) ![]PendingCompletion {
+        const pending = try alloc.alloc(PendingCompletion, self.events.items.len);
+        for (self.events.items, 0..) |scheduled, index| {
+            pending[index] = .{ .sequence = scheduled.sequence, .due_ns = scheduled.due_ns };
+        }
+        std.mem.sort(PendingCompletion, pending, {}, struct {
+            fn lessThan(_: void, lhs: PendingCompletion, rhs: PendingCompletion) bool {
+                if (lhs.due_ns != rhs.due_ns) return lhs.due_ns < rhs.due_ns;
+                return lhs.sequence < rhs.sequence;
+            }
+        }.lessThan);
+        return pending;
+    }
+
+    /// Completes one selected eligible operation. Selecting among multiple
+    /// due operations models completion reordering without changing callback
+    /// identity or relying on host scheduling.
+    pub fn completeSelected(self: *Runtime, sequence: u64) !void {
+        for (self.events.items, 0..) |scheduled, index| {
+            if (scheduled.sequence != sequence) continue;
+            if (scheduled.due_ns > self.now_ns) return error.StorageCompletionNotReady;
+            const removed = self.events.orderedRemove(index);
+            try removed.callback(removed.ctx);
+            return;
+        }
+        return error.UnknownStorageCompletion;
+    }
+
+    /// Moves a selected completion's eligibility later. This is a modeled
+    /// delay fault; callers must record the decision in their VOPR trace.
+    pub fn delaySelected(self: *Runtime, sequence: u64, delay_ns: u64) !void {
+        for (self.events.items) |*scheduled| {
+            if (scheduled.sequence != sequence) continue;
+            scheduled.due_ns = std.math.add(u64, scheduled.due_ns, delay_ns) catch
+                return error.StorageCompletionDeadlineOverflow;
+            return;
+        }
+        return error.UnknownStorageCompletion;
+    }
+
+    pub fn pendingCompletionCount(self: *const Runtime) usize {
+        return self.events.items.len;
     }
 
     pub fn runUntilIdle(self: *Runtime) !void {
@@ -1216,6 +1275,41 @@ test "storage sim completion scheduler advances to scheduled completion" {
     try runtime.completionScheduler().waitNs(10);
     try std.testing.expectEqual(@as(u64, 10), runtime.clock().nowNs());
     try std.testing.expectEqual(@as(u32, 1), counter.value);
+}
+
+test "storage sim exposes selected delayed and reordered completions" {
+    const Recorder = struct {
+        values: std.ArrayListUnmanaged(u8) = .empty,
+        const Context = struct { values: *std.ArrayListUnmanaged(u8), value: u8 };
+
+        fn record(ptr: *anyopaque) !void {
+            const context: *Context = @ptrCast(@alignCast(ptr));
+            try context.values.append(std.testing.allocator, context.value);
+        }
+    };
+
+    var runtime = Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+    var recorder = Recorder{};
+    defer recorder.values.deinit(std.testing.allocator);
+    var first = Recorder.Context{ .values = &recorder.values, .value = 1 };
+    var second = Recorder.Context{ .values = &recorder.values, .value = 2 };
+    try runtime.schedule(10, &first, Recorder.record);
+    try runtime.schedule(10, &second, Recorder.record);
+
+    const pending = try runtime.pendingCompletionsAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(pending);
+    try std.testing.expectEqual(@as(u64, 0), pending[0].sequence);
+    try std.testing.expectEqual(@as(u64, 1), pending[1].sequence);
+    try runtime.delaySelected(0, 10);
+    try runtime.advanceClockNs(10);
+    try std.testing.expectError(error.StorageCompletionNotReady, runtime.completeSelected(0));
+    try runtime.completeSelected(1);
+    try std.testing.expectEqualSlices(u8, &.{2}, recorder.values.items);
+    try runtime.advanceClockNs(10);
+    try runtime.completeSelected(0);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 1 }, recorder.values.items);
+    try std.testing.expectEqual(@as(usize, 0), runtime.pendingCompletionCount());
 }
 
 test "modeled device preserves only synced bytes across crash" {
