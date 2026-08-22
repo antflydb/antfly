@@ -2571,16 +2571,19 @@ type HASeedArtifactReceiptStatus struct {
 	TotalBytes                  uint64 `json:"totalBytes,omitempty"`
 	FileCount                   int32  `json:"fileCount,omitempty"`
 	RetainedCount               int32  `json:"retainedCount,omitempty"`
-	DeletedCount                int32  `json:"deletedCount,omitempty"`
-	ProtectedCount              int32  `json:"protectedCount,omitempty"`
-	ResumedTombstoneCount       int32  `json:"resumedTombstoneCount,omitempty"`
-	SkippedIneligibleCount      int32  `json:"skippedIneligibleCount,omitempty"`
-	CheckpointSHA256            string `json:"checkpointSHA256,omitempty"`
-	TopologyID                  string `json:"topologyID,omitempty"`
-	TopologyGeneration          int64  `json:"topologyGeneration,omitempty"`
-	NodeID                      string `json:"nodeID,omitempty"`
-	TargetPVCName               string `json:"targetPVCName,omitempty"`
-	TargetPVCUID                string `json:"targetPVCUID,omitempty"`
+	// DeletedCount is serialized even when zero so a successful no-op GC is
+	// distinguishable from missing deletion evidence.
+	// +optional
+	DeletedCount           int32  `json:"deletedCount"`
+	ProtectedCount         int32  `json:"protectedCount,omitempty"`
+	ResumedTombstoneCount  int32  `json:"resumedTombstoneCount,omitempty"`
+	SkippedIneligibleCount int32  `json:"skippedIneligibleCount,omitempty"`
+	CheckpointSHA256       string `json:"checkpointSHA256,omitempty"`
+	TopologyID             string `json:"topologyID,omitempty"`
+	TopologyGeneration     int64  `json:"topologyGeneration,omitempty"`
+	NodeID                 string `json:"nodeID,omitempty"`
+	TargetPVCName          string `json:"targetPVCName,omitempty"`
+	TargetPVCUID           string `json:"targetPVCUID,omitempty"`
 }
 
 // HAAdminActionResultStatus records correlation fields from a typed HA admin action response.
@@ -2672,6 +2675,10 @@ type HAAdminActionResultStatus struct {
 	SeedTableID uint64 `json:"seedTableID,omitempty"`
 	// +optional
 	SeedTimelineID uint64 `json:"seedTimelineID,omitempty"`
+	// TimelineID is the canonical timeline carried by a seeded-slot activation
+	// receipt. SeedTimelineID remains populated for backwards compatibility.
+	// +optional
+	TimelineID uint64 `json:"timelineID,omitempty"`
 	// +optional
 	SeedEpoch uint64 `json:"seedEpoch,omitempty"`
 	// +optional

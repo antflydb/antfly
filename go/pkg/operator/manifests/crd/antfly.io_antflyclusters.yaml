@@ -5371,6 +5371,9 @@ spec:
                             targetTimelineID:
                               format: int64
                               type: integer
+                            timelineID:
+                              format: int64
+                              type: integer
                           type: object
                         adminStatusCode:
                           type: integer

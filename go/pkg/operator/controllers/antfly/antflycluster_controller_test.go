@@ -8761,6 +8761,22 @@ func TestHAAdminSDKActionResultsSatisfyOperatorEvidenceGates(t *testing.T) {
 	g.Expect(requireHADirectAdminActionResultStatus(&activateAction, activation)).To(Succeed())
 	g.Expect(activateAction.AdminResult.CheckpointLSN).To(Equal(uint64(7)))
 	g.Expect(activateAction.AdminResult.SeedArtifactGeneration).To(Equal("seed-standby-a-5"))
+	g.Expect(activateAction.AdminResult.SeedTimelineID).To(Equal(uint64(4)))
+	g.Expect(activateAction.AdminResult.TimelineID).To(Equal(uint64(4)))
+	encodedActivation, err := json.Marshal(activateAction.AdminResult)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(string(encodedActivation)).To(ContainSubstring(`"seedTimelineID":4`))
+	g.Expect(string(encodedActivation)).To(ContainSubstring(`"timelineID":4`))
+
+	encodedNoOpGC, err := json.Marshal(&antflyv1.HASeedArtifactReceiptStatus{
+		FormatVersion: 1,
+		Generation:    "seed-standby-a-5",
+		SlotName:      "standby-a",
+		RetainedCount: 1,
+		DeletedCount:  0,
+	})
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(string(encodedNoOpGC)).To(ContainSubstring(`"deletedCount":0`))
 
 	bootstrapAction := directPrimaryAction(haActionBootstrapStandbySeed)
 	bootstrapAction.AdminNodeID = "standby-a"

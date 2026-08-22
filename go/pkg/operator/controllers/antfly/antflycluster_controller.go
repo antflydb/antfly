@@ -7016,6 +7016,7 @@ func haAdminActionResultFromSeededSlotActivateSDK(response adminsdk.HASeededSlot
 	result.ManifestSHA256 = strings.TrimSpace(response.ManifestSha256)
 	result.AggregateSHA256 = strings.TrimSpace(response.AggregateSha256)
 	result.SeedTimelineID = response.TimelineId
+	result.TimelineID = response.TimelineId
 	return result
 }
 
